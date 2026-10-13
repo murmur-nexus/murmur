@@ -13,5 +13,3 @@
 #
 # The list can only shrink: the census in tests/a2a_wire_conformance.rs fails when a listed
 # exception no longer occurs, so a card removes its lines when it lands.
-SendStreamingMessage event lf.a2a.v1.StreamResponse 54148d84 murmur SSE frames, not JSON-RPC StreamResponse events
-stream/watch event lf.a2a.v1.StreamResponse 2eea2c25 murmur SSE frames; 2eea2c25 moves the watch stream onto 54148d84's shapes

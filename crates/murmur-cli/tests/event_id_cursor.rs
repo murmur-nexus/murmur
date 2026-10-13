@@ -9,16 +9,15 @@ mod common;
 use std::{
     fs,
     io::Write,
-    net::TcpStream,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use common::idle_capsule::{
     end_turn, end_turn_server, end_turns, http_post_json, launch_idle_capsule,
-    launch_idle_capsule_with, open_watch, read_lines_until, sse_body, submit_task,
-    wait_for_task_ends, IdleCapsule, LineReader,
+    launch_idle_capsule_with, submit_task, wait_for_task_ends, IdleCapsule,
 };
+use common::stream::{Event, Watch};
 use serde_json::Value;
 
 const TOOL_NAME: &str = "request-input-tool";
@@ -134,55 +133,11 @@ fn wait_for_task_end(workdir: &Path, task_id: &str) {
     }
 }
 
-// ── frames ─────────────────────────────────────────────────────────────────────
-
-/// One SSE frame as written: its `id:` (if any), its event type and its raw data line.
-#[derive(Debug, Clone, PartialEq)]
-struct Frame {
-    id: Option<u64>,
-    event: String,
-    data: String,
-}
-
-impl Frame {
-    /// The task id in the frame's `data`, for the frames that carry one.
-    fn task_id(&self) -> Option<String> {
-        serde_json::from_str::<Value>(&self.data)
-            .ok()?
-            .get("id")?
-            .as_str()
-            .map(str::to_string)
-    }
-}
-
-/// Parse SSE body lines into frames, dropping comments such as the heartbeat.
-fn frames(body: &[(Instant, String)]) -> Vec<Frame> {
-    let mut out = Vec::new();
-    let (mut id, mut event, mut data) = (None, String::new(), String::new());
-    for (_, line) in body {
-        if line.is_empty() {
-            if !event.is_empty() {
-                out.push(Frame {
-                    id,
-                    event: std::mem::take(&mut event),
-                    data: std::mem::take(&mut data),
-                });
-            }
-            id = None;
-        } else if let Some(rest) = line.strip_prefix("id: ") {
-            id = rest.parse().ok();
-        } else if let Some(rest) = line.strip_prefix("event: ") {
-            event = rest.to_string();
-        } else if let Some(rest) = line.strip_prefix("data: ") {
-            data = rest.to_string();
-        }
-    }
-    out
-}
+// ── events ─────────────────────────────────────────────────────────────────────
 
 /// Launch a capsule, run two tasks to completion and return it with the full replay a watcher
 /// attached with `Last-Event-ID: 0` receives.
-fn two_tasks_replayed() -> (IdleCapsule, Vec<Frame>) {
+fn two_tasks_replayed() -> (IdleCapsule, Vec<Event>) {
     let capsule = launch_idle_capsule(end_turn_server(&["first reply", "second reply"]));
     submit_task(&capsule.url, "event-id-cursor-1", "first task");
     wait_for_task_ends(&capsule.workdir, 1);
@@ -193,53 +148,33 @@ fn two_tasks_replayed() -> (IdleCapsule, Vec<Frame>) {
     (capsule, replay)
 }
 
-/// The numbered frames a `stream/watch` attached with `last_event_id` receives within 3 s,
-/// after asserting nothing but `connection-ack` arrives without an id.
-fn watch_frames(addr: &str, last_event_id: u64) -> Vec<Frame> {
-    let conn = open_watch(addr, last_event_id);
-    let body = sse_body(&read_lines_until(
-        &conn,
-        Instant::now() + Duration::from_secs(3),
-    ));
-    let all = frames(&body);
+/// The events a `stream/watch` attached with `last_event_id` receives within 3 s after its
+/// `connection-ack`, which is asserted to come first.
+fn watch_frames(addr: &str, last_event_id: u64) -> Vec<Event> {
+    let mut watch = Watch::open(addr, last_event_id);
+    watch.read_until(Duration::from_secs(3), |_| false);
+    let all = watch.events;
     assert_eq!(
-        all.first().map(|f| f.event.as_str()),
+        all.first().map(Event::kind).as_deref(),
         Some("connection-ack"),
-        "stream/watch should open with connection-ack; frames were {all:#?}"
+        "stream/watch should open with connection-ack; events were {all:#?}"
     );
     all.into_iter().skip(1).collect()
 }
 
-/// The distinct task ids in the order their first frame was written.
-fn task_order(frames: &[Frame]) -> Vec<String> {
+/// The distinct task ids in the order their first event was written.
+fn task_order(events: &[Event]) -> Vec<String> {
     let mut order = Vec::new();
-    for task in frames.iter().filter_map(Frame::task_id) {
-        if !order.contains(&task) {
-            order.push(task);
+    for task in events.iter().filter_map(Event::task_id) {
+        if !order.iter().any(|known| known == task) {
+            order.push(task.to_string());
         }
     }
     order
 }
 
-/// Read numbered and unnumbered frames from `conn` until `done` holds for what has arrived, or
-/// 30 s pass.
-fn read_frames_until(conn: &TcpStream, done: impl Fn(&[Frame]) -> bool) -> Vec<Frame> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut reader = LineReader::new(conn);
-    let mut lines = Vec::new();
-    loop {
-        lines.extend(reader.read_until(Instant::now() + Duration::from_millis(250)));
-        let got = frames(&sse_body(&lines));
-        if done(&got) || Instant::now() >= deadline {
-            return got;
-        }
-    }
-}
-
-fn is_final_status_of(frame: &Frame, task_id: &str) -> bool {
-    frame.event == "status"
-        && frame.task_id().as_deref() == Some(task_id)
-        && frame.data.contains(r#""final":true"#)
+fn is_final_status_of(event: &Event, task_id: &str) -> bool {
+    event.is_terminal_status() && event.task_id() == Some(task_id)
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────
@@ -254,7 +189,7 @@ fn ids_ascend_across_tasks() {
     let (_capsule, replay) = two_tasks_replayed();
 
     assert!(
-        replay.iter().all(|f| f.event != "gap"),
+        replay.iter().all(|f| f.kind() != "gap"),
         "a replay from 0 of an unevicted buffer should carry no gap; frames were {replay:#?}"
     );
     let ids: Vec<u64> = replay
@@ -267,9 +202,14 @@ fn ids_ascend_across_tasks() {
     assert_eq!(ids, expected, "ids should be exactly 1..=n");
 
     let first = &replay[0];
-    assert_eq!(first.event, "status", "id 1 should be a status: {first:?}");
-    assert!(
-        first.data.contains(r#""state":"working""#),
+    assert_eq!(
+        first.kind(),
+        "status-update",
+        "id 1 should be a status: {first:?}"
+    );
+    assert_eq!(
+        first.murmur_state(),
+        Some("working"),
         "id 1 should be the first task's working status: {first:?}"
     );
 
@@ -282,7 +222,7 @@ fn ids_ascend_across_tasks() {
     let ids_of = |task: &str| -> Vec<u64> {
         replay
             .iter()
-            .filter(|f| f.task_id().as_deref() == Some(task))
+            .filter(|f| f.task_id() == Some(task))
             .filter_map(|f| f.id)
             .collect()
     };
@@ -314,21 +254,17 @@ fn resume_from_first_task_cursor() {
     );
     let cursor = replay
         .iter()
-        .find(|f| {
-            f.event == "status"
-                && f.task_id().as_deref() == Some(tasks[0].as_str())
-                && f.data.contains(r#""final":true"#)
-        })
+        .find(|f| is_final_status_of(f, &tasks[0]))
         .and_then(|f| f.id)
         .unwrap_or_else(|| panic!("no final status for the first task; frames were {replay:#?}"));
 
     let resumed = watch_frames(&capsule.url, cursor);
 
     assert!(
-        resumed.iter().all(|f| f.event != "gap"),
+        resumed.iter().all(|f| f.kind() != "gap"),
         "resuming from a buffered id should carry no gap; frames were {resumed:#?}"
     );
-    let expected: Vec<Frame> = replay
+    let expected: Vec<Event> = replay
         .iter()
         .filter(|f| f.id.is_some_and(|id| id > cursor))
         .cloned()
@@ -339,12 +275,12 @@ fn resume_from_first_task_cursor() {
     );
     let second_task_frames = replay
         .iter()
-        .filter(|f| f.task_id().as_deref() == Some(tasks[1].as_str()))
+        .filter(|f| f.task_id() == Some(tasks[1].as_str()))
         .count();
     assert_eq!(
         resumed
             .iter()
-            .filter(|f| f.task_id().as_deref() == Some(tasks[1].as_str()))
+            .filter(|f| f.task_id() == Some(tasks[1].as_str()))
             .count(),
         second_task_frames,
         "the resumed replay should include every frame of the second task"
@@ -352,7 +288,7 @@ fn resume_from_first_task_cursor() {
     assert!(
         resumed
             .iter()
-            .all(|f| f.task_id().as_deref() != Some(tasks[0].as_str())),
+            .all(|f| f.task_id() != Some(tasks[0].as_str())),
         "the resumed replay should include no frame of the first task; frames were {resumed:#?}"
     );
 }
@@ -372,8 +308,9 @@ fn reconnect_mid_task_receives_every_later_frame_once() {
     ));
     let first = submit_task(&capsule.url, "event-id-mid-1", "first task");
 
-    let dropped = open_watch(&capsule.url, 0);
-    let before = read_frames_until(&dropped, |got| got.iter().any(|f| f.id.is_some()));
+    let mut dropped = Watch::open(&capsule.url, 0);
+    dropped.read_until(Duration::from_secs(30), |event| event.id.is_some());
+    let before = std::mem::take(&mut dropped.events);
     drop(dropped);
     let last_seen = before
         .iter()
@@ -389,25 +326,26 @@ fn reconnect_mid_task_receives_every_later_frame_once() {
     wait_for_task_end(&capsule.workdir, &first);
     wait_for_state(&capsule.url, &second, "TASK_STATE_WORKING");
 
-    let resumed_conn = open_watch(&capsule.url, last_seen);
-    let resumed = read_frames_until(&resumed_conn, |got| {
-        got.iter().any(|f| is_final_status_of(f, &second))
+    let mut resumed_conn = Watch::open(&capsule.url, last_seen);
+    resumed_conn.read_until(Duration::from_secs(30), |event| {
+        is_final_status_of(event, &second)
     });
+    let resumed = resumed_conn.events;
     assert!(
         trace_records(&capsule.workdir, "task_end").len() == 2,
         "the second task should have finished while the client was reconnected"
     );
-    let resumed: Vec<Frame> = resumed
+    let resumed: Vec<Event> = resumed
         .into_iter()
-        .filter(|f| f.event != "connection-ack")
+        .filter(|f| f.kind() != "connection-ack")
         .collect();
     assert!(
-        resumed.iter().all(|f| f.event != "gap"),
+        resumed.iter().all(|f| f.kind() != "gap"),
         "nothing was evicted, so no gap; frames were {resumed:#?}"
     );
 
     let everything = watch_frames(&capsule.url, 0);
-    let expected: Vec<Frame> = everything
+    let expected: Vec<Event> = everything
         .iter()
         .filter(|f| f.id.is_some_and(|id| id > last_seen))
         .cloned()
@@ -420,8 +358,8 @@ fn reconnect_mid_task_receives_every_later_frame_once() {
         resumed.iter().any(|f| is_final_status_of(f, &first))
             && resumed
                 .iter()
-                .any(|f| f.task_id().as_deref() == Some(second.as_str())
-                    && f.data.contains(r#""state":"working""#)),
+                .any(|f| f.task_id() == Some(second.as_str())
+                    && f.murmur_state() == Some("working")),
         "the rest of the first task and the start of the second should both arrive; frames were {resumed:#?}"
     );
 }
@@ -499,37 +437,43 @@ fn every_kind_of_frame_shares_one_sequence() {
         "ids should be exactly 1..=n across every task and frame kind; frames were {replay:#?}"
     );
 
-    let has = |task: &str, needle: &str| {
+    let of_task = |task: &str| {
         replay
             .iter()
-            .any(|f| f.task_id().as_deref() == Some(task) && f.data.contains(needle))
+            .filter(|f| f.task_id() == Some(task))
+            .collect::<Vec<_>>()
     };
-    for (task, needle) in [
-        (&first, r#""state":"input-required""#),
-        (&first, r#""message":"resumed""#),
+    assert!(
+        of_task(&first)
+            .iter()
+            .any(|f| f.murmur_state() == Some("input-required")),
+        "expected {first} to wait for input; frames were {replay:#?}"
+    );
+    for (task, said) in [
+        (&first, "resumed"),
         (&queued, "task canceled before it started"),
     ] {
         assert!(
-            has(task, needle),
-            "expected a frame of {task} carrying {needle}; frames were {replay:#?}"
+            of_task(task).iter().any(|f| f.status_text() == Some(said)),
+            "expected a status of {task} saying {said}; frames were {replay:#?}"
         );
     }
     // Two attempts per task: one reopen boundary between them. Turns number straight through
     // both attempts, so each task has exactly one first turn.
-    let count = |task: &str, needle: &str| {
-        replay
+    let count = |task: &str, said: &dyn Fn(&str) -> bool| {
+        of_task(task)
             .iter()
-            .filter(|f| f.task_id().as_deref() == Some(task) && f.data.contains(needle))
+            .filter(|f| f.status_text().is_some_and(said))
             .count()
     };
     for task in [&first, &third] {
         assert_eq!(
-            count(task, r#""message":"reopened by hook "#),
+            count(task, &|text| text.starts_with("reopened by hook ")),
             1,
             "{task} should start two attempts; frames were {replay:#?}"
         );
         assert_eq!(
-            count(task, r#""message":"inference turn 1""#),
+            count(task, &|text| text == "inference turn 1"),
             1,
             "{task} should have one first turn across its attempts; frames were {replay:#?}"
         );

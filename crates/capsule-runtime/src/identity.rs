@@ -21,10 +21,11 @@ use crate::peer_tasks;
 use crate::resource_plane::{
     handle_resource_request, reason_phrase, ResourcePlane, ResourceResponse, RESOURCE_PATH_PREFIX,
 };
+pub(crate) use crate::streaming::STREAM_EXTENSION_URI;
 use crate::streaming::{
-    admit_live_frame, format_gap_event, format_lagged_event, format_unnumbered_sse_event, frame_id,
-    is_final_status_for, ReplayResult, SseBroadcast, SseEventBuffer, StreamFrame, StreamStatus,
-    TaskStatusUpdateEvent, SSE_HEARTBEAT_COMMENT, SSE_HEARTBEAT_INTERVAL,
+    ending_results, message_carrier, sse_event, status_carrier, task_result, MurmurFrame,
+    ReplayResult, SseBroadcast, SseEventBuffer, StreamEnd, StreamEvent, StreamFrame, StreamTask,
+    SSE_HEARTBEAT_COMMENT, SSE_HEARTBEAT_INTERVAL,
 };
 use crate::types::{CapabilityPolicy, InstalledArtifactSummary};
 
@@ -119,8 +120,8 @@ impl DoorMethod {
         }
     }
 
-    /// The method this door answers for a request's `method` string, or `None` when it answers
-    /// `-32601`.
+    /// The method this door answers for a request's `method` string, or `None` when it does not
+    /// serve one: `-32601`, or `-32004` for an A2A method the card says the door lacks.
     ///
     /// The only place a request's method is interpreted and the only place
     /// `lifecycle.task_acceptance` gates one: under `TaskAcceptance::None` neither task-starting
@@ -182,14 +183,11 @@ impl TransportKind {
     pub(crate) const ALL: [TransportKind; 2] = [TransportKind::Http, TransportKind::Process];
 }
 
-/// What the capsule's inference transport can actually do, beyond what the served method list
-/// already says: whether the card claims `capabilities.streaming`, and which frames the stream
-/// extension lists. Every transport can be stopped, so cancellation is not here: `CancelTask` is
-/// served under every acceptance.
+/// What the capsule's inference transport can do, beyond what the served method list already says:
+/// which frames the stream extension lists. Every transport writes the A2A v1.0 task events and
+/// can be stopped, so neither `capabilities.streaming` nor cancellation is here.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TransportCapabilities {
-    /// Whether the transport emits streaming text frames.
-    pub streams_text: bool,
     /// The transport family, which decides the frames [`served_frames`] lists.
     pub kind: TransportKind,
 }
@@ -197,9 +195,8 @@ pub(crate) struct TransportCapabilities {
 /// Whether a connection made with `method` can receive `frame` from a session on `transport`.
 ///
 /// Each frame's arm states which streaming methods carry it and which transports write it. Only
-/// `SendStreamingMessage` and `stream/watch` write frames; `stream/watch` alone writes the
-/// observer's `connection-ack` and `capsule-closed`, and `SendStreamingMessage` alone answers a
-/// request it cannot take with `error`.
+/// `SendStreamingMessage`, on a connection that activated the stream extension, and `stream/watch`
+/// write frames; `stream/watch` alone writes the observer's `connection-ack` and `capsule-closed`.
 pub(crate) fn writes_frame(
     method: DoorMethod,
     frame: StreamFrame,
@@ -207,18 +204,16 @@ pub(crate) fn writes_frame(
 ) -> bool {
     let (on_message_stream, on_stream_watch, transports): (bool, bool, &[TransportKind]) =
         match frame {
-            StreamFrame::Status
-            | StreamFrame::Artifact
-            | StreamFrame::Text
+            StreamFrame::Text
             | StreamFrame::Thinking
             | StreamFrame::ToolCallStarted
             | StreamFrame::ToolCallProgress
+            | StreamFrame::Artifact
             | StreamFrame::Gap
             | StreamFrame::Lagged => (true, true, &TransportKind::ALL),
             StreamFrame::ConnectionAck | StreamFrame::CapsuleClosed => {
                 (false, true, &TransportKind::ALL)
             }
-            StreamFrame::Error => (true, false, &TransportKind::ALL),
         };
     let carried = match method {
         DoorMethod::SendStreamingMessage => on_message_stream,
@@ -289,17 +284,11 @@ pub(crate) const DOOR_EXTENSION_URI: &str =
 pub(crate) const CAPSULE_EXTENSION_URI: &str =
     murmur_artifact::docs_reference_url!("agent-card/#murmur-capsule-v1");
 
-/// URI of the agent-card extension that lists every SSE event type the capsule's stream can write.
-/// It is the address of that extension's section in the reference docs, on the streaming protocol
-/// page beside the frames it names.
-pub(crate) const STREAM_EXTENSION_URI: &str =
-    murmur_artifact::docs_reference_url!("streaming-protocol/#murmur-stream-v1");
-
 /// What the door extension says about itself.
 const DOOR_EXTENSION_DESCRIPTION: &str = "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.";
 
 /// What the stream extension says about itself.
-const STREAM_EXTENSION_DESCRIPTION: &str = "Every server-sent event type this capsule's SendStreamingMessage and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.";
+const STREAM_EXTENSION_DESCRIPTION: &str = "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.";
 
 /// The id of the one skill a door that starts tasks advertises: running a task.
 pub(crate) const TASK_SKILL_ID: &str = "task";
@@ -337,9 +326,8 @@ const MEDIA_MODES: [&str; 2] = [TEXT_MEDIA_TYPE, DATA_MEDIA_TYPE];
 ///   the transport. It describes the stream protocol rather than the session, so it stays on the
 ///   public card of an authenticated door.
 ///
-/// `capabilities.streaming` is read off the served methods and the transport together: `true`
-/// when `SendStreamingMessage` is served and the transport streams text. A door that answers a method
-/// whose effect its transport cannot deliver still lists the method and says so here.
+/// `capabilities.streaming` is `true` exactly when `SendStreamingMessage` is served: every transport
+/// writes the A2A v1.0 task events, and streamed text is the stream extension's.
 ///
 /// `skills` is the one [`TASK_SKILL_ID`] skill when the door serves `SendMessage`, and empty
 /// otherwise. Installed tools are not skills: a caller cannot invoke one directly.
@@ -359,8 +347,7 @@ pub(crate) fn build_agent_card(
         .collect();
 
     let methods = served_methods(task_acceptance, false);
-    let streaming =
-        methods.contains(&DoorMethod::SendStreamingMessage.wire_name()) && transport.streams_text;
+    let streaming = methods.contains(&DoorMethod::SendStreamingMessage.wire_name());
     let declared_planes: Vec<&str> = [(planes.files, "files"), (planes.peer_files, "peer_files")]
         .into_iter()
         .filter_map(|(declared, name)| declared.then_some(name))
@@ -832,6 +819,12 @@ async fn handle_connection(
     // Every `A2A-Version` header, in order: a JSON-RPC request is served only when there is one.
     let mut a2a_versions: Vec<String> = Vec::new();
     let a2a_version_prefix = format!("{}:", crate::a2a::A2A_VERSION_HEADER.to_ascii_lowercase());
+    // Every `A2A-Extensions` header, in order: each activates the extensions it lists.
+    let mut a2a_extensions: Vec<String> = Vec::new();
+    let a2a_extensions_prefix = format!(
+        "{}:",
+        crate::a2a::A2A_EXTENSIONS_HEADER.to_ascii_lowercase()
+    );
 
     loop {
         let mut line = String::new();
@@ -856,6 +849,12 @@ async fn handle_connection(
                 .trim()
                 .to_string();
             a2a_versions.push(value);
+        } else if lower.starts_with(&a2a_extensions_prefix) {
+            // Taken from the line as sent: an extension URI is compared exactly.
+            let value = line.trim_end()[a2a_extensions_prefix.len()..]
+                .trim()
+                .to_string();
+            a2a_extensions.push(value);
         } else if let Some(rest) = lower.strip_prefix("content-length:") {
             content_length = rest.trim().parse().unwrap_or(0);
         } else if lower.starts_with("content-type:") && lower.contains("application/json") {
@@ -1060,7 +1059,9 @@ async fn handle_connection(
 
         // An unserved method is refused before its scope is judged: it is `-32601` to anyone the
         // door let in, since the card lists what it serves. A public door has no extended card,
-        // and A2A answers asking one for it as an unsupported operation.
+        // and a door that starts no task does not stream, which its card's
+        // `capabilities.streaming: false` says: A2A answers asking for either as an unsupported
+        // operation.
         let Some(resolved) = DoorMethod::resolve(&req.method, &task_acceptance, gate.is_some())
         else {
             let response = if req.method == DoorMethod::GetExtendedAgentCard.wire_name() {
@@ -1068,6 +1069,13 @@ async fn handle_connection(
                     req.id,
                     A2aError::UnsupportedOperation,
                     "this agent serves no extended agent card",
+                    &[],
+                )
+            } else if req.method == DoorMethod::SendStreamingMessage.wire_name() {
+                JsonRpcResponse::a2a_error(
+                    req.id,
+                    A2aError::UnsupportedOperation,
+                    "this agent does not stream: it starts no task",
                     &[],
                 )
             } else {
@@ -1132,7 +1140,13 @@ async fn handle_connection(
                         forget_session,
                         caller_member,
                     },
-                    last_event_id,
+                    StreamRequest {
+                        last_event_id,
+                        activated: crate::a2a::activates_extension(
+                            &a2a_extensions,
+                            STREAM_EXTENSION_URI,
+                        ),
+                    },
                     sse_tx,
                     sse_buffer,
                     closing,
@@ -1143,6 +1157,7 @@ async fn handle_connection(
             DoorMethod::StreamWatch => {
                 handle_stream_watch(
                     writer_half,
+                    &req.id,
                     last_event_id,
                     sse_tx,
                     sse_buffer,
@@ -1235,12 +1250,121 @@ fn framed_bytes(response: &ResourceResponse) -> Vec<u8> {
     bytes
 }
 
-/// `SendStreamingMessage`: route the message as [`route_message`] does, then stream the session's
-/// frames until the task it started or continued reaches its final status.
+/// What a `SendStreamingMessage` request asked of its stream besides the message.
+pub(crate) struct StreamRequest {
+    /// The `Last-Event-ID` the client resumes after.
+    pub last_event_id: Option<u64>,
+    /// Whether its `A2A-Extensions` headers activated [`STREAM_EXTENSION_URI`].
+    pub activated: bool,
+}
+
+/// One streaming connection: its socket, the request every event answers, and how far into the
+/// session's sequence it has got.
+struct StreamConnection {
+    writer: tokio::net::tcp::OwnedWriteHalf,
+    /// The request's JSON-RPC id, as JSON, which every event's response carries verbatim.
+    request_id: String,
+    /// Whether the connection receives the murmur frames.
+    activated: bool,
+    /// The highest id of the session's sequence this connection has written or passed over. A
+    /// live event at or below it was already in the replay: an event emitted between subscribing
+    /// and reading the buffer arrives both ways.
+    last_seen: Option<u64>,
+}
+
+impl StreamConnection {
+    /// Writes the SSE response head, which lists the stream extension in `A2A-Extensions` when the
+    /// connection activated it. `Err` means the client is gone.
+    async fn open(
+        mut writer: tokio::net::tcp::OwnedWriteHalf,
+        request_id: &Value,
+        activated: bool,
+    ) -> Result<Self, ()> {
+        use tokio::io::AsyncWriteExt;
+
+        let echo = if activated {
+            format!(
+                "{}: {STREAM_EXTENSION_URI}\r\n",
+                crate::a2a::A2A_EXTENSIONS_HEADER
+            )
+        } else {
+            String::new()
+        };
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: keep-alive\r\n{echo}\r\n"
+        );
+        writer.write_all(head.as_bytes()).await.map_err(|_| ())?;
+        Ok(Self {
+            writer,
+            request_id: serde_json::to_string(request_id).unwrap_or_else(|_| "null".into()),
+            activated,
+            last_seen: None,
+        })
+    }
+
+    /// Writes one event whose `result` is `result`, numbered `id` when it is in the session's
+    /// sequence.
+    async fn write(&mut self, id: Option<u64>, result: &str) -> Result<(), ()> {
+        use tokio::io::AsyncWriteExt;
+
+        let event = sse_event(id, &self.request_id, result);
+        self.writer
+            .write_all(event.as_bytes())
+            .await
+            .map_err(|_| ())
+    }
+
+    async fn heartbeat(&mut self) -> Result<(), ()> {
+        use tokio::io::AsyncWriteExt;
+
+        self.writer
+            .write_all(SSE_HEARTBEAT_COMMENT)
+            .await
+            .map_err(|_| ())
+    }
+
+    /// Whether the event numbered `id` is new to this connection, and marks it seen when it is.
+    fn admit(&mut self, id: u64) -> bool {
+        if self.last_seen.is_some_and(|seen| id <= seen) {
+            return false;
+        }
+        self.last_seen = Some(id);
+        true
+    }
+}
+
+/// The buffered events after `last_id`, and the first available id when the buffer cannot supply
+/// all of them.
+fn replay(
+    sse_buffer: &Mutex<SseEventBuffer>,
+    last_id: u64,
+) -> (Option<u64>, Vec<Arc<StreamEvent>>) {
+    match sse_buffer.lock().unwrap().replay_from(last_id) {
+        ReplayResult::Complete(events) => (None, events),
+        ReplayResult::WithGap {
+            first_available_id,
+            events,
+        } => (Some(first_available_id), events),
+    }
+}
+
+/// `SendStreamingMessage`: route the message as [`route_message`] does, then stream its task.
 ///
 /// Every refusal [`read_send_params`] or the router answers with is one JSON-RPC body, written
-/// before any SSE head. A new task the registry has no room for is the one refusal written as a
-/// stream: a `rejected` status frame.
+/// before any SSE head. A new task the registry has no room for is answered as a stream of exactly
+/// one unnumbered event, the `TASK_STATE_REJECTED` task `SendMessage` answers the same refusal
+/// with.
+///
+/// Otherwise the stream opens with the task as the registry held it when the message was taken,
+/// unnumbered; then, for a `Last-Event-ID`, the `gap` when one applies and the buffered events of
+/// this task after the cursor; then its live events. Only this task's events are written, and
+/// murmur frames only to a connection that activated the stream extension. The stream ends after
+/// the task's terminal status, replayed or live, and after a live `TASK_STATE_INPUT_REQUIRED`.
+///
+/// A connection that lagged may have lost the status that ends it, so from then on each heartbeat
+/// reads the task from the registry. Once the task has ended, or waits for input, the connection
+/// writes that status as `GetTask` reports it, after the `response` artifact when the task has
+/// one, both unnumbered, and ends.
 #[allow(clippy::too_many_arguments)]
 async fn handle_message_stream(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
@@ -1248,104 +1372,145 @@ async fn handle_message_stream(
     task_registry: &Arc<Mutex<TaskRegistry>>,
     task_tx: &mpsc::Sender<IncomingTask>,
     sender: MessageSender,
-    last_event_id: Option<u64>,
+    request: StreamRequest,
     sse_tx: SseBroadcast,
     sse_buffer: Arc<Mutex<SseEventBuffer>>,
     mut closing: watch::Receiver<bool>,
 ) {
     use tokio::io::AsyncWriteExt;
 
-    // Subscribe before the message is routed, so no frame the task writes once it is enqueued or
-    // handed its input is missed.
+    // Subscribe before the message is routed, so no event the task writes once it is enqueued or
+    // handed its input is missed. The sender is not kept: the channel closes once the session's
+    // own senders are gone.
     let mut rx = sse_tx.subscribe();
+    drop(sse_tx);
 
     let routed = match read_send_params(&req.params) {
         Ok(message) => route_message(&req.id, message, task_registry, task_tx, sender),
         Err(refusal) => MessageRoute::Refused(refusal.into_response(req.id.clone())),
     };
-    let (task_id, rejected) = match routed {
+    let (opening, rejected) = match routed {
         MessageRoute::Refused(response) => {
             let _ = writer
                 .write_all(response.into_http_response().as_bytes())
                 .await;
             return;
         }
-        MessageRoute::Started(task) | MessageRoute::Continued(task) => (task.id, None),
-        MessageRoute::Rejected { task, refusal } => (task.id.clone(), Some((task, refusal))),
+        MessageRoute::Started(task) | MessageRoute::Continued(task) => (task, false),
+        MessageRoute::Rejected(task) => (task, true),
     };
 
-    let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: keep-alive\r\n\r\n";
-    if writer.write_all(headers.as_bytes()).await.is_err() {
+    let Ok(mut connection) = StreamConnection::open(writer, &req.id, request.activated).await
+    else {
+        return;
+    };
+    // Unnumbered: the opening task is this connection's alone, never buffered, and an id would
+    // move a client's resume cursor.
+    if connection
+        .write(None, &task_result(&opening))
+        .await
+        .is_err()
+        || rejected
+    {
         return;
     }
+    let task = StreamTask::new(&opening.id, &opening.context_id);
+    // The state of the last status written for the task, which a carrier repeats.
+    let mut state = opening.status.state;
 
-    // Replay buffered events for reconnecting clients. The highest id written is where the live
-    // loop picks up, so a frame both replayed and received live is written once.
-    let mut last_written = None;
-    if let Some(last_id) = last_event_id {
-        match write_replay(&mut writer, &sse_buffer, last_id).await {
-            Ok(written) => last_written = written,
-            Err(()) => return,
+    if let Some(last_id) = request.last_event_id {
+        let (gap, events) = replay(&sse_buffer, last_id);
+        if let (Some(first_available_id), true) = (gap, connection.activated) {
+            let frame = MurmurFrame::Gap { first_available_id };
+            if connection
+                .write(None, &status_carrier(&task, state.clone(), &frame))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        for event in events {
+            connection.admit(event.id);
+            if event.task_id != task.task_id {
+                continue;
+            }
+            let Some(result) = event.result(connection.activated) else {
+                continue;
+            };
+            if connection.write(Some(event.id), result).await.is_err() {
+                return;
+            }
+            if let Some(written) = &event.state {
+                state = written.clone();
+            }
+            // A replayed `input-required` does not end the stream: the task has left that state
+            // by the time a continuation replays it.
+            if event.ends == Some(StreamEnd::Terminal) {
+                return;
+            }
         }
     }
 
-    if let Some((task, refusal)) = rejected {
-        let rejected_event = TaskStatusUpdateEvent {
-            id: task.id,
-            context_id: Some(task.context_id),
-            status: StreamStatus {
-                state: TaskState::Rejected.as_str().into(),
-                message: refusal.into(),
-                response: None,
-                reopen: None,
-            },
-            r#final: true,
-        };
-        let _ = writer
-            .write_all(format_rejected_event(&rejected_event).as_bytes())
-            .await;
-        return;
-    }
-
-    // Forward broadcast events to the SSE stream
     let mut heartbeat = tokio::time::interval(SSE_HEARTBEAT_INTERVAL);
     heartbeat.tick().await; // consume the immediate first tick
+    let mut lagged = false;
 
     loop {
         tokio::select! {
             biased;
             _ = heartbeat.tick() => {
-                if writer.write_all(SSE_HEARTBEAT_COMMENT).await.is_err() {
+                if connection.heartbeat().await.is_err() {
                     return;
                 }
+                if !lagged {
+                    continue;
+                }
+                let Some(results) = lost_stream_end(task_registry, &task) else {
+                    continue;
+                };
+                for result in results {
+                    if connection.write(None, &result).await.is_err() {
+                        return;
+                    }
+                }
+                return;
             }
             result = rx.recv() => {
                 match result {
-                    Ok(event_arc) => {
-                        if !admit_live_frame(&mut last_written, &event_arc) {
+                    Ok(event) => {
+                        if !connection.admit(event.id) || event.task_id != task.task_id {
                             continue;
                         }
-                        // Other tasks' frames are forwarded too; only this task's own final
-                        // status ends the connection.
-                        let is_final = is_final_status_for(&event_arc, &task_id);
-                        if writer.write_all(event_arc.as_bytes()).await.is_err() {
+                        let Some(result) = event.result(connection.activated) else {
+                            continue;
+                        };
+                        if connection.write(Some(event.id), result).await.is_err() {
                             return;
                         }
-                        if is_final {
+                        if let Some(written) = &event.state {
+                            state = written.clone();
+                        }
+                        if event.ends.is_some() {
                             return;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         crate::runtime_err!("[capsule-runtime] SSE broadcast lagged by {n} events");
-                        if writer
-                            .write_all(format_lagged_event(n).as_bytes())
-                            .await
-                            .is_err()
-                        {
-                            return;
+                        lagged = true;
+                        // A v1.0 client has no word for a loss, so only an activated connection
+                        // is told.
+                        if connection.activated {
+                            let frame = MurmurFrame::Lagged { missed: n };
+                            if connection
+                                .write(None, &status_carrier(&task, state.clone(), &frame))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
-                        continue;
                     }
                 }
             }
@@ -1354,87 +1519,94 @@ async fn handle_message_stream(
     }
 }
 
-/// Write the replay of the frames after `last_id` — preceded by a `gap` frame when the buffer
-/// cannot supply all of them — and return the highest id written, or `None` when the replay was
-/// empty. `Err` means the client is gone.
-async fn write_replay(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    sse_buffer: &Mutex<SseEventBuffer>,
-    last_id: u64,
-) -> Result<Option<u64>, ()> {
-    use tokio::io::AsyncWriteExt;
-
-    let replay = sse_buffer.lock().unwrap().replay_from(last_id);
-    let events = match replay {
-        ReplayResult::Complete(events) => events,
-        ReplayResult::WithGap {
-            first_available_id,
-            events,
-        } => {
-            let gap = format_gap_event(first_available_id);
-            writer.write_all(gap.as_bytes()).await.map_err(|_| ())?;
-            events
-        }
-    };
-    let mut last_written = None;
-    for event in events {
-        writer.write_all(event.as_bytes()).await.map_err(|_| ())?;
-        last_written = frame_id(&event).or(last_written);
+/// The events that end `task`'s stream, read from the registry for a connection that may have
+/// lost them, or `None` while the task is neither ended nor waiting for input.
+///
+/// An ended task's are what [`crate::streaming::emit_task_ending`] writes, read from `GetTask`'s
+/// view once its ending is recorded: a cancel records the state before the task stops, and the
+/// ending after. A task waiting for input is its `input-required` status carrying the prompt.
+fn lost_stream_end(task_registry: &Mutex<TaskRegistry>, task: &StreamTask) -> Option<Vec<String>> {
+    let reg = task_registry.lock().unwrap();
+    let held = reg.get_task(&task.task_id)?;
+    if held.status.state.is_terminal() && reg.has_ending(&task.task_id) {
+        return Some(ending_results(&held));
     }
-    Ok(last_written)
-}
-
-/// The `rejected` status written to a `SendStreamingMessage` connection the door refuses, busy or
-/// closing. It goes to that one connection and is never buffered, so it carries no `id:` line:
-/// it has no place in the session's sequence, and an id would move a client's resume cursor.
-fn format_rejected_event(event: &TaskStatusUpdateEvent) -> String {
-    let data = serde_json::to_string(event).unwrap_or_default();
-    format_unnumbered_sse_event(StreamFrame::Status, &data)
+    if held.status.state != TaskState::InputRequired {
+        return None;
+    }
+    let prompt = held
+        .artifact(crate::a2a::PROMPT_ARTIFACT)
+        .and_then(crate::a2a::A2aArtifact::first_text)
+        .unwrap_or_default();
+    Some(vec![crate::streaming::input_required_result(task, prompt)])
 }
 
 /// Passive observer handler for `stream/watch`.
 ///
-/// Does not submit a task or call `can_accept()`. Subscribes to the broadcast channel,
-/// replays buffered events, then forwards live events until the capsule shuts down or
-/// the client disconnects. A `final: true` status event ends one task turn but does NOT
-/// close this connection — the observer stays alive across turns.
+/// Does not submit a task or call `can_accept()`. The extension is always active: the response
+/// head lists it, and the murmur frames of every task are written. The stream opens with an
+/// unnumbered `connection-ack`, then replays the buffer after `Last-Event-ID` (from the start when
+/// absent), preceded by a `gap` when the buffer cannot supply all of it, then forwards live events
+/// until the capsule shuts down or the client disconnects. A task's terminal status does NOT
+/// close this connection: the observer stays across tasks. The frames that belong to no task —
+/// `connection-ack`, `gap`, `lagged` and `capsule-closed` — are `message` carriers.
 ///
 /// Writes [`SSE_HEARTBEAT_COMMENT`] every [`SSE_HEARTBEAT_INTERVAL`], whether or not events
 /// flowed in between, so an observer can tell an idle capsule from a dead socket. The handler
 /// runs on the runtime's worker pool, off the thread running the agent loop, so synchronous work
 /// inside a turn does not delay it.
 async fn handle_stream_watch(
-    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    writer: tokio::net::tcp::OwnedWriteHalf,
+    request_id: &Value,
     last_event_id: Option<u64>,
     sse_tx: SseBroadcast,
     sse_buffer: Arc<Mutex<SseEventBuffer>>,
     conversation_mode_str: String,
     mut closing: watch::Receiver<bool>,
 ) {
-    use tokio::io::AsyncWriteExt;
-
     // Subscribe before replaying so we don't miss events emitted between replay and loop start.
+    // The sender is not kept, so the channel's close reaches this connection as `capsule-closed`.
     let mut rx = sse_tx.subscribe();
+    drop(sse_tx);
 
-    let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: keep-alive\r\n\r\n";
-    if writer.write_all(headers.as_bytes()).await.is_err() {
-        return;
-    }
-
-    // Emit connection-ack so observers know the capsule's conversation mode without reading manifest.
-    let ack = format_unnumbered_sse_event(
-        StreamFrame::ConnectionAck,
-        &format!("{{\"role\":\"observer\",\"conversation_mode\":\"{conversation_mode_str}\"}}"),
-    );
-    if writer.write_all(ack.as_bytes()).await.is_err() {
-        return;
-    }
-
-    let Ok(mut last_written) =
-        write_replay(&mut writer, &sse_buffer, last_event_id.unwrap_or(0)).await
-    else {
+    let Ok(mut connection) = StreamConnection::open(writer, request_id, true).await else {
         return;
     };
+
+    // Says the capsule's conversation mode, so an observer need not read the manifest.
+    let ack = MurmurFrame::ConnectionAck {
+        role: "observer",
+        conversation_mode: conversation_mode_str,
+    };
+    if connection
+        .write(None, &message_carrier(&ack))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let (gap, events) = replay(&sse_buffer, last_event_id.unwrap_or(0));
+    if let Some(first_available_id) = gap {
+        let frame = MurmurFrame::Gap { first_available_id };
+        if connection
+            .write(None, &message_carrier(&frame))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    for event in events {
+        connection.admit(event.id);
+        if connection
+            .write(Some(event.id), &event.extended)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
 
     let mut heartbeat = tokio::time::interval(SSE_HEARTBEAT_INTERVAL);
     heartbeat.tick().await; // consume the immediate first tick
@@ -1444,41 +1616,37 @@ async fn handle_stream_watch(
             biased;
             _ = heartbeat.tick() => {
                 // A failed write means the observer is gone; there is nothing left to serve.
-                if writer.write_all(SSE_HEARTBEAT_COMMENT).await.is_err() {
+                if connection.heartbeat().await.is_err() {
                     return;
                 }
             }
             result = rx.recv() => {
                 match result {
-                    Ok(event_arc) => {
-                        if !admit_live_frame(&mut last_written, &event_arc) {
+                    Ok(event) => {
+                        if !connection.admit(event.id) {
                             continue;
                         }
-                        if writer.write_all(event_arc.as_bytes()).await.is_err() {
+                        if connection.write(Some(event.id), &event.extended).await.is_err() {
                             return;
                         }
-                        // Do NOT exit on a final status — it ends one task, not the capsule.
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        let closed = format_unnumbered_sse_event(StreamFrame::CapsuleClosed, "{}");
-                        let _ = writer.write_all(closed.as_bytes()).await;
+                        let _ = connection
+                            .write(None, &message_carrier(&MurmurFrame::CapsuleClosed))
+                            .await;
                         return;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         crate::runtime_err!("[capsule-runtime] stream/watch: SSE broadcast lagged by {n} events");
-                        if writer
-                            .write_all(format_lagged_event(n).as_bytes())
-                            .await
-                            .is_err()
-                        {
+                        let frame = MurmurFrame::Lagged { missed: n };
+                        if connection.write(None, &message_carrier(&frame)).await.is_err() {
                             return;
                         }
-                        continue;
                     }
                 }
             }
             // An exiting capsule ends an observer's stream without `capsule-closed`: that frame
-            // means the frame stream closed while the capsule still serves the connection.
+            // means the event stream closed while the capsule still serves the connection.
             () = door_closing(&mut closing) => return,
         }
     }
@@ -1629,11 +1797,8 @@ enum MessageRoute {
     /// A new task, enqueued and handed to the task loop, in `TASK_STATE_SUBMITTED`.
     Started(A2aTask),
     /// A new task refused because the capsule has no room for it or its session is closing, in
-    /// `TASK_STATE_REJECTED`. `refusal` is its status message. Nothing was enqueued.
-    Rejected {
-        task: A2aTask,
-        refusal: &'static str,
-    },
+    /// `TASK_STATE_REJECTED`, its status message saying which. Nothing was enqueued.
+    Rejected(A2aTask),
     /// The message went to the task it names, which was waiting for input and is now
     /// `TASK_STATE_WORKING`.
     Continued(A2aTask),
@@ -1763,7 +1928,7 @@ fn start_task(
             artifacts: None,
             metadata: None,
         };
-        return MessageRoute::Rejected { task, refusal };
+        return MessageRoute::Rejected(task);
     }
     reg.enqueue(&task_id, &context_id);
     if let Some(member) = &sender.caller_member {
@@ -1821,7 +1986,7 @@ fn handle_message_send(
     let task = match route_message(&id, message, task_registry, task_tx, sender) {
         MessageRoute::Started(task)
         | MessageRoute::Continued(task)
-        | MessageRoute::Rejected { task, .. } => task,
+        | MessageRoute::Rejected(task) => task,
         MessageRoute::Refused(response) => return response.into_http_response(),
     };
     JsonRpcResponse::ok(id, serde_json::json!({ "task": task })).into_http_response()
@@ -1853,8 +2018,8 @@ fn task_not_found_response(id: Value, task_id: Option<&str>) -> JsonRpcResponse 
 /// A formation member — `caller_member`, from the formation token the door let in — reads only
 /// the tasks it submitted itself. Every other id, another member's task or the operator's
 /// included, gets the same [`A2aError::TaskNotFound`] an id this capsule never held gets. A
-/// formation token reaches no `SendStreamingMessage`, whose connection forwards every task's
-/// frames, so `GetTask` is the only way a member reads a task.
+/// formation token reaches no `SendStreamingMessage`, so `GetTask` is the only way a member reads
+/// a task.
 fn handle_tasks_get(
     id: Value,
     params: &Value,
@@ -1987,7 +2152,6 @@ fn handle_session_stop(
 mod tests {
     use super::*;
     use crate::errors::RuntimeError;
-    use crate::streaming::format_sse_event;
 
     const ACCEPTANCES: [TaskAcceptance; 3] = [
         TaskAcceptance::None,
@@ -1995,9 +2159,8 @@ mod tests {
         TaskAcceptance::Queue,
     ];
 
-    /// The card an http capsule serves: that transport streams text.
+    /// The card an http capsule serves.
     const HTTP_TRANSPORT: TransportCapabilities = TransportCapabilities {
-        streams_text: true,
         kind: TransportKind::Http,
     };
 
@@ -2019,116 +2182,78 @@ mod tests {
         );
     }
 
+    /// Every murmur frame: what `stream/watch` carries, and so the stream extension's
+    /// `params.frames` under every acceptance, since `stream/watch` is served under each.
+    const ALL_FRAMES: &[&str] = &[
+        "text",
+        "thinking",
+        "tool-call-started",
+        "tool-call-progress",
+        "artifact",
+        "gap",
+        "lagged",
+        "connection-ack",
+        "capsule-closed",
+    ];
+
     /// The stream extension's `params.frames` a capsule on each transport serves under each
     /// acceptance. Written once per transport, so a frame one transport alone writes is an edit to
     /// that transport's table.
     const HTTP_FRAMES: [(TaskAcceptance, &[&str]); 3] = [
-        (
-            TaskAcceptance::None,
-            &[
-                "status",
-                "artifact",
-                "text",
-                "thinking",
-                "tool-call-started",
-                "tool-call-progress",
-                "gap",
-                "lagged",
-                "connection-ack",
-                "capsule-closed",
-            ],
-        ),
-        (
-            TaskAcceptance::Single,
-            &[
-                "status",
-                "artifact",
-                "text",
-                "thinking",
-                "tool-call-started",
-                "tool-call-progress",
-                "gap",
-                "lagged",
-                "connection-ack",
-                "capsule-closed",
-                "error",
-            ],
-        ),
-        (
-            TaskAcceptance::Queue,
-            &[
-                "status",
-                "artifact",
-                "text",
-                "thinking",
-                "tool-call-started",
-                "tool-call-progress",
-                "gap",
-                "lagged",
-                "connection-ack",
-                "capsule-closed",
-                "error",
-            ],
-        ),
+        (TaskAcceptance::None, ALL_FRAMES),
+        (TaskAcceptance::Single, ALL_FRAMES),
+        (TaskAcceptance::Queue, ALL_FRAMES),
     ];
 
     const PROCESS_FRAMES: [(TaskAcceptance, &[&str]); 3] = [
-        (
-            TaskAcceptance::None,
-            &[
-                "status",
-                "artifact",
-                "text",
-                "thinking",
-                "tool-call-started",
-                "tool-call-progress",
-                "gap",
-                "lagged",
-                "connection-ack",
-                "capsule-closed",
-            ],
-        ),
-        (
-            TaskAcceptance::Single,
-            &[
-                "status",
-                "artifact",
-                "text",
-                "thinking",
-                "tool-call-started",
-                "tool-call-progress",
-                "gap",
-                "lagged",
-                "connection-ack",
-                "capsule-closed",
-                "error",
-            ],
-        ),
-        (
-            TaskAcceptance::Queue,
-            &[
-                "status",
-                "artifact",
-                "text",
-                "thinking",
-                "tool-call-started",
-                "tool-call-progress",
-                "gap",
-                "lagged",
-                "connection-ack",
-                "capsule-closed",
-                "error",
-            ],
-        ),
+        (TaskAcceptance::None, ALL_FRAMES),
+        (TaskAcceptance::Single, ALL_FRAMES),
+        (TaskAcceptance::Queue, ALL_FRAMES),
     ];
+
+    /// What an activated `SendStreamingMessage` carries: every frame but the observer's own.
+    #[test]
+    fn stream_extension_send_streaming_message_carries_the_first_seven_frames() {
+        for transport in TransportKind::ALL {
+            let carried: Vec<&str> = StreamFrame::ALL
+                .into_iter()
+                .filter(|&frame| writes_frame(DoorMethod::SendStreamingMessage, frame, transport))
+                .map(StreamFrame::wire_name)
+                .collect();
+            assert_eq!(carried, ALL_FRAMES[..7], "{transport:?}");
+            let watched: Vec<&str> = StreamFrame::ALL
+                .into_iter()
+                .filter(|&frame| writes_frame(DoorMethod::StreamWatch, frame, transport))
+                .map(StreamFrame::wire_name)
+                .collect();
+            assert_eq!(watched, ALL_FRAMES, "{transport:?}");
+        }
+    }
+
+    #[test]
+    fn stream_extension_description_says_what_activation_does() {
+        let card = card_for(&TaskAcceptance::Queue, DeclaredPlanes::default());
+        let stream = card["capabilities"]["extensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|extension| extension["uri"] == STREAM_EXTENSION_URI)
+            .unwrap();
+        assert_eq!(
+            stream["description"],
+            "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on \
+             SendStreamingMessage when the request's A2A-Extensions header names this URI, and \
+             always on stream/watch. Each is carried in a StreamResponse under metadata keyed by \
+             this URI."
+        );
+        assert_eq!(stream["required"], false);
+    }
 
     /// Every `TransportCapabilities` a session can stage.
     fn every_transport() -> Vec<TransportCapabilities> {
         TransportKind::ALL
             .into_iter()
-            .flat_map(|kind| {
-                [false, true].map(|streams_text| TransportCapabilities { streams_text, kind })
-            })
+            .map(|kind| TransportCapabilities { kind })
             .collect()
     }
 
@@ -2260,7 +2385,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 3 * 2 * 2 * 4 * 2 * 2);
+        assert_eq!(checked, 3 * 2 * 2 * 4 * 2);
     }
 
     #[test]
@@ -2304,10 +2429,10 @@ mod tests {
                         },
                         {
                             "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-                            "description": "Every server-sent event type this capsule's SendStreamingMessage and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+                            "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
                             "required": false,
                             "params": {
-                                "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
+                                "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]
                             }
                         }
                     ]
@@ -2515,14 +2640,12 @@ mod tests {
             (TransportKind::Process, PROCESS_FRAMES),
         ] {
             for (acceptance, expected) in &table {
-                for streams_text in [false, true] {
-                    let transport = TransportCapabilities { streams_text, kind };
-                    assert_eq!(
-                        served_frames(acceptance, transport),
-                        *expected,
-                        "{kind:?} under {acceptance:?}"
-                    );
-                }
+                let transport = TransportCapabilities { kind };
+                assert_eq!(
+                    served_frames(acceptance, transport),
+                    *expected,
+                    "{kind:?} under {acceptance:?}"
+                );
             }
         }
     }
@@ -2559,10 +2682,7 @@ mod tests {
     #[test]
     fn stream_frame_every_variant_is_listed() {
         for kind in TransportKind::ALL {
-            let transport = TransportCapabilities {
-                streams_text: true,
-                kind,
-            };
+            let transport = TransportCapabilities { kind };
             let frames = served_frames(&TaskAcceptance::Single, transport);
             for frame in StreamFrame::ALL {
                 assert!(
@@ -2838,7 +2958,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 2 * 3 * 2 * 2 * 4 * 2 * 2 * 2);
+        assert_eq!(checked, 2 * 3 * 2 * 2 * 4 * 2 * 2);
     }
 
     #[test]
@@ -2870,10 +2990,10 @@ mod tests {
                         },
                         {
                             "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-                            "description": "Every server-sent event type this capsule's SendStreamingMessage and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+                            "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
                             "required": false,
                             "params": {
-                                "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
+                                "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]
                             }
                         }
                     ]
@@ -2930,8 +3050,8 @@ mod tests {
                           "params": { "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop", "GetExtendedAgentCard"], "peerTasks": false } },
                         { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1", "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.", "required": false,
                           "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } },
-                        { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "Every server-sent event type this capsule's SendStreamingMessage and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.", "required": false,
-                          "params": { "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"] } }
+                        { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.", "required": false,
+                          "params": { "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"] } }
                     ]
                 },
                 "securitySchemes": {
@@ -3072,27 +3192,18 @@ mod tests {
         }
     }
 
-    /// `streaming` is the served method AND the transport's answer, so a door that answers
-    /// `SendStreamingMessage` over a transport that streams nothing advertises the method and not the
-    /// capability. `CancelTask` is served whatever the transport: every transport can be stopped.
+    /// `streaming` is the served `SendStreamingMessage` alone: every transport writes the A2A
+    /// v1.0 task events, a process capsule whose driver streams no text included. `CancelTask` is
+    /// served whatever the transport: every transport can be stopped.
     #[test]
-    fn card_capabilities_are_the_method_and_the_transport() {
-        for (transport, streaming) in [
-            (
-                TransportCapabilities {
-                    streams_text: false,
-                    kind: TransportKind::Process,
-                },
-                false,
-            ),
-            (HTTP_TRANSPORT, true),
-        ] {
+    fn card_capabilities_are_the_method_on_every_transport() {
+        for transport in every_transport() {
             let card = card_for_transport(
                 &TaskAcceptance::Single,
                 DeclaredPlanes::default(),
                 transport,
             );
-            assert_eq!(card["capabilities"]["streaming"], streaming, "{card}");
+            assert_eq!(card["capabilities"]["streaming"], true, "{card}");
             let methods = door_methods(&card);
             assert!(methods.contains(&"SendStreamingMessage"), "{card}");
             assert!(methods.contains(&"CancelTask"), "{card}");
@@ -3104,37 +3215,12 @@ mod tests {
     /// under every acceptance.
     #[test]
     fn a_door_that_starts_no_task_advertises_no_streaming() {
-        for transport in [
-            HTTP_TRANSPORT,
-            TransportCapabilities {
-                streams_text: false,
-                kind: TransportKind::Process,
-            },
-        ] {
+        for transport in every_transport() {
             let card =
                 card_for_transport(&TaskAcceptance::None, DeclaredPlanes::default(), transport);
             assert_eq!(card["capabilities"]["streaming"], false, "{card}");
             assert!(door_methods(&card).contains(&"CancelTask"), "{card}");
         }
-    }
-
-    #[test]
-    fn rejected_status_carries_no_event_id() {
-        let frame = format_rejected_event(&TaskStatusUpdateEvent {
-            id: "tsk_1".into(),
-            context_id: Some("ctx_1".into()),
-            status: StreamStatus {
-                state: "rejected".into(),
-                message: "task rejected: capsule is busy".into(),
-                response: None,
-                reopen: None,
-            },
-            r#final: true,
-        });
-        assert!(frame.starts_with("event: status\ndata: {"), "{frame}");
-        assert!(!frame.contains("id: "), "{frame}");
-        assert!(frame.contains(r#""state":"rejected""#), "{frame}");
-        assert!(frame.ends_with("\n\n"), "{frame}");
     }
 
     fn message_send_params(message_id: &str) -> Value {
@@ -3605,79 +3691,6 @@ mod tests {
             .unwrap_or_else(|errors| panic!("{answer}: {errors:?}"));
     }
 
-    /// A `SendStreamingMessage` the door refuses because the session is closing is told so, in the
-    /// same unnumbered final frame a busy refusal uses; a busy refusal keeps its own message.
-    #[tokio::test]
-    async fn message_stream_refused_by_a_closed_registry_says_the_session_is_closing() {
-        for (close, expected) in [
-            (true, crate::a2a::REJECTED_SESSION_CLOSING_MESSAGE),
-            (false, crate::a2a::REJECTED_BUSY_MESSAGE),
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let (client, lines) = spawn_sse_line_reader(
-                listener.local_addr().unwrap(),
-                std::time::Duration::from_secs(30),
-            );
-            let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(4);
-            let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
-            let task_registry = Arc::new(Mutex::new(TaskRegistry::new(1, TaskAcceptance::Single)));
-            if close {
-                task_registry.lock().unwrap().close_to_new_work();
-            } else {
-                task_registry
-                    .lock()
-                    .unwrap()
-                    .enqueue("tsk_busy", "ctx_busy");
-            }
-            let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
-            let req = JsonRpcRequest {
-                id: serde_json::json!(1),
-                method: "SendStreamingMessage".to_string(),
-                params: message_send_params("msg_refused"),
-            };
-
-            let (sock, _peer) = listener.accept().await.unwrap();
-            let (_read_half, write_half) = sock.into_split();
-            let (_closing_tx, closing) = watch::channel(false);
-            handle_message_stream(
-                write_half,
-                req,
-                &task_registry,
-                &task_tx,
-                operator(),
-                None,
-                sse_tx,
-                Arc::clone(&sse_buffer),
-                closing,
-            )
-            .await;
-            let mut received = String::new();
-            collect_sse_lines(&lines, &mut received, None).await;
-            client.join().unwrap();
-
-            let body = sse_body(&received);
-            let data = body
-                .strip_prefix("event: status\ndata: ")
-                .and_then(|rest| rest.strip_suffix("\n\n"))
-                .unwrap_or_else(|| panic!("one unnumbered status frame expected:\n{body}"));
-            let frame: Value = serde_json::from_str(data).unwrap();
-            assert_eq!(frame["status"]["state"], "rejected", "{frame}");
-            assert_eq!(frame["status"]["message"], expected, "{frame}");
-            assert_eq!(frame["final"], true, "{frame}");
-            assert!(
-                task_rx.try_recv().is_err(),
-                "nothing was handed to the loop"
-            );
-            assert!(
-                matches!(
-                    sse_buffer.lock().unwrap().replay_from(0),
-                    ReplayResult::Complete(frames) if frames.is_empty()
-                ),
-                "a door refusal is never buffered"
-            );
-        }
-    }
-
     #[test]
     fn door_method_served_methods_are_exactly_what_resolve_serves() {
         for acceptance in &ACCEPTANCES {
@@ -3858,7 +3871,7 @@ mod tests {
         // about to be held.
         let (client, line_rx) = spawn_sse_line_reader(addr, BLOCK + Duration::from_secs(10));
 
-        let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
+        let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(16);
         let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
 
         let (_closing_tx, closing) = watch::channel(false);
@@ -3875,6 +3888,7 @@ mod tests {
                     let _read_half = read_half;
                     handle_stream_watch(
                         write_half,
+                        &serde_json::json!(1),
                         Some(0),
                         sse,
                         buffer,
@@ -4014,64 +4028,310 @@ mod tests {
         }
     }
 
-    /// The body of an HTTP response: everything after the header block.
-    fn sse_body(received: &str) -> &str {
+    /// The head and the body of an HTTP response.
+    fn split_response(received: &str) -> (&str, &str) {
         let at = received
             .find("\r\n\r\n")
             .unwrap_or_else(|| panic!("no header terminator in:\n{received}"));
-        &received[at + 4..]
+        (&received[..at + 2], &received[at + 4..])
     }
 
-    /// Capacity of the broadcast channel in the lag tests; each handler's queue holds this many.
-    const LAG_QUEUE: usize = 4;
-    /// Frames beyond [`LAG_QUEUE`] in the burst, and so the count the `lagged` frame must carry.
-    const LAG_MISSED: usize = 3;
+    /// The body of an HTTP response: everything after the header block.
+    fn sse_body(received: &str) -> &str {
+        split_response(received).1
+    }
 
-    /// The burst sent to a lagging connection: `LAG_QUEUE + LAG_MISSED` non-final frames with ids
-    /// from 1.
-    fn lag_burst() -> Vec<String> {
-        (1..=(LAG_QUEUE + LAG_MISSED) as u64)
-            .map(|id| {
-                format_sse_event(
-                    id,
-                    StreamFrame::Text,
-                    &format!("{{\"n\":{id},\"final\":false}}"),
-                )
+    /// Every event of an SSE body as its `id:` and the JSON-RPC response its `data:` carries,
+    /// heartbeats skipped. Every event is an optional `id:` line and one `data:` line; nothing
+    /// carries an `event:` line.
+    fn events_of(body: &str) -> Vec<(Option<u64>, Value)> {
+        assert!(body.is_empty() || body.ends_with("\n\n"), "{body}");
+        body.split("\n\n")
+            .filter(|block| !block.is_empty() && *block != ":heartbeat")
+            .map(|block| {
+                let lines: Vec<&str> = block.lines().collect();
+                let (id, data) = match lines.as_slice() {
+                    [data] => (None, *data),
+                    [id, data] => (
+                        Some(id.strip_prefix("id: ").unwrap().parse().unwrap()),
+                        *data,
+                    ),
+                    _ => panic!("an event is an optional id line and a data line: {block:?}"),
+                };
+                let data: Value = serde_json::from_str(data.strip_prefix("data: ").unwrap())
+                    .unwrap_or_else(|e| panic!("data is not JSON ({e}): {block}"));
+                assert_eq!(data["jsonrpc"], "2.0", "{block}");
+                (id, data)
             })
             .collect()
     }
 
-    fn assert_single_lagged_frame(body: &str) {
-        let expected = format!("event: lagged\ndata: {{\"missed\":{LAG_MISSED}}}\n\n");
+    /// One buffered event of `task_id` whose result is `{"n": id}`: a standard event both kinds of
+    /// connection receive, or a murmur frame only an activated one does.
+    fn stream_event(
+        id: u64,
+        task_id: &str,
+        murmur: bool,
+        ends: Option<StreamEnd>,
+    ) -> Arc<StreamEvent> {
+        let result = format!("{{\"n\":{id}}}");
+        Arc::new(StreamEvent {
+            id,
+            task_id: task_id.to_string(),
+            plain: (!murmur).then(|| result.clone()),
+            extended: result,
+            state: (!murmur).then_some(TaskState::Working),
+            ends,
+        })
+    }
+
+    /// The `n` each event's result carries, for events [`stream_event`] made.
+    fn ns(events: &[(Option<u64>, Value)]) -> Vec<u64> {
+        events
+            .iter()
+            .filter_map(|(_, data)| data["result"]["n"].as_u64())
+            .collect()
+    }
+
+    /// A `SendStreamingMessage` request carrying `params`, with JSON-RPC id `id`.
+    fn stream_request(id: Value, params: Value) -> JsonRpcRequest {
+        JsonRpcRequest {
+            id,
+            method: "SendStreamingMessage".to_string(),
+            params,
+        }
+    }
+
+    /// Serves one `SendStreamingMessage` connection on a fresh listener, returning the handler, the
+    /// client's line reader and the client thread.
+    async fn serve_message_stream(
+        req: JsonRpcRequest,
+        task_registry: Arc<Mutex<TaskRegistry>>,
+        task_tx: mpsc::Sender<IncomingTask>,
+        request: StreamRequest,
+        sse_tx: &SseBroadcast,
+        sse_buffer: &Arc<Mutex<SseEventBuffer>>,
+        closing: watch::Receiver<bool>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        std::sync::mpsc::Receiver<(std::time::Instant, String)>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, lines) = spawn_sse_line_reader(
+            listener.local_addr().unwrap(),
+            std::time::Duration::from_secs(30),
+        );
+        let (sock, _peer) = listener.accept().await.unwrap();
+        let (read_half, write_half) = sock.into_split();
+        let sse = sse_tx.clone();
+        let buffer = Arc::clone(sse_buffer);
+        let handler = tokio::spawn(async move {
+            let _read_half = read_half;
+            handle_message_stream(
+                write_half,
+                req,
+                &task_registry,
+                &task_tx,
+                operator(),
+                request,
+                sse,
+                buffer,
+                closing,
+            )
+            .await;
+        });
+        (handler, lines, client)
+    }
+
+    const PLAIN: StreamRequest = StreamRequest {
+        last_event_id: None,
+        activated: false,
+    };
+
+    const ACTIVATED: StreamRequest = StreamRequest {
+        last_event_id: None,
+        activated: true,
+    };
+
+    /// A `SendStreamingMessage` the door refuses because the session is closing is told so, in the
+    /// same one unnumbered `TASK_STATE_REJECTED` task a busy refusal is answered with; a busy
+    /// refusal keeps its own message.
+    #[tokio::test]
+    async fn message_stream_refused_by_a_closed_registry_says_the_session_is_closing() {
+        for (close, expected) in [
+            (true, crate::a2a::REJECTED_SESSION_CLOSING_MESSAGE),
+            (false, crate::a2a::REJECTED_BUSY_MESSAGE),
+        ] {
+            let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(4);
+            let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+            let task_registry = Arc::new(Mutex::new(TaskRegistry::new(1, TaskAcceptance::Single)));
+            if close {
+                task_registry.lock().unwrap().close_to_new_work();
+            } else {
+                task_registry
+                    .lock()
+                    .unwrap()
+                    .enqueue("tsk_busy", "ctx_busy");
+            }
+            let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
+            let (_closing_tx, closing) = watch::channel(false);
+            let (handler, lines, client) = serve_message_stream(
+                stream_request(serde_json::json!(1), message_send_params("msg_refused")),
+                task_registry,
+                task_tx,
+                PLAIN,
+                &sse_tx,
+                &sse_buffer,
+                closing,
+            )
+            .await;
+            handler.await.unwrap();
+            let mut received = String::new();
+            collect_sse_lines(&lines, &mut received, None).await;
+            client.join().unwrap();
+
+            let (head, body) = split_response(&received);
+            assert!(head.contains("content-type: text/event-stream"), "{head}");
+            let events = events_of(body);
+            assert_eq!(events.len(), 1, "one event: {body}");
+            let (id, data) = &events[0];
+            assert_eq!(*id, None, "a refusal is unnumbered");
+            assert_eq!(data["id"], 1);
+            let task = &data["result"]["task"];
+            assert_eq!(task["status"]["state"], "TASK_STATE_REJECTED", "{data}");
+            assert_eq!(
+                task["status"]["message"]["parts"][0]["text"], expected,
+                "{data}"
+            );
+            assert!(
+                task_rx.try_recv().is_err(),
+                "nothing was handed to the loop"
+            );
+            assert!(
+                matches!(
+                    sse_buffer.lock().unwrap().replay_from(0),
+                    ReplayResult::Complete(frames) if frames.is_empty()
+                ),
+                "a door refusal is never buffered"
+            );
+        }
+    }
+
+    /// A `SendStreamingMessage` whose task cannot be handed to the task loop is answered with one
+    /// JSON-RPC `-32603` body before any SSE head, and the task it would have started is taken
+    /// back out of the registry.
+    #[tokio::test]
+    async fn message_stream_whose_hand_off_fails_is_refused_before_the_head() {
+        let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(4);
+        let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+        let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
+        let (task_tx, task_rx) = mpsc::channel::<IncomingTask>(4);
+        drop(task_rx);
+        let (_closing_tx, closing) = watch::channel(false);
+        let (handler, lines, client) = serve_message_stream(
+            stream_request(serde_json::json!(5), message_send_params("msg_lost")),
+            Arc::clone(&task_registry),
+            task_tx,
+            ACTIVATED,
+            &sse_tx,
+            &sse_buffer,
+            closing,
+        )
+        .await;
+        handler.await.unwrap();
+        let mut received = String::new();
+        collect_sse_lines(&lines, &mut received, None).await;
+        client.join().unwrap();
+
+        let (head, body) = split_response(&received);
+        assert!(head.contains("content-type: application/json"), "{head}");
+        assert!(!head.contains("text/event-stream"), "{head}");
+        let answer: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(answer["id"], 5);
+        assert_eq!(answer["error"]["code"], INTERNAL_ERROR);
+        let reg = task_registry.lock().unwrap();
+        assert!(reg.history.is_empty(), "the enqueue was rolled back");
+        assert_eq!(reg.pending_count, 0);
+    }
+
+    /// A plain `SendStreamingMessage` opens with its task, writes only its own task's standard
+    /// events with their ids and the request's id, and ends on its terminal status. Another task's
+    /// events, its own murmur frames and the `A2A-Extensions` echo are absent.
+    #[tokio::test]
+    async fn message_stream_writes_only_its_own_tasks_standard_events() {
+        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(16);
+        drop(sse_rx);
+        let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+        let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
+        let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
+        let (_closing_tx, closing) = watch::channel(false);
+        let (handler, lines, client) = serve_message_stream(
+            stream_request(serde_json::json!("req-7"), message_send_params("msg_own")),
+            task_registry,
+            task_tx,
+            PLAIN,
+            &sse_tx,
+            &sse_buffer,
+            closing,
+        )
+        .await;
+        wait_for_subscriber(&sse_tx).await;
+        let task_id = task_rx.recv().await.unwrap().task_id;
+
+        for event in [
+            stream_event(1, &task_id, false, None),
+            stream_event(2, &task_id, true, None),
+            stream_event(3, "tsk_other", false, Some(StreamEnd::Terminal)),
+            stream_event(4, &task_id, false, Some(StreamEnd::Terminal)),
+            stream_event(5, &task_id, false, None),
+        ] {
+            sse_tx.send(event).unwrap();
+        }
+        handler.await.unwrap();
+        let mut received = String::new();
+        collect_sse_lines(&lines, &mut received, None).await;
+        client.join().unwrap();
+
+        let (head, body) = split_response(&received);
+        assert!(
+            !head.to_ascii_lowercase().contains("a2a-extensions"),
+            "{head}"
+        );
+        let events = events_of(body);
+        assert!(
+            events.iter().all(|(_, data)| data["id"] == "req-7"),
+            "{body}"
+        );
+        assert_eq!(events[0].0, None, "the opening task is unnumbered");
+        assert_eq!(events[0].1["result"]["task"]["id"], task_id.as_str());
         assert_eq!(
-            body.matches("event: lagged").count(),
-            1,
-            "expected exactly one lagged frame in:\n{body}"
+            events[0].1["result"]["task"]["status"]["state"],
+            "TASK_STATE_SUBMITTED"
         );
-        assert!(
-            body.contains(&expected),
-            "the lagged frame is not byte-exact `{expected:?}` in:\n{body}"
+        assert_eq!(
+            events[1..].iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [Some(1), Some(4)]
         );
-        let before = &body[..body.find(&expected).unwrap()];
-        assert!(
-            before.is_empty() || before.ends_with("\n\n"),
-            "the lagged frame does not start its own block, so it carries an id line:\n{body}"
-        );
+        assert_eq!(ns(&events), [1, 4]);
     }
 
-    fn assert_buffer_has_no_lagged_frame(sse_buffer: &Arc<Mutex<SseEventBuffer>>) {
-        let events = match sse_buffer.lock().unwrap().replay_from(0) {
-            ReplayResult::Complete(events) => events,
-            ReplayResult::WithGap { events, .. } => events,
-        };
-        assert!(
-            events.iter().all(|e| !e.contains("event: lagged")),
-            "a lagged frame entered the replay buffer"
-        );
+    /// The burst sent to a lagging connection: `LAG_QUEUE + LAG_MISSED` events of `task_id` with
+    /// ids from 1, none of which ends a stream.
+    fn lag_burst(task_id: &str, murmur: bool) -> Vec<Arc<StreamEvent>> {
+        (1..=(LAG_QUEUE + LAG_MISSED) as u64)
+            .map(|id| stream_event(id, task_id, murmur, None))
+            .collect()
     }
 
-    /// A `stream/watch` connection that falls behind is told how many live frames it lost, in one
-    /// id-less `lagged` frame written before the oldest retained frame, and stays open.
+    /// Capacity of the broadcast channel in the lag tests; each handler's queue holds this many.
+    const LAG_QUEUE: usize = 4;
+    /// Events beyond [`LAG_QUEUE`] in the burst, and so the count the `lagged` frame must carry.
+    const LAG_MISSED: usize = 3;
+
+    /// A `stream/watch` connection that falls behind is told how many live events it lost, in one
+    /// unnumbered `lagged` message carrier written before the oldest retained event, and stays
+    /// open.
     ///
     /// Current-thread flavour: the burst is sent with no await between sends, so the handler cannot
     /// drain its queue part-way through and the lost count is exact.
@@ -4083,7 +4343,7 @@ mod tests {
             std::time::Duration::from_secs(30),
         );
 
-        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(LAG_QUEUE);
+        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(LAG_QUEUE);
         drop(sse_rx);
         let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
 
@@ -4096,6 +4356,7 @@ mod tests {
             let _read_half = read_half;
             handle_stream_watch(
                 write_half,
+                &serde_json::json!(1),
                 Some(0),
                 sse,
                 buffer,
@@ -4106,190 +4367,308 @@ mod tests {
         });
         wait_for_subscriber(&sse_tx).await;
 
-        let burst = lag_burst();
-        for frame in &burst {
-            sse_tx.send(Arc::new(frame.clone())).unwrap();
+        for event in lag_burst("tsk_a", true) {
+            sse_tx.send(event).unwrap();
         }
-        let retained = &burst[LAG_MISSED..];
         let mut received = String::new();
-        collect_sse_lines(&lines, &mut received, Some(retained.last().unwrap())).await;
-
-        let last = format_sse_event(100, StreamFrame::Text, "{\"n\":\"last\",\"final\":false}");
-        sse_tx.send(Arc::new(last.clone())).unwrap();
-        collect_sse_lines(&lines, &mut received, Some(&last)).await;
+        collect_sse_lines(&lines, &mut received, Some("{\"n\":7}")).await;
+        sse_tx
+            .send(stream_event(100, "tsk_b", false, Some(StreamEnd::Terminal)))
+            .unwrap();
+        collect_sse_lines(&lines, &mut received, Some("{\"n\":100}")).await;
 
         watcher.abort();
         let _ = watcher.await;
         drop(sse_tx);
         client.join().unwrap();
 
-        let body = sse_body(&received);
-        assert_single_lagged_frame(body);
-        let expected = format!(
-            "event: connection-ack\ndata: {{\"role\":\"observer\",\"conversation_mode\":\"stateless\"}}\n\n\
-             event: lagged\ndata: {{\"missed\":{LAG_MISSED}}}\n\n{}{last}",
-            retained.concat()
+        let (head, body) = split_response(&received);
+        assert!(
+            head.contains(&format!("A2A-Extensions: {STREAM_EXTENSION_URI}\r\n")),
+            "stream/watch always echoes the stream extension: {head}"
         );
-        assert_eq!(body, expected);
-        assert_buffer_has_no_lagged_frame(&sse_buffer);
+        let events = events_of(body);
+        let frames: Vec<Value> = events
+            .iter()
+            .map(|(_, data)| crate::streaming::frame_of(&data["result"]))
+            .collect();
+        assert_eq!(
+            frames[0],
+            serde_json::json!({"frame": "connection-ack", "role": "observer", "conversationMode": "stateless"})
+        );
+        assert_eq!(
+            frames[1],
+            serde_json::json!({"frame": "lagged", "missed": LAG_MISSED})
+        );
+        for (id, data) in &events[..2] {
+            assert_eq!(*id, None, "{data}");
+            assert_eq!(data["result"]["message"]["role"], "ROLE_AGENT", "{data}");
+            assert!(
+                data["result"]["message"].get("contextId").is_none(),
+                "{data}"
+            );
+        }
+        assert_eq!(ns(&events), [4, 5, 6, 7, 100]);
+        assert!(
+            matches!(
+                sse_buffer.lock().unwrap().replay_from(0),
+                ReplayResult::Complete(events) if events.is_empty()
+            ),
+            "a lagged frame never enters the replay buffer"
+        );
     }
 
-    /// A `SendStreamingMessage` connection that falls behind is told how many live frames it lost, keeps
-    /// receiving — another task's final status included — and closes on its own task's first live
-    /// `final` status.
+    /// An activated `SendStreamingMessage` connection that falls behind is told how many live
+    /// events it lost, in a `lagged` carrier of its task repeating the state it last wrote, keeps
+    /// receiving, and closes on its own task's terminal status, not another task's.
     ///
     /// Current-thread flavour for the same reason as `stream_watch_writes_lagged_frame`.
     #[tokio::test]
     async fn message_stream_writes_lagged_frame() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (client, lines) = spawn_sse_line_reader(
-            listener.local_addr().unwrap(),
-            std::time::Duration::from_secs(30),
-        );
-
-        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(LAG_QUEUE);
+        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(LAG_QUEUE);
         drop(sse_rx);
         let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
         let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
         let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
-        let req = JsonRpcRequest {
-            id: serde_json::json!(1),
-            method: "SendStreamingMessage".to_string(),
-            params: serde_json::json!({
-                "message": {
-                    "messageId": "msg_lagged",
-                    "role": "ROLE_USER",
-                    "parts": [{"text": "hello"}]
-                }
-            }),
-        };
-
-        let (sock, _peer) = listener.accept().await.unwrap();
-        let (read_half, write_half) = sock.into_split();
-        let sse = sse_tx.clone();
-        let buffer = Arc::clone(&sse_buffer);
         let (_closing_tx, closing) = watch::channel(false);
-        let handler = tokio::spawn(async move {
-            let _read_half = read_half;
-            handle_message_stream(
-                write_half,
-                req,
-                &task_registry,
-                &task_tx,
-                operator(),
-                None,
-                sse,
-                buffer,
+        let (handler, lines, client) = serve_message_stream(
+            stream_request(serde_json::json!(1), message_send_params("msg_lagged")),
+            task_registry,
+            task_tx,
+            ACTIVATED,
+            &sse_tx,
+            &sse_buffer,
+            closing,
+        )
+        .await;
+        wait_for_subscriber(&sse_tx).await;
+        let task_id = task_rx.recv().await.unwrap().task_id;
+
+        for event in lag_burst(&task_id, true) {
+            sse_tx.send(event).unwrap();
+        }
+        let mut received = String::new();
+        collect_sse_lines(&lines, &mut received, Some("{\"n\":7}")).await;
+        sse_tx
+            .send(stream_event(
+                100,
+                "tsk_other",
+                false,
+                Some(StreamEnd::Terminal),
+            ))
+            .unwrap();
+        sse_tx
+            .send(stream_event(
+                101,
+                &task_id,
+                false,
+                Some(StreamEnd::Terminal),
+            ))
+            .unwrap();
+        handler.await.unwrap();
+        collect_sse_lines(&lines, &mut received, None).await;
+        client.join().unwrap();
+
+        let (head, body) = split_response(&received);
+        assert!(
+            head.contains(&format!("A2A-Extensions: {STREAM_EXTENSION_URI}\r\n")),
+            "{head}"
+        );
+        let events = events_of(body);
+        assert!(events[0].1["result"].get("task").is_some(), "{body}");
+        let (id, lagged) = &events[1];
+        assert_eq!(*id, None);
+        assert_eq!(
+            lagged["result"]["statusUpdate"]["taskId"],
+            task_id.as_str(),
+            "{lagged}"
+        );
+        assert_eq!(
+            lagged["result"]["statusUpdate"]["status"],
+            serde_json::json!({"state": "TASK_STATE_SUBMITTED"}),
+            "a carrier repeats the state the connection last wrote"
+        );
+        assert_eq!(
+            crate::streaming::frame_of(&lagged["result"]),
+            serde_json::json!({"frame": "lagged", "missed": LAG_MISSED})
+        );
+        assert_eq!(ns(&events), [4, 5, 6, 7, 101]);
+    }
+
+    /// A plain `SendStreamingMessage` connection that falls behind is told nothing of it, and a
+    /// connection that lost its task's terminal status still ends: on a heartbeat after the loss
+    /// it reads the task from the registry and writes how the task ended, as `GetTask` reports
+    /// it, unnumbered.
+    #[tokio::test]
+    async fn message_stream_that_lost_its_ending_writes_it_from_the_registry() {
+        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(LAG_QUEUE);
+        drop(sse_rx);
+        let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+        let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
+        let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
+        let (_closing_tx, closing) = watch::channel(false);
+        let (handler, lines, client) = serve_message_stream(
+            stream_request(serde_json::json!(1), message_send_params("msg_lost")),
+            Arc::clone(&task_registry),
+            task_tx,
+            PLAIN,
+            &sse_tx,
+            &sse_buffer,
+            closing,
+        )
+        .await;
+        wait_for_subscriber(&sse_tx).await;
+        let incoming = task_rx.recv().await.unwrap();
+        let task_id = incoming.task_id.clone();
+        {
+            let mut reg = task_registry.lock().unwrap();
+            reg.start_task(
+                task_id.clone(),
+                incoming.context_id.clone(),
+                crate::lanes::TaskLane::User,
+            );
+            reg.finish_task(TaskState::Completed);
+            reg.record_ending(&task_id, "session ended", Some("four"), false, &[]);
+        }
+
+        let lost_at = std::time::Instant::now();
+        for event in lag_burst("tsk_other", false) {
+            sse_tx.send(event).unwrap();
+        }
+        handler.await.unwrap();
+        assert!(
+            lost_at.elapsed() <= SSE_HEARTBEAT_INTERVAL + std::time::Duration::from_secs(2),
+            "the ending was written within one heartbeat of the loss"
+        );
+        let mut received = String::new();
+        collect_sse_lines(&lines, &mut received, None).await;
+        client.join().unwrap();
+
+        let events = events_of(sse_body(&received));
+        assert_eq!(events.len(), 3, "{received}");
+        assert!(events.iter().all(|(id, _)| id.is_none()), "{received}");
+        let reported = task_registry.lock().unwrap().get_task(&task_id).unwrap();
+        assert_eq!(
+            events[1].1["result"]["artifactUpdate"]["artifact"],
+            serde_json::to_value(reported.artifact("response").unwrap()).unwrap()
+        );
+        assert_eq!(events[1].1["result"]["artifactUpdate"]["lastChunk"], true);
+        assert_eq!(
+            events[2].1["result"]["statusUpdate"]["status"],
+            serde_json::to_value(&reported.status).unwrap()
+        );
+        assert!(!received.contains(STREAM_EXTENSION_URI), "{received}");
+    }
+
+    /// A continuation resuming after an evicted cursor is told of the gap in a carrier of its task
+    /// when it activated the extension, and told nothing when it did not. Either way it opens
+    /// with the task, now working, and replays none of another task's events.
+    #[tokio::test]
+    async fn message_stream_continuation_past_an_evicted_cursor_writes_a_gap_only_when_activated() {
+        for activated in [true, false] {
+            let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(16);
+            let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(2)));
+            let sink = Some((sse_tx.clone(), Arc::clone(&sse_buffer)));
+            let other = StreamTask::new("tsk_other", "ctx_other");
+            for turn in 1..=3 {
+                crate::streaming::emit_status(
+                    &sink,
+                    &other,
+                    TaskState::Working,
+                    &format!("inference turn {turn}"),
+                    None,
+                );
+            }
+            let (registry, _waiter) = routing_registry();
+            // The task's ending is already buffered, after an evicted stretch: the replay writes
+            // it, and it ends the stream.
+            let mut ended = registry.lock().unwrap().get_task("tsk_wait").unwrap();
+            ended.status = crate::a2a::TaskStatus::of(TaskState::Failed);
+            crate::streaming::emit_task_ending(&sink, &ended);
+            let (task_tx, _task_rx) = mpsc::channel::<IncomingTask>(4);
+            let (_closing_tx, closing) = watch::channel(false);
+            let (handler, lines, client) = serve_message_stream(
+                stream_request(
+                    serde_json::json!(1),
+                    serde_json::json!({"message": naming("tsk_wait", None, "main")}),
+                ),
+                Arc::clone(&registry),
+                task_tx,
+                StreamRequest {
+                    last_event_id: Some(0),
+                    activated,
+                },
+                &sse_tx,
+                &sse_buffer,
                 closing,
             )
             .await;
-        });
-        wait_for_subscriber(&sse_tx).await;
+            handler.await.unwrap();
+            let mut received = String::new();
+            collect_sse_lines(&lines, &mut received, None).await;
+            client.join().unwrap();
 
-        let burst = lag_burst();
-        for frame in &burst {
-            sse_tx.send(Arc::new(frame.clone())).unwrap();
+            let events = events_of(sse_body(&received));
+            let opening = &events[0].1["result"]["task"];
+            assert_eq!(opening["id"], "tsk_wait");
+            assert_eq!(opening["status"]["state"], "TASK_STATE_WORKING");
+            let gaps: Vec<&(Option<u64>, Value)> = events
+                .iter()
+                .filter(|(_, data)| crate::streaming::frame_of(&data["result"])["frame"] == "gap")
+                .collect();
+            if activated {
+                assert_eq!(gaps.len(), 1, "{received}");
+                let (id, gap) = gaps[0];
+                assert_eq!(*id, None);
+                assert_eq!(gap["result"]["statusUpdate"]["taskId"], "tsk_wait");
+                assert_eq!(
+                    crate::streaming::frame_of(&gap["result"]),
+                    serde_json::json!({"frame": "gap", "firstAvailableId": 3})
+                );
+            } else {
+                assert!(gaps.is_empty(), "{received}");
+                assert!(!received.contains(STREAM_EXTENSION_URI), "{received}");
+            }
+            let last = events.last().unwrap();
+            assert_eq!(last.0, Some(4));
+            assert_eq!(
+                last.1["result"]["statusUpdate"]["status"]["state"],
+                "TASK_STATE_FAILED"
+            );
+            assert!(!received.contains("tsk_other"), "{received}");
         }
-        let retained = &burst[LAG_MISSED..];
-        let mut received = String::new();
-        collect_sse_lines(&lines, &mut received, Some(retained.last().unwrap())).await;
-
-        let task_id = task_rx
-            .recv()
-            .await
-            .expect("the task was submitted")
-            .task_id;
-        let other_final = format_sse_event(
-            100,
-            StreamFrame::Status,
-            "{\"id\":\"tsk_other\",\"final\":true}",
-        );
-        sse_tx.send(Arc::new(other_final.clone())).unwrap();
-        let final_status = format_sse_event(
-            101,
-            StreamFrame::Status,
-            &format!("{{\"id\":\"{task_id}\",\"final\":true}}"),
-        );
-        sse_tx.send(Arc::new(final_status.clone())).unwrap();
-        collect_sse_lines(&lines, &mut received, None).await;
-
-        handler.await.unwrap();
-        client.join().unwrap();
-
-        let body = sse_body(&received);
-        assert_single_lagged_frame(body);
-        let expected = format!(
-            "event: lagged\ndata: {{\"missed\":{LAG_MISSED}}}\n\n{}{other_final}{final_status}",
-            retained.concat()
-        );
-        assert_eq!(body, expected);
-        assert_buffer_has_no_lagged_frame(&sse_buffer);
     }
 
-    /// The session's last frames are broadcast just before the door closes. A `SendStreamingMessage`
-    /// handler that has not yet been scheduled when the close lands still writes the final status
-    /// it was sent, and then ends the connection.
+    /// The session's last events are broadcast just before the door closes. A
+    /// `SendStreamingMessage` handler that has not yet been scheduled when the close lands still
+    /// writes the terminal status it was sent, and then ends the connection.
     ///
-    /// Current-thread flavour: the frame and the close are sent with no await between them, so
+    /// Current-thread flavour: the event and the close are sent with no await between them, so
     /// the handler sees both at once — the shape of a busy host, where it is scheduled late.
     #[tokio::test]
     async fn message_stream_writes_queued_frames_before_the_door_closes() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (client, lines) = spawn_sse_line_reader(
-            listener.local_addr().unwrap(),
-            std::time::Duration::from_secs(30),
-        );
-
-        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
+        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(16);
         drop(sse_rx);
         let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
         let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
         let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
-        let req = JsonRpcRequest {
-            id: serde_json::json!(1),
-            method: "SendStreamingMessage".to_string(),
-            params: serde_json::json!({
-                "message": {
-                    "messageId": "msg_closing",
-                    "role": "ROLE_USER",
-                    "parts": [{"text": "hello"}]
-                }
-            }),
-        };
-
-        let (sock, _peer) = listener.accept().await.unwrap();
-        let (read_half, write_half) = sock.into_split();
-        let sse = sse_tx.clone();
-        let buffer = Arc::clone(&sse_buffer);
         let (closing_tx, closing) = watch::channel(false);
-        let handler = tokio::spawn(async move {
-            let _read_half = read_half;
-            handle_message_stream(
-                write_half,
-                req,
-                &task_registry,
-                &task_tx,
-                operator(),
-                None,
-                sse,
-                buffer,
-                closing,
-            )
-            .await;
-        });
+        let (handler, lines, client) = serve_message_stream(
+            stream_request(serde_json::json!(1), message_send_params("msg_closing")),
+            task_registry,
+            task_tx,
+            PLAIN,
+            &sse_tx,
+            &sse_buffer,
+            closing,
+        )
+        .await;
         wait_for_subscriber(&sse_tx).await;
-        let task_id = task_rx
-            .recv()
-            .await
-            .expect("the task was submitted")
-            .task_id;
+        let task_id = task_rx.recv().await.unwrap().task_id;
 
-        let final_status = format_sse_event(
-            1,
-            StreamFrame::Status,
-            &format!("{{\"id\":\"{task_id}\",\"final\":true}}"),
-        );
-        sse_tx.send(Arc::new(final_status.clone())).unwrap();
+        sse_tx
+            .send(stream_event(1, &task_id, false, Some(StreamEnd::Terminal)))
+            .unwrap();
         closing_tx.send(true).unwrap();
 
         let mut received = String::new();
@@ -4297,10 +4676,13 @@ mod tests {
         handler.await.unwrap();
         client.join().unwrap();
 
-        assert_eq!(sse_body(&received), final_status);
+        let events = events_of(sse_body(&received));
+        assert_eq!(events.len(), 2, "{received}");
+        assert_eq!(events[1].0, Some(1));
+        assert_eq!(ns(&events), [1]);
     }
 
-    /// A `stream/watch` observer is written every frame it was sent before the door closed, rather
+    /// A `stream/watch` observer is written every event it was sent before the door closed, rather
     /// than having its socket dropped mid-queue, and the stream then ends without
     /// `capsule-closed`, as it does for any capsule that exits.
     #[tokio::test]
@@ -4311,7 +4693,7 @@ mod tests {
             std::time::Duration::from_secs(30),
         );
 
-        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
+        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(16);
         drop(sse_rx);
         let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
 
@@ -4324,6 +4706,7 @@ mod tests {
             let _read_half = read_half;
             handle_stream_watch(
                 write_half,
+                &serde_json::json!("watch-1"),
                 Some(0),
                 sse,
                 buffer,
@@ -4334,14 +4717,17 @@ mod tests {
         });
         wait_for_subscriber(&sse_tx).await;
 
-        let text = format_sse_event(1, StreamFrame::Text, "{\"n\":\"last\",\"final\":false}");
-        let final_status = format_sse_event(
-            2,
-            StreamFrame::Status,
-            "{\"id\":\"tsk_closing\",\"final\":true}",
-        );
-        sse_tx.send(Arc::new(text.clone())).unwrap();
-        sse_tx.send(Arc::new(final_status.clone())).unwrap();
+        sse_tx
+            .send(stream_event(1, "tsk_closing", true, None))
+            .unwrap();
+        sse_tx
+            .send(stream_event(
+                2,
+                "tsk_closing",
+                false,
+                Some(StreamEnd::Terminal),
+            ))
+            .unwrap();
         closing_tx.send(true).unwrap();
 
         let mut received = String::new();
@@ -4349,11 +4735,66 @@ mod tests {
         watcher.await.unwrap();
         client.join().unwrap();
 
-        let expected = format!(
-            "event: connection-ack\ndata: {{\"role\":\"observer\",\"conversation_mode\":\"stateless\"}}\n\n\
-             {text}{final_status}"
+        let events = events_of(sse_body(&received));
+        assert!(events.iter().all(|(_, data)| data["id"] == "watch-1"));
+        assert_eq!(
+            events.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [None, Some(1), Some(2)]
         );
-        assert_eq!(sse_body(&received), expected);
+        assert_eq!(
+            crate::streaming::frame_of(&events[0].1["result"])["frame"],
+            "connection-ack"
+        );
+        assert!(!received.contains("capsule-closed"), "{received}");
+    }
+
+    /// A `stream/watch` connection whose session's broadcast closes is told so in a
+    /// `capsule-closed` message carrier, and ends.
+    #[tokio::test]
+    async fn stream_watch_writes_capsule_closed_when_the_broadcast_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, lines) = spawn_sse_line_reader(
+            listener.local_addr().unwrap(),
+            std::time::Duration::from_secs(30),
+        );
+        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(16);
+        drop(sse_rx);
+        let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+        let (sock, _peer) = listener.accept().await.unwrap();
+        let (read_half, write_half) = sock.into_split();
+        let sse = sse_tx.clone();
+        let (_closing_tx, closing) = watch::channel(false);
+        let watcher = tokio::spawn(async move {
+            let _read_half = read_half;
+            handle_stream_watch(
+                write_half,
+                &serde_json::json!(1),
+                None,
+                sse,
+                sse_buffer,
+                "threaded".to_string(),
+                closing,
+            )
+            .await;
+        });
+        wait_for_subscriber(&sse_tx).await;
+        drop(sse_tx);
+        watcher.await.unwrap();
+        let mut received = String::new();
+        collect_sse_lines(&lines, &mut received, None).await;
+        client.join().unwrap();
+
+        let frames: Vec<Value> = events_of(sse_body(&received))
+            .iter()
+            .map(|(_, data)| crate::streaming::frame_of(&data["result"]))
+            .collect();
+        assert_eq!(
+            frames,
+            [
+                serde_json::json!({"frame": "connection-ack", "role": "observer", "conversationMode": "threaded"}),
+                serde_json::json!({"frame": "capsule-closed"}),
+            ]
+        );
     }
 
     const PROTOCOL_PAGE_PATH: &str = concat!(
@@ -4421,7 +4862,7 @@ mod tests {
         );
     }
 
-    /// The Frames-a-connection-misses section states `SSE_BROADCAST_CAPACITY` as the size of each
+    /// The Events-a-connection-misses section states `SSE_BROADCAST_CAPACITY` as the size of each
     /// connection's live queue.
     #[test]
     fn protocol_page_broadcast_queue_is_the_runtime_capacity() {
@@ -4434,7 +4875,7 @@ mod tests {
         ] {
             assert!(
                 section.contains(&phrase),
-                "the Frames a connection misses section ({{ #lagged }}) of {PROTOCOL_PAGE_PATH} \
+                "the Events a connection misses section ({{ #lagged }}) of {PROTOCOL_PAGE_PATH} \
                  does not say `{phrase}`; SSE_BROADCAST_CAPACITY is {capacity}"
             );
         }
@@ -4447,29 +4888,31 @@ mod tests {
     fn protocol_page_documents_the_lagged_frame() {
         let page = protocol_page();
         let section = protocol_page_section(&page, "event-lagged");
-        for required in ["`missed`", "{\"missed\":"] {
+        for required in ["`missed`", "\"frame\":\"lagged\",\"missed\":"] {
             assert!(
                 section.contains(required),
                 "the `lagged` section ({{ #event-lagged }}) of {PROTOCOL_PAGE_PATH} does not \
                  contain `{required}`"
             );
         }
-        for row in [
-            "| [`lagged`](#event-lagged) | yes | yes |",
-            "| `lagged` | no | — |",
-        ] {
-            assert!(
-                page.contains(row),
-                "{PROTOCOL_PAGE_PATH} has no `{row}` row"
-            );
-        }
+        let row = "| [`lagged`](#event-lagged) | yes | yes |";
+        assert!(
+            page.contains(row),
+            "{PROTOCOL_PAGE_PATH} has no `{row}` row"
+        );
+        assert!(
+            protocol_page_section(&page, "event-ids")
+                .lines()
+                .any(|line| line.contains("`lagged`") && line.ends_with("| no |")),
+            "the Event ids section of {PROTOCOL_PAGE_PATH} does not list `lagged` as unnumbered"
+        );
         assert!(
             protocol_page_section(&page, "replay").contains("`lagged`"),
             "the Replay section ({{ #replay }}) of {PROTOCOL_PAGE_PATH} does not list `lagged`"
         );
         assert!(
             !protocol_page_section(&page, "lagged").contains("Nothing is written in their place"),
-            "the Frames a connection misses section ({{ #lagged }}) of {PROTOCOL_PAGE_PATH} says \
+            "the Events a connection misses section ({{ #lagged }}) of {PROTOCOL_PAGE_PATH} says \
              nothing is written for lost frames"
         );
     }
@@ -4481,7 +4924,17 @@ mod tests {
         let page = protocol_page();
         let (tx, _rx) = tokio::sync::broadcast::channel(1);
         let buffer = std::sync::Arc::new(Mutex::new(SseEventBuffer::new(1)));
-        let first = crate::streaming::emit_frame(&tx, &buffer, StreamFrame::Status, "{}");
+        crate::streaming::emit_status(
+            &Some((tx, Arc::clone(&buffer))),
+            &StreamTask::new("tsk_1", "ctx_1"),
+            TaskState::Working,
+            "inference turn 1",
+            None,
+        );
+        let first = match buffer.lock().unwrap().replay_from(0) {
+            ReplayResult::Complete(events) => events[0].id,
+            ReplayResult::WithGap { .. } => panic!("one event fits"),
+        };
 
         let phrase = format!("| First id | `{first}` |");
         assert!(
@@ -4496,13 +4949,13 @@ mod tests {
         );
     }
 
-    /// The Replay section states `SSE_REPLAY_CAPACITY` as the number of frames a session keeps.
+    /// The Replay section states `SSE_REPLAY_CAPACITY` as the number of events a session keeps.
     #[test]
     fn protocol_page_replay_capacity_is_the_runtime_capacity() {
         let page = protocol_page();
         let section = protocol_page_section(&page, "replay");
         let capacity = crate::runtime::SSE_REPLAY_CAPACITY;
-        let phrase = format!("most recent {capacity} frames");
+        let phrase = format!("most recent {capacity} events");
         assert!(
             section.contains(&phrase),
             "the Replay section ({{ #replay }}) of {PROTOCOL_PAGE_PATH} does not say `{phrase}`; \

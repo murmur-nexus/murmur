@@ -46,10 +46,10 @@ The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_a
       },
       {
         "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-        "description": "Every server-sent event type this capsule's SendStreamingMessage and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+        "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
         "required": false,
         "params": {
-          "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
+          "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]
         }
       }
     ]
@@ -75,7 +75,7 @@ What murmur adds to the standard card sits in three [extensions](#extensions):
 |---|---|---|
 | [Door](#murmur-door-v1) | What does this listener answer, and does it serve other capsules? | The methods `POST /` dispatches, and [`exports.peer_tasks`](manifest.md#field-exports-peer-tasks) |
 | [Capsule](#murmur-capsule-v1) | Which session is this, and what may the capsule do? | The session, the installed artifacts, `capabilities.*` and the declared `exports` |
-| [Stream](#stream-extension) | Which frames can its stream send? | The streaming methods the door serves and the inference transport |
+| [Stream](#stream-extension) | Which frames can its stream send? | The streaming methods the door serves |
 
 A capsule that declares [`network.authentication`](manifest.md#field-network-authentication)
 serves a different public card, and moves the capsule extension to an extended card only an
@@ -120,19 +120,14 @@ ProtoJSON shape — see [Tasks and messages](#tasks-and-messages).
 
 | Key | Type | Value |
 |---|---|---|
-| `capabilities.streaming` | boolean | `true` when the [door extension](#murmur-door-v1) lists `SendStreamingMessage` and the capsule's inference transport streams text |
+| `capabilities.streaming` | boolean | `true` exactly when the [door extension](#murmur-door-v1) lists `SendStreamingMessage` |
 | `capabilities.pushNotifications` | boolean | `false` |
 | `capabilities.extendedAgentCard` | boolean | `false` on a public door, where every caller gets this card. `true` on an [authenticated door](#security) |
 | `capabilities.extensions` | array of objects | The [door extension](#murmur-door-v1), the [capsule extension](#murmur-capsule-v1), then the [stream extension](#stream-extension). An authenticated door's public card carries the door extension, then the stream extension |
 
-`streaming` is the door's answer and the transport's together: a door that answers
-`SendStreamingMessage` over a transport that streams nothing lists the method on the door extension
-and reports `false` here.
-
-| Transport | `streaming` |
-|---|---|
-| `http` | `true` when `SendStreamingMessage` is served |
-| `process` | `true` when `SendStreamingMessage` is served and the [process driver](manifest.md#process-driver) reports `streams-text` |
+A door that does not serve `SendStreamingMessage` —
+[`lifecycle.task_acceptance: none`](manifest.md#lifecycle-task-acceptance) — reports `false` and
+answers the method `-32004` `UnsupportedOperationError`.
 
 ## Security { #security }
 
@@ -204,10 +199,10 @@ methods a token reaches, not which tasks: a credential holding `SendStreamingMes
       },
       {
         "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-        "description": "Every server-sent event type this capsule's SendStreamingMessage and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+        "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
         "required": false,
         "params": {
-          "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
+          "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]
         }
       }
     ]
@@ -552,9 +547,10 @@ Every text part the door writes has `mediaType` `text/plain`, and every data par
 | A `TASK_STATE_INPUT_REQUIRED` task | The message's text is the task's reply, and the task is answered in `TASK_STATE_WORKING`. The door's capacity is not consulted |
 
 A message that names no task never reaches a waiting one. `SendStreamingMessage` answers each
-refusal as one JSON body before any event, except a new task refused for room, which is a `rejected`
-[status frame](streaming-protocol.md). A stream that continues a task ends on that task's final
-status.
+refusal as one JSON body before any event, except a new task refused because the capsule is busy
+or its session is closing, which is a stream of one `TASK_STATE_REJECTED`
+[`task` event](streaming-protocol.md#standard-events). How a stream ends and how a reply continues
+it is under [What `SendStreamingMessage` writes](streaming-protocol.md#stream-order).
 
 #### Referenced tasks { #reference-task-ids }
 
@@ -605,7 +601,7 @@ task, and `{"message": <Message>}` for a [completion](#murmur-errors) the door a
 
 `SendMessage` answers as soon as the task is accepted, whatever `configuration.returnImmediately`
 says: A2A v1.0 has a request without it wait for a terminal or interrupted state. Poll
-[`GetTask`](#tasks-get), or read the task's frames with `SendStreamingMessage`. The door ignores
+[`GetTask`](#tasks-get), or read the task's events with `SendStreamingMessage`. The door ignores
 `configuration`, push notification configs and `tenant`.
 
 A message from the agent — a task's `status.message`, a completion's acknowledgement — has `role`
@@ -633,8 +629,9 @@ Installed tools are not skills: a caller cannot invoke a tool directly. They are
 ## Extensions { #extensions }
 
 All three extensions are A2A `AgentExtension` objects with `required: false`: a standard A2A client
-can call the capsule without understanding any of them. The door does not require an
-`A2A-Extensions` header to activate them.
+can call the capsule without understanding any of them. The door and capsule extensions need no
+activation. The stream extension is activated per request; see
+[Streaming Protocol: Activation](streaming-protocol.md#activation).
 
 | Key | Value |
 |---|---|
@@ -732,7 +729,7 @@ is required: a `GetTask` without one, or with `""`, is answered `-32602` `GetTas
 | Key | Present |
 |---|---|
 | `id`, `contextId`, `status.state` | Always |
-| `status.message` | On a terminal task — `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_CANCELED` or `TASK_STATE_REJECTED` — whose final status said something: a `ROLE_AGENT` message with one text part, the same text as the task's final [`status` frame](streaming-protocol.md#one-final-status) |
+| `status.message` | On a terminal task — `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_CANCELED` or `TASK_STATE_REJECTED` — whose final status said something: a `ROLE_AGENT` message with one text part, as the task's [terminal status](streaming-protocol.md#one-final-status) on a stream carries it |
 | `artifacts: [{"artifactId": "response", …}]` | On a `TASK_STATE_COMPLETED` task that produced a response: its answer, as one text part |
 | `artifacts: [{"artifactId": "prompt", …}]` | On a `TASK_STATE_INPUT_REQUIRED` task: the question it is waiting on |
 | `metadata.murmur` | On a terminal task with something to say about answers it lacks — see [No-answer metadata](#no-answer-metadata) |
@@ -832,10 +829,9 @@ with a refusal. Planes appear in this order:
 
 URI: `https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1`
 
-`params.frames` lists every frame type the capsule's `SendStreamingMessage` and `stream/watch`
-connections can write. Its key and the frame list are on the streaming protocol page, under
-[Frame vocabulary](streaming-protocol.md#murmur-stream-v1). It is on the public card of every door,
-authenticated or not.
+`params.frames` lists the murmur frames a connection to the door can receive. Activation, the
+frames and the events that carry them are under
+[The stream extension](streaming-protocol.md#murmur-stream-v1).
 
 ## A card with no `supportedInterfaces` { #no-supported-interfaces }
 

@@ -1152,7 +1152,6 @@ mod tests {
                 crate::identity::DeclaredPlanes::default(),
                 false,
                 crate::identity::TransportCapabilities {
-                    streams_text: true,
                     kind: crate::identity::TransportKind::Http,
                 },
             );

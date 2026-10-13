@@ -136,8 +136,13 @@ fn lagged_warning(missed: u64) -> String {
     format!("[murmur] warning: this connection missed {missed} events")
 }
 
-/// Read a `stream/watch` SSE body to its end, rendering `status`, `artifact` and `text` frames to
-/// `out` and warnings to stderr.
+/// Read a `stream/watch` SSE body to its end, rendering task statuses, answers, tool results and
+/// text to `out` and warnings to stderr.
+///
+/// Every event's `data:` is a JSON-RPC response whose `result` is an A2A v1.0 `StreamResponse`.
+/// One carrying a murmur frame under `metadata[STREAM_EXTENSION_URI]` is read by its `frame`;
+/// any other `statusUpdate` is a status line, and a `response` `artifactUpdate` is the answer the
+/// task's `completed` line prints. Anything else is skipped.
 ///
 /// `reader` is positioned after the HTTP response headers. A write to `out` that fails with
 /// `BrokenPipe` ends the stream as [`StreamEnd::ReaderClosed`]; any other failed write is the
@@ -146,13 +151,10 @@ pub(crate) fn read_stream(
     mut reader: impl BufRead,
     out: &mut impl Write,
 ) -> std::io::Result<StreamEnd> {
-    let mut conversation_mode = String::from("stateless");
-    let mut task_context_map: HashMap<String, String> = HashMap::new();
-    let mut context_turns: HashMap<String, u32> = HashMap::new();
+    let mut view = WatchView::default();
 
-    let mut current_event_type = String::new();
     let mut current_data = String::new();
-    // An `id:` belongs to the frame it appears in, so it is recorded only once that frame's
+    // An `id:` belongs to the event it appears in, so it is recorded only once that event's
     // terminating blank line arrives.
     let mut current_id: Option<u64> = None;
     let mut last_event_id: Option<u64> = None;
@@ -170,64 +172,22 @@ pub(crate) fn read_stream(
             if current_id.is_some() {
                 last_event_id = current_id;
             }
-            if !current_event_type.is_empty() && !current_data.is_empty() {
-                match current_event_type.as_str() {
-                    "connection-ack" => {
-                        if let Ok(event) = serde_json::from_str::<Value>(&current_data) {
-                            if let Some(mode) =
-                                event.get("conversation_mode").and_then(Value::as_str)
-                            {
-                                conversation_mode = mode.to_string();
-                            }
+            if !current_data.is_empty() {
+                if let Ok(event) = serde_json::from_str::<Value>(&current_data) {
+                    match view.dispatch(out, &event["result"]) {
+                        Ok(Some(end)) => return Ok(end),
+                        Ok(None) => {}
+                        Err(e) if e.kind() == ErrorKind::BrokenPipe => {
+                            return Ok(StreamEnd::ReaderClosed)
                         }
+                        Err(e) => return Err(e),
                     }
-                    "gap" => {
-                        let first_id = serde_json::from_str::<Value>(&current_data)
-                            .ok()
-                            .and_then(|v| v.get("first_available_id").and_then(Value::as_u64))
-                            .unwrap_or(0);
-                        capsule_runtime::report_eprintln!("[murmur] warning: buffer overflow — some earlier events were lost (first available id: {first_id})");
-                    }
-                    "lagged" => {
-                        let missed = serde_json::from_str::<Value>(&current_data)
-                            .ok()
-                            .and_then(|v| v.get("missed").and_then(Value::as_u64))
-                            .unwrap_or(0);
-                        capsule_runtime::report_eprintln!("{}", lagged_warning(missed));
-                    }
-                    "capsule-closed" => return Ok(StreamEnd::CapsuleClosed),
-                    "status" | "artifact" | "text" => {
-                        // A `final` status ends one task, not the capsule, so the watch goes on.
-                        let rendered = dispatch_sse_event(
-                            out,
-                            &current_event_type,
-                            &current_data,
-                            &conversation_mode,
-                            &mut task_context_map,
-                            &mut context_turns,
-                        );
-                        match rendered {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == ErrorKind::BrokenPipe => {
-                                return Ok(StreamEnd::ReaderClosed)
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    // Reasoning chunks are not shown.
-                    "thinking" => {}
-                    // Forward compatibility: an event type this client does not know is skipped,
-                    // so the capsule can add one without breaking the watch.
-                    _ => {}
                 }
             }
-            current_event_type.clear();
             current_data.clear();
             current_id = None;
         } else if line.starts_with(':') {
-            // A comment line — the heartbeat — is not part of any frame.
-        } else if let Some(rest) = line.strip_prefix("event: ") {
-            current_event_type = rest.to_string();
+            // A comment line — the heartbeat — is not part of any event.
         } else if let Some(rest) = line.strip_prefix("data: ") {
             current_data = rest.to_string();
         } else if let Some(rest) = line.strip_prefix("id: ") {
@@ -236,103 +196,96 @@ pub(crate) fn read_stream(
     }
 }
 
-/// Render one `status`, `artifact` or `text` frame to `out`. Keys a frame carries beyond the ones
-/// read here are ignored.
-fn dispatch_sse_event(
-    out: &mut impl Write,
-    event_type: &str,
-    data: &str,
-    conversation_mode: &str,
-    task_context_map: &mut HashMap<String, String>,
-    context_turns: &mut HashMap<String, u32>,
-) -> std::io::Result<()> {
-    let is_final = data.contains("\"final\":true");
-    let is_threaded = conversation_mode == "threaded";
+/// What `mur watch` remembers between events.
+struct WatchView {
+    conversation_mode: String,
+    /// The turn each context is on, in threaded mode.
+    context_turns: HashMap<String, u32>,
+    /// Each task's answer, held from its `response` artifact until its `completed` line prints it.
+    responses: HashMap<String, String>,
+}
 
-    match event_type {
-        "status" => {
-            if let Ok(event) = serde_json::from_str::<Value>(data) {
-                let task_id = event
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let context_id_opt = event
-                    .get("context_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                let state = event
-                    .get("status")
-                    .and_then(|s| s.get("state"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
-                let message = event
-                    .get("status")
-                    .and_then(|s| s.get("message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let response = event
-                    .get("status")
-                    .and_then(|s| s.get("response"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+impl Default for WatchView {
+    fn default() -> Self {
+        Self {
+            conversation_mode: String::from("stateless"),
+            context_turns: HashMap::new(),
+            responses: HashMap::new(),
+        }
+    }
+}
 
-                // Update task→context mapping
-                if let Some(ref cid) = context_id_opt {
-                    task_context_map.insert(task_id.clone(), cid.clone());
-                }
+/// The states a task ends in, in murmur's words.
+const ENDED_STATES: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
 
-                if is_threaded {
-                    let cid = context_id_opt
-                        .or_else(|| task_context_map.get(&task_id).cloned())
-                        .unwrap_or_else(|| task_id.clone());
-
-                    let turn = *context_turns.entry(cid.clone()).or_insert(1);
-                    let prefix = format!("[{} / turn {turn} / {state}]", truncate_context_id(&cid));
-
-                    if is_final {
-                        writeln!(out, "{prefix}")?;
-                        if state == "completed" {
-                            if let Some(ref resp) = response {
-                                let col_width = terminal_width().saturating_sub(2);
-                                for line in wrap_text(resp, col_width) {
-                                    writeln!(out, "  {line}")?;
-                                }
-                                writeln!(out)?;
-                            }
-                        }
-                        *context_turns.entry(cid).or_insert(1) += 1;
-                    } else {
-                        writeln!(out, "{prefix}  {message}")?;
-                    }
-                } else {
-                    if is_final {
-                        writeln!(out, "[{state}]")?;
-                        if state == "completed" {
-                            if let Some(ref resp) = response {
-                                let col_width = terminal_width().saturating_sub(2);
-                                for line in wrap_text(resp, col_width) {
-                                    writeln!(out, "  {line}")?;
-                                }
-                                writeln!(out)?;
-                            }
-                        }
-                    } else {
-                        writeln!(out, "[{state}]  {message}")?;
-                    }
+impl WatchView {
+    /// Render one event's `StreamResponse`. `Some` when the event ends the stream.
+    fn dispatch(
+        &mut self,
+        out: &mut impl Write,
+        result: &Value,
+    ) -> std::io::Result<Option<StreamEnd>> {
+        let body = result
+            .get("statusUpdate")
+            .or_else(|| result.get("message"))
+            .unwrap_or(&Value::Null);
+        let frame = &body["metadata"][capsule_runtime::STREAM_EXTENSION_URI];
+        if let Some(name) = frame.get("frame").and_then(Value::as_str) {
+            return self.murmur_frame(out, name, frame);
+        }
+        if let Some(status) = result.get("statusUpdate") {
+            self.status_line(out, status)?;
+        } else if let Some(update) = result.get("artifactUpdate") {
+            let artifact = &update["artifact"];
+            if artifact["artifactId"] == "response" {
+                let text = artifact_text(artifact);
+                if let Some(task_id) = update["taskId"].as_str() {
+                    self.responses.insert(task_id.to_string(), text);
                 }
             }
         }
-        "artifact" => {
-            if let Ok(event) = serde_json::from_str::<Value>(data) {
-                let artifact = event.get("artifact").unwrap_or(&Value::Null);
-                let header = artifact_header(artifact);
-                let content = artifact
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+        // A `task` event, and any member this client does not know, is skipped, so the capsule
+        // can add one without breaking the watch.
+        Ok(None)
+    }
+
+    /// Render one murmur frame. Reasoning, tool calls being written and frames this client does
+    /// not know print nothing.
+    fn murmur_frame(
+        &mut self,
+        out: &mut impl Write,
+        name: &str,
+        frame: &Value,
+    ) -> std::io::Result<Option<StreamEnd>> {
+        match name {
+            "connection-ack" => {
+                if let Some(mode) = frame.get("conversationMode").and_then(Value::as_str) {
+                    self.conversation_mode = mode.to_string();
+                }
+            }
+            "gap" => {
+                let first_id = frame
+                    .get("firstAvailableId")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                capsule_runtime::report_eprintln!("[murmur] warning: buffer overflow — some earlier events were lost (first available id: {first_id})");
+            }
+            "lagged" => {
+                let missed = frame.get("missed").and_then(Value::as_u64).unwrap_or(0);
+                capsule_runtime::report_eprintln!("{}", lagged_warning(missed));
+            }
+            "capsule-closed" => return Ok(Some(StreamEnd::CapsuleClosed)),
+            "text" => {
+                if let Some(text) = frame.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        write!(out, "{text}")?;
+                        out.flush()?;
+                    }
+                }
+            }
+            "artifact" => {
+                let header = artifact_header(frame);
+                let content = frame.get("content").and_then(Value::as_str).unwrap_or("");
                 let mut content_lines = content.lines();
                 if let Some(first) = content_lines.next() {
                     writeln!(out, "{header} | {first}")?;
@@ -343,21 +296,73 @@ fn dispatch_sse_event(
                     writeln!(out, "{header}")?;
                 }
             }
+            _ => {}
         }
-        "text" => {
-            if let Ok(event) = serde_json::from_str::<Value>(data) {
-                if let Some(text) = event.get("text").and_then(Value::as_str) {
-                    if !text.is_empty() {
-                        write!(out, "{text}")?;
-                        out.flush()?;
-                    }
-                }
-            }
-        }
-        _ => {}
+        Ok(None)
     }
 
-    Ok(())
+    /// Render one task status: `[<state>]  <message>`, or for a task that ended `[<state>]` alone,
+    /// followed by the wrapped answer of a `completed` one. Threaded mode prefixes the context
+    /// and its turn, which a task's end advances.
+    fn status_line(&mut self, out: &mut impl Write, update: &Value) -> std::io::Result<()> {
+        let task_id = update["taskId"].as_str().unwrap_or("").to_string();
+        let status = &update["status"];
+        let state = status["state"]
+            .as_str()
+            .map(|wire| capsule_runtime::murmur_state_name(wire).unwrap_or(wire))
+            .unwrap_or("unknown");
+        let message = status["message"]["parts"]
+            .as_array()
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        let ended = ENDED_STATES.contains(&state);
+
+        let prefix = if self.conversation_mode == "threaded" {
+            let cid = update["contextId"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| task_id.clone());
+            let turn = *self.context_turns.entry(cid.clone()).or_insert(1);
+            if ended {
+                *self.context_turns.entry(cid.clone()).or_insert(1) += 1;
+            }
+            format!("[{} / turn {turn} / {state}]", truncate_context_id(&cid))
+        } else {
+            format!("[{state}]")
+        };
+
+        if !ended {
+            return writeln!(out, "{prefix}  {message}");
+        }
+        writeln!(out, "{prefix}")?;
+        let response = self.responses.remove(&task_id);
+        if state == "completed" {
+            let col_width = terminal_width().saturating_sub(2);
+            for line in wrap_text(&response.unwrap_or_default(), col_width) {
+                writeln!(out, "  {line}")?;
+            }
+            writeln!(out)?;
+        }
+        Ok(())
+    }
+}
+
+/// The text of an artifact's text parts, joined.
+fn artifact_text(artifact: &Value) -> String {
+    artifact["parts"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Truncate a context ID for display: "ctx_XXXXXXXX..." (first 8 hex chars after the prefix).
@@ -403,25 +408,25 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     lines
 }
 
-/// The `[artifact]` line's header for one frame's `artifact` object, without the content that
-/// follows it: `[artifact] tool: bash [error, exit 2, 1204ms]`.
+/// The `[artifact]` line's header for one `artifact` frame, without the content that follows it:
+/// `[artifact] tool: bash [error, exit 2, 1204ms]`.
 ///
 /// The bracketed outcome lists `ok` or `error`, then `exit <n>`, `<n>ms` and `truncated` for
-/// whichever of those the frame reports. A frame with no `is_error` key comes from a runtime that
+/// whichever of those the frame reports. A frame with no `isError` key comes from a runtime that
 /// reports no outcome, and gets no brackets rather than an `ok` it never claimed.
 fn artifact_header(artifact: &Value) -> String {
     let tool_name = artifact
-        .get("tool_name")
+        .get("toolName")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let Some(is_error) = artifact.get("is_error").and_then(Value::as_bool) else {
+    let Some(is_error) = artifact.get("isError").and_then(Value::as_bool) else {
         return format!("[artifact] tool: {tool_name}");
     };
     let mut outcome = vec![if is_error { "error" } else { "ok" }.to_string()];
-    if let Some(exit_code) = artifact.get("exit_code").and_then(Value::as_i64) {
+    if let Some(exit_code) = artifact.get("exitCode").and_then(Value::as_i64) {
         outcome.push(format!("exit {exit_code}"));
     }
-    if let Some(duration_ms) = artifact.get("duration_ms").and_then(Value::as_u64) {
+    if let Some(duration_ms) = artifact.get("durationMs").and_then(Value::as_u64) {
         outcome.push(format!("{duration_ms}ms"));
     }
     if artifact.get("truncated").and_then(Value::as_bool) == Some(true) {
@@ -435,6 +440,87 @@ mod tests {
     use serde_json::json;
 
     use super::{artifact_header, lagged_warning, read_stream, StreamEnd};
+    use capsule_runtime::STREAM_EXTENSION_URI;
+
+    /// One SSE event: an `id:` line when `id` is given, and a `data:` line holding a JSON-RPC
+    /// response whose `result` is `result`.
+    fn event(id: Option<u64>, result: serde_json::Value) -> String {
+        let id_line = id.map(|id| format!("id: {id}\n")).unwrap_or_default();
+        let data = json!({"jsonrpc": "2.0", "id": 1, "result": result});
+        format!("{id_line}data: {data}\n\n")
+    }
+
+    /// A murmur frame that belongs to no task, carried by a `message`.
+    fn message_frame(frame: serde_json::Value) -> String {
+        let name = frame["frame"].clone();
+        event(
+            None,
+            json!({"message": {
+                "messageId": "msg_1",
+                "role": "ROLE_AGENT",
+                "parts": [{"text": name, "mediaType": "text/plain"}],
+                "metadata": {STREAM_EXTENSION_URI: frame},
+            }}),
+        )
+    }
+
+    /// A murmur frame of `tsk_1`, carried by a `statusUpdate`.
+    fn task_frame(id: u64, frame: serde_json::Value) -> String {
+        event(
+            Some(id),
+            json!({"statusUpdate": {
+                "taskId": "tsk_1",
+                "contextId": "ctx_1",
+                "status": {"state": "TASK_STATE_WORKING"},
+                "metadata": {STREAM_EXTENSION_URI: frame},
+            }}),
+        )
+    }
+
+    /// A status of `tsk_1` in `state`, saying `message` when given.
+    fn status(id: Option<u64>, state: &str, message: Option<&str>) -> String {
+        let mut status = json!({"state": state});
+        if let Some(text) = message {
+            status["message"] = json!({
+                "messageId": "msg_2", "contextId": "ctx_1", "taskId": "tsk_1",
+                "role": "ROLE_AGENT", "parts": [{"text": text, "mediaType": "text/plain"}],
+            });
+        }
+        event(
+            id,
+            json!({"statusUpdate": {"taskId": "tsk_1", "contextId": "ctx_1", "status": status}}),
+        )
+    }
+
+    /// The `response` artifact of `tsk_1`, holding `text`.
+    fn response(id: u64, text: &str) -> String {
+        event(
+            Some(id),
+            json!({"artifactUpdate": {
+                "taskId": "tsk_1",
+                "contextId": "ctx_1",
+                "artifact": {
+                    "artifactId": "response",
+                    "name": "response",
+                    "parts": [{"text": text, "mediaType": "text/plain"}],
+                },
+                "lastChunk": true,
+            }}),
+        )
+    }
+
+    /// `tsk_1` completing with `answer`: its response, then its terminal status.
+    fn completed(id: u64, answer: &str) -> String {
+        format!(
+            "{}{}",
+            response(id, answer),
+            status(Some(id + 1), "TASK_STATE_COMPLETED", Some("session ended"))
+        )
+    }
+
+    fn closed() -> String {
+        message_frame(json!({"frame": "capsule-closed"}))
+    }
 
     /// Read `body` as a `stream/watch` SSE body, returning how it ended and what was rendered.
     fn read(body: &str) -> (StreamEnd, String) {
@@ -443,20 +529,25 @@ mod tests {
         (end, String::from_utf8(out).unwrap())
     }
 
-    const ACK: &str =
-        "event: connection-ack\ndata: {\"role\":\"observer\",\"conversation_mode\":\"stateless\"}\n\n";
+    fn ack() -> String {
+        message_frame(
+            json!({"frame": "connection-ack", "role": "observer", "conversationMode": "stateless"}),
+        )
+    }
 
     #[test]
     fn capsule_closed_ends_the_stream_as_closed() {
-        let body = format!("{ACK}event: capsule-closed\ndata: {{}}\n\n");
+        let body = format!("{}{}", ack(), closed());
         assert_eq!(read(&body).0, StreamEnd::CapsuleClosed);
     }
 
     #[test]
     fn eof_after_frames_with_ids_reports_the_last_id() {
         let body = format!(
-            "{ACK}id: 0\nevent: status\ndata: {{\"id\":\"tsk_1\",\"status\":{{\"state\":\"working\",\"message\":\"inference turn 1\"}},\"final\":false}}\n\n\
-             id: 7\nevent: text\ndata: {{\"id\":\"tsk_1\",\"text\":\"hi\",\"final\":false}}\n\n"
+            "{}{}{}",
+            ack(),
+            status(Some(0), "TASK_STATE_WORKING", Some("inference turn 1")),
+            task_frame(7, json!({"frame": "text", "text": "hi", "final": false}))
         );
         assert_eq!(
             read(&body).0,
@@ -469,7 +560,7 @@ mod tests {
     #[test]
     fn eof_after_only_the_ack_reports_no_id() {
         assert_eq!(
-            read(ACK).0,
+            read(&ack()).0,
             StreamEnd::ConnectionLost {
                 last_event_id: None
             }
@@ -479,8 +570,10 @@ mod tests {
     #[test]
     fn frames_without_an_id_keep_the_last_recorded_id() {
         let body = format!(
-            "id: 4\nevent: text\ndata: {{\"id\":\"tsk_1\",\"text\":\"\",\"final\":true}}\n\n\
-             event: gap\ndata: {{\"first_available_id\":2}}\n\n{ACK}"
+            "{}{}{}",
+            task_frame(4, json!({"frame": "text", "text": "", "final": true})),
+            message_frame(json!({"frame": "gap", "firstAvailableId": 2})),
+            ack()
         );
         assert_eq!(
             read(&body).0,
@@ -492,10 +585,12 @@ mod tests {
 
     #[test]
     fn an_id_is_recorded_only_once_its_frame_is_complete() {
-        let body = "id: 4\nevent: text\ndata: {\"id\":\"tsk_1\",\"text\":\"\",\"final\":true}\n\n\
-                    id: 5\nevent: text\n";
+        let body = format!(
+            "{}id: 5\n",
+            task_frame(4, json!({"frame": "text", "text": "", "final": true}))
+        );
         assert_eq!(
-            read(body).0,
+            read(&body).0,
             StreamEnd::ConnectionLost {
                 last_event_id: Some(4)
             }
@@ -504,9 +599,9 @@ mod tests {
 
     #[test]
     fn heartbeat_changes_nothing() {
-        let frame = "id: 3\nevent: status\ndata: {\"id\":\"tsk_1\",\"status\":{\"state\":\"working\",\"message\":\"inference turn 1\"},\"final\":false}\n\n";
-        let with = format!("{ACK}:heartbeat\n\n{frame}:heartbeat\n\n");
-        let without = format!("{ACK}{frame}");
+        let frame = status(Some(3), "TASK_STATE_WORKING", Some("inference turn 1"));
+        let with = format!("{}:heartbeat\n\n{frame}:heartbeat\n\n", ack());
+        let without = format!("{}{frame}", ack());
         assert_eq!(read(&with), read(&without));
         assert_eq!(
             read(&with).0,
@@ -516,16 +611,18 @@ mod tests {
         );
     }
 
-    const LAGGED: &str = "event: lagged\ndata: {\"missed\":3}\n\n";
+    fn lagged() -> String {
+        message_frame(json!({"frame": "lagged", "missed": 3}))
+    }
 
     #[test]
     fn a_lagged_frame_renders_nothing_and_the_stream_continues() {
-        let first = "id: 1\nevent: status\ndata: {\"id\":\"tsk_1\",\"status\":{\"state\":\"working\",\"message\":\"inference turn 1\"},\"final\":false}\n\n";
-        let second = "id: 5\nevent: status\ndata: {\"id\":\"tsk_1\",\"status\":{\"state\":\"completed\",\"message\":\"session ended\",\"response\":\"done\"},\"final\":true}\n\n";
-        let closed = "event: capsule-closed\ndata: {}\n\n";
-        let (end, rendered) = read(&format!("{ACK}{first}{LAGGED}{second}{closed}"));
+        let first = status(Some(1), "TASK_STATE_WORKING", Some("inference turn 1"));
+        let second = completed(5, "done");
+        let (ack, lagged, closed) = (ack(), lagged(), closed());
+        let (end, rendered) = read(&format!("{ack}{first}{lagged}{second}{closed}"));
         assert_eq!(end, StreamEnd::CapsuleClosed);
-        let (_, without_lag) = read(&format!("{ACK}{first}{second}{closed}"));
+        let (_, without_lag) = read(&format!("{ack}{first}{second}{closed}"));
         assert!(rendered.contains("[completed]"), "rendered: {rendered}");
         assert_eq!(rendered, without_lag);
     }
@@ -533,7 +630,10 @@ mod tests {
     #[test]
     fn eof_after_a_lagged_frame_reports_the_preceding_id() {
         let body = format!(
-            "{ACK}id: 9\nevent: text\ndata: {{\"id\":\"tsk_1\",\"text\":\"hi\",\"final\":false}}\n\n{LAGGED}"
+            "{}{}{}",
+            ack(),
+            task_frame(9, json!({"frame": "text", "text": "hi", "final": false})),
+            lagged()
         );
         assert_eq!(
             read(&body).0,
@@ -554,9 +654,19 @@ mod tests {
     #[test]
     fn thinking_and_unknown_event_types_are_consumed_without_ending_the_stream() {
         let body = format!(
-            "{ACK}id: 1\nevent: thinking\ndata: {{\"id\":\"tsk_1\",\"text\":\"hmm\",\"final\":false}}\n\n\
-             id: 2\nevent: some-future-type\ndata: {{\"anything\":true}}\n\n\
-             event: capsule-closed\ndata: {{}}\n\n"
+            "{}{}{}{}{}{}",
+            ack(),
+            task_frame(
+                1,
+                json!({"frame": "thinking", "text": "hmm", "final": false})
+            ),
+            task_frame(2, json!({"frame": "some-future-frame", "anything": true})),
+            event(Some(3), json!({"someFutureMember": {"anything": true}})),
+            event(
+                None,
+                json!({"task": {"id": "tsk_1", "contextId": "ctx_1", "status": {"state": "TASK_STATE_SUBMITTED"}}})
+            ),
+            closed()
         );
         let (end, rendered) = read(&body);
         assert_eq!(end, StreamEnd::CapsuleClosed);
@@ -565,10 +675,26 @@ mod tests {
 
     #[test]
     fn unknown_keys_render_as_if_absent() {
-        let plain = "event: status\ndata: {\"id\":\"tsk_1\",\"context_id\":\"ctx_1\",\"status\":{\"state\":\"completed\",\"message\":\"session ended\",\"response\":\"done\"},\"final\":true}\n\n\
-                     event: artifact\ndata: {\"id\":\"tsk_1\",\"artifact\":{\"tool_name\":\"bash\",\"content\":\"a\\nb\",\"fence_source\":null,\"tool_call_id\":\"c1\",\"is_error\":false,\"duration_ms\":4,\"exit_code\":0,\"truncated\":false}}\n\n";
-        let extended = "event: status\ndata: {\"id\":\"tsk_1\",\"context_id\":\"ctx_1\",\"extra\":1,\"status\":{\"state\":\"completed\",\"message\":\"session ended\",\"response\":\"done\",\"new_key\":[1]},\"final\":true}\n\n\
-                        event: artifact\ndata: {\"id\":\"tsk_1\",\"later\":{},\"artifact\":{\"tool_name\":\"bash\",\"content\":\"a\\nb\",\"fence_source\":null,\"tool_call_id\":\"c1\",\"is_error\":false,\"duration_ms\":4,\"exit_code\":0,\"truncated\":false,\"summary\":\"x\"}}\n\n";
+        let artifact = json!({
+            "frame": "artifact", "toolName": "bash", "content": "a\nb", "fenceSource": null,
+            "toolCallId": "c1", "isError": false, "durationMs": 4, "exitCode": 0,
+            "truncated": false,
+        });
+        let plain = format!(
+            "{}{}",
+            completed(1, "done"),
+            task_frame(3, artifact.clone())
+        );
+        let mut later = artifact;
+        later["summary"] = json!("x");
+        let extended = format!(
+            "{}{}{}",
+            response(1, "done").replace("\"lastChunk\"", "\"extra\":1,\"lastChunk\""),
+            status(Some(2), "TASK_STATE_COMPLETED", Some("session ended"))
+                .replace("\"status\":{", "\"later\":{},\"status\":{\"newKey\":[1],"),
+            task_frame(3, later)
+        );
+        let (plain, extended) = (plain.as_str(), extended.as_str());
         let (_, plain_out) = read(plain);
         assert_eq!(
             plain_out,
@@ -578,10 +704,29 @@ mod tests {
     }
 
     #[test]
+    fn statuses_print_in_murmurs_words_and_threaded_mode_numbers_turns() {
+        let body = format!(
+            "{}{}{}{}",
+            message_frame(
+                json!({"frame": "connection-ack", "role": "observer", "conversationMode": "threaded"})
+            ),
+            status(Some(1), "TASK_STATE_INPUT_REQUIRED", Some("Which file?")),
+            status(Some(2), "TASK_STATE_FAILED", Some("boom")),
+            status(Some(3), "TASK_STATE_WORKING", Some("inference turn 1")),
+        );
+        assert_eq!(
+            read(&body).1,
+            "[ctx_1... / turn 1 / input-required]  Which file?\n\
+             [ctx_1... / turn 1 / failed]\n\
+             [ctx_1... / turn 2 / working]  inference turn 1\n"
+        );
+    }
+
+    #[test]
     fn successful_shell_call_reports_ok_exit_and_duration() {
         let artifact = json!({
-            "tool_name": "bash", "content": "$ echo hello", "fence_source": "tool:bash",
-            "tool_call_id": "call_1", "is_error": false, "duration_ms": 12, "exit_code": 0,
+            "toolName": "bash", "content": "$ echo hello", "fenceSource": "tool:bash",
+            "toolCallId": "call_1", "isError": false, "durationMs": 12, "exitCode": 0,
             "truncated": false,
         });
         assert_eq!(
@@ -593,8 +738,8 @@ mod tests {
     #[test]
     fn failed_shell_call_reports_error_and_its_exit_code() {
         let artifact = json!({
-            "tool_name": "bash", "content": "", "fence_source": "tool:bash",
-            "tool_call_id": "call_1", "is_error": true, "duration_ms": 1204, "exit_code": 2,
+            "toolName": "bash", "content": "", "fenceSource": "tool:bash",
+            "toolCallId": "call_1", "isError": true, "durationMs": 1204, "exitCode": 2,
             "truncated": false,
         });
         assert_eq!(
@@ -606,8 +751,8 @@ mod tests {
     #[test]
     fn failed_call_without_a_subprocess_has_no_exit_segment() {
         let artifact = json!({
-            "tool_name": "write-file", "content": "permission denied", "fence_source": null,
-            "tool_call_id": "call_1", "is_error": true, "duration_ms": 3, "exit_code": null,
+            "toolName": "write-file", "content": "permission denied", "fenceSource": null,
+            "toolCallId": "call_1", "isError": true, "durationMs": 3, "exitCode": null,
             "truncated": false,
         });
         assert_eq!(
@@ -619,8 +764,8 @@ mod tests {
     #[test]
     fn truncated_call_ends_with_truncated() {
         let artifact = json!({
-            "tool_name": "read-file", "content": "partial", "fence_source": "tool:read-file",
-            "tool_call_id": "call_1", "is_error": false, "duration_ms": 5, "exit_code": null,
+            "toolName": "read-file", "content": "partial", "fenceSource": "tool:read-file",
+            "toolCallId": "call_1", "isError": false, "durationMs": 5, "exitCode": null,
             "truncated": true,
         });
         assert_eq!(
@@ -632,8 +777,8 @@ mod tests {
     #[test]
     fn hook_artifact_reports_only_ok() {
         let artifact = json!({
-            "tool_name": "my-hook", "content": "{\"reviewed\":true}", "fence_source": null,
-            "tool_call_id": null, "is_error": false, "duration_ms": null, "exit_code": null,
+            "toolName": "my-hook", "content": "{\"reviewed\":true}", "fenceSource": null,
+            "toolCallId": null, "isError": false, "durationMs": null, "exitCode": null,
             "truncated": false,
         });
         assert_eq!(artifact_header(&artifact), "[artifact] tool: my-hook [ok]");
@@ -641,7 +786,7 @@ mod tests {
 
     #[test]
     fn frame_from_a_runtime_without_outcome_fields_renders_without_brackets() {
-        let artifact = json!({ "tool_name": "bash", "content": "hello" });
+        let artifact = json!({ "toolName": "bash", "content": "hello" });
         assert_eq!(artifact_header(&artifact), "[artifact] tool: bash");
     }
 
@@ -658,12 +803,17 @@ mod tests {
         }
     }
 
-    const STATUS_THEN_MORE: &str = "id: 0\nevent: status\ndata: {\"id\":\"tsk_1\",\"status\":{\"state\":\"working\",\"message\":\"inference turn 1\"},\"final\":false}\n\n\
-         id: 1\nevent: capsule-closed\ndata: {}\n\n";
+    fn status_then_more() -> String {
+        format!(
+            "{}{}",
+            status(Some(0), "TASK_STATE_WORKING", Some("inference turn 1")),
+            closed()
+        )
+    }
 
     #[test]
     fn a_closed_reader_ends_the_stream_as_reader_closed() {
-        let body = format!("{ACK}{STATUS_THEN_MORE}");
+        let body = format!("{}{}", ack(), status_then_more());
         let end = read_stream(
             body.as_bytes(),
             &mut Refusing(std::io::ErrorKind::BrokenPipe),
@@ -674,7 +824,7 @@ mod tests {
 
     #[test]
     fn any_other_write_failure_is_an_error() {
-        let body = format!("{ACK}{STATUS_THEN_MORE}");
+        let body = format!("{}{}", ack(), status_then_more());
         let error = read_stream(
             body.as_bytes(),
             &mut Refusing(std::io::ErrorKind::StorageFull),

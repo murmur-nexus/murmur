@@ -424,31 +424,34 @@ fn a_capsule_that_accepts_no_tasks_lists_neither_task_starting_method() {
     assert_eq!(
         common::card_stream_frames(&card),
         [
-            "status",
-            "artifact",
             "text",
             "thinking",
             "tool-call-started",
             "tool-call-progress",
+            "artifact",
             "gap",
             "lagged",
             "connection-ack",
             "capsule-closed"
         ],
-        "no SendStreamingMessage, so no error frame: {card}"
+        "stream/watch alone carries every frame: {card}"
     );
     assert_eq!(card["capabilities"]["streaming"], false);
     assert_eq!(card["skills"], json!([]), "no task can be started: {card}");
     common::assert_a2a_agent_card(&card);
 
-    for (method, params) in [
-        ("SendMessage", message_params("m-send")),
-        ("SendStreamingMessage", message_params("m-stream")),
-    ] {
-        let refused = post_jsonrpc(&capsule.url, &rpc(method, params));
-        assert_eq!(refused["error"]["code"], -32601, "{method}: {refused}");
-        assert_eq!(refused["error"]["message"], "Method not found");
-    }
+    let refused = post_jsonrpc(&capsule.url, &rpc("SendMessage", message_params("m-send")));
+    assert_eq!(refused["error"]["code"], -32601, "SendMessage: {refused}");
+    assert_eq!(refused["error"]["message"], "Method not found");
+    // `capabilities.streaming: false` answers a stream request as an unsupported operation.
+    let refused = post_jsonrpc(
+        &capsule.url,
+        &rpc("SendStreamingMessage", message_params("m-stream")),
+    );
+    assert_eq!(
+        refused["error"]["code"], -32004,
+        "SendStreamingMessage: {refused}"
+    );
 
     let got = post_jsonrpc(&capsule.url, &rpc("GetTask", json!({"id": "tsk_unknown"})));
     assert!(

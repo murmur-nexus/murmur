@@ -122,9 +122,11 @@ fn stream_task_ids(body: &str) -> Vec<String> {
         .filter_map(|line| line.strip_prefix("data:"))
         .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
         .flat_map(|event| {
-            [&event, &event["result"]]
+            event["result"]
+                .as_object()
                 .into_iter()
-                .flat_map(|frame| [frame["id"].clone(), frame["taskId"].clone()])
+                .flat_map(|members| members.values())
+                .flat_map(|body| [body["id"].clone(), body["taskId"].clone()])
                 .collect::<Vec<_>>()
         })
         .filter_map(|id| id.as_str().map(str::to_string))

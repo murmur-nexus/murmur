@@ -378,7 +378,10 @@ fn open_watch(addr: &str) -> (TcpStream, Instant) {
     (stream, opened)
 }
 
-/// Reads until `line` arrives, or `budget` from `since` runs out.
+/// What the `connection-ack` carrier's `data:` line holds, which only it does.
+const CONNECTION_ACK: &str = "\"frame\":\"connection-ack\"";
+
+/// Reads until a line containing `line` arrives, or `budget` from `since` runs out.
 fn read_until_line(
     stream: &TcpStream,
     line: &str,
@@ -391,7 +394,7 @@ fn read_until_line(
     loop {
         if String::from_utf8_lossy(&seen)
             .lines()
-            .any(|l| l.trim_end() == line)
+            .any(|l| l.contains(line))
         {
             return Ok(());
         }
@@ -525,7 +528,7 @@ fn every_door_path_answers_while_the_turn_is_busy() {
     );
 
     let (watch, opened) = open_watch(&capsule.url());
-    read_until_line(&watch, "event: connection-ack", opened, PROBE_BUDGET)
+    read_until_line(&watch, CONNECTION_ACK, opened, PROBE_BUDGET)
         .unwrap_or_else(|e| panic!("stream/watch went unanswered mid-turn: {e}"));
     eprintln!("[busy-door] stream/watch acked in {:?}", opened.elapsed());
     let last_answer_ms = now_ms();
@@ -575,13 +578,8 @@ fn an_open_observer_does_not_outlive_the_session() {
     let url = capsule.url();
 
     let (watch, opened) = open_watch(&url);
-    read_until_line(
-        &watch,
-        "event: connection-ack",
-        opened,
-        Duration::from_secs(10),
-    )
-    .unwrap_or_else(|e| panic!("stream/watch did not open: {e}"));
+    read_until_line(&watch, CONNECTION_ACK, opened, Duration::from_secs(10))
+        .unwrap_or_else(|e| panic!("stream/watch did not open: {e}"));
 
     capsule.mur().args(["stop", "@1"]).assert().success();
 

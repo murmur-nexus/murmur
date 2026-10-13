@@ -517,24 +517,87 @@ fn tool_then_answer_server() -> common::ScriptedServer {
 
 // ── SSE client ────────────────────────────────────────────────────────────────
 
+/// One event as the tests here read it.
 #[derive(Debug, Clone)]
 struct SseEvent {
-    /// The frame's `id:`, or `None` for a frame written without one.
+    /// The event's `id:`, or `None` for an event written without one.
     id: Option<u64>,
+    /// The murmur frame's name, or `status` for a standard `statusUpdate`, `artifact-update` and
+    /// `task` for the other standard events.
     event_type: String,
+    /// A murmur frame's payload exactly as written, keys in wire order, or the standard event's
+    /// body.
     data: String,
-    /// When the frame's blank terminating line reached the client.
+    /// When the event's blank terminating line reached the client.
     received: Instant,
 }
 
 impl SseEvent {
+    /// The event whose `data:` line carried `line`, a JSON-RPC response.
+    fn read(id: Option<u64>, line: &str) -> Self {
+        let event = common::stream::parse(&format!("data: {line}\n\n")).remove(0);
+        let (event_type, data) = match event.kind().as_str() {
+            "status-update" => (
+                "status".to_string(),
+                event.result()["statusUpdate"].to_string(),
+            ),
+            "artifact-update" => (
+                "artifact-update".to_string(),
+                event.result()["artifactUpdate"].to_string(),
+            ),
+            "task" => ("task".to_string(), event.result()["task"].to_string()),
+            frame => (frame.to_string(), extension_payload(line)),
+        };
+        SseEvent {
+            id,
+            event_type,
+            data,
+            received: Instant::now(),
+        }
+    }
+
     fn json(&self) -> Value {
-        serde_json::from_str(&self.data).expect("every frame's data is JSON")
+        serde_json::from_str(&self.data).expect("every event's data is JSON")
+    }
+
+    fn is_terminal_status(&self) -> bool {
+        self.event_type == "status"
+            && self.json()["status"]["state"]
+                .as_str()
+                .and_then(capsule_runtime::murmur_state_name)
+                .is_some_and(|state| {
+                    ["completed", "failed", "canceled", "rejected"].contains(&state)
+                })
     }
 }
 
-/// Open a `SendStreamingMessage` connection and read until the first `status` frame with
-/// `"final":true`. A `text` frame with `"final":true` is not terminal.
+/// The JSON text of `line`'s `metadata[STREAM_EXTENSION_URI]` object, as written.
+fn extension_payload(line: &str) -> String {
+    let key = format!("\"{}\":", common::stream::STREAM_EXTENSION_URI);
+    let start = line.find(&key).expect("a murmur frame is keyed by the URI") + key.len();
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for (offset, byte) in line[start..].bytes().enumerate() {
+        match (in_string, escaped, byte) {
+            (true, true, _) => escaped = false,
+            (true, false, b'\\') => escaped = true,
+            (true, false, b'"') => in_string = false,
+            (true, false, _) => {}
+            (false, _, b'"') => in_string = true,
+            (false, _, b'{') => depth += 1,
+            (false, _, b'}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return line[start..start + offset + 1].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("an unterminated payload in {line}")
+}
+
+/// Open a `SendStreamingMessage` connection activating the stream extension and read until its
+/// task's terminal status, returning every event after the opening task.
 fn collect_sse_events(addr: &str, timeout: Duration) -> Vec<SseEvent> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -549,8 +612,9 @@ fn collect_sse_events(addr: &str, timeout: Duration) -> Vec<SseEvent> {
         }
     })
     .to_string();
+    let (extensions, uri) = common::stream::extensions_header();
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\n{extensions}: {uri}\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
         body.len()
     );
 
@@ -578,15 +642,20 @@ fn collect_sse_events(addr: &str, timeout: Duration) -> Vec<SseEvent> {
         }
     }
 
-    read_sse_until_final(&mut reader)
+    let mut events = read_sse_until_final(&mut reader);
+    assert_eq!(
+        events.first().map(|event| event.event_type.as_str()),
+        Some("task"),
+        "the stream opens with its task: {events:#?}"
+    );
+    events.remove(0);
+    events
 }
 
-/// Read SSE frames off `reader` until the first `status` frame with `"final":true`, or the end of
-/// the stream.
+/// Read events off `reader` until the first terminal status, or the end of the stream.
 fn read_sse_until_final(reader: &mut impl BufRead) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let mut id = None;
-    let mut event_type = String::new();
     let mut data = String::new();
     loop {
         let mut line = String::new();
@@ -599,25 +668,18 @@ fn read_sse_until_final(reader: &mut impl BufRead) -> Vec<SseEvent> {
             .trim_end_matches('\r')
             .to_string();
         if line.is_empty() {
-            if !event_type.is_empty() && !data.is_empty() {
-                let terminal = event_type == "status" && data.contains("\"final\":true");
-                events.push(SseEvent {
-                    id,
-                    event_type: event_type.clone(),
-                    data: data.clone(),
-                    received: Instant::now(),
-                });
+            if !data.is_empty() {
+                let event = SseEvent::read(id, &data);
+                let terminal = event.is_terminal_status();
+                events.push(event);
                 if terminal {
                     break;
                 }
             }
             id = None;
-            event_type.clear();
             data.clear();
         } else if let Some(rest) = line.strip_prefix("id: ") {
             id = rest.parse().ok();
-        } else if let Some(rest) = line.strip_prefix("event: ") {
-            event_type = rest.to_string();
         } else if let Some(rest) = line.strip_prefix("data: ") {
             data = rest.to_string();
         }
@@ -666,20 +728,25 @@ fn trace_events<'a>(trace: &'a [Value], event_type: &str) -> Vec<&'a Value> {
 
 // ── Frame labelling ───────────────────────────────────────────────────────────
 
-/// What each frame is, in one word per frame: the sequences two transports are compared by.
+/// What each event is, in one word per event: the sequences two transports are compared by.
 fn frame_kinds(events: &[SseEvent]) -> Vec<String> {
     events
         .iter()
         .map(|event| {
             let data = event.json();
             match event.event_type.as_str() {
-                "status" => match data["status"]["state"].as_str().unwrap_or_default() {
-                    "working" => format!(
-                        "status:working:{}",
-                        data["status"]["message"].as_str().unwrap_or_default()
-                    ),
-                    state => format!("status:{state}"),
-                },
+                "status" => {
+                    let state = data["status"]["state"].as_str().unwrap_or_default();
+                    match capsule_runtime::murmur_state_name(state).unwrap_or(state) {
+                        "working" => format!(
+                            "status:working:{}",
+                            data["status"]["message"]["parts"][0]["text"]
+                                .as_str()
+                                .unwrap_or_default()
+                        ),
+                        state => format!("status:{state}"),
+                    }
+                }
                 "text" | "thinking" => match data["final"] == Value::Bool(true) {
                     true => format!("{}:final", event.event_type),
                     false => format!("{}:chunk", event.event_type),
@@ -715,17 +782,32 @@ fn frames_of(events: &[SseEvent], event_type: &str) -> Vec<Value> {
         .collect()
 }
 
+/// The one terminal status of the stream's task, as `{"status": {state, message, response}}`:
+/// its state in murmur's word, its message's text, and the `response` artifact delivered before it.
 fn final_status(events: &[SseEvent]) -> Value {
-    let finals: Vec<Value> = frames_of(events, "status")
-        .into_iter()
-        .filter(|frame| frame["final"] == Value::Bool(true))
+    let finals: Vec<usize> = (0..events.len())
+        .filter(|&index| events[index].is_terminal_status())
         .collect();
     assert_eq!(
         finals.len(),
         1,
-        "an attempt writes exactly one final status frame; got {finals:#?}"
+        "an attempt writes exactly one terminal status; got {events:#?}"
     );
-    finals.into_iter().next().unwrap()
+    let status = events[finals[0]].json()["status"].clone();
+    let state = status["state"].as_str().unwrap();
+    let response = finals[0]
+        .checked_sub(1)
+        .map(|index| events[index].json())
+        .filter(|update| update["artifact"]["artifactId"] == "response")
+        .map(|update| update["artifact"]["parts"][0]["text"].clone());
+    let mut view = serde_json::json!({"status": {
+        "state": capsule_runtime::murmur_state_name(state).unwrap(),
+        "message": status["message"]["parts"][0]["text"],
+    }});
+    if let Some(response) = response {
+        view["status"]["response"] = response;
+    }
+    view
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -754,20 +836,21 @@ fn text_a_tool_call_and_an_answer_write_the_same_frames() {
             "artifact",
             "status:working:inference turn 2",
             "text:final",
+            "artifact-update",
             "status:completed",
         ],
     );
 
     for (transport, events) in [("http", &http_events), ("process", &process_events)] {
-        let artifact = &frames_of(events, "artifact")[0]["artifact"];
-        assert_eq!(artifact["tool_name"], TOOL, "{transport}: {artifact}");
-        assert_eq!(artifact["is_error"], false, "{transport}: {artifact}");
+        let artifact = &frames_of(events, "artifact")[0];
+        assert_eq!(artifact["toolName"], TOOL, "{transport}: {artifact}");
+        assert_eq!(artifact["isError"], false, "{transport}: {artifact}");
         assert!(
-            artifact["tool_call_id"].is_string(),
+            artifact["toolCallId"].is_string(),
             "{transport}: {artifact}"
         );
         assert!(
-            artifact["duration_ms"].is_number(),
+            artifact["durationMs"].is_number(),
             "{transport}: {artifact}"
         );
         assert_eq!(
@@ -800,6 +883,7 @@ fn streamed_text_arrives_in_the_same_shape() {
             "text:chunk",
             "text:chunk",
             "text:final",
+            "artifact-update",
             "status:completed",
         ],
     );
@@ -931,7 +1015,7 @@ fn thinking_reaches_the_client_once() {
 }
 
 /// S6. A process capsule's card advertises what its transport can do: `CancelTask` on the door
-/// extension, which every transport supports, and streaming, which is its driver's answer.
+/// extension and streaming, which every transport supports.
 #[test]
 fn a_process_capsule_advertises_cancellation_and_streaming() {
     if common::skip_without_host_support("a_process_capsule_advertises_cancellation_and_streaming")
@@ -952,34 +1036,30 @@ fn a_process_capsule_advertises_cancellation_and_streaming() {
 }
 
 /// The stream extension's `params.frames` of an http capsule that serves `SendStreamingMessage`.
-const HTTP_FRAMES: [&str; 11] = [
-    "status",
-    "artifact",
+const HTTP_FRAMES: [&str; 9] = [
     "text",
     "thinking",
     "tool-call-started",
     "tool-call-progress",
+    "artifact",
     "gap",
     "lagged",
     "connection-ack",
     "capsule-closed",
-    "error",
 ];
 
 /// The stream extension's `params.frames` of a `transport: process` capsule that serves
 /// `SendStreamingMessage`.
-const PROCESS_FRAMES: [&str; 11] = [
-    "status",
-    "artifact",
+const PROCESS_FRAMES: [&str; 9] = [
     "text",
     "thinking",
     "tool-call-started",
     "tool-call-progress",
+    "artifact",
     "gap",
     "lagged",
     "connection-ack",
     "capsule-closed",
-    "error",
 ];
 
 /// Each capsule's card lists the frames its transport writes, and text, one tool call and an
@@ -1007,9 +1087,12 @@ fn every_frame_a_capsule_writes_is_on_its_card() {
         assert_eq!(frames, expected, "{transport}: {card}");
 
         let events = collect_sse_events(&url, STREAM_TIMEOUT);
-        let observed: std::collections::BTreeSet<&str> =
-            events.iter().map(|e| e.event_type.as_str()).collect();
-        println!("{transport} observed event types: {observed:?}");
+        let observed: std::collections::BTreeSet<&str> = events
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .filter(|kind| !["status", "artifact-update", "task"].contains(kind))
+            .collect();
+        println!("{transport} observed murmur frames: {observed:?}");
         assert!(!observed.is_empty(), "{transport}: no frames");
         for event_type in &observed {
             assert!(
@@ -1109,37 +1192,35 @@ fn a_started_tool_call_streams_its_start_and_size_before_its_artifact() {
             "artifact",
             "status:working:inference turn 2",
             "text:final",
+            "artifact-update",
             "status:completed",
         ]
     );
 
-    let artifact = &frames_of(&events, "artifact")[0]["artifact"];
+    let artifact = &frames_of(&events, "artifact")[0];
     let started = &frames_of(&events, "tool-call-started")[0];
-    assert_eq!(started["tool_call_id"], "c1", "{started}");
-    assert_eq!(
-        started["tool_call_id"], artifact["tool_call_id"],
-        "{artifact}"
-    );
-    assert_eq!(started["tool_name"], TOOL, "{started}");
-    assert_eq!(started["tool_name"], artifact["tool_name"], "{artifact}");
+    assert_eq!(started["toolCallId"], "c1", "{started}");
+    assert_eq!(started["toolCallId"], artifact["toolCallId"], "{artifact}");
+    assert_eq!(started["toolName"], TOOL, "{started}");
+    assert_eq!(started["toolName"], artifact["toolName"], "{artifact}");
     let progress = frames_of(&events, "tool-call-progress");
     assert_eq!(
         progress
             .iter()
-            .map(|frame| frame["input_bytes"].clone())
+            .map(|frame| frame["inputBytes"].clone())
             .collect::<Vec<_>>(),
         [12, 40]
     );
     for frame in &progress {
-        assert_eq!(frame["tool_call_id"], "c1", "{frame}");
+        assert_eq!(frame["toolCallId"], "c1", "{frame}");
     }
     for event in &events {
         match event.event_type.as_str() {
             "tool-call-started" => {
-                assert_keys_in_order(&event.data, &["id", "tool_call_id", "tool_name"])
+                assert_keys_in_order(&event.data, &["frame", "toolCallId", "toolName"])
             }
             "tool-call-progress" => {
-                assert_keys_in_order(&event.data, &["id", "tool_call_id", "input_bytes"])
+                assert_keys_in_order(&event.data, &["frame", "toolCallId", "inputBytes"])
             }
             _ => {}
         }
@@ -1221,7 +1302,7 @@ fn a_large_tool_input_writes_a_bounded_number_of_progress_frames() {
         .as_millis() as u64;
     let sizes: Vec<u64> = frames_of(&events, "tool-call-progress")
         .iter()
-        .map(|frame| frame["input_bytes"].as_u64().unwrap())
+        .map(|frame| frame["inputBytes"].as_u64().unwrap())
         .collect();
     let ceiling = 2 + elapsed_ms.div_ceil(250);
     println!(
@@ -1309,10 +1390,12 @@ const PROGRESS_INPUT_BYTES: u64 = 30;
 /// Assert no frame but an `artifact` carries any four-byte piece of the call's input marker. The
 /// echo tool's result repeats its input, so the `artifact` that answers the call carries it.
 fn assert_no_input_outside_the_artifact(events: &[SseEvent]) {
-    // A piece made only of hex digits can occur by chance in a task or context id.
+    // A piece made only of hex digits can occur by chance in a task or context id, and one
+    // inside a frame's name occurs in that frame's `frame` key.
     let pieces: Vec<&str> = (0..=PROGRESS_MARKER.len() - 4)
         .map(|at| &PROGRESS_MARKER[at..at + 4])
         .filter(|piece| !piece.bytes().all(|b| b.is_ascii_hexdigit()))
+        .filter(|piece| !"tool-call-progress".contains(piece))
         .collect();
     for event in events.iter().filter(|event| event.event_type != "artifact") {
         for piece in &pieces {
@@ -1330,7 +1413,7 @@ fn assert_no_input_outside_the_artifact(events: &[SseEvent]) {
 fn progress_sizes(events: &[SseEvent]) -> Vec<u64> {
     frames_of(events, "tool-call-progress")
         .iter()
-        .map(|frame| frame["input_bytes"].as_u64().unwrap())
+        .map(|frame| frame["inputBytes"].as_u64().unwrap())
         .collect()
 }
 
@@ -1360,33 +1443,31 @@ fn a_started_tool_call_streams_its_start_and_size_on_http() {
             "artifact",
             "status:working:inference turn 2",
             "text:final",
+            "artifact-update",
             "status:completed",
         ],
     );
 
-    let artifact = &frames_of(&http_events, "artifact")[0]["artifact"];
+    let artifact = &frames_of(&http_events, "artifact")[0];
     let started = &frames_of(&http_events, "tool-call-started")[0];
-    assert_eq!(started["tool_call_id"], "c1", "{started}");
-    assert_eq!(
-        started["tool_call_id"], artifact["tool_call_id"],
-        "{artifact}"
-    );
-    assert_eq!(started["tool_name"], TOOL, "{started}");
-    assert_eq!(started["tool_name"], artifact["tool_name"], "{artifact}");
+    assert_eq!(started["toolCallId"], "c1", "{started}");
+    assert_eq!(started["toolCallId"], artifact["toolCallId"], "{artifact}");
+    assert_eq!(started["toolName"], TOOL, "{started}");
+    assert_eq!(started["toolName"], artifact["toolName"], "{artifact}");
     assert_eq!(
         progress_sizes(&http_events),
         [PROGRESS_INPUT_BYTES / 2, PROGRESS_INPUT_BYTES]
     );
     for frame in frames_of(&http_events, "tool-call-progress") {
-        assert_eq!(frame["tool_call_id"], "c1", "{frame}");
+        assert_eq!(frame["toolCallId"], "c1", "{frame}");
     }
     for event in &http_events {
         match event.event_type.as_str() {
             "tool-call-started" => {
-                assert_keys_in_order(&event.data, &["id", "tool_call_id", "tool_name"])
+                assert_keys_in_order(&event.data, &["frame", "toolCallId", "toolName"])
             }
             "tool-call-progress" => {
-                assert_keys_in_order(&event.data, &["id", "tool_call_id", "input_bytes"])
+                assert_keys_in_order(&event.data, &["frame", "toolCallId", "inputBytes"])
             }
             _ => {}
         }
@@ -1421,6 +1502,7 @@ fn text_and_thinking_still_stream_beside_a_started_tool_call_on_http() {
             "artifact",
             "status:working:inference turn 2",
             "text:final",
+            "artifact-update",
             "status:completed",
         ]
     );
@@ -1553,14 +1635,14 @@ fn an_unruly_http_driver_writes_no_frame_that_breaks_the_contract() {
     );
     let started = frames_of(&events, "tool-call-started");
     assert_eq!(started.len(), 1, "{started:#?}");
-    assert_eq!(started[0]["tool_call_id"], "c1");
+    assert_eq!(started[0]["toolCallId"], "c1");
     assert_eq!(progress_sizes(&events), [PROGRESS_INPUT_BYTES]);
     for event in &events {
         let data = event.json();
         assert!(!event.data.contains("ghost"), "{}", event.data);
         if event.event_type.starts_with("tool-call-") {
-            assert_ne!(data["tool_call_id"], "", "{}", event.data);
-            assert_eq!(data["tool_call_id"], "c1", "{}", event.data);
+            assert_ne!(data["toolCallId"], "", "{}", event.data);
+            assert_eq!(data["toolCallId"], "c1", "{}", event.data);
         }
     }
     assert_eq!(final_status(&events)["status"]["state"], "completed");
@@ -1587,24 +1669,23 @@ fn hook_artifacts(events: &[SseEvent]) -> Vec<Value> {
 fn artifacts_from(events: &[SseEvent], hook: &str) -> Vec<Value> {
     frames_of(events, "artifact")
         .into_iter()
-        .map(|frame| frame["artifact"].clone())
-        .filter(|artifact| artifact["tool_name"] == hook)
+        .filter(|artifact| artifact["toolName"] == hook)
         .collect()
 }
 
 /// Assert `artifact` is the hook's payload, carried the way the operator's own hook speaks:
 /// unfenced, and with none of a tool call's keys.
 fn assert_is_hook_artifact(transport: &str, artifact: &Value) {
-    assert_eq!(artifact["tool_name"], HOOK, "{transport}: {artifact}");
+    assert_eq!(artifact["toolName"], HOOK, "{transport}: {artifact}");
     assert_eq!(artifact["content"], HOOK_PAYLOAD, "{transport}: {artifact}");
-    for key in ["fence_source", "tool_call_id", "duration_ms", "exit_code"] {
+    for key in ["fenceSource", "toolCallId", "durationMs", "exitCode"] {
         assert_eq!(
             artifact[key],
             Value::Null,
             "{transport}: {key} in {artifact}"
         );
     }
-    assert_eq!(artifact["is_error"], false, "{transport}: {artifact}");
+    assert_eq!(artifact["isError"], false, "{transport}: {artifact}");
     assert_eq!(artifact["truncated"], false, "{transport}: {artifact}");
 }
 
@@ -1635,6 +1716,7 @@ fn an_inference_hook_artifact_writes_the_same_frames() {
             "status:working:inference turn 2",
             "artifact",
             "text:final",
+            "artifact-update",
             "status:completed",
         ],
     );
@@ -1642,16 +1724,16 @@ fn an_inference_hook_artifact_writes_the_same_frames() {
     let mut forwarded = Vec::new();
     for (transport, events) in [("http", &http_events), ("process", &process_events)] {
         let artifacts = frames_of(events, "artifact");
-        assert_eq!(artifacts[0]["artifact"]["tool_name"], TOOL, "{transport}");
+        assert_eq!(artifacts[0]["toolName"], TOOL, "{transport}");
         let hooks = hook_artifacts(events);
         assert_eq!(hooks.len(), 1, "{transport}: {hooks:#?}");
-        assert_is_hook_artifact(transport, &artifacts[1]["artifact"]);
+        assert_is_hook_artifact(transport, &artifacts[1]);
         assert_eq!(
             final_status(events)["status"]["response"],
             "PARITY-ANSWER",
             "{transport}"
         );
-        forwarded.push(artifacts[1]["artifact"].clone());
+        forwarded.push(artifacts[1].clone());
     }
     assert_eq!(forwarded[0], forwarded[1], "the hook's frame differs");
 }
@@ -1683,6 +1765,7 @@ fn a_streamed_answer_places_the_hook_artifact_after_the_cursor_removal() {
             "text:chunk",
             "text:final",
             "artifact",
+            "artifact-update",
             "status:completed",
         ],
     );
@@ -1690,7 +1773,7 @@ fn a_streamed_answer_places_the_hook_artifact_after_the_cursor_removal() {
     for (transport, events) in [("http", &http_events), ("process", &process_events)] {
         let texts = frames_of(events, "text");
         assert_eq!(texts[3]["text"], "", "{transport}: the cursor removal");
-        assert_is_hook_artifact(transport, &frames_of(events, "artifact")[0]["artifact"]);
+        assert_is_hook_artifact(transport, &frames_of(events, "artifact")[0]);
     }
 }
 

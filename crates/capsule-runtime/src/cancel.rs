@@ -56,8 +56,8 @@ pub(crate) const PHASE_HARNESS: &str = "harness";
 /// Cancelled while a `submit-plan` call was running its steps.
 pub(crate) const PHASE_PLAN: &str = "plan";
 
-/// What the terminal `canceled` status frame says. One constant for every transport: a client
-/// cannot tell from the frame which one ran the task.
+/// What the terminal `TASK_STATE_CANCELED` status says. One constant for every transport: a client
+/// cannot tell from the status which one ran the task.
 pub(crate) const CANCELED_STATUS_MESSAGE: &str = "task canceled";
 
 /// What `out/result.txt` holds once a task that ran ends `canceled`, so the file never presents

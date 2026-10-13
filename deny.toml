@@ -1,6 +1,11 @@
 [advisories]
 unmaintained = "all"
 yanked = "warn"
+ignore = [
+    # serde_yaml's parser; no maintained drop-in exists (serde_yaml_ng uses it too). Remove when
+    # manifest parsing moves to a safe-Rust YAML crate such as serde-saphyr.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained, not vulnerable; replacing serde_yaml is tracked separately" },
+]
 
 [licenses]
 allow = [

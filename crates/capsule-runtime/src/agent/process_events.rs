@@ -895,7 +895,7 @@ mod tests {
         RetryInfo, SessionInfo, ToolCallInfo, ToolCallProgress, ToolCallStart, ToolResultInfo,
         TurnFailure,
     };
-    use crate::streaming::SseEventBuffer;
+    use crate::streaming::{buffered, event_kind, frame_of, SseEventBuffer};
     use serde_json::Value as Json;
 
     /// The context every sink below runs a task under.
@@ -904,19 +904,25 @@ mod tests {
     /// The harness name every sink below records with the session it remembers.
     const HARNESS: &str = "fixture-harness";
 
-    /// The label a frame reads as: its event type, and for the two types whose shape depends on a
+    /// The label an event reads as: its kind, and for the two kinds whose shape depends on a
     /// key, the key. The same labelling the process/http parity tests compare sequences with.
-    fn frame_kind(frame: &str) -> String {
-        let data: Json = serde_json::from_str(frame_data(frame)).expect("frame data is JSON");
-        match event_type(frame) {
-            "status" => match data["status"]["state"].as_str().unwrap_or_default() {
-                "working" => format!(
-                    "status:working:{}",
-                    data["status"]["message"].as_str().unwrap_or_default()
-                ),
-                state => format!("status:{state}"),
-            },
-            "text" => match data["final"] == Json::Bool(true) {
+    fn frame_kind(event: &Json) -> String {
+        match event_kind(event).as_str() {
+            "status-update" => {
+                let status = &event["statusUpdate"]["status"];
+                let state = status["state"].as_str().unwrap_or_default();
+                let state = crate::a2a::murmur_state_name(state).unwrap_or(state);
+                match state {
+                    "working" => format!(
+                        "status:working:{}",
+                        status["message"]["parts"][0]["text"]
+                            .as_str()
+                            .unwrap_or_default()
+                    ),
+                    state => format!("status:{state}"),
+                }
+            }
+            "text" => match frame_of(event)["final"] == Json::Bool(true) {
                 true => "text:final".to_string(),
                 false => "text:chunk".to_string(),
             },
@@ -924,26 +930,16 @@ mod tests {
         }
     }
 
-    fn event_type(frame: &str) -> &str {
-        frame
-            .lines()
-            .find_map(|line| line.strip_prefix("event: "))
-            .expect("every frame names its event type")
-    }
-
-    fn frame_data(frame: &str) -> &str {
-        frame
-            .lines()
-            .find_map(|line| line.strip_prefix("data: "))
-            .expect("every frame carries data")
-    }
-
-    /// The parsed `data` of every frame of `event_type`, in order.
-    fn data_of(frames: &[String], event_type_wanted: &str) -> Vec<Json> {
-        frames
+    /// What every event of `kind` says, in order: a murmur frame's payload, or a
+    /// `statusUpdate`'s body for `"status"`.
+    fn data_of(events: &[Json], kind: &str) -> Vec<Json> {
+        events
             .iter()
-            .filter(|frame| event_type(frame) == event_type_wanted)
-            .map(|frame| serde_json::from_str(frame_data(frame)).expect("frame data is JSON"))
+            .filter_map(|event| match (kind, event_kind(event).as_str()) {
+                ("status", "status-update") => Some(event["statusUpdate"].clone()),
+                (wanted, found) if wanted == found => Some(frame_of(event)),
+                _ => None,
+            })
             .collect()
     }
 
@@ -1161,20 +1157,12 @@ mod tests {
 
         /// Each frame the A2A stream wrote, labelled by kind, in order.
         fn frame_kinds(&self) -> Vec<String> {
-            self.frames()
-                .iter()
-                .map(|frame| frame_kind(frame))
-                .collect()
+            self.frames().iter().map(frame_kind).collect()
         }
 
-        /// Each frame's `event: <type>` and parsed `data`, in order.
-        fn frames(&self) -> Vec<String> {
-            match self.frames.lock().unwrap().replay_from(0) {
-                crate::streaming::ReplayResult::Complete(frames)
-                | crate::streaming::ReplayResult::WithGap { events: frames, .. } => {
-                    frames.iter().map(|frame| frame.to_string()).collect()
-                }
-            }
+        /// Each event's `StreamResponse`, as an activated connection reads it, in order.
+        fn frames(&self) -> Vec<Json> {
+            buffered(&self.frames)
         }
 
         /// Every event written so far, parsed.
@@ -1904,18 +1892,18 @@ mod tests {
         ])
         .await;
         let frames = h.frames();
-        let artifact = &data_of(&frames, "artifact")[0]["artifact"];
-        assert_eq!(artifact["tool_name"], "echo-tool");
+        let artifact = &data_of(&frames, "artifact")[0];
+        assert_eq!(artifact["toolName"], "echo-tool");
         assert_eq!(artifact["content"], "done");
-        assert_eq!(artifact["tool_call_id"], "c1");
-        assert_eq!(artifact["is_error"], true);
-        assert!(artifact["duration_ms"].is_number(), "{artifact}");
+        assert_eq!(artifact["toolCallId"], "c1");
+        assert_eq!(artifact["isError"], true);
+        assert!(artifact["durationMs"].is_number(), "{artifact}");
         assert_eq!(
-            artifact["fence_source"],
+            artifact["fenceSource"],
             Json::Null,
             "the bridge returns tool output unfenced"
         );
-        assert_eq!(artifact["exit_code"], Json::Null);
+        assert_eq!(artifact["exitCode"], Json::Null);
         assert_eq!(artifact["truncated"], false);
     }
 
@@ -2151,7 +2139,7 @@ mod tests {
             .await;
         let names: Vec<Json> = data_of(&h.frames(), "artifact")
             .iter()
-            .map(|frame| frame["artifact"]["tool_name"].clone())
+            .map(|frame| frame["toolName"].clone())
             .collect();
         assert_eq!(names, vec!["first", "second"], "{:#?}", h.frames());
     }
@@ -2205,17 +2193,16 @@ mod tests {
             .turn_end("", vec![hook_artifact("review", r#"{"reviewed":true}"#)])
             .await;
         let frames = h.frames();
-        let artifact = &data_of(&frames, "artifact")[0]["artifact"];
+        let artifact = &data_of(&frames, "artifact")[0];
         assert_eq!(
             artifact,
-            &serde_json::to_value(StreamArtifact::hook(
-                "review".to_string(),
-                r#"{"reviewed":true}"#.to_string()
+            &serde_json::to_value(crate::streaming::MurmurFrame::Artifact(
+                StreamArtifact::hook("review".to_string(), r#"{"reviewed":true}"#.to_string())
             ))
             .unwrap()
         );
-        assert_eq!(artifact["fence_source"], Json::Null);
-        assert_eq!(artifact["tool_call_id"], Json::Null);
+        assert_eq!(artifact["fenceSource"], Json::Null);
+        assert_eq!(artifact["toolCallId"], Json::Null);
     }
 
     /// The attempt's ending, on the two paths out of a run the harness itself ends. The stream
@@ -2235,7 +2222,7 @@ mod tests {
         assert!(
             data_of(&h.frames(), "status")
                 .iter()
-                .all(|status| status["final"] == Json::Bool(false)),
+                .all(|status| status["status"]["state"] == "TASK_STATE_WORKING"),
             "{:#?}",
             h.frames()
         );
@@ -2301,7 +2288,7 @@ mod tests {
                 assert!(
                     data_of(&h.frames(), "status")
                         .iter()
-                        .all(|status| status["final"] == Json::Bool(false)),
+                        .all(|status| status["status"]["state"] == "TASK_STATE_WORKING"),
                     "{:#?}",
                     h.frames()
                 );
@@ -2368,10 +2355,10 @@ mod tests {
     // ── A tool call being written ─────────────────────────────────────────────
 
     /// The `input_bytes` of every `tool-call-progress` frame, in order.
-    fn progress_sizes(frames: &[String]) -> Vec<u64> {
+    fn progress_sizes(frames: &[Json]) -> Vec<u64> {
         data_of(frames, "tool-call-progress")
             .iter()
-            .map(|data| data["input_bytes"].as_u64().expect("input_bytes is a u64"))
+            .map(|data| data["inputBytes"].as_u64().expect("inputBytes is a u64"))
             .collect()
     }
 
@@ -2404,15 +2391,12 @@ mod tests {
         let started = data_of(&frames, "tool-call-started");
         assert_eq!(
             started[0],
-            serde_json::json!({"id": "tsk_test", "tool_call_id": "c1", "tool_name": "echo-tool"})
+            serde_json::json!({"frame": "tool-call-started", "toolCallId": "c1", "toolName": "echo-tool"})
         );
         assert_eq!(progress_sizes(&frames), [12, 40]);
         let progress = data_of(&frames, "tool-call-progress");
-        assert!(progress.iter().all(|data| data["tool_call_id"] == "c1"));
-        assert_eq!(
-            data_of(&frames, "artifact")[0]["artifact"]["tool_call_id"],
-            "c1"
-        );
+        assert!(progress.iter().all(|data| data["toolCallId"] == "c1"));
+        assert_eq!(data_of(&frames, "artifact")[0]["toolCallId"], "c1");
     }
 
     /// A started call and its progress are not model actions: the same run with and without them
@@ -2575,10 +2559,7 @@ mod tests {
         assert!(note.contains("c1"), "{note}");
         assert!(note.contains("'write_file'"), "{note}");
         assert!(note.contains("'echo-tool'"), "{note}");
-        assert_eq!(
-            data_of(&h.frames(), "artifact")[0]["artifact"]["tool_name"],
-            "echo-tool"
-        );
+        assert_eq!(data_of(&h.frames(), "artifact")[0]["toolName"], "echo-tool");
     }
 
     /// Hundreds of sizes in one batch write a handful of frames, so the task's first frames stay
@@ -2600,7 +2581,7 @@ mod tests {
         let replay = h.frames.lock().unwrap().replay_from(0);
         match replay {
             crate::streaming::ReplayResult::Complete(frames) => {
-                assert!(frames[0].starts_with("id: 1\n"), "{}", frames[0]);
+                assert_eq!(frames[0].id, 1);
             }
             crate::streaming::ReplayResult::WithGap { .. } => {
                 panic!("the burst evicted the task's first frames")

@@ -37,8 +37,8 @@ use crate::{
     spend::SpendRefusal,
     stream_events::settle_started_calls,
     streaming::{
-        emit_chunk_sse_final, emit_sse, SseBroadcast, SseEventBuffer, StreamArtifact, StreamFrame,
-        StreamStatus, TaskArtifactUpdateEvent, TaskStatusUpdateEvent,
+        emit_frame, emit_status, emit_text, MurmurFrame, SseBroadcast, SseEventBuffer,
+        StreamArtifact, StreamTask,
     },
     trace::{
         FailedInference, TraceWriter, WireCapture, INFERENCE_ERROR_DRIVER_FAILED,
@@ -493,7 +493,7 @@ pub(crate) fn task_state_for(outcome: &Result<AgentLoopExit, RuntimeError>) -> T
 /// How one attempt of a task ended, as the task's final status reports it if no `on-task-end`
 /// hook reopens the task. `state` is `Completed`, `Failed` or `Canceled`, never another state.
 ///
-/// An attempt records one and writes no final status itself: the task's one `final:true` frame is
+/// An attempt records one and writes no terminal status itself: the task's one terminal status is
 /// `run_task_with_reopens`'s, written from the last attempt's ending once the hooks have run.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AttemptEnding {
@@ -976,6 +976,8 @@ pub(crate) async fn run_agent_loop(
     }
 
     let task_id_str = task_id.clone().unwrap_or_default();
+    // The task this attempt's events belong to, when it serves an A2A task.
+    let stream_task = StreamTask::of(task_id.as_deref(), context_id.as_deref());
 
     let max_turns = inference.max_turns;
     // The trace's `session_start`/`session_end` frame and the `on-session-start`/
@@ -1171,23 +1173,14 @@ pub(crate) async fn run_agent_loop(
         session_tokens = input_tokens;
 
         // Emit "working" status BEFORE the LLM inference call returns (liveness signal)
-        if task_id.is_some() {
-            emit_sse(
+        if let Some(task) = &stream_task {
+            emit_status(
                 &sse,
-                StreamFrame::Status,
-                &TaskStatusUpdateEvent {
-                    id: task_id_str.clone(),
-                    context_id: context_id.clone(),
-                    status: StreamStatus {
-                        state: "working".into(),
-                        message: format!("inference turn {}", turn + 1),
-                        response: None,
-                        reopen: None,
-                    },
-                    r#final: false,
-                },
-            )
-            .await;
+                task,
+                TaskState::Working,
+                &format!("inference turn {}", turn + 1),
+                None,
+            );
         }
 
         // Reset per-turn streaming flag before each driver dispatch.
@@ -1286,7 +1279,7 @@ pub(crate) async fn run_agent_loop(
         // still held for each, ahead of the cursor removal and of anything else this turn writes.
         let started_calls = settle_started_calls(
             &sse,
-            task_id.as_deref(),
+            stream_task.as_ref(),
             &store_state.a2a_tool_calls,
             Instant::now(),
         );
@@ -1324,9 +1317,9 @@ pub(crate) async fn run_agent_loop(
 
         // Streaming driver: emit cursor-removal signal immediately after driver returns.
         // Non-streaming fallback text event is emitted per stop_reason branch below.
-        if let (Some(ref tid), Some((ref tx, ref buf))) = (&task_id, &sse) {
+        if let Some(task) = &stream_task {
             if store_state.a2a_chunks_emitted.load(Ordering::Relaxed) {
-                emit_chunk_sse_final(tx, buf, tid, "");
+                emit_text(&sse, task, "", true);
             }
         }
 
@@ -1853,25 +1846,21 @@ pub(crate) async fn run_agent_loop(
                                 record_demotion(trace, turn_u32, &detached).await;
                             }
                             // Emit artifact event after tool call returns
-                            if task_id.is_some() {
-                                emit_sse(
+                            if let Some(task) = &stream_task {
+                                emit_frame(
                                     &sse,
-                                    StreamFrame::Artifact,
-                                    &TaskArtifactUpdateEvent {
-                                        id: task_id_str.clone(),
-                                        artifact: StreamArtifact::tool_call(
-                                            tool_name.clone(),
-                                            text.clone(),
-                                            fence_source.clone(),
-                                            &tool_call_id,
-                                            is_error,
-                                            duration_ms,
-                                            exit_code,
-                                            truncated,
-                                        ),
-                                    },
-                                )
-                                .await;
+                                    task,
+                                    MurmurFrame::Artifact(StreamArtifact::tool_call(
+                                        tool_name.clone(),
+                                        text.clone(),
+                                        fence_source.clone(),
+                                        &tool_call_id,
+                                        is_error,
+                                        duration_ms,
+                                        exit_code,
+                                        truncated,
+                                    )),
+                                );
                             }
                             // A session-fatal dispatch failure ends the run here rather than
                             // being handed back to the model as one more failed tool call.
@@ -1936,28 +1925,24 @@ pub(crate) async fn run_agent_loop(
                             )
                             .await;
                             // Emit artifact event for error tool call too
-                            if task_id.is_some() {
-                                emit_sse(
+                            if let Some(task) = &stream_task {
+                                // The runtime's own text about a call that never reached a
+                                // tool: no source to name, no subprocess and no tool
+                                // declaration of truncation.
+                                emit_frame(
                                     &sse,
-                                    StreamFrame::Artifact,
-                                    &TaskArtifactUpdateEvent {
-                                        id: task_id_str.clone(),
-                                        // The runtime's own text about a call that never
-                                        // reached a tool: no source to name, no subprocess and
-                                        // no tool declaration of truncation.
-                                        artifact: StreamArtifact::tool_call(
-                                            tool_name.clone(),
-                                            error.clone(),
-                                            None,
-                                            &tool_call_id,
-                                            true,
-                                            duration_ms,
-                                            None,
-                                            false,
-                                        ),
-                                    },
-                                )
-                                .await;
+                                    task,
+                                    MurmurFrame::Artifact(StreamArtifact::tool_call(
+                                        tool_name.clone(),
+                                        error.clone(),
+                                        None,
+                                        &tool_call_id,
+                                        true,
+                                        duration_ms,
+                                        None,
+                                        false,
+                                    )),
+                                );
                             }
                             (true, error, None)
                         }
@@ -2000,7 +1985,6 @@ pub(crate) async fn run_agent_loop(
                     mode,
                     &sse,
                     task_id.as_deref(),
-                    &task_id_str,
                     context_id.clone(),
                     ending,
                     &hook_artifact,
@@ -2031,7 +2015,6 @@ pub(crate) async fn run_agent_loop(
                     mode,
                     &sse,
                     task_id.as_deref(),
-                    &task_id_str,
                     context_id.clone(),
                     ending,
                     &hook_artifact,
@@ -2410,7 +2393,6 @@ async fn finish_completed_turn(
     mode: ConversationMode,
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
     task_id: Option<&str>,
-    task_id_str: &str,
     context_id: Option<String>,
     ending: &mut Option<AttemptEnding>,
     hook_artifact: &[HookArtifact],
@@ -2460,25 +2442,24 @@ async fn finish_completed_turn(
 
     flush_hook_dispatch_faults(hooks, trace).await;
     otel.emit_session_end("ok").await;
-    if let (Some(tid), Some((tx, buf))) = (task_id, sse) {
-        // Forward every hook artifact to the SSE stream ahead of the task's final status.
+    if let Some(task) = StreamTask::of(task_id, context_id.as_deref()) {
+        // Forward every hook artifact to the stream ahead of the task's final status.
         for ha in hook_artifact {
-            emit_sse(
+            // A hook artifact is the capsule operator's own declared hook speaking, not content a
+            // tool fetched, and reaches the model unfenced.
+            emit_frame(
                 sse,
-                StreamFrame::Artifact,
-                &TaskArtifactUpdateEvent {
-                    id: task_id_str.to_string(),
-                    // A hook artifact is the capsule operator's own declared hook speaking, not
-                    // content a tool fetched, and reaches the model unfenced.
-                    artifact: StreamArtifact::hook(ha.hook_name.clone(), ha.payload.clone()),
-                },
-            )
-            .await;
+                &task,
+                MurmurFrame::Artifact(StreamArtifact::hook(
+                    ha.hook_name.clone(),
+                    ha.payload.clone(),
+                )),
+            );
         }
-        // Non-streaming driver fallback: emit full turn text as a single text event. Streaming
+        // Non-streaming driver fallback: emit full turn text as a single text frame. Streaming
         // drivers already emitted cursor-removal above (final:true, empty).
         if !store_state.a2a_chunks_emitted.load(Ordering::Relaxed) && !final_text.is_empty() {
-            emit_chunk_sse_final(tx, buf, tid, &final_text);
+            emit_text(sse, &task, &final_text, true);
         }
     }
 

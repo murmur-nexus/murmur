@@ -43,7 +43,7 @@ fn watch_idle_observer_receives_heartbeat() {
     let body = sse_body(&lines);
 
     assert!(
-        body.iter().any(|(_, line)| line == "event: connection-ack"),
+        body.iter().any(|(_, line)| line.contains(CONNECTION_ACK)),
         "stream/watch should open with a connection-ack; body was: {:?}",
         body.iter().map(|(_, l)| l).collect::<Vec<_>>()
     );
@@ -110,7 +110,7 @@ fn watch_heartbeat_does_not_perturb_event_ids() {
         "expected at least one heartbeat while holding the connection open; body was: {:?}",
         text(&across_body)
     );
-    // Every heartbeat stands alone between blank lines — no id:, no event: of its own.
+    // Every heartbeat stands alone between blank lines — no id: or data: of its own.
     for block in blocks(&across_body) {
         if block.iter().any(|line| line.starts_with(':')) {
             assert_eq!(
@@ -146,10 +146,21 @@ fn watch_heartbeat_does_not_perturb_event_ids() {
         "the id sequence replayed from Last-Event-ID: 0 changed once a heartbeat had been written"
     );
     assert_eq!(
-        text(&after_body),
-        text(&before_body),
+        replayed(&after_body),
+        replayed(&before_body),
         "the replayed body changed once a heartbeat had been written"
     );
+}
+
+/// What the `connection-ack` carrier's `data:` line holds, which only it does.
+const CONNECTION_ACK: &str = "\"frame\":\"connection-ack\"";
+
+/// The body's lines after its `connection-ack`, whose `messageId` is fresh on every connection.
+fn replayed(body: &[(Instant, String)]) -> Vec<String> {
+    text(body)
+        .into_iter()
+        .filter(|line| !line.contains(CONNECTION_ACK))
+        .collect()
 }
 
 fn text(body: &[(Instant, String)]) -> Vec<String> {

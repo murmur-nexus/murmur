@@ -93,7 +93,8 @@ fn the_door_fails_exactly_the_listed_exceptions() {
             end_turn(2, "running"),
             end_turn(3, "data"),
             end_turn(4, "streamed"),
-            end_turn(5, "spare"),
+            end_turn(5, "streamed with the extension"),
+            end_turn(6, "spare"),
         ],
         Duration::from_millis(400),
     );
@@ -200,17 +201,27 @@ fn the_door_fails_exactly_the_listed_exceptions() {
     assert_eq!(file.status, 200, "{file:?}");
     assert_eq!(file.json()["error"]["code"], -32005, "{file:?}");
 
-    let streamed = rpc(
-        &addr,
-        token,
-        "SendStreamingMessage",
-        message("m-census-stream", "stream"),
-    );
-    assert_eq!(streamed.status, 200, "{streamed:?}");
-    assert!(
-        streamed.body.contains("data:"),
-        "SendStreamingMessage wrote no events: {streamed:?}"
-    );
+    // A stream is measured plain and with the stream extension activated, whose response alone
+    // lists it in `A2A-Extensions`.
+    for (index, activated) in [false, true].into_iter().enumerate() {
+        let (streamed, events) = common::stream::stream_message(
+            &addr,
+            token,
+            message(&format!("m-census-stream-{index}"), "stream"),
+            activated,
+        );
+        assert_eq!(streamed.status, 200, "{streamed:?}");
+        assert!(
+            events.len() > 1,
+            "SendStreamingMessage wrote no task events: {streamed:?}"
+        );
+        assert_eq!(
+            streamed.header("a2a-extensions"),
+            activated.then_some(common::stream::STREAM_EXTENSION_URI),
+            "{streamed:?}"
+        );
+        assert_eq!(events.iter().any(|event| event.is_frame()), activated);
+    }
 
     let watched = rpc(&addr, token, "stream/watch", json!({}));
     assert_eq!(watched.status, 200, "{watched:?}");

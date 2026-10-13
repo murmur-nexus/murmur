@@ -22,18 +22,15 @@ use std::{
 };
 
 use crate::{
-    streaming::{
-        emit_chunk_sse, emit_frame, emit_thinking_chunk_sse, SseBroadcast, SseEventBuffer,
-        StreamFrame, TaskToolCallProgressEvent, TaskToolCallStartedEvent,
-    },
+    streaming::{emit_frame, emit_text, emit_thinking, MurmurFrame, StreamSink, StreamTask},
     tool_call_progress::{SettledCall, ToolCallProgress},
 };
 
 /// Where one dispatch's `murmur:stream/events` calls go.
 #[derive(Clone)]
 pub(crate) struct StreamEventsTarget {
-    pub(crate) sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    pub(crate) task_id: Option<String>,
+    pub(crate) sse: StreamSink,
+    pub(crate) task: Option<StreamTask>,
     /// Set by every `emit-chunk`, so the agent loop knows the turn's text was streamed.
     pub(crate) chunks_emitted: Arc<AtomicBool>,
     /// The calls the session's driver has started this attempt. `None` on every dispatch that is
@@ -41,55 +38,43 @@ pub(crate) struct StreamEventsTarget {
     pub(crate) tool_calls: Option<Arc<Mutex<ToolCallProgress>>>,
 }
 
-/// The broadcast, buffer and task id a frame is written with.
-struct Wire<'a> {
-    tx: &'a SseBroadcast,
-    buf: &'a Arc<Mutex<SseEventBuffer>>,
-    task_id: &'a str,
-}
-
 impl StreamEventsTarget {
-    /// Where a frame goes, when this dispatch serves an A2A task whose stream has somewhere to go.
-    fn wire(&self) -> Option<Wire<'_>> {
-        let (tx, buf) = self.sse.as_ref()?;
-        Some(Wire {
-            tx,
-            buf,
-            task_id: self.task_id.as_deref()?,
-        })
+    /// The task a frame goes to, when this dispatch serves an A2A task whose stream has somewhere
+    /// to go.
+    fn task(&self) -> Option<&StreamTask> {
+        self.sse.as_ref()?;
+        self.task.as_ref()
     }
 }
 
 /// `emit-chunk`: one streamed text fragment.
 pub(crate) fn emit_chunk(target: &StreamEventsTarget, chunk: &str) {
     target.chunks_emitted.store(true, Ordering::Relaxed);
-    if let Some(wire) = target.wire() {
-        emit_chunk_sse(wire.tx, wire.buf, wire.task_id, chunk);
+    if let Some(task) = target.task() {
+        emit_text(&target.sse, task, chunk, false);
     }
 }
 
 /// `emit-thinking-chunk`: one streamed thinking fragment.
 pub(crate) fn emit_thinking_chunk(target: &StreamEventsTarget, chunk: &str) {
-    if let Some(wire) = target.wire() {
-        emit_thinking_chunk_sse(wire.tx, wire.buf, wire.task_id, chunk);
+    if let Some(task) = target.task() {
+        emit_thinking(&target.sse, task, chunk);
     }
 }
 
 /// `tool-call-started`: the driver's model has begun writing call `id`, named `name`. Writes a
 /// `tool-call-started` frame when the tracker accepts the start.
 pub(crate) fn tool_call_started(target: &StreamEventsTarget, id: &str, name: &str) {
-    let (Some(wire), Some(tool_calls)) = (target.wire(), target.tool_calls.as_ref()) else {
+    let (Some(task), Some(tool_calls)) = (target.task(), target.tool_calls.as_ref()) else {
         return;
     };
     if !lock(tool_calls).start(id, name) {
         return;
     }
-    write(
-        wire.tx,
-        wire.buf,
-        StreamFrame::ToolCallStarted,
-        &TaskToolCallStartedEvent {
-            id: wire.task_id.to_string(),
+    emit_frame(
+        &target.sse,
+        task,
+        MurmurFrame::ToolCallStarted {
             tool_call_id: id.to_string(),
             tool_name: name.to_string(),
         },
@@ -104,13 +89,13 @@ pub(crate) fn tool_call_input_bytes(
     bytes: u64,
     now: Instant,
 ) {
-    let (Some(wire), Some(tool_calls)) = (target.wire(), target.tool_calls.as_ref()) else {
+    let (Some(task), Some(tool_calls)) = (target.task(), target.tool_calls.as_ref()) else {
         return;
     };
     let Some(size) = lock(tool_calls).report(id, bytes, now) else {
         return;
     };
-    write_progress(wire.tx, wire.buf, wire.task_id, id, size);
+    write_progress(&target.sse, task, id, size);
 }
 
 /// The driver's dispatch returned at `now`: settle every call it started and has not settled,
@@ -118,8 +103,8 @@ pub(crate) fn tool_call_input_bytes(
 /// carried, in the order they started. Outside an A2A task no call was started, so it writes and
 /// returns nothing.
 pub(crate) fn settle_started_calls(
-    sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    task_id: Option<&str>,
+    sse: &StreamSink,
+    task: Option<&StreamTask>,
     tool_calls: &Mutex<ToolCallProgress>,
     now: Instant,
 ) -> Vec<(String, String)> {
@@ -127,42 +112,23 @@ pub(crate) fn settle_started_calls(
     settled
         .into_iter()
         .map(|(id, SettledCall { name, held })| {
-            if let (Some((tx, buf)), Some(task_id), Some(size)) = (sse, task_id, held) {
-                write_progress(tx, buf, task_id, &id, size);
+            if let (Some(task), Some(size)) = (task, held) {
+                write_progress(sse, task, &id, size);
             }
             (id, name)
         })
         .collect()
 }
 
-fn write_progress(
-    tx: &SseBroadcast,
-    buf: &Arc<Mutex<SseEventBuffer>>,
-    task_id: &str,
-    tool_call_id: &str,
-    input_bytes: u64,
-) {
-    write(
-        tx,
-        buf,
-        StreamFrame::ToolCallProgress,
-        &TaskToolCallProgressEvent {
-            id: task_id.to_string(),
+fn write_progress(sse: &StreamSink, task: &StreamTask, tool_call_id: &str, input_bytes: u64) {
+    emit_frame(
+        sse,
+        task,
+        MurmurFrame::ToolCallProgress {
             tool_call_id: tool_call_id.to_string(),
             input_bytes,
         },
     );
-}
-
-fn write(
-    tx: &SseBroadcast,
-    buf: &Arc<Mutex<SseEventBuffer>>,
-    frame: StreamFrame,
-    data: &impl serde::Serialize,
-) {
-    if let Ok(data) = serde_json::to_string(data) {
-        emit_frame(tx, buf, frame, &data);
-    }
 }
 
 /// The tracker, recovered from a poisoned lock: a panic elsewhere must not trap the guest here.
@@ -179,7 +145,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::streaming::ReplayResult;
+    use crate::streaming::{buffered, event_kind, frame_of, SseEventBuffer};
 
     /// A target writing into a real buffer, carrying a tracker when `tracked`, and that buffer.
     fn target(tracked: bool) -> (StreamEventsTarget, Arc<Mutex<SseEventBuffer>>) {
@@ -187,30 +153,24 @@ mod tests {
         let frames = Arc::new(Mutex::new(SseEventBuffer::new(64)));
         let target = StreamEventsTarget {
             sse: Some((tx, Arc::clone(&frames))),
-            task_id: Some("tsk_test".to_string()),
+            task: Some(StreamTask::new("tsk_test", "ctx_test")),
             chunks_emitted: Arc::new(AtomicBool::new(false)),
             tool_calls: tracked.then(|| Arc::new(Mutex::new(ToolCallProgress::default()))),
         };
         (target, frames)
     }
 
-    /// The `event:` value and data of every frame the buffer holds, in order.
+    /// The kind and murmur frame of every event the buffer holds, in order.
     fn frames_in(frames: &Arc<Mutex<SseEventBuffer>>) -> Vec<(String, Value)> {
-        let ReplayResult::Complete(frames) = frames.lock().unwrap().replay_from(0) else {
-            panic!("a gap in a test buffer");
-        };
-        frames
+        buffered(frames)
             .iter()
-            .map(|frame| {
-                let event = frame
-                    .lines()
-                    .find_map(|line| line.strip_prefix("event: "))
-                    .unwrap();
-                let data = frame
-                    .lines()
-                    .find_map(|line| line.strip_prefix("data: "))
-                    .unwrap();
-                (event.to_string(), serde_json::from_str(data).unwrap())
+            .map(|result| {
+                assert_eq!(
+                    result["statusUpdate"]["status"],
+                    serde_json::json!({"state": "TASK_STATE_WORKING"})
+                );
+                assert_eq!(result["statusUpdate"]["taskId"], "tsk_test");
+                (event_kind(result), frame_of(result))
             })
             .collect()
     }
@@ -242,9 +202,9 @@ mod tests {
             [(
                 "tool-call-started".to_string(),
                 serde_json::json!({
-                    "id": "tsk_test",
-                    "tool_call_id": "c1",
-                    "tool_name": "echo-tool",
+                    "frame": "tool-call-started",
+                    "toolCallId": "c1",
+                    "toolName": "echo-tool",
                 })
             )]
         );
@@ -263,7 +223,7 @@ mod tests {
         tool_call_input_bytes(&target, "c1", 10, now + Duration::from_millis(2));
         let settled = settle_started_calls(
             &target.sse,
-            target.task_id.as_deref(),
+            target.task.as_ref(),
             target.tool_calls.as_ref().unwrap(),
             now + Duration::from_millis(3),
         );
@@ -271,7 +231,7 @@ mod tests {
         let progress: Vec<Value> = frames_in(&frames)
             .into_iter()
             .filter(|(kind, _)| kind == "tool-call-progress")
-            .map(|(_, data)| data["input_bytes"].clone())
+            .map(|(_, data)| data["inputBytes"].clone())
             .collect();
         assert_eq!(progress, [15, 30]);
         // Settled: a late report writes nothing.
@@ -291,7 +251,7 @@ mod tests {
         let tool_calls = Arc::new(Mutex::new(ToolCallProgress::default()));
         let target = StreamEventsTarget {
             sse: None,
-            task_id: None,
+            task: None,
             chunks_emitted: Arc::new(AtomicBool::new(false)),
             tool_calls: Some(Arc::clone(&tool_calls)),
         };
@@ -314,11 +274,11 @@ mod tests {
             [
                 (
                     "text".to_string(),
-                    serde_json::json!({"id": "tsk_test", "text": "hello", "final": false})
+                    serde_json::json!({"frame": "text", "text": "hello", "final": false})
                 ),
                 (
                     "thinking".to_string(),
-                    serde_json::json!({"id": "tsk_test", "text": "hmm", "final": false})
+                    serde_json::json!({"frame": "thinking", "text": "hmm", "final": false})
                 ),
             ]
         );

@@ -1829,7 +1829,7 @@ The bracket after a tool name is the call's outcome, read from the
 
 | Segment | Shown when |
 |---|---|
-| `ok` or `error` | Always — `error` when `is_error` is true |
+| `ok` or `error` | Always — `error` when `isError` is true |
 | `exit <n>` | The call ran a subprocess to completion |
 | `<n>ms` | The frame reports a duration |
 | `truncated` | The tool marked its result truncated |

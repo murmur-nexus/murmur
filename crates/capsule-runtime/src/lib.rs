@@ -131,6 +131,7 @@ pub use sealed::{
     UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH,
     SEALED_APPARMOR_PROFILE_SHA256,
 };
+pub use streaming::STREAM_EXTENSION_URI;
 // `cgroup` is a private module, but the entry points below are consumed from `murmur-cli` — the
 // three test-support probes from its integration tests, the `io.max` reporting from
 // `mur run --explain-scope` and the swap-bound reporting from `mur doctor`, each of which has to
@@ -143,7 +144,10 @@ pub use cgroup::{
 };
 // The door's protocol version and error tables: every client of a door sends the header pair,
 // and names the error it is answered with through `A2aError::from_code`.
-pub use a2a::{murmur_state_name, A2aError, MurmurError, A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER};
+pub use a2a::{
+    murmur_state_name, A2aError, MurmurError, A2A_EXTENSIONS_HEADER, A2A_PROTOCOL_VERSION,
+    A2A_VERSION_HEADER,
+};
 pub use child_launch::{
     child_workdir_for, launch_child_capsule, ChildLaunchRequest, LaunchedChild, MUR_BINARY_ENV,
     READINESS_TOKENS_FLAG,

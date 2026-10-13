@@ -62,6 +62,26 @@ pub(crate) fn version_not_supported(id: Value, values: &[String]) -> JsonRpcResp
     )
 }
 
+// ── A2A extensions ────────────────────────────────────────────────────────────
+
+/// The HTTP header a client activates A2A extensions in, and the header a response lists the
+/// extensions it activated in. Matched case-insensitively.
+pub const A2A_EXTENSIONS_HEADER: &str = "A2A-Extensions";
+
+/// Whether the [`A2A_EXTENSIONS_HEADER`] lines a request carried, `values`, activate `uri`.
+///
+/// Each line is a comma-separated list: every entry is trimmed, empty entries are dropped, and
+/// `uri` is activated when one entry equals it exactly. Any other URI is ignored, as an agent
+/// ignores a requested extension it does not support.
+pub(crate) fn activates_extension(values: &[String], uri: &str) -> bool {
+    values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| entry == uri)
+}
+
 // ── JSON-RPC 2.0 envelope types ───────────────────────────────────────────────
 
 /// `-32700`: the body is not JSON.
@@ -1445,6 +1465,12 @@ impl TaskRegistry {
         self.closed
     }
 
+    /// Whether `task_id`'s ending is recorded, which happens under the lock its terminal state is
+    /// written under on every path but a cancel, whose ending follows once the task stops.
+    pub(crate) fn has_ending(&self, task_id: &str) -> bool {
+        self.endings.contains_key(task_id)
+    }
+
     /// Return the prompt stored for an input-required task.
     #[allow(dead_code)] // used in unit tests
     pub(crate) fn get_input_prompt(&self, task_id: &str) -> Option<&str> {
@@ -2296,6 +2322,32 @@ mod tests {
             &["1.0", "1.0"],
         ] {
             assert!(!accepts_a2a_version(&versions(values)), "{values:?}");
+        }
+    }
+
+    #[test]
+    fn an_extension_is_activated_by_an_exact_entry_on_any_line() {
+        const URI: &str =
+            "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1";
+        let other = "https://example.com/x/v1";
+        for values in [
+            vec![URI.to_string()],
+            vec![format!(" {URI} ")],
+            vec![format!("{other}, {URI}")],
+            vec![format!("{other},,{URI},")],
+            vec![other.to_string(), URI.to_string()],
+        ] {
+            assert!(activates_extension(&values, URI), "{values:?}");
+        }
+        for values in [
+            vec![],
+            vec![String::new()],
+            vec![other.to_string()],
+            vec![format!("{URI}/")],
+            vec![URI.to_uppercase()],
+            vec![format!("{URI} {other}")],
+        ] {
+            assert!(!activates_extension(&values, URI), "{values:?}");
         }
     }
 
