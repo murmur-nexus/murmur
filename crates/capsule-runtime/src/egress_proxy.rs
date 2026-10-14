@@ -80,8 +80,8 @@ pub(crate) const EGRESS_DNS_PORT: u16 = 53;
 
 /// Ceiling on how many distinct TCP ports one capsule's allowlist opens listeners for.
 ///
-/// Bounds both the `pre_exec` fd array — which has to be a fixed-size stack buffer, see
-/// [`crate::network_namespace::MAX_NAMESPACE_SOCKETS`] — and the number of accept threads a
+/// Bounds both the namespace creator's fd array — which has to be a fixed-size stack buffer, see
+/// [`crate::network_namespace::MAX_SESSION_NETNS_FDS`] — and the number of accept threads a
 /// session starts. A manifest naming more distinct ports than this is not refused; the ports past
 /// the ceiling simply get no listener, which fails closed.
 pub(crate) const MAX_EGRESS_TCP_PORTS: usize = 16;
@@ -513,11 +513,11 @@ mod linux {
     impl EgressProxyHandle {
         /// Stops accepting and joins the listener threads.
         ///
-        /// Called once the subprocess tree has exited, from the same thread that ran the seccomp
-        /// supervisor. In-flight relay threads are deliberately *not* joined: their capsule-side
-        /// peer is already gone — a network namespace and every socket in it are destroyed when
-        /// the last task in it exits — so each returns on its own next read, and blocking a tool
-        /// call's return on them would trade a bounded wait for an unbounded one.
+        /// Called when the session ends, after its processes have been killed. In-flight relay
+        /// threads are deliberately *not* joined: their capsule-side peer is already gone — a
+        /// network namespace and every socket in it are destroyed when the last task in it exits —
+        /// so each returns on its own next read, and blocking the session's end on them would
+        /// trade a bounded wait for an unbounded one.
         pub(crate) fn shutdown(self) {
             self.stop.store(true, Ordering::SeqCst);
             for thread in self.threads {
@@ -528,7 +528,7 @@ mod linux {
 
     /// Takes ownership of the namespace's listening sockets and starts serving them.
     ///
-    /// `sockets` arrives in the order `network_namespace::create_capsule_netns` sent it: one TCP
+    /// `sockets` arrives in the order the session's namespace creator sent it: one TCP
     /// listener per allowlisted port, in the plan's port order, then the UDP resolver socket.
     /// Every descriptor was created *inside* the capsule's network namespace — a socket belongs to
     /// the namespace it was created in, not to whichever task holds the descriptor — which is what

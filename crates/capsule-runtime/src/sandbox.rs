@@ -85,8 +85,9 @@
 //!
 //! If kernel enforcement setup fails unexpectedly on a Linux host (not the expected
 //! "Landlock unsupported, degrade to `KernelSeccompOnly`" signal, but something like seccomp
-//! filter install failing, or the namespace-socket handshake failing before spawn) —
-//! `prepare_enforcement` returns `Err` and `execute_shell` must not call `.spawn()` at all.
+//! filter install failing, or the session's network namespace failing to be created before
+//! spawn) — `prepare_enforcement` returns `Err` and `execute_shell` must not call `.spawn()` at
+//! all.
 //! There is no code path where a Linux host silently runs a shell subprocess with zero
 //! enforcement because setup failed.
 
@@ -1972,6 +1973,13 @@ pub(crate) struct ShellEnforcement {
     /// disk filler stops writing at the first spawn after the ceiling is crossed rather than
     /// only at the next agent turn.
     pub(crate) workdir_guard: Option<Arc<crate::resources::WorkdirGuard>>,
+    /// The session's one network namespace, which every command on a kernel tier joins.
+    ///
+    /// Shared by every clone of this enforcement, so a listener one command starts is reachable
+    /// from the next. A fresh, not-yet-created namespace from [`Self::resolve`] and
+    /// [`Self::environment_only`]; a plan inside a session takes its session's through
+    /// [`Self::with_session_netns`]. Released by [`Self::end_session`].
+    pub(crate) session_netns: Arc<crate::network_namespace::SessionNetns>,
 }
 
 impl ShellEnforcement {
@@ -2038,6 +2046,7 @@ impl ShellEnforcement {
             resource_limits: policy.resources,
             cgroup_scope: None,
             workdir_guard: None,
+            session_netns: Arc::new(crate::network_namespace::SessionNetns::new()),
         })
     }
 
@@ -2127,7 +2136,80 @@ impl ShellEnforcement {
             resource_limits: crate::resources::HostResourceLimits::default(),
             cgroup_scope: None,
             workdir_guard: None,
+            session_netns: Arc::new(crate::network_namespace::SessionNetns::new()),
         }
+    }
+
+    /// Run this enforcement's commands in `session_netns` rather than in a namespace of its own.
+    ///
+    /// For a plan submitted inside a session: its shell steps are that session's commands, so
+    /// they share its loopback and its egress proxy.
+    pub(crate) fn with_session_netns(
+        mut self,
+        session_netns: Arc<crate::network_namespace::SessionNetns>,
+    ) -> Self {
+        self.session_netns = session_netns;
+        self
+    }
+
+    /// End the session: kill every process it started, then release its network namespace.
+    ///
+    /// Killing goes through the cgroup scope, which every spawn joins before `execve` and no fork
+    /// escapes, so a server backgrounded with `&`, a `setsid` double fork and a demoted command
+    /// still running are all in it. The namespace is released only once the scope is empty (or
+    /// [`SESSION_END_KILL_WAIT`] has passed), so its proxy never stops under a process still
+    /// using it. Idempotent; every spawn on this enforcement afterwards is refused.
+    pub(crate) fn end_session(&self) {
+        self.kill_session_processes();
+        self.session_netns.end();
+    }
+
+    /// Kill every process in this enforcement's cgroup scope and wait, bounded by
+    /// [`SESSION_END_KILL_WAIT`], for the scope to empty. Does nothing without a scope.
+    ///
+    /// The half of [`Self::end_session`] a plan runs at its own end: a plan's scope is its own,
+    /// and the namespace may be its session's.
+    pub(crate) fn kill_session_processes(&self) {
+        let Some(scope) = self.cgroup_scope.as_ref() else {
+            return;
+        };
+        if let Err(error) = scope.kill_all() {
+            crate::runtime_err!(
+                "[capsule-runtime] warning: could not kill the processes in cgroup scope {}: \
+                 {error}",
+                scope.path().display()
+            );
+        }
+        if !scope.wait_until_empty(SESSION_END_KILL_WAIT) {
+            crate::runtime_err!(
+                "[capsule-runtime] warning: cgroup scope {} still held processes {} ms after \
+                 they were killed",
+                scope.path().display(),
+                SESSION_END_KILL_WAIT.as_millis()
+            );
+        }
+    }
+}
+
+/// How long [`ShellEnforcement::end_session`] waits for a killed scope's `cgroup.procs` to empty.
+pub(crate) const SESSION_END_KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Calls [`ShellEnforcement::end_session`] when dropped.
+///
+/// Held by a launch for its whole length, so a session that ends by an error return still kills
+/// what it started. Every path that ends a session normally calls `end_session` itself first, at
+/// the point its teardown needs it; the call this makes then finds nothing left to do.
+pub(crate) struct EndSessionOnDrop(ShellEnforcement);
+
+impl EndSessionOnDrop {
+    pub(crate) fn new(enforcement: ShellEnforcement) -> Self {
+        Self(enforcement)
+    }
+}
+
+impl Drop for EndSessionOnDrop {
+    fn drop(&mut self) {
+        self.0.end_session();
     }
 }
 
@@ -2288,31 +2370,17 @@ pub(crate) fn warn_for_enforcement_tier(
     }
 }
 
-/// Handle to the (possibly no-op) side-channel machinery attached to one subprocess spawn. On
-/// Linux tiers, the background thread is already running by the time this is returned by
-/// `prepare_enforcement` — started BEFORE the caller calls `.spawn()`, not after.
+/// What `prepare_enforcement` hands back alongside the configured `Command`: on a kernel tier, the
+/// read end of the child's diagnostic pipe.
 ///
-/// This ordering is required, not incidental. The child builds its network namespace inside
-/// `pre_exec` and hands the namespace's listening sockets back over a `SOCK_DGRAM` socketpair;
-/// `std::process::Command::spawn()`'s parent side then blocks internally (via a close-on-exec
-/// error pipe) until the child's `execve` resolves. If the receiving thread only started after
-/// `.spawn()` returned, the capsule's very first outbound connection could beat the egress proxy
-/// to its own socket. Starting the thread first — racing concurrently with the fork/exec inside
-/// `.spawn()`, not gated behind it — closes that window.
-///
-/// The name is historical: nothing is "supervised" here any more (the seccomp-notify loops it once
-/// ran are retired — see this module's header). What is left is the fd hand-off, the egress
-/// proxy's lifetime, and the child's diagnostic pipe.
+/// The session's egress proxy is not here. It belongs to the session's
+/// [`crate::network_namespace::SessionNetns`] and outlives every command, so a process a command
+/// backgrounds keeps its allowlisted egress after the command returns.
 #[derive(Debug)]
 pub(crate) enum SupervisorHandle {
     Noop,
     #[cfg(target_os = "linux")]
     Linux {
-        /// Carries the started egress proxy back from the receiving thread, so the proxy's
-        /// lifetime ends with the subprocess tree it serves rather than outliving it. `None`
-        /// travels through here too — the hand-off can fail, and that is reported (and fatal to
-        /// the spawn) on its own path.
-        proxy_rx: std::sync::mpsc::Receiver<Option<crate::egress_proxy::EgressProxyHandle>>,
         /// Read end of the `CLOEXEC` diagnostic pipe whose write end was moved into the forked
         /// child's `pre_exec` closure. On a successful `execve` the write end closes
         /// automatically with nothing written (so a read yields immediate EOF); on a `pre_exec`
@@ -2324,29 +2392,6 @@ pub(crate) enum SupervisorHandle {
 }
 
 impl SupervisorHandle {
-    /// Shuts the session's egress proxy down, with a short bound so the shell call never hangs.
-    /// In practice the receive returns immediately: the thread's only blocking step is the
-    /// namespace-socket hand-off, which completed before the child could `execve` at all — long
-    /// before the caller finished waiting on the child.
-    ///
-    /// A proxy outliving its namespace would be serving sockets whose peers no longer exist, so
-    /// this is the teardown, not merely a thread join.
-    pub(crate) fn join_best_effort(self) {
-        match self {
-            SupervisorHandle::Noop => {}
-            #[cfg(target_os = "linux")]
-            SupervisorHandle::Linux { proxy_rx, .. } => {
-                if let Ok(Some(proxy)) = proxy_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                    proxy.shutdown();
-                }
-                // Deliberately not joining the underlying `JoinHandle`: dropping it without
-                // joining leaves the thread detached (it keeps running to completion in the
-                // background, reclaimed by the OS on exit), which is fine here since the value
-                // received above is the only thing it produces.
-            }
-        }
-    }
-
     /// Best-effort read of any failure detail the forked child wrote to the diagnostic pipe
     /// before its `pre_exec` closure returned `Err`. Only consulted by `execute_shell` when
     /// `Command::spawn()` itself returns `Err` — on the success path this is never called, so
@@ -2574,8 +2619,8 @@ pub(crate) fn prepare_enforcement(
 }
 
 /// Linux implementation of `prepare_enforcement`. See the module-level docs and the `linux_enforce`
-/// submodule for the mechanics (socketpair fd-passing side channel + `pre_exec` seccomp/Landlock
-/// installation + background namespace-socket receiving thread).
+/// submodule for the mechanics: the session's network namespace is established in the parent,
+/// and the `pre_exec` closure joins it, then installs the composed root, seccomp and Landlock.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 pub(crate) fn prepare_enforcement(
@@ -2636,33 +2681,11 @@ pub(crate) fn prepare_enforcement(
         None
     };
 
-    let mut fds = [0i32; 2];
-    // SAFETY: `fds` is a 2-element stack array, exactly the size `socketpair` writes into;
-    // no other precondition applies.
-    let rc = unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
-            0,
-            fds.as_mut_ptr(),
-        )
-    };
-    if rc != 0 {
-        return Err(format!(
-            "sandbox: socketpair() failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: both fds were just returned by the successful socketpair() call above; nothing
-    // else has taken ownership of them yet, so wrapping them in OwnedFd is exclusive/sound.
-    let (parent_sock, child_sock) =
-        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-
     // Dedicated CLOEXEC pipe carrying failure detail out of the child. The write end is moved
     // into the `pre_exec` closure; because it is CLOEXEC, a successful `execve` closes it with
     // nothing written (the parent's read then returns immediate EOF — zero cost on the success
     // path), while any `pre_exec` setup failure writes its real message here before the closure
-    // returns `Err`. Raw `pipe2` mirrors the raw `socketpair` convention used just above.
+    // returns `Err`.
     let mut diag_fds = [0i32; 2];
     // SAFETY: `diag_fds` is a 2-element stack array, exactly the size `pipe2` writes into; no
     // other precondition applies.
@@ -2682,23 +2705,23 @@ pub(crate) fn prepare_enforcement(
         )
     };
 
-    // Everything the child's namespace construction needs, resolved here in the parent: the
-    // `pre_exec` window permits no allocation, and `getuid()` in particular has to be read
-    // *before* the `unshare` — inside a fresh user namespace with no map written yet it reports
-    // the overflow id, and writing that back is refused on every host.
-    let netns_plan =
-        crate::network_namespace::CapsuleNetnsPlan::resolve(enforcement.egress_tcp_ports.clone());
-    let expected_namespace_sockets = netns_plan.socket_count();
-    let egress_policy = crate::egress_proxy::EgressPolicy::new(
-        enforcement.network_allow_rules.clone(),
-        enforcement.network_allow_ips.clone(),
-    );
+    // The session's network namespace, created by the first command that needs it and joined by
+    // every one after. Established here, in the parent and before the fork, so the egress proxy
+    // is already serving the namespace's listeners when the command's first connection arrives,
+    // and so a namespace that cannot be created fails this spawn with a legible error instead of
+    // running the command anywhere else. The join handle moves into the closure, which keeps both
+    // descriptors open until the `Command` is dropped.
+    let netns = enforcement.session_netns.establish(
+        &enforcement.egress_tcp_ports,
+        crate::egress_proxy::EgressPolicy::new(
+            enforcement.network_allow_rules.clone(),
+            enforcement.network_allow_ips.clone(),
+        ),
+    )?;
 
     let tier = enforcement.tier;
     // Copied out before the `move` closure below takes ownership of everything it touches, the
-    // same clone-before-move shape `tier` and the Landlock fds already use. Note the fd-passing
-    // socketpair above is created in the *parent*, before fork, so the child's own `sendmsg` over
-    // it is unaffected by a filter that denies `socket(AF_UNIX, ...)`.
+    // same clone-before-move shape `tier` and the Landlock fds already use.
     let unix_sockets_allowed = enforcement.unix_sockets_allowed;
     // Same clone-before-move shape. `HostResourceLimits` and `NprocBound` are `Copy`, and the
     // `RLIMIT_NPROC` decision is made here because its baseline is a `/proc` walk; the cgroup scope
@@ -2710,17 +2733,16 @@ pub(crate) fn prepare_enforcement(
 
     // SAFETY: this closure runs in the forked child, after fork() but before execve() — the
     // narrow pre_exec window where only async-signal-safe operations are permitted. It performs
-    // the capability-dropping `prctl`/`capset` sequence (bounding-set drop, capset clear, and the
-    // explicit `no_new_privs` `prctl`) plus one allocation-free `open`/`read`/`close` of
-    // `/proc/sys/kernel/cap_last_cap`, libseccomp filter construction/load (kernel syscalls), one
-    // `sendmsg` batch handing the network namespace's sockets to the parent over `child_sock`, and
-    // (KernelFull only)
-    // Landlock ruleset construction/`restrict_self` against already-open fds (also kernel
-    // syscalls) — no `open()`/`canonicalize()` beyond that one `cap_last_cap` read, no locks
-    // beyond what those syscalls need. On any failure it writes the real error message to the
-    // CLOEXEC diagnostic pipe (best-effort, bounded, raw `write` loop) before returning `Err`.
-    // `child_sock`, `diag_write`, and the Landlock fds are moved in and close automatically when
-    // the closure body finishes.
+    // two `setns` calls into the session's namespaces, the capability-dropping `prctl`/`capset`
+    // sequence (bounding-set drop, capset clear, and the explicit `no_new_privs` `prctl`) plus one
+    // allocation-free `open`/`read`/`close` of `/proc/sys/kernel/cap_last_cap`, libseccomp filter
+    // construction/load (kernel syscalls), and (KernelFull only) Landlock ruleset
+    // construction/`restrict_self` against already-open fds (also kernel syscalls) — no
+    // `open()`/`canonicalize()` beyond that one `cap_last_cap` read, no locks beyond what those
+    // syscalls need. On any failure it writes the real error message to the CLOEXEC diagnostic
+    // pipe (best-effort, bounded, raw `write` loop) before returning `Err`. `diag_write`, the
+    // namespace join handle and the Landlock fds are moved in, and are `CLOEXEC`, so none of them
+    // reaches the exec'd program.
     unsafe {
         command.pre_exec(move || {
             // Ordered first, before any seccomp filter is installed: these are the bounds that
@@ -2737,13 +2759,13 @@ pub(crate) fn prepare_enforcement(
                 }
             }
 
-            let sock_fd = child_sock.as_raw_fd();
+            let (user_ns_fd, net_ns_fd) = netns.raw_fds();
             match linux_enforce::child_install_enforcement(
                 tier,
-                &netns_plan,
+                user_ns_fd,
+                net_ns_fd,
                 sealed_spec.as_ref(),
                 landlock_fds.as_ref(),
-                sock_fd,
                 unix_sockets_allowed,
             ) {
                 Ok(()) => Ok(()),
@@ -2755,14 +2777,7 @@ pub(crate) fn prepare_enforcement(
         });
     }
 
-    // Start the namespace-socket receiving thread now — BEFORE the caller calls `.spawn()`. See
-    // `SupervisorHandle`'s doc comment for why this ordering (not "after spawn") is required.
-    Ok(linux_enforce::start_supervisor(
-        parent_sock,
-        egress_policy,
-        expected_namespace_sockets,
-        diag_read,
-    ))
+    Ok(SupervisorHandle::Linux { diag_read })
 }
 
 /// Which fixed device set Landlock grants, keyed on the tier.
@@ -2946,8 +2961,8 @@ fn build_sealed_root(
     sealed::build_sealed_root_spec(&plan)
 }
 
-/// Linux-only mechanics: fd-passing side channel, seccomp filter construction, Landlock
-/// application, and the background thread that receives the capsule's network-namespace sockets.
+/// Linux-only mechanics: the `pre_exec` enforcement sequence, seccomp filter construction and
+/// Landlock application.
 ///
 /// Nothing here uses `libseccomp`'s notify facility. `connect`/`sendto` are enforced by the
 /// network namespace and `execve`/`execveat` by Landlock `Execute` rights, both of which decide
@@ -2957,12 +2972,12 @@ fn build_sealed_root(
 #[cfg(target_os = "linux")]
 mod linux_enforce {
     use std::io;
-    use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+    use std::os::fd::{AsFd, OwnedFd, RawFd};
     use std::path::Path;
 
     use landlock::{make_bitflags, AccessFs, BitFlags};
 
-    use super::{EnforcementTier, LandlockGrant, SupervisorHandle};
+    use super::{EnforcementTier, LandlockGrant};
 
     /// Longest diagnostic message written to (or read from) the child-failure pipe. A message
     /// naming the failed step is far shorter than this; the bound just keeps the best-effort
@@ -3245,45 +3260,49 @@ mod linux_enforce {
         }
     }
 
-    /// Runs inside the forked child, pre-exec: builds the capsule's network namespace and hands
-    /// its listening sockets to the parent over `child_sock_fd`, strips the child's Linux
-    /// capabilities, installs the seccomp filter (the `socket()` domain denials keyed on
-    /// `unix_sockets_allowed`, over a default-deny syscall allowlist), and (on
-    /// `KernelFull`/`KernelSealed`) applies the Landlock filesystem scope — which is also what
-    /// enforces `capabilities.shell.allow`. Returning `Err` here aborts the exec (std's `Command`
-    /// machinery propagates it back to the parent's `.spawn()` call as an `io::Error`) — the
-    /// fail-closed path for setup failures that happen after fork.
-    ///
-    /// `child_sock_fd` carries exactly one hand-off: the namespace sockets.
+    /// Runs inside the forked child, pre-exec: joins the session's network namespace through
+    /// `user_ns_fd`/`net_ns_fd`, strips the child's Linux capabilities, installs the seccomp filter
+    /// (the `socket()` domain denials keyed on `unix_sockets_allowed`, over a default-deny syscall
+    /// allowlist), and (on `KernelFull`/`KernelSealed`) applies the Landlock filesystem scope —
+    /// which is also what enforces `capabilities.shell.allow`. Returning `Err` here aborts the
+    /// exec (std's `Command` machinery propagates it back to the parent's `.spawn()` call as an
+    /// `io::Error`) — the fail-closed path for setup failures that happen after fork.
     pub(super) fn child_install_enforcement(
         tier: EnforcementTier,
-        netns_plan: &crate::network_namespace::CapsuleNetnsPlan,
+        user_ns_fd: RawFd,
+        net_ns_fd: RawFd,
         sealed_spec: Option<&crate::sealed::SealedRootSpec>,
         landlock_fds: Option<&LandlockChildFds>,
-        child_sock_fd: RawFd,
         unix_sockets_allowed: bool,
     ) -> io::Result<()> {
-        // FIRST, on every kernel tier: the capsule's own network namespace. It has to precede
+        // FIRST, on every kernel tier: join the session's network namespace. It has to precede
         // everything below it for three separate reasons:
         //
-        //   * `SECCOMP_MUST_STAY_DENIED` denies `unshare` and the filter installed further down
-        //     denies `socket(AF_NETLINK)`, so this is the only window in which the namespace can
-        //     be built at all — the same argument the composed root makes.
-        //   * `drop_all_capabilities` (below) removes the `CAP_NET_ADMIN` that bringing `lo` up
-        //     and installing the local route require. The namespace is configured while the child
-        //     still holds them *inside its own new user namespace*, and never afterwards.
-        //   * on `KernelSealed`, the composed root's own `unshare(CLONE_NEWUSER)` nests a second
-        //     user namespace inside this one. A task in a descendant user namespace holds no
-        //     capability in the ancestor, so once that has happened the capsule cannot reconfigure
-        //     the network namespace it is confined to — which only holds if this runs first.
+        //   * `SECCOMP_MUST_STAY_DENIED` denies `setns`, so the filter installed further down
+        //     closes the only window in which the join can happen — the same argument the
+        //     composed root makes for `unshare`.
+        //   * joining the user namespace hands this child every capability *inside* it, and
+        //     `drop_all_capabilities` (below) strips them again before `execve`. Joining after
+        //     that drop would fail: entering the network namespace needs `CAP_SYS_ADMIN` there.
+        //   * on `KernelSealed`, the composed root's own `unshare(CLONE_NEWUSER)` nests its user
+        //     namespace inside the session's. A task in a descendant user namespace holds no
+        //     capability in the ancestor, so the capsule cannot reconfigure the network namespace
+        //     it is confined to — which only holds if the join comes first.
         //
-        // This is what replaced the `connect`/`sendto` seccomp-notify interception. There is no
-        // path that skips it and falls back: a host that cannot do this refused the launch back in
-        // `stage_session` (`RuntimeError::EgressNamespaceUnavailable`, `E-CAP-005`).
+        // There is no path that skips it and falls back: a host that cannot create the namespace
+        // was refused at launch (`RuntimeError::EgressNamespaceUnavailable`, `E-CAP-005`), and a
+        // spawn whose namespace could not be established failed before the fork.
         //
         // SAFETY: post-`fork()`, pre-exec child context — exactly the window this function
-        // documents itself as running in, and the one `create_capsule_netns` requires.
-        unsafe { crate::network_namespace::create_capsule_netns(netns_plan, child_sock_fd)? };
+        // documents itself as running in, and the one `join_session_netns` requires. Both
+        // descriptors are held open by the join handle the `pre_exec` closure owns.
+        unsafe { crate::network_namespace::join_session_netns(user_ns_fd, net_ns_fd) }.map_err(
+            |error| {
+                io::Error::other(format!(
+                    "sandbox: joining this session's network namespace failed: {error}"
+                ))
+            },
+        )?;
 
         // NEXT, and only on `KernelSealed`: build the private mount namespace and pivot onto the
         // composed root. This has to precede every *remaining* step in this closure, because
@@ -3320,9 +3339,9 @@ mod linux_enforce {
         // config read, a lock file, a log handle — would have leaked silently into every
         // subsequent subprocess, on every platform and every tier, with no test to catch it.
         //
-        // Running it first is also what makes it cover this function's *own* descriptors: the
-        // namespace-socket socketpair end, the diagnostic pipe and the Landlock grant fds are all used
-        // below but must never survive the `execve`.
+        // Running it here is also what makes it cover this function's *own* descriptors: the
+        // diagnostic pipe and the Landlock grant fds are used below but must never survive the
+        // `execve`, and neither may the session's namespace handles, already used above.
         mark_inherited_fds_cloexec()?;
 
         // Next, and on every kernel tier (not just `KernelFull`): Landlock and the Linux
@@ -3359,11 +3378,10 @@ mod linux_enforce {
     ///
     /// `CLOSE_RANGE_CLOEXEC` sets the flag rather than closing the descriptors outright. That is
     /// the required semantics here, not a softer variant of it: several fds in this range are
-    /// still needed *inside* this `pre_exec` window — the socketpair end `create_capsule_netns`
-    /// sends the namespace's listening sockets over, the diagnostic pipe a failure further down
-    /// writes to, and the Landlock grant fds `apply_landlock_scope` builds rules
-    /// from. Closing them here would break the very enforcement setup that follows; flagging
-    /// them means they keep working until `execve`, which then closes them for us.
+    /// still needed *inside* this `pre_exec` window — the diagnostic pipe a failure further down
+    /// writes to, and the Landlock grant fds `apply_landlock_scope` builds rules from. Closing
+    /// them here would break the very enforcement setup that follows; flagging them means they
+    /// keep working until `execve`, which then closes them for us.
     ///
     /// The range starts at 3, never 0 — see [`super::FD_HYGIENE_FIRST_FD`] for the recorded
     /// stdio decision and its reasoning.
@@ -4251,89 +4269,6 @@ mod linux_enforce {
             None
         } else {
             Some(String::from_utf8_lossy(&buf).into_owned())
-        }
-    }
-
-    /// Spawns the background thread that receives the capsule network namespace's listening
-    /// sockets from the child and starts serving them through the egress proxy — blocking on that
-    /// receive, racing concurrently with the caller's (not-yet-issued) `.spawn()` call rather than
-    /// running after it, per [`SupervisorHandle`]'s doc comment.
-    ///
-    /// The child sends exactly one `SCM_RIGHTS` batch over this socketpair, from
-    /// `create_capsule_netns` — the first thing its `pre_exec` window does. The thread finishes as
-    /// soon as the proxy is up and hands the live handle back over `proxy_rx` for
-    /// [`SupervisorHandle::join_best_effort`] to shut down, so the proxy stops when the shell
-    /// call has finished waiting on the subprocess tree. Both the foreground path and a demoted
-    /// command's own thread drain the child's pipes to EOF before that shutdown, which is what
-    /// makes them wait for every descendant holding the pipe.
-    ///
-    /// If the sockets never arrive (e.g. `fork()` itself failed, or the child's `pre_exec` closure
-    /// errored before reaching the send), there is no live child left unserved:
-    /// `Command::spawn()` surfaces that same underlying failure as its own `Err`, via the
-    /// close-on-exec error pipe, independently of this thread.
-    pub(super) fn start_supervisor(
-        parent_sock: OwnedFd,
-        egress_policy: crate::egress_proxy::EgressPolicy,
-        expected_namespace_sockets: usize,
-        diag_read: OwnedFd,
-    ) -> SupervisorHandle {
-        let (proxy_tx, proxy_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let proxy = start_namespace_proxy(
-                parent_sock.as_raw_fd(),
-                expected_namespace_sockets,
-                egress_policy,
-            );
-            // A closed receiver means the caller gave up waiting (its bounded `recv_timeout`
-            // elapsed). Dropping the handle here then shuts the proxy down on this thread instead,
-            // which is the same outcome by a different route — never a proxy left running.
-            if let Err(returned) = proxy_tx.send(proxy) {
-                if let Some(proxy) = returned.0 {
-                    proxy.shutdown();
-                }
-            }
-        });
-
-        SupervisorHandle::Linux {
-            proxy_rx,
-            diag_read,
-        }
-    }
-
-    /// Receives the in-namespace listening sockets and starts serving them.
-    ///
-    /// Returns `None` when the hand-off failed, which is not a silent degradation: the same
-    /// `pre_exec` failure that prevented the send also makes the child return `Err`, so
-    /// `Command::spawn()` reports it and no subprocess runs. There is no path where the capsule
-    /// starts with a namespace whose proxy never came up — that would be a capsule with no
-    /// network at all rather than an unbounded one, but it would present as an inexplicable
-    /// outage, so it is logged here too.
-    fn start_namespace_proxy(
-        sock_fd: RawFd,
-        expected: usize,
-        policy: crate::egress_proxy::EgressPolicy,
-    ) -> Option<crate::egress_proxy::EgressProxyHandle> {
-        let sockets = match crate::network_namespace::receive_namespace_sockets(sock_fd, expected) {
-            Ok(sockets) => sockets,
-            Err(error) => {
-                crate::runtime_err!(
-                    "[capsule-runtime] warning: failed to receive the capsule's network \
-                     namespace sockets: {error} (the subprocess spawn reports the underlying \
-                     pre_exec failure independently)"
-                );
-                return None;
-            }
-        };
-        match crate::egress_proxy::start_egress_proxy(sockets, policy) {
-            Ok(proxy) => Some(proxy),
-            Err(error) => {
-                crate::runtime_err!(
-                    "[capsule-runtime] warning: failed to serve the capsule's network namespace \
-                     sockets: {error} (the subprocess tree has no route off this host, so its \
-                     network calls fail closed)"
-                );
-                None
-            }
         }
     }
 
@@ -7354,7 +7289,12 @@ mod linux_integration_tests {
             Path::new("/tmp"),
         )
         .expect("environment_only must never fail");
-        supervisor.join_best_effort();
+        assert!(matches!(supervisor, SupervisorHandle::Noop));
+        assert_eq!(
+            enforcement.session_netns.creations(),
+            0,
+            "a tier with no kernel sandbox must not create a network namespace"
+        );
     }
 
     // Exec denial outside the allowlist is deliberately not asserted here. Exec is a Landlock
@@ -8928,5 +8868,481 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             no_new_privs.session_fatal().is_none(),
             "a no_new_privs failure is the tool call's problem, not the session's: {no_new_privs}"
         );
+    }
+
+    // ---- one network namespace per session -------------------------------------------------
+    //
+    // Every test below drives real commands through `execute_shell`/`run_shell` against an
+    // enforcement resolved the way `stage_session` resolves one, and reads what a later command of
+    // the same session — or of another session — can reach.
+
+    /// `bash`, `nc` and `sleep`, plus `extra`: what a model starting and probing a server uses.
+    fn server_policy(extra: &[&str]) -> CapabilityPolicy {
+        CapabilityPolicy {
+            shell_allow: ["bash", "nc", "sleep"]
+                .iter()
+                .chain(extra)
+                .map(|binary| binary.to_string())
+                .collect(),
+            ..CapabilityPolicy::default()
+        }
+    }
+
+    /// A session's enforcement, resolved as `stage_session` resolves a `scoped` capsule's.
+    fn session_enforcement(policy: &CapabilityPolicy) -> ShellEnforcement {
+        let enforcement = ShellEnforcement::resolve(
+            policy,
+            murmur_artifact::ContainmentClass::Scoped,
+            HostProbe::probe(),
+        )
+        .expect("the policy resolves");
+        assert_eq!(
+            enforcement.tier,
+            EnforcementTier::KernelFull,
+            "a scoped capsule on this host runs on KernelFull"
+        );
+        enforcement
+    }
+
+    /// A one-shot server on `127.0.0.1:<port>` that answers its one connection with `reply`,
+    /// backgrounded with its output redirected so the command that starts it returns at once.
+    fn one_shot_server(reply: &str, port: u16) -> String {
+        format!(
+            "(printf \"{reply}\\n\" | nc -N -l 127.0.0.1 {port}) >/dev/null 2>&1 & echo $! > server.pid"
+        )
+    }
+
+    /// Connects to `127.0.0.1:<port>`, retrying for up to five seconds while the server comes up,
+    /// and prints the first line it reads.
+    fn retrying_client(port: u16) -> String {
+        format!(
+            "for i in {{1..50}}; do exec 3<>/dev/tcp/127.0.0.1/{port} 2>/dev/null && break; \
+             sleep 0.1; done; read -r reply <&3; echo \"$reply\""
+        )
+    }
+
+    fn bash(
+        script: &str,
+        workdir: &Path,
+        policy: &CapabilityPolicy,
+        enforcement: &ShellEnforcement,
+    ) -> Result<crate::shell::ShellResult, crate::shell::ShellExecError> {
+        crate::shell::execute_shell(
+            "bash",
+            &["-c", script],
+            &[],
+            workdir,
+            workdir,
+            policy,
+            enforcement,
+        )
+    }
+
+    fn pid_in(workdir: &Path, file: &str) -> i32 {
+        std::fs::read_to_string(workdir.join(file))
+            .unwrap_or_else(|error| panic!("{file} was not written: {error}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| panic!("{file} holds no pid: {error}"))
+    }
+
+    fn process_exists(pid: i32) -> bool {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    /// Whether `/proc/<pid>` is gone within `timeout`. A killed process stays visible until its
+    /// parent — `init` for an orphan — reaps it, which takes a moment after the kill itself.
+    fn process_gone_within(pid: i32, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while process_exists(pid) {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        true
+    }
+
+    /// A server one command backgrounds answers a later, separate command of the same session.
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn a_listener_started_by_one_command_answers_the_next() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "a_listener_started_by_one_command_answers_the_next",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let policy = server_policy(&[]);
+        let enforcement = session_enforcement(&policy);
+
+        let started = std::time::Instant::now();
+        let server = bash(
+            &one_shot_server("pong", 8080),
+            temp.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("the server command runs");
+        let server_ms = started.elapsed().as_millis();
+        assert_eq!(server.exit_code, 0, "stderr: {}", server.stderr);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a backgrounded server with its output redirected must not hold the command open"
+        );
+
+        let client = bash(&retrying_client(8080), temp.path(), &policy, &enforcement)
+            .expect("the client command runs");
+        println!(
+            "tier {:?}; command 1 exit {} in {server_ms} ms; command 2 exit {} stdout {:?}; \
+             namespaces created: {}",
+            enforcement.tier,
+            server.exit_code,
+            client.exit_code,
+            client.stdout.trim(),
+            enforcement.session_netns.creations()
+        );
+        assert_eq!(client.exit_code, 0, "stderr: {}", client.stderr);
+        assert_eq!(client.stdout.trim(), "pong");
+        assert_eq!(enforcement.session_netns.creations(), 1);
+
+        enforcement.end_session();
+    }
+
+    /// A foreground server demoted after its grace period keeps listening, and a later command
+    /// reaches it; the demoted command then completes with what it received.
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn a_demoted_server_stays_reachable_from_later_commands() {
+        use crate::detached::{DetachPolicy, DetachedRegistry, DetachedReport};
+
+        if crate::network_namespace::skip_without_egress_namespace(
+            "a_demoted_server_stays_reachable_from_later_commands",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let policy = server_policy(&[]);
+        let enforcement = session_enforcement(&policy);
+        let (registry, mut reports) = DetachedRegistry::new();
+
+        let outcome = crate::shell::run_shell(
+            "nc",
+            &["-l", "127.0.0.1", "8080"],
+            &[],
+            temp.path(),
+            temp.path(),
+            &policy,
+            &enforcement,
+            Some(DetachPolicy {
+                grace: std::time::Duration::ZERO,
+                registry: Arc::clone(&registry),
+                command: "-l 127.0.0.1 8080".to_string(),
+                context_id: "ctx_demoted_server".to_string(),
+                provenance: None,
+                abandoned: None,
+            }),
+        )
+        .expect("the server command runs");
+        let crate::shell::ShellOutcome::Detached(info) = outcome else {
+            panic!("a zero grace period demotes the server, got {outcome:?}");
+        };
+
+        let client = bash(
+            "for i in {1..50}; do exec 3<>/dev/tcp/127.0.0.1/8080 2>/dev/null && break; \
+             sleep 0.1; done; echo ping >&3",
+            temp.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("the client command runs");
+        assert_eq!(client.exit_code, 0, "stderr: {}", client.stderr);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let completion = loop {
+            match reports.try_recv() {
+                Ok(DetachedReport::Completed(completion)) => break completion,
+                Ok(DetachedReport::Lost(_)) => {}
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(error) => panic!("the demoted server never completed: {error}"),
+            }
+        };
+        let log = std::fs::read_to_string(temp.path().join(&completion.output_path))
+            .expect("the demoted command's log is written");
+        println!(
+            "demoted as {}; client exit {}; completion {} exit {}; log has ping: {}",
+            info.work_id,
+            client.exit_code,
+            completion.work_id,
+            completion.exit_code,
+            log.contains("ping")
+        );
+        assert_eq!(completion.work_id, info.work_id);
+        assert_eq!(completion.exit_code, 0, "log: {log}");
+        assert!(log.contains("ping"), "log: {log}");
+
+        enforcement.end_session();
+    }
+
+    /// Two sessions each bind the same port on their own loopback, each reaches only its own
+    /// server, and the host reaches neither.
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn two_sessions_do_not_share_loopback() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "two_sessions_do_not_share_loopback",
+        ) {
+            return;
+        }
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let policy = server_policy(&[]);
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let session_a = session_enforcement(&policy);
+        let session_b = session_enforcement(&policy);
+
+        for (dir, session, reply) in [
+            (&dir_a, &session_a, "pong-a"),
+            (&dir_b, &session_b, "pong-b"),
+        ] {
+            let server = bash(&one_shot_server(reply, port), dir.path(), &policy, session)
+                .expect("the server command runs");
+            assert_eq!(server.exit_code, 0, "stderr: {}", server.stderr);
+        }
+        // Both servers bound the same port: each is still running, waiting for its one client.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        for dir in [&dir_a, &dir_b] {
+            let pid = pid_in(dir.path(), "server.pid");
+            assert!(process_exists(pid), "a server's bind on {port} failed");
+        }
+
+        let host = std::net::TcpStream::connect(("127.0.0.1", port));
+        let host_error = host.expect_err("the host must not reach a session's loopback server");
+        assert_eq!(host_error.kind(), std::io::ErrorKind::ConnectionRefused);
+
+        let client_b = bash(&retrying_client(port), dir_b.path(), &policy, &session_b)
+            .expect("B's client runs");
+        assert_eq!(client_b.exit_code, 0, "stderr: {}", client_b.stderr);
+
+        // B's one-shot server is spent; A's still listens on the same port in A's namespace.
+        let second_b = bash(
+            &format!("exec 3<>/dev/tcp/127.0.0.1/{port}"),
+            dir_b.path(),
+            &policy,
+            &session_b,
+        )
+        .expect("B's second client runs");
+
+        let client_a = bash(&retrying_client(port), dir_a.path(), &policy, &session_a)
+            .expect("A's client runs");
+        println!(
+            "port {port}; host connect: {host_error}; B read {:?}; B's second client exit {} \
+             stderr {:?}; A read {:?}",
+            client_b.stdout.trim(),
+            second_b.exit_code,
+            second_b.stderr.trim(),
+            client_a.stdout.trim()
+        );
+        assert_eq!(client_b.stdout.trim(), "pong-b");
+        assert_ne!(second_b.exit_code, 0);
+        assert!(
+            second_b.stderr.contains("Connection refused"),
+            "stderr: {}",
+            second_b.stderr
+        );
+        assert_eq!(client_a.exit_code, 0, "stderr: {}", client_a.stderr);
+        assert_eq!(client_a.stdout.trim(), "pong-a");
+
+        session_a.end_session();
+        session_b.end_session();
+    }
+
+    /// The session's one egress proxy serves every command, refuses what is not allowlisted,
+    /// and is created once.
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn the_session_proxy_serves_every_command() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "the_session_proxy_serves_every_command",
+        ) {
+            return;
+        }
+        // Answers every connection, so the first and third commands both get a reply.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                use std::io::Write;
+                if let Ok(mut stream) = stream {
+                    let _ = stream.write_all(b"pong\n");
+                }
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            network_allow: vec![format!("http://127.0.0.1:{port}")],
+            ..server_policy(&[])
+        };
+        let enforcement = session_enforcement(&policy);
+        let through_proxy =
+            format!("exec 3<>/dev/tcp/127.0.0.1/{port} && read -r reply <&3 && echo \"$reply\"");
+
+        let first = bash(&through_proxy, temp.path(), &policy, &enforcement).unwrap();
+        let unlisted = bash(
+            "exec 3<>/dev/tcp/10.255.255.1/9",
+            temp.path(),
+            &policy,
+            &enforcement,
+        )
+        .unwrap();
+        let third = bash(&through_proxy, temp.path(), &policy, &enforcement).unwrap();
+        println!(
+            "first {:?} exit {}; unlisted exit {} stderr {:?}; third {:?} exit {}; namespaces \
+             created: {}",
+            first.stdout.trim(),
+            first.exit_code,
+            unlisted.exit_code,
+            unlisted.stderr.trim(),
+            third.stdout.trim(),
+            third.exit_code,
+            enforcement.session_netns.creations()
+        );
+        assert_eq!(first.exit_code, 0, "stderr: {}", first.stderr);
+        assert_eq!(first.stdout.trim(), "pong");
+        assert_ne!(unlisted.exit_code, 0, "an unlisted destination must fail");
+        assert_eq!(third.exit_code, 0, "stderr: {}", third.stderr);
+        assert_eq!(third.stdout.trim(), "pong");
+        assert_eq!(enforcement.session_netns.creations(), 1);
+
+        enforcement.end_session();
+    }
+
+    /// Commands whose first spawns race each other still create exactly one namespace, and
+    /// all of them land in it.
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn concurrent_first_commands_share_one_namespace() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "concurrent_first_commands_share_one_namespace",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let policy = server_policy(&[]);
+        let enforcement = session_enforcement(&policy);
+        // One one-shot server per client, on its own port: a second client queued on a one-shot
+        // `nc -l` would sit in its listen backlog and be closed unanswered when it exits.
+        let servers = (8081..=8083)
+            .map(|port| one_shot_server("pong", port).replace("server.pid", &format!("{port}.pid")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let scripts = [
+            servers,
+            retrying_client(8081),
+            retrying_client(8082),
+            retrying_client(8083),
+        ];
+
+        let barrier = std::sync::Barrier::new(scripts.len());
+        let results: Vec<crate::shell::ShellResult> = std::thread::scope(|scope| {
+            let handles: Vec<_> = scripts
+                .iter()
+                .map(|script| {
+                    let enforcement = enforcement.clone();
+                    let (barrier, policy, workdir) = (&barrier, &policy, temp.path());
+                    scope.spawn(move || {
+                        barrier.wait();
+                        bash(script, workdir, policy, &enforcement).expect("the command runs")
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for (index, result) in results.iter().enumerate() {
+            println!(
+                "command {index}: exit {} stdout {:?}",
+                result.exit_code,
+                result.stdout.trim()
+            );
+            assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+        }
+        for client in &results[1..] {
+            assert_eq!(client.stdout.trim(), "pong");
+        }
+        println!(
+            "namespaces created: {}",
+            enforcement.session_netns.creations()
+        );
+        assert_eq!(enforcement.session_netns.creations(), 1);
+
+        enforcement.end_session();
+    }
+
+    /// Ending the session kills everything it started — a `setsid` process and a background
+    /// server included — releases the namespace, and refuses every command after.
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn ending_the_session_kills_everything_it_started() {
+        if crate::cgroup::skip_without_host_support(
+            "ending_the_session_kills_everything_it_started",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let policy = server_policy(&["setsid"]);
+        let scope =
+            crate::cgroup::prepare_scope(true, &policy.resources, "ses_end_kills", temp.path())
+                .expect("a delegated scope")
+                .scope
+                .expect("a required scope on Linux is never None");
+        let enforcement =
+            session_enforcement(&policy).with_host_bounding(Some(Arc::clone(&scope)), None);
+
+        let started = bash(
+            "setsid sleep 300 >/dev/null 2>&1 & echo $! > sleeper.pid; \
+             nc -l 127.0.0.1 8080 >/dev/null 2>&1 & echo $! > server.pid",
+            temp.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("the command runs");
+        assert_eq!(started.exit_code, 0, "stderr: {}", started.stderr);
+        let sleeper = pid_in(temp.path(), "sleeper.pid");
+        let server = pid_in(temp.path(), "server.pid");
+        assert!(process_exists(sleeper), "the setsid sleeper is running");
+        assert!(process_exists(server), "the background server is running");
+
+        let ending = std::time::Instant::now();
+        enforcement.end_session();
+        let took = ending.elapsed();
+
+        let sleeper_gone = process_gone_within(sleeper, std::time::Duration::from_secs(2));
+        let server_gone = process_gone_within(server, std::time::Duration::from_secs(2));
+        let procs = std::fs::read_to_string(scope.path().join("cgroup.procs")).unwrap();
+        let after = bash("true", temp.path(), &policy, &enforcement);
+        println!(
+            "end_session took {} ms; sleeper {sleeper} gone: {sleeper_gone}; server {server} \
+             gone: {server_gone}; cgroup.procs after: {:?}; next command: {:?}",
+            took.as_millis(),
+            procs.trim(),
+            after.as_ref().map(|result| result.exit_code)
+        );
+        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+        assert!(sleeper_gone, "the setsid sleeper outlived its session");
+        assert!(server_gone, "the background server outlived its session");
+        assert!(procs.trim().is_empty(), "cgroup.procs: {procs}");
+        let refusal = after
+            .expect_err("a command after the session ended must be refused")
+            .to_string();
+        assert!(refusal.contains("session has ended"), "{refusal}");
     }
 }

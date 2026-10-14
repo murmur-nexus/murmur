@@ -1609,9 +1609,10 @@ Three steps, in this order:
 A cancelled task's ending is its `task_end` record, or, for a task cancelled before it started,
 its `task_canceled` record with `phase: "queued"`.
 
-The door step is the only moment anything can ask the capsule what it leaves running. A detached
-shell command keeps its own lifecycle, and the record of it dies with the process, so the question
-is asked while the capsule is still answering. A delegated sub-capsule — one started by
+The door step is the only moment anything can ask the capsule what it was running. The record of a
+detached shell command dies with the process, so the question is asked while the capsule is still
+answering; the session's end in step 2 then kills the command with every other process the session
+started. A delegated sub-capsule — one started by
 `delegate-task` or by a [plan's `capsule` step](plans.md#when-the-task-is-cancelled) — is ended by
 the cancelled task that started it, and is named too.
 
@@ -1631,7 +1632,7 @@ items.
 
 | Line | Means |
 |---|---|
-| `running: …` or `ended: …`, one per item | The capsule answered and named these: `running:` for a detached shell command, which keeps running; `ended:` for a delegation, whose sub-capsule the cancelled task ended |
+| `running: …` or `ended: …`, one per item | The capsule answered and named these: `running:` for a detached shell command, running when it was named and killed when the session ended; `ended:` for a delegation, whose sub-capsule the cancelled task ended |
 | `residue: nothing else was left running` | The capsule answered and had nothing to name |
 | `residue: unknown — the capsule could not be asked: …` | The door did not answer, and the reason says why |
 
@@ -1916,7 +1917,7 @@ state `canceled`. What the task had in flight is named in the output, one line e
 
 | Line | Item | What the cancel did to it |
 |---|---|---|
-| `running:` | A detached shell command | Nothing: it keeps its own lifecycle |
+| `running:` | A detached shell command | Nothing: it runs until it finishes or its session ends, which kills it |
 | `ended:` | A sub-capsule the task delegated to, through `delegate-task` or a [plan's `capsule` step](plans.md#when-the-task-is-cancelled) | Ended it, with the task. A plan stops with it, and runs none of its remaining steps |
 
 ```text

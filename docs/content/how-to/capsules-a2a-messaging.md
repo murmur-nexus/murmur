@@ -468,7 +468,8 @@ held is answered `-32001`, `Task not found`. Both errors are listed under
 
 ### What the cancel names { #what-the-cancel-left-running }
 
-A detached shell command keeps its own lifecycle. A sub-capsule the task delegated to is ended by
+A detached shell command is not ended by the cancel: it runs until it finishes or its session
+ends, which kills it. A sub-capsule the task delegated to is ended by
 the cancelled task before its `task_end`, whether `delegate-task` started it or a
 [plan's `capsule` step](../reference/plans.md#when-the-task-is-cancelled) did; a plan stops with
 its task and runs none of its remaining steps. When either was in flight at the moment the cancel was

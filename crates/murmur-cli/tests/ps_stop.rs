@@ -1259,16 +1259,18 @@ fn a_queued_cancel_does_not_wait_out_the_deadline() {
 
 // ── 6. What the capsule left running ──────────────────────────────────────────
 
-/// A detached shell command is named, not killed. The line is the one `mur cancel` prints for the
-/// same item, because both go through one printer.
+/// A detached shell command is named before the session's end kills it. The line is the one
+/// `mur cancel` prints for the same item, because both go through one printer.
 #[test]
-fn stop_names_the_detached_command_it_leaves_running() {
-    if common::skip_without_host_support("stop_names_the_detached_command_it_leaves_running") {
+fn stop_names_the_detached_command_its_session_end_kills() {
+    if common::skip_without_host_support("stop_names_the_detached_command_its_session_end_kills") {
         return;
     }
+    // A duration no other test runs, so the `ps` check below cannot mistake another test's
+    // sleeper for this one.
     let server = common::ScriptedServer::start_with_delay(
         vec![
-            tool_call_response("msg_1", "toolu_1", "bash", json!({"command": "sleep 120"})),
+            tool_call_response("msg_1", "toolu_1", "bash", json!({"command": "sleep 173"})),
             end_turn_response("msg_2", "never delivered"),
         ],
         Duration::from_secs(30),
@@ -1303,17 +1305,28 @@ fn stop_names_the_detached_command_it_leaves_running() {
         .unwrap_or_else(|| panic!("no residue line in:\n{stdout}"));
     assert!(residue_line.contains("wrk_"), "{residue_line}");
     assert!(residue_line.contains("detached shell"), "{residue_line}");
-    assert!(residue_line.contains("sleep 120"), "{residue_line}");
+    assert!(residue_line.contains("sleep 173"), "{residue_line}");
 
-    // Naming it is the point: nothing here killed it.
-    let still_running = std::process::Command::new("ps")
-        .args(["-eo", "args"])
-        .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).contains("sleep 120"))
-        .unwrap_or(false);
+    // The stop ended the session, and the session's end killed what it started.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let still_running = loop {
+        let running = std::process::Command::new("ps")
+            .args(["-eo", "args"])
+            .output()
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .any(|line| line.trim() == "sleep 173")
+            })
+            .unwrap_or(false);
+        if !running || std::time::Instant::now() >= deadline {
+            break running;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert!(
-        still_running,
-        "the detached command was killed; `mur stop` names what it leaves running"
+        !still_running,
+        "the detached command outlived the session `mur stop` ended"
     );
 }
 

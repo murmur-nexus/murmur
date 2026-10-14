@@ -2242,24 +2242,25 @@ lifecycle:
 
 #### When a session ends with a command still running
 
-The session does not wait and does not kill: the command keeps running, detached, and the runtime
-stops owning its result. The discard is stated rather than left silent. One report goes to stderr
-and to `logs/bootstrap.log` under the [capsule workdir](workdir.md), naming every discarded command's
-work id, binary, command text and how long it had been running, and each command also gets a
+The session does not wait for it. It kills it, together with every other process the session
+started — a server a shell call put in the background with `&` included — and the result is lost.
+The kill is stated rather than left silent. One report goes to stderr and to `logs/bootstrap.log`
+under the [capsule workdir](workdir.md), naming every such command's work id, binary, command text
+and how long it had been running, and each command also gets a
 [`shell_abandoned`](observability-schemas.md#session-trace-tracejsonl) line in `trace.jsonl`.
 
 ```text
 [capsule-runtime] 1 background shell command discarded at session end.
 
-Session ses_01k4m2y7xq8f9v3n5r7t9w1c2e ended while 1 demoted shell command was unaccounted for. Nothing was waited for and nothing was killed; what is known about each is below.
+Session ses_01k4m2y7xq8f9v3n5r7t9w1c2e ended while 1 demoted shell command was unaccounted for. Every process the session started was killed when it ended; what is known about each command is below.
 
 work_id: wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2
 binary: /usr/bin/bash
 command: sleep 45; echo done
-state: still running after 45012 ms
-result: none — no exit code, and no logs/wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2.log will be written, because the thread that writes it ended with this session.
+state: killed at session end after 45012 ms
+result: none — it was killed before it finished, so no task carries an exit code. Whatever it wrote reaches logs/wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2.log only if the runtime wrote that file before it exited.
 
-A command still running keeps running, detached from this session, with nothing reading its output. Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep for a session that outlives its task and can be told the result instead.
+A session's end kills every command it demoted and every process its shell calls started in the background. Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep for a session that outlives its task and can be told the result instead.
 ```
 
 A command that finishes during teardown — too late for any task to carry its result, but with its
@@ -2281,11 +2282,13 @@ the exit code alone does not.
 
 #### What a backgrounded command costs when the host dies
 
-A backgrounded command outlives the runtime that started it. If the runtime is killed — `SIGKILL`,
-an out-of-memory kill, a host that goes away — the command keeps running with nothing reading its
-output, and nothing of its result survives: no exit code, no `logs/<work_id>.log`, no record of
-whether it finished. The work is a full run's compute spent for nothing, so `lifecycle.shell_grace_secs` is
-also a decision about how much compute one lost host can waste.
+Every way a session ends — its task finishing, `SIGTERM`, a spawner or formation ending it — kills
+the commands it moved to the background. A runtime that is itself killed — `SIGKILL`, an
+out-of-memory kill, a host that goes away — kills nothing: its commands keep running with nothing
+reading their output and no route off the host, and nothing of their results survives: no exit
+code, no `logs/<work_id>.log`, no record of whether they finished. The work is a full run's compute
+spent for nothing, so `lifecycle.shell_grace_secs` is also a decision about how much compute one
+lost host can waste.
 
 The record of the demotion does survive. The `shell_detached` line is written and flushed at the
 moment the command moves to the background, so a `SIGKILL` or a process crash keeps it, and

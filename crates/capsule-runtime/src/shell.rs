@@ -220,9 +220,12 @@ const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// and so neither has anywhere to deliver a completion.
 ///
 /// With `detach: Some`, the child is polled until it exits or the deadline passes. On the
-/// deadline the child, its two pipe readers, its own egress-proxy supervisor and the metadata
-/// needed to describe it all move to one plain OS thread — not a `spawn_blocking` task — so
-/// runtime teardown never waits on it and a session can exit while it runs.
+/// deadline the child, its two pipe readers and the metadata needed to describe it all move to
+/// one plain OS thread — not a `spawn_blocking` task — so runtime teardown never waits on it. The
+/// session's end kills it with every other process the session started.
+///
+/// Every command runs in the session's one network namespace, so a server one call starts — in
+/// the background, or demoted — is reachable from the next call of the same session.
 ///
 /// Everything before the spawn is identical on both paths, including the whole spawn-failure
 /// arm: a spawn failure happens inside the grace window and stays a foreground error.
@@ -337,7 +340,6 @@ pub(crate) fn run_shell(
                             return Ok(ShellOutcome::Detached(demote(
                                 child,
                                 readers,
-                                supervisor,
                                 DemotionContext {
                                     policy: detach.expect("the detach policy was matched above"),
                                     accessible_workdir: accessible_workdir.to_path_buf(),
@@ -358,7 +360,6 @@ pub(crate) fn run_shell(
         }
     };
     let (stdout_bytes, stderr_bytes) = readers.join();
-    supervisor.join_best_effort();
     let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
     let resource_limit_hit = classify_resource_limit(
@@ -514,7 +515,6 @@ struct DemotionContext {
 fn demote(
     mut child: std::process::Child,
     readers: OutputReaders,
-    supervisor: crate::sandbox::SupervisorHandle,
     context: DemotionContext,
 ) -> DetachedDispatchInfo {
     let work_id = crate::detached::new_work_id();
@@ -568,10 +568,6 @@ fn demote(
     std::thread::spawn(move || {
         let waited = child.wait();
         let (stdout_bytes, stderr_bytes) = readers.join();
-        // This command's own egress proxy, torn down with the command it served. Each
-        // `prepare_enforcement` call starts its own, so a foreground command finishing in the
-        // meantime cannot have taken this one down.
-        supervisor.join_best_effort();
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
         let (exit_code, resource_limit, mut error) = match waited {

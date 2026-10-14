@@ -1837,7 +1837,7 @@ pub fn stage_session(
     // A third refusal, in the same pre-staging seam and for the same fail-closed reason, but
     // about a mechanism that sits outside the containment ladder entirely: a capsule that can
     // spawn a native subprocess needs a network namespace to put it in, because that namespace —
-    // not a syscall filter — is now what makes `capabilities.network.allow` mean anything for
+    // not a syscall filter — is what makes `capabilities.network.allow` mean anything for
     // that subprocess. See `RuntimeError::EgressNamespaceUnavailable` for why this refuses even
     // when the allowlist is empty.
     //
@@ -1846,9 +1846,8 @@ pub fn stage_session(
     // nor `spawn.allow`, but `has_native_artifact` comes from `staged.installed_artifacts`, which
     // only exists after staging resolves the registry — i.e. after this very check has to have
     // already run, per the "before any registry pull" rule above. A native-artifact-only capsule
-    // therefore does not get this clean refusal on a host that cannot build the namespace; it
-    // instead surfaces as a raw `io::Error` out of `create_capsule_netns`'s `pre_exec` failure
-    // when that artifact is actually launched.
+    // therefore does not get this refusal on a host that cannot build the namespace, and its
+    // artifact is launched without entering a network namespace at all.
     crate::network_namespace::check_egress_namespace(
         !request.capability_policy.shell_allow.is_empty()
             || !request.capability_policy.spawn_allow.is_empty(),
@@ -2794,6 +2793,9 @@ fn launch(
     )
     .map_err(RuntimeError::Runtime)?
     .with_host_bounding(cgroup_scope, workdir_guard);
+    // Ends the session on every path out of this function, an error return included: every path
+    // that ends normally ends it explicitly first, and a second end is a no-op.
+    let _session_end = sandbox::EndSessionOnDrop::new(shell_enforcement.clone());
     let inference_env = session_guest_env(
         staged.inference.as_ref(),
         &staged.artifact_full_names,
@@ -3201,6 +3203,7 @@ fn launch(
         let protected_paths = staged.protected_paths.clone();
         let tool_annotations = staged.tool_annotations.clone();
         let shell_enforcement_for_state = shell_enforcement.clone();
+        let shell_enforcement_for_teardown = shell_enforcement.clone();
         let otel_endpoint = staged.otel_endpoint;
         let eval_config_json = staged.eval_config_json;
         let case_id = staged.case_id;
@@ -3711,6 +3714,7 @@ fn launch(
                                 Arc::clone(&task_registry),
                                 terminating.clone(),
                                 Arc::clone(&ended_by_formation),
+                                shell_enforcement_for_teardown.clone(),
                             ));
                         }
                     }
@@ -4342,9 +4346,9 @@ fn launch(
                     agent::flush_hook_dispatch_faults(&mut hooks, &mut trace).await;
 
                     // Work this session started and is not waiting for. Nothing here waits on a
-                    // detached command — that is the point of having detached it — but the loss
-                    // of its result is recorded rather than passed over in silence: a demoted
-                    // command lives entirely in process memory, so nothing of it survives here.
+                    // detached command — that is the point of having detached it — and the
+                    // session's end kills it, so the loss of its result is recorded rather than
+                    // passed over in silence.
                     let abandoned_at_ms = crate::trace::timestamp_ms();
                     // Outstanding work first, then the channel. `complete` removes a work id
                     // before it sends, so a command finishing during this teardown is briefly in
@@ -4362,6 +4366,12 @@ fn launch(
                             },
                         });
                     }
+                    // The session ends here: every process it started is killed, backgrounded
+                    // servers and the demoted commands just read included, and its network
+                    // namespace is released. After `outstanding` and before the drain below, so a
+                    // command this kills is already recorded as still running, and the completion
+                    // its own thread then sends is the duplicate the drain skips.
+                    shell_enforcement_for_teardown.end_session();
                     // Work that reported after the task loop stopped reading. No task will carry
                     // the result, so it is discarded on the same terms as work still running — but
                     // the exit code, the duration and the written output log all exist, and the
@@ -4449,9 +4459,11 @@ fn launch(
     // spawner lifeline's EOF does the same, before the run starts and for as long as it lasts.
     #[cfg(unix)]
     if let Some(lifeline) = spawner_lifeline {
+        let ending = shell_enforcement.clone();
         lifeline
-            .watch(|| {
+            .watch(move || {
                 crate::runtime_err!("{SPAWNER_LIFELINE_CLOSED}; ending the run");
+                ending.end_session();
                 std::process::exit(143);
             })
             .map_err(|error| RuntimeError::SpawnerLifelineUnreadable {
@@ -4634,6 +4646,10 @@ fn launch(
 
         Ok(())
     })?;
+
+    // The capsule's run has returned, so its session ends: every process a shell call started is
+    // killed and the session's network namespace is released.
+    store.data().shell_enforcement.end_session();
 
     // The trace lines the capsule's run buffered on its store, written now that it has returned.
     let pending_pulls = std::mem::take(&mut store.data_mut().pending_artifact_pulls);
@@ -9039,6 +9055,8 @@ impl CapsuleStoreState {
         let gates = gate.as_ref().is_some_and(|gate| gate.gates(self));
 
         let capability_policy = self.capability_policy.clone();
+        // The plan's shell steps are this session's commands, so they run in its namespace.
+        let session_netns = Arc::clone(&self.shell_enforcement.session_netns);
         let scheduler_workdir = self.accessible_workdir.clone();
         let scheduler_session_workdir = self.workdir.clone();
         let session_id = self.session_id.clone();
@@ -9120,7 +9138,7 @@ impl CapsuleStoreState {
                     .as_ref()
                     .map(|task| task as &dyn crate::plan::PlanTask),
             };
-            crate::plan::execute(&plan_path, &ctx)
+            crate::plan::execute_in_session(&plan_path, &ctx, session_netns)
         });
 
         let mut requests_open = true;
@@ -11275,6 +11293,7 @@ async fn run_termination(
     task_registry: Arc<Mutex<TaskRegistry>>,
     terminating: crate::cancel::CancelSignal,
     ended_by_formation: Arc<AtomicBool>,
+    shell_enforcement: sandbox::ShellEnforcement,
 ) {
     let mut sigterms = 0u32;
     let mut begun = false;
@@ -11292,6 +11311,8 @@ async fn run_termination(
                 }
                 sigterms += 1;
                 if sigterms > 1 {
+                    // An exit runs no teardown, so the session's processes are killed first.
+                    shell_enforcement.end_session();
                     std::process::exit(143);
                 }
                 TerminationCause::Sigterm
@@ -11331,19 +11352,26 @@ async fn run_termination(
                 }
             }
         }
-        begin_termination(&task_registry, &terminating, &ended_by_formation, cause);
+        begin_termination(
+            &task_registry,
+            &terminating,
+            &ended_by_formation,
+            cause,
+            &shell_enforcement,
+        );
     }
 }
 
 /// Cancel every live task, raise `ended_by_formation` when the formation's end is the cause, raise
-/// `terminating`, say why, and arm [`TERMINATE_TEARDOWN_DEADLINE`], after which the process exits
-/// with status 143 whatever it is doing.
+/// `terminating`, say why, and arm [`TERMINATE_TEARDOWN_DEADLINE`], after which the session's
+/// processes are killed and the process exits with status 143 whatever it is doing.
 #[cfg(unix)]
 fn begin_termination(
     task_registry: &Mutex<TaskRegistry>,
     terminating: &crate::cancel::CancelSignal,
     ended_by_formation: &AtomicBool,
     cause: TerminationCause,
+    shell_enforcement: &sandbox::ShellEnforcement,
 ) {
     // Cancelled before the signal is raised, so an agent loop that wakes on either finds its task
     // already `Canceled`.
@@ -11365,8 +11393,10 @@ fn begin_termination(
             "{SPAWNER_LIFELINE_CLOSED}; cancelling live tasks and ending the session"
         ),
     }
-    std::thread::spawn(|| {
+    let ending = shell_enforcement.clone();
+    std::thread::spawn(move || {
         std::thread::sleep(TERMINATE_TEARDOWN_DEADLINE);
+        ending.end_session();
         std::process::exit(143);
     });
 }
