@@ -16,7 +16,7 @@ name: my-agent
 version: "0.1.0"
 
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
     gateway:
@@ -32,7 +32,7 @@ inference:
   transport: http
   model: {{ v.model_anthropic }}
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 ```
 
 `mur build` packages this as a manifest-only `.mur.zip`.

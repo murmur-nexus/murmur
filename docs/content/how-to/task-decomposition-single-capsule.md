@@ -32,13 +32,13 @@ Six manifest fields work together to make the recursive pattern possible. Create
       max_tokens: {{ v.max_tokens_anthropic }}
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
           endpoint: https://api.anthropic.com
           api_key: ${ANTHROPIC_API_KEY}
-      - name: murmur-tool-editor
+      - name: murmur/tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
 
@@ -61,7 +61,7 @@ Six manifest fields work together to make the recursive pattern possible. Create
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
       system_prompt_file: instructions.md
 
     lifecycle:
@@ -80,13 +80,13 @@ Six manifest fields work together to make the recursive pattern possible. Create
       max_tokens: {{ v.max_tokens_openai }}
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
           endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
-      - name: murmur-tool-editor
+      - name: murmur/tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
 
@@ -109,7 +109,7 @@ Six manifest fields work together to make the recursive pattern possible. Create
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
       system_prompt_file: instructions.md
 
     lifecycle:
@@ -128,13 +128,13 @@ Six manifest fields work together to make the recursive pattern possible. Create
       max_tokens: {{ v.max_tokens_deepseek }}
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
           endpoint: https://api.deepseek.com
           api_key: ${DEEPSEEK_API_KEY}
-      - name: murmur-tool-editor
+      - name: murmur/tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
 
@@ -157,7 +157,7 @@ Six manifest fields work together to make the recursive pattern possible. Create
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
       system_prompt_file: instructions.md
 
     lifecycle:

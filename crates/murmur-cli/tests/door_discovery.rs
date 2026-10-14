@@ -26,7 +26,7 @@ use capsule_runtime::{
 use murmur_artifact::{load_runtime_manifest, ContainmentClass, LocalRegistry};
 use serde_json::{json, Value};
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 const ALL_METHODS: [&str; 8] = [
@@ -285,6 +285,7 @@ fn launch(task_acceptance: TaskAcceptance, exports: Option<&str>) -> Capsule {
             manifest_dir: project.clone(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools: HashSet::new(),

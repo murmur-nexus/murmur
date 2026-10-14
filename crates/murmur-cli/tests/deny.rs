@@ -19,7 +19,7 @@ use common::hook_wat::{
 };
 use serde_json::{json, Value};
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 /// The file a denied `bash` call would have created. Its absence is the measurement.
@@ -79,7 +79,8 @@ fn hook<'a>(name: &'a str, binding: &'a str, commit_policy: &'a str, wasm: Vec<u
     }
 }
 
-/// A capsule manifest declaring the driver, the given hooks and tools, and `bash`.
+/// A capsule manifest declaring the driver, the given hooks and tools, and `bash`. Hooks and tools
+/// are declared as `local/<name>`: they are published from `.mur.zip` files.
 fn create_manifest(
     project_dir: &Path,
     endpoint: &str,
@@ -92,7 +93,7 @@ fn create_manifest(
         .iter()
         .map(|h| {
             format!(
-                "  - name: {}\n    version: 0.1.0\n    runtime: hook\n",
+                "  - name: local/{}\n    version: 0.1.0\n    runtime: hook\n",
                 h.name
             )
         })
@@ -100,7 +101,7 @@ fn create_manifest(
     let tool_yaml: String = tools
         .iter()
         .map(|(name, version)| {
-            format!("  - name: {name}\n    version: {version}\n    runtime: tool\n")
+            format!("  - name: local/{name}\n    version: {version}\n    runtime: tool\n")
         })
         .collect();
     let limits = deadline_seconds

@@ -244,7 +244,7 @@ pub fn manifest_yaml(
     // A process driver has to come out of a store: `stage` installs this one into the case's
     // project store before `mur run` resolves it.
     yaml.push_str("artifacts:\n");
-    yaml.push_str(&format!("  - name: {}\n", driver_artifact::DRIVER_NAME));
+    yaml.push_str(&format!("  - name: {}\n", driver_artifact::DRIVER_ARTIFACT));
     yaml.push_str(&format!(
         "    version: {}\n",
         driver_artifact::DRIVER_VERSION
@@ -285,7 +285,10 @@ pub fn manifest_yaml(
     yaml.push_str("\ninference:\n");
     yaml.push_str("  transport: process\n");
     yaml.push_str("  driver:\n");
-    yaml.push_str(&format!("    artifact: {}\n", driver_artifact::DRIVER_NAME));
+    yaml.push_str(&format!(
+        "    artifact: {}\n",
+        driver_artifact::DRIVER_ARTIFACT
+    ));
     yaml.push_str("    config:\n");
     yaml.push_str(&format!("      tool: {}\n", yaml_str(&probe.tool)));
     yaml.push_str(&format!("      script: {}\n", yaml_str(&probe.script)));
@@ -1310,12 +1313,12 @@ mod tests {
                     "case {id} at class {class}"
                 );
                 let driver = inference.driver.as_ref().expect("an inference.driver");
-                assert_eq!(driver.artifact, driver_artifact::DRIVER_NAME);
+                assert_eq!(driver.artifact, driver_artifact::DRIVER_ARTIFACT);
                 assert!(
                     manifest
                         .artifacts
                         .iter()
-                        .any(|a| a.name == driver_artifact::DRIVER_NAME
+                        .any(|a| a.name == driver_artifact::DRIVER_ARTIFACT
                             && a.version == driver_artifact::DRIVER_VERSION
                             && matches!(a.runtime, ArtifactRuntime::Driver)),
                     "case {id} at class {class}: the driver is not declared under artifacts:"

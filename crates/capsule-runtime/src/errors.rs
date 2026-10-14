@@ -279,13 +279,26 @@ pub enum RuntimeError {
     /// have its manifest overwritten and every call to it answered by the runtime, so the collision
     /// is refused rather than resolved into a tool the capsule can never reach.
     #[error(
-        "artifact '{name}' collides with a tool the runtime provides itself; the reserved names \
-         are {}",
+        "artifact '{name}' has the tool name '{}', which collides with a tool the runtime \
+         provides itself; the reserved names are {}",
+        murmur_artifact::tool_name_of(name),
         crate::runtime::RESERVED_TOOL_NAMES.join(", ")
     )]
     ReservedToolName {
-        /// The declared artifact name that collides.
+        /// The declared artifact name whose tool name collides.
         name: String,
+    },
+
+    /// Two declared artifacts share a tool name, the bare part a session offers the model and
+    /// stages under `workdir/tools/`.
+    #[error(
+        "artifacts '{first}' and '{second}' share the tool name '{tool}'; a capsule offers each \
+         artifact to the model by its tool name, so no two may share one"
+    )]
+    DuplicateToolName {
+        first: String,
+        second: String,
+        tool: String,
     },
 
     /// A capsule's `capabilities.env.allow` names variables the credential backstop strips from

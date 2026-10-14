@@ -30,14 +30,14 @@ with `cargo install murmur-cli`.
 Start it on loopback:
 
 ```bash
-mur-roost --port 7700 --spawn-allow orchestrator --spawn-allow worker-a
+mur-roost --port 7700 --spawn-allow local/orchestrator --spawn-allow local/worker-a
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--port` | `7700` | Port to bind on `127.0.0.1` |
 | `--registry-path` | `$HOME/.murmur/artifacts` | Local artifact registry the daemon resolves manifests from |
-| `--spawn-allow` | *(empty)* | One capsule name that may register without an approval. Repeat the flag per name; `--spawn-allow=NAME` is also accepted |
+| `--spawn-allow` | *(empty)* | One capsule full name, `<scope>/<name>`, that may register without an approval. Repeat the flag per name; `--spawn-allow=NAME` is also accepted |
 | `--max-depth` | `3` | Levels of delegation allowed below a top-level capsule — see [Delegation bounds](#delegation-bounds) |
 | `--max-concurrent` | `4` | Children one session may hold live at once |
 | `--max-live-capsules` | Derived from the host's core count | Capsules live on the host at once across every formation, counting those already running when the daemon started — see [The machine ceiling](#the-machine-ceiling) |
@@ -114,14 +114,14 @@ Ask permission to spawn a capsule. This is where the allow list and the
 
 ```json
 {
-  "name":    "worker-a",
+  "name":    "local/worker-a",
   "version": "0.1.0"
 }
 ```
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `name` | string | yes | Capsule name; must be in the calling session's `capabilities.spawn.allow` |
+| `name` | string | yes | Capsule full name, `<scope>/<name>`; must be in the calling session's `capabilities.spawn.allow` |
 | `version` | string | yes | Capsule version |
 
 The body carries no manifest and no capability declaration, and any extra keys in it are ignored.
@@ -131,7 +131,7 @@ The body carries no manifest and no capability declaration, and any extra keys i
 ```json
 {
   "approval":      "msa1.eyJ2IjoxLCJz…",
-  "name":          "worker-a",
+  "name":          "local/worker-a",
   "version":       "0.1.0",
   "sha256":        "9f2c…",
   "expires_at_ms": 1756531200000
@@ -147,7 +147,7 @@ seconds after it was granted.
 
 | Status | Condition |
 |---|---|
-| `400 Bad Request` | Body is not valid JSON, or a required field is missing |
+| `400 Bad Request` | Body is not valid JSON, a required field is missing, or `name` is not a full name, `<scope>/<name>` |
 | `403 Forbidden` | The credential is absent or not valid, or names a session that is not running — see [Refusals](#refusals) |
 | `403 Forbidden` | `name` is not in the calling session's allow list |
 | `403 Forbidden` | The calling session has no delegation depth left — see [Delegation bounds](#delegation-bounds) |
@@ -180,7 +180,7 @@ capsule never calls this endpoint, needs no daemon, and runs with nothing listen
 ```json
 {
   "session_id": "ses_01a000c58eae7ca0901d5e6b7427df28",
-  "name":       "worker-a",
+  "name":       "local/worker-a",
   "version":    "0.1.0"
 }
 ```
@@ -188,7 +188,7 @@ capsule never calls this endpoint, needs no daemon, and runs with nothing listen
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `session_id` | string | yes | The registering session's own id, minted by its runtime. Must not already be registered |
-| `name` | string | yes | Capsule name, as published |
+| `name` | string | yes | Capsule full name, `<scope>/<name>`, as installed |
 | `version` | string | yes | Capsule version |
 
 Extra keys are ignored, including a `capabilities` or `envelope` block: the session's grants are
@@ -206,7 +206,7 @@ The session is now `running`, and the credential is what makes its `POST /spawn`
 
 | Status | Condition |
 |---|---|
-| `400 Bad Request` | Body is not valid JSON, or `session_id` is empty |
+| `400 Bad Request` | Body is not valid JSON, `session_id` is empty, or `name` is not a full name, `<scope>/<name>` |
 | `403 Forbidden` | The approval is not valid, or the session that earned it is no longer running, or `session_id` is already registered — see [Refusals](#refusals) |
 | `403 Forbidden` | The approval has expired, has already been redeemed, or names a different artifact |
 | `403 Forbidden` | No approval was presented and `name` is not in `--spawn-allow`, whether or not that name is published |
@@ -424,7 +424,7 @@ inventory its model is shown, so the model has nothing to call.
 
 | Argument | Required | Meaning |
 |---|---|---|
-| `capsule` | yes | The sub-capsule's name. The schema's `enum` holds exactly this capsule's `capabilities.spawn.allow`, so the granted names are the only names the model can supply |
+| `capsule` | yes | The sub-capsule's bare name. The schema's `enum` holds the bare part of each `capabilities.spawn.allow` entry — `worker` for `local/worker` — so the granted capsules are the only ones the model can name. The runtime maps the name back to the full entry before asking `mur-roost` |
 | `version` | yes | That capsule's exact version. `latest`, `stable` and `edge` are reserved words that resolve to no artifact |
 | `task` | yes | The whole of what the sub-capsule is told. It arrives as the child's first user message |
 
@@ -441,7 +441,7 @@ it are composed by the capsule's own runtime, so **a delegating capsule needs no
 |---|---|---|
 | `delegation_id` | string | `dlg_…`, the id this delegation is named by in `trace.jsonl` and on its outcome |
 | `session_id` | string | `ses_…`, the child's own session |
-| `capsule`, `version` | string | The artifact that was launched |
+| `capsule`, `version` | string | The artifact that was launched, `capsule` by its bare name |
 | `status` | string | `started` or `failed`. A refused call returns no object — see below |
 | `child_workdir` | string | The child's directory, relative to the delegating capsule's accessible workdir — where its own `trace.jsonl` is, and where its result will be. Present only on `started` |
 | `output` | string | Why there is no delegation, on `failed`. Absent on `started`, which has produced nothing yet |
@@ -658,10 +658,10 @@ them.
 A capsule that delegates can spawn only the names listed in its *own* manifest, even where the
 global list permits more:
 
-- Daemon started with `--spawn-allow orchestrator --spawn-allow worker-a --spawn-allow worker-b`
-- Capsule A's manifest: `capabilities.spawn.allow: [worker-a]`
+- Daemon started with `--spawn-allow local/orchestrator --spawn-allow local/worker-a --spawn-allow local/worker-b`
+- Capsule A's manifest: `capabilities.spawn.allow: [local/worker-a]`
 - Capsule A registers; its session ID is `ses_01a0…`
-- Capsule A's runtime sends `POST /spawn` with `name: worker-b` → **403**
+- Capsule A's runtime sends `POST /spawn` with `name: local/worker-b` → **403**
 
 ---
 
@@ -763,12 +763,12 @@ already holding a verifiable approval:
 |---|---|
 | Expired | `this spawn approval has passed its expiry; an approval is valid for 60 seconds from the POST /spawn that granted it` |
 | Replayed | `this spawn approval has already been redeemed; an approval covers one launch, so ask POST /spawn for another` |
-| Different coordinates | `this spawn approval was granted for 'worker-a@0.1.0', not 'worker-b@0.1.0'` |
-| Different bytes | `'worker-a@0.1.0' now resolves to a different artifact than the one this spawn approval was granted for (approved sha256 …, resolved sha256 …)` |
+| Different coordinates | `this spawn approval was granted for 'local/worker-a@0.1.0', not 'local/worker-b@0.1.0'` |
+| Different bytes | `'local/worker-a@0.1.0' now resolves to a different artifact than the one this spawn approval was granted for (approved sha256 …, resolved sha256 …)` |
 
 The name-list refusals are their own, and name the list an operator has to edit:
-`capsule 'worker-a' is not in parent's spawn_allow` at `POST /spawn`, and
-`capsule 'worker-a' is not in --spawn-allow` at `POST /register`.
+`capsule 'local/worker-a' is not in parent's spawn_allow` at `POST /spawn`, and
+`capsule 'local/worker-a' is not in --spawn-allow` at `POST /register`.
 
 !!! note "Trust boundary"
     Within a single-machine local deployment the process boundary is the trust boundary. The daemon

@@ -39,7 +39,7 @@ impl CountingRoost {
         let state = Arc::new(State {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             registry_path: registry.path().to_path_buf(),
-            spawn_allow: vec!["capsule".to_string()],
+            spawn_allow: vec!["local/capsule".to_string()],
             max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
             max_concurrent: mur_roost::bounds::DEFAULT_MAX_CONCURRENT,
             // One daemon serves every case in this suite, so its host census is the suite's total.
@@ -108,7 +108,11 @@ impl CountingRoost {
 
     /// Publish the project's capsule into the daemon's own registry, which is where the daemon
     /// resolves the manifest it derives a registrant's envelope from.
+    ///
+    /// `name` is the full name the capsule is filed under; its packed manifest carries the bare
+    /// part.
     fn publish(&self, name: &str, version: &str, manifest_body: &str) {
+        let bare = murmur_artifact::tool_name_of(name);
         let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
         {
             use std::io::Write;
@@ -116,7 +120,7 @@ impl CountingRoost {
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             zip.start_file("murmur.yaml", options).unwrap();
-            zip.write_all(format!("name: {name}\nversion: {version}\n{manifest_body}").as_bytes())
+            zip.write_all(format!("name: {bare}\nversion: {version}\n{manifest_body}").as_bytes())
                 .unwrap();
             zip.start_file("capsule.wasm", options).unwrap();
             zip.write_all(
@@ -128,7 +132,7 @@ impl CountingRoost {
         murmur_artifact::Registry::publish(
             &murmur_artifact::LocalRegistry::new(self.state.registry_path.clone()),
             murmur_artifact::ArtifactMeta {
-                name: name.to_string(),
+                name: murmur_artifact::ArtifactName::parse(name).unwrap(),
                 version: version.to_string(),
                 runtime: murmur_artifact::RuntimeType::Wasm,
                 artifact_runtime: "capsule".to_string(),
@@ -176,7 +180,7 @@ fn run(home: &TempDir, manifest: &Path, roost_url: Option<&str>) -> assert_cmd::
         .assert()
 }
 
-const SPAWN_CAPABILITIES: &str = "capabilities:\n  spawn:\n    allow:\n      - worker\n";
+const SPAWN_CAPABILITIES: &str = "capabilities:\n  spawn:\n    allow:\n      - local/worker\n";
 
 /// A capsule that declares `capabilities.spawn.allow` registers exactly once, appears as running
 /// while it runs, and is retired when it ends.
@@ -190,7 +194,7 @@ fn a_capsule_declaring_spawn_allow_registers_once() {
     let dir = TempDir::new().unwrap();
     let manifest = project(dir.path(), SPAWN_CAPABILITIES);
     let roost = CountingRoost::start();
-    roost.publish("capsule", "0.0.1", SPAWN_CAPABILITIES);
+    roost.publish("local/capsule", "0.0.1", SPAWN_CAPABILITIES);
 
     run(&home, &manifest, Some(&roost.url)).success();
 
@@ -283,7 +287,7 @@ fn an_installed_capsule_runs_by_name_and_version() {
     let store = home.path().join(".murmur").join("artifacts");
     fs::create_dir_all(&store).unwrap();
     let roost = CountingRoost::start();
-    roost.publish("installed", "0.1.0", "artifacts: []\n");
+    roost.publish("local/installed", "0.1.0", "artifacts: []\n");
     // The same bytes in the store the child resolves through.
     copy_tree(&roost.state.registry_path, &store);
 
@@ -294,7 +298,7 @@ fn an_installed_capsule_runs_by_name_and_version() {
         .args([
             "run",
             "--capsule",
-            "installed",
+            "local/installed",
             "--capsule-version",
             "0.1.0",
             "--workdir",
@@ -320,12 +324,12 @@ fn the_installed_capsule_flags_are_required_together() {
     let home = TempDir::new().unwrap();
 
     for arguments in [
-        vec!["run", "--capsule", "installed"],
+        vec!["run", "--capsule", "local/installed"],
         vec!["run", "--capsule-version", "0.1.0"],
         vec![
             "run",
             "--capsule",
-            "installed",
+            "local/installed",
             "--capsule-version",
             "0.1.0",
             "--manifest",
@@ -373,7 +377,7 @@ fn a_launched_child_registers_one_level_below_its_parent() {
     fs::create_dir_all(&store).unwrap();
 
     let roost = CountingRoost::start();
-    roost.publish("capsule", "0.0.1", SPAWN_CAPABILITIES);
+    roost.publish("local/capsule", "0.0.1", SPAWN_CAPABILITIES);
     // The same bytes in the store the child resolves through, so the approval's digest matches on
     // both sides.
     copy_tree(&roost.state.registry_path, &store);
@@ -382,7 +386,7 @@ fn a_launched_child_registers_one_level_below_its_parent() {
     roost.seed_parent(PARENT, "capsule", 2);
     let digest = murmur_artifact::Registry::resolve(
         &murmur_artifact::LocalRegistry::new(roost.state.registry_path.clone()),
-        "capsule",
+        &murmur_artifact::ArtifactName::parse("local/capsule").unwrap(),
         "0.0.1",
     )
     .unwrap()
@@ -390,7 +394,14 @@ fn a_launched_child_registers_one_level_below_its_parent() {
     let approval = roost
         .state
         .authority
-        .mint_approval_token(PARENT, "capsule", "0.0.1", &digest, 1, now_ms() + 60_000)
+        .mint_approval_token(
+            PARENT,
+            "local/capsule",
+            "0.0.1",
+            &digest,
+            1,
+            now_ms() + 60_000,
+        )
         .unwrap();
 
     Command::cargo_bin("mur")
@@ -400,7 +411,7 @@ fn a_launched_child_registers_one_level_below_its_parent() {
         .args([
             "run",
             "--capsule",
-            "capsule",
+            "local/capsule",
             "--capsule-version",
             "0.0.1",
             "--workdir",

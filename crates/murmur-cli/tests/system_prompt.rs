@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 use common::ScriptedServer;
 
-const DRIVER_ANTHROPIC_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_ANTHROPIC_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 #[test]
@@ -277,8 +277,8 @@ fn cli_system_prompt_overrides_a_prompt_file_that_does_not_exist() {
 fn cli_system_prompt_restores_an_overridden_prompt_artifact_to_the_inventory() {
     // Baseline: the manifest declaration alone binds the skill and hides it from the inventory.
     let baseline = CliFixture::new(vec![one_turn_response()]);
-    let manifest_path =
-        baseline.write_manifest_with_skill(&format!("  system_prompt_artifact: {SKILL_NAME}\n"));
+    let manifest_path = baseline
+        .write_manifest_with_skill(&format!("  system_prompt_artifact: local/{SKILL_NAME}\n"));
     let baseline_workdir = baseline.run_ok(&manifest_path, &[]);
 
     let baseline_system = baseline.only_system_field();
@@ -294,8 +294,8 @@ fn cli_system_prompt_restores_an_overridden_prompt_artifact_to_the_inventory() {
 
     // Overridden: the skill is an ordinary callable skill again.
     let fixture = CliFixture::new(vec![one_turn_response()]);
-    let manifest_path =
-        fixture.write_manifest_with_skill(&format!("  system_prompt_artifact: {SKILL_NAME}\n"));
+    let manifest_path = fixture
+        .write_manifest_with_skill(&format!("  system_prompt_artifact: local/{SKILL_NAME}\n"));
     let workdir = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
 
     let system_field = fixture.only_system_field();
@@ -533,7 +533,9 @@ impl CliFixture {
         let manifest_path = create_agent_manifest_full(
             self.project.path(),
             &self.server.endpoint,
-            &format!("  - name: {SKILL_NAME}\n    version: {SKILL_VERSION}\n    runtime: skill\n"),
+            &format!(
+                "  - name: local/{SKILL_NAME}\n    version: {SKILL_VERSION}\n    runtime: skill\n"
+            ),
             "",
             inference_extra,
             "",

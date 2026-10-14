@@ -23,7 +23,7 @@ Create a `murmur.yaml` file. A minimal agent capsule declares its identity, one 
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
@@ -34,7 +34,7 @@ Create a `murmur.yaml` file. A minimal agent capsule declares its identity, one 
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
     ```
 
 === "OpenAI"
@@ -44,7 +44,7 @@ Create a `murmur.yaml` file. A minimal agent capsule declares its identity, one 
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
@@ -55,7 +55,7 @@ Create a `murmur.yaml` file. A minimal agent capsule declares its identity, one 
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
     ```
 
 === "DeepSeek"
@@ -65,7 +65,7 @@ Create a `murmur.yaml` file. A minimal agent capsule declares its identity, one 
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
@@ -76,7 +76,7 @@ Create a `murmur.yaml` file. A minimal agent capsule declares its identity, one 
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
     ```
 
 The driver entry's `gateway.api_key` field reads from the environment at run time. Export your provider key in the shell you will run from:
@@ -169,13 +169,13 @@ This is a secondary path; [`transport: http`](#step-1-declare-the-capsule-in-mur
 
 ### Create a manifest
 
-Create a `murmur.yaml` in an empty directory. `murmur-driver-claude-code` drives the Claude CLI:
+Create a `murmur.yaml` in an empty directory. `murmur/driver-claude-code` drives the Claude CLI:
 
 ```yaml
 name: my-capsule
 version: "1.0.0"
 artifacts:
-  - name: murmur-driver-claude-code
+  - name: murmur/driver-claude-code
     version: "{{ v.murmur_driver_claude_code }}"
     runtime: driver
 capabilities:
@@ -184,7 +184,7 @@ capabilities:
 inference:
   transport: process
   driver:
-    artifact: murmur-driver-claude-code
+    artifact: murmur/driver-claude-code
   max_turns: 10
 ```
 

@@ -114,7 +114,7 @@ The response is the string `ready`.
 
 ## Step 2 — configure the manifest
 
-Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo's OTLP ingest port. The `murmur-hook-grafana` artifact adds a hook-side enriched span tree on top of the native emission path — both are independent and a failure in one does not suppress the other:
+Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo's OTLP ingest port. The `murmur/hook-grafana` artifact adds a hook-side enriched span tree on top of the native emission path — both are independent and a failure in one does not suppress the other:
 
 === "Anthropic"
 
@@ -123,13 +123,13 @@ Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
           endpoint: https://api.anthropic.com
           api_key: ${ANTHROPIC_API_KEY}
-      - name: murmur-hook-grafana
+      - name: murmur/hook-grafana
         version: "{{ v.murmur_hook_grafana }}"
         runtime: hook
         capabilities:
@@ -141,7 +141,7 @@ Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
 
     observability:
       otel_endpoint: http://localhost:4318
@@ -154,13 +154,13 @@ Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
           endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
-      - name: murmur-hook-grafana
+      - name: murmur/hook-grafana
         version: "{{ v.murmur_hook_grafana }}"
         runtime: hook
         capabilities:
@@ -172,7 +172,7 @@ Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
 
     observability:
       otel_endpoint: http://localhost:4318
@@ -185,13 +185,13 @@ Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
           endpoint: https://api.deepseek.com
           api_key: ${DEEPSEEK_API_KEY}
-      - name: murmur-hook-grafana
+      - name: murmur/hook-grafana
         version: "{{ v.murmur_hook_grafana }}"
         runtime: hook
         capabilities:
@@ -203,7 +203,7 @@ Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
 
     observability:
       otel_endpoint: http://localhost:4318
@@ -315,7 +315,7 @@ Once spans are flowing into Tempo, the topology view can query the same backend 
 | What to do | How |
 |---|---|
 | Emit spans | Set `observability.otel_endpoint: http://localhost:4318` in `murmur.yaml` |
-| Enrich spans with hook-side data | Declare `murmur-hook-grafana` as a `runtime: hook` artifact, and grant it the collector host via the entry's own `capabilities.network.allow` — hooks have no network by default (see [Hook capabilities](../reference/manifest.md#hook-capabilities)) |
+| Enrich spans with hook-side data | Declare `murmur/hook-grafana` as a `runtime: hook` artifact, and grant it the collector host via the entry's own `capabilities.network.allow` — hooks have no network by default (see [Hook capabilities](../reference/manifest.md#hook-capabilities)) |
 | Confirm spans arrived | `curl .../api/search?q=...` returns `traces.length > 0` |
 | Find sessions in Grafana | Explore → Tempo → TraceQL `{resource.service.name="my-capsule"}` |
 | Inspect a session | Click a trace ID → flame graph → span detail panel |

@@ -280,7 +280,7 @@ pub struct DelegationOutcome {
 
 impl DelegationOutcome {
     /// The text the parent's agent reads, fenced by [`outcomes_message`]: the delegation, the
-    /// capsule, the outcome, the duration and where the result is. Never the result itself, and
+    /// capsule by its bare name, the outcome, the duration and where the result is. Never the result itself, and
     /// never a claim that a file exists when the child wrote none.
     pub fn message_text(&self) -> String {
         let mut text = format!(
@@ -292,7 +292,7 @@ impl DelegationOutcome {
              duration_ms: {}\n\
              workdir: {}\n",
             self.delegation_id,
-            self.capsule_name,
+            murmur_artifact::tool_name_of(&self.capsule_name),
             self.capsule_version,
             self.session_id,
             self.status.as_str(),
@@ -356,14 +356,16 @@ pub(crate) fn outcomes_message(notices: &[OutcomeNotice]) -> String {
     notices
         .iter()
         .map(|notice| {
+            // The model knows the capsule by the bare name `delegate-task` offered it.
+            let capsule = murmur_artifact::tool_name_of(&notice.capsule);
             format!(
                 "[delegate-task] delegation {} to {}@{} ended {}:\n{}",
                 notice.delegation_id,
-                notice.capsule,
+                capsule,
                 notice.version,
                 notice.status,
                 crate::fence::wrap_untrusted(
-                    &crate::fence::delegation_source(&notice.capsule),
+                    &crate::fence::delegation_source(capsule),
                     &notice.body
                 )
             )
@@ -741,6 +743,23 @@ mod tests {
             2,
             "{message}"
         );
+    }
+
+    /// The continuation names the capsule by the bare name `delegate-task` offered the model,
+    /// though the outcome is recorded under the full `capabilities.spawn.allow` entry.
+    #[test]
+    fn delegate_task_outcomes_name_the_bare_capsule() {
+        let message =
+            outcomes_message(&[OutcomeNotice::recorded(&outcome(), "local/worker", "0.1.0")]);
+        assert!(
+            message.starts_with("[delegate-task] delegation dlg_0001 to worker@0.1.0 ended ok:\n"),
+            "{message}"
+        );
+        assert!(
+            message.contains("<untrusted-content source=delegation:worker>\n"),
+            "{message}"
+        );
+        assert!(!message.contains("local/"), "{message}");
     }
 
     /// The only unbounded input near a completion is the crash detail, and it is capped.

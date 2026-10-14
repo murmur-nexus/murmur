@@ -28,7 +28,7 @@ use common::hook_wat::{create_hook_zip, spin_hook_wasm};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 /// How long the hook spins, as `capabilities.limits.deadline_seconds`. Long enough that every
@@ -85,7 +85,7 @@ fn spinner_project(endpoint: &str, exports: &str) -> TempDir {
             "name: busy-door\nversion: 0.1.0\n\
              artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
              \x20   gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n  \
-             - name: spinner\n    version: 0.1.0\n    runtime: hook\n\
+             - name: local/spinner\n    version: 0.1.0\n    runtime: hook\n\
              capabilities:\n  network:\n    allow:\n      - {endpoint}\n  \
              limits:\n    deadline_seconds: {SPIN_SECONDS}\n\
              lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n  queue_depth: 8\n\

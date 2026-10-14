@@ -24,7 +24,7 @@ use tempfile::TempDir;
 
 use super::ScriptedServer;
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 // ── provider replies ───────────────────────────────────────────────────────────
@@ -166,6 +166,7 @@ fn stage_agent(
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools,

@@ -17,7 +17,7 @@ use murmur_artifact::{load_runtime_manifest, ArtifactRuntime, ContainmentClass, 
 use serde_json::Value;
 use tempfile::TempDir;
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 fn end_turn_server(text: &str) -> common::ScriptedServer {
@@ -111,6 +111,7 @@ fn stage_agent(
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools,
@@ -1761,7 +1762,7 @@ fn lifecycle_a_rejected_task_reads_rejected_over_tasks_get() {
         .unwrap()
         .replace(
             "capabilities:\n",
-            "  - name: session-end-spinner\n    version: 0.1.0\n    runtime: hook\ncapabilities:\n  limits:\n    deadline_seconds: 5\n",
+            "  - name: local/session-end-spinner\n    version: 0.1.0\n    runtime: hook\ncapabilities:\n  limits:\n    deadline_seconds: 5\n",
         );
     fs::write(&manifest_path, manifest).unwrap();
 

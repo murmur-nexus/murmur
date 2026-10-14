@@ -647,6 +647,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             manifest_dir: project_dir.clone(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: pinned_artifacts.clone(),
             allowlisted_tools: allowlisted_tools.clone(),
@@ -717,6 +718,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
                         resolved_version: entry.resolved_version.clone(),
                         sha256: super::locked_sha256(entry),
                         origin: LockOrigin::Operator,
+                        owner_id: None,
                     })
                     .collect(),
             };

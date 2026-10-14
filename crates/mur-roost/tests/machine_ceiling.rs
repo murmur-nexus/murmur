@@ -13,9 +13,9 @@ use std::process::Command;
 use common::{Daemon, PLAIN_WORKER_BODY};
 use mur_roost::bounds::{MAX_MAX_LIVE_CAPSULES, MIN_MAX_LIVE_CAPSULES};
 
-/// A capsule that may spawn `worker-a`, so a registered root can delegate.
+/// A capsule that may spawn `local/worker-a`, so a registered root can delegate.
 const ORCHESTRATOR_BODY: &str = "artifacts: []\ncapabilities:\n  network:\n    allow: \
-                                 [registry.internal]\n  spawn:\n    allow: [worker-a]\n";
+                                 [registry.internal]\n  spawn:\n    allow: [local/worker-a]\n";
 
 /// Register a root of the given capsule with no approval, and return the credential it delegates
 /// with.
@@ -30,13 +30,13 @@ fn root(daemon: &Daemon, capsule: &str) -> String {
 /// top level.
 fn orchestrating_daemon(max_depth: u32, max_concurrent: u32, max_live_capsules: u32) -> Daemon {
     let daemon = Daemon::capped(
-        vec!["orchestrator".to_string()],
+        vec!["local/orchestrator".to_string()],
         max_depth,
         max_concurrent,
         max_live_capsules,
     );
-    daemon.publish_body("orchestrator", "0.1.0", ORCHESTRATOR_BODY, "");
-    daemon.publish_body("worker-a", "0.1.0", PLAIN_WORKER_BODY, "");
+    daemon.publish_body("local/orchestrator", "0.1.0", ORCHESTRATOR_BODY, "");
+    daemon.publish_body("local/worker-a", "0.1.0", PLAIN_WORKER_BODY, "");
     daemon
 }
 
@@ -47,11 +47,11 @@ fn orchestrating_daemon(max_depth: u32, max_concurrent: u32, max_live_capsules: 
 #[test]
 fn unrelated_roots_exhaust_the_host_ceiling() {
     let daemon = orchestrating_daemon(3, 4, 3);
-    let first = root(&daemon, "orchestrator");
-    root(&daemon, "orchestrator");
-    root(&daemon, "orchestrator");
+    let first = root(&daemon, "local/orchestrator");
+    root(&daemon, "local/orchestrator");
+    root(&daemon, "local/orchestrator");
 
-    let refusal = daemon.permission("worker-a", "0.1.0", Some(&first));
+    let refusal = daemon.permission("local/worker-a", "0.1.0", Some(&first));
     assert_eq!(refusal.status, 403);
     assert_eq!(
         refusal.error(),
@@ -99,16 +99,16 @@ fn unrelated_roots_exhaust_the_host_ceiling() {
 fn the_machine_refusal_wins_and_names_only_its_own_flag() {
     // (a) Room on the host, none in the formation.
     let daemon = orchestrating_daemon(3, 1, 32);
-    let credential = root(&daemon, "orchestrator");
+    let credential = root(&daemon, "local/orchestrator");
     let child = daemon.child_session_id();
-    let approval = daemon.approval("worker-a", "0.1.0", &credential);
+    let approval = daemon.approval("local/worker-a", "0.1.0", &credential);
     assert_eq!(
         daemon
-            .register(&child, "worker-a", "0.1.0", Some(&approval))
+            .register(&child, "local/worker-a", "0.1.0", Some(&approval))
             .status,
         200,
     );
-    let refusal = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let refusal = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
     assert_eq!(refusal.status, 403);
     assert!(
         refusal.error().contains("--max-concurrent 1"),
@@ -123,9 +123,9 @@ fn the_machine_refusal_wins_and_names_only_its_own_flag() {
 
     // (b) Room in the formation, none on the host.
     let daemon = orchestrating_daemon(3, 4, 2);
-    let credential = root(&daemon, "orchestrator");
-    root(&daemon, "orchestrator");
-    let refusal = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let credential = root(&daemon, "local/orchestrator");
+    root(&daemon, "local/orchestrator");
+    let refusal = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
     assert_eq!(refusal.status, 403);
     assert!(
         refusal.error().contains("--max-live-capsules 2"),
@@ -140,17 +140,17 @@ fn the_machine_refusal_wins_and_names_only_its_own_flag() {
 
     // (c) Neither has room: one root holding its single allowed child is also the whole host.
     let daemon = orchestrating_daemon(3, 1, 2);
-    let credential = root(&daemon, "orchestrator");
+    let credential = root(&daemon, "local/orchestrator");
     let child = daemon.child_session_id();
-    let approval = daemon.approval("worker-a", "0.1.0", &credential);
+    let approval = daemon.approval("local/worker-a", "0.1.0", &credential);
     assert_eq!(
         daemon
-            .register(&child, "worker-a", "0.1.0", Some(&approval))
+            .register(&child, "local/worker-a", "0.1.0", Some(&approval))
             .status,
         200,
     );
     assert_eq!(daemon.status(&child).body["live_capsules"], 2);
-    let refusal = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let refusal = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
     assert_eq!(refusal.status, 403);
     assert!(
         refusal.error().contains("--max-live-capsules 2"),
@@ -171,8 +171,8 @@ fn the_machine_refusal_wins_and_names_only_its_own_flag() {
 #[test]
 fn depth_still_outranks_the_machine_ceiling() {
     let daemon = orchestrating_daemon(0, 4, 1);
-    let credential = root(&daemon, "orchestrator");
-    let refusal = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let credential = root(&daemon, "local/orchestrator");
+    let refusal = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
     assert_eq!(refusal.status, 403);
     assert_eq!(
         refusal.error(),
@@ -248,18 +248,18 @@ fn the_ceiling_flag_rejects_a_value_that_is_not_a_number() {
 /// default a plain install gets.
 #[test]
 fn a_small_formation_never_meets_the_default_ceiling() {
-    let daemon = Daemon::with_spawn_allow(vec!["orchestrator".to_string()]);
-    daemon.publish_body("orchestrator", "0.1.0", ORCHESTRATOR_BODY, "");
-    daemon.publish_body("worker-a", "0.1.0", PLAIN_WORKER_BODY, "");
-    let credential = root(&daemon, "orchestrator");
+    let daemon = Daemon::with_spawn_allow(vec!["local/orchestrator".to_string()]);
+    daemon.publish_body("local/orchestrator", "0.1.0", ORCHESTRATOR_BODY, "");
+    daemon.publish_body("local/worker-a", "0.1.0", PLAIN_WORKER_BODY, "");
+    let credential = root(&daemon, "local/orchestrator");
 
     for _ in 0..2 {
-        let permission = daemon.permission("worker-a", "0.1.0", Some(&credential));
+        let permission = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
         assert_eq!(permission.status, 200, "{:?}", permission.body);
         let approval = permission.body["approval"].as_str().unwrap();
         let registered = daemon.register(
             &daemon.child_session_id(),
-            "worker-a",
+            "local/worker-a",
             "0.1.0",
             Some(approval),
         );
@@ -277,8 +277,8 @@ fn a_finished_capsule_returns_its_machine_slot() {
     let daemon = orchestrating_daemon(3, 4, 2);
 
     for round in 0..11 {
-        let credential = root(&daemon, "orchestrator");
-        let permission = daemon.permission("worker-a", "0.1.0", Some(&credential));
+        let credential = root(&daemon, "local/orchestrator");
+        let permission = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
         assert_eq!(
             permission.status, 200,
             "round {round}: {:?}",
@@ -286,7 +286,7 @@ fn a_finished_capsule_returns_its_machine_slot() {
         );
         let approval = permission.body["approval"].as_str().unwrap().to_string();
         let child = daemon.child_session_id();
-        let registered = daemon.register(&child, "worker-a", "0.1.0", Some(&approval));
+        let registered = daemon.register(&child, "local/worker-a", "0.1.0", Some(&approval));
         assert_eq!(
             registered.status, 200,
             "round {round}: {:?}",
@@ -301,8 +301,8 @@ fn a_finished_capsule_returns_its_machine_slot() {
 
     // Eleven roots and eleven children are still in the map, and none of them holds a slot.
     assert_eq!(daemon.session_ids().len(), 22);
-    let credential = root(&daemon, "orchestrator");
-    let granted = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let credential = root(&daemon, "local/orchestrator");
+    let granted = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
     assert_eq!(granted.status, 200, "{:?}", granted.body);
 }
 
@@ -311,16 +311,16 @@ fn a_finished_capsule_returns_its_machine_slot() {
 #[test]
 fn an_unredeemed_approval_holds_a_machine_slot() {
     let daemon = orchestrating_daemon(3, 4, 2);
-    let credential = root(&daemon, "orchestrator");
+    let credential = root(&daemon, "local/orchestrator");
 
-    let first = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let first = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
     assert_eq!(first.status, 200, "{:?}", first.body);
     assert_eq!(
         daemon.status(&daemon.session_ids()[0]).body["live_capsules"],
         2
     );
 
-    let second = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let second = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
     assert_eq!(second.status, 403);
     assert!(
         second.error().contains("already holding 2"),
@@ -337,11 +337,11 @@ fn an_unredeemed_approval_holds_a_machine_slot() {
 fn a_zero_ceiling_refuses_every_delegation_but_no_root() {
     let daemon = orchestrating_daemon(3, 4, 0);
     let session = daemon.child_session_id();
-    let registered = daemon.register(&session, "orchestrator", "0.1.0", None);
+    let registered = daemon.register(&session, "local/orchestrator", "0.1.0", None);
     assert_eq!(registered.status, 200, "{:?}", registered.body);
     let credential = registered.body["credential"].as_str().unwrap().to_string();
 
-    let refusal = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let refusal = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
     assert_eq!(refusal.status, 403);
     assert!(
         refusal.error().contains("--max-live-capsules 0"),
@@ -355,12 +355,12 @@ fn a_zero_ceiling_refuses_every_delegation_but_no_root() {
 #[test]
 fn a_refused_spawn_is_answered_and_forgotten() {
     let daemon = orchestrating_daemon(3, 4, 2);
-    let credential = root(&daemon, "orchestrator");
-    root(&daemon, "orchestrator");
+    let credential = root(&daemon, "local/orchestrator");
+    root(&daemon, "local/orchestrator");
     let before = daemon.session_ids();
 
     for attempt in 0..5 {
-        let refusal = daemon.permission("worker-a", "0.1.0", Some(&credential));
+        let refusal = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
         assert_eq!(refusal.status, 403, "attempt {attempt}");
         assert!(
             refusal.error().contains("--max-live-capsules 2"),

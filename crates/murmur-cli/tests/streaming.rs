@@ -25,7 +25,7 @@ use zip::{
     CompressionMethod, ZipWriter,
 };
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 const SKILL_NAME: &str = "house-style";
@@ -36,7 +36,7 @@ const SKILL_GUIDANCE: &str = "# House style\n\nPrefer short sentences.";
 const TOOL_NAME: &str = "jsonl-line-count";
 const TOOL_VERSION: &str = "0.1.0";
 
-const STREAMING_DRIVER_NAME: &str = "streaming-driver";
+const STREAMING_DRIVER_NAME: &str = "local/streaming-driver";
 const STREAMING_DRIVER_VERSION: &str = "0.1.0";
 
 fn fixture_path(relative: &str) -> PathBuf {
@@ -121,7 +121,9 @@ fn setup_agent_project_with_skill(
             let skill =
                 common::create_skill_artifact(artifacts.path(), SKILL_NAME, SKILL_VERSION, content);
             common::publish_local(&home, &skill).success();
-            format!("  - name: {SKILL_NAME}\n    version: {SKILL_VERSION}\n    runtime: skill\n")
+            format!(
+                "  - name: local/{SKILL_NAME}\n    version: {SKILL_VERSION}\n    runtime: skill\n"
+            )
         }
         None => String::new(),
     };
@@ -166,6 +168,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools,
@@ -484,16 +487,15 @@ fn streaming_driver_wasm_path() -> PathBuf {
 }
 
 fn create_streaming_driver_artifact(dir: &Path) -> PathBuf {
-    let artifact_path = dir.join(format!(
-        "{STREAMING_DRIVER_NAME}-{STREAMING_DRIVER_VERSION}.mur.zip"
-    ));
+    let packed = murmur_artifact::tool_name_of(STREAMING_DRIVER_NAME);
+    let artifact_path = dir.join(format!("{packed}-{STREAMING_DRIVER_VERSION}.mur.zip"));
     let file = fs::File::create(&artifact_path).unwrap();
     let mut zip = ZipWriter::new(file);
     let opts: SimpleFileOptions =
         FileOptions::default().compression_method(CompressionMethod::Deflated);
 
     zip.start_file("murmur.yaml", opts).unwrap();
-    writeln!(zip, "name: {STREAMING_DRIVER_NAME}").unwrap();
+    writeln!(zip, "name: {packed}").unwrap();
     writeln!(zip, "version: {STREAMING_DRIVER_VERSION}").unwrap();
     writeln!(zip, "runtime: driver").unwrap();
     writeln!(zip, "upstream_auth:").unwrap();
@@ -554,6 +556,7 @@ fn stage_streaming_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtim
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools: HashSet::new(),
@@ -946,7 +949,7 @@ fn stage_skill_and_tool_agent(endpoint: &str) -> capsule_runtime::StagedSession 
     fs::write(
         project.path().join("murmur.yaml"),
         format!(
-            "name: streaming-tool-agent\nversion: 0.1.0\nartifacts:\n  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n    runtime: tool\n  - name: {SKILL_NAME}\n    version: {SKILL_VERSION}\n    runtime: skill\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n"
+            "name: streaming-tool-agent\nversion: 0.1.0\nartifacts:\n  - name: local/{TOOL_NAME}\n    version: {TOOL_VERSION}\n    runtime: tool\n  - name: local/{SKILL_NAME}\n    version: {SKILL_VERSION}\n    runtime: skill\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n"
         ),
     )
     .unwrap();

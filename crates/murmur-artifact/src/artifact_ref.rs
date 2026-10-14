@@ -1,8 +1,13 @@
 use thiserror::Error;
 
+use crate::artifact_name::{ArtifactName, ArtifactNameError};
+
+/// What `mur install <ref>` names, short of a path to a `.mur.zip` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactRef {
-    BareName(String),
+    /// `<scope>/<name>`, with no version: whatever the sources serve for it.
+    Name(ArtifactName),
+    /// `github:<owner>/<repo>@<tag>`: every asset of one release.
     GitHub {
         owner: String,
         repo: String,
@@ -26,7 +31,9 @@ impl ArtifactRef {
             return Err(ArtifactRefError::UnknownSourcePrefix(prefix.to_string()));
         }
 
-        Ok(Self::BareName(value.to_string()))
+        ArtifactName::parse(value)
+            .map(Self::Name)
+            .map_err(ArtifactRefError::Name)
     }
 }
 
@@ -38,6 +45,8 @@ pub enum ArtifactRefError {
     InvalidGitHub(String),
     #[error("unsupported artifact source prefix '{0}'")]
     UnknownSourcePrefix(String),
+    #[error(transparent)]
+    Name(ArtifactNameError),
 }
 
 fn parse_github(rest: &str) -> Result<ArtifactRef, ArtifactRefError> {
@@ -65,11 +74,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn artifact_ref_parses_bare_name() {
+    fn artifact_ref_parses_a_full_name() {
         assert_eq!(
-            ArtifactRef::parse("murmur-driver-anthropic").unwrap(),
-            ArtifactRef::BareName("murmur-driver-anthropic".to_string())
+            ArtifactRef::parse("murmur/driver-anthropic").unwrap(),
+            ArtifactRef::Name(ArtifactName::parse("murmur/driver-anthropic").unwrap())
         );
+    }
+
+    #[test]
+    fn artifact_ref_refuses_a_bare_name_with_the_scoped_hint() {
+        let error = ArtifactRef::parse("murmur-driver-anthropic").unwrap_err();
+        let ArtifactRefError::Name(name_error) = error else {
+            panic!("expected a name error, got {error:?}");
+        };
+        assert!(name_error
+            .hint()
+            .unwrap()
+            .contains("murmur/driver-anthropic"));
     }
 
     #[test]

@@ -21,7 +21,7 @@ use predicates::prelude::*;
 use serde_json::json;
 use tempfile::TempDir;
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 /// `--task <text>` reaches the model as the user message, verbatim.

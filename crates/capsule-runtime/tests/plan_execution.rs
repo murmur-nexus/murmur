@@ -57,7 +57,7 @@ fn ctx_gated<'a>(
         session_workdir: workdir,
         capability_policy: CapabilityPolicy {
             shell_allow: vec!["bash".to_string(), "printf".to_string()],
-            spawn_allow: vec!["worker".to_string()],
+            spawn_allow: vec!["local/worker".to_string()],
             ..CapabilityPolicy::default()
         },
         installed_tools: HashSet::from([
@@ -79,7 +79,8 @@ fn ctx_gated<'a>(
     }
 }
 
-/// A store holding the `worker` artifact every capsule step here delegates to.
+/// A store holding the `local/worker` artifact every capsule step here delegates to, by its
+/// bare name `worker`.
 ///
 /// A capsule step reads its child's declared `capabilities.env.allow` out of the packed manifest
 /// before it launches, so the artifact has to resolve even where the child is a stub `mur` that
@@ -89,7 +90,7 @@ fn worker_registry() -> Arc<dyn murmur_artifact::Registry> {
     static REGISTRY: OnceLock<TempDir> = OnceLock::new();
     let root = REGISTRY.get_or_init(|| {
         let dir = tempdir().unwrap();
-        common::publish_capsule(dir.path(), "worker", "0.1.0", "artifacts: []\n", None);
+        common::publish_capsule(dir.path(), "local/worker", "0.1.0", "artifacts: []\n", None);
         dir
     });
     Arc::new(murmur_artifact::LocalRegistry::new(root.path()))
@@ -293,7 +294,7 @@ fn test_capsule_step_sends_objective_as_plain_text() {
     // The spawn call names the capsule to start and nothing about the task; the task itself
     // rides the A2A message that follows.
     let spawned = fake_roost.spawn_request();
-    assert_eq!(spawned["name"], "worker");
+    assert_eq!(spawned["name"], "local/worker");
     assert!(spawned.get("input").is_none(), "{spawned}");
     assert_eq!(fake_roost.sent_text(), "Echo this task");
 }
@@ -692,7 +693,7 @@ fn test_capsule_step_asks_permission_then_launches_the_child_itself() {
         .collect();
     assert_eq!(paths, vec!["/spawn".to_string()]);
     let spawn = fake_roost.request("/spawn");
-    assert_eq!(spawn.body["name"], "worker");
+    assert_eq!(spawn.body["name"], "local/worker");
     assert_eq!(spawn.body["version"], "0.1.0");
     assert_eq!(
         spawn
@@ -708,7 +709,7 @@ fn test_capsule_step_asks_permission_then_launches_the_child_itself() {
     let argv = _stub.recorded("argv.txt");
     let child_dir = dir.path().join(".murmur").join("children");
     assert!(
-        argv.starts_with("run --capsule worker --capsule-version 0.1.0 --workdir "),
+        argv.starts_with("run --capsule local/worker --capsule-version 0.1.0 --workdir "),
         "{argv}"
     );
     assert!(argv.contains(&child_dir.display().to_string()), "{argv}");
@@ -1028,7 +1029,7 @@ impl FakeRoost {
                             200,
                             json!({
                                 "approval": TEST_APPROVAL,
-                                "name": "worker",
+                                "name": "local/worker",
                                 "version": "0.1.0",
                                 "sha256": "0".repeat(64),
                                 "expires_at_ms": 1_u64 << 42,
@@ -2115,7 +2116,7 @@ fn test_a_refused_capsule_step_delegation_is_traced_with_the_daemons_reason() {
     assert_eq!(end["outcome"], "refused", "{end}");
     assert!(end["delegation_id"].is_null(), "{end}");
     assert!(end["child_session_id"].is_null(), "{end}");
-    assert_eq!(end["capsule"], "worker", "{end}");
+    assert_eq!(end["capsule"], "local/worker", "{end}");
     assert_eq!(
         end["reason"].as_str().unwrap(),
         find(&report, "worker").error.as_deref().unwrap(),

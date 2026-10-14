@@ -538,6 +538,8 @@ impl Walk<'_> {
         name: &str,
         version: &str,
     ) -> Result<murmur_artifact::ResolvedArtifact, murmur_artifact::RegistryError> {
+        let name = &murmur_artifact::ArtifactName::parse(name)
+            .map_err(|error| murmur_artifact::RegistryError::InvalidInput(error.to_string()))?;
         let platform = Some(current_platform());
         let resolved = match &self.global_registry {
             Some(global) => FallbackRegistry {
@@ -627,7 +629,7 @@ fn installed_versions(registry: &LocalRegistry, name: &str) -> Vec<String> {
 mod tests {
     use std::io::Write;
 
-    use murmur_artifact::{sha256_hex, ArtifactMeta, RuntimeType};
+    use murmur_artifact::{sha256_hex, ArtifactMeta, ArtifactName, RuntimeType};
     use tempfile::TempDir;
 
     use super::*;
@@ -650,7 +652,7 @@ mod tests {
         LocalRegistry::new(project_dir.join(".murmur").join("artifacts"))
             .store_installed_overwrite(
                 ArtifactMeta {
-                    name: name.to_string(),
+                    name: ArtifactName::parse(name).unwrap(),
                     version: version.to_string(),
                     runtime: RuntimeType::Wasm,
                     artifact_runtime: "capsule".to_string(),
@@ -683,19 +685,19 @@ mod tests {
         let project = TempDir::new().unwrap();
         install_capsule(
             project.path(),
-            "fmt-worker",
+            "local/fmt-worker",
             "0.1.0",
-            "name: fmt-worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [A_KEY, B_KEY]\n  spawn:\n    allow: [fmt-deep]\n",
+            "name: fmt-worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [A_KEY, B_KEY]\n  spawn:\n    allow: [local/fmt-deep]\n",
         );
         install_capsule(
             project.path(),
-            "fmt-deep",
+            "local/fmt-deep",
             "0.2.0",
             "name: fmt-deep\nversion: 0.2.0\ncapabilities:\n  env:\n    allow: [B_KEY]\n",
         );
 
         let root = root_manifest(
-            "name: fmt-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [A_KEY, B_KEY]\n  spawn:\n    allow: [fmt-worker]\n",
+            "name: fmt-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [A_KEY, B_KEY]\n  spawn:\n    allow: [local/fmt-worker]\n",
         );
         let environment = EnvironmentNames::from_names(["A_KEY", "B_KEY"]);
         let report = walk_spawn_closure(&root, project.path(), None, &environment);
@@ -707,7 +709,11 @@ mod tests {
             .collect();
         assert_eq!(
             capsules,
-            ["fmt-root@0.0.1", "fmt-worker@0.1.0", "fmt-deep@0.2.0"]
+            [
+                "fmt-root@0.0.1",
+                "local/fmt-worker@0.1.0",
+                "local/fmt-deep@0.2.0"
+            ]
         );
         assert_eq!(
             report
@@ -719,7 +725,11 @@ mod tests {
         );
         assert_eq!(
             source_refs(&report.variables[1]),
-            ["fmt-root@0.0.1", "fmt-worker@0.1.0", "fmt-deep@0.2.0"]
+            [
+                "fmt-root@0.0.1",
+                "local/fmt-worker@0.1.0",
+                "local/fmt-deep@0.2.0"
+            ]
         );
         assert!(report.variables[1]
             .sources
@@ -737,19 +747,19 @@ mod tests {
         let project = TempDir::new().unwrap();
         install_capsule(
             project.path(),
-            "cyc-worker",
+            "local/cyc-worker",
             "0.1.0",
-            "name: cyc-worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    allow: [cyc-root]\n",
+            "name: cyc-worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    allow: [local/cyc-root]\n",
         );
         install_capsule(
             project.path(),
-            "cyc-root",
+            "local/cyc-root",
             "0.0.1",
-            "name: cyc-root\nversion: 0.0.1\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    allow: [cyc-worker]\n",
+            "name: cyc-root\nversion: 0.0.1\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    allow: [local/cyc-worker]\n",
         );
 
         let root = root_manifest(
-            "name: cyc-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    allow: [cyc-worker]\n",
+            "name: cyc-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    allow: [local/cyc-worker]\n",
         );
         let report = walk_spawn_closure(
             &root,
@@ -758,14 +768,16 @@ mod tests {
             &EnvironmentNames::from_names(["ROOT_KEY"]),
         );
 
+        // The root runs from its manifest under its bare name, so the walk meets the installed
+        // `local/cyc-root` once before the edge back to `local/cyc-worker` closes the loop.
         assert_eq!(report.cycles.len(), 1);
-        assert_eq!(report.cycles[0].parent, "cyc-worker@0.1.0");
-        assert_eq!(report.cycles[0].child, "cyc-root@0.0.1");
+        assert_eq!(report.cycles[0].parent, "local/cyc-root@0.0.1");
+        assert_eq!(report.cycles[0].child, "local/cyc-worker@0.1.0");
         assert_eq!(
             report
                 .inspected
                 .iter()
-                .filter(|capsule| capsule.reference() == "cyc-root@0.0.1")
+                .filter(|capsule| capsule.reference() == "local/cyc-root@0.0.1")
                 .count(),
             1
         );
@@ -776,13 +788,13 @@ mod tests {
         let project = TempDir::new().unwrap();
         install_capsule(
             project.path(),
-            "ref-worker",
+            "local/ref-worker",
             "0.1.0",
             "name: ref-worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [ROOT_KEY, WORKER_ONLY]\n",
         );
 
         let root = root_manifest(
-            "name: ref-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    allow: [ref-worker]\n",
+            "name: ref-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    allow: [local/ref-worker]\n",
         );
         let report = walk_spawn_closure(
             &root,
@@ -794,7 +806,7 @@ mod tests {
         assert_eq!(report.refusals.len(), 1);
         let refusal = &report.refusals[0];
         assert_eq!(refusal.parent, "ref-root@0.0.1");
-        assert_eq!(refusal.child, "ref-worker@0.1.0");
+        assert_eq!(refusal.child, "local/ref-worker@0.1.0");
         assert_eq!(refusal.variable, "WORKER_ONLY");
         assert_eq!(refusal.axis, "capabilities.env.allow");
         assert_eq!(refusal.axis, EnvelopeAxis::EnvAllow.manifest_key());
@@ -805,19 +817,19 @@ mod tests {
         let project = TempDir::new().unwrap();
         install_capsule(
             project.path(),
-            "amb-worker",
+            "local/amb-worker",
             "0.1.0",
             "name: amb-worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [OLD_ONLY]\n",
         );
         install_capsule(
             project.path(),
-            "amb-worker",
+            "local/amb-worker",
             "0.2.0",
             "name: amb-worker\nversion: 0.2.0\ncapabilities:\n  env:\n    allow: [NEW_ONLY]\n",
         );
 
         let root = root_manifest(
-            "name: amb-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    allow: [amb-worker]\n",
+            "name: amb-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    allow: [local/amb-worker]\n",
         );
         let report = walk_spawn_closure(
             &root,
@@ -843,7 +855,7 @@ mod tests {
     fn a_capsule_no_store_holds_is_not_installed_and_stops_that_edge() {
         let project = TempDir::new().unwrap();
         let root = root_manifest(
-            "name: ghost-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  spawn:\n    allow: [no-such-capsule-4c7e05b1]\n",
+            "name: ghost-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  spawn:\n    allow: [local/no-such-capsule-4c7e05b1]\n",
         );
         let report = walk_spawn_closure(
             &root,
@@ -853,7 +865,10 @@ mod tests {
         );
 
         assert_eq!(report.uninspectable.len(), 1);
-        assert_eq!(report.uninspectable[0].name, "no-such-capsule-4c7e05b1");
+        assert_eq!(
+            report.uninspectable[0].name,
+            "local/no-such-capsule-4c7e05b1"
+        );
         assert_eq!(report.uninspectable[0].declared_by, "ghost-root@0.0.1");
         assert!(matches!(
             report.uninspectable[0].reason,
@@ -871,7 +886,7 @@ mod tests {
         LocalRegistry::new(&store)
             .store_installed_overwrite(
                 ArtifactMeta {
-                    name: "torn-worker".to_string(),
+                    name: ArtifactName::parse("local/torn-worker").unwrap(),
                     version: "0.1.0".to_string(),
                     runtime: RuntimeType::Wasm,
                     artifact_runtime: "capsule".to_string(),
@@ -886,7 +901,7 @@ mod tests {
             .unwrap();
 
         let root = root_manifest(
-            "name: torn-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  spawn:\n    allow: [torn-worker]\n",
+            "name: torn-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  spawn:\n    allow: [local/torn-worker]\n",
         );
         let report = walk_spawn_closure(
             &root,
@@ -907,13 +922,13 @@ mod tests {
         let project = TempDir::new().unwrap();
         install_capsule(
             project.path(),
-            "infer-worker",
+            "local/infer-worker",
             "0.1.0",
-            "name: infer-worker\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${PROVIDER_KEY_4C7E05B1}\ninference:\n  transport: http\n  model: some-model\n  driver:\n    artifact: murmur-driver-anthropic\ncapabilities:\n  env:\n    allow: [PROVIDER_KEY_4C7E05B1]\n",
+            "name: infer-worker\nversion: 0.1.0\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${PROVIDER_KEY_4C7E05B1}\ninference:\n  transport: http\n  model: some-model\n  driver:\n    artifact: murmur/driver-anthropic\ncapabilities:\n  env:\n    allow: [PROVIDER_KEY_4C7E05B1]\n",
         );
 
         let root = root_manifest(
-            "name: infer-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [PROVIDER_KEY_4C7E05B1]\n  spawn:\n    allow: [infer-worker]\n",
+            "name: infer-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [PROVIDER_KEY_4C7E05B1]\n  spawn:\n    allow: [local/infer-worker]\n",
         );
         let report = walk_spawn_closure(
             &root,
@@ -929,7 +944,7 @@ mod tests {
         assert!(!variable.set);
         assert_eq!(
             source_refs(variable),
-            ["infer-root@0.0.1", "infer-worker@0.1.0"]
+            ["infer-root@0.0.1", "local/infer-worker@0.1.0"]
         );
     }
 
@@ -938,7 +953,7 @@ mod tests {
     #[test]
     fn a_control_secret_is_not_reported_as_unset() {
         let project = TempDir::new().unwrap();
-        let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\n  - name: card-api\n    version: 0.1.0\n    runtime: tool\n    gateway:\n      endpoint: https://cards.example.com\n      api_key: ${CARD_TOKEN}\ncontrol:\n  secrets: [CARD_TOKEN]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
+        let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\n  - name: local/card-api\n    version: 0.1.0\n    runtime: tool\n    gateway:\n      endpoint: https://cards.example.com\n      api_key: ${CARD_TOKEN}\ncontrol:\n  secrets: [CARD_TOKEN]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur/driver-anthropic\n";
         let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
         assert!(env_requirements_report(
             &root,
@@ -955,7 +970,7 @@ mod tests {
     #[test]
     fn a_solo_capsule_reports_its_unset_reference_and_nothing_else() {
         let project = TempDir::new().unwrap();
-        let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SOLO_REFERENCE_4C7E05B1}\ncapabilities:\n  env:\n    allow: [SOLO_ENV_ALLOW]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
+        let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SOLO_REFERENCE_4C7E05B1}\ncapabilities:\n  env:\n    allow: [SOLO_ENV_ALLOW]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur/driver-anthropic\n";
         let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
 
         let report = env_requirements_report(
@@ -980,7 +995,7 @@ mod tests {
         assert!(!report.variables[0].set);
         assert_eq!(
             report.variables[0].sources[0].manifest_key,
-            "artifacts.murmur-driver-anthropic.gateway.api_key"
+            "artifacts.murmur/driver-anthropic.gateway.api_key"
         );
         assert!(report.refusals.is_empty());
         assert!(report.uninspectable.is_empty());
@@ -992,7 +1007,7 @@ mod tests {
     #[test]
     fn a_solo_capsule_holding_every_reference_reports_nothing() {
         let project = TempDir::new().unwrap();
-        let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SOLO_REFERENCE_4C7E05B1}\ncapabilities:\n  env:\n    allow: [SOLO_ENV_ALLOW]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
+        let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SOLO_REFERENCE_4C7E05B1}\ncapabilities:\n  env:\n    allow: [SOLO_ENV_ALLOW]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur/driver-anthropic\n";
         let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
 
         assert!(env_requirements_report(
@@ -1010,7 +1025,7 @@ mod tests {
     #[test]
     fn a_reference_held_in_global_credentials_is_not_reported_missing() {
         let project = TempDir::new().unwrap();
-        let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SOLO_REFERENCE_4C7E05B1}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
+        let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SOLO_REFERENCE_4C7E05B1}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur/driver-anthropic\n";
         let root = RuntimeManifest::from_yaml_str(yaml).unwrap();
 
         assert!(env_requirements_report(
@@ -1042,11 +1057,11 @@ mod tests {
         let project = TempDir::new().unwrap();
         install_capsule(
             project.path(),
-            "src-worker",
+            "local/src-worker",
             "0.1.0",
             "name: src-worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [SHARED_KEY_4C7E05B1]\n",
         );
-        let yaml = "name: src-root\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SHARED_KEY_4C7E05B1}\ncapabilities:\n  env:\n    allow: [SHARED_KEY_4C7E05B1]\n  spawn:\n    allow: [src-worker]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
+        let yaml = "name: src-root\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SHARED_KEY_4C7E05B1}\ncapabilities:\n  env:\n    allow: [SHARED_KEY_4C7E05B1]\n  spawn:\n    allow: [local/src-worker]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur/driver-anthropic\n";
         let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
 
         let report = env_requirements_report(
@@ -1063,11 +1078,11 @@ mod tests {
         assert_eq!(variable.name, "SHARED_KEY_4C7E05B1");
         assert_eq!(
             source_refs(variable),
-            ["src-root@0.0.1", "src-worker@0.1.0", "src-root@0.0.1"]
+            ["src-root@0.0.1", "local/src-worker@0.1.0", "src-root@0.0.1"]
         );
         assert_eq!(
             variable.sources[2].manifest_key,
-            "artifacts.murmur-driver-anthropic.gateway.api_key"
+            "artifacts.murmur/driver-anthropic.gateway.api_key"
         );
     }
 

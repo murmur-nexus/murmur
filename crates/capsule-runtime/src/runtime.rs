@@ -14,10 +14,10 @@ use murmur_artifact::{
     current_platform, is_credential_shaped_env_name, native_binary_verdict,
     parse_hook_config_from_yaml, parse_tool_implementation_from_yaml, read_lockfile,
     runtime_warning_link, security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask,
-    ApiKeyReference, ArtifactImplementation, ArtifactRuntime, ContextConfig, ConversationMode,
-    HookBinding, InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockOrigin,
-    LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry, RegistryError,
-    RuntimeArtifact, RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME,
+    ApiKeyReference, ArtifactImplementation, ArtifactName, ArtifactRuntime, ContextConfig,
+    ConversationMode, HookBinding, InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig,
+    LockOrigin, LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry,
+    RegistryError, RuntimeArtifact, RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME,
     PACKED_MANIFEST_ENTRY, W_RUN_003, W_RUN_008, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
     W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018,
     W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
@@ -1644,6 +1644,7 @@ pub fn undeclarable_runtime_pin_role(
 /// behind.
 fn refuse_undeclarable_runtime_pin(
     artifact: &ArtifactRequest,
+    full_name: &str,
     version: &str,
     session: &str,
     system_prompt_artifact: Option<&str>,
@@ -1655,7 +1656,7 @@ fn refuse_undeclarable_runtime_pin(
         bound_as_system_prompt,
     ) {
         Some(declared_as) => Err(RuntimeError::RuntimeOriginNotDeclarable {
-            name: artifact.name.clone(),
+            name: full_name.to_string(),
             version: version.to_string(),
             session: session.to_string(),
             declared_as,
@@ -1670,7 +1671,7 @@ fn refuse_undeclarable_runtime_pin(
 /// checks can be layered in the seam between stage and launch without mixing concerns.
 pub fn stage_session(
     registry: Arc<dyn Registry>,
-    request: StageRequest,
+    mut request: StageRequest,
 ) -> Result<StagedSession, RuntimeError> {
     validate_capability_policy(&request.capability_policy)?;
     // Before any registry pull, component compile or workdir creation: if this host cannot
@@ -1747,6 +1748,14 @@ pub fn stage_session(
     // have said about a name nothing can legally publish under: no resolve, no pull and no hash
     // verification happens for a manifest that declares one.
     check_no_reserved_tool_names(
+        request
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.name.as_str()),
+    )?;
+    // The same seam for the same reason: two artifacts that would answer to one tool name are
+    // refused before either is resolved, naming both.
+    crate::tool_names::check_unique_tool_names(
         request
             .artifacts
             .iter()
@@ -1907,7 +1916,11 @@ pub fn stage_session(
     // Start ticking before the first guest runs: `dispatch_stage` below invokes on-stage
     // hooks, which are already subject to the epoch deadline.
     let epoch_ticker = EpochTicker::spawn(&engine);
-    let lock_expectations = request.lock_expectations.map(|entries| {
+    // Every report above names artifacts by full name; from here on the session knows each by its
+    // tool name, and `full_names` takes it back to the full name for the store, the lock and the
+    // identity records.
+    let full_names = crate::tool_names::localize_artifact_names(&mut request);
+    let lock_expectations = request.lock_expectations.take().map(|entries| {
         entries
             .into_iter()
             .map(|entry| (entry.name.clone(), entry))
@@ -1963,17 +1976,18 @@ pub fn stage_session(
             continue;
         }
 
+        let full_name = crate::tool_names::full_name_of(&full_names, &artifact.name).to_string();
         let (resolved_version, expected_hash, origin) = match &lock_expectations {
             Some(expected_by_name) => {
-                let expected = expected_by_name.get(&artifact.name).ok_or_else(|| {
+                let expected = expected_by_name.get(&full_name).ok_or_else(|| {
                     RuntimeError::LockMissingEntry {
-                        name: artifact.name.clone(),
+                        name: full_name.clone(),
                     }
                 })?;
 
                 if artifact.version != expected.resolved_version {
                     return Err(RuntimeError::LockVersionMismatch {
-                        name: artifact.name.clone(),
+                        name: full_name.clone(),
                         requested: artifact.version.clone(),
                         pinned: expected.resolved_version.clone(),
                     });
@@ -1982,6 +1996,7 @@ pub fn stage_session(
                 if let LockOrigin::Runtime { session } = &expected.origin {
                     refuse_undeclarable_runtime_pin(
                         artifact,
+                        &full_name,
                         &expected.resolved_version,
                         session,
                         request
@@ -2004,17 +2019,20 @@ pub fn stage_session(
         // platform-specific file exists, so a WASM artifact (which has no platform file) resolves
         // through the same call that gives a native artifact its platform variant. A store that
         // refused a missing platform match instead would break WASM resolution.
+        let artifact_name = ArtifactName::parse(&full_name).map_err(|error| {
+            RuntimeError::Runtime(format!("cannot resolve artifact '{full_name}': {error}"))
+        })?;
         let resolved = registry
-            .resolve_with_platform(&artifact.name, &resolved_version, Some(current_platform()))
-            .map_err(|err| map_registry_error(&artifact.name, &resolved_version, err))?;
+            .resolve_with_platform(&artifact_name, &resolved_version, Some(current_platform()))
+            .map_err(|err| map_registry_error(&full_name, &resolved_version, err))?;
 
         verify_sha256(
-            &artifact.name,
+            &full_name,
             &resolved_version,
             &resolved.bytes,
             &resolved.sha256,
         )
-        .map_err(|_| RuntimeError::artifact_integrity_failed(&artifact.name, &resolved_version))?;
+        .map_err(|_| RuntimeError::artifact_integrity_failed(&full_name, &resolved_version))?;
 
         // Which platform this payload gets pinned under in `murmur.lock`. A native binary is a
         // different payload per platform, so its hash is only ever the hash for this host; a
@@ -2026,7 +2044,7 @@ pub fn stage_session(
         if let Some(expected) = expected_hash {
             if resolved.sha256 != expected {
                 return Err(RuntimeError::artifact_integrity_failed(
-                    &artifact.name,
+                    &full_name,
                     &resolved_version,
                 ));
             }
@@ -2050,12 +2068,12 @@ pub fn stage_session(
                         // per-artifact grant to it. Say so rather than let the block read
                         // as enforced.
                         warn_on_unenforceable_native_capabilities(
-                            &artifact.name,
+                            &full_name,
                             artifact.capabilities.as_ref(),
                         );
                         // Same hazard, one layer over: config is delivered in the per-artifact
                         // WASI environment, which a host subprocess never has.
-                        warn_on_inert_native_config(&artifact.name, artifact.config.as_ref());
+                        warn_on_inert_native_config(&full_name, artifact.config.as_ref());
                         let binary = extract_native_binary(
                             &artifact.name,
                             &resolved_version,
@@ -2096,7 +2114,7 @@ pub fn stage_session(
                     .flatten();
                 check_driver_interface(
                     "process",
-                    &artifact.name,
+                    &full_name,
                     &resolved_version,
                     contracts.as_ref(),
                 )?;
@@ -2109,8 +2127,10 @@ pub fn stage_session(
                         version: resolved_version.clone(),
                         message: err.to_string(),
                     })?;
+                // Named by its full name: the driver's identity in the harness records and in
+                // every refusal that names it.
                 process_driver = Some((
-                    artifact.name.clone(),
+                    full_name.clone(),
                     resolved_version.clone(),
                     driver_component,
                 ));
@@ -2133,13 +2153,13 @@ pub fn stage_session(
                     .flatten();
                 // Every driver, not only the inference driver: a `switch_driver` target is
                 // dispatched through the same linker, which serves one stream interface.
-                check_stream_interface(&artifact.name, &resolved_version, contracts.as_ref())?;
+                check_stream_interface(&full_name, &resolved_version, contracts.as_ref())?;
                 if let Some((transport, _)) =
                     inference_driver.filter(|(_, name)| *name == artifact.name)
                 {
                     check_driver_interface(
                         transport,
-                        &artifact.name,
+                        &full_name,
                         &resolved_version,
                         contracts.as_ref(),
                     )?;
@@ -2214,13 +2234,13 @@ pub fn stage_session(
         }
 
         resolved_lock_artifacts.push(ResolvedLockArtifact {
-            name: artifact.name.clone(),
+            name: full_name.clone(),
             resolved_version: resolved_version.clone(),
             sha256: resolved.sha256,
             platform: resolved_platform,
         });
         installed_artifacts.push(InstalledArtifactSummary {
-            name: artifact.name.clone(),
+            name: full_name,
             version: resolved_version,
             runtime: artifact.runtime.clone(),
             implementation: artifact_implementation,
@@ -2320,10 +2340,9 @@ pub fn stage_session(
         &spend,
         injected_secrets.as_ref(),
     )?;
-    let driver_choices = request
-        .inference
-        .as_ref()
-        .map(|inference| stage_driver_choices(inference, &gateways, &unresolved_credentials));
+    let driver_choices = request.inference.as_ref().map(|inference| {
+        stage_driver_choices(inference, &full_names, &gateways, &unresolved_credentials)
+    });
     // Built after the gateways, because whether a driver choice can be selected depends on the
     // credential staging left it.
     let control = request
@@ -2424,7 +2443,7 @@ pub fn stage_session(
         write_tool_manifest(&workdir, name, manifest_yaml)?;
     }
 
-    install_native_binaries(&workdir, native_binaries)?;
+    install_native_binaries(&workdir, native_binaries, &full_names)?;
     install_skill_files(&workdir, skill_files)?;
 
     // Write generic manifests for any shell binary not already covered by a custom manifest.
@@ -2540,12 +2559,16 @@ pub fn stage_session(
         workdir,
         accessible_workdir,
         manifest_dir: request.manifest_dir,
+        capsule_artifact: request.capsule_artifact.unwrap_or_else(|| {
+            format!("{}/{}", murmur_artifact::LOCAL_SCOPE, request.capsule_name)
+        }),
         capsule_name: request.capsule_name,
         capsule_version: request.capsule_version,
         capsule_url: String::new(), // set by launch_session after port binding
         resolved_lock_artifacts,
         installed_artifacts,
         inference: request.inference,
+        artifact_full_names: full_names,
         gateways,
         spend,
         control,
@@ -2773,6 +2796,7 @@ fn launch(
     .with_host_bounding(cgroup_scope, workdir_guard);
     let inference_env = session_guest_env(
         staged.inference.as_ref(),
+        &staged.artifact_full_names,
         staged.gateways.inference(),
         staged
             .formation_member
@@ -2781,6 +2805,7 @@ fn launch(
             .as_ref(),
     );
     let gateways = staged.gateways.clone();
+    let session_gateway_records = session_gateways(&gateways, &staged.artifact_full_names);
     let control_for_state = staged.control.clone();
     let spend = Arc::clone(&staged.spend);
 
@@ -3268,7 +3293,7 @@ fn launch(
                 (Some(_), None) => "keyless",
                 (None, None) => "none",
             });
-            trace.set_gateways(session_gateways(&gateways));
+            trace.set_gateways(session_gateway_records);
             trace.set_control(session_control);
             trace.set_inference_choices(session_inference_choices);
             trace.set_tool_refresh(
@@ -4829,7 +4854,7 @@ impl RoostSession {
         let credential = crate::registration::register_session(
             &roost_url,
             &staged.session_id,
-            &staged.capsule_name,
+            &staged.capsule_artifact,
             &staged.capsule_version,
             staged.spawn_grant.as_ref(),
         )?;
@@ -4899,7 +4924,7 @@ impl DelegationReport {
     fn open(staged: &StagedSession) -> Result<Self, RuntimeError> {
         Ok(Self {
             handle: staged.spawner.clone(),
-            capsule_name: staged.capsule_name.clone(),
+            capsule_name: staged.capsule_artifact.clone(),
             capsule_version: staged.capsule_version.clone(),
             session_id: staged.session_id.clone(),
             accessible_workdir: staged.accessible_workdir.clone(),
@@ -6070,11 +6095,12 @@ pub(crate) fn gateway_env_pair(gateway: &CredentialGateway) -> (String, String) 
 /// it.
 fn session_guest_env(
     inference: Option<&murmur_artifact::InferenceConfig>,
+    full_names: &HashMap<String, String>,
     gateway: Option<&Arc<CredentialGateway>>,
     formation_peers: Option<&FormationPeers>,
 ) -> Vec<(String, String)> {
     let mut env = inference
-        .map(|inference| inference_env_pairs(inference, gateway))
+        .map(|inference| inference_env_pairs(inference, full_names, gateway))
         .unwrap_or_default();
     if let Some(peers) = formation_peers {
         let (name, value) = peers.env_pair();
@@ -6090,6 +6116,7 @@ fn session_guest_env(
 /// empty.
 fn inference_env_pairs(
     inference: &murmur_artifact::InferenceConfig,
+    full_names: &HashMap<String, String>,
     gateway: Option<&Arc<CredentialGateway>>,
 ) -> Vec<(String, String)> {
     let mut pairs = vec![
@@ -6112,7 +6139,7 @@ fn inference_env_pairs(
             inference
                 .driver
                 .as_ref()
-                .map(|d| d.artifact.clone())
+                .map(|d| crate::tool_names::full_name_of(full_names, &d.artifact).to_string())
                 .unwrap_or_default(),
         ),
     ];
@@ -6139,7 +6166,12 @@ fn driver_choice_env(
                     .map(|gateway| gateway.guest_endpoint())
                     .unwrap_or_default(),
                 "MURMUR_INFERENCE_MODEL" => choice.model.clone(),
-                "MURMUR_INFERENCE_DRIVER" => choice.driver.clone(),
+                // The session-wide value already names the primary's driver by full name.
+                "MURMUR_INFERENCE_DRIVER"
+                    if choice.name != murmur_artifact::PRIMARY_DRIVER_CHOICE =>
+                {
+                    choice.artifact.clone()
+                }
                 _ => value.clone(),
             };
             (key.clone(), value)
@@ -6838,8 +6870,10 @@ impl manage::Host for CapsuleStoreState {
             })
             .collect();
 
-        let existing: std::collections::HashSet<String> =
-            result.iter().map(|a| a.name.clone()).collect();
+        let existing: std::collections::HashSet<String> = result
+            .iter()
+            .map(|a| murmur_artifact::tool_name_of(&a.name).to_string())
+            .collect();
         for binary in &self.capability_policy.shell_allow {
             if !existing.contains(binary) {
                 result.push(manage::ArtifactSummary {
@@ -6876,6 +6910,8 @@ impl manage::Host for CapsuleStoreState {
                 origin: LockOrigin::Operator,
             };
             &fallback_summary
+        } else if let Err(error) = ArtifactName::parse(&name) {
+            return Err(crate::install_grant::name_refusal(&error));
         } else {
             return Err(format!("artifact '{name}' is not installed"));
         };
@@ -6883,7 +6919,7 @@ impl manage::Host for CapsuleStoreState {
         let manifest_path = self
             .workdir
             .join("tools")
-            .join(&name)
+            .join(murmur_artifact::tool_name_of(&name))
             .join(PACKED_MANIFEST_ENTRY);
 
         read_artifact_info_from_manifest(&manifest_path, summary)
@@ -6896,16 +6932,17 @@ impl manage::Host for CapsuleStoreState {
     fn pull(&mut self, name: String, version: String) -> Result<manage::ArtifactSummary, String> {
         // 0. The capsule's own `capabilities.install` grant, decided on the name and version
         // alone, so a refused request never reaches the registry.
-        if let Some(refusal) =
-            crate::install_grant::refuse_before_resolve(&self.capability_policy, &name, &version)
-        {
-            return Err(refusal);
-        }
+        let artifact_name =
+            crate::install_grant::refuse_before_resolve(&self.capability_policy, &name, &version)?;
+        // The tool name this pull would stage under, refused when another artifact of this
+        // session already answers to it: the model could not tell the two apart.
+        let tool = artifact_name.name().to_string();
+        crate::install_grant::refuse_tool_name_taken(&artifact_name, &self.installed_artifacts)?;
 
         // 1. Resolve + verify against the registry's own self-reported hash.
         let resolved = self
             .registry
-            .resolve_with_platform(&name, &version, Some(current_platform()))
+            .resolve_with_platform(&artifact_name, &version, Some(current_platform()))
             .map_err(|err| format!("failed to resolve {name}@{version}: {err}"))?;
 
         verify_sha256(&name, &version, &resolved.bytes, &resolved.sha256).map_err(|_| {
@@ -6916,7 +6953,7 @@ impl manage::Host for CapsuleStoreState {
         // resolved, and it is decided before the lock is read or anything is written or compiled.
         if let Some(refusal) = crate::install_grant::refuse_after_resolve(
             &self.capability_policy,
-            &name,
+            &artifact_name,
             &resolved.meta,
         ) {
             return Err(refusal);
@@ -6950,7 +6987,7 @@ impl manage::Host for CapsuleStoreState {
         // <workdir>/tools/<name>/ — no disk writes happen before steps 1-2 succeed.
         let manifest_yaml = extract_manifest_yaml(&name, &version, &resolved.bytes)
             .map_err(|err| err.to_string())?;
-        write_tool_manifest(&self.workdir, &name, &manifest_yaml).map_err(|err| err.to_string())?;
+        write_tool_manifest(&self.workdir, &tool, &manifest_yaml).map_err(|err| err.to_string())?;
 
         let (artifact_runtime, implementation, wasm_component) = match resolved.meta.runtime {
             RuntimeType::Wasm => {
@@ -6967,10 +7004,15 @@ impl manage::Host for CapsuleStoreState {
                 )
             }
             RuntimeType::Native => {
-                let binary = extract_native_binary(&name, &version, &resolved.bytes)
+                // The binary is packed at `bin/<bare name>`, the artifact's own `name:`.
+                let binary = extract_native_binary(&tool, &version, &resolved.bytes)
                     .map_err(|err| err.to_string())?;
-                install_native_binaries(&self.workdir, vec![(name.clone(), binary)])
-                    .map_err(|err| err.to_string())?;
+                install_native_binaries(
+                    &self.workdir,
+                    vec![(tool.clone(), binary)],
+                    &HashMap::from([(tool.clone(), name.clone())]),
+                )
+                .map_err(|err| err.to_string())?;
                 (
                     ArtifactRuntime::Tool,
                     Some(ArtifactImplementation::Native),
@@ -6980,7 +7022,7 @@ impl manage::Host for CapsuleStoreState {
             RuntimeType::Static => {
                 let skill_md = extract_skill_md(&name, &version, &resolved.bytes)
                     .map_err(|err| err.to_string())?;
-                install_skill_files(&self.workdir, vec![(name.clone(), skill_md)])
+                install_skill_files(&self.workdir, vec![(tool.clone(), skill_md)])
                     .map_err(|err| err.to_string())?;
                 (ArtifactRuntime::Skill, None, None)
             }
@@ -7002,7 +7044,7 @@ impl manage::Host for CapsuleStoreState {
         // 5. Reflect the pulled artifact in in-memory session state so list()/describe() (and,
         // for WASM tools, invoke()) see it immediately.
         if let Some(component) = wasm_component {
-            self.tool_components.insert(name.clone(), component);
+            self.tool_components.insert(tool.clone(), component);
         }
 
         let summary = InstalledArtifactSummary {
@@ -7021,7 +7063,7 @@ impl manage::Host for CapsuleStoreState {
         } else {
             self.installed_artifacts.push(summary.clone());
         }
-        self.removed_artifacts.remove(&name);
+        self.removed_artifacts.remove(&tool);
         self.installed_generation += 1;
         self.pending_artifact_pulls.push(summary.clone());
 
@@ -7076,14 +7118,15 @@ impl manage::Host for CapsuleStoreState {
 
         // 2. The session. The compiled form under `~/.murmur/compiled` is shared across sessions
         // and stays, so a later pull of the same version is warm.
-        self.tool_components.remove(&name);
+        let tool = murmur_artifact::tool_name_of(&name).to_string();
+        self.tool_components.remove(&tool);
         self.installed_artifacts
             .retain(|artifact| artifact.name != name);
-        self.removed_artifacts.insert(name.clone());
+        self.removed_artifacts.insert(tool.clone());
         self.installed_generation += 1;
 
         // 3. The files: manifest, `skill.md`, native binary.
-        let dir = self.workdir.join("tools").join(&name);
+        let dir = self.workdir.join("tools").join(&tool);
         match fs::remove_dir_all(&dir) {
             Ok(()) => Ok(true),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
@@ -7175,9 +7218,15 @@ fn stage_gateways(
         let Some(declared) = artifact.gateway.as_ref() else {
             continue;
         };
+        let installed = installed_artifacts
+            .iter()
+            .find(|installed| murmur_artifact::tool_name_of(&installed.name) == artifact.name);
+        // What leaves the session names the artifact as the manifest wrote it.
+        let full_name =
+            installed.map_or(artifact.name.as_str(), |installed| installed.name.as_str());
         if declared.api_key.is_none() && !declared.keyless {
             return Err(RuntimeError::GatewayWithoutCredential {
-                name: artifact.name.clone(),
+                name: full_name.to_string(),
                 endpoint: declared.endpoint.clone(),
             });
         }
@@ -7188,13 +7237,14 @@ fn stage_gateways(
             .map(|reference| match (reference, injected) {
                 (ApiKeyReference::Environment(name), Some(secrets)) if secrets.declares(name) => {
                     Ok(Arc::new(GatewayCredential::injected(
-                        &artifact.name,
+                        full_name,
                         name,
                         Arc::clone(secrets),
                     )))
                 }
-                _ => GatewayCredential::resolve(&artifact.name, reference, credentials_file)
-                    .map(Arc::new),
+                _ => {
+                    GatewayCredential::resolve(full_name, reference, credentials_file).map(Arc::new)
+                }
             })
             .transpose();
         let (credential, unresolved_credential) = match resolved {
@@ -7204,18 +7254,15 @@ fn stage_gateways(
             }
             Err(error) => return Err(error),
         };
-        let installed = installed_artifacts
-            .iter()
-            .find(|installed| installed.name == artifact.name);
         if installed.is_some_and(|installed| {
             installed.implementation == Some(ArtifactImplementation::Native)
         }) {
             return Err(RuntimeError::GatewayOnNativeArtifact {
-                name: artifact.name.clone(),
+                name: full_name.to_string(),
             });
         }
         let refuse = |reason: Option<String>| RuntimeError::GatewayArtifactDeclaresNoUpstreamAuth {
-            name: artifact.name.clone(),
+            name: full_name.to_string(),
             version: installed
                 .map(|installed| installed.version.clone())
                 .unwrap_or_else(|| artifact.version.clone()),
@@ -7270,10 +7317,11 @@ pub(crate) struct UnresolvedCredential {
 /// a `W-RUN-003` printed for every choice staged unavailable.
 fn stage_driver_choices(
     inference: &InferenceConfig,
+    full_names: &HashMap<String, String>,
     gateways: &GatewayTable,
     unresolved: &[UnresolvedCredential],
 ) -> crate::driver_choice::DriverChoices {
-    let mut choices = crate::driver_choice::DriverChoices::declared(inference);
+    let mut choices = crate::driver_choice::DriverChoices::declared(inference, full_names);
     let drivers: Vec<String> = choices.iter().map(|choice| choice.driver.clone()).collect();
     for driver in drivers {
         if let Some(missing) = unresolved.iter().find(|entry| entry.driver == driver) {
@@ -7305,7 +7353,7 @@ fn stage_driver_choices(
              nor the environment, so a switch to it will be refused; the session runs on the \
              primary ({})",
             choice.name,
-            choice.driver,
+            choice.artifact,
             choice.model,
             choice.unresolved_credential.as_deref().unwrap_or_default(),
             murmur_artifact::runtime_warning_link(W_RUN_003)
@@ -7314,8 +7362,8 @@ fn stage_driver_choices(
     choices
 }
 
-/// `session_start.inference_choices`: every driver choice, the primary first, or nothing for a
-/// capsule with no alternates. Never a key.
+/// `session_start.inference_choices`: every driver choice, the primary first, each driver by its
+/// full name, or nothing for a capsule with no alternates. Never a key.
 fn session_inference_choices(
     choices: &crate::driver_choice::DriverChoices,
 ) -> Vec<crate::trace::SessionInferenceChoice> {
@@ -7326,7 +7374,7 @@ fn session_inference_choices(
         .iter()
         .map(|choice| crate::trace::SessionInferenceChoice {
             name: choice.name.clone(),
-            driver: choice.driver.clone(),
+            driver: choice.artifact.clone(),
             model: choice.model.clone(),
             credential_source: choice.credential_source,
             available: choice.staged(),
@@ -7334,13 +7382,16 @@ fn session_inference_choices(
         .collect()
 }
 
-/// `session_start.gateways`: every gateway of the session, the inference gateway first. Never a
-/// key.
-fn session_gateways(gateways: &GatewayTable) -> Vec<crate::trace::SessionGateway> {
+/// `session_start.gateways`: every gateway of the session, the inference gateway first, each by
+/// its artifact's full name. Never a key.
+fn session_gateways(
+    gateways: &GatewayTable,
+    full_names: &HashMap<String, String>,
+) -> Vec<crate::trace::SessionGateway> {
     gateways
         .iter()
         .map(|gateway| crate::trace::SessionGateway {
-            artifact: gateway.artifact.clone(),
+            artifact: crate::tool_names::full_name_of(full_names, &gateway.artifact).to_string(),
             host: gateway.upstream_host().to_string(),
             credential_source: gateway
                 .credential()
@@ -7780,7 +7831,7 @@ impl CapsuleStoreState {
 pub(crate) fn artifact_origin_in(installed: &[InstalledArtifactSummary], name: &str) -> LockOrigin {
     installed
         .iter()
-        .find(|artifact| artifact.name == name)
+        .find(|artifact| murmur_artifact::tool_name_of(&artifact.name) == name)
         .map_or(LockOrigin::Operator, |artifact| artifact.origin.clone())
 }
 
@@ -8391,8 +8442,13 @@ impl CapsuleStoreState {
         input: murmur::tool::run::ToolInput,
     ) -> Result<murmur::tool::run::ToolResult, String> {
         let args = parse_tool_json_input(DELEGATE_TASK_TOOL, &input)?;
+        // The model names a capsule by the bare part `delegate-task`'s schema offers; mur-roost
+        // and the trace are asked about the full name it stands for.
         let request = crate::delegation_plane::DelegationRequest {
-            capsule: required_string_arg(DELEGATE_TASK_TOOL, &args, "capsule")?,
+            capsule: crate::tool_names::spawn_target(
+                &self.capability_policy.spawn_allow,
+                &required_string_arg(DELEGATE_TASK_TOOL, &args, "capsule")?,
+            ),
             version: required_string_arg(DELEGATE_TASK_TOOL, &args, "version")?,
             task: required_string_arg(DELEGATE_TASK_TOOL, &args, "task")?,
         };
@@ -8533,7 +8589,7 @@ impl CapsuleStoreState {
 
         let summary = format!(
             "Delegated to {}@{}: {}",
-            result.capsule,
+            murmur_artifact::tool_name_of(&result.capsule),
             result.version,
             status.as_str()
         );
@@ -9629,7 +9685,7 @@ pub(crate) fn is_reserved_tool_name(name: &str) -> bool {
     RESERVED_TOOL_NAMES.contains(&name)
 }
 
-/// Refuses the first declared artifact name that collides with a runtime-provided tool.
+/// Refuses the first declared artifact whose tool name collides with a runtime-provided tool.
 ///
 /// Called from `stage_session` ahead of the artifact loop, and from `mur run` ahead of its
 /// installed-artifact pre-flight, so the operator is told about the collision rather than about a
@@ -9639,7 +9695,7 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     for name in names {
-        if is_reserved_tool_name(name) {
+        if is_reserved_tool_name(murmur_artifact::tool_name_of(name)) {
             return Err(RuntimeError::ReservedToolName {
                 name: name.to_string(),
             });
@@ -9776,7 +9832,8 @@ fn write_tool_manifest_unchecked(
     })
 }
 
-/// Write each native tool's binary to `<workdir>/tools/<name>/<name>`, executable.
+/// Write each native tool's binary to `<workdir>/tools/<name>/<name>`, executable. `name` is the
+/// tool name; a refusal names the artifact by its full name from `full_names`.
 ///
 /// Every image is classified against this host before the first one is written. A batch holding
 /// one unrunnable binary installs none of them: a refusal that had already written two of three
@@ -9784,6 +9841,7 @@ fn write_tool_manifest_unchecked(
 fn install_native_binaries(
     workdir: &Path,
     native_binaries: Vec<(String, Vec<u8>)>,
+    full_names: &HashMap<String, String>,
 ) -> Result<(), RuntimeError> {
     let host_platform = current_platform();
     for (name, bytes) in &native_binaries {
@@ -9791,7 +9849,7 @@ fn install_native_binaries(
             native_binary_verdict(bytes, host_platform)
         {
             return Err(RuntimeError::NativeBinaryPlatformMismatch {
-                name: name.clone(),
+                name: crate::tool_names::full_name_of(full_names, name).to_string(),
                 binary_platform: binary_platform.to_string(),
                 host_platform: host_platform.to_string(),
             });
@@ -10047,7 +10105,12 @@ pub(crate) const DELEGATE_TASK_TOOL: &str = "delegate-task";
 /// identical on every launch for a given `spawn_allow`, because it sits in the cached prompt
 /// prefix.
 fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
-    let allowed = serde_json::to_string(spawn_allow).unwrap_or_else(|_| "[]".to_string());
+    // The bare parts, which the manifest parser keeps unique: the model never sees a scope.
+    let bare: Vec<&str> = spawn_allow
+        .iter()
+        .map(|entry| murmur_artifact::tool_name_of(entry))
+        .collect();
+    let allowed = serde_json::to_string(&bare).unwrap_or_else(|_| "[]".to_string());
     let schema = format!(
         r#"{{"type":"object","properties":{{"capsule":{{"type":"string","enum":{allowed}}},"version":{{"type":"string"}},"task":{{"type":"string"}}}},"required":["capsule","version","task"]}}"#
     );
@@ -10089,7 +10152,7 @@ fn delegate_task_result_data(
     let mut data = serde_json::json!({
         "delegation_id": result.delegation_id,
         "session_id": result.session_id,
-        "capsule": result.capsule,
+        "capsule": murmur_artifact::tool_name_of(&result.capsule),
         "version": result.version,
         "status": result.status.as_str(),
     });
@@ -11530,8 +11593,10 @@ mod tests {
     /// what stops it naming a capsule the operator never granted.
     #[test]
     fn the_delegation_manifest_carries_the_granted_names_and_nothing_else() {
-        let manifest =
-            super::delegate_task_tool_manifest(&["worker".to_string(), "reviewer".to_string()]);
+        let manifest = super::delegate_task_tool_manifest(&[
+            "local/worker".to_string(),
+            "ana/reviewer".to_string(),
+        ]);
         let parsed: serde_yaml::Value =
             serde_yaml::from_str(&manifest).expect("the generated manifest is YAML");
         assert_eq!(parsed["name"].as_str(), Some("delegate-task"));
@@ -11548,7 +11613,7 @@ mod tests {
         assert_eq!(
             schema["properties"]["capsule"]["enum"],
             serde_json::json!(["worker", "reviewer"]),
-            "the enum is the capsule's own spawn.allow, in declaration order"
+            "the enum is the bare parts of the capsule's own spawn.allow, in declaration order"
         );
         // No URL, no credential, no workdir, no capability: the runtime composes all four.
         for absent in ["roost", "url", "credential", "approval", "workdir"] {
@@ -11560,6 +11625,48 @@ mod tests {
                 "'{absent}' must not be an argument the agent supplies"
             );
         }
+    }
+
+    /// The model never sees a scope: `delegate-task` offers each `capabilities.spawn.allow` entry
+    /// by its bare part.
+    #[test]
+    fn delegate_task_enum_offers_the_bare_parts_of_spawn_allow() {
+        let manifest = super::delegate_task_tool_manifest(&["local/worker".to_string()]);
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&manifest).expect("the generated manifest is YAML");
+        let schema: serde_json::Value =
+            serde_json::from_str(parsed["input_schema"].as_str().expect("a schema string"))
+                .expect("the schema is JSON");
+        assert_eq!(
+            schema["properties"]["capsule"]["enum"],
+            serde_json::json!(["worker"])
+        );
+        assert!(!manifest.contains("local/"), "{manifest}");
+    }
+
+    /// The result names the capsule the way the model named it, though the delegation ran the
+    /// full entry `spawn_target` mapped it to.
+    #[test]
+    fn delegate_task_result_reports_the_bare_capsule_name() {
+        use crate::delegation_plane::{DelegationResult, DelegationStatus};
+
+        let result = DelegationResult {
+            delegation_id: "dlg_started".to_string(),
+            session_id: "ses_started".to_string(),
+            capsule: "local/worker".to_string(),
+            version: "0.1.0".to_string(),
+            status: DelegationStatus::Started,
+            output: String::new(),
+            result_path: None,
+            truncated: false,
+            child_workdir: Some("delegations/dlg_started".to_string()),
+        };
+        let data = super::delegate_task_result_data(&result);
+        assert_eq!(data["capsule"], "worker");
+        assert_eq!(
+            crate::tool_names::spawn_target(&["local/worker".to_string()], "worker"),
+            "local/worker"
+        );
     }
 
     /// A capsule that declares no `capabilities.spawn.allow` gets no file, so the tool is absent
@@ -11741,12 +11848,14 @@ mod tests {
 
     // ── switch-driver's synthetic manifest ───────────────────────────────────
 
+    /// The choices a session staged from `murmur/driver-anthropic` with a `murmur/driver-openai`
+    /// alternate holds: named by tool name, each carrying its full name.
     fn switchable_choices() -> crate::driver_choice::DriverChoices {
         let mut inference = murmur_artifact::InferenceConfig {
             transport: "http".to_string(),
             model: "claude-sonnet-4-5".to_string(),
             driver: Some(murmur_artifact::InferenceDriver {
-                artifact: "murmur-driver-anthropic".to_string(),
+                artifact: "driver-anthropic".to_string(),
                 config: None,
             }),
             command: None,
@@ -11765,9 +11874,19 @@ mod tests {
             .push(murmur_artifact::InferenceAlternate {
                 name: "gpt".to_string(),
                 model: "gpt-5: \"preview\"".to_string(),
-                driver: "murmur-driver-openai".to_string(),
+                driver: "driver-openai".to_string(),
             });
-        crate::driver_choice::DriverChoices::declared(&inference)
+        let full_names = HashMap::from([
+            (
+                "driver-anthropic".to_string(),
+                "murmur/driver-anthropic".to_string(),
+            ),
+            (
+                "driver-openai".to_string(),
+                "murmur/driver-openai".to_string(),
+            ),
+        ]);
+        crate::driver_choice::DriverChoices::declared(&inference, &full_names)
     }
 
     /// The tool's contract: one `driver` argument naming a declared choice, and a description
@@ -11790,12 +11909,11 @@ mod tests {
         );
         let description = parsed["description"].as_str().expect("a description");
         assert!(
-            description
-                .contains("primary (model claude-sonnet-4-5, driver murmur-driver-anthropic)"),
+            description.contains("primary (model claude-sonnet-4-5, driver driver-anthropic)"),
             "{description}"
         );
         assert!(
-            description.contains("gpt (model gpt-5: \"preview\", driver murmur-driver-openai)"),
+            description.contains("gpt (model gpt-5: \"preview\", driver driver-openai)"),
             "{description}"
         );
     }
@@ -11832,12 +11950,12 @@ mod tests {
             ),
             (
                 "MURMUR_INFERENCE_DRIVER".to_string(),
-                "murmur-driver-anthropic".to_string(),
+                "murmur/driver-anthropic".to_string(),
             ),
             ("MURMUR_SESSION_ID".to_string(), "ses_x".to_string()),
         ];
         let gateway = test_gateway(
-            "murmur-driver-openai",
+            "driver-openai",
             "http://127.0.0.1:2/openai/v1",
             "k",
             GatewayMetering::Inference(Arc::new(SpendMeter::unlimited())),
@@ -11858,13 +11976,13 @@ mod tests {
                 ),
                 (
                     "MURMUR_INFERENCE_DRIVER".to_string(),
-                    "murmur-driver-openai".to_string()
+                    "murmur/driver-openai".to_string()
                 ),
                 ("MURMUR_SESSION_ID".to_string(), "ses_x".to_string()),
             ]
         );
         let primary_gateway = Arc::new(test_gateway(
-            "murmur-driver-anthropic",
+            "driver-anthropic",
             "http://127.0.0.1:1/v1",
             "k",
             GatewayMetering::Inference(Arc::new(SpendMeter::unlimited())),
@@ -11882,42 +12000,36 @@ mod tests {
         let mut table = GatewayTable::default();
         let meter = Arc::new(SpendMeter::unlimited());
         table.insert(test_gateway(
-            "murmur-driver-anthropic",
+            "driver-anthropic",
             "http://127.0.0.1:1",
             "k",
             GatewayMetering::Inference(Arc::clone(&meter)),
         ));
         table.insert_alternate(test_gateway(
-            "murmur-driver-openai",
+            "driver-openai",
             "http://127.0.0.1:2",
             "k",
             GatewayMetering::Inference(meter),
         ));
+        assert_eq!(table.inference().unwrap().artifact, "driver-anthropic");
         assert_eq!(
-            table.inference().unwrap().artifact,
-            "murmur-driver-anthropic"
+            table.inference_for("driver-anthropic").unwrap().artifact,
+            "driver-anthropic"
         );
-        assert_eq!(
-            table
-                .inference_for("murmur-driver-anthropic")
-                .unwrap()
-                .artifact,
-            "murmur-driver-anthropic"
-        );
-        let openai = table.inference_for("murmur-driver-openai").unwrap();
+        let openai = table.inference_for("driver-openai").unwrap();
         assert!(openai.is_metered());
-        assert!(table.for_artifact("murmur-driver-openai").is_none());
-        assert!(table.for_artifact("murmur-driver-anthropic").is_none());
+        assert!(table.for_artifact("driver-openai").is_none());
+        assert!(table.for_artifact("driver-anthropic").is_none());
         assert!(table.inference_for("web-search").is_none());
-        let listed: Vec<(String, bool)> = super::session_gateways(&table)
+        let listed: Vec<(String, bool)> = super::session_gateways(&table, &HashMap::new())
             .into_iter()
             .map(|gateway| (gateway.artifact, gateway.metered))
             .collect();
         assert_eq!(
             listed,
             vec![
-                ("murmur-driver-anthropic".to_string(), true),
-                ("murmur-driver-openai".to_string(), true)
+                ("driver-anthropic".to_string(), true),
+                ("driver-openai".to_string(), true)
             ]
         );
     }
@@ -12034,6 +12146,91 @@ mod tests {
             .expect("a capsule with no collision is untouched");
     }
 
+    /// A minimal staging request declaring `names` as registry tools, with its workdir at
+    /// `project/workdir`.
+    fn tool_name_stage_request(project: &Path, names: &[&str]) -> StageRequest {
+        StageRequest {
+            artifacts: names
+                .iter()
+                .map(|name| crate::types::ArtifactRequest {
+                    name: name.to_string(),
+                    version: "1.0.0".to_string(),
+                    runtime: ArtifactRuntime::Tool,
+                    source: None,
+                    on_overflow: Default::default(),
+                    capabilities: None,
+                    config: None,
+                    gateway: None,
+                })
+                .collect(),
+            allowlisted_tools: names.iter().map(|name| name.to_string()).collect(),
+            inference: None,
+            workdir: Some(project.join("workdir")),
+            ..local_source_skill_agent_request(project)
+        }
+    }
+
+    /// Two scopes cannot both serve one tool name: staging refuses the pair naming both, before
+    /// the registry is read and before the workdir exists, so an empty store answers the same.
+    #[test]
+    fn stage_session_unique_tool_names_refuses_two_scopes_before_any_resolve() {
+        let project = tempfile::tempdir().unwrap();
+        let empty_store = tempfile::tempdir().unwrap();
+        let request =
+            tool_name_stage_request(project.path(), &["murmur/tool-editor", "ana/tool-editor"]);
+
+        let error = match stage_session(
+            Arc::new(murmur_artifact::LocalRegistry::new(empty_store.path())),
+            request,
+        ) {
+            Ok(_) => panic!("two artifacts sharing a tool name must be refused"),
+            Err(error) => error,
+        };
+
+        match &error {
+            RuntimeError::DuplicateToolName {
+                first,
+                second,
+                tool,
+            } => {
+                assert_eq!(first, "murmur/tool-editor");
+                assert_eq!(second, "ana/tool-editor");
+                assert_eq!(tool, "tool-editor");
+            }
+            other => panic!("expected DuplicateToolName, got {other:?}"),
+        }
+        assert!(!project.path().join("workdir").exists());
+        assert_eq!(fs::read_dir(empty_store.path()).unwrap().count(), 0);
+    }
+
+    /// A reserved name is refused on the bare part, whatever the scope.
+    #[test]
+    fn stage_session_reserved_tool_name_refuses_a_scoped_delegate_task() {
+        let project = tempfile::tempdir().unwrap();
+        let empty_store = tempfile::tempdir().unwrap();
+        let request = tool_name_stage_request(project.path(), &["murmur/delegate-task"]);
+
+        let error = match stage_session(
+            Arc::new(murmur_artifact::LocalRegistry::new(empty_store.path())),
+            request,
+        ) {
+            Ok(_) => panic!("a reserved tool name must be refused"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(&error, RuntimeError::ReservedToolName { name } if name == "murmur/delegate-task"),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("'murmur/delegate-task'"), "{message}");
+        assert!(
+            message.contains("has the tool name 'delegate-task'"),
+            "{message}"
+        );
+        assert!(!project.path().join("workdir").exists());
+    }
+
     // ── task-start-event.context-window ──────────────────────────────────────
 
     /// The manifest body every `context:` case below shares, minus the `context:` block.
@@ -12041,7 +12238,7 @@ mod tests {
 version: 0.1.0
 runtime: capsule
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -12052,7 +12249,7 @@ inference:
   model: claude-opus-4-5
   max_tokens: 4096
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#;
 
     /// The `context-window` the three `HookEvent::TaskStart` sites in `launch_session`
@@ -12894,12 +13091,12 @@ inference:
         impl Registry for FakeRegistry {
             fn resolve(
                 &self,
-                name: &str,
+                name: &ArtifactName,
                 version: &str,
             ) -> Result<ResolvedArtifact, RegistryError> {
                 Ok(ResolvedArtifact {
                     meta: ArtifactMeta {
-                        name: name.to_string(),
+                        name: name.clone(),
                         version: version.to_string(),
                         runtime: RuntimeType::Wasm,
                         artifact_runtime: "wasm".to_string(),
@@ -12933,9 +13130,10 @@ inference:
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
             capsule_version: String::new(),
+            capsule_artifact: None,
             capsule_component_bytes: b"not-a-component".to_vec(),
             artifacts: vec![crate::types::ArtifactRequest {
-                name: "echo-tool".to_string(),
+                name: "local/echo-tool".to_string(),
                 version: "0.0.1".to_string(),
                 runtime: ArtifactRuntime::Tool,
                 source: None,
@@ -12944,7 +13142,7 @@ inference:
                 config: None,
                 gateway: None,
             }],
-            allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
+            allowlisted_tools: HashSet::from(["local/echo-tool".to_string()]),
             lock_expectations: None,
             capability_policy: CapabilityPolicy::default(),
             inference: None,
@@ -12980,7 +13178,7 @@ inference:
         assert!(matches!(
             err,
             RuntimeError::ArtifactIntegrityFailed { name, version }
-                if name == "echo-tool" && version == "0.0.1"
+                if name == "local/echo-tool" && version == "0.0.1"
         ));
     }
 
@@ -12991,12 +13189,12 @@ inference:
         impl Registry for FakeRegistry {
             fn resolve(
                 &self,
-                name: &str,
+                name: &ArtifactName,
                 version: &str,
             ) -> Result<ResolvedArtifact, RegistryError> {
                 Ok(ResolvedArtifact {
                     meta: ArtifactMeta {
-                        name: name.to_string(),
+                        name: name.clone(),
                         version: version.to_string(),
                         runtime: RuntimeType::Wasm,
                         artifact_runtime: "wasm".to_string(),
@@ -13030,9 +13228,10 @@ inference:
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
             capsule_version: String::new(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: vec![crate::types::ArtifactRequest {
-                name: "echo-tool".to_string(),
+                name: "local/echo-tool".to_string(),
                 version: "0.0.1".to_string(),
                 runtime: ArtifactRuntime::Tool,
                 source: None,
@@ -13041,9 +13240,9 @@ inference:
                 config: None,
                 gateway: None,
             }],
-            allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
+            allowlisted_tools: HashSet::from(["local/echo-tool".to_string()]),
             lock_expectations: Some(vec![crate::types::LockExpectation {
-                name: "echo-tool".to_string(),
+                name: "local/echo-tool".to_string(),
                 resolved_version: "0.0.1".to_string(),
                 sha256: "different".to_string(),
                 origin: LockOrigin::Operator,
@@ -13082,7 +13281,7 @@ inference:
         assert!(matches!(
             err,
             RuntimeError::ArtifactIntegrityFailed { name, version }
-                if name == "echo-tool" && version == "0.0.1"
+                if name == "local/echo-tool" && version == "0.0.1"
         ));
     }
 
@@ -13093,7 +13292,7 @@ inference:
         impl Registry for FakeRegistry {
             fn resolve(
                 &self,
-                _name: &str,
+                _name: &ArtifactName,
                 _version: &str,
             ) -> Result<ResolvedArtifact, RegistryError> {
                 unreachable!("lock validation should fail before any registry resolve call")
@@ -13118,6 +13317,7 @@ inference:
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
             capsule_version: String::new(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: vec![crate::types::ArtifactRequest {
                 name: "echo-tool".to_string(),
@@ -13180,7 +13380,7 @@ inference:
         impl Registry for FakeRegistry {
             fn resolve(
                 &self,
-                _name: &str,
+                _name: &ArtifactName,
                 _version: &str,
             ) -> Result<ResolvedArtifact, RegistryError> {
                 unreachable!("version mismatch should fail before registry resolve")
@@ -13205,6 +13405,7 @@ inference:
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
             capsule_version: String::new(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: vec![crate::types::ArtifactRequest {
                 name: "echo-tool".to_string(),
@@ -13328,7 +13529,11 @@ inference:
     fn stage_session_refuses_an_env_allow_entry_the_backstop_strips() {
         struct PanicRegistry;
         impl Registry for PanicRegistry {
-            fn resolve(&self, _: &str, _: &str) -> Result<ResolvedArtifact, RegistryError> {
+            fn resolve(
+                &self,
+                _: &ArtifactName,
+                _: &str,
+            ) -> Result<ResolvedArtifact, RegistryError> {
                 panic!("the refusal must precede registry resolution");
             }
             fn publish(
@@ -13349,6 +13554,7 @@ inference:
             manifest_dir: project.path().to_path_buf(),
             capsule_name: "test".to_string(),
             capsule_version: "0.0.1".to_string(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: vec![crate::types::ArtifactRequest {
                 name: "some-tool".to_string(),
@@ -13406,7 +13612,7 @@ inference:
     /// Panics on every call: a local-source skill is staged without consulting the registry.
     struct LocalSourceOnlyRegistry;
     impl Registry for LocalSourceOnlyRegistry {
-        fn resolve(&self, _: &str, _: &str) -> Result<ResolvedArtifact, RegistryError> {
+        fn resolve(&self, _: &ArtifactName, _: &str) -> Result<ResolvedArtifact, RegistryError> {
             panic!("registry must not be called for a local-source skill");
         }
         fn publish(
@@ -13454,6 +13660,7 @@ inference:
             manifest_dir: project.to_path_buf(),
             capsule_name: "test".to_string(),
             capsule_version: "0.0.1".to_string(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: vec![crate::types::ArtifactRequest {
                 name: "my-skill".to_string(),
@@ -13602,14 +13809,20 @@ inference:
         let sha256 = registry.sha256.clone();
         let project = tempfile::tempdir().unwrap();
         let mut artifacts = local_source_skill_agent_request(project.path()).artifacts;
-        artifacts.push(registry_artifact("declared-skill", ArtifactRuntime::Skill));
-        artifacts.push(registry_artifact("pulled-skill", ArtifactRuntime::Skill));
+        artifacts.push(registry_artifact(
+            "local/declared-skill",
+            ArtifactRuntime::Skill,
+        ));
+        artifacts.push(registry_artifact(
+            "local/pulled-skill",
+            ArtifactRuntime::Skill,
+        ));
         let request = origin_stage_request(
             project.path(),
             artifacts,
             vec![
-                expectation("declared-skill", &sha256, LockOrigin::Operator),
-                expectation("pulled-skill", &sha256, pulled_by("ses_earlier")),
+                expectation("local/declared-skill", &sha256, LockOrigin::Operator),
+                expectation("local/pulled-skill", &sha256, pulled_by("ses_earlier")),
             ],
         );
 
@@ -13625,14 +13838,14 @@ inference:
                 .clone()
         };
         assert_eq!(origin_of("my-skill"), LockOrigin::Operator);
-        assert_eq!(origin_of("declared-skill"), LockOrigin::Operator);
-        assert_eq!(origin_of("pulled-skill"), pulled_by("ses_earlier"));
+        assert_eq!(origin_of("local/declared-skill"), LockOrigin::Operator);
+        assert_eq!(origin_of("local/pulled-skill"), pulled_by("ses_earlier"));
     }
 
     /// Panics on every call: a runtime-origin refusal precedes registry resolution.
     struct RefusalPrecedesRegistry;
     impl Registry for RefusalPrecedesRegistry {
-        fn resolve(&self, _: &str, _: &str) -> Result<ResolvedArtifact, RegistryError> {
+        fn resolve(&self, _: &ArtifactName, _: &str) -> Result<ResolvedArtifact, RegistryError> {
             panic!("the runtime-origin refusal must precede registry resolution");
         }
         fn publish(
@@ -13783,7 +13996,9 @@ inference:
         sha256: String,
     }
 
-    const PULLED_SKILL: &str = "pulled-style";
+    const PULLED_SKILL: &str = "local/pulled-style";
+    /// The tool name `PULLED_SKILL` is dispatched by.
+    const PULLED_SKILL_TOOL: &str = "pulled-style";
     const PULLED_SKILL_MD: &str = "# Pulled style\nAlways answer in French.\n";
 
     impl RuntimeOriginProject {
@@ -13797,14 +14012,15 @@ inference:
             let bytes = zip_with_files(&[
                 (
                     PACKED_MANIFEST_ENTRY,
-                    format!("name: {PULLED_SKILL}\nversion: 1.0.0\nruntime: skill\n").as_bytes(),
+                    format!("name: {PULLED_SKILL_TOOL}\nversion: 1.0.0\nruntime: skill\n")
+                        .as_bytes(),
                 ),
                 ("skill.md", PULLED_SKILL_MD.as_bytes()),
             ]);
             let sha256 = registry
                 .publish(
                     ArtifactMeta {
-                        name: PULLED_SKILL.to_string(),
+                        name: ArtifactName::parse(PULLED_SKILL).unwrap(),
                         version: "1.0.0".to_string(),
                         runtime: RuntimeType::Static,
                         artifact_runtime: "skill".to_string(),
@@ -13826,7 +14042,7 @@ inference:
             }
         }
 
-        /// A session granted `capabilities.install.skill: [pulled-style]`.
+        /// A session granted `capabilities.install.skill: [local/pulled-style]`.
         fn session(&self) -> CapsuleStoreState {
             let mut state = build_test_state(
                 self.registry.clone(),
@@ -13875,7 +14091,7 @@ inference:
         let pulled_by = LockOrigin::Runtime {
             session: "ses_test".to_string(),
         };
-        assert_eq!(state.artifact_origin(PULLED_SKILL), pulled_by);
+        assert_eq!(state.artifact_origin(PULLED_SKILL_TOOL), pulled_by);
         assert_eq!(state.pending_artifact_pulls.len(), 1);
         assert_eq!(state.pending_artifact_pulls[0].name, PULLED_SKILL);
         assert_eq!(state.pending_artifact_pulls[0].origin, pulled_by);
@@ -13905,9 +14121,12 @@ inference:
 
         pull_skill(&mut state).unwrap();
 
-        assert_eq!(state.artifact_origin(PULLED_SKILL), LockOrigin::Operator);
+        assert_eq!(
+            state.artifact_origin(PULLED_SKILL_TOOL),
+            LockOrigin::Operator
+        );
         assert_eq!(state.pending_artifact_pulls[0].origin, LockOrigin::Operator);
-        let outcome = call_skill(&state, PULLED_SKILL);
+        let outcome = call_skill(&state, PULLED_SKILL_TOOL);
         assert_eq!(outcome.fence_source, None);
         assert_eq!(outcome.result.data.as_deref(), Some(PULLED_SKILL_MD));
     }
@@ -13927,9 +14146,13 @@ inference:
         assert!(ungranted.pending_artifact_pulls.is_empty());
 
         let mut state = project.session();
-        grant_install(&mut state, &["missing-skill"], &[]);
-        manage::Host::pull(&mut state, "missing-skill".to_string(), "1.0.0".to_string())
-            .unwrap_err();
+        grant_install(&mut state, &["local/missing-skill"], &[]);
+        manage::Host::pull(
+            &mut state,
+            "local/missing-skill".to_string(),
+            "1.0.0".to_string(),
+        )
+        .unwrap_err();
         assert!(state.pending_artifact_pulls.is_empty());
         assert!(state.installed_artifacts.is_empty());
     }
@@ -14017,7 +14240,7 @@ inference:
         )
         .unwrap();
 
-        let runtime = call_skill(&state, PULLED_SKILL);
+        let runtime = call_skill(&state, PULLED_SKILL_TOOL);
         assert!(runtime.is_skill);
         assert_eq!(runtime.fence_source.as_deref(), Some("skill:pulled-style"));
         assert_eq!(
@@ -14098,7 +14321,7 @@ inference:
     fn resolved_payload(bytes: Vec<u8>) -> ResolvedArtifact {
         ResolvedArtifact {
             meta: ArtifactMeta {
-                name: "demo-tool".to_string(),
+                name: ArtifactName::parse("local/demo-tool").unwrap(),
                 version: "0.1.0".to_string(),
                 runtime: RuntimeType::Wasm,
                 artifact_runtime: "wasm".to_string(),
@@ -14437,10 +14660,14 @@ inference:
     }
 
     impl Registry for FakeSkillRegistry {
-        fn resolve(&self, name: &str, version: &str) -> Result<ResolvedArtifact, RegistryError> {
+        fn resolve(
+            &self,
+            name: &ArtifactName,
+            version: &str,
+        ) -> Result<ResolvedArtifact, RegistryError> {
             Ok(ResolvedArtifact {
                 meta: ArtifactMeta {
-                    name: name.to_string(),
+                    name: name.clone(),
                     version: version.to_string(),
                     runtime: self.runtime,
                     artifact_runtime: match self.runtime {
@@ -14490,11 +14717,15 @@ inference:
         let lock_path = project.path().join("murmur.lock");
 
         let mut state = build_test_state(registry, workdir.clone(), lock_path.clone());
-        grant_install(&mut state, &["my-skill"], &[]);
+        grant_install(&mut state, &["local/my-skill"], &[]);
 
-        let summary = manage::Host::pull(&mut state, "my-skill".to_string(), "1.0.0".to_string())
-            .expect("pull should succeed");
-        assert_eq!(summary.name, "my-skill");
+        let summary = manage::Host::pull(
+            &mut state,
+            "local/my-skill".to_string(),
+            "1.0.0".to_string(),
+        )
+        .expect("pull should succeed");
+        assert_eq!(summary.name, "local/my-skill");
         assert_eq!(summary.version, "1.0.0");
 
         let installed_skill_md = workdir.join("tools").join("my-skill").join("skill.md");
@@ -14504,12 +14735,12 @@ inference:
         assert!(state
             .installed_artifacts
             .iter()
-            .any(|a| a.name == "my-skill" && a.version == "1.0.0"));
+            .any(|a| a.name == "local/my-skill" && a.version == "1.0.0"));
 
         let lock = read_lockfile(&lock_path).expect("murmur.lock should have been written");
         let entry = lock
-            .artifact_for("my-skill")
-            .expect("lock entry for my-skill");
+            .artifact_for("local/my-skill")
+            .expect("lock entry for local/my-skill");
         assert_eq!(entry.resolved_version, "1.0.0");
         assert_eq!(entry.sha256.any.as_deref().unwrap(), expected_sha256);
     }
@@ -14538,13 +14769,17 @@ inference:
         .unwrap();
         let lock_path = project.path().join("murmur.lock");
         let mut state = build_test_state(registry, workdir.clone(), lock_path);
-        grant_install(&mut state, &["aaa-late-skill"], &[]);
+        grant_install(&mut state, &["local/aaa-late-skill"], &[]);
         (project, workdir, state)
     }
 
     fn pull_late_skill(state: &mut CapsuleStoreState) {
-        manage::Host::pull(state, "aaa-late-skill".to_string(), "1.0.0".to_string())
-            .expect("pull should succeed");
+        manage::Host::pull(
+            state,
+            "local/aaa-late-skill".to_string(),
+            "1.0.0".to_string(),
+        )
+        .expect("pull should succeed");
     }
 
     /// The payload a call carrying `tools` sends, as `run_agent_loop` builds it.
@@ -15346,12 +15581,12 @@ inference:
         impl Registry for TamperedRegistry {
             fn resolve(
                 &self,
-                name: &str,
+                name: &ArtifactName,
                 version: &str,
             ) -> Result<ResolvedArtifact, RegistryError> {
                 Ok(ResolvedArtifact {
                     meta: ArtifactMeta {
-                        name: name.to_string(),
+                        name: name.clone(),
                         version: version.to_string(),
                         runtime: RuntimeType::Static,
                         artifact_runtime: "skill".to_string(),
@@ -15389,10 +15624,14 @@ inference:
             workdir.clone(),
             lock_path.clone(),
         );
-        grant_install(&mut state, &["evil-tool"], &[]);
+        grant_install(&mut state, &["local/evil-tool"], &[]);
 
-        let err = manage::Host::pull(&mut state, "evil-tool".to_string(), "1.0.0".to_string())
-            .expect_err("tampered bytes must be rejected");
+        let err = manage::Host::pull(
+            &mut state,
+            "local/evil-tool".to_string(),
+            "1.0.0".to_string(),
+        )
+        .expect_err("tampered bytes must be rejected");
         assert!(err.contains("integrity"), "unexpected error message: {err}");
 
         assert!(!workdir.join("tools").join("evil-tool").exists());
@@ -15423,20 +15662,25 @@ inference:
             &MurmurLock {
                 lock_version: LOCK_VERSION,
                 artifacts: vec![LockedArtifact {
-                    name: "my-skill".to_string(),
+                    name: "local/my-skill".to_string(),
                     resolved_version: "1.0.0".to_string(),
                     sha256: LockedSha256::any("pinned-hash-from-earlier-pull".to_string()),
                     origin: LockOrigin::Operator,
+                    owner_id: None,
                 }],
             },
         )
         .unwrap();
 
         let mut state = build_test_state(registry, workdir.clone(), lock_path.clone());
-        grant_install(&mut state, &["my-skill"], &[]);
+        grant_install(&mut state, &["local/my-skill"], &[]);
 
-        let err = manage::Host::pull(&mut state, "my-skill".to_string(), "2.0.0".to_string())
-            .expect_err("lock conflict must be rejected");
+        let err = manage::Host::pull(
+            &mut state,
+            "local/my-skill".to_string(),
+            "2.0.0".to_string(),
+        )
+        .expect_err("lock conflict must be rejected");
         assert!(
             err.contains("murmur.lock conflict"),
             "unexpected error message: {err}"
@@ -15451,7 +15695,7 @@ inference:
 
         // Lock must be left exactly as it was.
         let lock = read_lockfile(&lock_path).unwrap();
-        let entry = lock.artifact_for("my-skill").unwrap();
+        let entry = lock.artifact_for("local/my-skill").unwrap();
         assert_eq!(entry.resolved_version, "1.0.0");
         assert_eq!(
             entry.sha256.any.as_deref().unwrap(),
@@ -15459,12 +15703,16 @@ inference:
         );
     }
 
-    /// A static skill `.mur.zip` for `name` at 1.0.0, and the registry serving it.
+    /// A static skill `.mur.zip` for full name `name` at 1.0.0, and the registry serving it.
     fn pulled_skill_registry(name: &str) -> FakeSkillRegistry {
         FakeSkillRegistry::new(zip_with_files(&[
             (
                 PACKED_MANIFEST_ENTRY,
-                format!("name: {name}\nversion: 1.0.0\nruntime: skill\n").as_bytes(),
+                format!(
+                    "name: {}\nversion: 1.0.0\nruntime: skill\n",
+                    murmur_artifact::tool_name_of(name)
+                )
+                .as_bytes(),
             ),
             ("skill.md", b"# guidance"),
         ]))
@@ -15472,29 +15720,36 @@ inference:
 
     #[test]
     fn a_runtime_pull_records_runtime_origin_and_its_session() {
-        let registry = Arc::new(pulled_skill_registry("my-skill"));
+        let registry = Arc::new(pulled_skill_registry("local/my-skill"));
         let project = tempfile::tempdir().unwrap();
         let workdir = project.path().join("workdir");
         fs::create_dir_all(&workdir).unwrap();
         let lock_path = project.path().join("murmur.lock");
         let mut state = build_test_state(registry, workdir, lock_path.clone());
-        grant_install(&mut state, &["my-skill"], &[]);
+        grant_install(&mut state, &["local/my-skill"], &[]);
 
-        manage::Host::pull(&mut state, "my-skill".to_string(), "1.0.0".to_string())
-            .expect("pull should succeed");
+        manage::Host::pull(
+            &mut state,
+            "local/my-skill".to_string(),
+            "1.0.0".to_string(),
+        )
+        .expect("pull should succeed");
 
         let expected = LockOrigin::Runtime {
             session: "ses_test".to_string(),
         };
         let lock = read_lockfile(&lock_path).unwrap();
-        assert_eq!(lock.artifact_for("my-skill").unwrap().origin, expected);
+        assert_eq!(
+            lock.artifact_for("local/my-skill").unwrap().origin,
+            expected
+        );
         let raw = fs::read_to_string(&lock_path).unwrap();
         assert!(raw.contains("origin: runtime"), "{raw}");
         assert!(raw.contains("session: ses_test"), "{raw}");
         let installed = state
             .installed_artifacts
             .iter()
-            .find(|artifact| artifact.name == "my-skill")
+            .find(|artifact| artifact.name == "local/my-skill")
             .unwrap();
         assert_eq!(installed.origin, expected);
     }
@@ -15502,9 +15757,9 @@ inference:
     #[test]
     fn a_runtime_pull_never_changes_an_existing_entrys_origin() {
         for (name, pinned_origin) in [
-            ("operator-skill", LockOrigin::Operator),
+            ("local/operator-skill", LockOrigin::Operator),
             (
-                "earlier-skill",
+                "local/earlier-skill",
                 LockOrigin::Runtime {
                     session: "ses_earlier".to_string(),
                 },
@@ -15516,6 +15771,7 @@ inference:
                 resolved_version: "1.0.0".to_string(),
                 sha256: LockedSha256::any(registry.sha256.clone()),
                 origin: pinned_origin.clone(),
+                owner_id: None,
             };
             let project = tempfile::tempdir().unwrap();
             let workdir = project.path().join("workdir");
@@ -15551,7 +15807,7 @@ inference:
     // Every test here pulls a WASM artifact, so each runs its inner half under a scratch `HOME`:
     // the cache lives in `$HOME/.murmur/compiled`, and no test may touch the real one.
 
-    const PULLED_WASM_TOOL: &str = "wasm-tool";
+    const PULLED_WASM_TOOL: &str = "local/wasm-tool";
 
     /// Runs `runtime::tests::<inner>` in a child process whose `HOME` is a fresh tempdir.
     fn pull_under_scratch_home(inner: &str) {
@@ -15568,11 +15824,13 @@ inference:
     }
 
     /// A `.mur.zip` for tool `name` whose root component is `root_wasm`.
+    /// A WASM tool zip packed under the bare part of `name`, which may be a full name.
     pub(crate) fn wasm_tool_zip(name: &str, root_wasm: &[u8]) -> Vec<u8> {
+        let packed = murmur_artifact::tool_name_of(name);
         zip_with_files(&[
             (
                 PACKED_MANIFEST_ENTRY,
-                format!("name: {name}\nversion: 1.0.0\nruntime: tool\n").as_bytes(),
+                format!("name: {packed}\nversion: 1.0.0\nruntime: tool\n").as_bytes(),
             ),
             ("tool.wasm", root_wasm),
         ])
@@ -15646,7 +15904,10 @@ inference:
 
     /// What `state` registered for `wasm-tool` exports.
     fn pulled_exports(state: &CapsuleStoreState) -> Vec<String> {
-        export_names(&state.engine, &state.tool_components[PULLED_WASM_TOOL])
+        export_names(
+            &state.engine,
+            &state.tool_components[murmur_artifact::tool_name_of(PULLED_WASM_TOOL)],
+        )
     }
 
     pub(crate) fn scratch_compiled_dir() -> PathBuf {
@@ -16105,11 +16366,11 @@ inference:
         )));
 
         let mut state = project.session();
-        let err = pull(&mut state, "bad-tool").expect_err("the pull fails to compile");
+        let err = pull(&mut state, "local/bad-tool").expect_err("the pull fails to compile");
         assert_eq!(
             err,
             format!(
-                "failed to compile pulled component 'bad-tool': {}",
+                "failed to compile pulled component 'local/bad-tool': {}",
                 Component::new(&build_engine().unwrap(), bad_wasm)
                     .expect_err("Component::new fails")
             )
@@ -16156,6 +16417,7 @@ inference:
                     resolved_version: "0.9.0".to_string(),
                     sha256: LockedSha256::any("pinned-hash-from-earlier-pull".to_string()),
                     origin: LockOrigin::Operator,
+                    owner_id: None,
                 }],
             },
         )
@@ -16210,14 +16472,16 @@ inference:
 
         // The list the agent or script root, every tool and driver store, and a hook's driver are
         // built from — for an agent session and for a script session alike.
-        let agent = session_guest_env(Some(&http_inference()), None, Some(&peers));
+        let agent = session_guest_env(Some(&http_inference()), &HashMap::new(), None, Some(&peers));
         assert_eq!(agent.last(), Some(&pair), "{agent:?}");
         assert!(agent.iter().any(|(key, _)| key == "MURMUR_INFERENCE_MODEL"));
-        let script = session_guest_env(None, None, Some(&peers));
+        let script = session_guest_env(None, &HashMap::new(), None, Some(&peers));
         assert_eq!(script, vec![pair.clone()]);
-        assert!(session_guest_env(Some(&http_inference()), None, None)
-            .iter()
-            .all(|(key, _)| key != name));
+        assert!(
+            session_guest_env(Some(&http_inference()), &HashMap::new(), None, None)
+                .iter()
+                .all(|(key, _)| key != name)
+        );
         assert!(native_env(&agent).iter().all(|(key, _)| key != name));
         assert!(native_env(&agent)
             .iter()
@@ -17515,15 +17779,15 @@ inference:
             GatewayMetering::Unmetered,
         );
         for pairs in [
-            inference_env_pairs(&inference, Some(&gateway)),
-            inference_env_pairs(&inference, None),
+            inference_env_pairs(&inference, &HashMap::new(), Some(&gateway)),
+            inference_env_pairs(&inference, &HashMap::new(), None),
             vec![gateway_env_pair(&gateway), gateway_env_pair(&tool)],
         ] {
             assert!(pairs
                 .iter()
                 .all(|(name, value)| name != "MURMUR_INFERENCE_API_KEY" && !value.contains(KEY)));
         }
-        let pairs = inference_env_pairs(&inference, Some(&gateway));
+        let pairs = inference_env_pairs(&inference, &HashMap::new(), Some(&gateway));
         assert!(pairs.contains(&(
             "MURMUR_INFERENCE_ENDPOINT".to_string(),
             "http://127.0.0.1:9/v1".to_string()
@@ -17546,25 +17810,29 @@ inference:
             "example.com".to_string(),
         ];
         let artifacts = murmur_artifact::RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+            "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur/driver-anthropic\n    \
              version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: \
-             https://api.anthropic.com\n      api_key: test-key\n  - name: web-search\n    version: 0.1.0\n    \
+             https://api.anthropic.com\n      api_key: test-key\n  - name: local/web-search\n    version: 0.1.0\n    \
              capabilities:\n      network:\n        allow: [api.tavily.com, api.anthropic.com]\n    \
              gateway:\n      endpoint: https://api.tavily.com\n      api_key: test-key\ninference:\n  model: m\n  \
-             driver:\n    artifact: murmur-driver-anthropic\n",
+             driver:\n    artifact: murmur/driver-anthropic\n",
         )
         .expect("fixture parses")
         .artifacts;
         assert_eq!(
             gateway_endpoint_allow_entries(&allow, &artifacts),
             vec![
-                ("api.anthropic.com", None, vec!["murmur-driver-anthropic"]),
+                ("api.anthropic.com", None, vec!["murmur/driver-anthropic"]),
                 (
                     "https://api.anthropic.com",
                     None,
-                    vec!["murmur-driver-anthropic"]
+                    vec!["murmur/driver-anthropic"]
                 ),
-                ("api.tavily.com", Some("web-search"), vec!["web-search"]),
+                (
+                    "api.tavily.com",
+                    Some("local/web-search"),
+                    vec!["local/web-search"],
+                ),
             ],
             "an artifact's own entry is matched against its own gateway only"
         );

@@ -76,7 +76,7 @@ impl Door {
                 "name: waiting-agent\nversion: 0.1.0\n\
                  artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    \
                  runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      \
-                 api_key: test-key\n  - name: {TOOL_NAME}\n    version: 0.1.0\n    \
+                 api_key: test-key\n  - name: {TOOL_ARTIFACT}\n    version: 0.1.0\n    \
                  runtime: tool\n\
                  capabilities:\n  network:\n    allow:\n      - {endpoint}\n\
                  inference:\n  transport: http\n  model: test-model\n  driver:\n    \
@@ -199,7 +199,10 @@ fn user(message_id: &str, parts: Value) -> Value {
     json!({"messageId": message_id, "role": "ROLE_USER", "parts": parts})
 }
 
+/// The tool name the model calls, which is also the name the artifact is packed under.
 const TOOL_NAME: &str = "request-input-tool";
+/// The tool's full name once installed from its `.mur.zip` file.
+const TOOL_ARTIFACT: &str = "local/request-input-tool";
 
 /// The `request-input-tool` fixture packed as an artifact in `dir`.
 fn request_input_tool(dir: &Path) -> PathBuf {

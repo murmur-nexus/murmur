@@ -17,7 +17,7 @@ Each one appears only when the declaration in the second column is present.
 | One per shell binary | [`capabilities.shell.allow`](manifest.md#shell-allow) | Runs that binary as a subprocess in the accessible workdir |
 | `share-file` | [`exports.peer_files`](manifest.md#field-exports-peer-files) | Mints a [peer-file handle](resource-plane.md#peer-plane) for one file under the declared export root |
 | `fetch-peer-file` | [`capabilities.peer_fetch`](manifest.md#field-peer-fetch) | Redeems a handle a peer sent and stores the file in this capsule's workdir |
-| `delegate-task` | [`capabilities.spawn.allow`](manifest.md#field-capabilities) | Hands one task to one sub-capsule and returns as soon as it is running and holding it; once the turn ends, the task waits and continues with the outcome — see [The delegation tool](roost-api.md#the-delegation-tool) |
+| `delegate-task` | [`capabilities.spawn.allow`](manifest.md#field-capabilities) | Hands one task to one sub-capsule, named by the bare part of its `spawn.allow` entry, and returns as soon as it is running and holding it; once the turn ends, the task waits and continues with the outcome — see [The delegation tool](roost-api.md#the-delegation-tool) |
 | `submit-plan` | [`capabilities.plan.submit`](manifest.md#field-capabilities) | Runs one plan of steps against this session's own tools and returns every step's result — see [Plans](plans.md) |
 | `switch-driver` | [`control.agent_settings: [inference.driver]`](manifest.md#field-control) | Selects the [driver choice](manifest.md#inference-alternates) the agent's next inference call is served by — see [`switch-driver`](#switch-driver) |
 | `call-member` | A [`reachability`](roster.md#reachability) rule in the formation's `roster.yaml` that lets this member call another | Hands one task to another formation member and returns at once, started or busy; the answer arrives later in the same task — see [`call-member`](#call-member) |
@@ -54,16 +54,17 @@ are additionally checked against that list again at dispatch.
 
 `share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member`
 and `end-without-answer` are reserved.
-A capsule declaring an artifact under one of them is refused at staging, before any artifact is
-pulled, with [`E-CAP-013`](diagnostics.md#e-cap-013). The same refusal covers an in-session
-`manage.pull()` of that name.
+The check is made on an artifact's tool name, the part of its full name after the `/`, so a
+capsule declaring `murmur/delegate-task` or `ana/delegate-task` is refused at staging, before any
+artifact is pulled, with [`E-CAP-013`](diagnostics.md#e-cap-013). The same refusal covers an
+in-session `manage.pull()` of such a name.
 
 A name is reserved whether or not the capsule declares the grant that would provide the tool, so
 adding or removing a capability never changes whether a manifest is accepted.
 
 Shell binary names are not reserved. They come from `capabilities.shell.allow`, which is the
 operator's own list, so there is no fixed set to reserve — and a capsule may declare both an
-artifact named `bash` and `bash` in its shell allowlist. Staging writes the artifact's manifest
+artifact whose bare name is `bash`, such as `local/bash`, and `bash` in its shell allowlist. Staging writes the artifact's manifest
 first and the shell manifest yields to it, so the inventory describes the artifact.
 
 Dispatch resolves such a pair by [precedence](../concepts/tools.md#tool-dispatch): a native

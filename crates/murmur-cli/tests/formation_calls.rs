@@ -176,9 +176,16 @@ impl Project {
         let mut roster = String::from("roster_version: 1\nmembers:\n");
         for member in &members {
             let body = body(member);
-            publish_to_store(&store, member.name, "0.1.0", "capsule", &body, None);
+            publish_to_store(
+                &store,
+                &format!("local/{}", member.name),
+                "0.1.0",
+                "capsule",
+                &body,
+                None,
+            );
             roster.push_str(&format!(
-                "  - name: {name}\n    capsule: {name}\n    version: 0.1.0\n{entry}",
+                "  - name: {name}\n    capsule: local/{name}\n    version: 0.1.0\n{entry}",
                 name = member.name,
                 entry = if member.entry {
                     "    entry: true\n"
@@ -1516,7 +1523,7 @@ fn one_member_twice_in_one_response_starts_once() {
 // ── A process lead ────────────────────────────────────────────────────────────
 
 /// The fixture process driver, run by every `transport: process` lead here.
-const PROCESS_DRIVER: &str = "fixture-process-driver";
+const PROCESS_DRIVER: &str = "local/fixture-process-driver";
 
 /// A `transport: process` lead whose harness calls worker through the bridged `call-member`
 /// and ends its turn. The bridged result carries the runtime's note after its fence; the answer

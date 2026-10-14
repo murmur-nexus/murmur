@@ -2273,7 +2273,7 @@ mod tests {
     fn a_state_store_is_reported_and_moves_no_other_field() {
         let policy = sample_policy();
         let stores = vec![StateStoreReport {
-            artifact: "murmur-tool-corpus".to_string(),
+            artifact: "murmur/tool-corpus".to_string(),
             store: "shey".to_string(),
             host_path: "/home/dev/.murmur/state/shey".to_string(),
         }];
@@ -2323,7 +2323,7 @@ mod tests {
         // Rendered under the grants, one line per declaring artifact; `<none>` when empty.
         assert!(with
             .render()
-            .contains("- murmur-tool-corpus: shey -> /home/dev/.murmur/state/shey"));
+            .contains("- murmur/tool-corpus: shey -> /home/dev/.murmur/state/shey"));
         assert!(without.render().contains("state stores: <none>"));
 
         // Always an array in JSON, never skipped: an absent key means an older runtime, not a
@@ -2333,7 +2333,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&with).unwrap()["state_stores"],
             serde_json::json!([{
-                "artifact": "murmur-tool-corpus",
+                "artifact": "murmur/tool-corpus",
                 "store": "shey",
                 "host_path": "/home/dev/.murmur/state/shey",
             }])

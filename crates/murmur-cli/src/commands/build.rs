@@ -95,7 +95,11 @@ fn resolve_skill_args(skill_arg: Option<&str>, source: &Path) -> (Option<String>
         // --skill with no value: source is the input path, name inferred
         None => (None, source.to_path_buf()),
         Some(val) => {
-            if looks_like_path(val) {
+            // `ana/x` reads like a relative path, but when no such path exists it is a scoped
+            // name, which `build_skill_artifact` refuses as one.
+            let scoped_name =
+                !Path::new(val).exists() && murmur_artifact::ArtifactName::parse(val).is_ok();
+            if looks_like_path(val) && !scoped_name {
                 // Looks like a path: treat as input, infer name
                 (None, PathBuf::from(val))
             } else {
@@ -314,6 +318,13 @@ pub(crate) fn build_skill_artifact(
     } else {
         infer_name_from_path(input)
     };
+    if artifact_name.contains('/') {
+        return Err(CliError::from(
+            murmur_artifact::BuildError::ScopedArtifactName {
+                name: artifact_name,
+            },
+        ));
+    }
 
     let manifest_bytes = match manifest_bytes_opt {
         Some(bytes) => {

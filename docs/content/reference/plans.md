@@ -34,7 +34,7 @@ places no dependency between them.
 | `id` | string | yes | Unique within the plan. Other steps name it in `depends_on` and in `$<id>.output` / `$<id>.status` references |
 | `tool` | string | see notes | A tool in this capsule's inventory. Exactly one of `tool`, `shell` or `capsule` per step |
 | `shell` | string | see notes | A command line whose first word is a binary in [`capabilities.shell.allow`](manifest.md#shell-allow). Split into words by the runtime, not by a shell — quote a pipeline as an argument (`bash -c '…'`) |
-| `capsule` | string | see notes | A capsule name in [`capabilities.spawn.allow`](manifest.md#field-capabilities), run as a sub-capsule through `mur-roost` — see [Roost API](roost-api.md). The version is `0.1.0` |
+| `capsule` | string | see notes | The bare name of a capsule in [`capabilities.spawn.allow`](manifest.md#field-capabilities) — `worker` for `local/worker` — run as a sub-capsule through `mur-roost` — see [Roost API](roost-api.md). The version is `0.1.0` |
 | `input` | object \| string | no | Handed to the step. A tool step receives it as its JSON input; a capsule step's input is the task text and must be a string or `{"objective": "<text>"}`; a shell step ignores it |
 | `depends_on` | list<string> | no | Step ids that must settle before this one is dispatched. Omitted, the step is ready immediately |
 | `if` | string | no | Condition deciding whether the step runs — see [Conditions](#conditions). A false condition settles the step as `skipped` without dispatching it |

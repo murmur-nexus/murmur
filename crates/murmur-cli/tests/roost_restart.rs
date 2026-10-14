@@ -25,12 +25,12 @@ use mur_roost::{authority::SpawnAuthority, RequestHeaders, State};
 use serde_json::Value;
 use tempfile::TempDir;
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
-/// A capsule that may spawn `worker`, so a registered root can delegate.
+/// A capsule that may spawn `local/worker`, so a registered root can delegate.
 const ROOT_BODY: &str = "artifacts: []\ncapabilities:\n  network:\n    allow: \
-                         [registry.internal]\n  spawn:\n    allow: [worker]\n";
+                         [registry.internal]\n  spawn:\n    allow: [local/worker]\n";
 const WORKER_BODY: &str = "artifacts: []\ncapabilities:\n  network:\n    allow: \
                            [registry.internal]\n";
 
@@ -166,8 +166,10 @@ fn pid_is_held(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Publishes a capsule into the daemon's registry under `name@0.1.0`.
+/// Publishes a capsule into the daemon's registry under the full name `name@0.1.0`; its packed
+/// manifest carries the bare part.
 fn publish(registry: &Path, name: &str, body: &str) {
+    let bare = murmur_artifact::tool_name_of(name);
     let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
     {
         use std::io::Write;
@@ -175,7 +177,7 @@ fn publish(registry: &Path, name: &str, body: &str) {
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
         zip.start_file("murmur.yaml", options).unwrap();
-        zip.write_all(format!("name: {name}\nversion: 0.1.0\n{body}").as_bytes())
+        zip.write_all(format!("name: {bare}\nversion: 0.1.0\n{body}").as_bytes())
             .unwrap();
         zip.start_file("capsule.wasm", options).unwrap();
         zip.write_all(
@@ -187,7 +189,7 @@ fn publish(registry: &Path, name: &str, body: &str) {
     murmur_artifact::Registry::publish(
         &murmur_artifact::LocalRegistry::new(registry),
         murmur_artifact::ArtifactMeta {
-            name: name.to_string(),
+            name: murmur_artifact::ArtifactName::parse(name).unwrap(),
             version: "0.1.0".to_string(),
             runtime: murmur_artifact::RuntimeType::Wasm,
             artifact_runtime: "capsule".to_string(),
@@ -231,7 +233,7 @@ fn spawn_worker(state: &Arc<State>, credential: &str) -> (u16, Value) {
         "POST",
         "/spawn",
         &[(SPAWN_CREDENTIAL_HEADER, credential)],
-        r#"{"name":"worker","version":"0.1.0"}"#,
+        r#"{"name":"local/worker","version":"0.1.0"}"#,
     )
 }
 
@@ -259,12 +261,12 @@ fn a_restarted_daemon_counts_running_capsules_until_they_exit() {
     assert_eq!(report.counted, 2, "{report:?}");
 
     let registry = tempfile::tempdir().unwrap();
-    publish(registry.path(), "root", ROOT_BODY);
-    publish(registry.path(), "worker", WORKER_BODY);
+    publish(registry.path(), "local/root", ROOT_BODY);
+    publish(registry.path(), "local/worker", WORKER_BODY);
     let state = Arc::new(State {
         jobs: Arc::new(Mutex::new(HashMap::new())),
         registry_path: registry.path().to_path_buf(),
-        spawn_allow: vec!["root".to_string()],
+        spawn_allow: vec!["local/root".to_string()],
         max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
         max_concurrent: mur_roost::bounds::DEFAULT_MAX_CONCURRENT,
         max_live_capsules: 3,
@@ -277,7 +279,7 @@ fn a_restarted_daemon_counts_running_capsules_until_they_exit() {
         "POST",
         "/register",
         &[],
-        &format!(r#"{{"session_id":"{root}","name":"root","version":"0.1.0"}}"#),
+        &format!(r#"{{"session_id":"{root}","name":"local/root","version":"0.1.0"}}"#),
     );
     assert_eq!(status, 200, "{body}");
     let credential = body["credential"].as_str().unwrap().to_string();

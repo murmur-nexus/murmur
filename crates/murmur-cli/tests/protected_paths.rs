@@ -19,7 +19,7 @@ use capsule_runtime::launch_session;
 use predicates::prelude::*;
 use serde_json::{json, Value};
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 /// The protected file every scenario aims at, and its original bytes. That the bytes are
@@ -139,7 +139,7 @@ fn create_manifest(project_dir: &Path, endpoint: &str, capsule: &Capsule<'_>) ->
     let tool_yaml: String = capsule
         .tools
         .iter()
-        .map(|(name, _)| format!("  - name: {name}\n    version: 0.1.0\n    runtime: tool\n"))
+        .map(|(name, _)| format!("  - name: local/{name}\n    version: 0.1.0\n    runtime: tool\n"))
         .collect();
     let shell_yaml: String = capsule
         .shell_allow
@@ -1171,7 +1171,7 @@ fn staging_project_with_tool(
             "name: staging-capsule\n\
              version: 0.1.0\n\
              artifacts:\n\
-             \x20 - name: {tool}\n\
+             \x20 - name: local/{tool}\n\
              \x20   version: 0.1.0\n\
              \x20   runtime: tool\n\
              {capabilities}"

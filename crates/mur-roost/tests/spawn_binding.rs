@@ -17,7 +17,7 @@ mod common;
 use capsule_runtime::SPAWN_APPROVAL_HEADER;
 use common::{Daemon, IDENTITY_REFUSAL};
 use mur_roost::{authority::now_ms, authority::SpawnAuthority, JobStatus};
-use murmur_artifact::{LocalRegistry, Registry};
+use murmur_artifact::{ArtifactName, LocalRegistry, Registry};
 
 /// The session every delegating case asks as. Its envelope lists `worker-a`, `worker-b` and
 /// `worker-c`.
@@ -38,19 +38,19 @@ const POOR_SESSION: &str = "ses_poo00000000000000000000000000poor";
 fn a_delegated_spawn_registers_the_artifact_its_approval_names() {
     let daemon = Daemon::new();
     daemon.seed_caller(CALLER_SESSION);
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let credential = daemon.credential(CALLER_SESSION);
 
-    let permission = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let permission = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
     assert_eq!(permission.status, 200, "{:?}", permission.body);
     let approval = permission.body["approval"].as_str().unwrap();
     assert!(approval.starts_with("msa1."), "{approval}");
-    assert_eq!(permission.body["name"], "worker-a");
+    assert_eq!(permission.body["name"], "local/worker-a");
     assert_eq!(permission.body["version"], "0.1.0");
     assert_eq!(
         permission.body["sha256"].as_str().unwrap(),
         LocalRegistry::new(daemon.registry.path())
-            .resolve("worker-a", "0.1.0")
+            .resolve(&ArtifactName::parse("local/worker-a").unwrap(), "0.1.0")
             .unwrap()
             .sha256
     );
@@ -65,7 +65,7 @@ fn a_delegated_spawn_registers_the_artifact_its_approval_names() {
     assert_eq!(daemon.session_ids(), vec![CALLER_SESSION]);
 
     let child = daemon.child_session_id();
-    let response = daemon.register(&child, "worker-a", "0.1.0", Some(approval));
+    let response = daemon.register(&child, "local/worker-a", "0.1.0", Some(approval));
 
     assert_eq!(response.status, 200, "{:?}", response.body);
     assert!(response.body["credential"]
@@ -91,11 +91,11 @@ fn asking_without_a_credential_is_refused() {
     daemon.seed_caller(RICH_SESSION);
     daemon.seed(
         POOR_SESSION,
-        "capabilities:\n  spawn:\n    allow: [worker-c]\n",
+        "capabilities:\n  spawn:\n    allow: [local/worker-c]\n",
     );
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
 
-    let response = daemon.permission("worker-a", "0.1.0", None);
+    let response = daemon.permission("local/worker-a", "0.1.0", None);
 
     assert_eq!(response.status, 403);
     assert_eq!(response.error(), IDENTITY_REFUSAL);
@@ -115,12 +115,12 @@ fn asking_without_a_credential_is_refused() {
 fn a_refusal_does_not_say_whether_a_session_exists() {
     let daemon = Daemon::new();
     daemon.seed_caller(CALLER_SESSION);
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
 
     // A credential this daemon did not mint: well-formed, and unverifiable.
     let foreign_authority = SpawnAuthority::generate().unwrap();
     let known = daemon.permission(
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(
             &foreign_authority
@@ -129,7 +129,7 @@ fn a_refusal_does_not_say_whether_a_session_exists() {
         ),
     );
     let unknown = daemon.permission(
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(
             &foreign_authority
@@ -145,13 +145,13 @@ fn a_refusal_does_not_say_whether_a_session_exists() {
     // session it names.
     let foreign_known = daemon.register(
         &daemon.child_session_id(),
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(
             &foreign_authority
                 .mint_approval_token(
                     CALLER_SESSION,
-                    "worker-a",
+                    "local/worker-a",
                     "0.1.0",
                     "d",
                     1,
@@ -162,13 +162,13 @@ fn a_refusal_does_not_say_whether_a_session_exists() {
     );
     let foreign_unknown = daemon.register(
         &daemon.child_session_id(),
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(
             &foreign_authority
                 .mint_approval_token(
                     "ses_no-such-session",
-                    "worker-a",
+                    "local/worker-a",
                     "0.1.0",
                     "d",
                     1,
@@ -193,9 +193,9 @@ fn a_credential_is_judged_and_bound_as_the_session_it_names() {
     daemon.seed_caller(RICH_SESSION);
     daemon.seed(
         POOR_SESSION,
-        "capabilities:\n  spawn:\n    allow: [worker-c]\n",
+        "capabilities:\n  spawn:\n    allow: [local/worker-c]\n",
     );
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let poor = daemon.credential(POOR_SESSION);
     let rich = daemon.credential(RICH_SESSION);
 
@@ -204,19 +204,19 @@ fn a_credential_is_judged_and_bound_as_the_session_it_names() {
     let redirected = daemon.post(
         "/spawn",
         &format!(
-            r#"{{"name":"worker-a","version":"0.1.0","spawned_by":"{RICH_SESSION}","session_id":"{RICH_SESSION}"}}"#
+            r#"{{"name":"local/worker-a","version":"0.1.0","spawned_by":"{RICH_SESSION}","session_id":"{RICH_SESSION}"}}"#
         ),
         &[(capsule_runtime::SPAWN_CREDENTIAL_HEADER, &poor)],
     );
     assert_eq!(redirected.status, 403);
     assert_eq!(
         redirected.error(),
-        "capsule 'worker-a' is not in parent's spawn_allow"
+        "capsule 'local/worker-a' is not in parent's spawn_allow"
     );
 
     // And an approval the rich session earned stops being redeemable the moment that session is no
     // longer running: the `sid` bound into the token is checked against the job store.
-    let approval = daemon.approval("worker-a", "0.1.0", &rich);
+    let approval = daemon.approval("local/worker-a", "0.1.0", &rich);
     daemon
         .state
         .jobs
@@ -228,7 +228,7 @@ fn a_credential_is_judged_and_bound_as_the_session_it_names() {
 
     let response = daemon.register(
         &daemon.child_session_id(),
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(&approval),
     );
@@ -251,47 +251,47 @@ fn a_credential_is_judged_and_bound_as_the_session_it_names() {
 fn an_approval_covers_one_artifact_by_name_version_and_digest() {
     let daemon = Daemon::new();
     daemon.seed_caller(CALLER_SESSION);
-    daemon.publish("worker-a", "0.1.0");
-    daemon.publish("worker-a", "0.2.0");
-    daemon.publish("worker-b", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.2.0");
+    daemon.publish("local/worker-b", "0.1.0");
     let credential = daemon.credential(CALLER_SESSION);
 
     let other_name = daemon.register(
         &daemon.child_session_id(),
-        "worker-b",
+        "local/worker-b",
         "0.1.0",
-        Some(&daemon.approval("worker-a", "0.1.0", &credential)),
+        Some(&daemon.approval("local/worker-a", "0.1.0", &credential)),
     );
     assert_eq!(other_name.status, 403);
     assert_eq!(
         other_name.error(),
-        "this spawn approval was granted for 'worker-a@0.1.0', not 'worker-b@0.1.0'"
+        "this spawn approval was granted for 'local/worker-a@0.1.0', not 'local/worker-b@0.1.0'"
     );
 
     let other_version = daemon.register(
         &daemon.child_session_id(),
-        "worker-a",
+        "local/worker-a",
         "0.2.0",
-        Some(&daemon.approval("worker-a", "0.1.0", &credential)),
+        Some(&daemon.approval("local/worker-a", "0.1.0", &credential)),
     );
     assert_eq!(other_version.status, 403);
     assert_eq!(
         other_version.error(),
-        "this spawn approval was granted for 'worker-a@0.1.0', not 'worker-a@0.2.0'"
+        "this spawn approval was granted for 'local/worker-a@0.1.0', not 'local/worker-a@0.2.0'"
     );
 
     // Same coordinate, different bytes: the manifest the referee read is no longer the manifest
     // that would be launched.
-    let approval = daemon.approval("worker-a", "0.1.0", &credential);
+    let approval = daemon.approval("local/worker-a", "0.1.0", &credential);
     daemon.publish_body(
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         common::PLAIN_WORKER_BODY,
         "republished with different bytes",
     );
     let other_bytes = daemon.register(
         &daemon.child_session_id(),
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(&approval),
     );
@@ -299,7 +299,7 @@ fn an_approval_covers_one_artifact_by_name_version_and_digest() {
     assert!(
         other_bytes
             .error()
-            .starts_with("'worker-a@0.1.0' now resolves to a different artifact than the one this spawn approval was granted for"),
+            .starts_with("'local/worker-a@0.1.0' now resolves to a different artifact than the one this spawn approval was granted for"),
         "{}",
         other_bytes.error(),
     );
@@ -320,9 +320,9 @@ fn an_approval_covers_one_artifact_by_name_version_and_digest() {
 fn an_approval_past_its_expiry_is_refused() {
     let daemon = Daemon::new();
     daemon.seed_caller(CALLER_SESSION);
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let digest = LocalRegistry::new(daemon.registry.path())
-        .resolve("worker-a", "0.1.0")
+        .resolve(&ArtifactName::parse("local/worker-a").unwrap(), "0.1.0")
         .unwrap()
         .sha256;
 
@@ -332,7 +332,7 @@ fn an_approval_past_its_expiry_is_refused() {
             .authority
             .mint_approval_token(
                 CALLER_SESSION,
-                "worker-a",
+                "local/worker-a",
                 "0.1.0",
                 &digest,
                 1,
@@ -343,7 +343,7 @@ fn an_approval_past_its_expiry_is_refused() {
 
     let expired = daemon.register(
         &daemon.child_session_id(),
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(&mint(now_ms() - 1)),
     );
@@ -356,7 +356,7 @@ fn an_approval_past_its_expiry_is_refused() {
 
     let live = daemon.register(
         &daemon.child_session_id(),
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(&mint(now_ms() + 60_000)),
     );
@@ -369,19 +369,19 @@ fn an_approval_past_its_expiry_is_refused() {
 fn an_approval_covers_exactly_one_launch() {
     let daemon = Daemon::new();
     daemon.seed_caller(CALLER_SESSION);
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let credential = daemon.credential(CALLER_SESSION);
-    let approval = daemon.approval("worker-a", "0.1.0", &credential);
+    let approval = daemon.approval("local/worker-a", "0.1.0", &credential);
 
     let first = daemon.register(
         &daemon.child_session_id(),
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(&approval),
     );
     let second = daemon.register(
         &daemon.child_session_id(),
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(&approval),
     );
@@ -403,12 +403,12 @@ fn an_approval_covers_exactly_one_launch() {
 /// it — not even for a name the operator listed.
 #[test]
 fn the_top_level_path_is_unchanged_and_needs_no_tokens() {
-    let daemon = Daemon::with_spawn_allow(vec!["worker-a".to_string()]);
+    let daemon = Daemon::with_spawn_allow(vec!["local/worker-a".to_string()]);
     daemon.seed_caller(CALLER_SESSION);
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let credential = daemon.credential(CALLER_SESSION);
 
-    let bare = daemon.register(&daemon.child_session_id(), "worker-a", "0.1.0", None);
+    let bare = daemon.register(&daemon.child_session_id(), "local/worker-a", "0.1.0", None);
     assert_eq!(bare.status, 200, "{:?}", bare.body);
     assert!(bare.body["credential"]
         .as_str()
@@ -419,7 +419,7 @@ fn the_top_level_path_is_unchanged_and_needs_no_tokens() {
     // operator's list instead.
     let unusable = daemon.register(
         &daemon.child_session_id(),
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some("msa1.e30.e30"),
     );
@@ -429,7 +429,7 @@ fn the_top_level_path_is_unchanged_and_needs_no_tokens() {
     // And a credential is not an approval, whatever header it is placed in.
     let credential_as_approval = daemon.register(
         &daemon.child_session_id(),
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(&credential),
     );
@@ -443,15 +443,15 @@ fn the_top_level_path_is_unchanged_and_needs_no_tokens() {
 fn a_credential_cannot_be_presented_as_its_own_approval() {
     let daemon = Daemon::new();
     daemon.seed_caller(CALLER_SESSION);
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let credential = daemon.credential(CALLER_SESSION);
-    let approval = daemon.approval("worker-a", "0.1.0", &credential);
+    let approval = daemon.approval("local/worker-a", "0.1.0", &credential);
 
     // The credential, in the approval header.
     let as_approval = daemon.post(
         "/register",
         &format!(
-            r#"{{"session_id":"{}","name":"worker-a","version":"0.1.0"}}"#,
+            r#"{{"session_id":"{}","name":"local/worker-a","version":"0.1.0"}}"#,
             daemon.child_session_id()
         ),
         &[(SPAWN_APPROVAL_HEADER, &credential)],
@@ -460,7 +460,7 @@ fn a_credential_cannot_be_presented_as_its_own_approval() {
     assert_eq!(as_approval.error(), IDENTITY_REFUSAL);
 
     // The approval, in the credential header.
-    let as_credential = daemon.permission("worker-a", "0.1.0", Some(&approval));
+    let as_credential = daemon.permission("local/worker-a", "0.1.0", Some(&approval));
     assert_eq!(as_credential.status, 403);
     assert_eq!(as_credential.error(), IDENTITY_REFUSAL);
 }
@@ -472,16 +472,16 @@ fn a_register_body_cannot_redirect_or_overwrite_a_session() {
     let daemon = Daemon::new();
     daemon.seed_caller(CALLER_SESSION);
     daemon.seed_caller(RICH_SESSION);
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let credential = daemon.credential(CALLER_SESSION);
 
     // Registering under an id the store already holds is refused, so a later registrant cannot
     // replace a running session's envelope with one of its own choosing.
     let overwrite = daemon.register(
         RICH_SESSION,
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
-        Some(&daemon.approval("worker-a", "0.1.0", &credential)),
+        Some(&daemon.approval("local/worker-a", "0.1.0", &credential)),
     );
     assert_eq!(overwrite.status, 403);
     assert_eq!(overwrite.error(), IDENTITY_REFUSAL);
@@ -504,9 +504,9 @@ fn a_register_body_cannot_redirect_or_overwrite_a_session() {
     let child = daemon.child_session_id();
     let ok = daemon.register(
         &child,
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
-        Some(&daemon.approval("worker-a", "0.1.0", &credential)),
+        Some(&daemon.approval("local/worker-a", "0.1.0", &credential)),
     );
     assert_eq!(ok.status, 200, "{:?}", ok.body);
     assert_eq!(
@@ -524,7 +524,7 @@ fn a_register_body_cannot_redirect_or_overwrite_a_session() {
 fn a_credential_for_a_finished_session_is_refused() {
     let daemon = Daemon::new();
     daemon.seed_caller(CALLER_SESSION);
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let credential = daemon.credential(CALLER_SESSION);
     daemon
         .state
@@ -535,7 +535,7 @@ fn a_credential_for_a_finished_session_is_refused() {
         .unwrap()
         .status = JobStatus::Complete;
 
-    let response = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let response = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
 
     assert_eq!(response.status, 403);
     assert_eq!(response.error(), IDENTITY_REFUSAL);
@@ -547,11 +547,14 @@ fn a_credential_for_a_finished_session_is_refused() {
 fn asking_permission_creates_no_session() {
     let daemon = Daemon::new();
     daemon.seed_caller(CALLER_SESSION);
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let credential = daemon.credential(CALLER_SESSION);
 
-    daemon.approval("worker-a", "0.1.0", &credential);
-    assert_eq!(daemon.permission("worker-z", "0.1.0", None).status, 403);
+    daemon.approval("local/worker-a", "0.1.0", &credential);
+    assert_eq!(
+        daemon.permission("local/worker-z", "0.1.0", None).status,
+        403
+    );
 
     assert_eq!(daemon.session_ids(), vec![CALLER_SESSION]);
     assert!(
@@ -560,9 +563,15 @@ fn asking_permission_creates_no_session() {
         daemon.workdir_entries()
     );
     // The registry holds published artifacts only — no session directory was created beside them.
-    let registry_entries: Vec<String> = std::fs::read_dir(daemon.registry.path())
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
-        .collect();
-    assert_eq!(registry_entries, vec!["worker-a"]);
+    let entries = |dir: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect()
+    };
+    assert_eq!(entries(daemon.registry.path()), vec!["local"]);
+    assert_eq!(
+        entries(&daemon.registry.path().join("local")),
+        vec!["worker-a"]
+    );
 }

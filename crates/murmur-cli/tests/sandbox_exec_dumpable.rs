@@ -25,7 +25,7 @@ use assert_cmd::Command;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 /// Emitted by the allowlisted binary and asserted on in the tool result. Deliberately not a

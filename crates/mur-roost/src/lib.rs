@@ -337,8 +337,9 @@ fn identity_refused() -> String {
 
 /// Resolves one capsule from the registry and parses its manifest.
 ///
-/// The `Err` side is a complete HTTP response rather than a message: every failure here is a
-/// server-side `500` about the registry or the artifact, and the caller has nothing to add.
+/// The `Err` side is a complete HTTP response rather than a message, and the caller has nothing
+/// to add: a `400` when `name` is not a full `<scope>/<name>`, otherwise a server-side `500`
+/// about the registry or the artifact.
 fn resolve_capsule(
     state: &Arc<State>,
     name: &str,
@@ -350,9 +351,11 @@ fn resolve_capsule(
     ),
     String,
 > {
+    let artifact_name = murmur_artifact::ArtifactName::parse(name)
+        .map_err(|e| err(400, "Bad Request", &e.to_string()))?;
     let registry = LocalRegistry::new(&state.registry_path);
     let resolved = registry
-        .resolve_with_platform(name, version, Some(current_platform()))
+        .resolve_with_platform(&artifact_name, version, Some(current_platform()))
         .map_err(|e| {
             err(
                 500,
@@ -508,7 +511,7 @@ fn handle_spawn(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> Str
     let child_depth = parent.depth_remaining - 1;
     let (approval, payload) = match state.authority.mint_approval_payload(
         &session_id,
-        &resolved.meta.name,
+        resolved.meta.name.as_str(),
         &resolved.meta.version,
         &resolved.sha256,
         child_depth,
@@ -569,7 +572,7 @@ fn handle_spawn(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> Str
 
     ok_json(&SpawnResponse {
         approval,
-        name: resolved.meta.name,
+        name: resolved.meta.name.to_string(),
         version: resolved.meta.version,
         sha256: resolved.sha256,
         expires_at_ms,
@@ -642,7 +645,9 @@ fn handle_register(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> 
             if session_record(state, &approved.sid).is_err() {
                 return identity_refused();
             }
-            if approved.name != resolved.meta.name || approved.version != resolved.meta.version {
+            if approved.name != resolved.meta.name.as_str()
+                || approved.version != resolved.meta.version
+            {
                 return err(
                     403,
                     "Forbidden",

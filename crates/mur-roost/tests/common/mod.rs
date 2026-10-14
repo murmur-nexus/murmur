@@ -48,8 +48,9 @@ pub fn manifest_yaml(name: &str, version: &str, body: &str) -> String {
     format!("name: {name}\nversion: {version}\n{body}")
 }
 
-/// Pack a `.mur.zip` with the given manifest and a root `capsule.wasm`, and publish it where
-/// `resolve_with_platform` will find it.
+/// Pack a `.mur.zip` with the given manifest and a root `capsule.wasm`, and publish it under the
+/// full name `name` where `resolve_with_platform` will find it; the packed manifest declares the
+/// bare part.
 ///
 /// `salt` lands in an extra zip entry the runtime never reads, so a coordinate can be republished
 /// with different bytes — and therefore a different sha256 — while staying the same capsule.
@@ -60,7 +61,7 @@ pub fn publish_capsule(registry_root: &Path, name: &str, version: &str, body: &s
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
         zip.start_file("murmur.yaml", options).unwrap();
-        zip.write_all(manifest_yaml(name, version, body).as_bytes())
+        zip.write_all(manifest_yaml(murmur_artifact::tool_name_of(name), version, body).as_bytes())
             .unwrap();
         zip.start_file("capsule.wasm", options).unwrap();
         zip.write_all(&std::fs::read(fixture_component(CAPSULE_COMPONENT)).unwrap())
@@ -75,7 +76,7 @@ pub fn publish_capsule(registry_root: &Path, name: &str, version: &str, body: &s
     LocalRegistry::new(registry_root)
         .publish(
             ArtifactMeta {
-                name: name.to_string(),
+                name: murmur_artifact::ArtifactName::parse(name).unwrap(),
                 version: version.to_string(),
                 runtime: RuntimeType::Wasm,
                 artifact_runtime: "capsule".to_string(),
@@ -180,13 +181,13 @@ impl Daemon {
         );
     }
 
-    /// A session that may spawn `worker-a`, `worker-b` and `worker-c`, holding enough network to
-    /// contain any of them.
+    /// A session that may spawn `local/worker-a`, `local/worker-b`, `local/worker-c` and
+    /// `local/worker`, holding enough network to contain any of them.
     pub fn seed_caller(&self, session_id: &str) {
         self.seed(
             session_id,
             "capabilities:\n  network:\n    allow: [registry.internal]\n  \
-             spawn:\n    allow: [worker-a, worker-b, worker-c, worker]\n",
+             spawn:\n    allow: [local/worker-a, local/worker-b, local/worker-c, local/worker]\n",
         );
     }
 

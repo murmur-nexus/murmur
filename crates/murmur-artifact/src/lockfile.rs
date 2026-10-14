@@ -9,14 +9,15 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::artifact_name::ArtifactName;
 use crate::registry::{ResolvedArtifact, RuntimeType};
 
 /// The only `lock_version` this build reads or writes.
 ///
-/// Version 2 pins a hash per platform; version 1 pinned one `sha256.wasm` per artifact and is
-/// refused rather than migrated, because accepting it would silently reinstate a single hash for
-/// an artifact whose payload differs per platform.
-pub const LOCK_VERSION: u32 = 2;
+/// Version 3 names every entry by its full `<scope>/<name>` and may carry the GitHub owner id of
+/// its scope. Older versions are refused rather than migrated: a version 2 entry names no scope,
+/// so nothing in it says whose artifact it pinned.
+pub const LOCK_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MurmurLock {
@@ -27,10 +28,13 @@ pub struct MurmurLock {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawLockedArtifact", into = "RawLockedArtifact")]
 pub struct LockedArtifact {
+    /// The full `<scope>/<name>`, checked by [`MurmurLock::validate`].
     pub name: String,
     pub resolved_version: String,
     pub sha256: LockedSha256,
     pub origin: LockOrigin,
+    /// GitHub's numeric id of the scope's owner, written as `owner_id` only when known.
+    pub owner_id: Option<u64>,
 }
 
 /// Who wrote a lock entry's pin.
@@ -74,6 +78,8 @@ struct RawLockedArtifact {
     origin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_id: Option<u64>,
 }
 
 impl TryFrom<RawLockedArtifact> for LockedArtifact {
@@ -112,6 +118,7 @@ impl TryFrom<RawLockedArtifact> for LockedArtifact {
             resolved_version: raw.resolved_version,
             sha256: raw.sha256,
             origin,
+            owner_id: raw.owner_id,
         })
     }
 }
@@ -128,6 +135,7 @@ impl From<LockedArtifact> for RawLockedArtifact {
             sha256: entry.sha256,
             origin: Some(origin.to_string()),
             session,
+            owner_id: entry.owner_id,
         }
     }
 }
@@ -378,6 +386,7 @@ impl MurmurLock {
                 resolved_version: version.to_string(),
                 sha256,
                 origin,
+                owner_id: None,
             });
             None
         }
@@ -393,19 +402,19 @@ impl MurmurLock {
     }
 
     pub fn validate(&self) -> Result<(), LockfileError> {
-        if self.lock_version != LOCK_VERSION {
-            return Err(LockfileError::Invalid(format!(
-                "unsupported lock_version {} (expected {}) \u{2014} delete murmur.lock and run \
-                 `mur install` to regenerate it",
-                self.lock_version, LOCK_VERSION
-            )));
-        }
+        check_lock_version(self.lock_version)?;
 
         for entry in &self.artifacts {
             if entry.name.trim().is_empty() {
                 return Err(LockfileError::Invalid(
                     "artifact entry has empty name".to_string(),
                 ));
+            }
+            if let Err(error) = ArtifactName::parse(&entry.name) {
+                return Err(LockfileError::Invalid(format!(
+                    "artifact '{}' is not named <scope>/<name> ({error}) {REGENERATE_HINT}",
+                    entry.name
+                )));
             }
             if entry.resolved_version.trim().is_empty() {
                 return Err(LockfileError::Invalid(format!(
@@ -428,6 +437,25 @@ impl MurmurLock {
     }
 }
 
+/// Appended to every refusal a fresh lock fixes.
+const REGENERATE_HINT: &str = "\u{2014} delete murmur.lock and run `mur install` to regenerate it";
+
+fn check_lock_version(lock_version: u32) -> Result<(), LockfileError> {
+    if lock_version == LOCK_VERSION {
+        return Ok(());
+    }
+    Err(LockfileError::Invalid(format!(
+        "unsupported lock_version {lock_version} (expected {LOCK_VERSION}) {REGENERATE_HINT}"
+    )))
+}
+
+/// Just the version key, read ahead of the entries so a lock of another version is refused for
+/// its version whatever its entries hold.
+#[derive(Deserialize)]
+struct LockVersionOnly {
+    lock_version: u32,
+}
+
 pub fn read_lockfile(path: &Path) -> Result<MurmurLock, LockfileError> {
     let raw = fs::read_to_string(path).map_err(|source| {
         if source.kind() == std::io::ErrorKind::NotFound {
@@ -440,8 +468,11 @@ pub fn read_lockfile(path: &Path) -> Result<MurmurLock, LockfileError> {
         }
     })?;
 
-    let lock: MurmurLock = serde_yaml::from_str(&raw)
-        .map_err(|err| LockfileError::Invalid(format!("YAML parse error: {err}")))?;
+    let parse_error =
+        |err: serde_yaml::Error| LockfileError::Invalid(format!("YAML parse error: {err}"));
+    let version: LockVersionOnly = serde_yaml::from_str(&raw).map_err(parse_error)?;
+    check_lock_version(version.lock_version)?;
+    let lock: MurmurLock = serde_yaml::from_str(&raw).map_err(parse_error)?;
 
     lock.validate()?;
     Ok(lock)
@@ -519,6 +550,7 @@ mod tests {
             resolved_version: version.to_string(),
             sha256,
             origin: LockOrigin::Operator,
+            owner_id: None,
         }
     }
 
@@ -539,7 +571,7 @@ mod tests {
         for origin in [LockOrigin::Operator, runtime("ses_puller")] {
             let raw = RawLockedArtifact::from(LockedArtifact {
                 origin: origin.clone(),
-                ..entry("a", "1.0.0", LockedSha256::any("abc"))
+                ..entry("local/a", "1.0.0", LockedSha256::any("abc"))
             });
             assert_eq!(raw.origin.as_deref(), Some(origin.as_str()));
             let read_back = LockedArtifact::try_from(raw).unwrap();
@@ -552,15 +584,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("murmur.lock");
         let lock = lock_with(vec![
-            entry("echo-tool", "0.0.1", LockedSha256::any("abc123")),
+            entry("local/echo-tool", "0.0.1", LockedSha256::any("abc123")),
             entry(
-                "native-tool",
+                "local/native-tool",
                 "0.1.0",
                 LockedSha256::for_one_platform("linux-x86_64", "def456"),
             ),
             LockedArtifact {
                 origin: runtime("ses_0190a1b2"),
-                ..entry("pulled-tool", "1.2.3", LockedSha256::any("fed789"))
+                ..entry("local/pulled-tool", "1.2.3", LockedSha256::any("fed789"))
             },
         ]);
 
@@ -579,9 +611,9 @@ mod tests {
         write_lockfile_atomic(
             &path,
             &lock_with(vec![
-                entry("component-tool", "0.1.0", LockedSha256::any("aaa")),
+                entry("local/component-tool", "0.1.0", LockedSha256::any("aaa")),
                 entry(
-                    "native-tool",
+                    "local/native-tool",
                     "0.1.0",
                     LockedSha256::for_one_platform("linux-x86_64", "bbb"),
                 ),
@@ -590,7 +622,7 @@ mod tests {
         .unwrap();
 
         let raw = fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("lock_version: 2"), "{raw}");
+        assert!(raw.contains("lock_version: 3"), "{raw}");
         assert!(
             !raw.contains("wasm"),
             "a v1 sha256.wasm key survived: {raw}"
@@ -607,7 +639,7 @@ mod tests {
         let path = dir.path().join("murmur.lock");
         fs::write(
             &path,
-            "lock_version: 2\nartifacts:\n  - name: echo-tool\n    resolved_version: 0.0.1\n    sha256:\n      any: abc\n  - name: native-tool\n    resolved_version: 0.1.0\n    sha256:\n      platforms:\n        linux-x86_64: def\n",
+            "lock_version: 3\nartifacts:\n  - name: local/echo-tool\n    resolved_version: 0.0.1\n    sha256:\n      any: abc\n  - name: local/native-tool\n    resolved_version: 0.1.0\n    sha256:\n      platforms:\n        linux-x86_64: def\n",
         )
         .unwrap();
 
@@ -626,22 +658,22 @@ mod tests {
     #[test]
     fn a_runtime_upsert_keeps_the_existing_origin() {
         let mut lock = lock_with(vec![
-            entry("operator-tool", "0.1.0", LockedSha256::any("aaa")),
+            entry("local/operator-tool", "0.1.0", LockedSha256::any("aaa")),
             LockedArtifact {
                 origin: runtime("ses_first"),
-                ..entry("pulled-tool", "0.1.0", LockedSha256::any("bbb"))
+                ..entry("local/pulled-tool", "0.1.0", LockedSha256::any("bbb"))
             },
         ]);
 
         let previous = lock.upsert(
-            "operator-tool",
+            "local/operator-tool",
             "0.1.0",
             LockedSha256::any("aaa"),
             runtime("ses_second"),
         );
         assert_eq!(previous, Some(LockOrigin::Operator));
         let previous = lock.upsert(
-            "pulled-tool",
+            "local/pulled-tool",
             "0.2.0",
             LockedSha256::any("ccc"),
             runtime("ses_second"),
@@ -649,22 +681,22 @@ mod tests {
         assert_eq!(previous, Some(runtime("ses_first")));
 
         assert_eq!(
-            lock.artifact_for("operator-tool").unwrap().origin,
+            lock.artifact_for("local/operator-tool").unwrap().origin,
             LockOrigin::Operator
         );
-        let pulled = lock.artifact_for("pulled-tool").unwrap();
+        let pulled = lock.artifact_for("local/pulled-tool").unwrap();
         assert_eq!(pulled.origin, runtime("ses_first"));
         assert_eq!(pulled.resolved_version, "0.2.0");
 
         let created = lock.upsert(
-            "new-tool",
+            "local/new-tool",
             "0.1.0",
             LockedSha256::any("ddd"),
             runtime("ses_second"),
         );
         assert_eq!(created, None);
         assert_eq!(
-            lock.artifact_for("new-tool").unwrap().origin,
+            lock.artifact_for("local/new-tool").unwrap().origin,
             runtime("ses_second")
         );
     }
@@ -675,11 +707,11 @@ mod tests {
         let path = dir.path().join("murmur.lock");
         let mut lock = lock_with(vec![LockedArtifact {
             origin: runtime("ses_puller"),
-            ..entry("pulled-tool", "0.1.0", LockedSha256::any("aaa"))
+            ..entry("local/pulled-tool", "0.1.0", LockedSha256::any("aaa"))
         }]);
 
         let previous = lock.upsert(
-            "pulled-tool",
+            "local/pulled-tool",
             "0.1.0",
             LockedSha256::any("aaa"),
             LockOrigin::Operator,
@@ -687,7 +719,7 @@ mod tests {
 
         assert_eq!(previous, Some(runtime("ses_puller")));
         assert_eq!(
-            lock.artifact_for("pulled-tool").unwrap().origin,
+            lock.artifact_for("local/pulled-tool").unwrap().origin,
             LockOrigin::Operator
         );
         write_lockfile_atomic(&path, &lock).unwrap();
@@ -698,25 +730,25 @@ mod tests {
 
     #[test]
     fn removing_a_lock_entry_leaves_every_other_entry_untouched() {
-        let first = entry("operator-tool", "0.1.0", LockedSha256::any("aaa"));
+        let first = entry("local/operator-tool", "0.1.0", LockedSha256::any("aaa"));
         let middle = LockedArtifact {
             origin: runtime("ses_puller"),
-            ..entry("pulled-tool", "1.2.3", LockedSha256::any("bbb"))
+            ..entry("local/pulled-tool", "1.2.3", LockedSha256::any("bbb"))
         };
         let last = entry(
-            "native-tool",
+            "local/native-tool",
             "0.2.0",
             LockedSha256::for_one_platform("linux-x86_64", "ccc"),
         );
         let mut lock = lock_with(vec![first.clone(), middle.clone(), last.clone()]);
 
-        assert_eq!(lock.remove("pulled-tool"), Some(middle));
+        assert_eq!(lock.remove("local/pulled-tool"), Some(middle));
         assert_eq!(lock.artifacts, vec![first, last]);
-        assert_eq!(lock.remove("absent"), None);
+        assert_eq!(lock.remove("local/absent"), None);
         assert_eq!(lock.artifacts.len(), 2);
 
-        lock.remove("operator-tool").unwrap();
-        lock.remove("native-tool").unwrap();
+        lock.remove("local/operator-tool").unwrap();
+        lock.remove("local/native-tool").unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("murmur.lock");
         write_lockfile_atomic(&path, &lock).unwrap();
@@ -733,7 +765,7 @@ mod tests {
             fs::write(
                 &path,
                 format!(
-                    "lock_version: 2\nartifacts:\n  - name: odd-tool\n    resolved_version: 0.1.0\n    sha256:\n      any: abc\n{origin_keys}"
+                    "lock_version: 3\nartifacts:\n  - name: local/odd-tool\n    resolved_version: 0.1.0\n    sha256:\n      any: abc\n{origin_keys}"
                 ),
             )
             .unwrap();
@@ -744,27 +776,101 @@ mod tests {
         };
 
         let message = refusal("    origin: runtime\n");
-        assert!(message.contains("'odd-tool'"), "{message}");
+        assert!(message.contains("'local/odd-tool'"), "{message}");
         assert!(message.contains("session"), "{message}");
 
         let message = refusal("    origin: runtime\n    session: \"  \"\n");
-        assert!(message.contains("'odd-tool'"), "{message}");
+        assert!(message.contains("'local/odd-tool'"), "{message}");
         assert!(message.contains("session"), "{message}");
 
         let message = refusal("    origin: operator\n    session: ses_x\n");
-        assert!(message.contains("'odd-tool'"), "{message}");
+        assert!(message.contains("'local/odd-tool'"), "{message}");
         assert!(message.contains("session"), "{message}");
 
         let message = refusal("    origin: capsule\n");
-        assert!(message.contains("'odd-tool'"), "{message}");
+        assert!(message.contains("'local/odd-tool'"), "{message}");
         assert!(message.contains("origin"), "{message}");
         assert!(message.contains("capsule"), "{message}");
 
         let blank_on_write = lock_with(vec![LockedArtifact {
             origin: runtime(""),
-            ..entry("odd-tool", "0.1.0", LockedSha256::any("abc"))
+            ..entry("local/odd-tool", "0.1.0", LockedSha256::any("abc"))
         }]);
         assert!(write_lockfile_atomic(&path, &blank_on_write).is_err());
+    }
+
+    #[test]
+    fn lockfile_version_two_is_refused_for_its_version_before_any_entry_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("murmur.lock");
+        fs::write(
+            &path,
+            "lock_version: 2\nartifacts:\n  - name: echo-tool\n    resolved_version: 0.0.1\n    sha256:\n      any: abc\n    origin: capsule\n",
+        )
+        .unwrap();
+
+        let message = read_lockfile(&path).unwrap_err().to_string();
+        assert!(
+            message.contains(
+                "unsupported lock_version 2 (expected 3) \u{2014} delete murmur.lock and run \
+                 `mur install` to regenerate it"
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("echo-tool"), "{message}");
+    }
+
+    #[test]
+    fn lockfile_v3_entry_with_a_bare_name_is_refused_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("murmur.lock");
+        fs::write(
+            &path,
+            "lock_version: 3\nartifacts:\n  - name: echo-tool\n    resolved_version: 0.0.1\n    sha256:\n      any: abc\n",
+        )
+        .unwrap();
+
+        let message = read_lockfile(&path).unwrap_err().to_string();
+        assert!(message.contains("'echo-tool'"), "{message}");
+        assert!(
+            message.contains("delete murmur.lock and run `mur install` to regenerate it"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn lockfile_owner_id_is_kept_when_present_and_omitted_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("murmur.lock");
+        fs::write(
+            &path,
+            "lock_version: 3\nartifacts:\n  - name: ana/tool-x\n    resolved_version: 1.0.0\n    sha256:\n      any: abc\n    origin: operator\n    owner_id: 12345\n",
+        )
+        .unwrap();
+
+        let mut lock = read_lockfile(&path).unwrap();
+        assert_eq!(
+            lock.artifact_for("ana/tool-x").unwrap().owner_id,
+            Some(12345)
+        );
+        lock.upsert(
+            "ana/tool-x",
+            "1.0.0",
+            LockedSha256::any("abc"),
+            LockOrigin::Operator,
+        );
+        lock.upsert(
+            "local/echo-tool",
+            "0.0.1",
+            LockedSha256::any("def"),
+            LockOrigin::Operator,
+        );
+        write_lockfile_atomic(&path, &lock).unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.matches("owner_id: 12345").count(), 1, "{raw}");
+        assert_eq!(raw.matches("owner_id").count(), 1, "{raw}");
+        assert_eq!(read_lockfile(&path).unwrap(), lock);
     }
 
     #[test]
@@ -773,14 +879,14 @@ mod tests {
         let path = dir.path().join("murmur.lock");
         fs::write(
             &path,
-            "lock_version: 1\nartifacts:\n  - name: echo-tool\n    resolved_version: 0.0.1\n    sha256:\n      wasm: abc\n",
+            "lock_version: 1\nartifacts:\n  - name: local/echo-tool\n    resolved_version: 0.0.1\n    sha256:\n      wasm: abc\n",
         )
         .unwrap();
 
         let err = read_lockfile(&path).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("lock_version 1"), "{message}");
-        assert!(message.contains("expected 2"), "{message}");
+        assert!(message.contains("expected 3"), "{message}");
         assert!(message.contains("delete murmur.lock"), "{message}");
         assert!(message.contains("mur install"), "{message}");
     }
@@ -788,7 +894,7 @@ mod tests {
     #[test]
     fn an_entry_must_pin_exactly_one_shape() {
         let neither = lock_with(vec![entry(
-            "tool",
+            "local/tool",
             "0.1.0",
             LockedSha256 {
                 any: None,
@@ -804,7 +910,7 @@ mod tests {
         let mut both = LockedSha256::any("aaa");
         both.platforms
             .insert("linux-x86_64".to_string(), "bbb".to_string());
-        let both = lock_with(vec![entry("tool", "0.1.0", both)]);
+        let both = lock_with(vec![entry("local/tool", "0.1.0", both)]);
         assert!(both
             .validate()
             .unwrap_err()
@@ -814,7 +920,7 @@ mod tests {
 
     #[test]
     fn empty_hashes_and_empty_platform_keys_are_rejected() {
-        let empty_any = lock_with(vec![entry("tool", "0.1.0", LockedSha256::any("  "))]);
+        let empty_any = lock_with(vec![entry("local/tool", "0.1.0", LockedSha256::any("  "))]);
         assert!(empty_any
             .validate()
             .unwrap_err()
@@ -822,7 +928,7 @@ mod tests {
             .contains("empty sha256.any"));
 
         let empty_platform_hash = lock_with(vec![entry(
-            "tool",
+            "local/tool",
             "0.1.0",
             LockedSha256::for_one_platform("linux-x86_64", ""),
         )]);
@@ -833,7 +939,7 @@ mod tests {
             .contains("empty sha256.platforms.linux-x86_64"));
 
         let empty_key = lock_with(vec![entry(
-            "tool",
+            "local/tool",
             "0.1.0",
             LockedSha256::for_one_platform("  ", "aaa"),
         )]);
@@ -859,19 +965,19 @@ mod tests {
     #[test]
     fn a_second_platform_is_added_beside_the_first() {
         let mut lock = lock_with(vec![entry(
-            "native-tool",
+            "local/native-tool",
             "0.1.0",
             LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
         )]);
 
         lock.upsert(
-            "native-tool",
+            "local/native-tool",
             "0.1.0",
             LockedSha256::for_one_platform("linux-x86_64", "linux-hash"),
             LockOrigin::Operator,
         );
 
-        let pinned = &lock.artifact_for("native-tool").unwrap().sha256;
+        let pinned = &lock.artifact_for("local/native-tool").unwrap().sha256;
         assert_eq!(pinned.for_platform("darwin-aarch64"), Some("mac-hash"));
         assert_eq!(pinned.for_platform("linux-x86_64"), Some("linux-hash"));
     }
@@ -879,25 +985,25 @@ mod tests {
     #[test]
     fn one_platforms_hash_is_replaced_without_touching_the_others() {
         let mut lock = lock_with(vec![entry(
-            "native-tool",
+            "local/native-tool",
             "0.1.0",
             LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
         )]);
         lock.upsert(
-            "native-tool",
+            "local/native-tool",
             "0.1.0",
             LockedSha256::for_one_platform("linux-x86_64", "linux-hash"),
             LockOrigin::Operator,
         );
 
         lock.upsert(
-            "native-tool",
+            "local/native-tool",
             "0.1.0",
             LockedSha256::for_one_platform("linux-x86_64", "rebuilt-linux-hash"),
             LockOrigin::Operator,
         );
 
-        let pinned = &lock.artifact_for("native-tool").unwrap().sha256;
+        let pinned = &lock.artifact_for("local/native-tool").unwrap().sha256;
         assert_eq!(
             pinned.for_platform("linux-x86_64"),
             Some("rebuilt-linux-hash")
@@ -908,19 +1014,19 @@ mod tests {
     #[test]
     fn a_new_version_discards_every_hash_pinned_for_the_old_one() {
         let mut lock = lock_with(vec![entry(
-            "native-tool",
+            "local/native-tool",
             "0.1.0",
             LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
         )]);
 
         lock.upsert(
-            "native-tool",
+            "local/native-tool",
             "0.2.0",
             LockedSha256::for_one_platform("linux-x86_64", "linux-hash"),
             LockOrigin::Operator,
         );
 
-        let pinned = &lock.artifact_for("native-tool").unwrap();
+        let pinned = &lock.artifact_for("local/native-tool").unwrap();
         assert_eq!(pinned.resolved_version, "0.2.0");
         assert_eq!(pinned.sha256.platform_tags(), vec!["linux-x86_64"]);
     }
@@ -928,19 +1034,19 @@ mod tests {
     #[test]
     fn a_shape_change_discards_the_hashes_of_the_old_shape() {
         let mut lock = lock_with(vec![entry(
-            "tool",
+            "local/tool",
             "0.1.0",
             LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
         )]);
 
         lock.upsert(
-            "tool",
+            "local/tool",
             "0.1.0",
             LockedSha256::any("wasm-hash"),
             LockOrigin::Operator,
         );
 
-        let pinned = &lock.artifact_for("tool").unwrap().sha256;
+        let pinned = &lock.artifact_for("local/tool").unwrap().sha256;
         assert_eq!(pinned.any.as_deref(), Some("wasm-hash"));
         assert!(pinned.platforms.is_empty());
     }
@@ -948,7 +1054,7 @@ mod tests {
     #[test]
     fn an_unpinned_platform_is_not_a_conflict_but_a_differing_hash_is() {
         let pinned = entry(
-            "native-tool",
+            "local/native-tool",
             "0.1.0",
             LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
         );

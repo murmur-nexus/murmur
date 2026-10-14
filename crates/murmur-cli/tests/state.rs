@@ -24,6 +24,8 @@ use zip::{
 };
 
 const TOOL_NAME: &str = "state-writer";
+/// The full name the state tool's `.mur.zip` installs under.
+const TOOL_ARTIFACT: &str = "local/state-writer";
 const TOOL_VERSION: &str = "0.1.0";
 const CAPSULE_NAME: &str = "state-capsule";
 
@@ -68,7 +70,7 @@ fn state_project_with_capsule(
     fs::write(
         project.join("murmur.yaml"),
         format!(
-            "name: {capsule_name}\nversion: 0.0.1\nartifacts:\n  - name: {TOOL_NAME}\n    \
+            "name: {capsule_name}\nversion: 0.0.1\nartifacts:\n  - name: {TOOL_ARTIFACT}\n    \
              version: {TOOL_VERSION}\n    runtime: tool\n{capabilities}"
         ),
     )
@@ -377,7 +379,7 @@ fn the_grant_is_reported_and_reporting_it_changes_nothing_else() {
     assert_eq!(
         declared["state_stores"],
         serde_json::json!([{
-            "artifact": TOOL_NAME,
+            "artifact": TOOL_ARTIFACT,
             "store": "shey",
             "host_path": expected_path,
         }])
@@ -387,7 +389,7 @@ fn the_grant_is_reported_and_reporting_it_changes_nothing_else() {
         .assert()
         .success()
         .stdout(predicate::str::contains(format!(
-            "{TOOL_NAME}: shey -> {expected_path}"
+            "{TOOL_ARTIFACT}: shey -> {expected_path}"
         )));
 
     // `--explain-scope` is read-only. Printing a host path must not be what brings it into being.
@@ -477,7 +479,7 @@ fn a_capsule_wide_declaration_warns_and_grants_nothing() {
     fs::write(
         project.path().join("murmur.yaml"),
         format!(
-            "name: {CAPSULE_NAME}\nversion: 0.0.1\nartifacts:\n  - name: {TOOL_NAME}\n    \
+            "name: {CAPSULE_NAME}\nversion: 0.0.1\nartifacts:\n  - name: {TOOL_ARTIFACT}\n    \
              version: {TOOL_VERSION}\n    runtime: tool\ncapabilities:\n  state:\n    store: \
              capsule-wide\n"
         ),
@@ -513,7 +515,7 @@ fn state_on_a_skill_entry_is_refused_at_parse_time() {
     fs::write(
         project.path().join("murmur.yaml"),
         format!(
-            "name: {CAPSULE_NAME}\nversion: 0.0.1\nartifacts:\n  - name: notes-skill\n    \
+            "name: {CAPSULE_NAME}\nversion: 0.0.1\nartifacts:\n  - name: local/notes-skill\n    \
              version: 1.0.0\n    runtime: skill\n    capabilities:\n      state: {{}}\n"
         ),
     )

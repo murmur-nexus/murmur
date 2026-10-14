@@ -23,7 +23,7 @@ use tempfile::TempDir;
 
 use common::hook_wat::{compaction_hook_wasm, create_hook_zip};
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 const CAPSULE_NAME: &str = "resume-capsule";
 const SUMMARY: &str = "COMPACTED-SUMMARY-OF-EARLIER-TALK";
@@ -52,7 +52,7 @@ fn create_manifest(
 ) -> PathBuf {
     let hooks: String = hook_names
         .iter()
-        .map(|name| format!("  - name: {name}\n    version: 0.1.0\n    runtime: hook\n"))
+        .map(|name| format!("  - name: local/{name}\n    version: 0.1.0\n    runtime: hook\n"))
         .collect();
     let manifest = format!(
         "name: {CAPSULE_NAME}\nversion: 0.1.0\n{blocks}artifacts:\n  - name: {DRIVER_NAME}\n    \

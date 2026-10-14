@@ -91,7 +91,7 @@ impl Default for MurConfig {
                 sources: vec![SourceConfig {
                     name: "official".to_string(),
                     r#type: SourceType::GitHub,
-                    repo: Some("murmur-nexus/default-artifacts".to_string()),
+                    repo: Some(crate::source::DEFAULT_ARTIFACTS_REPO.to_string()),
                     url: None,
                     token: None,
                 }],

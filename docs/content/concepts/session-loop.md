@@ -146,7 +146,7 @@ The reopen limit applies per task: in a `task_acceptance: queue` session, each t
 fresh at `0` reopens used, regardless of what an earlier task consumed.
 
 ```yaml
-name: murmur-hook-gatekeeper
+name: hook-gatekeeper
 version: 1.0.0
 runtime: hook
 binding: on-task-end
@@ -188,7 +188,7 @@ written to `trace.jsonl` as a
 `workdir/logs/bootstrap.log`.
 
 ```yaml
-name: murmur-hook-memory
+name: hook-memory
 version: 1.0.0
 runtime: hook
 binding: on-task-start

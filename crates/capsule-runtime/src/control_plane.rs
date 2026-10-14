@@ -1171,7 +1171,7 @@ mod tests {
         ControlState::new(
             config,
             inference,
-            DriverChoices::declared(inference),
+            DriverChoices::declared(inference, &std::collections::HashMap::new()),
             Arc::new(InjectedSecrets::new(&config.secrets)),
         )
     }
@@ -1778,7 +1778,7 @@ mod tests {
                     driver: driver.to_string(),
                 });
         }
-        let mut choices = DriverChoices::declared(&inference);
+        let mut choices = DriverChoices::declared(&inference, &std::collections::HashMap::new());
         choices.record_credential("anthropic", "config", None, None);
         choices.record_credential("openai", "injected", Some(ALT_KEY), None);
         choices.record_credential("other", "none", None, Some("MINI_KEY"));

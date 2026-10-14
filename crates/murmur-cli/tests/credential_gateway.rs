@@ -23,16 +23,20 @@ use std::{
 use assert_cmd::Command;
 use common::leaks::{files_containing, hex, sha256_hex};
 use common::recording_upstream::{RecordingUpstream, Reply};
-use murmur_artifact::{ArtifactMeta, LocalRegistry, Registry, RuntimeType};
+use murmur_artifact::{
+    tool_name_of, ArtifactMeta, ArtifactName, LocalRegistry, Registry, RuntimeType,
+};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-const TOOL: &str = "gateway-probe";
+// Every artifact here is installed from a `.mur.zip`, so each is named in the `local` scope.
+const TOOL: &str = "local/gateway-probe";
 /// The same component installed under a second name, whose entry declares no `gateway:`.
-const TOOL_B: &str = "gateway-probe-b";
-const HOOK: &str = "gateway-probe-hook";
-const DRIVER: &str = "murmur-driver-anthropic";
-const NATIVE_TOOL: &str = "native-gateway-tool";
+const TOOL_B: &str = "local/gateway-probe-b";
+const HOOK: &str = "local/gateway-probe-hook";
+const DRIVER: &str = "local/murmur-driver-anthropic";
+/// The native fixture tool, filed under the name its own manifest packs.
+const NATIVE_TOOL: &str = "local/tool-fixture";
 const VERSION: &str = "0.1.0";
 
 /// The key the operator holds. Assembled so no source line carries a credential-shaped literal.
@@ -126,9 +130,11 @@ impl Project {
         write_credentials(&self.config_path(), &self.credentials);
     }
 
-    /// Packs the probe component under `name` with a bundled manifest carrying `auth_block`.
+    /// Packs the probe component as the bare part of `name` with a bundled manifest carrying
+    /// `auth_block`.
     fn publish_tool(&self, name: &str, auth_block: &str) {
         let wasm = fs::read(fixture("gateway-probe/tool/gateway-probe.wasm")).unwrap();
+        let name = tool_name_of(name);
         let manifest = format!("name: {name}\nversion: {VERSION}\nruntime: wasm\n{auth_block}");
         self.publish_zip(name, &manifest, "tool.wasm", &wasm);
     }
@@ -155,6 +161,7 @@ impl Project {
             write::{FileOptions, SimpleFileOptions},
             CompressionMethod, ZipWriter,
         };
+        let name = tool_name_of(name);
         let path = self
             .artifacts
             .path()
@@ -540,12 +547,8 @@ fn gateway_without_upstream_auth_refuses() {
         let run = project.run(&[], &[]);
         assert!(!run.ok(), "{}", run.context());
         assert!(run.stderr.contains("E-RUN-025"), "{}", run.context());
-        assert!(
-            run.stderr
-                .contains(&format!("artifact '{TOOL}@{VERSION}' declares no usable")),
-            "{}",
-            run.context()
-        );
+        let refusal = format!("artifact '{}@{VERSION}' declares no usable", TOOL);
+        assert!(run.stderr.contains(&refusal), "{}", run.context());
         if let Some(reason) = reason {
             assert!(run.stderr.contains(reason), "{}", run.context());
         }
@@ -586,7 +589,10 @@ fn gateway_with_the_retired_block_name_refuses() {
         assert!(!run.ok(), "{}", run.context());
         for expected in [
             "E-RUN-025",
-            &format!("artifact '{TOOL}@{VERSION}' declares no usable upstream_auth: block"),
+            &format!(
+                "artifact '{}@{VERSION}' declares no usable upstream_auth: block",
+                TOOL
+            ),
             "was renamed to 'upstream_auth'",
         ] {
             assert!(
@@ -860,7 +866,7 @@ fn keyless_driver_completes() {
     assert!(
         run.warning_lines("W-SEC-030")
             .iter()
-            .all(|line| !line.contains(DRIVER)),
+            .all(|line| !line.contains(tool_name_of(DRIVER))),
         "{}",
         run.stderr
     );
@@ -888,7 +894,7 @@ fn gateway_on_native_tool_refuses() {
     LocalRegistry::new(project.home.path().join(".murmur").join("artifacts"))
         .publish(
             ArtifactMeta {
-                name: NATIVE_TOOL.to_string(),
+                name: ArtifactName::parse(NATIVE_TOOL).unwrap(),
                 version: VERSION.to_string(),
                 runtime: RuntimeType::Native,
                 artifact_runtime: "native".to_string(),
@@ -933,7 +939,7 @@ fn tool_use_turn(id: &str) -> String {
         "content": [{
             "type": "tool_use",
             "id": format!("toolu_{id}"),
-            "name": TOOL,
+            "name": tool_name_of(TOOL),
             "input": {"marker_hex": hex(MARKER)},
         }],
         "stop_reason": "tool_use",
@@ -1059,7 +1065,11 @@ fn unmetered_gateway_is_labelled() {
             "{surface}: {}",
             lines[0]
         );
-        assert!(!lines[0].contains(DRIVER), "{surface}: {}", lines[0]);
+        assert!(
+            !lines[0].contains(tool_name_of(DRIVER)),
+            "{surface}: {}",
+            lines[0]
+        );
         for key in [MARKER, DRIVER_MARKER] {
             assert!(!output.stdout.contains(key) && !output.stderr.contains(key));
         }
@@ -1177,7 +1187,8 @@ fn gateway_credential_not_found_refuses() {
     assert!(run.stderr.contains("E-MAN-003"), "{}", run.context());
     assert!(
         run.stderr.contains(&format!(
-            "gateway.api_key on artifact '{TOOL}' references ${{{UNSET}}}"
+            "gateway.api_key on artifact '{}' references ${{{UNSET}}}",
+            TOOL
         )),
         "{}",
         run.context()

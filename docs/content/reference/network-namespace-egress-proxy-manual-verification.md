@@ -427,7 +427,7 @@ Scenarios 3, 4, 5 and 7 were not run on this host. Scenario 6 was checked at sou
 (`docker` and `podman` both absent). A different machine from the integration-test run.
 
 **What ran, scenarios 1–5.** Real capsule sessions through the same launch path `mur run` uses,
-driven by scripted `tool_use` turns against the real `murmur-driver-anthropic` component. Only the
+driven by scripted `tool_use` turns against the real `murmur/driver-anthropic` component. Only the
 model API was replaced, by a local scripted server, because no `ANTHROPIC_API_KEY` was available.
 The fork, seccomp, Landlock, the network namespace and the egress proxy were the production code,
 running real `curl`, `getent` and `nc` subprocesses against the public internet.

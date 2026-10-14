@@ -20,7 +20,7 @@ use assert_cmd::Command;
 use capsule_runtime::process_driver::{describe_process_driver_wasm, InterruptMethod};
 use tempfile::TempDir;
 
-const DRIVER: &str = "fixture-process-driver";
+const DRIVER: &str = "local/fixture-process-driver";
 const VERSION: &str = "0.1.0";
 
 fn fixture_wasm() -> PathBuf {
@@ -68,9 +68,9 @@ struct Capsule {
 }
 
 impl Capsule {
-    /// Publishes `wasm` as `runtime: driver` artifact `name`, with no `inference_auth:`, and
-    /// writes a manifest declaring it with `entry_extra` appended to its entry, `top_extra` at the
-    /// top level, and `inference` as the whole `inference:` block.
+    /// Publishes `wasm` as `runtime: driver` artifact `name`, a full `local/` name, with no
+    /// `inference_auth:`, and writes a manifest declaring it with `entry_extra` appended to its
+    /// entry, `top_extra` at the top level, and `inference` as the whole `inference:` block.
     fn new(name: &str, wasm: &Path, entry_extra: &str, top_extra: &str, inference: &str) -> Self {
         let home = TempDir::new().unwrap();
         let artifacts = TempDir::new().unwrap();
@@ -226,11 +226,11 @@ fn missing_required_env_is_refused() {
 
 #[test]
 fn http_driver_under_process_is_refused() {
-    let name = "murmur-driver-anthropic";
+    let name = "local/murmur-driver-anthropic";
     let capsule = Capsule::process(name, &anthropic_wasm(), &["HOME"]);
     let text = capsule.run_refused();
     assert!(text.contains("E-RUN-029"), "{text}");
-    assert!(text.contains("murmur-driver-anthropic@0.1.0"), "{text}");
+    assert!(text.contains(&format!("'{name}@0.1.0'")), "{text}");
     assert!(text.contains("murmur:driver/process@0.3.0"), "{text}");
 }
 
@@ -239,7 +239,7 @@ fn http_driver_under_process_is_refused() {
 /// it was built from, so this stays testable after every later bump.
 #[test]
 fn a_driver_built_against_the_retired_version_is_refused() {
-    let name = "retired-process-driver";
+    let name = "local/retired-process-driver";
     let capsule = Capsule::process(name, &retired_wasm(), &["HOME"]);
     let text = capsule.run_refused();
     assert!(text.contains("E-RUN-029"), "{text}");
@@ -252,12 +252,12 @@ fn a_driver_built_against_the_retired_version_is_refused() {
 /// release built against the version the host accepts, installed with `mur install`.
 #[test]
 fn a_driver_built_against_0_2_0_is_refused_with_the_install_that_fixes_it() {
-    let name = "previous-process-driver";
+    let name = "local/previous-process-driver";
     let capsule = Capsule::process(name, &previous_wasm(), &["HOME"]);
     let text = capsule.run_refused();
     println!("{text}");
     assert!(text.contains("E-RUN-029"), "{text}");
-    assert!(text.contains(&format!("{name}@{VERSION}")), "{text}");
+    assert!(text.contains(&format!("'{name}@{VERSION}'")), "{text}");
     assert!(text.contains("murmur:driver/process@0.2.0"), "{text}");
     assert!(text.contains("murmur:driver/process@0.3.0"), "{text}");
     assert!(text.contains("mur install"), "{text}");
@@ -289,7 +289,7 @@ fn http_inference(name: &str) -> String {
 /// refused at launch rather than failing on its first turn, and the hint names the fix.
 #[test]
 fn a_driver_built_against_murmur_text_is_refused_with_the_install_that_fixes_it() {
-    let name = "text-streaming-driver";
+    let name = "local/text-streaming-driver";
     let capsule = Capsule::new(
         name,
         &text_stream_wasm(),
@@ -300,7 +300,7 @@ fn a_driver_built_against_murmur_text_is_refused_with_the_install_that_fixes_it(
     let text = capsule.run_refused();
     println!("{text}");
     assert!(text.contains("E-RUN-029"), "{text}");
-    assert!(text.contains(&format!("{name}@{VERSION}")), "{text}");
+    assert!(text.contains(&format!("'{name}@{VERSION}'")), "{text}");
     assert!(text.contains("murmur:text/chunks@0.1.0"), "{text}");
     assert!(text.contains("murmur:stream/events@0.1.0"), "{text}");
     assert!(text.contains("mur install"), "{text}");
@@ -310,8 +310,8 @@ fn a_driver_built_against_murmur_text_is_refused_with_the_install_that_fixes_it(
 /// dispatched through the same linker.
 #[test]
 fn a_declared_driver_that_is_not_the_inference_driver_is_refused_too() {
-    let inference_driver = "streaming-driver";
-    let second = "text-streaming-driver";
+    let inference_driver = "local/streaming-driver";
+    let second = "local/text-streaming-driver";
     let capsule = Capsule::new(
         inference_driver,
         &stream_events_wasm(),
@@ -333,7 +333,7 @@ fn a_declared_driver_that_is_not_the_inference_driver_is_refused_too() {
     let text = capsule.run_refused();
     println!("{text}");
     assert!(text.contains("E-RUN-029"), "{text}");
-    assert!(text.contains(&format!("{second}@{VERSION}")), "{text}");
+    assert!(text.contains(&format!("'{second}@{VERSION}'")), "{text}");
     assert!(!text.contains(&format!("'{inference_driver}@")), "{text}");
     assert!(text.contains("murmur:text/chunks@0.1.0"), "{text}");
     assert!(text.contains("murmur:stream/events@0.1.0"), "{text}");

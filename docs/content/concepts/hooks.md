@@ -52,13 +52,13 @@ committable arm is a decision the agent loop is blocked on — the context it co
 manifests it stages with, the feedback that reopens a task. `async` is available exactly where a
 hook commits nothing, so it requires `commit_policy: none`, and `on-stage` may never be `async`.
 
-Of the shipped hooks, `murmur-hook-debug` is the only `async` one, and it is stateless — it appends
-one JSON line per event and nothing waits on it. `murmur-hook-grafana` and `murmur-hook-eval`
+Of the shipped hooks, `murmur/hook-debug` is the only `async` one, and it is stateless — it appends
+one JSON line per event and nothing waits on it. `murmur/hook-grafana` and `murmur/hook-eval`
 declare no `execution_mode` and so run `blocking` even though both commit nothing: each buffers
 session state in memory across every call and exports it once at `on-session-end`.
 
 ```yaml
-name: murmur-hook-example
+name: hook-example
 version: 1.0.0
 runtime: hook
 binding: on-compaction           # when it fires

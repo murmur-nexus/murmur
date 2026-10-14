@@ -260,6 +260,56 @@ fn an_invalid_artifact_name_fails_the_build() {
         );
 }
 
+/// An artifact's own name is bare: `mur build` refuses `name: ana/tool-x`, naming where the scope
+/// comes from, and packs `name: tool-x` as written.
+#[test]
+fn a_scoped_artifact_name_is_refused_and_the_bare_name_builds() {
+    let dir = tempdir().unwrap();
+    let manifest = |name: &str| {
+        fs::write(
+            dir.path().join("murmur.yaml"),
+            format!(
+                "name: {name}\nversion: 0.1.0\nruntime: wasm\nrequires_files:\n  - tool.wasm\n"
+            ),
+        )
+        .unwrap();
+    };
+    fs::write(dir.path().join("tool.wasm"), b"\0asm").unwrap();
+    let build = || {
+        Command::cargo_bin("mur")
+            .unwrap()
+            .current_dir(dir.path())
+            .args(["build", dir.path().to_str().unwrap()])
+            .assert()
+    };
+
+    manifest("ana/tool-x");
+    build()
+        .failure()
+        .stderr(predicate::str::contains(
+            "error[E-BLD-001]: invalid artifact name 'ana/tool-x': an artifact's own name carries \
+             no scope, so it may not contain '/'",
+        ))
+        .stderr(predicate::str::contains(
+            "hint: the scope belongs to the source the artifact is published from, not to the \
+             artifact: name it 'tool-x', and it installs as <owner>/tool-x from \
+             github.com/<owner> or as local/tool-x from its .mur.zip file",
+        ));
+    assert!(!dir.path().join("tool-x-0.1.0.mur.zip").exists());
+
+    manifest("tool-x");
+    build().success();
+    let built = dir.path().join("tool-x-0.1.0.mur.zip");
+    let mut packed = String::new();
+    ZipArchive::new(fs::File::open(&built).unwrap())
+        .unwrap()
+        .by_name("murmur.yaml")
+        .unwrap()
+        .read_to_string(&mut packed)
+        .unwrap();
+    assert!(packed.contains("name: tool-x\n"), "{packed}");
+}
+
 #[test]
 fn a_declared_cargo_toml_warns_but_the_build_still_succeeds() {
     let dir = tempdir().unwrap();

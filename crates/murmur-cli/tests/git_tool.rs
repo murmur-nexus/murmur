@@ -5,10 +5,10 @@
 //! launch_session dispatches tool calls from a scripted LLM response, and we
 //! verify the tool's filesystem effects and the schema the driver sends up.
 //!
-//! The fixture tool stands in for the real `murmur-tool-git`: these cases are
+//! The fixture tool stands in for the real `murmur/tool-git`: these cases are
 //! about murmur's side of the contract — dispatch and the inventory →
 //! `input_schema` mapping — none of which is about git, and none of which needs
-//! an artifact from another checkout. `murmur-tool-git`'s own operations are
+//! an artifact from another checkout. `murmur/tool-git`'s own operations are
 //! tested in default-artifacts.
 
 #[path = "common/mod.rs"]
@@ -25,14 +25,17 @@ use capsule_runtime::{
     StageRequest,
 };
 use murmur_artifact::{
-    load_runtime_manifest, ArtifactMeta, ArtifactRuntime, ContainmentClass, LocalRegistry,
-    Registry, RuntimeType,
+    load_runtime_manifest, ArtifactMeta, ArtifactName, ArtifactRuntime, ContainmentClass,
+    LocalRegistry, Registry, RuntimeType,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
+/// The fixture tool's name in the store and the manifest.
+const TOOL_ARTIFACT: &str = "local/tool-fixture";
+/// The fixture tool's name as the model calls it: the part of [`TOOL_ARTIFACT`] after the `/`.
 const TOOL_NAME: &str = common::FIXTURE_NATIVE_TOOL_NAME;
 const TOOL_VERSION: &str = "0.1.0";
 
@@ -64,7 +67,7 @@ fn publish_fixture_tool(home: &TempDir, artifact_path: &Path) {
     let registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
     let bytes = fs::read(artifact_path).unwrap();
     let meta = ArtifactMeta {
-        name: TOOL_NAME.to_string(),
+        name: ArtifactName::parse(TOOL_ARTIFACT).unwrap(),
         version: TOOL_VERSION.to_string(),
         runtime: RuntimeType::Native,
         artifact_runtime: "native".to_string(),
@@ -132,7 +135,7 @@ fn stage_fixture_tool_session(
             ),
             driver_name = DRIVER_NAME,
             driver_version = DRIVER_VERSION,
-            tool_name = TOOL_NAME,
+            tool_name = TOOL_ARTIFACT,
             tool_version = TOOL_VERSION,
             endpoint = endpoint,
         ),
@@ -168,6 +171,7 @@ fn stage_fixture_tool_session(
             manifest_dir: project_dir.to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools,

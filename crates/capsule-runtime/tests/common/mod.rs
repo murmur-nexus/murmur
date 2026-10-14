@@ -82,7 +82,8 @@ pub fn mur_binary() -> &'static Path {
 // ── Artifacts ─────────────────────────────────────────────────────────────────
 
 /// Pack a `.mur.zip` holding `murmur.yaml` and, when given, a root `capsule.wasm`, and publish it
-/// into `registry_root`.
+/// into `registry_root` under the full name `name`; the packed `murmur.yaml` declares its bare
+/// part.
 pub fn publish_capsule(
     registry_root: &Path,
     name: &str,
@@ -96,8 +97,14 @@ pub fn publish_capsule(
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
         zip.start_file("murmur.yaml", options).unwrap();
-        zip.write_all(format!("name: {name}\nversion: {version}\n{manifest_body}").as_bytes())
-            .unwrap();
+        zip.write_all(
+            format!(
+                "name: {}\nversion: {version}\n{manifest_body}",
+                murmur_artifact::tool_name_of(name)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
         if let Some(component_path) = component_path {
             zip.start_file("capsule.wasm", options).unwrap();
             zip.write_all(&std::fs::read(component_path).unwrap())
@@ -108,7 +115,8 @@ pub fn publish_capsule(
     publish_bytes(registry_root, name, version, &cursor.into_inner());
 }
 
-/// Publish the inference driver an agent capsule needs, as a `driver` artifact.
+/// Publish the inference driver an agent capsule needs, as a `driver` artifact under the full
+/// name `name`.
 pub fn publish_driver(registry_root: &Path, name: &str, version: &str, wasm_path: &Path) {
     let mut cursor = Cursor::new(Vec::<u8>::new());
     {
@@ -118,8 +126,9 @@ pub fn publish_driver(registry_root: &Path, name: &str, version: &str, wasm_path
         zip.start_file("murmur.yaml", options).unwrap();
         zip.write_all(
             format!(
-                "name: {name}\nversion: {version}\nruntime: driver\n\
-                 upstream_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n"
+                "name: {}\nversion: {version}\nruntime: driver\n\
+                 upstream_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n",
+                murmur_artifact::tool_name_of(name)
             )
             .as_bytes(),
         )
@@ -135,7 +144,7 @@ fn publish_bytes(registry_root: &Path, name: &str, version: &str, bytes: &[u8]) 
     LocalRegistry::new(registry_root)
         .publish(
             ArtifactMeta {
-                name: name.to_string(),
+                name: murmur_artifact::ArtifactName::parse(name).unwrap(),
                 version: version.to_string(),
                 runtime: RuntimeType::Wasm,
                 artifact_runtime: "capsule".to_string(),

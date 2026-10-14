@@ -138,6 +138,22 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
         error @ RuntimeManifestError::TopLevelMurVersion => {
             CliError::with_hint(E_MAN_003, error.to_string(), TOP_LEVEL_MUR_VERSION_HINT)
         }
+        RuntimeManifestError::InvalidArtifactName {
+            field,
+            message,
+            hint,
+        } => {
+            let message = RuntimeManifestError::InvalidArtifactName {
+                field,
+                message,
+                hint: None,
+            }
+            .to_string();
+            match hint {
+                Some(hint) => CliError::with_hint(E_MAN_003, message, hint),
+                None => CliError::new(E_MAN_003, message),
+            }
+        }
         RuntimeManifestError::InvalidTraceConfig { field, message } => CliError::new(
             E_MAN_003,
             format!("{MANIFEST_FILENAME}: invalid trace config for '{field}': {message}"),

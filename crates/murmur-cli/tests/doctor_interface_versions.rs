@@ -12,7 +12,8 @@ use common::{create_hook_artifact, create_skill_artifact, create_tool_artifact, 
 use serde_json::Value;
 use tempfile::TempDir;
 
-const HOOK: &str = "stale-hook";
+/// Installed from its `.mur.zip` file, so filed in the `local` scope.
+const HOOK: &str = "local/stale-hook";
 const HOOK_VERSION: &str = "0.3.0";
 
 /// A hook component built against a retired `murmur:hook` and a retired `murmur:runtime`. The
@@ -48,8 +49,9 @@ fn publish_stale_hook(home: &TempDir) {
 }
 
 fn sidecar_path(home: &TempDir, name: &str, version: &str) -> PathBuf {
+    let bare = murmur_artifact::tool_name_of(name);
     home.path().join(format!(
-        ".murmur/artifacts/{name}/{version}/{name}-{version}.meta.json"
+        ".murmur/artifacts/{name}/{version}/{bare}-{version}.meta.json"
     ))
 }
 
@@ -164,12 +166,12 @@ fn current_artifacts_print_nothing() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/run/components/echo-tool.wasm");
     publish_local(
         &home,
-        &create_tool_artifact(work.path(), "current-tool", "0.1.0", &echo_tool),
+        &create_tool_artifact(work.path(), "local/current-tool", "0.1.0", &echo_tool),
     )
     .success();
     publish_local(
         &home,
-        &create_skill_artifact(work.path(), "current-skill", "0.1.0", "# guidance"),
+        &create_skill_artifact(work.path(), "local/current-skill", "0.1.0", "# guidance"),
     )
     .success();
 
@@ -233,7 +235,7 @@ fn a_package_this_mur_does_not_serve_is_named() {
     create_project(project.path(), " []");
     publish_component(
         &home,
-        "odd-hook",
+        "local/odd-hook",
         "0.1.0",
         r#"
         (component
@@ -254,8 +256,9 @@ fn a_package_this_mur_does_not_serve_is_named() {
     assert!(!stdout.contains("murmur:hook/lifecycle"), "{stdout}");
     assert!(stdout.contains("1 warning"), "{stdout}");
     assert!(
-        stdout
-            .contains("Fix: mur install -g odd-hook@<a release built without murmur:nonexistent>"),
+        stdout.contains(
+            "Fix: mur install -g local/odd-hook@<a release built without murmur:nonexistent>"
+        ),
         "{stdout}"
     );
 }

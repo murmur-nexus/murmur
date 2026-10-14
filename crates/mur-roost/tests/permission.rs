@@ -16,10 +16,10 @@ const PARENT_SESSION: &str = "ses_0000000000000000000000000000parent";
 fn a_granted_spawn_returns_permission_and_no_process() {
     let daemon = Daemon::new();
     daemon.seed_caller(PARENT_SESSION);
-    daemon.publish("worker", "0.1.0");
+    daemon.publish("local/worker", "0.1.0");
     let credential = daemon.credential(PARENT_SESSION);
 
-    let response = daemon.permission("worker", "0.1.0", Some(&credential));
+    let response = daemon.permission("local/worker", "0.1.0", Some(&credential));
 
     assert_eq!(response.status, 200, "{:?}", response.body);
     let object = response.body.as_object().unwrap();
@@ -37,10 +37,10 @@ fn a_granted_spawn_returns_permission_and_no_process() {
 fn a_granted_spawn_creates_no_workdir_no_session_and_no_trace() {
     let daemon = Daemon::new();
     daemon.seed_caller(PARENT_SESSION);
-    daemon.publish("worker", "0.1.0");
+    daemon.publish("local/worker", "0.1.0");
     let credential = daemon.credential(PARENT_SESSION);
 
-    daemon.approval("worker", "0.1.0", &credential);
+    daemon.approval("local/worker", "0.1.0", &credential);
 
     assert_eq!(daemon.session_ids(), vec![PARENT_SESSION]);
     assert!(
@@ -60,14 +60,14 @@ fn a_granted_spawn_creates_no_workdir_no_session_and_no_trace() {
 fn the_spawn_body_carries_no_workdir() {
     let daemon = Daemon::new();
     daemon.seed_caller(PARENT_SESSION);
-    daemon.publish("worker", "0.1.0");
+    daemon.publish("local/worker", "0.1.0");
     let credential = daemon.credential(PARENT_SESSION);
     let claimed = daemon.workdir.path().join("claimed-by-the-request");
 
     let response = daemon.post(
         "/spawn",
         &format!(
-            r#"{{"name":"worker","version":"0.1.0","workdir":{}}}"#,
+            r#"{{"name":"local/worker","version":"0.1.0","workdir":{}}}"#,
             serde_json::to_string(&claimed.display().to_string()).unwrap()
         ),
         &[(capsule_runtime::SPAWN_CREDENTIAL_HEADER, &credential)],
@@ -86,13 +86,13 @@ fn the_spawn_body_carries_no_workdir() {
 fn every_identity_failure_answers_with_one_refusal() {
     let daemon = Daemon::new();
     daemon.seed_caller(PARENT_SESSION);
-    daemon.publish("worker", "0.1.0");
+    daemon.publish("local/worker", "0.1.0");
 
-    let absent = daemon.permission("worker", "0.1.0", None);
-    let malformed = daemon.permission("worker", "0.1.0", Some("not-a-token"));
-    let wrong_family = daemon.permission("worker", "0.1.0", Some("msa1.e30.e30"));
+    let absent = daemon.permission("local/worker", "0.1.0", None);
+    let malformed = daemon.permission("local/worker", "0.1.0", Some("not-a-token"));
+    let wrong_family = daemon.permission("local/worker", "0.1.0", Some("msa1.e30.e30"));
     let unknown_session = daemon.permission(
-        "worker",
+        "local/worker",
         "0.1.0",
         Some(&daemon.credential("ses_never-registered")),
     );

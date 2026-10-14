@@ -4,8 +4,44 @@ use std::fmt;
 
 use bytes::Bytes;
 
+use murmur_artifact::{artifact_name_format_error, MURMUR_SCOPE, RESERVED_SCOPES};
+
 use crate::config::{MurConfig, SourceConfig, SourceType};
-use crate::error::{E_IO_003, E_REG_001, E_REG_006};
+use crate::error::{CliError, E_IO_003, E_REG_001, E_REG_006, E_REG_007};
+
+/// The repository Murmur's default artifacts are published from, the built-in `official` source.
+pub(crate) const DEFAULT_ARTIFACTS_REPO: &str = "murmur-nexus/default-artifacts";
+
+/// The scope every asset of `github:<owner>/<repo>` is stored under: [`MURMUR_SCOPE`] for
+/// [`DEFAULT_ARTIFACTS_REPO`], else the owner lowercased. Refused when the owner is no valid
+/// scope, or names one of [`RESERVED_SCOPES`], which no GitHub owner can claim.
+pub(crate) fn github_scope(owner: &str, repo: &str) -> Result<String, CliError> {
+    if format!("{owner}/{repo}").eq_ignore_ascii_case(DEFAULT_ARTIFACTS_REPO) {
+        return Ok(MURMUR_SCOPE.to_string());
+    }
+    let scope = owner.to_ascii_lowercase();
+    if RESERVED_SCOPES.contains(&scope.as_str()) {
+        return Err(CliError::with_hint(
+            E_REG_007,
+            format!("github:{owner}/{repo} cannot be installed: '{scope}' is a reserved scope"),
+            format!(
+                "'{}' names artifacts installed from a .mur.zip file and '{MURMUR_SCOPE}' names \
+                 those from {DEFAULT_ARTIFACTS_REPO}; no GitHub owner can claim either",
+                murmur_artifact::LOCAL_SCOPE
+            ),
+        ));
+    }
+    if let Some(reason) = artifact_name_format_error(&scope) {
+        return Err(CliError::new(
+            E_REG_007,
+            format!(
+                "github:{owner}/{repo} cannot be installed: the owner '{owner}' is not a valid \
+                 artifact scope (it {reason})"
+            ),
+        ));
+    }
+    Ok(scope)
+}
 
 use self::github::GitHubSource;
 

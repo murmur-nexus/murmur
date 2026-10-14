@@ -927,10 +927,10 @@ mod tests {
 
     fn manifest(extra: &str) -> RuntimeManifest {
         RuntimeManifest::from_yaml_str(&format!(
-            "name: my-agent\nversion: 0.1.0\nartifacts:\n  - name: bash\n    version: 1.0.0\n    \
-             runtime: tool\n  - name: drv\n    version: 1.0.0\n    runtime: driver\n    gateway:\n      \
-             endpoint: https://api.example.com\n      api_key: k\n\
-             inference:\n  transport: http\n  model: m\n  driver:\n    artifact: drv\n\
+            "name: my-agent\nversion: 0.1.0\nartifacts:\n  - name: local/bash\n    version: 1.0.0\n    \
+             runtime: tool\n  - name: local/drv\n    version: 1.0.0\n    runtime: driver\n    \
+             gateway:\n      endpoint: https://api.example.com\n      api_key: k\n\
+             inference:\n  transport: http\n  model: m\n  driver:\n    artifact: local/drv\n\
              capabilities:\n  shell:\n    allow: [git]\n  network:\n    allow: [api.example.com]\n\
              exports:\n  files:\n    root: out\n    mode: read-only\n{extra}"
         ))
@@ -946,7 +946,7 @@ mod tests {
                 "warning[W-SEC-032]: the door is bound to 0.0.0.0 and network.authentication is \
                  not declared — any caller that reaches it can call SendMessage, \
                  SendStreamingMessage, murmur.WatchSession, GetTask, ListTasks, CancelTask, \
-                 SubscribeToTask, murmur.StopSession, and the agent card publishes to any A2A client the session id, tools [bash], shell: \
+                 SubscribeToTask, murmur.StopSession, and the agent card publishes to any A2A client the session id, tools [local/bash], shell: \
                  true, network: true and planes [files] ({})",
                 security_warning_link(W_SEC_032)
             )

@@ -5020,7 +5020,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: greedy-hook
+  - name: local/greedy-hook
     version: 1.0.0
     runtime: hook
 "#,

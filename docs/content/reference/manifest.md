@@ -12,7 +12,7 @@ The manifest that ships inside a `.mur.zip`, read by `mur build` and `mur publis
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `name` | string | yes | Lowercase letters, digits and inner hyphens (`[a-z0-9-]`, no leading or trailing `-`), non-empty, at most 100 characters. Anything else fails the build with [`E-BLD-001`](diagnostics.md#e-bld-001). |
+| `name` | string | yes | The artifact's bare name, without a scope. Lowercase letters, digits and inner hyphens (`[a-z0-9-]`, no leading or trailing `-`), non-empty, at most 100 characters. Anything else, a `/` included, fails the build with [`E-BLD-001`](diagnostics.md#e-bld-001). The artifact installs as `<scope>/<name>` — see [Artifact names](../concepts/registry.md#artifact-names). |
 | `version` | string | yes | `latest`, `stable` and `edge` are reserved and cannot be published (`E-REG-004`). |
 | `runtime` | string | yes | The artifact's role. Two values change how it is packaged when `execution` is absent: `skill` packages as `static`, and `tool` with `implementation: native` packages as `native`. Everything else packages as `wasm`. |
 | `implementation` | `wasm \| native` | no | How a `runtime: tool` artifact is implemented. Default: `wasm`. |
@@ -83,9 +83,9 @@ of them is refused without running the tool — on `transport: http`, on `transp
 a [plan](#field-plan) `tool` step alike. The model is handed a failed tool result:
 
 ```text
-murmur-tool-editor: missing required field "operation"
+tool-editor: missing required field "operation"
 
-This call did not run. murmur-tool-editor's input_schema requires: "operation", "dest_path". Call it again with every one of them present. Only the presence of required fields is checked before a call runs — not their types, allowed values or nested contents.
+This call did not run. tool-editor's input_schema requires: "operation", "dest_path". Call it again with every one of them present. Only the presence of required fields is checked before a call runs — not their types, allowed values or nested contents.
 ```
 
 With several fields missing, the first line names all of them: `missing required fields
@@ -146,19 +146,19 @@ name: my-capsule
 version: "0.1.0"
 
 artifacts:
-  - name: some-tool
+  - name: ana/some-tool   # <scope>/<name>
     version: "1.2.3"
     runtime: tool  # optional, defaults to tool
     gateway:       # optional: the runtime presents this tool's third-party key for it
       endpoint: https://api.tavily.com
       api_key: ${TAVILY_API_KEY}   # optional; literal value or ${ENV_VAR}
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
     gateway:       # required on the transport: http driver
       endpoint: https://api.anthropic.com
       api_key: ${ANTHROPIC_API_KEY}
-  - name: murmur-hook-debug
+  - name: murmur/hook-debug
     version: "{{ v.murmur_hook_debug }}"
     runtime: hook  # lifecycle observer; hidden from the model
 
@@ -237,7 +237,7 @@ inference:
   transport: http
   model: claude-opus-4-5
   driver:
-    artifact: murmur-driver-anthropic  # its entry above carries the gateway
+    artifact: murmur/driver-anthropic  # its entry above carries the gateway
     config:
       some_flag: true             # optional free-form JSON object
   compaction:
@@ -258,7 +258,7 @@ inference:
 # inference:
 #   transport: process
 #   driver:
-#     artifact: my-process-driver   # the process driver that knows this harness
+#     artifact: local/my-process-driver  # the process driver that knows this harness
 #   max_turns: 10
 
 lifecycle:
@@ -294,7 +294,7 @@ deploy:                   # optional: read by mur deploy only
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `name` | string | yes | Capsule identity. |
+| `name` | string | yes | Capsule identity: the capsule's bare name, as for any [artifact](#artifact-manifest). |
 | `version` | string | yes | Capsule version. |
 
 #### `artifacts` { #field-artifacts }
@@ -302,7 +302,7 @@ deploy:                   # optional: read by mur deploy only
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `artifacts` | list | no | Defaults to empty. |
-| `artifacts[].name` | string | yes (per entry) | Artifact name. |
+| `artifacts[].name` | string | yes (per entry) | The artifact's full name, `<scope>/<name>`, such as `murmur/tool-git` — see [Artifact names](../concepts/registry.md#artifact-names). A bare name is refused with `E-MAN-003` and a hint naming its scoped forms. An entry that declares `source:` takes the bare name instead, and a scope on it is refused. The bare part is the tool name the model calls, so two entries may not share one ([`E-CAP-020`](diagnostics.md#e-cap-020)). |
 | `artifacts[].version` | string | yes (per entry) | Optional when `source` is set — see [Local-source artifacts](#local-source-skills). |
 | `artifacts[].runtime` | `tool \| driver \| hook \| skill` | no | Default: `tool`. `tool` and `skill` artifacts are model-visible; `driver` and `hook` artifacts are hidden from the model. `wasm` and `native` are rejected here — those belong in the artifact's own manifest as `implementation`. |
 | `artifacts[].source` | string | no | Local path the runtime resolves this artifact from instead of the registry. Requires `local_source: true`. See [Local-source artifacts](#local-source-skills). |
@@ -327,12 +327,12 @@ directory. Network and filesystem are granted back one hook at a time, from that
 ```yaml
 artifacts:
   # default-deny: no network, no filesystem
-  - name: murmur-hook-observe
+  - name: local/hook-observe
     version: 0.1.0
     runtime: hook
 
   # granted exactly one host and exactly one directory
-  - name: murmur-hook-telemetry
+  - name: local/hook-telemetry
     version: 0.1.0
     runtime: hook
     capabilities:
@@ -343,7 +343,7 @@ artifacts:
         scope: hook-state
 
   # granted the task text and the agent's result, and nothing else
-  - name: murmur-hook-output-gate
+  - name: local/hook-output-gate
     version: 0.1.0
     runtime: hook
     capabilities:
@@ -351,7 +351,7 @@ artifacts:
         read: true
 
   # granted the capsule's conversation record, and nothing else
-  - name: murmur-hook-recall
+  - name: local/hook-recall
     version: 0.1.0
     runtime: hook
     capabilities:
@@ -359,7 +359,7 @@ artifacts:
         read: true
 
   # granted a durable store and nothing else — no project directory at all
-  - name: murmur-hook-notes
+  - name: local/hook-notes
     version: 0.1.0
     runtime: hook
     capabilities:
@@ -425,12 +425,12 @@ capabilities:            # the capsule-wide ceiling
 
 artifacts:
   # unchanged: reaches both ceiling hosts, sees the whole workdir
-  - name: broad-tool
+  - name: local/broad-tool
     version: 0.1.0
     runtime: tool
 
   # narrowed: one host, and only the `cache/` subtree of the workdir
-  - name: scoped-tool
+  - name: local/scoped-tool
     version: 0.1.0
     runtime: tool
     capabilities:
@@ -441,7 +441,7 @@ artifacts:
         scope: cache
 
   # widened by exactly one directory: a durable store outside every workdir
-  - name: murmur-tool-corpus
+  - name: murmur/tool-corpus
     version: 0.1.0
     runtime: tool
     capabilities:
@@ -494,7 +494,7 @@ environment:
 
 ```yaml
 artifacts:
-  - name: murmur-tool-corpus
+  - name: murmur/tool-corpus
     version: 0.1.0
     runtime: tool
     capabilities:
@@ -541,7 +541,7 @@ declared:
 
 ```
   artifact config:
-    - murmur-tool-corpus
+    - murmur/tool-corpus
 ```
 
 `--json` emits the same names as `configured_artifacts`, and `trace.jsonl`'s `session_start`
@@ -565,7 +565,7 @@ it, and the runtime sends the request on to `gateway.endpoint` with the key atta
 
 ```yaml
 artifacts:
-  - name: murmur-tool-web-search
+  - name: local/tool-web-search
     version: "0.1.0"
     runtime: tool
     gateway:
@@ -662,7 +662,7 @@ behind the inference driver:
 
 ```yaml
 artifacts:
-  - name: murmur-driver-openai
+  - name: murmur/driver-openai
     version: "{{ v.murmur_driver_openai }}"
     runtime: driver
     gateway:
@@ -710,6 +710,9 @@ artifacts:
 
 Rules:
 
+- **A `source:` entry is named by its bare name**, such as `house-style`. A scope says where an
+  installed artifact came from, and a `source:` entry is not installed: `name: ana/house-style`
+  with `source:` is refused with `E-MAN-003` and the hint `drop the scope: name it 'house-style'`.
 - **`local_source` gates `source:`, not the role directly.** When `local_source` is absent its
   value is derived from the role: `true` for `runtime: skill`, `false` for everything else.
   Declaring `local_source: true` on a `tool`, `driver` or `hook` artifact opts it in; declaring
@@ -741,8 +744,8 @@ are resolved fresh from disk on every `mur run`.
 
 ##### `inference.system_prompt_artifact` { #inference-system-prompt-artifact }
 
-Names an artifact declared in `artifacts:` whose content is read once at launch and bound as the
-system prompt, instead of being called on demand. The named artifact must declare
+Names an artifact declared in `artifacts:`, by its entry's `name` as written, whose content is
+read once at launch and bound as the system prompt, instead of being called on demand. The named artifact must declare
 `prompt_payload: true`, or default to it as `runtime: skill` does; naming an artifact where
 `prompt_payload` is `false` fails with `E-MAN-003`. A skill bound this
 way is excluded from the callable tool inventory, because it is already in the system prompt. See
@@ -793,9 +796,9 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.conversation.read` | bool | no | Grant of the `murmur:conversation/read` import, applied **per hook only**. Declaring it in this capsule-wide block reaches nothing — no artifact can read the conversation record — and prints [`W-SEC-016`](diagnostics.md#w-sec-016) at staging. Put it on the hook entry that needs it: [Hook capabilities](#hook-capabilities). |
 | `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` directory is mounted — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
 | `capabilities.plan.submit` | bool | see notes | Default: absent, which is deny. `true` puts the [runtime-provided tool](runtime-provided-tools.md) `submit-plan` in the capsule's inventory, and the runtime's guidance on when to plan in its system prompt; a capsule that declares nothing is offered neither. Required when the `plan:` block is present — a block that omits it is refused at parse. It grants no reach of its own: every step of a plan runs through this capsule's own tools, `capabilities.shell.allow` and `capabilities.spawn.allow`. See [Plans](plans.md). `mur run --explain-scope` reports it as `plan submit`. |
-| `capabilities.install.skill` | list<string> | see notes | Default: absent, which is deny. Skills that `manage.pull` may install into a running session, as [install entries](#install-entries): an exact artifact name, a `<prefix>*`, or `*`. A skill is an artifact whose payload is a `skill.md` and nothing else. Capsule-wide only — declaring `install` on an `artifacts[]` entry is refused at parse. The same entries let `manage.remove` uninstall a skill the capsule pulled. With both install lists empty or absent, every pull and every removal is refused. See [`capabilities.install`](#field-install). `mur run --explain-scope` reports it as `install skill`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_skill`. |
+| `capabilities.install.skill` | list<string> | see notes | Default: absent, which is deny. Skills that `manage.pull` may install into a running session, as [install entries](#install-entries): an exact full name, `<scope>/*`, `<scope>/<prefix>*`, or `*`. A skill is an artifact whose payload is a `skill.md` and nothing else. Capsule-wide only — declaring `install` on an `artifacts[]` entry is refused at parse. The same entries let `manage.remove` uninstall a skill the capsule pulled. With both install lists empty or absent, every pull and every removal is refused. See [`capabilities.install`](#field-install). `mur run --explain-scope` reports it as `install skill`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_skill`. |
 | `capabilities.install.tool` | list<string> | see notes | Default: absent, which is deny. Tools, WASM or native, that `manage.pull` may install, as [install entries](#install-entries). The same entries let `manage.remove` uninstall a tool the capsule pulled. Drivers and hooks are never pullable or removable, under any entry. At least one of `skill` and `tool` must be non-empty when the `install:` block is present — an empty block is refused at parse. Capsule-wide only. `mur run --explain-scope` reports it as `install tool`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_tool`. |
-| `capabilities.spawn.allow` | list<string> | no | Capsule names this capsule may spawn as sub-capsules. `mur-roost` matches each spawn request's capsule name against this list and refuses a name that is absent from it — see [Per-session allow lists](roost-api.md#per-session-allow-lists) for the worked example. `capabilities.shell.allow` governs the executables the capsule runs itself. A non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux ([`E-CAP-005`](diagnostics.md#e-cap-005)). It also means the session registers with `mur-roost` at launch, so the daemon holds the ceiling it referees against: with no daemon reachable at `MURMUR_ROOST_URL` the launch is refused with [`E-RUN-019`](diagnostics.md#e-run-019). A non-empty list is also what puts the [runtime-provided tool](runtime-provided-tools.md) `delegate-task` in the capsule's inventory, with these names as the tool's `capsule` argument — see [The delegation tool](roost-api.md#the-delegation-tool). A capsule that declares none is offered no such tool. How deep a chain of delegations may go and how many children one session may hold at once are the daemon's, not this field's — see [Delegation bounds](roost-api.md#delegation-bounds). `mur run --explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_allow`. |
+| `capabilities.spawn.allow` | list<string> | no | Full names, `<scope>/<name>`, of the capsules this capsule may spawn as sub-capsules. A bare name is refused with `E-MAN-003`, and so are two entries with the same bare part, because `delegate-task` offers each capsule to the model by its bare part. `mur-roost` matches each spawn request's capsule name against this list and refuses a name that is absent from it — see [Per-session allow lists](roost-api.md#per-session-allow-lists) for the worked example. `capabilities.shell.allow` governs the executables the capsule runs itself. A non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux ([`E-CAP-005`](diagnostics.md#e-cap-005)). It also means the session registers with `mur-roost` at launch, so the daemon holds the ceiling it referees against: with no daemon reachable at `MURMUR_ROOST_URL` the launch is refused with [`E-RUN-019`](diagnostics.md#e-run-019). A non-empty list is also what puts the [runtime-provided tool](runtime-provided-tools.md) `delegate-task` in the capsule's inventory, with the bare part of each name as the tool's `capsule` argument — see [The delegation tool](roost-api.md#the-delegation-tool). A capsule that declares none is offered no such tool. How deep a chain of delegations may go and how many children one session may hold at once are the daemon's, not this field's — see [Delegation bounds](roost-api.md#delegation-bounds). `mur run --explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_allow`. |
 
 A `capabilities.network.allow` host that fails DNS resolution at launch is skipped rather than
 treated as an error: the run proceeds with that host contributing no addresses to the launch-time
@@ -870,8 +873,8 @@ uninstall them again through [`manage.remove`](wit-interfaces.md#manage-remove).
 ```yaml
 capabilities:
   install:
-    skill: [code-review, "style-*"]
-    tool: [jq]
+    skill: [ana/code-review, "ana/style-*"]
+    tool: [local/jq]
 ```
 
 | Key | Admits |
@@ -886,8 +889,9 @@ payload.
 A pull resolves from the registry the session was staged against. For `mur run` and `mur eval`
 that is the project artifact store, falling back to the global store under `~/.murmur`, so a grant
 admits only what [`mur install`](cli.md#mur-install) or [`mur publish`](cli.md#mur-publish) has
-already placed on this host. A pull names a bare artifact name and a version that is a single
-path segment; a `github:` reference, a path, or a version containing `/` or `..` is refused.
+already placed on this host. A pull names a full artifact name and a version that is a single
+path segment; a bare name, a `github:` reference, a path, or a version containing `/` or `..` is
+refused.
 
 A pulled artifact runs on this capsule's own grants. It gains no per-artifact capabilities, no
 gateway and no place in the `invoke()` allowlist, and the `capabilities:` block in its own bundled
@@ -997,7 +1001,7 @@ model. These fields are read under both transports:
 | `inference.max_turns` | integer | no | Maximum LLM inference calls per task. Default: `10`. Must be > 0. A hook's counted `run-inference` call is one of them: it is in `task_end.turns`, and an attempt [reopened](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task) after it is handed only the turns the task has left. |
 | `inference.system_prompt` | string | no | Text injected verbatim as the `system` parameter on every inference call. At most one of `system_prompt`, `system_prompt_file` and `system_prompt_artifact` may be set. |
 | `inference.system_prompt_file` | string | no | Path to a file whose content is injected as the system prompt, relative to the manifest directory. |
-| `inference.system_prompt_artifact` | string | no | Name of an artifact declared in `artifacts:` whose payload is bound as the system prompt — see [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
+| `inference.system_prompt_artifact` | string | no | The `name`, as written, of an artifact declared in `artifacts:` whose payload is bound as the system prompt — see [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
 
 These fields are read under `transport: http`. Setting any of them except `inference.model` under
 `transport: process` is a manifest error:
@@ -1030,6 +1034,13 @@ With no driver named, the message reads `on the artifacts: entry inference.drive
 artifact it names must be declared in `artifacts:` with `runtime: driver`, and a value of `config`
 that is not a mapping fails the manifest parse with `E-MAN-003`.
 
+`inference.driver.artifact`, `inference.alternates[].driver.artifact` and
+[`inference.system_prompt_artifact`](#inference-system-prompt-artifact) name an `artifacts:` entry
+by its `name` exactly as written: `murmur/driver-anthropic` for a resolved entry, the bare name for
+a `source:` entry. A name no entry declares is refused with `E-MAN-003`; when it is the bare part of
+exactly one declared entry, the message names that entry:
+`artifact 'driver-anthropic' is not declared in artifacts: (the declared 'murmur/driver-anthropic' has that name; refer to it as 'murmur/driver-anthropic')`.
+
 | Field | `transport: http` | `transport: process` |
 |---|---|---|
 | `inference.driver.artifact` | Required. The inference driver. Its entry must carry [`gateway.endpoint`](#artifact-gateway). | Required. The [process driver](#process-driver). Its entry may carry none of `gateway:`, `capabilities:` or `config:`. |
@@ -1046,27 +1057,27 @@ driver is an `artifacts:` entry.
 
 ```yaml
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
     gateway: { endpoint: https://api.anthropic.com, api_key: ${ANTHROPIC_API_KEY} }
-  - name: murmur-driver-openai
+  - name: murmur/driver-openai
     version: "{{ v.murmur_driver_openai }}"
     runtime: driver
     gateway: { endpoint: https://api.openai.com/v1, api_key: ${OPENAI_API_KEY} }
 inference:
   model: claude-sonnet-4-5
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
   alternates:
     - name: haiku
       model: claude-haiku-4-5
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
     - name: gpt
       model: gpt-5
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
 control:
   settings: [inference.driver]
 ```
@@ -1145,7 +1156,7 @@ these fields are accepted and inert:
 |---|---|---:|---|
 | `observability.otel_endpoint` | string | no | OTLP/HTTP endpoint for OTel span export (e.g. `http://localhost:4318`). When set, the runtime exports one span per session event as the event happens, and injects `MURMUR_OTEL_ENDPOINT` into every hook component's environment — see [OTel span emission](observability-schemas.md#otel-span-emission). When absent, no outbound telemetry is sent and `trace.jsonl` is the only output. An empty string counts as absent. |
 | `observability.eval.dataset_id` | string | no | Labels the `dataset_run` record in `eval.jsonl` and is forwarded to hooks as `MURMUR_DATASET_ID`. Useful when diffing runs from multiple datasets. |
-| `observability.eval.scorers` | list | no | Scorer configurations. When present with at least one valid scorer, `murmur-hook-eval` writes `eval.jsonl`. When absent or empty, the hook is a no-op and logs a warning. |
+| `observability.eval.scorers` | list | no | Scorer configurations. When present with at least one valid scorer, `murmur/hook-eval` writes `eval.jsonl`. When absent or empty, the hook is a no-op and logs a warning. |
 | `observability.eval.scorers[].type` | string | yes (per entry) | One of `exit_ok`, `max_turns`, `max_tokens`, `tool_sequence`, `llm_judge`. An unrecognized type is skipped with a message on stderr. `llm_judge` is unimplemented: it parses, logs a warning and emits no score. |
 | `observability.eval.scorers[].name` | string | no | Key this scorer's records appear under in `eval.jsonl`. Defaults to the scorer's `type`. |
 | `observability.eval.scorers[].max` | integer | no | Upper bound for `max_turns` and `max_tokens`. Default: `10` for `max_turns`, `100000` for `max_tokens`. Ignored by every other type. |
@@ -1351,7 +1362,7 @@ A retry budget means the same thing behind any provider, so it describes the rol
 inference:
   model: claude-opus-4-5
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
     config:
       max_retries: 3
       request_timeout_seconds: 60
@@ -1362,12 +1373,12 @@ key names illustrate the question; each driver documents the keys it reads.
 
 ### No — the key belongs to one artifact { #which-config-block-no }
 
-`murmur-driver-anthropic` reads `prompt_cache` and `prompt_cache_ttl` from its own entry in
+`murmur/driver-anthropic` reads `prompt_cache` and `prompt_cache_ttl` from its own entry in
 `artifacts:`:
 
 ```yaml
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
     config:
@@ -1383,7 +1394,7 @@ A tool or a hook has only this block, so every setting either role reads arrives
 
 ```yaml
 artifacts:
-  - name: murmur-tool-corpus
+  - name: murmur/tool-corpus
     version: 1.0.0
     runtime: tool
     capabilities:
@@ -1414,7 +1425,7 @@ fails with `E-RUN-006`.
 
 ```yaml
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
     gateway:
@@ -1427,7 +1438,7 @@ inference:
   max_tokens: 4096        # optional per-turn output cap; default 8192
   max_session_tokens: 2000000   # optional session spend ceiling; default none
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 ```
 
 #### Output cap: `inference.max_tokens` { #inference-max-tokens }
@@ -1577,7 +1588,7 @@ Refused under `transport: process` with `E-MAN-003`: the harness owns its tool l
 ##### Measured cost { #inference-tool-refresh-cost }
 
 Three consecutive calls of one conversation against OpenAI `gpt-5.6-luna` through
-`murmur-driver-openai`, each within seconds of the last, with the same system prompt and each
+`murmur/driver-openai`, each within seconds of the last, with the same system prompt and each
 call's messages beginning with every message of the call before:
 
 | Call | Tool list | Input tokens | Read from cache |
@@ -1598,7 +1609,7 @@ neither holds nor controls them.
 
 ```yaml
 artifacts:
-  - name: my-process-driver
+  - name: local/my-process-driver
     version: "0.1.0"
     runtime: driver
 capabilities:
@@ -1607,7 +1618,7 @@ capabilities:
 inference:
   transport: process
   driver:
-    artifact: my-process-driver
+    artifact: local/my-process-driver
   max_turns: 10
 ```
 
@@ -1644,13 +1655,13 @@ capabilities:
   env:
     allow: [HOME]            # every variable the driver's describe() requires
 artifacts:
-  - name: my-process-driver
+  - name: local/my-process-driver
     version: "0.1.0"
     runtime: driver
 inference:
   transport: process
   driver:
-    artifact: my-process-driver
+    artifact: local/my-process-driver
     config: {}               # optional; handed to the driver as JSON
 ```
 
@@ -1708,7 +1719,7 @@ it does with a successful return value is set by the hook's own `commit_policy`.
 
 ```yaml
 artifacts:
-  - name: murmur-hook-debug
+  - name: murmur/hook-debug
     version: "{{ v.murmur_hook_debug }}"
     runtime: hook
 
@@ -1722,7 +1733,7 @@ observability:
 | Invocation order | Multiple hooks are invoked in manifest declaration order for each event. |
 | Failure handling | A hook that returns an error does not abort the agent loop. The error is appended to `workdir/logs/hook-<name>.log`. For an `execution_mode: async` hook it is also recorded as a `hook_dispatch_error` event in `trace.jsonl`, since the log is otherwise the only place it appears. A blocking hook's error is additionally surfaced to the agent loop, which is fatal only for compaction. |
 | Workdir access | A hook sees one directory, and only where its entry in the capsule manifest grants a `filesystem.scope` — see [Hook capabilities](#hook-capabilities). |
-| Reference hook | `murmur-hook-debug` writes one JSON object per event to `workdir/hook-debug.jsonl`. |
+| Reference hook | `murmur/hook-debug` writes one JSON object per event to `workdir/hook-debug.jsonl`. |
 | Call deadline | Each hook lifecycle call gets its own wall-clock budget: `capabilities.limits.deadline_seconds` when the manifest sets it, otherwise 30 seconds — well below the capsule-wide 600-second default, so one wedged hook cannot stall a session for most of ten minutes per event. |
 
 ### Hook contract fields { #hook-contract-fields }
@@ -1805,7 +1816,7 @@ is full, which only happens when the hook is falling behind the rate of lifecycl
 
 ```yaml
 artifacts:
-  - name: murmur-hook-grafana
+  - name: murmur/hook-grafana
     version: "{{ v.murmur_hook_grafana }}"
     runtime: hook
     on_overflow: block   # wait for room instead of dropping events under load
@@ -2049,21 +2060,25 @@ the same terms. Omit the key to deliver no variable.
 
 ### Install entries { #install-entries }
 
-Each entry in `capabilities.install.skill` and `capabilities.install.tool` takes one of three
+Each entry in `capabilities.install.skill` and `capabilities.install.tool` takes one of four
 forms:
 
 | Form | Example | Matches |
 |---|---|---|
-| Exact name | `code-review` | That artifact name only |
-| Prefix | `style-*` | Every artifact name that begins with the prefix |
-| Wildcard | `*` | Every artifact name |
+| Exact full name | `ana/code-review` | That artifact only |
+| Scope and prefix | `ana/style-*` | Every artifact in the scope whose bare name begins with the prefix |
+| Scope | `ana/*` | Every artifact in the scope |
+| Wildcard | `*` | Every artifact of every scope |
 
-- An exact name follows the artifact-name rule: lowercase letters, digits and inner `-`, at most
-  100 characters.
-- A prefix is non-empty, uses the same characters, does not begin with `-`, and ends in a single
-  `*`. It may end in `-` before the `*`.
-- Anything else is refused at parse, naming the key and the entry: a `*` anywhere but the end, a
-  second `*`, uppercase, `/`, `:`, whitespace, or an empty string.
+- An exact name is a full name, `<scope>/<name>` — see
+  [Artifact names](../concepts/registry.md#artifact-names).
+- A prefix uses the same characters as a name, does not begin with `-`, and ends in a single `*`.
+  It may end in `-` before the `*`.
+- An entry with no scope, such as `code-review` or `style-*`, is refused at parse with a hint
+  naming its scoped forms. Anything else is refused too, naming the key and the entry: a `*`
+  anywhere but the end, a second `*`, uppercase, a second `/`, `:`, whitespace, or an empty string.
+- Only `*` reaches across scopes, so a child capsule's entries are covered by its parent's only
+  when they stay within the scopes its parent's entries name.
 - A block that names no entry in either list is refused at parse, naming `capabilities.install`.
   Omit the block to grant no install.
 - An unknown key inside the block, such as `driver:`, grants nothing and warns with

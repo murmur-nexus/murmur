@@ -17,7 +17,7 @@ The relevant manifest options are:
 
 ## Step 1 — create murmur.yaml with the memory hook
 
-Every task on `inference.transport: http` already appends the messages it sends to a durable conversation record — this is on by default and needs no configuration. What is not automatic is putting any of that record back in front of the model. `murmur-hook-memory` is the artifact that does it: bound to `on-task-start`, it reads the record, selects a budget-bounded chronological slice, and seeds it at the head of the new task's context.
+Every task on `inference.transport: http` already appends the messages it sends to a durable conversation record — this is on by default and needs no configuration. What is not automatic is putting any of that record back in front of the model. `murmur/hook-memory` is the artifact that does it: bound to `on-task-start`, it reads the record, selects a budget-bounded chronological slice, and seeds it at the head of the new task's context.
 
 Create a `murmur.yaml` file:
 
@@ -31,13 +31,13 @@ Create a `murmur.yaml` file:
       max_tokens: {{ v.max_tokens_anthropic }}
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
           endpoint: https://api.anthropic.com
           api_key: ${ANTHROPIC_API_KEY}
-      - name: murmur-hook-memory
+      - name: murmur/hook-memory
         version: "{{ v.murmur_hook_memory }}"
         runtime: hook
         capabilities:
@@ -48,7 +48,7 @@ Create a `murmur.yaml` file:
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
     ```
 
 === "OpenAI"
@@ -61,13 +61,13 @@ Create a `murmur.yaml` file:
       max_tokens: {{ v.max_tokens_openai }}
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
           endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
-      - name: murmur-hook-memory
+      - name: murmur/hook-memory
         version: "{{ v.murmur_hook_memory }}"
         runtime: hook
         capabilities:
@@ -78,7 +78,7 @@ Create a `murmur.yaml` file:
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
     ```
 
 === "DeepSeek"
@@ -91,13 +91,13 @@ Create a `murmur.yaml` file:
       max_tokens: {{ v.max_tokens_deepseek }}
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
           endpoint: https://api.deepseek.com
           api_key: ${DEEPSEEK_API_KEY}
-      - name: murmur-hook-memory
+      - name: murmur/hook-memory
         version: "{{ v.murmur_hook_memory }}"
         runtime: hook
         capabilities:
@@ -108,10 +108,10 @@ Create a `murmur.yaml` file:
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
     ```
 
-`capabilities.conversation.read: true` on the hook's own entry is required, not inferred — a `murmur-hook-memory` declared without it fails every read and seeds nothing. `context.max_tokens` is required too: it is what `context.seed_budget` is a fraction of, and without it a seed the hook returns is refused.
+`capabilities.conversation.read: true` on the hook's own entry is required, not inferred — a `murmur/hook-memory` declared without it fails every read and seeds nothing. `context.max_tokens` is required too: it is what `context.seed_budget` is a fraction of, and without it a seed the hook returns is refused.
 
 ---
 
@@ -166,7 +166,7 @@ Run it under the same context id:
 mur run --task task.md --context nightly-build-investigation
 ```
 
-The second run's `murmur-hook-memory` reads the record the first run wrote under that context id and seeds the relevant slice — the model answers from what the first run actually recorded, not from a fresh start. Omit `--context` and each run gets its own fresh id, so nothing carries over.
+The second run's `murmur/hook-memory` reads the record the first run wrote under that context id and seeds the relevant slice — the model answers from what the first run actually recorded, not from a fresh start. Omit `--context` and each run gets its own fresh id, so nothing carries over.
 
 ---
 
@@ -194,7 +194,7 @@ No **Context** section at all means no `on-task-start` hook returned a seed — 
 
 ## Step 6 — turn the record off, or keep it separate per capsule
 
-`context.record: off` stops the runtime from writing anything under `~/.murmur/conversations/` at all — useful for a capsule that should never retain what it saw, agent-to-agent handoffs included. `murmur-hook-memory` gracefully reads an empty page in that case rather than failing.
+`context.record: off` stops the runtime from writing anything under `~/.murmur/conversations/` at all — useful for a capsule that should never retain what it saw, agent-to-agent handoffs included. `murmur/hook-memory` gracefully reads an empty page in that case rather than failing.
 
 ```yaml
 context:
@@ -214,11 +214,11 @@ context:
 
 ## Step 7 — give the capsule a place to write its own notes
 
-The conversation record and the memory hook cover what the model *said*. For structured notes the agent writes on purpose — findings, decisions, anything worth keeping past the task that produced it — declare a durable state store instead. `murmur-tool-corpus` is the shipped implementation: an append-only, schema-validated record store the capsule's own `murmur-tool-editor` or shell grant cannot reach, because it lives outside the workdir entirely.
+The conversation record and the memory hook cover what the model *said*. For structured notes the agent writes on purpose — findings, decisions, anything worth keeping past the task that produced it — declare a durable state store instead. `murmur/tool-corpus` is the shipped implementation: an append-only, schema-validated record store the capsule's own `murmur/tool-editor` or shell grant cannot reach, because it lives outside the workdir entirely.
 
 ```yaml
 artifacts:
-  - name: murmur-tool-corpus
+  - name: murmur/tool-corpus
     version: "{{ v.murmur_tool_corpus }}"
     runtime: tool
     capabilities:
@@ -236,7 +236,7 @@ artifacts:
             additionalProperties: false
 ```
 
-See [`murmur-tool-corpus`](../reference/default-artifacts.md#murmur-tool-corpus) for its five operations, and [Durable state store](../reference/workdir.md#state-store) for where the grant actually points and how it differs from the conversation record. Confirm the grant resolved before relying on it:
+See [`murmur/tool-corpus`](../reference/default-artifacts.md#murmur-tool-corpus) for its five operations, and [Durable state store](../reference/workdir.md#state-store) for where the grant actually points and how it differs from the conversation record. Confirm the grant resolved before relying on it:
 
 ```bash
 mur run --explain-scope
@@ -244,7 +244,7 @@ mur run --explain-scope
 
 ```text
   state stores:
-    - murmur-tool-corpus: my-agent -> /home/dev/.murmur/state/my-agent
+    - murmur/tool-corpus: my-agent -> /home/dev/.murmur/state/my-agent
 ```
 
 ---
@@ -256,9 +256,9 @@ mur run --explain-scope
 | `context.record: on` (default) | Every task appends its messages to a durable conversation record |
 | `context.record: off` | Nothing is written; a hook granted `capabilities.conversation.read` reads an empty page |
 | `context.record_store: <name>` | Names the record's directory explicitly; default is the capsule name |
-| `murmur-hook-memory` with `capabilities.conversation.read: true` on its own entry | Seeds each task with the relevant slice of prior conversation; the capsule-wide `capabilities` block cannot grant this |
+| `murmur/hook-memory` with `capabilities.conversation.read: true` on its own entry | Seeds each task with the relevant slice of prior conversation; the capsule-wide `capabilities` block cannot grant this |
 | `context.seed_budget` (default `0.10`) | Fraction of `context.max_tokens` a seed may occupy |
 | `context.seed_overflow_margin` (default `0.10`) | Slack before an over-budget seed is trimmed or summarized instead of seeded whole |
 | `mur run --context <id>` | Two runs with the same id share one conversation record |
 | `capabilities.state: {}` on an artifact entry | Grants that artifact a durable directory outside the workdir, keyed by capsule |
-| `murmur-tool-corpus` | Ships as the append-only, schema-validated store for an agent's own notes |
+| `murmur/tool-corpus` | Ships as the append-only, schema-validated store for an agent's own notes |

@@ -29,14 +29,14 @@ use tempfile::TempDir;
 fn create_delegating_project(home: &TempDir, project_dir: &Path) {
     install_capsule(
         &global_store(home),
-        "worker",
+        "local/worker",
         "0.1.0",
         "name: worker\nversion: 0.1.0\n",
     );
     fs::write(
         project_dir.join("murmur.yaml"),
         "name: doctor-fixture\nversion: 0.0.1\nartifacts: []\n\
-         capabilities:\n  spawn:\n    allow:\n      - worker\n",
+         capabilities:\n  spawn:\n    allow:\n      - local/worker\n",
     )
     .unwrap();
 }
@@ -156,6 +156,7 @@ fn write_lock(project_dir: &Path, name: &str, resolved_version: &str, sha256: &s
                 resolved_version: resolved_version.to_string(),
                 sha256: LockedSha256::any(sha256.to_string()),
                 origin: LockOrigin::Operator,
+                owner_id: None,
             }],
         },
     )
@@ -191,7 +192,7 @@ fn install_capsule(store_root: &Path, name: &str, version: &str, manifest_yaml: 
     murmur_artifact::LocalRegistry::new(store_root)
         .store_installed_overwrite(
             murmur_artifact::ArtifactMeta {
-                name: name.to_string(),
+                name: murmur_artifact::ArtifactName::parse(name).unwrap(),
                 version: version.to_string(),
                 runtime: murmur_artifact::RuntimeType::Wasm,
                 artifact_runtime: "capsule".to_string(),
@@ -242,21 +243,21 @@ fn create_three_level_closure(home: &TempDir, project_dir: &Path) {
     let global = global_store(home);
     install_capsule(
         &global,
-        "worker",
+        "local/worker",
         "0.1.0",
         "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [WORKER_KEY, DEEP_KEY]\n  \
-         spawn:\n    allow: [deep-worker]\n",
+         spawn:\n    allow: [local/deep-worker]\n",
     );
     install_capsule(
         &global,
-        "deep-worker",
+        "local/deep-worker",
         "0.2.0",
         "name: deep-worker\nversion: 0.2.0\ncapabilities:\n  env:\n    allow: [DEEP_KEY]\n",
     );
     fs::write(
         project_dir.join("murmur.yaml"),
         "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
-         allow: [ROOT_KEY, WORKER_KEY, DEEP_KEY]\n  spawn:\n    allow: [worker]\n",
+         allow: [ROOT_KEY, WORKER_KEY, DEEP_KEY]\n  spawn:\n    allow: [local/worker]\n",
     )
     .unwrap();
 }
@@ -269,11 +270,11 @@ fn create_referencing_project(project_dir: &Path, api_key: &str) {
     fs::write(
         project_dir.join("murmur.yaml"),
         format!(
-            "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+            "name: solo\nversion: 0.0.1\nartifacts:\n  - name: local/murmur-driver-anthropic\n    \
              version: 0.1.0\n    runtime: driver\n    gateway:\n      \
              endpoint: http://127.0.0.1:8080\n      api_key: {api_key}\ninference:\n  \
              transport: http\n  model: test-model\n  driver:\n    \
-             artifact: murmur-driver-anthropic\n"
+             artifact: local/murmur-driver-anthropic\n"
         ),
     )
     .unwrap();
@@ -285,7 +286,7 @@ fn install_referenced_driver(home: &TempDir) {
     let artifacts = tempfile::tempdir().unwrap();
     let driver = common::create_driver_artifact(
         artifacts.path(),
-        "murmur-driver-anthropic",
+        "local/murmur-driver-anthropic",
         "0.1.0",
         &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
     );
@@ -311,15 +312,17 @@ fn doctor_passes_when_declared_artifact_is_in_project_store() {
 
     create_project(
         project.path(),
-        "  - name: doctor-skill\n    version: 0.1.0\n    runtime: skill\n",
+        "  - name: local/doctor-skill\n    version: 0.1.0\n    runtime: skill\n",
     );
-    let artifact = skill_artifact(&staging, "doctor-skill", "0.1.0");
+    let artifact = skill_artifact(&staging, "local/doctor-skill", "0.1.0");
     common::install_artifact_to_project(project.path(), &artifact).success();
 
     mur_doctor(&home, project.path())
         .success()
         .stdout(predicate::str::contains("All checks passed."))
-        .stdout(predicate::str::contains("\u{2713}  doctor-skill@0.1.0"))
+        .stdout(predicate::str::contains(
+            "\u{2713}  local/doctor-skill@0.1.0",
+        ))
         .stdout(predicate::str::contains(platform()));
 }
 
@@ -331,15 +334,17 @@ fn doctor_passes_when_declared_artifact_is_only_in_global_store() {
 
     create_project(
         project.path(),
-        "  - name: global-skill\n    version: 0.3.0\n    runtime: skill\n",
+        "  - name: local/global-skill\n    version: 0.3.0\n    runtime: skill\n",
     );
-    let artifact = skill_artifact(&staging, "global-skill", "0.3.0");
+    let artifact = skill_artifact(&staging, "local/global-skill", "0.3.0");
     common::publish_local(&home, &artifact).success();
 
     mur_doctor(&home, project.path())
         .success()
         .stdout(predicate::str::contains("All checks passed."))
-        .stdout(predicate::str::contains("\u{2713}  global-skill@0.3.0"));
+        .stdout(predicate::str::contains(
+            "\u{2713}  local/global-skill@0.3.0",
+        ));
 }
 
 #[test]
@@ -349,7 +354,7 @@ fn doctor_fails_when_declared_artifact_is_in_neither_store() {
 
     create_project(
         project.path(),
-        "  - name: absent-skill\n    version: 9.9.9\n    runtime: skill\n",
+        "  - name: local/absent-skill\n    version: 9.9.9\n    runtime: skill\n",
     );
 
     let assert = mur_doctor(&home, project.path()).failure();
@@ -358,15 +363,15 @@ fn doctor_fails_when_declared_artifact_is_in_neither_store() {
     assert!(
         stdout
             .lines()
-            .any(|line| line.contains('\u{2717}') && line.contains("absent-skill@9.9.9")),
-        "expected a failing line naming absent-skill@9.9.9, got:\n{stdout}"
+            .any(|line| line.contains('\u{2717}') && line.contains("local/absent-skill@9.9.9")),
+        "expected a failing line naming local/absent-skill@9.9.9, got:\n{stdout}"
     );
     assert!(
         stdout.contains("0 checks passed, 1 error found."),
         "expected a pass/fail summary, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("Fix: mur install absent-skill@9.9.9"),
+        stdout.contains("Fix: mur install local/absent-skill@9.9.9"),
         "expected a `mur install` fix hint, got:\n{stdout}"
     );
 }
@@ -381,9 +386,9 @@ fn doctor_checklist_follows_the_manifest_version_pin() {
     // Only 0.1.0 is ever installed.
     create_project(
         project.path(),
-        "  - name: pinned-skill\n    version: 0.1.0\n    runtime: skill\n",
+        "  - name: local/pinned-skill\n    version: 0.1.0\n    runtime: skill\n",
     );
-    let artifact = skill_artifact(&staging, "pinned-skill", "0.1.0");
+    let artifact = skill_artifact(&staging, "local/pinned-skill", "0.1.0");
     common::install_artifact_to_project(project.path(), &artifact).success();
 
     mur_doctor(&home, project.path())
@@ -393,14 +398,16 @@ fn doctor_checklist_follows_the_manifest_version_pin() {
     // Bump the pin only — no code change, no reinstall.
     create_project(
         project.path(),
-        "  - name: pinned-skill\n    version: 0.2.0\n    runtime: skill\n",
+        "  - name: local/pinned-skill\n    version: 0.2.0\n    runtime: skill\n",
     );
 
     mur_doctor(&home, project.path())
         .failure()
-        .stdout(predicate::str::contains("\u{2717}  pinned-skill@0.2.0"))
         .stdout(predicate::str::contains(
-            "Fix: mur install pinned-skill@0.2.0",
+            "\u{2717}  local/pinned-skill@0.2.0",
+        ))
+        .stdout(predicate::str::contains(
+            "Fix: mur install local/pinned-skill@0.2.0",
         ));
 }
 
@@ -412,18 +419,22 @@ fn doctor_reports_pass_and_fail_counts_across_declared_artifacts() {
 
     create_project(
         project.path(),
-        "  - name: present-skill\n    version: 0.1.0\n    runtime: skill\n\
-         \x20 - name: missing-a\n    version: 1.0.0\n    runtime: skill\n\
-         \x20 - name: missing-b\n    version: 2.0.0\n    runtime: skill\n",
+        "  - name: local/present-skill\n    version: 0.1.0\n    runtime: skill\n\
+         \x20 - name: local/missing-a\n    version: 1.0.0\n    runtime: skill\n\
+         \x20 - name: local/missing-b\n    version: 2.0.0\n    runtime: skill\n",
     );
-    let artifact = skill_artifact(&staging, "present-skill", "0.1.0");
+    let artifact = skill_artifact(&staging, "local/present-skill", "0.1.0");
     common::install_artifact_to_project(project.path(), &artifact).success();
 
     mur_doctor(&home, project.path())
         .failure()
         .stdout(predicate::str::contains("1 check passed, 2 errors found."))
-        .stdout(predicate::str::contains("Fix: mur install missing-a@1.0.0"))
-        .stdout(predicate::str::contains("Fix: mur install missing-b@2.0.0"));
+        .stdout(predicate::str::contains(
+            "Fix: mur install local/missing-a@1.0.0",
+        ))
+        .stdout(predicate::str::contains(
+            "Fix: mur install local/missing-b@2.0.0",
+        ));
 }
 
 /// A `source:` skill is resolved from the filesystem at stage time, never a
@@ -458,9 +469,9 @@ fn doctor_walks_up_to_the_project_root_from_a_subdirectory() {
 
     create_project(
         project.path(),
-        "  - name: nested-skill\n    version: 0.1.0\n    runtime: skill\n",
+        "  - name: local/nested-skill\n    version: 0.1.0\n    runtime: skill\n",
     );
-    let artifact = skill_artifact(&staging, "nested-skill", "0.1.0");
+    let artifact = skill_artifact(&staging, "local/nested-skill", "0.1.0");
     common::install_artifact_to_project(project.path(), &artifact).success();
 
     let nested = project.path().join("src/deep");
@@ -468,7 +479,9 @@ fn doctor_walks_up_to_the_project_root_from_a_subdirectory() {
 
     mur_doctor(&home, &nested)
         .success()
-        .stdout(predicate::str::contains("\u{2713}  nested-skill@0.1.0"));
+        .stdout(predicate::str::contains(
+            "\u{2713}  local/nested-skill@0.1.0",
+        ));
 }
 
 #[test]
@@ -486,6 +499,55 @@ fn doctor_fails_with_e_io_001_when_no_project_root_is_found() {
         .stdout(predicate::str::contains("All checks passed.").not());
 }
 
+// ── Artifact stores ───────────────────────────────────────────────────────────
+
+/// A global store still holding an old flat `<name>/<version>/` directory beside the
+/// `<scope>/<name>/<version>/` layout: doctor names the old directory as safe to delete, and
+/// the finding leaves the exit status as it was.
+#[test]
+fn doctor_names_an_old_layout_store_directory_without_changing_the_exit_status() {
+    let home = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_project(project.path(), " []\n");
+    let echo_tool = common::create_tool_artifact(
+        staging.path(),
+        "local/echo-tool",
+        "0.0.1",
+        &common::fixture_path("run/components/echo-tool.wasm"),
+    );
+    common::publish_local(&home, &echo_tool).success();
+    let store = global_store(&home);
+    assert!(store
+        .join("local/echo-tool/0.0.1/echo-tool-0.0.1.mur.zip")
+        .exists());
+
+    let without = mur_doctor(&home, project.path()).get_output().clone();
+    assert!(
+        !String::from_utf8_lossy(&without.stdout).contains("Artifact stores"),
+        "{}",
+        streams(&without)
+    );
+
+    let old = store.join("murmur-tool-git/0.2.0");
+    fs::create_dir_all(&old).unwrap();
+    fs::write(old.join("murmur-tool-git-0.2.0.mur.zip"), b"old").unwrap();
+    fs::write(old.join("murmur-tool-git-0.2.0.sha256"), sha256_hex(b"old")).unwrap();
+
+    let with = mur_doctor(&home, project.path()).get_output().clone();
+    let stdout = String::from_utf8_lossy(&with.stdout);
+    assert!(stdout.contains("Artifact stores"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "  global store: {}: old layout, nothing reads it, safe to delete",
+            store.join("murmur-tool-git").display()
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("local/echo-tool: old layout"), "{stdout}");
+    assert_eq!(with.status.code(), without.status.code());
+}
+
 // ── Lock integrity ────────────────────────────────────────────────────────────
 
 /// Without a lockfile there is nothing to verify against — presence stays the whole
@@ -498,12 +560,12 @@ fn doctor_says_nothing_about_the_lock_when_no_lockfile_exists() {
 
     create_project(
         project.path(),
-        "  - name: solo-skill\n    version: 0.1.0\n    runtime: skill\n",
+        "  - name: local/solo-skill\n    version: 0.1.0\n    runtime: skill\n",
     );
-    let artifact = skill_artifact(&staging, "solo-skill", "0.1.0");
-    // Installed straight from a file, which stores the artifact without pinning a lock.
+    let artifact = skill_artifact(&staging, "local/solo-skill", "0.1.0");
+    // Installed straight from a file, which pins it; the lock is removed to leave none.
     common::install_artifact_to_project(project.path(), &artifact).success();
-    assert!(!project.path().join("murmur.lock").exists());
+    fs::remove_file(project.path().join("murmur.lock")).unwrap();
 
     let assert = mur_doctor(&home, project.path()).success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
@@ -525,11 +587,11 @@ fn doctor_passes_when_the_lock_matches_the_installed_artifact() {
 
     create_project(
         project.path(),
-        "  - name: locked-skill\n    version: 0.1.0\n    runtime: skill\n",
+        "  - name: local/locked-skill\n    version: 0.1.0\n    runtime: skill\n",
     );
-    let artifact = skill_artifact(&staging, "locked-skill", "0.1.0");
+    let artifact = skill_artifact(&staging, "local/locked-skill", "0.1.0");
     common::publish_local(&home, &artifact).success();
-    install_pinned_to_project(&home, project.path(), "locked-skill@0.1.0").success();
+    install_pinned_to_project(&home, project.path(), "local/locked-skill@0.1.0").success();
     assert!(
         project.path().join("murmur.lock").exists(),
         "a registry-resolved project install must pin murmur.lock"
@@ -537,12 +599,14 @@ fn doctor_passes_when_the_lock_matches_the_installed_artifact() {
 
     mur_doctor(&home, project.path())
         .success()
-        .stdout(predicate::str::contains("\u{2713}  locked-skill@0.1.0"))
+        .stdout(predicate::str::contains(
+            "\u{2713}  local/locked-skill@0.1.0",
+        ))
         .stdout(predicate::str::contains("All checks passed."));
 }
 
 /// Rewrite the origin of each `(name, session)` in `project_dir/murmur.lock` to a runtime pull by
-/// that session, and add `stray-tool@2.0.0` as a pull the manifest does not declare.
+/// that session, and add `local/stray-tool@2.0.0` as a pull the manifest does not declare.
 fn mark_pulled_at_runtime(project_dir: &Path, pulls: &[(&str, &str)]) {
     let lock_path = project_dir.join("murmur.lock");
     let mut lock = murmur_artifact::read_lockfile(&lock_path).unwrap();
@@ -557,12 +621,13 @@ fn mark_pulled_at_runtime(project_dir: &Path, pulls: &[(&str, &str)]) {
         };
     }
     lock.artifacts.push(LockedArtifact {
-        name: "stray-tool".to_string(),
+        name: "local/stray-tool".to_string(),
         resolved_version: "2.0.0".to_string(),
         sha256: LockedSha256::any("stray-hash".to_string()),
         origin: LockOrigin::Runtime {
             session: "ses_stray".to_string(),
         },
+        owner_id: None,
     });
     write_lockfile_atomic(&lock_path, &lock).unwrap();
 }
@@ -573,23 +638,26 @@ fn doctor_reports_runtime_origin_pins() {
     let staging = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
-    let skill = skill_artifact(&staging, "pulled-skill", "0.1.0");
+    let skill = skill_artifact(&staging, "local/pulled-skill", "0.1.0");
     let tool = common::create_tool_artifact(
         staging.path(),
-        "gated-tool",
+        "local/gated-tool",
         "0.1.0",
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/run/components/echo-tool.wasm"),
     );
     common::publish_local(&home, &skill).success();
     common::publish_local(&home, &tool).success();
-    let declared = "  - name: pulled-skill\n    version: 0.1.0\n    runtime: skill\n\
-                    \x20 - name: gated-tool\n    version: 0.1.0\n    runtime: tool\n";
+    let declared = "  - name: local/pulled-skill\n    version: 0.1.0\n    runtime: skill\n\
+                    \x20 - name: local/gated-tool\n    version: 0.1.0\n    runtime: tool\n";
     create_project(project.path(), declared);
-    install_pinned_to_project(&home, project.path(), "pulled-skill@0.1.0").success();
-    install_pinned_to_project(&home, project.path(), "gated-tool@0.1.0").success();
+    install_pinned_to_project(&home, project.path(), "local/pulled-skill@0.1.0").success();
+    install_pinned_to_project(&home, project.path(), "local/gated-tool@0.1.0").success();
     mark_pulled_at_runtime(
         project.path(),
-        &[("pulled-skill", "ses_skill"), ("gated-tool", "ses_tool")],
+        &[
+            ("local/pulled-skill", "ses_skill"),
+            ("local/gated-tool", "ses_tool"),
+        ],
     );
     create_project(
         project.path(),
@@ -602,22 +670,22 @@ fn doctor_reports_runtime_origin_pins() {
         .failure()
         .code(1)
         .stdout(predicate::str::contains(
-            "\u{26A0}  pulled-skill@0.1.0   \u{2014} pulled at runtime by session ses_skill",
+            "\u{26A0}  local/pulled-skill@0.1.0   \u{2014} pulled at runtime by session ses_skill",
         ))
         .stdout(predicate::str::contains(
-            "\u{2717}  gated-tool@0.1.0     \u{2014} murmur.lock pins 'gated-tool' from a runtime \
+            "\u{2717}  local/gated-tool@0.1.0     \u{2014} murmur.lock pins 'local/gated-tool' from a runtime \
              pull by session ses_tool; murmur.yaml declares it with gateway:",
         ))
         .stdout(predicate::str::contains(
-            "\u{00B7}  stray-tool@2.0.0     pulled at runtime by session ses_stray \u{2014} not \
+            "\u{00B7}  local/stray-tool@2.0.0     pulled at runtime by session ses_stray \u{2014} not \
              declared in murmur.yaml, so mur run does not stage it",
         ))
         .stdout(predicate::str::contains("1 error found, 1 warning"))
         .stdout(predicate::str::contains(
-            "Fix: mur install gated-tool@0.1.0",
+            "Fix: mur install local/gated-tool@0.1.0",
         ))
         .stdout(predicate::str::contains(
-            "Fix: mur install pulled-skill@0.1.0",
+            "Fix: mur install local/pulled-skill@0.1.0",
         ))
         .stdout(predicate::str::contains("Fix: mur install stray-tool").not());
 
@@ -625,10 +693,10 @@ fn doctor_reports_runtime_origin_pins() {
     mur_doctor(&home, project.path())
         .success()
         .stdout(predicate::str::contains(
-            "\u{26A0}  gated-tool@0.1.0     \u{2014} pulled at runtime by session ses_tool",
+            "\u{26A0}  local/gated-tool@0.1.0     \u{2014} pulled at runtime by session ses_tool",
         ))
         .stdout(predicate::str::contains("0 errors found, 2 warnings"))
-        .stdout(predicate::str::contains("stray-tool@2.0.0"));
+        .stdout(predicate::str::contains("local/stray-tool@2.0.0"));
 }
 
 /// A runtime pin bound as `inference.system_prompt_artifact` is the refusal `mur run` makes with
@@ -639,32 +707,33 @@ fn doctor_reports_a_runtime_pin_bound_as_the_system_prompt() {
     let staging = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
-    let skill = skill_artifact(&staging, "pulled-skill", "0.1.0");
+    let skill = skill_artifact(&staging, "local/pulled-skill", "0.1.0");
     let driver = common::create_driver_artifact(
         staging.path(),
-        "murmur-driver-anthropic",
+        "local/murmur-driver-anthropic",
         "0.1.4",
         &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
     );
     common::publish_local(&home, &skill).success();
     common::publish_local(&home, &driver).success();
-    let declared = "  - name: pulled-skill\n    version: 0.1.0\n    runtime: skill\n\
-                    \x20 - name: murmur-driver-anthropic\n    version: 0.1.4\n    runtime: driver\n\
+    let declared = "  - name: local/pulled-skill\n    version: 0.1.0\n    runtime: skill\n\
+                    \x20 - name: local/murmur-driver-anthropic\n    version: 0.1.4\n    runtime: driver\n\
                     \x20   gateway:\n      endpoint: http://127.0.0.1:9\n      keyless: true\n";
     let inference = |bound: &str| {
         format!(
             "inference:\n  transport: http\n  model: test-model\n{bound}  driver:\n    \
-             artifact: murmur-driver-anthropic\n"
+             artifact: local/murmur-driver-anthropic\n"
         )
     };
     create_project(project.path(), &format!("{declared}{}", inference("")));
-    install_pinned_to_project(&home, project.path(), "pulled-skill@0.1.0").success();
-    install_pinned_to_project(&home, project.path(), "murmur-driver-anthropic@0.1.4").success();
+    install_pinned_to_project(&home, project.path(), "local/pulled-skill@0.1.0").success();
+    install_pinned_to_project(&home, project.path(), "local/murmur-driver-anthropic@0.1.4")
+        .success();
     let lock_path = project.path().join("murmur.lock");
     let mut lock = murmur_artifact::read_lockfile(&lock_path).unwrap();
     lock.artifacts
         .iter_mut()
-        .find(|entry| entry.name == "pulled-skill")
+        .find(|entry| entry.name == "local/pulled-skill")
         .unwrap()
         .origin = LockOrigin::Runtime {
         session: "ses_skill".to_string(),
@@ -675,19 +744,19 @@ fn doctor_reports_a_runtime_pin_bound_as_the_system_prompt() {
         project.path(),
         &format!(
             "{declared}{}",
-            inference("  system_prompt_artifact: pulled-skill\n")
+            inference("  system_prompt_artifact: local/pulled-skill\n")
         ),
     );
     mur_doctor(&home, project.path())
         .failure()
         .code(1)
-        .stdout(predicate::str::contains("\u{2717}  pulled-skill@0.1.0"))
+        .stdout(predicate::str::contains("\u{2717}  local/pulled-skill@0.1.0"))
         .stdout(predicate::str::contains(
-            "\u{2014} murmur.lock pins 'pulled-skill' from a runtime pull by session ses_skill; \
+            "\u{2014} murmur.lock pins 'local/pulled-skill' from a runtime pull by session ses_skill; \
              murmur.yaml declares it with inference.system_prompt_artifact",
         ))
         .stdout(predicate::str::contains(
-            "Fix: mur install pulled-skill@0.1.0",
+            "Fix: mur install local/pulled-skill@0.1.0",
         ));
 
     create_project(project.path(), &format!("{declared}{}", inference("")));
@@ -709,18 +778,23 @@ fn doctor_fails_when_the_lock_sha256_does_not_match_the_installed_bytes() {
 
     create_project(
         project.path(),
-        "  - name: drifted-skill\n    version: 0.1.0\n    runtime: skill\n",
+        "  - name: local/drifted-skill\n    version: 0.1.0\n    runtime: skill\n",
     );
-    let artifact = skill_artifact(&staging, "drifted-skill", "0.1.0");
+    let artifact = skill_artifact(&staging, "local/drifted-skill", "0.1.0");
     common::install_artifact_to_project(project.path(), &artifact).success();
-    write_lock(project.path(), "drifted-skill", "0.1.0", &"0".repeat(64));
+    write_lock(
+        project.path(),
+        "local/drifted-skill",
+        "0.1.0",
+        &"0".repeat(64),
+    );
 
     let assert = mur_doctor(&home, project.path()).failure();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
 
     assert!(
         stdout.lines().any(|line| line.contains('\u{2717}')
-            && line.contains("artifact integrity check failed for drifted-skill@0.1.0")),
+            && line.contains("artifact integrity check failed for local/drifted-skill@0.1.0")),
         "expected E-REG-002 wording on the failing line, got:\n{stdout}"
     );
     assert!(
@@ -736,7 +810,7 @@ fn doctor_fails_when_the_lock_sha256_does_not_match_the_installed_bytes() {
     );
     assert!(
         stdout.contains(
-            "Fix: drifted-skill: artifact on disk does not match murmur.lock \u{2014} re-publish or delete the lock"
+            "Fix: local/drifted-skill: artifact on disk does not match murmur.lock \u{2014} re-publish or delete the lock"
         ),
         "expected the E-REG-002 hint as the fix, got:\n{stdout}"
     );
@@ -755,12 +829,17 @@ fn doctor_fails_when_the_lock_pins_a_different_version_than_the_manifest() {
 
     create_project(
         project.path(),
-        "  - name: repinned-skill\n    version: 0.1.0\n    runtime: skill\n",
+        "  - name: local/repinned-skill\n    version: 0.1.0\n    runtime: skill\n",
     );
-    let artifact = skill_artifact(&staging, "repinned-skill", "0.1.0");
+    let artifact = skill_artifact(&staging, "local/repinned-skill", "0.1.0");
     common::install_artifact_to_project(project.path(), &artifact).success();
     // Same artifact on disk, but the lock claims a version the manifest does not ask for.
-    write_lock(project.path(), "repinned-skill", "0.2.0", &"0".repeat(64));
+    write_lock(
+        project.path(),
+        "local/repinned-skill",
+        "0.2.0",
+        &"0".repeat(64),
+    );
 
     let assert = mur_doctor(&home, project.path()).failure();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
@@ -768,7 +847,7 @@ fn doctor_fails_when_the_lock_pins_a_different_version_than_the_manifest() {
     assert!(
         stdout.lines().any(|line| line.contains('\u{2717}')
             && line.contains(
-                "murmur.lock version mismatch for 'repinned-skill': manifest requested 0.1.0, lock pinned 0.2.0"
+                "murmur.lock version mismatch for 'local/repinned-skill': manifest requested 0.1.0, lock pinned 0.2.0"
             )),
         "expected lock version-mismatch wording, got:\n{stdout}"
     );
@@ -782,7 +861,7 @@ fn doctor_fails_when_the_lock_pins_a_different_version_than_the_manifest() {
         "got:\n{stdout}"
     );
     assert!(
-        stdout.contains("Fix: repinned-skill: remove the stale murmur.lock entry, then run mur install repinned-skill@0.1.0"),
+        stdout.contains("Fix: local/repinned-skill: remove the stale murmur.lock entry, then run mur install local/repinned-skill@0.1.0"),
         "got:\n{stdout}"
     );
 }
@@ -795,23 +874,28 @@ fn doctor_fails_when_the_lock_has_no_entry_for_a_declared_artifact() {
 
     create_project(
         project.path(),
-        "  - name: unpinned-skill\n    version: 0.1.0\n    runtime: skill\n",
+        "  - name: local/unpinned-skill\n    version: 0.1.0\n    runtime: skill\n",
     );
-    let artifact = skill_artifact(&staging, "unpinned-skill", "0.1.0");
+    let artifact = skill_artifact(&staging, "local/unpinned-skill", "0.1.0");
     common::install_artifact_to_project(project.path(), &artifact).success();
     // A lockfile that pins something else entirely — the declared artifact is unpinned.
-    write_lock(project.path(), "other-skill", "9.9.9", &"0".repeat(64));
+    write_lock(
+        project.path(),
+        "local/other-skill",
+        "9.9.9",
+        &"0".repeat(64),
+    );
 
     let assert = mur_doctor(&home, project.path()).failure();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
 
     assert!(
         stdout.lines().any(|line| line.contains('\u{2717}')
-            && line.contains("murmur.lock missing artifact entry for 'unpinned-skill'")),
+            && line.contains("murmur.lock missing artifact entry for 'local/unpinned-skill'")),
         "expected E-RUN-003 wording, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("Fix: mur install unpinned-skill@0.1.0"),
+        stdout.contains("Fix: mur install local/unpinned-skill@0.1.0"),
         "got:\n{stdout}"
     );
     assert!(
@@ -830,19 +914,19 @@ fn doctor_exempts_local_source_skills_from_lock_checks() {
 
     create_project(
         project.path(),
-        "  - name: pinned-dep\n    version: 0.1.0\n    runtime: skill\n",
+        "  - name: local/pinned-dep\n    version: 0.1.0\n    runtime: skill\n",
     );
-    let artifact = skill_artifact(&staging, "pinned-dep", "0.1.0");
+    let artifact = skill_artifact(&staging, "local/pinned-dep", "0.1.0");
     common::install_artifact_to_project(project.path(), &artifact).success();
     let installed_sha = sha256_hex(&fs::read(&artifact).unwrap());
-    write_lock(project.path(), "pinned-dep", "0.1.0", &installed_sha);
+    write_lock(project.path(), "local/pinned-dep", "0.1.0", &installed_sha);
 
     // Add a local-source skill the lock knows nothing about.
     fs::create_dir_all(project.path().join("skills")).unwrap();
     fs::write(project.path().join("skills/skill.md"), "# local\n").unwrap();
     create_project(
         project.path(),
-        "  - name: pinned-dep\n    version: 0.1.0\n    runtime: skill\n\
+        "  - name: local/pinned-dep\n    version: 0.1.0\n    runtime: skill\n\
          \x20 - name: local-skill\n    version: 0.1.0\n    runtime: skill\n    source: ./skills\n",
     );
 
@@ -872,9 +956,9 @@ fn doctor_surfaces_a_malformed_lockfile_before_any_checklist() {
 
     create_project(
         project.path(),
-        "  - name: broken-lock-skill\n    version: 0.1.0\n    runtime: skill\n",
+        "  - name: local/broken-lock-skill\n    version: 0.1.0\n    runtime: skill\n",
     );
-    let artifact = skill_artifact(&staging, "broken-lock-skill", "0.1.0");
+    let artifact = skill_artifact(&staging, "local/broken-lock-skill", "0.1.0");
     common::install_artifact_to_project(project.path(), &artifact).success();
     fs::write(project.path().join("murmur.lock"), "lock_version: [\n").unwrap();
 
@@ -884,7 +968,7 @@ fn doctor_surfaces_a_malformed_lockfile_before_any_checklist() {
     assert.stderr(predicate::str::contains("error[E-RUN-003]"));
 
     assert!(
-        !stdout.contains("broken-lock-skill@0.1.0"),
+        !stdout.contains("local/broken-lock-skill@0.1.0"),
         "no checklist line may print, got:\n{stdout}"
     );
     assert!(!stdout.contains("All checks passed."), "got:\n{stdout}");
@@ -916,9 +1000,9 @@ fn doctor_rejects_inference_max_task_reopens() {
 
     fs::write(
         project.path().join("murmur.yaml"),
-        "name: reopen-fixture\nversion: 0.0.1\nartifacts:\n  - name: fixture-process-driver\n    \
+        "name: reopen-fixture\nversion: 0.0.1\nartifacts:\n  - name: local/fixture-process-driver\n    \
          version: 0.1.0\n    runtime: driver\n\
-         inference:\n  transport: process\n  driver:\n    artifact: fixture-process-driver\n  \
+         inference:\n  transport: process\n  driver:\n    artifact: local/fixture-process-driver\n  \
          max_task_reopens: 3\n",
     )
     .unwrap();
@@ -1165,7 +1249,7 @@ fn env_requirements_reports_the_whole_closure_three_levels_deep() {
     .success()
     .stdout(predicate::str::contains("Environment requirements"))
     .stdout(predicate::str::contains(
-        "capsules: root-capsule@0.0.1, worker@0.1.0, deep-worker@0.2.0",
+        "capsules: root-capsule@0.0.1, local/worker@0.1.0, local/deep-worker@0.2.0",
     ))
     .stdout(predicate::str::contains("\u{2713}  ROOT_KEY"))
     .stdout(predicate::str::contains("\u{2713}  WORKER_KEY"))
@@ -1195,7 +1279,7 @@ fn env_requirements_fails_on_a_variable_nothing_sets() {
     .failure()
     .stdout(predicate::str::contains("\u{2717}  DEEP_KEY"))
     .stdout(predicate::str::contains("unset"))
-    .stdout(predicate::str::contains("deep-worker@0.2.0"))
+    .stdout(predicate::str::contains("local/deep-worker@0.2.0"))
     .stdout(predicate::str::contains("Fix: export DEEP_KEY"))
     .stderr(predicate::str::contains("E-CAP-014"));
 }
@@ -1237,14 +1321,14 @@ fn env_requirements_names_a_declaration_roost_will_refuse_on_both_sides() {
     let project = tempfile::tempdir().unwrap();
     install_capsule(
         &global_store(&home),
-        "worker",
+        "local/worker",
         "0.1.0",
         "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [ROOT_KEY, WORKER_ONLY]\n",
     );
     fs::write(
         project.path().join("murmur.yaml"),
         "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
-         allow: [ROOT_KEY]\n  spawn:\n    allow: [worker]\n",
+         allow: [ROOT_KEY]\n  spawn:\n    allow: [local/worker]\n",
     )
     .unwrap();
 
@@ -1258,11 +1342,11 @@ fn env_requirements_names_a_declaration_roost_will_refuse_on_both_sides() {
         "declarations mur-roost will refuse:",
     ))
     .stdout(predicate::str::contains(
-        "worker@0.1.0 declares capabilities.env.allow 'WORKER_ONLY', which its parent \
+        "local/worker@0.1.0 declares capabilities.env.allow 'WORKER_ONLY', which its parent \
          root-capsule@0.0.1 does not",
     ))
     .stdout(predicate::str::contains("Fix: root-capsule@0.0.1"))
-    .stdout(predicate::str::contains("worker@0.1.0"))
+    .stdout(predicate::str::contains("local/worker@0.1.0"))
     .stderr(predicate::str::contains(
         "error[E-CAP-015]: 1 declaration in the spawn closure exceeds the envelope the capsule \
          spawning it holds, and mur-roost refuses a spawn that widens one.",
@@ -1276,22 +1360,22 @@ fn env_requirements_terminates_on_a_cyclic_spawn_allow_and_names_the_edge() {
     let global = global_store(&home);
     install_capsule(
         &global,
-        "worker",
+        "local/worker",
         "0.1.0",
         "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    \
-         allow: [root-capsule]\n",
+         allow: [local/root-capsule]\n",
     );
     install_capsule(
         &global,
-        "root-capsule",
+        "local/root-capsule",
         "0.0.1",
         "name: root-capsule\nversion: 0.0.1\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  \
-         spawn:\n    allow: [worker]\n",
+         spawn:\n    allow: [local/worker]\n",
     );
     fs::write(
         project.path().join("murmur.yaml"),
         "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
-         allow: [ROOT_KEY]\n  spawn:\n    allow: [worker]\n",
+         allow: [ROOT_KEY]\n  spawn:\n    allow: [local/worker]\n",
     )
     .unwrap();
 
@@ -1302,14 +1386,17 @@ fn env_requirements_terminates_on_a_cyclic_spawn_allow_and_names_the_edge() {
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
-        stdout.contains("spawn.allow cycle: worker@0.1.0 \u{2192} root-capsule@0.0.1"),
+        stdout.contains("spawn.allow cycle: local/root-capsule@0.0.1 \u{2192} local/worker@0.1.0"),
         "{stdout}"
     );
+    // The root runs under its bare name, so the installed `local/root-capsule` is inspected
+    // once before the edge back to `local/worker` closes the loop.
     let capsules_line = stdout
         .lines()
         .find(|line| line.trim_start().starts_with("capsules:"))
         .unwrap();
-    assert_eq!(capsules_line.matches("root-capsule@0.0.1").count(), 1);
+    assert_eq!(capsules_line.matches("local/root-capsule@0.0.1").count(), 1);
+    assert_eq!(capsules_line.matches("local/worker@0.1.0").count(), 1);
 }
 
 #[test]
@@ -1318,14 +1405,14 @@ fn env_requirements_counts_and_names_a_capsule_it_could_not_inspect() {
     let project = tempfile::tempdir().unwrap();
     install_capsule(
         &global_store(&home),
-        "worker",
+        "local/worker",
         "0.1.0",
         "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n",
     );
     fs::write(
         project.path().join("murmur.yaml"),
         "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
-         allow: [ROOT_KEY]\n  spawn:\n    allow: [worker, ghost-worker]\n",
+         allow: [ROOT_KEY]\n  spawn:\n    allow: [local/worker, local/ghost-worker]\n",
     )
     .unwrap();
 
@@ -1335,13 +1422,13 @@ fn env_requirements_counts_and_names_a_capsule_it_could_not_inspect() {
             "could not inspect 1 of 3 capsules in the spawn closure",
         ))
         .stdout(predicate::str::contains(
-            "- ghost-worker (declared by root-capsule@0.0.1): not installed in the project or \
+            "- local/ghost-worker (declared by root-capsule@0.0.1): not installed in the project or \
              global store",
         ))
-        .stdout(predicate::str::contains("Fix: ghost-worker:"))
+        .stdout(predicate::str::contains("Fix: local/ghost-worker:"))
         .stderr(predicate::str::contains(
             "warning[W-REG-002]: 1 capsule in the spawn closure could not be inspected, so what it \
-             declares is absent from the report above: ghost-worker",
+             declares is absent from the report above: local/ghost-worker",
         ));
 }
 
@@ -1395,22 +1482,22 @@ fn env_requirements_output_never_says_formation() {
     let global = global_store(&refused_home);
     install_capsule(
         &global,
-        "worker",
+        "local/worker",
         "0.1.0",
         "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [ROOT_KEY, WORKER_ONLY]\n  \
-         spawn:\n    allow: [root-capsule]\n",
+         spawn:\n    allow: [local/root-capsule]\n",
     );
     install_capsule(
         &global,
-        "root-capsule",
+        "local/root-capsule",
         "0.0.1",
         "name: root-capsule\nversion: 0.0.1\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  \
-         spawn:\n    allow: [worker]\n",
+         spawn:\n    allow: [local/worker]\n",
     );
     fs::write(
         refused_project.path().join("murmur.yaml"),
         "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
-         allow: [ROOT_KEY]\n  spawn:\n    allow: [worker, ghost-worker]\n",
+         allow: [ROOT_KEY]\n  spawn:\n    allow: [local/worker, local/ghost-worker]\n",
     )
     .unwrap();
     fs::write(refused_project.path().join(".env"), "no-equals-here\n").unwrap();
@@ -1433,10 +1520,12 @@ fn env_requirements_output_never_says_formation() {
         "Fix: export DEEP_KEY",
         "declarations mur-roost will refuse:",
         "error[E-CAP-015]",
-        "could not inspect 1 of 3 capsules in the spawn closure:",
-        "- ghost-worker (declared by root-capsule@0.0.1)",
+        // The root runs under its bare name, so the installed `local/root-capsule` its worker
+        // spawns is a fourth capsule in the closure.
+        "could not inspect 1 of 4 capsules in the spawn closure:",
+        "- local/ghost-worker (declared by root-capsule@0.0.1)",
         "warning[W-REG-002]",
-        "spawn.allow cycle: worker@0.1.0 \u{2192} root-capsule@0.0.1",
+        "spawn.allow cycle: local/root-capsule@0.0.1 \u{2192} local/worker@0.1.0",
         "/.env could not be read",
     ] {
         assert!(lit.contains(line), "{line} not printed in:\n{lit}");
@@ -1528,20 +1617,20 @@ fn two_installed_versions_with_nothing_pinning_which_is_uninspectable() {
     let global = global_store(&home);
     install_capsule(
         &global,
-        "worker",
+        "local/worker",
         "0.1.0",
         "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [OLD_ONLY]\n",
     );
     install_capsule(
         &global,
-        "worker",
+        "local/worker",
         "0.2.0",
         "name: worker\nversion: 0.2.0\ncapabilities:\n  env:\n    allow: [NEW_ONLY]\n",
     );
     fs::write(
         project.path().join("murmur.yaml"),
         "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
-         allow: [ROOT_KEY]\n  spawn:\n    allow: [worker]\n",
+         allow: [ROOT_KEY]\n  spawn:\n    allow: [local/worker]\n",
     )
     .unwrap();
 
@@ -1564,23 +1653,23 @@ fn the_lockfile_decides_which_version_the_walk_reads() {
     let global = global_store(&home);
     let pinned_sha256 = install_capsule(
         &global,
-        "worker",
+        "local/worker",
         "0.1.0",
         "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [OLD_ONLY]\n",
     );
     install_capsule(
         &global,
-        "worker",
+        "local/worker",
         "0.2.0",
         "name: worker\nversion: 0.2.0\ncapabilities:\n  env:\n    allow: [NEW_ONLY]\n",
     );
     fs::write(
         project.path().join("murmur.yaml"),
         "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
-         allow: [ROOT_KEY, OLD_ONLY]\n  spawn:\n    allow: [worker]\n",
+         allow: [ROOT_KEY, OLD_ONLY]\n  spawn:\n    allow: [local/worker]\n",
     )
     .unwrap();
-    write_lock(project.path(), "worker", "0.1.0", &pinned_sha256);
+    write_lock(project.path(), "local/worker", "0.1.0", &pinned_sha256);
 
     mur_doctor_with_env(
         &home,
@@ -1593,7 +1682,7 @@ fn the_lockfile_decides_which_version_the_walk_reads() {
     )
     .success()
     .stdout(predicate::str::contains(
-        "capsules: root-capsule@0.0.1, worker@0.1.0",
+        "capsules: root-capsule@0.0.1, local/worker@0.1.0",
     ))
     .stdout(predicate::str::contains("OLD_ONLY"))
     .stdout(predicate::str::contains("NEW_ONLY").not())
@@ -1607,18 +1696,18 @@ fn a_child_manifest_with_an_unresolvable_env_reference_is_still_read() {
     let project = tempfile::tempdir().unwrap();
     install_capsule(
         &global_store(&home),
-        "worker",
+        "local/worker",
         "0.1.0",
-        "name: worker\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+        "name: worker\nversion: 0.1.0\nartifacts:\n  - name: local/murmur-driver-anthropic\n    \
          version: 0.1.0\n    runtime: driver\n    gateway:\n      \
          endpoint: http://127.0.0.1:8080\n      api_key: ${PROVIDER_KEY}\ninference:\n  \
          transport: http\n  model: claude-x\n  driver:\n    \
-         artifact: murmur-driver-anthropic\ncapabilities:\n  env:\n    allow: [PROVIDER_KEY]\n",
+         artifact: local/murmur-driver-anthropic\ncapabilities:\n  env:\n    allow: [PROVIDER_KEY]\n",
     );
     fs::write(
         project.path().join("murmur.yaml"),
         "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
-         allow: [ROOT_KEY, PROVIDER_KEY]\n  spawn:\n    allow: [worker]\n",
+         allow: [ROOT_KEY, PROVIDER_KEY]\n  spawn:\n    allow: [local/worker]\n",
     )
     .unwrap();
 
@@ -1629,11 +1718,11 @@ fn a_child_manifest_with_an_unresolvable_env_reference_is_still_read() {
     )
     .failure()
     .stdout(predicate::str::contains(
-        "capsules: root-capsule@0.0.1, worker@0.1.0",
+        "capsules: root-capsule@0.0.1, local/worker@0.1.0",
     ))
     .stdout(predicate::str::contains("could not inspect").not())
     .stdout(predicate::str::contains("\u{2717}  PROVIDER_KEY"))
-    .stdout(predicate::str::contains("worker@0.1.0"))
+    .stdout(predicate::str::contains("local/worker@0.1.0"))
     .stderr(predicate::str::contains("E-CAP-014"));
 }
 
@@ -1653,7 +1742,7 @@ fn an_unresolvable_reference_in_the_project_manifest_is_reported_not_refused() {
         .stdout(predicate::str::contains("\u{2717}  SOLO_PROVIDER_KEY"))
         .stdout(predicate::str::contains("unset"))
         .stdout(predicate::str::contains(
-            "solo@0.0.1 (artifacts.murmur-driver-anthropic.gateway.api_key)",
+            "solo@0.0.1 (artifacts.local/murmur-driver-anthropic.gateway.api_key)",
         ))
         .stdout(predicate::str::contains("Fix: export SOLO_PROVIDER_KEY"))
         .stdout(predicate::str::contains(format!(
@@ -1679,19 +1768,19 @@ fn every_unset_variable_is_reported_not_only_the_first() {
     let project = tempfile::tempdir().unwrap();
     install_capsule(
         &global_store(&home),
-        "worker",
+        "local/worker",
         "0.1.0",
         "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [SECOND_KEY, THIRD_KEY]\n",
     );
     fs::write(
         project.path().join("murmur.yaml"),
-        "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+        "name: solo\nversion: 0.0.1\nartifacts:\n  - name: local/murmur-driver-anthropic\n    \
          version: 0.1.0\n    runtime: driver\n    gateway:\n      \
          endpoint: http://127.0.0.1:8080\n      api_key: ${SOLO_PROVIDER_KEY}\ninference:\n  \
          transport: http\n  model: test-model\n  driver:\n    \
-         artifact: murmur-driver-anthropic\ncapabilities:\n  \
+         artifact: local/murmur-driver-anthropic\ncapabilities:\n  \
          env:\n    allow: [SOLO_PROVIDER_KEY, SECOND_KEY, THIRD_KEY]\n  spawn:\n    \
-         allow: [worker]\n",
+         allow: [local/worker]\n",
     )
     .unwrap();
 
@@ -1779,18 +1868,18 @@ fn the_roots_own_reference_joins_the_closures_variable_list() {
     let project = tempfile::tempdir().unwrap();
     install_capsule(
         &global_store(&home),
-        "worker",
+        "local/worker",
         "0.1.0",
         "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [WORKER_KEY]\n",
     );
     fs::write(
         project.path().join("murmur.yaml"),
-        "name: root-capsule\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+        "name: root-capsule\nversion: 0.0.1\nartifacts:\n  - name: local/murmur-driver-anthropic\n    \
          version: 0.1.0\n    runtime: driver\n    gateway:\n      \
          endpoint: http://127.0.0.1:8080\n      api_key: ${ROOT_PROVIDER_KEY}\ninference:\n  \
          transport: http\n  model: test-model\n  driver:\n    \
-         artifact: murmur-driver-anthropic\ncapabilities:\n  \
-         env:\n    allow: [WORKER_KEY]\n  spawn:\n    allow: [worker]\n",
+         artifact: local/murmur-driver-anthropic\ncapabilities:\n  \
+         env:\n    allow: [WORKER_KEY]\n  spawn:\n    allow: [local/worker]\n",
     )
     .unwrap();
 
@@ -1801,14 +1890,14 @@ fn the_roots_own_reference_joins_the_closures_variable_list() {
     )
     .failure()
     .stdout(predicate::str::contains(
-        "capsules: root-capsule@0.0.1, worker@0.1.0",
+        "capsules: root-capsule@0.0.1, local/worker@0.1.0",
     ))
     .stdout(predicate::str::contains(
         "\u{2717}  ROOT_PROVIDER_KEY   unset   \u{2014} root-capsule@0.0.1 \
-         (artifacts.murmur-driver-anthropic.gateway.api_key)",
+         (artifacts.local/murmur-driver-anthropic.gateway.api_key)",
     ))
     .stdout(predicate::str::contains(
-        "\u{2717}  WORKER_KEY          unset   \u{2014} root-capsule@0.0.1, worker@0.1.0",
+        "\u{2717}  WORKER_KEY          unset   \u{2014} root-capsule@0.0.1, local/worker@0.1.0",
     ))
     .get_output()
     .clone();
@@ -1875,7 +1964,7 @@ fn mur_run_still_refuses_the_reference_mur_doctor_reports() {
         .failure()
         .stderr(predicate::str::contains("E-MAN-003"))
         .stderr(predicate::str::contains(
-            "gateway.api_key on artifact 'murmur-driver-anthropic'",
+            "gateway.api_key on artifact 'local/murmur-driver-anthropic'",
         ))
         .stderr(predicate::str::contains("${SOLO_PROVIDER_KEY}"));
 }
@@ -2076,7 +2165,10 @@ fn doctor_reports_the_compiled_forms_directory_as_owner_only() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let components = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/run/components");
-    create_project(project.path(), "  - name: echo-tool\n    version: 0.1.0\n");
+    create_project(
+        project.path(),
+        "  - name: local/echo-tool\n    version: 0.1.0\n",
+    );
     fs::copy(
         components.join("capsule-allowlisted.wasm"),
         project.path().join("capsule.wasm"),

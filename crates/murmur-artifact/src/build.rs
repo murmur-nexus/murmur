@@ -75,6 +75,12 @@ pub enum BuildError {
     /// prefix or a namespace, which is a registry concern rather than a packaging one.
     #[error("invalid artifact name '{name}': {reason}")]
     InvalidArtifactName { name: String, reason: String },
+    /// `name:` carries a scope. An artifact declares its bare name; the scope is the source's.
+    #[error(
+        "invalid artifact name '{name}': an artifact's own name carries no scope, so it may not \
+         contain '/'"
+    )]
+    ScopedArtifactName { name: String },
     /// A `requires_files:` entry would not survive the runtime's own entry-name rule
     /// ([`sanitize_entry_path`]): it is absolute, or it climbs out of the source tree.
     #[error("requires_files entry '{entry}' has an unsafe path: {reason}")]
@@ -342,8 +348,14 @@ fn check_declared_entry(source_dir: &Path, declared: &str) -> Result<(), BuildEr
 
 /// Validate an artifact `name:` as a format, and nothing more.
 ///
-/// The rule itself is [`artifact_name_format_error`]; this wraps its reason in the build error.
-fn validate_artifact_name(name: &str) -> Result<(), BuildError> {
+/// The rule itself is [`artifact_name_format_error`]; this wraps its reason in the build error,
+/// and names a scoped name as such.
+pub fn validate_artifact_name(name: &str) -> Result<(), BuildError> {
+    if name.contains('/') {
+        return Err(BuildError::ScopedArtifactName {
+            name: name.to_string(),
+        });
+    }
     match artifact_name_format_error(name) {
         Some(reason) => Err(BuildError::InvalidArtifactName {
             name: name.to_string(),
@@ -510,7 +522,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join(MANIFEST_FILENAME),
-            "name: murmur-hook-compact\nversion: 0.3.0\nruntime: hook\nexecution: wasm\nrequires_files:\n  - murmur_hook_compact.wasm\n",
+            "name: hook-compact\nversion: 0.3.0\nruntime: hook\nexecution: wasm\nrequires_files:\n  - murmur_hook_compact.wasm\n",
         )
         .unwrap();
         fs::write(dir.path().join("murmur_hook_compact.wasm"), b"\0asm").unwrap();
@@ -620,7 +632,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join(MANIFEST_FILENAME),
-            "name: murmur-hook-compact\nversion: 0.3.0\nruntime: hook\nexecution: wasm\nrequires_files:\n  - murmur_hook_compact.wasm\n",
+            "name: hook-compact\nversion: 0.3.0\nruntime: hook\nexecution: wasm\nrequires_files:\n  - murmur_hook_compact.wasm\n",
         )
         .unwrap();
 
@@ -778,7 +790,8 @@ mod tests {
         for (name, expected_reason) in [
             ("My-Tool", "lowercase"),
             ("my tool", "lowercase"),
-            ("tools/my-tool", "lowercase"),
+            ("tools/my-tool", "carries no scope"),
+            ("ana/tool-x", "carries no scope"),
             ("tools\\\\my-tool", "lowercase"),
             ("my_tool", "lowercase"),
             ("-my-tool", "start or end"),

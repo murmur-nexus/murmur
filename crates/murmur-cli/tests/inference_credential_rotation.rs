@@ -23,8 +23,8 @@ use std::{
 use serde_json::Value;
 use tempfile::TempDir;
 
-const DRIVER: &str = "murmur-driver-anthropic";
-const SKILL: &str = "rotation-skill";
+const DRIVER: &str = "local/murmur-driver-anthropic";
+const SKILL: &str = "local/rotation-skill";
 const VERSION: &str = "0.1.0";
 const AUTH: &str = "upstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
 const NAME: &str = "ROTATION_TEST_KEY";

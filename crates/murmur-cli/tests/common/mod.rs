@@ -165,6 +165,12 @@ pub fn write_no_source_config(home: &Path) {
     fs::write(dir.join("config.yaml"), "registry:\n  sources: []\n").unwrap();
 }
 
+/// The full name `local/<name>`: what an artifact installed from its `.mur.zip` file or by
+/// `mur publish` is declared, granted and spawned under. A model knows it by `name` alone.
+pub fn local(name: &str) -> String {
+    format!("local/{name}")
+}
+
 pub fn publish_local(home: &TempDir, artifact_path: &Path) -> Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home.path())
@@ -294,7 +300,7 @@ pub fn fixture_path(relative: &str) -> PathBuf {
 
 /// Name of the fixture native tool crate under `tests/fixtures/native-tool/`,
 /// used both as the artifact name and as the binary name inside `bin/`.
-pub const FIXTURE_NATIVE_TOOL_NAME: &str = "murmur-tool-fixture";
+pub const FIXTURE_NATIVE_TOOL_NAME: &str = "tool-fixture";
 
 /// Build (once) and locate the fixture native tool binary.
 ///
@@ -350,6 +356,7 @@ pub fn create_native_tool_zip(
     manifest_bytes: &[u8],
     binary_path: &Path,
 ) -> PathBuf {
+    let name = murmur_artifact::tool_name_of(name);
     let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
     let file = fs::File::create(&artifact_path).unwrap();
     let mut zip = ZipWriter::new(file);
@@ -477,6 +484,7 @@ fn stage_agent_session_inner(
             manifest_dir: project_dir.to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools,
@@ -520,6 +528,9 @@ fn stage_agent_session_inner(
     .unwrap()
 }
 
+/// A WASM driver artifact. Like every `create_*_artifact` helper here, `name` may be a full name:
+/// the artifact is packed and its file named by the bare part, so installing the file files it as
+/// `local/<bare>`.
 pub fn create_driver_artifact(dir: &Path, name: &str, version: &str, wasm_path: &Path) -> PathBuf {
     // A `transport: http` capsule refuses a driver that does not say how its provider takes the key.
     create_driver_artifact_with_auth(
@@ -540,6 +551,7 @@ pub fn create_driver_artifact_with_auth(
     wasm_path: &Path,
     auth_block: &str,
 ) -> PathBuf {
+    let name = murmur_artifact::tool_name_of(name);
     let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
     let file = fs::File::create(&artifact_path).unwrap();
     let mut zip = ZipWriter::new(file);
@@ -573,6 +585,7 @@ pub fn create_tool_artifact_with_auth(
     wasm_path: &Path,
     auth_block: &str,
 ) -> PathBuf {
+    let name = murmur_artifact::tool_name_of(name);
     let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
     let file = fs::File::create(&artifact_path).unwrap();
     let mut zip = ZipWriter::new(file);
@@ -593,6 +606,7 @@ pub fn create_tool_artifact_with_auth(
 }
 
 pub fn create_hook_artifact(dir: &Path, name: &str, version: &str, wasm_path: &Path) -> PathBuf {
+    let name = murmur_artifact::tool_name_of(name);
     let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
     let file = fs::File::create(&artifact_path).unwrap();
     let mut zip = ZipWriter::new(file);
@@ -624,6 +638,7 @@ pub fn create_native_artifact(
     description: Option<&str>,
     input_schema: Option<&str>,
 ) -> PathBuf {
+    let name = murmur_artifact::tool_name_of(name);
     let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
     let file = fs::File::create(&artifact_path).unwrap();
     let mut zip = ZipWriter::new(file);
@@ -666,6 +681,7 @@ pub fn create_skill_artifact(
     version: &str,
     skill_content: &str,
 ) -> PathBuf {
+    let name = murmur_artifact::tool_name_of(name);
     let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
     let file = fs::File::create(&artifact_path).unwrap();
     let mut zip = ZipWriter::new(file);
@@ -1000,9 +1016,9 @@ pub fn unfence(text: &str) -> String {
         .to_string()
 }
 
-/// Pack a `murmur.yaml` of `name`, `version` and `manifest_body`, plus `component` as a
-/// `(entry name, file)` pair, and publish it into the local registry rooted at `store` as an
-/// `artifact_runtime` artifact.
+/// Pack a `murmur.yaml` of `name`'s bare part, `version` and `manifest_body`, plus `component` as
+/// a `(entry name, file)` pair, and publish it into the local registry rooted at `store` under the
+/// full name `name` as an `artifact_runtime` artifact.
 pub fn publish_to_store(
     store: &Path,
     name: &str,
@@ -1016,8 +1032,14 @@ pub fn publish_to_store(
         let mut zip = ZipWriter::new(&mut cursor);
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         zip.start_file("murmur.yaml", options).unwrap();
-        zip.write_all(format!("name: {name}\nversion: {version}\n{manifest_body}").as_bytes())
-            .unwrap();
+        zip.write_all(
+            format!(
+                "name: {}\nversion: {version}\n{manifest_body}",
+                murmur_artifact::tool_name_of(name)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
         if let Some((entry, path)) = component {
             zip.start_file(entry, options).unwrap();
             zip.write_all(&fs::read(path).unwrap()).unwrap();
@@ -1027,7 +1049,7 @@ pub fn publish_to_store(
     murmur_artifact::Registry::publish(
         &LocalRegistry::new(store),
         murmur_artifact::ArtifactMeta {
-            name: name.to_string(),
+            name: murmur_artifact::ArtifactName::parse(name).unwrap(),
             version: version.to_string(),
             runtime: murmur_artifact::RuntimeType::Wasm,
             artifact_runtime: artifact_runtime.to_string(),

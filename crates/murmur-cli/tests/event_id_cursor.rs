@@ -20,9 +20,12 @@ use common::idle_capsule::{
 use common::stream::{Event, Watch};
 use serde_json::Value;
 
+/// The tool name the model calls, which is also the name the artifact is packed under.
 const TOOL_NAME: &str = "request-input-tool";
+/// The tool's full name once installed from its `.mur.zip` file.
+const TOOL_ARTIFACT: &str = "local/request-input-tool";
 const TOOL_VERSION: &str = "0.1.0";
-const REOPEN_HOOK_NAME: &str = "reopen-every-task";
+const REOPEN_HOOK_NAME: &str = "local/reopen-every-task";
 
 // ── capsule ────────────────────────────────────────────────────────────────────
 
@@ -81,7 +84,8 @@ fn launch_with_input_tool_and_reopen_hook(server: common::ScriptedServer) -> Idl
         );
         common::publish_local(home, &hook).success();
         format!(
-            "  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n    runtime: tool\n  - name: {REOPEN_HOOK_NAME}\n    version: 0.1.0\n    runtime: hook\n"
+            "  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n    runtime: tool\n  \
+             - name: {REOPEN_HOOK_NAME}\n    version: 0.1.0\n    runtime: hook\n"
         )
     })
 }
