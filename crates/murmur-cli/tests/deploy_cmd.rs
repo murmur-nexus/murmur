@@ -566,6 +566,55 @@ fn deploy_mur_version_absent_is_none() {
     assert_eq!(manifest.deploy_mur_version(), None);
 }
 
+/// `mur deploy run` is the command the pin is for, so its refusal of the top-level key carries the
+/// same code and hint as `mur run`'s, before any SSH attempt.
+#[test]
+fn deploy_refuses_a_top_level_mur_version_with_a_hint_naming_deploy_mur_version() {
+    let dir = tempdir().unwrap();
+    let config_dir = dir.path().join(".murmur");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.yaml"),
+        "registry:\n  sources: []\nbeta:\n  enabled:\n    - mur-deploy\n",
+    )
+    .unwrap();
+    let manifest_p = dir.path().join("murmur.yaml");
+    fs::write(
+        &manifest_p,
+        "name: my-agent\nversion: 0.1.0\nmur_version: \"0.4.5\"\n",
+    )
+    .unwrap();
+
+    let out = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args([
+            "deploy",
+            "run",
+            "--host",
+            "192.0.2.1", // TEST-NET; never reached because the manifest is refused first
+            "--manifest",
+            manifest_p.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error[E-MAN-003]"), "{stderr}");
+    assert!(
+        stderr.contains("'mur_version' is not a top-level key"),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains("hint:") && line.contains("deploy.mur_version")),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("SSH"), "{stderr}");
+}
+
 // ─── manifest-referenced file upload ─────────────────────────────────────────
 
 #[test]

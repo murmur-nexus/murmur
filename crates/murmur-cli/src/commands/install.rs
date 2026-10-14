@@ -486,8 +486,8 @@ fn install_manifest_deps(
     let lock_path = root.join("murmur.lock");
 
     let manifest_path = resolve_manifest_path(&root);
-    let runtime_manifest = load_runtime_manifest(&manifest_path)
-        .map_err(|err| CliError::new(E_IO_003, format!("failed to load manifest: {err:?}")))?;
+    let runtime_manifest =
+        load_runtime_manifest(&manifest_path).map_err(super::runtime_manifest_error_to_cli)?;
 
     // Collect only the artifacts we need to install (skip inline-source ones).
     let artifacts: Vec<_> = runtime_manifest

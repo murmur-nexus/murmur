@@ -1009,12 +1009,8 @@ pub(crate) fn run_deploy(
     let _staging_guard = StagingGuard(staging_dir.clone());
 
     // ── 0.4. Load manifest, artifacts, sources ────────────────────────────────
-    let runtime_manifest = load_runtime_manifest(&manifest_path).map_err(|e| {
-        CliError::new(
-            E_IO_003,
-            format!("failed to parse manifest for staging: {e}"),
-        )
-    })?;
+    let runtime_manifest =
+        load_runtime_manifest(&manifest_path).map_err(super::runtime_manifest_error_to_cli)?;
     let artifact_refs = collect_deploy_artifacts(&runtime_manifest);
     let local_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
     let mur_config = load_mur_config()?;

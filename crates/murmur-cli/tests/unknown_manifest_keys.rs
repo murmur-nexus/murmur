@@ -162,8 +162,8 @@ fn a_key_with_no_near_neighbour_is_not_called_a_typo() {
     assert!(!lines[0].contains("spelling"));
 }
 
-/// A top-level `mur_version` is refused before anything is staged, and both the message and the
-/// hint name `deploy.mur_version`.
+/// A top-level `mur_version` is refused before anything is staged, on every surface that loads the
+/// project manifest, and both the message and the hint name `deploy.mur_version`.
 #[test]
 fn a_top_level_mur_version_is_refused_with_a_hint_naming_deploy_mur_version() {
     let home = TempDir::new().unwrap();
@@ -173,33 +173,39 @@ fn a_top_level_mur_version_is_refused_with_a_hint_naming_deploy_mur_version() {
         "name: c\nversion: 0.1.0\nmur_version: \"0.4.5\"\n",
     );
 
-    let output = Command::cargo_bin("mur")
-        .unwrap()
-        .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
-        .current_dir(dir.path())
-        .args(["run", "--manifest", "murmur.yaml", "--explain-scope"])
-        .assert()
-        .failure()
-        .get_output()
-        .stderr
-        .clone();
-    let stderr = String::from_utf8(output).unwrap();
+    for args in [
+        &["run", "--manifest", "murmur.yaml", "--explain-scope"][..],
+        &["doctor"],
+        &["install"],
+    ] {
+        let output = Command::cargo_bin("mur")
+            .unwrap()
+            .env("HOME", home.path())
+            .env_remove("NEXUS_API_KEY")
+            .current_dir(dir.path())
+            .args(args)
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone();
+        let stderr = String::from_utf8(output).unwrap();
 
-    assert!(stderr.contains("error[E-MAN-003]"), "{stderr}");
-    assert!(
-        stderr.contains(
-            "murmur.yaml: 'mur_version' is not a top-level key — the mur release a deploy \
-             installs is pinned as 'deploy.mur_version'"
-        ),
-        "{stderr}"
-    );
-    assert!(
-        stderr
-            .lines()
-            .any(|line| line.contains("hint:") && line.contains("deploy.mur_version")),
-        "{stderr}"
-    );
+        assert!(stderr.contains("error[E-MAN-003]"), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains(
+                "murmur.yaml: 'mur_version' is not a top-level key — the mur release a deploy \
+                 installs is pinned as 'deploy.mur_version'"
+            ),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.contains("hint:") && line.contains("deploy.mur_version")),
+            "{args:?}: {stderr}"
+        );
+    }
 }
 
 /// `deploy:` is read by `mur deploy` alone: a pin under it, higher or lower than the running
