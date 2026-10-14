@@ -522,7 +522,6 @@ fn tokens_stay_out_of_the_session() {
     let stopped = assert_cmd::Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args(["stop", "@1"])
         .assert()
         .success()

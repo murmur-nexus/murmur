@@ -57,11 +57,6 @@ fn setup_agent_project(endpoint: &str) -> (TempDir, PathBuf) {
     // Write project files first so find_project_root() works during install.
     fs::write(
         project.path().join("murmur.yaml"),
-        "registry:\n  default: local\n",
-    )
-    .unwrap();
-    fs::write(
-        project.path().join("murmur.yaml"),
         format!(
             "name: json-launch-agent\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n"
         ),
@@ -427,7 +422,6 @@ fn no_json_flag_human_readable_output_unchanged() {
     let output = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",
@@ -485,7 +479,6 @@ fn json_launch_workdir_flag_is_reflected() {
     let output = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",
@@ -558,7 +551,6 @@ fn spawn_json_run(
     let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"));
     command
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args(["run", "--manifest", manifest_path.to_str().unwrap()]);
     if let Some(task_file) = task_file {
         command.args(["--task", task_file.to_str().unwrap()]);
@@ -825,7 +817,6 @@ fn human_launch_runs_to_its_end_after_the_supervisor_stops_reading() {
 
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",
@@ -1107,7 +1098,6 @@ fn a_malformed_formation_id_refuses_the_launch_with_e_run_044() {
         let output = Command::cargo_bin("mur")
             .unwrap()
             .env("HOME", home.path())
-            .env_remove("NEXUS_API_KEY")
             .env(capsule_runtime::formation::FORMATION_ID_ENV, value)
             .args(["run", "--manifest", manifest_path.to_str().unwrap()])
             .assert()
@@ -1203,7 +1193,6 @@ fn verbose_launch_prints_the_formation_of_a_member_only() {
         let mut command = Command::cargo_bin("mur").unwrap();
         command
             .env("HOME", home.path())
-            .env_remove("NEXUS_API_KEY")
             .env_remove(capsule_runtime::formation::FORMATION_ID_ENV)
             .args([
                 "run",

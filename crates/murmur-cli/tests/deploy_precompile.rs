@@ -88,7 +88,6 @@ impl Deployer {
             Command::cargo_bin("mur")
                 .unwrap()
                 .env("HOME", home.path())
-                .env_remove("NEXUS_API_KEY")
                 .env_remove(CEILING_ENV)
                 .args(["install", "-g", "--no-precompile", zip.to_str().unwrap()])
                 .assert()
@@ -140,7 +139,6 @@ impl Deployer {
         command
             .env("HOME", self.home.path())
             .env("PATH", target.path_env())
-            .env_remove("NEXUS_API_KEY")
             .env_remove(CEILING_ENV)
             .current_dir(self.project.path())
             .timeout(Duration::from_secs(600))

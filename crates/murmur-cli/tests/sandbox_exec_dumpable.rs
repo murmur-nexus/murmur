@@ -148,7 +148,6 @@ fn mur(home: &TempDir, project: &Path) -> Command {
     let mut command = Command::cargo_bin("mur").unwrap();
     command
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project)
         .timeout(Duration::from_secs(180));
     command
@@ -180,7 +179,6 @@ fn mur_in_delegated_scope(home: &TempDir, project: &Path) -> Command {
         ])
         .arg(mur_binary)
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project)
         .timeout(Duration::from_secs(180));
     command

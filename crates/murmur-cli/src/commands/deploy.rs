@@ -545,7 +545,7 @@ fn resolve_mur_binary_impl(
         return Ok(cache_path);
     }
 
-    let client = crate::registry_client::blocking_agent(std::time::Duration::from_secs(60));
+    let client = crate::http::blocking_agent(std::time::Duration::from_secs(60));
 
     // Read GitHub token from the environment so private-repo release assets can be
     // fetched.  GITHUB_TOKEN is the standard name set by GitHub Actions and gh-auth;

@@ -6,17 +6,13 @@ use std::{
 use murmur_artifact::{
     current_platform, is_reserved_version, load_manifest, load_manifest_from_artifact,
     load_manifest_yaml_from_artifact, parse_tool_implementation_from_yaml, resolve_manifest_path,
-    split_platform_tag, ArtifactImplementation, ArtifactMeta, RuntimeType,
+    split_platform_tag, ArtifactImplementation, ArtifactMeta, LocalRegistry, Registry, RuntimeType,
 };
 
-use crate::{
-    config::resolve_registry,
-    error::{CliError, E_IO_001, E_IO_003, E_REG_004},
-};
+use crate::error::{CliError, E_IO_001, E_IO_003, E_REG_004};
 
 pub(crate) fn run_publish(
     artifact_path_arg: Option<&Path>,
-    registry_override: Option<&str>,
     platform: Option<&str>,
 ) -> Result<(), CliError> {
     let artifact_path = resolve_publish_artifact_path(artifact_path_arg)?;
@@ -107,8 +103,8 @@ pub(crate) fn run_publish(
         wit_contracts: None,
     };
 
-    let registry = resolve_registry(registry_override)?;
-    registry.publish(meta, &bytes).map_err(CliError::from)?;
+    let global_store = LocalRegistry::from_default_home().map_err(CliError::from)?;
+    global_store.publish(meta, &bytes).map_err(CliError::from)?;
     capsule_runtime::report_println!("Published {artifact_id}");
     Ok(())
 }

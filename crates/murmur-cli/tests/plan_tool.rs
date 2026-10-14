@@ -116,7 +116,6 @@ fn run(home: &TempDir, manifest: &Path, task: &str) -> assert_cmd::assert::Asser
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",

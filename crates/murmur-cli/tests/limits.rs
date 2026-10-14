@@ -48,7 +48,6 @@ fn create_project(project_dir: &Path, capsule_fixture: &str, capabilities_yaml: 
 fn run_capsule(home: &Path, manifest_path: &Path) -> assert_cmd::assert::Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home)
-        .env_remove("NEXUS_API_KEY")
         .timeout(RUN_TIMEOUT)
         .args([
             "run",

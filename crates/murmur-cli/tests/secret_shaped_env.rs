@@ -35,7 +35,6 @@ fn explain_scope_stderr_with_env(
     let mut command = Command::cargo_bin("mur").unwrap();
     command
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project_dir)
         .args(["run", "--manifest", "murmur.yaml", "--explain-scope"])
         .args(extra_args);
@@ -52,7 +51,6 @@ fn doctor_stderr(home: &TempDir, project_dir: &Path) -> String {
     let output = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project_dir)
         .arg("doctor")
         .assert()

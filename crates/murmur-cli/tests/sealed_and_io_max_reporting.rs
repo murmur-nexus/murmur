@@ -102,7 +102,6 @@ fn mur_run(home: &TempDir, manifest: &Path, task: &str) -> assert_cmd::assert::A
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",

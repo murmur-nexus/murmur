@@ -65,7 +65,7 @@ Capsules are designed to be fast-starting and horizontally scalable.
 Every capsule goes through the same runtime, which turns its manifest into a running process:
 
 - Parses capsule and artifact metadata
-- Resolves dependencies from local/remote registry sources
+- Resolves dependencies from the project store, then the global store
 - Configures capability grants (filesystem, network, shell) from the manifest (see
   [Access control](access-control.md))
 - Links and invokes runtime interfaces for tools and artifact management

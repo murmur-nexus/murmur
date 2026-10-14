@@ -145,7 +145,6 @@ impl Run {
         let out = Command::cargo_bin("mur")
             .unwrap()
             .env("HOME", self.home.path())
-            .env_remove("NEXUS_API_KEY")
             .args([
                 "trace",
                 "steps",
@@ -175,7 +174,6 @@ fn run(config_mode: Option<&str>) -> Run {
     let assertion = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",

@@ -229,7 +229,6 @@ impl Capsule {
         let mut command = Command::new(assert_cmd::cargo::cargo_bin("mur"));
         command
             .env("HOME", self.home.path())
-            .env_remove("NEXUS_API_KEY")
             .env_remove(NAME)
             .current_dir(self.project.path());
         if let Some(key) = env_key {

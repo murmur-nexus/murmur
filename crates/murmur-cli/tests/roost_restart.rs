@@ -47,7 +47,6 @@ fn driver_home() -> TempDir {
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args(["publish", driver.to_str().unwrap()])
         .assert()
         .success();
@@ -87,7 +86,6 @@ impl Capsule {
             .arg("--json")
             .current_dir(project.path())
             .env("HOME", home)
-            .env_remove("NEXUS_API_KEY")
             .env_remove("MURMUR_ROOST_URL")
             .envs(env.iter().copied())
             .stdout(Stdio::piped())

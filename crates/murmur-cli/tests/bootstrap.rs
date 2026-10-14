@@ -327,11 +327,6 @@ fn script_capsule_without_wasm_fails_with_run_004() {
     // Write a manifest with no inference block and no capsule.wasm — should fail.
     fs::write(
         project.path().join("murmur.yaml"),
-        "registry:\n  default: local\n",
-    )
-    .unwrap();
-    fs::write(
-        project.path().join("murmur.yaml"),
         "name: script-capsule\nversion: 0.1.0\nartifacts: []\n",
     )
     .unwrap();
@@ -453,11 +448,6 @@ fn agent_system_prompt_includes_capsule_context() {
     common::publish_local(&home, &driver_artifact).success();
 
     let manifest_system_prompt = "You are a helpful assistant.";
-    fs::write(
-        project.path().join("murmur.yaml"),
-        "registry:\n  default: local\n",
-    )
-    .unwrap();
     fs::write(
         project.path().join("murmur.yaml"),
         format!(
@@ -737,12 +727,6 @@ fn create_agent_project(
     driver_name: &str,
     include_tool_artifact: bool,
 ) -> PathBuf {
-    fs::write(
-        project_dir.join("murmur.yaml"),
-        "registry:\n  default: local\n",
-    )
-    .unwrap();
-
     // No capsule.wasm — agent capsules are manifest-only.
 
     let mut artifacts_yaml = if include_tool_artifact {

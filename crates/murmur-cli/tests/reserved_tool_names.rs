@@ -42,7 +42,6 @@ fn manifest(project: &Path, artifact_name: &str, blocks: &str) -> std::path::Pat
 fn run(home: &TempDir, manifest_path: &Path) -> assert_cmd::assert::Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",
@@ -133,7 +132,6 @@ fn explain_scope_refuses_the_same_manifest() {
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",

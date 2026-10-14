@@ -9,11 +9,12 @@ mod config;
 mod env_requirements;
 mod error;
 mod formation_trace;
+mod http;
 mod live_address;
-mod registry_client;
 mod residue;
 mod session_address;
 mod source;
+mod stores;
 
 use std::path::PathBuf;
 
@@ -116,7 +117,7 @@ enum Commands {
         #[arg(
             long,
             value_name = "NAME",
-            conflicts_with_all = ["task", "registry"],
+            conflicts_with_all = ["task", "index"],
             required_unless_present = "task"
         )]
         roster: Option<String>,
@@ -124,20 +125,22 @@ enum Commands {
         /// Plain-language task description for the capsule to generate (beta: mur-new)
         task: Option<String>,
 
-        /// Registry to search for artifacts: "local" scans ~/.murmur/artifacts/; a URL fetches
-        /// that index. Defaults to the configured public index URL.
-        #[arg(long, value_name = "URL|local")]
-        registry: Option<String>,
+        /// Artifact index to search: "local" lists the global store ~/.murmur/artifacts/; an
+        /// http:// or https:// URL is fetched; anything else is a file path. Defaults to
+        /// registry.index_url in ~/.murmur/config.yaml, else the public index URL.
+        #[arg(long, value_name = "PATH|URL|local")]
+        index: Option<String>,
     },
     /// Search the public artifact index for artifacts matching a keyword
     Search {
         /// Search query — matched case-insensitively against name, description, and tags
         query: String,
 
-        /// Registry to search: "local" scans ~/.murmur/artifacts/; a URL fetches that index.
-        /// Defaults to the configured public index URL (registry.index_url in ~/.murmur/config.yaml).
-        #[arg(long, value_name = "URL|local")]
-        registry: Option<String>,
+        /// Artifact index to search: "local" lists the global store ~/.murmur/artifacts/; an
+        /// http:// or https:// URL is fetched; anything else is a file path. Defaults to
+        /// registry.index_url in ~/.murmur/config.yaml, else the public index URL.
+        #[arg(long, value_name = "PATH|URL|local")]
+        index: Option<String>,
 
         /// Maximum number of results to show
         #[arg(long, default_value = "10")]
@@ -174,14 +177,10 @@ enum Commands {
         #[arg(long, value_name = "TEXT")]
         summary: Option<String>,
     },
-    /// Publish an existing .mur.zip artifact to the configured registry
+    /// Publish an existing .mur.zip artifact into the global store (~/.murmur/artifacts/)
     Publish {
         /// Artifact path. If omitted, defaults to <name>-<version>.mur.zip in current directory.
         artifact_path: Option<PathBuf>,
-
-        /// Remote registry base URL override (forces remote mode)
-        #[arg(long)]
-        registry: Option<String>,
 
         /// Platform tag for native artifacts (e.g. darwin-aarch64). Auto-detected when omitted for native artifacts.
         #[arg(long)]
@@ -190,14 +189,10 @@ enum Commands {
     /// Install an artifact into the project store (.murmur/artifacts/) by default, or globally with -g.
     /// With no arguments, installs all manifest deps from murmur.yaml into the project store.
     Install {
-        /// Artifact reference: name@version (registry), bare name (source chain),
-        /// github:<owner>/<repo>@<tag>, or a local file path (./artifact.mur.zip).
-        /// Omit to install all manifest deps from murmur.yaml.
+        /// Artifact reference: name@version (the global store, then the configured sources),
+        /// bare name (the sources), github:<owner>/<repo>@<tag>, or a local file path
+        /// (./artifact.mur.zip). Omit to install all manifest deps from murmur.yaml.
         artifact: Option<String>,
-
-        /// Remote registry base URL override (forces remote mode)
-        #[arg(long)]
-        registry: Option<String>,
 
         /// Install into the global store (~/.murmur/artifacts/) instead of the project store
         #[arg(short = 'g', long)]
@@ -589,7 +584,7 @@ fn main() {
                 "Scaffold a formation: ./<NAME>/ holding a roster.yaml and one capsule per member",
             )
             .mut_arg("task", |arg| arg.hide(true))
-            .mut_arg("registry", |arg| arg.hide(true))
+            .mut_arg("index", |arg| arg.hide(true))
         });
     }
     #[cfg(feature = "beta-mur-deploy")]
@@ -619,7 +614,7 @@ fn main() {
         Commands::New {
             roster: None,
             task,
-            registry,
+            index,
         } => {
             if !beta_config.is_enabled("mur-new") {
                 capsule_runtime::report_eprintln!(
@@ -630,7 +625,7 @@ fn main() {
                 std::process::exit(1);
             }
             // clap requires --roster or <task>, so a task is present here.
-            run_new(&task.unwrap_or_default(), registry.as_deref())
+            run_new(&task.unwrap_or_default(), index.as_deref())
         }
         Commands::List {
             global,
@@ -639,9 +634,9 @@ fn main() {
         } => run_list(global, all, contract.as_deref()),
         Commands::Search {
             query,
-            registry,
+            index,
             limit,
-        } => run_search(&query, registry.as_deref(), limit),
+        } => run_search(&query, index.as_deref(), limit),
         Commands::Doctor { bind } => run_doctor(&bind),
         Commands::Build {
             source,
@@ -658,26 +653,14 @@ fn main() {
         ),
         Commands::Publish {
             artifact_path,
-            registry,
             platform,
-        } => run_publish(
-            artifact_path.as_deref(),
-            registry.as_deref(),
-            platform.as_deref(),
-        ),
+        } => run_publish(artifact_path.as_deref(), platform.as_deref()),
         Commands::Install {
             artifact,
-            registry,
             global,
             all_platforms,
             no_precompile,
-        } => run_install(
-            artifact.as_deref(),
-            registry.as_deref(),
-            global,
-            all_platforms,
-            no_precompile,
-        ),
+        } => run_install(artifact.as_deref(), global, all_platforms, no_precompile),
         Commands::Precompile {
             files,
             workdir,
@@ -901,9 +884,19 @@ fn main() {
 /// `Error::print` writes the text itself so the stream and the colour choice (the command's
 /// `ColorChoice`, then `anstream`'s terminal and `NO_COLOR`/`CLICOLOR` checks on stdout) stay
 /// clap's own.
+///
+/// A `--registry` flag refused as an unknown argument is followed by one `hint:` line naming
+/// where the invoked command reads or writes artifacts instead.
 fn exit_on_parse_error(err: &clap::Error) -> ! {
     if err.use_stderr() {
-        err.exit();
+        let hint = is_registry_flag(err)
+            .then(|| std::env::args_os().nth(1))
+            .flatten()
+            .and_then(|subcommand| registry_flag_hint(subcommand.to_str()?));
+        let Some(hint) = hint else { err.exit() };
+        let _ = err.print();
+        capsule_runtime::report_eprintln!("  hint: {hint}");
+        std::process::exit(err.exit_code());
     }
     let written = err
         .print()
@@ -913,6 +906,33 @@ fn exit_on_parse_error(err: &clap::Error) -> ! {
             exit_on_stdout_failure(&failure)
         }
         _ => std::process::exit(err.exit_code()),
+    }
+}
+
+/// Whether `err` refuses an unknown `--registry` or `--registry=<value>` argument.
+fn is_registry_flag(err: &clap::Error) -> bool {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    err.kind() == ErrorKind::UnknownArgument
+        && matches!(
+            err.get(ContextKind::InvalidArg),
+            Some(ContextValue::String(arg)) if arg == "--registry" || arg.starts_with("--registry=")
+        )
+}
+
+/// The hint for a `--registry` flag passed to `subcommand`: where that command reads or writes
+/// artifacts, or `None` for a command with nothing to name. `mur` has no global flags, so the
+/// subcommand is the first argument.
+fn registry_flag_hint(subcommand: &str) -> Option<&'static str> {
+    match subcommand {
+        "install" => Some(
+            "`mur install` resolves from the global store ~/.murmur/artifacts/, then the \
+             registry.sources in ~/.murmur/config.yaml",
+        ),
+        "publish" => Some("`mur publish` writes into the global store ~/.murmur/artifacts/"),
+        "search" => Some("to choose the artifact index, pass --index <PATH|URL|local>"),
+        #[cfg(feature = "beta-mur-new")]
+        "new" => Some("to choose the artifact index, pass --index <PATH|URL|local>"),
+        _ => None,
     }
 }
 

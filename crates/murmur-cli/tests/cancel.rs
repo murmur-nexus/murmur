@@ -419,9 +419,7 @@ fn request_text(request: &Value) -> String {
 }
 
 fn mur() -> Command {
-    let mut cmd = Command::cargo_bin("mur").unwrap();
-    cmd.env_remove("NEXUS_API_KEY");
-    cmd
+    Command::cargo_bin("mur").unwrap()
 }
 
 // ── 1. The provider call stops ────────────────────────────────────────────────
@@ -1455,7 +1453,6 @@ fn door_auth_cancel_and_watch_by_session_address() {
     let mut watch = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
         .args(["watch", "@1"])
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .env_remove(capsule_runtime::DOOR_TOKEN_ENV)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

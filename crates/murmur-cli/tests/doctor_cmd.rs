@@ -90,7 +90,6 @@ fn mur_doctor_with_roost_env(
     let mut command = Command::cargo_bin("mur").unwrap();
     command
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .env("PATH", path)
         .env_remove("MURMUR_ROOST_URL")
         .current_dir(project_dir)
@@ -123,7 +122,6 @@ fn mur_doctor(home: &TempDir, project_dir: &Path) -> assert_cmd::assert::Assert 
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project_dir)
         .arg("doctor")
         .assert()
@@ -139,7 +137,6 @@ fn install_pinned_to_project(
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project_dir)
         .args(["install", artifact_ref])
         .assert()
@@ -225,7 +222,6 @@ fn mur_doctor_with_env(
     let mut command = Command::cargo_bin("mur").unwrap();
     command
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project_dir)
         // A cyclic spawn.allow must terminate. Bounded so a walk that recursed forever fails the
         // case rather than hanging the suite.
@@ -1845,7 +1841,6 @@ fn mur_run_still_refuses_the_reference_mur_doctor_reports() {
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .env_remove("SOLO_PROVIDER_KEY")
         .current_dir(project.path())
         .arg("run")
@@ -1881,7 +1876,6 @@ fn doctor_names_the_running_binary_and_what_attaches_to_it() {
     let mut command = Command::new(&unusual);
     command
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project.path())
         .arg("doctor");
 
@@ -2143,7 +2137,6 @@ fn doctor_stdout(home: &Path, project: &Path, args: &[&str]) -> String {
     let output = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home)
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project)
         .arg("doctor")
         .args(args)

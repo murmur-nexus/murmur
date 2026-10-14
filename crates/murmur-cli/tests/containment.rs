@@ -39,7 +39,6 @@ fn mur_run(home: &TempDir, project_dir: &Path, args: &[&str]) -> assert_cmd::ass
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project_dir)
         .arg("run")
         .arg("--manifest")

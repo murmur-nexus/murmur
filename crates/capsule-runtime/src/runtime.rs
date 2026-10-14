@@ -1999,12 +1999,10 @@ pub fn stage_session(
             None => (artifact.version.clone(), None, LockOrigin::Operator),
         };
 
-        // Always pass current_platform(). LocalRegistry and RemoteRegistry both implement a
-        // fallback: if no platform-specific file exists they return the generic file. This
-        // means WASM artifacts (which have no platform file) resolve transparently, while
-        // native artifacts get their correct platform variant. Nexus must preserve this
-        // fallback behaviour — if it ever becomes strict (error on no platform match), WASM
-        // resolution will break.
+        // Always pass current_platform(). `LocalRegistry` falls back to the generic file when no
+        // platform-specific file exists, so a WASM artifact (which has no platform file) resolves
+        // through the same call that gives a native artifact its platform variant. A store that
+        // refused a missing platform match instead would break WASM resolution.
         let resolved = registry
             .resolve_with_platform(&artifact.name, &resolved_version, Some(current_platform()))
             .map_err(|err| map_registry_error(&artifact.name, &resolved_version, err))?;

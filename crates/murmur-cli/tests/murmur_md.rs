@@ -29,12 +29,6 @@ fn create_agent_manifest(
     shell_allow: &[&str],
     context_max_tokens: Option<u32>,
 ) -> PathBuf {
-    fs::write(
-        project_dir.join("murmur.yaml"),
-        "registry:\n  default: local\n",
-    )
-    .unwrap();
-
     let context_section = context_max_tokens
         .map(|n| format!("context:\n  max_tokens: {n}\n"))
         .unwrap_or_default();

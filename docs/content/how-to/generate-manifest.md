@@ -9,7 +9,7 @@
 
 `mur new` takes a plain-language task description and writes a ready-to-refine `murmur.yaml`
 to the current directory. It cold-boots a short-lived generator capsule backed by Claude Haiku,
-which queries the artifact registry to discover relevant tools and produces a manifest tailored
+which queries the artifact index to discover relevant tools and produces a manifest tailored
 to the task — no schema knowledge required.
 
 The relevant manifest options are:
@@ -95,12 +95,12 @@ the request is authenticated:
 export MURMUR_REGISTRY_TOKEN=ghp_...
 ```
 
-The token is injected automatically when the registry URL hostname is `raw.githubusercontent.com`
+The token is injected automatically when the index URL hostname is `raw.githubusercontent.com`
 or `api.github.com`. For public repos it is optional — unauthenticated requests are served
 without a token. For private repos it is required.
 
-If you point `mur new` at a custom registry URL on a private GitHub repo (see Step 2), the
-same `MURMUR_REGISTRY_TOKEN` value is reused. Registries on other hostnames are never given the
+If you point `mur new` at a custom index URL on a private GitHub repo (see Step 2), the
+same `MURMUR_REGISTRY_TOKEN` value is reused. Indexes on other hostnames are never given the
 token automatically.
 
 ---
@@ -120,15 +120,15 @@ mur new: generating manifest...
 murmur.yaml written to /path/to/current-dir/murmur.yaml
 ```
 
-The generator queries the artifact registry, reasons about the task, and writes `murmur.yaml`
+The generator queries the artifact index, reasons about the task, and writes `murmur.yaml`
 to the current directory.
 
 To restrict artifact discovery to versions already installed in `~/.murmur/artifacts/` — which
 guarantees the generated manifest references versions you can run immediately — pass
-`--registry local`:
+`--index local`:
 
 ```bash
-mur new "review this PR for security issues" --registry local
+mur new "review this PR for security issues" --index local
 ```
 
 To point the generator at a custom artifact index — for example, a private GitHub-hosted
@@ -136,7 +136,7 @@ To point the generator at a custom artifact index — for example, a private Git
 
 ```bash
 mur new "review this PR for security issues" \
-  --registry https://raw.githubusercontent.com/your-org/your-artifacts/main/artifacts-index.json
+  --index https://raw.githubusercontent.com/your-org/your-artifacts/main/artifacts-index.json
 ```
 
 When the URL hostname is `raw.githubusercontent.com` or `api.github.com`, `mur new`
@@ -323,8 +323,8 @@ The generator picks one of two shapes based on the task description.
     ```
 
 !!! note "Generated manifests are a starting point"
-    Artifact versions in the generated manifest reflect what the generator found in the registry at
-    run time. Re-run with `--registry local` to ensure versions match what is installed, or run
+    Artifact versions in the generated manifest reflect what the generator found in the artifact index at
+    run time. Re-run with `--index local` to ensure versions match what is installed, or run
     `mur list` to compare.
 
 ---
@@ -397,8 +397,8 @@ mur run --manifest murmur.yaml --task task.md
 | Feature / setting | How it works |
 |---|---|
 | `mur new "<description>"` | Boots a generator capsule; writes `murmur.yaml` to CWD |
-| `--registry local` | Restricts artifact discovery to `~/.murmur/artifacts/`; ensures generated versions are installed |
-| `--registry <url>` | Queries a custom artifact index; GitHub URLs receive the bearer token automatically |
+| `--index local` | Restricts artifact discovery to `~/.murmur/artifacts/`; ensures generated versions are installed |
+| `--index <url>` | Queries a custom artifact index; GitHub URLs receive the bearer token automatically |
 | `MURMUR_REGISTRY_TOKEN` | GitHub PAT injected as `Authorization: Bearer` on `raw.githubusercontent.com` and `api.github.com` requests; required for private repos, optional for public |
 | Single capsule | Generated for focused, bounded tasks — no `spawn` block |
 | Orchestrator | Generated for research and pipeline tasks — adds a `capabilities.spawn.allow` list |
@@ -411,7 +411,7 @@ mur run --manifest murmur.yaml --task task.md
 
 ## See also
 
-- [`mur search`](../reference/cli.md#mur-search) — search the artifact registry interactively from the CLI
+- [`mur search`](../reference/cli.md#mur-search) — search the artifact index from the CLI
 - **`murmur-tool-registry-search`** — the in-capsule tool the generator uses for artifact discovery
 - **`murmur-skill-create-manifest`** — full schema reference skill for authoring manifests manually
 - [`mur build`](../reference/cli.md#mur-build) — build the generated capsule into a `.mur.zip`

@@ -64,7 +64,7 @@ fn write_registry_source_config(home: &Path) {
 
 fn mur(home: &TempDir) -> Command {
     let mut cmd = Command::cargo_bin("mur").unwrap();
-    cmd.env("HOME", home.path()).env_remove("NEXUS_API_KEY");
+    cmd.env("HOME", home.path());
     cmd
 }
 

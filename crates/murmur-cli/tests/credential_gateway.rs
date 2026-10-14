@@ -193,7 +193,6 @@ impl Project {
         let mut command = Command::cargo_bin("mur").unwrap();
         command
             .env("HOME", self.home.path())
-            .env_remove("NEXUS_API_KEY")
             .env_remove(CREDENTIAL)
             .env_remove(DRIVER_CREDENTIAL)
             .current_dir(self.project.path());

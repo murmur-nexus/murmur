@@ -262,7 +262,6 @@ impl MurRun {
             .args(args)
             .current_dir(manifest.parent().unwrap())
             .env("HOME", home)
-            .env_remove("NEXUS_API_KEY")
             .env_remove(capsule_runtime::DOOR_TOKEN_ENV)
             .env_remove(capsule_runtime::formation::FORMATION_ID_ENV)
             .env_remove(capsule_runtime::formation::FORMATION_PEERS_ENV)
@@ -601,7 +600,6 @@ pub fn mur(home: &Path, env: &[(&str, &str)]) -> assert_cmd::Command {
     let mut command = assert_cmd::Command::cargo_bin("mur").unwrap();
     command
         .env("HOME", home)
-        .env_remove("NEXUS_API_KEY")
         .env_remove(capsule_runtime::DOOR_TOKEN_ENV)
         .envs(env.iter().copied());
     command

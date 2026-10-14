@@ -27,7 +27,6 @@ fn mur(home: &TempDir, cwd: &Path, api_base: &str) -> Command {
     let mut cmd = Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home.path())
         .env("MUR_GITHUB_API_BASE", api_base)
-        .env_remove("NEXUS_API_KEY")
         .env_remove("GITHUB_TOKEN")
         .current_dir(cwd)
         .timeout(Duration::from_secs(60));

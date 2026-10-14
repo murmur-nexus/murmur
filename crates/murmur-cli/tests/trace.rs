@@ -47,11 +47,6 @@ fn end_turn_response() -> String {
 // ── Manifest helper ──────────────────────────────────────────────────────────
 
 fn create_manifest(project_dir: &std::path::Path, endpoint: &str) -> PathBuf {
-    fs::write(
-        project_dir.join("murmur.yaml"),
-        "registry:\n  default: local\n",
-    )
-    .unwrap();
     let manifest = format!(
         concat!(
             "name: trace-test\n",
@@ -685,7 +680,6 @@ fn session_start_effective_grants_match_explain_scope_json() {
     let explain_stdout = assert_cmd::Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project.path())
         .args([
             "run",

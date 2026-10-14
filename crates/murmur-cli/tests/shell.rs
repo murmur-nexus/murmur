@@ -293,12 +293,6 @@ fn create_agent_project_with_lifecycle(
     shell_allow: &[&str],
     lifecycle_yaml: &str,
 ) -> PathBuf {
-    fs::write(
-        project_dir.join("murmur.yaml"),
-        "registry:\n  default: local\n",
-    )
-    .unwrap();
-
     let shell_allow_yaml = shell_allow
         .iter()
         .map(|binary| format!("      - {binary}\n"))
@@ -513,7 +507,6 @@ fn shell_records_work_abandoned_when_the_session_ends() {
     let started = std::time::Instant::now();
     let status = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",
@@ -615,7 +608,6 @@ fn spawn_mur_run(
     let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"));
     command
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .arg("run")
         .arg("--manifest")
         .arg(manifest_path)

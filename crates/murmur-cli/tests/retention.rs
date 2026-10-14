@@ -117,7 +117,7 @@ fn write_manifest(dir: &Path, name: &str, endpoint: &str, blocks: &str) -> PathB
 
 fn run_manifest(home: &TempDir, manifest: &Path, workdir: &Path, extra: &[&str]) -> Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
-    cmd.env("HOME", home.path()).env_remove("NEXUS_API_KEY");
+    cmd.env("HOME", home.path());
     cmd.args([
         "run",
         "--manifest",
@@ -133,7 +133,7 @@ fn run_manifest(home: &TempDir, manifest: &Path, workdir: &Path, extra: &[&str])
 
 fn conversation(home: &TempDir, args: &[&str]) -> Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
-    cmd.env("HOME", home.path()).env_remove("NEXUS_API_KEY");
+    cmd.env("HOME", home.path());
     cmd.arg("conversation").args(args).assert()
 }
 

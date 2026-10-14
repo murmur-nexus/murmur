@@ -77,7 +77,7 @@ fn inject_driver_key(runtime_manifest: &mut RuntimeManifest, key: &str) {
     }
 }
 
-pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError> {
+pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     // Resolve inference config: config file → env var → interactive wizard.
     let inf = resolve_inference_config()?;
 
@@ -115,7 +115,7 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
     check_artifacts_installed(&local_registry, &generator_artifacts)?;
 
     // Build the task prompt with a compact inline schema.
-    let task_prompt = build_task_prompt(task, registry, &inf);
+    let task_prompt = build_task_prompt(task, index, &inf);
 
     // Create a temp dir for the generator session. The session workdir lives inside it
     // (manifest_dir/workdir/<session_id>/), so cleanup on Drop removes everything.
@@ -433,9 +433,11 @@ fn check_artifacts_installed(
     Ok(())
 }
 
-fn build_task_prompt(task: &str, registry: Option<&str>, _inf: &InferenceConfig) -> String {
-    let registry_arg = match registry {
-        Some(reg) => format!(", \"registry\":\"{reg}\""),
+/// The prompt for the generator capsule. `index` reaches the registry-search tool under that
+/// tool's own input key, `registry`.
+fn build_task_prompt(task: &str, index: Option<&str>, _inf: &InferenceConfig) -> String {
+    let registry_arg = match index {
+        Some(index) => format!(", \"registry\":\"{index}\""),
         None => String::new(),
     };
 
@@ -860,20 +862,20 @@ mod tests {
     }
 
     #[test]
-    fn registry_flag_appears_in_task_prompt() {
+    fn index_flag_appears_in_task_prompt_as_the_tools_registry_input() {
         let prompt = build_task_prompt("summarise a document", Some("local"), &anthropic_inf());
         assert!(
             prompt.contains("\"registry\":\"local\""),
-            "task prompt should embed registry arg so the agent passes it to murmur-tool-registry-search"
+            "task prompt should embed the --index value under the `registry` input key of murmur-tool-registry-search"
         );
     }
 
     #[test]
-    fn no_registry_flag_omits_registry_from_prompt() {
+    fn no_index_flag_omits_registry_from_prompt() {
         let prompt = build_task_prompt("summarise a document", None, &anthropic_inf());
         assert!(
             !prompt.contains("\"registry\""),
-            "task prompt should not include registry when flag is absent"
+            "task prompt should not include the registry input when --index is absent"
         );
     }
 
