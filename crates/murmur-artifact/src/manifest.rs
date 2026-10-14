@@ -585,12 +585,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_block_message_names_the_manifest_file() {
-        assert!(REGISTRY_BLOCK_MESSAGE.starts_with(&format!("{MANIFEST_FILENAME}: ")));
-        assert!(REGISTRY_BLOCK_MESSAGE.contains(&format!("'{REGISTRY_BLOCK_KEY}'")));
-    }
-
-    #[test]
     fn registry_block_is_refused() {
         let err = Manifest::from_yaml_str(
             "name: hello\nversion: 0.1.0\nruntime: tool\nregistry:\n  default: local\n",

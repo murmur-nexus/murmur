@@ -7,11 +7,10 @@ use murmur_artifact::{
 
 /// Resolves against `primary` first and, on `NotFound` only, falls back to `secondary`.
 ///
-/// This is how a session is meant to find its artifacts: the project store first, then the
-/// global one. Both `mur run` and `mur eval` stage against it, so an artifact reachable by the
-/// pre-flight check in `commands::run::artifact_presence` is also reachable by the staging that
-/// follows — the two disagreeing is what let `mur publish` + `mur run` report an artifact as
-/// present and then fail to stage it.
+/// A session finds its artifacts in the project store first, then the global one. Both `mur run`
+/// and `mur eval` stage against this chain, so an artifact the pre-flight check in
+/// `commands::run::artifact_presence` reports as present is also one staging can load; staging
+/// against a single store would let the two disagree.
 ///
 /// Only `NotFound` falls through. Any other error is a real failure of the primary store and is
 /// returned as such rather than being masked by a lookup somewhere else.

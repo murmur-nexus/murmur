@@ -24,7 +24,7 @@ We strongly believe that if you own the knowledge domain, you should own the har
 
 **Getting Started** covers project orientation, setup, and your first run.
 
-**Concepts** explains core architecture: capsules, the registry, the runtime, and the agent bootstrap.
+**Concepts** explains core architecture: capsules, sources and stores, the runtime, and the agent bootstrap.
 
 **How-to Guides** covers common tasks and practical workflows.
 

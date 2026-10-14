@@ -163,7 +163,7 @@ fn help_for_install_publish_and_search_omits_registry() {
 
 // ── publish writes into the global store ─────────────────────────────────────
 
-/// An API-key-shaped variable left over from the retired remote mode changes nothing.
+/// An API-key-shaped variable in the environment does not change where `mur publish` writes.
 #[test]
 fn publish_writes_into_the_global_store_whatever_the_environment_holds() {
     let home = TempDir::new().unwrap();

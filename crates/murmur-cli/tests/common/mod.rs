@@ -205,14 +205,12 @@ pub fn install_artifact_to_project_with_home(
         .assert()
 }
 
-#[allow(dead_code)]
 pub fn run_capsule(home: &TempDir, manifest_path: &Path) -> Assert {
     run_capsule_with_env(home, manifest_path, &[])
 }
 
 /// `run_capsule` with `extra_env` set on the `mur` process itself, for tests that need a
 /// host variable present in the runtime's environment to observe whether it reaches a guest.
-#[allow(dead_code)]
 pub fn run_capsule_with_env(
     home: &TempDir,
     manifest_path: &Path,

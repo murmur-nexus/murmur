@@ -13,17 +13,11 @@ with exactly what was installed and never reaches the network for an artifact.
 
 ## Resolution order
 
-| Command | Looks in, in order |
-|---|---|
-| `mur install <name>@<version>` | The global store, then each source in `registry.sources` |
-| `mur install <name>` | Each source in `registry.sources`, latest release |
-| `mur install github:<owner>/<repo>@<tag>` | That repository's release |
-| `mur install <path>` | The file |
-| `mur install` (no argument) | For each artifact in `murmur.yaml`: the global store, then each source |
-| `mur run`, `mur doctor`, `mur eval` | The project store, then the global store |
-
-The source named by `registry.default` is tried first; the rest follow in the order listed. The
-full rules, including what an empty `registry.sources` does, are in
+`mur install <name>@<version>`, and `mur install` with no argument, check the global store before
+any source, so an artifact you published or installed with `-g` is copied rather than downloaded
+again. `mur run`, `mur doctor` and `mur eval` read the project store, then the global store, and
+never a source. Sources are tried with the one `registry.default` names first, then the rest in
+the order listed. The order for every form of `mur install` is in
 [Resolution order](../reference/config.md#resolution-order).
 
 A `murmur.yaml` does not choose where its artifacts come from: a top-level `registry:` key is

@@ -2862,7 +2862,7 @@ Notes:
 
 ## `mur eval`
 
-Read and analyze `eval.jsonl` files produced by `murmur-hook-eval`, or drive a capsule against a dataset. These commands are read-only except for `mur eval run`, which launches real capsule sessions. 
+Read and analyze `eval.jsonl` files produced by `murmur-hook-eval`, or drive a capsule against a dataset. These commands are read-only except for `mur eval run`, which launches real capsule sessions.
 
 See [Structured evaluation (`eval.jsonl`)](observability-schemas.md#structured-evaluation-evaljsonl) for the file format.
 
