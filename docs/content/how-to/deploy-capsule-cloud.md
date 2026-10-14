@@ -13,7 +13,7 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [mur_version](../reference/manifest.md#field-mur-version) | Pins the exact `mur` binary version installed on the VM |
+| [deploy.mur_version](../reference/manifest.md#field-deploy) | Pins the exact `mur` binary version installed on the VM |
 | [inference.driver.artifact](../reference/manifest.md#field-inference) | Inference driver — required for agent capsules |
 | [inference.system_prompt_file](../reference/manifest.md#inference-system-prompt) | Local file uploaded alongside the manifest as the system prompt |
 | [lifecycle.task_acceptance](../reference/manifest.md#lifecycle-task-acceptance) | Whether the deployed capsule accepts incoming A2A tasks |
@@ -40,12 +40,14 @@ Make a note of the VM's public IP address before continuing.
 
 ## Step 2 — pin the mur version (recommended)
 
-Add a `mur_version` field to your `murmur.yaml`:
+Add a `deploy:` block with a `mur_version` field to your `murmur.yaml`:
 
 ```yaml
 name: my-agent
 version: "0.1.0"
-mur_version: "X.Y.Z"
+
+deploy:
+  mur_version: "X.Y.Z"
 
 artifacts:
   - name: murmur-driver-anthropic
@@ -62,9 +64,9 @@ inference:
     artifact: murmur-driver-anthropic
 ```
 
-When `mur_version` is set, `mur deploy run` downloads that exact binary from GitHub releases and caches it at `~/.murmur/bin/mur-{version}-linux-x86_64`. Subsequent deploys with the same version skip the download entirely.
+When `deploy.mur_version` is set, `mur deploy run` downloads that exact binary from GitHub releases and caches it at `~/.murmur/bin/mur-{version}-linux-x86_64`. Subsequent deploys with the same version skip the download entirely.
 
-If `mur_version` is omitted, the version of the `mur` binary running on your machine is used instead.
+If `deploy.mur_version` is omitted, the version of the `mur` binary running on your machine is used instead. `mur run` reads nothing in `deploy:`, so the pin has no effect on local runs.
 
 Pin a release that has `mur precompile`. With an older one the deploy prints [`W-DEPLOY-001`](../reference/diagnostics.md#w-deploy-001) and the capsule compiles its artifacts on its first launch.
 
@@ -149,7 +151,7 @@ All output goes to **stderr**. Save the deployment ID from the box — you will 
 1. Parses the manifest and resolves every declared artifact for the target platform — fails immediately if any artifact is unavailable, before touching the network. A native artifact installed for this host is not reused for a different target: the target platform's payload is downloaded and cached beside it
 2. Checks that every file referenced by the manifest (e.g. `inference.system_prompt_file`) exists locally — fails immediately if any file is missing
 3. Validates every `--env` entry; a missing `=` or empty key causes an immediate exit
-4. Resolves the `mur` binary: uses `manifest.mur_version` if set, otherwise the running version; downloads and caches if not already cached
+4. Resolves the `mur` binary: uses `deploy.mur_version` from the manifest if set, otherwise the running version; downloads and caches if not already cached
 5. Waits up to 30 seconds for SSH to become available on the VM
 6. Uploads the `mur` binary to `/usr/local/bin/mur`
 7. Uploads the manifest, any manifest-referenced local files, and the optional workdir
@@ -391,7 +393,7 @@ CARGO_PROFILE_DEV_DEBUG=0 cargo build --release \
 | Output | Success summary box on **stderr** showing url, deployment id (`dep_` prefix + 8 hex chars), and elapsed time |
 | VM management | You create and delete VMs through your cloud provider; `mur deploy run` never provisions or terminates VMs |
 | Recommended OS | Ubuntu 22.04 LTS or 24.04 LTS |
-| mur binary | Auto-downloaded from GitHub releases; pin with `mur_version` in the manifest |
+| mur binary | Auto-downloaded from GitHub releases; pin with `deploy.mur_version` in the manifest |
 | Manifest files | `inference.system_prompt_file` and any other referenced local files are uploaded automatically |
 | Env vars | `--env KEY=VALUE` (repeatable) · `--env-file <path>` · auto-loads `.env` next to the manifest if neither flag is passed |
 | Artifact pre-staging | All manifest artifacts are resolved and uploaded before the capsule starts |

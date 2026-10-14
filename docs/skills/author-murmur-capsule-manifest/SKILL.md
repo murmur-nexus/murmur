@@ -630,7 +630,7 @@ If a required artifact name/version, endpoint, model ID, or host path cannot be 
 
 Use this order when writing the final YAML. It keeps dependencies readable and exposes posture early:
 
-1. `name`, `version`, optional `mur_version`;
+1. `name`, `version`, and an optional `deploy.mur_version` deploy pin, written under `deploy:` — a top-level `mur_version` is refused with [`E-MAN-003`](https://docs.murmur.nexus/reference/diagnostics/#e-man-003);
 2. `artifacts`;
 3. capsule-wide `capabilities`;
 4. `network` only when a fixed A2A internal port is required;

@@ -47,7 +47,7 @@ section that explains it.
 | `E-IO-003` | General I/O error (read/write failure), including a write to standard output that failed for a reason other than its reader going away | [Piped output](cli.md#piped-output) |
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
-| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication), a credential scope that names a retired door method, a `network.authentication` declared beside a non-empty `capabilities.spawn.allow`, a `lifecycle.queue_depth: 0` under `task_acceptance: queue`, a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds, or a top-level `registry:` key | [E-MAN-003](#e-man-003) |
+| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication), a credential scope that names a retired door method, a `network.authentication` declared beside a non-empty `capabilities.spawn.allow`, a `lifecycle.queue_depth: 0` under `task_acceptance: queue`, a top-level `mur_version`, which is pinned as [`deploy.mur_version`](manifest.md#field-deploy), a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds, or a top-level `registry:` key | [E-MAN-003](#e-man-003) |
 | `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new-task) |
 | `E-NEW-002` | The name given to `mur new --roster`, or a capsule name derived from it, is not an artifact name | [`mur new --roster`](cli.md#mur-new-roster) |
 | `E-NEW-003` | The directory `mur new --roster` would write already exists | [`mur new --roster`](cli.md#mur-new-roster-writing) |
@@ -226,6 +226,16 @@ error[E-MAN-003]: the launch sets lifecycle.task_acceptance to queue, and murmur
 
 Under `single` and `none`, `queue_depth` has no effect, and any value is accepted. See
 [`lifecycle.queue_depth`](manifest.md#field-lifecycle).
+
+A top-level `mur_version` key is refused whatever its value, including blank, and with or without a
+`deploy:` block beside it:
+
+```text
+error[E-MAN-003]: murmur.yaml: 'mur_version' is not a top-level key — the mur release a deploy installs is pinned as 'deploy.mur_version'
+  hint: move the pin under deploy: as deploy.mur_version — only mur deploy reads it, to choose the mur it installs on the target
+```
+
+See [`deploy`](manifest.md#field-deploy).
 
 ## Capability errors
 
@@ -1703,7 +1713,7 @@ warning[W-DEPLOY-001]: the target could not precompile murmur-tool-echo@1.0.0; t
 
 | Form | Cause | Fix |
 |---|---|---|
-| `did not precompile (<error>)` | The target's `mur` printed no [`mur precompile`](cli.md#mur-precompile) report. The parenthesis quotes the first line it printed on stderr: `unrecognized subcommand 'precompile'` means the target runs a `mur` release older than the command; an SSH error means the command never ran | Set `mur_version` in the manifest to a release that has `mur precompile`, or pass `--mur-binary` |
+| `did not precompile (<error>)` | The target's `mur` printed no [`mur precompile`](cli.md#mur-precompile) report. The parenthesis quotes the first line it printed on stderr: `unrecognized subcommand 'precompile'` means the target runs a `mur` release older than the command; an SSH error means the command never ran | Set [`deploy.mur_version`](manifest.md#field-deploy) in the manifest to a release that has `mur precompile`, or pass `--mur-binary` |
 | `could not precompile <name@version>, …` | The report names those artifacts `failed`: the payload is not a `.mur.zip`, has no `murmur.yaml` that parses, or its WASM does not compile on the target | Rebuild or re-publish the artifact. An artifact whose WASM does not compile also fails the capsule's launch |
 
 The capsule's first launch compiles what the target did not, taking as long as a launch with
@@ -2774,8 +2784,7 @@ installs, and there is no way to suppress it for one. The entry grammar is in
 ### W-SEC-019 — an unrecognized key in `murmur.yaml` { #w-sec-019 }
 
 **Fires when:** `murmur.yaml` carries a key no field of the block it sits in claims. Once per such
-key, on stderr, from `mur run` and from `mur doctor` in identical words. One further line is added
-when `mur_version` pins a `major.minor.patch` version higher than the running binary's.
+key, on stderr, from `mur run` and from `mur doctor` in identical words.
 
 **Why it matters:** the manifest parser sets `deny_unknown_fields` nowhere, so a key it does not
 recognize is accepted and applied to nothing. Without this warning a misspelled
@@ -2795,13 +2804,6 @@ A key with no near neighbour is one this build does not know, which a newer `mur
 [murmur-artifact] warning[W-SEC-019]: unrecognized key 'quantum_teleport' at the top level — this build of mur does not recognize it and no key it does recognize there is close to it, so the key may come from a newer mur. It was parsed and ignored; nothing here says the manifest is misspelled (https://docs.murmur.nexus/reference/diagnostics/#w-sec-019)
 ```
 
-A higher `mur_version` pin names the cause directly rather than leaving it to be inferred from
-unfamiliar key names:
-
-```text
-[murmur-artifact] warning[W-SEC-019]: this manifest pins mur 99.0.0, you are running 0.2.0; 2 keys in it are not recognized by this build (https://docs.murmur.nexus/reference/diagnostics/#w-sec-019)
-```
-
 | Part of the line | What it names |
 |---|---|
 | `'read-only'` | The key, spelled as the manifest spells it |
@@ -2814,12 +2816,8 @@ make a manifest written for a newer `mur` unloadable by an older one, which turn
 addition into a breaking change across a fleet.
 
 **What to do:** correct the spelling when a suggestion is offered. When none is, check whether the
-key belongs to a newer `mur` than the one running — `mur --version` against the `mur_version` pin —
-and upgrade rather than edit the manifest. A version-gap line answers that question outright.
-
-The pin is separate from this warning and unchanged by it: `mur_version` is compared for equality
-by `mur run`, which warns on any difference in either direction, and only a pin parsing as a
-numeric triple *higher* than the running version adds the third line above.
+key belongs to a newer `mur` than the one running — `mur --version` against the release the
+manifest was written for — and upgrade rather than edit the manifest.
 
 ### W-SEC-020 — retired { #w-sec-020 }
 

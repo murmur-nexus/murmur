@@ -104,67 +104,15 @@ pub fn nearest_known_key(declared: &str, known: &[&str]) -> Option<String> {
         .map(|(_, candidate)| candidate.to_string())
 }
 
-/// A `major.minor.patch` version as a comparable triple, or `None` for anything else.
-///
-/// Deliberately not a semver parse: the workspace carries no semver crate. A pin carrying a
-/// pre-release or build suffix, or any component that is not a plain number, simply yields no
-/// version-gap line — silence is the correct answer to a pin this cannot read, not an error.
-fn numeric_triple(version: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = version.trim().split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((major, minor, patch))
-}
-
-/// The extra line naming a stale binary, or `None` when the pin is absent, unreadable, or not
-/// higher than the running version.
-///
-/// A pin lower than the running version produces nothing here: `mur_version` is a pin rather than
-/// a floor, and the pre-existing "manifest requires mur … but you are running mur …" warning
-/// already fires on a difference in either direction.
-fn version_gap_line(
-    unknown_count: usize,
-    mur_version: Option<&str>,
-    running_version: &str,
-) -> Option<String> {
-    let pinned = mur_version?;
-    if numeric_triple(pinned)? <= numeric_triple(running_version)? {
-        return None;
-    }
-    let link = security_warning_link(W_SEC_019);
-    let keys = if unknown_count == 1 {
-        "1 key in it is not recognized by this build".to_string()
-    } else {
-        format!("{unknown_count} keys in it are not recognized by this build")
-    };
-    Some(format!(
-        "[murmur-artifact] warning[{W_SEC_019}]: this manifest pins mur {pinned}, you are running \
-         {running_version}; {keys} ({link})"
-    ))
-}
-
 /// The complete `W-SEC-019` output for one parsed manifest: one line per unrecognized key, in the
-/// order they were captured, followed by the version-gap line when there is one.
+/// order they were captured.
 ///
 /// Returns the lines rather than printing them so `mur run` and `mur doctor` emit one identical
 /// set of bytes, and so a test can assert the wording without capturing stderr.
 #[must_use]
-pub fn unknown_manifest_key_warnings(
-    keys: &[UnknownManifestKey],
-    mur_version: Option<&str>,
-    running_version: &str,
-) -> Vec<String> {
-    if keys.is_empty() {
-        return Vec::new();
-    }
-
+pub fn unknown_manifest_key_warnings(keys: &[UnknownManifestKey]) -> Vec<String> {
     let link = security_warning_link(W_SEC_019);
-    let mut lines: Vec<String> = keys
-        .iter()
+    keys.iter()
         .map(|unknown| {
             let key = &unknown.key;
             let location = unknown.location();
@@ -183,10 +131,7 @@ pub fn unknown_manifest_key_warnings(
                 ),
             }
         })
-        .collect();
-
-    lines.extend(version_gap_line(keys.len(), mur_version, running_version));
-    lines
+        .collect()
 }
 
 /// Prints [`unknown_manifest_key_warnings`] to stderr, one line each.
@@ -194,12 +139,8 @@ pub fn unknown_manifest_key_warnings(
 /// The single emitter both `mur run` and `mur doctor` call, on the
 /// `warn_on_interpreter_runtime_grants` precedent: two surfaces cannot word one ignored key
 /// differently if neither of them formats it.
-pub fn warn_on_unknown_manifest_keys(manifest: &RuntimeManifest, running_version: &str) {
-    for line in unknown_manifest_key_warnings(
-        &manifest.unknown_keys,
-        manifest.mur_version.as_deref(),
-        running_version,
-    ) {
+pub fn warn_on_unknown_manifest_keys(manifest: &RuntimeManifest) {
+    for line in unknown_manifest_key_warnings(&manifest.unknown_keys) {
         crate::warn_line(format_args!("{line}"));
     }
 }
@@ -250,15 +191,11 @@ mod tests {
 
     #[test]
     fn a_near_match_is_worded_as_a_spelling_problem() {
-        let lines = unknown_manifest_key_warnings(
-            &[unknown(
-                "read-only",
-                "capabilities.filesystem",
-                Some("read_only"),
-            )],
-            None,
-            "0.2.0",
-        );
+        let lines = unknown_manifest_key_warnings(&[unknown(
+            "read-only",
+            "capabilities.filesystem",
+            Some("read_only"),
+        )]);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("unrecognized key 'read-only' in capabilities.filesystem"));
         assert!(lines[0].contains("did you mean 'read_only'?"));
@@ -268,8 +205,7 @@ mod tests {
 
     #[test]
     fn no_near_match_is_worded_as_a_possibly_newer_key() {
-        let lines =
-            unknown_manifest_key_warnings(&[unknown("quantum_teleport", "", None)], None, "0.2.0");
+        let lines = unknown_manifest_key_warnings(&[unknown("quantum_teleport", "", None)]);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("unrecognized key 'quantum_teleport' at the top level"));
         assert!(lines[0].contains("may come from a newer mur"));
@@ -278,50 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn a_higher_pin_names_both_versions_and_the_count() {
-        let lines = unknown_manifest_key_warnings(
-            &[unknown("a", "", None), unknown("b", "", None)],
-            Some("99.0.0"),
-            "0.2.0",
-        );
-        assert_eq!(lines.len(), 3);
-        assert!(lines[2].contains(
-            "this manifest pins mur 99.0.0, you are running 0.2.0; 2 keys in it are not \
-             recognized by this build"
-        ));
-    }
-
-    #[test]
-    fn one_unrecognized_key_reads_in_the_singular() {
-        let lines =
-            unknown_manifest_key_warnings(&[unknown("a", "", None)], Some("99.0.0"), "0.2.0");
-        assert_eq!(lines.len(), 2);
-        assert!(lines[1].contains("1 key in it is not recognized by this build"));
-    }
-
-    /// `mur_version` is a pin, not a floor, so nothing is said about a lower one — the
-    /// pre-existing mismatch warning in `mur run` already covers that direction.
-    #[test]
-    fn a_lower_or_equal_pin_adds_no_line() {
-        for pinned in ["0.1.0", "0.2.0"] {
-            let lines =
-                unknown_manifest_key_warnings(&[unknown("a", "", None)], Some(pinned), "0.2.0");
-            assert_eq!(lines.len(), 1, "pin {pinned}");
-        }
-    }
-
-    /// A pin this cannot read is silence, never an error.
-    #[test]
-    fn an_unparseable_pin_adds_no_line_and_no_error() {
-        for pinned in ["1.2.3-rc1", "latest", "1.2", "1.2.3.4", ""] {
-            let lines =
-                unknown_manifest_key_warnings(&[unknown("a", "", None)], Some(pinned), "0.2.0");
-            assert_eq!(lines.len(), 1, "pin {pinned}");
-        }
-    }
-
-    #[test]
     fn a_manifest_with_no_unrecognized_key_emits_nothing_at_all() {
-        assert!(unknown_manifest_key_warnings(&[], Some("99.0.0"), "0.2.0").is_empty());
+        assert!(unknown_manifest_key_warnings(&[]).is_empty());
     }
 }

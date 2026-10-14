@@ -1392,7 +1392,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // Keys this build does not recognize, in the same words and from the same emitter `mur run`
     // uses — an operator reaching for `mur doctor` to find out why a declaration did nothing is
     // exactly who this is for. Non-fatal, stderr only; nothing here reaches `fixes`.
-    warn_on_unknown_manifest_keys(&runtime_manifest, env!("CARGO_PKG_VERSION"));
+    warn_on_unknown_manifest_keys(&runtime_manifest);
 
     // `mur doctor` validates the manifest without launching a session, but the capsule-ceiling
     // `interpreter_runtime` grant is a posture warning an operator should see here too — surface

@@ -160,33 +160,99 @@ fn a_key_with_no_near_neighbour_is_not_called_a_typo() {
     assert!(!lines[0].contains("spelling"));
 }
 
-/// A pin higher than the running binary names the cause directly, so nobody has to infer a stale
-/// binary from unfamiliar key names — and the pre-existing pin-mismatch warning is untouched.
+/// A top-level `mur_version` is refused before anything is staged, on every surface that loads the
+/// project manifest, and both the message and the hint name `deploy.mur_version`.
 #[test]
-fn a_higher_pin_adds_a_line_naming_both_versions_and_the_count() {
+fn a_top_level_mur_version_is_refused_with_a_hint_naming_deploy_mur_version() {
     let home = TempDir::new().unwrap();
     let dir = TempDir::new().unwrap();
     project(
         dir.path(),
-        "name: pin-capsule\nversion: 0.1.0\nmur_version: \"99.0.0\"\nquantum_teleport: true\n\
-         capabilities:\n  filesystem:\n    read-only:\n      - tests\n",
+        "name: c\nversion: 0.1.0\nmur_version: \"0.4.5\"\n",
     );
 
-    let stderr = explain_scope_stderr(&home, dir.path());
-    let lines = warning_lines(&stderr);
-    assert_eq!(lines.len(), 3, "{stderr}");
-    assert!(lines[2].contains(&format!(
-        "this manifest pins mur 99.0.0, you are running {}; 2 keys in it are not recognized by \
-         this build",
-        env!("CARGO_PKG_VERSION")
-    )));
-    assert!(
-        stderr.contains(&format!(
-            "warning: manifest requires mur 99.0.0 but you are running mur {}",
-            env!("CARGO_PKG_VERSION")
-        )),
-        "{stderr}"
+    for args in [
+        &["run", "--manifest", "murmur.yaml", "--explain-scope"][..],
+        &["doctor"],
+        &["install"],
+    ] {
+        let output = Command::cargo_bin("mur")
+            .unwrap()
+            .env("HOME", home.path())
+            .env_remove("NEXUS_API_KEY")
+            .current_dir(dir.path())
+            .args(args)
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone();
+        let stderr = String::from_utf8(output).unwrap();
+
+        assert!(stderr.contains("error[E-MAN-003]"), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains(
+                "murmur.yaml: 'mur_version' is not a top-level key — the mur release a deploy \
+                 installs is pinned as 'deploy.mur_version'"
+            ),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.contains("hint:") && line.contains("deploy.mur_version")),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+/// `deploy:` is read by `mur deploy` alone: a pin under it, higher or lower than the running
+/// binary, adds nothing to either surface, and the per-key lines are unchanged beside it.
+#[test]
+fn a_deploy_pin_warns_nothing_on_either_surface() {
+    let home = TempDir::new().unwrap();
+    let higher = TempDir::new().unwrap();
+    project(
+        higher.path(),
+        "name: pin-capsule\nversion: 0.1.0\ndeploy:\n  mur_version: \"99.0.0\"\nquantum_teleport: true\n",
     );
+    let lower = TempDir::new().unwrap();
+    project(
+        lower.path(),
+        "name: pin-capsule\nversion: 0.1.0\ndeploy:\n  mur_version: \"0.0.1\"\n",
+    );
+
+    let higher_streams = [
+        explain_scope_stderr(&home, higher.path()),
+        doctor_stderr(&home, higher.path()),
+    ];
+    for stderr in &higher_streams {
+        let lines = warning_lines(stderr);
+        assert_eq!(lines.len(), 1, "{stderr}");
+        assert!(
+            lines[0].contains("unrecognized key 'quantum_teleport' at the top level"),
+            "{stderr}"
+        );
+    }
+
+    let lower_streams = [
+        explain_scope_stderr(&home, lower.path()),
+        doctor_stderr(&home, lower.path()),
+    ];
+    for stderr in &lower_streams {
+        assert!(warning_lines(stderr).is_empty(), "{stderr}");
+    }
+
+    // No version line on either surface, in either wording, and neither pinned version quoted.
+    let mut absent = ["requires", "pins"]
+        .map(|verb| format!("{verb} mur"))
+        .to_vec();
+    absent.extend(["99.0.0", "0.0.1"].map(str::to_string));
+    for stderr in higher_streams.iter().chain(&lower_streams) {
+        for absent in &absent {
+            assert!(!stderr.contains(absent.as_str()), "{absent:?} in {stderr}");
+        }
+    }
 }
 
 /// The least a delegated sub-capsule needs to be publishable — `runtime:` plus `execution:` —

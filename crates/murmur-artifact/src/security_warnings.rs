@@ -173,10 +173,6 @@ pub const W_SEC_018: &str = "W-SEC-018";
 /// the recognized key of that block it most resembles. A near match is worded as a spelling
 /// problem; no near match is worded as a key this build does not know, which a newer `mur` may.
 ///
-/// One further line is emitted when `mur_version` pins a numeric triple higher than the running
-/// binary's, naming both versions and the count, so a stale binary is stated rather than inferred
-/// from unfamiliar key names.
-///
 /// Never a refusal: `#[serde(deny_unknown_fields)]` is deliberately set nowhere in the manifest
 /// parser, because refusing an unknown key makes a manifest written for a newer `mur` unloadable
 /// by an older one. Fires from `mur run` and from `mur doctor`, in the same words.

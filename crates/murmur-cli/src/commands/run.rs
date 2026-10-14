@@ -405,23 +405,12 @@ pub(crate) fn run_run(
         }
     };
 
-    // Warn if the manifest pins a different mur version than is currently running.
-    // Do not abort — local development routinely runs ahead of a pinned version.
-    if let Some(required) = &runtime_manifest.mur_version {
-        let running = env!("CARGO_PKG_VERSION");
-        if required != running {
-            capsule_runtime::runtime_err!(
-                "warning: manifest requires mur {required} but you are running mur {running}"
-            );
-        }
-    }
-
     // Keys the manifest declared that this build does not recognize, captured during parse rather
     // than dropped. Emitted here — at the seam that already holds the parsed manifest — rather
     // than from `stage_session`, so `--explain-scope` reports them without staging anything and so
     // `StageRequest` gains no field. `mur doctor` calls the same emitter, so the two surfaces
     // cannot word one ignored key differently. Never a refusal: the capsule launches regardless.
-    warn_on_unknown_manifest_keys(&runtime_manifest, env!("CARGO_PKG_VERSION"));
+    warn_on_unknown_manifest_keys(&runtime_manifest);
 
     // A door bound off loopback with no `network.authentication` answers anyone who reaches it.
     // Same seam and same reasons as the warning above, and `mur doctor --bind` renders the same

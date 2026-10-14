@@ -687,7 +687,7 @@ failed          ./broken.mur.zip
 
 **Exit status:** `0` when no file is `failed`; `1`, after the full report, when any is.
 
-A `mur` release older than this command exits with `error: unrecognized subcommand 'precompile'`. A deploy whose target runs such a release prints [`W-DEPLOY-001`](diagnostics.md#w-deploy-001) and continues; set `mur_version` in the manifest to a release that has `mur precompile`, or pass `--mur-binary`.
+A `mur` release older than this command exits with `error: unrecognized subcommand 'precompile'`. A deploy whose target runs such a release prints [`W-DEPLOY-001`](diagnostics.md#w-deploy-001) and continues; set [`deploy.mur_version`](manifest.md#field-deploy) in the manifest to a release that has `mur precompile`, or pass `--mur-binary`.
 
 ---
 
@@ -2024,7 +2024,7 @@ mur deploy run --host <ip> [--ssh-user <user>] [--ssh-key <path>]
 | `--ssh-key` | — | Path to SSH private key; uses SSH agent if omitted |
 | `--manifest` | `./murmur.yaml` | Path to the capsule manifest to deploy |
 | `--workdir` | — | Local directory to upload as the capsule's working directory |
-| `--mur-binary` | — | Path to a `mur` binary for `--deploy-platform` to upload. When omitted, the release named by `mur_version` in the manifest (or the running `mur` version) is downloaded from GitHub and cached at `~/.murmur/bin/mur-{version}-{platform}` |
+| `--mur-binary` | — | Path to a `mur` binary for `--deploy-platform` to upload. When omitted, the release named by [`deploy.mur_version`](manifest.md#field-deploy) in the manifest (or the running `mur` version) is downloaded from GitHub and cached at `~/.murmur/bin/mur-{version}-{platform}` |
 | `--env` | — | Environment variable in `KEY=VALUE` format; repeat for multiple vars |
 | `--env-file` | — | Path to a `.env` file of `KEY=VALUE` lines, `#` comments ignored. Takes precedence over the `.env` beside the manifest, which is loaded when neither `--env` nor `--env-file` is given |
 | `--deploy-platform` | `linux-x86_64` | Platform the uploaded artifacts and `mur` binary are resolved for |

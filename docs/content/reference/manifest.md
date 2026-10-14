@@ -283,6 +283,9 @@ exports:
 control:                  # optional: what a controller may change while the capsule runs
   settings: [inference.max_tokens]
   secrets: [TAVILY_API_KEY]   # each backs some artifact's gateway.api_key: ${NAME}
+
+deploy:                   # optional: read by mur deploy only
+  mur_version: "1.0.0"    # optional; the mur release installed on the target, default the running mur
 ```
 
 ### Field reference
@@ -293,20 +296,6 @@ control:                  # optional: what a controller may change while the cap
 |---|---|---:|---|
 | `name` | string | yes | Capsule identity. |
 | `version` | string | yes | Capsule version. |
-| `mur_version` | string | no | Pins the `mur` runtime version this capsule requires — see [`mur_version`](#field-mur-version). |
-
-#### `mur_version` { #field-mur-version }
-
-Pins the exact version of the `mur` binary that must run this capsule.
-
-```yaml
-mur_version: "1.0.0"
-```
-
-| Command | Behaviour |
-|---|---|
-| `mur deploy run` | Downloads `mur-{version}-{platform}` from GitHub releases and installs it on the target VM, regardless of which `mur` version is running locally. The binary is cached at `~/.murmur/bin/mur-{version}-{platform}` and reused on subsequent deploys. Omitted, the running `mur` binary's version is used. |
-| `mur run` | Prints a warning to stderr when the running `mur` version does not match. The run continues. |
 
 #### `artifacts` { #field-artifacts }
 
@@ -1308,6 +1297,23 @@ surface is on. Every refusal above is `E-MAN-003`, naming `control.settings`, `c
 `control.agent_settings` or `control` and quoting the entry. An unknown key under `control:` is reported as
 [`W-SEC-019`](diagnostics.md#w-sec-019). Nothing a controller sets is persisted: a restart starts
 from these values again.
+
+#### `deploy` { #field-deploy }
+
+Settings read by `mur deploy run` alone. `mur run` and `mur doctor` read nothing in `deploy:`.
+
+```yaml
+deploy:
+  mur_version: "1.0.0"
+```
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `deploy` | map | no | Absent or `deploy: {}`, every field takes its default. |
+| `deploy.mur_version` | string | no | The `mur` release `mur deploy run` downloads from GitHub releases, caches at `~/.murmur/bin/mur-{version}-{platform}` and installs on the target. Default: the version of the `mur` running `mur deploy run`. A blank value takes the default. [`--mur-binary`](cli.md#mur-deploy-run) takes precedence over it. |
+
+A top-level `mur_version` key is refused with [`E-MAN-003`](diagnostics.md#e-man-003), whatever its
+value; the pin is written as `deploy.mur_version`.
 
 ---
 
