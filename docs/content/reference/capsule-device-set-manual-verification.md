@@ -215,8 +215,8 @@ for dev in (\"/dev/zero\", \"/dev/urandom\"):
 
 ### Scenario 4 — every other device is refused
 
-This is the security claim. It needs no new code to hold — `handle_access` declares the full ABI v1
-right-set, so an unlisted path is denied — but "needs no code" is not "verified".
+This is the security claim. It needs no new code to hold — `handle_access` declares every right of the
+ruleset's [Landlock ABI](containment.md#landlock-abi), so an unlisted path is denied — but "needs no code" is not "verified".
 
 ```bash
 SCRATCH_SCRIPT='

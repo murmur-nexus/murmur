@@ -1590,7 +1590,8 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
 
     // Which Landlock ABI the kernel offers and which the runtime builds a capsule's ruleset at. A
     // host question too, printed for every project: below ABI v2 a capsule cannot move a file
-    // between two folders of its own workdir, which breaks `uv` with no hint of why.
+    // between two folders of its own workdir, which breaks any tool that renames a file into place
+    // with no hint of why.
     report_landlock_abi();
 
     // The modes of everything under `~/.murmur`, which holds provider credentials and deploy keys

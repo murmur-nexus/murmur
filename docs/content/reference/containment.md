@@ -45,68 +45,6 @@ Treat `capabilities.shell.allow` as advisory on a host below kernel 5.13.
 The `mechanism:` column is what `mur run --explain-scope` prints, and it always reports what the
 *host* can back — never what the session installed.
 
-### Where the user namespace comes from { #userns-grant }
-
-The Sealed tier and the capsule network namespace both need an unprivileged user namespace, and on
-an AppArmor host something has to permit one. `mur run --explain-scope` prints which permission is
-in effect on the line below `mechanism:`, and `--explain-scope --json` carries the same value as
-`userns_grant`:
-
-```text
-Containment
-  declared:  sealed
-  achieved:  sealed
-  floor met: yes
-  mechanism: mountns+pivot_root+landlock+seccomp
-  userns grant: profile_confining
-  landlock ABI: 3
-```
-
-| `userns grant:` | What permits the namespace | Scope of the permission |
-|---|---|---|
-| `apparmor_absent` | AppArmor is not enabled on this host | nothing was ever restricted; no profile is needed |
-| `profile_confining` | the shipped `mur-sealed` AppArmor profile is confining this binary | `mur` alone — the configuration murmur ships |
-| `restriction_disabled_host_wide` | `kernel.apparmor_restrict_unprivileged_userns` is `0` | every program on the machine; reported as [`W-SEC-013`](diagnostics.md#w-sec-013) |
-| `withheld` | nothing | `sealed` is refused with `E-CAP-003`, and a capsule that spawns a subprocess with `E-CAP-005` |
-
-The line is `n/a` off Linux, where AppArmor does not exist. The same value is written to
-`session_start.userns_grant` in
-[`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl), so a finished session's record
-distinguishes a `sealed` result obtained through the shipped profile from one obtained on a host
-whose unprivileged-userns hardening was switched off.
-
-A checkout build runs as `./target/debug/mur` or `./target/release/mur`, which no shipped profile
-attaches to. `sudo scripts/install-dev-apparmor.sh` generates and loads a profile for exactly those
-two paths, so building from source needs no host-wide sysctl.
-
-### Which Landlock ABI the ruleset is built at { #landlock-abi }
-
-On both Landlock tiers the runtime builds the capsule's ruleset at the kernel's Landlock ABI, capped
-at v3. Two of the workdir's rights depend on it:
-
-| Ruleset ABI | Kernel | Moving or hard-linking a file between two workdir folders | `truncate(2)` on a host file outside the workdir |
-|---|---|---|---|
-| 1 | Linux 5.13–5.18 | fails with `EXDEV` (`Invalid cross-device link`) | not mediated: succeeds wherever the capsule's user may write |
-| 2 | Linux 5.19–6.1 | permitted (`Refer`) | not mediated |
-| 3 | Linux 6.2 and later | permitted (`Refer`) | refused (`Truncate`) |
-
-At ABI 1, tools that fall back to copy-and-delete (`mv`, `pip`, `git`) still work, and `uv` and
-other tools that rename atomically between folders fail. Nothing moves or links across the
-workdir boundary at any ABI: a move needs `Refer` on both sides, and no path outside the workdir
-carries it.
-
-`mur run --explain-scope` prints the ABI on the `landlock ABI:` line below `userns grant:`, and
-`--explain-scope --json` and `session_start.effective_grants` in
-[`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl) carry it as `landlock_abi`. The
-value is `n/a`, or `null` in JSON, when no Landlock domain is installed. `mur doctor` prints the
-kernel's ABI and the ruleset ABI in its `Landlock` block, and says what this host loses below ABI 3:
-
-```text
-Landlock
-  kernel ABI: 8
-  ruleset ABI: 3 (the kernel's, capped at 3)
-```
-
 **What the Full tier grants.** The Landlock scope grants the capsule workdir a near-full access set
 **and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
 interpreter (dynamic loader), and the transitive closure of their shared libraries — so an
@@ -156,6 +94,67 @@ unlisted binary, or connecting to a host outside `capabilities.network.allow`.
 
 These are kernel behaviours, so the only check that means anything is a run on a real host. The
 hand-run procedures that do that are listed under [Verification](#verification).
+
+### Where the user namespace comes from { #userns-grant }
+
+The Sealed tier and the capsule network namespace both need an unprivileged user namespace, and on
+an AppArmor host something has to permit one. `mur run --explain-scope` prints which permission is
+in effect on the line below `mechanism:`, and `--explain-scope --json` carries the same value as
+`userns_grant`:
+
+```text
+Containment
+  declared:  sealed
+  achieved:  sealed
+  floor met: yes
+  mechanism: mountns+pivot_root+landlock+seccomp
+  userns grant: profile_confining
+  landlock ABI: 3
+```
+
+| `userns grant:` | What permits the namespace | Scope of the permission |
+|---|---|---|
+| `apparmor_absent` | AppArmor is not enabled on this host | nothing was ever restricted; no profile is needed |
+| `profile_confining` | the shipped `mur-sealed` AppArmor profile is confining this binary | `mur` alone — the configuration murmur ships |
+| `restriction_disabled_host_wide` | `kernel.apparmor_restrict_unprivileged_userns` is `0` | every program on the machine; reported as [`W-SEC-013`](diagnostics.md#w-sec-013) |
+| `withheld` | nothing | `sealed` is refused with `E-CAP-003`, and a capsule that spawns a subprocess with `E-CAP-005` |
+
+The line is `n/a` off Linux, where AppArmor does not exist. The same value is written to
+`session_start.userns_grant` in
+[`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl), so a finished session's record
+distinguishes a `sealed` result obtained through the shipped profile from one obtained on a host
+whose unprivileged-userns hardening was switched off.
+
+A checkout build runs as `./target/debug/mur` or `./target/release/mur`, which no shipped profile
+attaches to. `sudo scripts/install-dev-apparmor.sh` generates and loads a profile for exactly those
+two paths, so building from source needs no host-wide sysctl.
+
+### Which Landlock ABI the ruleset is built at { #landlock-abi }
+
+On the Sealed and Full tiers the runtime builds the capsule's ruleset at the kernel's Landlock ABI,
+capped at v3. Two of the workdir's rights depend on it:
+
+| Ruleset ABI | Kernel | Moving or hard-linking a file between two workdir folders | `truncate(2)` on a host file outside the workdir |
+|---|---|---|---|
+| 1 | Linux 5.13–5.18 | fails with `EXDEV` (`Invalid cross-device link`) | not mediated: succeeds wherever the capsule's user may write |
+| 2 | Linux 5.19–6.1 | permitted (`Refer`) | not mediated |
+| 3 | Linux 6.2 and later | permitted (`Refer`) | refused (`Truncate`) |
+
+At ABI 1, tools that fall back to copy-and-delete (`mv`, `pip`, `git`) still work, and `uv` and
+other tools that rename atomically between folders fail. Nothing moves or links across the
+workdir boundary at any ABI.
+
+`mur run --explain-scope` prints the ABI on the `landlock ABI:` line below `userns grant:`, and
+`--explain-scope --json` and `session_start.effective_grants` in
+[`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl) carry it as `landlock_abi`. The
+value is `n/a`, or `null` in JSON, when no Landlock domain is installed. `mur doctor` prints the
+kernel's ABI and the ruleset ABI in its `Landlock` block, and says what this host loses below ABI 3:
+
+```text
+Landlock
+  kernel ABI: 8
+  ruleset ABI: 3 (the kernel's, capped at 3)
+```
 
 ---
 

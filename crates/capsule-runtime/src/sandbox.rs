@@ -3064,11 +3064,12 @@ mod linux_enforce {
     /// Two rights are granted from an ABI later than v1:
     ///
     ///   - `Refer` (ABI v2, Linux 5.19) — moving and hard-linking a file between two folders.
-    ///     Landlock refuses every cross-folder `rename(2)`/`link(2)` with `EXDEV` unless both
-    ///     folders grant it, whether or not the ruleset handles it, so without it `uv` and every
-    ///     other tool that renames a finished file into place fails in the workdir. It reaches
-    ///     nothing outside: the destination of a move must grant at least the source's rights, and
-    ///     no rule outside the workdir and its own `/tmp` store carries `Refer` or any write right.
+    ///     Landlock refuses every cross-folder `rename(2)`/`link(2)` with `EXDEV` unless the ruleset
+    ///     handles `Refer` and both folders grant it, so without it every tool that renames a
+    ///     finished file into place from a sibling folder fails in the workdir. It reaches nothing
+    ///     outside: a move or link needs `Refer` on both the source and the destination folder, no
+    ///     rule outside the workdir and its own `/tmp` store carries it, and Landlock also refuses
+    ///     any move that would leave the file with more rights at its destination than its source.
     ///   - `Truncate` (ABI v3, Linux 6.2) — `truncate(2)`, `ftruncate(2)` and `open(O_TRUNC)`.
     ///     Below v3 Landlock does not mediate truncation at all, so a capsule could zero any host
     ///     file its uid can write. Handling it denies that everywhere except the rules that grant
@@ -3917,8 +3918,8 @@ mod linux_enforce {
     /// still denied.
     ///
     /// The ruleset is built at `fds.abi` — the kernel's ABI capped at
-    /// [`super::LANDLOCK_TARGET_ABI`], decided in the parent — or at ABI v1 when that is `None`. `handle_access` declares the
-    /// **full** `from_all` set of that ABI, under `CompatLevel::HardRequirement`, and every rule's
+    /// [`super::LANDLOCK_TARGET_ABI`], decided in the parent — or at ABI v1 when that is `None`.
+    /// `handle_access` declares the **full** `from_all` set of that ABI, under `CompatLevel::HardRequirement`, and every rule's
     /// rights are masked to it first: a right the ABI does not know would otherwise fail
     /// `add_rule`, and masking it out is what a kernel of that ABI would enforce anyway. Built at
     /// v1, the ruleset is bit for bit the one a 5.13–5.18 kernel gets.
@@ -7033,8 +7034,8 @@ mod linux_integration_tests {
     }
 
     /// The workdir right set as a ruleset built at ABI v1 sees it, after `apply_landlock_scope`
-    /// masks it to the handled set: exactly the set installed before `Refer` and `Truncate` were
-    /// granted, so a 5.13–5.18 kernel gets the ruleset it always did.
+    /// masks it to the handled set: exactly ABI v1 minus the three `Make*` rights, with neither
+    /// `Refer` nor `Truncate`, so a 5.13–5.18 kernel is handed no right it does not know.
     #[test]
     fn workdir_rights_masked_to_abi_v1_equal_the_pre_refer_set() {
         use landlock::{Access, AccessFs, ABI};
@@ -7969,13 +7970,14 @@ echo ok
         );
     }
 
-    /// The reported bug end to end: `uv venv` then `uv pip install <wheel>` in the workdir,
-    /// offline, which renames the unpacked wheel out of uv's cache into the venv. Passes at the
-    /// probed ABI, and fails with `EXDEV` at ABI v1, so the pass is `Refer`'s.
+    /// `uv venv` then `uv pip install <wheel>` in the workdir, offline: uv unpacks the wheel into
+    /// a temporary folder in its cache and renames it into place. Passes at the probed ABI, and
+    /// fails with `EXDEV` at ABI v1, so the pass is `Refer`'s.
     ///
     /// Ignored because it needs two host-side inputs a stock host does not have:
     /// `MURMUR_TEST_UV`, an absolute path to a `uv` binary, and `MURMUR_TEST_WHEEL`, an absolute
-    /// path to a pure-Python wheel such as `six-1.16.0-py2.py3-none-any.whl`. Run without them it
+    /// path to `six-1.16.0-py2.py3-none-any.whl`, whose module and version the script checks after
+    /// installing it. Run without them it
     /// panics naming the missing variable. `uv`, `python3` and its stdlib are granted by this
     /// test's policy only.
     #[test]
@@ -8057,7 +8059,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         assert_ne!(refused.exit_code, 0, "at ABI v1 the install must fail");
         assert!(
             output.contains("os error 18") || output.contains("Invalid cross-device link"),
-            "at ABI v1 the install must fail with EXDEV, reproducing the reported bug: {output}"
+            "at ABI v1 the install must fail with EXDEV: {output}"
         );
     }
 
