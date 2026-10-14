@@ -1828,7 +1828,7 @@ pub fn stage_session(
     // A third refusal, in the same pre-staging seam and for the same fail-closed reason, but
     // about a mechanism that sits outside the containment ladder entirely: a capsule that can
     // spawn a native subprocess needs a network namespace to put it in, because that namespace —
-    // not a syscall filter — is now what makes `capabilities.network.allow` mean anything for
+    // not a syscall filter — is what makes `capabilities.network.allow` mean anything for
     // that subprocess. See `RuntimeError::EgressNamespaceUnavailable` for why this refuses even
     // when the allowlist is empty.
     //
@@ -1837,9 +1837,8 @@ pub fn stage_session(
     // nor `spawn.allow`, but `has_native_artifact` comes from `staged.installed_artifacts`, which
     // only exists after staging resolves the registry — i.e. after this very check has to have
     // already run, per the "before any registry pull" rule above. A native-artifact-only capsule
-    // therefore does not get this clean refusal on a host that cannot build the namespace; it
-    // instead surfaces as a raw `io::Error` out of `create_capsule_netns`'s `pre_exec` failure
-    // when that artifact is actually launched.
+    // therefore does not get this refusal on a host that cannot build the namespace, and its
+    // artifact is launched without entering a network namespace at all.
     crate::network_namespace::check_egress_namespace(
         !request.capability_policy.shell_allow.is_empty()
             || !request.capability_policy.spawn_allow.is_empty(),

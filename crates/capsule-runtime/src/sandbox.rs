@@ -8963,7 +8963,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         true
     }
 
-    /// S1: a server one command backgrounds answers a later, separate command of the same session.
+    /// A server one command backgrounds answers a later, separate command of the same session.
     #[test]
     #[allow(clippy::print_stdout)]
     fn a_listener_started_by_one_command_answers_the_next() {
@@ -9009,7 +9009,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         enforcement.end_session();
     }
 
-    /// S3: a foreground server demoted after its grace period keeps listening, and a later command
+    /// A foreground server demoted after its grace period keeps listening, and a later command
     /// reaches it; the demoted command then completes with what it received.
     #[test]
     #[allow(clippy::print_stdout)]
@@ -9086,7 +9086,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         enforcement.end_session();
     }
 
-    /// S4: two sessions each bind the same port on their own loopback, each reaches only its own
+    /// Two sessions each bind the same port on their own loopback, each reaches only its own
     /// server, and the host reaches neither.
     #[test]
     #[allow(clippy::print_stdout)]
@@ -9161,7 +9161,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         session_b.end_session();
     }
 
-    /// S5: the session's one egress proxy serves every command, refuses what is not allowlisted,
+    /// The session's one egress proxy serves every command, refuses what is not allowlisted,
     /// and is created once.
     #[test]
     #[allow(clippy::print_stdout)]
@@ -9222,7 +9222,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         enforcement.end_session();
     }
 
-    /// S6: commands whose first spawns race each other still create exactly one namespace, and
+    /// Commands whose first spawns race each other still create exactly one namespace, and
     /// all of them land in it.
     #[test]
     #[allow(clippy::print_stdout)]
@@ -9287,7 +9287,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         enforcement.end_session();
     }
 
-    /// S7: ending the session kills everything it started — a `setsid` process and a background
+    /// Ending the session kills everything it started — a `setsid` process and a background
     /// server included — releases the namespace, and refuses every command after.
     #[test]
     #[allow(clippy::print_stdout)]

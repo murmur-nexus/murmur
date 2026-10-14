@@ -994,7 +994,7 @@ The items a `murmur.StopSession` answer lists, and the data parts of a `CancelTa
 
 | `kind` | Names | Keys |
 |---|---|---|
-| `detached_shell` | A [demoted shell command](manifest.md#lifecycle-shell-grace-secs), which keeps running | `work_id` (`wrk_…`), `binary`, `command`, `started_at_ms` |
+| `detached_shell` | A [demoted shell command](manifest.md#lifecycle-shell-grace-secs), which runs until it finishes or its session ends, which kills it | `work_id` (`wrk_…`), `binary`, `command`, `started_at_ms` |
 | `delegation` | A sub-capsule the cancelled task delegated to, which that task ends | `delegation_id` (`dlg_…`), `capsule`, `version`, `child_session_id`, `child_workdir` |
 
 ```json

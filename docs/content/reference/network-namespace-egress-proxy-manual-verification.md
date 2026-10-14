@@ -1,6 +1,6 @@
 # Network namespace + egress proxy — manual verification on a real Linux host
 
-!!! warning "Status: **PARTIAL — 2026-10-14.** Scenarios 1–5 and 7 pass through live capsule sessions on Ubuntu 24.04; scenario 7 covers the capability-grant reason only. Scenarios 8–11 pass through integration tests and one scripted-model session; scenario 10 has not been run as two concurrent `mur run`s. Scenario 6's answer — `CAP_SYS_PTRACE` is not required — was measured with a user-namespace substitute for `docker run`; the two-arm `docker run` comparison has not been run."
+!!! warning "Status: **PARTIAL — 2026-10-14.** Scenarios 1–5 and 7 pass through live capsule sessions on Ubuntu 24.04; scenario 7 covers the capability-grant reason only. Scenarios 8–11 pass through integration tests and scripted-model sessions; scenarios 8, 10 and 11 also pass through real `mur run` processes with a scripted model. Scenario 6's answer — `CAP_SYS_PTRACE` is not required — was measured with a user-namespace substitute for `docker run`; the two-arm `docker run` comparison has not been run."
 
     This procedure must be run by hand, on a real Linux host: a green `cargo build`, `cargo test`
     or `cargo clippy` says nothing about this boundary — see
@@ -531,7 +531,7 @@ anything not run; do not infer a result from a passing build.
 | [7](#scenario-7) | `E-CAP-005` refusal, both reasons | **PASS** — Ubuntu 24.04, 2026-08-06, capability-grant reason only; kernel-support reason PENDING | [Live sessions](#run-2026-08-06-live), [repeat](#run-2026-08-06-repeat) |
 | [8](#scenario-8) | Server from one call answers the next | **PASS** — Ubuntu 24.04, 2026-10-14, integration tests and a scripted-model session | [Session namespace](#run-2026-10-14-session-namespace) |
 | [9](#scenario-9) | Demoted server answers a later call | **PASS** — Ubuntu 24.04, 2026-10-14, integration test | [Session namespace](#run-2026-10-14-session-namespace) |
-| [10](#scenario-10) | Second session and host cannot reach it | **PASS** — Ubuntu 24.04, 2026-10-14, integration test with two sessions in one process; two concurrent `mur run`s PENDING | [Session namespace](#run-2026-10-14-session-namespace) |
+| [10](#scenario-10) | Second session and host cannot reach it | **PASS** — Ubuntu 24.04, 2026-10-14, integration test with two sessions in one process, and two concurrent `mur run`s | [Session namespace](#run-2026-10-14-session-namespace), [two `mur run`s](#run-2026-10-14-two-runs) |
 | [11](#scenario-11) | Nothing outlives the session | **PASS** — Ubuntu 24.04, 2026-10-14, integration test and a scripted-model session | [Session namespace](#run-2026-10-14-session-namespace) |
 
 ### 2026-08-06 — integration tests on a bare host { #run-2026-08-06-integration }
@@ -712,9 +712,28 @@ production code, and only the model's replies were scripted.
 | `cgroup::tests::killing_a_scope_without_cgroup_kill_empties_it` | 11, on a kernel without `cgroup.kill` | `members before: [3 pids]; fallback kill: Ok(()); empty: true; cgroup.procs after: []; bash: signal: 9 (SIGKILL)` |
 | `plan::tests::a_plan_shell_step_joins_the_session_namespace` | 8, from a plan step | `plan completed: true; step client Success output Some("pong"); session namespaces created: 1` |
 
-Scenario 10 ran as two sessions in one test process, not as two concurrent `mur run`s; the
-two-process run is PENDING. Scenario 9's completion was read off the runtime's own completion
-channel, not delivered to a live agent.
+Scenario 9's completion was read off the runtime's own completion channel, not delivered to a
+live agent.
+
+### 2026-10-14 — two concurrent `mur run`s { #run-2026-10-14-two-runs }
+
+**Host.** As [above](#run-2026-10-14-session-namespace), nothing listening on the host's
+`127.0.0.1:8080`.
+
+**What ran.** `mur run` processes built from the tree under test, each driving the bundled
+Anthropic driver against a local HTTP server that replies with scripted `bash` tool calls. The
+shell calls, the sandbox, the namespace and the scope were the production code.
+
+| Step | Where | Observed |
+|---|---|---|
+| Scenario 8 + 11: call 1 starts `(printf 'pong\n' \| nc -N -l 127.0.0.1 8080) >server.log 2>&1 &` and `setsid sleep 300 >/dev/null 2>&1 &` | session 1 (default lifecycle) | `Exit code: 0`, `started` |
+| Call 2: `nc -N -w 5 127.0.0.1 8080 </dev/null; echo "exit=$?"; kill -0 "$(<sleeper.pid)" && echo sleeper-alive` | session 1 | `pong`, `exit=0`, `sleeper-alive`; two `shell` records with `exit_code: 0` |
+| After `mur run` exited 0 | host | both pids absent from `/proc`; `pgrep -af 'sleep 300'` finds nothing |
+| Scenario 10: `nc -k -l 127.0.0.1 8080 >/dev/null 2>&1 &` | session A (`queue` + `sleep`) | `started`; the server pid alive |
+| `nc -z -w 2 127.0.0.1 8080` | host, A running | `exit=1` |
+| `nc -N -w 2 127.0.0.1 8080 </dev/null; echo "exit=$?"` | session B, concurrent: A's capsule with only its name and model endpoint changed | `exit=1` |
+| `nc -z -w 2 127.0.0.1 8080` | session A, a later call | `Connection to 127.0.0.1 8080 port [tcp/*] succeeded!`, `exit=0` |
+| `mur stop <A>` | host | `signal: SIGTERM`; A's server pid gone; `pgrep -af 'nc -k -l 127.0.0.1 8080'` exits 1 |
 
 ### Pending
 
@@ -722,7 +741,6 @@ channel, not delivered to a live agent.
 |---|---|---|
 | [6b](#scenario-6b) | The two-arm `docker run` comparison | A host with a container runtime |
 | [7](#scenario-7) | The kernel-support-missing reason | A host that can be set to `user.max_user_namespaces=0`, or a kernel built with `CONFIG_USER_NS=n` |
-| [10](#scenario-10) | Two concurrent `mur run`s of the same capsule, by hand | A real model or a hand-driven session in each of two terminals |
 
 ## Known limits { #known-limits }
 

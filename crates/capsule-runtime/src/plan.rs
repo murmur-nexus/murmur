@@ -1785,7 +1785,7 @@ mod tests {
         assert_eq!(report.results[0].error.as_deref(), Some("exit code 3"));
     }
 
-    /// S9: a plan submitted inside a session runs its shell steps in that session's network
+    /// A plan submitted inside a session runs its shell steps in that session's network
     /// namespace, so a step reaches a server one of the session's own commands started — and the
     /// plan leaves the namespace to the session when it ends.
     #[cfg(target_os = "linux")]

@@ -64,16 +64,12 @@
 //! all, which is what lets `mur` install per-user.
 //!
 //! *No proxy process inside the namespace, and no holder process.* A multithreaded process cannot
-//! enter a user namespace: the runtime's own `setns(user_fd, CLONE_NEWUSER)` returns `EINVAL`, and
-//! returned `EPERM` from a runtime thread when the proxy was first built. A freshly forked child is
-//! single-threaded, and the euid that owns the session's user namespace holds every capability in
-//! it, so the same `setns` from a command's `pre_exec` window succeeds, followed by
-//! `setns(net_fd, CLONE_NEWNET)`. Measured on Linux 7.0 (Ubuntu 24.04, uid 1000,
-//! `apparmor_restrict_unprivileged_userns=0`, the `mur-sealed` profile loaded): two children that
-//! joined this way saw the same netns inode, and one reached a server the other started on
-//! `127.0.0.1`, while the parent's own connect to that address was refused. Passing the listening
-//! sockets *out* is what lets the proxy serve the namespace from the host's side with no privilege
-//! at all.
+//! enter a user namespace: `setns(user_fd, CLONE_NEWUSER)` from the runtime fails (`EINVAL`, or
+//! `EPERM` from one of its threads). A freshly forked child is single-threaded, and the euid that
+//! owns the session's user namespace holds every capability in it, so the same `setns` from a
+//! command's `pre_exec` window succeeds, followed by `setns(net_fd, CLONE_NEWNET)`. Passing the
+//! listening sockets *out* is what lets the proxy serve the namespace from the host's side with no
+//! privilege at all.
 //!
 //! A long-lived single-threaded holder that forked each command on request was the alternative.
 //! It would make every command its child rather than the runtime's, so every `Child` the shell
@@ -705,8 +701,7 @@ mod linux {
     /// `sealed` command goes on to `unshare(CLONE_NEWUSER | CLONE_NEWNS)` a *nested* user
     /// namespace, and a process in a descendant user namespace holds no capabilities in the
     /// ancestor that owns this network namespace, so a `sealed` capsule cannot reconfigure the
-    /// namespace confining it — verified by observing `SIOCSIFFLAGS` return `EPERM` from inside the
-    /// nested namespace, rather than assumed from the capability rules.
+    /// namespace confining it: `SIOCSIFFLAGS` returns `EPERM` from inside the nested namespace.
     ///
     /// # Safety
     /// Post-`fork()` child context only. Every call below is async-signal-safe and nothing here

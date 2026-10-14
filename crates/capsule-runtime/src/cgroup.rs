@@ -1018,24 +1018,13 @@ impl CgroupScope {
     /// Opened without `O_CREAT`, so a file this kernel does not expose reads as `NotFound`
     /// rather than as a refused create.
     fn write_limit(&self, limit: &ScopeLimit) -> Result<(), String> {
-        use std::io::Write as _;
         let path = self.path.join(limit.file);
         let value = &limit.value;
-        let file = match std::fs::OpenOptions::new().write(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if limit.absent_ok && error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(());
-            }
-            Err(error) => {
-                return Err(format!(
-                    "could not write {value} to {}: {error}",
-                    path.display()
-                ))
-            }
-        };
-        (&file)
-            .write_all(format!("{value}\n").as_bytes())
-            .map_err(|error| format!("could not write {value} to {}: {error}", path.display()))
+        match write_existing(&path, &format!("{value}\n")) {
+            Err(error) if limit.absent_ok && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            written => written
+                .map_err(|error| format!("could not write {value} to {}: {error}", path.display())),
+        }
     }
 
     /// Best-effort `io.max` on the workdir's backing block device, reported rather than printed.
