@@ -36,7 +36,8 @@ use std::path::Path;
 
 use capsule_runtime::ResolvedLockArtifact;
 use murmur_artifact::{
-    read_lockfile, LockedSha256, LockfileError, MurmurLock, RuntimeManifestError, MANIFEST_FILENAME,
+    read_lockfile, LockedSha256, LockfileError, MurmurLock, RuntimeManifestError,
+    MANIFEST_FILENAME, REGISTRY_BLOCK_HINT,
 };
 
 use crate::error::{
@@ -143,6 +144,9 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
             error.to_string(),
             GATEWAY_WITHOUT_CREDENTIAL_HINT,
         ),
+        error @ RuntimeManifestError::RegistryBlock => {
+            CliError::with_hint(E_MAN_003, error.to_string(), REGISTRY_BLOCK_HINT)
+        }
         RuntimeManifestError::Io { path, source } => CliError::new(
             E_IO_003,
             format!("failed to read {MANIFEST_FILENAME} at {path}: {source}"),

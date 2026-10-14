@@ -89,7 +89,6 @@ fn driver_home() -> Arc<TempDir> {
     let mut publish = Command::cargo_bin("mur").unwrap();
     publish
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args(["publish", driver.to_str().unwrap()])
         .assert()
         .success();
@@ -217,7 +216,6 @@ fn start_capsule(home: &Arc<TempDir>, project: TempDir, attachment: Attachment) 
         .env("HOME", home.path())
         .env(MARKER_ENV, MARKER_VALUE)
         .env(API_KEY_ENV, API_KEY_VALUE)
-        .env_remove("NEXUS_API_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -453,7 +451,7 @@ fn kill(pid: u32, signal: i32) {
 
 fn mur(home: &Path) -> Command {
     let mut command = Command::cargo_bin("mur").unwrap();
-    command.env("HOME", home).env_remove("NEXUS_API_KEY");
+    command.env("HOME", home);
     command
 }
 
@@ -857,7 +855,6 @@ fn a_run_with_no_home_at_all_refuses_before_a_session_exists() {
     let mut command = Command::cargo_bin("mur").unwrap();
     let failure = command
         .env_remove("HOME")
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project.path())
         .args(["run", "--manifest"])
         .arg(project.path().join("murmur.yaml"))
@@ -896,7 +893,6 @@ fn a_script_capsule_writes_no_record() {
         .arg("do nothing for a while")
         .current_dir(project.path())
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

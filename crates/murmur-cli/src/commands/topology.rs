@@ -149,7 +149,7 @@ impl TempoClient {
     fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: crate::registry_client::blocking_agent(std::time::Duration::from_secs(10)),
+            client: crate::http::blocking_agent(std::time::Duration::from_secs(10)),
         }
     }
 

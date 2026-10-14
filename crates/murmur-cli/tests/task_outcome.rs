@@ -119,7 +119,6 @@ fn run_queue_exit(home: &TempDir, project: &Project) -> Run {
         .unwrap()
         .env("HOME", home.path())
         .env("MURMUR_A2A_TIMEOUT_SECS", "1")
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project.dir.path())
         .args([
             "run",

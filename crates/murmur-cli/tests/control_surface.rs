@@ -105,10 +105,7 @@ impl Home {
 
 fn mur(home: &Path) -> Command {
     let mut command = Command::new(assert_cmd::cargo::cargo_bin("mur"));
-    command
-        .env("HOME", home)
-        .env_remove("NEXUS_API_KEY")
-        .env_remove(SECRET);
+    command.env("HOME", home).env_remove(SECRET);
     command
 }
 

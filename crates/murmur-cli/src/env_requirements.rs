@@ -15,7 +15,7 @@ use murmur_artifact::{
     MurmurLock, ReferencedEnvVariable, Registry, RuntimeManifest,
 };
 
-use crate::registry_client::FallbackRegistry;
+use crate::stores::FallbackRegistry;
 
 /// Everything the walk found, ready to render.
 pub(crate) struct EnvRequirementsReport {

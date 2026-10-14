@@ -18,7 +18,7 @@ use capsule_runtime::{admit_roster_file, FormationId};
 use murmur_artifact::{LocalRegistry, TraceRetainConfig, ROSTER_FILENAME};
 
 use crate::error::{CliError, E_IO_003, E_ROS_001, E_RUN_045, E_RUN_046};
-use crate::registry_client::FallbackRegistry;
+use crate::stores::FallbackRegistry;
 
 use super::read_optional_lockfile;
 

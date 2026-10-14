@@ -1,3 +1,6 @@
+#[path = "common/mod.rs"]
+mod common;
+
 use assert_cmd::Command;
 use murmur_artifact::{ArtifactMeta, LocalRegistry, Registry, RuntimeType};
 use predicates::prelude::*;
@@ -6,7 +9,7 @@ use tempfile::TempDir;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Write a minimal valid artifacts-index.json to a temp file.
-/// Returns the path as a String for use with --registry.
+/// Returns the path as a String for use with --index.
 fn write_index(dir: &TempDir, entries: &[serde_json::Value]) -> String {
     let index = serde_json::json!({
         "schema_version": "1",
@@ -16,6 +19,15 @@ fn write_index(dir: &TempDir, entries: &[serde_json::Value]) -> String {
     let path = dir.path().join("artifacts-index.json");
     std::fs::write(&path, serde_json::to_string_pretty(&index).unwrap()).unwrap();
     path.to_str().unwrap().to_string()
+}
+
+fn index_json(entries: &[serde_json::Value]) -> String {
+    serde_json::json!({
+        "schema_version": "1",
+        "updated_at": "2026-06-07T00:00:00Z",
+        "artifacts": entries
+    })
+    .to_string()
 }
 
 fn tool_entry(name: &str) -> serde_json::Value {
@@ -46,8 +58,17 @@ fn publish_local(home: &TempDir, name: &str) {
 }
 
 fn mur_search(home: &TempDir, args: &[&str]) -> assert_cmd::assert::Assert {
+    mur_search_in(home, home.path(), args)
+}
+
+/// `mur search` run from `cwd`, for an index path given relative to it.
+fn mur_search_in(
+    home: &TempDir,
+    cwd: &std::path::Path,
+    args: &[&str],
+) -> assert_cmd::assert::Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
-    cmd.env("HOME", home.path()).arg("search");
+    cmd.env("HOME", home.path()).current_dir(cwd).arg("search");
     for arg in args {
         cmd.arg(arg);
     }
@@ -56,22 +77,22 @@ fn mur_search(home: &TempDir, args: &[&str]) -> assert_cmd::assert::Assert {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// Remote-style fetch: query matches → result row printed.
+/// Absolute index path: query matches → result row printed.
 #[test]
 fn search_index_query_matches_returns_row() {
     let dir = TempDir::new().unwrap();
     let idx = write_index(&dir, &[tool_entry("murmur-tool-git")]);
-    mur_search(&dir, &["git", "--registry", &idx])
+    mur_search(&dir, &["git", "--index", &idx])
         .success()
         .stdout(predicate::str::contains("murmur-tool-git"));
 }
 
-/// Remote-style fetch: query doesn't match → "No results found", exits 0.
+/// Absolute index path: query doesn't match → "No results found", exits 0.
 #[test]
 fn search_index_no_match_prints_no_results() {
     let dir = TempDir::new().unwrap();
     let idx = write_index(&dir, &[tool_entry("murmur-tool-git")]);
-    mur_search(&dir, &["zzznomatch", "--registry", &idx])
+    mur_search(&dir, &["zzznomatch", "--index", &idx])
         .success()
         .stdout(predicate::str::contains("No results found"));
 }
@@ -81,7 +102,7 @@ fn search_index_no_match_prints_no_results() {
 fn search_local_populated_returns_artifact() {
     let home = TempDir::new().unwrap();
     publish_local(&home, "murmur-tool-editor");
-    mur_search(&home, &["editor", "--registry", "local"])
+    mur_search(&home, &["editor", "--index", "local"])
         .success()
         .stdout(predicate::str::contains("murmur-tool-editor"));
 }
@@ -90,7 +111,7 @@ fn search_local_populated_returns_artifact() {
 #[test]
 fn search_local_empty_returns_no_results() {
     let home = TempDir::new().unwrap();
-    mur_search(&home, &["git", "--registry", "local"])
+    mur_search(&home, &["git", "--index", "local"])
         .success()
         .stdout(predicate::str::contains("No results found"));
 }
@@ -107,7 +128,7 @@ fn search_wrong_schema_version_fails_gracefully() {
     let path = dir.path().join("bad.json");
     std::fs::write(&path, serde_json::to_string(&bad).unwrap()).unwrap();
     let path_str = path.to_str().unwrap();
-    mur_search(&TempDir::new().unwrap(), &["git", "--registry", path_str])
+    mur_search(&TempDir::new().unwrap(), &["git", "--index", path_str])
         .failure()
         .stderr(predicate::str::contains("schema version"));
 }
@@ -125,7 +146,7 @@ fn search_limit_caps_results() {
         ],
     );
     // "murmur" matches all three; limit to 1
-    let output = mur_search(&dir, &["murmur", "--registry", &idx, "--limit", "1"])
+    let output = mur_search(&dir, &["murmur", "--index", &idx, "--limit", "1"])
         .success()
         .get_output()
         .stdout
@@ -145,7 +166,64 @@ fn search_limit_caps_results() {
 fn search_network_error_exits_nonzero_with_url_in_message() {
     let home = TempDir::new().unwrap();
     let bad_url = "https://this-does-not-exist.invalid/artifacts-index.json";
-    mur_search(&home, &["git", "--registry", bad_url])
+    mur_search(&home, &["git", "--index", bad_url])
         .failure()
         .stderr(predicate::str::contains(bad_url));
+}
+
+/// A relative index path is read from disk against the working directory, never fetched.
+#[test]
+fn search_relative_index_path_is_read_from_disk() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    write_index(&dir, &[tool_entry("murmur-tool-git")]);
+    for relative in ["./artifacts-index.json", "artifacts-index.json"] {
+        mur_search_in(&home, dir.path(), &["git", "--index", relative])
+            .success()
+            .stdout(predicate::str::contains("murmur-tool-git"));
+    }
+}
+
+/// A missing index file fails with E-IO-003 naming the path.
+#[test]
+fn search_missing_index_file_names_the_path() {
+    let home = TempDir::new().unwrap();
+    mur_search(&home, &["git", "--index", "./no-such-index.json"])
+        .failure()
+        .stderr(predicate::str::contains("E-IO-003"))
+        .stderr(predicate::str::contains("./no-such-index.json"));
+}
+
+/// An http:// index is fetched.
+#[test]
+fn search_http_index_is_fetched() {
+    let home = TempDir::new().unwrap();
+    let server = common::ScriptedServer::start(vec![index_json(&[tool_entry("murmur-tool-git")])]);
+    let url = format!("{}/artifacts-index.json", server.endpoint);
+    mur_search(&home, &["git", "--index", &url])
+        .success()
+        .stdout(predicate::str::contains("murmur-tool-git"));
+    assert_eq!(server.requests().len(), 1);
+}
+
+/// With no --index, `registry.index_url` in ~/.murmur/config.yaml is fetched.
+#[test]
+fn search_without_index_fetches_the_configured_index_url() {
+    let home = TempDir::new().unwrap();
+    let server =
+        common::ScriptedServer::start(vec![index_json(&[tool_entry("murmur-tool-editor")])]);
+    let config_dir = home.path().join(".murmur");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.yaml"),
+        format!(
+            "registry:\n  index_url: {}/artifacts-index.json\n",
+            server.endpoint
+        ),
+    )
+    .unwrap();
+    mur_search(&home, &["editor"])
+        .success()
+        .stdout(predicate::str::contains("murmur-tool-editor"));
+    assert_eq!(server.requests().len(), 1);
 }

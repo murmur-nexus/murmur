@@ -162,7 +162,6 @@ fn run(home: &TempDir, manifest: &Path, roost_url: Option<&str>) -> assert_cmd::
     let mut command = Command::cargo_bin("mur").unwrap();
     command
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .env_remove("MURMUR_ROOST_URL");
     if let Some(url) = roost_url {
         command.env("MURMUR_ROOST_URL", url);
@@ -291,7 +290,6 @@ fn an_installed_capsule_runs_by_name_and_version() {
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .env_remove("MURMUR_ROOST_URL")
         .args([
             "run",
@@ -398,7 +396,6 @@ fn a_launched_child_registers_one_level_below_its_parent() {
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .env("MURMUR_ROOST_URL", &roost.url)
         .args([
             "run",

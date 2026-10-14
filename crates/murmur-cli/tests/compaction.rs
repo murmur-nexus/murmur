@@ -178,12 +178,6 @@ fn compact_not_declared_threshold_reached_warning_logged() {
 /// Create a test project manifest for compaction tests: context.max_tokens=200 and
 /// compaction.threshold=0.01, so compaction fires on the very first turn, and bash allowed.
 fn create_compaction_manifest(project_dir: &Path, endpoint: &str, driver_name: &str) -> PathBuf {
-    fs::write(
-        project_dir.join("murmur.yaml"),
-        "registry:\n  default: local\n",
-    )
-    .unwrap();
-
     // Build the manifest string with explicit indentation — never use `\` line
     // continuations in format! when indentation matters.
     let manifest = format!(

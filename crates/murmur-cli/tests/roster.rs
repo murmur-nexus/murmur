@@ -173,7 +173,6 @@ fn mur_doctor(home: &TempDir, project_dir: &Path) -> Doctor {
     let output = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project_dir)
         .arg("doctor")
         .output()
@@ -763,7 +762,6 @@ fn s12_mur_run_never_reads_roster_yaml() {
 
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project.path())
         .args(["run", "--manifest", "murmur.yaml", "--task"])
         .arg(&task)

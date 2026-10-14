@@ -14,7 +14,6 @@ fn doctor_stdout(home: &TempDir, project_dir: &Path) -> String {
     let output = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project_dir)
         .arg("doctor")
         .assert()

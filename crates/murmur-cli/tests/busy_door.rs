@@ -129,9 +129,7 @@ impl Capsule {
 
     fn mur(&self) -> Command {
         let mut command = Command::cargo_bin("mur").unwrap();
-        command
-            .env("HOME", self.home.path())
-            .env_remove("NEXUS_API_KEY");
+        command.env("HOME", self.home.path());
         command
     }
 }
@@ -155,7 +153,6 @@ fn start_spinner(exports: &str) -> Capsule {
         .arg("--json")
         .current_dir(project.path())
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

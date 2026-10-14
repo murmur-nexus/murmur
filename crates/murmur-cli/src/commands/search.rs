@@ -10,7 +10,7 @@ use crate::{
 };
 
 // The default public artifact index URL. Overridable via ~/.murmur/config.yaml key
-// registry.index_url, or per-command with --registry <url>.
+// registry.index_url, or per-command with --index <PATH|URL|local>.
 pub const DEFAULT_INDEX_URL: &str =
     "https://raw.githubusercontent.com/murmur-nexus/default-artifacts/refs/heads/main/artifacts-index.json";
 
@@ -39,15 +39,34 @@ pub struct ArtifactIndexEntry {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub(crate) fn run_search(
-    query: &str,
-    registry: Option<&str>,
-    limit: usize,
-) -> Result<(), CliError> {
-    let entries: Vec<ArtifactIndexEntry> = match registry {
-        Some("local") => scan_local()?,
-        Some(path) if path.starts_with('/') => read_local_file(path)?,
-        Some(url) => fetch_remote(url)?,
+/// Where `--index` reads the artifact index from.
+#[derive(Debug, PartialEq, Eq)]
+enum IndexSource<'a> {
+    /// `local`: the global store's own listing.
+    GlobalStore,
+    /// A value starting `http://` or `https://`.
+    Url(&'a str),
+    /// Any other value: a file path, relative to the working directory or absolute.
+    File(&'a str),
+}
+
+impl<'a> IndexSource<'a> {
+    fn parse(value: &'a str) -> Self {
+        if value == "local" {
+            Self::GlobalStore
+        } else if value.starts_with("http://") || value.starts_with("https://") {
+            Self::Url(value)
+        } else {
+            Self::File(value)
+        }
+    }
+}
+
+pub(crate) fn run_search(query: &str, index: Option<&str>, limit: usize) -> Result<(), CliError> {
+    let entries: Vec<ArtifactIndexEntry> = match index.map(IndexSource::parse) {
+        Some(IndexSource::GlobalStore) => scan_local()?,
+        Some(IndexSource::File(path)) => read_local_file(path)?,
+        Some(IndexSource::Url(url)) => fetch_remote(url)?,
         None => {
             let url = resolve_index_url()?;
             fetch_remote(&url)?
@@ -70,7 +89,7 @@ pub(crate) fn run_search(
     Ok(())
 }
 
-// ── Registry modes ────────────────────────────────────────────────────────────
+// ── Index sources ─────────────────────────────────────────────────────────────
 
 fn resolve_index_url() -> Result<String, CliError> {
     let config = config::load_effective_mur_config()?;
@@ -106,7 +125,7 @@ fn read_local_file(path: &str) -> Result<Vec<ArtifactIndexEntry>, CliError> {
 }
 
 fn fetch_remote(url: &str) -> Result<Vec<ArtifactIndexEntry>, CliError> {
-    let client = crate::registry_client::blocking_agent(Duration::from_secs(30));
+    let client = crate::http::blocking_agent(Duration::from_secs(30));
     let mut response = client.get(url).call().map_err(|e| {
         CliError::new(
             E_IO_003,
@@ -217,5 +236,38 @@ fn print_results(entries: &[&ArtifactIndexEntry]) {
         let version = &entry.version;
         let runtime = &entry.runtime;
         capsule_runtime::report_println!("{name:<nw$}  {version:<vw$}  {runtime:<rw$}  {desc}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IndexSource;
+
+    #[test]
+    fn local_names_the_global_store() {
+        assert_eq!(IndexSource::parse("local"), IndexSource::GlobalStore);
+    }
+
+    #[test]
+    fn an_http_or_https_value_is_a_url() {
+        for url in [
+            "http://127.0.0.1:8080/artifacts-index.json",
+            "https://example.com/artifacts-index.json",
+        ] {
+            assert_eq!(IndexSource::parse(url), IndexSource::Url(url));
+        }
+    }
+
+    #[test]
+    fn any_other_value_is_a_file_path() {
+        for path in [
+            "./artifacts-index.json",
+            "artifacts-index.json",
+            "../index/artifacts-index.json",
+            "/abs/artifacts-index.json",
+            "localhost/artifacts-index.json",
+        ] {
+            assert_eq!(IndexSource::parse(path), IndexSource::File(path));
+        }
     }
 }

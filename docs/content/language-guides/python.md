@@ -5,7 +5,7 @@ If your tool can be packaged as a supported artifact runtime, it can participate
 
 This guide walks through building, packaging, and publishing a Murmur tool artifact written in Python.
 
-By the end, you will have a working `.mur.zip` published to your local registry and a capsule that can invoke it.
+By the end, you will have a working `.mur.zip` published into your global store and a capsule that can invoke it.
 
 Prefer shipping a native binary instead of WASM? See [Python Tool Quickstart (Native)](python-native.md).
 

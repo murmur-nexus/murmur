@@ -419,7 +419,6 @@ fn a_capsule_that_never_delegates_is_unaffected() {
     let assert = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .env_remove(SPAWNER_ENV)
         // A daemon is listening and named, and this capsule must still not reach for it.
         .env("MURMUR_ROOST_URL", &roost.url)
@@ -484,7 +483,6 @@ fn a_malformed_spawner_handle_refuses_the_launch() {
     let assert = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .env(SPAWNER_ENV, "not-a-spawner-handle")
         .args([
             "run",

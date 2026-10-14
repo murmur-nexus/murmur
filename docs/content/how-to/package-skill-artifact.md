@@ -15,7 +15,7 @@ The relevant manifest options are:
 
 There are two ways to get a skill into a capsule:
 
-- **Package and publish** (Steps 1–6 below) — the distribution path. `mur build --skill` produces a `.mur.zip`, `mur publish` puts it in the registry, and the capsule declares it by `name` + `version`. Use this to share a skill across machines or pin a version.
+- **Package and publish** (Steps 1–6 below) — the distribution path. `mur build --skill` produces a `.mur.zip`, `mur publish` puts it in the global store, and the capsule declares it by `name` + `version`. Use this to share a skill across machines or pin a version.
 - **Local source** ([Fast iteration](#fast-iteration-source-a-skill-from-a-local-path)) — the authoring path. The capsule points `source:` at a `skill.md` on disk; the runtime reads it directly on every run. Edit the file, relaunch, the change is live. No build or publish step.
 
 ---
@@ -149,7 +149,7 @@ description: 'Project PR review conventions'   # only present when --summary is 
 If the input folder already contains a `murmur.yaml`, it is used and the `description` field is set or overwritten when `--summary` is provided. The manifest must declare `runtime: skill`; any other runtime value is an error (`E-MAN-003`).
 
 !!! warning "Agents with Bash or file-read tools will bypass the skill runtime"
-    If your capsule exposes a Bash tool or a file-reader, the agent will almost always prefer a direct tool call to read the `skill.md` path rather than calling the skill through the runtime. The skill's tool-inventory entry is effectively invisible to it. If you need the agent to invoke the skill via the runtime (so the guidance is loaded on-demand and appears as a tool call in the trace), package and publish it first — then declare it by name and version in the manifest rather than via `source:`. See [Step 3](#step-3-publish-to-the-local-registry) onwards.
+    If your capsule exposes a Bash tool or a file-reader, the agent will almost always prefer a direct tool call to read the `skill.md` path rather than calling the skill through the runtime. The skill's tool-inventory entry is effectively invisible to it. If you need the agent to invoke the skill via the runtime (so the guidance is loaded on-demand and appears as a tool call in the trace), package and publish it first — then declare it by name and version in the manifest rather than via `source:`. See [Step 3](#step-3-publish-into-the-global-store) onwards.
 
 ### From a project folder with an explicit manifest
 
@@ -179,26 +179,13 @@ error[E-IO-003]: missing required file 'skill.md' in /path/to/my-skill
 
 ---
 
-## Step 3 — publish to the local registry
+## Step 3 — publish into the global store
 
 ```bash
 mur publish code-review-conventions-1.0.0.mur.zip
 ```
 
-??? info "Choosing a registry target"
-    Without `--registry`, the target is determined by your workspace config (`registry.default` / `registry.remote_url` in `murmur.yaml`). You can override it explicitly:
-
-    - **`--registry local`** — writes to `~/.murmur/artifacts/`. No remote registry or API key needed. Use this when you are working locally or have no remote configured.
-
-        ```bash
-        mur publish --registry local code-review-conventions-1.0.0.mur.zip
-        ```
-
-    - **`--registry <url>`** — publishes to a remote registry at that URL. Requires `NEXUS_API_KEY` to be set.
-
-        ```bash
-        mur publish --registry https://registry.example.com code-review-conventions-1.0.0.mur.zip
-        ```
+`mur publish` writes the artifact into the global store, `~/.murmur/artifacts/code-review-conventions/1.0.0/`, where every project on this machine can install it from.
 
 Then install:
 

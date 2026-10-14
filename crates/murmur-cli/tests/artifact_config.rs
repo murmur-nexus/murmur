@@ -118,7 +118,7 @@ fn run_and_read(home: &TempDir, manifest: &Path) -> String {
 
 fn explain_scope(home: &TempDir, manifest: &Path) -> Command {
     let mut cmd = Command::cargo_bin("mur").unwrap();
-    cmd.env("HOME", home.path()).env_remove("NEXUS_API_KEY");
+    cmd.env("HOME", home.path());
     cmd.args(["run", "--manifest", manifest.to_str().unwrap()]);
     cmd.arg("--explain-scope");
     cmd

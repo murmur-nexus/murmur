@@ -52,7 +52,6 @@ const CREDENTIAL_ENV_PATTERNS: &[&str] = &[
     "OPENAI_API_KEY",
     "GOOGLE_API_KEY",
     "HUGGING_FACE_HUB_TOKEN",
-    "NEXUS_API_KEY",
     "AWS_*",
     "GITHUB_TOKEN",
     "GH_TOKEN",

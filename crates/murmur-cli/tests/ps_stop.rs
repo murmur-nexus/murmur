@@ -74,7 +74,6 @@ fn driver_home() -> Arc<TempDir> {
     let mut publish = Command::cargo_bin("mur").unwrap();
     publish
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args(["publish", driver.to_str().unwrap()])
         .assert()
         .success();
@@ -180,7 +179,6 @@ fn start_in_project(home: &Arc<TempDir>, project: Arc<TempDir>, env: &[(&str, &s
         .arg("--json")
         .current_dir(project.path())
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .envs(env.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -435,7 +433,7 @@ fn running_as_root() -> bool {
 
 fn mur(home: &Path) -> Command {
     let mut command = Command::cargo_bin("mur").unwrap();
-    command.env("HOME", home).env_remove("NEXUS_API_KEY");
+    command.env("HOME", home);
     command
 }
 
@@ -1827,7 +1825,6 @@ fn a_sigterm_ends_mur_eval_at_once() {
         .arg(&dataset)
         .current_dir(project.path())
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

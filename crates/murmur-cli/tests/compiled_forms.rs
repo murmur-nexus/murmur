@@ -546,7 +546,6 @@ fn a_home_inside_the_capsule_workdir_gets_no_compiled_forms() {
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", &home)
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",
@@ -622,7 +621,6 @@ fn concurrent_first_runs_both_succeed() {
     let spawn = || {
         std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
             .env("HOME", project.home.path())
-            .env_remove("NEXUS_API_KEY")
             .args([
                 "run",
                 "--manifest",
@@ -970,7 +968,6 @@ fn a_manifest_install_fills_in_missing_forms_for_cached_artifacts() {
             Command::cargo_bin("mur")
                 .unwrap()
                 .env("HOME", home.path())
-                .env_remove("NEXUS_API_KEY")
                 .current_dir(project.path())
                 .arg("install")
                 .args(extra_args)

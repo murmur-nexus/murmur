@@ -37,7 +37,6 @@ fn create_artifact_fixture(dir: &Path, name: &str, version: &str) -> PathBuf {
 fn run_publish_local(artifact_path: &Path, home: &TempDir) -> assert_cmd::assert::Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args(["publish", artifact_path.to_str().unwrap()])
         .assert()
 }
@@ -45,7 +44,6 @@ fn run_publish_local(artifact_path: &Path, home: &TempDir) -> assert_cmd::assert
 fn run_install_local(artifact_ref: &str, home: &TempDir) -> assert_cmd::assert::Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args(["install", "-g", artifact_ref])
         .assert()
 }

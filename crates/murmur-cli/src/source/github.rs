@@ -8,7 +8,7 @@ use murmur_artifact::{current_platform, split_platform_suffix, SUPPORTED_PLATFOR
 use serde::Deserialize;
 use ureq::Agent;
 
-use crate::registry_client::blocking_agent;
+use crate::http::blocking_agent;
 
 use super::{ArtifactSource, RateLimitSignal, SourceError, SourceResolution};
 

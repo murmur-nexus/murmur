@@ -5,6 +5,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::{
+    manifest::{REGISTRY_BLOCK_KEY, REGISTRY_BLOCK_MESSAGE},
     manifest_path::MANIFEST_FILENAME,
     trace_capture::{resolve_trace_capture, TraceCapture},
     unknown_manifest_keys::{nearest_known_key, UnknownManifestKey},
@@ -1822,6 +1823,9 @@ pub enum RuntimeManifestError {
     QueueWithoutRoom,
     #[error("{}: invalid trace config for '{field}': {message}", MANIFEST_FILENAME)]
     InvalidTraceConfig { field: String, message: String },
+    /// The manifest declares a top-level [`REGISTRY_BLOCK_KEY`].
+    #[error("{}", REGISTRY_BLOCK_MESSAGE)]
+    RegistryBlock,
     /// A `gateway:` names an upstream but neither binds a non-blank `api_key` nor declares
     /// `keyless: true`. Decided on what the manifest wrote, so it fires identically with and
     /// without secret resolution.
@@ -3209,6 +3213,11 @@ impl RuntimeManifest {
                 ))
             }
         })?;
+
+        // The key is not a field of `RawRuntimeManifest`, so it lands in the unknown-key map.
+        if raw.unknown.contains_key(REGISTRY_BLOCK_KEY) {
+            return Err(RuntimeManifestError::RegistryBlock);
+        }
 
         // Collected before any field is moved out of `raw`, so the walk sees the whole document
         // rather than the part validation happens to reach before its first refusal.
@@ -13247,5 +13256,65 @@ mod network_authentication_tests {
                 ),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod registry_block_tests {
+    use super::*;
+
+    const REGISTRY_BLOCK: &str = "registry:\n  default: local\n";
+
+    #[test]
+    fn registry_block_is_refused_by_both_entry_points() {
+        let input = format!("name: cap\nversion: 0.0.1\nartifacts: []\n{REGISTRY_BLOCK}");
+        for result in [
+            RuntimeManifest::from_yaml_str(&input),
+            RuntimeManifest::from_yaml_str_without_secrets(&input),
+        ] {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, RuntimeManifestError::RegistryBlock),
+                "{err:?}"
+            );
+            assert_eq!(err.to_string(), REGISTRY_BLOCK_MESSAGE);
+        }
+    }
+
+    #[test]
+    fn registry_block_is_refused_before_any_other_field() {
+        // `name` is missing and `lifecycle.queue_depth: 0` under `queue` is refused on its own;
+        // the registry refusal still wins.
+        let input = format!(
+            "version: 0.0.1\nlifecycle:\n  task_acceptance: queue\n  queue_depth: 0\n\
+             {REGISTRY_BLOCK}"
+        );
+        let err = RuntimeManifest::from_yaml_str(&input).unwrap_err();
+        assert!(
+            matches!(err, RuntimeManifestError::RegistryBlock),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn registry_block_refusal_applies_whatever_the_block_holds() {
+        for block in ["registry: local\n", "registry: {}\n", "registry: []\n"] {
+            let input = format!("name: cap\nversion: 0.0.1\n{block}");
+            assert!(
+                matches!(
+                    RuntimeManifest::from_yaml_str(&input),
+                    Err(RuntimeManifestError::RegistryBlock)
+                ),
+                "{block}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_manifest_without_a_registry_block_parses_unchanged() {
+        let manifest =
+            RuntimeManifest::from_yaml_str("name: cap\nversion: 0.0.1\nartifacts: []\n").unwrap();
+        assert_eq!(manifest.name, "cap");
+        assert_eq!(manifest.version, "0.0.1");
     }
 }

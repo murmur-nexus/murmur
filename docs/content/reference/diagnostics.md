@@ -47,7 +47,7 @@ section that explains it.
 | `E-IO-003` | General I/O error (read/write failure), including a write to standard output that failed for a reason other than its reader going away | [Piped output](cli.md#piped-output) |
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
-| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication), a credential scope that names a retired door method, a `network.authentication` declared beside a non-empty `capabilities.spawn.allow`, a `lifecycle.queue_depth: 0` under `task_acceptance: queue`, or a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds | [E-MAN-003](#e-man-003) |
+| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication), a credential scope that names a retired door method, a `network.authentication` declared beside a non-empty `capabilities.spawn.allow`, a `lifecycle.queue_depth: 0` under `task_acceptance: queue`, a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds, or a top-level `registry:` key | [E-MAN-003](#e-man-003) |
 | `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new-task) |
 | `E-NEW-002` | The name given to `mur new --roster`, or a capsule name derived from it, is not an artifact name | [`mur new --roster`](cli.md#mur-new-roster) |
 | `E-NEW-003` | The directory `mur new --roster` would write already exists | [`mur new --roster`](cli.md#mur-new-roster-writing) |
@@ -198,6 +198,15 @@ error[E-MAN-003]: murmur.yaml: invalid network config for 'network.authenticatio
 
 The scopes are listed under
 [`network.authentication`](manifest.md#field-network-authentication).
+
+A top-level `registry:` key is refused by every command that reads a `murmur.yaml`, before any
+other field is checked. Artifacts resolve from the stores and the sources in
+`~/.murmur/config.yaml`; see [Resolution order](config.md#resolution-order):
+
+```text
+error[E-MAN-003]: murmur.yaml: 'registry' is not a manifest key
+  hint: remove it; artifacts resolve from the project store (.murmur/artifacts/), the global store (~/.murmur/artifacts/), and then the sources under registry.sources in ~/.murmur/config.yaml
+```
 
 A `lifecycle.queue_depth` of `0` under `task_acceptance: queue` leaves the queue no room for a
 waiting task, and is refused before anything launches:

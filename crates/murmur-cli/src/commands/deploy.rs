@@ -545,7 +545,7 @@ fn resolve_mur_binary_impl(
         return Ok(cache_path);
     }
 
-    let client = crate::registry_client::blocking_agent(std::time::Duration::from_secs(60));
+    let client = crate::http::blocking_agent(std::time::Duration::from_secs(60));
 
     // Read GitHub token from the environment so private-repo release assets can be
     // fetched.  GITHUB_TOKEN is the standard name set by GitHub Actions and gh-auth;
@@ -2624,10 +2624,9 @@ mod tests {
 
         let orig_path = std::env::var("PATH").unwrap_or_default();
         let patched = format!("{}:{orig_path}", dir.path().display());
-        // SAFETY: PATH modification is test-only. This test must not run concurrently
-        // with other tests that also modify PATH. Within a single test binary, tests
-        // run sequentially unless --test-threads > 1. The fake `scp` only exists for
-        // the duration of this test.
+        // SAFETY: test-only, and sound only while no other thread reads or writes PATH. nextest
+        // runs each test in its own process; under `cargo test`, which runs a binary's tests on
+        // parallel threads, this test must not share a run with another that touches PATH.
         unsafe { std::env::set_var("PATH", &patched) };
 
         let result = scp_upload(
@@ -2639,6 +2638,7 @@ mod tests {
             false,
         );
 
+        // SAFETY: as above; restores the PATH this test started with.
         unsafe { std::env::set_var("PATH", &orig_path) };
 
         let err = result.expect_err("scp_upload must fail when scp exits non-zero");

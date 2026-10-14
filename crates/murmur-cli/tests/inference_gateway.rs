@@ -174,7 +174,6 @@ impl Capsule {
         Command::cargo_bin("mur")
             .unwrap()
             .env("HOME", self.home.path())
-            .env_remove("NEXUS_API_KEY")
             .env("GATEWAY_TEST_KEY", key)
             .current_dir(self.project.path())
             .args([
@@ -326,7 +325,6 @@ impl Capsule {
             Command::cargo_bin("mur")
                 .unwrap()
                 .env("HOME", self.home.path())
-                .env_remove("NEXUS_API_KEY")
                 .env("GATEWAY_TEST_KEY", MARKER)
                 .current_dir(self.project.path())
                 .args([

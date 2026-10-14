@@ -605,7 +605,6 @@ fn mur_run(
 ) -> assert_cmd::assert::Assert {
     let mut cmd = assert_cmd::Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args(["run", "--manifest", manifest_path.to_str().unwrap()])
         .args(extra_args)
         .assert()
@@ -691,12 +690,6 @@ fn create_agent_manifest_full(
     inference_extra: &str,
     trailer: &str,
 ) -> PathBuf {
-    fs::write(
-        project_dir.join("murmur.yaml"),
-        "registry:\n  default: local\n",
-    )
-    .unwrap();
-
     let manifest = format!(
         concat!(
             "name: system-prompt-test\n",

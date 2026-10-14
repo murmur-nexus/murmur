@@ -173,7 +173,7 @@ fn publish_artifacts(home: &TempDir, artifact_dir: &Path, hooks: &[(&str, &str, 
 /// `mur run` with the task inline, plus whatever flags the case needs.
 fn run(home: &TempDir, manifest: &Path, extra: &[&str]) -> Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
-    cmd.env("HOME", home.path()).env_remove("NEXUS_API_KEY");
+    cmd.env("HOME", home.path());
     cmd.args([
         "run",
         "--manifest",

@@ -110,8 +110,7 @@ impl Fixture {
     /// `mur run` with `task` inline, plus whatever flags the case needs.
     fn run(&self, task: &str, extra: &[&str]) -> Assert {
         let mut cmd = Command::cargo_bin("mur").unwrap();
-        cmd.env("HOME", self.home.path())
-            .env_remove("NEXUS_API_KEY");
+        cmd.env("HOME", self.home.path());
         cmd.args([
             "run",
             "--manifest",

@@ -113,11 +113,6 @@ fn setup_project(home: &TempDir, endpoint: &str, extra_lifecycle_yaml: &str) -> 
 
     fs::write(
         project.path().join("murmur.yaml"),
-        "registry:\n  default: local\n",
-    )
-    .unwrap();
-    fs::write(
-        project.path().join("murmur.yaml"),
         format!(
             "name: input-required-agent\n\
              version: 0.1.0\n\

@@ -53,7 +53,6 @@ fn publish(home: &TempDir, artifact_path: &Path) -> assert_cmd::assert::Assert {
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args(["publish", artifact_path.to_str().unwrap()])
         .assert()
 }

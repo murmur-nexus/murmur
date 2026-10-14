@@ -18,8 +18,8 @@ use murmur_artifact::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CliError, E_IO_001, E_IO_003};
-use crate::registry_client::FallbackRegistry;
 use crate::session_address::{self, SessionQuery};
+use crate::stores::FallbackRegistry;
 
 use super::{fail_run, lockfile_error_to_cli, runtime_manifest_error_to_cli};
 

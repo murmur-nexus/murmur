@@ -113,7 +113,6 @@ impl Capsule {
         let output = Command::cargo_bin("mur")
             .unwrap()
             .env("HOME", self.home.path())
-            .env_remove("NEXUS_API_KEY")
             .current_dir(self.project.path())
             .args([
                 "run",
@@ -363,7 +362,6 @@ fn install_accepts_process_driver_without_inference_auth() {
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project.path())
         .args(["install", artifact.to_str().unwrap()])
         .assert()

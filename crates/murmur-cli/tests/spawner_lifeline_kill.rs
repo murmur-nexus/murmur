@@ -157,7 +157,6 @@ impl World {
             .env("HOME", self.home.path())
             .env("MURMUR_ROOST_URL", &self.roost_url)
             .env_remove(capsule_runtime::MUR_BINARY_ENV)
-            .env_remove("NEXUS_API_KEY")
             .env_remove(capsule_runtime::DOOR_TOKEN_ENV)
             .env_remove(capsule_runtime::formation::FORMATION_ID_ENV)
             .env_remove(capsule_runtime::formation::FORMATION_PEERS_ENV)
@@ -425,7 +424,6 @@ fn trace_show(delegation: &Delegation) -> String {
     let output = Command::new(assert_cmd::cargo::cargo_bin("mur"))
         .args(["trace", "show"])
         .arg(delegation.child_session.join("trace.jsonl"))
-        .env_remove("NEXUS_API_KEY")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
