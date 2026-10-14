@@ -68,8 +68,8 @@ pub(crate) enum DeployCommand {
         workdir: Option<std::path::PathBuf>,
 
         /// Path to a pre-built mur binary for the target platform. If omitted, the version
-        /// from manifest.mur_version (or the running mur version) is downloaded from GitHub
-        /// releases and cached at ~/.murmur/bin/mur-{version}-{platform}.
+        /// from deploy.mur_version in the manifest (or the running mur version) is downloaded
+        /// from GitHub releases and cached at ~/.murmur/bin/mur-{version}-{platform}.
         #[arg(long)]
         mur_binary: Option<std::path::PathBuf>,
 
@@ -512,13 +512,22 @@ fn resolve_manifest_file(
     Ok((local_path, filename))
 }
 
+/// The `mur` release a deploy installs on the target. Version priority: `deploy.mur_version` >
+/// the running binary's version.
+fn target_mur_version(manifest: &RuntimeManifest) -> &str {
+    manifest
+        .deploy_mur_version()
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 /// Inner implementation of mur binary resolution; takes an explicit home directory so
 /// unit tests can exercise cache-hit logic without mutating process environment variables.
-/// `dl_progress`: optional ProgressBar to show download progress (pass `None` on cache hit
+/// `version` is [`target_mur_version`]'s answer; an explicit `--mur-binary` takes precedence over
+/// it. `dl_progress`: optional ProgressBar to show download progress (pass `None` on cache hit
 /// or in tests).
 fn resolve_mur_binary_impl(
     explicit: Option<&Path>,
-    manifest_version: Option<&str>,
+    version: &str,
     platform: &str,
     home: &Path,
     dl_progress: Option<&ProgressBar>,
@@ -533,9 +542,6 @@ fn resolve_mur_binary_impl(
         }
         return Ok(p.to_path_buf());
     }
-
-    // Version priority: manifest.mur_version > running binary version.
-    let version = manifest_version.unwrap_or(env!("CARGO_PKG_VERSION"));
 
     let cache_dir = home.join(".murmur").join("bin");
     let cache_path = cache_dir.join(format!("mur-{version}-{platform}"));
@@ -1029,10 +1035,7 @@ pub(crate) fn run_deploy(
         .collect();
 
     // ── 0.6. Pre-check mur binary cache ──────────────────────────────────────
-    let mur_version = runtime_manifest
-        .mur_version
-        .as_deref()
-        .unwrap_or(env!("CARGO_PKG_VERSION"));
+    let mur_version = target_mur_version(&runtime_manifest);
     let is_mur_cached =
         check_mur_binary_cached(mur_binary_arg, mur_version, target_platform, &home);
     let is_mur_explicit = mur_binary_arg.is_some();
@@ -1298,13 +1301,8 @@ pub(crate) fn run_deploy(
 
     // ── 2. Resolve mur binary ─────────────────────────────────────────────────
     let local_mur_binary = if is_mur_cached || is_mur_explicit {
-        let path = resolve_mur_binary_impl(
-            mur_binary_arg,
-            runtime_manifest.mur_version.as_deref(),
-            target_platform,
-            &home,
-            None,
-        )?;
+        let path =
+            resolve_mur_binary_impl(mur_binary_arg, mur_version, target_platform, &home, None)?;
         let done_label = if is_mur_explicit {
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             format!(
@@ -1324,7 +1322,7 @@ pub(crate) fn run_deploy(
         mur_bin_pb.enable_steady_tick(Duration::from_millis(80));
         let path = resolve_mur_binary_impl(
             mur_binary_arg,
-            runtime_manifest.mur_version.as_deref(),
+            mur_version,
             target_platform,
             &home,
             Some(&mur_bin_pb),
@@ -2282,7 +2280,8 @@ mod tests {
         fs::write(&binary, b"fake-binary").unwrap();
 
         let result =
-            resolve_mur_binary_impl(Some(&binary), None, "linux-x86_64", dir.path(), None).unwrap();
+            resolve_mur_binary_impl(Some(&binary), "0.4.5", "linux-x86_64", dir.path(), None)
+                .unwrap();
         assert_eq!(result, binary);
     }
 
@@ -2291,8 +2290,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("nonexistent-mur");
 
-        let err = resolve_mur_binary_impl(Some(&missing), None, "linux-x86_64", dir.path(), None)
-            .unwrap_err();
+        let err =
+            resolve_mur_binary_impl(Some(&missing), "0.4.5", "linux-x86_64", dir.path(), None)
+                .unwrap_err();
         assert!(
             err.message.contains("--mur-binary not found"),
             "expected mur-binary-not-found error, got: {}",
@@ -2301,35 +2301,52 @@ mod tests {
     }
 
     #[test]
-    fn resolve_mur_binary_uses_manifest_version_for_cache_lookup() {
+    fn target_mur_version_reads_the_deploy_pin() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.1.0\ndeploy:\n  mur_version: \"0.4.5\"\n",
+        )
+        .unwrap();
+        assert_eq!(target_mur_version(&manifest), "0.4.5");
+    }
+
+    #[test]
+    fn target_mur_version_is_the_running_version_without_a_pin() {
+        for yaml in [
+            "name: cap\nversion: 0.1.0\n",
+            "name: cap\nversion: 0.1.0\ndeploy: {}\n",
+            "name: cap\nversion: 0.1.0\ndeploy:\n  mur_version: \"\"\n",
+        ] {
+            let manifest = RuntimeManifest::from_yaml_str(yaml).unwrap();
+            assert_eq!(
+                target_mur_version(&manifest),
+                env!("CARGO_PKG_VERSION"),
+                "{yaml:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_mur_binary_returns_the_cached_binary_for_the_deploy_pin() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.1.0\ndeploy:\n  mur_version: \"0.4.5\"\n",
+        )
+        .unwrap();
         let dir = tempdir().unwrap();
         let cache_dir = dir.path().join(".murmur").join("bin");
         fs::create_dir_all(&cache_dir).unwrap();
         let cached = cache_dir.join("mur-0.4.5-linux-x86_64");
         fs::write(&cached, b"fake-cached-binary").unwrap();
 
+        let version = target_mur_version(&manifest);
+        assert!(check_mur_binary_cached(
+            None,
+            version,
+            "linux-x86_64",
+            dir.path()
+        ));
         let result =
-            resolve_mur_binary_impl(None, Some("0.4.5"), "linux-x86_64", dir.path(), None).unwrap();
-        assert_eq!(
-            result, cached,
-            "should return cached path for manifest version 0.4.5"
-        );
-    }
-
-    #[test]
-    fn resolve_mur_binary_uses_running_version_when_no_manifest_version() {
-        let dir = tempdir().unwrap();
-        let running_version = env!("CARGO_PKG_VERSION");
-        let cache_dir = dir.path().join(".murmur").join("bin");
-        fs::create_dir_all(&cache_dir).unwrap();
-        let cached = cache_dir.join(format!("mur-{running_version}-linux-x86_64"));
-        fs::write(&cached, b"fake-cached-binary").unwrap();
-
-        let result = resolve_mur_binary_impl(None, None, "linux-x86_64", dir.path(), None).unwrap();
-        assert_eq!(
-            result, cached,
-            "should return cached path for running version"
-        );
+            resolve_mur_binary_impl(None, version, "linux-x86_64", dir.path(), None).unwrap();
+        assert_eq!(result, cached);
     }
 
     // ─── staging path ─────────────────────────────────────────────────────────

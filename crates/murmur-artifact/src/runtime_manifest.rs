@@ -583,11 +583,8 @@ pub struct RuntimeManifest {
     /// — the block absent, `control: {}`, or both lists empty — means the capsule has no control
     /// surface and mints no token.
     pub control: Option<ControlConfig>,
-    /// Pins the mur runtime version required by this capsule.
-    /// Used by `mur deploy` to select the binary version to install on the VM,
-    /// and by `mur run` to warn on version mismatch.
-    /// If absent, the running mur binary's version is used.
-    pub mur_version: Option<String>,
+    /// The `deploy:` block. `None` when the manifest declares none.
+    pub deploy: Option<DeployConfig>,
     /// Every key the manifest declared that this build does not recognize, captured by each
     /// `Raw*` block's `#[serde(flatten)]` overflow map instead of dropped.
     ///
@@ -616,6 +613,21 @@ impl RuntimeManifest {
             .as_ref()
             .is_some_and(Exports::accepts_peer_tasks)
     }
+
+    /// The `mur` release `mur deploy` installs on the target: `deploy.mur_version`, or `None`
+    /// when the block or the key is absent or the value is blank.
+    pub fn deploy_mur_version(&self) -> Option<&str> {
+        self.deploy.as_ref()?.mur_version.as_deref()
+    }
+}
+
+/// The top-level `deploy:` block, read by `mur deploy` only. `mur run` takes no meaning from it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeployConfig {
+    /// The `mur` release `mur deploy` downloads, caches at `~/.murmur/bin/mur-{version}-{platform}`
+    /// and installs on the target. `None` for an absent or blank value, in which case the
+    /// deploying `mur`'s own version is installed.
+    pub mur_version: Option<String>,
 }
 
 /// A setting of a running session that a controller may change over the control surface, when
@@ -1820,6 +1832,14 @@ pub enum RuntimeManifestError {
         MANIFEST_FILENAME
     )]
     QueueWithoutRoom,
+    /// A top-level `mur_version` key, whatever its value. The message names the replacement so a
+    /// surface that prints only the message still points at it.
+    #[error(
+        "{}: 'mur_version' is not a top-level key — the mur release a deploy installs is pinned \
+         as 'deploy.mur_version'",
+        MANIFEST_FILENAME
+    )]
+    TopLevelMurVersion,
     #[error("{}: invalid trace config for '{field}': {message}", MANIFEST_FILENAME)]
     InvalidTraceConfig { field: String, message: String },
     /// A `gateway:` names an upstream but neither binds a non-blank `api_key` nor declares
@@ -1868,7 +1888,12 @@ struct RawRuntimeManifest {
     #[serde(default)]
     control: Option<RawControl>,
     #[serde(default)]
-    mur_version: Option<String>,
+    deploy: Option<RawDeploy>,
+    /// Captured only to refuse it, as [`RuntimeManifestError::TopLevelMurVersion`]: the pin is
+    /// `deploy.mur_version`. Present-detection rather than a typed value, so a number, a blank
+    /// string and a bare `mur_version:` are all refused.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    mur_version: Option<serde_yaml::Value>,
     /// Captured only to refuse it. `config:` is delivered to one artifact through that artifact's
     /// own grant, so a capsule-wide block reaches nothing; without this field it would be one of
     /// the unrecognized top-level keys this manifest silently ignores.
@@ -1898,6 +1923,14 @@ struct RawRuntimeManifest {
     #[serde(default)]
     #[allow(dead_code)]
     requires_files: Option<serde_yaml::Value>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDeploy {
+    #[serde(default)]
+    mur_version: Option<String>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2499,6 +2532,7 @@ impl RawBlock for RawRuntimeManifest {
         "lifecycle",
         "exports",
         "control",
+        "deploy",
         "mur_version",
         "config",
         "runtime",
@@ -2542,6 +2576,16 @@ impl RawBlock for RawRuntimeManifest {
         if let Some(control) = &self.control {
             collect_block(control, &child_path(path, "control"), out);
         }
+        if let Some(deploy) = &self.deploy {
+            collect_block(deploy, &child_path(path, "deploy"), out);
+        }
+    }
+}
+
+impl RawBlock for RawDeploy {
+    const KNOWN_KEYS: &'static [&'static str] = &["mur_version"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
     }
 }
 
@@ -3214,6 +3258,10 @@ impl RuntimeManifest {
         // rather than the part validation happens to reach before its first refusal.
         let unknown_keys = collect_unknown_keys(&raw);
 
+        if raw.mur_version.is_some() {
+            return Err(RuntimeManifestError::TopLevelMurVersion);
+        }
+
         let name = raw.name.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
             RuntimeManifestError::MissingField {
                 field: "name".to_string(),
@@ -3590,7 +3638,9 @@ impl RuntimeManifest {
             lifecycle,
             exports,
             control,
-            mur_version: raw.mur_version.filter(|s| !s.trim().is_empty()),
+            deploy: raw.deploy.map(|deploy| DeployConfig {
+                mur_version: deploy.mur_version.filter(|s| !s.trim().is_empty()),
+            }),
             unknown_keys,
         })
     }
@@ -10238,28 +10288,95 @@ context:
     }
 
     #[test]
-    fn mur_version_parses_correctly() {
+    fn deploy_block_mur_version_parses() {
         let manifest = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.1.0\nartifacts: []\nmur_version: \"0.4.5\"\n",
+            "name: cap\nversion: 0.1.0\nartifacts: []\ndeploy:\n  mur_version: \"0.4.5\"\n",
         )
         .unwrap();
-        assert_eq!(manifest.mur_version, Some("0.4.5".to_string()));
+        assert_eq!(manifest.deploy_mur_version(), Some("0.4.5"));
+        assert_eq!(
+            manifest.deploy,
+            Some(DeployConfig {
+                mur_version: Some("0.4.5".to_string())
+            })
+        );
     }
 
     #[test]
-    fn mur_version_absent_is_none() {
+    fn deploy_block_absent_is_none() {
         let manifest =
             RuntimeManifest::from_yaml_str("name: cap\nversion: 0.1.0\nartifacts: []\n").unwrap();
-        assert_eq!(manifest.mur_version, None);
+        assert_eq!(manifest.deploy, None);
+        assert_eq!(manifest.deploy_mur_version(), None);
+    }
+
+    /// A blank pin and an empty block both mean "install the deploying mur's own version".
+    #[test]
+    fn deploy_block_blank_mur_version_is_none() {
+        for deploy in [
+            "deploy:\n  mur_version: \"\"\n",
+            "deploy:\n  mur_version: \"  \"\n",
+        ] {
+            let manifest = RuntimeManifest::from_yaml_str(&format!(
+                "name: cap\nversion: 0.1.0\nartifacts: []\n{deploy}"
+            ))
+            .unwrap();
+            assert_eq!(manifest.deploy_mur_version(), None, "{deploy:?}");
+        }
+        let manifest =
+            RuntimeManifest::from_yaml_str("name: cap\nversion: 0.1.0\ndeploy: {}\n").unwrap();
+        assert_eq!(manifest.deploy, Some(DeployConfig::default()));
+        assert_eq!(manifest.deploy_mur_version(), None);
     }
 
     #[test]
-    fn mur_version_empty_string_is_none() {
-        let manifest = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.1.0\nartifacts: []\nmur_version: \"\"\n",
-        )
-        .unwrap();
-        assert_eq!(manifest.mur_version, None);
+    fn deploy_block_misspelled_key_is_reported_under_deploy() {
+        assert_eq!(
+            unknown_keys_of("name: cap\nversion: 0.1.0\ndeploy:\n  mur_versoin: \"0.4.5\"\n"),
+            vec![(
+                "mur_versoin".to_string(),
+                "deploy".to_string(),
+                Some("mur_version".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn a_top_level_mur_version_is_refused_naming_deploy_mur_version() {
+        for pin in [
+            "mur_version: \"0.4.5\"\n",
+            "mur_version: 0.4.0\n",
+            "mur_version: \"\"\n",
+            "mur_version:\n",
+        ] {
+            let error = RuntimeManifest::from_yaml_str(&format!(
+                "name: cap\nversion: 0.1.0\nartifacts: []\n{pin}"
+            ))
+            .expect_err(pin);
+            assert!(
+                matches!(error, RuntimeManifestError::TopLevelMurVersion),
+                "{pin:?}: {error:?}"
+            );
+            assert!(error.to_string().contains("deploy.mur_version"), "{error}");
+        }
+        assert_eq!(
+            RuntimeManifestError::TopLevelMurVersion.to_string(),
+            "murmur.yaml: 'mur_version' is not a top-level key — the mur release a deploy \
+             installs is pinned as 'deploy.mur_version'"
+        );
+    }
+
+    #[test]
+    fn a_top_level_mur_version_is_refused_beside_a_deploy_block() {
+        let yaml = "name: cap\nversion: 0.1.0\nmur_version: \"0.4.5\"\ndeploy:\n  mur_version: \"0.4.5\"\n";
+        assert!(matches!(
+            RuntimeManifest::from_yaml_str(yaml),
+            Err(RuntimeManifestError::TopLevelMurVersion)
+        ));
+        assert!(matches!(
+            RuntimeManifest::from_yaml_str_without_secrets(yaml),
+            Err(RuntimeManifestError::TopLevelMurVersion)
+        ));
     }
 
     #[test]
@@ -11900,7 +12017,8 @@ capabilities:
             r#"
 name: cap
 version: 0.1.0
-mur_version: "0.2.0"
+deploy:
+  mur_version: "0.2.0"
 artifacts:
   - name: notes-tool
     version: 0.1.0

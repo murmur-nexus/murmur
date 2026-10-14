@@ -121,6 +121,11 @@ pub(crate) const QUEUE_WITHOUT_ROOM_HINT: &str =
     "set lifecycle.queue_depth to 1 or more, or use lifecycle.task_acceptance: single to take one \
      task at a time";
 
+/// The hint on the `E-MAN-003` refusal of a top-level `mur_version` key.
+pub(crate) const TOP_LEVEL_MUR_VERSION_HINT: &str =
+    "move the pin under deploy: as deploy.mur_version — only mur deploy reads it, to choose the \
+     mur it installs on the target";
+
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
 pub const E_BLD_002: &str = "E-BLD-002"; // requires_files entry is unsafe or collides in the archive

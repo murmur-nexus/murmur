@@ -52,7 +52,7 @@
 
 *[lifecycle.queue_depth]: integer · pending task buffer · default 1 · excess tasks rejected
 
-*[mur_version]: pins mur binary version installed on the VM · omit to use the running version
+*[mur_version]: the deploy.mur_version pin — the mur release mur deploy installs on the target · omit to use the running version
 
 *[lifecycle.conversation]: stateless: each task independent · default | threaded: tasks share history per contextId
 

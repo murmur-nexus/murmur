@@ -548,22 +548,22 @@ fn missing_artifact_fails_before_ssh_attempt() {
     );
 }
 
-// ─── mur_version field ───────────────────────────────────────────────────────
+// ─── deploy.mur_version ──────────────────────────────────────────────────────
 
 #[test]
-fn mur_version_parses_from_manifest_yaml() {
+fn deploy_mur_version_parses_from_manifest_yaml() {
     let manifest = RuntimeManifest::from_yaml_str(
-        "name: cap\nversion: 0.1.0\nartifacts: []\nmur_version: \"0.4.5\"\n",
+        "name: cap\nversion: 0.1.0\nartifacts: []\ndeploy:\n  mur_version: \"0.4.5\"\n",
     )
     .unwrap();
-    assert_eq!(manifest.mur_version, Some("0.4.5".to_string()));
+    assert_eq!(manifest.deploy_mur_version(), Some("0.4.5"));
 }
 
 #[test]
-fn mur_version_absent_is_none() {
+fn deploy_mur_version_absent_is_none() {
     let manifest =
         RuntimeManifest::from_yaml_str("name: cap\nversion: 0.1.0\nartifacts: []\n").unwrap();
-    assert_eq!(manifest.mur_version, None);
+    assert_eq!(manifest.deploy_mur_version(), None);
 }
 
 // ─── manifest-referenced file upload ─────────────────────────────────────────

@@ -159,14 +159,15 @@ fn suite() -> &'static Suite {
         );
 
         // An agent child: it binds a port and waits, so it is still running when the launch
-        // returns and can be killed. `mur_version` is deliberately stale, so `mur run` writes one
-        // predictable line to its stderr before anything else — the line a crash quotes back.
+        // returns and can be killed. `stderr_marker` is an unrecognized top-level key, so `mur run`
+        // writes one predictable `W-SEC-019` line to its stderr first — the line a crash quotes
+        // back.
         common::publish_capsule(
             &registry_path,
             "slow-worker",
             "0.1.0",
             &format!(
-                "mur_version: \"0.0.1\"\nartifacts:\n  - name: {DRIVER}\n    version: \
+                "stderr_marker: true\nartifacts:\n  - name: {DRIVER}\n    version: \
                  {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {url}\n      \
                  api_key: test-key\ncapabilities:\n  network:\n    \
                  allow: [{endpoint}]\nlifecycle:\n  task_acceptance: queue\n  after_task: sleep\n\
@@ -765,8 +766,8 @@ fn a_child_killed_without_reporting_is_reported_by_its_launcher() {
         .expect("a delegated launch has an id");
     let pid = child.pid();
     assert!(pid > 0);
-    // The stale `mur_version` warning is the child's own line, and it is on its stderr before
-    // anything else the child does.
+    // The `W-SEC-019` line for `stderr_marker` is the child's own line, and it is on its stderr
+    // before anything else the child does.
     wait_for(
         "the child to write its stderr line",
         Duration::from_secs(60),
@@ -774,7 +775,7 @@ fn a_child_killed_without_reporting_is_reported_by_its_launcher() {
             child
                 .stderr_tail()
                 .iter()
-                .any(|line| line.contains("manifest requires mur 0.0.1"))
+                .any(|line| line.contains("unrecognized key 'stderr_marker'"))
         },
     );
 
@@ -792,7 +793,10 @@ fn a_child_killed_without_reporting_is_reported_by_its_launcher() {
         .as_str()
         .expect("a crash carries detail");
     assert!(detail.contains("signal: 9"), "{detail}");
-    assert!(detail.contains("manifest requires mur 0.0.1"), "{detail}");
+    assert!(
+        detail.contains("unrecognized key 'stderr_marker'"),
+        "{detail}"
+    );
     assert!(
         !parent.heard_of(&delegation_id),
         "the parent must start no task for a completion"

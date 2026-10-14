@@ -1056,6 +1056,29 @@ mod tests {
         assert!(lead_text.contains("after_task: exit"));
     }
 
+    /// The mur release a deploy installs is the deployer's choice, so no scaffold pins it.
+    #[test]
+    fn no_scaffolded_file_pins_mur_version() {
+        for provider in PROVIDERS {
+            let config = InferenceConfig {
+                provider: provider.name.to_string(),
+                ..InferenceConfig::default()
+            };
+            let (_, lead, worker, scaffold) = files(&choose_provider(Some(&config)).unwrap());
+            for (path, text) in &scaffold.files {
+                for line in text.lines() {
+                    assert!(
+                        !line.starts_with("mur_version:") && !line.starts_with("deploy:"),
+                        "{}: {line}",
+                        path.display()
+                    );
+                }
+            }
+            assert_eq!(lead.deploy_mur_version(), None);
+            assert_eq!(worker.deploy_mur_version(), None);
+        }
+    }
+
     #[test]
     fn the_driver_key_is_the_providers_reference() {
         for provider in PROVIDERS {
