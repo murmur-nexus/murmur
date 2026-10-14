@@ -21,8 +21,9 @@ capsule can execute a binary the operator did not name.
 
 The mechanism is one Landlock right. Each allowlisted binary gets a narrow read+execute
 `PathBeneath` grant at its real host path (plus its ELF interpreter and its `DT_NEEDED` closure, so
-it can actually link). The session workdir — the one place the capsule can write — gets every other
-ABI v1 right *except* `Execute`, unless the manifest declares
+it can actually link). The session workdir — the one place the capsule can write — gets every right
+of the ABI the ruleset is built at except device-node and socket creation, and *except* `Execute`,
+unless the manifest declares
 [`capabilities.filesystem.workdir_exec: true`](containment.md#field-workdir-exec).
 
 This replaced a seccomp-notify exec supervisor that intercepted `execve(2)`/`execveat(2)` and
@@ -52,6 +53,10 @@ Six things are checked by hand:
 4. `mur run --explain-scope` reports `workdir exec` and the class it forced;
 5. `trace.jsonl`'s `session_start` carries `workdir_exec`;
 6. `workdir_exec: true` + `capabilities.containment: scoped` refuses with `E-CAP-003`.
+
+Steps 7–12 check the rest of the workdir's right set: that files move and hard-link between its
+folders, that nothing moves across its boundary, and that truncation outside it is refused. Unlike
+steps 1–2, each of these is a committed test that runs a real sandboxed `bash` on a Landlock host.
 
 ## What this deliberately is not
 
@@ -481,6 +486,198 @@ error[E-RUN-001]: failed to compile capsule component: failed to parse WebAssemb
 
 Any `E-CAP-003` or `W-SEC-011` here is a regression against every existing manifest in the repo.
 
+## Steps 7–12 — Moves, hard links and truncation in the workdir
+
+The workdir's rule also carries two rights from Landlock ABIs later than v1. The runtime builds the
+ruleset at the kernel's Landlock ABI, capped at v3:
+
+| Right | From | Grants on the workdir | Without it |
+|-------|------|-----------------------|------------|
+| `Refer` | ABI v2, Linux 5.19 | moving and hard-linking a file between two of its folders | every cross-folder `rename(2)`/`link(2)` fails with `EXDEV` (`Invalid cross-device link`), so `uv` fails |
+| `Truncate` | ABI v3, Linux 6.2 | `truncate(2)`, `ftruncate(2)` and `open(O_TRUNC)` | truncation is not mediated anywhere, so a capsule can zero any host file its user can write |
+
+Steps 8–12 run committed tests in `sandbox::linux_integration_tests`. Each builds its sandbox the
+way a `scoped` session does, from a live host probe, and runs a real `bash` through the production
+spawn path. A line starting `[SKIP-HOST]` or `skipping` means the test proved nothing on that host.
+
+Steps 8, 10 and 12 need a kernel reporting Landlock ABI 2 or later. Steps 9 and 11 need ABI 3 or
+later.
+
+### Step 7 — `mur doctor` and `--explain-scope` name the ABI
+
+Use the `/tmp/we-default` fixture from step 4:
+
+```sh
+(cd /tmp/we-default && "$BIN" doctor)
+"$BIN" run --manifest /tmp/we-default/murmur.yaml --explain-scope | grep 'landlock ABI'
+"$BIN" run --manifest /tmp/we-default/murmur.yaml --explain-scope --json | jq .landlock_abi
+```
+
+Expected on a kernel reporting ABI 3 or later:
+
+```
+Landlock
+  kernel ABI: 8
+  ruleset ABI: 3 (the kernel's, capped at 3)
+```
+
+```
+  landlock ABI: 3
+```
+
+```
+3
+```
+
+On a kernel reporting ABI 1, `mur doctor` adds a line saying that moving or hard-linking a file
+between folders inside the work folder fails with `EXDEV` on this host.
+
+### Step 8 — A move inside the workdir is a real rename
+
+```sh
+cargo nextest run --profile ci -p capsule-runtime --lib --no-capture \
+  linux_integration_tests::kernel_tier_moves_files_between_workdir_folders
+```
+
+The capsule runs `mv a/x b/x`, compares the inode before and after, then `ln b/x a/y` and
+`mv a/d b/d`. Expected:
+
+```
+exit 0
+--- stdout
+mv a/x b/x: inode 38784720 -> 38784720
+ln b/x a/y: ok
+mv a/d b/d: ok
+--- stderr
+---
+```
+
+The same inode number on both sides is the check: the file was renamed, not copied.
+
+### Step 9 — Built at ABI v1, the same link fails with `EXDEV`
+
+```sh
+cargo nextest run --profile ci -p capsule-runtime --lib --no-capture \
+  linux_integration_tests::kernel_tier_at_abi_v1_refuses_cross_folder_links_with_exdev
+```
+
+The test forces the ruleset a 5.13–5.18 kernel gets. Expected:
+
+```
+exit 42
+--- stdout
+mv a/x b/x: inode 38784714 -> 38784715
+--- stderr
+ln: failed to create hard link 'a/y' => 'b/x': Invalid cross-device link
+---
+```
+
+`exit 42` is the script's own exit code, so the capsule launched. `mv` still moved the file, by
+copying it to a new inode and deleting the original. `ln` has no such fallback and fails.
+
+### Step 10 — Nothing moves or links across the workdir boundary
+
+```sh
+cargo nextest run --profile ci -p capsule-runtime --lib --no-capture \
+  linux_integration_tests::kernel_tier_refuses_rename_out_of_the_workdir \
+  linux_integration_tests::kernel_tier_refuses_rename_into_the_workdir
+```
+
+The workdir is `<base>/work`, beside `<base>/outside` on the same filesystem, so a refusal comes
+from Landlock and not from a mount boundary. Expected:
+
+```
+mv: cannot move 'x' to '/tmp/.tmp9JEAJ4/outside/x': Permission denied
+ln: failed to create hard link '/tmp/.tmp9JEAJ4/outside/x2' => 'x': Permission denied
+```
+
+```
+mv: cannot move '/tmp/.tmpeBt9zl/outside/y' to './y': Permission denied
+ln: failed to create hard link './y2' => '/tmp/.tmpeBt9zl/outside/y': Invalid cross-device link
+```
+
+Afterwards each test checks on the host that the source is where it was, with its content, and that
+nothing appeared on the other side.
+
+### Step 11 — Truncation outside the workdir is refused
+
+```sh
+cargo nextest run --profile ci -p capsule-runtime --lib --no-capture \
+  linux_integration_tests::kernel_tier_truncate
+```
+
+Two tests:
+
+| Test | Runs in the capsule | Expected |
+|------|---------------------|----------|
+| `kernel_tier_truncate_outside_the_workdir_is_refused` | `perl -e 'truncate($ARGV[0], 0) or die "$!\n"' <base>/outside/t`, once at the probed ABI and once at ABI v1 | `Permission denied` and `outside/t` still reads `keep`; then at ABI v1 exit 0 and `outside/t` is empty |
+| `kernel_tier_truncate_inside_the_workdir_and_dev_null_still_work` | `truncate -s 0 f`, `>` over an existing file, `: > g`, `echo discard > /dev/null` | exit 0 |
+
+The ABI v1 half of the first test is the gap ABI v3 closes: on a 5.13–6.1 kernel the same call
+succeeds. `perl` may print a locale warning first; the capsule cannot read the host's locale files,
+and the warning does not affect the result.
+
+### Step 12 — `uv venv` and `uv pip install` in the workdir
+
+The test needs a `uv` binary and a small pure-Python wheel, both fetched on the host first:
+
+```sh
+python3 -m venv /tmp/uv-tool && /tmp/uv-tool/bin/pip install uv
+python3 -m pip download --no-deps --only-binary=:all: six==1.16.0 -d /tmp/uv-wheel
+```
+
+On a host without `ensurepip`, take `uv` from its wheel instead:
+
+```sh
+mkdir -p /tmp/uv-dl /tmp/uv-tool/bin
+python3 -m pip download --no-deps --only-binary=:all: uv -d /tmp/uv-dl
+python3 -I -c 'import glob,zipfile; z=zipfile.ZipFile(glob.glob("/tmp/uv-dl/uv-*.whl")[0]); open("/tmp/uv-tool/bin/uv","wb").write(z.read([n for n in z.namelist() if n.endswith("/scripts/uv")][0]))'
+chmod +x /tmp/uv-tool/bin/uv
+```
+
+Then:
+
+```sh
+MURMUR_TEST_UV=/tmp/uv-tool/bin/uv \
+MURMUR_TEST_WHEEL=/tmp/uv-wheel/six-1.16.0-py2.py3-none-any.whl \
+cargo nextest run --profile ci -p capsule-runtime --lib --run-ignored only --no-capture \
+  linux_integration_tests::kernel_tier_uv_installs_a_wheel_in_the_workdir
+```
+
+The capsule runs `uv venv`, then `uv pip install --offline --no-index` of the copied wheel, then
+imports it. Its policy grants `uv`, `python3` and the Python standard library. The install runs
+twice: once at the probed ABI, once at ABI v1. Expected:
+
+```
+exit 0
+--- stdout
+1.16.0
+--- stderr
+Using CPython 3.12.3 interpreter at: /usr/bin/python3.12
+Creating virtual environment at: .venv
+Activate with: source .venv/bin/activate
+Resolved 1 package in 3ms
+Prepared 1 package in 5ms
+Installed 1 package in 1ms
+ + six==1.16.0 (from file:///tmp/.tmpzaQ4RE/six-1.16.0-py2.py3-none-any.whl)
+---
+exit 2
+--- stdout
+--- stderr
+Using CPython 3.12.3 interpreter at: /usr/bin/python3.12
+Creating virtual environment at: .venv
+Activate with: source .venv/bin/activate
+Resolved 1 package in 10ms
+error: Failed to read `six @ file:///tmp/.tmp47OnBk/six-1.16.0-py2.py3-none-any.whl`
+  cause: Failed to write to the distribution cache
+  cause: failed to rename file from /tmp/.tmp47OnBk/.uv-cache/.tmpjnLZ6J to /tmp/.tmp47OnBk/.uv-cache/archive-v0/JlDLU4SWmvmwgx55: Invalid cross-device link (os error 18)
+---
+```
+
+The second run is the reported failure: `uv` unpacks the wheel into a temporary folder in its
+cache and renames it into place, and at ABI v1 that rename is `EXDEV`. Run without the two
+variables, the test fails with a message naming the missing one.
+
 ## Recording the result
 
 Fill this table in on real hardware. `PENDING` is the correct entry for anything not run — do not
@@ -494,6 +691,13 @@ infer a result from a passing build.
 | 4 | `--explain-scope` reports `workdir exec` and the forced class | **PASS (build stage, 2026-08-06)** | See below |
 | 5 | `W-SEC-011` fires at staging / `trace.jsonl` carries `workdir_exec` | **PARTIAL (build stage, 2026-08-06)** — warning observed; `trace.jsonl` half **PENDING** | See below |
 | 6 | `E-CAP-003` on `workdir_exec` + `scoped`; default manifest unaffected | **PASS (build stage, 2026-08-06)** | See below |
+| 7 | `mur doctor` and `--explain-scope` name the ruleset ABI | **PASS (build stage, 2026-10-14)** | [Run of 2026-10-14](#run-of-2026-10-14-moves-links-and-truncation) |
+| 8 | A move between workdir folders keeps its inode; `ln` and a directory move succeed | **PASS (build stage, 2026-10-14)** | [Run of 2026-10-14](#run-of-2026-10-14-moves-links-and-truncation) |
+| 9 | Built at ABI v1, the capsule launches and `ln` across folders is `EXDEV` | **PASS (build stage, 2026-10-14)** | [Run of 2026-10-14](#run-of-2026-10-14-moves-links-and-truncation) |
+| 10 | No move or link out of or into the workdir | **PASS (build stage, 2026-10-14)** | [Run of 2026-10-14](#run-of-2026-10-14-moves-links-and-truncation) |
+| 11 | `truncate(2)` outside the workdir refused; inside and `/dev/null` work | **PASS (build stage, 2026-10-14)** | [Run of 2026-10-14](#run-of-2026-10-14-moves-links-and-truncation) |
+| 12 | `uv venv` + `uv pip install` succeed; fail with `EXDEV` at ABI v1 | **PASS (build stage, 2026-10-14)** | [Run of 2026-10-14](#run-of-2026-10-14-moves-links-and-truncation) |
+| 9 on a real 5.13–5.18 kernel | Probed ABI 1, capsule launches, `ln` across folders is `EXDEV`, `mur doctor` prints the `EXDEV` line | **PENDING** — no such host available | — |
 
 ### Run of 2026-08-06 — build-host observations
 
@@ -530,6 +734,26 @@ build host had. The field is covered by
 `trace::tests::session_start_records_workdir_exec_next_to_the_class_it_forced`, which is a
 serialization test and not a substitute for reading a real session's trace.
 
+### Run of 2026-10-14 — moves, links and truncation
+
+**Host.** `Linux 7.0.0-28-generic`, x86_64, Ubuntu, non-root, bare metal. The kernel reports
+Landlock ABI 8; the runtime builds at ABI 3. The tests resolved to `EnforcementTier::KernelFull`
+(a `scoped` session on a sealed-capable host). No test printed a skip line.
+
+**Step 7.** Against `target/debug/mur` in a project declaring `capabilities.shell.allow: [bash]`:
+
+```
+Landlock
+  kernel ABI: 8
+  ruleset ABI: 3 (the kernel's, capped at 3)
+```
+
+`mur doctor` exited `0` with `All checks passed.`, and `--explain-scope` printed `landlock ABI: 3`
+directly under `userns grant:`; `--explain-scope --json | jq .landlock_abi` printed `3`.
+
+**Steps 8–12.** The outputs in those steps are the real, unedited output of this run, with the
+`uv` 0.13.1 binary taken from its wheel (this host has no `ensurepip`) and `six` 1.16.0.
+
 ### What is still owed
 
 * Step 5's `trace.jsonl` half, on a host with a runnable capsule.
@@ -538,6 +762,7 @@ serialization test and not a substitute for reading a real session's trace.
   meets.
 * Step 1 on a `KernelFull`-only host (no user namespaces), to confirm the property does not depend
   on the composed root that `KernelSealed` additionally installs.
+* Step 9 on a real 5.13–5.18 kernel, where the probe itself reports ABI 1.
 
 ## Related
 

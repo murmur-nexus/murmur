@@ -20,10 +20,10 @@
 //!     destination `sockaddr`, `domain` is an integer in a register, so the kernel's own BPF can
 //!     compare it with no userspace round-trip and no notification at all. This is what stops a
 //!     capsule reaching `/var/run/docker.sock` (host root) over `AF_UNIX`, which no other
-//!     mechanism here covers: a network namespace does not mediate `AF_UNIX` at all, and Landlock
-//!     ABI v1 does not mediate an abstract-namespace socket. `AF_NETLINK`/`AF_PACKET` are denied
-//!     unconditionally; `AF_UNIX` is denied unless `capabilities.network.unix_sockets` says
-//!     otherwise.
+//!     mechanism here covers: a network namespace does not mediate `AF_UNIX` at all, and no
+//!     Landlock ABI the ruleset is built at mediates an abstract-namespace socket.
+//!     `AF_NETLINK`/`AF_PACKET` are denied unconditionally; `AF_UNIX` is denied unless
+//!     `capabilities.network.unix_sockets` says otherwise.
 //!   - **a default-deny syscall allowlist** modelled on the OCI/Docker default seccomp profile —
 //!     see `SECCOMP_SYSCALL_ALLOWLIST`. The filter's default action is `SECCOMP_RET_ERRNO(EPERM)`,
 //!     so a syscall named by neither that array nor one of the rules above is refused outright,
@@ -32,7 +32,10 @@
 //!     `userfaultfd`, `perf_event_open`, `ptrace` and the rest of `SECCOMP_MUST_STAY_DENIED` out
 //!     of a capsule's reach. The filter also sets `SCMP_FLTATR_CTL_LOG`, so each denial reaches
 //!     the kernel audit trail with a syscall number, pid and comm.
-//!   - **Landlock LSM** to scope filesystem access to the capsule's `workdir`. The workdir's own
+//!   - **Landlock LSM** to scope filesystem access to the capsule's `workdir`. The ruleset is
+//!     built at the kernel's Landlock ABI, capped at `LANDLOCK_TARGET_ABI` (v3), so on a 5.19+
+//!     kernel files move and hard-link between folders inside the workdir (`Refer`), and on 6.2+
+//!     truncation outside it is refused (`Truncate`). The workdir's own
 //!     grant deliberately withholds `MakeChar`/`MakeBlock`/`MakeSock`, and withholds `Execute`
 //!     unless `capabilities.filesystem.workdir_exec` is declared — see
 //!     `linux_enforce::WORKDIR_ACCESS_RIGHTS_NO_EXEC` and `linux_enforce::workdir_access_rights`.
@@ -182,6 +185,9 @@ pub(crate) fn applied_tier(
 #[derive(Debug, Clone, Copy)]
 pub struct HostProbe {
     landlock_fully_enforced: Option<bool>,
+    /// The kernel's Landlock ABI, from `linux_enforce::kernel_landlock_abi`. `None` off Linux and
+    /// on a Linux kernel without Landlock.
+    landlock_kernel_abi: Option<u8>,
     sealed: crate::sealed::SealedProbe,
 }
 
@@ -213,11 +219,13 @@ impl HostProbe {
         #[cfg(target_os = "linux")]
         let probe = HostProbe {
             landlock_fully_enforced: linux_enforce::probe_landlock_full_access(),
+            landlock_kernel_abi: linux_enforce::kernel_landlock_abi(),
             sealed: crate::sealed::probe_sealed_support(),
         };
         #[cfg(not(target_os = "linux"))]
         let probe = HostProbe {
             landlock_fully_enforced: None,
+            landlock_kernel_abi: None,
             sealed: crate::sealed::SealedProbe::default(),
         };
         probe
@@ -232,7 +240,18 @@ impl HostProbe {
     ) -> HostProbe {
         HostProbe {
             landlock_fully_enforced,
+            landlock_kernel_abi: None,
             sealed,
+        }
+    }
+
+    /// This probe with its kernel Landlock ABI reading replaced. The seam the ABI tests use to
+    /// resolve a session as a kernel reporting `abi` would, on a host that reports another.
+    #[cfg(test)]
+    pub(crate) fn with_landlock_kernel_abi(self, abi: Option<u8>) -> HostProbe {
+        HostProbe {
+            landlock_kernel_abi: abi,
+            ..self
         }
     }
 
@@ -262,6 +281,12 @@ impl HostProbe {
         } else {
             None
         }
+    }
+
+    /// The kernel's Landlock ABI version, or `None` when the kernel has no Landlock (off Linux
+    /// always). The ABI the session's ruleset is built at is [`ruleset_landlock_abi`] of this.
+    pub fn landlock_kernel_abi(&self) -> Option<u8> {
+        self.landlock_kernel_abi
     }
 
     /// How many probes this process has taken, counting from zero at startup and never
@@ -302,6 +327,77 @@ pub fn detect_sealed_blocker() -> Option<crate::sealed::SealedBlocker> {
 /// moment.
 pub fn detect_userns_grant() -> Option<crate::sealed::UsernsGrant> {
     HostProbe::probe().userns_grant()
+}
+
+/// The kernel's Landlock ABI version, or `None` when there is no Landlock (off Linux always), from
+/// a reading taken here.
+///
+/// Takes its own probe, as its neighbours do; a session reads it off its own [`HostProbe`].
+pub fn detect_landlock_abi() -> Option<u8> {
+    HostProbe::probe().landlock_kernel_abi()
+}
+
+/// The highest Landlock ABI a capsule's ruleset is built at.
+///
+/// v2 adds `Refer` (moving and hard-linking between folders) and v3 adds `Truncate`, both granted
+/// on the workdir — see `linux_enforce::WORKDIR_ACCESS_RIGHTS_NO_EXEC`. v4 is not taken: it
+/// handles TCP `bind`/`connect`, and declaring those rights would deny every TCP connection the
+/// rules do not re-grant, which is the network namespace and egress proxy's boundary to draw. v5
+/// (`IoctlDev`) and v6 (abstract unix sockets and signals) each move a different boundary again.
+pub(crate) const LANDLOCK_TARGET_ABI: u8 = 3;
+
+/// The Landlock ABI this session's ruleset is built at: the kernel's, capped at
+/// [`LANDLOCK_TARGET_ABI`], on the two tiers that install a Landlock domain, and `None` on every
+/// other tier or when the kernel reports no Landlock.
+///
+/// Pure, so the ABI the trace records and the ABI the child builds at are the same function of
+/// the same [`HostProbe`] reading.
+pub(crate) fn ruleset_landlock_abi(kernel_abi: Option<u8>, tier: EnforcementTier) -> Option<u8> {
+    match tier {
+        EnforcementTier::KernelFull | EnforcementTier::KernelSealed => kernel_abi
+            .filter(|abi| *abi >= 1)
+            .map(|abi| abi.min(LANDLOCK_TARGET_ABI)),
+        EnforcementTier::KernelSeccompOnly | EnforcementTier::EnvironmentOnly => None,
+    }
+}
+
+/// The lines `mur doctor` prints under its `Landlock` heading for a kernel reporting
+/// `kernel_abi`: what the kernel offers, what the runtime builds at, and what a capsule loses on
+/// this host below [`LANDLOCK_TARGET_ABI`].
+///
+/// Pure and cross-platform, so a test can check the exact words for a kernel this host is not.
+pub fn landlock_doctor_lines(kernel_abi: Option<u8>) -> Vec<String> {
+    if !cfg!(target_os = "linux") {
+        return vec!["kernel ABI: n/a (Landlock is a Linux mechanism)".to_string()];
+    }
+    let Some(kernel) = kernel_abi.filter(|abi| *abi >= 1) else {
+        return vec![
+            "kernel ABI: none (no Landlock on this host)".to_string(),
+            "ruleset ABI: n/a (no Landlock domain is installed)".to_string(),
+        ];
+    };
+    let built = kernel.min(LANDLOCK_TARGET_ABI);
+    let mut lines = vec![
+        format!("kernel ABI: {kernel}"),
+        format!("ruleset ABI: {built} (the kernel's, capped at {LANDLOCK_TARGET_ABI})"),
+    ];
+    if built < 2 {
+        lines.push(
+            "moving or hard-linking a file between folders inside the work folder fails with \
+             EXDEV (Invalid cross-device link) on this host; Linux 5.19 (Landlock ABI v2) \
+             permits it. Tools that fall back to copy-and-delete (mv, pip, git) still work; uv \
+             and other tools that rename atomically between folders do not."
+                .to_string(),
+        );
+    }
+    if built < 3 {
+        lines.push(
+            "truncate(2) on a file outside the work folder is not mediated below Landlock ABI v3 \
+             (Linux 6.2)."
+                .to_string(),
+        );
+    }
+    lines
 }
 
 /// Resolves every host in `network_allow` (via `crate::network_policy::parse_network_allow_rules`,
@@ -467,11 +563,12 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
 // ---- derived Landlock read+execute grant set ----
 //
 // On `KernelFull`, Landlock scopes the shell subprocess tree to the workdir. The workdir rule
-// grants `linux_enforce::WORKDIR_ACCESS_RIGHTS` (everything in ABI v1 except device-node and
-// unix-socket creation), but — once `restrict_self()` lands — `Execute`/`ReadFile` are then denied
-// on every path *outside* the workdir, including the `shell.allow` binaries themselves, their ELF
-// interpreter (dynamic loader), and every shared library they pull in. That silently defeats the
-// seccomp exec-allowlist: each allowlisted `execve` fails with EACCES before it runs.
+// grants `linux_enforce::workdir_access_rights` (every right of the ABI the ruleset is built at
+// except device-node and unix-socket creation, and `Execute` unless `workdir_exec`), but — once
+// `restrict_self()` lands — `Execute`/`ReadFile` are then denied on every path *outside* the
+// workdir, including the `shell.allow` binaries themselves, their ELF interpreter (dynamic loader),
+// and every shared library they pull in. That silently defeats the seccomp exec-allowlist: each
+// allowlisted `execve` fails with EACCES before it runs.
 //
 // The functions below derive the exact extra paths that must get a narrow read+execute grant
 // outside the workdir: the canonical `shell.allow` binaries (already resolved by
@@ -1138,7 +1235,8 @@ pub(crate) struct CapsuleDeviceGrant {
 /// Three entries, no more — `apply_landlock_scope` adds one `PathBeneath` rule per entry, and
 /// every device path *not* listed here (`/dev/random`, `/dev/full`, `/dev/tty`, `/dev/sda`, …)
 /// stays denied by the same mechanism that already denies every other unlisted path: with
-/// `handle_access` declaring the full ABI v1 right-set, "no rule" means "denied", not "ungoverned".
+/// `handle_access` declaring the full right-set of the ABI the ruleset is built at, "no rule" means
+/// "denied", not "ungoverned".
 ///
 ///   - **`/dev/null` — read *and* write.** This is the one deliberate exception to "nothing
 ///     outside the workdir is writable". A read-only grant would be broken, not merely strict:
@@ -1794,6 +1892,15 @@ pub(crate) struct ShellEnforcement {
     /// nothing to withhold — which is part of why that tier cannot reach `scoped`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) workdir_exec: bool,
+    /// The Landlock ABI the child's ruleset is built at: [`ruleset_landlock_abi`] of the session's
+    /// [`HostProbe`] and [`Self::tier`], decided here so the ABI `session_start` records is the one
+    /// installed. `None` on the tiers with no Landlock domain, and off Linux always.
+    ///
+    /// On `KernelFull`/`KernelSealed` a `None` builds at ABI v1, the narrowest set, so a missing
+    /// reading can only narrow what the capsule may do. `Some(1)` likewise reproduces exactly
+    /// what a 5.13–5.18 kernel installs, which is how the tests force that ruleset on a newer one.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) landlock_abi: Option<u8>,
     /// Narrow read (never write) Landlock grants *outside* the workdir so the allowlisted
     /// binaries can actually exec, dynamically link, and (for a path-based interpreter) reach their
     /// stdlib. Five origins, combined here:
@@ -1924,6 +2031,7 @@ impl ShellEnforcement {
             egress_tcp_ports,
             unix_sockets_allowed: policy.unix_sockets_allowed,
             workdir_exec: policy.workdir_exec_allowed,
+            landlock_abi: ruleset_landlock_abi(probe.landlock_kernel_abi(), tier),
             landlock_grants,
             sealed_bind_dirs,
             staged_runtime_dirs,
@@ -2008,6 +2116,9 @@ impl ShellEnforcement {
             // Denied, like every other grant this constructor zeroes out. Inert on this tier (no
             // Landlock domain exists to withhold anything from), but it must not read as "allowed".
             workdir_exec: false,
+            // No Landlock domain on this tier. A test that spreads this over a Landlock tier
+            // builds at ABI v1, the narrowest set.
+            landlock_abi: None,
             landlock_grants: Vec::new(),
             sealed_bind_dirs: Vec::new(),
             staged_runtime_dirs: Vec::new(),
@@ -2502,6 +2613,7 @@ pub(crate) fn prepare_enforcement(
             &enforcement.landlock_grants,
             &landlock_device_grants(enforcement.tier),
             enforcement.workdir_exec,
+            enforcement.landlock_abi,
             enforcement.tier,
         )?)
     } else {
@@ -2890,6 +3002,10 @@ mod linux_enforce {
         /// applies to so `apply_landlock_scope` — which runs in `pre_exec` and must read nothing
         /// but its argument — has the whole workdir rule decided for it before fork.
         workdir_exec: bool,
+        /// The Landlock ABI the ruleset is built at, decided in the parent from the session's
+        /// [`super::HostProbe`] (see [`super::ShellEnforcement::landlock_abi`]) so the child reads
+        /// no host state of its own. `None` builds at ABI v1, the narrowest set.
+        abi: Option<u8>,
         /// `<workdir>/.mur-tmp` — the directory `plan_composed_root` bind-mounts at `/tmp` inside
         /// the composed root — opened on `KernelSealed` and `None` on every other tier, which has
         /// no composed root and therefore no such bind.
@@ -2935,13 +3051,29 @@ mod linux_enforce {
         }
     }
 
-    /// The Landlock ABI v1 rights granted on the capsule **workdir's own** `PathBeneath` rule,
+    /// The Landlock rights granted on the capsule **workdir's own** `PathBeneath` rule,
     /// *excluding* `Execute` — see [`workdir_access_rights`], which adds it back for a capsule that
     /// declared `capabilities.filesystem.workdir_exec: true`.
     ///
-    /// Spelled out variant by variant rather than `AccessFs::from_all(ABI::V1)` for two reasons:
-    /// `from_all` hides what is actually handed to the capsule, and four of ABI v1's thirteen
-    /// rights are withheld from this constant.
+    /// Spelled out variant by variant rather than `AccessFs::from_all` for two reasons: `from_all`
+    /// hides what is actually handed to the capsule, and four rights are withheld from this
+    /// constant. It is the set for [`super::LANDLOCK_TARGET_ABI`]; `apply_landlock_scope` masks it
+    /// to the ABI the ruleset is built at, so on an older kernel the rights that ABI does not know
+    /// simply drop out.
+    ///
+    /// Two rights are granted from an ABI later than v1:
+    ///
+    ///   - `Refer` (ABI v2, Linux 5.19) — moving and hard-linking a file between two folders.
+    ///     Landlock refuses every cross-folder `rename(2)`/`link(2)` with `EXDEV` unless both
+    ///     folders grant it, whether or not the ruleset handles it, so without it `uv` and every
+    ///     other tool that renames a finished file into place fails in the workdir. It reaches
+    ///     nothing outside: the destination of a move must grant at least the source's rights, and
+    ///     no rule outside the workdir and its own `/tmp` store carries `Refer` or any write right.
+    ///   - `Truncate` (ABI v3, Linux 6.2) — `truncate(2)`, `ftruncate(2)` and `open(O_TRUNC)`.
+    ///     Below v3 Landlock does not mediate truncation at all, so a capsule could zero any host
+    ///     file its uid can write. Handling it denies that everywhere except the rules that grant
+    ///     it, which are exactly the ones already carrying `WriteFile`: this one and the writable
+    ///     devices.
     ///
     ///   - `Execute` — the one this constant withholds *conditionally*. Withholding it is what
     ///     makes `capabilities.shell.allow` a complete, sound statement: Landlock refuses the exec
@@ -2967,8 +3099,8 @@ mod linux_enforce {
     /// `MakeFifo` stays granted: real build tooling does create named pipes in its working tree,
     /// and a FIFO carries none of the raw-device risk above.
     ///
-    /// Because `apply_landlock_scope`'s `handle_access` still declares the *full*
-    /// `from_all(ABI::V1)` set, a right this rule withholds is not merely "not extra-granted" — it
+    /// Because `apply_landlock_scope`'s `handle_access` declares the *full* `from_all` set of the
+    /// ABI it builds at, a right this rule withholds is not merely "not extra-granted" — it
     /// is **denied on every path this rule covers**, workdir included, once `restrict_self()` takes
     /// effect — so withholding `Execute` here is enforcement, not a mere omission. The three
     /// `Make*` rights are denied domain-wide because no other rule grants them either; `Execute`
@@ -2985,6 +3117,8 @@ mod linux_enforce {
             | MakeReg
             | MakeFifo
             | MakeSym
+            | Refer
+            | Truncate
     });
 
     /// The workdir's `PathBeneath` rights for one capsule: [`WORKDIR_ACCESS_RIGHTS_NO_EXEC`], plus
@@ -3000,6 +3134,30 @@ mod linux_enforce {
         } else {
             WORKDIR_ACCESS_RIGHTS_NO_EXEC
         }
+    }
+
+    /// The kernel's Landlock ABI version, or `None` when the kernel has no Landlock.
+    ///
+    /// `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` returns the version and
+    /// creates nothing — no ruleset fd and no domain — so unlike
+    /// [`probe_landlock_full_access`] it is safe to call in-process. A kernel built without
+    /// Landlock, or with it disabled at boot, fails it with `ENOSYS`/`EOPNOTSUPP`.
+    pub(super) fn kernel_landlock_abi() -> Option<u8> {
+        const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+        // SAFETY: with a null attribute pointer, a zero size and only the VERSION flag set, the
+        // kernel reads no memory and allocates no fd; the call has no side effect to undo.
+        let version = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<libc::c_void>(),
+                0usize,
+                LANDLOCK_CREATE_RULESET_VERSION,
+            )
+        };
+        if version <= 0 {
+            return None;
+        }
+        Some(u8::try_from(version).unwrap_or(u8::MAX))
     }
 
     /// Probes real Landlock support by building a ruleset granting full access to `/` and
@@ -3030,6 +3188,9 @@ mod linux_enforce {
         const PROBE_PARTIAL: i32 = 1;
         const PROBE_FAILED: i32 = 2;
 
+        // ABI v1 on purpose: this decides whether a Landlock tier is available at all, which v1
+        // answers on every Landlock kernel. The ABI a capsule's ruleset is built at is read
+        // separately, by `kernel_landlock_abi`.
         let abi = ABI::V1;
         let access_all = AccessFs::from_all(abi);
 
@@ -3741,11 +3902,11 @@ mod linux_enforce {
     ///     `true` everywhere except the two tier-issued sealed grants, which are deliberately
     ///     readable (and, on a directory, enumerable) but not runnable;
     ///   - each entry of the fixed [`CAPSULE_DEVICE_GRANTS`] set gets `ReadFile`, plus `WriteFile`
-    ///     if its `writable` bit is set. That bit is set for exactly one path — `/dev/null` — which
-    ///     is therefore the *only* writable path outside the workdir in the whole sandbox. This
-    ///     list is a compile-time constant, not manifest-derived: no capability declaration widens
-    ///     or narrows it. Every device path it does not name stays denied by the ordinary
-    ///     no-matching-rule path below.
+    ///     and `Truncate` if its `writable` bit is set. That bit is set for exactly one path —
+    ///     `/dev/null` — which is therefore the *only* writable path outside the workdir in the
+    ///     whole sandbox. This list is a compile-time constant, not manifest-derived: no capability
+    ///     declaration widens or narrows it. Every device path it does not name stays denied by the
+    ///     ordinary no-matching-rule path below.
     ///
     /// Without the second kind of rule, `restrict_self()` denies `Execute`/`ReadFile` on every
     /// path outside the workdir, so every allowlisted binary's `execve` fails with EACCES before
@@ -3755,8 +3916,15 @@ mod linux_enforce {
     /// so a write to any other outside path — including one of these read+execute grant paths — is
     /// still denied.
     ///
-    /// `handle_access` must declare the union of every access bit any rule uses, and it stays the
-    /// **full** ABI v1 set deliberately: a bit declared there but granted by no rule is denied for
+    /// The ruleset is built at `fds.abi` — the kernel's ABI capped at
+    /// [`super::LANDLOCK_TARGET_ABI`], decided in the parent — or at ABI v1 when that is `None`. `handle_access` declares the
+    /// **full** `from_all` set of that ABI, under `CompatLevel::HardRequirement`, and every rule's
+    /// rights are masked to it first: a right the ABI does not know would otherwise fail
+    /// `add_rule`, and masking it out is what a kernel of that ABI would enforce anyway. Built at
+    /// v1, the ruleset is bit for bit the one a 5.13–5.18 kernel gets.
+    ///
+    /// `handle_access` must declare the union of every access bit any rule uses, and it is the
+    /// full set deliberately: a bit declared there but granted by no rule is denied for
     /// the whole domain, which is exactly how the rights missing from
     /// [`WORKDIR_ACCESS_RIGHTS_NO_EXEC`] become denied rather than merely un-granted, and it is also what
     /// makes every device outside [`CAPSULE_DEVICE_GRANTS`] denied. A grant path — or a device
@@ -3776,8 +3944,8 @@ mod linux_enforce {
             RulesetCreatedAttr, ABI,
         };
 
-        let abi = ABI::V1;
-        let access_all = AccessFs::from_all(abi);
+        let abi = fds.abi.map_or(ABI::V1, |abi| ABI::from(i32::from(abi)));
+        let handled = AccessFs::from_all(abi);
         // Enough for the loader to open, read, and map-execute a binary or shared library, and to
         // open a file inside a granted directory by exact name — but no write access, and (without
         // `ReadDir`) no enumeration of the directory's own entries.
@@ -3793,9 +3961,11 @@ mod linux_enforce {
         // `ReadDir` on a non-directory with `EINVAL`, and a rejected rule fails the launch below.
         let read_only: BitFlags<AccessFs> = AccessFs::ReadFile.into();
         // Device rights. No `Execute` (a character device is never exec'd) and no `ReadDir` (it is
-        // not a directory) — only the two data bits, with `WriteFile` reserved for `/dev/null`.
+        // not a directory) — only the data bits, with `WriteFile` reserved for the writable
+        // devices. `Truncate` rides with `WriteFile` because a shell's `>/dev/null` opens with
+        // `O_TRUNC`, and handling `Truncate` from ABI v3 would otherwise refuse it.
         let device_read: BitFlags<AccessFs> = AccessFs::ReadFile.into();
-        let device_read_write = device_read | AccessFs::WriteFile;
+        let device_read_write = device_read | AccessFs::WriteFile | AccessFs::Truncate;
 
         // The one writable right-set in this function, resolved once and used by both rules that
         // carry it. The composed root's `/tmp` is a bind of a directory inside the workdir — the
@@ -3803,14 +3973,14 @@ mod linux_enforce {
         // included: `workdir_exec: false` must no more permit running a binary from `/tmp` than
         // from the workdir it is stored in. Sharing the binding is what keeps that true; two
         // separate calls could drift apart.
-        let writable_rights = workdir_access_rights(fds.workdir_exec);
+        let writable_rights = workdir_access_rights(fds.workdir_exec) & handled;
 
         // Every fd here was already opened in the parent (before fork). This function performs no
         // `open()`/`canonicalize()` — only the Landlock ruleset syscalls against already-open fds,
         // so a failure here can only be the kernel call itself, not an unrelated path resolution.
         let mut ruleset = Ruleset::default()
             .set_compatibility(CompatLevel::HardRequirement)
-            .handle_access(access_all)
+            .handle_access(handled)
             .map_err(|error| format!("landlock: handle_access failed: {error}"))?
             .create()
             .map_err(|error| format!("landlock: ruleset create failed: {error}"))?
@@ -3833,7 +4003,7 @@ mod linux_enforce {
         // the grant loop's rules for those two paths are taken on the host's files, not on these.
         for identity_fd in &fds.sealed_identity_fds {
             ruleset = ruleset
-                .add_rule(PathBeneath::new(identity_fd.as_fd(), read_only))
+                .add_rule(PathBeneath::new(identity_fd.as_fd(), read_only & handled))
                 .map_err(|error| {
                     format!("landlock: add_rule for a synthetic /etc file failed: {error}")
                 })?;
@@ -3850,7 +4020,7 @@ mod linux_enforce {
                 (false, false) => read_only,
             };
             ruleset = ruleset
-                .add_rule(PathBeneath::new(grant.fd.as_fd(), access))
+                .add_rule(PathBeneath::new(grant.fd.as_fd(), access & handled))
                 .map_err(|error| format!("landlock: add_rule for grant failed: {error}"))?;
         }
 
@@ -3864,7 +4034,7 @@ mod linux_enforce {
                 device_read
             };
             ruleset = ruleset
-                .add_rule(PathBeneath::new(device.fd.as_fd(), access))
+                .add_rule(PathBeneath::new(device.fd.as_fd(), access & handled))
                 .map_err(|error| format!("landlock: add_rule for device failed: {error}"))?;
         }
 
@@ -3907,6 +4077,7 @@ mod linux_enforce {
         landlock_grants: &[LandlockGrant],
         device_grants: &[super::CapsuleDeviceGrant],
         workdir_exec: bool,
+        abi: Option<u8>,
         tier: EnforcementTier,
     ) -> Result<LandlockChildFds, String> {
         let workdir_fd = open_o_path(accessible_workdir)
@@ -3991,6 +4162,7 @@ mod linux_enforce {
         Ok(LandlockChildFds {
             workdir_fd,
             workdir_exec,
+            abi,
             sealed_tmp_fd,
             sealed_identity_fds,
             grants,
@@ -4927,6 +5099,126 @@ mod tests {
             tier_from_probe(false, Some(true), sealed_capable()),
             EnforcementTier::EnvironmentOnly
         );
+    }
+
+    /// The ruleset ABI is the kernel's, capped at v3, on the two Landlock tiers only.
+    #[test]
+    fn ruleset_landlock_abi_is_the_kernel_abi_capped_at_the_target_on_landlock_tiers() {
+        for tier in [EnforcementTier::KernelFull, EnforcementTier::KernelSealed] {
+            for (kernel, built) in [
+                (Some(1), Some(1)),
+                (Some(2), Some(2)),
+                (Some(3), Some(3)),
+                (Some(8), Some(3)),
+                (Some(u8::MAX), Some(3)),
+            ] {
+                assert_eq!(
+                    ruleset_landlock_abi(kernel, tier),
+                    built,
+                    "kernel ABI {kernel:?} on {tier:?}"
+                );
+            }
+        }
+    }
+
+    /// No Landlock on the kernel, or a tier that installs no Landlock domain, builds at no ABI.
+    #[test]
+    fn ruleset_landlock_abi_is_none_without_a_kernel_abi_or_a_landlock_tier() {
+        for tier in [EnforcementTier::KernelFull, EnforcementTier::KernelSealed] {
+            assert_eq!(ruleset_landlock_abi(None, tier), None);
+            assert_eq!(ruleset_landlock_abi(Some(0), tier), None);
+        }
+        for tier in [
+            EnforcementTier::KernelSeccompOnly,
+            EnforcementTier::EnvironmentOnly,
+        ] {
+            for kernel in [None, Some(0), Some(1), Some(3), Some(8)] {
+                assert_eq!(
+                    ruleset_landlock_abi(kernel, tier),
+                    None,
+                    "kernel ABI {kernel:?} on {tier:?}"
+                );
+            }
+        }
+    }
+
+    /// `ShellEnforcement::resolve` carries the ruleset ABI of the probe it is handed, keyed on the
+    /// applied tier, and an all-negative probe carries none.
+    #[test]
+    fn ruleset_landlock_abi_reaches_shell_enforcement_from_the_probe() {
+        let negative = HostProbe::from_parts(None, crate::sealed::SealedProbe::default());
+        for abi in [None, Some(1), Some(8)] {
+            let enforcement = ShellEnforcement::resolve(
+                &CapabilityPolicy::default(),
+                murmur_artifact::ContainmentClass::Advisory,
+                negative.with_landlock_kernel_abi(abi),
+            )
+            .unwrap();
+            assert_eq!(
+                enforcement.landlock_abi,
+                ruleset_landlock_abi(abi, enforcement.tier),
+                "kernel ABI {abi:?}"
+            );
+            // An all-negative probe resolves below the Landlock tiers on every OS.
+            assert_eq!(enforcement.landlock_abi, None);
+        }
+        if cfg!(target_os = "linux") {
+            let full = HostProbe::from_parts(Some(true), crate::sealed::SealedProbe::default());
+            let enforcement = ShellEnforcement::resolve(
+                &CapabilityPolicy::default(),
+                murmur_artifact::ContainmentClass::Scoped,
+                full.with_landlock_kernel_abi(Some(8)),
+            )
+            .unwrap();
+            assert_eq!(enforcement.tier, EnforcementTier::KernelFull);
+            assert_eq!(enforcement.landlock_abi, Some(LANDLOCK_TARGET_ABI));
+        }
+    }
+
+    /// The `mur doctor` Landlock block for each kernel ABI that changes what it says.
+    #[test]
+    fn landlock_doctor_lines_name_the_kernel_and_ruleset_abi() {
+        if !cfg!(target_os = "linux") {
+            for abi in [None, Some(1), Some(8)] {
+                assert_eq!(
+                    landlock_doctor_lines(abi),
+                    vec!["kernel ABI: n/a (Landlock is a Linux mechanism)".to_string()]
+                );
+            }
+            return;
+        }
+
+        let none = landlock_doctor_lines(None).join("\n");
+        assert!(none.contains("no Landlock on this host"), "{none}");
+        assert_eq!(landlock_doctor_lines(Some(0)), landlock_doctor_lines(None));
+
+        let v1 = landlock_doctor_lines(Some(1)).join("\n");
+        assert!(v1.contains("kernel ABI: 1"), "{v1}");
+        assert!(v1.contains("ruleset ABI: 1"), "{v1}");
+        assert!(v1.contains("EXDEV"), "{v1}");
+        assert!(v1.contains("Invalid cross-device link"), "{v1}");
+        assert!(v1.contains("Linux 5.19 (Landlock ABI v2)"), "{v1}");
+        assert!(v1.contains("uv"), "{v1}");
+
+        let v2 = landlock_doctor_lines(Some(2)).join("\n");
+        assert!(v2.contains("kernel ABI: 2"), "{v2}");
+        assert!(v2.contains("ruleset ABI: 2"), "{v2}");
+        assert!(!v2.contains("EXDEV"), "{v2}");
+        assert!(
+            v2.contains("not mediated below Landlock ABI v3 (Linux 6.2)"),
+            "{v2}"
+        );
+
+        for kernel in [3, 8] {
+            let lines = landlock_doctor_lines(Some(kernel));
+            assert_eq!(
+                lines,
+                vec![
+                    format!("kernel ABI: {kernel}"),
+                    "ruleset ABI: 3 (the kernel's, capped at 3)".to_string(),
+                ]
+            );
+        }
     }
 
     /// A capsule that declared the weaker class keeps the weaker mechanism, even where the host
@@ -6679,19 +6971,25 @@ mod linux_integration_tests {
     }
 
     /// Pure content check on the workdir access-right set: no kernel call, no fork, no spawn.
-    /// It pins *which* Landlock ABI v1 rights `apply_landlock_scope` hands the workdir, so
-    /// re-adding device-node creation becomes a test failure instead of a silent regression.
+    /// It pins *which* rights of [`LANDLOCK_TARGET_ABI`] `apply_landlock_scope` hands the workdir,
+    /// so re-adding device-node creation, or losing the move and truncate rights, becomes a test
+    /// failure instead of a silent regression.
     ///
     /// It proves **nothing** about whether the kernel enforces that set — that is the manual
     /// acceptance procedure in
-    /// `docs/content/reference/workdir-device-node-manual-verification.md`, not this test.
+    /// `docs/content/reference/workdir-device-node-manual-verification.md` and the
+    /// `kernel_tier_*` tests below, not this test.
     /// It lives in this `#[cfg(target_os = "linux")]` module rather than the cross-platform
     /// `tests` module only because `landlock::AccessFs` is a Linux-only dependency.
     #[test]
     fn workdir_landlock_grant_withholds_device_and_socket_creation() {
         use landlock::{Access, AccessFs, ABI};
 
-        let all_v1 = AccessFs::from_all(ABI::V1);
+        assert_eq!(
+            LANDLOCK_TARGET_ABI, 3,
+            "this test pins the ABI v3 set; raising the cap needs this test revisited with it"
+        );
+        let all_v3 = AccessFs::from_all(ABI::V3);
         // The `workdir_exec: true` set — the widest the workdir can ever be — so the three
         // unconditionally-withheld rights below are checked against the permissive case rather
         // than passing trivially because `Execute` happened to be absent too.
@@ -6699,15 +6997,24 @@ mod linux_integration_tests {
 
         for withheld in [AccessFs::MakeChar, AccessFs::MakeBlock, AccessFs::MakeSock] {
             assert!(
-                all_v1.contains(withheld),
-                "{withheld:?} is expected to be part of Landlock ABI v1 — if it is not, this \
+                all_v3.contains(withheld),
+                "{withheld:?} is expected to be part of Landlock ABI v3 — if it is not, this \
                  test's premise (and the workdir grant's comment) needs revisiting"
             );
             assert!(
                 !granted.contains(withheld),
-                "the workdir grant must withhold {withheld:?}: with the full ABI v1 set declared \
+                "the workdir grant must withhold {withheld:?}: with the full ABI set declared \
                  by handle_access, withholding it here is what makes it denied rather than merely \
                  un-granted"
+            );
+        }
+
+        for added in [AccessFs::Refer, AccessFs::Truncate] {
+            assert!(
+                granted.contains(added),
+                "the workdir grant must carry {added:?}: without Refer a move between workdir \
+                 folders is EXDEV, and without Truncate a v3 ruleset refuses truncating the \
+                 capsule's own files"
             );
         }
 
@@ -6716,12 +7023,36 @@ mod linux_integration_tests {
             "MakeFifo stays granted — real build tooling creates named pipes in its working tree"
         );
 
-        let expected = all_v1 & !(AccessFs::MakeChar | AccessFs::MakeBlock | AccessFs::MakeSock);
+        let expected = all_v3 & !(AccessFs::MakeChar | AccessFs::MakeBlock | AccessFs::MakeSock);
         assert_eq!(
             granted, expected,
-            "the workdir_exec grant must be exactly Landlock ABI v1 minus \
+            "the workdir_exec grant must be exactly Landlock ABI v3 minus \
              MakeChar/MakeBlock/MakeSock — nothing else may be added or dropped without updating \
              this test and the constant's comment together"
+        );
+    }
+
+    /// The workdir right set as a ruleset built at ABI v1 sees it, after `apply_landlock_scope`
+    /// masks it to the handled set: exactly the set installed before `Refer` and `Truncate` were
+    /// granted, so a 5.13–5.18 kernel gets the ruleset it always did.
+    #[test]
+    fn workdir_rights_masked_to_abi_v1_equal_the_pre_refer_set() {
+        use landlock::{Access, AccessFs, ABI};
+
+        let all_v1 = AccessFs::from_all(ABI::V1);
+        let masked = linux_enforce::workdir_access_rights(true) & all_v1;
+
+        assert_eq!(
+            masked,
+            all_v1 & !(AccessFs::MakeChar | AccessFs::MakeBlock | AccessFs::MakeSock),
+            "masked to ABI v1, the workdir grant must be the v1 set minus the three Make* rights"
+        );
+        assert!(!masked.contains(AccessFs::Refer));
+        assert!(!masked.contains(AccessFs::Truncate));
+        assert_eq!(
+            linux_enforce::workdir_access_rights(false) & all_v1,
+            masked & !AccessFs::Execute,
+            "masking must not move the workdir_exec axis"
         );
     }
 
@@ -6774,6 +7105,7 @@ mod linux_integration_tests {
             &[],
             &[],
             false,
+            None,
             EnforcementTier::KernelSealed,
         )
         .expect("a real, writable workdir must yield sealed Landlock fds");
@@ -6811,6 +7143,7 @@ mod linux_integration_tests {
                 &[],
                 &[],
                 false,
+                None,
                 tier,
             )
             .expect("a real, writable workdir must yield Landlock fds on any tier");
@@ -6847,6 +7180,7 @@ mod linux_integration_tests {
             &[],
             &[],
             false,
+            None,
             EnforcementTier::KernelSealed,
         )
         .expect("a real, writable workdir must yield sealed Landlock fds");
@@ -6890,6 +7224,7 @@ mod linux_integration_tests {
                 &[],
                 &[],
                 false,
+                None,
                 tier,
             )
             .expect("a real, writable workdir must yield Landlock fds on any tier");
@@ -7328,6 +7663,401 @@ mod linux_integration_tests {
         assert_ne!(
             result.exit_code, 0,
             "reading a file outside the Landlock-scoped workdir must fail under KernelFull"
+        );
+    }
+
+    // ---- moves, links and truncation under the ruleset ABI ----
+    //
+    // The tests below resolve their enforcement the way a session does — `ShellEnforcement::resolve`
+    // over a live `HostProbe` at `scoped` — so the ruleset ABI they run under is the one the probe
+    // fills. Each one that needs a newer ABI than this host offers prints a skip line and returns.
+
+    /// A `scoped` session's enforcement for `policy`, from a live probe, or `None` (after a skip
+    /// line naming `test`) when this host cannot install a Landlock domain at `min_abi` or above.
+    fn scoped_landlock_enforcement(
+        test: &str,
+        policy: &CapabilityPolicy,
+        min_abi: u8,
+    ) -> Option<ShellEnforcement> {
+        if crate::network_namespace::skip_without_egress_namespace(test) {
+            return None;
+        }
+        let probe = HostProbe::probe();
+        let enforcement =
+            ShellEnforcement::resolve(policy, murmur_artifact::ContainmentClass::Scoped, probe)
+                .unwrap();
+        if enforcement.tier != EnforcementTier::KernelFull
+            || enforcement.landlock_abi < Some(min_abi)
+        {
+            eprintln!(
+                "skipping {test}: needs EnforcementTier::KernelFull with a Landlock ruleset at ABI \
+                 {min_abi} or later; resolved {:?} at ABI {:?} (kernel reports {:?})",
+                enforcement.tier,
+                enforcement.landlock_abi,
+                probe.landlock_kernel_abi()
+            );
+            return None;
+        }
+        Some(enforcement)
+    }
+
+    fn coreutils_policy(extra: &[&str]) -> CapabilityPolicy {
+        let mut shell_allow: Vec<String> = ["bash", "mkdir", "mv", "ln", "stat", "cat"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        shell_allow.extend(extra.iter().map(|name| name.to_string()));
+        CapabilityPolicy {
+            shell_allow,
+            ..CapabilityPolicy::default()
+        }
+    }
+
+    fn run_bash_in(
+        workdir: &Path,
+        script: &str,
+        policy: &CapabilityPolicy,
+        enforcement: &ShellEnforcement,
+    ) -> crate::shell::ShellResult {
+        let result = crate::shell::execute_shell(
+            "bash",
+            &["-c", script],
+            &[],
+            workdir,
+            workdir,
+            policy,
+            enforcement,
+        )
+        .unwrap();
+        println!(
+            "exit {}\n--- stdout\n{}--- stderr\n{}---",
+            result.exit_code, result.stdout, result.stderr
+        );
+        result
+    }
+
+    /// A `<base>/work` workdir with a sibling `<base>/outside` on the same filesystem, so a
+    /// refusal between them is Landlock's and never the VFS's cross-mount `EXDEV`.
+    fn work_and_outside() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let base = tempfile::tempdir().unwrap();
+        let work = base.path().join("work");
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        (base, work, outside)
+    }
+
+    /// With `Refer` granted on the workdir, `mv` between two of its folders is a real `rename(2)`
+    /// (the inode survives), and `ln` and a directory reparent across folders both succeed.
+    #[test]
+    fn kernel_tier_moves_files_between_workdir_folders() {
+        let test = "kernel_tier_moves_files_between_workdir_folders";
+        let policy = coreutils_policy(&[]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 3) else {
+            return;
+        };
+        assert_eq!(enforcement.tier, EnforcementTier::KernelFull);
+        assert_eq!(enforcement.landlock_abi, Some(3));
+
+        let temp = tempfile::tempdir().unwrap();
+        let result = run_bash_in(
+            temp.path(),
+            r#"set -e
+mkdir a b
+echo payload > a/x
+before=$(stat -c %i a/x)
+mv a/x b/x
+after=$(stat -c %i b/x)
+echo "mv a/x b/x: inode $before -> $after"
+[ "$before" = "$after" ] || { echo "inode changed, mv copied instead of renaming" >&2; exit 10; }
+ln b/x a/y
+[ "$(cat a/y)" = payload ] || exit 11
+echo "ln b/x a/y: ok"
+mkdir a/d
+mv a/d b/d
+[ -d b/d ] && [ ! -e a/d ] || exit 12
+echo "mv a/d b/d: ok"
+"#,
+            &policy,
+            &enforcement,
+        );
+
+        assert_eq!(
+            result.exit_code, 0,
+            "a move, a hard link and a directory reparent between workdir folders must all \
+             succeed under Refer"
+        );
+    }
+
+    /// The ruleset a 5.13–5.18 kernel gets, forced through the same `landlock_abi` field the probe
+    /// fills: the capsule still launches, `ln` across folders is `EXDEV`, and `mv` survives only
+    /// by copying.
+    #[test]
+    fn kernel_tier_at_abi_v1_refuses_cross_folder_links_with_exdev() {
+        let test = "kernel_tier_at_abi_v1_refuses_cross_folder_links_with_exdev";
+        let policy = coreutils_policy(&[]);
+        let Some(mut enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        enforcement.landlock_abi = Some(1);
+
+        let temp = tempfile::tempdir().unwrap();
+        let result = run_bash_in(
+            temp.path(),
+            r#"mkdir a b || exit 20
+echo payload > a/x || exit 21
+before=$(stat -c %i a/x)
+mv a/x b/x || exit 22
+[ -f b/x ] && [ ! -e a/x ] || exit 23
+after=$(stat -c %i b/x)
+echo "mv a/x b/x: inode $before -> $after"
+[ "$before" != "$after" ] || exit 24
+if ln b/x a/y; then exit 25; fi
+exit 42
+"#,
+            &policy,
+            &enforcement,
+        );
+
+        assert_eq!(
+            result.exit_code, 42,
+            "the capsule must launch at ABI v1 and run the script to its own exit code: mv falls \
+             back to copy-and-delete (a new inode) and ln fails"
+        );
+        assert!(
+            result.stderr.contains("Invalid cross-device link"),
+            "ln across workdir folders at ABI v1 must fail with EXDEV; stderr: {}",
+            result.stderr
+        );
+    }
+
+    /// Nothing is moved or linked out of the workdir into a sibling folder on the same filesystem.
+    #[test]
+    fn kernel_tier_refuses_rename_out_of_the_workdir() {
+        let test = "kernel_tier_refuses_rename_out_of_the_workdir";
+        let policy = coreutils_policy(&[]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 2) else {
+            return;
+        };
+
+        let (_base, work, outside) = work_and_outside();
+        let script = format!(
+            r#"echo payload > x || exit 20
+if mv x '{outside}/x'; then exit 21; fi
+if ln x '{outside}/x2'; then exit 22; fi
+exit 0
+"#,
+            outside = outside.display()
+        );
+        let result = run_bash_in(&work, &script, &policy, &enforcement);
+
+        assert_eq!(
+            result.exit_code, 0,
+            "mv and ln out of the workdir must both fail"
+        );
+        assert!(
+            work.join("x").exists(),
+            "the source must stay in the workdir"
+        );
+        assert!(!outside.join("x").exists(), "nothing may be moved out");
+        assert!(!outside.join("x2").exists(), "nothing may be linked out");
+    }
+
+    /// Nothing is moved or linked into the workdir from a sibling folder on the same filesystem.
+    #[test]
+    fn kernel_tier_refuses_rename_into_the_workdir() {
+        let test = "kernel_tier_refuses_rename_into_the_workdir";
+        let policy = coreutils_policy(&[]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 2) else {
+            return;
+        };
+
+        let (_base, work, outside) = work_and_outside();
+        std::fs::write(outside.join("y"), "original\n").unwrap();
+        let script = format!(
+            r#"if mv '{outside}/y' ./y; then exit 21; fi
+if ln '{outside}/y' ./y2; then exit 22; fi
+exit 0
+"#,
+            outside = outside.display()
+        );
+        let result = run_bash_in(&work, &script, &policy, &enforcement);
+
+        assert_eq!(
+            result.exit_code, 0,
+            "mv and ln into the workdir must both fail"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("y")).unwrap(),
+            "original\n",
+            "the outside file must be untouched"
+        );
+        assert!(!work.join("y").exists(), "nothing may be moved in");
+        assert!(!work.join("y2").exists(), "nothing may be linked in");
+    }
+
+    /// A by-path `truncate(2)` on a host file outside the workdir: refused once the ruleset
+    /// handles `Truncate` (ABI v3), and not mediated at all at ABI v1 — the gap v3 closes.
+    #[test]
+    fn kernel_tier_truncate_outside_the_workdir_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let test = "kernel_tier_truncate_outside_the_workdir_is_refused";
+        let policy = coreutils_policy(&["perl"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 3) else {
+            return;
+        };
+
+        let (_base, work, outside) = work_and_outside();
+        let target = outside.join("t");
+        std::fs::write(&target, "keep\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let script = format!(
+            r#"perl -e 'truncate($ARGV[0], 0) or die "$!\n"' '{}'"#,
+            target.display()
+        );
+
+        let refused = run_bash_in(&work, &script, &policy, &enforcement);
+        assert_ne!(
+            refused.exit_code, 0,
+            "truncate(2) outside the workdir must be refused at ABI 3"
+        );
+        assert!(
+            refused.stderr.contains("Permission denied"),
+            "the refusal must be EACCES; stderr: {}",
+            refused.stderr
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep\n");
+
+        let mut at_v1 = enforcement.clone();
+        at_v1.landlock_abi = Some(1);
+        let unmediated = run_bash_in(&work, &script, &policy, &at_v1);
+        assert_eq!(
+            unmediated.exit_code, 0,
+            "at ABI v1 truncate(2) is not mediated, which is the gap this test pins as closed above"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
+    }
+
+    /// Handling `Truncate` must not refuse what a capsule truncates legitimately: its own files,
+    /// with `truncate` and with a `>` redirect over an existing file, and `/dev/null`.
+    #[test]
+    fn kernel_tier_truncate_inside_the_workdir_and_dev_null_still_work() {
+        let test = "kernel_tier_truncate_inside_the_workdir_and_dev_null_still_work";
+        let policy = coreutils_policy(&["truncate"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 3) else {
+            return;
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let result = run_bash_in(
+            temp.path(),
+            r#"set -e
+echo hello > f && truncate -s 0 f && [ ! -s f ]
+echo again > f && echo over > f && [ "$(cat f)" = over ]
+: > g
+echo discard > /dev/null
+echo ok
+"#,
+            &policy,
+            &enforcement,
+        );
+
+        assert_eq!(
+            result.exit_code, 0,
+            "truncating inside the workdir and writing to /dev/null must keep working"
+        );
+    }
+
+    /// The reported bug end to end: `uv venv` then `uv pip install <wheel>` in the workdir,
+    /// offline, which renames the unpacked wheel out of uv's cache into the venv. Passes at the
+    /// probed ABI, and fails with `EXDEV` at ABI v1, so the pass is `Refer`'s.
+    ///
+    /// Ignored because it needs two host-side inputs a stock host does not have:
+    /// `MURMUR_TEST_UV`, an absolute path to a `uv` binary, and `MURMUR_TEST_WHEEL`, an absolute
+    /// path to a pure-Python wheel such as `six-1.16.0-py2.py3-none-any.whl`. Run without them it
+    /// panics naming the missing variable. `uv`, `python3` and its stdlib are granted by this
+    /// test's policy only.
+    #[test]
+    #[ignore = "needs MURMUR_TEST_UV and MURMUR_TEST_WHEEL; see the doc comment"]
+    fn kernel_tier_uv_installs_a_wheel_in_the_workdir() {
+        let test = "kernel_tier_uv_installs_a_wheel_in_the_workdir";
+        let input = |name: &str| {
+            let value = std::env::var(name)
+                .unwrap_or_else(|_| panic!("{test} needs {name} set to an absolute path"));
+            let path = PathBuf::from(value);
+            assert!(
+                path.is_absolute() && path.is_file(),
+                "{name}={} is not a file",
+                path.display()
+            );
+            path
+        };
+        let uv = input("MURMUR_TEST_UV");
+        let wheel = input("MURMUR_TEST_WHEEL");
+        let python = std::fs::canonicalize("/usr/bin/python3").expect("host python3");
+        let stdlib = std::process::Command::new(&python)
+            .args([
+                "-I",
+                "-c",
+                "import sysconfig; print(sysconfig.get_paths()['stdlib'])",
+            ])
+            .output()
+            .expect("host python3 runs");
+        let stdlib = String::from_utf8(stdlib.stdout).unwrap().trim().to_string();
+
+        let policy = CapabilityPolicy {
+            shell_allow: vec![
+                "bash".to_string(),
+                uv.display().to_string(),
+                python.display().to_string(),
+            ],
+            shell_interpreter_runtime: vec![InterpreterRuntimeGrant {
+                binary: "python3".to_string(),
+                dirs: vec![murmur_artifact::InterpreterRuntimeDir {
+                    path: stdlib,
+                    list_dir: true,
+                }],
+            }],
+            ..CapabilityPolicy::default()
+        };
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 2) else {
+            return;
+        };
+
+        let wheel_name = wheel.file_name().unwrap().to_str().unwrap().to_string();
+        let script = format!(
+            r#"set -e
+export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
+'{uv}' venv --python '{python}' .venv
+'{uv}' pip install --offline --no-index --python .venv/bin/python './{wheel_name}'
+.venv/bin/python -c 'import six; print(six.__version__)'
+"#,
+            uv = uv.display(),
+            python = python.display(),
+        );
+        let install = |enforcement: &ShellEnforcement| {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::copy(&wheel, temp.path().join(&wheel_name)).unwrap();
+            run_bash_in(temp.path(), &script, &policy, enforcement)
+        };
+
+        let at_probed = install(&enforcement);
+        assert_eq!(
+            at_probed.exit_code, 0,
+            "uv must install the wheel at ABI {:?}",
+            enforcement.landlock_abi
+        );
+        assert!(at_probed.stdout.contains("1.16.0"), "{}", at_probed.stdout);
+
+        let mut at_v1 = enforcement.clone();
+        at_v1.landlock_abi = Some(1);
+        let refused = install(&at_v1);
+        let output = format!("{}{}", refused.stdout, refused.stderr);
+        assert_ne!(refused.exit_code, 0, "at ABI v1 the install must fail");
+        assert!(
+            output.contains("os error 18") || output.contains("Invalid cross-device link"),
+            "at ABI v1 the install must fail with EXDEV, reproducing the reported bug: {output}"
         );
     }
 

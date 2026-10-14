@@ -477,6 +477,16 @@ pub struct ScopeReport {
     /// profile confining `mur` — otherwise produce byte-identical reports while differing enormously
     /// in what else on the machine can create a user namespace.
     pub userns_grant: Option<UsernsGrant>,
+    /// The Landlock ABI this session's ruleset is built at: the kernel's, capped at
+    /// [`crate::sandbox::LANDLOCK_TARGET_ABI`], or `null` when no Landlock domain is installed —
+    /// a tier below `landlock+seccomp`, or a kernel without Landlock.
+    ///
+    /// Keyed on [`crate::sandbox::applied_tier`], like [`Self::filesystem_boundary`], and computed
+    /// by the same [`crate::sandbox::ruleset_landlock_abi`] the shell child builds at, so the
+    /// trace records the ruleset that was installed. Always serialized, on the same terms as
+    /// [`Self::userns_grant`]. Below 2 a file cannot be moved or hard-linked between two folders
+    /// of the workdir; below 3 truncating a host file outside it is not refused.
+    pub landlock_abi: Option<u8>,
     /// `capabilities.filesystem.scope`, verbatim.
     pub filesystem_scope: Option<String>,
     /// `capabilities.filesystem.workdir_exec`. Always present (never skipped when `false`), so a
@@ -687,6 +697,13 @@ impl ScopeReport {
             match self.userns_grant {
                 Some(grant) => grant.wire_name(),
                 None => "n/a",
+            }
+        ));
+        out.push_str(&format!(
+            "  landlock ABI: {}\n",
+            match self.landlock_abi {
+                Some(abi) => abi.to_string(),
+                None => "n/a".to_string(),
             }
         ));
 
@@ -916,6 +933,7 @@ pub fn explain_scope(
         probe.tier(),
         probe.sealed_blocker(),
         probe.userns_grant(),
+        probe.landlock_kernel_abi(),
         exports,
         state_stores,
         configured_artifacts,
@@ -933,6 +951,7 @@ pub(crate) fn scope_report_for_tier(
     tier: EnforcementTier,
     sealed_blocker: Option<SealedBlocker>,
     userns_grant: Option<UsernsGrant>,
+    landlock_kernel_abi: Option<u8>,
     exports: Option<&Exports>,
     state_stores: Vec<StateStoreReport>,
     configured_artifacts: Vec<String>,
@@ -942,8 +961,8 @@ pub(crate) fn scope_report_for_tier(
     let achieved = achieved_containment_class(tier, policy.workdir_exec_allowed);
     // The tier this session would actually install: the host reading `enforcement_tier`
     // reports, capped by the declared floor, which is the same `sandbox::applied_tier`
-    // `ShellEnforcement::resolve` runs. Two fields below are keyed on it rather than on
-    // `achieved`, because both describe mechanisms rather than the class this host can back.
+    // `ShellEnforcement::resolve` runs. Three fields below are keyed on it rather than on
+    // `achieved`, because all three describe mechanisms rather than the class this host can back.
     let applied = crate::sandbox::applied_tier(tier, declared);
     let shortfall_reason = containment_shortfall_reason(
         declared,
@@ -959,6 +978,7 @@ pub(crate) fn scope_report_for_tier(
         shortfall_reason,
         enforcement_tier: enforcement_tier_name(tier),
         userns_grant,
+        landlock_abi: crate::sandbox::ruleset_landlock_abi(landlock_kernel_abi, applied),
         // Copied straight through and never consulted above: `achieved` is already computed, and
         // no export or peer grant may reach it.
         exports_files: exports
@@ -1447,6 +1467,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1489,6 +1510,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1527,6 +1549,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1541,6 +1564,7 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
+            None,
             None,
             None,
             None,
@@ -1567,6 +1591,7 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
+            None,
             None,
             None,
             None,
@@ -1602,6 +1627,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1632,6 +1658,7 @@ mod tests {
                 ContainmentClass::Sealed,
                 *tier,
                 Some(SealedBlocker::NamespaceCreationDenied),
+                None,
                 None,
                 None,
                 Vec::new(),
@@ -1665,6 +1692,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1686,6 +1714,7 @@ mod tests {
             Some(SealedBlocker::NamespaceCreationDenied),
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1702,6 +1731,7 @@ mod tests {
             ContainmentClass::Sealed,
             EnforcementTier::EnvironmentOnly,
             Some(SealedBlocker::NotLinux),
+            None,
             None,
             None,
             Vec::new(),
@@ -1723,6 +1753,7 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Sealed,
             EnforcementTier::KernelSealed,
+            None,
             None,
             None,
             None,
@@ -1748,6 +1779,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1763,6 +1795,60 @@ mod tests {
         assert!(value.get("shortfall_reason").is_none());
     }
 
+    /// `landlock_abi` is the ruleset ABI of the *applied* tier: the kernel's capped at 3 on a
+    /// Landlock tier, `null` below one, and the key is present either way.
+    #[test]
+    fn scope_report_names_the_landlock_abi_the_ruleset_is_built_at() {
+        let report = |tier, kernel| {
+            scope_report_for_tier(
+                &sample_policy(),
+                ContainmentClass::Scoped,
+                tier,
+                None,
+                None,
+                kernel,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                IoMaxReport::default(),
+            )
+        };
+
+        for (tier, kernel, expected) in [
+            (EnforcementTier::KernelFull, Some(8), Some(3)),
+            (EnforcementTier::KernelSealed, Some(8), Some(3)),
+            (EnforcementTier::KernelFull, Some(2), Some(2)),
+            (EnforcementTier::KernelFull, Some(1), Some(1)),
+            (EnforcementTier::KernelFull, None, None),
+            (EnforcementTier::KernelSeccompOnly, Some(8), None),
+            (EnforcementTier::EnvironmentOnly, None, None),
+        ] {
+            let scope = report(tier, kernel);
+            assert_eq!(
+                scope.landlock_abi, expected,
+                "{tier:?} with kernel {kernel:?}"
+            );
+
+            let value: serde_json::Value = serde_json::to_value(&scope).unwrap();
+            assert!(value.as_object().unwrap().contains_key("landlock_abi"));
+            match expected {
+                Some(abi) => assert_eq!(value["landlock_abi"], abi),
+                None => assert!(value["landlock_abi"].is_null()),
+            }
+
+            let rendered = scope.render();
+            let line = match expected {
+                Some(abi) => format!("  landlock ABI: {abi}\n"),
+                None => "  landlock ABI: n/a\n".to_string(),
+            };
+            assert!(rendered.contains(&line), "{rendered}");
+            assert!(
+                rendered.find("userns grant:").unwrap() < rendered.find("landlock ABI:").unwrap()
+            );
+        }
+    }
+
     /// The grant is reported, and it never moves a class, a floor or a mechanism: the same tier
     /// with four different grants produces four reports that differ in exactly one field.
     #[test]
@@ -1771,6 +1857,7 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Advisory,
             EnforcementTier::KernelSealed,
+            None,
             None,
             None,
             None,
@@ -1787,6 +1874,7 @@ mod tests {
                 EnforcementTier::KernelSealed,
                 None,
                 Some(*grant),
+                None,
                 None,
                 Vec::new(),
                 Vec::new(),
@@ -1819,6 +1907,7 @@ mod tests {
             ContainmentClass::Sealed,
             EnforcementTier::KernelFull,
             Some(SealedBlocker::AppArmorProfileMissing),
+            None,
             None,
             None,
             Vec::new(),
@@ -1858,6 +1947,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -1867,6 +1957,7 @@ mod tests {
                     &policy,
                     ContainmentClass::Scoped,
                     *tier,
+                    None,
                     None,
                     None,
                     Some(&Exports {
@@ -1934,6 +2025,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -1943,6 +2035,7 @@ mod tests {
                     &with_policy,
                     ContainmentClass::Scoped,
                     *tier,
+                    None,
                     None,
                     None,
                     Some(&Exports {
@@ -1999,6 +2092,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2015,6 +2109,7 @@ mod tests {
             },
             ContainmentClass::Advisory,
             EnforcementTier::KernelSealed,
+            None,
             None,
             None,
             Some(&Exports {
@@ -2051,6 +2146,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2068,6 +2164,7 @@ mod tests {
             },
             ContainmentClass::Advisory,
             EnforcementTier::KernelSealed,
+            None,
             None,
             None,
             Some(&Exports {
@@ -2096,6 +2193,7 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Scoped,
             tier,
+            None,
             None,
             None,
             peer_tasks
@@ -2187,6 +2285,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2196,6 +2295,7 @@ mod tests {
             &policy,
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
+            None,
             None,
             None,
             None,
@@ -2275,6 +2375,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2284,6 +2385,7 @@ mod tests {
             &policy,
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
+            None,
             None,
             None,
             None,
@@ -2361,6 +2463,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2373,6 +2476,7 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Advisory,
             EnforcementTier::KernelFull,
+            None,
             None,
             None,
             Some(&Exports {
@@ -2405,6 +2509,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2420,6 +2525,7 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Advisory,
             EnforcementTier::KernelFull,
+            None,
             None,
             None,
             Some(&Exports {
@@ -2460,6 +2566,7 @@ mod tests {
             &policy,
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
+            None,
             None,
             None,
             None,
@@ -2662,6 +2769,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2685,6 +2793,7 @@ mod tests {
             &sample_policy(),
             declared,
             tier,
+            None,
             None,
             None,
             None,
@@ -2853,6 +2962,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2956,6 +3066,7 @@ mod tests {
                 &policy,
                 declared,
                 probe.tier(),
+                None,
                 None,
                 None,
                 None,

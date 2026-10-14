@@ -4675,6 +4675,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -5171,6 +5172,7 @@ mod tests {
                 None,
                 Some(grant),
                 None,
+                None,
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -5226,6 +5228,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -5268,6 +5271,8 @@ mod tests {
             EnforcementTier::KernelFull,
             None,
             None,
+            // A kernel above the cap, so `landlock_abi` is written as an integer, not `null`.
+            Some(8),
             None,
             // Populated rather than empty so the whole-report assertion below really covers this
             // field: an empty vec would pass whether or not it was written at all.
