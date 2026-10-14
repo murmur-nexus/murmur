@@ -375,6 +375,10 @@ pub struct StageRequest {
     pub manifest_dir: PathBuf,
     pub capsule_name: String,
     pub capsule_version: String,
+    /// The full `<scope>/<name>` the capsule was resolved by, for one launched by name
+    /// (`mur run --capsule`). The session registers with mur-roost and reports its completion
+    /// under it. `None` for a capsule run from a project directory, which is `local/<capsule_name>`.
+    pub capsule_artifact: Option<String>,
     pub capsule_component_bytes: Vec<u8>,
     pub artifacts: Vec<ArtifactRequest>,
     pub allowlisted_tools: HashSet<String>,
@@ -509,9 +513,13 @@ pub struct StagedSession {
     pub(crate) manifest_dir: PathBuf,
     pub(crate) capsule_name: String,
     pub(crate) capsule_version: String,
+    /// [`StageRequest::capsule_artifact`], or `local/<capsule_name>` for a project run.
+    pub(crate) capsule_artifact: String,
     pub(crate) capsule_url: String,
     pub resolved_lock_artifacts: Vec<ResolvedLockArtifact>,
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
+    /// Each staged artifact's full name, by the tool name the session knows it by.
+    pub(crate) artifact_full_names: std::collections::HashMap<String, String>,
     pub(crate) inference: Option<InferenceConfig>,
     /// Every credential gateway of the session, built at staging from each artifact entry's
     /// `gateway:` block and the artifact's own `upstream_auth:` declaration. Empty when no entry

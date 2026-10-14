@@ -177,11 +177,12 @@ fn publish_writes_into_the_global_store_whatever_the_environment_holds() {
         .arg(&artifact)
         .assert()
         .success()
-        .stdout(predicate::str::contains("Published my-skill@1.0.0"));
+        .stdout(predicate::str::contains("Published local/my-skill@1.0.0"));
 
     let version_dir = home
         .path()
         .join(".murmur/artifacts")
+        .join("local")
         .join("my-skill")
         .join("1.0.0");
     assert!(
@@ -194,7 +195,7 @@ fn publish_writes_into_the_global_store_whatever_the_environment_holds() {
 // ── a registry: block in murmur.yaml is refused ──────────────────────────────
 
 const CAPSULE_WITH_REGISTRY_BLOCK: &str =
-    "name: cap\nversion: 0.1.0\nartifacts:\n  - name: foo\n    version: 1.0.0\n    runtime: tool\nregistry:\n  default: local\n";
+    "name: cap\nversion: 0.1.0\nartifacts:\n  - name: local/foo\n    version: 1.0.0\n    runtime: tool\nregistry:\n  default: local\n";
 
 fn assert_registry_block_refused(assert: assert_cmd::assert::Assert) {
     assert

@@ -1,7 +1,9 @@
 # Default Artifacts
 
-Murmur publishes the artifacts below. Declare one in `artifacts:` and install it with
-[`mur install`](installing-artifacts.md) — none of them has to be built locally.
+Murmur publishes the artifacts below from `murmur-nexus/default-artifacts`, in the `murmur` scope:
+each is named `murmur/<name>`, and a capsule's model calls a tool by `<name>` alone — see
+[Artifact names](../concepts/registry.md#artifact-names). Declare one in `artifacts:` and install
+it with [`mur install`](installing-artifacts.md) — none of them has to be built locally.
 [`mur search`](cli.md#mur-search) reads the same index from the terminal.
 
 This page also documents the environment the runtime hands hook and driver components.
@@ -16,9 +18,9 @@ provider, and name it in [`inference.driver.artifact`](manifest.md#field-inferen
 
 | Artifact | Provider |
 |---|---|
-| `murmur-driver-anthropic` | Anthropic Messages API |
-| `murmur-driver-openai` | OpenAI Chat Completions, and the Responses API for `gpt-5` and later models |
-| `murmur-driver-deepseek` | DeepSeek |
+| `murmur/driver-anthropic` | Anthropic Messages API |
+| `murmur/driver-openai` | OpenAI Chat Completions, and the Responses API for `gpt-5` and later models |
+| `murmur/driver-deepseek` | DeepSeek |
 
 Every driver reads the same [inference environment](#driver-environment) and passes
 [`inference.max_tokens`](manifest.md#inference-max-tokens) through unchanged as the provider's
@@ -32,7 +34,7 @@ Declare one with `runtime: driver`, no `gateway:` block, and name it in
 
 | Artifact | Harness |
 |---|---|
-| `murmur-driver-claude-code` | The Claude CLI (`claude`) |
+| `murmur/driver-claude-code` | The Claude CLI (`claude`) |
 
 See [Run a capsule on your subscription](../how-to/run-capsule-on-subscription.md)
 for what that transport costs before you choose it.
@@ -48,23 +50,23 @@ need a [`filesystem` grant](manifest.md#hook-capabilities).
 
 | Artifact | Fires on | What it does |
 |---|---|---|
-| `murmur-hook-compact` | `on-compaction` | Summarizes conversation history when the session token threshold is reached, and replaces the context with the summary |
-| `murmur-hook-debug` | Every event except `on-stage` | Appends one JSON object per lifecycle event to `hook-debug.jsonl` |
-| `murmur-hook-diff-summary` | Every event | Snapshots files before each editor tool call and emits a unified-diff summary at the end of the turn |
-| `murmur-hook-eval` | Every event | Scores the session against the configured scorers and writes `eval.jsonl` |
-| `murmur-hook-grafana` | Every event | Emits OpenTelemetry spans for each lifecycle event to a Grafana Tempo OTLP/HTTP endpoint |
-| `murmur-hook-memory` | `on-task-start` | Seeds a task with the relevant, budget-bounded slice of the conversation record read so far |
-| `murmur-hook-regression-verifier` | Every event | Watches a task's test runs and reopens the task when a change broke previously-passing tests |
-| `murmur-hook-shell-desc` | `on-stage` | Returns enriched tool manifests for common shell binaries at staging time |
+| `murmur/hook-compact` | `on-compaction` | Summarizes conversation history when the session token threshold is reached, and replaces the context with the summary |
+| `murmur/hook-debug` | Every event except `on-stage` | Appends one JSON object per lifecycle event to `hook-debug.jsonl` |
+| `murmur/hook-diff-summary` | Every event | Snapshots files before each editor tool call and emits a unified-diff summary at the end of the turn |
+| `murmur/hook-eval` | Every event | Scores the session against the configured scorers and writes `eval.jsonl` |
+| `murmur/hook-grafana` | Every event | Emits OpenTelemetry spans for each lifecycle event to a Grafana Tempo OTLP/HTTP endpoint |
+| `murmur/hook-memory` | `on-task-start` | Seeds a task with the relevant, budget-bounded slice of the conversation record read so far |
+| `murmur/hook-regression-verifier` | Every event | Watches a task's test runs and reopens the task when a change broke previously-passing tests |
+| `murmur/hook-shell-desc` | `on-stage` | Returns enriched tool manifests for common shell binaries at staging time |
 
-### `murmur-hook-debug`
+### `murmur/hook-debug` { #murmur-hook-debug }
 
 The quickest way to see what the runtime dispatched during a session. It is the only shipped hook
 that runs `execution_mode: async`, so the agent loop never waits on it.
 
 ```yaml
 artifacts:
-  - name: murmur-hook-debug
+  - name: murmur/hook-debug
     version: "{{ v.murmur_hook_debug }}"
     runtime: hook
     capabilities:
@@ -75,11 +77,11 @@ artifacts:
 `scope: .` mounts the accessible workdir as the hook's current directory, which is where
 `hook-debug.jsonl` lands.
 
-### `murmur-hook-grafana`
+### `murmur/hook-grafana` { #murmur-hook-grafana }
 
 ```yaml
 artifacts:
-  - name: murmur-hook-grafana
+  - name: murmur/hook-grafana
     version: "{{ v.murmur_hook_grafana }}"
     runtime: hook
 
@@ -88,14 +90,14 @@ observability:
 ```
 
 Without `observability.otel_endpoint` the hook logs a warning to
-`workdir/logs/hook-murmur-hook-grafana.log` and exports nothing for that session. The session runs
+`workdir/logs/hook-hook-grafana.log` and exports nothing for that session. The session runs
 as normal.
 
-### `murmur-hook-eval`
+### `murmur/hook-eval` { #murmur-hook-eval }
 
 ```yaml
 artifacts:
-  - name: murmur-hook-eval
+  - name: murmur/hook-eval
     version: "{{ v.murmur_hook_eval }}"
     runtime: hook
 
@@ -111,7 +113,7 @@ observability:
 ```
 
 Without an `observability.eval` block the hook logs a warning to
-`workdir/logs/hook-murmur-hook-eval.log` and scores nothing. The session runs as normal.
+`workdir/logs/hook-hook-eval.log` and scores nothing. The session runs as normal.
 
 See [Scorer types](observability-schemas.md#structured-evaluation-evaljsonl) for what each scorer
 measures and the shape of the file it writes, [`observability.eval`](manifest.md#field-observability)
@@ -124,17 +126,17 @@ files.
 
 | Artifact | What it does |
 |---|---|
-| `murmur-tool-code-coverage` | Spectrum-based fault localization (Ochiai / Tarantula) over per-test LCOV reports the agent has already captured. Reads a repository indexed by `murmur-tool-code-graph` |
-| `murmur-tool-code-graph` | Indexes a Rust or Python repository into a symbol/edge graph and answers structured queries over it. Symbols are addressed by a stable identity rather than by `file:line` |
-| `murmur-tool-corpus` | Append-only, schema-validated record store for a capsule's own notes, behind the capsule's `capabilities.state` grant |
-| `murmur-tool-create` | Scaffolds a new tool artifact directory: `murmur.yaml`, a stub implementation and a README |
-| `murmur-tool-editor` | Reads, writes, patches and searches files without a shell grant |
-| `murmur-tool-git` | Structured git operations returning typed JSON, in place of `git` in `capabilities.shell.allow` |
-| `murmur-tool-registry-search` | Searches the artifact index by keyword |
-| `murmur-tool-request-input` | Pauses the agent loop and requests external input over A2A; the answer comes back as the tool result |
-| `murmur-tool-test-report` | Parses a test-runner output file the agent has already captured into a structured list of failures |
+| `murmur/tool-code-coverage` | Spectrum-based fault localization (Ochiai / Tarantula) over per-test LCOV reports the agent has already captured. Reads a repository indexed by `murmur/tool-code-graph` |
+| `murmur/tool-code-graph` | Indexes a Rust or Python repository into a symbol/edge graph and answers structured queries over it. Symbols are addressed by a stable identity rather than by `file:line` |
+| `murmur/tool-corpus` | Append-only, schema-validated record store for a capsule's own notes, behind the capsule's `capabilities.state` grant |
+| `murmur/tool-create` | Scaffolds a new tool artifact directory: `murmur.yaml`, a stub implementation and a README |
+| `murmur/tool-editor` | Reads, writes, patches and searches files without a shell grant |
+| `murmur/tool-git` | Structured git operations returning typed JSON, in place of `git` in `capabilities.shell.allow` |
+| `murmur/tool-registry-search` | Searches the artifact index by keyword |
+| `murmur/tool-request-input` | Pauses the agent loop and requests external input over A2A; the answer comes back as the tool result |
+| `murmur/tool-test-report` | Parses a test-runner output file the agent has already captured into a structured list of failures |
 
-### `murmur-tool-corpus`
+### `murmur/tool-corpus` { #murmur-tool-corpus }
 
 An append-only JSON-lines store for records a capsule wants to keep across turns —
 `state/corpus.jsonl`, reachable only where the manifest entry grants
@@ -155,7 +157,7 @@ entry with none gets `config_missing` on every operation but `verify`. A line th
 is skipped rather than failing the call: the response carries `skipped_lines` and
 `skipped_line_count` so the damage reaches the trace on the next call.
 
-### `murmur-tool-registry-search`
+### `murmur/tool-registry-search` { #murmur-tool-registry-search }
 
 Returns ranked matches with name, version, runtime, description and publication date, so a capsule
 can discover artifacts mid-session. It takes three inputs:
@@ -176,8 +178,8 @@ with `E-RUN-008` if it is not installed first.
 
 | Artifact | What it does |
 |---|---|
-| `murmur-skill-create-manifest` | How to write a valid `murmur.yaml`. `mur new` loads it into its generator capsule |
-| `murmur-skill-investigation-checkpoint` | The `checkpoints/decisions.json` convention for recording and reusing investigative verdicts across a session |
+| `murmur/skill-create-manifest` | How to write a valid `murmur.yaml`. `mur new` loads it into its generator capsule |
+| `murmur/skill-investigation-checkpoint` | The `checkpoints/decisions.json` convention for recording and reusing investigative verdicts across a session |
 
 ---
 

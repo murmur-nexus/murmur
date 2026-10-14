@@ -63,9 +63,9 @@ before the first task begins
 | `max_session_tokens` | u64 \| null | [`inference.max_session_tokens`](manifest.md#inference-max-session-tokens). Always present; `null` when no session ceiling applies |
 | `machine_tokens_per_day` | u64 \| null | [`spend.machine_tokens_per_day`](config.md#spend) when this session is counted against it. Always present; `null` when no machine ceiling was in effect, and under `transport: process` |
 | `capabilities` | string[] | The capability categories the manifest granted anything under: `"network"`, `"filesystem"`, `"shell"` |
-| `tools_declared` | string[] | Names of the tools offered to the model |
+| `tools_declared` | string[] | Names of the tools offered to the model: each artifact's bare name, the part of its full name after the `/` |
 | `tool_refresh` | string \| null | [`inference.tool_refresh`](manifest.md#inference-tool-refresh): `"compaction"` \| `"immediate"` under `transport: http`, `null` under `transport: process`. Always written |
-| `runtime_artifacts` | array of object | Every staged artifact whose [`murmur.lock` pin](workdir.md#lock-origin) a running capsule fetched, in staging order. One object per artifact: `name`, `version`, `origin` (always `"runtime"`), `session` (the session whose `manage.pull()` wrote the pin) and `trust` (always `"untrusted"`). Each reached the model marked — see [Artifact origin](../concepts/access-control.md#artifact-origin). Always written; `[]` when every staged artifact is operator-pinned |
+| `runtime_artifacts` | array of object | Every staged artifact whose [`murmur.lock` pin](workdir.md#lock-origin) a running capsule fetched, in staging order. One object per artifact: `name` (the full name, `<scope>/<name>`), `version`, `origin` (always `"runtime"`), `session` (the session whose `manage.pull()` wrote the pin) and `trust` (always `"untrusted"`). Each reached the model marked — see [Artifact origin](../concepts/access-control.md#artifact-origin). Always written; `[]` when every staged artifact is operator-pinned |
 | `containment_declared` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the strongest class the manifest, workspace config or `--containment` asked for. Always present; `"advisory"` when none of them declared one |
 | `containment_achieved` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the class this host can enforce, capped by `workdir_exec`. Nothing in a manifest can raise it. See [Containment](containment.md) |
 | `userns_grant` | string \| null | Where this host's permission to create an unprivileged user namespace came from: `"apparmor_absent"`, `"restriction_disabled_host_wide"`, `"profile_confining"` or `"withheld"`. Always written; `null` only off Linux, where AppArmor does not exist. Two sessions can reach the same `containment_achieved` through different permissions, so read this alongside it. See [`W-SEC-013`](diagnostics.md#w-sec-013) |
@@ -73,7 +73,7 @@ before the first task begins
 | `resumed_from` | string \| null | The session [`mur run --resume`](cli.md#mur-run) continued, verbatim as the address resolved it. `null` on an ordinary launch. Always written, so its absence identifies a trace from a runtime predating the field |
 | `context_id` | string \| null | The context id every task of this launch runs under: the `mur run --context` value, or the id `--resume` resolved to. `null` when each task mints its own — `task_start.context_id` carries the id a task actually ran under either way. Always written, on the same terms as `resumed_from` |
 | `control` | object | What may be changed on this session: `settings` (the names `control.settings` lists), `secrets` (the names `control.secrets` lists) and `agent_settings` (the names `control.agent_settings` lists; absent when it lists none). Written only when the manifest declares [`control:`](manifest.md#field-control); absent otherwise. Never a value — see [Control surface](control-surface.md) |
-| `inference_choices` | array of object | Every [driver choice](manifest.md#inference-alternates), `primary` first, one object each: `name`, `driver`, `model`, `credential_source` (as on `gateways`, or `"none"` for a credential found nowhere at launch) and `available` (whether that credential resolved at launch; an injected one is `true` here and checked again at each switch). Written only when `inference.alternates` is declared; absent otherwise |
+| `inference_choices` | array of object | Every [driver choice](manifest.md#inference-alternates), `primary` first, one object each: `name`, `driver` (the driver artifact's full name), `model`, `credential_source` (as on `gateways`, or `"none"` for a credential found nowhere at launch) and `available` (whether that credential resolved at launch; an injected one is `true` here and checked again at each switch). Written only when `inference.alternates` is declared; absent otherwise |
 | `spawned_by` | string | `ses_…` — the session that spawned this one, for a capsule another capsule launched with [`delegate-task`](runtime-provided-tools.md) or with a plan's [`capsule` step](plans.md). Written only then; the field is absent from every other line rather than written as `null`, so a capsule nobody delegated produces a byte-identical record |
 | `delegation_id` | string | `dlg_…` — the delegation that created this session, character-identical to the id on the spawning session's own `delegation_start`. Present exactly when `spawned_by` is |
 | `formation_id` | string | `frm_…` — the [formation](cli.md#mur-run-formation) this session is a member of. Written only for a member; absent rather than `null` otherwise, so a session in no formation produces a byte-identical record. `session_start` is always the trace's first line, so this is too. See [Reading a formation](#formation) |
@@ -81,7 +81,7 @@ before the first task begins
 | `formation_callees` | list of strings | The members this one may call, in roster order: `[]` for a member that may call nobody. Present exactly when `formation_member` is. See [How reachability is enforced](roster.md#enforcement) |
 | `system_prompt_source` | string | `"manifest"` \| `"cli"` \| `"none"` — where the system prompt in effect came from. `"cli"` whenever [`mur run --system-prompt`](cli.md#mur-run) was passed, including when its value was empty and therefore cleared the prompt. Always written, so its absence identifies a trace from a runtime predating the field rather than a session with no prompt |
 | `credential_source` | string | `"config"` \| `"environment"` \| `"manifest"` \| `"keyless"` \| `"none"` — where the inference key this session attaches came from: [`credentials.<NAME>`](config.md#credentials) in the global config, the launching environment, a literal `gateway.api_key` on the driver's entry, a driver entry with [`keyless: true`](manifest.md#gateway-keyless), or no inference gateway at all. Never the key, a hash of it, its length or any part of it |
-| `gateways` | array of object | Every [credential gateway](manifest.md#artifact-gateway) the session holds, the configured driver's first and the rest by artifact name. One object per gateway: `artifact` (the entry's name), `host` (the host of `gateway.endpoint`, with its port when one was written), `credential_source` (`"config"` \| `"environment"` \| `"manifest"` \| `"keyless"` as `credential_source` above, or `"injected"` for a name in [`control.secrets`](manifest.md#field-control), supplied by a controller and held in memory only) and `metered` (`true` only for the gateways of the configured `transport: http` driver and of each `inference.alternates` driver, whose calls count toward the spend ceilings). Always written; `[]` when no entry declares `gateway:`. Never a key |
+| `gateways` | array of object | Every [credential gateway](manifest.md#artifact-gateway) the session holds, the configured driver's first and the rest by artifact name. One object per gateway: `artifact` (the entry's full name, `scope/name`), `host` (the host of `gateway.endpoint`, with its port when one was written), `credential_source` (`"config"` \| `"environment"` \| `"manifest"` \| `"keyless"` as `credential_source` above, or `"injected"` for a name in [`control.secrets`](manifest.md#field-control), supplied by a controller and held in memory only) and `metered` (`true` only for the gateways of the configured `transport: http` driver and of each `inference.alternates` driver, whose calls count toward the spend ceilings). Always written; `[]` when no entry declares `gateway:`. Never a key |
 | `system_prompt_sha256` | string \| null | SHA-256 (lowercase hex) of the prompt as resolved — the manifest's or the override's own text, before the runtime prepends its `[Capsule]` identity block. `null` when no prompt was in effect. Always written, so two sessions can be compared for prompt equality without either trace carrying the prompt itself. Under [`trace.capture: content`](manifest.md#field-trace) those bytes are also stored as `blobs/<system_prompt_sha256>`. Deliberately a different value from `inference.system_sha`, which covers the augmented prompt that went on the wire |
 | `effective_grants` | object | The complete grant set this session ran under — the same object [`mur run --explain-scope --json`](../how-to/different-ways-to-run-murmur.md#step-5-inspect-the-capsules-reach-before-launching-it) prints for the same manifest on the same host: `declared_containment`, `achieved_containment`, `floor_met`, `shortfall_reason` (present only when `floor_met` is `false`), `enforcement_tier`, `userns_grant`, `landlock_abi` (the [Landlock ABI the ruleset is built at](containment.md#landlock-abi), `null` when no Landlock domain is installed), `filesystem_scope`, `workdir_exec`, `read_only_paths` (the subtrees [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) protects; `[]` when the manifest declares none), `read_only_advisory_for` (the entries of `shell_allow` that protection is only advisory against; `[]` when it is enforced for every call the runtime can read as a write), `network_allow`, `unix_sockets`, `shell_allow`, `spawn_allow`, `env_allow`, `install_skill` and `install_tool` (the entries of [`capabilities.install`](manifest.md#field-install); `[]` when the manifest declares none), `interpreter_runtime_grants`, `staged_runtime_grants`, `preopens` (one entry per `runtime: tool`, `runtime: driver` and `runtime: hook` entry — `artifact`, `role`, the declared `scope` or `null`, and a `surface` of `whole-workdir`, `scoped-subtree` or `nothing`; `[]` when the capsule declares only skills), `state_stores` (`[]` when no artifact declares [`capabilities.state`](manifest.md#field-capabilities)), `configured_artifacts` (`[]` when no artifact declares [`config:`](manifest.md#artifact-config)), `exports_files` (`null` when the manifest declares no [`exports.files`](manifest.md#field-exports)), `peer_files` (`null` when the manifest declares no [`exports.peer_files`](manifest.md#field-exports-peer-files)), `peer_tasks` (`true` only when the manifest declares [`exports.peer_tasks.accept: true`](manifest.md#field-exports-peer-tasks); `false` otherwise), `peer_fetch_allow` (`[]` when the manifest declares no [`capabilities.peer_fetch`](manifest.md#field-peer-fetch)), `runtime_writes`, `filesystem_boundary` (always present; a `restriction` of `advisory`, `enforced` or `absent` naming the filesystem mechanism this session installs rather than the class this host can back, and `not_protected`, the statements `mur run --explain-scope` prints under `Not protected here` — `[]` at `absent`, and two statements otherwise, one about the filesystem and one about the `HOME` rewrite; see [Testing containment honestly](containment.md#testing-containment)) and `io_max` (always present; `declared_bytes_per_sec`, a `status` of `enforced`, `unavailable`, `not-required` or `not-probed`, and a `reason` absent only when the status is `enforced` — see [Whether the I/O ceiling applied](resource-limits.md#io-max-report)). Where `capabilities` above names categories, this names the actual destinations, binaries, capsule names and paths |
 | `effective_grants.runtime_writes` | array of object | Every path the runtime itself writes inside the accessible workdir, so a consumer for whom that workdir is the deliverable can subtract them and be left with what the capsule changed. One object per path, with `path`, `kind` (`"file"` \| `"directory"`), `scope` (`"accessible"` \| `"session"`) and `condition` (`"always"`, `"workdir-provided"`, `"agent-session"`, `"script-session"`, `"shell"`, `"peer-fetch"`, `"spawn"`, `"delegated"` or `"sealed"`). Paths are relative to the accessible workdir and carry the literal segment `<session-id>`, which `session_id` on this same line supplies. The `"sealed"` rows are present exactly when this session composes a sealed root, which needs both a host that reaches the sealed tier and a containment class that asked for it — so a sealed-capable host running an `advisory` capsule reports the sealed `enforcement_tier` with no `"sealed"` rows. Every other condition names when the path appears rather than deciding whether the row is listed. See [Session workdir](workdir.md) |
@@ -189,7 +189,7 @@ and upstream, plus:
 
 | Field | Type | Notes |
 |---|---|---|
-| `artifact` | string | The artifact entry whose `gateway.api_key` this is |
+| `artifact` | string | The full name of the artifact entry whose `gateway.api_key` this is |
 
 A `change: "rejected"` here fails nothing: the `401` went back to the artifact as its response.
 
@@ -552,7 +552,7 @@ loop has exited, on every exit path
 
 | Field | Type | Notes |
 |---|---|---|
-| `name` | string | The artifact pulled |
+| `name` | string | The full name of the artifact pulled, `<scope>/<name>` |
 | `version` | string | The version pulled |
 | `runtime` | string | `"skill"` \| `"tool"` |
 | `origin` | string | `"runtime"` \| `"operator"` — the lock entry's origin after the pull. `"operator"` when the operator had already pinned the same version, which a pull leaves the operator's |
@@ -1100,7 +1100,7 @@ and has reported its session id
 | Field | Type | Notes |
 |---|---|---|
 | `delegation_id` | string | `dlg_…`, the id the delegation is named by. Always present: a delegation with no id was never launched and writes no line here |
-| `capsule` | string | The sub-capsule that was named |
+| `capsule` | string | The full name, `<scope>/<name>`, of the sub-capsule that was named |
 | `version` | string | The version that was named |
 | `child_session_id` | string | `ses_…`, the session the child's runtime minted for itself |
 | `child_workdir` | string | The child's directory, relative to this capsule's accessible workdir. Join the two, then `.murmur/<child_session_id>/trace.jsonl`, to reach the child's own trace |
@@ -1113,7 +1113,7 @@ from the parent's side whatever happens next. A delegation the daemon refused wr
 
 | Field | Type | Notes |
 |---|---|---|
-| `capsule` | string | The sub-capsule that was named |
+| `capsule` | string | The full name, `<scope>/<name>`, of the sub-capsule that was named |
 | `version` | string | The version that was named |
 | `delegation_id` | string \| null | `dlg_…`, the id the delegation is named by. `null` whenever no child was launched: a delegation the daemon refused, or one that was never started, was never made |
 | `child_session_id` | string \| null | `ses_…`, the child's own session, so its trace is findable. `null` when no child ran |
@@ -1340,7 +1340,7 @@ The `artifact` frame on a capsule's event stream, and every other frame, is list
 
 ## Structured evaluation (`eval.jsonl`) schema { #structured-evaluation-evaljsonl }
 
-`murmur-hook-eval` writes `workdir/<session_id>/eval.jsonl` at session end when the capsule
+`murmur/hook-eval` writes `workdir/<session_id>/eval.jsonl` at session end when the capsule
 declares the hook and [`observability.eval.scorers`](manifest.md#field-observability) holds at
 least one scorer. The hook writes this file, not the runtime; it is a sibling of `trace.jsonl` in
 the same session workdir and shares its session scope.
@@ -1399,7 +1399,7 @@ export paths:
 | Path | Exports | Failures |
 |---|---|---|
 | The runtime's own emitter | Each span as an OTLP/HTTP JSON POST to `<otel_endpoint>/v1/traces`, sent as its event happens; the root `capsule.session` span goes last. Always present — no artifact required | Logged to `workdir/logs/otel.log` |
-| Hook-side export | The runtime injects the endpoint as the `MURMUR_OTEL_ENDPOINT` environment variable into every hook component. `murmur-hook-grafana` (and any hook that reads it) uses this to export its own enriched span tree | Logged to `workdir/logs/hook-<name>.log` |
+| Hook-side export | The runtime injects the endpoint as the `MURMUR_OTEL_ENDPOINT` environment variable into every hook component. `murmur/hook-grafana` (and any hook that reads it) uses this to export its own enriched span tree | Logged to `workdir/logs/hook-<name>.log` |
 
 Neither path can suppress or corrupt the other, and a failure on either is non-fatal.
 
@@ -1429,5 +1429,5 @@ by task, not by session.
 - `trace.jsonl` is written whether or not `observability.otel_endpoint` is set, and whether or not
   the endpoint is reachable.
 - A session that belongs to a [formation](cli.md#mur-run-formation) hands its formation id to every
-  hook as `MURMUR_FORMATION_ID`, and `murmur-hook-grafana` adds it to the root span as
+  hook as `MURMUR_FORMATION_ID`, and `murmur/hook-grafana` adds it to the root span as
   `murmur.formation_id`. A session in no formation hands none.

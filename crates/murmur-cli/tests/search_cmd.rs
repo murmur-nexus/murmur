@@ -45,7 +45,7 @@ fn publish_local(home: &TempDir, name: &str) {
     let root = home.path().join(".murmur/artifacts");
     let reg = LocalRegistry::new(root);
     let meta = ArtifactMeta {
-        name: name.to_string(),
+        name: murmur_artifact::ArtifactName::parse(name).unwrap(),
         version: "1.0.0".to_string(),
         runtime: RuntimeType::Native,
         artifact_runtime: "native".to_string(),
@@ -97,14 +97,14 @@ fn search_index_no_match_prints_no_results() {
         .stdout(predicate::str::contains("No results found"));
 }
 
-/// Local scan: populated store → artifact appears in results.
+/// Local scan: populated store → artifact appears in results, under its full name.
 #[test]
 fn search_local_populated_returns_artifact() {
     let home = TempDir::new().unwrap();
-    publish_local(&home, "murmur-tool-editor");
+    publish_local(&home, "local/tool-editor");
     mur_search(&home, &["editor", "--index", "local"])
         .success()
-        .stdout(predicate::str::contains("murmur-tool-editor"));
+        .stdout(predicate::str::contains("local/tool-editor"));
 }
 
 /// Local scan: empty store → "No results found", exits 0, no network call.

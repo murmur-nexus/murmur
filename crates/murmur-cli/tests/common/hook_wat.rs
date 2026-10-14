@@ -568,7 +568,7 @@ pub fn run_inference_then_artifact_hook_wasm() -> Vec<u8> {
 }
 
 /// Pack a hook `.mur.zip` whose bundled manifest declares the binding and commit policy the
-/// runtime cross-checks at staging.
+/// runtime cross-checks at staging. `name` may be a full name; the hook packs its bare part.
 pub fn create_hook_zip(
     dir: &Path,
     name: &str,
@@ -579,6 +579,7 @@ pub fn create_hook_zip(
     use std::io::Write;
     use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
+    let name = murmur_artifact::tool_name_of(name);
     let artifact_path = dir.join(format!("{name}-0.1.0.mur.zip"));
     let file = fs::File::create(&artifact_path).unwrap();
     let mut zip = ZipWriter::new(file);

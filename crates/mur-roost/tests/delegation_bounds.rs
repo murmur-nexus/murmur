@@ -15,11 +15,11 @@ use std::thread;
 
 use common::{Daemon, IDENTITY_REFUSAL, PLAIN_WORKER_BODY};
 use mur_roost::authority::{now_ms, SpawnAuthority};
-use murmur_artifact::{LocalRegistry, Registry};
+use murmur_artifact::{ArtifactName, LocalRegistry, Registry};
 
 /// A capsule whose `capabilities.spawn.allow` names itself. Under the envelope rule alone it is
 /// contained by every copy of itself, so nothing but the depth budget ends the chain.
-const RECURSER_BODY: &str = "artifacts: []\ncapabilities:\n  spawn:\n    allow: [recurser]\n";
+const RECURSER_BODY: &str = "artifacts: []\ncapabilities:\n  spawn:\n    allow: [local/recurser]\n";
 
 const PARENT_SESSION: &str = "ses_00000000000000000000000000parent";
 
@@ -48,18 +48,18 @@ fn descend(daemon: &Daemon, capsule: &str, credential: &str) -> Result<(String, 
 /// recursing until the host runs out of processes.
 #[test]
 fn a_capsule_that_names_itself_terminates_at_the_declared_depth() {
-    let daemon = Daemon::bounded(vec!["recurser".to_string()], 3, 4);
-    daemon.publish_body("recurser", "0.1.0", RECURSER_BODY, "");
+    let daemon = Daemon::bounded(vec!["local/recurser".to_string()], 3, 4);
+    daemon.publish_body("local/recurser", "0.1.0", RECURSER_BODY, "");
 
     let root = daemon.child_session_id();
-    let registered = daemon.register(&root, "recurser", "0.1.0", None);
+    let registered = daemon.register(&root, "local/recurser", "0.1.0", None);
     assert_eq!(registered.status, 200, "{:?}", registered.body);
     let mut credential = registered.body["credential"].as_str().unwrap().to_string();
     let mut chain = vec![root];
 
     for level in 1..=3 {
-        let (child, child_credential) =
-            descend(&daemon, "recurser", &credential).unwrap_or_else(|refusal| {
+        let (child, child_credential) = descend(&daemon, "local/recurser", &credential)
+            .unwrap_or_else(|refusal| {
                 panic!("level {level} must be granted, got: {refusal}");
             });
         chain.push(child);
@@ -69,7 +69,7 @@ fn a_capsule_that_names_itself_terminates_at_the_declared_depth() {
     // The deepest level holds no budget, so its own request for one more level is refused — and
     // stays refused however many times it asks.
     for _ in 0..3 {
-        let refusal = descend(&daemon, "recurser", &credential).unwrap_err();
+        let refusal = descend(&daemon, "local/recurser", &credential).unwrap_err();
         assert_eq!(
             refusal,
             "delegation depth bound reached: this daemon allows 3 levels of delegation below a \
@@ -108,17 +108,17 @@ fn a_child_cannot_claim_more_depth_than_its_parent_had() {
     daemon.seed_at_depth(
         PARENT_SESSION,
         "capabilities:\n  network:\n    allow: [registry.internal]\n  \
-         spawn:\n    allow: [worker-a]\n",
+         spawn:\n    allow: [local/worker-a]\n",
         1,
     );
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let credential = daemon.credential(PARENT_SESSION);
 
     let ordinary = daemon.child_session_id();
-    let approval = daemon.approval("worker-a", "0.1.0", &credential);
+    let approval = daemon.approval("local/worker-a", "0.1.0", &credential);
     assert_eq!(
         daemon
-            .register(&ordinary, "worker-a", "0.1.0", Some(&approval))
+            .register(&ordinary, "local/worker-a", "0.1.0", Some(&approval))
             .status,
         200,
     );
@@ -127,10 +127,10 @@ fn a_child_cannot_claim_more_depth_than_its_parent_had() {
     // The same request with a depth of its own in the body. `POST /register` has no such field,
     // so the extra key is read by nothing and the session registers with the sealed budget.
     let claimant = daemon.child_session_id();
-    let approval = daemon.approval("worker-a", "0.1.0", &credential);
+    let approval = daemon.approval("local/worker-a", "0.1.0", &credential);
     let claimed = daemon.register_body(
         &format!(
-            r#"{{"session_id":"{claimant}","name":"worker-a","version":"0.1.0","depth_remaining":99}}"#
+            r#"{{"session_id":"{claimant}","name":"local/worker-a","version":"0.1.0","depth_remaining":99}}"#
         ),
         Some(&approval),
     );
@@ -138,14 +138,14 @@ fn a_child_cannot_claim_more_depth_than_its_parent_had() {
     assert_eq!(daemon.status(&claimant).body["depth_remaining"], 0);
 
     // The same approval with one character of its payload segment altered.
-    let approval = daemon.approval("worker-a", "0.1.0", &credential);
+    let approval = daemon.approval("local/worker-a", "0.1.0", &credential);
     let mut segments: Vec<String> = approval.split('.').map(str::to_string).collect();
     let payload = &mut segments[1];
     let first = payload.remove(0);
     payload.insert(0, if first == 'a' { 'b' } else { 'a' });
     let forged = daemon.register(
         &daemon.child_session_id(),
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(&segments.join(".")),
     );
@@ -161,14 +161,14 @@ fn a_child_cannot_claim_more_depth_than_its_parent_had() {
 fn a_concurrency_cap_refuses_naming_the_bound_and_the_count() {
     let daemon = Daemon::bounded(Vec::new(), 3, 2);
     daemon.seed_caller(PARENT_SESSION);
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let credential = daemon.credential(PARENT_SESSION);
 
-    let (_, first_child) = descend(&daemon, "worker-a", &credential).unwrap();
-    descend(&daemon, "worker-a", &credential).unwrap();
+    let (_, first_child) = descend(&daemon, "local/worker-a", &credential).unwrap();
+    descend(&daemon, "local/worker-a", &credential).unwrap();
     assert_eq!(daemon.status(PARENT_SESSION).body["live_children"], 2);
 
-    let refusal = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let refusal = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
     assert_eq!(refusal.status, 403);
     assert_eq!(
         refusal.error(),
@@ -180,7 +180,7 @@ fn a_concurrency_cap_refuses_naming_the_bound_and_the_count() {
     // A child that ends frees its slot.
     assert_eq!(daemon.deregister(&first_child, "complete").status, 200);
     assert_eq!(daemon.status(PARENT_SESSION).body["live_children"], 1);
-    let granted = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let granted = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
     assert_eq!(granted.status, 200, "{:?}", granted.body);
 }
 
@@ -190,14 +190,14 @@ fn a_concurrency_cap_refuses_naming_the_bound_and_the_count() {
 fn an_approved_but_unlaunched_child_holds_its_slot() {
     let daemon = Daemon::bounded(Vec::new(), 3, 1);
     daemon.seed_caller(PARENT_SESSION);
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let credential = daemon.credential(PARENT_SESSION);
 
-    let first = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let first = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
     assert_eq!(first.status, 200, "{:?}", first.body);
     assert_eq!(daemon.status(PARENT_SESSION).body["live_children"], 1);
 
-    let second = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let second = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
     assert_eq!(second.status, 403);
     assert_eq!(
         second.error(),
@@ -219,15 +219,17 @@ fn an_approved_but_unlaunched_child_holds_its_slot() {
 /// `--max-depth 0` and `--max-concurrent 0` each refuse every delegation.
 #[test]
 fn a_zero_bound_refuses_every_delegation() {
-    let no_depth = Daemon::bounded(vec!["recurser".to_string()], 0, 4);
-    no_depth.publish_body("recurser", "0.1.0", RECURSER_BODY, "");
+    let no_depth = Daemon::bounded(vec!["local/recurser".to_string()], 0, 4);
+    no_depth.publish_body("local/recurser", "0.1.0", RECURSER_BODY, "");
     let root = no_depth.child_session_id();
-    let credential = no_depth.register(&root, "recurser", "0.1.0", None).body["credential"]
+    let credential = no_depth
+        .register(&root, "local/recurser", "0.1.0", None)
+        .body["credential"]
         .as_str()
         .unwrap()
         .to_string();
     assert_eq!(no_depth.status(&root).body["depth_remaining"], 0);
-    let refusal = no_depth.permission("recurser", "0.1.0", Some(&credential));
+    let refusal = no_depth.permission("local/recurser", "0.1.0", Some(&credential));
     assert_eq!(refusal.status, 403);
     assert!(
         refusal.error().contains("--max-depth 0"),
@@ -237,9 +239,9 @@ fn a_zero_bound_refuses_every_delegation() {
 
     let no_children = Daemon::bounded(Vec::new(), 3, 0);
     no_children.seed_caller(PARENT_SESSION);
-    no_children.publish("worker-a", "0.1.0");
+    no_children.publish("local/worker-a", "0.1.0");
     let refusal = no_children.permission(
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(&no_children.credential(PARENT_SESSION)),
     );
@@ -259,39 +261,39 @@ fn a_zero_bound_refuses_every_delegation() {
 #[test]
 fn a_bound_that_cannot_be_evaluated_refuses() {
     // (a) The asking session ended, and its credential still carries a valid MAC.
-    let daemon = Daemon::bounded(vec!["worker".to_string()], 3, 4);
-    daemon.publish_body("worker", "0.1.0", PLAIN_WORKER_BODY, "");
-    daemon.publish("worker-a", "0.1.0");
+    let daemon = Daemon::bounded(vec!["local/worker".to_string()], 3, 4);
+    daemon.publish_body("local/worker", "0.1.0", PLAIN_WORKER_BODY, "");
+    daemon.publish("local/worker-a", "0.1.0");
     let root = daemon.child_session_id();
-    let credential = daemon.register(&root, "worker", "0.1.0", None).body["credential"]
+    let credential = daemon.register(&root, "local/worker", "0.1.0", None).body["credential"]
         .as_str()
         .unwrap()
         .to_string();
     assert_eq!(daemon.deregister(&credential, "complete").status, 200);
-    let ended = daemon.permission("worker-a", "0.1.0", Some(&credential));
+    let ended = daemon.permission("local/worker-a", "0.1.0", Some(&credential));
     assert_eq!(ended.status, 403);
     assert_eq!(ended.error(), IDENTITY_REFUSAL);
 
     // (b) The granting session ended between the ask and the registration.
-    let daemon = Daemon::bounded(vec!["worker".to_string()], 3, 4);
+    let daemon = Daemon::bounded(vec!["local/worker".to_string()], 3, 4);
     daemon.publish_body(
-        "worker",
+        "local/worker",
         "0.1.0",
         "artifacts: []\ncapabilities:\n  network:\n    allow: [registry.internal]\n  \
-         spawn:\n    allow: [worker-a]\n",
+         spawn:\n    allow: [local/worker-a]\n",
         "",
     );
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let parent = daemon.child_session_id();
-    let credential = daemon.register(&parent, "worker", "0.1.0", None).body["credential"]
+    let credential = daemon.register(&parent, "local/worker", "0.1.0", None).body["credential"]
         .as_str()
         .unwrap()
         .to_string();
-    let approval = daemon.approval("worker-a", "0.1.0", &credential);
+    let approval = daemon.approval("local/worker-a", "0.1.0", &credential);
     assert_eq!(daemon.deregister(&credential, "complete").status, 200);
     let orphaned = daemon.register(
         &daemon.child_session_id(),
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(&approval),
     );
@@ -303,16 +305,16 @@ fn a_bound_that_cannot_be_evaluated_refuses() {
     // never held.
     let daemon = Daemon::new();
     daemon.seed_caller(PARENT_SESSION);
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let digest = LocalRegistry::new(daemon.registry.path())
-        .resolve("worker-a", "0.1.0")
+        .resolve(&ArtifactName::parse("local/worker-a").unwrap(), "0.1.0")
         .unwrap()
         .sha256;
     let foreign = SpawnAuthority::generate().unwrap();
     let foreign_approval = foreign
         .mint_approval_token(
             PARENT_SESSION,
-            "worker-a",
+            "local/worker-a",
             "0.1.0",
             &digest,
             99,
@@ -321,7 +323,7 @@ fn a_bound_that_cannot_be_evaluated_refuses() {
         .unwrap();
     let refused = daemon.register(
         &daemon.child_session_id(),
-        "worker-a",
+        "local/worker-a",
         "0.1.0",
         Some(&foreign_approval),
     );
@@ -379,10 +381,13 @@ fn the_bound_flags_reject_a_value_that_is_not_a_number() {
 /// `--max-depth`.
 #[test]
 fn a_registration_with_no_approval_starts_from_max_depth() {
-    let daemon = Daemon::bounded(vec!["worker".to_string()], 2, 4);
-    daemon.publish_body("worker", "0.1.0", PLAIN_WORKER_BODY, "");
+    let daemon = Daemon::bounded(vec!["local/worker".to_string()], 2, 4);
+    daemon.publish_body("local/worker", "0.1.0", PLAIN_WORKER_BODY, "");
     let root = daemon.child_session_id();
-    assert_eq!(daemon.register(&root, "worker", "0.1.0", None).status, 200);
+    assert_eq!(
+        daemon.register(&root, "local/worker", "0.1.0", None).status,
+        200
+    );
     let status = daemon.status(&root);
     assert_eq!(status.body["status"], "running");
     assert_eq!(status.body["depth_remaining"], 2);
@@ -398,7 +403,7 @@ fn a_registration_with_no_approval_starts_from_max_depth() {
 fn concurrent_asks_cannot_take_more_slots_than_the_bound() {
     let daemon = Arc::new(Daemon::bounded(Vec::new(), 3, 1));
     daemon.seed_caller(PARENT_SESSION);
-    daemon.publish("worker-a", "0.1.0");
+    daemon.publish("local/worker-a", "0.1.0");
     let credential = daemon.credential(PARENT_SESSION);
 
     let granted = Arc::new(AtomicUsize::new(0));
@@ -412,7 +417,7 @@ fn concurrent_asks_cannot_take_more_slots_than_the_bound() {
         threads.push(thread::spawn(move || {
             start.wait();
             if daemon
-                .permission("worker-a", "0.1.0", Some(&credential))
+                .permission("local/worker-a", "0.1.0", Some(&credential))
                 .status
                 == 200
             {

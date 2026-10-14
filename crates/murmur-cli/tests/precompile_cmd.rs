@@ -267,7 +267,7 @@ fn a_launch_loads_the_form_precompile_stored() {
     fs::write(
         project.path().join("murmur.yaml"),
         format!(
-            "name: capsule\nversion: 0.0.1\nartifacts:\n  - name: {TOOL}\n    version: {VERSION}\n"
+            "name: capsule\nversion: 0.0.1\nartifacts:\n  - name: local/{TOOL}\n    version: {VERSION}\n"
         ),
     )
     .unwrap();

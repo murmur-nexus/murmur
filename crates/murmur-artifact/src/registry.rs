@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    artifact::declared_runtime_from_artifact_bytes,
+    artifact::{declared_runtime_from_artifact_bytes, load_manifest_from_artifact_bytes},
+    artifact_name::ArtifactName,
+    build::artifact_name_format_error,
     platform::split_platform_tag,
     wit_contract::{wit_contracts_from_artifact_bytes, WitContracts},
 };
@@ -61,7 +63,8 @@ impl FromStr for RuntimeType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactMeta {
-    pub name: String,
+    /// The full `<scope>/<name>` the artifact is filed under.
+    pub name: ArtifactName,
     pub version: String,
     pub runtime: RuntimeType,
     /// High-level role from the artifact manifest `runtime:` field (e.g. "driver", "tool",
@@ -110,7 +113,11 @@ pub struct ResolvedArtifact {
 }
 
 pub trait Registry: Send + Sync {
-    fn resolve(&self, name: &str, version: &str) -> Result<ResolvedArtifact, RegistryError>;
+    fn resolve(
+        &self,
+        name: &ArtifactName,
+        version: &str,
+    ) -> Result<ResolvedArtifact, RegistryError>;
 
     /// Resolve an artifact, preferring a platform-specific variant when `platform` is `Some`.
     ///
@@ -119,7 +126,7 @@ pub trait Registry: Send + Sync {
     /// to the generic file when no tagged variant exists.
     fn resolve_with_platform(
         &self,
-        name: &str,
+        name: &ArtifactName,
         version: &str,
         platform: Option<&str>,
     ) -> Result<ResolvedArtifact, RegistryError> {
@@ -151,32 +158,44 @@ impl LocalRegistry {
     }
 
     #[must_use]
-    pub fn artifact_path_for(&self, name: &str, version: &str) -> PathBuf {
+    pub fn artifact_path_for(&self, name: &ArtifactName, version: &str) -> PathBuf {
         self.artifact_dir(name, version)
-            .join(format!("{name}-{version}.mur.zip"))
+            .join(format!("{}-{version}.mur.zip", name.name()))
     }
 
     #[must_use]
-    pub fn sha256_path_for(&self, name: &str, version: &str) -> PathBuf {
+    pub fn sha256_path_for(&self, name: &ArtifactName, version: &str) -> PathBuf {
         self.artifact_dir(name, version)
-            .join(format!("{name}-{version}.sha256"))
+            .join(format!("{}-{version}.sha256", name.name()))
     }
 
-    /// Path for a platform-specific artifact variant (e.g. `git-tool-0.4.0-darwin-aarch64.mur.zip`).
+    /// Path for a platform-specific artifact variant (e.g.
+    /// `<root>/ana/tool-git/0.4.0/tool-git-0.4.0-darwin-aarch64.mur.zip`).
     #[must_use]
-    pub fn artifact_path_for_platform(&self, name: &str, version: &str, platform: &str) -> PathBuf {
+    pub fn artifact_path_for_platform(
+        &self,
+        name: &ArtifactName,
+        version: &str,
+        platform: &str,
+    ) -> PathBuf {
         self.artifact_dir(name, version)
-            .join(format!("{name}-{version}-{platform}.mur.zip"))
+            .join(format!("{}-{version}-{platform}.mur.zip", name.name()))
     }
 
     #[must_use]
-    fn sha256_path_for_platform(&self, name: &str, version: &str, platform: &str) -> PathBuf {
+    fn sha256_path_for_platform(
+        &self,
+        name: &ArtifactName,
+        version: &str,
+        platform: &str,
+    ) -> PathBuf {
         self.artifact_dir(name, version)
-            .join(format!("{name}-{version}-{platform}.sha256"))
+            .join(format!("{}-{version}-{platform}.sha256", name.name()))
     }
 
-    fn artifact_dir(&self, name: &str, version: &str) -> PathBuf {
-        self.root.join(name).join(version)
+    /// `<root>/<scope>/<name>/<version>`. The file names inside carry the bare name only.
+    fn artifact_dir(&self, name: &ArtifactName, version: &str) -> PathBuf {
+        self.root.join(name.scope()).join(name.name()).join(version)
     }
 
     /// Path of the metadata sidecar describing one payload.
@@ -186,12 +205,52 @@ impl LocalRegistry {
     /// payload in it: a single untagged file would be overwritten by every platform installed
     /// after the first, leaving the store claiming one platform's provenance for all of them.
     #[must_use]
-    pub fn metadata_path_for(&self, name: &str, version: &str, platform: Option<&str>) -> PathBuf {
+    pub fn metadata_path_for(
+        &self,
+        name: &ArtifactName,
+        version: &str,
+        platform: Option<&str>,
+    ) -> PathBuf {
+        let bare = name.name();
         let file_name = match platform {
-            Some(platform) => format!("{name}-{version}-{platform}.meta.json"),
-            None => format!("{name}-{version}.meta.json"),
+            Some(platform) => format!("{bare}-{version}-{platform}.meta.json"),
+            None => format!("{bare}-{version}.meta.json"),
         };
         self.artifact_dir(name, version).join(file_name)
+    }
+
+    /// The top-level directories of this store in the flat layout that predates scopes, sorted:
+    /// a `<root>/<d>` holding some `<d>/<version>/<d>-<version>*.mur.zip` or `.sha256`. Nothing
+    /// reads them; `mur doctor` reports them as safe to delete. A store that does not exist has
+    /// none.
+    pub fn old_layout_entries(&self) -> Result<Vec<String>, RegistryError> {
+        let mut found = Vec::new();
+        for name_dir in read_subdirs(&self.root)? {
+            let Some(name) = dir_name(&name_dir) else {
+                continue;
+            };
+            let mut old = false;
+            for version_dir in read_subdirs(&name_dir)? {
+                let Some(version) = dir_name(&version_dir) else {
+                    continue;
+                };
+                let stem = format!("{name}-{version}");
+                old = read_file_names(&version_dir)?.iter().any(|file| {
+                    file.strip_prefix(&stem).is_some_and(|tail| {
+                        (tail.starts_with('-') || tail.starts_with('.'))
+                            && (file.ends_with(".mur.zip") || file.ends_with(".sha256"))
+                    })
+                });
+                if old {
+                    break;
+                }
+            }
+            if old {
+                found.push(name);
+            }
+        }
+        found.sort_unstable();
+        Ok(found)
     }
 
     // Currently at most one platform per artifact. Vec<Platform> is kept for forward
@@ -208,7 +267,7 @@ impl LocalRegistry {
         bytes: &[u8],
         expected_sha256: &str,
     ) -> Result<(), RegistryError> {
-        verify_sha256(&meta.name, &meta.version, bytes, expected_sha256)?;
+        verify_sha256(meta.name.as_str(), &meta.version, bytes, expected_sha256)?;
         self.write_artifact_set(&meta, bytes, expected_sha256, true)
     }
 
@@ -219,6 +278,18 @@ impl LocalRegistry {
         sha256: &str,
         overwrite: bool,
     ) -> Result<(), RegistryError> {
+        // The bare part a payload is filed under is its tool name in every session that stages
+        // it, so it must be the name the artifact declares. A payload with no readable manifest
+        // declares nothing to compare.
+        if let Ok(packed) = load_manifest_from_artifact_bytes(bytes) {
+            if packed.name != meta.name.name() {
+                return Err(RegistryError::PackedNameMismatch {
+                    name: meta.name.to_string(),
+                    version: meta.version.clone(),
+                    packed: packed.name,
+                });
+            }
+        }
         let dir = self.artifact_dir(&meta.name, &meta.version);
         fs::create_dir_all(&dir).map_err(|source| RegistryError::Io {
             path: dir.display().to_string(),
@@ -240,7 +311,7 @@ impl LocalRegistry {
 
         if !overwrite && (artifact_path.exists() || hash_path.exists()) {
             return Err(RegistryError::Conflict {
-                name: meta.name.clone(),
+                name: meta.name.to_string(),
                 version: meta.version.clone(),
             });
         }
@@ -299,7 +370,7 @@ impl LocalRegistry {
 
     fn resolve_impl(
         &self,
-        name: &str,
+        name: &ArtifactName,
         version: &str,
         platform: Option<&str>,
     ) -> Result<ResolvedArtifact, RegistryError> {
@@ -364,6 +435,7 @@ impl LocalRegistry {
         } else {
             derived_meta(name, version, &bytes, path_platform)
         };
+        meta.name = name.clone();
 
         // What an artifact is, is what its own packed murmur.yaml says: a payload readable here
         // overrules the sidecar rather than the other way round, so a value recorded wrongly by
@@ -396,13 +468,17 @@ impl LocalRegistry {
 }
 
 impl Registry for LocalRegistry {
-    fn resolve(&self, name: &str, version: &str) -> Result<ResolvedArtifact, RegistryError> {
+    fn resolve(
+        &self,
+        name: &ArtifactName,
+        version: &str,
+    ) -> Result<ResolvedArtifact, RegistryError> {
         self.resolve_impl(name, version, None)
     }
 
     fn resolve_with_platform(
         &self,
-        name: &str,
+        name: &ArtifactName,
         version: &str,
         platform: Option<&str>,
     ) -> Result<ResolvedArtifact, RegistryError> {
@@ -422,132 +498,29 @@ impl Registry for LocalRegistry {
     }
 
     fn list_index(&self) -> Result<Vec<ArtifactMeta>, RegistryError> {
-        if !self.root.exists() {
-            return Ok(Vec::new());
-        }
-
         let mut index = Vec::new();
-
-        for name_entry in fs::read_dir(&self.root).map_err(|source| RegistryError::Io {
-            path: self.root.display().to_string(),
-            source,
-        })? {
-            let name_entry = name_entry.map_err(|source| RegistryError::Io {
-                path: self.root.display().to_string(),
-                source,
-            })?;
-            let name_path = name_entry.path();
-            if !name_path.is_dir() {
-                continue;
-            }
-
-            let Some(name_name) = name_path.file_name().and_then(|s| s.to_str()) else {
+        for scope_dir in read_subdirs(&self.root)? {
+            let Some(scope) = dir_name(&scope_dir) else {
                 continue;
             };
-
-            for version_entry in fs::read_dir(&name_path).map_err(|source| RegistryError::Io {
-                path: name_path.display().to_string(),
-                source,
-            })? {
-                let version_entry = version_entry.map_err(|source| RegistryError::Io {
-                    path: name_path.display().to_string(),
-                    source,
-                })?;
-                let version_path = version_entry.path();
-                if !version_path.is_dir() {
-                    continue;
-                }
-
-                let Some(version_name) = version_path.file_name().and_then(|s| s.to_str()) else {
+            if artifact_name_format_error(&scope).is_some() {
+                continue;
+            }
+            for name_dir in read_subdirs(&scope_dir)? {
+                let Some(bare) = dir_name(&name_dir) else {
                     continue;
                 };
-
-                // A version directory may contain the generic `name-ver.mur.zip` (WASM,
-                // static) or one `name-ver-<platform>.mur.zip` per platform (native), and one
-                // metadata sidecar beside each payload.
-                let mut payloads: Vec<PathBuf> = Vec::new();
-                let mut sidecars: Vec<PathBuf> = Vec::new();
-                let prefix = format!("{name_name}-{version_name}");
-                let mut names: Vec<String> = fs::read_dir(&version_path)
-                    .map_err(|source| RegistryError::Io {
-                        path: version_path.display().to_string(),
-                        source,
-                    })?
-                    .flatten()
-                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                    .collect();
-                names.sort_unstable();
-                for file_name in names {
-                    let Some(tail) = file_name.strip_prefix(&prefix) else {
+                let Ok(name) = ArtifactName::from_parts(&scope, &bare) else {
+                    continue;
+                };
+                for version_dir in read_subdirs(&name_dir)? {
+                    let Some(version) = dir_name(&version_dir) else {
                         continue;
                     };
-                    if !tail.is_empty() && !tail.starts_with('-') && !tail.starts_with('.') {
-                        continue;
-                    }
-                    if file_name.ends_with(".mur.zip") {
-                        payloads.push(version_path.join(&file_name));
-                    } else if file_name.ends_with(".meta.json") {
-                        sidecars.push(version_path.join(&file_name));
+                    if let Some(meta) = self.index_row(&name, &version, &version_dir)? {
+                        index.push(meta);
                     }
                 }
-
-                let has_generic = self.artifact_path_for(name_name, version_name).exists()
-                    && self.sha256_path_for(name_name, version_name).exists();
-                if !has_generic && payloads.is_empty() {
-                    continue;
-                }
-
-                // One row per name+version, however many payloads back it: `mur list` reports
-                // an artifact, and `platforms` is the set of platforms that artifact is
-                // installed for. A row per sidecar would list the same artifact twice.
-                let mut sidecar_metas = Vec::with_capacity(sidecars.len());
-                for sidecar in &sidecars {
-                    sidecar_metas.push(
-                        read_metadata(sidecar)
-                            .map_err(|source| RegistryError::Io {
-                                path: sidecar.display().to_string(),
-                                source,
-                            })?
-                            .meta,
-                    );
-                }
-
-                let mut meta = match sidecar_metas.first() {
-                    Some(first) => {
-                        let mut meta = first.clone();
-                        meta.platforms = sidecar_metas
-                            .iter()
-                            .flat_map(|meta| meta.platforms.iter().cloned())
-                            .collect();
-                        meta.platforms.sort_unstable();
-                        meta.platforms.dedup();
-                        meta
-                    }
-                    // No sidecar anywhere in this directory: read the payload rather than
-                    // guessing, the same derivation `resolve_impl` makes. Only a directory
-                    // missing its sidecars pays for this read.
-                    None => {
-                        let payload = if has_generic {
-                            self.artifact_path_for(name_name, version_name)
-                        } else {
-                            payloads[0].clone()
-                        };
-                        let path_platform = payload
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .and_then(crate::platform::split_platform_suffix)
-                            .map(|(_, platform)| platform);
-                        let bytes = fs::read(&payload).map_err(|source| RegistryError::Io {
-                            path: payload.display().to_string(),
-                            source,
-                        })?;
-                        derived_meta(name_name, version_name, &bytes, path_platform)
-                    }
-                };
-
-                meta.name = name_name.to_string();
-                meta.version = version_name.to_string();
-                index.push(meta);
             }
         }
 
@@ -561,12 +534,152 @@ impl Registry for LocalRegistry {
     }
 }
 
+impl LocalRegistry {
+    /// The one `list_index` row for `name@version`, read from `version_dir`, or `None` when the
+    /// directory holds no payload.
+    fn index_row(
+        &self,
+        name: &ArtifactName,
+        version: &str,
+        version_dir: &Path,
+    ) -> Result<Option<ArtifactMeta>, RegistryError> {
+        // A version directory may contain the generic `name-ver.mur.zip` (WASM, static) or one
+        // `name-ver-<platform>.mur.zip` per platform (native), and one metadata sidecar beside
+        // each payload.
+        let mut payloads: Vec<PathBuf> = Vec::new();
+        let mut sidecars: Vec<PathBuf> = Vec::new();
+        let prefix = format!("{}-{version}", name.name());
+        for file_name in read_file_names(version_dir)? {
+            let Some(tail) = file_name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if !tail.is_empty() && !tail.starts_with('-') && !tail.starts_with('.') {
+                continue;
+            }
+            if file_name.ends_with(".mur.zip") {
+                payloads.push(version_dir.join(&file_name));
+            } else if file_name.ends_with(".meta.json") {
+                sidecars.push(version_dir.join(&file_name));
+            }
+        }
+
+        let has_generic = self.artifact_path_for(name, version).exists()
+            && self.sha256_path_for(name, version).exists();
+        if !has_generic && payloads.is_empty() {
+            return Ok(None);
+        }
+
+        // One row per name+version, however many payloads back it: `mur list` reports an
+        // artifact, and `platforms` is the set of platforms that artifact is installed for. A row
+        // per sidecar would list the same artifact twice.
+        let mut sidecar_metas = Vec::with_capacity(sidecars.len());
+        for sidecar in &sidecars {
+            sidecar_metas.push(
+                read_metadata(sidecar)
+                    .map_err(|source| RegistryError::Io {
+                        path: sidecar.display().to_string(),
+                        source,
+                    })?
+                    .meta,
+            );
+        }
+
+        let mut meta = match sidecar_metas.first() {
+            Some(first) => {
+                let mut meta = first.clone();
+                meta.platforms = sidecar_metas
+                    .iter()
+                    .flat_map(|meta| meta.platforms.iter().cloned())
+                    .collect();
+                meta.platforms.sort_unstable();
+                meta.platforms.dedup();
+                meta
+            }
+            // No sidecar anywhere in this directory: read the payload rather than guessing, the
+            // same derivation `resolve_impl` makes. Only a directory missing its sidecars pays
+            // for this read.
+            None => {
+                let payload = if has_generic {
+                    self.artifact_path_for(name, version)
+                } else {
+                    payloads[0].clone()
+                };
+                let path_platform = payload
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(crate::platform::split_platform_suffix)
+                    .map(|(_, platform)| platform);
+                let bytes = fs::read(&payload).map_err(|source| RegistryError::Io {
+                    path: payload.display().to_string(),
+                    source,
+                })?;
+                derived_meta(name, version, &bytes, path_platform)
+            }
+        };
+
+        meta.name = name.clone();
+        meta.version = version.to_string();
+        Ok(Some(meta))
+    }
+}
+
+/// The subdirectories of `dir`, sorted; none when `dir` does not exist.
+fn read_subdirs(dir: &Path) -> Result<Vec<PathBuf>, RegistryError> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let io_error = |source| RegistryError::Io {
+        path: dir.display().to_string(),
+        source,
+    };
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(dir).map_err(io_error)? {
+        let path = entry.map_err(io_error)?.path();
+        if path.is_dir() {
+            dirs.push(path);
+        }
+    }
+    dirs.sort_unstable();
+    Ok(dirs)
+}
+
+/// The file names in `dir`, sorted.
+fn read_file_names(dir: &Path) -> Result<Vec<String>, RegistryError> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map_err(|source| RegistryError::Io {
+            path: dir.display().to_string(),
+            source,
+        })?
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort_unstable();
+    Ok(names)
+}
+
+fn dir_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+}
+
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error("artifact {name}@{version} not found")]
     NotFound { name: String, version: String },
     #[error("artifact {name}@{version} already exists")]
     Conflict { name: String, version: String },
+    /// The payload's packed `murmur.yaml` declares a different name than the bare part of the
+    /// full name it was to be filed under.
+    #[error(
+        "artifact {name}@{version} declares name '{packed}' in its murmur.yaml, so it cannot be \
+         filed as {name}"
+    )]
+    PackedNameMismatch {
+        name: String,
+        version: String,
+        packed: String,
+    },
     #[error("reserved artifact version '{0}' is not allowed")]
     ReservedVersion(String),
     #[error("{0}")]
@@ -749,7 +862,7 @@ fn restore_backup(backup: &Path, final_path: &Path, had_backup: bool) -> Result<
 /// that does not parse falls back to `wasm` with nothing else filled in, so an opaque payload
 /// still resolves.
 fn derived_meta(
-    name: &str,
+    name: &ArtifactName,
     version: &str,
     bytes: &[u8],
     path_platform: Option<&str>,
@@ -759,7 +872,7 @@ fn derived_meta(
         |declared| (declared.runtime, declared.artifact_runtime),
     );
     ArtifactMeta {
-        name: name.to_string(),
+        name: name.clone(),
         version: version.to_string(),
         runtime,
         artifact_runtime,
@@ -939,9 +1052,14 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// `ana/<bare>`: the scope these tests file everything under.
+    fn n(bare: &str) -> ArtifactName {
+        ArtifactName::from_parts("ana", bare).unwrap()
+    }
+
     fn test_meta(name: &str, version: &str) -> ArtifactMeta {
         ArtifactMeta {
-            name: name.to_string(),
+            name: n(name),
             version: version.to_string(),
             runtime: RuntimeType::Wasm,
             artifact_runtime: "wasm".to_string(),
@@ -960,10 +1078,10 @@ mod tests {
         let bytes = b"artifact-contents";
 
         let published = registry.publish(meta.clone(), bytes).unwrap();
-        assert_eq!(published.artifact_id, "hello@0.0.2");
+        assert_eq!(published.artifact_id, "ana/hello@0.0.2");
 
-        let artifact_path = dir.path().join("hello/0.0.2/hello-0.0.2.mur.zip");
-        let sha_path = dir.path().join("hello/0.0.2/hello-0.0.2.sha256");
+        let artifact_path = dir.path().join("ana/hello/0.0.2/hello-0.0.2.mur.zip");
+        let sha_path = dir.path().join("ana/hello/0.0.2/hello-0.0.2.sha256");
 
         assert!(artifact_path.exists());
         assert!(sha_path.exists());
@@ -983,9 +1101,9 @@ mod tests {
             .publish(test_meta("hello", "0.0.2"), bytes)
             .unwrap();
 
-        let resolved = registry.resolve("hello", "0.0.2").unwrap();
+        let resolved = registry.resolve(&n("hello"), "0.0.2").unwrap();
         assert_eq!(resolved.bytes, Bytes::from_static(bytes));
-        assert_eq!(resolved.meta.name, "hello");
+        assert_eq!(resolved.meta.name, "ana/hello");
         assert_eq!(resolved.sha256, sha256_hex(bytes));
     }
 
@@ -994,10 +1112,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let registry = LocalRegistry::new(dir.path());
 
-        let err = registry.resolve("missing", "1.0.0").unwrap_err();
+        let err = registry.resolve(&n("missing"), "1.0.0").unwrap_err();
         assert!(matches!(
             err,
-            RegistryError::NotFound { name, version } if name == "missing" && version == "1.0.0"
+            RegistryError::NotFound { name, version } if name == "ana/missing" && version == "1.0.0"
         ));
     }
 
@@ -1043,7 +1161,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            RegistryError::Conflict { name, version } if name == "hello" && version == "0.0.2"
+            RegistryError::Conflict { name, version } if name == "ana/hello" && version == "0.0.2"
         ));
     }
 
@@ -1060,7 +1178,7 @@ mod tests {
             .store_installed_overwrite(meta, new_bytes, &new_sha)
             .unwrap();
 
-        let resolved = registry.resolve("hello", "0.0.2").unwrap();
+        let resolved = registry.resolve(&n("hello"), "0.0.2").unwrap();
         assert_eq!(resolved.bytes, Bytes::from_static(new_bytes));
         assert_eq!(resolved.sha256, new_sha);
     }
@@ -1071,7 +1189,7 @@ mod tests {
         let registry = LocalRegistry::new(dir.path());
         let meta = test_meta("hello", "0.0.2");
 
-        let target_dir = dir.path().join("hello/0.0.2");
+        let target_dir = dir.path().join("ana/hello/0.0.2");
         fs::create_dir_all(&target_dir).unwrap();
 
         let original_perms = fs::metadata(&target_dir).unwrap().permissions();
@@ -1081,8 +1199,8 @@ mod tests {
 
         let _ = registry.publish(meta, b"bytes").unwrap_err();
 
-        let artifact_path = dir.path().join("hello/0.0.2/hello-0.0.2.mur.zip");
-        let sha_path = dir.path().join("hello/0.0.2/hello-0.0.2.sha256");
+        let artifact_path = dir.path().join("ana/hello/0.0.2/hello-0.0.2.mur.zip");
+        let sha_path = dir.path().join("ana/hello/0.0.2/hello-0.0.2.sha256");
         assert!(!artifact_path.exists());
         assert!(!sha_path.exists());
 
@@ -1098,8 +1216,8 @@ mod tests {
 
         let index = registry.list_index().unwrap();
         assert_eq!(index.len(), 2);
-        assert_eq!(index[0].name, "a");
-        assert_eq!(index[1].name, "b");
+        assert_eq!(index[0].name.as_str(), "ana/a");
+        assert_eq!(index[1].name.as_str(), "ana/b");
     }
 
     #[test]
@@ -1120,7 +1238,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let registry = LocalRegistry::new(dir.path());
         let meta = ArtifactMeta {
-            name: "my-skill".to_string(),
+            name: n("my-skill"),
             version: "0.1.0".to_string(),
             runtime: RuntimeType::Static,
             artifact_runtime: "skill".to_string(),
@@ -1180,7 +1298,7 @@ mod tests {
         registry.publish(test_meta("ct", "0.1.0"), &bytes).unwrap();
 
         let contracts = registry
-            .resolve("ct", "0.1.0")
+            .resolve(&n("ct"), "0.1.0")
             .unwrap()
             .meta
             .wit_contracts
@@ -1204,7 +1322,7 @@ mod tests {
             .unwrap();
 
         let contracts = registry
-            .resolve("ct", "0.1.0")
+            .resolve(&n("ct"), "0.1.0")
             .unwrap()
             .meta
             .wit_contracts
@@ -1228,7 +1346,7 @@ mod tests {
             .unwrap();
 
         assert!(registry
-            .resolve("skill", "0.1.0")
+            .resolve(&n("skill"), "0.1.0")
             .unwrap()
             .meta
             .wit_contracts
@@ -1255,13 +1373,14 @@ mod tests {
             let registry = LocalRegistry::new(dir.path());
             registry.publish(test_meta(name, "0.1.0"), &bytes).unwrap();
 
-            let raw = fs::read_to_string(registry.metadata_path_for(name, "0.1.0", None)).unwrap();
+            let raw =
+                fs::read_to_string(registry.metadata_path_for(&n(name), "0.1.0", None)).unwrap();
             assert!(
                 !raw.contains("wit_contracts"),
                 "{name}: metadata carries a wit_contracts key: {raw}"
             );
             assert!(registry
-                .resolve(name, "0.1.0")
+                .resolve(&n(name), "0.1.0")
                 .unwrap()
                 .meta
                 .wit_contracts
@@ -1274,7 +1393,7 @@ mod tests {
     fn native_meta(name: &str, version: &str, platform: &str) -> ArtifactMeta {
         let (os, arch) = crate::platform::split_platform_tag(platform).unwrap();
         ArtifactMeta {
-            name: name.to_string(),
+            name: n(name),
             version: version.to_string(),
             runtime: RuntimeType::Native,
             artifact_runtime: "tool".to_string(),
@@ -1313,7 +1432,7 @@ mod tests {
                 .unwrap();
         }
 
-        let version_dir = dir.path().join("nativetool/0.1.0");
+        let version_dir = dir.path().join("ana/nativetool/0.1.0");
         let mut files: Vec<String> = fs::read_dir(&version_dir)
             .unwrap()
             .flatten()
@@ -1333,10 +1452,10 @@ mod tests {
         );
 
         let resolved_linux = registry
-            .resolve_with_platform("nativetool", "0.1.0", Some("linux-x86_64"))
+            .resolve_with_platform(&n("nativetool"), "0.1.0", Some("linux-x86_64"))
             .unwrap();
         let resolved_darwin = registry
-            .resolve_with_platform("nativetool", "0.1.0", Some("darwin-aarch64"))
+            .resolve_with_platform(&n("nativetool"), "0.1.0", Some("darwin-aarch64"))
             .unwrap();
 
         assert_eq!(resolved_linux.platform_match, PlatformMatch::Tagged);
@@ -1373,11 +1492,11 @@ mod tests {
 
         assert!(dir
             .path()
-            .join("wasmtool/0.1.0/wasmtool-0.1.0.meta.json")
+            .join("ana/wasmtool/0.1.0/wasmtool-0.1.0.meta.json")
             .exists());
         // Requested for a platform this payload was never tagged with, and still resolved.
         let resolved = registry
-            .resolve_with_platform("wasmtool", "0.1.0", Some("darwin-aarch64"))
+            .resolve_with_platform(&n("wasmtool"), "0.1.0", Some("darwin-aarch64"))
             .unwrap();
         assert_eq!(resolved.platform_match, PlatformMatch::NotApplicable);
         assert!(resolved.meta.platforms.is_empty());
@@ -1396,7 +1515,7 @@ mod tests {
             .unwrap();
 
         let resolved = registry
-            .resolve_with_platform("nativetool", "0.1.0", Some("linux-x86_64"))
+            .resolve_with_platform(&n("nativetool"), "0.1.0", Some("linux-x86_64"))
             .unwrap();
         assert_eq!(resolved.platform_match, PlatformMatch::UntaggedFallback);
         assert_eq!(resolved.bytes, Bytes::from(bytes));
@@ -1407,7 +1526,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let registry = LocalRegistry::new(dir.path());
         let bytes = native_artifact_zip("nativetool", "0.1.0", b"binary");
-        let version_dir = dir.path().join("nativetool/0.1.0");
+        let version_dir = dir.path().join("ana/nativetool/0.1.0");
         fs::create_dir_all(&version_dir).unwrap();
         fs::write(
             version_dir.join("nativetool-0.1.0-linux-x86_64.mur.zip"),
@@ -1421,7 +1540,7 @@ mod tests {
         .unwrap();
 
         let resolved = registry
-            .resolve_with_platform("nativetool", "0.1.0", Some("linux-x86_64"))
+            .resolve_with_platform(&n("nativetool"), "0.1.0", Some("linux-x86_64"))
             .unwrap();
         assert_eq!(resolved.meta.runtime, RuntimeType::Native);
         assert_eq!(resolved.meta.artifact_runtime, "tool");
@@ -1441,7 +1560,7 @@ mod tests {
     fn a_payload_that_does_not_parse_keeps_the_pre_derivation_defaults() {
         let dir = tempdir().unwrap();
         let registry = LocalRegistry::new(dir.path());
-        let version_dir = dir.path().join("opaque/0.1.0");
+        let version_dir = dir.path().join("ana/opaque/0.1.0");
         fs::create_dir_all(&version_dir).unwrap();
         fs::write(version_dir.join("opaque-0.1.0.mur.zip"), b"not-a-zip").unwrap();
         fs::write(
@@ -1450,7 +1569,7 @@ mod tests {
         )
         .unwrap();
 
-        let resolved = registry.resolve("opaque", "0.1.0").unwrap();
+        let resolved = registry.resolve(&n("opaque"), "0.1.0").unwrap();
         assert_eq!(resolved.meta.runtime, RuntimeType::Wasm);
         assert!(resolved.meta.artifact_runtime.is_empty());
         assert!(resolved.meta.platforms.is_empty());
@@ -1494,10 +1613,10 @@ mod tests {
             .publish(test_meta("old", "0.1.0"), b"bytes")
             .unwrap();
 
-        let path = registry.metadata_path_for("old", "0.1.0", None);
+        let path = registry.metadata_path_for(&n("old"), "0.1.0", None);
         fs::write(
             &path,
-            r#"{"meta":{"name":"old","version":"0.1.0","runtime":"wasm","artifact_runtime":"tool","platforms":[],"description":null,"tags":[]}}"#,
+            r#"{"meta":{"name":"ana/old","version":"0.1.0","runtime":"wasm","artifact_runtime":"tool","platforms":[],"description":null,"tags":[]}}"#,
         )
         .unwrap();
 
@@ -1532,15 +1651,19 @@ mod tests {
         recorded_runtime: &str,
         recorded_artifact_runtime: &str,
     ) {
-        let dir = registry.artifact_path_for(name, version);
+        let dir = registry.artifact_path_for(&n(name), version);
         let dir = dir.parent().unwrap();
         fs::create_dir_all(dir).unwrap();
-        fs::write(registry.artifact_path_for(name, version), bytes).unwrap();
-        fs::write(registry.sha256_path_for(name, version), sha256_hex(bytes)).unwrap();
+        fs::write(registry.artifact_path_for(&n(name), version), bytes).unwrap();
+        fs::write(
+            registry.sha256_path_for(&n(name), version),
+            sha256_hex(bytes),
+        )
+        .unwrap();
         let meta = format!(
-            r#"{{"meta":{{"name":"{name}","version":"{version}","runtime":"{recorded_runtime}","artifact_runtime":"{recorded_artifact_runtime}","platforms":[],"description":null,"tags":[]}}}}"#
+            r#"{{"meta":{{"name":"ana/{name}","version":"{version}","runtime":"{recorded_runtime}","artifact_runtime":"{recorded_artifact_runtime}","platforms":[],"description":null,"tags":[]}}}}"#
         );
-        fs::write(registry.metadata_path_for(name, version, None), meta).unwrap();
+        fs::write(registry.metadata_path_for(&n(name), version, None), meta).unwrap();
     }
 
     #[test]
@@ -1550,10 +1673,10 @@ mod tests {
         let bytes = native_zip("my-tool", "1.0.0");
         write_store_by_hand(&registry, "my-tool", "1.0.0", &bytes, "wasm", "");
 
-        let metadata_path = registry.metadata_path_for("my-tool", "1.0.0", None);
+        let metadata_path = registry.metadata_path_for(&n("my-tool"), "1.0.0", None);
         let on_disk_before = fs::read_to_string(&metadata_path).unwrap();
 
-        let resolved = registry.resolve("my-tool", "1.0.0").unwrap();
+        let resolved = registry.resolve(&n("my-tool"), "1.0.0").unwrap();
 
         assert_eq!(resolved.meta.runtime, RuntimeType::Native);
         assert_eq!(resolved.meta.artifact_runtime, "tool");
@@ -1577,10 +1700,214 @@ mod tests {
             "tool",
         );
 
-        let resolved = registry.resolve("opaque", "1.0.0").unwrap();
+        let resolved = registry.resolve(&n("opaque"), "1.0.0").unwrap();
 
         assert_eq!(resolved.meta.runtime, RuntimeType::Native);
         assert_eq!(resolved.meta.artifact_runtime, "tool");
+    }
+
+    // ── scoped layout ─────────────────────────────────────────────────────────
+
+    fn meta_in(scope: &str, bare: &str, version: &str) -> ArtifactMeta {
+        ArtifactMeta {
+            name: ArtifactName::from_parts(scope, bare).unwrap(),
+            ..test_meta(bare, version)
+        }
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut files: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn registry_files_a_native_payload_under_scope_name_version_with_the_bare_name() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let bytes = native_artifact_zip("tool-x", "1.2.0", b"linux-binary");
+
+        let published = registry
+            .publish(native_meta("tool-x", "1.2.0", "linux-x86_64"), &bytes)
+            .unwrap();
+        assert_eq!(published.artifact_id, "ana/tool-x@1.2.0");
+
+        let version_dir = dir.path().join("ana/tool-x/1.2.0");
+        assert_eq!(
+            files_in(&version_dir),
+            vec![
+                "tool-x-1.2.0-linux-x86_64.meta.json",
+                "tool-x-1.2.0-linux-x86_64.mur.zip",
+                "tool-x-1.2.0-linux-x86_64.sha256",
+            ]
+        );
+        assert_eq!(
+            registry.artifact_path_for_platform(&n("tool-x"), "1.2.0", "linux-x86_64"),
+            version_dir.join("tool-x-1.2.0-linux-x86_64.mur.zip")
+        );
+        let sidecar = read_metadata(&version_dir.join("tool-x-1.2.0-linux-x86_64.meta.json"))
+            .unwrap()
+            .meta;
+        assert_eq!(sidecar.name.as_str(), "ana/tool-x");
+        assert_eq!(
+            sidecar.platforms,
+            vec![("linux".to_string(), "x86_64".to_string())]
+        );
+
+        let resolved = registry
+            .resolve_with_platform(&n("tool-x"), "1.2.0", Some("linux-x86_64"))
+            .unwrap();
+        assert_eq!(resolved.platform_match, PlatformMatch::Tagged);
+        assert_eq!(resolved.meta.name.as_str(), "ana/tool-x");
+        assert_eq!(resolved.bytes, Bytes::from(bytes));
+    }
+
+    #[test]
+    fn registry_lists_one_bare_name_in_two_scopes_as_two_rows_sorted_by_full_name() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        registry
+            .publish(meta_in("bob", "tool-x", "1.0.0"), b"bob")
+            .unwrap();
+        registry
+            .publish(meta_in("ana", "tool-x", "1.0.0"), b"ana")
+            .unwrap();
+
+        let index = registry.list_index().unwrap();
+        let names: Vec<&str> = index.iter().map(|meta| meta.name.as_str()).collect();
+        assert_eq!(names, ["ana/tool-x", "bob/tool-x"]);
+
+        let ana = registry.resolve(&n("tool-x"), "1.0.0").unwrap();
+        let bob = registry
+            .resolve(&ArtifactName::parse("bob/tool-x").unwrap(), "1.0.0")
+            .unwrap();
+        assert_eq!(ana.bytes, Bytes::from_static(b"ana"));
+        assert_eq!(bob.bytes, Bytes::from_static(b"bob"));
+    }
+
+    #[test]
+    fn registry_refuses_a_payload_packed_under_another_name_and_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let bytes = zip_with(&[
+            (
+                "murmur.yaml",
+                b"name: other\nversion: 1.0.0\nruntime: tool\n",
+            ),
+            ("tool.wasm", b"\0asm"),
+        ]);
+
+        let error = registry
+            .publish(test_meta("tool-x", "1.0.0"), &bytes)
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                RegistryError::PackedNameMismatch { name, version, packed }
+                    if name == "ana/tool-x" && version == "1.0.0" && packed == "other"
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "artifact ana/tool-x@1.0.0 declares name 'other' in its murmur.yaml, so it cannot be \
+             filed as ana/tool-x"
+        );
+
+        let error = registry
+            .store_installed_overwrite(test_meta("tool-x", "1.0.0"), &bytes, &sha256_hex(&bytes))
+            .unwrap_err();
+        assert!(
+            matches!(error, RegistryError::PackedNameMismatch { .. }),
+            "{error:?}"
+        );
+        assert!(files_in(dir.path()).is_empty(), "the store was written to");
+    }
+
+    #[test]
+    fn registry_stores_a_payload_with_no_packed_manifest_as_before() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let no_manifest = zip_with(&[("tool.wasm", b"\0asm")]);
+
+        registry
+            .publish(test_meta("tool-x", "1.0.0"), &no_manifest)
+            .unwrap();
+        registry
+            .publish(test_meta("opaque", "1.0.0"), b"not-a-zip")
+            .unwrap();
+
+        assert!(dir
+            .path()
+            .join("ana/tool-x/1.0.0/tool-x-1.0.0.mur.zip")
+            .exists());
+        assert!(dir
+            .path()
+            .join("ana/opaque/1.0.0/opaque-1.0.0.mur.zip")
+            .exists());
+        let resolved = registry.resolve(&n("tool-x"), "1.0.0").unwrap();
+        assert_eq!(resolved.bytes, Bytes::from(no_manifest));
+    }
+
+    #[test]
+    fn registry_list_index_skips_a_directory_whose_name_fails_the_part_rule() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        registry
+            .publish(test_meta("tool-x", "1.0.0"), b"good")
+            .unwrap();
+        for (scope, bare) in [("Bad_Scope", "x"), ("ana", "Bad_Name"), ("-ana", "x")] {
+            let version_dir = dir.path().join(scope).join(bare).join("1.0.0");
+            fs::create_dir_all(&version_dir).unwrap();
+            fs::write(version_dir.join(format!("{bare}-1.0.0.mur.zip")), b"bad").unwrap();
+            fs::write(
+                version_dir.join(format!("{bare}-1.0.0.sha256")),
+                sha256_hex(b"bad"),
+            )
+            .unwrap();
+        }
+
+        let index = registry.list_index().unwrap();
+        let names: Vec<&str> = index.iter().map(|meta| meta.name.as_str()).collect();
+        assert_eq!(names, ["ana/tool-x"]);
+    }
+
+    #[test]
+    fn old_layout_entries_list_the_flat_store_and_nothing_else() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        assert!(registry.old_layout_entries().unwrap().is_empty());
+
+        let old_dir = dir.path().join("murmur-tool-git/0.2.0");
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::write(old_dir.join("murmur-tool-git-0.2.0.mur.zip"), b"old").unwrap();
+        fs::write(
+            old_dir.join("murmur-tool-git-0.2.0.sha256"),
+            sha256_hex(b"old"),
+        )
+        .unwrap();
+        registry
+            .publish(meta_in("local", "echo-tool", "0.0.1"), b"new")
+            .unwrap();
+
+        assert_eq!(
+            registry.old_layout_entries().unwrap(),
+            vec!["murmur-tool-git".to_string()]
+        );
+        let index = registry.list_index().unwrap();
+        let names: Vec<&str> = index.iter().map(|meta| meta.name.as_str()).collect();
+        assert_eq!(names, ["local/echo-tool"]);
+    }
+
+    #[test]
+    fn old_layout_entries_of_a_missing_store_are_empty() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path().join("absent"));
+        assert!(registry.old_layout_entries().unwrap().is_empty());
     }
 
     /// The FIPS 180-2 SHA-256 vectors short enough to write as literals, as `(name, input, digest)`.

@@ -185,7 +185,7 @@ error[E-IO-003]: missing required file 'skill.md' in /path/to/my-skill
 mur publish code-review-conventions-1.0.0.mur.zip
 ```
 
-`mur publish` writes the artifact into the global store, `~/.murmur/artifacts/code-review-conventions/1.0.0/`, where every project on this machine can install it from.
+`mur publish` writes the artifact into the global store as `local/code-review-conventions`, at `~/.murmur/artifacts/local/code-review-conventions/1.0.0/`, where every project on this machine can install it from. A file names no publisher, so what it publishes is in the `local` scope.
 
 Then install:
 
@@ -206,14 +206,14 @@ Create a `murmur.yaml` for the capsule that needs the skill. Add the skill artif
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
           endpoint: https://api.anthropic.com
           api_key: ${ANTHROPIC_API_KEY}
 
-      - name: code-review-conventions
+      - name: local/code-review-conventions
         version: "1.0.0"
         runtime: skill
 
@@ -221,7 +221,7 @@ Create a `murmur.yaml` for the capsule that needs the skill. Add the skill artif
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
       system_prompt: |
         You are a code review assistant.
     ```
@@ -233,14 +233,14 @@ Create a `murmur.yaml` for the capsule that needs the skill. Add the skill artif
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
           endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
 
-      - name: code-review-conventions
+      - name: local/code-review-conventions
         version: "1.0.0"
         runtime: skill
 
@@ -248,7 +248,7 @@ Create a `murmur.yaml` for the capsule that needs the skill. Add the skill artif
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
       system_prompt: |
         You are a code review assistant.
     ```
@@ -260,14 +260,14 @@ Create a `murmur.yaml` for the capsule that needs the skill. Add the skill artif
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
           endpoint: https://api.deepseek.com
           api_key: ${DEEPSEEK_API_KEY}
 
-      - name: code-review-conventions
+      - name: local/code-review-conventions
         version: "1.0.0"
         runtime: skill
 
@@ -275,12 +275,12 @@ Create a `murmur.yaml` for the capsule that needs the skill. Add the skill artif
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
       system_prompt: |
         You are a code review assistant.
     ```
 
-The skill appears in the agent's tool inventory as a zero-argument callable. When the agent calls `code-review-conventions`, the runtime reads `tools/code-review-conventions/skill.md` and returns the content as the tool result. No file-read capability is required.
+The skill appears in the agent's tool inventory as a zero-argument callable, under the part of its name after the `/`. When the agent calls `code-review-conventions`, the runtime reads `tools/code-review-conventions/skill.md` and returns the content as the tool result. No file-read capability is required.
 
 If you want the skill's content pre-loaded as the system prompt instead of called on-demand, use [`inference.system_prompt_artifact`](capsule-system-prompt.md#step-4-load-the-prompt-from-a-skill-artifact) instead.
 

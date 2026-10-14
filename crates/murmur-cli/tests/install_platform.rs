@@ -16,15 +16,25 @@ use std::{
 use assert_cmd::Command;
 use common::github_release::{wasm_tool_zip, MockRelease};
 use murmur_artifact::{
-    current_platform, read_lockfile, sha256_hex, write_lockfile_atomic, LocalRegistry, LockOrigin,
-    LockedArtifact, LockedSha256, MurmurLock, PlatformMatch, Registry, RuntimeType, LOCK_VERSION,
-    SUPPORTED_PLATFORMS,
+    current_platform, read_lockfile, sha256_hex, write_lockfile_atomic, ArtifactName,
+    LocalRegistry, LockOrigin, LockedArtifact, LockedSha256, MurmurLock, PlatformMatch, Registry,
+    RuntimeType, LOCK_VERSION, SUPPORTED_PLATFORMS,
 };
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+/// The bare name: the artifact's packed `name:` and the stem of every asset and store file.
 const NAME: &str = "nativetool";
+/// The full name a source-chain install files it under: the scope of the `acme/artifacts`
+/// source the tests configure.
+const SOURCED_NAME: &str = "acme/nativetool";
+/// The full name it is filed under when installed from its `.mur.zip` file.
+const LOCAL_NAME: &str = "local/nativetool";
 const VERSION: &str = "0.1.0";
+
+fn full_name(name: &str) -> ArtifactName {
+    ArtifactName::parse(name).unwrap()
+}
 
 /// A `SUPPORTED_PLATFORMS` member that is not this host's, so a test can assert on a platform
 /// nothing here can resolve without knowing which host it runs on.
@@ -104,13 +114,17 @@ fn all_platforms_install_files_each_platform_beside_the_other() {
 
     mur(&home)
         .env("MUR_GITHUB_API_BASE", &release.api_base)
-        .args(["install", "--all-platforms", &format!("{NAME}@{VERSION}")])
+        .args([
+            "install",
+            "--all-platforms",
+            &format!("{SOURCED_NAME}@{VERSION}"),
+        ])
         .assert()
         .success();
 
     let version_dir = home
         .path()
-        .join(format!(".murmur/artifacts/{NAME}/{VERSION}"));
+        .join(format!(".murmur/artifacts/{SOURCED_NAME}/{VERSION}"));
     let mut files: Vec<String> = fs::read_dir(&version_dir)
         .unwrap()
         .flatten()
@@ -131,11 +145,12 @@ fn all_platforms_install_files_each_platform_beside_the_other() {
     );
 
     let store = LocalRegistry::new(home.path().join(".murmur/artifacts"));
+    let name = full_name(SOURCED_NAME);
     let resolved_linux = store
-        .resolve_with_platform(NAME, VERSION, Some("linux-x86_64"))
+        .resolve_with_platform(&name, VERSION, Some("linux-x86_64"))
         .unwrap();
     let resolved_darwin = store
-        .resolve_with_platform(NAME, VERSION, Some("darwin-aarch64"))
+        .resolve_with_platform(&name, VERSION, Some("darwin-aarch64"))
         .unwrap();
 
     assert_eq!(resolved_linux.bytes, linux_bytes);
@@ -156,7 +171,67 @@ fn all_platforms_install_files_each_platform_beside_the_other() {
     // `mur list` reports the artifact once, for both platforms.
     let index = store.list_index().unwrap();
     assert_eq!(index.len(), 1);
+    assert_eq!(index[0].name, name);
     assert_eq!(index[0].platforms.len(), 2);
+}
+
+// ── An explicit release files every asset under the repository's scope ──────
+
+#[test]
+fn a_github_release_files_each_platform_asset_under_the_owners_scope() {
+    let home = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+
+    let linux_name = format!("{NAME}-{VERSION}-linux-x86_64.mur.zip");
+    let darwin_name = format!("{NAME}-{VERSION}-darwin-aarch64.mur.zip");
+    let linux = fs::read(native_zip(staging.path(), &linux_name, "linux")).unwrap();
+    let darwin = fs::read(native_zip(staging.path(), &darwin_name, "darwin")).unwrap();
+    let wasm = fs::read(wasm_tool_zip(staging.path(), "wasmtool", VERSION)).unwrap();
+    let release = MockRelease::start_tagged(
+        &format!("v{VERSION}"),
+        vec![
+            (linux_name.clone(), linux),
+            (darwin_name.clone(), darwin),
+            (format!("wasmtool-{VERSION}.mur.zip"), wasm),
+        ],
+    );
+
+    // The owner is written with capitals; the scope is the owner lowercased.
+    mur(&home)
+        .env("MUR_GITHUB_API_BASE", &release.api_base)
+        .env_remove("GITHUB_TOKEN")
+        .args([
+            "install",
+            "-g",
+            "--no-precompile",
+            &format!("github:Acme/artifacts@v{VERSION}"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "Installed {SOURCED_NAME}@{VERSION}"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "Installed acme/wasmtool@{VERSION}"
+        )));
+
+    let store_root = home.path().join(".murmur/artifacts");
+    let native_dir = store_root.join(format!("{SOURCED_NAME}/{VERSION}"));
+    assert!(native_dir.join(&linux_name).exists());
+    assert!(native_dir.join(&darwin_name).exists());
+    assert!(store_root
+        .join(format!(
+            "acme/wasmtool/{VERSION}/wasmtool-{VERSION}.mur.zip"
+        ))
+        .exists());
+
+    let names: Vec<String> = LocalRegistry::new(store_root)
+        .list_index()
+        .unwrap()
+        .into_iter()
+        .map(|meta| meta.name.to_string())
+        .collect();
+    assert_eq!(names, vec![SOURCED_NAME, "acme/wasmtool"]);
 }
 
 // ── S2: a WASM artifact stays untagged ───────────────────────────────────────
@@ -183,13 +258,13 @@ fn a_wasm_artifact_installs_untagged_and_resolves_for_any_platform() {
     mur(&home)
         .env("MUR_GITHUB_API_BASE", &release.api_base)
         .current_dir(project.path())
-        .args(["install", &format!("wasmtool@{VERSION}")])
+        .args(["install", &format!("acme/wasmtool@{VERSION}")])
         .assert()
         .success();
 
     let version_dir = project
         .path()
-        .join(format!(".murmur/artifacts/wasmtool/{VERSION}"));
+        .join(format!(".murmur/artifacts/acme/wasmtool/{VERSION}"));
     assert!(version_dir
         .join(format!("wasmtool-{VERSION}.mur.zip"))
         .exists());
@@ -200,14 +275,18 @@ fn a_wasm_artifact_installs_untagged_and_resolves_for_any_platform() {
     let store = LocalRegistry::new(project.path().join(".murmur/artifacts"));
     // A platform this host is not: a platform-independent payload resolves for it anyway.
     let resolved = store
-        .resolve_with_platform("wasmtool", VERSION, Some(foreign_platform()))
+        .resolve_with_platform(
+            &full_name("acme/wasmtool"),
+            VERSION,
+            Some(foreign_platform()),
+        )
         .unwrap();
     assert!(resolved.meta.platforms.is_empty());
     assert_eq!(resolved.platform_match, PlatformMatch::NotApplicable);
 
     // S7's other half: a platform-independent payload is pinned once, under `any`.
     let lock = read_lockfile(&project.path().join("murmur.lock")).unwrap();
-    let entry = lock.artifact_for("wasmtool").unwrap();
+    let entry = lock.artifact_for("acme/wasmtool").unwrap();
     assert_eq!(
         entry.sha256.any.as_deref(),
         Some(sha256_hex(&bytes).as_str())
@@ -246,7 +325,7 @@ fn a_release_without_this_platforms_asset_fails_naming_the_platform() {
     mur(&home)
         .env("MUR_GITHUB_API_BASE", &release.api_base)
         .current_dir(project.path())
-        .args(["install", &format!("{NAME}@{VERSION}")])
+        .args(["install", &format!("{SOURCED_NAME}@{VERSION}")])
         .assert()
         .failure()
         .stderr(predicate::str::contains(current_platform()))
@@ -254,7 +333,11 @@ fn a_release_without_this_platforms_asset_fails_naming_the_platform() {
         .stderr(predicate::str::contains("this release publishes"));
 
     assert!(
-        !project.path().join(".murmur/artifacts").join(NAME).exists(),
+        !project
+            .path()
+            .join(".murmur/artifacts")
+            .join(SOURCED_NAME)
+            .exists(),
         "a refused install must leave no payload behind"
     );
 }
@@ -281,7 +364,7 @@ fn init_project(dir: &Path) {
     fs::write(
         dir.join("murmur.yaml"),
         format!(
-            "name: platform-fixture\nversion: 0.0.1\nartifacts:\n  - name: {NAME}\n    version: {VERSION}\n    runtime: tool\n"
+            "name: platform-fixture\nversion: 0.0.1\nartifacts:\n  - name: {LOCAL_NAME}\n    version: {VERSION}\n    runtime: tool\n"
         ),
     )
     .unwrap();
@@ -298,20 +381,20 @@ fn installing_a_native_artifact_pins_a_hash_under_this_platform() {
 
     mur(&home)
         .current_dir(project.path())
-        .args(["install", &format!("{NAME}@{VERSION}")])
+        .args(["install", &format!("{LOCAL_NAME}@{VERSION}")])
         .assert()
         .success();
 
     let lock_path = project.path().join("murmur.lock");
     let raw = fs::read_to_string(&lock_path).unwrap();
-    assert!(raw.contains("lock_version: 2"), "{raw}");
+    assert!(raw.contains("lock_version: 3"), "{raw}");
     assert!(
         !raw.contains("wasm:"),
         "a v1 sha256.wasm key survived: {raw}"
     );
 
     let lock = read_lockfile(&lock_path).unwrap();
-    let entry = lock.artifact_for(NAME).unwrap();
+    let entry = lock.artifact_for(LOCAL_NAME).unwrap();
     assert!(entry.sha256.any.is_none());
     assert_eq!(
         entry.sha256.for_platform(current_platform()),
@@ -321,7 +404,7 @@ fn installing_a_native_artifact_pins_a_hash_under_this_platform() {
     // Re-running changes nothing.
     mur(&home)
         .current_dir(project.path())
-        .args(["install", &format!("{NAME}@{VERSION}")])
+        .args(["install", &format!("{LOCAL_NAME}@{VERSION}")])
         .assert()
         .success();
     assert_eq!(read_lockfile(&lock_path).unwrap(), lock);
@@ -339,7 +422,7 @@ fn a_lock_written_for_another_platform_names_the_platform_and_is_repaired_by_ins
     // with one written on a machine this is not.
     mur(&home)
         .current_dir(project.path())
-        .args(["install", &format!("{NAME}@{VERSION}")])
+        .args(["install", &format!("{LOCAL_NAME}@{VERSION}")])
         .assert()
         .success();
 
@@ -351,10 +434,11 @@ fn a_lock_written_for_another_platform_names_the_platform_and_is_repaired_by_ins
         &MurmurLock {
             lock_version: LOCK_VERSION,
             artifacts: vec![LockedArtifact {
-                name: NAME.to_string(),
+                name: LOCAL_NAME.to_string(),
                 resolved_version: VERSION.to_string(),
                 sha256: LockedSha256::for_one_platform(other, "hash-from-the-other-machine"),
                 origin: LockOrigin::Operator,
+                owner_id: None,
             }],
         },
     )
@@ -374,13 +458,13 @@ fn a_lock_written_for_another_platform_names_the_platform_and_is_repaired_by_ins
     // Installing on this host adds this platform's hash and leaves the other one alone.
     mur(&home)
         .current_dir(project.path())
-        .args(["install", &format!("{NAME}@{VERSION}")])
+        .args(["install", &format!("{LOCAL_NAME}@{VERSION}")])
         .assert()
         .success();
 
     let entry = read_lockfile(&lock_path)
         .unwrap()
-        .artifact_for(NAME)
+        .artifact_for(LOCAL_NAME)
         .cloned()
         .unwrap();
     assert_eq!(
@@ -405,7 +489,7 @@ fn a_lock_written_for_another_platform_names_the_platform_and_is_repaired_by_ins
 /// A store as an install written before this change left it: a native payload and its hash at
 /// the generic paths, and one untagged metadata file claiming no platform at all.
 fn write_old_shape_store(root: &Path, artifact: &Path) {
-    let version_dir = root.join(NAME).join(VERSION);
+    let version_dir = root.join(LOCAL_NAME).join(VERSION);
     fs::create_dir_all(&version_dir).unwrap();
     let bytes = fs::read(artifact).unwrap();
     fs::write(
@@ -421,7 +505,7 @@ fn write_old_shape_store(root: &Path, artifact: &Path) {
     fs::write(
         version_dir.join(format!("{NAME}-{VERSION}.meta.json")),
         format!(
-            r#"{{"meta":{{"name":"{NAME}","version":"{VERSION}","runtime":"native","artifact_runtime":"tool","platforms":[],"description":null,"tags":[]}}}}"#
+            r#"{{"meta":{{"name":"{LOCAL_NAME}","version":"{VERSION}","runtime":"native","artifact_runtime":"tool","platforms":[],"description":null,"tags":[]}}}}"#
         ),
     )
     .unwrap();
@@ -443,7 +527,7 @@ fn an_old_shape_store_still_resolves_and_is_reported() {
 
     let store = LocalRegistry::new(project.path().join(".murmur/artifacts"));
     let resolved = store
-        .resolve_with_platform(NAME, VERSION, Some(current_platform()))
+        .resolve_with_platform(&full_name(LOCAL_NAME), VERSION, Some(current_platform()))
         .unwrap();
     assert_eq!(resolved.platform_match, PlatformMatch::UntaggedFallback);
 
@@ -455,7 +539,7 @@ fn an_old_shape_store_still_resolves_and_is_reported() {
         .success()
         .stdout(predicate::str::contains("W-REG-001"))
         .stdout(predicate::str::contains(format!(
-            "Fix: mur install {NAME}@{VERSION}"
+            "Fix: mur install {LOCAL_NAME}@{VERSION}"
         )));
 
     // `mur run` says the same thing on stderr. It goes on to fail for its own reasons — this
@@ -471,9 +555,12 @@ fn an_old_shape_store_still_resolves_and_is_reported() {
         stderr.contains("warning[W-REG-001]"),
         "expected a W-REG-001 warning, got: {stderr}"
     );
-    assert!(stderr.contains(&format!("{NAME}@{VERSION}")), "{stderr}");
     assert!(
-        stderr.contains(&format!("mur install {NAME}@{VERSION}")),
+        stderr.contains(&format!("{LOCAL_NAME}@{VERSION}")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("mur install {LOCAL_NAME}@{VERSION}")),
         "{stderr}"
     );
 }
@@ -502,7 +589,7 @@ fn a_local_native_file_records_the_platform_its_name_carries_or_this_host() {
 
     let version_dir = home
         .path()
-        .join(format!(".murmur/artifacts/{NAME}/{VERSION}"));
+        .join(format!(".murmur/artifacts/{LOCAL_NAME}/{VERSION}"));
     let host = current_platform();
     assert!(version_dir
         .join(format!("{NAME}-{VERSION}-{host}.mur.zip"))

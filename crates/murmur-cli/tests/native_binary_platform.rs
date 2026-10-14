@@ -25,7 +25,10 @@ use murmur_artifact::{
 use predicates::prelude::*;
 use tempfile::{tempdir, TempDir};
 
+/// The tool name the session knows the fixture by: the bare part of [`TOOL_ARTIFACT`].
 const TOOL_NAME: &str = "platform-fixture-tool";
+/// The full name the fixture is installed and declared under, as from its `.mur.zip` file.
+const TOOL_ARTIFACT: &str = "local/platform-fixture-tool";
 const TOOL_VERSION: &str = "0.1.0";
 
 // ── Synthetic executable headers ─────────────────────────────────────────────
@@ -94,7 +97,7 @@ fn native_tool_zip(dir: &Path, payload: &[u8]) -> std::path::PathBuf {
 fn publish_to_home(home: &TempDir, artifact_path: &Path) {
     let registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
     let meta = ArtifactMeta {
-        name: TOOL_NAME.to_string(),
+        name: murmur_artifact::ArtifactName::parse(TOOL_ARTIFACT).unwrap(),
         version: TOOL_VERSION.to_string(),
         runtime: RuntimeType::Native,
         artifact_runtime: "native".to_string(),
@@ -114,7 +117,7 @@ fn write_capsule_manifest(project_dir: &Path) -> RuntimeManifest {
     fs::write(
         &manifest_path,
         format!(
-            "name: platform-capsule\nversion: 0.1.0\nartifacts:\n  - name: {TOOL_NAME}\n    \
+            "name: platform-capsule\nversion: 0.1.0\nartifacts:\n  - name: {TOOL_ARTIFACT}\n    \
              version: {TOOL_VERSION}\n    runtime: tool\n"
         ),
     )
@@ -161,13 +164,14 @@ fn stage_request(project_dir: &Path, manifest: &RuntimeManifest) -> StageRequest
         })
         .collect();
     let mut allowlisted_tools = HashSet::new();
-    allowlisted_tools.insert(TOOL_NAME.to_string());
+    allowlisted_tools.insert(TOOL_ARTIFACT.to_string());
 
     StageRequest {
         credentials_file: None,
         manifest_dir: project_dir.to_path_buf(),
         capsule_name: manifest.name.clone(),
         capsule_version: manifest.version.clone(),
+        capsule_artifact: None,
         capsule_component_bytes: Vec::new(),
         artifacts,
         allowlisted_tools,
@@ -278,7 +282,7 @@ fn staging_refuses_a_native_binary_built_for_another_platform() {
             binary_platform,
             host_platform,
         } => {
-            assert_eq!(name, TOOL_NAME);
+            assert_eq!(name, TOOL_ARTIFACT);
             assert_eq!(binary_platform, foreign_platform);
             assert_eq!(host_platform, current_platform());
         }
@@ -312,7 +316,7 @@ fn doctor_fails_the_line_for_a_native_binary_built_for_another_platform() {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
 
     assert!(
-        stdout.contains(&format!("\u{2717}  {TOOL_NAME}@{TOOL_VERSION}")),
+        stdout.contains(&format!("\u{2717}  {TOOL_ARTIFACT}@{TOOL_VERSION}")),
         "expected a failing line for the artifact:\n{stdout}"
     );
     assert!(
@@ -323,7 +327,7 @@ fn doctor_fails_the_line_for_a_native_binary_built_for_another_platform() {
         "failing line must name both platforms:\n{stdout}"
     );
     assert!(
-        stdout.contains(&format!("Fix: {TOOL_NAME}:")),
+        stdout.contains(&format!("Fix: {TOOL_ARTIFACT}:")),
         "expected a Fix: line naming the artifact:\n{stdout}"
     );
     assert!(
@@ -409,7 +413,7 @@ fn an_unrecognised_payload_stages_and_doctor_reports_it_unverified() {
     mur_doctor(&home, project.path())
         .success()
         .stdout(predicate::str::contains(format!(
-            "\u{2713}  {TOOL_NAME}@{TOOL_VERSION}"
+            "\u{2713}  {TOOL_ARTIFACT}@{TOOL_VERSION}"
         )))
         .stdout(predicate::str::contains("platform unverified"))
         .stdout(predicate::str::contains("All checks passed."));
@@ -424,18 +428,22 @@ fn doctor_reports_a_platform_independent_artifact_as_such() {
 
     fs::write(
         project.path().join("murmur.yaml"),
-        "name: platform-capsule\nversion: 0.1.0\nartifacts:\n  - name: platform-skill\n    \
+        "name: platform-capsule\nversion: 0.1.0\nartifacts:\n  - name: local/platform-skill\n    \
          version: 0.1.0\n    runtime: skill\n",
     )
     .unwrap();
-    let artifact =
-        common::create_skill_artifact(staging.path(), "platform-skill", "0.1.0", "# guidance\n");
+    let artifact = common::create_skill_artifact(
+        staging.path(),
+        "local/platform-skill",
+        "0.1.0",
+        "# guidance\n",
+    );
     common::install_artifact_to_project(project.path(), &artifact).success();
 
     mur_doctor(&home, project.path())
         .success()
         .stdout(predicate::str::contains(
-            "\u{2713}  platform-skill@0.1.0   platform-independent",
+            "\u{2713}  local/platform-skill@0.1.0   platform-independent",
         ))
         .stdout(predicate::str::contains("All checks passed."));
 }

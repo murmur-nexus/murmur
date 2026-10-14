@@ -498,10 +498,10 @@ mod tests {
              network:\n    allow: [registry.internal]\n    unix_sockets: false\n  \
              peer_fetch:\n    allow: [peer.internal]\n  \
              shell:\n    allow: [git]\n  \
-             spawn:\n    allow: [worker-a]\n  \
+             spawn:\n    allow: [local/worker-a]\n  \
              env:\n    allow: [HOME]\n  \
              filesystem:\n    scope: data\n    workdir_exec: false\n  \
-             install:\n    skill: [\"style-*\"]\n    tool: [jq]\n";
+             install:\n    skill: [\"local/style-*\"]\n    tool: [local/jq]\n";
         let parent = envelope(parent_yaml);
 
         let cases: &[(&str, EnvelopeAxis, &str)] = &[
@@ -526,9 +526,9 @@ mod tests {
                 "curl",
             ),
             (
-                "capabilities:\n  spawn:\n    allow: [worker-b]\n",
+                "capabilities:\n  spawn:\n    allow: [local/worker-b]\n",
                 EnvelopeAxis::SpawnAllow,
-                "worker-b",
+                "local/worker-b",
             ),
             (
                 "capabilities:\n  env:\n    allow: [GITHUB_TOKEN]\n",
@@ -556,9 +556,9 @@ mod tests {
                 "*",
             ),
             (
-                "capabilities:\n  filesystem:\n    scope: data\n  install:\n    tool: [yq]\n",
+                "capabilities:\n  filesystem:\n    scope: data\n  install:\n    tool: [local/yq]\n",
                 EnvelopeAxis::InstallTool,
-                "yq",
+                "local/yq",
             ),
         ];
 
@@ -576,15 +576,16 @@ mod tests {
     /// under a parent prefix, never a wider prefix or `*`.
     #[test]
     fn a_child_install_entry_fits_only_under_a_covering_parent_entry() {
-        let parent = envelope("capabilities:\n  install:\n    skill: [\"style-*\"]\n");
+        let parent = envelope("capabilities:\n  install:\n    skill: [\"local/style-*\"]\n");
 
         for (skill, covered) in [
-            ("style-rust", true),
-            ("\"style-rust-*\"", true),
-            ("\"style-*\"", true),
-            ("\"style*\"", false),
+            ("local/style-rust", true),
+            ("\"local/style-rust-*\"", true),
+            ("\"local/style-*\"", true),
+            ("\"local/style*\"", false),
+            ("\"ana/style-rust\"", false),
             ("\"*\"", false),
-            ("stylist", false),
+            ("local/stylist", false),
         ] {
             let child = envelope(&format!(
                 "capabilities:\n  install:\n    skill: [{skill}]\n"
@@ -597,10 +598,10 @@ mod tests {
             }
         }
 
-        let child_tool = envelope("capabilities:\n  install:\n    tool: [style-rust]\n");
+        let child_tool = envelope("capabilities:\n  install:\n    tool: [local/style-rust]\n");
         let violation = parent.contains(&child_tool).unwrap_err();
         assert_eq!(violation.axis, EnvelopeAxis::InstallTool);
-        assert_eq!(violation.entry, "style-rust");
+        assert_eq!(violation.entry, "local/style-rust");
     }
 
     /// A child that declares no install block holds none, whatever its parent holds.
@@ -661,7 +662,7 @@ mod tests {
             manifest_envelope(
                 name,
                 &format!(
-                    "artifacts:\n  - name: writer\n    version: 0.1.0\n    runtime: tool\n    \
+                    "artifacts:\n  - name: local/writer\n    version: 0.1.0\n    runtime: tool\n    \
                      capabilities:\n      state:\n        store: {store}\n"
                 ),
             )
@@ -685,7 +686,7 @@ mod tests {
     fn an_undeclared_store_resolves_to_the_capsule_name() {
         let envelope = manifest_envelope(
             "notes-capsule",
-            "artifacts:\n  - name: writer\n    version: 0.1.0\n    runtime: tool\n    \
+            "artifacts:\n  - name: local/writer\n    version: 0.1.0\n    runtime: tool\n    \
              capabilities:\n      state: {}\n",
         );
 

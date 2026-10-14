@@ -194,7 +194,7 @@ mur publish jsonl-line-count-0.1.0.mur.zip
 Expected publish output:
 
 ```text
-Published jsonl-line-count@0.1.0
+Published local/jsonl-line-count@0.1.0
 ```
 
 ---
@@ -207,7 +207,7 @@ In capsule `murmur.yaml`:
 name: my-capsule
 version: "0.1.0"
 artifacts:
-  - name: jsonl-line-count
+  - name: local/jsonl-line-count
     version: "0.1.0"
     runtime: wasm
 ```
@@ -222,7 +222,7 @@ With your capsule artifact in place, run:
 mur run
 ```
 
-At runtime, Murmur resolves `jsonl-line-count@0.1.0`, installs it, and dispatches it when invoked.
+At runtime, Murmur resolves `local/jsonl-line-count@0.1.0` and offers it to the model as the tool `jsonl-line-count`.
 
 ---
 

@@ -27,9 +27,12 @@ use zip::{
     CompressionMethod, ZipWriter,
 };
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
+/// The tool name the model calls, which is also the name the artifact is packed under.
 const TOOL_NAME: &str = "request-input-tool";
+/// The tool's full name once installed from its `.mur.zip` file.
+const TOOL_ARTIFACT: &str = "local/request-input-tool";
 const TOOL_VERSION: &str = "0.1.0";
 
 fn fixture_path(relative: &str) -> PathBuf {
@@ -123,7 +126,7 @@ fn setup_project(home: &TempDir, endpoint: &str, extra_lifecycle_yaml: &str) -> 
              \x20   gateway:\n\
              \x20     endpoint: {endpoint}\n\
              \x20     api_key: test-key\n\
-             \x20 - name: {TOOL_NAME}\n\
+             \x20 - name: {TOOL_ARTIFACT}\n\
              \x20   version: {TOOL_VERSION}\n\
              \x20   runtime: tool\n\
              capabilities:\n\
@@ -176,6 +179,7 @@ fn stage_agent(
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools,

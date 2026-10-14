@@ -24,7 +24,7 @@ Start from a working agent manifest (inference block, driver artifact, network a
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
@@ -35,7 +35,7 @@ Start from a working agent manifest (inference block, driver artifact, network a
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
 
     lifecycle:
       task_acceptance: queue
@@ -51,7 +51,7 @@ Start from a working agent manifest (inference block, driver artifact, network a
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
@@ -62,7 +62,7 @@ Start from a working agent manifest (inference block, driver artifact, network a
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
 
     lifecycle:
       task_acceptance: queue
@@ -78,7 +78,7 @@ Start from a working agent manifest (inference block, driver artifact, network a
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
@@ -89,7 +89,7 @@ Start from a working agent manifest (inference block, driver artifact, network a
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
 
     lifecycle:
       task_acceptance: queue

@@ -23,7 +23,7 @@ Create a `murmur.yaml` file with `inference.system_prompt` set to the text you w
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
@@ -34,7 +34,7 @@ Create a `murmur.yaml` file with `inference.system_prompt` set to the text you w
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
       system_prompt: |
         You are a concise data analyst. Always respond with:
         1. A one-sentence summary of what you found.
@@ -49,7 +49,7 @@ Create a `murmur.yaml` file with `inference.system_prompt` set to the text you w
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
@@ -60,7 +60,7 @@ Create a `murmur.yaml` file with `inference.system_prompt` set to the text you w
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
       system_prompt: |
         You are a concise data analyst. Always respond with:
         1. A one-sentence summary of what you found.
@@ -75,7 +75,7 @@ Create a `murmur.yaml` file with `inference.system_prompt` set to the text you w
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
@@ -86,7 +86,7 @@ Create a `murmur.yaml` file with `inference.system_prompt` set to the text you w
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
       system_prompt: |
         You are a concise data analyst. Always respond with:
         1. A one-sentence summary of what you found.
@@ -145,17 +145,17 @@ Rules:
 
 ## Step 4 — load the prompt from a skill artifact
 
-If your system prompt is already packaged as a [skill artifact](package-skill-artifact.md), you can bind it directly instead of duplicating the content in a separate file. Set `inference.system_prompt_artifact` to the name of the skill:
+If your system prompt is already packaged as a [skill artifact](package-skill-artifact.md), you can bind it directly instead of duplicating the content in a separate file. Set `inference.system_prompt_artifact` to the skill's name as its `artifacts:` entry writes it — `local/<name>` for one you published yourself:
 
 ```yaml
 artifacts:
-  - name: code-review-conventions
+  - name: local/code-review-conventions
     version: "1.0.0"
     runtime: skill
 
 inference:
   ...
-  system_prompt_artifact: code-review-conventions
+  system_prompt_artifact: local/code-review-conventions
 ```
 
 At launch, the runtime reads `workdir/tools/code-review-conventions/skill.md` and uses that content as the system prompt for every inference turn. The skill is **not** added to the callable tool inventory — it is already in context and would double-inject if called.

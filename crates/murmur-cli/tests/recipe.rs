@@ -17,7 +17,7 @@ use capsule_runtime::launch_session;
 use common::hook_wat::{create_hook_zip, shell_echo_deny_hook_wasm};
 use serde_json::{json, Value};
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 /// The marker a justfile puts in the `build` recipe's body. A hook that echoes it back was
@@ -47,7 +47,7 @@ fn create_manifest(project_dir: &Path, endpoint: &str, shell_binary: &str) -> Pa
             "    gateway:\n",
             "      endpoint: {endpoint}\n",
             "      api_key: test-key\n",
-            "  - name: echoer\n",
+            "  - name: local/echoer\n",
             "    version: 0.1.0\n",
             "    runtime: hook\n",
             "capabilities:\n",

@@ -49,12 +49,12 @@ mur new --roster crew
 ```text
 Scaffolded formation 'crew' in ./crew
   crew/roster.yaml          lead is the entry member; lead may call worker
-  crew/lead/murmur.yaml     capsule crew-lead@0.1.0
-  crew/worker/murmur.yaml   capsule crew-worker@0.1.0, serves peers
+  crew/lead/murmur.yaml     capsule local/crew-lead@0.1.0
+  crew/worker/murmur.yaml   capsule local/crew-worker@0.1.0, serves peers
 
 Next:
   mur config set -g credentials.OPENAI_API_KEY <your key>
-  mur install -g murmur-driver-openai@0.9.0
+  mur install -g murmur/driver-openai@0.9.0
   mur build crew/lead && mur install -g crew/lead/crew-lead-0.1.0.mur.zip
   mur build crew/worker && mur install -g crew/worker/crew-worker-0.1.0.mur.zip
   mur run --roster crew --task "<your task>"
@@ -75,12 +75,12 @@ The roster names the members, marks one as the entry member, and says who may ca
 ```yaml
 members:
   - name: lead                      # its name in this roster, used by reachability
-    capsule: crew-lead              # built from lead/murmur.yaml
+    capsule: local/crew-lead        # built from lead/murmur.yaml
     version: 0.1.0                  # the exact version installed
 …
     entry: true
   - name: worker                    # its name in this roster, used by reachability
-    capsule: crew-worker            # built from worker/murmur.yaml
+    capsule: local/crew-worker      # built from worker/murmur.yaml
     version: 0.1.0                  # the exact version installed
 …
 reachability:
@@ -186,17 +186,17 @@ Install the driver both members declare:
 === "Anthropic"
 
     ```bash
-    mur install -g murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}
+    mur install -g murmur/driver-anthropic@{{ v.murmur_driver_anthropic }}
     ```
 
 === "OpenAI"
 
     ```bash
-    mur install -g murmur-driver-openai@{{ v.murmur_driver_openai }}
+    mur install -g murmur/driver-openai@{{ v.murmur_driver_openai }}
     ```
 
 ```text
-Installed murmur-driver-openai@0.9.0 from github:murmur-nexus/default-artifacts
+Installed murmur/driver-openai@0.9.0 from github:murmur-nexus/default-artifacts
 ```
 
 --8<-- "includes/mur-pull-info.md"
@@ -210,9 +210,9 @@ mur build crew/worker && mur install -g crew/worker/crew-worker-0.1.0.mur.zip
 
 ```text
 Built artifact: crew/lead/crew-lead-0.1.0.mur.zip
-Installed crew-lead@0.1.0 from crew/lead/crew-lead-0.1.0.mur.zip
+Installed local/crew-lead@0.1.0 from crew/lead/crew-lead-0.1.0.mur.zip
 Built artifact: crew/worker/crew-worker-0.1.0.mur.zip
-Installed crew-worker@0.1.0 from crew/worker/crew-worker-0.1.0.mur.zip
+Installed local/crew-worker@0.1.0 from crew/worker/crew-worker-0.1.0.mur.zip
 ```
 
 Optionally, check the formation from the `crew` directory. With no `murmur.yaml` there,
@@ -229,8 +229,8 @@ No murmur.yaml in /tmp/crew-run-d078/work/crew: checking its roster.yaml. Run mu
 
 Roster
   file: /tmp/crew-run-d078/work/crew/roster.yaml
-  lead     crew-lead@0.1.0     entry   refuses peers   authenticated door
-  worker   crew-worker@0.1.0           serves peers    authenticated door
+  lead     local/crew-lead@0.1.0     entry   refuses peers   authenticated door
+  worker   local/crew-worker@0.1.0           serves peers    authenticated door
   reachability: lead → worker
 
 All checks passed.
@@ -249,7 +249,7 @@ mur run --roster crew --task "Write a four-line poem about a lighthouse keeper."
 ```text
 …
 formation: frm_01a1100295f47ea3b227ddf4612759f3
-  peer   worker  crew-worker@0.1.0  pid 2768649  ses_01a11002968476428a785ab0b3ae4fbb  http://localhost:39151
+  peer   worker  local/crew-worker@0.1.0  pid 2768649  ses_01a11002968476428a785ab0b3ae4fbb  http://localhost:39151
                  workdir /tmp/crew-run-d078/home/.murmur/formations/frm_01a1100295f47ea3b227ddf4612759f3/worker
   entry  lead    starting
 …

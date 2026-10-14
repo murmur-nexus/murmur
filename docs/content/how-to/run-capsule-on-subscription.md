@@ -5,7 +5,7 @@ A capsule normally reaches a model over HTTPS with an API key you declare in its
 ??? definition "What is a process driver?"
     A **process driver** is a WASM artifact declared with `runtime: driver` that knows how to drive one harness CLI: which executable to run, which arguments to pass, how to read its output, and what its exit codes mean. Murmur's runtime holds none of that — it resolves a binary, moves bytes, and records what the driver says happened.
 
-    A process driver is granted nothing: no environment, no files, no network, and no Murmur host interface. `murmur-driver-claude-code` is the driver for the Claude CLI.
+    A process driver is granted nothing: no environment, no files, no network, and no Murmur host interface. `murmur/driver-claude-code` is the driver for the Claude CLI.
 
 The relevant manifest options are:
 
@@ -63,10 +63,10 @@ name: my-capsule
 version: "0.1.0"
 
 artifacts:
-  - name: murmur-driver-claude-code
+  - name: murmur/driver-claude-code
     version: "{{ v.murmur_driver_claude_code }}"
     runtime: driver
-  - name: murmur-tool-editor
+  - name: murmur/tool-editor
     version: "{{ v.murmur_tool_editor }}"
     runtime: tool
 
@@ -81,7 +81,7 @@ inference:
   max_turns: 100
   system_prompt_file: ./instructions.md
   driver:
-    artifact: murmur-driver-claude-code
+    artifact: murmur/driver-claude-code
 
 lifecycle:
   conversation: threaded
@@ -134,7 +134,7 @@ Two kinds of entry reach the model this way:
 
 | Declared as | Reaches the model as |
 |---|---|
-| A `runtime: tool` artifact, such as `murmur-tool-editor` | One tool per artifact, under its own name |
+| A `runtime: tool` artifact, such as `murmur/tool-editor` | One tool per artifact, under the part of its name after the `/`: `tool-editor` |
 | A binary in [capabilities.shell.allow](../reference/manifest.md#field-capabilities) | One tool per binary, running in the capsule workdir |
 
 `runtime: driver` and `runtime: hook` artifacts are not offered to the model, on this transport as on the other.
@@ -215,22 +215,22 @@ name: my-coding-capsule
 version: "1.0.0"
 
 artifacts:
-  - name: murmur-driver-claude-code
+  - name: murmur/driver-claude-code
     runtime: driver
     version: "{{ v.murmur_driver_claude_code }}"
-  - name: murmur-tool-editor
+  - name: murmur/tool-editor
     runtime: tool
     version: "{{ v.murmur_tool_editor }}"
-  - name: murmur-tool-code-graph
+  - name: murmur/tool-code-graph
     runtime: tool
     version: "{{ v.murmur_tool_code_graph }}"
-  - name: murmur-hook-diff-summary
+  - name: murmur/hook-diff-summary
     runtime: hook
     version: "{{ v.murmur_hook_diff_summary }}"
     capabilities:
       filesystem:
         scope: "."
-  - name: murmur-tool-corpus
+  - name: murmur/tool-corpus
     runtime: tool
     version: "{{ v.murmur_tool_corpus }}"
     capabilities:
@@ -287,7 +287,7 @@ inference:
   max_turns: 100
   system_prompt_file: ./instructions.md
   driver:
-    artifact: murmur-driver-claude-code
+    artifact: murmur/driver-claude-code
 
 lifecycle:
   task_acceptance: queue

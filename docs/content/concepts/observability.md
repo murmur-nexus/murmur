@@ -2,7 +2,7 @@
 
 Every agent session produces a structured trace at `workdir/<session_id>/trace.jsonl`,
 written directly by the runtime regardless of whether any hooks are declared. When
-`murmur-hook-eval` is configured with at least one scorer, that hook (not the runtime)
+`murmur/hook-eval` is configured with at least one scorer, that hook (not the runtime)
 additionally writes `workdir/<session_id>/eval.jsonl` at session end. See [Session trace
 (`trace.jsonl`)](../reference/observability-schemas.md#session-trace-tracejsonl) and [Structured evaluation
 (`eval.jsonl`)](../reference/observability-schemas.md#structured-evaluation-evaljsonl) for the full schemas, and

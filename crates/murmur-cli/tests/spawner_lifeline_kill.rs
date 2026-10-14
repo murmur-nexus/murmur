@@ -56,6 +56,13 @@ const TWO_LEVELS: Duration = Duration::from_secs(60);
 /// How long a delegation may take to start.
 const START_LIMIT: Duration = Duration::from_secs(240);
 
+/// The full name a capsule this file names by `name` is published and granted under. The model
+/// names a sub-capsule by `name`, the bare part `delegate-task` and `submit-plan` offer; the
+/// store, `capabilities.spawn.allow`, the daemon and the delegation records use the full name.
+fn full(name: &str) -> String {
+    format!("local/{name}")
+}
+
 const SPAWNER_CLOSED: &str = "spawner lifeline closed — the session that delegated to this one \
                               has ended";
 
@@ -86,7 +93,8 @@ fn agent_body(endpoint: &str, capabilities_extra: &str, lifecycle: &str, tail: &
 const QUEUE_SLEEP: &str = "lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n";
 
 fn spawn_allow(names: &[&str]) -> String {
-    format!("  spawn:\n    allow: [{}]\n", names.join(", "))
+    let entries: Vec<String> = names.iter().map(|name| full(name)).collect();
+    format!("  spawn:\n    allow: [{}]\n", entries.join(", "))
 }
 
 impl World {
@@ -109,7 +117,7 @@ impl World {
         );
         publish_to_store(
             &registry,
-            MUTE,
+            &full(MUTE),
             VERSION,
             "capsule",
             &agent_body(&never_replying(), "", QUEUE_SLEEP, ""),
@@ -119,7 +127,7 @@ impl World {
         let state = Arc::new(State {
             jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             registry_path: registry.clone(),
-            spawn_allow: top_level.iter().map(|name| name.to_string()).collect(),
+            spawn_allow: top_level.iter().map(|name| full(name)).collect(),
             max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
             max_concurrent: mur_roost::bounds::DEFAULT_MAX_CONCURRENT,
             max_live_capsules: u32::MAX,
@@ -144,7 +152,7 @@ impl World {
     }
 
     fn publish(&self, name: &str, body: &str) {
-        publish_to_store(&self.registry, name, VERSION, "capsule", body, None);
+        publish_to_store(&self.registry, &full(name), VERSION, "capsule", body, None);
     }
 
     /// `mur <args>` in `dir`, under this world's `HOME` and daemon, with nothing a launch could
@@ -974,6 +982,13 @@ fn a_parent_stopped_mid_plan_ends_the_plan_steps_child_first() {
     let mut parent = Parent::start(&world, "stopped-planner", &body, model, |_| {});
     parent.submit();
     let delegation = await_delegation(parent.project.path(), &parent.session_id());
+    // The plan's step named the bare `mute-worker`; what was asked of the daemon, and recorded,
+    // is the full name it stands for.
+    let started = parent_trace(&parent)
+        .into_iter()
+        .find(|event| event["event_type"] == "delegation_start")
+        .expect("a delegation_start record");
+    assert_eq!(started["capsule"], full(MUTE).as_str(), "{started}");
     assert!(
         !delegation.processes().is_empty(),
         "the child is not running"
@@ -1124,13 +1139,13 @@ fn a_formation_member_killed_outright_takes_its_child_with_it() {
     // The daemon reads the entry member's envelope from its own registry; the launcher runs the
     // members from the project's store.
     world.publish("planner", &planner);
-    publish_to_store(&store, "planner", VERSION, "capsule", &planner, None);
-    publish_to_store(&store, "coder", VERSION, "capsule", &coder, None);
+    publish_to_store(&store, &full("planner"), VERSION, "capsule", &planner, None);
+    publish_to_store(&store, &full("coder"), VERSION, "capsule", &coder, None);
     std::fs::write(
         project.path().join("roster.yaml"),
         format!(
-            "roster_version: 1\nmembers:\n  - name: coder\n    capsule: coder\n    version: \
-             {VERSION}\n  - name: planner\n    capsule: planner\n    version: {VERSION}\n    \
+            "roster_version: 1\nmembers:\n  - name: coder\n    capsule: local/coder\n    version: \
+             {VERSION}\n  - name: planner\n    capsule: local/planner\n    version: {VERSION}\n    \
              entry: true\n"
         ),
     )

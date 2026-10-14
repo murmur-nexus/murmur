@@ -204,6 +204,38 @@ fn skill_build_pre_authored_manifest_preserved() {
     assert!(manifest.contains("runtime: skill"), "got: {manifest}");
 }
 
+/// A skill's own name carries no scope: the scope comes from the source it is published from.
+#[test]
+fn skill_build_flag_refuses_a_scoped_name() {
+    let src = tempdir().unwrap();
+    let outdir = tempdir().unwrap();
+    fs::write(src.path().join("SKILL.md"), "# Skill\n").unwrap();
+
+    Command::cargo_bin("mur")
+        .unwrap()
+        .args(["build", "--skill", "ana/x", src.path().to_str().unwrap()])
+        .current_dir(outdir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "error[E-BLD-001]: invalid artifact name 'ana/x': an artifact's own name carries no \
+             scope, so it may not contain '/'",
+        ))
+        .stderr(predicate::str::contains(
+            "hint: the scope belongs to the source the artifact is published from, not to the \
+             artifact: name it 'x', and it installs as <owner>/x from github.com/<owner> or as \
+             local/x from its .mur.zip file",
+        ));
+
+    let has_zip = fs::read_dir(outdir.path()).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".mur.zip")
+    });
+    assert!(!has_zip, "a refused build writes no zip");
+}
+
 #[test]
 fn skill_build_existing_mur_build_unchanged() {
     // Verify the standard `mur build <path>` behavior is not affected
@@ -274,12 +306,12 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
     // 3. Publish to local registry
     common::publish_local(&home, &artifact)
         .success()
-        .stdout(predicate::str::contains("Published rt-skill@0.1.0"));
+        .stdout(predicate::str::contains("Published local/rt-skill@0.1.0"));
 
-    // 4. Verify it's in the registry
+    // 4. Verify it's in the registry, filed in the `local` scope under its packed name
     assert!(home
         .path()
-        .join(".murmur/artifacts/rt-skill/0.1.0")
+        .join(".murmur/artifacts/local/rt-skill/0.1.0/rt-skill-0.1.0.mur.zip")
         .exists());
 
     // 5. Stage a capsule that declares the skill artifact.
@@ -287,7 +319,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
     // capsule (which allows empty WASM bytes). The inference endpoint is never called
     // during staging — only the skill artifact installation path runs.
     let capsule_dir: TempDir = tempdir().unwrap();
-    let manifest_content = "name: test-capsule\nversion: 0.1.0\nartifacts:\n  - name: rt-skill\n    version: 0.1.0\n    runtime: skill\n";
+    let manifest_content = "name: test-capsule\nversion: 0.1.0\nartifacts:\n  - name: local/rt-skill\n    version: 0.1.0\n    runtime: skill\n";
     let manifest_path = capsule_dir.path().join("murmur.yaml");
     fs::write(&manifest_path, manifest_content).unwrap();
 
@@ -313,7 +345,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
         transport: "http".to_string(),
         model: "test-model".to_string(),
         driver: Some(InferenceDriver {
-            artifact: "dummy-driver".to_string(),
+            artifact: "local/dummy-driver".to_string(),
             config: None,
         }),
         command: None,
@@ -337,6 +369,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools: HashSet::new(),
@@ -370,7 +403,8 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
     )
     .unwrap();
 
-    // 6. Verify tools/rt-skill/skill.md is present in the workdir
+    // 6. Verify tools/rt-skill/skill.md is present in the workdir: the model-facing directory
+    // carries the bare name
     let skill_path = staged
         .workdir
         .join("tools")

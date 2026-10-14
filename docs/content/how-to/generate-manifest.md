@@ -32,7 +32,7 @@ Install the inference driver for your provider:
 === "Anthropic"
 
     ```bash
-    mur install murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}
+    mur install murmur/driver-anthropic@{{ v.murmur_driver_anthropic }}
     ```
 
     --8<-- "includes/mur-pull-info.md"
@@ -40,7 +40,7 @@ Install the inference driver for your provider:
 === "OpenAI"
 
     ```bash
-    mur install murmur-driver-openai@{{ v.murmur_driver_openai }}
+    mur install murmur/driver-openai@{{ v.murmur_driver_openai }}
     ```
 
     --8<-- "includes/mur-pull-info.md"
@@ -48,15 +48,15 @@ Install the inference driver for your provider:
 === "DeepSeek"
 
     ```bash
-    mur install murmur-driver-deepseek@{{ v.murmur_driver_deepseek }}
+    mur install murmur/driver-deepseek@{{ v.murmur_driver_deepseek }}
     ```
 
     --8<-- "includes/mur-pull-info.md"
 
-Install `murmur-tool-registry-search`:
+Install `murmur/tool-registry-search`:
 
 ```bash
-mur install murmur-tool-registry-search@{{ v.murmur_tool_registry_search }}
+mur install murmur/tool-registry-search@{{ v.murmur_tool_registry_search }}
 ```
 
 --8<-- "includes/mur-pull-info.md"
@@ -158,13 +158,13 @@ The generator picks one of two shapes based on the task description.
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
           endpoint: https://api.anthropic.com
           api_key: ${ANTHROPIC_API_KEY}
-      - name: murmur-tool-git
+      - name: murmur/tool-git
         version: "{{ v.murmur_tool_git }}"
         runtime: tool
 
@@ -175,7 +175,7 @@ The generator picks one of two shapes based on the task description.
     inference:
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
     ```
 
 === "OpenAI"
@@ -185,13 +185,13 @@ The generator picks one of two shapes based on the task description.
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
           endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
-      - name: murmur-tool-git
+      - name: murmur/tool-git
         version: "{{ v.murmur_tool_git }}"
         runtime: tool
 
@@ -202,7 +202,7 @@ The generator picks one of two shapes based on the task description.
     inference:
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
     ```
 
 === "DeepSeek"
@@ -212,13 +212,13 @@ The generator picks one of two shapes based on the task description.
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
           endpoint: https://api.deepseek.com
           api_key: ${DEEPSEEK_API_KEY}
-      - name: murmur-tool-git
+      - name: murmur/tool-git
         version: "{{ v.murmur_tool_git }}"
         runtime: tool
 
@@ -229,7 +229,7 @@ The generator picks one of two shapes based on the task description.
     inference:
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
     ```
 
 **Orchestrator** — for research, multi-step, pipeline, or report tasks. The generator adds a
@@ -242,7 +242,7 @@ The generator picks one of two shapes based on the task description.
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
@@ -252,7 +252,7 @@ The generator picks one of two shapes based on the task description.
     capabilities:
       spawn:
         allow:
-          - climate-data-worker
+          - local/climate-data-worker
 
     lifecycle:
       task_acceptance: single
@@ -261,7 +261,7 @@ The generator picks one of two shapes based on the task description.
     inference:
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
     ```
 
 === "OpenAI"
@@ -271,7 +271,7 @@ The generator picks one of two shapes based on the task description.
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
@@ -281,7 +281,7 @@ The generator picks one of two shapes based on the task description.
     capabilities:
       spawn:
         allow:
-          - climate-data-worker
+          - local/climate-data-worker
 
     lifecycle:
       task_acceptance: single
@@ -290,7 +290,7 @@ The generator picks one of two shapes based on the task description.
     inference:
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
     ```
 
 === "DeepSeek"
@@ -300,7 +300,7 @@ The generator picks one of two shapes based on the task description.
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
@@ -310,7 +310,7 @@ The generator picks one of two shapes based on the task description.
     capabilities:
       spawn:
         allow:
-          - climate-data-worker
+          - local/climate-data-worker
 
     lifecycle:
       task_acceptance: single
@@ -319,7 +319,7 @@ The generator picks one of two shapes based on the task description.
     inference:
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
     ```
 
 !!! note "Generated manifests are a starting point"
@@ -404,7 +404,7 @@ mur run --manifest murmur.yaml --task task.md
 | Orchestrator | Generated for research and pipeline tasks — adds a `capabilities.spawn.allow` list |
 | Validation | Generated YAML is validated before writing; nothing written if validation fails |
 | Inference config | Config file (`inference:` in `~/.murmur/config.yaml`) → env var (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) → interactive first-run wizard |
-| Generator artifacts | `murmur-driver-anthropic` (or `murmur-driver-openai`), `murmur-tool-registry-search`, `murmur-tool-editor` and `murmur-skill-create-manifest` must all be installed |
+| Generator artifacts | `murmur/driver-anthropic` (or `murmur/driver-openai`), `murmur/tool-registry-search`, `murmur/tool-editor` and `murmur/skill-create-manifest` must all be installed |
 | `inference.model` | Defaults to `claude-haiku-4-5-20251001`; change it in the generated manifest if needed |
 
 ---
@@ -412,7 +412,7 @@ mur run --manifest murmur.yaml --task task.md
 ## See also
 
 - [`mur search`](../reference/cli.md#mur-search) — search the artifact index from the CLI
-- **`murmur-tool-registry-search`** — the in-capsule tool the generator uses for artifact discovery
-- **`murmur-skill-create-manifest`** — full schema reference skill for authoring manifests manually
+- **`murmur/tool-registry-search`** — the in-capsule tool the generator uses for artifact discovery
+- **`murmur/skill-create-manifest`** — full schema reference skill for authoring manifests manually
 - [`mur build`](../reference/cli.md#mur-build) — build the generated capsule into a `.mur.zip`
 - [`mur run`](../reference/cli.md#mur-run) — run the capsule locally

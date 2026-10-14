@@ -9,8 +9,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The driver's artifact name; every generated manifest names it in `inference.driver.artifact`.
+/// The driver's own artifact name, as `driver/murmur.yaml` declares it and `mur build` packs it.
 pub const DRIVER_NAME: &str = "escape-conformance-driver";
+/// The full name the driver is filed under once [`install_into`] installs it from its `.mur.zip`
+/// file, in the `local` scope; every generated manifest declares it under `artifacts:` and names
+/// it in `inference.driver.artifact`.
+pub const DRIVER_ARTIFACT: &str = "local/escape-conformance-driver";
 /// The driver's artifact version, as `driver/murmur.yaml` declares it.
 pub const DRIVER_VERSION: &str = "0.1.0";
 /// The committed component, built from `driver/src/lib.rs`.
@@ -124,6 +128,13 @@ mod tests {
                 capsule_runtime::process_driver::PROCESS_DRIVER_IFACE
             );
         }
+    }
+
+    #[test]
+    fn the_installed_driver_is_filed_in_the_local_scope_under_its_own_name() {
+        let name = murmur_artifact::ArtifactName::parse(DRIVER_ARTIFACT).unwrap();
+        assert_eq!(name.scope(), murmur_artifact::LOCAL_SCOPE);
+        assert_eq!(name.name(), DRIVER_NAME);
     }
 
     #[test]

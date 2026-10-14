@@ -90,9 +90,11 @@ fn check_artifact_platform(
         return PlatformVerdict::Independent;
     }
 
-    let Ok(binary) =
-        capsule_runtime::artifact::extract_native_binary(name, version, artifact_bytes)
-    else {
+    let Ok(binary) = capsule_runtime::artifact::extract_native_binary(
+        murmur_artifact::tool_name_of(name),
+        version,
+        artifact_bytes,
+    ) else {
         return PlatformVerdict::Unverified;
     };
 
@@ -356,6 +358,33 @@ fn report_userns_grant() {
 
     // Stderr, in the same words `mur run` uses at staging, so the two cannot state it differently.
     warn_on_userns_restriction_disabled_host_wide(grant);
+}
+
+/// Prints an `Artifact stores` section naming every directory of the project and global stores
+/// left in the flat layout that predates scopes: nothing resolves from one, so each is safe to
+/// delete. Prints nothing when there is none. A report only: it adds no fix and cannot change
+/// doctor's exit status, and an unreadable store is left to the checks that resolve from it.
+fn report_artifact_stores(project: &LocalRegistry, global: &LocalRegistry) {
+    let mut lines = Vec::new();
+    for (label, store) in [("project", project), ("global", global)] {
+        let Ok(entries) = store.old_layout_entries() else {
+            continue;
+        };
+        for entry in entries {
+            lines.push(format!(
+                "  {label} store: {}: old layout, nothing reads it, safe to delete",
+                store.root().join(&entry).display()
+            ));
+        }
+    }
+    if lines.is_empty() {
+        return;
+    }
+    capsule_runtime::report_println!("Artifact stores");
+    for line in lines {
+        capsule_runtime::report_println!("{line}");
+    }
+    capsule_runtime::report_println!();
 }
 
 /// Prints the mode of `~/.murmur` and of every entry in it, and a `W-SEC-028` line on stderr for
@@ -828,7 +857,7 @@ fn report_interface_versions(project: &LocalRegistry, global: &LocalRegistry) ->
             }
             stale.push(StaleArtifact {
                 scope,
-                name: meta.name,
+                name: meta.name.to_string(),
                 version: meta.version,
                 unserved,
             });
@@ -1660,6 +1689,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // project on the machine, and an operator upgrading `mur` needs the whole list of what the
     // new host refuses.
     let interface_findings = report_interface_versions(&project_registry, &global_registry);
+    report_artifact_stores(&project_registry, &global_registry);
 
     capsule_runtime::report_println!("Checking {} for {platform}...", manifest_path.display());
 

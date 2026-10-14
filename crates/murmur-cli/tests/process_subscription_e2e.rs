@@ -1,6 +1,6 @@
 //! A coding task, end to end, on a `transport: process` capsule: the real `claude` binary, the
-//! real `murmur-driver-claude-code` from the local artifact store, the real runtime bridge, the
-//! real `murmur-tool-editor`, and a scratch git repository — driven over the same A2A door an
+//! real `murmur/driver-claude-code` from the local artifact store, the real runtime bridge, the
+//! real `murmur/tool-editor`, and a scratch git repository — driven over the same A2A door an
 //! `http` capsule answers on.
 //!
 //! Every Murmur component here is the shipped one. The single substitution is the upstream model
@@ -67,11 +67,15 @@ use tempfile::TempDir;
 
 /// The process driver under test. Named here and nowhere else in `crates/`: everything that knows
 /// about Claude Code lives in this artifact, and this file is the fixture that drives it.
-const DRIVER_NAME: &str = "murmur-driver-claude-code";
+const DRIVER_NAME: &str = "murmur/driver-claude-code";
 
 /// The tool the capsule edits its repository through. A WASM artifact, dispatched by murmur when
 /// the harness calls it over the bridge.
-const EDITOR_NAME: &str = "murmur-tool-editor";
+const EDITOR_ARTIFACT: &str = "murmur/tool-editor";
+
+/// [`EDITOR_ARTIFACT`]'s tool name: the part after the `/`, which is all the harness and the
+/// model ever see.
+const EDITOR_NAME: &str = "tool-editor";
 
 /// The harness binary the driver's `describe()` names, looked up on `PATH`.
 const HARNESS_BINARY: &str = "claude";
@@ -159,8 +163,8 @@ fn prereqs() -> &'static Prereqs {
     static PREREQS: OnceLock<Prereqs> = OnceLock::new();
     PREREQS.get_or_init(|| {
         // Resolved before `scratch_home` rewrites `$HOME`, so the store this reads is the
-        // operator's real one. Nothing below writes to it: each `.mur.zip` is copied out and
-        // republished into the case's own scratch home.
+        // operator's real one. Nothing below writes to it: each `.mur.zip` is copied out into the
+        // case's own scratch home.
         let store = artifact_store();
         let mut missing: Vec<String> = Vec::new();
 
@@ -182,19 +186,16 @@ fn prereqs() -> &'static Prereqs {
         let driver = latest_in_store(&store, DRIVER_NAME);
         if driver.is_none() {
             missing.push(format!(
-                "'{DRIVER_NAME}' is not published in {}\n    build and publish it from a \
-                 default-artifacts checkout: `scripts/local-install.sh {DRIVER_NAME} <capsule-dir>`, \
-                 or `mur build drivers/{DRIVER_NAME} -o /tmp/{DRIVER_NAME}.mur.zip && mur publish \
-                 /tmp/{DRIVER_NAME}.mur.zip`",
+                "'{DRIVER_NAME}' is not installed in {}\n    install it into the global store: \
+                 `mur install -g {DRIVER_NAME}@<version>`",
                 store.display()
             ));
         }
-        let editor = latest_in_store(&store, EDITOR_NAME);
+        let editor = latest_in_store(&store, EDITOR_ARTIFACT);
         if editor.is_none() {
             missing.push(format!(
-                "'{EDITOR_NAME}' is not published in {}\n    build and publish it from a \
-                 default-artifacts checkout: `cargo build -p {EDITOR_NAME} --target wasm32-wasip2 \
-                 --release`, then `mur build` + `mur publish`",
+                "'{EDITOR_ARTIFACT}' is not installed in {}\n    install it into the global store: \
+                 `mur install -g {EDITOR_ARTIFACT}@<version>`",
                 store.display()
             ));
         }
@@ -226,7 +227,10 @@ fn prereqs() -> &'static Prereqs {
         let harness_version = harness_version(&harness);
         println!("claude --version: {harness_version}");
         let driver = driver.expect("checked above");
-        println!("{DRIVER_NAME} resolved from the local store at {}", driver.version);
+        println!(
+            "{DRIVER_NAME} resolved from the local store at {}",
+            driver.version
+        );
 
         Prereqs {
             harness,
@@ -323,11 +327,12 @@ fn harness_version(harness: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// The highest version of `name` published in `store`, as a path to its `.mur.zip`.
+/// The highest version of the full name `name` installed in `store`, as a path to its `.mur.zip`.
 ///
-/// Read-only: the caller copies the zip out and republishes it into a scratch home. Nothing in
-/// this file writes to the operator's store.
+/// Read-only: the caller copies the zip out into a scratch home. Nothing in this file writes to
+/// the operator's store.
 fn latest_in_store(store: &Path, name: &str) -> Option<StoreArtifact> {
+    let bare = murmur_artifact::tool_name_of(name);
     let mut versions: Vec<String> = fs::read_dir(store.join(name))
         .ok()?
         .flatten()
@@ -339,7 +344,7 @@ fn latest_in_store(store: &Path, name: &str) -> Option<StoreArtifact> {
     let zip = store
         .join(name)
         .join(&version)
-        .join(format!("{name}-{version}.mur.zip"));
+        .join(format!("{bare}-{version}.mur.zip"));
     zip.is_file().then(|| StoreArtifact {
         name: name.to_string(),
         version,
@@ -347,18 +352,20 @@ fn latest_in_store(store: &Path, name: &str) -> Option<StoreArtifact> {
     })
 }
 
-/// The `.mur.zip` published for `name@version` in `store`, if there is one.
+/// The `.mur.zip` installed for the full name `name` at `version` in `store`, if there is one.
 ///
-/// A portable artifact is published as `<name>-<version>.mur.zip`; one built per platform carries
-/// a target suffix (`<name>-<version>-linux-x86_64.mur.zip`), so a name-and-version match alone
-/// would miss every native tool. The exact name wins when both are present.
+/// It is filed under `<scope>/<name>/<version>/`, its file named by the bare part. A portable
+/// artifact is stored as `<name>-<version>.mur.zip`; one built per platform carries a target
+/// suffix (`<name>-<version>-linux-x86_64.mur.zip`), so a name-and-version match alone would miss
+/// every native tool. The exact name wins when both are present.
 fn published_zip(store: &Path, name: &str, version: &str) -> Option<PathBuf> {
+    let bare = murmur_artifact::tool_name_of(name);
     let dir = store.join(name).join(version);
-    let exact = dir.join(format!("{name}-{version}.mur.zip"));
+    let exact = dir.join(format!("{bare}-{version}.mur.zip"));
     if exact.is_file() {
         return Some(exact);
     }
-    let prefix = format!("{name}-{version}-");
+    let prefix = format!("{bare}-{version}-");
     let mut candidates: Vec<PathBuf> = fs::read_dir(&dir)
         .ok()?
         .flatten()
@@ -682,21 +689,31 @@ impl E2eCapsule {
     }
 }
 
-/// Copy a `.mur.zip` out of the host store and publish it into `home`.
+/// Copy an artifact's store entry — its `.mur.zip` and the sidecars beside it — out of the host
+/// store into `home`'s, under the same full name.
 ///
-/// Copied rather than published in place, because `mur publish` writes into the home it is given
-/// and this file must never write into the operator's `~/.murmur/artifacts`.
+/// Copied rather than installed, because `mur publish` and `mur install <file>` file an artifact
+/// as `local/<name>`, not under the scope the host store holds it in, and this file must never
+/// write into the operator's `~/.murmur/artifacts`.
 fn publish_copy(home: &TempDir, artifact: &StoreArtifact) {
-    let staging = home.path().join("incoming");
-    fs::create_dir_all(&staging).unwrap();
-    let local = staging.join(format!("{}-{}.mur.zip", artifact.name, artifact.version));
-    fs::copy(&artifact.zip, &local).unwrap_or_else(|error| {
-        panic!(
-            "could not copy {} into the scratch home: {error}",
-            artifact.zip.display()
-        )
-    });
-    common::publish_local(home, &local).success();
+    let source = artifact.zip.parent().unwrap();
+    let dest = home
+        .path()
+        .join(".murmur")
+        .join("artifacts")
+        .join(&artifact.name)
+        .join(&artifact.version);
+    fs::create_dir_all(&dest).unwrap();
+    for entry in fs::read_dir(source).unwrap().flatten() {
+        if entry.path().is_file() {
+            fs::copy(entry.path(), dest.join(entry.file_name())).unwrap_or_else(|error| {
+                panic!(
+                    "could not copy {} into the scratch home: {error}",
+                    entry.path().display()
+                )
+            });
+        }
+    }
 }
 
 /// The manifest every case writes: this transport, this driver, this tool, and the environment
@@ -714,7 +731,7 @@ fn manifest_yaml(name: &str, prereqs: &Prereqs) -> String {
          version: 0.1.0\n\
          artifacts:\n  \
          - name: {DRIVER_NAME}\n    version: \"{driver_version}\"\n    runtime: driver\n  \
-         - name: {EDITOR_NAME}\n    version: \"{editor_version}\"\n    runtime: tool\n\
+         - name: {EDITOR_ARTIFACT}\n    version: \"{editor_version}\"\n    runtime: tool\n\
          capabilities:\n  env:\n    allow:\n{allow}\
          inference:\n  transport: process\n  max_turns: 10\n  driver:\n    artifact: {DRIVER_NAME}\n\
          lifecycle:\n  task_acceptance: queue\n  queue_depth: 8\n  after_task: sleep\n  \
@@ -774,6 +791,7 @@ fn stage(home: &TempDir, manifest_path: &Path, repo: &Path) -> capsule_runtime::
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools,
@@ -1293,8 +1311,8 @@ fn mur_install_resolves_the_driver_from_the_local_store() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
-    // Every artifact the manifest declares, copied out of the host store and republished into a
-    // scratch home. A name absent from the host store fails here naming itself.
+    // Every artifact the manifest declares, copied out of the host store into a scratch home under
+    // the same full name. A name absent from the host store fails here naming itself.
     let manifest_source = common::fixture_path("subscription-e2e/murmur.yaml");
     let manifest_text = fs::read_to_string(&manifest_source).unwrap();
     let manifest: serde_yaml::Value = serde_yaml::from_str(&manifest_text).unwrap();
@@ -1313,8 +1331,8 @@ fn mur_install_resolves_the_driver_from_the_local_store() {
     for (name, version) in &declared {
         let zip = published_zip(&store, name, version).unwrap_or_else(|| {
             panic!(
-                "the nexus manifest declares {name}@{version}, which is not published in {}\n  \
-                 build and publish it from a default-artifacts checkout before running this case",
+                "the nexus manifest declares {name}@{version}, which is not installed in {}\n  \
+                 install it with `mur install -g {name}@{version}` before running this case",
                 store.display()
             )
         });

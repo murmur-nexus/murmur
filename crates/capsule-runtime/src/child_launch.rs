@@ -489,7 +489,8 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// The 16 hex characters are fresh per call, so delegating the same capsule name and version twice
 /// yields two directories rather than one shared one. Beneath `.murmur/`, alongside the parent's
 /// own session directories, so a child's tree is inside the parent's single preopen and is pruned
-/// with it.
+/// with it. `<name>` is the bare part of a full `capsule_name`, so the directory is one segment
+/// whatever the scope.
 pub fn child_workdir_for(parent_accessible_workdir: &Path, capsule_name: &str) -> PathBuf {
     let suffix = mac_token::random_hex(8).unwrap_or_else(|_| {
         // The OS CSPRNG is not expected to fail; a nanosecond clock reading still distinguishes
@@ -505,7 +506,10 @@ pub fn child_workdir_for(parent_accessible_workdir: &Path, capsule_name: &str) -
     parent_accessible_workdir
         .join(".murmur")
         .join("children")
-        .join(format!("{capsule_name}-{suffix}"))
+        .join(format!(
+            "{}-{suffix}",
+            murmur_artifact::tool_name_of(capsule_name)
+        ))
 }
 
 /// Create the child's directory, start `mur` on it, and wait for the child to report itself.
@@ -1301,6 +1305,22 @@ mod tests {
             first.file_name().unwrap().to_string_lossy().len(),
             "worker-".len() + 16
         );
+    }
+
+    /// A full name's scope adds no directory level: the child of `local/worker` sits beside the
+    /// child of `worker`.
+    #[test]
+    fn a_child_directory_is_named_by_the_bare_part_of_a_full_name() {
+        let parent = PathBuf::from("/tmp/parent");
+        let scoped = child_workdir_for(&parent, "local/worker");
+
+        assert_eq!(
+            scoped.parent(),
+            Some(parent.join(".murmur").join("children").as_path())
+        );
+        let name = scoped.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("worker-"), "{name}");
+        assert_eq!(name.len(), "worker-".len() + 16);
     }
 
     fn request(env_allow: &[&str], spawner: Option<Spawner>) -> ChildLaunchRequest {

@@ -145,13 +145,13 @@ impl Project {
             "task_acceptance: queue\n  after_task: sleep",
             "",
         );
-        publish_to_store(&store, "lead", "0.1.0", "capsule", &lead, None);
-        publish_to_store(&store, "worker", "0.1.0", "capsule", &worker, None);
+        publish_to_store(&store, "local/lead", "0.1.0", "capsule", &lead, None);
+        publish_to_store(&store, "local/worker", "0.1.0", "capsule", &worker, None);
         std::fs::write(
             dir.path().join("roster.yaml"),
-            "roster_version: 1\nmembers:\n  - name: lead\n    capsule: lead\n    version: 0.1.0\n    \
-             entry: true\n  - name: worker\n    capsule: worker\n    version: 0.1.0\n\
-             reachability:\n  - from: lead\n    to: [worker]\n",
+            "roster_version: 1\nmembers:\n  - name: lead\n    capsule: local/lead\n    \
+             version: 0.1.0\n    entry: true\n  - name: worker\n    capsule: local/worker\n    \
+             version: 0.1.0\nreachability:\n  - from: lead\n    to: [worker]\n",
         )
         .unwrap();
         Self { dir, home, model }

@@ -18,7 +18,7 @@ subdirectory instead of the whole workdir:
 ```yaml
 # in the capsule's own murmur.yaml
 artifacts:
-  - name: murmur-tool-fetch
+  - name: ana/tool-fetch
     version: 1.0.0
     runtime: tool
     capabilities:
@@ -81,7 +81,7 @@ from a registry can never grant itself anything:
 ```yaml
 # in the capsule's own murmur.yaml
 artifacts:
-  - name: murmur-hook-telemetry
+  - name: ana/hook-telemetry
     version: 1.0.0
     runtime: hook
     capabilities:

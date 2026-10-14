@@ -1,6 +1,6 @@
 # How to pause your agent for human input
 
-Some tasks reach a decision point the agent cannot resolve on its own — a target environment, an approval threshold, a destructive step that needs sign-off. `murmur-tool-request-input` gives the model a ready-made tool to pause at that point, surface a question to the operator, and resume exactly where it left off once the operator replies.
+Some tasks reach a decision point the agent cannot resolve on its own — a target environment, an approval threshold, a destructive step that needs sign-off. `murmur/tool-request-input` gives the model a ready-made tool to pause at that point, surface a question to the operator, and resume exactly where it left off once the operator replies.
 
 The relevant manifest options are:
 
@@ -13,7 +13,7 @@ The relevant manifest options are:
 
 ## Step 1 — write the manifest
 
-Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with `runtime: tool`, and write a `system_prompt` that tells the model when to pause:
+Create a `murmur.yaml` file. Add `murmur/tool-request-input` to `artifacts` with `runtime: tool`, and write a `system_prompt` that tells the model when to pause:
 
 === "Anthropic"
 
@@ -25,13 +25,13 @@ Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with
       internal_port: 52222
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
           endpoint: https://api.anthropic.com
           api_key: ${ANTHROPIC_API_KEY}
-      - name: murmur-tool-request-input
+      - name: murmur/tool-request-input
         version: "{{ v.murmur_tool_request_input }}"
         runtime: tool
 
@@ -39,11 +39,11 @@ Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
       system_prompt: |
         You are a deployment agent. When you reach a decision you cannot make on your own —
         such as which environment to target or whether to proceed with a destructive step —
-        call murmur-tool-request-input with a clear, specific question for the operator.
+        call tool-request-input with a clear, specific question for the operator.
     ```
 
 === "OpenAI"
@@ -56,13 +56,13 @@ Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with
       internal_port: 52222
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
           endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
-      - name: murmur-tool-request-input
+      - name: murmur/tool-request-input
         version: "{{ v.murmur_tool_request_input }}"
         runtime: tool
 
@@ -70,11 +70,11 @@ Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
       system_prompt: |
         You are a deployment agent. When you reach a decision you cannot make on your own —
         such as which environment to target or whether to proceed with a destructive step —
-        call murmur-tool-request-input with a clear, specific question for the operator.
+        call tool-request-input with a clear, specific question for the operator.
     ```
 
 === "DeepSeek"
@@ -87,13 +87,13 @@ Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with
       internal_port: 52222
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
           endpoint: https://api.deepseek.com
           api_key: ${DEEPSEEK_API_KEY}
-      - name: murmur-tool-request-input
+      - name: murmur/tool-request-input
         version: "{{ v.murmur_tool_request_input }}"
         runtime: tool
 
@@ -101,16 +101,16 @@ Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
       system_prompt: |
         You are a deployment agent. When you reach a decision you cannot make on your own —
         such as which environment to target or whether to proceed with a destructive step —
-        call murmur-tool-request-input with a clear, specific question for the operator.
+        call tool-request-input with a clear, specific question for the operator.
     ```
 
 `network.internal_port` pins the capsule to a fixed port on every run. Without it the runtime picks an OS-assigned port at startup, which changes between runs.
 
-`runtime: tool` registers the WASM component with the capsule runtime. The model sees it as a callable tool named `murmur-tool-request-input` with one parameter:
+`runtime: tool` registers the WASM component with the capsule runtime. The model sees it as a callable tool named `tool-request-input`, the part of the artifact name after the `/`, with one parameter:
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -130,7 +130,7 @@ mur install
 
 --8<-- "includes/mur-pull-info.md"
 
-`murmur-tool-request-input` is a WASM artifact — no platform tag is required. `mur install` resolves the correct variant for every artifact in the manifest automatically.
+`murmur/tool-request-input` is a WASM artifact — no platform tag is required. `mur install` resolves the correct variant for every artifact in the manifest automatically.
 
 ---
 
@@ -303,7 +303,7 @@ When the deadline passes, the tool call fails and the attempt ends. The task the
 
 | Feature / setting | How it works |
 |---|---|
-| `murmur-tool-request-input` | WASM tool artifact; `runtime: tool`; platform-independent |
+| `murmur/tool-request-input` | WASM tool artifact; `runtime: tool`; platform-independent |
 | `prompt` parameter | The question the model asks the operator; string, required |
 | Task state while waiting | `"TASK_STATE_INPUT_REQUIRED"` |
 | Where to read the question | `result.artifacts[0].parts[0].text` from `GetTask` |

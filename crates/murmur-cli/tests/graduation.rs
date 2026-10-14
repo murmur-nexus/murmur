@@ -20,8 +20,19 @@ use murmur_artifact::{
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-const TOOL_NAME: &str = "jsonl-line-count";
+/// The tool `mur publish` files from its `.mur.zip`, so it is in the `local` scope.
+const TOOL_NAME: &str = "local/jsonl-line-count";
 const TOOL_VERSION: &str = "0.1.0";
+
+/// The capsule manifest the graduation cases launch, declaring the tool by its full name.
+const CAPSULE_MANIFEST: &str = concat!(
+    "name: graduation-capsule\n",
+    "version: 0.1.0\n",
+    "artifacts:\n",
+    "  - name: local/jsonl-line-count\n",
+    "    version: 0.1.0\n",
+    "    runtime: tool\n",
+);
 
 #[test]
 fn graduation_full_round_trip() {
@@ -29,7 +40,7 @@ fn graduation_full_round_trip() {
     let artifact_dir = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
-    copy_dir_all(&fixture_path("graduation/capsule"), project.path());
+    write_capsule_project(project.path());
 
     let artifact_path = artifact_dir.path().join("jsonl-line-count-0.1.0.mur.zip");
     build_tool_fixture(&fixture_path("graduation/tool"), &artifact_path)
@@ -38,7 +49,9 @@ fn graduation_full_round_trip() {
 
     common::publish_local(&home, &artifact_path)
         .success()
-        .stdout(predicate::str::contains("Published jsonl-line-count@0.1.0"));
+        .stdout(predicate::str::contains(
+            "Published local/jsonl-line-count@0.1.0",
+        ));
 
     let launched_workdir = stage_and_launch(&home, project.path());
 
@@ -62,7 +75,7 @@ fn graduation_second_run_uses_lock() {
     let artifact_dir = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
-    copy_dir_all(&fixture_path("graduation/capsule"), project.path());
+    write_capsule_project(project.path());
 
     let artifact_path = artifact_dir.path().join("jsonl-line-count-0.1.0.mur.zip");
     build_tool_fixture(&fixture_path("graduation/tool"), &artifact_path)
@@ -71,7 +84,9 @@ fn graduation_second_run_uses_lock() {
 
     common::publish_local(&home, &artifact_path)
         .success()
-        .stdout(predicate::str::contains("Published jsonl-line-count@0.1.0"));
+        .stdout(predicate::str::contains(
+            "Published local/jsonl-line-count@0.1.0",
+        ));
 
     let first_workdir = stage_and_launch(&home, project.path());
     assert_eq!(
@@ -105,7 +120,14 @@ fn graduation_bad_artifact_version_surfaces_error() {
 
     fs::write(
         project.path().join("murmur.yaml"),
-        "name: graduation-capsule\nversion: 0.1.0\nartifacts:\n  - name: jsonl-line-count\n    version: 9.9.9\n    runtime: tool\n",
+        concat!(
+            "name: graduation-capsule\n",
+            "version: 0.1.0\n",
+            "artifacts:\n",
+            "  - name: local/jsonl-line-count\n",
+            "    version: 9.9.9\n",
+            "    runtime: tool\n",
+        ),
     )
     .unwrap();
 
@@ -113,7 +135,7 @@ fn graduation_bad_artifact_version_surfaces_error() {
         .failure()
         .stderr(predicate::str::contains("error[E-RUN-008]:"))
         .stderr(predicate::str::contains(
-            "missing artifacts: jsonl-line-count@9.9.9",
+            "missing artifacts: local/jsonl-line-count@9.9.9",
         ))
         .stderr(predicate::str::contains("run `mur install`"));
 
@@ -208,6 +230,7 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
             manifest_dir: project_dir.to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes,
             artifacts: staged_artifacts,
             allowlisted_tools,
@@ -252,6 +275,7 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
                     resolved_version: entry.resolved_version.clone(),
                     sha256: LockedSha256::any(entry.sha256.clone()),
                     origin: LockOrigin::Operator,
+                    owner_id: None,
                 })
                 .collect(),
         };
@@ -261,17 +285,13 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
     launch_session(staged, |_| {}).unwrap().workdir
 }
 
-fn copy_dir_all(src: &Path, dst: &Path) {
-    fs::create_dir_all(dst).unwrap();
-    for entry in fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let ty = entry.file_type().unwrap();
-        let target = dst.join(entry.file_name());
-
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &target);
-        } else {
-            fs::copy(entry.path(), target).unwrap();
-        }
-    }
+/// Lay out the graduation capsule in `project_dir`: the fixture capsule component plus
+/// [`CAPSULE_MANIFEST`].
+fn write_capsule_project(project_dir: &Path) {
+    fs::copy(
+        fixture_path("graduation/capsule/capsule.wasm"),
+        project_dir.join("capsule.wasm"),
+    )
+    .unwrap();
+    fs::write(project_dir.join("murmur.yaml"), CAPSULE_MANIFEST).unwrap();
 }

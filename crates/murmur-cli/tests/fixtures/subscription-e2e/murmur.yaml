@@ -5,22 +5,22 @@ deploy:
   mur_version: 0.4.0
 
 artifacts:
-  - name: murmur-driver-claude-code
+  - name: murmur/driver-claude-code
     runtime: driver
     version: "0.1.0"
-  - name: murmur-tool-editor
+  - name: murmur/tool-editor
     runtime: tool
     version: "0.5.0"
-  - name: murmur-tool-code-graph
+  - name: murmur/tool-code-graph
     runtime: tool
     version: "0.2.0"
-  - name: murmur-hook-diff-summary
+  - name: murmur/hook-diff-summary
     runtime: hook
     version: "0.8.0"
     capabilities:
       filesystem:
         scope: "."
-  - name: murmur-tool-corpus
+  - name: murmur/tool-corpus
     runtime: tool
     version: "0.2.0"
     capabilities:
@@ -77,7 +77,7 @@ inference:
   max_turns: 100
   system_prompt_file: ./instructions.md
   driver:
-    artifact: murmur-driver-claude-code
+    artifact: murmur/driver-claude-code
 
 lifecycle:
   task_acceptance: queue

@@ -15,7 +15,7 @@ use std::{
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-pub const DRIVER_NAME: &str = "murmur-driver-anthropic";
+pub const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 pub const DRIVER_VERSION: &str = "0.1.4";
 
 /// `network.authentication` with a `watcher` that may read tasks and watch, and a `reader` that
@@ -113,6 +113,7 @@ fn stage_door_with(
             manifest_dir: manifest.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts,
             allowlisted_tools,

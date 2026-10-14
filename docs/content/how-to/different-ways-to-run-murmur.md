@@ -23,7 +23,7 @@ Create a `murmur.yaml` file:
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
@@ -34,7 +34,7 @@ Create a `murmur.yaml` file:
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
     ```
 
 === "OpenAI"
@@ -44,7 +44,7 @@ Create a `murmur.yaml` file:
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
@@ -55,7 +55,7 @@ Create a `murmur.yaml` file:
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
     ```
 
 === "DeepSeek"
@@ -65,7 +65,7 @@ Create a `murmur.yaml` file:
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
@@ -76,7 +76,7 @@ Create a `murmur.yaml` file:
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
     ```
 
 Create a `task.md` file next to it with the work you want done:
@@ -134,12 +134,12 @@ murmur: url localhost:52222
 session: ses_019ed2af76b57c42912b612f07dd4d51
 workdir: /path/to/workdir/ses_019ed2af76b57c42912b612f07dd4d51
 manifest: my-agent v0.1.0
-driver: murmur-driver-anthropic (claude-sonnet-4-6)
+driver: murmur/driver-anthropic (claude-sonnet-4-6)
 skills: 2 installed
 status:  ok
 ```
 
-The `driver:` line names the driver artifact and the model. Under [`transport: process`](../reference/manifest.md#transport-process) it carries the word `process` between the two — `murmur-driver-claude-code process ()`, with the model empty when the manifest leaves it to the harness. The `skills:` line appears only when the manifest declares at least one `runtime: skill` artifact.
+The `driver:` line names the driver artifact and the model. Under [`transport: process`](../reference/manifest.md#transport-process) it carries the word `process` between the two — `murmur/driver-claude-code process ()`, with the model empty when the manifest leaves it to the harness. The `skills:` line appears only when the manifest declares at least one `runtime: skill` artifact.
 
 ---
 
@@ -242,9 +242,9 @@ Effective grants
   workdir exec:     false
   read_only: <none>
   preopens:
-    - murmur-tool-git (tool): the whole accessible workdir — no capabilities.filesystem.scope declared
-    - murmur-driver-anthropic (driver): the whole accessible workdir — no capabilities.filesystem.scope declared
-    - murmur-hook-telemetry (hook): nothing preopened — no capabilities.filesystem.scope declared
+    - murmur/tool-git (tool): the whole accessible workdir — no capabilities.filesystem.scope declared
+    - murmur/driver-anthropic (driver): the whole accessible workdir — no capabilities.filesystem.scope declared
+    - ana/hook-telemetry (hook): nothing preopened — no capabilities.filesystem.scope declared
   network allow: <none>
   unix sockets:     false
   shell allow: <none>

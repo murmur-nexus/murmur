@@ -27,9 +27,10 @@ use common::{
 };
 use tempfile::TempDir;
 
-const DRIVER: &str = "murmur-driver-anthropic";
-const TOOL: &str = "echo-tool";
-const NATIVE: &str = "native-echo";
+// Installed from their `.mur.zip` files, so filed in the `local` scope.
+const DRIVER: &str = "local/murmur-driver-anthropic";
+const TOOL: &str = "local/echo-tool";
+const NATIVE: &str = "local/native-echo";
 const VERSION: &str = "0.1.0";
 const KEY: &str = "sk-loopback-deploy";
 const CEILING_ENV: &str = "MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES";
@@ -262,11 +263,22 @@ fn real_mur() -> PathBuf {
 
 // ─── the target ──────────────────────────────────────────────────────────────
 
+/// Where deploy uploads the payload of the full name `name`, relative to the target's root:
+/// `.murmur/artifacts/<scope>/<name>/<version>/<name>-<version>[-<platform>].mur.zip`, the
+/// native tool's file name carrying the deploy platform.
+fn remote_payload(name: &str) -> String {
+    let bare = murmur_artifact::tool_name_of(name);
+    let platform = if name == NATIVE {
+        format!("-{}", murmur_artifact::current_platform())
+    } else {
+        String::new()
+    };
+    format!(".murmur/artifacts/{name}/{VERSION}/{bare}-{VERSION}{platform}.mur.zip")
+}
+
 /// The sha256 of the payload deploy uploaded for `name`.
 fn uploaded_sha256(target: &LoopbackTarget, name: &str) -> String {
-    let zip = target.root().join(format!(
-        ".murmur/artifacts/{name}/{VERSION}/{name}-{VERSION}.mur.zip"
-    ));
+    let zip = target.root().join(remote_payload(name));
     murmur_artifact::sha256_hex(&fs::read(&zip).unwrap())
 }
 
@@ -428,7 +440,7 @@ fn a_deploy_compiles_on_the_target_and_the_first_launch_loads_the_forms() {
     assert!(command.contains(" precompile --json "), "{command}");
     assert!(command.contains(&format!(" --workdir {dir} ")), "{command}");
     for name in [DRIVER, TOOL, NATIVE] {
-        let path = format!(" /root/.murmur/artifacts/{name}/{VERSION}/{name}-{VERSION}.mur.zip");
+        let path = format!(" /root/{}", remote_payload(name));
         assert!(command.contains(&path), "{path} missing from {command}");
     }
 

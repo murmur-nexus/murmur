@@ -66,9 +66,11 @@ fn list(home: &TempDir, args: &[&str]) -> assert_cmd::assert::Assert {
     cmd.assert()
 }
 
+/// The `.meta.json` sidecar `mur publish` wrote for the packed name `name`, which it files as
+/// `local/<name>`.
 fn raw_metadata(home: &TempDir, name: &str, version: &str) -> String {
     fs::read_to_string(home.path().join(format!(
-        ".murmur/artifacts/{name}/{version}/{name}-{version}.meta.json"
+        ".murmur/artifacts/local/{name}/{version}/{name}-{version}.meta.json"
     )))
     .unwrap()
 }

@@ -23,9 +23,9 @@ use capsule_runtime::SPAWN_CREDENTIAL_HEADER;
 use common::{publish_capsule, PLAIN_WORKER_BODY};
 use mur_roost::census;
 
-/// A capsule that may spawn `worker-a`, so a registered root can delegate.
+/// A capsule that may spawn `local/worker-a`, so a registered root can delegate.
 const ORCHESTRATOR_BODY: &str = "artifacts: []\ncapabilities:\n  network:\n    allow: \
-                                 [registry.internal]\n  spawn:\n    allow: [worker-a]\n";
+                                 [registry.internal]\n  spawn:\n    allow: [local/worker-a]\n";
 
 const CENSUS_PREFIX: &str = "mur-roost: cannot count the capsules already running on this host: ";
 
@@ -175,7 +175,9 @@ impl Roost {
             "POST",
             "/register",
             &[],
-            &format!(r#"{{"session_id":"{session_id}","name":"orchestrator","version":"0.1.0"}}"#),
+            &format!(
+                r#"{{"session_id":"{session_id}","name":"local/orchestrator","version":"0.1.0"}}"#
+            ),
         );
         assert_eq!(status, 200, "{body}");
         body["credential"].as_str().unwrap().to_string()
@@ -186,7 +188,7 @@ impl Roost {
             "POST",
             "/spawn",
             &[(SPAWN_CREDENTIAL_HEADER, credential)],
-            r#"{"name":"worker-a","version":"0.1.0"}"#,
+            r#"{"name":"local/worker-a","version":"0.1.0"}"#,
         )
     }
 
@@ -213,12 +215,18 @@ fn publishing_registry() -> tempfile::TempDir {
     let registry = tempfile::tempdir().unwrap();
     publish_capsule(
         registry.path(),
-        "orchestrator",
+        "local/orchestrator",
         "0.1.0",
         ORCHESTRATOR_BODY,
         "",
     );
-    publish_capsule(registry.path(), "worker-a", "0.1.0", PLAIN_WORKER_BODY, "");
+    publish_capsule(
+        registry.path(),
+        "local/worker-a",
+        "0.1.0",
+        PLAIN_WORKER_BODY,
+        "",
+    );
     registry
 }
 
@@ -245,7 +253,12 @@ fn a_restarted_daemon_counts_the_capsules_still_running() {
         "127.0.0.1:1",
     );
     std::fs::write(dir.join("ses_0199unparseable0000000000000004.json"), "{").unwrap();
-    let args = ["--max-live-capsules", "3", "--spawn-allow", "orchestrator"];
+    let args = [
+        "--max-live-capsules",
+        "3",
+        "--spawn-allow",
+        "local/orchestrator",
+    ];
 
     Roost::start(home.path(), registry.path(), &args).stop();
     let roost = Roost::start(home.path(), registry.path(), &args);

@@ -75,7 +75,7 @@ and `pread64`, which the probe also uses.
   `CLOSE_RANGE_CLOEXEC` in 5.11). Confirm with `uname -r`.
 - `mur` built from this branch and on `PATH`, plus a working `cc` and `cargo`.
 - An inference driver artifact installed and an API key exported, since a capsule tool call is
-  driven by the agent loop. The example below uses `murmur-driver-anthropic` and
+  driven by the agent loop. The example below uses `murmur/driver-anthropic` and
   `ANTHROPIC_API_KEY`; any driver works.
 - Confirm the host actually resolves to a kernel-enforcement tier before trusting anything.
   A capsule that logs `W-SEC-003` (`capabilities.shell.allow is non-empty and this host ...`)
@@ -254,13 +254,13 @@ name: fd-hygiene-check
 version: "0.1.0"
 
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: "1.0.0"
     runtime: driver
     gateway:
       endpoint: https://api.anthropic.com
       api_key: ${ANTHROPIC_API_KEY}
-  - name: fdprobe-native
+  - name: local/fdprobe-native
     version: "0.1.0"
     runtime: tool
 
@@ -273,7 +273,7 @@ inference:
   transport: http
   model: claude-sonnet-5
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
   max_turns: 6
 EOF
 cat > /tmp/fdhygiene/capsule/task.md <<'EOF'

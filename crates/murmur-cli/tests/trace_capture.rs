@@ -18,7 +18,7 @@ use std::{
 use capsule_runtime::{launch_session, StagedSession};
 use serde_json::Value;
 
-const DRIVER_NAME: &str = "wire-digest-driver";
+const DRIVER_NAME: &str = "local/wire-digest-driver";
 const DRIVER_VERSION: &str = "0.1.0";
 
 fn driver_wasm() -> PathBuf {

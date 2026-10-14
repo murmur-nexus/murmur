@@ -217,16 +217,16 @@ For each artifact decide:
 - whether its effective capabilities should be narrower than the capsule ceiling;
 - whether it needs durable `state`.
 
-A registry artifact normally looks like:
+A registry artifact normally looks like this, named by its full name `<scope>/<name>` (`murmur/<name>` for a Murmur default artifact, `local/<name>` for one installed from a `.mur.zip` file):
 
 ```yaml
 artifacts:
-  - name: <artifact-name>
+  - name: <scope>/<artifact-name>
     version: "<pinned-version>"
     runtime: tool
 ```
 
-A local skill can look like:
+A local skill keeps its bare name, with no scope:
 
 ```yaml
 artifacts:
@@ -251,7 +251,7 @@ Required structure:
 
 ```yaml
 artifacts:
-  - name: <driver-artifact>
+  - name: <scope>/<driver-artifact>
     version: "<pinned-version>"
     runtime: driver
     gateway:
@@ -261,7 +261,7 @@ artifacts:
 inference:
   model: <model-id>
   driver:
-    artifact: <driver-artifact>
+    artifact: <scope>/<driver-artifact>
 ```
 
 Rules:
@@ -383,7 +383,7 @@ Do not claim a stronger posture than another field makes possible. In particular
 
 #### Spawn
 
-Use `capabilities.spawn.allow` only when this capsule may create named sub-capsules. List exact allowed capsule names. Do not use shell permissions as a substitute for Murmur capsule spawning.
+Use `capabilities.spawn.allow` only when this capsule may create named sub-capsules. List exact allowed capsule full names (`<scope>/<name>`); no two may share the part after the `/`. Do not use shell permissions as a substitute for Murmur capsule spawning.
 
 #### Peer file ingestion
 
@@ -399,7 +399,7 @@ A hook inherits neither the capsule network ceiling nor the capsule filesystem. 
 
 ```yaml
 artifacts:
-  - name: <hook-artifact>
+  - name: <scope>/<hook-artifact>
     version: "<version>"
     runtime: hook
     capabilities:
@@ -430,7 +430,7 @@ capabilities:
       - https://other.example.com
 
 artifacts:
-  - name: focused-tool
+  - name: local/focused-tool
     version: "<version>"
     runtime: tool
     capabilities:
@@ -453,7 +453,7 @@ Use `config:` on an `artifacts:` entry for settings specific to that exact artif
 
 ```yaml
 artifacts:
-  - name: corpus-tool
+  - name: local/corpus-tool
     version: "<version>"
     runtime: tool
     config:

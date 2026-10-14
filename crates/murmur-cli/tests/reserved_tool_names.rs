@@ -24,15 +24,22 @@ const RESERVED: [&str; 5] = [
     "end-without-answer",
 ];
 
-/// An agent capsule declaring one tool artifact under `artifact_name`, plus whatever extra
-/// top-level YAML the case needs. Nothing it names is published anywhere.
-fn manifest(project: &Path, artifact_name: &str, blocks: &str) -> std::path::PathBuf {
+/// The full name a tool artifact whose tool name is `tool` is declared under here.
+fn full_name(tool: &str) -> String {
+    format!("local/{tool}")
+}
+
+/// An agent capsule declaring one tool artifact whose tool name is `tool`, under
+/// [`full_name`], plus whatever extra top-level YAML the case needs. Nothing it names is
+/// published anywhere.
+fn manifest(project: &Path, tool: &str, blocks: &str) -> std::path::PathBuf {
+    let artifact_name = full_name(tool);
     let yaml = format!(
         "name: {CAPSULE_NAME}\nversion: 0.1.0\n{blocks}artifacts:\n  - name: {artifact_name}\n    \
-         version: 0.1.0\n    runtime: tool\n  - name: murmur-driver-anthropic\n    version: \
+         version: 0.1.0\n    runtime: tool\n  - name: local/murmur-driver-anthropic\n    version: \
          0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:1\n      \
          api_key: test-key\ninference:\n  transport: http\n  model: test-model\n  driver:\n    \
-         artifact: murmur-driver-anthropic\n",
+         artifact: local/murmur-driver-anthropic\n",
     );
     let path = project.join("murmur.yaml");
     fs::write(&path, yaml).unwrap();
@@ -52,8 +59,9 @@ fn run(home: &TempDir, manifest_path: &Path) -> assert_cmd::assert::Assert {
         .assert()
 }
 
-/// Each reserved name is refused by code, and the message carries the whole set so the operator
-/// can see what else is off-limits without opening the docs.
+/// Each reserved name is refused by code, naming the declared full name and the tool name that
+/// collides, and the message carries the whole set so the operator can see what else is
+/// off-limits without opening the docs.
 #[test]
 fn an_artifact_under_a_reserved_name_refuses_the_launch() {
     let home = tempfile::tempdir().unwrap();
@@ -65,7 +73,11 @@ fn an_artifact_under_a_reserved_name_refuses_the_launch() {
         let assert = run(&home, &path)
             .failure()
             .stderr(predicate::str::contains("error[E-CAP-013]"))
-            .stderr(predicate::str::contains(format!("artifact '{name}'")))
+            .stderr(predicate::str::contains(format!(
+                "artifact '{}' has the tool name '{name}', which collides with a tool the runtime \
+                 provides itself",
+                full_name(name)
+            )))
             .stderr(
                 predicate::str::contains("rename the artifact")
                     .or(predicate::str::contains("Rename the artifact")),
@@ -106,7 +118,7 @@ fn the_refusal_does_not_depend_on_the_grant_that_provides_the_tool() {
         ),
         (
             "delegate-task",
-            "capabilities:\n  spawn:\n    allow:\n      - worker\n",
+            "capabilities:\n  spawn:\n    allow:\n      - local/worker\n",
         ),
         ("submit-plan", "capabilities:\n  plan:\n    submit: true\n"),
     ];
@@ -117,7 +129,10 @@ fn the_refusal_does_not_depend_on_the_grant_that_provides_the_tool() {
         run(&home, &path)
             .failure()
             .stderr(predicate::str::contains("error[E-CAP-013]"))
-            .stderr(predicate::str::contains(format!("artifact '{name}'")));
+            .stderr(predicate::str::contains(format!(
+                "artifact '{}' has the tool name '{name}'",
+                full_name(name)
+            )));
     }
 }
 

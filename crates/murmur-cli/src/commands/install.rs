@@ -9,16 +9,19 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use murmur_artifact::{
     current_platform, load_manifest_from_artifact_bytes, load_runtime_manifest, read_lockfile,
     registry_warning_link, resolve_manifest_path, sha256_hex, split_platform_suffix,
-    split_platform_tag, verify_sha256, write_lockfile_atomic, ArtifactMeta, ArtifactRef,
-    LocalRegistry, LockOrigin, LockedSha256, LockfileError, MurmurLock, Platform, Registry,
-    RegistryError, RuntimeType, LOCK_VERSION, MANIFEST_FILENAME, SUPPORTED_PLATFORMS, W_REG_001,
+    split_platform_tag, verify_sha256, write_lockfile_atomic, ArtifactMeta, ArtifactName,
+    ArtifactRef, ArtifactRefError, LocalRegistry, LockOrigin, LockedSha256, LockfileError,
+    MurmurLock, Platform, Registry, RegistryError, RuntimeType, LOCAL_SCOPE, LOCK_VERSION,
+    MANIFEST_FILENAME, SUPPORTED_PLATFORMS, W_REG_001,
 };
 use rayon::prelude::*;
 
 use crate::{
     config::load_effective_mur_config,
-    error::{CliError, E_IO_001, E_IO_003, E_REG_001, E_REG_005},
-    source::{SourceChain, SourceChainError},
+    error::{
+        artifact_name_arg, local_store_miss, CliError, E_IO_001, E_IO_003, E_REG_001, E_REG_005,
+    },
+    source::{github_scope, SourceChain, SourceChainError},
 };
 
 use super::runtime_manifest_error_to_cli;
@@ -145,9 +148,19 @@ fn print_adoptions(adoptions: &[String]) {
 
 // ─── source-chain helpers ─────────────────────────────────────────────────────
 
+/// The full name a payload a source returned is stored under.
+pub(crate) enum Filing<'a> {
+    /// The name the operator asked for; the store refuses a payload packed under another one.
+    As(&'a ArtifactName),
+    /// Whatever the payload's own packed name is, in this scope: every asset of a `github:`
+    /// release, each in the scope of its repository.
+    InScope(&'a str),
+}
+
 pub(crate) fn install_resolved(
     local_registry: &LocalRegistry,
     resolved: crate::source::ResolvedSource,
+    filing: Filing<'_>,
     lock_path: Option<&Path>,
     precompiler: Option<&Precompiler>,
 ) -> Result<(), CliError> {
@@ -167,10 +180,24 @@ pub(crate) fn install_resolved(
     } else {
         manifest.version.clone()
     };
+    let full_name = match filing {
+        Filing::As(name) => name.clone(),
+        Filing::InScope(scope) => {
+            ArtifactName::from_parts(scope, &manifest.name).map_err(|error| {
+                CliError::new(
+                    E_IO_003,
+                    format!(
+                        "an asset from {} cannot be stored in the '{scope}' scope: {error}",
+                        resolved.source
+                    ),
+                )
+            })?
+        }
+    };
     let sha256 = sha256_hex(&resolved.bytes);
     let runtime = manifest.registry_runtime();
     let meta = ArtifactMeta {
-        name: manifest.name.clone(),
+        name: full_name.clone(),
         version: installed_version.clone(),
         runtime,
         artifact_runtime: manifest.runtime.clone(),
@@ -178,7 +205,7 @@ pub(crate) fn install_resolved(
         // `--all-platforms` or deploy fetch installs a payload for a platform that is not the
         // one running the install.
         platforms: recorded_platforms(
-            &manifest.name,
+            full_name.as_str(),
             &installed_version,
             runtime,
             resolved.platform.as_deref(),
@@ -196,20 +223,18 @@ pub(crate) fn install_resolved(
     // later fails with E-RUN-003.
     if let Some(lock_path) = lock_path {
         if let Some(adoption) =
-            upsert_lock_entry(lock_path, &manifest.name, &installed_version, pin)?
+            upsert_lock_entry(lock_path, full_name.as_str(), &installed_version, pin)?
         {
             capsule_runtime::report_println!("{adoption}");
         }
     }
     capsule_runtime::report_println!(
-        "Installed {}@{} from {}",
-        manifest.name,
-        installed_version,
+        "Installed {full_name}@{installed_version} from {}",
         resolved.source
     );
     precompile(
         precompiler,
-        &manifest.name,
+        full_name.as_str(),
         &installed_version,
         &resolved.bytes,
     );
@@ -306,6 +331,15 @@ pub(crate) fn run_install(
         return run_install_all_platforms(artifact_ref, no_precompile);
     }
 
+    // Refusals that need no store come first, so a refused install creates nothing.
+    match artifact_ref {
+        Some(ref_str) => refuse_malformed_ref(ref_str)?,
+        None if !global => {
+            let manifest_path = resolve_manifest_path(&find_project_root()?);
+            load_runtime_manifest(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
+        }
+        None => {}
+    }
     let (store, project_root) = determine_store(global)?;
 
     match artifact_ref {
@@ -379,69 +413,106 @@ fn install_single(
     project_root: Option<&Path>,
     no_precompile: bool,
 ) -> Result<(), CliError> {
+    let lock_path = project_root.map(|r| r.join("murmur.lock"));
     if is_local_path(artifact_ref) {
         let precompiler = build_precompiler(no_precompile, project_root);
-        return install_from_local_file(artifact_ref, store, precompiler.as_ref());
+        return install_from_local_file(
+            artifact_ref,
+            store,
+            lock_path.as_deref(),
+            precompiler.as_ref(),
+        );
     }
 
     if is_source_chain_ref(artifact_ref) {
-        let config = load_effective_mur_config()?;
-        let chain = SourceChain::from_config(&config);
-        let parsed =
-            ArtifactRef::parse(artifact_ref).map_err(|e| CliError::new(E_IO_003, e.to_string()))?;
-        let resolved_list = match &parsed {
-            ArtifactRef::BareName(name) => vec![chain
-                .resolve_bare(name, None)
-                .map_err(source_chain_error_to_cli)?],
-            ArtifactRef::GitHub { owner, repo, tag } => chain
-                .resolve_github_all(owner, repo, tag)
-                .map_err(source_chain_error_to_cli)?,
-        };
-        let lock_path = project_root.map(|r| r.join("murmur.lock"));
+        let parsed = ArtifactRef::parse(artifact_ref).map_err(|error| match error {
+            ArtifactRefError::Name(_) => artifact_name_arg(artifact_ref)
+                .err()
+                .unwrap_or_else(|| CliError::new(E_IO_003, error.to_string())),
+            other => CliError::new(E_IO_003, other.to_string()),
+        })?;
         let precompiler = build_precompiler(no_precompile, project_root);
-        for resolved in resolved_list {
-            install_resolved(store, resolved, lock_path.as_deref(), precompiler.as_ref())?;
+        match &parsed {
+            ArtifactRef::Name(name) => {
+                if name.is_local() {
+                    return Err(local_scope_unversioned(name));
+                }
+                let chain = SourceChain::from_config(&load_effective_mur_config()?);
+                let resolved = chain
+                    .resolve_bare(name.name(), None)
+                    .map_err(source_chain_error_to_cli)?;
+                install_resolved(
+                    store,
+                    resolved,
+                    Filing::As(name),
+                    lock_path.as_deref(),
+                    precompiler.as_ref(),
+                )?;
+            }
+            ArtifactRef::GitHub { owner, repo, tag } => {
+                // Refused before any request: a reserved scope cannot be claimed by an owner.
+                let scope = github_scope(owner, repo)?;
+                let chain = SourceChain::from_config(&load_effective_mur_config()?);
+                let resolved_list = chain
+                    .resolve_github_all(owner, repo, tag)
+                    .map_err(source_chain_error_to_cli)?;
+                for resolved in resolved_list {
+                    install_resolved(
+                        store,
+                        resolved,
+                        Filing::InScope(&scope),
+                        lock_path.as_deref(),
+                        precompiler.as_ref(),
+                    )?;
+                }
+            }
         }
         return Ok(());
     }
 
-    // name@version — the global store first, the source chain on NotFound
+    // scope/name@version — the global store first, the source chain on NotFound
     let (name, version) = parse_versioned_ref(artifact_ref)?;
     let global_store = LocalRegistry::from_default_home().map_err(CliError::from)?;
     // The name the payload is filed under, which for a native artifact carries its platform tag.
-    let mut file_stem = format!("{name}-{version}");
-    let payload = match global_store.resolve_with_platform(name, version, Some(current_platform()))
+    let mut file_stem = format!("{}-{version}", name.name());
+    let payload = match global_store.resolve_with_platform(&name, version, Some(current_platform()))
     {
         Ok(resolved) => {
-            verify_sha256(name, version, &resolved.bytes, &resolved.sha256)
+            verify_sha256(name.as_str(), version, &resolved.bytes, &resolved.sha256)
                 .map_err(CliError::from)?;
             let pin = lock_pin(&resolved.meta, &resolved.sha256);
             if let Some((os, arch)) = resolved.meta.platforms.first() {
-                file_stem = format!("{name}-{version}-{os}-{arch}");
+                file_stem = format!("{}-{version}-{os}-{arch}", name.name());
             }
-            if let Some(root) = project_root {
-                check_lock_conflict(&root.join("murmur.lock"), name, version, &pin)?;
+            if let Some(lock_path) = &lock_path {
+                check_lock_conflict(lock_path, name.as_str(), version, &pin)?;
             }
             store
                 .store_installed_overwrite(resolved.meta, &resolved.bytes, &resolved.sha256)
                 .map_err(CliError::from)?;
-            if let Some(root) = project_root {
-                if let Some(adoption) =
-                    upsert_lock_entry(&root.join("murmur.lock"), name, version, pin)?
-                {
+            if let Some(lock_path) = &lock_path {
+                if let Some(adoption) = upsert_lock_entry(lock_path, name.as_str(), version, pin)? {
                     capsule_runtime::report_println!("{adoption}");
                 }
             }
             resolved.bytes
         }
+        Err(RegistryError::NotFound { .. }) if name.is_local() => {
+            return Err(local_store_miss(&name, version));
+        }
         Err(RegistryError::NotFound { .. }) => match configured_source_chain()? {
             Some(chain) => {
                 let resolved = chain
-                    .resolve_bare(name, Some(version))
+                    .resolve_bare(name.name(), Some(version))
                     .map_err(source_chain_error_to_cli)?;
-                let lock_path = project_root.map(|r| r.join("murmur.lock"));
                 let precompiler = build_precompiler(no_precompile, project_root);
-                install_resolved(store, resolved, lock_path.as_deref(), precompiler.as_ref())?;
+                install_resolved(
+                    store,
+                    resolved,
+                    Filing::As(&name),
+                    lock_path.as_deref(),
+                    precompiler.as_ref(),
+                )?;
                 return Ok(());
             }
             None => {
@@ -457,15 +528,30 @@ fn install_single(
 
     let display = store_display(store);
     capsule_runtime::report_println!(
-        "Installed {name}@{version} → {display}/{name}/{version}/{file_stem}.mur.zip"
+        "Installed {name}@{version} \u{2192} {display}/{}/{}/{version}/{file_stem}.mur.zip",
+        name.scope(),
+        name.name()
     );
     precompile(
         build_precompiler(no_precompile, project_root).as_ref(),
-        name,
+        name.as_str(),
         version,
         &payload,
     );
     Ok(())
+}
+
+/// The refusal of `mur install local/<name>` with no version: the sources are what an
+/// unversioned name asks, and none serves the `local` scope.
+fn local_scope_unversioned(name: &ArtifactName) -> CliError {
+    CliError::with_hint(
+        E_REG_001,
+        format!("no source serves the '{LOCAL_SCOPE}' scope, so {name} cannot be looked up"),
+        format!(
+            "a {LOCAL_SCOPE}/ artifact is installed from its .mur.zip file: mur install ./{}-<version>.mur.zip",
+            name.name()
+        ),
+    )
 }
 
 fn install_manifest_deps(
@@ -478,17 +564,30 @@ fn install_manifest_deps(
         None => find_project_root()?,
     };
     let lock_path = root.join("murmur.lock");
+    // A lock this build cannot read is refused before anything is fetched or stored.
+    match read_lockfile(&lock_path) {
+        Ok(_) | Err(LockfileError::NotFound(_)) => {}
+        Err(err) => return Err(super::lockfile_error_to_cli(err)),
+    }
 
     let manifest_path = resolve_manifest_path(&root);
     let runtime_manifest =
         load_runtime_manifest(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
 
-    // Collect only the artifacts we need to install (skip inline-source ones).
+    // Collect only the artifacts we need to install (skip inline-source ones), by the full name
+    // each resolves under; the manifest parser has already refused any other form.
     let artifacts: Vec<_> = runtime_manifest
         .artifacts
         .iter()
         .filter(|a| a.source.is_none())
         .collect();
+    let full_names = artifacts
+        .iter()
+        .map(|a| {
+            a.artifact_name()
+                .map_err(|error| CliError::new(E_IO_003, error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     if artifacts.is_empty() {
         capsule_runtime::report_println!("No artifacts in manifest.");
@@ -501,7 +600,8 @@ fn install_manifest_deps(
     // Pre-check which artifacts are already in the project store.
     let cached_flags: Vec<bool> = artifacts
         .iter()
-        .map(|a| store.artifact_path_for(&a.name, &a.version).exists())
+        .zip(&full_names)
+        .map(|(a, name)| store.artifact_path_for(name, &a.version).exists())
         .collect();
 
     // ── Progress styles (matches deploy.rs exactly) ───────────────────────────
@@ -591,7 +691,7 @@ fn install_manifest_deps(
             }
 
             let result = fetch_and_store(
-                artifact.name.as_str(),
+                &full_names[i],
                 artifact.version.as_str(),
                 &global_store,
                 source_chain.as_ref(),
@@ -771,22 +871,34 @@ struct FetchOutcome {
     payload: bytes::Bytes,
 }
 
-/// Fetch one artifact from the global store (or the source chain on a miss) and write it
-/// to `store`.
+/// Pin one artifact `store` already holds, or fetch it from the global store (or the source chain
+/// on a miss) and write it to `store`.
 fn fetch_and_store(
-    name: &str,
+    name: &ArtifactName,
     version: &str,
     global_store: &LocalRegistry,
     source_chain: Option<&SourceChain>,
     store: &LocalRegistry,
     lock_path: &Path,
 ) -> Result<FetchOutcome, CliError> {
+    // What the project store holds already — an artifact installed from a file, notably, which no
+    // other place has — is pinned where it is.
+    if let Ok(held) = store.resolve_with_platform(name, version, Some(current_platform())) {
+        verify_sha256(name.as_str(), version, &held.bytes, &held.sha256).map_err(CliError::from)?;
+        let pin = lock_pin(&held.meta, &held.sha256);
+        check_lock_conflict(lock_path, name.as_str(), version, &pin)?;
+        return Ok(FetchOutcome {
+            bytes_len: held.bytes.len() as u64,
+            lock_upsert: Some((name.to_string(), version.to_string(), pin)),
+            payload: held.bytes,
+        });
+    }
     match global_store.resolve_with_platform(name, version, Some(current_platform())) {
         Ok(resolved) => {
-            verify_sha256(name, version, &resolved.bytes, &resolved.sha256)
+            verify_sha256(name.as_str(), version, &resolved.bytes, &resolved.sha256)
                 .map_err(CliError::from)?;
             let pin = lock_pin(&resolved.meta, &resolved.sha256);
-            check_lock_conflict(lock_path, name, version, &pin)?;
+            check_lock_conflict(lock_path, name.as_str(), version, &pin)?;
             let len = resolved.bytes.len() as u64;
             store
                 .store_installed_overwrite(resolved.meta, &resolved.bytes, &resolved.sha256)
@@ -797,10 +909,13 @@ fn fetch_and_store(
                 payload: resolved.bytes,
             })
         }
+        Err(RegistryError::NotFound { .. }) if name.is_local() => {
+            Err(local_store_miss(name, version))
+        }
         Err(RegistryError::NotFound { .. }) => match source_chain {
             Some(chain) => {
                 let resolved = chain
-                    .resolve_bare(name, Some(version))
+                    .resolve_bare(name.name(), Some(version))
                     .map_err(source_chain_error_to_cli)?;
                 let sha256 = sha256_hex(&resolved.bytes);
                 let len = resolved.bytes.len() as u64;
@@ -820,12 +935,12 @@ fn fetch_and_store(
                 }
                 let runtime = inner.registry_runtime();
                 let meta = ArtifactMeta {
-                    name: inner.name.clone(),
+                    name: name.clone(),
                     version: version.to_string(),
                     runtime,
                     artifact_runtime: inner.runtime.clone(),
                     platforms: recorded_platforms(
-                        name,
+                        name.as_str(),
                         version,
                         runtime,
                         resolved.platform.as_deref(),
@@ -856,10 +971,15 @@ fn fetch_and_store(
     }
 }
 
-/// Install a `.mur.zip` sitting on this filesystem into `store`.
+/// Install a `.mur.zip` sitting on this filesystem into `store`, as `local/<packed name>`, and pin
+/// it in the project's `murmur.lock` when `lock_path` is given.
+///
+/// A file can claim no other scope: a scope says whose artifact it is, and nothing in a file on
+/// disk shows that it came from the owner it would name.
 pub(crate) fn install_from_local_file(
     path_str: &str,
     store: &LocalRegistry,
+    lock_path: Option<&Path>,
     precompiler: Option<&Precompiler>,
 ) -> Result<(), CliError> {
     let bytes = std::fs::read(path_str)
@@ -875,14 +995,20 @@ pub(crate) fn install_from_local_file(
         None
     };
 
+    let name = ArtifactName::from_parts(LOCAL_SCOPE, &manifest.name).map_err(|error| {
+        CliError::new(
+            E_IO_003,
+            format!("{path_str} declares a name that cannot be installed: {error}"),
+        )
+    })?;
     let sha256 = sha256_hex(&bytes);
     let meta = ArtifactMeta {
-        name: manifest.name.clone(),
+        name: name.clone(),
         version: manifest.version.clone(),
         runtime,
         artifact_runtime: manifest.runtime.clone(),
         platforms: recorded_platforms(
-            &manifest.name,
+            name.as_str(),
             &manifest.version,
             runtime,
             platform.as_deref(),
@@ -891,17 +1017,19 @@ pub(crate) fn install_from_local_file(
         tags: Vec::new(),
         wit_contracts: None,
     };
+    let pin = lock_pin(&meta, &sha256);
     store
         .store_installed_overwrite(meta, &bytes, &sha256)
         .map_err(CliError::from)?;
+    if let Some(lock_path) = lock_path {
+        if let Some(adoption) = upsert_lock_entry(lock_path, name.as_str(), &manifest.version, pin)?
+        {
+            capsule_runtime::report_println!("{adoption}");
+        }
+    }
 
-    capsule_runtime::report_println!(
-        "Installed {}@{} from {}",
-        manifest.name,
-        manifest.version,
-        path_str
-    );
-    precompile(precompiler, &manifest.name, &manifest.version, &bytes);
+    capsule_runtime::report_println!("Installed {name}@{} from {path_str}", manifest.version);
+    precompile(precompiler, name.as_str(), &manifest.version, &bytes);
     Ok(())
 }
 
@@ -946,11 +1074,14 @@ fn run_install_all_platforms(
     let Some(ref_str) = artifact_ref else {
         return Err(CliError::new(
             E_IO_003,
-            "--all-platforms requires an artifact reference (name@version)",
+            "--all-platforms requires an artifact reference (scope/name@version)",
         ));
     };
 
     let (name, version) = parse_versioned_ref(ref_str)?;
+    if name.is_local() {
+        return Err(local_store_miss(&name, version));
+    }
 
     let config = load_effective_mur_config()?;
     let chain = SourceChain::from_config(&config);
@@ -965,7 +1096,7 @@ fn run_install_all_platforms(
     let global_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
 
     for platform in ALL_PLATFORMS {
-        match chain.resolve_bare_for_platform(name, version, platform) {
+        match chain.resolve_bare_for_platform(name.name(), version, platform) {
             Ok(resolved) => {
                 let sha256 = sha256_hex(&resolved.bytes);
                 let manifest = load_manifest_from_artifact_bytes(&resolved.bytes).map_err(|e| {
@@ -979,11 +1110,11 @@ fn run_install_all_platforms(
                 // platform's payload, and a source that answered with an untagged asset
                 // answered for that request.
                 let meta = ArtifactMeta {
-                    name: name.to_string(),
+                    name: name.clone(),
                     version: version.to_string(),
                     runtime,
                     artifact_runtime: manifest.runtime.clone(),
-                    platforms: recorded_platforms(name, version, runtime, Some(platform)),
+                    platforms: recorded_platforms(name.as_str(), version, runtime, Some(platform)),
                     description: None,
                     tags: Vec::new(),
                     wit_contracts: None,
@@ -995,14 +1126,17 @@ fn run_install_all_platforms(
                     .store_installed_overwrite(meta, &resolved.bytes, &sha256)
                     .map_err(CliError::from)?;
                 capsule_runtime::report_println!(
-                    "Installed {name}@{version} ({platform}) → ~/.murmur/artifacts/{name}/{version}/{name}-{version}-{platform}.mur.zip"
+                    "Installed {name}@{version} ({platform}) → ~/.murmur/artifacts/{}/{}/{version}/{}-{version}-{platform}.mur.zip",
+                    name.scope(),
+                    name.name(),
+                    name.name()
                 );
                 // Only this host's payload: a form is native code for the machine that compiled
                 // it, so another platform's payload has nothing to gain from one here.
                 if *platform == current_platform() {
                     precompile(
                         build_precompiler(no_precompile, None).as_ref(),
-                        name,
+                        name.as_str(),
                         version,
                         &resolved.bytes,
                     );
@@ -1031,12 +1165,32 @@ fn is_local_path(s: &str) -> bool {
         || (s.contains('/') && s.ends_with(".mur.zip"))
 }
 
+/// `E-REG-007` for a reference that names an artifact by anything but a full name, and the
+/// reserved-scope refusal of a `github:` owner, both decided on the text alone.
+fn refuse_malformed_ref(artifact_ref: &str) -> Result<(), CliError> {
+    if is_local_path(artifact_ref) {
+        return Ok(());
+    }
+    if artifact_ref.starts_with("github:") {
+        if let Ok(ArtifactRef::GitHub { owner, repo, .. }) = ArtifactRef::parse(artifact_ref) {
+            github_scope(&owner, &repo)?;
+        }
+        return Ok(());
+    }
+    if artifact_ref.contains(':') {
+        return Ok(());
+    }
+    let name = artifact_ref.split('@').next().unwrap_or_default();
+    artifact_name_arg(name).map(|_| ())
+}
+
 fn is_source_chain_ref(s: &str) -> bool {
-    // github: prefix or bare name (no @)
+    // github: prefix or a name with no @version
     s.contains(':') || !s.contains('@')
 }
 
-pub(crate) fn parse_versioned_ref(input: &str) -> Result<(&str, &str), CliError> {
+/// `<scope>/<name>@<version>`, the name refused with `E-REG-007` when it is not a full name.
+pub(crate) fn parse_versioned_ref(input: &str) -> Result<(ArtifactName, &str), CliError> {
     let mut segments = input.split('@');
     let name = segments.next().unwrap_or_default();
     let version = segments.next().unwrap_or_default();
@@ -1044,11 +1198,11 @@ pub(crate) fn parse_versioned_ref(input: &str) -> Result<(&str, &str), CliError>
     if name.is_empty() || version.is_empty() || segments.next().is_some() {
         return Err(CliError::new(
             E_IO_003,
-            "artifact reference must be in the format <name@version>",
+            "artifact reference must be in the format <scope/name@version>",
         ));
     }
 
-    Ok((name, version))
+    Ok((artifact_name_arg(name)?, version))
 }
 
 fn store_display(store: &LocalRegistry) -> String {
@@ -1103,9 +1257,10 @@ mod tests {
 
         let store_dir = tempdir().unwrap();
         let store = murmur_artifact::LocalRegistry::new(store_dir.path());
-        super::install_from_local_file(file.to_str().unwrap(), &store, None).unwrap();
+        super::install_from_local_file(file.to_str().unwrap(), &store, None, None).unwrap();
 
-        let meta_path = store.metadata_path_for("my-tool", "1.0.0", Some(platform));
+        let name = murmur_artifact::ArtifactName::parse("local/my-tool").unwrap();
+        let meta_path = store.metadata_path_for(&name, "1.0.0", Some(platform));
         let recorded: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(meta_path).unwrap()).unwrap();
         assert_eq!(recorded["meta"]["runtime"], "native");

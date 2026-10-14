@@ -64,6 +64,8 @@
 //! **Nothing survives a restart.** A relaunch or `--resume` starts on `primary`. A resumed history
 //! keeps its `produced_by` marks, so reasoning an alternate wrote is not replayed to the primary.
 
+use std::collections::HashMap;
+
 use murmur_artifact::{InferenceConfig, PRIMARY_DRIVER_CHOICE};
 use serde_json::{json, Value};
 
@@ -72,8 +74,11 @@ use serde_json::{json, Value};
 pub(crate) struct DriverChoice {
     /// [`PRIMARY_DRIVER_CHOICE`] or an alternate's `name`.
     pub(crate) name: String,
-    /// The driver artifact the call is dispatched to.
+    /// The tool name of the driver artifact the call is dispatched to.
     pub(crate) driver: String,
+    /// The driver artifact's full name, as the manifest declares it: what the driver's store sees
+    /// as `MURMUR_INFERENCE_DRIVER` and what `GET /control` lists.
+    pub(crate) artifact: String,
     /// The model string the payload carries.
     pub(crate) model: String,
     /// Where the driver's gateway credential came from, as `session_start` names it: `"config"`,
@@ -108,15 +113,22 @@ pub(crate) struct DriverChoices {
 
 impl DriverChoices {
     /// The choices `inference` declares, each staged with no credential recorded. Staging fills in
-    /// the credential of each through [`Self::record_credential`].
-    pub(crate) fn declared(inference: &InferenceConfig) -> Self {
+    /// the credential of each through [`Self::record_credential`]. `inference` names drivers by
+    /// tool name; `full_names` takes each to its full name.
+    pub(crate) fn declared(
+        inference: &InferenceConfig,
+        full_names: &HashMap<String, String>,
+    ) -> Self {
+        let full = |driver: &str| crate::tool_names::full_name_of(full_names, driver).to_string();
+        let primary_driver = inference
+            .driver
+            .as_ref()
+            .map(|driver| driver.artifact.clone())
+            .unwrap_or_default();
         let primary = DriverChoice {
             name: PRIMARY_DRIVER_CHOICE.to_string(),
-            driver: inference
-                .driver
-                .as_ref()
-                .map(|driver| driver.artifact.clone())
-                .unwrap_or_default(),
+            artifact: full(&primary_driver),
+            driver: primary_driver,
             model: inference.model.clone(),
             credential_source: "none",
             injected_secret: None,
@@ -125,6 +137,7 @@ impl DriverChoices {
         let alternates = inference.alternates.iter().map(|alternate| DriverChoice {
             name: alternate.name.clone(),
             driver: alternate.driver.clone(),
+            artifact: full(&alternate.driver),
             model: alternate.model.clone(),
             credential_source: "none",
             injected_secret: None,
@@ -198,7 +211,7 @@ impl DriverChoices {
             .map(|choice| {
                 json!({
                     "name": choice.name,
-                    "driver": choice.driver,
+                    "driver": choice.artifact,
                     "model": choice.model,
                     "available": available(choice),
                 })
@@ -217,7 +230,7 @@ mod tests {
             transport: "http".to_string(),
             model: "claude-sonnet-4-5".to_string(),
             driver: Some(InferenceDriver {
-                artifact: "murmur-driver-anthropic".to_string(),
+                artifact: "driver-anthropic".to_string(),
                 config: None,
             }),
             command: None,
@@ -233,26 +246,42 @@ mod tests {
                 InferenceAlternate {
                     name: "haiku".to_string(),
                     model: "claude-haiku-4-5".to_string(),
-                    driver: "murmur-driver-anthropic".to_string(),
+                    driver: "driver-anthropic".to_string(),
                 },
                 InferenceAlternate {
                     name: "gpt".to_string(),
                     model: "gpt-5".to_string(),
-                    driver: "murmur-driver-openai".to_string(),
+                    driver: "driver-openai".to_string(),
                 },
             ],
         }
     }
 
+    /// What staging maps each driver's tool name back to.
+    fn full_names() -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "driver-anthropic".to_string(),
+                "murmur/driver-anthropic".to_string(),
+            ),
+            (
+                "driver-openai".to_string(),
+                "murmur/driver-openai".to_string(),
+            ),
+        ])
+    }
+
     #[test]
     fn driver_choice_table_puts_primary_first_then_alternates_in_order() {
-        let choices = DriverChoices::declared(&inference());
+        let choices = DriverChoices::declared(&inference(), &full_names());
         let names: Vec<&str> = choices.iter().map(|choice| choice.name.as_str()).collect();
         assert_eq!(names, vec!["primary", "haiku", "gpt"]);
-        assert_eq!(choices.primary().driver, "murmur-driver-anthropic");
+        assert_eq!(choices.primary().driver, "driver-anthropic");
+        assert_eq!(choices.primary().artifact, "murmur/driver-anthropic");
+        assert_eq!(choices.get(2).unwrap().artifact, "murmur/driver-openai");
         assert_eq!(choices.primary().model, "claude-sonnet-4-5");
         assert_eq!(choices.index_of("gpt"), Some(2));
-        assert_eq!(choices.index_of("murmur-driver-openai"), None);
+        assert_eq!(choices.index_of("driver-openai"), None);
         assert!(choices.has_alternates());
         assert_eq!(choices.names(), "primary, haiku, gpt");
     }
@@ -261,7 +290,7 @@ mod tests {
     fn driver_choice_without_alternates_is_the_primary_alone() {
         let mut bare = inference();
         bare.alternates.clear();
-        let choices = DriverChoices::declared(&bare);
+        let choices = DriverChoices::declared(&bare, &HashMap::new());
         assert!(!choices.has_alternates());
         assert_eq!(choices.get(1), None);
     }
@@ -269,9 +298,9 @@ mod tests {
     /// A credential is recorded per driver, so two choices on one driver share it.
     #[test]
     fn driver_choice_credential_is_recorded_for_every_choice_on_the_driver() {
-        let mut choices = DriverChoices::declared(&inference());
-        choices.record_credential("murmur-driver-anthropic", "config", None, None);
-        choices.record_credential("murmur-driver-openai", "none", None, Some("OPENAI_API_KEY"));
+        let mut choices = DriverChoices::declared(&inference(), &full_names());
+        choices.record_credential("driver-anthropic", "config", None, None);
+        choices.record_credential("driver-openai", "none", None, Some("OPENAI_API_KEY"));
         assert_eq!(choices.get(1).unwrap().credential_source, "config");
         assert!(choices.get(1).unwrap().staged());
         let gpt = choices.get(2).unwrap();
@@ -279,14 +308,14 @@ mod tests {
         assert_eq!(gpt.unresolved_credential.as_deref(), Some("OPENAI_API_KEY"));
         assert_eq!(
             gpt.producer(),
-            json!({"driver": "murmur-driver-openai", "model": "gpt-5"})
+            json!({"driver": "driver-openai", "model": "gpt-5"})
         );
         assert_eq!(
             choices.listing(DriverChoice::staged),
             vec![
-                json!({"name": "primary", "driver": "murmur-driver-anthropic", "model": "claude-sonnet-4-5", "available": true}),
-                json!({"name": "haiku", "driver": "murmur-driver-anthropic", "model": "claude-haiku-4-5", "available": true}),
-                json!({"name": "gpt", "driver": "murmur-driver-openai", "model": "gpt-5", "available": false}),
+                json!({"name": "primary", "driver": "murmur/driver-anthropic", "model": "claude-sonnet-4-5", "available": true}),
+                json!({"name": "haiku", "driver": "murmur/driver-anthropic", "model": "claude-haiku-4-5", "available": true}),
+                json!({"name": "gpt", "driver": "murmur/driver-openai", "model": "gpt-5", "available": false}),
             ]
         );
     }

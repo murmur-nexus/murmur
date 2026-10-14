@@ -62,6 +62,7 @@ fn stage_request(capsule_dir: &TempDir, manifest: &RuntimeManifest) -> StageRequ
         manifest_dir: capsule_dir.path().to_path_buf(),
         capsule_name: manifest.name.clone(),
         capsule_version: manifest.version.clone(),
+        capsule_artifact: None,
         capsule_component_bytes: Vec::new(),
         artifacts: requested_from(manifest),
         allowlisted_tools: HashSet::new(),

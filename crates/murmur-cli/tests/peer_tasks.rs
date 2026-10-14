@@ -69,6 +69,7 @@ fn stage(home: &TempDir, manifest: &Path) -> StagedSession {
             manifest_dir: manifest.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts,
             allowlisted_tools: Default::default(),

@@ -26,9 +26,9 @@ use tempfile::TempDir;
 
 /// The capsule the parent session is registered as. Its manifest is the ceiling every child in
 /// this suite is refereed against.
-const PARENT_CAPSULE: &str = "suite-parent";
+const PARENT_CAPSULE: &str = "local/suite-parent";
 const PARENT_SESSION: &str = "ses_suite000000000000000000000parent";
-const DRIVER: &str = "murmur-driver-anthropic";
+const DRIVER: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 /// Two host variables the parent holds and each child declares at most one of.
@@ -77,17 +77,18 @@ fn suite() -> &'static Suite {
                 "artifacts: []\ncapabilities:\n  \
                  network:\n    allow: [{endpoint}]\n  \
                  env:\n    allow: [{A_ONLY}, {B_ONLY}, MURMUR_TEST_ALLOWED_VAR]\n  \
-                 spawn:\n    allow: [child-agent, child-a, child-b, child-escape, child-sealed, \
-                 child-leak, child-reader, child-repeat, child-handed]\n",
+                 spawn:\n    allow: [local/child-agent, local/child-a, local/child-b, \
+                 local/child-escape, local/child-sealed, local/child-leak, local/child-reader, \
+                 local/child-repeat, local/child-handed]\n",
                 endpoint = inference.authority(),
             ),
             Some(&component("capsule-env-echo.wasm")),
         );
 
         // Script children that write into their own directory and try to leave it.
-        for name in ["child-a", "child-b"] {
+        for name in ["local/child-a", "local/child-b"] {
             let allow = match name {
-                "child-a" => format!("  env:\n    allow: [{A_ONLY}]\n"),
+                "local/child-a" => format!("  env:\n    allow: [{A_ONLY}]\n"),
                 _ => format!("  env:\n    allow: [{B_ONLY}]\n"),
             };
             common::publish_capsule(
@@ -100,7 +101,7 @@ fn suite() -> &'static Suite {
         }
         common::publish_capsule(
             &registry_path,
-            "child-escape",
+            "local/child-escape",
             "0.1.0",
             "artifacts: []\n",
             Some(&component("capsule-filesystem-escape.wasm")),
@@ -108,7 +109,7 @@ fn suite() -> &'static Suite {
 
         // Script children that read the paths their parent named, and report what each attempt
         // was served.
-        for name in ["child-reader", "child-repeat"] {
+        for name in ["local/child-reader", "local/child-repeat"] {
             common::publish_capsule(
                 &registry_path,
                 name,
@@ -119,7 +120,7 @@ fn suite() -> &'static Suite {
         }
         common::publish_capsule(
             &registry_path,
-            "child-leak",
+            "local/child-leak",
             "0.1.0",
             "artifacts: []\ncapabilities:\n  env:\n    allow: [MURMUR_TEST_ALLOWED_VAR]\n",
             Some(&component("capsule-env-echo.wasm")),
@@ -127,9 +128,9 @@ fn suite() -> &'static Suite {
 
         // Agent children: they bind a port and serve A2A.
         for (name, containment) in [
-            ("child-agent", ""),
-            ("child-sealed", "  containment: sealed\n"),
-            ("child-handed", ""),
+            ("local/child-agent", ""),
+            ("local/child-sealed", "  containment: sealed\n"),
+            ("local/child-handed", ""),
         ] {
             common::publish_capsule(
                 &registry_path,
@@ -180,7 +181,7 @@ fn recording_wrapper(home: &Path, mur: &Path) -> PathBuf {
         format!(
             "#!/bin/sh
              case \" $* \" in
-  *\" child-handed \"*)
+  *\" local/child-handed \"*)
                  env > handed.env
                  ls -l /proc/$$/fd > handed.fd
                  cat \"/proc/$$/fdinfo/$MURMUR_SPAWNER_LIFELINE\" > handed.fdinfo
@@ -340,16 +341,16 @@ fn a_parents_runtime_launches_an_approved_child_as_a_separate_process() {
     let suite = suite();
     let parent = Parent::new();
 
-    let (_, answer) = parent.approve("child-agent");
+    let (_, answer) = parent.approve("local/child-agent");
     // Permission, not a process: the daemon answered with an artifact and an expiry, and nothing
     // that could address anything running.
-    assert_eq!(answer["name"], "child-agent");
+    assert_eq!(answer["name"], "local/child-agent");
     assert_eq!(answer["version"], "0.1.0");
     assert!(answer["sha256"].as_str().unwrap().len() == 64);
     assert!(answer.get("capsule_url").is_none());
     assert!(answer.get("session_id").is_none());
 
-    let mut child = parent.launch("child-agent", &[]);
+    let mut child = parent.launch("local/child-agent", &[]);
 
     assert_ne!(child.pid(), std::process::id());
     assert!(child.capsule_url.starts_with("http://"), "{child:?}");
@@ -409,8 +410,8 @@ fn a_parents_runtime_launches_an_approved_child_as_a_separate_process() {
 fn two_children_of_the_same_parent_are_independent() {
     let parent = Parent::new();
 
-    let a = parent.launch("child-a", &[A_ONLY]);
-    let b = parent.launch("child-b", &[B_ONLY]);
+    let a = parent.launch("local/child-a", &[A_ONLY]);
+    let b = parent.launch("local/child-b", &[B_ONLY]);
 
     // The environment the parent built for each, which is the environment `execve` received.
     let names = |child: &LaunchedChild| -> Vec<String> {
@@ -464,7 +465,7 @@ fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
         child.env.iter().map(|(key, _)| key.clone()).collect()
     };
 
-    let plain = parent.launch("child-a", &[]);
+    let plain = parent.launch("local/child-a", &[]);
     assert_eq!(
         keys(&plain),
         [
@@ -478,10 +479,10 @@ fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
 
     // The same launch with lineage. It reports to nobody, so the handle is the whole of what the
     // spawner adds and no watcher runs.
-    let (grant, _) = parent.approve("child-b");
+    let (grant, _) = parent.approve("local/child-b");
     let delegated = launch_child_capsule(ChildLaunchRequest {
         parent_accessible_workdir: parent.dir().to_path_buf(),
-        capsule_name: "child-b".to_string(),
+        capsule_name: "local/child-b".to_string(),
         capsule_version: "0.1.0".to_string(),
         grant,
         child_env_allow: Vec::new(),
@@ -521,7 +522,7 @@ fn a_child_joins_its_parents_formation_with_or_without_a_spawner() {
         report_to: None,
     };
 
-    for (name, spawner) in [("child-a", Some(lineage)), ("child-b", None)] {
+    for (name, spawner) in [("local/child-a", Some(lineage)), ("local/child-b", None)] {
         let (grant, _) = parent.approve(name);
         let child = launch_child_capsule(ChildLaunchRequest {
             parent_accessible_workdir: parent.dir().to_path_buf(),
@@ -545,7 +546,7 @@ fn a_child_joins_its_parents_formation_with_or_without_a_spawner() {
         assert_eq!(child.formation_id, Some(formation.clone()), "{name}");
     }
 
-    let outside = parent.launch("child-a", &[]);
+    let outside = parent.launch("local/child-a", &[]);
     assert!(
         !outside.env.iter().any(|(key, _)| key == FORMATION_ID_ENV),
         "{:?}",
@@ -564,13 +565,13 @@ fn a_child_cannot_reach_its_parents_workdir_or_its_siblings() {
     let parent = Parent::new();
     std::fs::write(parent.dir().join("parent-secret.txt"), "parent only").unwrap();
 
-    let sibling = parent.launch("child-b", &[B_ONLY]);
+    let sibling = parent.launch("local/child-b", &[B_ONLY]);
     std::fs::write(sibling.workdir.join("sibling-secret.txt"), "sibling only").unwrap();
 
     // The escaping child gets its own input from the parent, placed in its own directory before it
     // is asked to do anything with it.
-    let escaping_dir = child_workdir_for(parent.dir(), "child-escape");
-    let child = parent.launch("child-escape", &[]);
+    let escaping_dir = child_workdir_for(parent.dir(), "local/child-escape");
+    let child = parent.launch("local/child-escape", &[]);
 
     // Its attempt to reach `../../outside.txt` — out of its preopen and into the parent's
     // `.murmur/` — was refused by the WASI layer rather than served.
@@ -620,7 +621,7 @@ fn a_child_cannot_reach_its_parents_workdir_or_its_siblings() {
         expected.extend(["blocked", "blocked", "blocked"]);
     }
 
-    let (reader, outcomes) = parent.launch_reading("child-reader", &targets, |dir| {
+    let (reader, outcomes) = parent.launch_reading("local/child-reader", &targets, |dir| {
         std::fs::write(dir.join("input.txt"), "placed by the parent").unwrap();
         #[cfg(unix)]
         {
@@ -665,7 +666,7 @@ fn each_delegation_gets_a_directory_of_its_own() {
     let parent = Parent::new();
 
     let (first, first_read) =
-        parent.launch_reading("child-repeat", &["./input.txt".to_string()], |dir| {
+        parent.launch_reading("local/child-repeat", &["./input.txt".to_string()], |dir| {
             std::fs::write(dir.join("input.txt"), "first only").unwrap();
         });
     std::fs::write(first.workdir.join("placed-by-the-parent.txt"), "kept").unwrap();
@@ -677,7 +678,7 @@ fn each_delegation_gets_a_directory_of_its_own() {
         .to_string_lossy()
         .to_string();
     let (second, second_read) = parent.launch_reading(
-        "child-repeat",
+        "local/child-repeat",
         &[
             "./input.txt".to_string(),
             format!("../{first_dir}/input.txt"),
@@ -738,12 +739,12 @@ fn each_delegation_gets_a_directory_of_its_own() {
 fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
     let suite = suite();
     let parent = Parent::new();
-    let (grant, _) = parent.approve("child-leak");
+    let (grant, _) = parent.approve("local/child-leak");
     let approval = grant.expose().to_string();
 
     let child = launch_child_capsule(ChildLaunchRequest {
         parent_accessible_workdir: parent.dir().to_path_buf(),
-        capsule_name: "child-leak".to_string(),
+        capsule_name: "local/child-leak".to_string(),
         capsule_version: "0.1.0".to_string(),
         grant,
         child_env_allow: vec!["MURMUR_TEST_ALLOWED_VAR".to_string()],
@@ -798,7 +799,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
     // reason, and nothing else.
     let error = launch_child_capsule(ChildLaunchRequest {
         parent_accessible_workdir: parent.dir().to_path_buf(),
-        capsule_name: "child-leak".to_string(),
+        capsule_name: "local/child-leak".to_string(),
         capsule_version: "0.1.0".to_string(),
         grant: SpawnApproval::new(approval.clone()),
         child_env_allow: Vec::new(),
@@ -820,7 +821,7 @@ fn a_registration_failure_names_the_daemon_and_the_reason() {
     let error = capsule_runtime::register_session(
         "http://127.0.0.1:1",
         "ses_unreachable",
-        "child-leak",
+        "local/child-leak",
         "0.1.0",
         Some(&SpawnApproval::new("msa1.secret.token".to_string())),
     )
@@ -843,7 +844,7 @@ fn a_sealed_child_either_achieves_its_floor_or_is_refused() {
     let host_reaches_sealed =
         capsule_runtime::detect_achieved_containment() == murmur_artifact::ContainmentClass::Sealed;
 
-    match parent.try_launch("child-sealed", &[]) {
+    match parent.try_launch("local/child-sealed", &[]) {
         Ok(mut child) => {
             assert!(
                 host_reaches_sealed,
@@ -918,7 +919,7 @@ fn the_child_directory_naming_rule_is_stable_and_unique() {
 fn dropping_a_launched_child_terminates_and_reaps_it() {
     let parent = Parent::new();
     let pid = {
-        let child = parent.launch("child-agent", &[]);
+        let child = parent.launch("local/child-agent", &[]);
         let pid = child.pid();
         assert!(process_is_alive(pid));
         pid
@@ -937,7 +938,7 @@ fn dropping_a_launched_child_terminates_and_reaps_it() {
 #[test]
 fn a_launched_child_lives_exactly_as_long_as_its_handle() {
     let parent = Parent::new();
-    let child = parent.launch("child-agent", &[]);
+    let child = parent.launch("local/child-agent", &[]);
     let pid = child.pid();
     assert!(process_is_alive(pid));
 
@@ -979,13 +980,13 @@ fn a_child_holds_its_own_spawner_lifeline_read_end_and_no_formation_lifeline() {
 
     let parent = Parent::new();
     let formation = FormationId::mint();
-    let (grant, _) = parent.approve("child-handed");
+    let (grant, _) = parent.approve("local/child-handed");
     // Decoys in this process's own environment, allowlisted for the child: neither may reach it.
     std::env::set_var(FORMATION_LIFELINE_ENV, "4097");
     std::env::set_var(SPAWNER_LIFELINE_ENV, "4098");
     let launched = launch_child_capsule(ChildLaunchRequest {
         parent_accessible_workdir: parent.dir().to_path_buf(),
-        capsule_name: "child-handed".to_string(),
+        capsule_name: "local/child-handed".to_string(),
         capsule_version: "0.1.0".to_string(),
         grant,
         child_env_allow: vec![

@@ -30,7 +30,7 @@ use murmur_artifact::{load_runtime_manifest, ArtifactRuntime, ContainmentClass, 
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-const DRIVER: &str = "fixture-process-driver";
+const DRIVER: &str = "local/fixture-process-driver";
 const DRIVER_VERSION: &str = "0.1.0";
 
 /// The grace every interrupted harness in this binary gets, short enough that a test that has to
@@ -287,6 +287,7 @@ fn stage(home: &TempDir, manifest_path: &Path, sleeps: bool) -> capsule_runtime:
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools,

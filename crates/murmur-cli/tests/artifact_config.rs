@@ -23,10 +23,12 @@ use zip::{
     CompressionMethod, ZipWriter,
 };
 
-const TOOL_NAME: &str = "config-echo";
+/// Full name of the config-reporting tool, installed from a `.mur.zip` file and so in the `local`
+/// scope; the capsule fixture invokes it by its bare part.
+const TOOL_NAME: &str = "local/config-echo";
 /// Second artifact name the capsule fixture also invokes, installed from the same component, so
 /// the scoping scenario can declare two entries that differ only in their `config:` block.
-const SECOND_TOOL_NAME: &str = "config-echo-b";
+const SECOND_TOOL_NAME: &str = "local/config-echo-b";
 const TOOL_VERSION: &str = "0.1.0";
 const CAPSULE_NAME: &str = "config-capsule";
 
@@ -71,8 +73,10 @@ fn one_tool_project(project: &Path, config_yaml: Option<&str>) -> PathBuf {
     config_project(project, &[artifact_entry(TOOL_NAME, config_yaml)])
 }
 
-/// Install the config-reporting tool into `project`'s own artifact store, under `name`.
+/// Install the config-reporting tool into `project`'s own artifact store, under the full `name`;
+/// the zip is packed under its bare part.
 fn install_config_tool(fixture: &Path, project: &Path, name: &str) {
+    let name = murmur_artifact::tool_name_of(name);
     let artifact = fixture.join(format!("{name}-{TOOL_VERSION}.mur.zip"));
     let mut zip = ZipWriter::new(fs::File::create(&artifact).unwrap());
     let options: SimpleFileOptions =
@@ -307,7 +311,7 @@ fn config_on_a_skill_entry_is_refused_at_parse_time() {
     fs::write(
         project.path().join("murmur.yaml"),
         format!(
-            "name: {CAPSULE_NAME}\nversion: 0.0.1\nartifacts:\n  - name: notes-skill\n    \
+            "name: {CAPSULE_NAME}\nversion: 0.0.1\nartifacts:\n  - name: local/notes-skill\n    \
              version: 1.0.0\n    runtime: skill\n    config:\n      who: me\n"
         ),
     )
@@ -484,7 +488,7 @@ fn config_on_a_native_tool_warns_and_is_not_delivered() {
     let assertion = common::run_capsule(&home, &manifest)
         .success()
         .stderr(predicate::str::contains("warning[W-SEC-015]"))
-        .stderr(predicate::str::contains(TOOL_NAME))
+        .stderr(predicate::str::contains(format!("artifact '{TOOL_NAME}'")))
         .stderr(predicate::str::contains("host subprocess"));
 
     let stdout = String::from_utf8(assertion.get_output().stdout.clone()).unwrap();

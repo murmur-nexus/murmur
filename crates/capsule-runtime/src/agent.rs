@@ -143,7 +143,12 @@ impl AgentRunConfig {
         inference: &InferenceConfig,
     ) -> (DriverChoice, Option<String>) {
         let Some(control) = self.control.as_ref() else {
-            return (DriverChoices::declared(inference).primary().clone(), None);
+            return (
+                DriverChoices::declared(inference, &std::collections::HashMap::new())
+                    .primary()
+                    .clone(),
+                None,
+            );
         };
         let reading = control.for_call(murmur_artifact::ControllableSetting::InferenceDriver);
         let choice = reading
@@ -159,7 +164,9 @@ impl AgentRunConfig {
     /// reached its call records as its producer.
     fn selected_driver_choice(&self, inference: &InferenceConfig) -> DriverChoice {
         let Some(control) = self.control.as_ref() else {
-            return DriverChoices::declared(inference).primary().clone();
+            return DriverChoices::declared(inference, &std::collections::HashMap::new())
+                .primary()
+                .clone();
         };
         control
             .selected(murmur_artifact::ControllableSetting::InferenceDriver)

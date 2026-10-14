@@ -20,6 +20,16 @@ pub struct MockRelease {
 impl MockRelease {
     /// `assets` are `(file name, bytes)` pairs, published with ids `1..=assets.len()`.
     pub fn start(tag: &str, assets: Vec<(String, Vec<u8>)>) -> Self {
+        Self::serve(tag, assets, false)
+    }
+
+    /// [`Self::start`], also answering `releases/tags/<tag>` with the release, the lookup an
+    /// explicit `github:<owner>/<repo>@<tag>` install makes.
+    pub fn start_tagged(tag: &str, assets: Vec<(String, Vec<u8>)>) -> Self {
+        Self::serve(tag, assets, true)
+    }
+
+    fn serve(tag: &str, assets: Vec<(String, Vec<u8>)>, serve_tag: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         let paths = Arc::new(Mutex::new(Vec::new()));
@@ -35,6 +45,7 @@ impl MockRelease {
         );
 
         let recorded = Arc::clone(&paths);
+        let tag_path = format!("/releases/tags/{tag}");
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
@@ -43,7 +54,9 @@ impl MockRelease {
                 };
                 recorded.lock().unwrap().push(path.clone());
 
-                let _ = if path.ends_with("/releases/latest") {
+                let _ = if path.ends_with("/releases/latest")
+                    || (serve_tag && path.ends_with(&tag_path))
+                {
                     write_response(
                         &mut stream,
                         200,
@@ -75,8 +88,10 @@ impl MockRelease {
     }
 }
 
-/// A minimal wasm tool artifact, `dir/<name>-<version>.mur.zip`.
+/// A minimal wasm tool artifact, `dir/<name>-<version>.mur.zip`, packed under the bare part of
+/// `name`.
 pub fn wasm_tool_zip(dir: &Path, name: &str, version: &str) -> PathBuf {
+    let name = murmur_artifact::tool_name_of(name);
     let path = dir.join(format!("{name}-{version}.mur.zip"));
     let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
     let options: zip::write::SimpleFileOptions =

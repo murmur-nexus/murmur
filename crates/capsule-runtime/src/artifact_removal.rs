@@ -63,7 +63,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use murmur_artifact::{artifact_name_format_error, ArtifactRuntime, LockOrigin, MurmurLock};
+use murmur_artifact::{ArtifactName, ArtifactRuntime, LockOrigin, MurmurLock};
 
 use crate::install_grant::{self, NOT_GRANTED};
 use crate::types::{CapabilityPolicy, InstalledArtifactSummary};
@@ -76,7 +76,7 @@ pub(crate) const NOT_REMOVABLE: &str = "not-removable:";
 /// on and check against `murmur.lock`. `Ok(None)` means the session has not installed `name` and
 /// `remove` answers `Ok(false)`.
 ///
-/// Checks, in order: the session holds an install grant; `name` is an artifact name; the session
+/// Checks, in order: the session holds an install grant; `name` is a full artifact name; the session
 /// has installed `name`; it is not a hook or a driver; `murmur.yaml` does not declare it; the
 /// session's record of its origin is runtime.
 pub(crate) fn refuse_before_lock<'a>(
@@ -91,11 +91,8 @@ pub(crate) fn refuse_before_lock<'a>(
              refused"
         ));
     }
-    if let Some(reason) = artifact_name_format_error(name) {
-        return Err(format!(
-            "{NOT_GRANTED} '{name}' is not an artifact name ({reason}); capabilities.install \
-             matches bare artifact names only"
-        ));
+    if let Err(error) = ArtifactName::parse(name) {
+        return Err(install_grant::name_refusal(&error));
     }
     let Some(summary) = installed.iter().find(|artifact| artifact.name == name) else {
         return Ok(None);
@@ -173,6 +170,8 @@ mod tests {
         LockedArtifact, LockedSha256, MurmurLock, LOCK_VERSION, PACKED_MANIFEST_ENTRY,
     };
 
+    use murmur_artifact::tool_name_of;
+
     use super::*;
     use crate::agent::inventory::build_tool_inventory;
     use crate::bindings::host::murmur::{
@@ -182,7 +181,9 @@ mod tests {
     use crate::install_grant::{pull, tree, Project, VERSION};
     use crate::runtime::{cwasm_entries, scratch_compiled_dir, CapsuleStoreState};
 
-    const SKILL: &str = "late-skill";
+    const SKILL: &str = "local/late-skill";
+    /// The tool name `SKILL` is dispatched by.
+    const SKILL_TOOL: &str = "late-skill";
     const SKILL_TEXT: &str = "# late guidance";
 
     /// Runs `artifact_removal::tests::<inner>` in a child process whose `HOME` is a fresh
@@ -258,7 +259,7 @@ mod tests {
         let err = manage::Host::describe(state, name.to_string())
             .expect_err("a removed artifact is not described");
         assert!(err.contains("is not installed"), "{err}");
-        assert!(state.removed_artifacts.contains(name));
+        assert!(state.removed_artifacts.contains(tool_name_of(name)));
     }
 
     fn summary(
@@ -299,7 +300,7 @@ mod tests {
                 dir.join(PACKED_MANIFEST_ENTRY),
                 format!(
                     "name: {}\nversion: {VERSION}\nruntime: tool\n",
-                    artifact.name
+                    tool_name_of(&artifact.name)
                 ),
             )
             .unwrap();
@@ -308,6 +309,7 @@ mod tests {
                 resolved_version: VERSION.to_string(),
                 sha256: LockedSha256::any("aaa"),
                 origin: artifact.origin.clone(),
+                owner_id: None,
             });
             state.installed_artifacts.push(artifact.clone());
         }
@@ -327,7 +329,10 @@ mod tests {
         project.publish_skill(SKILL, SKILL_TEXT);
         let mut state = project.session(&[SKILL], &[]);
         pull(&mut state, SKILL).expect("a granted skill pulls");
-        assert!(dispatch(&state, SKILL).await.unwrap().contains(SKILL_TEXT));
+        assert!(dispatch(&state, SKILL_TOOL)
+            .await
+            .unwrap()
+            .contains(SKILL_TEXT));
         let generation = state.installed_generation;
 
         assert_eq!(remove(&mut state, SKILL), Ok(true));
@@ -348,22 +353,22 @@ mod tests {
             return;
         }
         let project = Project::new();
-        project.publish_wasm_tool("wasm-tool");
-        let mut state = project.session(&[], &["wasm-tool"]);
-        pull(&mut state, "wasm-tool").expect("a granted WASM tool pulls");
+        project.publish_wasm_tool("local/wasm-tool");
+        let mut state = project.session(&[], &["local/wasm-tool"]);
+        pull(&mut state, "local/wasm-tool").expect("a granted WASM tool pulls");
         assert!(state.tool_components.contains_key("wasm-tool"));
         let sha256 = read_lockfile(&project.lock_path)
             .unwrap()
-            .artifact_for("wasm-tool")
+            .artifact_for("local/wasm-tool")
             .unwrap()
             .sha256
             .any
             .clone()
             .unwrap();
 
-        assert_eq!(remove(&mut state, "wasm-tool"), Ok(true));
+        assert_eq!(remove(&mut state, "local/wasm-tool"), Ok(true));
 
-        assert_gone(&project, &mut state, "wasm-tool");
+        assert_gone(&project, &mut state, "local/wasm-tool");
         assert!(!state.tool_components.contains_key("wasm-tool"));
         let forms = cwasm_entries(&scratch_compiled_dir());
         assert_eq!(forms.len(), 1, "{forms:?}");
@@ -374,16 +379,44 @@ mod tests {
     #[test]
     fn a_pulled_native_tool_is_removed_and_its_binary_deleted() {
         let project = Project::new();
-        project.publish_native_tool("native-tool");
-        let mut state = project.session(&[], &["native-tool"]);
-        pull(&mut state, "native-tool").expect("a granted native tool pulls");
-        let binary = project.installed("native-tool").join("native-tool");
+        project.publish_native_tool("local/native-tool");
+        let mut state = project.session(&[], &["local/native-tool"]);
+        pull(&mut state, "local/native-tool").expect("a granted native tool pulls");
+        let binary = project.installed("local/native-tool").join("native-tool");
         assert!(binary.is_file());
 
-        assert_eq!(remove(&mut state, "native-tool"), Ok(true));
+        assert_eq!(remove(&mut state, "local/native-tool"), Ok(true));
 
         assert!(!binary.exists());
-        assert_gone(&project, &mut state, "native-tool");
+        assert_gone(&project, &mut state, "local/native-tool");
+    }
+
+    #[test]
+    fn a_scoped_artifact_is_removed_by_its_full_name_and_refused_by_its_bare_one() {
+        let project = Project::new();
+        project.publish_native_tool("ana/tool-x");
+        let mut state = project.session(&[], &["ana/tool-*"]);
+        pull(&mut state, "ana/tool-x").expect("a granted scoped tool pulls");
+        let dir = project.workdir.join("tools").join("tool-x");
+        assert!(dir.is_dir());
+        let before = snapshot(&project, &state);
+
+        let err = remove(&mut state, "tool-x").expect_err("a bare name is refused");
+        assert!(
+            err.starts_with("not-granted: 'tool-x' is not a full artifact name"),
+            "{err}"
+        );
+        assert!(err.contains("'local/tool-x'"), "{err}");
+        assert_eq!(snapshot(&project, &state), before);
+
+        assert_eq!(remove(&mut state, "ana/tool-x"), Ok(true));
+
+        assert!(!dir.exists());
+        assert!(read_lockfile(&project.lock_path)
+            .unwrap()
+            .artifact_for("ana/tool-x")
+            .is_none());
+        assert_gone(&project, &mut state, "ana/tool-x");
     }
 
     #[test]
@@ -399,21 +432,22 @@ mod tests {
         }
         let project = Project::new();
         project.publish_skill(SKILL, SKILL_TEXT);
-        project.publish_wasm_tool("wasm-tool");
-        let mut state = project.session(&[SKILL], &["wasm-tool"]);
+        project.publish_wasm_tool("local/wasm-tool");
+        let mut state = project.session(&[SKILL], &["local/wasm-tool"]);
         pull(&mut state, SKILL).unwrap();
-        pull(&mut state, "wasm-tool").unwrap();
+        pull(&mut state, "local/wasm-tool").unwrap();
         state.allowlisted_tools.insert("wasm-tool".to_string());
 
-        for name in [SKILL, "wasm-tool"] {
+        for name in [SKILL, "local/wasm-tool"] {
             assert_eq!(remove(&mut state, name), Ok(true));
+            let tool = tool_name_of(name);
             let refusal = format!(
-                "tool '{name}' was removed from this session by manage.remove; it can no longer \
+                "tool '{tool}' was removed from this session by manage.remove; it can no longer \
                  be called"
             );
-            assert_eq!(dispatch(&state, name).await, Err(refusal.clone()));
+            assert_eq!(dispatch(&state, tool).await, Err(refusal.clone()));
             assert_eq!(
-                invoke::Host::invoke(&mut state, name.to_string(), input()).map(|_| ()),
+                invoke::Host::invoke(&mut state, tool.to_string(), input()).map(|_| ()),
                 Err(refusal)
             );
         }
@@ -440,7 +474,7 @@ mod tests {
         };
 
         pull(&mut state, SKILL).unwrap();
-        assert_eq!(names(&state), vec![SKILL, "zzz-existing-tool"]);
+        assert_eq!(names(&state), vec![SKILL_TOOL, "zzz-existing-tool"]);
 
         assert_eq!(remove(&mut state, SKILL), Ok(true));
         assert_eq!(names(&state), vec!["zzz-existing-tool"]);
@@ -449,17 +483,17 @@ mod tests {
     #[test]
     fn a_shell_binary_shadowed_by_a_pulled_tool_is_reachable_again_after_removal() {
         let project = Project::new();
-        project.publish_native_tool("shadow-tool");
-        let mut state = project.session(&[], &["shadow-tool"]);
+        project.publish_native_tool("local/shadow-tool");
+        let mut state = project.session(&[], &["local/shadow-tool"]);
         state.capability_policy.shell_allow = vec!["shadow-tool".to_string()];
 
-        pull(&mut state, "shadow-tool").unwrap();
+        pull(&mut state, "local/shadow-tool").unwrap();
         assert!(matches!(
             state.resolve_call("shadow-tool", &input()),
             ResolvedCall::Tool { .. }
         ));
 
-        assert_eq!(remove(&mut state, "shadow-tool"), Ok(true));
+        assert_eq!(remove(&mut state, "local/shadow-tool"), Ok(true));
         match state.resolve_call("shadow-tool", &input()) {
             ResolvedCall::Shell { argv, .. } => assert_eq!(argv, vec!["--version"]),
             ResolvedCall::Tool { .. } => panic!("the shell branch is reachable again"),
@@ -479,6 +513,7 @@ mod tests {
                     resolved_version: VERSION.to_string(),
                     sha256: LockedSha256::any(sha256),
                     origin: LockOrigin::Operator,
+                    owner_id: None,
                 }],
             },
         )
@@ -493,7 +528,10 @@ mod tests {
         );
 
         assert_eq!(snapshot(&project, &state), before);
-        assert!(dispatch(&state, SKILL).await.unwrap().contains(SKILL_TEXT));
+        assert!(dispatch(&state, SKILL_TOOL)
+            .await
+            .unwrap()
+            .contains(SKILL_TEXT));
     }
 
     #[test]
@@ -504,14 +542,18 @@ mod tests {
             &project,
             &mut state,
             &[
-                summary("decl-op", ArtifactRuntime::Tool, LockOrigin::Operator),
-                summary("decl-rt", ArtifactRuntime::Tool, runtime_origin("ses_prev")),
+                summary("local/decl-op", ArtifactRuntime::Tool, LockOrigin::Operator),
+                summary(
+                    "local/decl-rt",
+                    ArtifactRuntime::Tool,
+                    runtime_origin("ses_prev"),
+                ),
             ],
         );
-        state.declared_artifacts = ["decl-op", "decl-rt"].map(String::from).into();
+        state.declared_artifacts = ["local/decl-op", "local/decl-rt"].map(String::from).into();
         let before = snapshot(&project, &state);
 
-        for name in ["decl-op", "decl-rt"] {
+        for name in ["local/decl-op", "local/decl-rt"] {
             assert_eq!(
                 remove(&mut state, name),
                 Err(format!(
@@ -529,25 +571,25 @@ mod tests {
         let mut state = project.session(&["*"], &["*"]);
         let cases = [
             (
-                "decl-hook",
+                "local/decl-hook",
                 ArtifactRuntime::Hook,
                 LockOrigin::Operator,
                 "hook",
             ),
             (
-                "decl-driver",
+                "local/decl-driver",
                 ArtifactRuntime::Driver,
                 LockOrigin::Operator,
                 "driver",
             ),
             (
-                "rt-hook",
+                "local/rt-hook",
                 ArtifactRuntime::Hook,
                 runtime_origin("ses_test"),
                 "hook",
             ),
             (
-                "rt-driver",
+                "local/rt-driver",
                 ArtifactRuntime::Driver,
                 runtime_origin("ses_test"),
                 "driver",
@@ -558,7 +600,9 @@ mod tests {
             .map(|(name, runtime, origin, _)| summary(name, runtime.clone(), origin.clone()))
             .collect();
         stage(&project, &mut state, &artifacts);
-        state.declared_artifacts = ["decl-hook", "decl-driver"].map(String::from).into();
+        state.declared_artifacts = ["local/decl-hook", "local/decl-driver"]
+            .map(String::from)
+            .into();
         let before = snapshot(&project, &state);
 
         for (name, _, _, role) in cases {
@@ -595,7 +639,7 @@ mod tests {
         state.capability_policy = granted;
         let err = remove(&mut state, "../x").expect_err("a path is not an artifact name");
         assert!(
-            err.starts_with("not-granted: '../x' is not an artifact name ("),
+            err.starts_with("not-granted: '../x' is not a valid artifact name: "),
             "{err}"
         );
         assert_eq!(snapshot(&project, &state), before);
@@ -610,11 +654,16 @@ mod tests {
         pull(&mut state, SKILL).unwrap();
         assert!(listed(&mut state).contains(&"some-binary".to_string()));
 
-        for name in ["never-pulled", "some-binary"] {
-            let before = snapshot(&project, &state);
-            assert_eq!(remove(&mut state, name), Ok(false));
-            assert_eq!(snapshot(&project, &state), before);
-        }
+        let before = snapshot(&project, &state);
+        assert_eq!(remove(&mut state, "local/never-pulled"), Ok(false));
+        assert_eq!(snapshot(&project, &state), before);
+        // A shell binary has no full name, so `remove` refuses it as it refuses any bare name.
+        let err = remove(&mut state, "some-binary").expect_err("a bare name is refused");
+        assert!(
+            err.starts_with("not-granted: 'some-binary' is not a full artifact name"),
+            "{err}"
+        );
+        assert_eq!(snapshot(&project, &state), before);
 
         assert_eq!(remove(&mut state, SKILL), Ok(true));
         let before = snapshot(&project, &state);
@@ -677,8 +726,8 @@ mod tests {
             .map(|a| a.version.as_str())
             .collect();
         assert_eq!(installed, vec!["2.0.0"]);
-        assert!(!state.removed_artifacts.contains(SKILL));
-        assert!(dispatch(&state, SKILL)
+        assert!(!state.removed_artifacts.contains(SKILL_TOOL));
+        assert!(dispatch(&state, SKILL_TOOL)
             .await
             .unwrap()
             .contains("# second guidance"));
@@ -718,7 +767,10 @@ mod tests {
         let err = write_failed.expect_err("the lock cannot be written");
         assert!(err.starts_with("failed to write murmur.lock: "), "{err}");
         assert_eq!(snapshot(&project, &state), before);
-        assert!(dispatch(&state, SKILL).await.unwrap().contains(SKILL_TEXT));
+        assert!(dispatch(&state, SKILL_TOOL)
+            .await
+            .unwrap()
+            .contains(SKILL_TEXT));
 
         set_mode(&dir, 0o555);
         let delete_failed = remove(&mut state, SKILL);
@@ -734,8 +786,8 @@ mod tests {
         assert!(!project.locked(SKILL));
         assert!(state.installed_artifacts.iter().all(|a| a.name != SKILL));
         assert_eq!(
-            dispatch(&state, SKILL).await,
-            Err(called_after_removal(SKILL))
+            dispatch(&state, SKILL_TOOL).await,
+            Err(called_after_removal(SKILL_TOOL))
         );
     }
 }

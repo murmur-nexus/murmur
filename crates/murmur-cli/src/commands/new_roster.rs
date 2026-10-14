@@ -44,7 +44,7 @@ pub(crate) struct Provider {
 
 pub(crate) const ANTHROPIC: Provider = Provider {
     name: "anthropic",
-    driver: "murmur-driver-anthropic",
+    driver: "murmur/driver-anthropic",
     driver_version: "0.10.0",
     default_endpoint: "https://api.anthropic.com",
     default_model: "claude-haiku-4-5-20251001",
@@ -53,7 +53,7 @@ pub(crate) const ANTHROPIC: Provider = Provider {
 
 pub(crate) const OPENAI: Provider = Provider {
     name: "openai",
-    driver: "murmur-driver-openai",
+    driver: "murmur/driver-openai",
     driver_version: "0.9.0",
     default_endpoint: "https://api.openai.com/v1",
     default_model: "gpt-5.6-luna",
@@ -147,9 +147,20 @@ impl Scaffold {
     }
 }
 
-/// The capsule name the member `member` of the formation `name` runs.
+/// The capsule name the member `member` of the formation `name` runs: the `name:` its
+/// `murmur.yaml` declares and its `.mur.zip` is built under.
 pub(crate) fn capsule_name(name: &str, member: &str) -> String {
     format!("{name}-{member}")
+}
+
+/// The full name the roster runs a member's capsule by. Its `.mur.zip` is installed from a file,
+/// which puts it in the `local` scope.
+pub(crate) fn capsule_full_name(name: &str, member: &str) -> String {
+    format!(
+        "{}/{}",
+        murmur_artifact::LOCAL_SCOPE,
+        capsule_name(name, member)
+    )
 }
 
 /// Write `./<name>/` in the current directory. Nothing is written unless every file renders and
@@ -428,7 +439,7 @@ pub(crate) fn render_summary(name: &str, choice: &ProviderChoice) -> String {
             format!("{name}/{}/{MANIFEST_FILENAME}", member.name),
             format!(
                 "capsule {}@{SCAFFOLD_VERSION}{}",
-                capsule_name(name, member.name),
+                capsule_full_name(name, member.name),
                 if member.serves_peers {
                     ", serves peers"
                 } else {
@@ -559,7 +570,7 @@ fn render_roster(name: &str) -> String {
     .see(0, "roster/#members")
     .bare(0, "members:");
     for member in MEMBERS {
-        let capsule = capsule_name(name, member.name);
+        let capsule = capsule_full_name(name, member.name);
         yaml.line(
             2,
             &format!("- name: {}", member.name),
@@ -923,8 +934,8 @@ mod tests {
         assert_eq!(
             members,
             [
-                ("lead", "crew-lead", "0.1.0", true),
-                ("worker", "crew-worker", "0.1.0", false)
+                ("lead", "local/crew-lead", "0.1.0", true),
+                ("worker", "local/crew-worker", "0.1.0", false)
             ]
         );
         let RosterReachability::Rules(rules) = &roster.reachability else {
@@ -1253,12 +1264,12 @@ mod tests {
             render_summary("crew", &default_choice()),
             "Scaffolded formation 'crew' in ./crew
   crew/roster.yaml          lead is the entry member; lead may call worker
-  crew/lead/murmur.yaml     capsule crew-lead@0.1.0
-  crew/worker/murmur.yaml   capsule crew-worker@0.1.0, serves peers
+  crew/lead/murmur.yaml     capsule local/crew-lead@0.1.0
+  crew/worker/murmur.yaml   capsule local/crew-worker@0.1.0, serves peers
 
 Next:
   mur config set -g credentials.ANTHROPIC_API_KEY <your key>
-  mur install -g murmur-driver-anthropic@0.10.0
+  mur install -g murmur/driver-anthropic@0.10.0
   mur build crew/lead && mur install -g crew/lead/crew-lead-0.1.0.mur.zip
   mur build crew/worker && mur install -g crew/worker/crew-worker-0.1.0.mur.zip
   mur run --roster crew --task \"<your task>\"

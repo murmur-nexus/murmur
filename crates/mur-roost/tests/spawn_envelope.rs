@@ -26,17 +26,17 @@ fn a_child_within_its_parents_envelope_launches() {
         "capabilities:\n  network:\n    allow: [registry.internal, api.example.com]\n  \
          env:\n    allow: [MURMUR_TEST_ALLOWED_VAR]\n  \
          filesystem:\n    scope: data\n  \
-         spawn:\n    allow: [worker]\n",
+         spawn:\n    allow: [local/worker]\n",
     );
     daemon.publish_body(
-        "worker",
+        "local/worker",
         "0.1.0",
         "artifacts: []\ncapabilities:\n  network:\n    allow: [registry.internal]\n  \
          filesystem:\n    scope: data/in\n",
         "",
     );
 
-    let response = daemon.spawn("worker", Some(PARENT_SESSION));
+    let response = daemon.spawn("local/worker", Some(PARENT_SESSION));
 
     assert_eq!(response.status, 200, "{:?}", response.body);
     let credential = response.body["credential"].as_str().unwrap();
@@ -50,18 +50,71 @@ fn a_child_install_grant_within_its_parents_is_approved() {
     let daemon = Daemon::new();
     daemon.seed(
         PARENT_SESSION,
-        "capabilities:\n  install:\n    skill: [\"style-*\"]\n    tool: [jq]\n  \
-         spawn:\n    allow: [worker]\n",
+        "capabilities:\n  install:\n    skill: [\"local/style-*\"]\n    tool: [local/jq]\n  \
+         spawn:\n    allow: [local/worker]\n",
     );
     daemon.publish_body(
-        "worker",
+        "local/worker",
         "0.1.0",
-        "artifacts: []\ncapabilities:\n  install:\n    skill: [style-rust]\n    tool: [jq]\n",
+        "artifacts: []\ncapabilities:\n  install:\n    skill: [local/style-rust]\n    tool: [local/jq]\n",
         "",
     );
 
-    let response = daemon.spawn("worker", Some(PARENT_SESSION));
+    let response = daemon.spawn("local/worker", Some(PARENT_SESSION));
 
+    assert_eq!(response.status, 200, "{:?}", response.body);
+}
+
+/// A parent's install entry never reaches across scopes: a child naming the same bare name or
+/// prefix in another scope is wider than its parent and is refused, naming the entry. Only `*`
+/// covers every scope.
+#[test]
+fn a_child_install_grant_in_another_scope_is_refused() {
+    let parent = "capabilities:\n  install:\n    skill: [\"ana/style-*\"]\n    tool: [ana/jq]\n  \
+                  spawn:\n    allow: [local/worker]\n";
+    for (child, key, entry) in [
+        (
+            "skill: [bob/style-rust]",
+            "capabilities.install.skill",
+            "bob/style-rust",
+        ),
+        (
+            "skill: [\"bob/style-*\"]",
+            "capabilities.install.skill",
+            "bob/style-*",
+        ),
+        ("tool: [bob/jq]", "capabilities.install.tool", "bob/jq"),
+        ("tool: [\"*\"]", "capabilities.install.tool", "'*'"),
+    ] {
+        let daemon = Daemon::new();
+        daemon.seed(PARENT_SESSION, parent);
+        daemon.publish_body(
+            "local/worker",
+            "0.1.0",
+            &format!("artifacts: []\ncapabilities:\n  install:\n    {child}\n"),
+            "",
+        );
+
+        let response = daemon.spawn("local/worker", Some(PARENT_SESSION));
+
+        assert_eq!(response.status, 403, "{child}: {:?}", response.body);
+        let error = response.error();
+        assert!(error.contains(key), "{child}: {error}");
+        assert!(error.contains(entry), "{child}: {error}");
+    }
+
+    let daemon = Daemon::new();
+    daemon.seed(
+        PARENT_SESSION,
+        "capabilities:\n  install:\n    skill: [\"*\"]\n  spawn:\n    allow: [local/worker]\n",
+    );
+    daemon.publish_body(
+        "local/worker",
+        "0.1.0",
+        "artifacts: []\ncapabilities:\n  install:\n    skill: [bob/style-rust, \"ana/*\"]\n",
+        "",
+    );
+    let response = daemon.spawn("local/worker", Some(PARENT_SESSION));
     assert_eq!(response.status, 200, "{:?}", response.body);
 }
 
@@ -73,16 +126,16 @@ fn a_network_host_the_parent_does_not_hold_is_refused_by_axis_and_entry() {
     daemon.seed(
         PARENT_SESSION,
         "capabilities:\n  network:\n    allow: [registry.internal]\n  \
-         spawn:\n    allow: [worker]\n",
+         spawn:\n    allow: [local/worker]\n",
     );
     daemon.publish_body(
-        "worker",
+        "local/worker",
         "0.1.0",
         "artifacts: []\ncapabilities:\n  network:\n    allow: [api.example.com]\n",
         "",
     );
 
-    let response = daemon.spawn("worker", Some(PARENT_SESSION));
+    let response = daemon.spawn("local/worker", Some(PARENT_SESSION));
 
     assert_eq!(response.status, 403);
     let error = response.error();
@@ -100,98 +153,98 @@ fn every_axis_refuses_naming_its_own_manifest_key_and_entry() {
     // `(child name, parent capabilities, child capabilities, manifest key, offending entry)`.
     let cases: &[(&str, &str, &str, &str, &str)] = &[
         (
-            "child-network",
+            "local/child-network",
             "  network:\n    allow: [registry.internal]\n",
             "  network:\n    allow: [api.example.com]\n",
             "capabilities.network.allow",
             "api.example.com",
         ),
         (
-            "child-unix-sockets",
+            "local/child-unix-sockets",
             "  network:\n    allow: [registry.internal]\n    unix_sockets: false\n",
             "  network:\n    allow: [registry.internal]\n    unix_sockets: true\n",
             "capabilities.network.unix_sockets",
             "true",
         ),
         (
-            "child-peer-fetch",
+            "local/child-peer-fetch",
             "  peer_fetch:\n    allow: [peer.internal]\n",
             "  peer_fetch:\n    allow: [other.internal]\n",
             "capabilities.peer_fetch.allow",
             "other.internal",
         ),
         (
-            "child-shell",
+            "local/child-shell",
             "  shell:\n    allow: [git]\n",
             "  shell:\n    allow: [curl]\n",
             "capabilities.shell.allow",
             "curl",
         ),
         (
-            "child-spawn",
+            "local/child-spawn",
             "",
-            "  spawn:\n    allow: [grandchild]\n",
+            "  spawn:\n    allow: [local/grandchild]\n",
             "capabilities.spawn.allow",
-            "grandchild",
+            "local/grandchild",
         ),
         (
-            "child-env",
+            "local/child-env",
             "  env:\n    allow: [HOME]\n",
             "  env:\n    allow: [GITHUB_TOKEN]\n",
             "capabilities.env.allow",
             "GITHUB_TOKEN",
         ),
         (
-            "child-scope-sibling",
+            "local/child-scope-sibling",
             "  filesystem:\n    scope: data\n",
             "  filesystem:\n    scope: other\n",
             "capabilities.filesystem.scope",
             "other",
         ),
         (
-            "child-scope-escape",
+            "local/child-scope-escape",
             "  filesystem:\n    scope: data\n",
             "  filesystem:\n    scope: data/../other\n",
             "capabilities.filesystem.scope",
             "data/../other",
         ),
         (
-            "child-scope-absent",
+            "local/child-scope-absent",
             "  filesystem:\n    scope: data\n",
             "",
             "capabilities.filesystem.scope",
             "data",
         ),
         (
-            "child-workdir-exec",
+            "local/child-workdir-exec",
             "  filesystem:\n    scope: data\n    workdir_exec: false\n",
             "  filesystem:\n    scope: data\n    workdir_exec: true\n",
             "capabilities.filesystem.workdir_exec",
             "true",
         ),
         (
-            "child-install-skill",
-            "  install:\n    skill: [\"style-*\"]\n    tool: [jq]\n",
+            "local/child-install-skill",
+            "  install:\n    skill: [\"local/style-*\"]\n    tool: [local/jq]\n",
             "  install:\n    skill: [\"*\"]\n",
             "capabilities.install.skill",
             "'*'",
         ),
         (
-            "child-install-skill-wider",
-            "  install:\n    skill: [\"style-*\"]\n    tool: [jq]\n",
-            "  install:\n    skill: [\"style*\"]\n",
+            "local/child-install-skill-wider",
+            "  install:\n    skill: [\"local/style-*\"]\n    tool: [local/jq]\n",
+            "  install:\n    skill: [\"local/style*\"]\n",
             "capabilities.install.skill",
-            "style*",
+            "local/style*",
         ),
         (
-            "child-install-tool",
-            "  install:\n    skill: [\"style-*\"]\n    tool: [jq]\n",
-            "  install:\n    tool: [yq]\n",
+            "local/child-install-tool",
+            "  install:\n    skill: [\"local/style-*\"]\n    tool: [local/jq]\n",
+            "  install:\n    tool: [local/yq]\n",
             "capabilities.install.tool",
-            "yq",
+            "local/yq",
         ),
         (
-            "child-containment",
+            "local/child-containment",
             "  containment: scoped\n",
             "  containment: advisory\n",
             "capabilities.containment",
@@ -202,10 +255,10 @@ fn every_axis_refuses_naming_its_own_manifest_key_and_entry() {
     // A store is granted per artifact, so this case declares one on each side rather than at
     // capsule level, where a `state:` block grants nothing at all.
     let state_case = (
-        "child-state",
-        "artifacts:\n  - name: writer\n    version: 0.1.0\n    runtime: tool\n    \
+        "local/child-state",
+        "artifacts:\n  - name: local/writer\n    version: 0.1.0\n    runtime: tool\n    \
          capabilities:\n      state:\n        store: parent-notes\n",
-        "artifacts:\n  - name: writer\n    version: 0.1.0\n    runtime: tool\n    \
+        "artifacts:\n  - name: local/writer\n    version: 0.1.0\n    runtime: tool\n    \
          capabilities:\n      state:\n        store: child-notes\n",
         "capabilities.state.store",
         "child-notes",
@@ -277,16 +330,16 @@ fn a_raised_containment_floor_clears_the_referee_and_is_judged_by_the_child_itse
     let daemon = Daemon::new();
     daemon.seed(
         PARENT_SESSION,
-        "capabilities:\n  containment: scoped\n  spawn:\n    allow: [worker]\n",
+        "capabilities:\n  containment: scoped\n  spawn:\n    allow: [local/worker]\n",
     );
     daemon.publish_body(
-        "worker",
+        "local/worker",
         "0.1.0",
         "artifacts: []\ncapabilities:\n  containment: sealed\n",
         "",
     );
 
-    let response = daemon.spawn("worker", Some(PARENT_SESSION));
+    let response = daemon.spawn("local/worker", Some(PARENT_SESSION));
 
     assert!(
         !format!("{:?}", response.body).contains("capabilities.containment"),
@@ -304,24 +357,27 @@ fn the_name_check_runs_first_and_names_no_axis() {
     daemon.seed(
         PARENT_SESSION,
         "capabilities:\n  network:\n    allow: [registry.internal]\n  \
-         spawn:\n    allow: [some-other-worker]\n",
+         spawn:\n    allow: [local/some-other-worker]\n",
     );
-    daemon.publish_body("worker", "0.1.0", "artifacts: []\n", "");
+    daemon.publish_body("local/worker", "0.1.0", "artifacts: []\n", "");
 
-    let response = daemon.spawn("worker", Some(PARENT_SESSION));
+    let response = daemon.spawn("local/worker", Some(PARENT_SESSION));
 
     assert_eq!(response.status, 403);
     let error = response.error();
-    assert_eq!(error, "capsule 'worker' is not in parent's spawn_allow");
+    assert_eq!(
+        error,
+        "capsule 'local/worker' is not in parent's spawn_allow"
+    );
 }
 
 /// With no parent there is no envelope to be within, so the global list is the only gate — even
 /// for a manifest whose grants would exceed any parent.
 #[test]
 fn a_top_level_spawn_has_no_parent_to_be_within() {
-    let daemon = Daemon::with_spawn_allow(vec!["worker".to_string()]);
+    let daemon = Daemon::with_spawn_allow(vec!["local/worker".to_string()]);
     daemon.publish_body(
-        "worker",
+        "local/worker",
         "0.1.0",
         "artifacts: []\ncapabilities:\n  network:\n    allow: [api.example.com]\n    \
          unix_sockets: true\n  filesystem:\n    workdir_exec: true\n  \
@@ -329,7 +385,7 @@ fn a_top_level_spawn_has_no_parent_to_be_within() {
         "",
     );
 
-    let response = daemon.spawn("worker", None);
+    let response = daemon.spawn("local/worker", None);
 
     assert_eq!(response.status, 200, "{:?}", response.body);
     assert!(response.body["credential"]
@@ -341,12 +397,15 @@ fn a_top_level_spawn_has_no_parent_to_be_within() {
 #[test]
 fn a_top_level_spawn_of_an_unlisted_name_is_still_refused_by_the_flag() {
     let daemon = Daemon::new();
-    daemon.publish("worker", "0.1.0");
+    daemon.publish("local/worker", "0.1.0");
 
-    let response = daemon.spawn("worker", None);
+    let response = daemon.spawn("local/worker", None);
 
     assert_eq!(response.status, 403);
-    assert_eq!(response.error(), "capsule 'worker' is not in --spawn-allow");
+    assert_eq!(
+        response.error(),
+        "capsule 'local/worker' is not in --spawn-allow"
+    );
 }
 
 /// The referee reads the registry manifest, never the request. A body carrying its own narrow,
@@ -357,10 +416,10 @@ fn a_manifest_supplied_in_the_request_is_not_consulted() {
     daemon.seed(
         PARENT_SESSION,
         "capabilities:\n  network:\n    allow: [registry.internal]\n  \
-         spawn:\n    allow: [worker]\n",
+         spawn:\n    allow: [local/worker]\n",
     );
     daemon.publish_body(
-        "worker",
+        "local/worker",
         "0.1.0",
         "artifacts: []\ncapabilities:\n  network:\n    allow: [api.example.com]\n",
         "",
@@ -369,8 +428,8 @@ fn a_manifest_supplied_in_the_request_is_not_consulted() {
 
     let response = daemon.post(
         "/spawn",
-        r#"{"name":"worker","version":"0.1.0",
-            "manifest":{"name":"worker","version":"0.1.0","capabilities":{"network":{"allow":["registry.internal"]}}},
+        r#"{"name":"local/worker","version":"0.1.0",
+            "manifest":{"name":"local/worker","version":"0.1.0","capabilities":{"network":{"allow":["registry.internal"]}}},
             "capabilities":{"network":{"allow":["registry.internal"]}}}"#,
         &[(capsule_runtime::SPAWN_CREDENTIAL_HEADER, &credential)],
     );
@@ -391,16 +450,19 @@ fn a_refused_spawn_creates_nothing() {
     daemon.seed(
         PARENT_SESSION,
         "capabilities:\n  network:\n    allow: [registry.internal]\n  \
-         spawn:\n    allow: [worker]\n",
+         spawn:\n    allow: [local/worker]\n",
     );
     daemon.publish_body(
-        "worker",
+        "local/worker",
         "0.1.0",
         "artifacts: []\ncapabilities:\n  network:\n    allow: [api.example.com]\n",
         "",
     );
 
-    assert_eq!(daemon.spawn("worker", Some(PARENT_SESSION)).status, 403);
+    assert_eq!(
+        daemon.spawn("local/worker", Some(PARENT_SESSION)).status,
+        403
+    );
 
     let jobs = daemon.state.jobs.lock().unwrap();
     assert_eq!(jobs.len(), 1);

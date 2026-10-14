@@ -1,4 +1,4 @@
-# `murmur-tool-fixture` — native tool fixture
+# `tool-fixture` — native tool fixture
 
 A small host-native tool binary used by `crates/murmur-cli/tests/git_tool.rs` and
 `crates/murmur-cli/tests/native_tool_packaging.rs`.

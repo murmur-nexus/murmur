@@ -25,8 +25,12 @@ use common::recording_upstream::{RecordingUpstream, Reply};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-const DRIVER: &str = "murmur-driver-anthropic";
+const DRIVER: &str = "local/murmur-driver-anthropic";
+/// The probe tool's name as the model calls it.
 const TOOL: &str = "gateway-probe";
+/// The probe tool's full name, as the manifest declares it and the session's gateway records
+/// carry it; published from a `.mur.zip` file.
+const TOOL_ARTIFACT: &str = "local/gateway-probe";
 const VERSION: &str = "0.1.0";
 const SECRET: &str = "CARD_TOKEN";
 /// The driver's key, written literally: these tests are about the tool's credential.
@@ -192,7 +196,7 @@ fn project(provider: &str, tool: Option<&str>, extra: &str) -> Project {
 /// `gateway-probe`'s entry, its gateway at `upstream` keyed by `${CARD_TOKEN}`.
 fn keyed_tool(upstream: &str) -> String {
     format!(
-        "  - name: {TOOL}\n    version: {VERSION}\n    runtime: tool\n    gateway:\n      \
+        "  - name: {TOOL_ARTIFACT}\n    version: {VERSION}\n    runtime: tool\n    gateway:\n      \
          endpoint: {upstream}/v1\n      api_key: ${{{SECRET}}}\n"
     )
 }
@@ -200,7 +204,7 @@ fn keyed_tool(upstream: &str) -> String {
 /// `gateway-probe`'s entry, its gateway at `upstream` and keyless.
 fn keyless_tool(upstream: &str) -> String {
     format!(
-        "  - name: {TOOL}\n    version: {VERSION}\n    runtime: tool\n    gateway:\n      \
+        "  - name: {TOOL_ARTIFACT}\n    version: {VERSION}\n    runtime: tool\n    gateway:\n      \
          endpoint: {upstream}/v1\n      keyless: true\n"
     )
 }
@@ -648,7 +652,7 @@ fn an_injected_secret_reaches_the_gateway_and_no_record() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|gateway| gateway["artifact"] == TOOL)
+        .find(|gateway| gateway["artifact"] == TOOL_ARTIFACT)
         .unwrap();
     assert_eq!(tool_gateway["credential_source"], "injected");
     assert_eq!(
@@ -736,7 +740,7 @@ fn a_request_before_injection_never_reaches_the_upstream() {
     let credential_events = of_type(&events, "gateway_credential");
     assert_eq!(credential_events.len(), 1, "{credential_events:?}");
     let event = credential_events[0];
-    assert_eq!(event["artifact"], TOOL);
+    assert_eq!(event["artifact"], TOOL_ARTIFACT);
     assert_eq!(event["source"], "injected");
     assert_eq!(event["credential"], SECRET);
     assert_eq!(event["change"], "unreadable");

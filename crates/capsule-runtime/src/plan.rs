@@ -1139,7 +1139,11 @@ fn dispatch_shell_step(
 }
 
 fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Value) -> StepResult {
-    let capsule = step.capsule.as_deref().unwrap_or_default();
+    let named = step.capsule.as_deref().unwrap_or_default();
+    // A step names a capsule by the bare part, as `delegate-task` does; mur-roost is asked about
+    // the full `capabilities.spawn.allow` entry it stands for.
+    let full = crate::tool_names::spawn_target(&ctx.capability_policy.spawn_allow, named);
+    let capsule = full.as_str();
     // `validate_plan` already accepted this step's un-interpolated input, and interpolation
     // replaces a string with a string, so the refusal here is unreachable through `execute`.
     let task = match capsule_task_text(&input) {
@@ -1213,7 +1217,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
             // against, and a context that names none means `0.1.0`.
             version: ctx
                 .capsule_versions
-                .get(capsule)
+                .get(named)
                 .cloned()
                 .unwrap_or_else(|| "0.1.0".to_string()),
             task,

@@ -199,9 +199,25 @@ fn store_key(scratch: &Scratch, step: &str, key_var: &str) {
     assert!(!set.stdout.contains(TEST_KEY) && !set.stderr.contains(TEST_KEY));
 }
 
+/// The `extra.v.<key>` value in `docs/mkdocs.yml`: the driver version a scaffolded member pins.
+fn docs_version(key: &str) -> String {
+    let mkdocs = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/mkdocs.yml"),
+    )
+    .unwrap();
+    let prefix = format!("{key}:");
+    let line = mkdocs
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no {key} in docs/mkdocs.yml"));
+    line[prefix.len()..].trim().trim_matches('"').to_string()
+}
+
 /// Run the printed key, driver and build-and-install steps, `steps[0..4]`, as printed. The driver
-/// step is served by the fixture driver, published locally under the name and version the step
-/// prints, the version label being metadata only.
+/// step is served by the fixture driver, filed in the global store under the full name and
+/// version the step prints, the version label being metadata only, so the printed
+/// `mur install -g` finds it there without asking a source.
 fn install_as_printed(scratch: &Scratch, steps: &[String]) {
     store_key(scratch, &steps[0], "ANTHROPIC_API_KEY");
     let (driver_name, driver_version) = steps[1]
@@ -209,7 +225,8 @@ fn install_as_printed(scratch: &Scratch, steps: &[String]) {
         .unwrap_or_else(|| panic!("the second step installs the driver: {}", steps[1]))
         .split_once('@')
         .unwrap();
-    assert_eq!(driver_name, "murmur-driver-anthropic");
+    assert_eq!(driver_name, "murmur/driver-anthropic");
+    assert_eq!(driver_version, docs_version("murmur_driver_anthropic"));
     let artifacts = tempfile::tempdir().unwrap();
     let driver_zip = common::create_driver_artifact(
         artifacts.path(),
@@ -217,8 +234,22 @@ fn install_as_printed(scratch: &Scratch, steps: &[String]) {
         driver_version,
         &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
     );
-    common::publish_local(&scratch.home, &driver_zip).success();
-    for step in &steps[2..4] {
+    murmur_artifact::Registry::publish(
+        &murmur_artifact::LocalRegistry::new(scratch.home.path().join(".murmur/artifacts")),
+        murmur_artifact::ArtifactMeta {
+            name: murmur_artifact::ArtifactName::parse(driver_name).unwrap(),
+            version: driver_version.to_string(),
+            runtime: murmur_artifact::RuntimeType::Wasm,
+            artifact_runtime: "driver".to_string(),
+            platforms: Vec::new(),
+            description: None,
+            tags: Vec::new(),
+            wit_contracts: None,
+        },
+        &std::fs::read(&driver_zip).unwrap(),
+    )
+    .unwrap();
+    for step in &steps[1..4] {
         for command in step.split("&&") {
             let words: Vec<&str> = command.split_whitespace().collect();
             assert_eq!(words[0], "mur", "{step}");
@@ -268,6 +299,19 @@ fn the_scaffold_installs_and_launches_as_printed() {
 
     assert_eq!(steps[4], "mur run --roster crew --task \"<your task>\"");
     assert_eq!(steps.len(), 5, "{steps:?}");
+    // Each member is named by the full name its built zip installs under, which is the name
+    // `mur run --roster` launches it with.
+    let roster = scratch.read("crew/roster.yaml");
+    let capsules: Vec<&str> = roster
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("capsule: "))
+        .map(|rest| rest.split_whitespace().next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        capsules,
+        ["local/crew-lead", "local/crew-worker"],
+        "{roster}"
+    );
 
     let _lock = launch_lock();
     let mut launcher = scratch
@@ -633,8 +677,8 @@ fn doctor_in_the_scaffolded_formation_checks_its_roster() {
     assert_eq!(
         admitted.stdout,
         format!(
-            "{preamble}  lead     crew-lead@0.1.0     entry   refuses peers   authenticated door
-  worker   crew-worker@0.1.0           serves peers    authenticated door
+            "{preamble}  lead     local/crew-lead@0.1.0     entry   refuses peers   authenticated door
+  worker   local/crew-worker@0.1.0           serves peers    authenticated door
   reachability: lead \u{2192} worker
 
 All checks passed.
@@ -692,7 +736,7 @@ fn a_hand_resume_of_a_members_session_joins_no_formation() {
     let mut resume = scratch.command(&[
         "run",
         "--capsule",
-        "crew-lead",
+        "local/crew-lead",
         "--capsule-version",
         "0.1.0",
         "--workdir",
@@ -752,7 +796,8 @@ fn with_no_config_the_members_name_anthropic() {
     for member in ["lead", "worker"] {
         let manifest = scratch.manifest(member);
         let driver = &manifest.artifacts[0];
-        assert_eq!(driver.name, "murmur-driver-anthropic");
+        assert_eq!(driver.name, "murmur/driver-anthropic");
+        assert_eq!(driver.version, docs_version("murmur_driver_anthropic"));
         let gateway = driver.gateway.as_ref().unwrap();
         assert_eq!(gateway.endpoint, "https://api.anthropic.com");
         assert_eq!(
@@ -816,7 +861,8 @@ fn an_openai_config_names_the_openai_driver_and_key() {
     for member in ["lead", "worker"] {
         let manifest = scratch.manifest(member);
         let driver = &manifest.artifacts[0];
-        assert_eq!(driver.name, "murmur-driver-openai");
+        assert_eq!(driver.name, "murmur/driver-openai");
+        assert_eq!(driver.version, docs_version("murmur_driver_openai"));
         let gateway = driver.gateway.as_ref().unwrap();
         assert_eq!(gateway.endpoint, "https://api.openai.com/v1");
         assert_eq!(
@@ -826,7 +872,13 @@ fn an_openai_config_names_the_openai_driver_and_key() {
         assert_eq!(manifest.inference.unwrap().model, "gpt-5.6-luna");
     }
     let steps = next_steps(&new.stdout);
-    assert!(steps[1].starts_with("mur install -g murmur-driver-openai@"));
+    assert_eq!(
+        steps[1],
+        format!(
+            "mur install -g murmur/driver-openai@{}",
+            docs_version("murmur_driver_openai")
+        )
+    );
     assert!(steps.contains(&"mur config set -g credentials.OPENAI_API_KEY <your key>".to_string()));
     assert!(!new.stdout.contains("ANTHROPIC_API_KEY"));
     assert_eq!(

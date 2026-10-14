@@ -26,8 +26,13 @@ use common::recording_upstream::{RecordedRequest, RecordingUpstream, Reply};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-const ANTHROPIC: &str = "murmur-driver-anthropic";
-const OPENAI: &str = "murmur-driver-openai";
+/// The drivers' full names, published from `.mur.zip` files: what the manifest declares, what
+/// `GET /control` lists and what a driver sees as `MURMUR_INFERENCE_DRIVER`.
+const ANTHROPIC: &str = "local/murmur-driver-anthropic";
+const OPENAI: &str = "local/murmur-driver-openai";
+/// The bare tool name of [`ANTHROPIC`]: what `produced_by` names the driver by.
+/// `inference_choices`, `gateways` and `W-RUN-003` carry the full name.
+const ANTHROPIC_TOOL: &str = "murmur-driver-anthropic";
 const VERSION: &str = "0.1.0";
 const CAPSULE: &str = "switch-agent";
 const SONNET: &str = "claude-sonnet-4-5";
@@ -46,8 +51,8 @@ const BEARER_AUTH: &str = "upstream_auth:\n  header: Authorization\n  value: \"B
 const THREADED: &str =
     "lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n  conversation: threaded\n";
 const GPT_ALTERNATE: &str =
-    "    - name: gpt\n      model: gpt-5\n      driver:\n        artifact: murmur-driver-openai\n";
-const HAIKU_ALTERNATE: &str = "    - name: haiku\n      model: claude-haiku-4-5\n      driver:\n        artifact: murmur-driver-anthropic\n";
+    "    - name: gpt\n      model: gpt-5\n      driver:\n        artifact: local/murmur-driver-openai\n";
+const HAIKU_ALTERNATE: &str = "    - name: haiku\n      model: claude-haiku-4-5\n      driver:\n        artifact: local/murmur-driver-anthropic\n";
 const CONTROLLER: &str = "control:\n  settings: [inference.driver]\n";
 const AGENT: &str = "control:\n  agent_settings: [inference.driver]\n";
 
@@ -702,7 +707,7 @@ fn s2_an_undeclared_choice_is_refused_and_changes_nothing() {
     );
     assert!(
         show.stdout
-            .contains("model gpt-5  driver murmur-driver-openai  available"),
+            .contains("model gpt-5  driver local/murmur-driver-openai  available"),
         "{}",
         show.context()
     );
@@ -867,7 +872,7 @@ fn s3_an_alternate_whose_credential_is_missing_at_launch_is_staged_unavailable()
     let show = mur_control(home.path(), &["show"], None);
     assert!(
         show.stdout
-            .contains("model gpt-5  driver murmur-driver-openai  unavailable"),
+            .contains("model gpt-5  driver local/murmur-driver-openai  unavailable"),
         "{}",
         show.context()
     );
@@ -943,7 +948,7 @@ fn s4_an_artifact_named_switch_driver_is_refused() {
     let project = project(
         "http://127.0.0.1:9",
         Spec {
-            artifacts: "  - name: switch-driver\n    version: 0.1.0\n    runtime: tool\n",
+            artifacts: "  - name: local/switch-driver\n    version: 0.1.0\n    runtime: tool\n",
             ..Spec::default()
         },
     );
@@ -1115,9 +1120,9 @@ fn s6_signed_thinking_goes_only_to_the_model_that_wrote_it() {
     assert_eq!(
         producers,
         vec![
-            json!({"driver": ANTHROPIC, "model": SONNET}),
-            json!({"driver": ANTHROPIC, "model": HAIKU}),
-            json!({"driver": ANTHROPIC, "model": SONNET}),
+            json!({"driver": ANTHROPIC_TOOL, "model": SONNET}),
+            json!({"driver": ANTHROPIC_TOOL, "model": HAIKU}),
+            json!({"driver": ANTHROPIC_TOOL, "model": SONNET}),
         ]
     );
 }
@@ -1134,7 +1139,7 @@ fn s7_each_refused_manifest_fails_mur_run_with_e_man_003_naming_the_field() {
         (
             Spec {
                 openai: Some(openai),
-                alternates: "    - name: primary\n      model: gpt-5\n      driver:\n        artifact: murmur-driver-openai\n",
+                alternates: "    - name: primary\n      model: gpt-5\n      driver:\n        artifact: local/murmur-driver-openai\n",
                 top: CONTROLLER,
                 ..Spec::default()
             },
@@ -1152,7 +1157,7 @@ fn s7_each_refused_manifest_fails_mur_run_with_e_man_003_naming_the_field() {
         (
             Spec {
                 openai: Some(openai),
-                alternates: "    - name: Gpt\n      model: gpt-5\n      driver:\n        artifact: murmur-driver-openai\n",
+                alternates: "    - name: Gpt\n      model: gpt-5\n      driver:\n        artifact: local/murmur-driver-openai\n",
                 top: CONTROLLER,
                 ..Spec::default()
             },
@@ -1161,7 +1166,7 @@ fn s7_each_refused_manifest_fails_mur_run_with_e_man_003_naming_the_field() {
         (
             Spec {
                 openai: Some(openai),
-                alternates: "    - name: gpt\n      model: \"\"\n      driver:\n        artifact: murmur-driver-openai\n",
+                alternates: "    - name: gpt\n      model: \"\"\n      driver:\n        artifact: local/murmur-driver-openai\n",
                 top: CONTROLLER,
                 ..Spec::default()
             },
@@ -1178,7 +1183,7 @@ fn s7_each_refused_manifest_fails_mur_run_with_e_man_003_naming_the_field() {
         (
             Spec {
                 openai: Some(openai),
-                alternates: "    - name: gpt\n      model: gpt-5\n      driver:\n        artifact: murmur-driver-openai\n        config:\n          store: true\n",
+                alternates: "    - name: gpt\n      model: gpt-5\n      driver:\n        artifact: local/murmur-driver-openai\n        config:\n          store: true\n",
                 top: CONTROLLER,
                 ..Spec::default()
             },
@@ -1186,7 +1191,7 @@ fn s7_each_refused_manifest_fails_mur_run_with_e_man_003_naming_the_field() {
         ),
         (
             Spec {
-                alternates: "    - name: same\n      model: claude-sonnet-4-5\n      driver:\n        artifact: murmur-driver-anthropic\n",
+                alternates: "    - name: same\n      model: claude-sonnet-4-5\n      driver:\n        artifact: local/murmur-driver-anthropic\n",
                 top: CONTROLLER,
                 ..Spec::default()
             },
@@ -1237,7 +1242,8 @@ fn s7_each_refused_manifest_fails_mur_run_with_e_man_003_naming_the_field() {
     let project = project(
         "http://127.0.0.1:9",
         Spec {
-            artifacts: "  - name: murmur-driver-openai\n    version: 0.1.0\n    runtime: driver\n",
+            artifacts:
+                "  - name: local/murmur-driver-openai\n    version: 0.1.0\n    runtime: driver\n",
             alternates: GPT_ALTERNATE,
             top: CONTROLLER,
             ..Spec::default()
@@ -1257,9 +1263,9 @@ fn s7_each_refused_manifest_fails_mur_run_with_e_man_003_naming_the_field() {
     fs::write(
         dir.path().join("murmur.yaml"),
         format!(
-            "name: {CAPSULE}\nversion: 0.1.0\nartifacts:\n  - name: drv\n    version: 0.1.0\n    \
-             runtime: driver\ninference:\n  transport: process\n  driver:\n    artifact: drv\n  \
-             alternates:\n{GPT_ALTERNATE}"
+            "name: {CAPSULE}\nversion: 0.1.0\nartifacts:\n  - name: local/drv\n    \
+             version: 0.1.0\n    runtime: driver\ninference:\n  transport: process\n  driver:\n    \
+             artifact: local/drv\n  alternates:\n{GPT_ALTERNATE}"
         ),
     )
     .unwrap();

@@ -65,14 +65,14 @@ impl Door {
         let artifacts = tempfile::tempdir().unwrap();
         let driver = common::create_driver_artifact(
             artifacts.path(),
-            "tool-progress-driver",
+            "local/tool-progress-driver",
             "0.1.0",
             &common::fixture_path("tool-progress-driver/tool/tool-progress-driver.wasm"),
         );
         common::publish_local(&home, &driver).success();
         let tool = common::create_tool_artifact(
             artifacts.path(),
-            "echo-tool",
+            "local/echo-tool",
             "0.1.0",
             &common::fixture_path("run/components/echo-tool.wasm"),
         );
@@ -82,11 +82,12 @@ impl Door {
             project.path().join("murmur.yaml"),
             format!(
                 "name: {name}\nversion: 0.1.0\n\
-                 artifacts:\n  - name: tool-progress-driver\n    version: 0.1.0\n    \
+                 artifacts:\n  - name: local/tool-progress-driver\n    version: 0.1.0\n    \
                  runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:1\n      \
-                 api_key: test-key\n  - name: echo-tool\n    version: 0.1.0\n    runtime: tool\n\
+                 api_key: test-key\n  - name: local/echo-tool\n    version: 0.1.0\n    \
+                 runtime: tool\n\
                  inference:\n  transport: http\n  model: tool-progress-streaming\n  driver:\n    \
-                 artifact: tool-progress-driver\n{QUEUE_SLEEP_YAML}"
+                 artifact: local/tool-progress-driver\n{QUEUE_SLEEP_YAML}"
             ),
         )
         .unwrap();
@@ -113,7 +114,7 @@ impl Door {
                 "name: waiting-agent\nversion: 0.1.0\n\
                  artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    \
                  runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      \
-                 api_key: test-key\n  - name: {REQUEST_INPUT_TOOL}\n    version: 0.1.0\n    \
+                 api_key: test-key\n  - name: {REQUEST_INPUT_ARTIFACT}\n    version: 0.1.0\n    \
                  runtime: tool\n\
                  capabilities:\n  network:\n    allow:\n      - {endpoint}\n\
                  inference:\n  transport: http\n  model: test-model\n  driver:\n    \
@@ -167,7 +168,10 @@ fn tool_then_four() -> common::ScriptedServer {
     ])
 }
 
+/// The tool name the model calls, which is also the name the artifact is packed under.
 const REQUEST_INPUT_TOOL: &str = "request-input-tool";
+/// The tool's full name once installed from its `.mur.zip` file.
+const REQUEST_INPUT_ARTIFACT: &str = "local/request-input-tool";
 
 /// The `request-input-tool` fixture packed as an artifact in `dir`.
 fn request_input_tool(dir: &Path) -> PathBuf {

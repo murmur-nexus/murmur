@@ -166,7 +166,7 @@ name: sealed-check
 version: 0.1.0
 
 artifacts:
-  - name: murmur-driver-claude-code
+  - name: murmur/driver-claude-code
     version: "0.1.0"
     runtime: driver
 
@@ -181,7 +181,7 @@ capabilities:
 inference:
   transport: process
   driver:
-    artifact: murmur-driver-claude-code
+    artifact: murmur/driver-claude-code
   max_turns: 4
 ```
 

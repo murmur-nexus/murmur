@@ -412,9 +412,15 @@ impl DelegationPlane {
     /// rather than an empty list: a child launched without what it declares fails later and less
     /// legibly.
     fn child_env_allow(&self, capsule: &str, version: &str) -> Result<Vec<String>, RuntimeError> {
+        let name = murmur_artifact::ArtifactName::parse(capsule).map_err(|error| {
+            RuntimeError::Runtime(format!(
+                "cannot read what '{capsule}@{version}' declares under capabilities.env.allow: \
+                 {error}"
+            ))
+        })?;
         let resolved = self
             .registry
-            .resolve_with_platform(capsule, version, Some(murmur_artifact::current_platform()))
+            .resolve_with_platform(&name, version, Some(murmur_artifact::current_platform()))
             .map_err(|error| {
                 RuntimeError::Runtime(format!(
                     "cannot read what '{capsule}@{version}' declares under \
@@ -1221,7 +1227,7 @@ mod tests {
 
     fn request() -> DelegationRequest {
         DelegationRequest {
-            capsule: "worker".to_string(),
+            capsule: "local/worker".to_string(),
             version: "0.1.0".to_string(),
             task: "t".to_string(),
         }
@@ -1483,7 +1489,7 @@ mod tests {
         let plane = plane_over(&store, &["MURMUR_TEST_PROVIDER_KEY"]);
 
         let error = plane
-            .child_env_allow("worker", "0.1.0")
+            .child_env_allow("local/worker", "0.1.0")
             .expect_err("an empty store resolves nothing");
         let message = error.to_string();
         assert!(message.contains("worker"), "{message}");
@@ -1491,7 +1497,7 @@ mod tests {
         assert!(message.contains("capabilities.env.allow"), "{message}");
     }
 
-    /// A `worker@0.1.0` in a store of its own, declaring `capabilities.env.allow: [A, B, C]`.
+    /// A `local/worker@0.1.0` in a store of its own, declaring `capabilities.env.allow: [A, B, C]`.
     ///
     /// Packed the way `mur publish` packs one — a `murmur.yaml` entry in a `.mur.zip` — because
     /// [`DelegationPlane::child_env_allow`] reads the child's declaration out of the archive
@@ -1517,7 +1523,7 @@ mod tests {
         murmur_artifact::Registry::publish(
             &murmur_artifact::LocalRegistry::new(store.path()),
             murmur_artifact::ArtifactMeta {
-                name: "worker".to_string(),
+                name: murmur_artifact::ArtifactName::parse("local/worker").unwrap(),
                 version: "0.1.0".to_string(),
                 runtime: murmur_artifact::RuntimeType::Wasm,
                 artifact_runtime: "capsule".to_string(),

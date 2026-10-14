@@ -69,8 +69,8 @@ Under `lifecycle.task_acceptance: queue` with `lifecycle.after_task: sleep` the 
 | `out/compaction-summaries.jsonl` | The text each committed compaction replaced the context with. See [below](#compaction-summaries) |
 | `logs/bootstrap.log` | Staging and agent-loop diagnostics: the installed tool inventory, once per session and again each time it changes, compaction decisions, non-fatal write failures, and any line the runtime could not write to a [closed standard output or standard error](cli.md#mur-run-closed-stream) |
 | `logs/otel.log` | OpenTelemetry exporter diagnostics |
-| `logs/hook-<hook-name>.log` | Errors from one hook, one per line |
-| `tools/<name>/murmur.yaml` | A staged artifact's manifest |
+| `logs/hook-<hook-name>.log` | Errors from one hook, one per line. `<hook-name>` is the bare name: `hook-grafana` for `murmur/hook-grafana` |
+| `tools/<name>/murmur.yaml` | A staged artifact's manifest. `<name>` is the artifact's bare name, the part of its full name after the `/`, which is also its tool name |
 | `tools/<name>/<name>` | A staged native binary, marked executable |
 | `tools/<name>/skill.md` | A staged skill's text. The runtime returns this as the tool result when the skill is called |
 | `blobs/<sha256>` | Trace bodies too large to inline, addressed by their own digest. See [Observability schemas](observability-schemas.md) |
@@ -130,7 +130,7 @@ launch that gets a fresh `<manifest-dir>/workdir/<session-id>` reads back exactl
 launch wrote.
 
 **It sits outside every workdir, and only the artifact that declared it can reach it.** A subtree
-of the workdir would be readable by anything that can reach the workdir — `murmur-tool-editor` and
+of the workdir would be readable by anything that can reach the workdir — `murmur/tool-editor` and
 `shell` included — and `capabilities.filesystem.scope` cannot help, because it is a single path
 prefix: protecting one subtree would mean narrowing every other artifact. The capsule's own code
 declares no artifact grant and reaches no store.
@@ -160,7 +160,7 @@ that means the same thing whichever directory the capsule was launched from.
 
 ```
   state stores:
-    - murmur-tool-corpus: shey -> /home/dev/.murmur/state/shey
+    - murmur/tool-corpus: shey -> /home/dev/.murmur/state/shey
 ```
 
 `--json` emits the same list as `state_stores`, and `trace.jsonl`'s `session_start` carries it
@@ -311,7 +311,7 @@ conversation. The runtime keeps no message list for that capsule and records one
 [`context.record_store`](manifest.md#field-context) points both transports at the same place.
 
 ```json
-{"type":"murmur.harness-session","session_id":"0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55","harness":"claude-code","driver":"murmur-driver-claude-code","created_ms":1758326400000,"updated_ms":1758326461000}
+{"type":"murmur.harness-session","session_id":"0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55","harness":"claude-code","driver":"driver-claude-code","created_ms":1758326400000,"updated_ms":1758326461000}
 ```
 
 | Key | Value |
@@ -319,7 +319,7 @@ conversation. The runtime keeps no message list for that capsule and records one
 | `type` | Always `murmur.harness-session`. A file carrying anything else is read as no entry |
 | `session_id` | What the harness calls this conversation. Opaque: the runtime only ever hands it back |
 | `harness` | The harness its process driver named, for a person reading the directory |
-| `driver` | The process driver artifact that drove it, for a person reading the directory |
+| `driver` | The bare name of the process driver artifact that drove it, for a person reading the directory |
 | `created_ms` | When this context first got a session |
 | `updated_ms` | When the entry was last written |
 
@@ -429,15 +429,15 @@ the turn and the two token counts, not the text.
 registry-resolved artifact to a version and a hash, and records who wrote the pin:
 
 ```yaml
-lock_version: 2
+lock_version: 3
 artifacts:
-  - name: some-tool
+  - name: ana/some-tool
     resolved_version: "1.2.3"
     sha256:
       any: "<sha256>"
     origin: runtime
     session: ses_0190a1b2c3d4...
-  - name: some-native-tool
+  - name: local/some-native-tool
     resolved_version: "0.4.2"
     sha256:
       platforms:
@@ -446,7 +446,11 @@ artifacts:
     origin: operator
 ```
 
-`lock_version` must be `2`. An entry carries exactly one of two hash shapes:
+`lock_version` must be `3`. Each entry's `name` is the artifact's full name, `<scope>/<name>` —
+see [Artifact names](../concepts/registry.md#artifact-names). An entry may carry `owner_id`,
+GitHub's numeric id of the scope's owner, written only when known.
+
+An entry carries exactly one of two hash shapes:
 
 | Key | Pins | Written for |
 |---|---|---|
@@ -469,7 +473,7 @@ to the lock. A platform the entry has no key for is not a disagreement.
 |---|---|
 | `mur run` | Creates `murmur.lock` when none exists. Once present, only verifies against it — an existing entry is never refreshed |
 | `mur eval` | As `mur run`, once for the whole dataset run |
-| `mur install` | Upserts an entry for each artifact it installs successfully, preserving the rest. Skipped for `-g` (no project directory), for local-file installs, and for `--all-platforms`, which installs into the global store |
+| `mur install` | Upserts an entry for each artifact it installs successfully, preserving the rest. An artifact installed from a file is pinned as `local/<name>`. Skipped for `-g` (no project directory) and for `--all-platforms`, which installs into the global store |
 | `manage.pull()` | The same verify-then-upsert, from a running capsule rather than the CLI. Pins a new entry as `origin: runtime` — see [Pin origin](#lock-origin) |
 | `manage.remove()` | Deletes one `origin: runtime` entry the manifest does not declare, and rewrites every other entry unchanged — see [Pin origin](#lock-origin) |
 
@@ -510,7 +514,7 @@ whose pin has `origin: runtime` is handled by role:
 | `runtime: hook`, `runtime: driver`, or with `gateway:` | Refused with [`E-RUN-043`](diagnostics.md#e-run-043) |
 | A skill named by `inference.system_prompt_artifact` | Refused with [`E-RUN-043`](diagnostics.md#e-run-043) |
 
-Both hold on every launch until `mur install <name>@<version>` adopts the pin as `operator`.
+Both hold on every launch until `mur install <scope>/<name>@<version>` adopts the pin as `operator`.
 `session_start.runtime_artifacts` in [`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl)
 lists every runtime pin a launch staged. [`mur doctor`](cli.md#mur-doctor) reports every runtime
 pin.
@@ -523,9 +527,9 @@ A capsule with write access to the project directory — one run with the projec
 `murmur.lock` in [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) to have the
 runtime refuse the writes to it that it can identify.
 
-A `lock_version: 1` file is refused rather than migrated — it pinned one `sha256.wasm` per
-artifact, which cannot describe a native artifact's per-platform payloads. Delete `murmur.lock` and
-run `mur install` to regenerate it.
+A lock of any other `lock_version`, or an entry whose `name` is not a full name, is refused before
+any entry is checked, with a message ending "delete murmur.lock and run `mur install` to regenerate
+it". Delete `murmur.lock` and run `mur install` to regenerate it.
 
 A missing entry for a manifest artifact, an entry with no hash for this host's platform, an
 unsupported `lock_version`, or a malformed `origin` / `session` pair fails the run with

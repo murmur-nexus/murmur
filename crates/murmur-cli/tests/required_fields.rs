@@ -18,7 +18,7 @@ use capsule_runtime::launch_session;
 use common::hook_wat::{create_hook_zip, deny_hook_wasm};
 use serde_json::{json, Value};
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 const EDITOR: &str = "murmur-tool-editor";
@@ -92,14 +92,14 @@ const HOOK_REASON: &str = "editing is not allowed here";
 
 fn create_manifest(project_dir: &Path, endpoint: &str, capsule: &Capsule<'_>) -> PathBuf {
     let hook_yaml = if capsule.deny_hook {
-        format!("  - name: {HOOK_NAME}\n    version: 0.1.0\n    runtime: hook\n")
+        format!("  - name: local/{HOOK_NAME}\n    version: 0.1.0\n    runtime: hook\n")
     } else {
         String::new()
     };
     let tool_yaml: String = capsule
         .tools
         .iter()
-        .map(|(name, _)| format!("  - name: {name}\n    version: 0.1.0\n    runtime: tool\n"))
+        .map(|(name, _)| format!("  - name: local/{name}\n    version: 0.1.0\n    runtime: tool\n"))
         .collect();
     let plan = if capsule.plan_submit {
         "  plan:\n    submit: true\n"

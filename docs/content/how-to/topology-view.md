@@ -92,7 +92,7 @@ Create a `murmur.yaml` with `observability.otel_endpoint` pointing to the OTLP i
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
@@ -103,7 +103,7 @@ Create a `murmur.yaml` with `observability.otel_endpoint` pointing to the OTLP i
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
 
     observability:
       otel_endpoint: http://localhost:4318
@@ -116,7 +116,7 @@ Create a `murmur.yaml` with `observability.otel_endpoint` pointing to the OTLP i
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
@@ -127,7 +127,7 @@ Create a `murmur.yaml` with `observability.otel_endpoint` pointing to the OTLP i
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
 
     observability:
       otel_endpoint: http://localhost:4318
@@ -140,7 +140,7 @@ Create a `murmur.yaml` with `observability.otel_endpoint` pointing to the OTLP i
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
@@ -151,7 +151,7 @@ Create a `murmur.yaml` with `observability.otel_endpoint` pointing to the OTLP i
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
 
     observability:
       otel_endpoint: http://localhost:4318
@@ -256,7 +256,7 @@ Create `worker/murmur.yaml`:
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
@@ -267,7 +267,7 @@ Create `worker/murmur.yaml`:
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
 
     observability:
       otel_endpoint: http://localhost:4318
@@ -284,7 +284,7 @@ Create `worker/murmur.yaml`:
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
@@ -295,7 +295,7 @@ Create `worker/murmur.yaml`:
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
 
     observability:
       otel_endpoint: http://localhost:4318
@@ -312,7 +312,7 @@ Create `worker/murmur.yaml`:
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
@@ -323,7 +323,7 @@ Create `worker/murmur.yaml`:
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
 
     observability:
       otel_endpoint: http://localhost:4318

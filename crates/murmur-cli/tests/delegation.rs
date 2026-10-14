@@ -38,7 +38,7 @@ use murmur_artifact::{load_runtime_manifest, ContainmentClass, LocalRegistry};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-const DRIVER: &str = "murmur-driver-anthropic";
+const DRIVER: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 /// The capsule every delegating case in this file runs. One name, one published manifest: the
@@ -48,6 +48,16 @@ const PARENT: &str = "delegator";
 /// The capsule of the one case that declares no `capabilities.spawn.allow`.
 const UNGRANTED_PARENT: &str = "solo";
 const VERSION: &str = "0.1.0";
+
+/// The scope every capsule here is published under, as a capsule installed from its `.mur.zip`
+/// file is. The capsule consts are the bare names the model is offered; the store, the daemon,
+/// `spawn.allow` and the trace's `delegation` records carry [`full`] names.
+const SCOPE: &str = "local";
+
+/// The full name of the capsule the model knows as `name`.
+fn full(name: &str) -> String {
+    format!("{SCOPE}/{name}")
+}
 
 /// The sub-capsule that answers. Its model always replies with [`WORKER_ANSWER`], so text that
 /// reaches the parent came from the child and from nowhere else.
@@ -111,6 +121,8 @@ struct RecordingRoost {
     credentials: Arc<Mutex<HashSet<String>>>,
     approvals: Arc<Mutex<HashSet<String>>>,
     spawn_requests: Arc<AtomicUsize>,
+    /// The capsule name every `POST /spawn` named, in arrival order.
+    spawned: Arc<Mutex<Vec<String>>>,
     /// Capsule name → the sentence a `POST /spawn` naming it is refused with, answered by the
     /// proxy instead of being relayed.
     ///
@@ -149,21 +161,24 @@ impl RecordingRoost {
         let credentials = Arc::new(Mutex::new(HashSet::new()));
         let approvals = Arc::new(Mutex::new(HashSet::new()));
         let spawn_requests = Arc::new(AtomicUsize::new(0));
+        let spawned = Arc::new(Mutex::new(Vec::new()));
         let refusals = Arc::new(Mutex::new(HashMap::new()));
 
-        let (seen_credentials, seen_approvals, counted, canned) = (
+        let (seen_credentials, seen_approvals, counted, named, canned) = (
             Arc::clone(&credentials),
             Arc::clone(&approvals),
             Arc::clone(&spawn_requests),
+            Arc::clone(&spawned),
             Arc::clone(&refusals),
         );
         thread::spawn(move || {
             for stream in proxy.incoming().flatten() {
                 let upstream = daemon_addr.clone();
-                let (seen_credentials, seen_approvals, counted, canned) = (
+                let (seen_credentials, seen_approvals, counted, named, canned) = (
                     Arc::clone(&seen_credentials),
                     Arc::clone(&seen_approvals),
                     Arc::clone(&counted),
+                    Arc::clone(&named),
                     Arc::clone(&canned),
                 );
                 thread::spawn(move || {
@@ -173,6 +188,7 @@ impl RecordingRoost {
                         &seen_credentials,
                         &seen_approvals,
                         &counted,
+                        &named,
                         &canned,
                     );
                 });
@@ -185,6 +201,7 @@ impl RecordingRoost {
             credentials,
             approvals,
             spawn_requests,
+            spawned,
             refusals,
         }
     }
@@ -208,10 +225,15 @@ impl RecordingRoost {
         self.spawn_requests.load(Ordering::SeqCst)
     }
 
+    /// The capsule names every `POST /spawn` so far has named, across every case.
+    fn spawned_names(&self) -> Vec<String> {
+        self.spawned.lock().unwrap().clone()
+    }
+
     fn publish(&self, name: &str, version: &str, body: &str, component: Option<&Path>) {
         common::publish_to_store(
             &self.state.registry_path,
-            name,
+            &full(name),
             version,
             "capsule",
             body,
@@ -227,6 +249,7 @@ fn relay(
     credentials: &Mutex<HashSet<String>>,
     approvals: &Mutex<HashSet<String>>,
     spawn_requests: &AtomicUsize,
+    spawned: &Mutex<Vec<String>>,
     refusals: &Mutex<HashMap<String, String>>,
 ) {
     let Some(request) = read_framed_request(&mut client) else {
@@ -236,6 +259,7 @@ fn relay(
     if head.starts_with("POST /spawn ") {
         spawn_requests.fetch_add(1, Ordering::SeqCst);
         if let Some(name) = extract_json_string(&head, "name") {
+            spawned.lock().unwrap().push(name.clone());
             if let Some(sentence) = refusals.lock().unwrap().get(&name).cloned() {
                 let body = json!({ "error": sentence }).to_string();
                 let raw = format!(
@@ -332,8 +356,9 @@ fn publish_driver(registry_root: &Path) {
         zip.start_file("murmur.yaml", options).unwrap();
         zip.write_all(
             format!(
-                "name: {DRIVER}\nversion: {DRIVER_VERSION}\nruntime: driver\n\
-                 upstream_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n"
+                "name: {}\nversion: {DRIVER_VERSION}\nruntime: driver\n\
+                 upstream_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n",
+                murmur_artifact::tool_name_of(DRIVER)
             )
             .as_bytes(),
         )
@@ -351,7 +376,7 @@ fn publish_driver(registry_root: &Path) {
     murmur_artifact::Registry::publish(
         &LocalRegistry::new(registry_root),
         murmur_artifact::ArtifactMeta {
-            name: DRIVER.to_string(),
+            name: murmur_artifact::ArtifactName::parse(DRIVER).unwrap(),
             version: DRIVER_VERSION.to_string(),
             runtime: murmur_artifact::RuntimeType::Wasm,
             artifact_runtime: "driver".to_string(),
@@ -539,7 +564,10 @@ fn suite() -> &'static Suite {
         publish_driver(&registry);
 
         // The daemon's own list gates a top-level registrant, which every parent here is.
-        let roost = RecordingRoost::start(&registry, &[PARENT, UNGRANTED_PARENT]);
+        let roost = RecordingRoost::start(
+            &registry,
+            &[full(PARENT).as_str(), full(UNGRANTED_PARENT).as_str()],
+        );
         std::env::set_var("MURMUR_ROOST_URL", &roost.url);
 
         // The parent's envelope, and the only thing about the parent the daemon reads. Loopback
@@ -553,9 +581,20 @@ fn suite() -> &'static Suite {
                 "artifacts: []\ncapabilities:\n  \
                  network:\n    allow: [127.0.0.1]\n  \
                  env:\n    allow: [{PROVIDER_KEY_VAR}]\n  \
-                 spawn:\n    allow: [{WORKER}, {WORKER_TWO}, {WORKER_THREE}, {GREEDY_WORKER}, \
-                 {MUTE_WORKER}, {DEEP_WORKER}, {THIRSTY_WORKER}, {AUTH_WORKER}, \
-                 {STAYING_WORKER}]\n"
+                 spawn:\n    allow: [{}]\n",
+                [
+                    WORKER,
+                    WORKER_TWO,
+                    WORKER_THREE,
+                    GREEDY_WORKER,
+                    MUTE_WORKER,
+                    DEEP_WORKER,
+                    THIRSTY_WORKER,
+                    AUTH_WORKER,
+                    STAYING_WORKER
+                ]
+                .map(full)
+                .join(", ")
             ),
             Some(&common::fixture_path(
                 "run/components/capsule-env-echo.wasm",
@@ -1064,6 +1103,7 @@ fn stage_request(
         manifest_dir: project.to_path_buf(),
         capsule_name: runtime_manifest.name.clone(),
         capsule_version: runtime_manifest.version.clone(),
+        capsule_artifact: None,
         capsule_component_bytes: Vec::new(),
         artifacts: runtime_manifest
             .artifacts
@@ -1307,8 +1347,9 @@ fn find_in_files(root: &Path, needle: &str) -> Option<PathBuf> {
     })
 }
 
-const SPAWN_YAML: &str = "  spawn:\n    allow: [worker, worker-two, worker-three, greedy-worker, \
-                          mute-worker, deep-worker, thirsty-worker]\n";
+const SPAWN_YAML: &str = "  spawn:\n    allow: [local/worker, local/worker-two, \
+                          local/worker-three, local/greedy-worker, local/mute-worker, \
+                          local/deep-worker, local/thirsty-worker]\n";
 
 // ── Cases ─────────────────────────────────────────────────────────────────────
 
@@ -1458,7 +1499,7 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "{started}"
     );
-    assert_eq!(started["capsule"], WORKER, "{started}");
+    assert_eq!(started["capsule"], full(WORKER), "{started}");
     assert_eq!(started["version"], VERSION, "{started}");
     let child_session_id = started["child_session_id"].as_str().unwrap_or_default();
     assert!(!child_session_id.is_empty(), "{started}");
@@ -1531,7 +1572,7 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     let event = &events[0];
     assert_eq!(event["outcome"], "ok", "{event}");
     assert_eq!(event["delegation_id"], json!(delegation_id), "{event}");
-    assert_eq!(event["capsule"], WORKER, "{event}");
+    assert_eq!(event["capsule"], full(WORKER), "{event}");
     assert_eq!(event["version"], VERSION, "{event}");
     assert_eq!(event["child_session_id"], result["session_id"], "{event}");
     assert_eq!(event["reason"], Value::Null, "{event}");
@@ -1640,6 +1681,76 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     assert_eq!(parent.task_state(&second), "TASK_STATE_COMPLETED");
 }
 
+/// `spawn.allow` names a capsule by its full name and the model by its bare one.
+///
+/// The `delegate-task` enum offers `worker` for `local/worker`; the runtime maps the model's
+/// `worker` back to `local/worker` before asking the daemon, so the spawn request and the trace's
+/// `delegation_start` and `delegation` records carry the full name, while the tool result and the
+/// continuation the model is handed name `worker`.
+#[test]
+fn delegate_task_offers_the_bare_name_and_spawns_the_full_one() {
+    if common::skip_without_host_support(
+        "delegate_task_offers_the_bare_name_and_spawns_the_full_one",
+    ) {
+        return;
+    }
+    let suite = suite();
+    let parent = Parent::launch(
+        PARENT,
+        &format!("  spawn:\n    allow: [{}]\n", full(WORKER)),
+    );
+
+    let manifest = std::fs::read_to_string(
+        parent
+            .session_dir
+            .join("tools")
+            .join("delegate-task")
+            .join("murmur.yaml"),
+    )
+    .expect("a granted capsule is written a delegate-task manifest");
+    let declared: serde_yaml::Value = serde_yaml::from_str(&manifest).unwrap();
+    let schema: Value = serde_json::from_str(declared["input_schema"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        schema["properties"]["capsule"]["enum"],
+        json!([WORKER]),
+        "{schema}"
+    );
+
+    let text = parent.delegate("toolu_scoped", WORKER, VERSION, "summarise the report");
+    let result: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("the tool result is JSON ({error}): {text}"));
+    assert_eq!(result["status"], "started", "{result}");
+    assert_eq!(result["capsule"], WORKER, "{result}");
+    let delegation_id = result["delegation_id"].as_str().unwrap_or_default();
+
+    let spawned = suite.roost.spawned_names();
+    assert!(spawned.contains(&full(WORKER)), "{spawned:?}");
+    assert!(
+        !spawned.iter().any(|name| !name.contains('/')),
+        "every spawn request names a full name: {spawned:?}"
+    );
+
+    let started = parent.events("delegation_start");
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0]["capsule"], full(WORKER), "{}", started[0]);
+    let ended = parent.events("delegation");
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!(ended[0]["capsule"], full(WORKER), "{}", ended[0]);
+    assert_eq!(ended[0]["outcome"], "ok", "{}", ended[0]);
+
+    let handed = await_model_message(&parent, OUTCOME_OPENING, Duration::from_secs(120));
+    assert!(
+        handed.starts_with(&format!(
+            "{OUTCOME_OPENING}{delegation_id} to {WORKER}@{VERSION} ended ok:\n"
+        )),
+        "{handed}"
+    );
+    assert!(
+        !handed.contains(&full(WORKER)),
+        "the model is never handed a scope: {handed}"
+    );
+}
+
 /// A child that declares `network.authentication` is driven by its unauthenticated parent with the
 /// operator token from its readiness line, and its outcome arrives exactly as a public child's
 /// does. No door token reaches the parent's workdir, its trace or its model.
@@ -1649,7 +1760,10 @@ fn authenticated_child_is_driven_with_its_operator_token() {
         return;
     }
     let _suite = suite();
-    let parent = Parent::launch(PARENT, &format!("  spawn:\n    allow: [{AUTH_WORKER}]\n"));
+    let parent = Parent::launch(
+        PARENT,
+        &format!("  spawn:\n    allow: [{}]\n", full(AUTH_WORKER)),
+    );
 
     let text = parent.delegate("toolu_auth", AUTH_WORKER, VERSION, "summarise the report");
     let result: Value = serde_json::from_str(&text)
@@ -1680,7 +1794,7 @@ fn authenticated_child_is_driven_with_its_operator_token() {
     let events = parent.events("delegation");
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["outcome"], "ok", "{events:?}");
-    assert_eq!(events[0]["capsule"], AUTH_WORKER, "{events:?}");
+    assert_eq!(events[0]["capsule"], full(AUTH_WORKER), "{events:?}");
 
     let model_context = serde_json::to_string(&parent.server.requests()).unwrap();
     assert!(
@@ -1850,7 +1964,9 @@ fn a_bound_refusal_reaches_the_parents_trace_unaltered() {
         max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
     }
     .to_string();
-    suite().roost.refuse_spawns_of(DEEP_WORKER, &sentence);
+    suite()
+        .roost
+        .refuse_spawns_of(&full(DEEP_WORKER), &sentence);
 
     let parent = Parent::launch(PARENT, SPAWN_YAML);
     let text = parent.delegate("toolu_bound", DEEP_WORKER, VERSION, "go one deeper");
@@ -1904,7 +2020,7 @@ fn a_wedged_started_child_is_ended_at_the_deadline() {
     let trace = parent.trace_events();
     let launch = only_event(&trace, "delegation_start");
     assert_eq!(launch["delegation_id"], json!(delegation_id), "{launch}");
-    assert_eq!(launch["capsule"], MUTE_WORKER, "{launch}");
+    assert_eq!(launch["capsule"], full(MUTE_WORKER), "{launch}");
     assert!(
         parent.events("delegation").is_empty(),
         "the call returned in {call_took:?} with the delegation already closed"
@@ -2253,7 +2369,7 @@ fn a_cancel_mid_delegation_names_the_child_and_ends_it() {
         json!(delegation_id),
         "{delegation}"
     );
-    assert_eq!(delegation["capsule"], MUTE_WORKER, "{delegation}");
+    assert_eq!(delegation["capsule"], full(MUTE_WORKER), "{delegation}");
 
     // The child is ended by the task, not left to run out its deadline.
     let gone = Instant::now() + Duration::from_secs(30);
@@ -2390,7 +2506,7 @@ fn a_cancel_mid_plan_ends_the_plan_steps_sub_capsule() {
         .find(|item| item["kind"] == "delegation")
         .unwrap_or_else(|| panic!("no delegation residue in {items:?}"));
     assert_eq!(residue["delegation_id"], json!(delegation_id), "{residue}");
-    assert_eq!(residue["capsule"], MUTE_WORKER, "{residue}");
+    assert_eq!(residue["capsule"], full(MUTE_WORKER), "{residue}");
 
     // Ended from inside the step, not left to run out the delegation deadline.
     let gone = Instant::now() + Duration::from_secs(10);
@@ -2509,7 +2625,10 @@ fn a_plan_step_that_completes_closes_its_own_delegation() {
     }
     let parent = Parent::launch(
         PARENT,
-        &format!("  spawn:\n    allow: [{STAYING_WORKER}]\n  plan:\n    submit: true\n"),
+        &format!(
+            "  spawn:\n    allow: [{}]\n  plan:\n    submit: true\n",
+            full(STAYING_WORKER)
+        ),
     );
     parent.server.push(tool_use_response(
         "toolu_plan_ok",

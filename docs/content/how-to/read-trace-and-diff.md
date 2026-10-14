@@ -15,7 +15,7 @@ murmur: url localhost:52222
 session: ses_6801f81dd28b4a9daf434e8324c4793e
 workdir: /path/to/workdir/ses_6801f81dd28b4a9daf434e8324c4793e
 manifest: my-agent v0.1.0
-driver: murmur-driver-anthropic (claude-sonnet-4-6)
+driver: murmur/driver-anthropic (claude-sonnet-4-6)
 ```
 
 The trace lives at `<workdir>/trace.jsonl`. It is always written — even if the session failed — and cannot be suppressed by the capsule.

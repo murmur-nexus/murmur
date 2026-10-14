@@ -2,7 +2,8 @@
 //! `<project>/.murmur/artifacts/` and the global store `~/.murmur/artifacts/`.
 
 use murmur_artifact::{
-    ArtifactMeta, LocalRegistry, PublishResult, Registry, RegistryError, ResolvedArtifact,
+    ArtifactMeta, ArtifactName, LocalRegistry, PublishResult, Registry, RegistryError,
+    ResolvedArtifact,
 };
 
 /// Resolves against `primary` first and, on `NotFound` only, falls back to `secondary`.
@@ -20,7 +21,11 @@ pub(crate) struct FallbackRegistry {
 }
 
 impl Registry for FallbackRegistry {
-    fn resolve(&self, name: &str, version: &str) -> Result<ResolvedArtifact, RegistryError> {
+    fn resolve(
+        &self,
+        name: &ArtifactName,
+        version: &str,
+    ) -> Result<ResolvedArtifact, RegistryError> {
         match self.primary.resolve(name, version) {
             Err(RegistryError::NotFound { .. }) => self.secondary.resolve(name, version),
             other => other,
@@ -29,7 +34,7 @@ impl Registry for FallbackRegistry {
 
     fn resolve_with_platform(
         &self,
-        name: &str,
+        name: &ArtifactName,
         version: &str,
         platform: Option<&str>,
     ) -> Result<ResolvedArtifact, RegistryError> {

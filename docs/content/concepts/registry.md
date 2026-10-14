@@ -11,9 +11,68 @@
 an artifact you built into the global store. `mur run` reads the stores only, so a capsule launches
 with exactly what was installed and never reaches the network for an artifact.
 
+A source is asked for an artifact by its bare name. Until `murmur-nexus/default-artifacts`
+publishes its artifacts under the names on these pages, it serves only the older asset names: of
+the two, `murmur/murmur-tool-git@0.2.0` resolves from it and `murmur/tool-git@0.2.0` does not.
+
+## Artifact names { #artifact-names }
+
+An installed artifact has a full name, `<scope>/<name>`: `murmur/tool-git`, `ana/tool-x`,
+`local/my-tool`.
+
+| Part | What it is |
+|---|---|
+| `<scope>` | Whose artifact it is |
+| `<name>` | The bare name: the `name:` the artifact's own `murmur.yaml` declares, and the name a capsule's model calls it by |
+
+A full name has exactly one `/`. Each part is lowercase letters, digits and `-`, does not start or
+end with `-`, and is at most 100 characters.
+
+The scope is chosen by where the artifact is installed from:
+
+| Installed from | Scope |
+|---|---|
+| `murmur-nexus/default-artifacts` | `murmur` |
+| A `.mur.zip` file (`mur install <path>`), or written by `mur publish` | `local`. No source is ever asked for a `local/` artifact |
+| Any other GitHub repository | The repository owner, lowercased: `github:Ana/tools@v1` installs as `ana/<name>` |
+
+`murmur` and `local` are reserved: a `github:` owner named either is refused with
+[`E-REG-007`](../reference/diagnostics.md#e-reg-007). `mur install <scope>/<name>@<version>` asks
+the sources for `<name>` and stores what it finds under the full name given.
+
+Everything that resolves an artifact takes the full name: `mur install`, `mur run --capsule`,
+`artifacts:` entries in `murmur.yaml`, `members[].capsule` in `roster.yaml`, `murmur.lock`, and
+`manage.*`. A bare name there is refused, with a hint naming its scoped forms. Three places take
+the bare name:
+
+| Place | Example |
+|---|---|
+| An artifact's own `name:`, the one `mur build` packs | `name: tool-git` |
+| A `source:` entry in `artifacts:` | `- name: style` with `source: ./skills/style` |
+| Inside a session: the tool name the model calls, `workdir/tools/<name>/`, skill names in `MURMUR.md` | `tool-git` |
+
+Because a session names each artifact by its bare name, two artifacts a capsule declares cannot
+share one: `murmur/tool-editor` and `ana/tool-editor` together are refused with
+[`E-CAP-020`](../reference/diagnostics.md#e-cap-020).
+
+### Store layout { #store-layout }
+
+Under a store root, an artifact is filed at:
+
+```text
+<root>/<scope>/<name>/<version>/<name>-<version>[-<platform>].mur.zip
+```
+
+with its `.sha256` and `.meta.json` beside it under the same stem. A store directory in the flat
+`<root>/<name>/<version>/` layout is not read by any command, and [`mur doctor`](../reference/cli.md#mur-doctor)
+names each one as safe to delete. An artifact is filed under the bare name its own `murmur.yaml`
+declares: installing one under a full name whose bare part differs is refused with
+[`E-REG-002`](../reference/diagnostics.md#e-reg-002). The files of the layout are in
+[Local artifact cache](../reference/installing-artifacts.md#local-artifact-cache).
+
 ## Resolution order
 
-`mur install <name>@<version>`, and `mur install` with no argument, check the global store before
+`mur install <scope>/<name>@<version>`, and `mur install` with no argument, check the global store before
 any source, so an artifact you published or installed with `-g` is copied rather than downloaded
 again. `mur run`, `mur doctor` and `mur eval` read the project store, then the global store, and
 never a source. Sources are tried with the one `registry.default` names first, then the rest in
@@ -33,7 +92,7 @@ commands read and write it.
 ## Lock integrity { #lock-integrity }
 
 `murmur.lock` pins what a project actually resolved: for every artifact resolved from a store or a source, the
-concrete version and the sha256 of its bytes. Local-source artifacts are never written to it —
+concrete version and the sha256 of its bytes. Artifacts declared with `source:` are never written to it —
 they are read fresh from disk on every run.
 
 When a lockfile is present, three things are checked before a session is staged:

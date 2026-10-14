@@ -19,9 +19,9 @@ use capsule_runtime::{
 use murmur_artifact::warn_on_unknown_manifest_keys;
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_dotenv_non_override, load_runtime_manifest,
-    read_lockfile, registry_warning_link, sha256_hex, write_lockfile_atomic, ArtifactRuntime,
-    ContainmentClass, InferenceConfig, LocalRegistry, LockOrigin, LockedArtifact, LockfileError,
-    MurmurLock, PlatformMatch, Registry, ResolvedArtifact, LOCK_VERSION, W_REG_001,
+    read_lockfile, registry_warning_link, sha256_hex, write_lockfile_atomic, ArtifactName,
+    ArtifactRuntime, ContainmentClass, InferenceConfig, LocalRegistry, LockOrigin, LockedArtifact,
+    LockfileError, MurmurLock, PlatformMatch, Registry, ResolvedArtifact, LOCK_VERSION, W_REG_001,
 };
 use murmur_artifact::{runtime_warning_link, W_RUN_007};
 
@@ -177,6 +177,10 @@ pub(crate) fn run_run(
     // directory: nothing is read from disk beside the artifact itself, and the only directory
     // involved is the workdir. It is the path a delegated child is launched on.
     let installed_capsule = capsule_arg.zip(capsule_version_arg);
+    if let Some(name) = capsule_arg {
+        crate::error::artifact_name_arg(name)
+            .map_err(|error| fail(&session_id, &workdir, error, json))?;
+    }
 
     let (manifest_path, project_dir) = match installed_capsule {
         Some(_) => {
@@ -484,6 +488,15 @@ pub(crate) fn run_run(
             .map(|artifact| artifact.name.as_str()),
     )
     .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+    // Two artifacts answering to one tool name would otherwise surface as whichever of them the
+    // pre-flight found missing first; refused here on the terms staging refuses them.
+    capsule_runtime::tool_names::check_unique_tool_names(
+        runtime_manifest
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.name.as_str()),
+    )
+    .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
 
     // The containment floor is the strongest class any of the three sources asked for. This is
     // one of two reasons `mur run` reads a MurConfig at all; the machine spend ceiling below is
@@ -748,6 +761,7 @@ pub(crate) fn run_run(
         manifest_dir: project_dir.clone(),
         capsule_name: runtime_manifest.name.clone(),
         capsule_version: runtime_manifest.version.clone(),
+        capsule_artifact: installed_capsule.map(|(name, _)| name.to_string()),
         capsule_component_bytes,
         artifacts: staged_artifacts,
         allowlisted_tools,
@@ -848,6 +862,7 @@ pub(crate) fn run_run(
                     resolved_version: entry.resolved_version.clone(),
                     sha256: locked_sha256(entry),
                     origin: LockOrigin::Operator,
+                    owner_id: None,
                 })
                 .collect(),
         };
@@ -1030,10 +1045,13 @@ pub(crate) fn artifact_presence(
     if artifact.source.is_some() {
         return ArtifactPresence::LocalSource;
     }
+    let Ok(name) = ArtifactName::parse(&artifact.name) else {
+        return ArtifactPresence::Missing;
+    };
     match project_registry
-        .resolve_with_platform(&artifact.name, &artifact.version, Some(platform))
+        .resolve_with_platform(&name, &artifact.version, Some(platform))
         .or_else(|_| {
-            global_registry.resolve_with_platform(&artifact.name, &artifact.version, Some(platform))
+            global_registry.resolve_with_platform(&name, &artifact.version, Some(platform))
         }) {
         Ok(resolved) => ArtifactPresence::Installed(Box::new(resolved)),
         Err(_) => ArtifactPresence::Missing,
@@ -1257,11 +1275,12 @@ fn resolve_installed_capsule(
     name: &str,
     version: &str,
 ) -> Result<ResolvedArtifact, CliError> {
+    let artifact_name = crate::error::artifact_name_arg(name)?;
     FallbackRegistry {
         primary: LocalRegistry::new(project_dir.join(".murmur").join("artifacts")),
         secondary: LocalRegistry::from_default_home().map_err(CliError::from)?,
     }
-    .resolve_with_platform(name, version, Some(current_platform()))
+    .resolve_with_platform(&artifact_name, version, Some(current_platform()))
     .map_err(|source| {
         CliError::with_hint(
             E_RUN_008,

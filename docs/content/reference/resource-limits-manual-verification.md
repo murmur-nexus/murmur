@@ -141,7 +141,7 @@ name: resource-limit-probe
 version: 0.1.0
 
 artifacts:
-  - name: murmur-driver-claude-code
+  - name: murmur/driver-claude-code
     version: "0.1.0"
     runtime: driver
 
@@ -165,7 +165,7 @@ capabilities:
 inference:
   transport: process
   driver:
-    artifact: murmur-driver-claude-code
+    artifact: murmur/driver-claude-code
   max_turns: 4
 ```
 
@@ -476,7 +476,7 @@ Restore the delegation drop-in afterwards.
 A native-implementation tool artifact gets the same rlimits and cgroup scope as a
 `capabilities.shell.allow` subprocess.
 
-With a native tool artifact installed (e.g. `murmur-tool-git`), run any task that invokes it and,
+With a native tool artifact installed (e.g. `murmur/tool-git`), run any task that invokes it and,
 while it runs, confirm it is inside the scope:
 
 ```bash

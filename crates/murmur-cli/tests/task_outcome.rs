@@ -32,7 +32,7 @@ use murmur_artifact::{load_runtime_manifest, ArtifactRuntime, ContainmentClass, 
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-const DRIVER: &str = "murmur-driver-anthropic";
+const DRIVER: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.0";
 const TASK: &str = "Say hello.";
 
@@ -369,12 +369,12 @@ fn s7_an_unsupported_stop_reason_fails_the_task() {
     common::publish_local(&home, &artifact).success();
     let endpoint = "http://127.0.0.1:9";
     let project = project(&format!(
-        "name: outcome-nostop\nversion: 0.1.0\nartifacts:\n  - name: truncation-driver\n    \
+        "name: outcome-nostop\nversion: 0.1.0\nartifacts:\n  - name: local/truncation-driver\n    \
          version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      \
          api_key: test-key\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\n\
          lifecycle:\n  task_acceptance: queue\n  after_task: exit\n\
          inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: \
-         truncation-driver\n    config:\n      mode: NOSTOP\n"
+         local/truncation-driver\n    config:\n      mode: NOSTOP\n"
     ));
     let run = run_queue_exit(&home, &project);
     let trace = run.trace();
@@ -512,6 +512,7 @@ fn stage(
             manifest_dir: project,
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools,

@@ -11,7 +11,9 @@ use chrono::Utc;
 use clap::Subcommand;
 use console::{measure_text_width, style};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use murmur_artifact::{load_runtime_manifest, LocalRegistry, RuntimeManifest, MANIFEST_FILENAME};
+use murmur_artifact::{
+    load_runtime_manifest, ArtifactName, LocalRegistry, RuntimeManifest, MANIFEST_FILENAME,
+};
 use rayon::prelude::*;
 use uuid::Uuid;
 
@@ -103,10 +105,23 @@ pub(crate) enum DeployCommand {
 /// ready to upload to the remote VM.
 #[derive(Debug)]
 pub(crate) struct StagedArtifact {
-    pub name: String,
+    pub name: ArtifactName,
     pub version: String,
     pub bytes: Vec<u8>,
     pub sha256: String,
+    /// The platform a native payload is for, which its file name carries; `None` for a payload
+    /// every platform runs.
+    pub platform: Option<String>,
+}
+
+impl StagedArtifact {
+    /// `<name>-<version>[-<platform>]`, the store's leaf file name without its extension.
+    fn file_stem(&self) -> String {
+        match &self.platform {
+            Some(platform) => format!("{}-{}-{platform}", self.name.name(), self.version),
+            None => format!("{}-{}", self.name.name(), self.version),
+        }
+    }
 }
 
 /// Resolve an artifact for `target_platform`, either from the local registry or by
@@ -116,7 +131,7 @@ pub(crate) struct StagedArtifact {
 /// Step B: if Step A misses, fetch from the source chain with the target platform.
 /// Fetched artifacts are cached at the platform-specific local path.
 pub(crate) fn ensure_artifact_for_deploy(
-    name: &str,
+    name: &ArtifactName,
     version: &str,
     target_platform: &str,
     local_registry: &LocalRegistry,
@@ -137,19 +152,24 @@ pub(crate) fn ensure_artifact_for_deploy(
                 // Different platform native — fall through to Step B to fetch the target variant
             } else {
                 return Ok(StagedArtifact {
-                    name: name.to_string(),
+                    name: name.clone(),
                     version: version.to_string(),
                     bytes: resolved.bytes.to_vec(),
                     sha256: resolved.sha256,
+                    platform: is_native.then(|| target_platform.to_string()),
                 });
             }
         }
         Err(RegistryError::NotFound { .. }) => {}
         Err(e) => return Err(crate::error::CliError::from(e)),
     }
+    // No source serves the `local` scope, so a miss is final and nothing is contacted.
+    if name.is_local() {
+        return Err(crate::error::local_store_miss(name, version));
+    }
 
     // Step B — fetch from source chain with explicit target platform
-    match chain.resolve_bare_for_platform(name, version, target_platform) {
+    match chain.resolve_bare_for_platform(name.name(), version, target_platform) {
         Ok(resolved) => {
             let bytes = resolved.bytes.to_vec();
             let sha256 = murmur_artifact::sha256_hex(&bytes);
@@ -170,7 +190,7 @@ pub(crate) fn ensure_artifact_for_deploy(
             local_registry
                 .store_installed_overwrite(
                     murmur_artifact::ArtifactMeta {
-                        name: name.to_string(),
+                        name: name.clone(),
                         version: version.to_string(),
                         runtime,
                         artifact_runtime: manifest.runtime.clone(),
@@ -193,10 +213,11 @@ pub(crate) fn ensure_artifact_for_deploy(
                 .map_err(crate::error::CliError::from)?;
 
             Ok(StagedArtifact {
-                name: name.to_string(),
+                name: name.clone(),
                 version: version.to_string(),
                 bytes,
                 sha256,
+                platform: (runtime == RuntimeType::Native).then(|| target_platform.to_string()),
             })
         }
         Err(chain_err) => {
@@ -413,11 +434,16 @@ fn truncate(s: &str, max: usize) -> &str {
 /// `InferenceDriver.artifact` is a bare name string (no version). Drivers that appear in
 /// `manifest.artifacts` are already collected; drivers only in `inference.driver` (no version
 /// available) are not stageable and are omitted here.
-fn collect_deploy_artifacts(manifest: &RuntimeManifest) -> Vec<(String, String)> {
+/// Every artifact the manifest resolves from a store, by full name and version, once each. A
+/// `source:` entry is read from its path, never from a store, and is not among them.
+fn collect_deploy_artifacts(manifest: &RuntimeManifest) -> Vec<(ArtifactName, String)> {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
     for a in &manifest.artifacts {
-        let key = (a.name.clone(), a.version.clone());
+        let Ok(name) = a.artifact_name() else {
+            continue;
+        };
+        let key = (name, a.version.clone());
         if seen.insert(key.clone()) {
             result.push(key);
         }
@@ -820,17 +846,22 @@ fn abandon_step(pb: &ProgressBar, style: &ProgressStyle, msg: impl Into<String>)
     pb.abandon_with_message(msg.into());
 }
 
-/// The target's global-store directory of the artifact `name@version`, which holds
-/// `{name}-{version}.mur.zip` and its `.sha256`.
-fn remote_store_dir(name: &str, version: &str) -> String {
-    format!("/root/.murmur/artifacts/{name}/{version}")
+/// The target's global-store directory of the artifact `name@version`,
+/// `/root/.murmur/artifacts/<scope>/<name>/<version>`, the layout the target's `mur` reads.
+fn remote_store_dir(name: &ArtifactName, version: &str) -> String {
+    format!(
+        "/root/.murmur/artifacts/{}/{}/{version}",
+        name.scope(),
+        name.name()
+    )
 }
 
-/// The path deploy uploads the payload of `name@version` to, and the target compiles it from.
-fn remote_payload_path(name: &str, version: &str) -> String {
+/// The path deploy uploads `artifact`'s payload to, and the target compiles it from.
+fn remote_payload_path(artifact: &StagedArtifact) -> String {
     format!(
-        "{}/{name}-{version}.mur.zip",
-        remote_store_dir(name, version)
+        "{}/{}.mur.zip",
+        remote_store_dir(&artifact.name, &artifact.version),
+        artifact.file_stem()
     )
 }
 
@@ -1497,7 +1528,7 @@ pub(crate) fn run_deploy(
 
         // Write all staging files to disk first (fast, sequential).
         for artifact in &staged {
-            let stem = format!("{}-{}", artifact.name, artifact.version);
+            let stem = artifact.file_stem();
             std::fs::write(staging_dir.join(format!("{stem}.mur.zip")), &artifact.bytes)
                 .map_err(|e| CliError::new(E_IO_003, format!("staging {}: {e}", artifact.name)))?;
             std::fs::write(
@@ -1546,7 +1577,7 @@ pub(crate) fn run_deploy(
                 });
 
                 let result = (|| {
-                    let stem = format!("{}-{}", artifact.name, artifact.version);
+                    let stem = artifact.file_stem();
                     let staged_zip = staging_dir.join(format!("{stem}.mur.zip"));
                     let staged_sha = staging_dir.join(format!("{stem}.sha256"));
                     let remote_dir = remote_store_dir(&artifact.name, &artifact.version);
@@ -1556,7 +1587,7 @@ pub(crate) fn run_deploy(
                         key_ref,
                         ssh_user,
                         &staged_zip.to_string_lossy(),
-                        &remote_payload_path(&artifact.name, &artifact.version),
+                        &remote_payload_path(artifact),
                         false,
                     )?;
                     scp_upload(
@@ -1665,10 +1696,7 @@ pub(crate) fn run_deploy(
             &spinner_style,
             format!("⚙ compile {} artifact{}", n_arts, s(n_arts)),
         );
-        let remote_zips: Vec<String> = staged
-            .iter()
-            .map(|artifact| remote_payload_path(&artifact.name, &artifact.version))
-            .collect();
+        let remote_zips: Vec<String> = staged.iter().map(remote_payload_path).collect();
         let command = build_precompile_command(&remote_deploy_dir, &remote_zips);
         let compile_start = Instant::now();
         let (report, stderr) = match ssh_exec_output(host, key_ref, ssh_user, &command) {
@@ -1984,24 +2012,50 @@ mod tests {
         let start = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml");
         let compile = build_precompile_command(
             "/root/mur-abc123",
-            &["/root/.murmur/artifacts/a/0.1.0/a-0.1.0.mur.zip".to_string()],
+            &["/root/.murmur/artifacts/local/a/0.1.0/a-0.1.0.mur.zip".to_string()],
         );
         assert!(start.starts_with(&prefix), "{start}");
         assert!(compile.starts_with(&prefix), "{compile}");
     }
 
+    fn staged(name: &str, version: &str, platform: Option<&str>) -> StagedArtifact {
+        StagedArtifact {
+            name: ArtifactName::parse(name).unwrap(),
+            version: version.to_string(),
+            bytes: Vec::new(),
+            sha256: String::new(),
+            platform: platform.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_wasm_payload_uploads_under_its_scope_and_bare_name() {
+        assert_eq!(
+            remote_payload_path(&staged("murmur/tool-git", "0.2.0", None)),
+            "/root/.murmur/artifacts/murmur/tool-git/0.2.0/tool-git-0.2.0.mur.zip"
+        );
+    }
+
+    #[test]
+    fn a_native_payload_uploads_under_its_scope_with_the_platform_in_its_file_name() {
+        assert_eq!(
+            remote_payload_path(&staged("ana/tool-x", "1.0.0", Some("linux-x86_64"))),
+            "/root/.murmur/artifacts/ana/tool-x/1.0.0/tool-x-1.0.0-linux-x86_64.mur.zip"
+        );
+    }
+
     #[test]
     fn the_compile_command_names_every_payload_under_the_start_scripts_workdir() {
         let paths = [
-            remote_payload_path("a", "0.1.0"),
-            remote_payload_path("b", "1.2.3"),
+            remote_payload_path(&staged("local/a", "0.1.0", None)),
+            remote_payload_path(&staged("murmur/b", "1.2.3", Some("linux-aarch64"))),
         ];
         assert_eq!(
             build_precompile_command("/root/mur-abc123", &paths),
             "[ -f /root/mur-abc123/.env ] && set -a && . /root/mur-abc123/.env && set +a; \
              /usr/local/bin/mur precompile --json --workdir /root/mur-abc123 \
-             /root/.murmur/artifacts/a/0.1.0/a-0.1.0.mur.zip \
-             /root/.murmur/artifacts/b/1.2.3/b-1.2.3.mur.zip"
+             /root/.murmur/artifacts/local/a/0.1.0/a-0.1.0.mur.zip \
+             /root/.murmur/artifacts/murmur/b/1.2.3/b-1.2.3-linux-aarch64.mur.zip"
         );
         let start = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml");
         assert!(start.contains(" --workdir /root/mur-abc123 "), "{start}");
@@ -2163,12 +2217,12 @@ mod tests {
         let instructions = dir.path().join("instructions.md");
         fs::write(&instructions, "You are an assistant.").unwrap();
 
-        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur/driver-anthropic\n    \
              version: 0.1.0\n    runtime: driver\n    gateway:\n      \
              endpoint: http://localhost:8080\n      keyless: true\n\
              inference:\n  model: test\n  \
              system_prompt_file: instructions.md\n  \
-             driver:\n    artifact: murmur-driver-anthropic\n"
+             driver:\n    artifact: murmur/driver-anthropic\n"
             .to_string();
         let manifest = RuntimeManifest::from_yaml_str(&yaml).unwrap();
 
@@ -2184,12 +2238,12 @@ mod tests {
         let dir = tempdir().unwrap();
         // Do NOT create instructions.md
 
-        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur/driver-anthropic\n    \
                     version: 0.1.0\n    runtime: driver\n    gateway:\n      \
                     endpoint: http://localhost:8080\n      keyless: true\n\
                     inference:\n  model: test\n  \
                     system_prompt_file: instructions.md\n  \
-                    driver:\n    artifact: murmur-driver-anthropic\n";
+                    driver:\n    artifact: murmur/driver-anthropic\n";
         let manifest = RuntimeManifest::from_yaml_str(yaml).unwrap();
 
         let err = collect_manifest_files(&manifest, dir.path()).unwrap_err();
@@ -2206,12 +2260,12 @@ mod tests {
         let instructions = dir.path().join("compaction-instructions.md");
         fs::write(&instructions, "Summarize aggressively.").unwrap();
 
-        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur/driver-anthropic\n    \
                     version: 0.1.0\n    runtime: driver\n    gateway:\n      \
                     endpoint: http://localhost:8080\n      keyless: true\n\
                     inference:\n  model: test\n  \
                     compaction:\n    system_prompt_file: compaction-instructions.md\n  \
-                    driver:\n    artifact: murmur-driver-anthropic\n";
+                    driver:\n    artifact: murmur/driver-anthropic\n";
         let manifest = RuntimeManifest::from_yaml_str(yaml).unwrap();
 
         let files = collect_manifest_files(&manifest, dir.path()).unwrap();
@@ -2226,12 +2280,12 @@ mod tests {
         let dir = tempdir().unwrap();
         // Do NOT create compaction-instructions.md
 
-        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur/driver-anthropic\n    \
                     version: 0.1.0\n    runtime: driver\n    gateway:\n      \
                     endpoint: http://localhost:8080\n      keyless: true\n\
                     inference:\n  model: test\n  \
                     compaction:\n    system_prompt_file: compaction-instructions.md\n  \
-                    driver:\n    artifact: murmur-driver-anthropic\n";
+                    driver:\n    artifact: murmur/driver-anthropic\n";
         let manifest = RuntimeManifest::from_yaml_str(yaml).unwrap();
 
         let err = collect_manifest_files(&manifest, dir.path()).unwrap_err();
@@ -2252,13 +2306,13 @@ mod tests {
         fs::write(dir.path().join("instructions.md"), "You are an assistant.").unwrap();
         fs::write(dir.path().join("compaction.md"), "Summarize.").unwrap();
 
-        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur/driver-anthropic\n    \
                     version: 0.1.0\n    runtime: driver\n    gateway:\n      \
                     endpoint: http://localhost:8080\n      keyless: true\n\
                     inference:\n  model: test\n  \
                     system_prompt_file: instructions.md\n  \
                     compaction:\n    system_prompt_file: compaction.md\n  \
-                    driver:\n    artifact: murmur-driver-anthropic\n";
+                    driver:\n    artifact: murmur/driver-anthropic\n";
         let manifest = RuntimeManifest::from_yaml_str(yaml).unwrap();
 
         let files = collect_manifest_files(&manifest, dir.path()).unwrap();
@@ -2435,21 +2489,22 @@ mod tests {
         let registry = LocalRegistry::new(dir.path());
 
         let pairs: Vec<(&str, &str)> = vec![
-            ("art-1", "1.0.0"),
-            ("art-2", "1.0.0"),
-            ("art-3", "1.0.0"),
-            ("art-4", "1.0.0"),
-            ("art-5", "1.0.0"),
-            ("art-6", "1.0.0"),
+            ("local/art-1", "1.0.0"),
+            ("local/art-2", "1.0.0"),
+            ("local/art-3", "1.0.0"),
+            ("local/art-4", "1.0.0"),
+            ("local/art-5", "1.0.0"),
+            ("local/art-6", "1.0.0"),
         ];
 
         for (name, version) in &pairs {
-            let bytes = make_zip_bytes(name, version);
+            let name = ArtifactName::parse(name).unwrap();
+            let bytes = make_zip_bytes(name.name(), version);
             let sha256 = sha256_hex(&bytes);
             registry
                 .store_installed_overwrite(
                     ArtifactMeta {
-                        name: name.to_string(),
+                        name,
                         version: version.to_string(),
                         runtime: RuntimeType::Wasm,
                         artifact_runtime: "wasm".to_string(),
@@ -2472,7 +2527,8 @@ mod tests {
         let results: Vec<Result<StagedArtifact, CliError>> = pairs
             .par_iter()
             .map(|(name, version)| {
-                ensure_artifact_for_deploy(name, version, "linux-x86_64", &registry, &chain)
+                let name = ArtifactName::parse(name).unwrap();
+                ensure_artifact_for_deploy(&name, version, "linux-x86_64", &registry, &chain)
             })
             .collect();
 
@@ -2484,7 +2540,7 @@ mod tests {
             assert!(
                 pairs
                     .iter()
-                    .any(|(n, v)| *n == artifact.name && *v == artifact.version),
+                    .any(|(n, v)| *n == artifact.name.as_str() && *v == artifact.version),
                 "unexpected artifact in results: {}@{}",
                 artifact.name,
                 artifact.version
@@ -2688,7 +2744,12 @@ mod tests {
         };
 
         use super::super::ensure_artifact_for_deploy;
-        use murmur_artifact::sha256_hex;
+        use murmur_artifact::{sha256_hex, ArtifactName};
+
+        /// The full name every test here stages; its zip is packed under the bare part.
+        fn tool() -> ArtifactName {
+            ArtifactName::parse("ana/my-tool").unwrap()
+        }
 
         fn make_zip(name: &str, version: &str) -> Vec<u8> {
             let mut cursor = std::io::Cursor::new(Vec::new());
@@ -2733,12 +2794,12 @@ mod tests {
             SourceChain::from_sources_for_test(Vec::new(), Vec::<SourceConfig>::new())
         }
 
-        fn store_wasm(registry: &LocalRegistry, name: &str, version: &str, bytes: &[u8]) {
+        fn store_wasm(registry: &LocalRegistry, name: &ArtifactName, version: &str, bytes: &[u8]) {
             let sha256 = sha256_hex(bytes);
             registry
                 .store_installed_overwrite(
                     ArtifactMeta {
-                        name: name.to_string(),
+                        name: name.clone(),
                         version: version.to_string(),
                         runtime: RuntimeType::Wasm,
                         artifact_runtime: "wasm".to_string(),
@@ -2755,7 +2816,7 @@ mod tests {
 
         fn store_native_at_platform_path(
             registry: &LocalRegistry,
-            name: &str,
+            name: &ArtifactName,
             version: &str,
             platform: &str,
             bytes: &[u8],
@@ -2767,13 +2828,13 @@ mod tests {
             let sha256_path = artifact_path
                 .parent()
                 .unwrap()
-                .join(format!("{name}-{version}-{platform}.sha256"));
+                .join(format!("{}-{version}-{platform}.sha256", name.name()));
             std::fs::write(&sha256_path, sha256.as_bytes()).unwrap();
             let (os, arch) = murmur_artifact::split_platform_tag(platform).unwrap();
             let meta_path = registry.metadata_path_for(name, version, Some(platform));
             let meta = serde_json::json!({
                 "meta": {
-                    "name": name, "version": version,
+                    "name": name.as_str(), "version": version,
                     "runtime": "native", "artifact_runtime": "tool",
                     "platforms": [[os, arch]], "description": null, "tags": []
                 }
@@ -2783,7 +2844,7 @@ mod tests {
 
         fn store_native_at_generic_path(
             registry: &LocalRegistry,
-            name: &str,
+            name: &ArtifactName,
             version: &str,
             bytes: &[u8],
         ) {
@@ -2794,15 +2855,15 @@ mod tests {
             let sha256_path = artifact_path
                 .parent()
                 .unwrap()
-                .join(format!("{name}-{version}.sha256"));
+                .join(format!("{}-{version}.sha256", name.name()));
             std::fs::write(&sha256_path, sha256.as_bytes()).unwrap();
             let meta_path = artifact_path
                 .parent()
                 .unwrap()
-                .join(format!("{name}-{version}.meta.json"));
+                .join(format!("{}-{version}.meta.json", name.name()));
             let meta = serde_json::json!({
                 "meta": {
-                    "name": name, "version": version,
+                    "name": name.as_str(), "version": version,
                     "runtime": "native", "artifact_runtime": "native",
                     "platforms": [], "description": null, "tags": []
                 }
@@ -2861,17 +2922,18 @@ mod tests {
             let dir = tempdir().unwrap();
             let registry = LocalRegistry::new(dir.path());
             let bytes = make_zip("my-tool", "1.0.0");
-            store_wasm(&registry, "my-tool", "1.0.0", &bytes);
+            store_wasm(&registry, &tool(), "1.0.0", &bytes);
 
             let (chain, called) = mock_chain(Err(SourceError::NotFound(
                 "should not be called".to_string(),
             )));
 
             let staged =
-                ensure_artifact_for_deploy("my-tool", "1.0.0", "linux-x86_64", &registry, &chain)
+                ensure_artifact_for_deploy(&tool(), "1.0.0", "linux-x86_64", &registry, &chain)
                     .unwrap();
 
-            assert_eq!(staged.name, "my-tool");
+            assert_eq!(staged.name, tool());
+            assert_eq!(staged.platform, None);
             assert_eq!(staged.version, "1.0.0");
             assert_eq!(staged.bytes, bytes);
             assert!(
@@ -2889,7 +2951,7 @@ mod tests {
             let (chain, called) = mock_chain(Ok(bytes.clone()));
 
             let staged =
-                ensure_artifact_for_deploy("my-tool", "1.0.0", "linux-x86_64", &registry, &chain)
+                ensure_artifact_for_deploy(&tool(), "1.0.0", "linux-x86_64", &registry, &chain)
                     .unwrap();
 
             assert_eq!(staged.bytes, bytes);
@@ -2907,7 +2969,7 @@ mod tests {
             let darwin_bytes = make_native_zip("my-tool", "1.0.0", b"darwin-binary");
             store_native_at_platform_path(
                 &registry,
-                "my-tool",
+                &tool(),
                 "1.0.0",
                 "darwin-aarch64",
                 &darwin_bytes,
@@ -2917,16 +2979,17 @@ mod tests {
             let (chain, called) = mock_chain(Ok(linux_bytes.clone()));
 
             let staged =
-                ensure_artifact_for_deploy("my-tool", "1.0.0", "linux-x86_64", &registry, &chain)
+                ensure_artifact_for_deploy(&tool(), "1.0.0", "linux-x86_64", &registry, &chain)
                     .unwrap();
 
             assert_eq!(staged.bytes, linux_bytes);
+            assert_eq!(staged.platform.as_deref(), Some("linux-x86_64"));
             assert!(
                 called.load(Ordering::SeqCst),
                 "chain must be called to fetch the linux variant"
             );
 
-            let cached = registry.artifact_path_for_platform("my-tool", "1.0.0", "linux-x86_64");
+            let cached = registry.artifact_path_for_platform(&tool(), "1.0.0", "linux-x86_64");
             assert!(cached.exists(), "linux binary should be cached locally");
         }
 
@@ -2936,7 +2999,7 @@ mod tests {
             let registry = LocalRegistry::new(dir.path());
 
             let bytes = make_native_zip("my-tool", "1.0.0", b"native-binary");
-            store_native_at_generic_path(&registry, "my-tool", "1.0.0", &bytes);
+            store_native_at_generic_path(&registry, &tool(), "1.0.0", &bytes);
 
             let (chain, called) = mock_chain(Err(SourceError::NotFound(
                 "should not be called".to_string(),
@@ -2944,7 +3007,7 @@ mod tests {
 
             let target = current_platform();
             let staged =
-                ensure_artifact_for_deploy("my-tool", "1.0.0", target, &registry, &chain).unwrap();
+                ensure_artifact_for_deploy(&tool(), "1.0.0", target, &registry, &chain).unwrap();
 
             assert_eq!(staged.bytes, bytes);
             assert!(
@@ -2961,7 +3024,7 @@ mod tests {
             let (chain, _) = mock_chain(Err(SourceError::NotFound("404".to_string())));
 
             let err = ensure_artifact_for_deploy(
-                "missing-tool",
+                &ArtifactName::parse("ana/missing-tool").unwrap(),
                 "9.9.9",
                 "linux-x86_64",
                 &registry,
@@ -2981,6 +3044,42 @@ mod tests {
             );
         }
 
+        /// No source serves the `local` scope, so a `local/` artifact missing from the store is
+        /// refused without asking one.
+        #[test]
+        fn a_local_artifact_missing_from_the_store_is_refused_without_asking_a_source() {
+            let dir = tempdir().unwrap();
+            let registry = LocalRegistry::new(dir.path());
+            let (chain, called) = mock_chain(Ok(make_zip("my-tool", "1.0.0")));
+
+            let err = ensure_artifact_for_deploy(
+                &ArtifactName::parse("local/my-tool").unwrap(),
+                "1.0.0",
+                "linux-x86_64",
+                &registry,
+                &chain,
+            )
+            .unwrap_err();
+
+            assert_eq!(err.code, crate::error::E_REG_001);
+            assert_eq!(
+                err.message,
+                "artifact local/my-tool@1.0.0 is not in the store, and no source serves the \
+                 'local' scope"
+            );
+            assert_eq!(
+                err.hint.as_deref(),
+                Some(
+                    "a local/ artifact is installed from its .mur.zip file: \
+                     mur install ./my-tool-1.0.0.mur.zip"
+                )
+            );
+            assert!(
+                !called.load(Ordering::SeqCst),
+                "no source may be asked for a local/ artifact"
+            );
+        }
+
         /// A store holding one payload per platform stages the target's, not this host's.
         #[test]
         fn a_tagged_store_stages_the_target_platforms_payload() {
@@ -2995,11 +3094,11 @@ mod tests {
 
             let host_bytes = make_native_zip("my-tool", "1.0.0", b"this-host");
             let target_bytes = make_native_zip("my-tool", "1.0.0", b"the-target");
-            store_native_at_platform_path(&registry, "my-tool", "1.0.0", host, &host_bytes);
-            store_native_at_platform_path(&registry, "my-tool", "1.0.0", target, &target_bytes);
+            store_native_at_platform_path(&registry, &tool(), "1.0.0", host, &host_bytes);
+            store_native_at_platform_path(&registry, &tool(), "1.0.0", target, &target_bytes);
 
             let staged = ensure_artifact_for_deploy(
-                "my-tool",
+                &tool(),
                 "1.0.0",
                 target,
                 &registry,
@@ -3026,10 +3125,10 @@ mod tests {
                 .unwrap();
 
             let bytes = make_native_zip("my-tool", "1.0.0", b"this-host");
-            store_native_at_generic_path(&registry, "my-tool", "1.0.0", &bytes);
+            store_native_at_generic_path(&registry, &tool(), "1.0.0", &bytes);
 
             let err = ensure_artifact_for_deploy(
-                "my-tool",
+                &tool(),
                 "1.0.0",
                 target,
                 &registry,
@@ -3048,7 +3147,7 @@ mod tests {
         /// own manifest leaves behind.
         fn store_native_recorded_as_wasm(
             registry: &LocalRegistry,
-            name: &str,
+            name: &ArtifactName,
             version: &str,
             bytes: &[u8],
         ) {
@@ -3060,13 +3159,13 @@ mod tests {
                 artifact_path
                     .parent()
                     .unwrap()
-                    .join(format!("{name}-{version}.sha256")),
+                    .join(format!("{}-{version}.sha256", name.name())),
                 sha256.as_bytes(),
             )
             .unwrap();
             let meta = serde_json::json!({
                 "meta": {
-                    "name": name, "version": version,
+                    "name": name.as_str(), "version": version,
                     "runtime": "wasm", "artifact_runtime": "",
                     "platforms": [], "description": null, "tags": []
                 }
@@ -3092,13 +3191,13 @@ mod tests {
                 .unwrap();
 
             let host_bytes = make_native_zip("my-tool", "1.0.0", b"this-host");
-            store_native_recorded_as_wasm(&registry, "my-tool", "1.0.0", &host_bytes);
+            store_native_recorded_as_wasm(&registry, &tool(), "1.0.0", &host_bytes);
 
             let target_bytes = make_native_zip("my-tool", "1.0.0", b"the-target");
             let (chain, called) = mock_chain(Ok(target_bytes.clone()));
 
             let staged =
-                ensure_artifact_for_deploy("my-tool", "1.0.0", target, &registry, &chain).unwrap();
+                ensure_artifact_for_deploy(&tool(), "1.0.0", target, &registry, &chain).unwrap();
 
             assert_eq!(staged.bytes, target_bytes);
             assert_ne!(staged.bytes, host_bytes);
@@ -3108,7 +3207,7 @@ mod tests {
             );
             assert!(
                 registry
-                    .artifact_path_for_platform("my-tool", "1.0.0", target)
+                    .artifact_path_for_platform(&tool(), "1.0.0", target)
                     .exists(),
                 "the fetched payload must be cached under the target platform"
             );
@@ -3117,10 +3216,10 @@ mod tests {
 
     fn door_manifest(extra: &str) -> RuntimeManifest {
         RuntimeManifest::from_yaml_str(&format!(
-            "name: my-agent\nversion: 0.1.0\nartifacts:\n  - name: drv\n    version: 1.0.0\n    \
+            "name: my-agent\nversion: 0.1.0\nartifacts:\n  - name: local/drv\n    version: 1.0.0\n    \
              runtime: driver\n    gateway:\n      endpoint: https://api.example.com\n      \
              api_key: k\ninference:\n  transport: http\n  model: m\n  driver:\n    \
-             artifact: drv\n{extra}"
+             artifact: local/drv\n{extra}"
         ))
         .unwrap()
     }

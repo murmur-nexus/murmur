@@ -18,7 +18,7 @@ use assert_cmd::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
-const DRIVER_NAME: &str = "truncation-driver";
+const DRIVER_NAME: &str = "local/truncation-driver";
 const DRIVER_VERSION: &str = "0.1.0";
 const TASK_TEXT: &str = "Name the three main causes.";
 const CONTEXT_ID: &str = "ctx_truncation";

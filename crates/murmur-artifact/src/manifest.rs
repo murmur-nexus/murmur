@@ -440,7 +440,7 @@ mod upstream_auth_tests {
     use super::*;
 
     /// Each block exactly as the four shipped drivers write it, comment line included.
-    const ANTHROPIC: &str = "name: murmur-driver-anthropic\nversion: 0.1.0\nruntime: driver\n\n\
+    const ANTHROPIC: &str = "name: driver-anthropic\nversion: 0.1.0\nruntime: driver\n\n\
         # How this provider expects the inference credential to be presented; the runtime substitutes {key}.\n\
         upstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
     const BEARER: &str = "\n# How this provider expects the inference credential to be presented; the runtime substitutes {key}.\n\
@@ -459,11 +459,7 @@ mod upstream_auth_tests {
 
     #[test]
     fn upstream_auth_parses_the_three_bearer_blocks() {
-        for driver in [
-            "murmur-driver-openai",
-            "murmur-driver-deepseek",
-            "murmur-driver-moonshotai",
-        ] {
+        for driver in ["driver-openai", "driver-deepseek", "driver-moonshotai"] {
             let auth = parse_upstream_auth(&bearer(driver)).unwrap().unwrap();
             assert_eq!(auth.header, "Authorization", "{driver}");
             assert_eq!(auth.render("sk-2"), "Bearer sk-2", "{driver}");

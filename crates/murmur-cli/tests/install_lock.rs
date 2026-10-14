@@ -90,7 +90,7 @@ fn install_no_args_installs_manifest_declared_dependency() {
 
     fs::write(
         project.path().join("murmur.yaml"),
-        "name: dep-project\nversion: 0.0.1\nartifacts:\n  - name: declared-dep\n    version: 1.2.3\n    runtime: tool\n",
+        "name: dep-project\nversion: 0.0.1\nartifacts:\n  - name: local/declared-dep\n    version: 1.2.3\n    runtime: tool\n",
     )
     .unwrap();
 
@@ -98,7 +98,7 @@ fn install_no_args_installs_manifest_declared_dependency() {
 
     let installed = project
         .path()
-        .join(".murmur/artifacts/declared-dep/1.2.3/declared-dep-1.2.3.mur.zip");
+        .join(".murmur/artifacts/local/declared-dep/1.2.3/declared-dep-1.2.3.mur.zip");
     assert!(
         installed.exists(),
         "manifest-declared dependency should be installed into the project store"
@@ -106,7 +106,7 @@ fn install_no_args_installs_manifest_declared_dependency() {
 
     let lock = read_lockfile(&project.path().join("murmur.lock")).unwrap();
     let entry = lock
-        .artifact_for("declared-dep")
+        .artifact_for("local/declared-dep")
         .expect("lock entry for declared-dep");
     assert_eq!(entry.resolved_version, "1.2.3");
     assert_eq!(entry.sha256.any.as_deref().unwrap(), expected_sha256);
@@ -117,7 +117,7 @@ fn write_manifest_with_deps(dir: &Path, deps: &[(&str, &str)]) {
     let mut manifest = String::from("name: dep-project\nversion: 0.0.1\nartifacts:\n");
     for (name, version) in deps {
         manifest.push_str(&format!(
-            "  - name: {name}\n    version: {version}\n    runtime: tool\n"
+            "  - name: local/{name}\n    version: {version}\n    runtime: tool\n"
         ));
     }
     fs::write(dir.join("murmur.yaml"), manifest).unwrap();
@@ -136,15 +136,15 @@ fn assert_installed_and_pinned(project: &Path, name: &str, version: &str, sha256
     assert!(
         project
             .join(format!(
-                ".murmur/artifacts/{name}/{version}/{name}-{version}.mur.zip"
+                ".murmur/artifacts/local/{name}/{version}/{name}-{version}.mur.zip"
             ))
             .exists(),
         "{name}@{version} should have been stored despite other artifacts failing"
     );
     let lock = read_lockfile(&project.join("murmur.lock")).unwrap();
     let entry = lock
-        .artifact_for(name)
-        .unwrap_or_else(|| panic!("lock entry for {name}"));
+        .artifact_for(&format!("local/{name}"))
+        .unwrap_or_else(|| panic!("lock entry for local/{name}"));
     assert_eq!(entry.resolved_version, version);
     assert_eq!(entry.sha256.any.as_deref().unwrap(), sha256);
 }
@@ -179,7 +179,7 @@ fn install_partial_failure_pins_successes_and_names_failure() {
     assert!(
         !project
             .path()
-            .join(".murmur/artifacts/partial-missing")
+            .join(".murmur/artifacts/local/partial-missing")
             .exists(),
         "the unpublished artifact must not be stored"
     );
@@ -242,7 +242,7 @@ fn install_total_failure_writes_no_lock_and_names_every_failure() {
         .stdout(predicate::str::contains(
             "2 of 2 artifacts failed to install:",
         ))
-        .stdout(predicate::str::contains("installed ").not());
+        .stdout(predicate::str::is_match("(?m)^installed ").unwrap().not());
 
     assert!(
         !project.path().join("murmur.lock").exists(),
@@ -271,12 +271,12 @@ fn install_from_nested_subdirectory_finds_project_root() {
     let artifact = create_artifact_fixture(work.path(), "nested-tool", "1.0.0");
     run_publish_local(&artifact, &home).success();
 
-    run_install_project("nested-tool@1.0.0", &home, &nested).success();
+    run_install_project("local/nested-tool@1.0.0", &home, &nested).success();
 
     assert!(
         project
             .path()
-            .join(".murmur/artifacts/nested-tool/1.0.0/nested-tool-1.0.0.mur.zip")
+            .join(".murmur/artifacts/local/nested-tool/1.0.0/nested-tool-1.0.0.mur.zip")
             .exists(),
         "artifact should land in the project root store"
     );
@@ -298,23 +298,25 @@ fn install_registers_lock_entry_for_registry_resolved_artifact() {
 
     run_publish_local(&artifact, &home).success();
 
-    run_install_project("locked-tool@1.0.0", &home, project.path())
+    run_install_project("local/locked-tool@1.0.0", &home, project.path())
         .success()
-        .stdout(predicate::str::contains("Installed locked-tool@1.0.0"));
+        .stdout(predicate::str::contains(
+            "Installed local/locked-tool@1.0.0",
+        ));
 
     let lock_path = project.path().join("murmur.lock");
     assert!(lock_path.exists(), "murmur.lock should have been created");
 
     let lock = read_lockfile(&lock_path).unwrap();
     let entry = lock
-        .artifact_for("locked-tool")
+        .artifact_for("local/locked-tool")
         .expect("lock entry for locked-tool");
     assert_eq!(entry.resolved_version, "1.0.0");
     assert_eq!(entry.sha256.any.as_deref().unwrap(), expected_sha256);
 
     let installed = project
         .path()
-        .join(".murmur/artifacts/locked-tool/1.0.0/locked-tool-1.0.0.mur.zip");
+        .join(".murmur/artifacts/local/locked-tool/1.0.0/locked-tool-1.0.0.mur.zip");
     assert!(installed.exists());
 }
 
@@ -329,10 +331,11 @@ fn install_upserts_lock_preserving_existing_entries() {
     let preexisting = MurmurLock {
         lock_version: LOCK_VERSION,
         artifacts: vec![LockedArtifact {
-            name: "already-pinned".to_string(),
+            name: "local/already-pinned".to_string(),
             resolved_version: "0.4.0".to_string(),
             sha256: LockedSha256::any("preexisting-hash".to_string()),
             origin: LockOrigin::Operator,
+            owner_id: None,
         }],
     };
     murmur_artifact::write_lockfile_atomic(&lock_path, &preexisting).unwrap();
@@ -341,18 +344,130 @@ fn install_upserts_lock_preserving_existing_entries() {
     let expected_sha256 = sha256_hex(&fs::read(&artifact).unwrap());
     run_publish_local(&artifact, &home).success();
 
-    run_install_project("new-tool@2.0.0", &home, project.path()).success();
+    run_install_project("local/new-tool@2.0.0", &home, project.path()).success();
 
     let lock = read_lockfile(&lock_path).unwrap();
     assert_eq!(lock.artifacts.len(), 2, "existing entry must be preserved");
 
-    let existing = lock.artifact_for("already-pinned").unwrap();
+    let existing = lock.artifact_for("local/already-pinned").unwrap();
     assert_eq!(existing.resolved_version, "0.4.0");
     assert_eq!(existing.sha256.any.as_deref().unwrap(), "preexisting-hash");
 
-    let new_entry = lock.artifact_for("new-tool").unwrap();
+    let new_entry = lock.artifact_for("local/new-tool").unwrap();
     assert_eq!(new_entry.resolved_version, "2.0.0");
     assert_eq!(new_entry.sha256.any.as_deref().unwrap(), expected_sha256);
+}
+
+const REGENERATE: &str = "delete murmur.lock and run `mur install` to regenerate it";
+
+/// A lock this build does not read is refused for its version by both install paths, before any
+/// entry is looked at, and is left as it was.
+#[test]
+fn a_version_2_lock_is_refused_with_the_regenerate_text_and_left_untouched() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    publish_fixture(&work, &home, "v2-tool", "1.0.0");
+    write_manifest_with_deps(project.path(), &[("v2-tool", "1.0.0")]);
+
+    let lock_path = project.path().join("murmur.lock");
+    let v2 =
+        "lock_version: 2\nartifacts:\n  - name: already-pinned\n    resolved_version: 0.4.0\n    \
+              sha256:\n      any: preexisting-hash\n";
+    fs::write(&lock_path, v2).unwrap();
+
+    for assert in [
+        run_install_project("local/v2-tool@1.0.0", &home, project.path()),
+        run_install_manifest_deps(&home, project.path()),
+    ] {
+        let output = assert.failure().get_output().clone();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            text.contains(&format!(
+                "unsupported lock_version 2 (expected 3) \u{2014} {REGENERATE}"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("'already-pinned'"), "{text}");
+    }
+    assert_eq!(fs::read_to_string(&lock_path).unwrap(), v2);
+    assert!(!project
+        .path()
+        .join(".murmur/artifacts/local/v2-tool")
+        .exists());
+}
+
+/// A version 3 entry still carrying a bare name is refused naming that entry.
+#[test]
+fn a_version_3_lock_entry_with_a_bare_name_is_refused_naming_it() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    init_project(project.path());
+    publish_fixture(&work, &home, "bare-tool", "1.0.0");
+
+    fs::write(
+        project.path().join("murmur.lock"),
+        "lock_version: 3\nartifacts:\n  - name: already-pinned\n    resolved_version: 0.4.0\n    \
+         sha256:\n      any: preexisting-hash\n",
+    )
+    .unwrap();
+
+    let output = run_install_project("local/bare-tool@1.0.0", &home, project.path())
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("artifact 'already-pinned' is not named <scope>/<name>"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(REGENERATE), "{stderr}");
+}
+
+/// Rewriting the lock keeps an entry's `owner_id`, and an entry the install adds carries none.
+#[test]
+fn an_install_keeps_an_existing_entrys_owner_id() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    init_project(project.path());
+
+    let lock_path = project.path().join("murmur.lock");
+    murmur_artifact::write_lockfile_atomic(
+        &lock_path,
+        &MurmurLock {
+            lock_version: LOCK_VERSION,
+            artifacts: vec![LockedArtifact {
+                name: "ana/owned-tool".to_string(),
+                resolved_version: "0.4.0".to_string(),
+                sha256: LockedSha256::any("owned-hash".to_string()),
+                origin: LockOrigin::Operator,
+                owner_id: Some(4242),
+            }],
+        },
+    )
+    .unwrap();
+
+    publish_fixture(&work, &home, "added-tool", "1.0.0");
+    run_install_project("local/added-tool@1.0.0", &home, project.path()).success();
+
+    let raw = fs::read_to_string(&lock_path).unwrap();
+    assert!(raw.contains("lock_version: 3"), "{raw}");
+    assert_eq!(raw.matches("owner_id").count(), 1, "{raw}");
+    let lock = read_lockfile(&lock_path).unwrap();
+    assert_eq!(
+        lock.artifact_for("ana/owned-tool").unwrap().owner_id,
+        Some(4242)
+    );
+    assert_eq!(
+        lock.artifact_for("local/added-tool").unwrap().owner_id,
+        None
+    );
 }
 
 #[test]
@@ -369,26 +484,27 @@ fn install_rejects_lock_conflict_and_writes_nothing() {
     let pinned = MurmurLock {
         lock_version: LOCK_VERSION,
         artifacts: vec![LockedArtifact {
-            name: "conflict-tool".to_string(),
+            name: "local/conflict-tool".to_string(),
             resolved_version: "1.0.0".to_string(),
             sha256: LockedSha256::any("a-completely-different-hash-from-a-prior-pull".to_string()),
             origin: LockOrigin::Operator,
+            owner_id: None,
         }],
     };
     murmur_artifact::write_lockfile_atomic(&lock_path, &pinned).unwrap();
 
-    run_install_project("conflict-tool@1.0.0", &home, project.path())
+    run_install_project("local/conflict-tool@1.0.0", &home, project.path())
         .failure()
         .stderr(predicate::str::contains("error[E-REG-005]:"))
         .stderr(predicate::str::contains("murmur.lock conflict"));
 
     // Nothing was written to the project-local store.
-    let installed_dir = project.path().join(".murmur/artifacts/conflict-tool");
+    let installed_dir = project.path().join(".murmur/artifacts/local/conflict-tool");
     assert!(!installed_dir.exists());
 
     // The lock is untouched.
     let lock = read_lockfile(&lock_path).unwrap();
-    let entry = lock.artifact_for("conflict-tool").unwrap();
+    let entry = lock.artifact_for("local/conflict-tool").unwrap();
     assert_eq!(
         entry.sha256.any.as_deref().unwrap(),
         "a-completely-different-hash-from-a-prior-pull"
@@ -407,12 +523,12 @@ fn an_installed_artifact_is_pinned_with_operator_origin() {
     publish_fixture(&work, &home, "declared-tool", "1.0.0");
     write_manifest_with_deps(project.path(), &[("declared-tool", "1.0.0")]);
 
-    run_install_project("named-tool@1.0.0", &home, project.path()).success();
+    run_install_project("local/named-tool@1.0.0", &home, project.path()).success();
     run_install_manifest_deps(&home, project.path()).success();
 
     let lock_path = project.path().join("murmur.lock");
     let lock = read_lockfile(&lock_path).unwrap();
-    for name in ["named-tool", "declared-tool"] {
+    for name in ["local/named-tool", "local/declared-tool"] {
         assert_eq!(
             lock.artifact_for(name).unwrap().origin,
             LockOrigin::Operator,
@@ -446,30 +562,34 @@ fn installing_a_runtime_pin_adopts_it_as_operator() {
     let lock_path = project.path().join("murmur.lock");
     let untouched = vec![
         LockedArtifact {
-            name: "operator-tool".to_string(),
+            name: "local/operator-tool".to_string(),
             resolved_version: "0.1.0".to_string(),
             sha256: LockedSha256::any("operator-hash".to_string()),
             origin: LockOrigin::Operator,
+            owner_id: None,
         },
         LockedArtifact {
-            name: "other-pull".to_string(),
+            name: "local/other-pull".to_string(),
             resolved_version: "0.2.0".to_string(),
             sha256: LockedSha256::any("other-hash".to_string()),
             origin: pulled_by("ses_other"),
+            owner_id: None,
         },
     ];
     let mut artifacts = untouched.clone();
     artifacts.push(LockedArtifact {
-        name: "pulled-tool".to_string(),
+        name: "local/pulled-tool".to_string(),
         resolved_version: "1.0.0".to_string(),
         sha256: LockedSha256::any(named_sha),
         origin: pulled_by("ses_puller"),
+        owner_id: None,
     });
     artifacts.push(LockedArtifact {
-        name: "pulled-dep".to_string(),
+        name: "local/pulled-dep".to_string(),
         resolved_version: "1.0.0".to_string(),
         sha256: LockedSha256::any(declared_sha),
         origin: pulled_by("ses_dep_puller"),
+        owner_id: None,
     });
     murmur_artifact::write_lockfile_atomic(
         &lock_path,
@@ -480,9 +600,9 @@ fn installing_a_runtime_pin_adopts_it_as_operator() {
     )
     .unwrap();
 
-    let adopted_named = "Adopted pulled-tool@1.0.0 as operator-declared (it was pulled at \
+    let adopted_named = "Adopted local/pulled-tool@1.0.0 as operator-declared (it was pulled at \
                          runtime by session ses_puller)";
-    let output = run_install_project("pulled-tool@1.0.0", &home, project.path())
+    let output = run_install_project("local/pulled-tool@1.0.0", &home, project.path())
         .success()
         .get_output()
         .stdout
@@ -490,7 +610,7 @@ fn installing_a_runtime_pin_adopts_it_as_operator() {
     let stdout = String::from_utf8(output).unwrap();
     assert_eq!(stdout.matches(adopted_named).count(), 1, "{stdout}");
 
-    let adopted_declared = "Adopted pulled-dep@1.0.0 as operator-declared (it was pulled at \
+    let adopted_declared = "Adopted local/pulled-dep@1.0.0 as operator-declared (it was pulled at \
                             runtime by session ses_dep_puller)";
     run_install_manifest_deps(&home, project.path())
         .success()
@@ -498,11 +618,11 @@ fn installing_a_runtime_pin_adopts_it_as_operator() {
 
     let lock = read_lockfile(&lock_path).unwrap();
     assert_eq!(
-        lock.artifact_for("pulled-tool").unwrap().origin,
+        lock.artifact_for("local/pulled-tool").unwrap().origin,
         LockOrigin::Operator
     );
     assert_eq!(
-        lock.artifact_for("pulled-dep").unwrap().origin,
+        lock.artifact_for("local/pulled-dep").unwrap().origin,
         LockOrigin::Operator
     );
     for entry in &untouched {
@@ -514,7 +634,7 @@ fn installing_a_runtime_pin_adopts_it_as_operator() {
     assert!(raw.contains("session: ses_other"), "{raw}");
 
     // Installing an operator pin again adopts nothing.
-    run_install_project("pulled-tool@1.0.0", &home, project.path())
+    run_install_project("local/pulled-tool@1.0.0", &home, project.path())
         .success()
         .stdout(predicate::str::contains("Adopted").not());
 }

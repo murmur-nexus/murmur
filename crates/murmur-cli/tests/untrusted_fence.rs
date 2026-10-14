@@ -24,7 +24,7 @@ use zip::{
     CompressionMethod, ZipWriter,
 };
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 const WASM_TOOL: &str = "echo-tool";
 const NATIVE_TOOL: &str = common::FIXTURE_NATIVE_TOOL_NAME;
@@ -92,7 +92,8 @@ fn publish_native_tool(home: &TempDir, artifact_dir: &Path, binary: &Path) {
     registry
         .publish(
             ArtifactMeta {
-                name: NATIVE_TOOL.to_string(),
+                name: murmur_artifact::ArtifactName::parse(&format!("local/{NATIVE_TOOL}"))
+                    .unwrap(),
                 version: TOOL_VERSION.to_string(),
                 runtime: RuntimeType::Native,
                 artifact_runtime: "native".to_string(),
@@ -112,6 +113,9 @@ fn publish_skill(home: &TempDir, artifact_dir: &Path, content: &str) {
 }
 
 /// Write a capsule manifest naming `tools` as tool artifacts and `shell_allow` as shell binaries.
+///
+/// Each tool is given by its tool name and declared as `local/<name>`, the full name its
+/// `.mur.zip` installs under.
 fn write_manifest(
     project_dir: &Path,
     endpoint: &str,
@@ -121,7 +125,7 @@ fn write_manifest(
     let tool_entries = tools
         .iter()
         .map(|(name, runtime)| {
-            format!("  - name: {name}\n    version: {TOOL_VERSION}\n    runtime: {runtime}\n")
+            format!("  - name: local/{name}\n    version: {TOOL_VERSION}\n    runtime: {runtime}\n")
         })
         .collect::<String>();
     let shell_section = if shell_allow.is_empty() {

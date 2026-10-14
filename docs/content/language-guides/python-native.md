@@ -135,7 +135,7 @@ In capsule `murmur.yaml`:
 name: my-capsule
 version: "0.1.0"
 artifacts:
-  - name: py-echo-native
+  - name: local/py-echo-native
     version: "0.1.0"
     runtime: native
 ```

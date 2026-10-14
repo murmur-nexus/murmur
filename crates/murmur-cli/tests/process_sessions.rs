@@ -27,9 +27,9 @@ use assert_cmd::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
-const DRIVER: &str = "fixture-process-driver";
+const DRIVER: &str = "local/fixture-process-driver";
 /// The `transport: http` driver the forget-refusal case runs against; it needs no provider.
-const HTTP_DRIVER: &str = "fixture-streaming-driver";
+const HTTP_DRIVER: &str = "local/fixture-streaming-driver";
 const DRIVER_VERSION: &str = "0.1.0";
 const CAPSULE: &str = "process-sessions";
 const HARNESS: &str = "fixture-harness";
@@ -1018,7 +1018,7 @@ fn the_conversation_record_stays_inert_under_process() {
 
     let capsule = Built::new()
         .hooks(
-            "  - name: seed-hook\n    version: 0.1.0\n    runtime: hook\n  - name: read-hook\n    \
+            "  - name: local/seed-hook\n    version: 0.1.0\n    runtime: hook\n  - name: local/read-hook\n    \
              version: 0.1.0\n    runtime: hook\n    capabilities:\n      conversation:\n        \
              read: true\n",
         )

@@ -4,32 +4,37 @@
 
 ## Reference forms
 
-| Form | Example | Resolved against |
-|---|---|---|
-| Name and version | `murmur-tool-git@{{ v.murmur_tool_git }}` | The global store first, then the configured sources |
-| Bare name | `murmur-tool-git` | The configured sources, latest release |
-| GitHub release | `github:<owner>/<repo>@<tag>` | That release, directly |
-| Local file | `./murmur-tool-git-{{ v.murmur_tool_git }}.mur.zip` | A path on disk. A reference counts as a path when it starts with `./`, `../` or `/`, or contains `/` and ends in `.mur.zip` |
+| Form | Example | Resolved against | Stored as |
+|---|---|---|---|
+| Name and version | `murmur/tool-git@{{ v.murmur_tool_git }}` | The global store first, then the configured sources, asked for the bare name `tool-git`. A `local/` name is never asked of a source | The name given |
+| Name | `murmur/tool-git` | The configured sources, asked for the bare name, latest release | The name given |
+| GitHub release | `github:<owner>/<repo>@<tag>` | That release, directly | `<scope>/<name>` for each asset, `<scope>` being the repository's scope and `<name>` the name the asset's `murmur.yaml` declares |
+| Local file | `./tool-git-{{ v.murmur_tool_git }}.mur.zip` | A path on disk. A reference counts as a path when it starts with `./`, `../` or `/`, or contains `/` and ends in `.mur.zip` | `local/<name>`, `<name>` being the name the file's `murmur.yaml` declares |
+
+Every name on the command line is a full name, `<scope>/<name>` — see
+[Artifact names](../concepts/registry.md#artifact-names). A bare name such as `tool-git` is refused
+with [`E-REG-007`](diagnostics.md#e-reg-007), and so is a `github:` reference whose owner is
+`local` or `murmur`.
 
 ```bash
-mur install murmur-tool-git@{{ v.murmur_tool_git }}
+mur install murmur/tool-git@{{ v.murmur_tool_git }}
 ```
 
 ## Which assets an install pulls
 
 | Reference | Assets installed |
 |---|---|
-| `<name>` or `<name>@<version>` | One — the matching asset from the first source that has it |
+| `<scope>/<name>` or `<scope>/<name>@<version>` | One — the matching asset from the first source that has it |
 | `github:<owner>/<repo>@<tag>` | Every `.mur.zip` asset in that release |
 
 Use a name reference to take a single artifact out of a release that contains several; the `github:` form cannot target one asset. A name reference needs the repository configured as a source — see [Multiple sources and fallthrough](#multiple-sources-and-fallthrough).
 
-`<name>@<version>` searches the release tagged `<version>`, then `v<version>`, then the source's latest release, so a repository whose release tags are independent of artifact versions still resolves. Within a release, assets are matched by filename in this order, where `<platform>` is the host platform — `darwin-aarch64`, `darwin-x86_64`, `linux-aarch64` or `linux-x86_64`:
+`<scope>/<name>@<version>` searches the release tagged `<version>`, then `v<version>`, then the source's latest release, so a repository whose release tags are independent of artifact versions still resolves. Within a release, assets are matched by filename in this order, where `<name>` is the bare name and `<platform>` is the host platform — `darwin-aarch64`, `darwin-x86_64`, `linux-aarch64` or `linux-x86_64`:
 
 | Reference | Filenames tried, in order |
 |---|---|
-| `<name>@<version>` | `<name>-<version>-<platform>.mur.zip`, `<name>-<version>.mur.zip` |
-| `<name>` | `<name>-*-<platform>.mur.zip`, `<name>.mur.zip`, `<name>-*.mur.zip` — the last pattern matches only assets whose filename carries no platform tag |
+| `<scope>/<name>@<version>` | `<name>-<version>-<platform>.mur.zip`, `<name>-<version>.mur.zip` |
+| `<scope>/<name>` | `<name>-*-<platform>.mur.zip`, `<name>.mur.zip`, `<name>-*.mur.zip` — the last pattern matches only assets whose filename carries no platform tag |
 
 A platform tag in an asset filename is the publisher's declaration of which platform those bytes are for, so a tagged asset is only ever installed on the platform it names. When no filename matches, the install fails with [`E-REG-001`](diagnostics.md) naming the host platform and the platforms the release publishes that artifact for. `linux-aarch64` is a supported target for which Murmur's own releases publish no asset: an artifact needed there is built on that host with [`mur build`](cli.md#mur-build) and installed from the resulting path.
 
@@ -98,7 +103,7 @@ registry:
 
 ## Default source
 
-With neither `~/.murmur/config.yaml` nor `<cwd>/.murmur/config.yaml` present, `mur install` uses one built-in source: the public GitHub repository `murmur-nexus/default-artifacts`, which needs no token. Once `~/.murmur/config.yaml` exists, its `registry.sources` list is the whole chain — see [Merge rules](config.md#merge-rules). To install from local stores only, set `registry.sources: []` in that file: a `name@version` missing from the store then fails with `E-REG-001`.
+With neither `~/.murmur/config.yaml` nor `<cwd>/.murmur/config.yaml` present, `mur install` uses one built-in source: the public GitHub repository `murmur-nexus/default-artifacts`, which needs no token. Once `~/.murmur/config.yaml` exists, its `registry.sources` list is the whole chain — see [Merge rules](config.md#merge-rules). To install from local stores only, set `registry.sources: []` in that file: a `<scope>/<name>@<version>` missing from the store then fails with `E-REG-001`.
 
 ## Local artifact cache
 
@@ -109,16 +114,20 @@ With neither `~/.murmur/config.yaml` nor `<cwd>/.murmur/config.yaml` present, `m
 | Project | `<project root>/.murmur/artifacts/` — the nearest directory at or above the working directory that holds a `murmur.yaml`. Installing without one fails with `E-IO-001` |
 | Global | `~/.murmur/artifacts/` |
 
-Under either root, an artifact occupies `<name>/<version>/`. A native artifact is a different binary per platform, so its three files carry the platform tag its payload was built for; every other payload is one set of bytes each host resolves, and its files carry no tag:
+Under either root, an artifact occupies `<scope>/<name>/<version>/`, and the files in it are named by the bare `<name>`: `murmur/tool-git@{{ v.murmur_tool_git }}` is filed at `murmur/tool-git/{{ v.murmur_tool_git }}/tool-git-{{ v.murmur_tool_git }}.mur.zip`. A native artifact is a different binary per platform, so its three files carry the platform tag its payload was built for; every other payload is one set of bytes each host resolves, and its files carry no tag:
 
 | File | Holds |
 |---|---|
 | `<name>-<version>.mur.zip` | The artifact — a WASM component or a static skill |
 | `<name>-<version>.sha256` | Its SHA-256 |
-| `<name>-<version>.meta.json` | Its name, version, runtime, platforms, description, tags and WIT contracts |
+| `<name>-<version>.meta.json` | Its full name, version, runtime, platforms, description, tags and WIT contracts |
 | `<name>-<version>-<platform>.mur.zip` | A native artifact's payload for one platform |
 | `<name>-<version>-<platform>.sha256` | That payload's SHA-256 |
 | `<name>-<version>-<platform>.meta.json` | That payload's metadata, with `platforms` naming the one platform |
+
+An artifact is filed under the bare name its own `murmur.yaml` declares: a payload whose packed `name:` differs from the bare part of the name it is installed as is refused with [`E-REG-002`](diagnostics.md#e-reg-002).
+
+A store directory in the flat `<name>/<version>/` layout, with no scope directory, is not read by any command. [`mur doctor`](cli.md#mur-doctor) names each one in its `Artifact stores` block as safe to delete.
 
 One version directory holds one payload, hash and metadata file per platform installed, so installing a native artifact for a second platform sits beside the first rather than replacing it. A resolve prefers the tagged payload for the host's platform and falls back to the untagged one, which is how a WASM artifact resolves everywhere; a *native* artifact resolved through that fallback is reported as [`W-REG-001`](diagnostics.md#w-reg-001).
 
@@ -126,10 +135,10 @@ The `runtime` and `artifact_runtime` keys of the metadata file record what the p
 
 The `wit_contracts` key of the metadata file records the versioned WIT interface names the packed component declares, under `exports` and `imports`. The store derives both lists from the artifact bytes on every write, so they always describe the artifact they sit beside. The key is absent for an artifact carrying no readable component — a native binary, a skill, or a payload that is not a WebAssembly component. `mur list --contract <PREFIX>` reads it; see [`mur list`](cli.md#mur-list).
 
-`mur install --all-platforms <name>@<version>` installs into the global store, once per platform it downloads for, writing the same three files per platform as any other install.
+`mur install --all-platforms <scope>/<name>@<version>` installs into the global store, once per platform it downloads for, writing the same three files per platform as any other install.
 
 The global root is derived from `$HOME` (or `$USERPROFILE` on Windows). No environment variable overrides it; to relocate the store, set `HOME` before invoking `mur`.
 
 ## Resolution order { #resolution-order }
 
-A `<name>@<version>` reference is resolved from the global store `~/.murmur/artifacts/` first, and falls through to the configured sources only when the global store does not have it. `mur install` with no argument does the same for each artifact `murmur.yaml` declares. The order for every command is in [Resolution order](config.md#resolution-order).
+A `<scope>/<name>@<version>` reference is resolved from the global store `~/.murmur/artifacts/` first, and falls through to the configured sources only when the global store does not have it. `mur install` with no argument does the same for each artifact `murmur.yaml` declares. The order for every command is in [Resolution order](config.md#resolution-order).

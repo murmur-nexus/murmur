@@ -91,9 +91,20 @@ pub(crate) fn run_publish(
         }
     };
 
-    let artifact_id = format!("{}@{}", artifact_manifest.name, artifact_manifest.version);
+    // A file names no owner it could be checked against, so what it publishes is `local/`.
+    let name = murmur_artifact::ArtifactName::from_parts(
+        murmur_artifact::LOCAL_SCOPE,
+        &artifact_manifest.name,
+    )
+    .map_err(|error| {
+        CliError::new(
+            E_IO_003,
+            format!("the artifact declares a name that cannot be published: {error}"),
+        )
+    })?;
+    let artifact_id = format!("{name}@{}", artifact_manifest.version);
     let meta = ArtifactMeta {
-        name: artifact_manifest.name,
+        name,
         version: artifact_manifest.version,
         runtime,
         artifact_runtime: artifact_manifest.runtime,

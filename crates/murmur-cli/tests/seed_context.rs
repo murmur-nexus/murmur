@@ -16,7 +16,7 @@ use capsule_runtime::launch_session;
 use common::hook_wat::{compaction_hook_wasm, create_hook_zip, seed_hook_wasm};
 use serde_json::{json, Value};
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 /// The task the capsule is given, asserted verbatim as the message a seed must precede.
@@ -52,7 +52,7 @@ fn create_manifest(
 ) -> PathBuf {
     let hooks: String = hook_names
         .iter()
-        .map(|name| format!("  - name: {name}\n    version: 0.1.0\n    runtime: hook\n"))
+        .map(|name| format!("  - name: local/{name}\n    version: 0.1.0\n    runtime: hook\n"))
         .collect();
 
     let manifest = format!(

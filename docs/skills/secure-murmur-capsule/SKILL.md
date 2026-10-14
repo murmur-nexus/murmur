@@ -124,14 +124,14 @@ Example shape; adapt endpoints, scopes, artifact names, versions, and provider f
 
 ```yaml
 artifacts:
-  - name: murmur-driver-example
+  - name: ana/driver-example
     version: "1.0.0"
     runtime: driver
     gateway:
       endpoint: https://api.example.com
       api_key: ${EXAMPLE_API_KEY}
 
-  - name: murmur-tool-reader
+  - name: ana/tool-reader
     version: "1.0.0"
     runtime: tool
     capabilities:
@@ -149,7 +149,7 @@ capabilities:
 inference:
   model: example-model
   driver:
-    artifact: murmur-driver-example
+    artifact: ana/driver-example
 ```
 
 Do not copy this example unchanged. It demonstrates a ceiling and explicit narrowing, not a complete manifest.

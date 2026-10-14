@@ -1,6 +1,6 @@
 # How to score your agent's behavior with eval
 
-Murmur's eval system lets you run your capsule against a dataset of test cases and automatically score each session. Scores are written to `eval.jsonl` alongside `trace.jsonl` in each session workdir and can be compared across runs with `mur eval diff`. This guide shows how to wire up `murmur-hook-eval`, write a dataset, run it, and interpret the results.
+Murmur's eval system lets you run your capsule against a dataset of test cases and automatically score each session. Scores are written to `eval.jsonl` alongside `trace.jsonl` in each session workdir and can be compared across runs with `mur eval diff`. This guide shows how to wire up `murmur/hook-eval`, write a dataset, run it, and interpret the results.
 
 The relevant manifest options are:
 
@@ -11,9 +11,9 @@ The relevant manifest options are:
 
 ---
 
-## Step 1 — declare murmur-hook-eval in the manifest
+## Step 1 — declare murmur/hook-eval in the manifest
 
-`murmur-hook-eval` is a hook artifact — it runs at fixed lifecycle points and writes scores. Create a `murmur.yaml` file with `runtime: hook` and configure scorers under `observability.eval`:
+`murmur/hook-eval` is a hook artifact — it runs at fixed lifecycle points and writes scores. Create a `murmur.yaml` file with `runtime: hook` and configure scorers under `observability.eval`:
 
 === "Anthropic"
 
@@ -22,19 +22,19 @@ The relevant manifest options are:
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
           endpoint: https://api.anthropic.com
           api_key: ${ANTHROPIC_API_KEY}
-      - name: murmur-hook-eval
+      - name: murmur/hook-eval
         version: "{{ v.murmur_hook_eval }}"
         runtime: hook
         capabilities:
           filesystem:
             scope: .          # the hook writes the session's eval.jsonl scores here; hooks get no filesystem by default
-      - name: murmur-tool-editor
+      - name: murmur/tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
 
@@ -47,7 +47,7 @@ The relevant manifest options are:
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
 
     observability:
       eval:
@@ -63,7 +63,7 @@ The relevant manifest options are:
             max: 3000
           - type: tool_sequence
             name: tool_order
-            expected: [murmur-tool-editor]
+            expected: [tool-editor]
     ```
 
 === "OpenAI"
@@ -73,19 +73,19 @@ The relevant manifest options are:
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
           endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
-      - name: murmur-hook-eval
+      - name: murmur/hook-eval
         version: "{{ v.murmur_hook_eval }}"
         runtime: hook
         capabilities:
           filesystem:
             scope: .          # the hook writes the session's eval.jsonl scores here; hooks get no filesystem by default
-      - name: murmur-tool-editor
+      - name: murmur/tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
 
@@ -98,7 +98,7 @@ The relevant manifest options are:
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
 
     observability:
       eval:
@@ -114,7 +114,7 @@ The relevant manifest options are:
             max: 3000
           - type: tool_sequence
             name: tool_order
-            expected: [murmur-tool-editor]
+            expected: [tool-editor]
     ```
 
 === "DeepSeek"
@@ -124,19 +124,19 @@ The relevant manifest options are:
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
           endpoint: https://api.deepseek.com
           api_key: ${DEEPSEEK_API_KEY}
-      - name: murmur-hook-eval
+      - name: murmur/hook-eval
         version: "{{ v.murmur_hook_eval }}"
         runtime: hook
         capabilities:
           filesystem:
             scope: .          # the hook writes the session's eval.jsonl scores here; hooks get no filesystem by default
-      - name: murmur-tool-editor
+      - name: murmur/tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
 
@@ -149,7 +149,7 @@ The relevant manifest options are:
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
 
     observability:
       eval:
@@ -165,7 +165,7 @@ The relevant manifest options are:
             max: 3000
           - type: tool_sequence
             name: tool_order
-            expected: [murmur-tool-editor]
+            expected: [tool-editor]
     ```
 
 **What each scorer does:**
@@ -384,9 +384,9 @@ mur trace show
 
 | Step | What you do |
 |---|---|
-| Declare `murmur-hook-eval` with `runtime: hook` | Activates the eval hook for this capsule |
+| Declare `murmur/hook-eval` with `runtime: hook` | Activates the eval hook for this capsule |
 | Grant it `capabilities.filesystem.scope` on its own entry | Lets it write `eval.jsonl`; hooks have no filesystem access by default (see [Hook capabilities](../reference/manifest.md#hook-capabilities)) |
-| Declare `murmur-tool-editor` with `runtime: tool` | Gives the agent file-read capability; required for `tool_sequence` cases |
+| Declare `murmur/tool-editor` with `runtime: tool` | Gives the agent file-read capability; required for `tool_sequence` cases |
 | Configure `observability.eval.scorers` | Defines the scoring criteria — all scorers run for every case |
 | Write `eval.jsonl` | One case per line, each with a `case_id` and `task_path` |
 | `mur eval run` | Runs all cases against `eval.jsonl` and prints a pass/fail summary |

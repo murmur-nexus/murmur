@@ -42,7 +42,7 @@ const STREAM_DEADLINE: Duration = Duration::from_secs(60);
 fn publish_reopen_hook(home: &tempfile::TempDir, dir: &Path, name: &str, wasm: &[u8]) -> String {
     let hook = common::hook_wat::create_hook_zip(dir, name, "on-task-end", "reopen-task", wasm);
     common::publish_local(home, &hook).success();
-    format!("  - name: {name}\n    version: 0.1.0\n    runtime: hook\n")
+    format!("  - name: local/{name}\n    version: 0.1.0\n    runtime: hook\n")
 }
 
 fn create_tool_artifact(dir: &Path) -> PathBuf {
@@ -84,8 +84,9 @@ fn launch_with_hook(
 fn launch_with_input_tool(server: common::ScriptedServer, reopen_once: bool) -> IdleCapsule {
     launch_idle_capsule_with_input_timeout(server, Some(2), move |home, dir| {
         common::publish_local(home, &create_tool_artifact(dir)).success();
-        let mut extra =
-            format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n    runtime: tool\n");
+        let mut extra = format!(
+            "  - name: local/{TOOL_NAME}\n    version: {TOOL_VERSION}\n    runtime: tool\n"
+        );
         if reopen_once {
             extra.push_str(&publish_reopen_hook(
                 home,

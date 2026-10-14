@@ -43,10 +43,10 @@ use tempfile::TempDir;
 /// The capsule every parent process in this suite runs. Its manifest is the ceiling each child is
 /// refereed against, and it accepts a queue of tasks and sleeps between them, which keeps its door
 /// answering for as long as a case needs it.
-const PARENT_CAPSULE: &str = "completion-parent";
+const PARENT_CAPSULE: &str = "local/completion-parent";
 /// The session the suite registers for itself, to obtain the credential `POST /spawn` wants.
 const APPROVER_SESSION: &str = "ses_completion00000000000approver";
-const DRIVER: &str = "murmur-driver-anthropic";
+const DRIVER: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 /// The variable the `worker` capsule echoes into its result file. Set once for the process, so a
@@ -106,7 +106,8 @@ fn suite() -> &'static Suite {
                  api_key: test-key\ncapabilities:\n  \
                  network:\n    allow: [{endpoint}, {failing}]\n  \
                  env:\n    allow: [{MARKER_VAR}]\n  \
-                 spawn:\n    allow: [worker, waiting-worker, slow-worker, failing-worker]\n\
+                 spawn:\n    allow: [local/worker, local/waiting-worker, local/slow-worker, \
+                 local/failing-worker]\n\
                  lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n\
                  trace:\n  capture: content\n\
                  inference:\n  transport: http\n  model: test-model\n  \
@@ -122,7 +123,7 @@ fn suite() -> &'static Suite {
         // the session runs and shuts down cleanly, and its task did not complete.
         common::publish_capsule(
             &registry_path,
-            "failing-worker",
+            "local/failing-worker",
             "0.1.0",
             &format!(
                 "artifacts:\n  - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    runtime: \
@@ -141,7 +142,7 @@ fn suite() -> &'static Suite {
         // exits, so the result is something only the child could have written.
         common::publish_capsule(
             &registry_path,
-            "worker",
+            "local/worker",
             "0.1.0",
             &format!("artifacts: []\ncapabilities:\n  env:\n    allow: [{MARKER_VAR}]\n"),
             Some(&component("capsule-env-echo.wasm")),
@@ -152,7 +153,7 @@ fn suite() -> &'static Suite {
         // can arrange rather than race.
         common::publish_capsule(
             &registry_path,
-            "waiting-worker",
+            "local/waiting-worker",
             "0.1.0",
             "artifacts: []\n",
             Some(&component("capsule-path-reader.wasm")),
@@ -164,7 +165,7 @@ fn suite() -> &'static Suite {
         // back.
         common::publish_capsule(
             &registry_path,
-            "slow-worker",
+            "local/slow-worker",
             "0.1.0",
             &format!(
                 "stderr_marker: true\nartifacts:\n  - name: {DRIVER}\n    version: \
@@ -557,14 +558,14 @@ fn a_child_knows_its_spawner_from_an_injected_value_and_not_an_inherited_one() {
 
     let delegated = launch(
         parent_dir.path(),
-        "worker",
+        "local/worker",
         &[MARKER_VAR],
         Some(spawner.clone()),
     );
-    let undelegated = launch(parent_dir.path(), "worker", &[MARKER_VAR], None);
+    let undelegated = launch(parent_dir.path(), "local/worker", &[MARKER_VAR], None);
     let allowlisting = launch(
         parent_dir.path(),
-        "worker",
+        "local/worker",
         &[MARKER_VAR, SPAWNER_ENV],
         Some(spawner.clone()),
     );
@@ -640,7 +641,7 @@ fn a_finished_childs_completion_is_refused_by_a_parent_with_no_task_waiting_for_
 
     let child = launch(
         parent_dir.path(),
-        "worker",
+        "local/worker",
         &[MARKER_VAR],
         Some(parent.spawner()),
     );
@@ -655,7 +656,7 @@ fn a_finished_childs_completion_is_refused_by_a_parent_with_no_task_waiting_for_
     assert_refused_as_unwaited(&completion, &delegation_id);
     assert_eq!(completion["result_path"], "out/result.txt");
     assert_eq!(completion["delegation_id"], delegation_id);
-    assert_eq!(completion["capsule_name"], "worker");
+    assert_eq!(completion["capsule_name"], "local/worker");
     assert_eq!(completion["session_id"], child.session_id);
     assert_eq!(completion["workdir"], child.workdir.display().to_string());
 
@@ -695,7 +696,7 @@ fn an_agent_child_whose_task_failed_reports_error() {
         let _slot = agent_child_slot();
         launch(
             parent_dir.path(),
-            "failing-worker",
+            "local/failing-worker",
             &[],
             Some(parent.spawner()),
         )
@@ -755,7 +756,7 @@ fn a_child_killed_without_reporting_is_reported_by_its_launcher() {
         let _slot = agent_child_slot();
         launch(
             parent_dir.path(),
-            "slow-worker",
+            "local/slow-worker",
             &[],
             Some(parent.spawner()),
         )
@@ -826,8 +827,14 @@ fn a_completion_with_no_parent_left_is_recorded_rather_than_dropped() {
     // The child waits for `targets.txt` before it finishes, so the parent can be killed while it
     // is demonstrably still working rather than in a race with its exit.
     let child = std::thread::scope(|scope| {
-        let launch_thread =
-            scope.spawn(|| launch(parent_dir.path(), "waiting-worker", &[], Some(spawner)));
+        let launch_thread = scope.spawn(|| {
+            launch(
+                parent_dir.path(),
+                "local/waiting-worker",
+                &[],
+                Some(spawner),
+            )
+        });
         let child_dir = wait_for_new_dir(&children_dir, &before).expect("the child's directory");
         parent.kill();
         std::fs::write(child_dir.join("targets.part"), "targets.txt").unwrap();
@@ -894,7 +901,7 @@ fn a_completion_addressed_to_another_session_is_refused_and_recorded() {
     };
     let child = launch(
         parent_dir.path(),
-        "worker",
+        "local/worker",
         &[MARKER_VAR],
         Some(misaddressed),
     );
@@ -946,7 +953,7 @@ fn a_childs_spawner_handle_carries_no_trust_class() {
 
     let child = launch(
         parent_dir.path(),
-        "worker",
+        "local/worker",
         &[MARKER_VAR],
         Some(parent.spawner()),
     );
@@ -998,7 +1005,7 @@ fn a_delegation_the_parent_ends_is_recorded_and_not_announced() {
         let _slot = agent_child_slot();
         launch(
             parent_dir.path(),
-            "slow-worker",
+            "local/slow-worker",
             &[],
             Some(parent.spawner()),
         )
@@ -1054,7 +1061,7 @@ fn a_started_child_that_never_ends_is_stopped_at_its_deadline() {
     let _slot = agent_child_slot();
     let child = launch_bounded(
         parent_dir.path(),
-        "slow-worker",
+        "local/slow-worker",
         &[],
         Some(parent.spawner()),
         Some(Duration::from_secs(5)),

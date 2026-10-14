@@ -21,7 +21,7 @@ use capsule_runtime::launch_session;
 use common::hook_wat::{create_hook_zip, deny_hook_wasm, none_hook_wasm, spin_hook_wasm};
 use serde_json::Value;
 
-const DRIVER: &str = "fixture-process-driver";
+const DRIVER: &str = "local/fixture-process-driver";
 const DRIVER_VERSION: &str = "0.1.0";
 
 /// The native tool every hook scenario calls through the bridge. It writes [`MARKER`] and answers
@@ -232,7 +232,7 @@ fn create_manifest(project: &Path, capsule: &Capsule<'_>, harness: &Path) -> Pat
         .iter()
         .map(|h| {
             format!(
-                "  - name: {}\n    version: 0.1.0\n    runtime: hook\n",
+                "  - name: local/{}\n    version: 0.1.0\n    runtime: hook\n",
                 h.name
             )
         })
@@ -240,13 +240,13 @@ fn create_manifest(project: &Path, capsule: &Capsule<'_>, harness: &Path) -> Pat
     let mut tool_yaml = String::new();
     if capsule.marker_tool {
         tool_yaml.push_str(&format!(
-            "  - name: {}\n    version: 0.1.0\n    runtime: tool\n",
+            "  - name: local/{}\n    version: 0.1.0\n    runtime: tool\n",
             capsule.tool_name
         ));
     }
     if capsule.echo_tool {
         tool_yaml.push_str(&format!(
-            "  - name: {ECHO_TOOL}\n    version: 0.1.0\n    runtime: tool\n"
+            "  - name: local/{ECHO_TOOL}\n    version: 0.1.0\n    runtime: tool\n"
         ));
     }
     let shell_yaml = if capsule.shell_allow.is_empty() {

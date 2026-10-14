@@ -35,9 +35,12 @@ use zip::{
     CompressionMethod, ZipWriter,
 };
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
+/// The tool name the model calls, which is also the name the artifact is packed under.
 const INPUT_TOOL_NAME: &str = "request-input-tool";
+/// The tool's full name once installed from its `.mur.zip` file.
+const INPUT_TOOL_ARTIFACT: &str = "local/request-input-tool";
 const INPUT_TOOL_VERSION: &str = "0.1.0";
 
 /// A scratch `$HOME` for this whole test binary.
@@ -182,6 +185,7 @@ fn stage_agent(
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools,
@@ -943,7 +947,8 @@ fn cancel_from_input_required_reaches_canceled() {
         &server.endpoint,
         "cancel-input",
         &format!(
-            "  - name: {INPUT_TOOL_NAME}\n    version: {INPUT_TOOL_VERSION}\n    runtime: tool\n\
+            "  - name: {INPUT_TOOL_ARTIFACT}\n    version: {INPUT_TOOL_VERSION}\n    \
+             runtime: tool\n\
              capabilities:\n  network:\n    allow:\n      - {}\n",
             server.endpoint
         ),
