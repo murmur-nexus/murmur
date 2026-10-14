@@ -86,9 +86,9 @@ fn write_index(dir: &TempDir, entries: &[Value]) -> String {
     path.to_str().unwrap().to_string()
 }
 
-/// The S7 index: a tool whose newest version names an interface version no `mur` serves, a
-/// native tool whose newest version has no payload for this host, a hook naming a package this
-/// `mur` does not serve, and a skill that fits everywhere.
+/// An index exercising the fit rule: a tool whose newest version names an interface version no
+/// `mur` serves, a native tool whose newest version has no payload for this host, a hook naming
+/// a package this `mur` does not serve, and a skill that fits everywhere.
 fn fit_index_entries() -> Vec<Value> {
     let tool_run = format!("murmur:tool/run@{}", served("murmur:tool"));
     vec![

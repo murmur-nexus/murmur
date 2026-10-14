@@ -115,7 +115,8 @@ pub(crate) fn installed_contracts(
     union
 }
 
-/// An interface name as a doctor line or a search note shows it: as recorded, or marked when it carries no version.
+/// An interface name as a doctor line or a search note shows it: as recorded, or marked when it
+/// carries no version.
 pub(crate) fn interface_label(interface: &UnservedInterface) -> String {
     match interface.artifact_version {
         Some(_) => interface.interface.clone(),

@@ -1808,8 +1808,8 @@ error[E-IDX-001]: release holds no .mur.zip file to index
 ### E-IDX-002 — not a schema 2 artifact index { #e-idx-002 }
 
 `mur search`, and `mur index --merge`, read only a schema 2 [artifact index](artifact-index.md).
-A schema 1 index, whose `schema_version` is the string `1`, is refused with a hint for its
-publisher:
+A schema 1 index, whose `schema_version` is `1` as a string or a number, is refused with a hint
+for its publisher:
 
 ```text
 error[E-IDX-002]: artifact index https://raw.githubusercontent.com/ana/my-artifacts/main/artifacts-index.json is a schema 1 index

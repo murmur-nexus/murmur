@@ -35,8 +35,15 @@ mur build ./tool-editor --output release/
 mur build ./hook-audit --output release/
 ```
 
-Each artifact becomes `<name>-<version>.mur.zip`. A native tool becomes one file per platform,
-`<name>-<version>-<platform>.mur.zip`; build it on each platform into the same directory.
+Each artifact becomes `<name>-<version>.mur.zip`. A native tool needs one file per platform, named
+`<name>-<version>-<platform>.mur.zip`. Build it on each platform and give `--output` that file
+name:
+
+```bash
+mur build ./tool-git --output release/tool-git-0.2.0-linux-x86_64.mur.zip
+```
+
+`<platform>` is one of `darwin-aarch64`, `darwin-x86_64`, `linux-aarch64` or `linux-x86_64`.
 
 ## Step 2 — write the index
 
@@ -69,8 +76,8 @@ Create the release and upload every file in the directory as one of its assets:
 gh release create v1.1.0 --repo ana/my-artifacts release/*
 ```
 
-Upload the `.mur.zip` files and `artifacts-index.json` together. The index names each file by the
-release it was uploaded to, so a file left out of the release cannot be installed from it.
+Upload the `.mur.zip` files and `artifacts-index.json` together. The index records `v1.1.0` as
+the release holding every file in the directory, so each of those files must be an asset of it.
 
 ## Step 4 — search your source
 

@@ -77,7 +77,7 @@ fn pack_native(dir: &Path, name: &str, version: &str, platform: &str) -> PathBuf
     )
 }
 
-/// The S1 directory: an echo tool at two versions, a hook exporting an interface no `mur`
+/// A release directory: an echo tool at two versions, a hook exporting an interface no `mur`
 /// serves, a native tool with two platform payloads, a skill, and two entries `mur index` skips.
 fn release_dir() -> TempDir {
     let dir = TempDir::new().unwrap();
@@ -151,7 +151,7 @@ fn assert_matches_published_schema(index: &Path) {
         .output()
         .is_ok_and(|out| out.status.success());
     if !has_validator {
-        eprintln!("python3 with jsonschema is not installed; schema validation skipped");
+        eprintln!("[SKIP] schema validation: python3 with jsonschema is not installed");
         return;
     }
     let out = StdCommand::new("python3")
@@ -183,7 +183,7 @@ fn artifact<'a>(index: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("{name} not in {index}"))
 }
 
-// ── S1: the happy path ────────────────────────────────────────────────────────
+// ── Indexing a release directory ─────────────────────────────────────────────
 
 #[test]
 fn indexes_every_artifact_in_the_directory_from_the_files_themselves() {
@@ -313,7 +313,7 @@ fn indexes_every_artifact_in_the_directory_from_the_files_themselves() {
     assert!(skill["versions"][0]["assets"][0].get("platform").is_none());
 }
 
-// ── S2: determinism ───────────────────────────────────────────────────────────
+// ── Determinism ───────────────────────────────────────────────────────────────
 
 #[test]
 fn indexing_the_same_files_gives_the_same_bytes() {
@@ -393,7 +393,7 @@ fn indexing_the_same_files_gives_the_same_bytes() {
     assert_eq!(entries_of(out.path()), ["a.json", "b.json", "c.json"]);
 }
 
-// ── S4: files that cannot be indexed ──────────────────────────────────────────
+// ── Files that cannot be indexed ──────────────────────────────────────────────
 
 /// Run `mur index` over `dir` into an `out.json` that already exists, and assert it is refused
 /// with `code`, every `needle` on stderr, and `out.json` untouched with nothing left beside it.
@@ -517,7 +517,7 @@ fn a_file_that_cannot_be_indexed_refuses_the_directory() {
     assert_refused(empty.path(), &[], "E-IDX-001", &["holds no .mur.zip file"]);
 }
 
-// ── S5: --repo and --release ──────────────────────────────────────────────────
+// ── --repo and --release ──────────────────────────────────────────────────────
 
 #[test]
 fn the_scope_comes_from_the_repository_by_the_install_rule() {
@@ -621,7 +621,7 @@ fn repo_and_release_are_required() {
     }
 }
 
-// ── S6: --merge ───────────────────────────────────────────────────────────────
+// ── --merge ───────────────────────────────────────────────────────────────────
 
 fn asset(file: &str, fill: char) -> Value {
     json!({ "file": file, "sha256": fill.to_string().repeat(64) })
