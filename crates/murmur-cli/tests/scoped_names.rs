@@ -146,7 +146,7 @@ fn echo_tool_zip(dir: &Path) -> PathBuf {
     common::create_tool_artifact(dir, "echo-tool", "0.0.1", &echo_tool_wasm())
 }
 
-// ── The manifest refuses a bare name (acceptance 1) ──────────────────────────
+// ── The manifest refuses a bare name ──────────────────────────────────────────
 
 #[test]
 fn a_bare_artifact_name_in_murmur_yaml_is_refused_with_the_scoped_forms() {
@@ -192,7 +192,8 @@ fn a_scoped_name_passes_parsing_and_fails_on_the_missing_artifact() {
         .failure();
     let stderr = stderr_of(&assert);
     assert!(!stderr.contains("E-MAN-003"), "{stderr}");
-    assert!(stderr.contains("murmur/tool-editor"), "{stderr}");
+    assert!(stderr.contains("error[E-RUN-008]"), "{stderr}");
+    assert!(stderr.contains("murmur/tool-editor@0.6.0"), "{stderr}");
 }
 
 // ── The other surfaces ────────────────────────────────────────────────────────
@@ -485,7 +486,7 @@ fn a_manifest_install_of_a_missing_local_artifact_asks_no_source() {
     assert!(!source.was_contacted());
 }
 
-// ── Sources (interim) ────────────────────────────────────────────────────────
+// ── Sources ───────────────────────────────────────────────────────────────────
 
 /// A `.mur.zip` packed as the WASM tool `packed@version`, under `dir`, named `file_name`.
 fn packed_tool(dir: &Path, packed: &str, version: &str, file_name: &str) -> Vec<u8> {
@@ -516,9 +517,14 @@ fn a_scoped_install_asks_the_sources_for_the_bare_name_and_stores_the_full_one()
         .exists());
     let lock = read_lockfile(&project.path().join("murmur.lock")).unwrap();
     assert!(lock.artifact_for("ana/tool-x").is_some());
+    // The release lists one asset, `tool-x-1.0.0.mur.zip`, so fetching it means the source was
+    // asked for the bare name.
     assert!(
-        release.paths().iter().any(|path| path.contains("tool-x")) || !release.paths().is_empty(),
-        "the source was asked: {:?}",
+        release
+            .paths()
+            .iter()
+            .any(|path| path.ends_with("/releases/assets/1")),
+        "the asset named by the bare name was fetched: {:?}",
         release.paths()
     );
 }
@@ -593,7 +599,7 @@ fn an_asset_packed_under_another_name_is_refused_and_stores_nothing() {
     );
 }
 
-// ── The lock (acceptance 4) ──────────────────────────────────────────────────
+// ── The lock ──────────────────────────────────────────────────────────────────
 
 /// An agent project declaring `local/echo-tool`, installed from its `.mur.zip`, beside the driver
 /// already in its store, so nothing it declares is asked of a source.
@@ -725,7 +731,7 @@ fn an_owner_id_survives_a_lock_rewrite_and_a_new_entry_carries_none() {
     assert!(lock.artifact_for("local/echo-tool").is_some());
 }
 
-// ── Staging: tool names are unique, and the model sees only them (acceptance 2, 3) ──
+// ── Staging: tool names are unique, and the model sees only them ──────────────
 
 /// A project whose store holds the driver and, for each `(full name, description)`, the WASM
 /// echo tool packed as `tool-editor`, with a v3 lock entry for every one of them.
@@ -926,7 +932,7 @@ fn the_model_is_offered_the_bare_tool_name_and_never_a_scope() {
         .exists());
 }
 
-// ── Doctor and the old store layout ──────────────────────────────────────────
+// ── Doctor and the old store layout ───────────────────────────────────────────
 
 #[test]
 fn doctor_names_an_old_layout_store_directory_as_safe_to_delete() {
@@ -976,7 +982,7 @@ fn doctor_names_an_old_layout_store_directory_as_safe_to_delete() {
     assert!(!listed.contains("murmur-tool-git"), "{listed}");
 }
 
-// ── `mur build` packs the bare name ──────────────────────────────────────────
+// ── `mur build` packs the bare name ───────────────────────────────────────────
 
 #[test]
 fn build_refuses_a_scoped_name_and_packs_a_bare_one() {

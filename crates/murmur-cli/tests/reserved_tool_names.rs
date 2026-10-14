@@ -24,16 +24,11 @@ const RESERVED: [&str; 5] = [
     "end-without-answer",
 ];
 
-/// The full name a tool artifact whose tool name is `tool` is declared under here.
-fn full_name(tool: &str) -> String {
-    format!("local/{tool}")
-}
-
 /// An agent capsule declaring one tool artifact whose tool name is `tool`, under
 /// [`full_name`], plus whatever extra top-level YAML the case needs. Nothing it names is
 /// published anywhere.
 fn manifest(project: &Path, tool: &str, blocks: &str) -> std::path::PathBuf {
-    let artifact_name = full_name(tool);
+    let artifact_name = common::local(tool);
     let yaml = format!(
         "name: {CAPSULE_NAME}\nversion: 0.1.0\n{blocks}artifacts:\n  - name: {artifact_name}\n    \
          version: 0.1.0\n    runtime: tool\n  - name: local/murmur-driver-anthropic\n    version: \
@@ -76,7 +71,7 @@ fn an_artifact_under_a_reserved_name_refuses_the_launch() {
             .stderr(predicate::str::contains(format!(
                 "artifact '{}' has the tool name '{name}', which collides with a tool the runtime \
                  provides itself",
-                full_name(name)
+                common::local(name)
             )))
             .stderr(
                 predicate::str::contains("rename the artifact")
@@ -131,7 +126,7 @@ fn the_refusal_does_not_depend_on_the_grant_that_provides_the_tool() {
             .stderr(predicate::str::contains("error[E-CAP-013]"))
             .stderr(predicate::str::contains(format!(
                 "artifact '{}' has the tool name '{name}'",
-                full_name(name)
+                common::local(name)
             )));
     }
 }

@@ -165,7 +165,7 @@ pub(crate) fn ensure_artifact_for_deploy(
     }
     // No source serves the `local` scope, so a miss is final and nothing is contacted.
     if name.is_local() {
-        return Err(crate::error::local_store_miss(name, version));
+        return Err(crate::error::local_store_miss(name, Some(version)));
     }
 
     // Step B — fetch from source chain with explicit target platform

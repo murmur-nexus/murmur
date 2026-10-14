@@ -36,11 +36,6 @@ const PROBE_CALL: &str = "toolu_formation_probe";
 /// `.mur.zip` file is. Member capsules and [`PROBE_TOOL`] are named by their bare part elsewhere.
 const SCOPE: &str = "local";
 
-/// The full name of the artifact a member or a model knows as `name`.
-fn full(name: &str) -> String {
-    format!("{SCOPE}/{name}")
-}
-
 // ── Artifacts ─────────────────────────────────────────────────────────────────
 
 /// An agent capsule's manifest body: its driver against `endpoint`, an authenticated door that
@@ -206,7 +201,7 @@ impl Project {
         let store = dir.path().join(".murmur").join("artifacts");
         publish_to_store(
             &store,
-            &full(PROBE_TOOL),
+            &common::local(PROBE_TOOL),
             PROBE_VERSION,
             "tool",
             "runtime: tool\n",
@@ -246,7 +241,7 @@ impl Project {
             let body = member_manifest(&model.server.endpoint, lifecycle, driver_version);
             publish_to_store(
                 &store,
-                &full(member.capsule),
+                &common::local(member.capsule),
                 member.version,
                 "capsule",
                 &body,
@@ -1527,7 +1522,7 @@ fn a_member_whose_bytes_changed_since_admission_is_refused() {
     );
     assert_eq!(run.status.code(), Some(1), "{}", run.stderr);
     assert!(run.stderr.contains("error[E-RUN-047]"), "{}", run.stderr);
-    let coder = ArtifactName::parse(&full("coder")).unwrap();
+    let coder = ArtifactName::parse(&common::local("coder")).unwrap();
     let installed = std::fs::read_to_string(
         LocalRegistry::new(project.path().join(".murmur").join("artifacts"))
             .sha256_path_for(&coder, "1.2.0"),

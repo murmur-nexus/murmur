@@ -56,13 +56,6 @@ const TWO_LEVELS: Duration = Duration::from_secs(60);
 /// How long a delegation may take to start.
 const START_LIMIT: Duration = Duration::from_secs(240);
 
-/// The full name a capsule this file names by `name` is published and granted under. The model
-/// names a sub-capsule by `name`, the bare part `delegate-task` and `submit-plan` offer; the
-/// store, `capabilities.spawn.allow`, the daemon and the delegation records use the full name.
-fn full(name: &str) -> String {
-    format!("local/{name}")
-}
-
 const SPAWNER_CLOSED: &str = "spawner lifeline closed — the session that delegated to this one \
                               has ended";
 
@@ -93,7 +86,7 @@ fn agent_body(endpoint: &str, capabilities_extra: &str, lifecycle: &str, tail: &
 const QUEUE_SLEEP: &str = "lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n";
 
 fn spawn_allow(names: &[&str]) -> String {
-    let entries: Vec<String> = names.iter().map(|name| full(name)).collect();
+    let entries: Vec<String> = names.iter().map(|name| common::local(name)).collect();
     format!("  spawn:\n    allow: [{}]\n", entries.join(", "))
 }
 
@@ -117,7 +110,7 @@ impl World {
         );
         publish_to_store(
             &registry,
-            &full(MUTE),
+            &common::local(MUTE),
             VERSION,
             "capsule",
             &agent_body(&never_replying(), "", QUEUE_SLEEP, ""),
@@ -127,7 +120,7 @@ impl World {
         let state = Arc::new(State {
             jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             registry_path: registry.clone(),
-            spawn_allow: top_level.iter().map(|name| full(name)).collect(),
+            spawn_allow: top_level.iter().map(|name| common::local(name)).collect(),
             max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
             max_concurrent: mur_roost::bounds::DEFAULT_MAX_CONCURRENT,
             max_live_capsules: u32::MAX,
@@ -152,7 +145,14 @@ impl World {
     }
 
     fn publish(&self, name: &str, body: &str) {
-        publish_to_store(&self.registry, &full(name), VERSION, "capsule", body, None);
+        publish_to_store(
+            &self.registry,
+            &common::local(name),
+            VERSION,
+            "capsule",
+            body,
+            None,
+        );
     }
 
     /// `mur <args>` in `dir`, under this world's `HOME` and daemon, with nothing a launch could
@@ -988,7 +988,11 @@ fn a_parent_stopped_mid_plan_ends_the_plan_steps_child_first() {
         .into_iter()
         .find(|event| event["event_type"] == "delegation_start")
         .expect("a delegation_start record");
-    assert_eq!(started["capsule"], full(MUTE).as_str(), "{started}");
+    assert_eq!(
+        started["capsule"],
+        common::local(MUTE).as_str(),
+        "{started}"
+    );
     assert!(
         !delegation.processes().is_empty(),
         "the child is not running"
@@ -1139,8 +1143,22 @@ fn a_formation_member_killed_outright_takes_its_child_with_it() {
     // The daemon reads the entry member's envelope from its own registry; the launcher runs the
     // members from the project's store.
     world.publish("planner", &planner);
-    publish_to_store(&store, &full("planner"), VERSION, "capsule", &planner, None);
-    publish_to_store(&store, &full("coder"), VERSION, "capsule", &coder, None);
+    publish_to_store(
+        &store,
+        &common::local("planner"),
+        VERSION,
+        "capsule",
+        &planner,
+        None,
+    );
+    publish_to_store(
+        &store,
+        &common::local("coder"),
+        VERSION,
+        "capsule",
+        &coder,
+        None,
+    );
     std::fs::write(
         project.path().join("roster.yaml"),
         format!(

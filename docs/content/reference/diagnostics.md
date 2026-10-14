@@ -1549,9 +1549,8 @@ error[E-CAP-020]: artifacts 'murmur/tool-editor' and 'ana/tool-editor' share the
 ```
 
 A `source:` entry counts by its bare name, so `- name: tool-editor` with `source:` beside
-`murmur/tool-editor` is refused the same way. `mur run` checks before resolving any artifact, and
-staging checks again, so nothing is resolved and no session directory is created. Declare one of
-the two.
+`murmur/tool-editor` is refused the same way. The check runs before any artifact is resolved, so
+nothing is resolved and no session directory is created. Declare one of the two.
 
 ## Conversation record errors
 

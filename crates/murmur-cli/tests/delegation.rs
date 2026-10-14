@@ -52,13 +52,6 @@ const VERSION: &str = "0.1.0";
 /// The scope every capsule here is published under, as a capsule installed from its `.mur.zip`
 /// file is. The capsule consts are the bare names the model is offered; the store, the daemon,
 /// `spawn.allow` and the trace's `delegation` records carry [`full`] names.
-const SCOPE: &str = "local";
-
-/// The full name of the capsule the model knows as `name`.
-fn full(name: &str) -> String {
-    format!("{SCOPE}/{name}")
-}
-
 /// The sub-capsule that answers. Its model always replies with [`WORKER_ANSWER`], so text that
 /// reaches the parent came from the child and from nowhere else.
 const WORKER: &str = "worker";
@@ -233,7 +226,7 @@ impl RecordingRoost {
     fn publish(&self, name: &str, version: &str, body: &str, component: Option<&Path>) {
         common::publish_to_store(
             &self.state.registry_path,
-            &full(name),
+            &common::local(name),
             version,
             "capsule",
             body,
@@ -566,7 +559,10 @@ fn suite() -> &'static Suite {
         // The daemon's own list gates a top-level registrant, which every parent here is.
         let roost = RecordingRoost::start(
             &registry,
-            &[full(PARENT).as_str(), full(UNGRANTED_PARENT).as_str()],
+            &[
+                common::local(PARENT).as_str(),
+                common::local(UNGRANTED_PARENT).as_str(),
+            ],
         );
         std::env::set_var("MURMUR_ROOST_URL", &roost.url);
 
@@ -593,7 +589,7 @@ fn suite() -> &'static Suite {
                     AUTH_WORKER,
                     STAYING_WORKER
                 ]
-                .map(full)
+                .map(common::local)
                 .join(", ")
             ),
             Some(&common::fixture_path(
@@ -1499,7 +1495,7 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "{started}"
     );
-    assert_eq!(started["capsule"], full(WORKER), "{started}");
+    assert_eq!(started["capsule"], common::local(WORKER), "{started}");
     assert_eq!(started["version"], VERSION, "{started}");
     let child_session_id = started["child_session_id"].as_str().unwrap_or_default();
     assert!(!child_session_id.is_empty(), "{started}");
@@ -1572,7 +1568,7 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     let event = &events[0];
     assert_eq!(event["outcome"], "ok", "{event}");
     assert_eq!(event["delegation_id"], json!(delegation_id), "{event}");
-    assert_eq!(event["capsule"], full(WORKER), "{event}");
+    assert_eq!(event["capsule"], common::local(WORKER), "{event}");
     assert_eq!(event["version"], VERSION, "{event}");
     assert_eq!(event["child_session_id"], result["session_id"], "{event}");
     assert_eq!(event["reason"], Value::Null, "{event}");
@@ -1697,7 +1693,7 @@ fn delegate_task_offers_the_bare_name_and_spawns_the_full_one() {
     let suite = suite();
     let parent = Parent::launch(
         PARENT,
-        &format!("  spawn:\n    allow: [{}]\n", full(WORKER)),
+        &format!("  spawn:\n    allow: [{}]\n", common::local(WORKER)),
     );
 
     let manifest = std::fs::read_to_string(
@@ -1724,7 +1720,7 @@ fn delegate_task_offers_the_bare_name_and_spawns_the_full_one() {
     let delegation_id = result["delegation_id"].as_str().unwrap_or_default();
 
     let spawned = suite.roost.spawned_names();
-    assert!(spawned.contains(&full(WORKER)), "{spawned:?}");
+    assert!(spawned.contains(&common::local(WORKER)), "{spawned:?}");
     assert!(
         !spawned.iter().any(|name| !name.contains('/')),
         "every spawn request names a full name: {spawned:?}"
@@ -1732,10 +1728,15 @@ fn delegate_task_offers_the_bare_name_and_spawns_the_full_one() {
 
     let started = parent.events("delegation_start");
     assert_eq!(started.len(), 1, "{started:?}");
-    assert_eq!(started[0]["capsule"], full(WORKER), "{}", started[0]);
+    assert_eq!(
+        started[0]["capsule"],
+        common::local(WORKER),
+        "{}",
+        started[0]
+    );
     let ended = parent.events("delegation");
     assert_eq!(ended.len(), 1, "{ended:?}");
-    assert_eq!(ended[0]["capsule"], full(WORKER), "{}", ended[0]);
+    assert_eq!(ended[0]["capsule"], common::local(WORKER), "{}", ended[0]);
     assert_eq!(ended[0]["outcome"], "ok", "{}", ended[0]);
 
     let handed = await_model_message(&parent, OUTCOME_OPENING, Duration::from_secs(120));
@@ -1746,7 +1747,7 @@ fn delegate_task_offers_the_bare_name_and_spawns_the_full_one() {
         "{handed}"
     );
     assert!(
-        !handed.contains(&full(WORKER)),
+        !handed.contains(&common::local(WORKER)),
         "the model is never handed a scope: {handed}"
     );
 }
@@ -1762,7 +1763,7 @@ fn authenticated_child_is_driven_with_its_operator_token() {
     let _suite = suite();
     let parent = Parent::launch(
         PARENT,
-        &format!("  spawn:\n    allow: [{}]\n", full(AUTH_WORKER)),
+        &format!("  spawn:\n    allow: [{}]\n", common::local(AUTH_WORKER)),
     );
 
     let text = parent.delegate("toolu_auth", AUTH_WORKER, VERSION, "summarise the report");
@@ -1794,7 +1795,11 @@ fn authenticated_child_is_driven_with_its_operator_token() {
     let events = parent.events("delegation");
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["outcome"], "ok", "{events:?}");
-    assert_eq!(events[0]["capsule"], full(AUTH_WORKER), "{events:?}");
+    assert_eq!(
+        events[0]["capsule"],
+        common::local(AUTH_WORKER),
+        "{events:?}"
+    );
 
     let model_context = serde_json::to_string(&parent.server.requests()).unwrap();
     assert!(
@@ -1966,7 +1971,7 @@ fn a_bound_refusal_reaches_the_parents_trace_unaltered() {
     .to_string();
     suite()
         .roost
-        .refuse_spawns_of(&full(DEEP_WORKER), &sentence);
+        .refuse_spawns_of(&common::local(DEEP_WORKER), &sentence);
 
     let parent = Parent::launch(PARENT, SPAWN_YAML);
     let text = parent.delegate("toolu_bound", DEEP_WORKER, VERSION, "go one deeper");
@@ -2020,7 +2025,7 @@ fn a_wedged_started_child_is_ended_at_the_deadline() {
     let trace = parent.trace_events();
     let launch = only_event(&trace, "delegation_start");
     assert_eq!(launch["delegation_id"], json!(delegation_id), "{launch}");
-    assert_eq!(launch["capsule"], full(MUTE_WORKER), "{launch}");
+    assert_eq!(launch["capsule"], common::local(MUTE_WORKER), "{launch}");
     assert!(
         parent.events("delegation").is_empty(),
         "the call returned in {call_took:?} with the delegation already closed"
@@ -2369,7 +2374,11 @@ fn a_cancel_mid_delegation_names_the_child_and_ends_it() {
         json!(delegation_id),
         "{delegation}"
     );
-    assert_eq!(delegation["capsule"], full(MUTE_WORKER), "{delegation}");
+    assert_eq!(
+        delegation["capsule"],
+        common::local(MUTE_WORKER),
+        "{delegation}"
+    );
 
     // The child is ended by the task, not left to run out its deadline.
     let gone = Instant::now() + Duration::from_secs(30);
@@ -2506,7 +2515,7 @@ fn a_cancel_mid_plan_ends_the_plan_steps_sub_capsule() {
         .find(|item| item["kind"] == "delegation")
         .unwrap_or_else(|| panic!("no delegation residue in {items:?}"));
     assert_eq!(residue["delegation_id"], json!(delegation_id), "{residue}");
-    assert_eq!(residue["capsule"], full(MUTE_WORKER), "{residue}");
+    assert_eq!(residue["capsule"], common::local(MUTE_WORKER), "{residue}");
 
     // Ended from inside the step, not left to run out the delegation deadline.
     let gone = Instant::now() + Duration::from_secs(10);
@@ -2627,7 +2636,7 @@ fn a_plan_step_that_completes_closes_its_own_delegation() {
         PARENT,
         &format!(
             "  spawn:\n    allow: [{}]\n  plan:\n    submit: true\n",
-            full(STAYING_WORKER)
+            common::local(STAYING_WORKER)
         ),
     );
     parent.server.push(tool_use_response(

@@ -165,6 +165,12 @@ pub fn write_no_source_config(home: &Path) {
     fs::write(dir.join("config.yaml"), "registry:\n  sources: []\n").unwrap();
 }
 
+/// The full name `local/<name>`: what an artifact installed from its `.mur.zip` file or by
+/// `mur publish` is declared, granted and spawned under. A model knows it by `name` alone.
+pub fn local(name: &str) -> String {
+    format!("local/{name}")
+}
+
 pub fn publish_local(home: &TempDir, artifact_path: &Path) -> Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home.path())

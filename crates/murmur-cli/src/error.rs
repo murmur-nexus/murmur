@@ -1063,24 +1063,42 @@ impl From<BuildError> for CliError {
 /// A full artifact name from the command line, or `E-REG-007` naming why it is not one: for a
 /// bare name, with the hint naming its scoped forms.
 pub(crate) fn artifact_name_arg(input: &str) -> Result<murmur_artifact::ArtifactName, CliError> {
-    murmur_artifact::ArtifactName::parse(input).map_err(|error| match error.hint() {
-        Some(hint) => CliError::with_hint(E_REG_007, error.to_string(), hint),
-        None => CliError::new(E_REG_007, error.to_string()),
-    })
+    murmur_artifact::ArtifactName::parse(input).map_err(artifact_name_error)
 }
 
-/// The refusal of a `local/` artifact the stores do not hold. No source serves the `local` scope,
-/// so none is asked.
-pub(crate) fn local_store_miss(name: &murmur_artifact::ArtifactName, version: &str) -> CliError {
+/// `E-REG-007` for a command-line name that is not a full name.
+pub(crate) fn artifact_name_error(error: murmur_artifact::ArtifactNameError) -> CliError {
+    match error.hint() {
+        Some(hint) => CliError::with_hint(E_REG_007, error.to_string(), hint),
+        None => CliError::new(E_REG_007, error.to_string()),
+    }
+}
+
+/// The refusal of a `local/` artifact the stores do not hold, at `version` or, for `None`, at
+/// any version. No source serves the `local` scope, so none is asked.
+pub(crate) fn local_store_miss(
+    name: &murmur_artifact::ArtifactName,
+    version: Option<&str>,
+) -> CliError {
+    let scope = murmur_artifact::LOCAL_SCOPE;
+    let (message, file_version) = match version {
+        Some(version) => (
+            format!(
+                "artifact {name}@{version} is not in the store, and no source serves the \
+                 '{scope}' scope"
+            ),
+            version,
+        ),
+        None => (
+            format!("no source serves the '{scope}' scope, so {name} cannot be looked up"),
+            "<version>",
+        ),
+    };
     CliError::with_hint(
         E_REG_001,
+        message,
         format!(
-            "artifact {name}@{version} is not in the store, and no source serves the '{}' scope",
-            murmur_artifact::LOCAL_SCOPE
-        ),
-        format!(
-            "a {}/ artifact is installed from its .mur.zip file: mur install ./{}-{version}.mur.zip",
-            murmur_artifact::LOCAL_SCOPE,
+            "a {scope}/ artifact is installed from its .mur.zip file: mur install ./{}-{file_version}.mur.zip",
             name.name()
         ),
     )

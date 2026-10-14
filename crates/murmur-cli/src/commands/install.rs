@@ -19,7 +19,8 @@ use rayon::prelude::*;
 use crate::{
     config::load_effective_mur_config,
     error::{
-        artifact_name_arg, local_store_miss, CliError, E_IO_001, E_IO_003, E_REG_001, E_REG_005,
+        artifact_name_arg, artifact_name_error, local_store_miss, CliError, E_IO_001, E_IO_003,
+        E_REG_001, E_REG_005,
     },
     source::{github_scope, SourceChain, SourceChainError},
 };
@@ -426,16 +427,14 @@ fn install_single(
 
     if is_source_chain_ref(artifact_ref) {
         let parsed = ArtifactRef::parse(artifact_ref).map_err(|error| match error {
-            ArtifactRefError::Name(_) => artifact_name_arg(artifact_ref)
-                .err()
-                .unwrap_or_else(|| CliError::new(E_IO_003, error.to_string())),
+            ArtifactRefError::Name(error) => artifact_name_error(error),
             other => CliError::new(E_IO_003, other.to_string()),
         })?;
         let precompiler = build_precompiler(no_precompile, project_root);
         match &parsed {
             ArtifactRef::Name(name) => {
                 if name.is_local() {
-                    return Err(local_scope_unversioned(name));
+                    return Err(local_store_miss(name, None));
                 }
                 let chain = SourceChain::from_config(&load_effective_mur_config()?);
                 let resolved = chain
@@ -498,7 +497,7 @@ fn install_single(
             resolved.bytes
         }
         Err(RegistryError::NotFound { .. }) if name.is_local() => {
-            return Err(local_store_miss(&name, version));
+            return Err(local_store_miss(&name, Some(version)));
         }
         Err(RegistryError::NotFound { .. }) => match configured_source_chain()? {
             Some(chain) => {
@@ -541,19 +540,6 @@ fn install_single(
     Ok(())
 }
 
-/// The refusal of `mur install local/<name>` with no version: the sources are what an
-/// unversioned name asks, and none serves the `local` scope.
-fn local_scope_unversioned(name: &ArtifactName) -> CliError {
-    CliError::with_hint(
-        E_REG_001,
-        format!("no source serves the '{LOCAL_SCOPE}' scope, so {name} cannot be looked up"),
-        format!(
-            "a {LOCAL_SCOPE}/ artifact is installed from its .mur.zip file: mur install ./{}-<version>.mur.zip",
-            name.name()
-        ),
-    )
-}
-
 fn install_manifest_deps(
     store: &LocalRegistry,
     project_root: &Option<PathBuf>,
@@ -574,8 +560,8 @@ fn install_manifest_deps(
     let runtime_manifest =
         load_runtime_manifest(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
 
-    // Collect only the artifacts we need to install (skip inline-source ones), by the full name
-    // each resolves under; the manifest parser has already refused any other form.
+    // The artifacts to install, by the full name each resolves under; inline-source entries are
+    // skipped, and the manifest parser has already refused any other form.
     let artifacts: Vec<_> = runtime_manifest
         .artifacts
         .iter()
@@ -910,7 +896,7 @@ fn fetch_and_store(
             })
         }
         Err(RegistryError::NotFound { .. }) if name.is_local() => {
-            Err(local_store_miss(name, version))
+            Err(local_store_miss(name, Some(version)))
         }
         Err(RegistryError::NotFound { .. }) => match source_chain {
             Some(chain) => {
@@ -1080,7 +1066,7 @@ fn run_install_all_platforms(
 
     let (name, version) = parse_versioned_ref(ref_str)?;
     if name.is_local() {
-        return Err(local_store_miss(&name, version));
+        return Err(local_store_miss(&name, Some(version)));
     }
 
     let config = load_effective_mur_config()?;

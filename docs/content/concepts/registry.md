@@ -11,9 +11,10 @@
 an artifact you built into the global store. `mur run` reads the stores only, so a capsule launches
 with exactly what was installed and never reaches the network for an artifact.
 
-A source is asked for an artifact by its bare name. Until `murmur-nexus/default-artifacts`
-publishes its artifacts under the names on these pages, it serves only the older asset names: of
-the two, `murmur/murmur-tool-git@0.2.0` resolves from it and `murmur/tool-git@0.2.0` does not.
+`mur install <scope>/<name>@<version>` asks each source for the bare `<name>` and stores what it
+finds under the full name you gave. The releases `murmur-nexus/default-artifacts` publishes name
+their assets with a `murmur-` prefix, so `murmur/murmur-tool-git@0.2.0` resolves from it and
+`murmur/tool-git@0.2.0` does not.
 
 ## Artifact names { #artifact-names }
 
@@ -37,8 +38,7 @@ The scope is chosen by where the artifact is installed from:
 | Any other GitHub repository | The repository owner, lowercased: `github:Ana/tools@v1` installs as `ana/<name>` |
 
 `murmur` and `local` are reserved: a `github:` owner named either is refused with
-[`E-REG-007`](../reference/diagnostics.md#e-reg-007). `mur install <scope>/<name>@<version>` asks
-the sources for `<name>` and stores what it finds under the full name given.
+[`E-REG-007`](../reference/diagnostics.md#e-reg-007).
 
 Everything that resolves an artifact takes the full name: `mur install`, `mur run --capsule`,
 `artifacts:` entries in `murmur.yaml`, `members[].capsule` in `roster.yaml`, `murmur.lock`, and
