@@ -21321,6 +21321,7 @@ mod member_call_tests {
             assert_eq!(header("x-murmur-task-trust"), ["trusted"]);
             let sent: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
             assert_eq!(sent["method"], "SendMessage");
+            assert_eq!(sent["params"]["configuration"]["returnImmediately"], true);
             let message = &sent["params"]["message"];
             assert_eq!(message["role"], "ROLE_USER");
             assert_eq!(message["parts"][0]["text"], "add 2 and 2");
@@ -21939,6 +21940,7 @@ mod member_call_tests {
                 body["params"]["message"]["messageId"],
                 format!("msg_{call_id}")
             );
+            assert_eq!(body["params"]["configuration"]["returnImmediately"], true);
         }
         let seen = seen.lock().unwrap();
         for request in seen.iter() {

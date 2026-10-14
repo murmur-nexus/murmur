@@ -193,6 +193,17 @@ pub(crate) mod capture {
                 .unwrap_or_default()
         }
 
+        /// Whether the body's `params.configuration.returnImmediately` is `true`.
+        pub(crate) fn returns_immediately(&self) -> bool {
+            serde_json::from_str::<serde_json::Value>(&self.body)
+                .ok()
+                .and_then(|body| {
+                    body.pointer("/params/configuration/returnImmediately")
+                        .cloned()
+                })
+                == Some(serde_json::Value::Bool(true))
+        }
+
         /// The body's JSON-RPC `method`.
         pub(crate) fn method(&self) -> String {
             serde_json::from_str::<serde_json::Value>(&self.body)

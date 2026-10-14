@@ -263,7 +263,7 @@ fn send(addr: &str, message: Value) -> Value {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "SendMessage",
-        "params": { "message": message }
+        "params": { "message": message, "configuration": {"returnImmediately": true} }
     })
     .to_string();
     http_post_json(addr, "/", &body)

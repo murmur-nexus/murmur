@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use capsule_runtime::formation::{FORMATION_ID_ENV, FORMATION_PEERS_ENV};
 use capsule_runtime::{FormationId, MemberLifeline, FORMATION_LIFELINE_ENV};
 use common::door_capsule::{
-    agent_project, driver_home, end_turn, message, rpc, wait_completed, wait_for_requests,
-    AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
+    agent_project, driver_home, end_turn, message, returning_immediately, rpc, wait_completed,
+    wait_for_requests, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
 };
 use common::{
     assert_wound_down_by_formation, event_kinds as kinds, read_whole_trace as read_trace,
@@ -228,7 +228,12 @@ impl Member {
     }
 
     fn send(&self, message: Value) -> String {
-        let sent = rpc(&self.url(), Some(&self.token()), "SendMessage", message);
+        let sent = rpc(
+            &self.url(),
+            Some(&self.token()),
+            "SendMessage",
+            returning_immediately(message),
+        );
         assert_eq!(sent.status, 200, "{sent:?}");
         sent.json()["result"]["task"]["id"]
             .as_str()

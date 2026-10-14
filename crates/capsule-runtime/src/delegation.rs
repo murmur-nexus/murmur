@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::a2a::{user_message, A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER};
+use crate::a2a::{send_message_params, user_message, A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER};
 use crate::errors::RuntimeError;
 use crate::http_client::http_json;
 use crate::origin::{TaskOrigin, PEER_ORIGIN_HEADER};
@@ -472,13 +472,11 @@ pub fn deliver_completion(
         "jsonrpc": "2.0",
         "id": format!("req_{}", uuid::Uuid::now_v7().simple()),
         "method": "SendMessage",
-        "params": {
-            "message": user_message(
-                &format!("msg_{}", uuid::Uuid::now_v7().simple()),
-                Some(&handle.context_id),
-                &outcome.message_text(),
-            )
-        }
+        "params": send_message_params(user_message(
+            &format!("msg_{}", uuid::Uuid::now_v7().simple()),
+            Some(&handle.context_id),
+            &outcome.message_text(),
+        ))
     })
     .to_string();
 
@@ -816,6 +814,7 @@ mod tests {
         deliver_completion(&handle(), &to, &outcome()).unwrap();
         let sent = sent.join().unwrap();
         assert_eq!(sent.method(), "SendMessage");
+        assert!(sent.returns_immediately(), "{}", sent.body);
         assert_eq!(sent.header("a2a-version"), ["1.0"]);
         assert_eq!(sent.header(PEER_ORIGIN_HEADER), ["completion"]);
         assert_eq!(sent.header(DELEGATION_ID_HEADER), ["dlg_0001"]);

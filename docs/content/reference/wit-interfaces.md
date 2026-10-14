@@ -330,8 +330,9 @@ the component is aborted and the attempt ends; the task ends `TASK_STATE_FAILED`
 
 Sends a task to a peer capsule. `send` takes the peer URL and a message — a `message-id`, an
 optional `context-id`, and the `text` — and returns the peer's `task-id`, `context-id`, and
-`state`. The runtime sends it as a JSON-RPC `SendMessage` with `A2A-Version: 1.0`, so the capsule
-never sees the wire format.
+`state`. The runtime sends it as a JSON-RPC `SendMessage` with `A2A-Version: 1.0` and
+`configuration.returnImmediately: true`, so the peer answers as soon as it accepts the task and the
+capsule never sees the wire format.
 
 | Behaviour | Detail |
 |---|---|

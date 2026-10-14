@@ -208,7 +208,7 @@ fn rpc(addr: &str, method: &str, params: Value) -> Value {
 }
 
 fn submit(addr: &str, message_id: &str, text: &str) -> String {
-    let params = json!({"message": {
+    let params = json!({"configuration": {"returnImmediately": true}, "message": {
         "messageId": message_id,
         "role": "ROLE_USER",
         "parts": [{"text": text, "mediaType": "text/plain"}]

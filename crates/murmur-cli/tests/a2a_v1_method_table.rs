@@ -19,9 +19,9 @@ use std::{
 };
 
 use common::door_capsule::{
-    agent_project, driver_home, end_turn, launch_door, message, push_config_requests, request, rpc,
-    stage_door, stage_door_with_tools, Response, AUTHENTICATION_YAML, CREDENTIALS_YAML,
-    DRIVER_NAME, DRIVER_VERSION, QUEUE_SLEEP_YAML,
+    agent_project, driver_home, end_turn, launch_door, message, push_config_requests, request,
+    returning_immediately, rpc, stage_door, stage_door_with_tools, Response, AUTHENTICATION_YAML,
+    CREDENTIALS_YAML, DRIVER_NAME, DRIVER_VERSION, QUEUE_SLEEP_YAML,
 };
 use common::stream::{stream_method, subscribe, Event, STREAM_EXTENSION_URI};
 use serde_json::{json, Value};
@@ -115,7 +115,7 @@ impl Door {
 
     /// Starts a task as `who` with `params`, and returns its id.
     fn start(&self, who: Option<&str>, params: Value) -> String {
-        let answer = self.answer(who, "SendMessage", params);
+        let answer = self.answer(who, "SendMessage", returning_immediately(params));
         answer["result"]["task"]["id"]
             .as_str()
             .unwrap_or_else(|| panic!("SendMessage answered no task: {answer}"))
@@ -582,7 +582,11 @@ fn owner_rule_hides_another_credentials_tasks_on_every_method() {
         listed.contains(&done) && listed.contains(&waiting),
         "{listed:?}"
     );
-    let answered = door.answer(Some("operator"), "SendMessage", reply(&waiting, "left"));
+    let answered = door.answer(
+        Some("operator"),
+        "SendMessage",
+        returning_immediately(reply(&waiting, "left")),
+    );
     assert_eq!(
         answered["result"]["task"]["status"]["state"], "TASK_STATE_WORKING",
         "{answered}"
@@ -803,7 +807,11 @@ fn subscribe_input_required_survives_the_wait_and_resumes_from_a_cursor() {
         !watcher.is_finished(),
         "the subscription ended on input-required"
     );
-    door.answer(None, "SendMessage", reply(&first, "left"));
+    door.answer(
+        None,
+        "SendMessage",
+        returning_immediately(reply(&first, "left")),
+    );
     let (response, events) = watcher.join().unwrap();
     assert_eq!(events[0].kind(), "task", "{response:?}");
     assert_eq!(events[0].state(), Some("TASK_STATE_INPUT_REQUIRED"));
@@ -823,7 +831,11 @@ fn subscribe_input_required_survives_the_wait_and_resumes_from_a_cursor() {
     let second = door.start(None, message("m-second", "ask me again"));
     door.wait_state(None, &second, "TASK_STATE_INPUT_REQUIRED");
     let watcher = subscribe_in_background(&door.addr, &second, Some(0));
-    door.answer(None, "SendMessage", reply(&second, "right"));
+    door.answer(
+        None,
+        "SendMessage",
+        returning_immediately(reply(&second, "right")),
+    );
     let (response, events) = watcher.join().unwrap();
     assert_eq!(events[0].kind(), "task", "{response:?}");
     assert_eq!(events[0].id, None, "{response:?}");

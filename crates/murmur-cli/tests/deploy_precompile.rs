@@ -238,7 +238,7 @@ fn post_task(address: &str) {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "SendMessage",
-        "params": {"message": {
+        "params": {"configuration": {"returnImmediately": true}, "message": {
             "messageId": "msg-1",
             "role": "ROLE_USER",
             "parts": [{"text": "Say hello.", "mediaType": "text/plain"}]

@@ -365,7 +365,9 @@ fn every_method_the_card_lists_is_answered_and_an_unlisted_one_is_not() {
     assert_eq!(common::card_capsule_params(&card)["planes"], json!([]));
     assert_eq!(card["capabilities"]["streaming"], true);
 
-    let sent = post_jsonrpc(&capsule.url, &rpc("SendMessage", message_params("m-send")));
+    let mut params = message_params("m-send");
+    params["configuration"] = json!({"returnImmediately": true});
+    let sent = post_jsonrpc(&capsule.url, &rpc("SendMessage", params));
     assert_ne!(sent["error"]["code"], -32601, "SendMessage: {sent}");
     let task_id = sent["result"]["task"]["id"]
         .as_str()

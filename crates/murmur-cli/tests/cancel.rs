@@ -299,7 +299,7 @@ fn send_message(addr: &str, message_id: &str, text: &str, context_id: Option<&st
             "jsonrpc": "2.0",
             "id": 1,
             "method": "SendMessage",
-            "params": {"message": message}
+            "params": {"message": message, "configuration": {"returnImmediately": true}}
         })
         .to_string(),
     )

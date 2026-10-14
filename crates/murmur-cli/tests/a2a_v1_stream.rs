@@ -20,8 +20,9 @@ use std::{
 };
 
 use common::door_capsule::{
-    agent_project, driver_home, end_turn, launch_door, message, request, rpc, stage_door,
-    stage_door_with_tools, Response, A2A_VERSION, DRIVER_NAME, DRIVER_VERSION, QUEUE_SLEEP_YAML,
+    agent_project, driver_home, end_turn, launch_door, message, request, returning_immediately,
+    rpc, stage_door, stage_door_with_tools, Response, A2A_VERSION, DRIVER_NAME, DRIVER_VERSION,
+    QUEUE_SLEEP_YAML,
 };
 use common::stream::{
     extensions_header, of_task, stream_message, stream_message_with, Event, Watch,
@@ -600,7 +601,8 @@ fn own_task_only_on_a_message_stream_and_every_task_on_watch() {
         Some(format!("{}, {STREAM_EXTENSION_URI}", common::DOOR_EXTENSION_URI).as_str())
     );
 
-    let first = door.rpc("SendMessage", message("m-a", "a"))["result"]["task"]["id"]
+    let first = door.rpc("SendMessage", returning_immediately(message("m-a", "a")))["result"]
+        ["task"]["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -650,7 +652,8 @@ fn refusal_busy_rejects_in_one_task_event_and_malformed_is_json() {
         &QUEUE_SLEEP_YAML.replace("queue_depth: 8", "queue_depth: 1"),
     );
     // One task running and one queued fill a queue of one.
-    let running = door.rpc("SendMessage", message("m-1", "one"))["result"]["task"]["id"]
+    let running = door.rpc("SendMessage", returning_immediately(message("m-1", "one")))["result"]
+        ["task"]["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -659,7 +662,7 @@ fn refusal_busy_rejects_in_one_task_event_and_malformed_is_json() {
         assert!(Instant::now() < deadline, "the first task never started");
         thread::sleep(Duration::from_millis(20));
     }
-    door.rpc("SendMessage", message("m-2", "two"));
+    door.rpc("SendMessage", returning_immediately(message("m-2", "two")));
 
     let (response, events) = door.stream(message("m-3", "three"), true);
     assert_eq!(response.status, 200);

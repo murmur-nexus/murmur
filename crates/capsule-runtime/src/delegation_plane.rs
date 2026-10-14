@@ -41,8 +41,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::a2a::{
-    user_message, A2aTask, SendMessageResult, TaskState, A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER,
-    RESPONSE_ARTIFACT,
+    send_message_params, user_message, A2aTask, SendMessageResult, TaskState, A2A_PROTOCOL_VERSION,
+    A2A_VERSION_HEADER, RESPONSE_ARTIFACT,
 };
 use crate::child_launch::{
     launch_child_capsule, workdir_relative_to, ChildLaunchRequest, LaunchedChild,
@@ -992,9 +992,11 @@ fn deliver_task(
         "jsonrpc": "2.0",
         "id": delegation_id,
         "method": "SendMessage",
-        "params": {
-            "message": user_message(&format!("msg_{delegation_id}"), None, &request.task)
-        }
+        "params": send_message_params(user_message(
+            &format!("msg_{delegation_id}"),
+            None,
+            &request.task
+        ))
     })
     .to_string();
     let authorization = door_token.map(crate::door_auth::bearer_header);
@@ -1264,8 +1266,8 @@ mod tests {
         assert!(refused.contains("403 peer_not_accepted"), "{refused}");
     }
 
-    /// The task goes to the child as an A2A 1.0 `SendMessage`, and is polled with `GetTask`, each
-    /// naming the version beside the child's bearer.
+    /// The task goes to the child as an A2A 1.0 `SendMessage` answered at acceptance, and is polled
+    /// with `GetTask`, each naming the version beside the child's bearer.
     #[test]
     fn a_delegation_hands_over_and_polls_with_a2a_1_0_requests() {
         use crate::http_client::capture::answer_one;
@@ -1287,6 +1289,7 @@ mod tests {
         assert_eq!(task_id, "tsk_child");
         let sent = sent.join().unwrap();
         assert_eq!(sent.method(), "SendMessage");
+        assert!(sent.returns_immediately(), "{}", sent.body);
         assert_eq!(sent.header("a2a-version"), ["1.0"]);
         assert_eq!(sent.header("authorization"), ["Bearer tok"]);
         let message = sent.message();

@@ -24,8 +24,8 @@ use capsule_runtime::{
     ChildLifeline, FormationId, MemberLifeline, FORMATION_LIFELINE_ENV, SPAWNER_LIFELINE_ENV,
 };
 use common::door_capsule::{
-    agent_project, driver_home, end_turn, message, rpc, wait_for_requests, AUTHENTICATION_YAML,
-    QUEUE_SLEEP_YAML,
+    agent_project, driver_home, end_turn, message, returning_immediately, rpc, wait_for_requests,
+    AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
 };
 use common::{
     event_kinds as kinds, read_whole_trace as read_trace, sessions_under, signal, ScriptedServer,
@@ -243,7 +243,7 @@ impl Session {
             &self.url(),
             Some(&self.token()),
             "SendMessage",
-            message("m-held", "hold"),
+            returning_immediately(message("m-held", "hold")),
         );
         assert_eq!(sent.status, 200, "{sent:?}");
         sent.json()["result"]["task"]["id"]

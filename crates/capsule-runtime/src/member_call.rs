@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::a2a::{
-    user_message, A2aError, A2aTask, SendMessageResult, TaskState, A2A_PROTOCOL_VERSION,
-    A2A_VERSION_HEADER,
+    send_message_params, user_message, A2aError, A2aTask, SendMessageResult, TaskState,
+    A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER,
 };
 use crate::cancel::CancelSignal;
 use crate::formation_credentials::{virtual_url, FormationMember, FormationToken};
@@ -340,7 +340,7 @@ fn offer_task(
         "jsonrpc": "2.0",
         "id": request_id,
         "method": "SendMessage",
-        "params": { "message": user_message(&format!("msg_{call_id}"), None, task) }
+        "params": send_message_params(user_message(&format!("msg_{call_id}"), None, task))
     });
     let member = &route.member;
     let answer = door_request(route, &body, timeout).map_err(|error| {
@@ -2722,6 +2722,31 @@ pub(crate) mod tests {
             unconfirmed_cancel(Err(DoorRequestError::Transport("gone".to_string()))).as_deref(),
             Some("gone")
         );
+    }
+
+    /// A task goes to a callee's door as a `SendMessage` answered at acceptance, and the call
+    /// takes the id of the task the door holds.
+    #[test]
+    fn an_offer_asks_the_callee_s_door_to_answer_at_acceptance() {
+        let (addr, sent) = crate::http_client::capture::answer_one(
+            json!({"jsonrpc": "2.0", "id": "mcl_1", "result": {"task": {"id": "tsk_worker",
+                "contextId": "c", "status": {"state": "TASK_STATE_SUBMITTED"}}}})
+            .to_string(),
+        );
+        let route = CallRoute {
+            formation: member_calling(&["worker"], &format!("http://{addr}")),
+            network_allow_rules: rules(&["127.0.0.1"]),
+            member: "worker".to_string(),
+            headers: CallHeaders::new(None, None),
+        };
+        assert_eq!(
+            send_task(&route, "mcl_1", "review this").unwrap(),
+            "tsk_worker"
+        );
+        let sent = sent.join().unwrap();
+        assert_eq!(sent.method(), "SendMessage");
+        assert!(sent.returns_immediately(), "{}", sent.body);
+        assert_eq!(sent.message()["parts"][0]["text"], "review this");
     }
 
     /// Every request to a callee's door names A2A 1.0, beside its bearer and the call headers.

@@ -908,6 +908,9 @@ pub(crate) struct IncomingMessage {
     /// harness session its context names before its first attempt. Never `true` on a message
     /// that names a `taskId`.
     pub forget_session: bool,
+    /// `configuration.returnImmediately`: `SendMessage` answers once the task is accepted rather
+    /// than once it settles. `SendStreamingMessage` reads no meaning into it.
+    pub return_immediately: bool,
 }
 
 /// Why the door refused a message, and so answered no task.
@@ -979,11 +982,12 @@ pub(crate) fn push_notification_not_supported(id: Value) -> JsonRpcResponse {
 /// are strings where present; `referenceTaskIds` is an array of non-empty strings naming at most
 /// [`MAX_REFERENCE_TASK_IDS`] distinct tasks; `metadata[DOOR_EXTENSION_URI]` is an object where
 /// present; its `forgetSession` is a boolean where present; `forgetSession: true` names no
-/// `taskId`. Then the first `raw` or `url` part is [`MessageRefusal::ContentTypeNotSupported`],
-/// and a `configuration.taskPushNotificationConfig` that is present and not `null` is
+/// `taskId`; `configuration.returnImmediately` is a boolean where present and not `null`. Then the
+/// first `raw` or `url` part is [`MessageRefusal::ContentTypeNotSupported`], and a
+/// `configuration.taskPushNotificationConfig` that is present and not `null` is
 /// [`MessageRefusal::PushNotificationNotSupported`]. The rest of `configuration` and unknown
-/// fields are ignored, a `metadata` that is not an object and every other key of it and of the
-/// door extension's object among them.
+/// fields are ignored, a `configuration` that is not an object, a `metadata` that is not an object
+/// and every other key of it and of the door extension's object among them.
 pub(crate) fn read_send_params(params: &Value) -> Result<IncomingMessage, MessageRefusal> {
     let invalid = |message: String| Err(MessageRefusal::InvalidParams(message));
     let Some(message) = params.get("message").and_then(Value::as_object) else {
@@ -1082,6 +1086,12 @@ pub(crate) fn read_send_params(params: &Value) -> Result<IncomingMessage, Messag
              not on one that continues task {task_id}"
         ));
     }
+    let configuration = params.get("configuration");
+    let return_immediately = match configuration.and_then(|c| c.get("returnImmediately")) {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(immediately)) => *immediately,
+        Some(_) => return invalid("configuration.returnImmediately must be a boolean".to_string()),
+    };
     if let Some((part_index, part)) = parts
         .iter()
         .enumerate()
@@ -1093,8 +1103,7 @@ pub(crate) fn read_send_params(params: &Value) -> Result<IncomingMessage, Messag
             media_type: part.media_type.clone(),
         });
     }
-    if params
-        .get("configuration")
+    if configuration
         .and_then(|configuration| configuration.get("taskPushNotificationConfig"))
         .is_some_and(|config| !config.is_null())
     {
@@ -1108,6 +1117,7 @@ pub(crate) fn read_send_params(params: &Value) -> Result<IncomingMessage, Messag
         parts,
         door_extension: door_metadata.is_some(),
         forget_session,
+        return_immediately,
     })
 }
 
@@ -1187,6 +1197,16 @@ pub(crate) fn user_message(message_id: &str, context_id: Option<&str>, text: &st
         message["contextId"] = Value::String(context_id.to_string());
     }
     message
+}
+
+/// The `SendMessage` params a murmur client sends a door: `message` with
+/// `configuration.returnImmediately: true`, so the door answers once the task is accepted rather
+/// than once it settles.
+pub(crate) fn send_message_params(message: Value) -> Value {
+    serde_json::json!({
+        "message": message,
+        "configuration": { "returnImmediately": true },
+    })
 }
 
 /// A `SendMessageResponse`, as a door's `SendMessage` `result` carries it: the oneof of a task and
@@ -3398,6 +3418,86 @@ mod tests {
         );
     }
 
+    /// `params` for a well-formed message with `configuration` as given.
+    fn configured(configuration: Value) -> Value {
+        serde_json::json!({
+            "message": user(serde_json::json!([{"text": "a"}])),
+            "configuration": configuration,
+        })
+    }
+
+    #[test]
+    fn read_send_params_reads_return_immediately_true_only_for_true() {
+        let immediately = read_send_params(&configured(serde_json::json!({
+            "returnImmediately": true,
+        })))
+        .unwrap();
+        assert!(immediately.return_immediately);
+        for params in [
+            params(user(serde_json::json!([{"text": "a"}]))),
+            configured(Value::Null),
+            configured(serde_json::json!({})),
+            configured(serde_json::json!({"returnImmediately": null})),
+            configured(serde_json::json!({"returnImmediately": false})),
+            configured(serde_json::json!({"historyLength": 2})),
+            configured(serde_json::json!("ignored")),
+        ] {
+            assert!(
+                !read_send_params(&params).unwrap().return_immediately,
+                "{params}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_send_params_refuses_a_return_immediately_that_is_not_a_boolean() {
+        for value in [
+            Value::from("yes"),
+            Value::from(1),
+            serde_json::json!({}),
+            serde_json::json!([true]),
+        ] {
+            let params = configured(serde_json::json!({ "returnImmediately": value }));
+            assert_eq!(
+                invalid_params(&params),
+                "configuration.returnImmediately must be a boolean",
+                "{params}"
+            );
+            let answer = wire(
+                &read_send_params(&params)
+                    .unwrap_err()
+                    .into_response(1.into()),
+            );
+            assert_eq!(answer["error"]["code"], -32602);
+            assert_eq!(
+                answer["error"]["message"],
+                "Invalid params: configuration.returnImmediately must be a boolean"
+            );
+        }
+    }
+
+    /// The flag is the last `-32602` check: after the door extension's, before the file part and
+    /// the push config.
+    #[test]
+    fn read_send_params_checks_return_immediately_in_order() {
+        let mut message = with_metadata(door(serde_json::json!({"forgetSession": 1})), None);
+        message["configuration"] = serde_json::json!({"returnImmediately": "yes"});
+        assert!(invalid_params(&message).contains("forgetSession"));
+
+        let mut message = configured(serde_json::json!({
+            "returnImmediately": "yes",
+            "taskPushNotificationConfig": {"url": "https://example.com/hook"},
+        }));
+        message["message"]["parts"] = serde_json::json!([{"raw": "aGk="}]);
+        assert!(invalid_params(&message).contains("returnImmediately"));
+
+        message["configuration"]["returnImmediately"] = Value::Bool(true);
+        assert!(matches!(
+            read_send_params(&message),
+            Err(MessageRefusal::ContentTypeNotSupported { .. })
+        ));
+    }
+
     /// A file part is refused only once the message is otherwise well formed, naming the first.
     #[test]
     fn read_send_params_refuses_the_first_file_part_with_content_type_not_supported() {
@@ -3521,6 +3621,20 @@ mod tests {
             .get("contextId")
             .is_none());
         assert!(read_send_params(&params(user_message("msg_1", None, "hello"))).is_ok());
+    }
+
+    #[test]
+    fn send_message_params_answer_at_acceptance() {
+        let message = user_message("msg_1", None, "hello");
+        let params = send_message_params(message.clone());
+        assert_eq!(
+            params,
+            serde_json::json!({
+                "message": message,
+                "configuration": {"returnImmediately": true},
+            })
+        );
+        assert!(read_send_params(&params).unwrap().return_immediately);
     }
 
     #[test]

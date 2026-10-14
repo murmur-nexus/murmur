@@ -495,6 +495,13 @@ pub fn message(message_id: &str, text: &str) -> Value {
         "parts": [{"text": text, "mediaType": "text/plain"}]}})
 }
 
+/// `SendMessage` `params` with `configuration.returnImmediately: true`, so the door answers once
+/// the task is accepted rather than once it settles.
+pub fn returning_immediately(mut params: Value) -> Value {
+    params["configuration"] = json!({"returnImmediately": true});
+    params
+}
+
 /// Polls `GetTask` under `token` until the task reaches `TASK_STATE_COMPLETED`, and returns it.
 pub fn wait_completed(addr: &str, token: Option<&str>, task_id: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -578,7 +585,7 @@ pub fn authenticated_capsule_with_a_task_in_flight(
         &run.url(),
         Some(&run.token("operator")),
         "SendMessage",
-        message("m-held", "hold"),
+        returning_immediately(message("m-held", "hold")),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
     let task_id = sent.json()["result"]["task"]["id"]

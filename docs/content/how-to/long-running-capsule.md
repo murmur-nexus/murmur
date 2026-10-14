@@ -162,7 +162,8 @@ curl -s -X POST http://localhost:$PORT \
         "contextId": "ctx-001",
         "role": "ROLE_USER",
         "parts": [{"text": "Here are some scores: alice=92, bob=85, carol=78, dave=91. How many entries are there?"}]
-      }
+      },
+      "configuration": {"returnImmediately": true}
     }
   }'
 ```
@@ -184,6 +185,9 @@ Response:
 ```
 
 Save the returned `result.task.id` — that is the **task ID** you will use to poll status.
+`"returnImmediately": true` is what has the door answer once it accepts the task. Without it the
+door holds the request until the task settles and answers with the finished task — see
+[Agent Card: Answers](../reference/agent-card.md#send-message-response).
 
 Send a second task while the first is still running. Use the same `contextId` to continue the conversation thread:
 
@@ -201,7 +205,8 @@ curl -s -X POST http://localhost:$PORT \
         "contextId": "ctx-001",
         "role": "ROLE_USER",
         "parts": [{"text": "Who has the highest score?"}]
-      }
+      },
+      "configuration": {"returnImmediately": true}
     }
   }'
 ```

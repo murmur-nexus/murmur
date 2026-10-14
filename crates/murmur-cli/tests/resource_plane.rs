@@ -134,6 +134,7 @@ fn message_send_body(id: &str, text: &str) -> String {
         "id": 1,
         "method": "SendMessage",
         "params": {
+            "configuration": {"returnImmediately": true},
             "message": {
                 "messageId": id,
                 "role": "ROLE_USER",

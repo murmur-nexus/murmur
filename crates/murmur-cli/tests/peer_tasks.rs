@@ -22,8 +22,8 @@ use capsule_runtime::{
     StageRequest, StagedSession, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER,
 };
 use common::door_capsule::{
-    agent_project, driver_home, end_turn, message, request, rpc, Response, A2A_VERSION,
-    AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
+    agent_project, driver_home, end_turn, message, request, returning_immediately, rpc, Response,
+    A2A_VERSION, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
 };
 use murmur_artifact::{load_runtime_manifest, ContainmentClass, LocalRegistry};
 use serde_json::{json, Value};
@@ -223,7 +223,7 @@ fn send(addr: &str, headers: &[(&str, &str)], message_id: &str) -> Response {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "SendMessage",
-        "params": message(message_id, "hello from elsewhere"),
+        "params": returning_immediately(message(message_id, "hello from elsewhere")),
     })
     .to_string();
     let mut headers = headers.to_vec();

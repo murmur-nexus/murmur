@@ -1971,7 +1971,10 @@ fn two_tier_formation_trace_names_every_call() {
             addr,
             Some(&token),
             "SendMessage",
-            common::door_capsule::message(&format!("m-op-{sent}"), "OPERATOR-TASK"),
+            common::door_capsule::returning_immediately(common::door_capsule::message(
+                &format!("m-op-{sent}"),
+                "OPERATOR-TASK",
+            )),
         )
         .json();
         if answer["result"]["task"]["status"]["state"] == "TASK_STATE_REJECTED" {

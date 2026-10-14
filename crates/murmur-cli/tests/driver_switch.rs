@@ -510,7 +510,7 @@ impl Idle {
             "jsonrpc": "2.0",
             "id": n,
             "method": "SendMessage",
-            "params": {"message": {
+            "params": {"configuration": {"returnImmediately": true}, "message": {
                 "messageId": format!("switch-{n}"),
                 "role": "ROLE_USER",
                 "contextId": CONTEXT,

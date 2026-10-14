@@ -2,7 +2,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::a2a::{
-    murmur_state_name, send_message_member, user_message, A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER,
+    murmur_state_name, send_message_member, send_message_params, user_message,
+    A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER,
 };
 use crate::origin::{stamp_for_peer, TaskProvenance, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER};
 
@@ -65,13 +66,11 @@ pub(crate) async fn send_a2a_message(
         "jsonrpc": "2.0",
         "id": request_id,
         "method": "SendMessage",
-        "params": {
-            "message": user_message(
-                &message.message_id,
-                message.context_id.as_deref(),
-                &message.text,
-            )
-        }
+        "params": send_message_params(user_message(
+            &message.message_id,
+            message.context_id.as_deref(),
+            &message.text,
+        ))
     })
     .to_string();
 
@@ -429,7 +428,8 @@ mod tests {
         }
     }
 
-    /// The guest's message goes out as an A2A 1.0 `SendMessage`, naming its version.
+    /// The guest's message goes out as an A2A 1.0 `SendMessage` answered at acceptance, naming its
+    /// version.
     #[tokio::test]
     async fn outbound_send_is_a_v1_send_message_naming_its_version() {
         let request = request_head_for(None).await;
@@ -440,6 +440,10 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
         assert_eq!(body["method"], "SendMessage");
+        assert_eq!(
+            body["params"]["configuration"],
+            serde_json::json!({"returnImmediately": true})
+        );
         let message = &body["params"]["message"];
         assert_eq!(message["role"], "ROLE_USER");
         assert_eq!(

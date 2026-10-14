@@ -637,7 +637,7 @@ fn send_message(addr: &str, text: &str) -> String {
     let sent = rpc(
         addr,
         "SendMessage",
-        json!({"message": {
+        json!({"configuration": {"returnImmediately": true}, "message": {
             "messageId": "msg-1",
             "role": "ROLE_USER",
             "parts": [{"text": text, "mediaType": "text/plain"}]
