@@ -350,7 +350,7 @@ registry:
   index_url: https://my-org.example.com/artifacts-index.json
 ```
 
-`registry.index_url` applies to every `mur search` invocation that does not pass `--registry`.
+`registry.index_url` applies to every `mur search` invocation that does not pass `--index`.
 
 **`artifacts-index.json` shape:**
 
@@ -385,21 +385,23 @@ registry:
 
 ---
 
-## Registry selection rules
+## Resolution order { #resolution-order }
 
-`mur install` and `mur publish` resolve artifacts against either the local registry under
-`~/.murmur/artifacts/` or a remote Nexus registry, chosen in this order:
+`mur` reads artifacts from the stores on disk and the sources under `registry.sources`. A
+`murmur.yaml` does not choose between them: a top-level `registry:` key in one is refused with
+[`E-MAN-003`](diagnostics.md#e-man-003).
 
-1. `--registry <value>` — `local` (case-insensitive) selects local mode; any other value is the
-   remote URL.
-2. `registry.remote_url` in `murmur.yaml` — remote mode at that URL.
-3. `registry.default` in `murmur.yaml` — `local` or `remote`; `remote` uses
-   `http://localhost:7800`. Any other value fails with `E-IO-003`.
-4. Local mode.
+| Command | Resolves from, in order |
+|---|---|
+| `mur install <name>@<version>` | 1. The global store `~/.murmur/artifacts/`<br>2. Each source in `registry.sources` |
+| `mur install` (no argument) | The same, for each artifact `murmur.yaml` declares |
+| `mur install <name>` | Each source in `registry.sources`, latest release |
+| `mur install github:<owner>/<repo>@<tag>` | That repository's release |
+| `mur install <path>` | The file |
+| `mur publish` | Writes into the global store |
+| `mur run`, `mur doctor`, `mur eval` | 1. The project store `<project root>/.murmur/artifacts/`<br>2. The global store. Never a source |
 
-These two keys live in the workspace manifest `murmur.yaml`. Its `registry.default` takes `local`
-or `remote`, unlike `registry.default` in `.murmur/config.yaml`, which names a `sources` entry.
+Sources are tried with the one `registry.default` names first, then the rest in the order listed;
+[Merge rules](#merge-rules) set which sources the chain holds. A `<name>@<version>` that neither
+the global store nor any source has fails with `E-REG-001`.
 
-Remote mode requires the `NEXUS_API_KEY` environment variable; without it the command fails with
-`E-IO-003` and the message `NEXUS_API_KEY is required for remote registry mode. Set it or use
-local mode.`

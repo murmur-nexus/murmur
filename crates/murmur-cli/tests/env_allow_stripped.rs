@@ -36,7 +36,6 @@ fn refused_explain_scope_stderr(
     let mut command = Command::cargo_bin("mur").unwrap();
     command
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .env_remove("GITHUB_TOKEN")
         .current_dir(project_dir)
         .args(["run", "--manifest", "murmur.yaml", "--explain-scope"]);
@@ -177,7 +176,6 @@ fn a_real_run_refuses_before_any_registry_work() {
     let output = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .env("GITHUB_TOKEN", "a-real-looking-token")
         .args([
             "run",
@@ -221,7 +219,6 @@ fn doctor_warns_that_run_will_refuse_and_keeps_going() {
     let output = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .env_remove("GITHUB_TOKEN")
         .current_dir(dir.path())
         .arg("doctor")

@@ -4,15 +4,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use murmur_artifact::{ContainmentClass, LocalRegistry, Registry};
+use murmur_artifact::ContainmentClass;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    error::{CliError, E_IO_001, E_IO_003},
-    registry_client::RemoteRegistry,
-};
-
-pub(crate) const DEFAULT_REMOTE_REGISTRY: &str = "http://localhost:7800";
+use crate::error::{CliError, E_IO_001, E_IO_003};
 
 /// Runtime feature flag state. Persisted under `beta:` in ~/.murmur/config.yaml.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -174,106 +169,6 @@ impl SourceConfig {
 #[serde(rename_all = "lowercase")]
 pub enum SourceType {
     GitHub,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct WorkspaceConfig {
-    #[serde(default)]
-    registry: WorkspaceRegistryConfig,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct WorkspaceRegistryConfig {
-    default: Option<String>,
-    remote_url: Option<String>,
-}
-
-pub(crate) enum RegistryMode {
-    Local,
-    Remote { url: String },
-}
-
-pub(crate) fn resolve_registry(
-    registry_override: Option<&str>,
-) -> Result<Box<dyn Registry>, CliError> {
-    let config = load_workspace_config()?;
-    let mode = resolve_registry_mode(registry_override, &config)?;
-
-    match mode {
-        RegistryMode::Local => Ok(Box::new(
-            LocalRegistry::from_default_home().map_err(CliError::from)?,
-        )),
-        RegistryMode::Remote { url } => {
-            let api_key = std::env::var("NEXUS_API_KEY").map_err(|_| {
-                CliError::new(
-                    E_IO_003,
-                    "NEXUS_API_KEY is required for remote registry mode. Set it or use local mode.",
-                )
-            })?;
-            Ok(Box::new(RemoteRegistry::new(url, api_key)))
-        }
-    }
-}
-
-fn resolve_registry_mode(
-    registry_override: Option<&str>,
-    config: &WorkspaceConfig,
-) -> Result<RegistryMode, CliError> {
-    if let Some(url) = registry_override {
-        if url.trim().eq_ignore_ascii_case("local") {
-            return Ok(RegistryMode::Local);
-        }
-        return Ok(RegistryMode::Remote {
-            url: url.trim().trim_end_matches('/').to_string(),
-        });
-    }
-
-    if let Some(remote_url) = config
-        .registry
-        .remote_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return Ok(RegistryMode::Remote {
-            url: remote_url.trim_end_matches('/').to_string(),
-        });
-    }
-
-    match config.registry.default.as_deref() {
-        None | Some("local") => Ok(RegistryMode::Local),
-        Some("remote") => Ok(RegistryMode::Remote {
-            url: DEFAULT_REMOTE_REGISTRY.to_string(),
-        }),
-        Some(other) => Err(CliError::new(
-            E_IO_003,
-            format!(
-                "invalid registry.default '{}' (expected local|remote)",
-                other
-            ),
-        )),
-    }
-}
-
-fn load_workspace_config() -> Result<WorkspaceConfig, CliError> {
-    let config_path = workspace_config_path()?;
-    if !config_path.exists() {
-        return Ok(WorkspaceConfig::default());
-    }
-
-    let raw = fs::read_to_string(&config_path).map_err(|source| {
-        CliError::new(
-            E_IO_003,
-            format!("failed to read {}: {source}", config_path.display()),
-        )
-    })?;
-
-    serde_yaml::from_str::<WorkspaceConfig>(&raw).map_err(|source| {
-        CliError::new(
-            E_IO_003,
-            format!("failed to parse {}: {source}", config_path.display()),
-        )
-    })
 }
 
 pub fn load_mur_config() -> Result<MurConfig, CliError> {
@@ -606,42 +501,6 @@ fn write_mur_config_file(
     })?;
 
     Ok(())
-}
-
-fn workspace_config_path() -> Result<PathBuf, CliError> {
-    let cwd = std::env::current_dir().map_err(|source| {
-        CliError::new(
-            E_IO_003,
-            format!("failed to determine current working directory: {source}"),
-        )
-    })?;
-    Ok(cwd.join("murmur.yaml"))
-}
-
-/// Build a `RemoteRegistry` pointing at the URL from `murmur.yaml` (or the
-/// built-in default) using `NEXUS_API_KEY` from the environment.
-// No command wires up remote-registry mode; this is the single place that resolves the URL
-// and `NEXUS_API_KEY`, and deleting it would scatter that resolution across any future caller.
-#[allow(dead_code)]
-pub(crate) fn build_remote_registry() -> Result<RemoteRegistry, CliError> {
-    let config = load_workspace_config()?;
-    let url = config
-        .registry
-        .remote_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| DEFAULT_REMOTE_REGISTRY.to_string());
-
-    let api_key = std::env::var("NEXUS_API_KEY").map_err(|_| {
-        CliError::new(
-            E_IO_003,
-            "NEXUS_API_KEY is required for remote registry mode. Set it or use local mode.",
-        )
-    })?;
-
-    Ok(RemoteRegistry::new(url, api_key))
 }
 
 pub fn mur_config_path() -> Result<PathBuf, CliError> {

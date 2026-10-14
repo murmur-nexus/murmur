@@ -165,7 +165,6 @@ fn mur(home: &Path, cwd: &Path, stub: &Stub, token: Option<&str>) -> Command {
     command
         .env("HOME", home)
         .env("MUR_GITHUB_API_BASE", &stub.api_base)
-        .env_remove("NEXUS_API_KEY")
         .current_dir(cwd);
     match token {
         Some(token) => command.env("GITHUB_TOKEN", token),

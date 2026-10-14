@@ -80,6 +80,7 @@ plugins:
         reference/build-lints.md: reference/diagnostics.md
         reference/capsule-io.md: reference/workdir.md
         reference/verification.md: reference/containment.md
+        reference/nexus-api.md: concepts/registry.md
 
 hooks:
   # Dumps fully-resolved page markdown to .agent-export/pages.json for the
@@ -163,7 +164,7 @@ nav:
       - Context: concepts/context.md
       - Formations: concepts/formations.md
       - Observability: concepts/observability.md
-      - Registry: concepts/registry.md
+      - Sources and stores: concepts/registry.md
   - How-to Guides:
       - Configure a long-running capsule: how-to/long-running-capsule.md
       - Lock down a capsule's capabilities: how-to/lock-down-capsule.md
@@ -206,7 +207,6 @@ nav:
       - Default Artifacts: reference/default-artifacts.md
       - Installing Artifacts: reference/installing-artifacts.md
       - WIT Interfaces: reference/wit-interfaces.md
-      - Nexus API: reference/nexus-api.md
       - Roost API: reference/roost-api.md
   - Contributing:
       - Overview: contributing/index.md

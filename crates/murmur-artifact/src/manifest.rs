@@ -42,6 +42,9 @@ pub enum ManifestError {
     },
     #[error("{}: field '{field}' {message}", MANIFEST_FILENAME)]
     InvalidValue { field: String, message: String },
+    /// The manifest declares a top-level [`REGISTRY_BLOCK_KEY`].
+    #[error("{}", REGISTRY_BLOCK_MESSAGE)]
+    RegistryBlock,
     #[error("failed to read {} at {path}: {source}", MANIFEST_FILENAME)]
     Io {
         path: String,
@@ -49,6 +52,21 @@ pub enum ManifestError {
         source: std::io::Error,
     },
 }
+
+/// The top-level key no `murmur.yaml` may declare. Where artifacts come from is the operator's
+/// configuration, not the manifest's: the project store, the global store, then the sources under
+/// `registry.sources` in `~/.murmur/config.yaml`. Both manifest parsers refuse the key before
+/// validating any other field, with [`ManifestError::RegistryBlock`] and
+/// [`crate::RuntimeManifestError::RegistryBlock`].
+pub const REGISTRY_BLOCK_KEY: &str = "registry";
+
+/// The message of both `RegistryBlock` refusals.
+pub const REGISTRY_BLOCK_MESSAGE: &str = "murmur.yaml: 'registry' is not a manifest key";
+
+/// The hint the CLI attaches to both `RegistryBlock` refusals.
+pub const REGISTRY_BLOCK_HINT: &str = "remove it; artifacts resolve from the project store \
+     (.murmur/artifacts/), the global store (~/.murmur/artifacts/), and then the sources under \
+     registry.sources in ~/.murmur/config.yaml";
 
 #[must_use = "validated manifest is required to proceed with build"]
 pub fn load_manifest(path: &Path) -> Result<Manifest, ManifestError> {
@@ -108,6 +126,10 @@ impl Manifest {
                 expected: "mapping".to_string(),
                 got: yaml_type_name(&value),
             })?;
+
+        if root.contains_key(Value::String(REGISTRY_BLOCK_KEY.to_string())) {
+            return Err(ManifestError::RegistryBlock);
+        }
 
         let name = required_string(root, "name")?;
         let version = required_string(root, "version")?;
@@ -561,6 +583,35 @@ mod upstream_auth_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_block_is_refused() {
+        let err = Manifest::from_yaml_str(
+            "name: hello\nversion: 0.1.0\nruntime: tool\nregistry:\n  default: local\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ManifestError::RegistryBlock), "{err:?}");
+        assert_eq!(err.to_string(), REGISTRY_BLOCK_MESSAGE);
+    }
+
+    #[test]
+    fn registry_block_is_refused_before_any_other_field() {
+        // `name` is missing and `execution` is invalid; the registry refusal still wins.
+        let err = Manifest::from_yaml_str(
+            "version: 0.1.0\nruntime: tool\nexecution: bogus\nregistry: {}\n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ManifestError::RegistryBlock), "{err:?}");
+    }
+
+    #[test]
+    fn a_manifest_without_a_registry_block_parses_unchanged() {
+        let manifest =
+            Manifest::from_yaml_str("name: hello\nversion: 0.1.0\nruntime: tool\n").unwrap();
+        assert_eq!(manifest.name, "hello");
+        assert_eq!(manifest.version, "0.1.0");
+        assert_eq!(manifest.runtime, "tool");
+    }
 
     #[test]
     fn missing_name_field_is_actionable() {

@@ -39,7 +39,7 @@ use crate::error::{
     CliError, E_CAP_002, E_CAP_004, E_CAP_005, E_CAP_006, E_CAP_014, E_CAP_015, E_CAP_016,
     E_IO_003, E_RUN_019,
 };
-use crate::registry_client::FallbackRegistry;
+use crate::stores::FallbackRegistry;
 
 /// Whether an installed artifact's payload can run on the host doctor is checking for.
 ///

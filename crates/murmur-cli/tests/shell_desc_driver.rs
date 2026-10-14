@@ -16,12 +16,6 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
     let project = tempfile::tempdir().unwrap();
     let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
 
-    fs::write(
-        project.path().join("murmur.yaml"),
-        "registry:\n  default: local\n",
-    )
-    .unwrap();
-
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {

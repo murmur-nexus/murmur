@@ -56,7 +56,8 @@ pub use lockfile::{
 };
 pub use manifest::{
     describe_yaml_shape, load_manifest, parse_upstream_auth, refuse_retired_auth_block, Manifest,
-    ManifestError, UpstreamAuth, RETIRED_AUTH_BLOCK, UPSTREAM_AUTH_KEY_PLACEHOLDER,
+    ManifestError, UpstreamAuth, REGISTRY_BLOCK_HINT, REGISTRY_BLOCK_KEY, REGISTRY_BLOCK_MESSAGE,
+    RETIRED_AUTH_BLOCK, UPSTREAM_AUTH_KEY_PLACEHOLDER,
 };
 pub use manifest_path::{resolve_manifest_path, MANIFEST_FILENAME};
 pub use payload_shape::{

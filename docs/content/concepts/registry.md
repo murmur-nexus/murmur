@@ -1,27 +1,38 @@
-# Registry
+# Sources and stores
 
-Murmur Nexus is the artifact registry layer.
+`mur` gets artifacts from two kinds of place:
 
-Its responsibility is simple: store and serve versioned `.mur.zip` artifacts.
+| Kind | What it is | Where it is configured |
+|---|---|---|
+| Store | A directory of installed `.mur.zip` artifacts on this machine: the project store `<project root>/.murmur/artifacts/` and the global store `~/.murmur/artifacts/`. See [Local artifact cache](../reference/installing-artifacts.md#local-artifact-cache) | Fixed paths |
+| Source | A GitHub repository whose releases carry `.mur.zip` assets. `murmur-nexus/default-artifacts` is built in | `registry.sources` in `~/.murmur/config.yaml` — see [Multiple sources and fallthrough](../reference/installing-artifacts.md#multiple-sources-and-fallthrough) |
 
-## Versioning and channels
+`mur install` copies an artifact from a source, a store or a file into a store. `mur publish` writes
+an artifact you built into the global store. `mur run` reads the stores only, so a capsule launches
+with exactly what was installed and never reaches the network for an artifact.
 
-Murmur treats versions as immutable identities. Channel pointers (for example `latest`/`stable`) are mutable aliases that resolve to concrete versions at install time.
+## Resolution order
 
-For reproducibility, lock data records concrete resolved versions and artifact hashes — see
+`mur install <name>@<version>`, and `mur install` with no argument, check the global store before
+any source, so an artifact you published or installed with `-g` is copied rather than downloaded
+again. `mur run`, `mur doctor` and `mur eval` read the project store, then the global store, and
+never a source. Sources are tried with the one `registry.default` names first, then the rest in
+the order listed. The order for every form of `mur install` is in
+[Resolution order](../reference/config.md#resolution-order).
+
+A `murmur.yaml` does not choose where its artifacts come from: a top-level `registry:` key is
+refused with [`E-MAN-003`](../reference/diagnostics.md#e-man-003).
+
+## Versioning
+
+Murmur treats versions as immutable identities. For reproducibility, lock data records concrete
+resolved versions and artifact hashes — see
 [Lockfile (`murmur.lock`)](../reference/workdir.md#lockfile-murmurlock) for which
 commands read and write it.
 
-## Local vs remote resolution
-
-Murmur supports:
-
-- **Local registry mode** — resolves artifacts from the [local stores](../reference/installing-artifacts.md#local-artifact-cache) on disk: the project store at `<project root>/.murmur/artifacts/` and the global store at `~/.murmur/artifacts/`. `mur run` checks the project store first and the global store second. The default source for populating them is the `murmur-nexus/default-artifacts` GitHub repository.
-- **Remote registry mode** — resolves artifacts from a Nexus instance over HTTP. Requires `NEXUS_API_KEY` to be set.
-
 ## Lock integrity { #lock-integrity }
 
-`murmur.lock` pins what a project actually resolved: for every registry-resolved artifact, the
+`murmur.lock` pins what a project actually resolved: for every artifact resolved from a store or a source, the
 concrete version and the sha256 of its bytes. Local-source artifacts are never written to it —
 they are read fresh from disk on every run.
 
@@ -46,8 +57,8 @@ installed, with nothing to compare it against.
 
 ## Artifact integrity
 
-Every `.mur.zip` a capsule or the CLI reads — whether fetched from the registry or already on
-disk — goes through a shared hardening layer before any of its bytes are trusted:
+Every `.mur.zip` a capsule or the CLI reads — whether fetched from a source or already in a
+store — goes through a shared hardening layer before any of its bytes are trusted:
 
 - **Path sanitization** — an entry name with a leading `/` or any `..` component is never
   selected as the capsule's root `.wasm` file (or any other extracted file); it's treated as if

@@ -6,7 +6,7 @@
 
 | Form | Example | Resolved against |
 |---|---|---|
-| Name and version | `murmur-tool-git@{{ v.murmur_tool_git }}` | The registry first, then the configured sources |
+| Name and version | `murmur-tool-git@{{ v.murmur_tool_git }}` | The global store first, then the configured sources |
 | Bare name | `murmur-tool-git` | The configured sources, latest release |
 | GitHub release | `github:<owner>/<repo>@<tag>` | That release, directly |
 | Local file | `./murmur-tool-git-{{ v.murmur_tool_git }}.mur.zip` | A path on disk. A reference counts as a path when it starts with `./`, `../` or `/`, or contains `/` and ends in `.mur.zip` |
@@ -130,6 +130,6 @@ The `wit_contracts` key of the metadata file records the versioned WIT interface
 
 The global root is derived from `$HOME` (or `$USERPROFILE` on Windows). No environment variable overrides it; to relocate the store, set `HOME` before invoking `mur`.
 
-## Registry selection
+## Resolution order { #resolution-order }
 
-A `<name>@<version>` reference is resolved against a registry first, and falls through to the configured sources only when the registry does not have it. The registry is the local store unless remote mode is selected, by `--registry <url>`, by `registry.remote_url` in `murmur.yaml`, or by `registry.default: remote` in `murmur.yaml`. Remote mode requires the `NEXUS_API_KEY` environment variable. See [Registry selection rules](config.md#registry-selection-rules).
+A `<name>@<version>` reference is resolved from the global store `~/.murmur/artifacts/` first, and falls through to the configured sources only when the global store does not have it. `mur install` with no argument does the same for each artifact `murmur.yaml` declares. The order for every command is in [Resolution order](config.md#resolution-order).

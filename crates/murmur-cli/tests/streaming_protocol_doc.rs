@@ -117,7 +117,6 @@ fn start_capsule(server: &common::ScriptedServer, name: &str) -> Capsule {
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args(["publish", driver.to_str().unwrap()])
         .assert()
         .success();
@@ -145,7 +144,6 @@ fn start_capsule(server: &common::ScriptedServer, name: &str) -> Capsule {
         .arg("--json")
         .current_dir(project.path())
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -493,7 +491,6 @@ fn watch_reports_a_lost_connection() {
 
     let mut watch = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
         .args(["watch", "--url", &capsule.url()])
-        .env_remove("NEXUS_API_KEY")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -816,7 +813,6 @@ fn watch_prints_the_same_lines() {
 
     let mut watch = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
         .args(["watch", "--url", &addr])
-        .env_remove("NEXUS_API_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()

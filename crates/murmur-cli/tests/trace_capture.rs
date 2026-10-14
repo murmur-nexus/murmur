@@ -456,7 +456,6 @@ fn mur_run_with_trace(trace_block: &str) -> (assert_cmd::assert::Assert, tempfil
     let assert = assert_cmd::Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args(["run", "--manifest", manifest_path.to_str().unwrap()])
         .args(["--task", "Digest the wire."])
         .assert();

@@ -140,7 +140,7 @@ fn run_and_read(home: &TempDir, manifest: &Path) -> String {
 
 fn explain_scope(home: &TempDir, manifest: &Path, json: bool) -> Command {
     let mut cmd = Command::cargo_bin("mur").unwrap();
-    cmd.env("HOME", home.path()).env_remove("NEXUS_API_KEY");
+    cmd.env("HOME", home.path());
     cmd.args(["run", "--manifest", manifest.to_str().unwrap()]);
     if json {
         cmd.arg("--json");
@@ -445,7 +445,6 @@ fn an_unresolvable_home_refuses_only_a_capsule_that_declared_a_store() {
     refused
         .current_dir(cwd.path())
         .env("HOME", "relative-home")
-        .env_remove("NEXUS_API_KEY")
         .args(["run", "--manifest", declared.to_str().unwrap()])
         .assert()
         .failure()
@@ -462,7 +461,6 @@ fn an_unresolvable_home_refuses_only_a_capsule_that_declared_a_store() {
     launched
         .current_dir(cwd.path())
         .env("HOME", "relative-home")
-        .env_remove("NEXUS_API_KEY")
         .args(["run", "--manifest", undeclared.to_str().unwrap()])
         .assert()
         .success();

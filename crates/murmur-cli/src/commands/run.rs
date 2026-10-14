@@ -32,7 +32,7 @@ use crate::{
         CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_008, E_RUN_015, E_RUN_016, E_RUN_019,
         E_RUN_047,
     },
-    registry_client::FallbackRegistry,
+    stores::FallbackRegistry,
 };
 
 use super::{

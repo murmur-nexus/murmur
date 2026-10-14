@@ -72,7 +72,6 @@ impl Scratch {
         command
             .args(args)
             .env("HOME", self.home.path())
-            .env_remove("NEXUS_API_KEY")
             .current_dir(self.cwd.path())
             .stdin(Stdio::null());
         command
@@ -190,7 +189,6 @@ fn assert_head_takes_one_line(scratch: &Scratch, pipeline: &str) {
     let output = Command::new("bash")
         .args(["-c", &format!("set -o pipefail; {pipeline}")])
         .env("HOME", scratch.home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(scratch.cwd.path())
         .stdin(Stdio::null())
         .output()

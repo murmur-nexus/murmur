@@ -59,7 +59,6 @@ pub fn assert_trace_ends_canceled(trace_path: &Path) {
     let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
         .args(["trace", "show"])
         .arg(trace_path)
-        .env_remove("NEXUS_API_KEY")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -169,7 +168,6 @@ pub fn write_no_source_config(home: &Path) {
 pub fn publish_local(home: &TempDir, artifact_path: &Path) -> Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args(["publish", artifact_path.to_str().unwrap()])
         .assert()
 }
@@ -201,28 +199,25 @@ pub fn install_artifact_to_project_with_home(
 ) -> Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project_dir)
         .args(["install", artifact_path.to_str().unwrap()])
         .args(extra_args)
         .assert()
 }
 
-#[allow(dead_code)]
 pub fn run_capsule(home: &TempDir, manifest_path: &Path) -> Assert {
     run_capsule_with_env(home, manifest_path, &[])
 }
 
 /// `run_capsule` with `extra_env` set on the `mur` process itself, for tests that need a
 /// host variable present in the runtime's environment to observe whether it reaches a guest.
-#[allow(dead_code)]
 pub fn run_capsule_with_env(
     home: &TempDir,
     manifest_path: &Path,
     extra_env: &[(&str, &str)],
 ) -> Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
-    cmd.env("HOME", home.path()).env_remove("NEXUS_API_KEY");
+    cmd.env("HOME", home.path());
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -1051,7 +1046,6 @@ pub fn explain_scope_json(home: &TempDir, manifest: &Path) -> Value {
     let stdout = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",

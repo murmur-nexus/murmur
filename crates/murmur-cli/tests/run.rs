@@ -533,7 +533,6 @@ fn run_no_env_file_skips_dotenv_and_refuses_the_unresolved_credential() {
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .env_remove("CI_TEST_VAR")
         .args([
             "run",
@@ -566,7 +565,6 @@ fn run_without_no_env_file_flag_loads_dotenv_and_reads_the_credential_from_it() 
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .env_remove("CI_TEST_VAR")
         .args(["run", "--manifest", manifest_path.to_str().unwrap()])
         .assert()
@@ -897,7 +895,6 @@ fn authenticated_parent_refused() {
     let output = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args(["run", "--manifest", manifest.to_str().unwrap()])
         .current_dir(project.path())
         .assert()

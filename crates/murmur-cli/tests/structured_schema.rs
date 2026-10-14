@@ -137,11 +137,6 @@ fn setup_agent_project(endpoint: &str) -> (TempDir, PathBuf) {
 
     fs::write(
         project.path().join("murmur.yaml"),
-        "registry:\n  default: local\n",
-    )
-    .unwrap();
-    fs::write(
-        project.path().join("murmur.yaml"),
         format!(
             "name: structured-agent\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n"
         ),
@@ -191,7 +186,6 @@ fn run_mur(home: &TempDir, manifest_path: &Path, extra_args: &[&str]) -> String 
 
     let output = cmd
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args(args)
         .assert()
         .success()

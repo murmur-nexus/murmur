@@ -4,7 +4,8 @@ use capsule_runtime::{
     process_driver::PROCESS_DRIVER_IFACE, RosterRefusal, RuntimeError, MAX_ARTIFACT_CONFIG_BYTES,
 };
 use murmur_artifact::{
-    BuildError, ManifestError, RegistryError, MANIFEST_FILENAME, RETIRED_AUTH_BLOCK,
+    BuildError, ManifestError, RegistryError, MANIFEST_FILENAME, REGISTRY_BLOCK_HINT,
+    RETIRED_AUTH_BLOCK,
 };
 
 // Manifest parsing
@@ -931,6 +932,9 @@ impl From<ManifestError> for CliError {
                 E_MAN_003,
                 format!("{MANIFEST_FILENAME}: field '{field}' {message}"),
             ),
+            error @ ManifestError::RegistryBlock => {
+                CliError::with_hint(E_MAN_003, error.to_string(), REGISTRY_BLOCK_HINT)
+            }
             ManifestError::NotFound(path) => {
                 CliError::new(E_IO_001, format!("{MANIFEST_FILENAME} not found at {path}"))
             }

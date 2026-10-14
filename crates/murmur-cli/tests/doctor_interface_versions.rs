@@ -73,7 +73,6 @@ fn mur_doctor(home: &TempDir, project_dir: &Path) -> assert_cmd::assert::Assert 
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project_dir)
         .arg("doctor")
         .assert()

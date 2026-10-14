@@ -130,6 +130,15 @@ One `murmur.yaml` can be both manifests at once: a capsule you also publish carr
 run-time meaning from them, and do not report them as unrecognized keys
 ([`W-SEC-019`](diagnostics.md#w-sec-019)).
 
+Where artifacts come from is set in `~/.murmur/config.yaml`, not in a manifest — see
+[Resolution order](config.md#resolution-order). Both manifests refuse a top-level `registry:` key,
+whatever it holds, before any other field is checked, so `mur install`, `mur run`, `mur doctor`,
+`mur eval`, `mur build` and `mur publish` all fail on it with `E-MAN-003`:
+
+| Field | Refused with |
+|---|---|
+| `registry` | `murmur.yaml: 'registry' is not a manifest key` |
+
 ### Supported shape
 
 ```yaml

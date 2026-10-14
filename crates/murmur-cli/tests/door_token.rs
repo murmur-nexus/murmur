@@ -37,7 +37,6 @@ impl Redirected {
             .arg(manifest)
             .current_dir(manifest.parent().unwrap())
             .env("HOME", home)
-            .env_remove("NEXUS_API_KEY")
             .env_remove(capsule_runtime::DOOR_TOKEN_ENV)
             .env_remove(capsule_runtime::formation::FORMATION_ID_ENV)
             .env_remove(capsule_runtime::formation::FORMATION_PEERS_ENV)

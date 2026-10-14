@@ -617,7 +617,6 @@ fn mur(home: &Path, project: &Path, args: &[&str]) -> std::process::Output {
     assert_cmd::Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home)
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project)
         .args(args)
         .output()

@@ -180,7 +180,6 @@ fn start(home: TempDir, project: TempDir, manifest: &Path, env: &[(&str, &str)])
         .arg("--json")
         .current_dir(project.path())
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (key, value) in env {

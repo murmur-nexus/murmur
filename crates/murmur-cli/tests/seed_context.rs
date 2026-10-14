@@ -50,12 +50,6 @@ fn create_manifest(
     seed_budget: &str,
     hook_names: &[&str],
 ) -> PathBuf {
-    fs::write(
-        project_dir.join("murmur.yaml"),
-        "registry:\n  default: local\n",
-    )
-    .unwrap();
-
     let hooks: String = hook_names
         .iter()
         .map(|name| format!("  - name: {name}\n    version: 0.1.0\n    runtime: hook\n"))

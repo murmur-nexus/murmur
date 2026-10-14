@@ -871,7 +871,6 @@ fn s11_a_process_manifest_without_a_driver_is_refused() {
         let output = Command::cargo_bin("mur")
             .unwrap()
             .env("HOME", home.path())
-            .env_remove("NEXUS_API_KEY")
             .current_dir(project.path())
             .args([
                 "run",

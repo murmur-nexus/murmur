@@ -1052,7 +1052,6 @@ fn a_malformed_read_only_entry_refuses_the_launch() {
 
         mur()
             .env("HOME", home.path())
-            .env_remove("NEXUS_API_KEY")
             .args([
                 "run",
                 "--manifest",
@@ -1089,7 +1088,6 @@ fn staging_warns_that_read_only_is_advisory_for_an_interpreter() {
 
     mur()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",
@@ -1127,7 +1125,6 @@ fn no_declaration_means_no_warning() {
 
     mur()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",
@@ -1212,7 +1209,6 @@ fn staging_warns_that_an_unannotated_tool_schema_is_judged_by_key_name() {
     );
     mur()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",
@@ -1234,7 +1230,6 @@ fn staging_warns_that_an_unannotated_tool_schema_is_judged_by_key_name() {
     );
     mur()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",
@@ -1266,7 +1261,6 @@ fn staging_warns_about_a_path_shaped_property_beside_an_annotated_one() {
     );
     mur()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",
@@ -1300,7 +1294,6 @@ fn staging_warns_about_an_opaque_string_property() {
     );
     mur()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",
@@ -1338,7 +1331,6 @@ fn a_declared_destination_list_silences_the_schema_warning() {
             staging_project_with_tool(&home, artifact_dir.path(), &["tests"], tool, Some(schema));
         mur()
             .env("HOME", home.path())
-            .env_remove("NEXUS_API_KEY")
             .args([
                 "run",
                 "--manifest",
@@ -1367,7 +1359,6 @@ fn a_capsule_without_read_only_gets_no_schema_warning() {
 
     mur()
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .args([
             "run",
             "--manifest",

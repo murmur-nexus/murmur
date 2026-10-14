@@ -118,7 +118,6 @@ impl Project {
     fn run(&self, extra: &[&str]) -> Assert {
         let mut cmd = Command::cargo_bin("mur").unwrap();
         cmd.env("HOME", self.home.path())
-            .env_remove("NEXUS_API_KEY")
             .args([
                 "run",
                 "--manifest",
@@ -520,7 +519,6 @@ fn a_runtime_pin_bound_as_the_system_prompt_fails_with_e_run_043() {
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", p.home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(p.project.path())
         .args(["install", &format!("{PULLED_SKILL}@{SKILL_VERSION}")])
         .assert()

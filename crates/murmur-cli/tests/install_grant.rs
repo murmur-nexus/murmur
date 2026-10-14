@@ -22,7 +22,6 @@ fn mur(home: &TempDir, project_dir: &Path, args: &[&str]) -> Command {
     let mut command = Command::cargo_bin("mur").unwrap();
     command
         .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
         .current_dir(project_dir)
         .args(args);
     command

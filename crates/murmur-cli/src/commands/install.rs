@@ -10,16 +10,18 @@ use murmur_artifact::{
     current_platform, load_manifest_from_artifact_bytes, load_runtime_manifest, read_lockfile,
     registry_warning_link, resolve_manifest_path, sha256_hex, split_platform_suffix,
     split_platform_tag, verify_sha256, write_lockfile_atomic, ArtifactMeta, ArtifactRef,
-    LocalRegistry, LockOrigin, LockedSha256, LockfileError, MurmurLock, Platform, RegistryError,
-    RuntimeType, LOCK_VERSION, MANIFEST_FILENAME, SUPPORTED_PLATFORMS, W_REG_001,
+    LocalRegistry, LockOrigin, LockedSha256, LockfileError, MurmurLock, Platform, Registry,
+    RegistryError, RuntimeType, LOCK_VERSION, MANIFEST_FILENAME, SUPPORTED_PLATFORMS, W_REG_001,
 };
 use rayon::prelude::*;
 
 use crate::{
-    config::{load_effective_mur_config, resolve_registry},
+    config::load_effective_mur_config,
     error::{CliError, E_IO_001, E_IO_003, E_REG_001, E_REG_005},
     source::{SourceChain, SourceChainError},
 };
+
+use super::runtime_manifest_error_to_cli;
 
 /// Compare a registry-resolved artifact against any existing `murmur.lock` pin at
 /// `lock_path`, refusing to install when they disagree. A missing lockfile is not a
@@ -296,7 +298,6 @@ fn format_bytes(n: u64) -> String {
 
 pub(crate) fn run_install(
     artifact_ref: Option<&str>,
-    registry_override: Option<&str>,
     global: bool,
     all_platforms: bool,
     no_precompile: bool,
@@ -308,14 +309,8 @@ pub(crate) fn run_install(
     let (store, project_root) = determine_store(global)?;
 
     match artifact_ref {
-        None => install_manifest_deps(&store, &project_root, registry_override, no_precompile),
-        Some(ref_str) => install_single(
-            ref_str,
-            registry_override,
-            &store,
-            project_root.as_deref(),
-            no_precompile,
-        ),
+        None => install_manifest_deps(&store, &project_root, no_precompile),
+        Some(ref_str) => install_single(ref_str, &store, project_root.as_deref(), no_precompile),
     }
 }
 
@@ -380,7 +375,6 @@ fn configured_source_chain() -> Result<Option<SourceChain>, CliError> {
 
 fn install_single(
     artifact_ref: &str,
-    registry_override: Option<&str>,
     store: &LocalRegistry,
     project_root: Option<&Path>,
     no_precompile: bool,
@@ -411,12 +405,13 @@ fn install_single(
         return Ok(());
     }
 
-    // name@version — registry first, source chain fallback on NotFound
+    // name@version — the global store first, the source chain on NotFound
     let (name, version) = parse_versioned_ref(artifact_ref)?;
-    let registry = resolve_registry(registry_override)?;
+    let global_store = LocalRegistry::from_default_home().map_err(CliError::from)?;
     // The name the payload is filed under, which for a native artifact carries its platform tag.
     let mut file_stem = format!("{name}-{version}");
-    let payload = match registry.resolve_with_platform(name, version, Some(current_platform())) {
+    let payload = match global_store.resolve_with_platform(name, version, Some(current_platform()))
+    {
         Ok(resolved) => {
             verify_sha256(name, version, &resolved.bytes, &resolved.sha256)
                 .map_err(CliError::from)?;
@@ -476,7 +471,6 @@ fn install_single(
 fn install_manifest_deps(
     store: &LocalRegistry,
     project_root: &Option<PathBuf>,
-    registry_override: Option<&str>,
     no_precompile: bool,
 ) -> Result<(), CliError> {
     let root = match project_root {
@@ -487,7 +481,7 @@ fn install_manifest_deps(
 
     let manifest_path = resolve_manifest_path(&root);
     let runtime_manifest =
-        load_runtime_manifest(&manifest_path).map_err(super::runtime_manifest_error_to_cli)?;
+        load_runtime_manifest(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
 
     // Collect only the artifacts we need to install (skip inline-source ones).
     let artifacts: Vec<_> = runtime_manifest
@@ -501,7 +495,7 @@ fn install_manifest_deps(
         return Ok(());
     }
 
-    let registry = resolve_registry(registry_override)?;
+    let global_store = LocalRegistry::from_default_home().map_err(CliError::from)?;
     let source_chain = configured_source_chain()?;
 
     // Pre-check which artifacts are already in the project store.
@@ -599,7 +593,7 @@ fn install_manifest_deps(
             let result = fetch_and_store(
                 artifact.name.as_str(),
                 artifact.version.as_str(),
-                &*registry,
+                &global_store,
                 source_chain.as_ref(),
                 store,
                 &lock_path,
@@ -777,17 +771,17 @@ struct FetchOutcome {
     payload: bytes::Bytes,
 }
 
-/// Fetch one artifact from the registry (or source chain fallback) and write it
-/// to the store.
+/// Fetch one artifact from the global store (or the source chain on a miss) and write it
+/// to `store`.
 fn fetch_and_store(
     name: &str,
     version: &str,
-    registry: &dyn murmur_artifact::Registry,
+    global_store: &LocalRegistry,
     source_chain: Option<&SourceChain>,
     store: &LocalRegistry,
     lock_path: &Path,
 ) -> Result<FetchOutcome, CliError> {
-    match registry.resolve_with_platform(name, version, Some(current_platform())) {
+    match global_store.resolve_with_platform(name, version, Some(current_platform())) {
         Ok(resolved) => {
             verify_sha256(name, version, &resolved.bytes, &resolved.sha256)
                 .map_err(CliError::from)?;
@@ -1066,4 +1060,55 @@ fn store_display(store: &LocalRegistry) -> String {
         }
     }
     root.display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use tempfile::tempdir;
+    use zip::{write::SimpleFileOptions, ZipWriter};
+
+    fn native_zip(name: &str, version: &str) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut cursor);
+            let opts = SimpleFileOptions::default();
+            zip.start_file("murmur.yaml", opts).unwrap();
+            write!(
+                zip,
+                "name: {name}\nversion: {version}\nruntime: tool\nimplementation: native\n"
+            )
+            .unwrap();
+            zip.start_file(format!("bin/{name}"), opts).unwrap();
+            zip.write_all(b"binary").unwrap();
+            zip.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    /// A native `.mur.zip` installed from a file records the packaging type it declares.
+    #[test]
+    fn a_local_file_install_records_the_declared_packaging_type() {
+        let bytes = native_zip("my-tool", "1.0.0");
+
+        // The local-file path reads the platform off the file name, so the file is named the
+        // way a published platform-tagged asset is.
+        let platform = murmur_artifact::SUPPORTED_PLATFORMS[0];
+        let source_dir = tempdir().unwrap();
+        let file = source_dir
+            .path()
+            .join(format!("my-tool-1.0.0-{platform}.mur.zip"));
+        std::fs::write(&file, &bytes).unwrap();
+
+        let store_dir = tempdir().unwrap();
+        let store = murmur_artifact::LocalRegistry::new(store_dir.path());
+        super::install_from_local_file(file.to_str().unwrap(), &store, None).unwrap();
+
+        let meta_path = store.metadata_path_for("my-tool", "1.0.0", Some(platform));
+        let recorded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(meta_path).unwrap()).unwrap();
+        assert_eq!(recorded["meta"]["runtime"], "native");
+        assert_eq!(recorded["meta"]["artifact_runtime"], "tool");
+    }
 }

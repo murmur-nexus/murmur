@@ -70,7 +70,6 @@ impl Scratch {
             .args(args)
             .current_dir(self.path())
             .env("HOME", self.home.path())
-            .env_remove("NEXUS_API_KEY")
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("OPENAI_API_KEY")
             .env_remove(capsule_runtime::DOOR_TOKEN_ENV)
@@ -985,6 +984,7 @@ fn the_default_build_has_only_the_roster_form() {
     assert!(help.stdout.contains("--roster <NAME>"), "{}", help.stdout);
     assert!(!help.stdout.contains("<TASK>"), "{}", help.stdout);
     assert!(!help.stdout.contains("--registry"), "{}", help.stdout);
+    assert!(!help.stdout.contains("--index"), "{}", help.stdout);
 
     let task = scratch.run(&["new", "summarise a doc"]);
     task.assert_code(2);
@@ -1000,9 +1000,30 @@ fn the_roster_form_conflicts_with_the_task_form() {
     scratch
         .run(&["new", "--roster", "crew", "summarise a doc"])
         .assert_code(2);
-    scratch
-        .run(&["new", "--roster", "crew", "--registry", "local"])
-        .assert_code(2);
+    let conflict = scratch.run(&["new", "--roster", "crew", "--index", "local"]);
+    conflict.assert_code(2);
+    assert!(conflict.stderr.contains("--index"), "{}", conflict.stderr);
+    assert!(scratch.tree().is_empty(), "{:?}", scratch.tree());
+}
+
+#[cfg(feature = "beta-mur-new")]
+#[test]
+fn the_task_form_refuses_registry_and_names_index() {
+    let scratch = Scratch::new();
+    let refused = scratch.run(&["new", "summarise a doc", "--registry", "local"]);
+    refused.assert_code(2);
+    assert!(
+        refused.stderr.contains("unexpected argument '--registry'"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        refused
+            .stderr
+            .contains("hint: to choose the artifact index, pass --index <PATH|URL|local>"),
+        "{}",
+        refused.stderr
+    );
     assert!(scratch.tree().is_empty(), "{:?}", scratch.tree());
 }
 
