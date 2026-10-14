@@ -360,7 +360,7 @@ registry:
   "updated_at": "2026-06-07T00:00:00Z",
   "artifacts": [
     {
-      "name": "murmur-tool-git",
+      "name": "tool-git",
       "version": "1.0.0",
       "runtime": "tool",
       "description": "Structured git interface for Murmur capsules.",
@@ -376,7 +376,7 @@ registry:
 | `schema_version` | string | yes | Must be `"1"`. Any other value fails the search with `E-IO-003` |
 | `updated_at` | string | yes | ISO 8601 UTC timestamp of the last regeneration |
 | `artifacts` | array | yes | One entry per published artifact |
-| `name` | string | yes | Artifact name, matching `name:` in its `murmur.yaml` |
+| `name` | string | yes | Artifact name, matching `name:` in its `murmur.yaml`: the bare name, without a scope |
 | `version` | string | yes | SemVer string |
 | `runtime` | string | yes | `driver`, `hook`, `tool`, or `skill` |
 | `description` | string | no | Short description from `murmur.yaml`. `mur search` matches the query against it and prints an em dash when it is absent |
@@ -393,15 +393,15 @@ registry:
 
 | Command | Resolves from, in order |
 |---|---|
-| `mur install <name>@<version>` | 1. The global store `~/.murmur/artifacts/`<br>2. Each source in `registry.sources` |
+| `mur install <scope>/<name>@<version>` | 1. The global store `~/.murmur/artifacts/`<br>2. Each source in `registry.sources`, asked for `<name>`. A `local/` artifact is never asked of a source |
 | `mur install` (no argument) | The same, for each artifact `murmur.yaml` declares |
-| `mur install <name>` | Each source in `registry.sources`, latest release |
+| `mur install <scope>/<name>` | Each source in `registry.sources`, asked for `<name>`, latest release |
 | `mur install github:<owner>/<repo>@<tag>` | That repository's release |
-| `mur install <path>` | The file |
-| `mur publish` | Writes into the global store |
+| `mur install <path>` | The file, installed as `local/<name>` |
+| `mur publish` | Writes into the global store, as `local/<name>` |
 | `mur run`, `mur doctor`, `mur eval` | 1. The project store `<project root>/.murmur/artifacts/`<br>2. The global store. Never a source |
 
 Sources are tried with the one `registry.default` names first, then the rest in the order listed;
-[Merge rules](#merge-rules) set which sources the chain holds. A `<name>@<version>` that neither
+[Merge rules](#merge-rules) set which sources the chain holds. A `<scope>/<name>@<version>` that neither
 the global store nor any source has fails with `E-REG-001`.
 

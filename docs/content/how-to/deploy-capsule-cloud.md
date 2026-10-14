@@ -50,7 +50,7 @@ deploy:
   mur_version: "X.Y.Z"
 
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
     gateway:
@@ -61,7 +61,7 @@ inference:
   transport: http
   model: {{ v.model_anthropic }}
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 ```
 
 When `deploy.mur_version` is set, `mur deploy run` downloads that exact binary from GitHub releases and caches it at `~/.murmur/bin/mur-{version}-linux-x86_64`. Subsequent deploys with the same version skip the download entirely.
@@ -89,13 +89,13 @@ Initial state (everything pending):
 
 ```text
   · ↓ 1 artifact  1 to fetch
-      · ↓ murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}
+      · ↓ murmur/driver-anthropic@{{ v.murmur_driver_anthropic }}
   · ↓ mur vX.Y.Z
   · SSH
   · ↑ mur binary
   · ↑ files
   · ↑ 1 artifact
-      · ↑ murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}
+      · ↑ murmur/driver-anthropic@{{ v.murmur_driver_anthropic }}
   · ⚙ compile 1 artifact
   · → start capsule
 ```
@@ -104,7 +104,7 @@ During downloads, each artifact being fetched shows a bytes / total bar:
 
 ```text
   ⠸ ↓ 1 artifact
-      ⠸ ↓ murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}  1.38 MiB/2.90 MiB  [██████░░░░░░]
+      ⠸ ↓ murmur/driver-anthropic@{{ v.murmur_driver_anthropic }}  1.38 MiB/2.90 MiB  [██████░░░░░░]
   · ↓ mur vX.Y.Z
   ...
 ```
@@ -310,7 +310,7 @@ inference:
   model: {{ v.model_anthropic }}
   system_prompt_file: instructions.md
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 ```
 
 `mur deploy run` automatically detects `instructions.md` as a referenced local file, verifies it exists before attempting any SSH connection, and uploads it alongside the manifest to the remote deploy directory. No additional flags required.
@@ -343,7 +343,7 @@ In the manifest, reference variables with `${VAR_NAME}`:
 
 ```yaml
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
     gateway:

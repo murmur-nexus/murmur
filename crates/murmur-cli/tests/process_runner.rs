@@ -26,7 +26,7 @@ use zip::{
     CompressionMethod, ZipWriter,
 };
 
-const DRIVER: &str = "fixture-process-driver";
+const DRIVER: &str = "local/fixture-process-driver";
 const DRIVER_VERSION: &str = "0.1.0";
 const TOOL: &str = "echo-tool";
 
@@ -180,7 +180,7 @@ impl Built {
                 create_tool_artifact(artifacts.path(), TOOL, DRIVER_VERSION, &echo_tool_wasm());
             common::publish_local(&home, &tool).success();
             entries.push_str(&format!(
-                "  - name: {TOOL}\n    version: {DRIVER_VERSION}\n    runtime: tool\n"
+                "  - name: local/{TOOL}\n    version: {DRIVER_VERSION}\n    runtime: tool\n"
             ));
         }
         if let Some((name, binding, wasm)) = self.hook.as_ref() {
@@ -188,7 +188,7 @@ impl Built {
                 common::hook_wat::create_hook_zip(artifacts.path(), name, binding, "none", wasm);
             common::publish_local(&home, &hook).success();
             entries.push_str(&format!(
-                "  - name: {name}\n    version: {DRIVER_VERSION}\n    runtime: hook\n"
+                "  - name: local/{name}\n    version: {DRIVER_VERSION}\n    runtime: hook\n"
             ));
         }
 
@@ -889,7 +889,7 @@ fn s11_a_process_manifest_without_a_driver_is_refused() {
         assert!(!output.status.success(), "{text}");
         assert!(text.contains("E-MAN-003"), "{text}");
         assert!(text.contains("inference.driver.artifact"), "{text}");
-        assert!(text.contains("murmur-driver-claude-code"), "{text}");
+        assert!(text.contains("murmur/driver-claude-code"), "{text}");
     }
 }
 

@@ -2,7 +2,8 @@
 //!
 //! Driven through the real binary: the claim is that an operator can read, before launching
 //! anything, which skills and tools a capsule may pull at runtime, and that both surfaces say it
-//! in one voice.
+//! in one voice. Every entry is a scoped install pattern: an exact full name, a scope and name
+//! prefix ending in `*`, or `*` alone.
 
 use std::{fs, path::Path};
 
@@ -48,10 +49,11 @@ fn doctor_stdout(home: &TempDir, project_dir: &Path) -> String {
     String::from_utf8(output).unwrap()
 }
 
-const DECLARED: &str =
-    "capabilities:\n  install:\n    skill: [code-review]\n    tool: [\"lint-*\"]\n";
+const DECLARED: &str = "capabilities:\n  install:\n    skill: [ana/code-review]\n    \
+                        tool: [\"ana/lint-*\", \"murmur/*\"]\n";
 
-const DECLARED_LINES: &str = "  install skill:\n    - code-review\n  install tool:\n    - lint-*\n";
+const DECLARED_LINES: &str =
+    "  install skill:\n    - ana/code-review\n  install tool:\n    - ana/lint-*\n    - murmur/*\n";
 
 const UNDECLARED_LINES: &str = "  install skill: <none>\n  install tool: <none>\n";
 
@@ -113,8 +115,14 @@ fn both_json_keys_are_arrays_for_every_capsule() {
     project(declared.path(), DECLARED);
     let json: serde_json::Value =
         serde_json::from_str(explain_scope(&home, declared.path(), &["--json"]).trim()).unwrap();
-    assert_eq!(json["install_skill"], serde_json::json!(["code-review"]));
-    assert_eq!(json["install_tool"], serde_json::json!(["lint-*"]));
+    assert_eq!(
+        json["install_skill"],
+        serde_json::json!(["ana/code-review"])
+    );
+    assert_eq!(
+        json["install_tool"],
+        serde_json::json!(["ana/lint-*", "murmur/*"])
+    );
 
     let silent = TempDir::new().unwrap();
     project(silent.path(), "");
@@ -165,4 +173,48 @@ fn an_empty_install_block_is_refused_naming_the_key() {
     .clone();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("capabilities.install"), "{stderr}");
+}
+
+/// An entry with no scope is refused naming the entry, the accepted forms and its scoped forms:
+/// a grant admits full names, so a bare entry would match nothing a capsule can pull.
+#[test]
+fn an_unscoped_install_entry_is_refused_with_its_scoped_forms() {
+    for (capabilities, key, entry, scoped) in [
+        (
+            "capabilities:\n  install:\n    skill: [code-review]\n",
+            "capabilities.install.skill[0]",
+            "code-review",
+            "'local/code-review'",
+        ),
+        (
+            "capabilities:\n  install:\n    tool: [ana/lint-*, \"lint-*\"]\n",
+            "capabilities.install.tool[1]",
+            "lint-*",
+            "'local/lint-*'",
+        ),
+    ] {
+        let home = TempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
+        project(dir.path(), capabilities);
+
+        let output = mur(
+            &home,
+            dir.path(),
+            &["run", "--manifest", "murmur.yaml", "--explain-scope"],
+        )
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        for needle in [
+            "error[E-MAN-003]".to_string(),
+            format!("invalid artifact name in '{key}'"),
+            format!("entry \"{entry}\" is invalid ('{entry}' names no scope)"),
+            murmur_artifact::install_pattern::INSTALL_ENTRY_ACCEPTED_FORM.to_string(),
+            scoped.to_string(),
+        ] {
+            assert!(stderr.contains(&needle), "{needle} missing from:\n{stderr}");
+        }
+    }
 }

@@ -20,7 +20,7 @@ use murmur_artifact::{load_runtime_manifest, ArtifactRuntime, ContainmentClass, 
 use serde_json::Value;
 use tempfile::TempDir;
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 const CAPSULE_NAME: &str = "json-launch-agent";
 const CAPSULE_VERSION: &str = "0.1.0";
@@ -100,6 +100,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools,

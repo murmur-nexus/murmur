@@ -26,7 +26,7 @@ use mur_roost::{authority::SpawnAuthority, State};
 use serde_json::Value;
 use tempfile::TempDir;
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 // ── An agent capsule in queue+sleep, launched in process ──────────────────────

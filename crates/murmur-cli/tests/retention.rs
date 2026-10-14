@@ -20,7 +20,7 @@ use assert_cmd::{assert::Assert, Command};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 const CAPSULE_NAME: &str = "retention-capsule";
 const TASK_TEXT: &str = "Say something short.";

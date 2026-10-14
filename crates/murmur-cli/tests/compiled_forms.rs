@@ -23,7 +23,10 @@ use zip::{
     CompressionMethod, ZipWriter,
 };
 
-const TOOL_NAME: &str = "echo-tool";
+/// Full name of the tool every scenario installs from a `.mur.zip` file, so in the `local` scope.
+const TOOL_NAME: &str = "local/echo-tool";
+/// The bare part of [`TOOL_NAME`]: the name the zip is packed under and its store files carry.
+const TOOL_BARE: &str = "echo-tool";
 const TOOL_VERSION: &str = "0.1.0";
 
 /// A project running the `capsule-allowlisted.wasm` script capsule with `echo-tool` installed
@@ -130,8 +133,8 @@ impl Project {
         String::from_utf8_lossy(&output.stderr).into_owned()
     }
 
-    /// Declares the WASM tool `name`, built from the `fixture` component, and installs it
-    /// project-locally.
+    /// Declares the WASM tool with full name `name`, built from the `fixture` component, and
+    /// installs it project-locally.
     fn add_tool(&self, name: &str, fixture: &str) {
         let dir = tempfile::tempdir().unwrap();
         let artifact =
@@ -374,7 +377,7 @@ fn a_launch_that_stores_a_form_prunes_a_stale_set_and_keeps_the_current_one() {
     let crashed_temp = plant(&compiled, &temp_name(4242), 2 * HOUR);
     let live_temp = plant(&compiled, &temp_name(4243), Duration::ZERO);
 
-    project.add_tool("config-echo", "config-echo.wasm");
+    project.add_tool("local/config-echo", "config-echo.wasm");
     project.run();
 
     for path in stale_set.iter().chain([&crashed_temp]) {
@@ -387,7 +390,7 @@ fn a_launch_that_stores_a_form_prunes_a_stale_set_and_keeps_the_current_one() {
         current.iter().map(|path| inode(path)).collect::<Vec<_>>(),
         inodes
     );
-    let new_form = project.artifact_form("config-echo");
+    let new_form = project.artifact_form("local/config-echo");
     assert_matches_sidecar(&new_form);
     assert_eq!(forms(&compiled), {
         let mut expected = vec![tool_form, capsule_form, new_form, fresh_set[1].clone()];
@@ -986,7 +989,7 @@ fn a_manifest_install_fills_in_missing_forms_for_cached_artifacts() {
     assert!(project
         .path()
         .join(format!(
-            ".murmur/artifacts/{TOOL_NAME}/{TOOL_VERSION}/{TOOL_NAME}-{TOOL_VERSION}.mur.zip"
+            ".murmur/artifacts/{TOOL_NAME}/{TOOL_VERSION}/{TOOL_BARE}-{TOOL_VERSION}.mur.zip"
         ))
         .is_file());
     assert!(!compiled.exists(), "{} was created", compiled.display());
@@ -1027,14 +1030,14 @@ fn a_failed_precompile_never_fails_the_install() {
     let fixture = tempfile::tempdir().unwrap();
     let artifact = fixture
         .path()
-        .join(format!("{TOOL_NAME}-{TOOL_VERSION}.mur.zip"));
+        .join(format!("{TOOL_BARE}-{TOOL_VERSION}.mur.zip"));
     let mut zip = ZipWriter::new(fs::File::create(&artifact).unwrap());
     let options: SimpleFileOptions =
         FileOptions::default().compression_method(CompressionMethod::Deflated);
     zip.start_file("murmur.yaml", options).unwrap();
     write!(
         zip,
-        "name: {TOOL_NAME}\nversion: {TOOL_VERSION}\nruntime: tool\n"
+        "name: {TOOL_BARE}\nversion: {TOOL_VERSION}\nruntime: tool\n"
     )
     .unwrap();
     zip.start_file("tool.wasm", options).unwrap();
@@ -1087,7 +1090,7 @@ fn a_tampered_payload_fails_even_with_an_install_written_form() {
     let form = installed.tool_form();
     installed.project.run();
     let installed_zip = installed.project.project.path().join(format!(
-        ".murmur/artifacts/{TOOL_NAME}/{TOOL_VERSION}/{TOOL_NAME}-{TOOL_VERSION}.mur.zip"
+        ".murmur/artifacts/{TOOL_NAME}/{TOOL_VERSION}/{TOOL_BARE}-{TOOL_VERSION}.mur.zip"
     ));
     fs::write(installed_zip, b"tampered").unwrap();
 
@@ -1120,12 +1123,14 @@ fn create_project(project_dir: &Path, capsule_fixture: &str, artifacts_yaml: &st
     project_dir.join("murmur.yaml")
 }
 
+/// Packs a WASM tool `.mur.zip` for the full name `name`, under its bare part.
 fn create_tool_artifact(
     dir: &Path,
     name: &str,
     version: &str,
     tool_component_path: &Path,
 ) -> PathBuf {
+    let name = murmur_artifact::tool_name_of(name);
     let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
     let file = fs::File::create(&artifact_path).unwrap();
     let mut zip = ZipWriter::new(file);

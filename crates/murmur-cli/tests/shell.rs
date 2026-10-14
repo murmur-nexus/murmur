@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 use common::ScriptedServer;
 
-const DRIVER_ANTHROPIC_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_ANTHROPIC_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 #[test]

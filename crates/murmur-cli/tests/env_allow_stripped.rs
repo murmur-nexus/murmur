@@ -165,11 +165,11 @@ fn a_real_run_refuses_before_any_registry_work() {
     fs::write(
         &manifest,
         "name: stripped-env-capsule\nversion: 0.1.0\ncapabilities:\n  env:\n    allow:\n      \
-         - GITHUB_TOKEN\nartifacts:\n  - name: uninstalled-tool\n    version: 0.1.0\n    \
-         runtime: tool\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    \
+         - GITHUB_TOKEN\nartifacts:\n  - name: local/uninstalled-tool\n    version: 0.1.0\n    \
+         runtime: tool\n  - name: local/murmur-driver-anthropic\n    version: 0.1.0\n    \
          runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:1\n      \
          api_key: test-key\ninference:\n  transport: http\n  model: test-model\n  driver:\n    \
-         artifact: murmur-driver-anthropic\n",
+         artifact: local/murmur-driver-anthropic\n",
     )
     .unwrap();
 

@@ -28,17 +28,17 @@ const W_ROS_001_LINK: &str = "https://docs.murmur.nexus/reference/diagnostics/#w
 const THREE_CALLERS_ROSTER: &str = "roster_version: 1
 members:
   - name: lead
-    capsule: lead
+    capsule: local/lead
     version: 1.0.0
     entry: true
   - name: a
-    capsule: a
+    capsule: local/a
     version: 1.0.0
   - name: b
-    capsule: b
+    capsule: local/b
     version: 1.0.0
   - name: target
-    capsule: target
+    capsule: local/target
     version: 1.0.0
 reachability:
   - from: lead
@@ -52,14 +52,14 @@ reachability:
 const S1_ROSTER: &str = "roster_version: 1
 members:
   - name: planner
-    capsule: planner
+    capsule: local/planner
     version: 0.3.0
     entry: true
   - name: coder
-    capsule: coder
+    capsule: local/coder
     version: 1.2.0
   - name: reviewer
-    capsule: reviewer
+    capsule: local/reviewer
     version: 0.9.0
 reachability:
   - from: planner
@@ -92,6 +92,9 @@ fn queue_manifest(name: &str, version: &str, depth: usize) -> String {
 
 /// Install a capsule into `store_root` whose packed `murmur.yaml` is exactly `manifest_yaml`.
 /// Admission reads that one entry, so no payload is needed. Returns the stored bytes' sha256.
+///
+/// `name` is the capsule's bare name; it is filed as `local/<name>`, the full name a capsule
+/// installed from its `.mur.zip` file has, which is what every roster here names.
 fn install_capsule(store_root: &Path, name: &str, version: &str, manifest_yaml: &str) -> String {
     use std::io::Write;
 
@@ -109,7 +112,7 @@ fn install_capsule(store_root: &Path, name: &str, version: &str, manifest_yaml: 
     murmur_artifact::LocalRegistry::new(store_root)
         .store_installed_overwrite(
             murmur_artifact::ArtifactMeta {
-                name: name.to_string(),
+                name: murmur_artifact::ArtifactName::from_parts("local", name).unwrap(),
                 version: version.to_string(),
                 runtime: murmur_artifact::RuntimeType::Wasm,
                 artifact_runtime: "capsule".to_string(),
@@ -157,6 +160,7 @@ fn write_lock(project_dir: &Path, name: &str, resolved_version: &str, sha256: &s
                 resolved_version: resolved_version.to_string(),
                 sha256: LockedSha256::any(sha256.to_string()),
                 origin: LockOrigin::Operator,
+                owner_id: None,
             }],
         },
     )
@@ -300,9 +304,12 @@ fn s1_doctor_prints_the_admitted_roster_and_passes() {
                     .join("roster.yaml")
                     .display()
             ),
-            "  planner    planner@0.3.0    entry   serves peers    authenticated door".to_string(),
-            "  coder      coder@1.2.0              serves peers    authenticated door".to_string(),
-            "  reviewer   reviewer@0.9.0           serves peers    authenticated door".to_string(),
+            "  planner    local/planner@0.3.0    entry   serves peers    authenticated door"
+                .to_string(),
+            "  coder      local/coder@1.2.0              serves peers    authenticated door"
+                .to_string(),
+            "  reviewer   local/reviewer@0.9.0           serves peers    authenticated door"
+                .to_string(),
             "  reachability: planner \u{2192} coder, planner \u{2192} reviewer, reviewer \u{2192} coder"
                 .to_string(),
             format!(
@@ -316,7 +323,7 @@ fn s1_doctor_prints_the_admitted_roster_and_passes() {
     );
     assert!(
         doctor.stdout.ends_with(
-            "0 checks passed, 0 errors found, 1 warning.\n\nFix: coder (coder@1.2.0): set \
+            "0 checks passed, 0 errors found, 1 warning.\n\nFix: coder (local/coder@1.2.0): set \
              lifecycle.task_acceptance: queue and lifecycle.queue_depth: 1 in its murmur.yaml so \
              all 2 members that may call it are held at once, or narrow its callers in roster.yaml \
              (warning[W-ROS-001])\n"
@@ -339,7 +346,7 @@ fn s2_a_single_public_member_is_admitted_with_no_reachability() {
     );
     write_roster(
         project.path(),
-        "roster_version: 1\nmembers:\n  - name: solo\n    capsule: solo\n    version: 1.0.0\n    entry: true\n",
+        "roster_version: 1\nmembers:\n  - name: solo\n    capsule: local/solo\n    version: 1.0.0\n    entry: true\n",
     );
 
     let doctor = mur_doctor(&home, project.path());
@@ -372,9 +379,9 @@ fn s3_all_expands_to_the_members_that_both_serve_peers() {
     }
     write_roster(
         project.path(),
-        "roster_version: 1\nmembers:\n  - {name: a, capsule: a, version: 1.0.0, entry: true}\n  \
-         - {name: b, capsule: b, version: 1.0.0}\n  - {name: c, capsule: c, version: 1.0.0}\n  \
-         - {name: d, capsule: d, version: 1.0.0}\nreachability: all\n",
+        "roster_version: 1\nmembers:\n  - {name: a, capsule: local/a, version: 1.0.0, entry: true}\n  \
+         - {name: b, capsule: local/b, version: 1.0.0}\n  - {name: c, capsule: local/c, version: 1.0.0}\n  \
+         - {name: d, capsule: local/d, version: 1.0.0}\nreachability: all\n",
     );
 
     let doctor = mur_doctor(&home, project.path());
@@ -441,8 +448,8 @@ fn s4_no_entry_member_or_several_is_e_ros_002() {
 
 #[test]
 fn s5_a_duplicate_name_is_e_ros_003_installed_or_not() {
-    let roster = "roster_version: 1\nmembers:\n  - {name: coder, capsule: coder, version: 1.2.0, entry: true}\n  \
-                  - {name: coder, capsule: coder, version: 1.2.0, entry: true}\n";
+    let roster = "roster_version: 1\nmembers:\n  - {name: coder, capsule: local/coder, version: 1.2.0, entry: true}\n  \
+                  - {name: coder, capsule: local/coder, version: 1.2.0, entry: true}\n";
     let home = tempfile::tempdir().unwrap();
 
     let installed = tempfile::tempdir().unwrap();
@@ -559,7 +566,7 @@ fn s8_a_public_door_in_a_roster_with_traffic_is_e_ros_006() {
         project.path(),
         &S1_ROSTER.replace(
             "reachability:",
-            "  - name: notes\n    capsule: notes\n    version: 1.0.0\nreachability:",
+            "  - name: notes\n    capsule: local/notes\n    version: 1.0.0\nreachability:",
         ),
     );
     assert_refused(
@@ -582,7 +589,7 @@ fn s9_an_uninstalled_or_unreadable_member_is_e_ros_007() {
     assert_refused(
         &mur_doctor(&home, project.path()),
         "E-ROS-007",
-        &["'coder'", "coder@9.9.9"],
+        &["'coder'", "local/coder@9.9.9"],
     );
 
     write_roster(project.path(), S1_ROSTER);
@@ -595,7 +602,7 @@ fn s9_an_uninstalled_or_unreadable_member_is_e_ros_007() {
     assert_refused(
         &mur_doctor(&home, project.path()),
         "E-ROS-007",
-        &["'coder'", "coder@1.2.0"],
+        &["'coder'", "local/coder@1.2.0"],
     );
 }
 
@@ -604,7 +611,7 @@ fn s9_a_member_installed_only_in_the_global_store_resolves() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     s1_project(project.path());
-    fs::remove_dir_all(project_store(project.path()).join("coder")).unwrap();
+    fs::remove_dir_all(project_store(project.path()).join("local").join("coder")).unwrap();
     install_capsule(
         &global_store(&home),
         "coder",
@@ -625,7 +632,7 @@ fn s10_murmur_lock_verifies_a_member_and_is_never_written() {
     assert_admitted(&mur_doctor(&home, project.path()));
     assert!(!lock_path.exists(), "admission never creates murmur.lock");
 
-    write_lock(project.path(), "coder", "1.2.0", &hashes["coder"]);
+    write_lock(project.path(), "local/coder", "1.2.0", &hashes["coder"]);
     let before = fs::read(&lock_path).unwrap();
     assert_admitted(&mur_doctor(&home, project.path()));
     assert_eq!(fs::read(&lock_path).unwrap(), before);
@@ -634,7 +641,7 @@ fn s10_murmur_lock_verifies_a_member_and_is_never_written() {
         ("1.2.0", "0".repeat(64)),
         ("1.1.0", hashes["coder"].clone()),
     ] {
-        write_lock(project.path(), "coder", version, &sha256);
+        write_lock(project.path(), "local/coder", version, &sha256);
         let before = fs::read(&lock_path).unwrap();
         let doctor = mur_doctor(&home, project.path());
         assert_refused(&doctor, "E-REG-005", &["'coder'", "murmur.lock conflict"]);
@@ -676,6 +683,37 @@ fn s11_a_malformed_roster_is_e_ros_001_naming_the_key_path() {
         write_roster(project.path(), &roster);
         assert_refused(&mur_doctor(&home, project.path()), "E-ROS-001", needles);
     }
+}
+
+/// A member's `capsule:` is a full artifact name; a bare one is refused as malformed, with the
+/// scoped forms in the hint, before any store is read.
+#[test]
+fn s11_a_bare_member_capsule_is_e_ros_001_with_the_scoped_hint() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_project(project.path());
+    write_roster(
+        project.path(),
+        &S1_ROSTER.replace("capsule: local/planner", "capsule: planner"),
+    );
+
+    let doctor = mur_doctor(&home, project.path());
+    assert_refused(
+        &doctor,
+        "E-ROS-001",
+        &[
+            "members[0].capsule (member 'planner')",
+            "'planner' is not a full artifact name: an artifact is named <scope>/<name>",
+        ],
+    );
+    assert!(!doctor.stderr.contains("E-ROS-007"), "{}", doctor.stderr);
+    assert!(
+        doctor
+            .stderr
+            .contains("'local/planner' for one installed from a .mur.zip file"),
+        "{}",
+        doctor.stderr
+    );
 }
 
 // ── S12: no roster, no change ────────────────────────────────────────────────
@@ -725,7 +763,7 @@ fn s12_without_a_roster_doctor_prints_no_roster_block() {
 
 #[test]
 fn s12_mur_run_never_reads_roster_yaml() {
-    const DRIVER_NAME: &str = "murmur-driver-anthropic";
+    const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
     const DRIVER_VERSION: &str = "0.1.4";
 
     let server = common::ScriptedServer::start(vec![serde_json::json!({
@@ -797,14 +835,14 @@ fn s13_admission_creates_changes_and_removes_nothing() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let hashes = s1_project(project.path());
-    fs::remove_dir_all(project_store(project.path()).join("reviewer")).unwrap();
+    fs::remove_dir_all(project_store(project.path()).join("local").join("reviewer")).unwrap();
     install_capsule(
         &global_store(&home),
         "reviewer",
         "0.9.0",
         &manifest("reviewer", "0.9.0", true, true),
     );
-    write_lock(project.path(), "coder", "1.2.0", &hashes["coder"]);
+    write_lock(project.path(), "local/coder", "1.2.0", &hashes["coder"]);
 
     let project_before = snapshot(project.path());
     let global_before = snapshot(&global_store(&home));
@@ -834,8 +872,8 @@ fn s13_a_duplicate_and_an_unknown_rule_name_is_e_ros_003_every_time() {
     s1_project(project.path());
     write_roster(
         project.path(),
-        "roster_version: 1\nmembers:\n  - {name: coder, capsule: coder, version: 1.2.0, entry: true}\n  \
-         - {name: coder, capsule: coder, version: 1.2.0}\nreachability:\n  - from: coder\n    \
+        "roster_version: 1\nmembers:\n  - {name: coder, capsule: local/coder, version: 1.2.0, entry: true}\n  \
+         - {name: coder, capsule: local/coder, version: 1.2.0}\nreachability:\n  - from: coder\n    \
          to: [ghost]\n",
     );
     for _ in 0..3 {
@@ -938,7 +976,7 @@ fn s15_a_formation_directory_is_checked_as_one_and_its_parent_as_before() {
     // S1's `coder` draws `W-ROS-001`; a warning leaves the exit code alone.
     assert!(
         doctor.stdout.contains(
-            "\n\n0 checks passed, 0 errors found, 1 warning.\n\nFix: coder (coder@1.2.0): "
+            "\n\n0 checks passed, 0 errors found, 1 warning.\n\nFix: coder (local/coder@1.2.0): "
         ),
         "{}",
         doctor.stdout
@@ -969,7 +1007,7 @@ struct ProjectThenGlobal {
 impl murmur_artifact::Registry for ProjectThenGlobal {
     fn resolve(
         &self,
-        name: &str,
+        name: &murmur_artifact::ArtifactName,
         version: &str,
     ) -> Result<murmur_artifact::ResolvedArtifact, murmur_artifact::RegistryError> {
         self.resolve_with_platform(name, version, None)
@@ -977,7 +1015,7 @@ impl murmur_artifact::Registry for ProjectThenGlobal {
 
     fn resolve_with_platform(
         &self,
-        name: &str,
+        name: &murmur_artifact::ArtifactName,
         version: &str,
         platform: Option<&str>,
     ) -> Result<murmur_artifact::ResolvedArtifact, murmur_artifact::RegistryError> {
@@ -1062,7 +1100,7 @@ fn assert_three_callers_warned(doctor: &Doctor) {
     );
     assert!(
         doctor.stdout.contains(
-            "0 checks passed, 0 errors found, 1 warning.\n\nFix: target (target@1.0.0): set \
+            "0 checks passed, 0 errors found, 1 warning.\n\nFix: target (local/target@1.0.0): set \
              lifecycle.queue_depth: 2 in its murmur.yaml so all 3 members that may call it are \
              held at once, or narrow its callers in roster.yaml (warning[W-ROS-001])\n"
         ),

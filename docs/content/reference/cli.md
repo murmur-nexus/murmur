@@ -237,8 +237,8 @@ mur new --roster <NAME>
 ```text
 <NAME>/
   roster.yaml          the formation: lead is the entry member, and lead may call worker
-  lead/murmur.yaml     the entry member, capsule <NAME>-lead
-  worker/murmur.yaml   the member lead may call, capsule <NAME>-worker
+  lead/murmur.yaml     the entry member, capsule local/<NAME>-lead
+  worker/murmur.yaml   the member lead may call, capsule local/<NAME>-worker
 ```
 
 | Convention | Value |
@@ -246,7 +246,7 @@ mur new --roster <NAME>
 | Formation directory | `./<NAME>/`, the directory `mur run --roster <NAME>` takes |
 | Roster | `<NAME>/roster.yaml`, at the directory's root |
 | Member sources | `<NAME>/<member>/murmur.yaml`: one subdirectory per member, named after the member |
-| Capsule names | `<NAME>-<member>`, so two scaffolded formations never share a capsule name |
+| Capsule names | `<NAME>-<member>` in each member's `murmur.yaml`, so two scaffolded formations never share a capsule name. A member's `.mur.zip` is installed from a file, so the roster runs it as `local/<NAME>-<member>` |
 | Versions | `0.1.0` for every capsule |
 | Install scope | The global store, `mur install -g`. The directory has no top-level `murmur.yaml`, so `mur install` without `-g` refuses there |
 
@@ -260,9 +260,9 @@ section of this reference.
 | Key | Value |
 |---|---|
 | [`roster_version`](roster.md#fields) | `1` |
-| [`members[0]`](roster.md#members) | `name: lead`, `capsule: <NAME>-lead`, `version: 0.1.0` |
+| [`members[0]`](roster.md#members) | `name: lead`, `capsule: local/<NAME>-lead`, `version: 0.1.0` |
 | [`members[0].entry`](roster.md#entry-member) | `true` |
-| [`members[1]`](roster.md#members) | `name: worker`, `capsule: <NAME>-worker`, `version: 0.1.0` |
+| [`members[1]`](roster.md#members) | `name: worker`, `capsule: local/<NAME>-worker`, `version: 0.1.0` |
 | [`reachability`](roster.md#reachability) | One rule: `from: lead`, `to: [worker]`. Its comment explains that `all` would grant nothing here: `all` pairs only members that both serve peers, and `lead` does not |
 
 `lead/murmur.yaml` and `worker/murmur.yaml`:
@@ -299,8 +299,8 @@ The provider comes from `inference.provider`, `inference.endpoint` and `inferenc
 
 | `inference.provider` | Driver | Default endpoint | Default model | `gateway.api_key` |
 |---|---|---|---|---|
-| `anthropic`, empty, or no `inference:` block | `murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}` | `https://api.anthropic.com` | `claude-haiku-4-5-20251001` | `${ANTHROPIC_API_KEY}` |
-| `openai` | `murmur-driver-openai@{{ v.murmur_driver_openai }}` | `https://api.openai.com/v1` | `gpt-5.6-luna` | `${OPENAI_API_KEY}` |
+| `anthropic`, empty, or no `inference:` block | `murmur/driver-anthropic@{{ v.murmur_driver_anthropic }}` | `https://api.anthropic.com` | `claude-haiku-4-5-20251001` | `${ANTHROPIC_API_KEY}` |
+| `openai` | `murmur/driver-openai@{{ v.murmur_driver_openai }}` | `https://api.openai.com/v1` | `gpt-5.6-luna` | `${OPENAI_API_KEY}` |
 | Any other value | Refused with `E-NEW-004` | — | — | — |
 
 A configured `inference.endpoint` must pass [`gateway.endpoint` validation](manifest.md#gateway-endpoint-validation),
@@ -314,12 +314,12 @@ formation. For `mur new --roster crew` with no `inference:` block:
 ```text
 Scaffolded formation 'crew' in ./crew
   crew/roster.yaml          lead is the entry member; lead may call worker
-  crew/lead/murmur.yaml     capsule crew-lead@0.1.0
-  crew/worker/murmur.yaml   capsule crew-worker@0.1.0, serves peers
+  crew/lead/murmur.yaml     capsule local/crew-lead@0.1.0
+  crew/worker/murmur.yaml   capsule local/crew-worker@0.1.0, serves peers
 
 Next:
   mur config set -g credentials.ANTHROPIC_API_KEY <your key>
-  mur install -g murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}
+  mur install -g murmur/driver-anthropic@{{ v.murmur_driver_anthropic }}
   mur build crew/lead && mur install -g crew/lead/crew-lead-0.1.0.mur.zip
   mur build crew/worker && mur install -g crew/worker/crew-worker-0.1.0.mur.zip
   mur run --roster crew --task "<your task>"
@@ -370,7 +370,7 @@ mur new "<task description>" [--index <PATH|URL|local>]
 | Argument / Flag | Required | Description |
 |---|---|---|
 | `<task description>` | yes | Plain-language description of what the capsule should do |
-| `--index` | no | Artifact index the generator searches, passed unchanged to `murmur-tool-registry-search` as its `registry` input — `local` lists the global store `~/.murmur/artifacts/`; a URL fetches that index. Omit for the public index. `--registry` is refused with exit status 2 and a hint naming `--index` |
+| `--index` | no | Artifact index the generator searches, passed unchanged to `murmur/tool-registry-search` as its `registry` input — `local` lists the global store `~/.murmur/artifacts/`; a URL fetches that index. Omit for the public index. `--registry` is refused with exit status 2 and a hint naming `--index` |
 
 **Prerequisites:**
 
@@ -384,10 +384,10 @@ mur new "<task description>" [--index <PATH|URL|local>]
     project-level `<cwd>/.murmur/config.yaml` file described in
     [Configuration files](config.md#configuration-files).
 - The generator's own artifacts must be installed:
-    - the driver for your chosen provider — `murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}` or `murmur-driver-openai@{{ v.murmur_driver_openai }}`
-    - `murmur-tool-registry-search@{{ v.murmur_tool_registry_search }}`
-    - `murmur-tool-editor@{{ v.murmur_tool_editor }}`
-    - `murmur-skill-create-manifest@{{ v.murmur_skill_create_manifest }}`
+    - the driver for your chosen provider — `murmur/driver-anthropic@{{ v.murmur_driver_anthropic }}` or `murmur/driver-openai@{{ v.murmur_driver_openai }}`
+    - `murmur/tool-registry-search@{{ v.murmur_tool_registry_search }}`
+    - `murmur/tool-editor@{{ v.murmur_tool_editor }}`
+    - `murmur/skill-create-manifest@{{ v.murmur_skill_create_manifest }}`
 
 Install missing artifacts with `mur install <name>@<version>`. `mur new` exits with a clear
 error and install hint naming the first artifact it cannot resolve.
@@ -419,7 +419,7 @@ The generator automatically infers whether the task is:
 
 **Generator behavior:**
 
-The generator reads its manifest guide, calls `murmur-tool-registry-search` to find artifacts for the task, and writes the manifest to `out/murmur.yaml` in its own session workdir. The CLI reads that file, validates the YAML, then writes it to `murmur.yaml` in the current directory through a temporary file and a rename, so an interrupted run leaves no partial manifest. A generator that writes no `out/murmur.yaml` fails with `E-NEW-001`, quoting whatever the agent did produce.
+The generator reads its manifest guide, calls `murmur/tool-registry-search` to find artifacts for the task, and writes the manifest to `out/murmur.yaml` in its own session workdir. The CLI reads that file, validates the YAML, then writes it to `murmur.yaml` in the current directory through a temporary file and a rename, so an interrupted run leaves no partial manifest. A generator that writes no `out/murmur.yaml` fails with `E-NEW-001`, quoting whatever the agent did produce.
 
 If the generated YAML fails validation, nothing is written to CWD and the error is printed to stderr.
 
@@ -475,7 +475,10 @@ mur build .
   manifest-only archive; a **wasm** artifact does not — with no root `*.wasm` to pack it fails
   with [`E-BLD-003`](diagnostics.md#e-bld-003).
 - Validates the manifest `name:`, the `requires_files:` paths and the resulting payload shape,
-  and warns about redundant or misplaced declarations — see [Build Lints](diagnostics.md)
+  and warns about redundant or misplaced declarations — see [Build Lints](diagnostics.md). `name:`
+  is the artifact's bare name: a `/` in it is refused with [`E-BLD-001`](diagnostics.md#e-bld-001),
+  because the scope comes from where the artifact is installed from — see
+  [Artifact names](../concepts/registry.md#artifact-names)
 - Output written **inside the source directory** unless `--output` is specified
 
 ### Skill packaging (`--skill`)
@@ -504,7 +507,7 @@ mur build --skill [<name>] <path> [--version <version>]
 
 Examples: `my-coding-skill/` → `my-coding-skill`; `My Skill.zip` → `my_skill`
 
-**`<name>` vs `<path>` disambiguation** — if the value immediately following `--skill` contains `/`, `\`, or starts with `.`, it is treated as the input path (name inferred); otherwise it is the explicit artifact name and `<path>` is the next positional argument.
+**`<name>` vs `<path>` disambiguation** — if the value immediately following `--skill` contains `/`, `\`, or starts with `.`, it is treated as the input path (name inferred); otherwise it is the explicit artifact name and `<path>` is the next positional argument. A value with a `/` that is no existing path, such as `ana/x`, is read as a scoped name and refused with `E-BLD-001`: the name is bare.
 
 **`murmur.yaml` handling:**
 
@@ -531,6 +534,7 @@ mur build --skill external-skill.zip
 
 | Code | Meaning |
 |---|---|
+| `E-BLD-001` | The artifact name contains `/` |
 | `E-IO-001` | `SKILL.md` not found in the input folder or zip (case-insensitive search found no match) |
 | `E-MAN-002` | `murmur.yaml` present but YAML is malformed |
 | `E-MAN-003` | `murmur.yaml` present but `runtime` is not `skill` |
@@ -541,7 +545,7 @@ See also: [Package a skill into an artifact](../how-to/package-skill-artifact.md
 
 ## `mur publish`
 
-Publish an existing artifact into the global store, `~/.murmur/artifacts/<name>/<version>/`.
+Publish an existing artifact into the global store as `local/<name>`, at `~/.murmur/artifacts/local/<name>/<version>/`. `<name>` is the `name:` the artifact's own `murmur.yaml` declares.
 
 ```bash
 mur publish [artifact_path] [--platform <os-arch>]
@@ -558,7 +562,7 @@ mur publish my-tool-0.1.0.mur.zip
 ```
 
 ```text
-Published my-tool@0.1.0
+Published local/my-tool@0.1.0
 ```
 
 Example — native artifact (auto-detected platform):
@@ -569,7 +573,7 @@ mur publish my-native-tool-0.1.0.mur.zip
 
 ```text
 Platform: darwin-aarch64 (auto-detected)
-Published my-native-tool@0.1.0
+Published local/my-native-tool@0.1.0
 ```
 
 Reserved versions rejected:
@@ -588,8 +592,8 @@ Fetch and install artifacts from the global store, the configured sources, or a 
 # Install all artifacts declared in the project manifest (reads murmur.yaml in or above CWD)
 mur install
 
-# Install a specific artifact by name@version: the global store, then the configured sources
-mur install <name@version>
+# Install a specific artifact by scope/name@version: the global store, then the configured sources
+mur install <scope/name@version>
 
 # Install from a GitHub source directly
 mur install github:<owner>/<repo>@<tag>
@@ -598,16 +602,18 @@ mur install github:<owner>/<repo>@<tag>
 mur install -g <ref>
 
 # Download all platform variants into the global store (CI / cross-platform seeding)
-mur install --all-platforms <name@version>
+mur install --all-platforms <scope/name@version>
 ```
 
 | Form | Behavior |
 |---|---|
 | `mur install` (no args) | Reads `murmur.yaml` in or above CWD; fetches all declared artifacts in parallel into the project-local store (`.murmur/artifacts/` next to the manifest) |
-| `mur install <name@version>` | Fetches a specific artifact into the project-local store |
-| `mur install github:<owner>/<repo>@<tag>` | Fetches directly from a GitHub release into the project-local store |
+| `mur install <scope/name@version>` | Fetches a specific artifact into the project-local store. A `local/` artifact is taken from the global store only; no source is asked |
+| `mur install <scope/name>` | Fetches the latest release of an artifact from the configured sources |
+| `mur install github:<owner>/<repo>@<tag>` | Fetches every asset of a GitHub release into the project-local store, each under the repository's scope |
+| `mur install <path>` | Installs a `.mur.zip` file as `local/<name>`, `<name>` being the name its `murmur.yaml` declares |
 | `mur install -g <ref>` | Fetches into the global store (`~/.murmur/artifacts/`) |
-| `mur install --all-platforms <name@version>` | Downloads all platform variants into the global store, filing each under its own platform tag; useful for CI and cross-platform build seeding |
+| `mur install --all-platforms <scope/name@version>` | Downloads all platform variants into the global store, filing each under its own platform tag; useful for CI and cross-platform build seeding |
 | `mur install --no-precompile` | Installs without compiling. Without the flag, `mur install` compiles each WASM tool, driver and hook it installs into [`~/.murmur/compiled/`](config.md#murmur-home-permissions), for this machine and this `mur` build, so the first `mur run` loads it instead of compiling it. With no arguments that includes each manifest artifact already in the store, and one whose compiled form is already there is not compiled again. A compile that fails does not fail the install or change its output; that artifact compiles on its first launch |
 
 `mur install` (no args) is the standard pre-run step. It reads `murmur.yaml`, resolves every artifact listed in it, and if an artifact is not in the global store it falls back to the configured source chain automatically. See [Resolution order](config.md#resolution-order). `--registry` is refused with exit status 2 and a hint naming that order.
@@ -622,7 +628,7 @@ mur run
 Example — install a specific artifact:
 
 ```bash
-mur install murmur-tool-git@{{ v.murmur_tool_git }}
+mur install murmur/tool-git@{{ v.murmur_tool_git }}
 ```
 
 Behavior:
@@ -633,10 +639,19 @@ Behavior:
 4. Pin the name, resolved version and SHA-256 in `murmur.lock` as [`origin: operator`](workdir.md#lock-origin) — project installs only, since `-g` has no project to pin. An entry a capsule pinned through `manage.pull()` is adopted as operator-declared, with one line after the lock is written:
 
     ```text
-    Adopted some-tool@1.2.3 as operator-declared (it was pulled at runtime by session ses_0190a1b2c3d4...)
+    Adopted ana/some-tool@1.2.3 as operator-declared (it was pulled at runtime by session ses_0190a1b2c3d4...)
     ```
 
 5. Compile each WASM tool, driver and hook for this machine into `~/.murmur/compiled/`, unless `--no-precompile` is given (see the table above)
+
+A `local/` artifact missing from the global store is refused without asking a source:
+
+```text
+error[E-REG-001]: artifact local/x@1.0.0 is not in the store, and no source serves the 'local' scope
+  hint: a local/ artifact is installed from its .mur.zip file: mur install ./x-1.0.0.mur.zip
+```
+
+A name that is not `<scope>/<name>` is refused with [`E-REG-007`](diagnostics.md#e-reg-007). The reference forms and what each one stores are in [Installing artifacts](installing-artifacts.md#reference-forms).
 
 ---
 
@@ -666,15 +681,15 @@ Each WASM tool, driver and hook is compiled under this machine's `mur` build and
 **Text output** — one line per file: the outcome, then `name@version`, or the path when the file has no readable manifest.
 
 ```text
-compiled        murmur-tool-echo@1.0.0
-not wasm        murmur-tool-git@{{ v.murmur_tool_git }}
+compiled        tool-echo@1.0.0
+not wasm        tool-git@{{ v.murmur_tool_git }}
 failed          ./broken.mur.zip
 ```
 
 **JSON output** (`--json`) — exactly one line:
 
 ```json
-{"mur_version":"1.0.0","decompression_ceiling":524288000,"artifacts":[{"path":"./echo.mur.zip","name":"murmur-tool-echo","version":"1.0.0","outcome":"compiled"},{"path":"./broken.mur.zip","name":null,"version":null,"outcome":"failed"}]}
+{"mur_version":"1.0.0","decompression_ceiling":524288000,"artifacts":[{"path":"./echo.mur.zip","name":"tool-echo","version":"1.0.0","outcome":"compiled"},{"path":"./broken.mur.zip","name":null,"version":null,"outcome":"failed"}]}
 ```
 
 | Field | Type | Description |
@@ -682,7 +697,7 @@ failed          ./broken.mur.zip
 | `mur_version` | string | Version of the `mur` that compiled |
 | `decompression_ceiling` | integer | The `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES` value the forms were compiled under, in bytes |
 | `artifacts[].path` | string | The path as given |
-| `artifacts[].name`, `artifacts[].version` | string or `null` | From the file's `murmur.yaml`; `null` when there is none that parses |
+| `artifacts[].name`, `artifacts[].version` | string or `null` | From the file's `murmur.yaml`, so the name is the bare name; `null` when there is none that parses |
 | `artifacts[].outcome` | string | One of the JSON outcomes above |
 
 **Exit status:** `0` when no file is `failed`; `1`, after the full report, when any is.
@@ -693,7 +708,7 @@ A `mur` release older than this command exits with `error: unrecognized subcomma
 
 ## `mur list`
 
-List installed artifacts. Scope follows where you run the command.
+List installed artifacts by full name, `<scope>/<name>`, sorted by name. Which store is listed follows where you run the command.
 
 ```bash
 # Inside a project directory — show the project store
@@ -702,7 +717,7 @@ mur list
 # Show the global store (~/.murmur/artifacts/)
 mur list -g
 
-# Show both stores with a SCOPE column (project / global)
+# Show both stores with a STORE column (project / global)
 mur list --all
 
 # Show only artifacts declaring a WIT interface under murmur:hook
@@ -713,7 +728,7 @@ mur list -g --contract murmur:hook
 |---|---|
 | _(none)_ | Project store (`.murmur/artifacts/` next to `murmur.yaml`) when inside a project directory |
 | `-g` | Global store (`~/.murmur/artifacts/`) |
-| `--all` | Both stores; output leads with a `SCOPE` column (`project` or `global`) |
+| `--all` | Both stores; output leads with a `STORE` column (`project` or `global`) |
 | `--contract <PREFIX>` | Only artifacts whose recorded [WIT contracts](installing-artifacts.md#local-artifact-cache) include an interface name starting with `PREFIX`; output includes a `CONTRACTS` column naming the matches. Combines with `-g` and `--all` |
 
 `--contract` matches the imports and the exports alike: a package version bump renames the
@@ -723,24 +738,24 @@ Example output (`mur list`):
 
 ```text
 NAME                     VERSION  RUNTIME  PLATFORMS
-murmur-driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —
-murmur-tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64
+murmur/driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —
+murmur/tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64
 ```
 
 Example output (`mur list --all`):
 
 ```text
-SCOPE    NAME                     VERSION  RUNTIME  PLATFORMS
-project  murmur-driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —
-global   murmur-tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64
+STORE    NAME                     VERSION  RUNTIME  PLATFORMS
+project  murmur/driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —
+global   murmur/tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64
 ```
 
 Example output (`mur list -g --contract murmur:tool`):
 
 ```text
 NAME                     VERSION  RUNTIME  PLATFORMS       CONTRACTS
-murmur-driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —               murmur:tool-registry/invoke@0.1.0
-murmur-tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64  murmur:tool/run@0.1.0
+murmur/driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —               murmur:tool-registry/invoke@0.1.0
+murmur/tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64  murmur:tool/run@0.1.0
 ```
 
 ---
@@ -791,6 +806,7 @@ Ahead of the checklist it prints these blocks. None of them affects the exit cod
 | `Install grant` | The `install skill` and `install tool` entries of [`capabilities.install`](manifest.md#field-install) |
 | `Memory bound` | [`capabilities.resources.cgroup_memory_bytes`](manifest.md#field-capabilities) and the two cgroup files a launch writes from it — see [Memory bound](#doctor-memory-bound) |
 | `Interface versions` | Installed artifacts built against an interface version this `mur` does not serve, printed only when there is something to report. See [Interface versions](#doctor-interface-versions) |
+| `Artifact stores` | Each directory of the project or global store in the flat `<name>/<version>/` layout, which nothing reads, as `  global store: <path>: old layout, nothing reads it, safe to delete`. Printed only when there is one. See [Store layout](installing-artifacts.md#local-artifact-cache) |
 
 `Read-only paths` and `Install grant` print the same lines, in the same words, as [`mur run --explain-scope`](#mur-run).
 
@@ -826,7 +842,7 @@ This block is stricter than the manifest blocks above, which report a refusal of
 
 Only names are printed. No variable's value is read into the report or written anywhere, and set/unset is decided by presence alone, so a name set to the empty string counts as set. The workspace `.env` counts because `mur run` loads it; a `.env` that cannot be parsed is reported by file and line, adds a `Fix:` entry, and leaves the variable list computed from this shell's environment alone.
 
-A variable line names every capsule that needs the name. A name a capsule declares in `capabilities.env.allow` is attributed to that capsule alone; a name reached through any other manifest field carries that field in brackets, as `solo@0.0.1 (artifacts.murmur-driver-anthropic.gateway.api_key)`.
+A variable line names every capsule that needs the name. A name a capsule declares in `capabilities.env.allow` is attributed to that capsule alone; a name reached through any other manifest field carries that field in brackets, as `solo@0.0.1 (artifacts.murmur/driver-anthropic.gateway.api_key)`.
 
 **Output — a spawn closure with one unset variable:**
 
@@ -844,15 +860,15 @@ Environment requirements
 Environment requirements
   capsules: solo@0.0.1
   variables:
-    ✗  SOLO_PROVIDER_KEY   unset   — solo@0.0.1 (artifacts.murmur-driver-anthropic.gateway.api_key)
+    ✗  SOLO_PROVIDER_KEY   unset   — solo@0.0.1 (artifacts.murmur/driver-anthropic.gateway.api_key)
 ```
 
 **Output — happy path:**
 
 ```text
 Filesystem preopens
-  - murmur-driver-anthropic (driver): the whole accessible workdir — no capabilities.filesystem.scope declared
-  - murmur-tool-git (tool): one subtree of the accessible workdir — capabilities.filesystem.scope: repo
+  - murmur/driver-anthropic (driver): the whole accessible workdir — no capabilities.filesystem.scope declared
+  - murmur/tool-git (tool): one subtree of the accessible workdir — capabilities.filesystem.scope: repo
 
 Read-only paths
   read_only:
@@ -861,8 +877,8 @@ Read-only paths
   read_only enforcement: enforced for every tool call and every shell command the dispatch check can read
 
 Checking /path/to/murmur.yaml for darwin-aarch64...
-  ✓  murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}   platform-independent
-  ✓  murmur-tool-git@{{ v.murmur_tool_git }}            darwin-aarch64
+  ✓  murmur/driver-anthropic@{{ v.murmur_driver_anthropic }}   platform-independent
+  ✓  murmur/tool-git@{{ v.murmur_tool_git }}            darwin-aarch64
 
 All checks passed.
 ```
@@ -871,22 +887,22 @@ All checks passed.
 
 ```text
 Checking /path/to/murmur.yaml for darwin-aarch64...
-  ✗  murmur-tool-git@{{ v.murmur_tool_git }}   darwin-aarch64   — missing
+  ✗  murmur/tool-git@{{ v.murmur_tool_git }}   darwin-aarch64   — missing
 
 0 checks passed, 1 error found.
 
-Fix: mur install murmur-tool-git@{{ v.murmur_tool_git }}
+Fix: mur install murmur/tool-git@{{ v.murmur_tool_git }}
 ```
 
 **Output — a native binary built for another platform:**
 
 ```text
 Checking /path/to/murmur.yaml for linux-x86_64...
-  ✗  murmur-tool-git@{{ v.murmur_tool_git }}   linux-x86_64   — native binary is built for darwin-aarch64, this host is linux-x86_64
+  ✗  murmur/tool-git@{{ v.murmur_tool_git }}   linux-x86_64   — native binary is built for darwin-aarch64, this host is linux-x86_64
 
 0 checks passed, 1 error found.
 
-Fix: murmur-tool-git: native binary is built for darwin-aarch64 — reinstall murmur-tool-git@{{ v.murmur_tool_git }} on this host
+Fix: murmur/tool-git: native binary is built for darwin-aarch64 — reinstall murmur/tool-git@{{ v.murmur_tool_git }} on this host
 ```
 
 ### Memory bound { #doctor-memory-bound }
@@ -937,27 +953,27 @@ one of three lines:
 
 ```text
 Checking /path/to/murmur.yaml for linux-x86_64...
-  ⚠  demo-skill@0.1.0   — pulled at runtime by session ses_0190a1b2c3d4
-  ✗  demo-tool@0.1.0    — murmur.lock pins 'demo-tool' from a runtime pull by session ses_0190a1b2c3d4; murmur.yaml declares it with gateway:
-  ·  other-tool@2.0.0   pulled at runtime by session ses_0190a1b2c3d4 — not declared in murmur.yaml, so mur run does not stage it
+  ⚠  ana/demo-skill@0.1.0   — pulled at runtime by session ses_0190a1b2c3d4
+  ✗  ana/demo-tool@0.1.0    — murmur.lock pins 'ana/demo-tool' from a runtime pull by session ses_0190a1b2c3d4; murmur.yaml declares it with gateway:
+  ·  ana/other-tool@2.0.0   pulled at runtime by session ses_0190a1b2c3d4 — not declared in murmur.yaml, so mur run does not stage it
 
 1 check passed, 1 error found, 1 warning.
 
-Fix: mur install demo-tool@0.1.0
-Fix: mur install demo-skill@0.1.0
+Fix: mur install ana/demo-tool@0.1.0
+Fix: mur install ana/demo-skill@0.1.0
 ```
 
 **Output — lock hash mismatch:**
 
 ```text
 Checking /path/to/murmur.yaml for darwin-aarch64...
-  ✗  demo-skill@0.1.0   darwin-aarch64   — artifact integrity check failed for demo-skill@0.1.0
+  ✗  ana/demo-skill@0.1.0   darwin-aarch64   — artifact integrity check failed for ana/demo-skill@0.1.0
         expected sha256 (murmur.lock): deadbeef
         actual sha256 (on disk):       0e29c7e8c291a2800a266a01c28300e24f2a640d4a21a085e4fd9aee01adfaef
 
 0 checks passed, 1 error found.
 
-Fix: demo-skill: artifact on disk does not match murmur.lock — re-publish or delete the lock
+Fix: ana/demo-skill: artifact on disk does not match murmur.lock — re-publish or delete the lock
 ```
 
 ### Murmur home { #doctor-murmur-home }
@@ -1046,9 +1062,9 @@ entry, and the exit code is `1`. The codes are [`E-ROS-001`](diagnostics.md#e-ro
 ```text
 Roster
   file: /path/to/roster.yaml
-  planner    planner@0.3.0    entry   serves peers    authenticated door
-  coder      coder@1.2.0              serves peers    authenticated door
-  reviewer   reviewer@0.9.0           serves peers    authenticated door
+  planner    local/planner@0.3.0    entry   serves peers    authenticated door
+  coder      local/coder@1.2.0              serves peers    authenticated door
+  reviewer   local/reviewer@0.9.0           serves peers    authenticated door
   reachability: planner → coder, planner → reviewer, reviewer → coder
   warning[W-ROS-001]: roster.yaml lets 2 members call 'coder' (planner, reviewer), but it holds 1 task at once — lifecycle.task_acceptance: single — so a call that arrives while it is busy waits and is offered again, and is rejected only if it stays busy until the call's deadline; lifecycle.task_acceptance: queue with lifecycle.queue_depth: 1 would hold them all (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)
 ```
@@ -1088,15 +1104,15 @@ interface list, it is read from the installed payload. The check never writes to
 
 ```text
 Interface versions
-  ⚠  stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
-  ⚠  stale-hook@0.3.0   global    imports murmur:runtime/inference@0.3.0 — this mur serves murmur:runtime@0.4.0
+  ⚠  ana/stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
+  ⚠  ana/stale-hook@0.3.0   global    imports murmur:runtime/inference@0.3.0 — this mur serves murmur:runtime@0.4.0
   mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/reference/diagnostics/#w-reg-003)
 
 Checking /path/to/murmur.yaml for linux-x86_64...
 
 0 checks passed, 0 errors found, 1 warning.
 
-Fix: mur install -g stale-hook@<a release built against murmur:hook@0.9.0, murmur:runtime@0.4.0>
+Fix: mur install -g ana/stale-hook@<a release built against murmur:hook@0.9.0, murmur:runtime@0.4.0>
 ```
 
 | Line | Meaning |
@@ -1136,11 +1152,11 @@ A stale artifact this project does not declare adds its `Fix:` line in the same 
 
 ```text
 Checking /path/to/murmur.yaml for linux-x86_64...
-  ⚠  murmur-tool-git@{{ v.murmur_tool_git }}   linux-x86_64   — native artifact with no recorded platform (warning[W-REG-001])
+  ⚠  murmur/tool-git@{{ v.murmur_tool_git }}   linux-x86_64   — native artifact with no recorded platform (warning[W-REG-001])
 
 1 check passed, 0 errors found, 1 warning.
 
-Fix: mur install murmur-tool-git@{{ v.murmur_tool_git }}
+Fix: mur install murmur/tool-git@{{ v.murmur_tool_git }}
 ```
 
 **Exit codes:**
@@ -1154,7 +1170,7 @@ Fix: mur install murmur-tool-git@{{ v.murmur_tool_git }}
 |---|---|
 | `E-IO-001` | No `murmur.yaml` found in the current directory or any parent, and the current directory holds no `roster.yaml` |
 | `E-MAN-001` / `E-MAN-002` / `E-MAN-003` | Manifest failed to load — missing field, YAML syntax error, or invalid field, respectively |
-| `E-RUN-003` | `murmur.lock` exists but failed to parse or validate — including a `lock_version` other than 2, which is refused rather than migrated |
+| `E-RUN-003` | `murmur.lock` exists but failed to parse or validate — including a `lock_version` other than 3, which is refused rather than migrated |
 | `E-RUN-021` | A declared native tool's binary is built for another platform — reported on the checklist line; `mur run` refuses the same artifact at staging |
 | `E-RUN-043` | A declared artifact's pin was written by `manage.pull()` and `murmur.yaml` declares it as a hook, a driver, or with `gateway:` — reported on the checklist line; `mur run` refuses the same artifact at staging |
 | `E-CAP-014` | A variable the spawn closure's `capabilities.env.allow` declares is unset in this environment |
@@ -1179,7 +1195,7 @@ mur run --roster [<path>] [--task <path-or-text>] [--json]
 |---|---|---|
 | `--manifest` | `./murmur.yaml` | Path to the capsule manifest |
 | `--roster` | `./roster.yaml` when the flag is given with no value | Launch the formation a [roster](roster.md) declares, for one task. Takes the project directory or the `roster.yaml` inside it; any other file name refuses with [`E-ROS-001`](diagnostics.md#e-ros-001). Passes `--task`, `--json`, `--verbose`, `--no-env-file` and `--containment` through to its members, and cannot be combined with any other flag. See [Launching a formation](#mur-run-roster) |
-| `--capsule` | — | Run an installed artifact by name instead of a project directory. Requires `--capsule-version`, and cannot be combined with an explicitly given `--manifest`. The capsule is resolved from the project store and then the global store, and staged from the artifact bytes in memory: no `murmur.yaml` is read from disk, and no `murmur.lock` is read or written. This is the form a parent capsule's runtime launches a delegated child on |
+| `--capsule` | — | Run an installed artifact by its full name, `<scope>/<name>`, instead of a project directory; a bare name is refused with [`E-REG-007`](diagnostics.md#e-reg-007). Requires `--capsule-version`, and cannot be combined with an explicitly given `--manifest`. The capsule is resolved from the project store and then the global store, and staged from the artifact bytes in memory: no `murmur.yaml` is read from disk, and no `murmur.lock` is read or written. This is the form a parent capsule's runtime launches a delegated child on |
 | `--capsule-version` | — | Version of the `--capsule` artifact. Required with `--capsule` |
 | `--spawn-grant-stdin` | off | Read one line from standard input as this launch's spawn approval, and present it when the session registers with `mur-roost`. Set by a parent capsule's runtime when it launches a delegated child. Standard input rather than an argument or an environment variable, both of which any process running as the same user can read out of `/proc` |
 | `--task` | — | Written to the capsule workdir as `task.md` before launch. An existing file path is copied; any other value is written verbatim as UTF-8 text |
@@ -1262,7 +1278,8 @@ Current runtime constraints:
 
 - `mur run` accepts all four artifact runtimes: `tool`, `driver`, `hook`, and `skill`
 - `tool` artifacts are exposed as model-callable tools; `driver`, `hook`, and `skill` artifacts are staged for runtime use but are hidden from the model's tool inventory
-- `skill` artifacts install `skill.md` to `tools/<name>/skill.md` in the workdir; the agent reads them voluntarily via filesystem access
+- `tool` artifacts are offered to the model under their bare name, the part after the `/`: `murmur/tool-git` is the tool `tool-git`. Two declared artifacts with one bare name are refused with [`E-CAP-020`](diagnostics.md#e-cap-020)
+- `skill` artifacts install `skill.md` to `tools/<name>/skill.md` in the workdir, `<name>` being the bare name; the agent reads them voluntarily via filesystem access
 - Capsule component discovery:
   - prefers `capsule.wasm`
   - otherwise requires exactly one root `*.wasm`
@@ -2062,7 +2079,7 @@ for humans and its layout is not a stable interface.
 3. Wait up to 30s for SSH to become available on the VM
 4. Upload the `mur` binary via `scp` to `/usr/local/bin/mur`
 5. Upload the manifest, the files it references and the optional workdir to `/root/mur-<id>/`
-6. Upload every artifact into the VM's global store, `/root/.murmur/artifacts/<name>/<version>/`
+6. Upload every artifact into the VM's global store, `/root/.murmur/artifacts/<scope>/<name>/<version>/`. A declared `local/` artifact missing from the local stores is refused without asking a source
 7. Write the environment variables to `/root/mur-<id>/.env`, mode `600`, when there are any
 8. Run [`mur precompile --json --workdir /root/mur-<id>`](#mur-precompile) on the VM over every uploaded artifact, with the `.env` exported; skipped under `--no-precompile` or when the capsule declares no artifacts
 9. Run `mur run --manifest <path> --workdir /root/mur-<id> --json` on the VM with the same `.env` exported; wait up to 120s for the JSON line
@@ -2651,9 +2668,9 @@ A call refused because its input lacked a field the tool's
 every missing field, followed by a `tool_call` row marked `✗` on both transports:
 
 ```text
-  turn 0  tool_call  murmur-tool-editor
-    tool_input_refused murmur-tool-editor  missing operation
-    tool_call  murmur-tool-editor  0ms  ✗
+  turn 0  tool_call  tool-editor
+    tool_input_refused tool-editor  missing operation
+    tool_call  tool-editor  0ms  ✗
 ```
 
 | Transport | Where the `tool_call` row comes from |
@@ -2864,7 +2881,7 @@ Notes:
 
 ## `mur eval`
 
-Read and analyze `eval.jsonl` files produced by `murmur-hook-eval`, or drive a capsule against a dataset. These commands are read-only except for `mur eval run`, which launches real capsule sessions.
+Read and analyze `eval.jsonl` files produced by `murmur/hook-eval`, or drive a capsule against a dataset. These commands are read-only except for `mur eval run`, which launches real capsule sessions.
 
 See [Structured evaluation (`eval.jsonl`)](observability-schemas.md#structured-evaluation-evaljsonl) for the file format.
 
@@ -2979,7 +2996,7 @@ pass: 2/2
 
 **Non-obvious behaviour:**
 
-- `mur eval run` reads `murmur.yaml` from `<capsule-dir>/murmur.yaml`. The capsule must declare `murmur-hook-eval` in its `artifacts:` block — the CLI does not inject the hook automatically.
+- `mur eval run` reads `murmur.yaml` from `<capsule-dir>/murmur.yaml`. The capsule must declare `murmur/hook-eval` in its `artifacts:` block — the CLI does not inject the hook automatically.
 - The lockfile (`murmur.lock`) is read from `<capsule-dir>/murmur.lock`. If absent, one is created on the first case run and reused for subsequent cases.
 - A case that fails to stage (e.g. missing artifact) is recorded as `stage_failed` and does not count toward `pass`.
 - `MURMUR_DATASET_ID` is taken from `observability.eval.dataset_id` in the manifest, not from the dataset file.
@@ -3057,10 +3074,12 @@ mur search <query> [--index <PATH|URL|local>] [--limit <n>]
 **Output format:**
 
 ```text
-NAME                     VERSION  RUNTIME  DESCRIPTION
-murmur-tool-git          {{ v.murmur_tool_git }}    tool     Structured git interface for Murmur capsules.
-murmur-driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   Anthropic Messages API inference driver for Murmur agent capsules.
+NAME              VERSION  RUNTIME  DESCRIPTION
+tool-git          {{ v.murmur_tool_git }}    tool     Structured git interface for Murmur capsules.
+driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   Anthropic Messages API inference driver for Murmur agent capsules.
 ```
+
+`NAME` is the name the index records, which is the artifact's bare name; an artifact listed in the default index installs as `murmur/<name>`. With `--index local`, `NAME` is the full name from the global store.
 
 When no artifacts match, prints `No results found.` and exits `0` (not an error).
 

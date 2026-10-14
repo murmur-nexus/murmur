@@ -24,7 +24,7 @@ use common::leaks::files_containing;
 use common::recording_upstream::{read_request, RecordedRequest};
 use tempfile::TempDir;
 
-const ANTHROPIC_DRIVER: &str = "murmur-driver-anthropic";
+const ANTHROPIC_DRIVER: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.0";
 const ANTHROPIC_AUTH: &str = "upstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
 
@@ -254,7 +254,7 @@ fn upstream_request_matches_recording() {
     assert_eq!(rendered, golden);
 }
 
-const ENV_REPORT_DRIVER: &str = "env-report-driver";
+const ENV_REPORT_DRIVER: &str = "local/env-report-driver";
 const MARKER: &str = "sk-gateway-test-marker";
 const W_SEC_025_LINK: &str = "https://docs.murmur.nexus/reference/diagnostics/#w-sec-025";
 
@@ -429,7 +429,7 @@ fn driver_without_upstream_auth_refuses() {
         assert!(!run.output.status.success(), "{combined}");
         assert!(combined.contains("E-RUN-025"), "{combined}");
         assert!(
-            combined.contains(&format!("{ENV_REPORT_DRIVER}@{DRIVER_VERSION}")),
+            combined.contains(&format!("artifact '{ENV_REPORT_DRIVER}@{DRIVER_VERSION}'")),
             "{combined}"
         );
         if let Some(reason) = reason {
@@ -458,7 +458,7 @@ fn driver_with_the_retired_block_name_refuses() {
     assert!(!run.output.status.success(), "{combined}");
     for expected in [
         "E-RUN-025",
-        &format!("{ENV_REPORT_DRIVER}@{DRIVER_VERSION}"),
+        &format!("artifact '{ENV_REPORT_DRIVER}@{DRIVER_VERSION}'"),
         "was renamed to 'upstream_auth'",
     ] {
         assert!(combined.contains(expected), "{expected}: {combined}");

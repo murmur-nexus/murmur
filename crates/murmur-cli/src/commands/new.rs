@@ -139,6 +139,7 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
         manifest_dir,
         capsule_name: runtime_manifest.name.clone(),
         capsule_version: runtime_manifest.version.clone(),
+        capsule_artifact: None,
         capsule_component_bytes: Vec::new(), // agent capsule — no WASM component
         artifacts: generator_artifacts,
         allowlisted_tools,
@@ -187,8 +188,8 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
 
     capsule_runtime::report_eprintln!("mur new: generating manifest...");
 
-    // Run the generator synchronously. The capsule reads skill.md via murmur-tool-editor,
-    // discovers artifacts via murmur-tool-registry-search, generates the manifest, and writes
+    // Run the generator synchronously. The capsule reads skill.md via murmur/tool-editor,
+    // discovers artifacts via murmur/tool-registry-search, generates the manifest, and writes
     // it to out/murmur.yaml. The session exits via after_task: exit.
     launch_session(staged, |_url| {}).map_err(CliError::from)?;
 
@@ -382,13 +383,13 @@ artifacts:
     gateway:
       endpoint: {endpoint}
       api_key: {META_MANIFEST_KEY_PLACEHOLDER}
-  - name: murmur-tool-registry-search
+  - name: murmur/tool-registry-search
     version: "0.4.13"
     runtime: tool
-  - name: murmur-tool-editor
+  - name: murmur/tool-editor
     version: "0.4.4"
     runtime: tool
-  - name: murmur-skill-create-manifest
+  - name: murmur/skill-create-manifest
     version: "0.1.1"
     runtime: skill
 lifecycle:
@@ -411,8 +412,10 @@ fn check_artifacts_installed(
     artifacts: &[ArtifactRequest],
 ) -> Result<(), CliError> {
     for artifact in artifacts {
+        let name = murmur_artifact::ArtifactName::parse(&artifact.name)
+            .map_err(|error| CliError::new(E_RUN_008, error.to_string()))?;
         match local_registry.resolve_with_platform(
-            &artifact.name,
+            &name,
             &artifact.version,
             Some(current_platform()),
         ) {
@@ -443,7 +446,7 @@ fn build_task_prompt(task: &str, index: Option<&str>, _inf: &InferenceConfig) ->
 
     format!(
         r#"Step 1 — Read your manifest generation guide:
-Call read_file with path "tools/murmur-skill-create-manifest/skill.md".
+Call read_file with path "tools/skill-create-manifest/skill.md".
 Read the full contents before proceeding.
 
 Step 2 — Search for available artifacts:
@@ -455,7 +458,7 @@ Step 3 — Generate the manifest:
 Task: {task}
 
 Follow all guidance from the skill file. The manifest must pass `mur build` validation.
-Prefer murmur-tool-git and murmur-tool-editor over granting bash shell access.
+Prefer murmur/tool-git and murmur/tool-editor over granting bash shell access.
 Use the exact artifact versions returned by the registry search.
 Include runtime: tool at the top level.
 

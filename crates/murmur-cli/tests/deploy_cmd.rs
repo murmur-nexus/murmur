@@ -522,7 +522,7 @@ fn missing_artifact_fails_before_ssh_attempt() {
     let manifest_p = dir.path().join("murmur.yaml");
     fs::write(
         &manifest_p,
-        "name: my-agent\nversion: 0.1.0\nartifacts:\n  - name: my-missing-tool\n    version: 9.9.9\n",
+        "name: my-agent\nversion: 0.1.0\nartifacts:\n  - name: ana/my-missing-tool\n    version: 9.9.9\n",
     )
     .unwrap();
 
@@ -543,9 +543,58 @@ fn missing_artifact_fails_before_ssh_attempt() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("my-missing-tool"),
+        stderr.contains("ana/my-missing-tool"),
         "error must name the missing artifact, got: {stderr}"
     );
+    assert!(
+        !stderr.contains("E-MAN-003"),
+        "the name is valid, got: {stderr}"
+    );
+}
+
+/// A `local/` artifact comes only from a `.mur.zip` file, so a store miss is refused naming that
+/// file without asking any source, even with the built-in source configured.
+#[test]
+fn missing_local_artifact_fails_without_asking_a_source() {
+    let dir = tempdir().unwrap();
+    enable_deploy_beta(dir.path());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let api_base = format!("http://{}", listener.local_addr().unwrap());
+
+    let manifest_p = dir.path().join("murmur.yaml");
+    fs::write(
+        &manifest_p,
+        "name: my-agent\nversion: 0.1.0\nartifacts:\n  - name: local/my-tool\n    \
+         version: 1.0.0\n",
+    )
+    .unwrap();
+
+    let out = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", dir.path())
+        .env("MUR_GITHUB_API_BASE", &api_base)
+        .env_remove("GITHUB_TOKEN")
+        .args([
+            "deploy",
+            "run",
+            "--host",
+            "192.0.2.1", // TEST-NET; never reached because staging fails first
+            "--manifest",
+            manifest_p.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for needle in [
+        "artifact local/my-tool@1.0.0 is not in the store, and no source serves the 'local' scope",
+        "mur install ./my-tool-1.0.0.mur.zip",
+    ] {
+        assert!(stderr.contains(needle), "{needle} missing from: {stderr}");
+    }
+    listener.set_nonblocking(true).unwrap();
+    assert!(listener.accept().is_err(), "a local/ miss asked a source");
 }
 
 // ─── deploy.mur_version ──────────────────────────────────────────────────────
@@ -636,11 +685,11 @@ fn missing_system_prompt_file_fails_before_ssh_attempt() {
     fs::write(
         &manifest_p,
         "name: my-agent\nversion: 0.1.0\n\
-         artifacts:\n  - name: murmur-driver-openai\n    version: 0.1.0\n    runtime: driver\n    \
+         artifacts:\n  - name: murmur/driver-openai\n    version: 0.1.0\n    runtime: driver\n    \
          gateway:\n      endpoint: http://localhost:8080\n      keyless: true\n\
          inference:\n  model: gpt-4\n  \
          system_prompt_file: instructions.md\n  \
-         driver:\n    artifact: murmur-driver-openai\n",
+         driver:\n    artifact: murmur/driver-openai\n",
     )
     .unwrap();
 

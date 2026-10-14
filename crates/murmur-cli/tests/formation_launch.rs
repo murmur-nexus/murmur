@@ -24,13 +24,17 @@ use common::{
     assert_wound_down_by_formation as assert_wound_down, event_kinds, publish_to_store,
     read_whole_trace as read_trace, tool_result_text, tool_use_response, ScriptedServer,
 };
-use murmur_artifact::LocalRegistry;
+use murmur_artifact::{ArtifactName, LocalRegistry};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
 const PROBE_TOOL: &str = "formation-probe";
 const PROBE_VERSION: &str = "0.1.0";
 const PROBE_CALL: &str = "toolu_formation_probe";
+
+/// The scope every artifact a project here installs is filed under, as one installed from its
+/// `.mur.zip` file is. Member capsules and [`PROBE_TOOL`] are named by their bare part elsewhere.
+const SCOPE: &str = "local";
 
 // ── Artifacts ─────────────────────────────────────────────────────────────────
 
@@ -41,7 +45,7 @@ fn member_manifest(endpoint: &str, lifecycle: &str, driver_version: &str) -> Str
     format!(
         "artifacts:\n  - name: {DRIVER_NAME}\n    version: {driver_version}\n    runtime: driver\n    \
          gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
-         \x20 - name: {PROBE_TOOL}\n    version: {PROBE_VERSION}\n    runtime: tool\n\
+         \x20 - name: {SCOPE}/{PROBE_TOOL}\n    version: {PROBE_VERSION}\n    runtime: tool\n\
          capabilities:\n  network:\n    allow: [localhost]\n\
          lifecycle:\n  {lifecycle}\n\
          inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n\
@@ -159,7 +163,7 @@ const PLANNER: Member = entry("planner", "0.3.0");
 /// `member`'s entry under the roster's `members:`.
 fn roster_line(member: &Member) -> String {
     format!(
-        "  - name: {name}\n    capsule: {capsule}\n    version: {version}\n{entry}",
+        "  - name: {name}\n    capsule: {SCOPE}/{capsule}\n    version: {version}\n{entry}",
         name = member.name,
         capsule = member.capsule,
         version = member.version,
@@ -197,7 +201,7 @@ impl Project {
         let store = dir.path().join(".murmur").join("artifacts");
         publish_to_store(
             &store,
-            PROBE_TOOL,
+            &common::local(PROBE_TOOL),
             PROBE_VERSION,
             "tool",
             "runtime: tool\n",
@@ -237,7 +241,7 @@ impl Project {
             let body = member_manifest(&model.server.endpoint, lifecycle, driver_version);
             publish_to_store(
                 &store,
-                member.capsule,
+                &common::local(member.capsule),
                 member.version,
                 "capsule",
                 &body,
@@ -1096,7 +1100,7 @@ fn a_peer_that_cannot_start_refuses_the_launch_and_leaves_nothing_running() {
         assert!(launcher.stdout().is_empty(), "no formation line is printed");
 
         assert!(stderr.contains("error[E-RUN-045]"), "{stderr}");
-        assert!(stderr.contains("'broken' (broken@0.1.0)"), "{stderr}");
+        assert!(stderr.contains("'broken' (local/broken@0.1.0)"), "{stderr}");
         assert!(
             stderr.contains("exited with status 1 before reporting"),
             "{stderr}"
@@ -1481,7 +1485,7 @@ fn an_unreadable_or_orphaned_peers_variable_refuses_with_e_run_046() {
             &[
                 "run",
                 "--capsule",
-                "planner",
+                "local/planner",
                 "--capsule-version",
                 "0.3.0",
                 "--json",
@@ -1508,7 +1512,7 @@ fn a_member_whose_bytes_changed_since_admission_is_refused() {
         &[
             "run",
             "--capsule",
-            "coder",
+            "local/coder",
             "--capsule-version",
             "1.2.0",
             "--capsule-sha256",
@@ -1518,9 +1522,10 @@ fn a_member_whose_bytes_changed_since_admission_is_refused() {
     );
     assert_eq!(run.status.code(), Some(1), "{}", run.stderr);
     assert!(run.stderr.contains("error[E-RUN-047]"), "{}", run.stderr);
+    let coder = ArtifactName::parse(&common::local("coder")).unwrap();
     let installed = std::fs::read_to_string(
         LocalRegistry::new(project.path().join(".murmur").join("artifacts"))
-            .sha256_path_for("coder", "1.2.0"),
+            .sha256_path_for(&coder, "1.2.0"),
     )
     .unwrap();
     assert!(run.stderr.contains(installed.trim()), "{}", run.stderr);
@@ -1535,7 +1540,7 @@ fn a_member_whose_bytes_changed_since_admission_is_refused() {
     let alternate = TempDir::new().unwrap();
     publish_to_store(
         alternate.path(),
-        "coder",
+        coder.as_str(),
         "1.2.0",
         "capsule",
         &format!(
@@ -1551,15 +1556,20 @@ fn a_member_whose_bytes_changed_since_admission_is_refused() {
     let from = LocalRegistry::new(alternate.path());
     let to = LocalRegistry::new(project.path().join(".murmur").join("artifacts"));
     let wrapper = alternate.path().join("mur");
+    // Every command line the launcher starts a member with, one per line.
+    let argv_log = alternate.path().join("argv.log");
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\ncase \"$*\" in *'--capsule coder '*) cp '{}' '{}'; cp '{}' '{}';; esac\n\
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+             case \"$*\" in *'--capsule local/coder '*) \
+             cp '{}' '{}'; cp '{}' '{}';; esac\n\
              exec '{}' \"$@\"\n",
-            from.artifact_path_for("coder", "1.2.0").display(),
-            to.artifact_path_for("coder", "1.2.0").display(),
-            from.sha256_path_for("coder", "1.2.0").display(),
-            to.sha256_path_for("coder", "1.2.0").display(),
+            argv_log.display(),
+            from.artifact_path_for(&coder, "1.2.0").display(),
+            to.artifact_path_for(&coder, "1.2.0").display(),
+            from.sha256_path_for(&coder, "1.2.0").display(),
+            to.sha256_path_for(&coder, "1.2.0").display(),
             assert_cmd::cargo::cargo_bin("mur").display(),
         ),
     )
@@ -1572,10 +1582,17 @@ fn a_member_whose_bytes_changed_since_admission_is_refused() {
     let stderr = launcher.stderr();
     assert_ne!(status.code(), Some(0), "{stderr}");
     assert!(stderr.contains("error[E-RUN-045]"), "{stderr}");
-    assert!(stderr.contains("'coder' (coder@1.2.0)"), "{stderr}");
+    assert!(stderr.contains("'coder' (local/coder@1.2.0)"), "{stderr}");
     assert!(
         stderr.contains("E-RUN-047"),
         "the member's refusal is quoted: {stderr}"
+    );
+    // The roster's `capsule: local/coder` reaches the member's command line as its full name.
+    let argv = std::fs::read_to_string(&argv_log).unwrap();
+    assert!(
+        argv.lines()
+            .any(|line| line.contains("--capsule local/coder --capsule-version 1.2.0")),
+        "{argv}"
     );
     assert!(launcher.stdout().is_empty());
     project.assert_no_member_remains(&[], Duration::from_secs(30));
@@ -1617,7 +1634,7 @@ fn refusals_before_anything_starts() {
     for conflicting in [
         &["--workdir", "x"][..],
         &["--bind", "0.0.0.0"],
-        &["--capsule", "coder", "--capsule-version", "1.2.0"],
+        &["--capsule", "local/coder", "--capsule-version", "1.2.0"],
         &["--resume"],
         &["--context", "ctx"],
         &["--spawn-grant-stdin"],
@@ -1731,7 +1748,7 @@ fn mur_run_without_roster_ignores_an_invalid_roster() {
         &[
             "run",
             "--capsule",
-            "coder",
+            "local/coder",
             "--capsule-version",
             "1.2.0",
             "--explain-scope",
@@ -2093,7 +2110,7 @@ impl Project {
     }
 }
 
-/// `mur run --capsule coder` started by hand from the project, outside any launcher: in the
+/// `mur run --capsule local/coder` started by hand from the project, outside any launcher: in the
 /// formation `formation_id` names, when one is given, which is what prints `W-RUN-007`.
 struct HandStarted {
     child: std::process::Child,
@@ -2107,7 +2124,7 @@ impl HandStarted {
         let mut command = project.command(&[
             "run",
             "--capsule",
-            "coder",
+            "local/coder",
             "--capsule-version",
             CODER.version,
             "--json",

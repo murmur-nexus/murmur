@@ -8,7 +8,7 @@ section that explains it.
 
 | Code | Meaning | Details |
 |---|---|---|
-| `E-BLD-001` | Manifest `name:` is not a valid artifact identifier | [E-BLD-001](#e-bld-001) |
+| `E-BLD-001` | Manifest `name:` is not a valid artifact identifier, or carries a scope | [E-BLD-001](#e-bld-001) |
 | `E-BLD-002` | `requires_files:` entry is unsafe (absolute, `..`, symlink) or collides inside the archive | [E-BLD-002](#e-bld-002) |
 | `E-BLD-003` | Packed entry set is not a launchable wasm payload | [E-BLD-003](#e-bld-003) |
 | `E-BLD-004` | Artifact manifest declares `inference_auth:`, the former name of `upstream_auth:` | [E-BLD-004](#e-bld-004) |
@@ -24,13 +24,14 @@ section that explains it.
 | `E-CAP-010` | An artifact entry's `config:` block cannot be delivered as `MURMUR_ARTIFACT_CONFIG` | [E-CAP-010](#e-cap-010) |
 | `E-CAP-011` | `context.record_store`, or `mur run --context`, does not name one conversation record directory | [E-CAP-011](#e-cap-011) |
 | `E-CAP-012` | A `capabilities.filesystem.read_only` entry is not a usable workdir subpath | [E-CAP-012](#e-cap-012) |
-| `E-CAP-013` | An artifact claims the name of a tool the runtime provides itself | [E-CAP-013](#e-cap-013) |
+| `E-CAP-013` | An artifact's tool name is the name of a tool the runtime provides itself | [E-CAP-013](#e-cap-013) |
 | `E-CAP-014` | A variable this project needs is set by nothing in the environment | [E-CAP-014](#e-cap-014) |
 | `E-CAP-015` | A capsule declares a `capabilities.env.allow` entry the capsule that spawns it does not hold | [E-CAP-015](#e-cap-015) |
 | `E-CAP-016` | A `capabilities.env.allow` entry names a variable the credential backstop strips from every WASM component | [E-CAP-016](#e-cap-016) |
 | `E-CAP-017` | A `gateway:` is declared on a native tool, whose requests never pass the credential gateway | [E-CAP-017](#e-cap-017) |
 | `E-CAP-018` | A `gateway:` names an endpoint but binds no `api_key` and does not declare `keyless: true` | [E-CAP-018](#e-cap-018) |
 | `E-CAP-019` | A process driver requires a variable `capabilities.env.allow` does not declare | [E-CAP-019](#e-cap-019) |
+| `E-CAP-020` | Two declared artifacts share a tool name, the part of their names after the `/` | [E-CAP-020](#e-cap-020) |
 | `E-CNV-001` | No such record store or context id under `~/.murmur/conversations/` | [E-CNV-001](#e-cnv-001) |
 | `E-CNV-002` | A context id is present under more than one record store | [E-CNV-002](#e-cnv-002) |
 | `E-CNV-003` | `mur conversation truncate --keep` is not a usable number of messages to keep | [E-CNV-003](#e-cnv-003) |
@@ -47,18 +48,19 @@ section that explains it.
 | `E-IO-003` | General I/O error (read/write failure), including a write to standard output that failed for a reason other than its reader going away | [Piped output](cli.md#piped-output) |
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
-| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication), a credential scope that names a retired door method, a `network.authentication` declared beside a non-empty `capabilities.spawn.allow`, a `lifecycle.queue_depth: 0` under `task_acceptance: queue`, a top-level `mur_version`, which is pinned as [`deploy.mur_version`](manifest.md#field-deploy), a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds, or a top-level `registry:` key | [E-MAN-003](#e-man-003) |
+| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication), a credential scope that names a retired door method, a `network.authentication` declared beside a non-empty `capabilities.spawn.allow`, a `lifecycle.queue_depth: 0` under `task_acceptance: queue`, a top-level `mur_version`, which is pinned as [`deploy.mur_version`](manifest.md#field-deploy), a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds, an artifact name that is not `<scope>/<name>` where a full name is required, a scope on a `source:` entry, two `capabilities.spawn.allow` entries with one bare part, or a top-level `registry:` key | [E-MAN-003](#e-man-003) |
 | `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new-task) |
 | `E-NEW-002` | The name given to `mur new --roster`, or a capsule name derived from it, is not an artifact name | [`mur new --roster`](cli.md#mur-new-roster) |
 | `E-NEW-003` | The directory `mur new --roster` would write already exists | [`mur new --roster`](cli.md#mur-new-roster-writing) |
 | `E-NEW-004` | `inference.provider` in `~/.murmur/config.yaml` names a provider `mur new --roster` has no driver for | [`mur new --roster`](cli.md#mur-new-roster-provider) |
-| `E-REG-001` | Every source asked answered that it has no such artifact, or no asset of it for the host platform | [`mur install`](cli.md#mur-install) |
-| `E-REG-002` | Installed artifact bytes do not match the sha256 recorded for them | [Lockfile](workdir.md#lockfile-murmurlock) |
+| `E-REG-001` | Every source asked answered that it has no such artifact, or no asset of it for the host platform; or a `local/` artifact is not in the store, and no source serves the `local` scope | [`mur install`](cli.md#mur-install) |
+| `E-REG-002` | Installed artifact bytes do not match the sha256 recorded for them, or an artifact's packed `name:` is not the bare part of the name it is installed as | [E-REG-002](#e-reg-002) |
 | `E-REG-003` | An artifact of that name and version is already published | [`mur publish`](cli.md#mur-publish) |
 | `E-REG-004` | Reserved version string (`latest`, `stable`, `edge`) | [`mur publish`](cli.md#mur-publish) |
 | `E-REG-005` | A registry-resolved artifact's version or hash, or a [roster member's](roster.md#murmur-lock), disagrees with the `murmur.lock` entry | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-REG-006` | A source did not answer an artifact lookup — rate limited, refused, unreachable, or misconfigured — so whether it publishes the artifact is not known | [E-REG-006](#e-reg-006) |
-| `E-ROS-001` | `roster.yaml` is missing, unreadable, or does not have the roster shape | [E-ROS-001](#e-ros-001) |
+| `E-REG-007` | An artifact name on the command line is not `<scope>/<name>`, or a `github:` owner claims a reserved scope | [E-REG-007](#e-reg-007) |
+| `E-ROS-001` | `roster.yaml` is missing, unreadable, or does not have the roster shape, or names a member's capsule by a bare name | [E-ROS-001](#e-ros-001) |
 | `E-ROS-002` | A roster marks no member `entry: true`, or more than one | [E-ROS-002](#e-ros-002) |
 | `E-ROS-003` | Two roster members share one `name` | [E-ROS-003](#e-ros-003) |
 | `E-ROS-004` | A `reachability` rule names a member the roster does not have | [E-ROS-004](#e-ros-004) |
@@ -68,7 +70,7 @@ section that explains it.
 | `E-ROS-008` | A `reachability` rule lists the entry member in `to` | [E-ROS-008](#e-ros-008) |
 | `E-RUN-001` | Capsule crashed, compile failure, missing component export, execution deadline exceeded (`capabilities.limits.deadline_seconds`), or resource limit exceeded (`capabilities.limits.memory_bytes`/`table_elements`) | [Execution limits](resource-limits.md#execution-limits) |
 | `E-RUN-002` | Missing WASI import (linker error) | — |
-| `E-RUN-003` | Unsupported `lock_version`, missing lock entry, a lock entry with no hash for this host's platform, or a malformed `origin` / `session` pair | [Lockfile](workdir.md#lockfile-murmurlock) |
+| `E-RUN-003` | A `lock_version` other than `3`, a lock entry not named `<scope>/<name>`, missing lock entry, a lock entry with no hash for this host's platform, or a malformed `origin` / `session` pair | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-RUN-004` | Capsule WASM not found at expected path | — |
 | `E-RUN-005` | Inference driver not configured in manifest | [Inference configuration](manifest.md#inference-config) |
 | `E-RUN-006` | Inference driver artifact not installed, or a `transport: process` harness binary was not found | [E-RUN-006](#e-run-006) |
@@ -198,6 +200,22 @@ error[E-MAN-003]: murmur.yaml: invalid network config for 'network.authenticatio
 
 The scopes are listed under
 [`network.authentication`](manifest.md#field-network-authentication).
+
+An `artifacts:` entry, a `capabilities.spawn.allow` entry and a `capabilities.install` entry name
+an artifact by its full name, `<scope>/<name>`. A bare name is refused, and the hint names its
+scoped forms — see [Artifact names](../concepts/registry.md#artifact-names):
+
+```text
+error[E-MAN-003]: murmur.yaml: invalid artifact name in 'artifacts[0].name': 'tool-editor' is not a full artifact name: an artifact is named <scope>/<name>
+  hint: name it with its scope: 'murmur/tool-editor' for a Murmur default artifact, '<owner>/tool-editor' for one published from github.com/<owner>, or 'local/tool-editor' for one installed from a .mur.zip file
+```
+
+| Manifest | Refused because |
+|---|---|
+| A `source:` entry named `ana/style` | A `source:` entry is named by its bare name; the hint is `drop the scope: name it 'style'` |
+| `capabilities.spawn.allow: [local/worker, ana/worker]` | `delegate-task` offers each capsule to the model by its bare part, so two entries may not share one |
+| `capabilities.install.tool: ["tool-*"]` | An install entry names its scope: `ana/tool-*`, `ana/*`, an exact full name, or `*` |
+| `inference.driver.artifact: driver-anthropic` beside a declared `murmur/driver-anthropic` | `inference.driver.artifact` names the entry as written; the message names the declared entry to refer to |
 
 A top-level `registry:` key is refused by every command that reads a `murmur.yaml`, before any
 other field is checked. Artifacts resolve from the stores and the sources in
@@ -472,7 +490,7 @@ that binary was built for against this host's, before any of the session's nativ
 written to the workdir:
 
 ```text
-error[E-RUN-021]: native tool 'murmur-tool-git' cannot run on this host: its binary is built for darwin-aarch64, this host is linux-x86_64
+error[E-RUN-021]: native tool 'tool-git' cannot run on this host: its binary is built for darwin-aarch64, this host is linux-x86_64
   hint: the installed artifact holds a binary for another platform — reinstall it on this host with `mur install <name>@<version>`, or publish a build for this host's platform
 ```
 
@@ -617,7 +635,7 @@ refuses at staging, before any component runs or any request is sent. The refusa
 or not `gateway.api_key` is set, and to the inference driver, tools and hooks alike.
 
 ```text
-error[E-RUN-025]: artifact 'murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}' declares no usable upstream_auth: block
+error[E-RUN-025]: artifact 'murmur/driver-anthropic@{{ v.murmur_driver_anthropic }}' declares no usable upstream_auth: block
   hint: the runtime presents the key itself and needs the artifact to say how; update the artifact to a version whose murmur.yaml declares upstream_auth:, or remove gateway: from its entry
 ```
 
@@ -959,13 +977,13 @@ of these roles. When more than one applies, the first in the table is named:
 | `inference.system_prompt_artifact` | `inference:`, naming the skill as the system prompt | `stop binding it as inference.system_prompt_artifact in murmur.yaml` |
 
 ```text
-error[E-RUN-043]: murmur.lock pins 'some-tool@1.2.3' from a runtime pull by session ses_0190a1b2c3d4..., and murmur.yaml declares it with gateway:, which only an operator-declared pin may carry
-  hint: run `mur install some-tool@1.2.3` to adopt the pin as operator-declared, or remove gateway: from its murmur.yaml entry
+error[E-RUN-043]: murmur.lock pins 'ana/some-tool@1.2.3' from a runtime pull by session ses_0190a1b2c3d4..., and murmur.yaml declares it with gateway:, which only an operator-declared pin may carry
+  hint: run `mur install ana/some-tool@1.2.3` to adopt the pin as operator-declared, or remove gateway: from its murmur.yaml entry
 ```
 
 ```text
-error[E-RUN-043]: murmur.lock pins 'some-skill@1.0.0' from a runtime pull by session ses_0190a1b2c3d4..., and murmur.yaml declares it with inference.system_prompt_artifact, which only an operator-declared pin may carry
-  hint: run `mur install some-skill@1.0.0` to adopt the pin as operator-declared, or stop binding it as inference.system_prompt_artifact in murmur.yaml
+error[E-RUN-043]: murmur.lock pins 'ana/some-skill@1.0.0' from a runtime pull by session ses_0190a1b2c3d4..., and murmur.yaml declares it with inference.system_prompt_artifact, which only an operator-declared pin may carry
+  hint: run `mur install ana/some-skill@1.0.0` to adopt the pin as operator-declared, or stop binding it as inference.system_prompt_artifact in murmur.yaml
 ```
 
 A `mur run --system-prompt` override replaces the binding, so an overridden launch stages the skill
@@ -1004,8 +1022,8 @@ stopped, the entry member is never started, and no formation line is printed:
 ```text
 error[E-RUN-045]: the formation could not be launched
   'broken' (broken@0.1.0): its process exited with status 1 before reporting; its last stderr lines were:
-      [capsule-runtime] warning[W-SEC-027]: artifact 'murmur-driver-anthropic' gateway.api_key is written literally in murmur.yaml, so the key is read once at launch and this capsule cannot pick up a rotated key until it is restarted; store the key with `mur config set -g credentials.<NAME> <key>` to have it re-read (https://docs.murmur.nexus/reference/diagnostics/#w-sec-027)
-      error[E-RUN-008]: missing artifacts: murmur-driver-anthropic@9.9.9
+      [capsule-runtime] warning[W-SEC-027]: artifact 'murmur/driver-anthropic' gateway.api_key is written literally in murmur.yaml, so the key is read once at launch and this capsule cannot pick up a rotated key until it is restarted; store the key with `mur config set -g credentials.<NAME> <key>` to have it re-read (https://docs.murmur.nexus/reference/diagnostics/#w-sec-027)
+      error[E-RUN-008]: missing artifacts: murmur/driver-anthropic@9.9.9
         hint: run `mur install` to install all manifest dependencies
   stopped: coder (pid 529088), reviewer (pid 529091)
   hint: the formation was not launched, and nothing it started is still running; fix the member named above and launch again. `mur run --capsule <capsule> --capsule-version <version>` runs one member on its own and shows its whole output
@@ -1098,7 +1116,7 @@ it. A member whose installed artifact now hashes differently — reinstalled or 
 admission and launch — refuses before staging, rather than run other bytes:
 
 ```text
-error[E-RUN-047]: capsule 'coder@1.2.0' resolved to bytes with sha256 7bec909458461f9f56fca830b2c939a63eb79f2041c758e7390c1a9704a0167f, but it was admitted with sha256 0000000000000000000000000000000000000000000000000000000000000000
+error[E-RUN-047]: capsule 'local/coder@1.2.0' resolved to bytes with sha256 7bec909458461f9f56fca830b2c939a63eb79f2041c758e7390c1a9704a0167f, but it was admitted with sha256 0000000000000000000000000000000000000000000000000000000000000000
   hint: the installed artifact changed after the roster was admitted; launch the formation again so admission reads what is installed now
 ```
 
@@ -1306,7 +1324,7 @@ environment variable holding JSON, so the block has to be a string-keyed mapping
 JSON within 65536 bytes. Each rule refuses by name, quoting what the entry declared:
 
 ```text
-error[E-CAP-010]: invalid config for artifact 'murmur-tool-corpus': 'config:' must be a mapping of keys to values, but this entry declares a sequence
+error[E-CAP-010]: invalid config for artifact 'murmur/tool-corpus': 'config:' must be a mapping of keys to values, but this entry declares a sequence
   hint: config: on an artifact entry must be a mapping with string keys that serializes to at most 65536 bytes of JSON; it is delivered to that artifact alone as MURMUR_ARTIFACT_CONFIG. Omit the key entirely to deliver no variable, and keep secrets out of it — see https://docs.murmur.nexus/reference/manifest/#artifact-config
 ```
 
@@ -1314,7 +1332,7 @@ An oversized block is refused rather than truncated, and the message names the s
 to alongside the limit:
 
 ```text
-error[E-CAP-010]: invalid config for artifact 'murmur-tool-corpus': 'config:' serializes to 70011 bytes of JSON, over the 65536-byte limit for MURMUR_ARTIFACT_CONFIG
+error[E-CAP-010]: invalid config for artifact 'murmur/tool-corpus': 'config:' serializes to 70011 bytes of JSON, over the 65536-byte limit for MURMUR_ARTIFACT_CONFIG
 ```
 
 `config:` written with no value under it is an empty block, refused on the same terms. Omit the key
@@ -1368,11 +1386,12 @@ rather than refused. See [Read-only paths](manifest.md#read-only-paths).
 ### E-CAP-013 — an artifact claims a runtime-provided tool name { #e-cap-013 }
 
 `share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member` and
-`end-without-answer` are answered by the runtime itself, so an artifact cannot be declared under
-any of them:
+`end-without-answer` are answered by the runtime itself, so no artifact may have one of them as its
+tool name, the part of its full name after the `/`. `murmur/delegate-task` is refused as
+`delegate-task` would be:
 
 ```text
-error[E-CAP-013]: artifact 'delegate-task' collides with a tool the runtime provides itself; the reserved names are share-file, fetch-peer-file, delegate-task, submit-plan, switch-driver, call-member, end-without-answer
+error[E-CAP-013]: artifact 'murmur/delegate-task' has the tool name 'delegate-task', which collides with a tool the runtime provides itself; the reserved names are share-file, fetch-peer-file, delegate-task, submit-plan, switch-driver, call-member, end-without-answer
   hint: the runtime answers these names itself, so an artifact under one of them would be shadowed at dispatch whatever the tool allowlist said. Rename the artifact, or drop the dependency if the runtime-provided tool is what you wanted — see https://docs.murmur.nexus/reference/runtime-provided-tools/
 ```
 
@@ -1410,7 +1429,7 @@ Names only: no value is read into the report or printed. A name set to the empty
 set, because the runtime copies it through as-is. The matching stdout line is
 `✗ NAME   unset   — <capsule>@<version>`, naming every capsule that needs the name. A name reached
 through a field other than `capabilities.env.allow` carries that field in brackets, as
-`✗ NAME   unset   — solo@0.0.1 (artifacts.murmur-driver-anthropic.gateway.api_key)`. This is one of the two `Environment requirements` findings
+`✗ NAME   unset   — solo@0.0.1 (artifacts.murmur/driver-anthropic.gateway.api_key)`. This is one of the two `Environment requirements` findings
 that make `mur doctor` exit non-zero.
 
 ### E-CAP-015 — a declaration `mur-roost` will refuse { #e-cap-015 }
@@ -1494,7 +1513,7 @@ non-blank `api_key` and does not write `keyless: true`. An `api_key` that is abs
 whitespace or null counts as none, as does `keyless: false`.
 
 ```text
-error[E-CAP-018]: murmur.yaml: invalid artifact declaration at index 0: artifact 'murmur-tool-web-search' declares gateway.endpoint 'https://api.tavily.com' but binds no credential
+error[E-CAP-018]: murmur.yaml: invalid artifact declaration at index 0: artifact 'local/tool-web-search' declares gateway.endpoint 'https://api.tavily.com' but binds no credential
   hint: set gateway.api_key: ${NAME} on this entry to have the runtime present a key, or write gateway.keyless: true if this upstream takes no key — the runtime never infers keylessness from the address
 ```
 
@@ -1517,6 +1536,21 @@ manifest declares. `mur run` refuses at staging and names each missing variable.
 error[E-CAP-019]: process driver 'my-process-driver@1.0.0' requires MY_PROFILE in its environment, which capabilities.env.allow does not declare
   hint: add each variable to capabilities.env.allow — the harness sees only variables the manifest declares
 ```
+
+### E-CAP-020 — two artifacts share a tool name { #e-cap-020 }
+
+A session offers each declared artifact to the model by its tool name, the part of its full name
+after the `/`, and stages it under `workdir/tools/<tool name>/`. Two declared artifacts with one
+tool name are refused, whatever their scopes:
+
+```text
+error[E-CAP-020]: artifacts 'murmur/tool-editor' and 'ana/tool-editor' share the tool name 'tool-editor'; a capsule offers each artifact to the model by its tool name, so no two may share one
+  hint: declare one of them: the model calls each artifact by the part of its name after the '/', so two scopes cannot both serve one tool name in a capsule — see https://docs.murmur.nexus/reference/diagnostics/#e-cap-020
+```
+
+A `source:` entry counts by its bare name, so `- name: tool-editor` with `source:` beside
+`murmur/tool-editor` is refused the same way. The check runs before any artifact is resolved, so
+nothing is resolved and no session directory is created. Declare one of the two.
 
 ## Conversation record errors
 
@@ -1578,23 +1612,29 @@ warnings, which are about capability and enforcement posture.
 error[E-BLD-001]: invalid artifact name '<name>': <reason>
 ```
 
-An artifact `name:` becomes a filename (`<name>-<version>.mur.zip`), a registry key and a
-directory in the local store, so it is held to the lowest common denominator of all three:
+An artifact `name:` is its bare name. It becomes a filename (`<name>-<version>.mur.zip`), the tool
+name the model calls and a directory in the local store, so it is held to the lowest common
+denominator of all three:
 
 - non-empty, at most 100 characters
 - ASCII lowercase letters, digits and `-` only
 - no leading or trailing `-`
 
-Uppercase letters, spaces, `/`, `\` and `_` are rejected by the character rule. This is a
-*format* check only — it reserves no prefix and no namespace. `murmur-hook-compact` and
-`murmur-tool-git` are ordinary valid names; who may publish a given name is a registry
-question, not a packaging one.
+Uppercase letters, spaces, `\` and `_` are rejected by the character rule. A `/` is refused on its
+own, in `name:` and in `mur build --skill <name>` alike, because the scope belongs to the source
+the artifact is installed from — see [Artifact names](../concepts/registry.md#artifact-names):
+
+```text
+error[E-BLD-001]: invalid artifact name 'ana/tool-x': an artifact's own name carries no scope, so it may not contain '/'
+  hint: the scope belongs to the source the artifact is published from, not to the artifact: name it 'tool-x', and it installs as <owner>/tool-x from github.com/<owner> or as local/tool-x from its .mur.zip file
+```
 
 ```yaml
 name: my-tool        # ok
 name: My Tool        # E-BLD-001
 name: my_tool        # E-BLD-001
 name: -my-tool       # E-BLD-001
+name: ana/my-tool    # E-BLD-001
 ```
 
 ### E-BLD-002 — unsafe or colliding `requires_files:` entry { #e-bld-002 }
@@ -1708,7 +1748,7 @@ Two forms:
 
 ```text
 warning[W-DEPLOY-001]: the target did not precompile (error: unrecognized subcommand 'precompile'); the capsule compiles its artifacts on its first launch
-warning[W-DEPLOY-001]: the target could not precompile murmur-tool-echo@1.0.0; the capsule compiles it on its first launch
+warning[W-DEPLOY-001]: the target could not precompile tool-echo@1.0.0; the capsule compiles it on its first launch
 ```
 
 | Form | Cause | Fix |
@@ -1734,6 +1774,25 @@ reverse. To run under this machine's value, pass the `--env` the warning gives.
 
 ## Registry errors
 
+### E-REG-002 — an artifact's bytes or name do not match { #e-reg-002 }
+
+Installed bytes that do not hash to the sha256 [`murmur.lock`](workdir.md#lockfile-murmurlock)
+records for them are refused:
+
+```text
+error[E-REG-002]: artifact integrity check failed for ana/tool-x@1.0.0
+  hint: artifact on disk does not match murmur.lock — re-publish or delete the lock
+```
+
+An artifact is filed under the bare name its own `murmur.yaml` declares — see
+[Store layout](../concepts/registry.md#store-layout). Installing it under a full name whose bare
+part differs is refused, and nothing is written to the store:
+
+```text
+error[E-REG-002]: artifact ana/tool-x@1.0.0 declares name 'tool-y' in its murmur.yaml, so it cannot be filed as ana/tool-x
+  hint: an artifact is filed under the name its own murmur.yaml declares; install it as ana/tool-y
+```
+
 ### E-REG-006 — a source did not answer the lookup { #e-reg-006 }
 
 `mur install`, `mur install --all-platforms` and `mur deploy run` look an artifact up in each
@@ -1743,7 +1802,7 @@ rather than [`E-REG-001`](cli.md#mur-install): one source may publish the artifa
 gets one line with what it returned:
 
 ```text
-error[E-REG-006]: could not look up 'murmur-driver-anthropic': GitHub rate-limited the lookup, so whether a source publishes the artifact is not known
+error[E-REG-006]: could not look up 'driver-anthropic': GitHub rate-limited the lookup, so whether a source publishes the artifact is not known
   github:murmur-nexus/default-artifacts — rate limited by GitHub (HTTP 403, x-ratelimit-remaining: 0): API rate limit exceeded for 203.0.113.7. — resets in about 41 minutes
   hint: set GITHUB_TOKEN to any GitHub token, for example `export GITHUB_TOKEN=$(gh auth token)`, or point the source's `token:` in config.yaml at a variable you already export, such as `token: ${GH_TOKEN}` — GitHub allows 60 unauthenticated API requests an hour and each artifact lookup can spend four; see https://docs.murmur.nexus/reference/installing-artifacts/
 ```
@@ -1767,6 +1826,32 @@ An explicit `mur install github:<owner>/<repo>@<tag>` reports a rate limit the s
 | `HTTP 5xx`, `request failed: …` | GitHub or the network did not answer | Retry |
 | `invalid github repo …`, ``missing `repo` …`` | The source entry is misconfigured | Fix the entry in the [`registry:` section](config.md#registry-section) |
 
+### E-REG-007 — a command-line artifact name is not `<scope>/<name>` { #e-reg-007 }
+
+`mur install <ref>` and `mur run --capsule` take an artifact's full name, `<scope>/<name>` — see
+[Artifact names](../concepts/registry.md#artifact-names). A bare name is refused with a hint naming
+its scoped forms:
+
+```text
+error[E-REG-007]: 'tool-editor' is not a full artifact name: an artifact is named <scope>/<name>
+  hint: name it with its scope: 'murmur/tool-editor' for a Murmur default artifact, '<owner>/tool-editor' for one published from github.com/<owner>, or 'local/tool-editor' for one installed from a .mur.zip file
+```
+
+A name with more than one `/`, or a part the name rule refuses, is refused with the reason and no
+hint:
+
+```text
+error[E-REG-007]: 'a/b/c' is not a valid artifact name: expected exactly one '/', between the scope and the name
+```
+
+`local` and `murmur` are reserved scopes, so a `github:` reference whose owner is either is
+refused:
+
+```text
+error[E-REG-007]: github:local/repo cannot be installed: 'local' is a reserved scope
+  hint: 'local' names artifacts installed from a .mur.zip file and 'murmur' names those from murmur-nexus/default-artifacts; no GitHub owner can claim either
+```
+
 ---
 
 ## Registry warnings
@@ -1778,8 +1863,8 @@ the exit code of `mur doctor`.
 ### W-REG-001 — installed native artifact with no recorded platform { #w-reg-001 }
 
 ```text
-warning[W-REG-001]: murmur-tool-git@0.4.2 is a native artifact with no recorded platform — it resolved from the generic store path, where every host resolves the same payload
-  Fix: mur install murmur-tool-git@0.4.2
+warning[W-REG-001]: murmur/tool-git@0.4.2 is a native artifact with no recorded platform — it resolved from the generic store path, where every host resolves the same payload
+  Fix: mur install murmur/tool-git@0.4.2
   (https://docs.murmur.nexus/reference/diagnostics/#w-reg-001)
 ```
 
@@ -1815,7 +1900,7 @@ each one and why:
 
 ```text
   could not inspect 1 of 3 capsules in the spawn closure:
-    - ghost-worker (declared by root-capsule@0.0.1): not installed in the project or global store
+    - local/ghost-worker (declared by root-capsule@0.0.1): not installed in the project or global store
 ```
 
 Three reasons:
@@ -1833,7 +1918,7 @@ into the report.
 
 ```text
 Interface versions
-  ⚠  stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
+  ⚠  ana/stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
   mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/reference/diagnostics/#w-reg-003)
 ```
 
@@ -1875,6 +1960,7 @@ error[E-ROS-001]: roster.yaml: members[1].version (member 'coder'): 'latest' is 
 | `roster_version` other than `1` | Write `roster_version: 1` |
 | `members` empty | List at least one member |
 | A `name` that does not match `^[a-z][a-z0-9-]{0,31}$` | Use lowercase letters, digits and `-`, starting with a letter, at most 32 characters |
+| A `capsule` that is a bare name, such as `crew-lead` | Name the capsule by its full name, as `mur list` shows it: `local/crew-lead` for one installed from its `.mur.zip` file |
 | A `capsule` that is not a valid artifact name | Name the capsule as `mur list` shows it |
 | A `version` that is blank, `latest`, `stable` or `edge` | Write the exact installed version |
 | A `reachability` string other than `all` | Write `all` or a list of rules |
@@ -2047,7 +2133,7 @@ Nothing is refused: the run proceeds on the driver as written. The trace carries
 ### W-RUN-003 — an unavailable driver choice { #w-run-003 }
 
 ```text
-[capsule-runtime] warning[W-RUN-003]: driver choice 'gpt' (driver murmur-driver-openai, model gpt-5) is unavailable: its credential OPENAI_API_KEY was found in neither the global config's credentials: nor the environment, so a switch to it will be refused; the session runs on the primary
+[capsule-runtime] warning[W-RUN-003]: driver choice 'gpt' (driver murmur/driver-openai, model gpt-5) is unavailable: its credential OPENAI_API_KEY was found in neither the global config's credentials: nor the environment, so a switch to it will be refused; the session runs on the primary
   (https://docs.murmur.nexus/reference/diagnostics/#w-run-003)
 ```
 
@@ -2628,7 +2714,7 @@ structurally valid, exactly as an inert `shell` block on a hook entry is
 
 ```yaml
 artifacts:
-  - name: murmur-tool-corpus
+  - name: murmur/tool-corpus
     version: 0.1.0
     runtime: tool
     capabilities:
@@ -2653,7 +2739,7 @@ rather than per-artifact, so no `MURMUR_ARTIFACT_CONFIG` is delivered anywhere. 
 warning the only signal is a tool that behaves as though it were never configured.
 
 ```text
-[capsule-runtime] warning[W-SEC-015]: artifact 'murmur-tool-fixture' declares 'config:' but ships a native implementation — a native tool runs as a host subprocess and reads no per-artifact config, so no MURMUR_ARTIFACT_CONFIG is delivered (https://docs.murmur.nexus/reference/diagnostics/#w-sec-015)
+[capsule-runtime] warning[W-SEC-015]: artifact 'local/tool-fixture' declares 'config:' but ships a native implementation — a native tool runs as a host subprocess and reads no per-artifact config, so no MURMUR_ARTIFACT_CONFIG is delivered (https://docs.murmur.nexus/reference/diagnostics/#w-sec-015)
 ```
 
 **What the runtime does about it:** nothing is refused and no exit code changes, exactly as for a
@@ -2688,7 +2774,7 @@ as [`W-SEC-014`](#w-sec-014).
 
 ```yaml
 artifacts:
-  - name: murmur-hook-recall
+  - name: local/hook-recall
     version: 0.1.0
     runtime: hook
     capabilities:
@@ -2983,7 +3069,7 @@ naming the entry and the artifact, on stderr, from `mur run` (including `mur run
 and from `mur doctor`.
 
 ```text
-[capsule-runtime] warning[W-SEC-025]: capabilities.network.allow entry 'https://api.anthropic.com' names the gateway.endpoint host of artifact 'murmur-driver-anthropic'; the gateway does not use it — the runtime reaches that upstream itself — so the entry only grants tools, subprocesses and artifacts direct reach to that host without the key (https://docs.murmur.nexus/reference/diagnostics/#w-sec-025)
+[capsule-runtime] warning[W-SEC-025]: capabilities.network.allow entry 'https://api.anthropic.com' names the gateway.endpoint host of artifact 'murmur/driver-anthropic'; the gateway does not use it — the runtime reaches that upstream itself — so the entry only grants tools, subprocesses and artifacts direct reach to that host without the key (https://docs.murmur.nexus/reference/diagnostics/#w-sec-025)
 ```
 
 For an entry on an artifact's own `capabilities:`, the warning begins
@@ -3013,7 +3099,7 @@ supplies. It fires once per such key, naming the artifact, on stderr, from `mur 
 `mur run --explain-scope`) and from `mur doctor`.
 
 ```text
-[capsule-runtime] warning[W-SEC-027]: artifact 'murmur-driver-anthropic' gateway.api_key: ${ANTHROPIC_API_KEY} is read from the environment variable ANTHROPIC_API_KEY, because credentials.ANTHROPIC_API_KEY is not set in the global config, so the key is read once at launch and this capsule cannot pick up a rotated key until it is restarted; store the key with `mur config set -g credentials.ANTHROPIC_API_KEY <key>` to have it re-read (https://docs.murmur.nexus/reference/diagnostics/#w-sec-027)
+[capsule-runtime] warning[W-SEC-027]: artifact 'murmur/driver-anthropic' gateway.api_key: ${ANTHROPIC_API_KEY} is read from the environment variable ANTHROPIC_API_KEY, because credentials.ANTHROPIC_API_KEY is not set in the global config, so the key is read once at launch and this capsule cannot pick up a rotated key until it is restarted; store the key with `mur config set -g credentials.ANTHROPIC_API_KEY <key>` to have it re-read (https://docs.murmur.nexus/reference/diagnostics/#w-sec-027)
 ```
 
 For a literal, the warning names `artifact '<name>' gateway.api_key is written literally in
@@ -3094,7 +3180,7 @@ the next `mur doctor`.
 driver.
 
 ```text
-[capsule-runtime] warning[W-SEC-030]: artifact 'murmur-tool-web-search' reaches api.tavily.com through the credential gateway, unmetered — murmur neither counts nor limits what its calls spend, and inference.max_session_tokens and spend.machine_tokens_per_day do not cover it (https://docs.murmur.nexus/reference/diagnostics/#w-sec-030)
+[capsule-runtime] warning[W-SEC-030]: artifact 'local/tool-web-search' reaches api.tavily.com through the credential gateway, unmetered — murmur neither counts nor limits what its calls spend, and inference.max_session_tokens and spend.machine_tokens_per_day do not cover it (https://docs.murmur.nexus/reference/diagnostics/#w-sec-030)
 ```
 
 **Why it matters:** only the configured driver's calls count toward the spend ceilings. This

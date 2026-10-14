@@ -63,7 +63,7 @@ fn format_contracts(meta: &ArtifactMeta, prefix: &str) -> String {
     contract_matches(meta, prefix).join(", ")
 }
 
-// ── --all: both stores with SCOPE column ─────────────────────────────────────
+// ── --all: both stores with STORE column ─────────────────────────────────────
 
 fn run_list_all(contract: Option<&str>) -> Result<(), CliError> {
     let mut entries: Vec<(String, ArtifactMeta)> = Vec::new();
@@ -108,7 +108,7 @@ pub(crate) fn print_artifact_table(index: &[ArtifactMeta], contract: Option<&str
 
     let nw = index
         .iter()
-        .map(|m| m.name.len())
+        .map(|m| m.name.as_str().len())
         .max()
         .unwrap_or(0)
         .max(H_NAME.len());
@@ -164,7 +164,7 @@ pub(crate) fn print_artifact_table(index: &[ArtifactMeta], contract: Option<&str
 }
 
 fn print_artifact_table_scoped(entries: &[(String, ArtifactMeta)], contract: Option<&str>) {
-    const H_SCOPE: &str = "SCOPE";
+    const H_STORE: &str = "STORE";
     const H_NAME: &str = "NAME";
     const H_VERSION: &str = "VERSION";
     const H_RUNTIME: &str = "RUNTIME";
@@ -175,10 +175,10 @@ fn print_artifact_table_scoped(entries: &[(String, ArtifactMeta)], contract: Opt
         .map(|(s, _)| s.len())
         .max()
         .unwrap_or(0)
-        .max(H_SCOPE.len());
+        .max(H_STORE.len());
     let nw = entries
         .iter()
-        .map(|(_, m)| m.name.len())
+        .map(|(_, m)| m.name.as_str().len())
         .max()
         .unwrap_or(0)
         .max(H_NAME.len());
@@ -197,7 +197,7 @@ fn print_artifact_table_scoped(entries: &[(String, ArtifactMeta)], contract: Opt
 
     let Some(prefix) = contract else {
         capsule_runtime::report_println!(
-            "{H_SCOPE:<sw$}  {H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_PLATFORMS}"
+            "{H_STORE:<sw$}  {H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_PLATFORMS}"
         );
         for (scope, meta) in entries {
             let platforms = format_platforms(&meta.platforms);
@@ -219,7 +219,7 @@ fn print_artifact_table_scoped(entries: &[(String, ArtifactMeta)], contract: Opt
         .max(H_PLATFORMS.len());
 
     capsule_runtime::report_println!(
-        "{H_SCOPE:<sw$}  {H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_PLATFORMS:<pw$}  {H_CONTRACTS}"
+        "{H_STORE:<sw$}  {H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_PLATFORMS:<pw$}  {H_CONTRACTS}"
     );
     for (scope, meta) in entries {
         let platforms = format_platforms(&meta.platforms);

@@ -20,6 +20,7 @@ pub const E_REG_003: &str = "E-REG-003"; // artifact already exists (conflict)
 pub const E_REG_004: &str = "E-REG-004"; // reserved version string
 pub const E_REG_005: &str = "E-REG-005"; // registry-resolved artifact conflicts with murmur.lock
 pub const E_REG_006: &str = "E-REG-006"; // a source did not answer an artifact lookup (rate limited, refused, unreachable, or misconfigured)
+pub const E_REG_007: &str = "E-REG-007"; // an artifact name on the command line is not scope/name
 
 // Formation rosters
 pub const E_ROS_001: &str = "E-ROS-001"; // roster.yaml is missing, unreadable or malformed
@@ -109,6 +110,7 @@ pub const E_CAP_016: &str = "E-CAP-016"; // a capabilities.env.allow entry names
 pub const E_CAP_017: &str = "E-CAP-017"; // a gateway: is declared on a native tool, whose requests never pass the credential gateway
 pub const E_CAP_018: &str = "E-CAP-018"; // a gateway: names an endpoint but binds no api_key and does not declare keyless: true
 pub const E_CAP_019: &str = "E-CAP-019"; // a process driver requires a variable capabilities.env.allow does not declare
+pub const E_CAP_020: &str = "E-CAP-020"; // two declared artifacts share a tool name
 
 /// The hint on every `E-CAP-018` refusal, from the manifest parser and from staging alike.
 pub(crate) const GATEWAY_WITHOUT_CREDENTIAL_HINT: &str =
@@ -389,6 +391,16 @@ impl From<RuntimeError> for CliError {
                      artifact, or drop the dependency if the runtime-provided tool is what you \
                      wanted — see ",
                     murmur_artifact::docs_reference_url!("runtime-provided-tools/")
+                ),
+            ),
+            error @ RuntimeError::DuplicateToolName { .. } => CliError::with_hint(
+                E_CAP_020,
+                error.to_string(),
+                format!(
+                    "declare one of them: the model calls each artifact by the part of its name \
+                     after the '/', so two scopes cannot both serve one tool name in a capsule \
+                     — see {}",
+                    murmur_artifact::diagnostic_link("E-CAP-020")
                 ),
             ),
             error @ RuntimeError::EnvAllowStrippedByBackstop { .. } => CliError::with_hint(
@@ -895,6 +907,26 @@ impl From<RegistryError> for CliError {
             RegistryError::InvalidInput(message) => {
                 CliError::new(E_IO_003, format!("registry error: {message}"))
             }
+            RegistryError::PackedNameMismatch {
+                name,
+                version,
+                packed,
+            } => {
+                let scope = murmur_artifact::ArtifactName::parse(&name)
+                    .map(|name| name.scope().to_string())
+                    .unwrap_or_else(|_| "<scope>".to_string());
+                let hint = format!(
+                    "an artifact is filed under the name its own murmur.yaml declares; install it \
+                     as {scope}/{packed}"
+                );
+                let message = RegistryError::PackedNameMismatch {
+                    name,
+                    version,
+                    packed,
+                }
+                .to_string();
+                CliError::with_hint(E_REG_002, message, hint)
+            }
             RegistryError::IntegrityMismatch { name, version, .. } => CliError::with_hint(
                 E_REG_002,
                 format!("artifact integrity check failed for {name}@{version}"),
@@ -980,6 +1012,14 @@ impl From<BuildError> for CliError {
                 format!("invalid artifact name '{name}': {reason}"),
                 "artifact names are lowercase letters, digits and inner hyphens, e.g. my-tool",
             ),
+            BuildError::ScopedArtifactName { name } => {
+                let hint = scoped_build_name_hint(murmur_artifact::tool_name_of(&name));
+                CliError::with_hint(
+                    E_BLD_001,
+                    BuildError::ScopedArtifactName { name }.to_string(),
+                    hint,
+                )
+            }
             BuildError::UnsafeRequiredPath { entry, reason } => CliError::with_hint(
                 E_BLD_002,
                 format!("requires_files entry '{entry}' has an unsafe path: {reason}"),
@@ -1020,11 +1060,67 @@ impl From<BuildError> for CliError {
     }
 }
 
+/// A full artifact name from the command line, or `E-REG-007` naming why it is not one: for a
+/// bare name, with the hint naming its scoped forms.
+pub(crate) fn artifact_name_arg(input: &str) -> Result<murmur_artifact::ArtifactName, CliError> {
+    murmur_artifact::ArtifactName::parse(input).map_err(artifact_name_error)
+}
+
+/// `E-REG-007` for a command-line name that is not a full name.
+pub(crate) fn artifact_name_error(error: murmur_artifact::ArtifactNameError) -> CliError {
+    match error.hint() {
+        Some(hint) => CliError::with_hint(E_REG_007, error.to_string(), hint),
+        None => CliError::new(E_REG_007, error.to_string()),
+    }
+}
+
+/// The refusal of a `local/` artifact the stores do not hold, at `version` or, for `None`, at
+/// any version. No source serves the `local` scope, so none is asked.
+pub(crate) fn local_store_miss(
+    name: &murmur_artifact::ArtifactName,
+    version: Option<&str>,
+) -> CliError {
+    let scope = murmur_artifact::LOCAL_SCOPE;
+    let (message, file_version) = match version {
+        Some(version) => (
+            format!(
+                "artifact {name}@{version} is not in the store, and no source serves the \
+                 '{scope}' scope"
+            ),
+            version,
+        ),
+        None => (
+            format!("no source serves the '{scope}' scope, so {name} cannot be looked up"),
+            "<version>",
+        ),
+    };
+    CliError::with_hint(
+        E_REG_001,
+        message,
+        format!(
+            "a {scope}/ artifact is installed from its .mur.zip file: mur install ./{}-{file_version}.mur.zip",
+            name.name()
+        ),
+    )
+}
+
+/// The hint for a scoped `name:` (or `--skill` name) handed to `mur build`.
+pub(crate) fn scoped_build_name_hint(bare: &str) -> String {
+    format!(
+        "the scope belongs to the source the artifact is published from, not to the artifact: \
+         name it '{bare}', and it installs as <owner>/{bare} from github.com/<owner> or as \
+         local/{bare} from its .mur.zip file"
+    )
+}
+
 impl From<RosterRefusal> for CliError {
     fn from(refusal: RosterRefusal) -> Self {
         let message = refusal.to_string();
         let (code, hint) = match &refusal {
-            RosterRefusal::Malformed { .. } => (
+            RosterRefusal::Malformed {
+                hint: Some(hint), ..
+            } => (E_ROS_001, hint.clone()),
+            RosterRefusal::Malformed { hint: None, .. } => (
                 E_ROS_001,
                 format!(
                     "correct the key named above in roster.yaml — see {} for every key, its type \

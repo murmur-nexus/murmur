@@ -23,6 +23,7 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
             manifest_dir: project.path().to_path_buf(),
             capsule_name: "test-no-driver".to_string(),
             capsule_version: "0.1.0".to_string(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: vec![],
             allowlisted_tools: HashSet::new(),

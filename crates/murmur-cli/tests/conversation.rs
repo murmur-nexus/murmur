@@ -26,7 +26,7 @@ use common::hook_wat::{
     MARK_REPORT_SEP, SEED_CONTEXT,
 };
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 const CAPSULE_NAME: &str = "record-capsule";
 const TASK_TEXT: &str = "Report what you remember.";
@@ -108,7 +108,8 @@ fn tool_call() -> String {
     tool_call_named("toolu_1", "bash")
 }
 
-/// A capsule manifest declaring the driver, `blocks` of extra top-level YAML, and the hooks.
+/// A capsule manifest declaring the driver, `blocks` of extra top-level YAML, and the hooks,
+/// each as `local/<name>`: they are published from `.mur.zip` files.
 fn create_manifest(
     project_dir: &Path,
     endpoint: &str,
@@ -129,7 +130,7 @@ fn create_manifest_named(
 ) -> PathBuf {
     let hooks: String = hook_names
         .iter()
-        .map(|name| format!("  - name: {name}\n    version: 0.1.0\n    runtime: hook\n"))
+        .map(|name| format!("  - name: local/{name}\n    version: 0.1.0\n    runtime: hook\n"))
         .collect();
     let manifest = format!(
         "name: {CAPSULE_NAME}\nversion: 0.1.0\n{blocks}artifacts:\n  - name: {DRIVER_NAME}\n    \
@@ -143,9 +144,9 @@ fn create_manifest_named(
     path
 }
 
-/// Grant the hook entry `hook_name` in `manifest` `capabilities.conversation.read`.
+/// Grant the hook entry `local/<hook_name>` in `manifest` `capabilities.conversation.read`.
 fn grant_conversation_read(manifest: &Path, hook_name: &str) {
-    let entry = format!("  - name: {hook_name}\n    version: 0.1.0\n    runtime: hook\n");
+    let entry = format!("  - name: local/{hook_name}\n    version: 0.1.0\n    runtime: hook\n");
     let text = fs::read_to_string(manifest).unwrap();
     assert!(text.contains(&entry), "{hook_name} is declared: {text}");
     let granted = text.replace(
@@ -945,7 +946,7 @@ fn the_record_labels_a_fenced_tool_message() {
         )
         .replace(
             "      api_key: test-key\n",
-            &format!("      api_key: test-key\n  - name: {SKILL_NAME}\n    version: 0.1.0\n    runtime: skill\n"),
+            &format!("      api_key: test-key\n  - name: local/{SKILL_NAME}\n    version: 0.1.0\n    runtime: skill\n"),
         );
     fs::write(&f.manifest, manifest).unwrap();
 

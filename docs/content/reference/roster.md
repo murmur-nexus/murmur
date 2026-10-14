@@ -8,14 +8,14 @@ the project directory `mur run --roster` names, which needs no `murmur.yaml` of 
 roster_version: 1
 members:
   - name: planner
-    capsule: planner
+    capsule: local/planner
     version: 0.3.0
     entry: true
   - name: coder
-    capsule: coder
+    capsule: local/coder
     version: 1.2.0
   - name: reviewer
-    capsule: reviewer
+    capsule: local/reviewer
     version: 0.9.0
 reachability:
   - from: planner
@@ -40,7 +40,7 @@ Every key is listed below. Any other key, at any level, is refused with
 | `roster_version` | integer | yes | Must be `1`. |
 | `members` | list | yes | At least one entry. Order matters: admission reports faults in this order. |
 | `members[].name` | string | yes | The member's name within this roster. Matches `^[a-z][a-z0-9-]{0,31}$`. Unique within the roster. |
-| `members[].capsule` | string | yes | The installed capsule the member runs. A valid artifact name. Two members may run the same capsule. |
+| `members[].capsule` | string | yes | The installed capsule the member runs, by its full name, `<scope>/<name>` — see [Artifact names](../concepts/registry.md#artifact-names). A capsule installed from its `.mur.zip` file is `local/<name>`. A bare name is refused with [`E-ROS-001`](diagnostics.md#e-ros-001) and a hint naming its scoped forms. Two members may run the same capsule. |
 | `members[].version` | string | yes | The exact version of `capsule`. Not blank, and not `latest`, `stable` or `edge`. An unquoted number such as `1.10` reads as its text, as `artifacts[].version` does in `murmur.yaml`. |
 | `members[].entry` | boolean | no | `true` on exactly one member. Default: `false`. |
 | `reachability` | `all` or list | no | Which members may call which. Default: no member may call another. An empty list means the same. |

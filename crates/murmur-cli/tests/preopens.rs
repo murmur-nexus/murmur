@@ -32,7 +32,7 @@ fn artifact_entry(name: &str, runtime: &str, capabilities_yaml: Option<&str>) ->
         .map(|yaml| format!("    capabilities:{yaml}\n"))
         .unwrap_or_default();
     format!(
-        "  - name: {name}\n    version: {ARTIFACT_VERSION}\n    runtime: {runtime}\n{capabilities}"
+        "  - name: local/{name}\n    version: {ARTIFACT_VERSION}\n    runtime: {runtime}\n{capabilities}"
     )
 }
 
@@ -120,7 +120,7 @@ fn an_undeclared_tool_reads_as_the_whole_workdir() {
     let stdout = explain_scope_stdout(&home, dir.path());
     assert!(
         stdout.contains(
-            "- notes-tool (tool): the whole accessible workdir — no capabilities.filesystem.scope \
+            "- local/notes-tool (tool): the whole accessible workdir — no capabilities.filesystem.scope \
              declared"
         ),
         "expected the whole-workdir line, got:\n{stdout}"
@@ -151,7 +151,7 @@ fn a_scoped_tool_reads_as_a_subtree() {
     let stdout = explain_scope_stdout(&home, dir.path());
     assert!(
         stdout.contains(
-            "- notes-tool (tool): one subtree of the accessible workdir — \
+            "- local/notes-tool (tool): one subtree of the accessible workdir — \
              capabilities.filesystem.scope: cache"
         ),
         "expected the scoped line, got:\n{stdout}"
@@ -183,9 +183,9 @@ fn the_three_surfaces_render_as_three_different_lines() {
         .lines()
         .map(str::trim)
         .filter(|line| {
-            line.starts_with("- notes-tool")
-                || line.starts_with("- cache-tool")
-                || line.starts_with("- telemetry-hook")
+            line.starts_with("- local/notes-tool")
+                || line.starts_with("- local/cache-tool")
+                || line.starts_with("- local/telemetry-hook")
         })
         .collect();
 
@@ -232,19 +232,19 @@ fn the_json_report_carries_a_stable_preopen_shape() {
         explain_scope_json(&home, dir.path())["preopens"],
         serde_json::json!([
             {
-                "artifact": "notes-tool",
+                "artifact": "local/notes-tool",
                 "role": "tool",
                 "scope": null,
                 "surface": "whole-workdir",
             },
             {
-                "artifact": "cache-tool",
+                "artifact": "local/cache-tool",
                 "role": "driver",
                 "scope": "cache",
                 "surface": "scoped-subtree",
             },
             {
-                "artifact": "telemetry-hook",
+                "artifact": "local/telemetry-hook",
                 "role": "hook",
                 "scope": null,
                 "surface": "nothing",
@@ -322,7 +322,7 @@ fn a_capsule_wide_scope_does_not_narrow_a_tools_preopen() {
         report["preopens"],
         serde_json::json!([
             {
-                "artifact": "notes-tool",
+                "artifact": "local/notes-tool",
                 "role": "tool",
                 "scope": null,
                 "surface": "whole-workdir",
@@ -330,7 +330,7 @@ fn a_capsule_wide_scope_does_not_narrow_a_tools_preopen() {
         ])
     );
     assert!(explain_scope_stdout(&home, dir.path())
-        .contains("- notes-tool (tool): the whole accessible workdir"));
+        .contains("- local/notes-tool (tool): the whole accessible workdir"));
 }
 
 /// `mur doctor` prints the same lines from the same resolver, and its verdict is untouched: a wide
@@ -363,14 +363,14 @@ fn doctor_reports_the_same_preopens_without_changing_its_verdict() {
     assert!(stdout.contains("Filesystem preopens"), "got:\n{stdout}");
     assert!(
         stdout.contains(
-            "- notes-tool (tool): the whole accessible workdir — no capabilities.filesystem.scope \
+            "- local/notes-tool (tool): the whole accessible workdir — no capabilities.filesystem.scope \
              declared"
         ),
         "got:\n{stdout}"
     );
     assert!(
         stdout.contains(
-            "- telemetry-hook (hook): nothing preopened — no capabilities.filesystem.scope declared"
+            "- local/telemetry-hook (hook): nothing preopened — no capabilities.filesystem.scope declared"
         ),
         "got:\n{stdout}"
     );

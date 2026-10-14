@@ -24,7 +24,7 @@ use assert_cmd::Command;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-const DRIVER: &str = "murmur-driver-anthropic";
+const DRIVER: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 /// The one tool a plan step in this file calls. A skill, because a skill needs no component and

@@ -9,7 +9,7 @@ use tempfile::TempDir;
 
 use common::ScriptedServer;
 
-const DRIVER_ANTHROPIC_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_ANTHROPIC_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 fn fixture_path(relative: &str) -> PathBuf {
@@ -46,7 +46,7 @@ fn create_agent_manifest(
     let extra_artifact_entries = extra_artifacts
         .iter()
         .map(|(name, version, runtime)| {
-            format!("  - name: {name}\n    version: {version}\n    runtime: {runtime}\n")
+            format!("  - name: local/{name}\n    version: {version}\n    runtime: {runtime}\n")
         })
         .collect::<String>();
 

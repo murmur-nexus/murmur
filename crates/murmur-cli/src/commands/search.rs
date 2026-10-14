@@ -171,7 +171,7 @@ fn scan_local() -> Result<Vec<ArtifactIndexEntry>, CliError> {
 
 fn meta_to_entry(meta: ArtifactMeta) -> ArtifactIndexEntry {
     ArtifactIndexEntry {
-        name: meta.name,
+        name: meta.name.to_string(),
         version: meta.version,
         runtime: meta.artifact_runtime,
         description: meta.description,

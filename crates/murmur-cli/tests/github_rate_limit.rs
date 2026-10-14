@@ -17,7 +17,10 @@ use std::{
 use assert_cmd::Command;
 use predicates::prelude::*;
 
-const ARTIFACT: &str = "murmur-tool-git";
+/// The bare name the releases publish their assets under.
+const ARTIFACT: &str = "tool-git";
+/// The full name installed: the scope of the `acme/*` sources.
+const FULL_NAME: &str = "acme/tool-git";
 const VERSION: &str = "0.4.2";
 
 const RATE_LIMIT_BODY: &str = "{\"message\":\"API rate limit exceeded for 127.0.0.1. (But here's the good news: Authenticated requests get a higher rate limit.)\",\"documentation_url\":\"https://docs.github.com/rest/overview/resources-in-the-rest-api#rate-limiting\"}";
@@ -185,7 +188,7 @@ fn hint_line(stderr: &str) -> &str {
 }
 
 fn assert_nothing_installed(home: &Path) {
-    let store = home.join(".murmur").join("artifacts").join(ARTIFACT);
+    let store = home.join(".murmur").join("artifacts").join(FULL_NAME);
     assert!(!store.exists(), "{} was written", store.display());
 }
 
@@ -198,7 +201,7 @@ fn an_unauthenticated_rate_limit_is_unanswered_and_names_the_token_fix() {
     let stub = Stub::start(|_| Reply::rate_limited());
 
     let assert = mur(home.path(), cwd.path(), &stub, None)
-        .args(["install", &format!("{ARTIFACT}@{VERSION}"), "-g"])
+        .args(["install", &format!("{FULL_NAME}@{VERSION}"), "-g"])
         .assert()
         .failure();
     let stderr = stderr_of(&assert);
@@ -237,7 +240,7 @@ fn a_rate_limit_with_a_token_gives_no_token_advice() {
     let stub = Stub::start(|_| Reply::rate_limited());
 
     let assert = mur(home.path(), cwd.path(), &stub, Some("test-token"))
-        .args(["install", &format!("{ARTIFACT}@{VERSION}"), "-g"])
+        .args(["install", &format!("{FULL_NAME}@{VERSION}"), "-g"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("E-REG-006"))
@@ -272,7 +275,7 @@ fn a_saml_refusal_is_unanswered_without_rate_limit_advice() {
     });
 
     let assert = mur(home.path(), cwd.path(), &stub, Some("test-token"))
-        .args(["install", &format!("{ARTIFACT}@{VERSION}"), "-g"])
+        .args(["install", &format!("{FULL_NAME}@{VERSION}"), "-g"])
         .assert()
         .failure();
     let stderr = stderr_of(&assert);
@@ -310,7 +313,7 @@ fn a_rate_limited_asset_download_is_unanswered() {
     });
 
     let assert = mur(home.path(), cwd.path(), &stub, None)
-        .args(["install", &format!("{ARTIFACT}@{VERSION}"), "-g"])
+        .args(["install", &format!("{FULL_NAME}@{VERSION}"), "-g"])
         .assert()
         .failure();
     let stderr = stderr_of(&assert);
@@ -341,7 +344,7 @@ fn a_chain_with_one_unanswered_source_is_unanswered() {
     });
 
     let assert = mur(home.path(), cwd.path(), &stub, None)
-        .args(["install", &format!("{ARTIFACT}@{VERSION}"), "-g"])
+        .args(["install", &format!("{FULL_NAME}@{VERSION}"), "-g"])
         .assert()
         .failure();
     let stderr = stderr_of(&assert);
@@ -373,7 +376,7 @@ fn a_manifest_install_reports_every_rate_limited_artifact_as_unanswered() {
     fs::write(
         project.path().join("murmur.yaml"),
         format!(
-            "name: dep-project\nversion: 0.0.1\nartifacts:\n  - name: murmur-tool-git\n    version: {VERSION}\n    runtime: tool\n  - name: murmur-tool-fs\n    version: {VERSION}\n    runtime: tool\n"
+            "name: dep-project\nversion: 0.0.1\nartifacts:\n  - name: acme/tool-git\n    version: {VERSION}\n    runtime: tool\n  - name: acme/tool-fs\n    version: {VERSION}\n    runtime: tool\n"
         ),
     )
     .unwrap();
@@ -387,11 +390,11 @@ fn a_manifest_install_reports_every_rate_limited_artifact_as_unanswered() {
     let stderr = stderr_of(&assert);
 
     assert!(
-        stdout.contains(&format!("murmur-tool-git@{VERSION}")),
+        stdout.contains(&format!("acme/tool-git@{VERSION}")),
         "{stdout}"
     );
     assert!(
-        stdout.contains(&format!("murmur-tool-fs@{VERSION}")),
+        stdout.contains(&format!("acme/tool-fs@{VERSION}")),
         "{stdout}"
     );
     assert_eq!(stdout.matches("error[E-REG-006]:").count(), 2, "{stdout}");

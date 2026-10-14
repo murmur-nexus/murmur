@@ -16,7 +16,7 @@ use std::{
 use capsule_runtime::{launch_session, StagedSession};
 use serde_json::Value;
 
-const DRIVER_NAME: &str = "usage-driver";
+const DRIVER_NAME: &str = "local/usage-driver";
 const DRIVER_VERSION: &str = "0.1.0";
 
 /// The constants the fixture reports, mirrored from

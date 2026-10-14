@@ -3,6 +3,7 @@
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 pub mod artifact;
+pub mod artifact_name;
 pub mod artifact_ref;
 pub mod build;
 pub mod build_lints;
@@ -39,10 +40,14 @@ pub use artifact::{
     load_manifest_from_artifact_bytes, load_manifest_yaml_from_artifact,
     load_manifest_yaml_from_artifact_bytes, ArtifactError, DeclaredRuntime,
 };
+pub use artifact_name::{
+    prefix_part_error, unscoped_name_hint, ArtifactName, ArtifactNameError, LOCAL_SCOPE,
+    MURMUR_SCOPE, RESERVED_SCOPES,
+};
 pub use artifact_ref::{ArtifactRef, ArtifactRefError};
 pub use build::{
-    artifact_name_format_error, build_artifact, BuildError, MAX_ARTIFACT_NAME_LEN,
-    PACKED_MANIFEST_ENTRY,
+    artifact_name_format_error, build_artifact, validate_artifact_name, BuildError,
+    MAX_ARTIFACT_NAME_LEN, PACKED_MANIFEST_ENTRY,
 };
 pub use build_lints::{
     build_warning_link, lint_build_warnings, BuildWarning, RESERVED_ROOT_ENTRIES, W_BLD_001,
@@ -85,9 +90,9 @@ pub use runtime_manifest::{
     commit_policy_for_binding, effective_containment_floor, load_runtime_manifest, parse_byte_size,
     parse_duration_secs, parse_hook_config_from_yaml, parse_tool_implementation_from_yaml,
     read_hook_config, read_runtime_manifest_text, read_tool_implementation,
-    referenced_env_variables, AfterTask, ApiKeyReference, ArtifactGateway, ArtifactImplementation,
-    ArtifactRuntime, AuthenticationScheme, Capabilities, CompactionConfig, ContainmentClass,
-    ContextConfig, ContextRetainConfig, ControlConfig, ControllableSetting,
+    referenced_env_variables, tool_name_of, AfterTask, ApiKeyReference, ArtifactGateway,
+    ArtifactImplementation, ArtifactRuntime, AuthenticationScheme, Capabilities, CompactionConfig,
+    ContainmentClass, ContextConfig, ContextRetainConfig, ControlConfig, ControllableSetting,
     ConversationCapabilities, ConversationMode, DeployConfig, DoorCredential, EnvCapabilities,
     EvalConfig, ExportMode, Exports, FileExport, FilesystemCapabilities, HookBinding,
     HookCommitPolicy, HookConfig, HookExecutionMode, HookOverflowPolicy, InferenceAlternate,

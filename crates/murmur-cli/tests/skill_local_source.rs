@@ -26,7 +26,7 @@ fn stub_inference() -> Option<InferenceConfig> {
         transport: "http".to_string(),
         model: "test-model".to_string(),
         driver: Some(InferenceDriver {
-            artifact: "dummy-driver".to_string(),
+            artifact: "local/dummy-driver".to_string(),
             config: None,
         }),
         command: None,
@@ -87,6 +87,7 @@ fn local_source_file_path_installs_skill_md() {
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_from(&runtime_manifest),
             allowlisted_tools: HashSet::new(),
@@ -157,6 +158,7 @@ fn local_source_directory_path_finds_skill_md_case_insensitively() {
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_from(&runtime_manifest),
             allowlisted_tools: HashSet::new(),
@@ -223,7 +225,7 @@ fn local_source_coexists_with_registry_skill() {
     fs::create_dir_all(&local_skill).unwrap();
     fs::write(local_skill.join("skill.md"), "# Local Skill\n").unwrap();
 
-    let manifest_content = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: reg-skill\n    version: 0.1.0\n    runtime: skill\n  - name: local-skill\n    source: ./local/\n    runtime: skill\n";
+    let manifest_content = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: local/reg-skill\n    version: 0.1.0\n    runtime: skill\n  - name: local-skill\n    source: ./local/\n    runtime: skill\n";
     let manifest_path = capsule_dir.path().join("murmur.yaml");
     fs::write(&manifest_path, manifest_content).unwrap();
 
@@ -238,6 +240,7 @@ fn local_source_coexists_with_registry_skill() {
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_from(&runtime_manifest),
             allowlisted_tools: HashSet::new(),
@@ -323,7 +326,7 @@ fn home_with_dummy_driver() -> TempDir {
 fn source_path_missing_fails_naming_path() {
     let capsule_dir: TempDir = tempdir().unwrap();
     // Skill source points at a path that does not exist. Inference present so staging is reached.
-    let manifest_content = "name: cap\nversion: 0.1.0\ninference:\n  transport: http\n  model: test\n  driver:\n    artifact: dummy-driver\nartifacts:\n  - name: ghost\n    source: ./skills/ghost/skill.md\n    runtime: skill\n  - name: dummy-driver\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://localhost:9999\n      keyless: true\n";
+    let manifest_content = "name: cap\nversion: 0.1.0\ninference:\n  transport: http\n  model: test\n  driver:\n    artifact: local/dummy-driver\nartifacts:\n  - name: ghost\n    source: ./skills/ghost/skill.md\n    runtime: skill\n  - name: local/dummy-driver\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://localhost:9999\n      keyless: true\n";
     let manifest_path = capsule_dir.path().join("murmur.yaml");
     fs::write(&manifest_path, manifest_content).unwrap();
 
@@ -348,7 +351,7 @@ fn source_directory_without_skill_md_fails() {
     let empty = capsule_dir.path().join("skills").join("empty");
     fs::create_dir_all(&empty).unwrap();
 
-    let manifest_content = "name: cap\nversion: 0.1.0\ninference:\n  transport: http\n  model: test\n  driver:\n    artifact: dummy-driver\nartifacts:\n  - name: empty-skill\n    source: ./skills/empty/\n    runtime: skill\n  - name: dummy-driver\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://localhost:9999\n      keyless: true\n";
+    let manifest_content = "name: cap\nversion: 0.1.0\ninference:\n  transport: http\n  model: test\n  driver:\n    artifact: local/dummy-driver\nartifacts:\n  - name: empty-skill\n    source: ./skills/empty/\n    runtime: skill\n  - name: local/dummy-driver\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://localhost:9999\n      keyless: true\n";
     let manifest_path = capsule_dir.path().join("murmur.yaml");
     fs::write(&manifest_path, manifest_content).unwrap();
 

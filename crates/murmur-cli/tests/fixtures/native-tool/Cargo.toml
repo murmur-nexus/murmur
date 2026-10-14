@@ -1,11 +1,11 @@
 [package]
-name = "murmur-tool-fixture"
+name = "tool-fixture"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
 [[bin]]
-name = "murmur-tool-fixture"
+name = "tool-fixture"
 path = "src/main.rs"
 
 [dependencies]

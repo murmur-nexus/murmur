@@ -17,7 +17,10 @@ use assert_cmd::Command;
 use murmur_artifact::{current_platform, SUPPORTED_PLATFORMS};
 use predicates::prelude::*;
 
-const ARTIFACT: &str = "murmur-tool-git";
+/// The bare name the release publishes its assets under.
+const ARTIFACT: &str = "tool-git";
+/// The full name installed: the scope of the `acme/artifacts` source.
+const FULL_NAME: &str = "acme/tool-git";
 const VERSION: &str = "0.4.2";
 const RELEASE_TAG: &str = "v9.9.9";
 
@@ -122,7 +125,7 @@ fn install_refuses_a_release_that_publishes_no_asset_for_this_platform() {
         .env("MUR_GITHUB_API_BASE", &api_base)
         .env_remove("GITHUB_TOKEN")
         .current_dir(cwd.path())
-        .args(["install", &format!("{ARTIFACT}@{VERSION}"), "-g"])
+        .args(["install", &format!("{FULL_NAME}@{VERSION}"), "-g"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("E-REG-001"))
@@ -137,6 +140,10 @@ fn install_refuses_a_release_that_publishes_no_asset_for_this_platform() {
     drop(assertion);
 
     // A refusal writes nothing: no asset download is issued at all.
-    let store = home.path().join(".murmur").join("artifacts").join(ARTIFACT);
+    let store = home
+        .path()
+        .join(".murmur")
+        .join("artifacts")
+        .join(FULL_NAME);
     assert!(!store.exists(), "{} was written", store.display());
 }

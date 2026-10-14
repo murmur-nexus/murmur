@@ -200,8 +200,18 @@ what is installed, `diagnostics` returns the session id alongside that list, `pu
 new artifact, and `remove` uninstalls one the capsule pulled. `search` is unimplemented: calling it
 returns an error.
 
+Every function takes and returns artifacts by full name, `<scope>/<name>` — see
+[Artifact names](../concepts/registry.md#artifact-names). The signatures are unchanged: a name is a
+`string`. A name that is not a full name is refused with an error string beginning `not-granted:`,
+which for a bare name carries the hint naming its scoped forms:
+
+```text
+not-granted: 'tool-x' is not a full artifact name: an artifact is named <scope>/<name>; name it with its scope: 'murmur/tool-x' for a Murmur default artifact, '<owner>/tool-x' for one published from github.com/<owner>, or 'local/tool-x' for one installed from a .mur.zip file
+```
+
 `pull` resolves an artifact from the session's registry, verifies its bytes against the registry
-hash and any pinned `murmur.lock` entry, then installs it under `<workdir>/tools/<name>/` and
+hash and any pinned `murmur.lock` entry, then installs it under `<workdir>/tools/<name>/`, `<name>`
+being the bare part of its full name, and
 updates `murmur.lock`. A new entry is pinned as [`origin: runtime`](workdir.md#lock-origin) with
 the id of the pulling session, which the runtime supplies itself; an entry that already exists
 keeps its origin. A hash mismatch, or a version or hash that conflicts with an existing
@@ -217,11 +227,12 @@ refusal is about a name. The checks run in this order:
 | Order | Refused when | Registry read |
 |---:|---|---|
 | 1 | The capsule declares no `capabilities.install` | No |
-| 2 | The name is not a bare artifact name | No |
+| 2 | The name is not a full artifact name, `<scope>/<name>` | No |
 | 3 | The version is not a single path segment: empty, `.`, `..`, or containing `/` | No |
 | 4 | No entry in either install list matches the name | No |
-| 5 | The artifact is not a skill or a tool — a `driver`, a `hook`, or a role that disagrees with its payload | Yes |
-| 6 | No entry in the list for the artifact's own kind matches the name | Yes |
+| 5 | Another artifact of this session already has its tool name, the bare part: pulling `ana/tool-y` while `murmur/tool-y` is installed returns `not-granted: 'ana/tool-y' has the tool name 'tool-y', which 'murmur/tool-y' already holds in this session; …` | No |
+| 6 | The artifact is not a skill or a tool — a `driver`, a `hook`, or a role that disagrees with its payload | Yes |
+| 7 | No entry in the list for the artifact's own kind matches the name | Yes |
 
 A refused pull writes nothing: no file under `tools/`, no `murmur.lock` change, and no compiled
 form. `diagnostics` states the grant in `runtime-state.capabilities`, as
@@ -261,7 +272,7 @@ A removal deletes the artifact from every place `pull` put it:
 
 | Place | After `remove` |
 |---|---|
-| `<workdir>/tools/<name>/` | Deleted: the manifest, `skill.md` and the native binary |
+| `<workdir>/tools/<name>/`, `<name>` being the bare part | Deleted: the manifest, `skill.md` and the native binary |
 | `list()` and `describe()` | The name is gone. `describe()` returns `artifact '<name>' is not installed` |
 | `murmur.lock` | The entry is deleted. Every other entry is rewritten unchanged |
 | `invoke()` | A call to the name returns `tool '<name>' was removed from this session by manage.remove; it can no longer be called` |
@@ -272,7 +283,7 @@ The checks run in this order, and a refused removal changes nothing:
 | Order | Returns | When |
 |---:|---|---|
 | 1 | `not-granted: this capsule declares no capabilities.install, so removing '<name>' is refused` | The capsule declares no `capabilities.install` |
-| 2 | `not-granted: '<name>' is not an artifact name (<reason>); capabilities.install matches bare artifact names only` | The name is not a bare artifact name |
+| 2 | `not-granted: '<name>' is not a full artifact name: …` or `not-granted: '<name>' is not a valid artifact name: <reason>` | The name is not a full artifact name, `<scope>/<name>` |
 | 3 | `ok(false)` | The session has no installed artifact of that name |
 | 4 | `not-removable: '<name>' is a <hook\|driver>; hooks and drivers are fixed at launch and cannot be removed while the session runs` | The artifact is a hook or a driver, whatever its origin |
 | 5 | `not-removable: '<name>' is declared in murmur.yaml; an artifact the operator declared stays for the life of the session` | `murmur.yaml` declares the artifact, whatever its origin. The next `mur run` needs its `murmur.lock` entry |

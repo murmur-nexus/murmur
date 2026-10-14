@@ -5,6 +5,8 @@ use thiserror::Error;
 use url::Url;
 
 use crate::{
+    artifact_name::{ArtifactName, ArtifactNameError},
+    build::artifact_name_format_error,
     manifest::{REGISTRY_BLOCK_KEY, REGISTRY_BLOCK_MESSAGE},
     manifest_path::MANIFEST_FILENAME,
     trace_capture::{resolve_trace_capture, TraceCapture},
@@ -1108,6 +1110,28 @@ pub struct RuntimeArtifact {
     pub gateway: Option<ArtifactGateway>,
 }
 
+impl RuntimeArtifact {
+    /// The name a staged session knows this artifact by: the bare part of its full name, or a
+    /// `source:` entry's own name. It is the model-facing tool name and the directory under
+    /// `workdir/tools/`.
+    #[must_use]
+    pub fn tool_name(&self) -> &str {
+        tool_name_of(&self.name)
+    }
+
+    /// The full name this entry resolves by. A `source:` entry, named by its bare name, has none.
+    pub fn artifact_name(&self) -> Result<ArtifactName, ArtifactNameError> {
+        ArtifactName::parse(&self.name)
+    }
+}
+
+/// The bare part of an artifact reference as a manifest writes it: the text after the `/` of a
+/// full name, or the whole of a bare one.
+#[must_use]
+pub fn tool_name_of(name: &str) -> &str {
+    name.split_once('/').map_or(name, |(_, bare)| bare)
+}
+
 /// One artifact's credential gateway, as the operator declared it on the artifact's entry.
 ///
 /// Debug never prints a literal key: [`ApiKeyReference`]'s own `Debug` redacts it.
@@ -1843,6 +1867,14 @@ pub enum RuntimeManifestError {
     TopLevelMurVersion,
     #[error("{}: invalid trace config for '{field}': {message}", MANIFEST_FILENAME)]
     InvalidTraceConfig { field: String, message: String },
+    /// A field naming an artifact to resolve does not hold a full `<scope>/<name>`, or a
+    /// `source:` entry's name is not a bare name. `hint` names the form to write instead.
+    #[error("{}: invalid artifact name in '{field}': {message}", MANIFEST_FILENAME)]
+    InvalidArtifactName {
+        field: String,
+        message: String,
+        hint: Option<String>,
+    },
     /// The manifest declares a top-level [`REGISTRY_BLOCK_KEY`].
     #[error("{}", REGISTRY_BLOCK_MESSAGE)]
     RegistryBlock,
@@ -3302,6 +3334,7 @@ impl RuntimeManifest {
                     })?;
 
                 let source = artifact.source.filter(|s| !s.trim().is_empty());
+                check_entry_name(index, &name, source.is_some())?;
 
                 let runtime = match artifact.runtime.as_deref() {
                     None | Some("tool") => ArtifactRuntime::Tool,
@@ -3570,7 +3603,7 @@ impl RuntimeManifest {
                 None => {
                     return Err(RuntimeManifestError::InvalidInferenceConfig {
                         field: "inference.system_prompt_artifact".to_string(),
-                        message: format!("artifact '{sp_art}' is not declared in artifacts:"),
+                        message: not_declared_message(&artifacts, sp_art),
                     });
                 }
                 Some(a) if !a.prompt_payload => {
@@ -4417,9 +4450,10 @@ fn parse_capabilities(
         })
         .transpose()?;
 
-    let spawn = raw_caps.spawn.map(|raw_spawn| SpawnCapabilities {
-        allow: raw_spawn.allow,
-    });
+    let spawn = raw_caps
+        .spawn
+        .map(|raw_spawn| parse_spawn_allow(raw_spawn.allow))
+        .transpose()?;
 
     let env = raw_caps.env.map(|raw_env| EnvCapabilities {
         allow: raw_env.allow,
@@ -4514,6 +4548,93 @@ fn parse_capabilities(
     }))
 }
 
+/// Lower `capabilities.spawn.allow`: every entry a full name, no two sharing a bare part —
+/// `delegate-task` offers the model the bare parts, so each must pick out one capsule.
+fn parse_spawn_allow(allow: Vec<String>) -> Result<SpawnCapabilities, RuntimeManifestError> {
+    let mut parsed: Vec<ArtifactName> = Vec::with_capacity(allow.len());
+    for (index, entry) in allow.iter().enumerate() {
+        let name = ArtifactName::parse(entry).map_err(|error| {
+            RuntimeManifestError::InvalidArtifactName {
+                field: format!("capabilities.spawn.allow[{index}]"),
+                message: error.to_string(),
+                hint: error.hint(),
+            }
+        })?;
+        if let Some(earlier) = parsed
+            .iter()
+            .find(|earlier| earlier.name() == name.name() && **earlier != name)
+        {
+            return Err(RuntimeManifestError::InvalidArtifactName {
+                field: format!("capabilities.spawn.allow[{index}]"),
+                message: format!(
+                    "'{earlier}' and '{name}' share the name '{}', which is how delegate-task \
+                     offers a capsule to the model",
+                    name.name()
+                ),
+                hint: Some(format!(
+                    "keep one of '{earlier}' and '{name}' in capabilities.spawn.allow"
+                )),
+            });
+        }
+        parsed.push(name);
+    }
+    Ok(SpawnCapabilities { allow })
+}
+
+/// Refuse an `artifacts[index].name` of the wrong form: a full name for an entry that resolves,
+/// a bare name for a `source:` entry, which is never resolved or locked.
+fn check_entry_name(
+    index: usize,
+    name: &str,
+    has_source: bool,
+) -> Result<(), RuntimeManifestError> {
+    let field = format!("artifacts[{index}].name");
+    if !has_source {
+        return ArtifactName::parse(name).map(|_| ()).map_err(|error| {
+            RuntimeManifestError::InvalidArtifactName {
+                field,
+                message: error.to_string(),
+                hint: error.hint(),
+            }
+        });
+    }
+    if let Some((_, bare)) = name.split_once('/') {
+        return Err(RuntimeManifestError::InvalidArtifactName {
+            field,
+            message: format!(
+                "'{name}' declares 'source:', so it is named by its bare name; a scope says \
+                 where a resolved artifact comes from, and a source: entry is never resolved"
+            ),
+            hint: Some(format!("drop the scope: name it '{bare}'")),
+        });
+    }
+    match artifact_name_format_error(name) {
+        Some(reason) => Err(RuntimeManifestError::InvalidArtifactName {
+            field,
+            message: format!("'{name}' is not a valid artifact name: it {reason}"),
+            hint: None,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The refusal of a reference to an artifact `artifacts:` does not declare. When exactly one
+/// declared entry has `name` as its bare part, the message names that entry, the reference the
+/// operator most likely meant.
+fn not_declared_message(artifacts: &[RuntimeArtifact], name: &str) -> String {
+    let mut same_bare = artifacts
+        .iter()
+        .filter(|artifact| artifact.name != name && artifact.tool_name() == tool_name_of(name));
+    match (same_bare.next(), same_bare.next()) {
+        (Some(only), None) => format!(
+            "artifact '{name}' is not declared in artifacts: (the declared '{}' has that name; \
+             refer to it as '{}')",
+            only.name, only.name
+        ),
+        _ => format!("artifact '{name}' is not declared in artifacts:"),
+    }
+}
+
 /// Lower `capabilities.install`, refusing a block that names nothing and any entry outside
 /// [`crate::install_pattern`]'s grammar.
 fn parse_install(raw: RawInstallCapabilities) -> Result<InstallCapabilities, RuntimeManifestError> {
@@ -4526,14 +4647,16 @@ fn parse_install(raw: RawInstallCapabilities) -> Result<InstallCapabilities, Run
         });
     }
     for (key, entries) in [("skill", &raw.skill), ("tool", &raw.tool)] {
-        for entry in entries {
-            crate::install_pattern::validate(entry).map_err(|reason| {
-                RuntimeManifestError::InvalidCapabilities {
-                    field: format!("capabilities.install.{key}"),
+        for (index, entry) in entries.iter().enumerate() {
+            crate::install_pattern::validate(entry).map_err(|error| {
+                RuntimeManifestError::InvalidArtifactName {
+                    field: format!("capabilities.install.{key}[{index}]"),
                     message: format!(
-                        "entry {entry:?} is invalid ({reason}); expected {}",
+                        "entry {entry:?} is invalid ({}); expected {}",
+                        error.reason,
                         crate::install_pattern::INSTALL_ENTRY_ACCEPTED_FORM
                     ),
+                    hint: error.hint,
                 }
             })?;
         }
@@ -4829,7 +4952,7 @@ const PROCESS_DRIVER_REQUIRED: &str =
     "missing required field; a transport: process capsule must name the process driver that \
      knows how to drive its harness. inference.command no longer selects a harness — it only \
      overrides the binary the driver names. Add inference.driver.artifact naming a process \
-     driver, for example murmur-driver-claude-code";
+     driver, for example murmur/driver-claude-code";
 
 fn parse_inference(
     raw: Option<RawInferenceConfig>,
@@ -5661,6 +5784,17 @@ fn validate_driver_gateways(
         .unwrap_or_default();
     let under_process = inference.is_some_and(|inference| inference.transport == "process");
 
+    // A reference to nothing is reported as such before any entry is judged against it: a
+    // misspelt driver name would otherwise read as a gateway on the wrong driver.
+    if let Some(driver) = configured_driver {
+        if !artifacts.iter().any(|artifact| artifact.name == driver) {
+            return Err(RuntimeManifestError::InvalidInferenceConfig {
+                field: "inference.driver.artifact".to_string(),
+                message: not_declared_message(artifacts, driver),
+            });
+        }
+    }
+
     for (index, artifact) in artifacts.iter().enumerate() {
         if artifact.runtime != ArtifactRuntime::Driver || artifact.gateway.is_none() {
             continue;
@@ -5700,7 +5834,7 @@ fn validate_driver_gateways(
         else {
             return Err(RuntimeManifestError::InvalidInferenceConfig {
                 field: "inference.driver.artifact".to_string(),
-                message: format!("artifact '{driver}' is not declared in artifacts:"),
+                message: not_declared_message(artifacts, driver),
             });
         };
         if entry.gateway.is_none() {
@@ -5740,9 +5874,7 @@ fn validate_driver_choices(
         };
         let driver = alternate.driver.as_str();
         let Some(entry) = artifacts.iter().find(|artifact| artifact.name == driver) else {
-            return Err(refuse(format!(
-                "artifact '{driver}' is not declared in artifacts:"
-            )));
+            return Err(refuse(not_declared_message(artifacts, driver)));
         };
         if entry.runtime != ArtifactRuntime::Driver {
             return Err(refuse(format!(
@@ -5812,7 +5944,7 @@ fn validate_process_driver_entry(
     else {
         return Err(RuntimeManifestError::InvalidInferenceConfig {
             field: "inference.driver.artifact".to_string(),
-            message: format!("artifact '{driver}' is not declared in artifacts:"),
+            message: not_declared_message(artifacts, driver),
         });
     };
     if entry.runtime != ArtifactRuntime::Driver {
@@ -6280,7 +6412,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: notes-tool
+  - name: local/notes-tool
     version: 1.0.0
     runtime: tool
     capabilities:
@@ -6308,7 +6440,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: notes-tool
+  - name: local/notes-tool
     version: 1.0.0
     runtime: tool
     capabilities:
@@ -6332,7 +6464,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: notes-tool
+  - name: local/notes-tool
     version: 1.0.0
     runtime: tool
     capabilities:
@@ -6374,7 +6506,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: notes-tool
+  - name: local/notes-tool
     version: 1.0.0
     runtime: tool
     capabilities:
@@ -6458,7 +6590,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 "#,
         )
@@ -6475,7 +6607,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
     runtime: tool
 "#,
@@ -6492,7 +6624,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
     runtime: wasm
 "#,
@@ -6511,7 +6643,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
     runtime: native
 "#,
@@ -6548,7 +6680,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 capabilities:
   network:
@@ -6582,7 +6714,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 capabilities:
   env:
@@ -6607,7 +6739,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 capabilities:
   network:
@@ -6629,7 +6761,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 capabilities:
   env: {}
@@ -6650,7 +6782,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 "#,
         )
@@ -6666,7 +6798,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 capabilities:
   network:
@@ -6691,7 +6823,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 capabilities:
   network: {}
@@ -6712,7 +6844,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 capabilities:
   network:
@@ -6734,7 +6866,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 capabilities:
   network:
@@ -6753,7 +6885,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 capabilities:
   network:
@@ -6848,7 +6980,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 capabilities:
   filesystem:
@@ -6873,7 +7005,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 capabilities:
   network:
@@ -6893,7 +7025,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 capabilities:
   filesystem:
@@ -6919,7 +7051,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: echo
+  - name: local/echo
     version: 1.2.3
 capabilities:
   filesystem:
@@ -7199,14 +7331,19 @@ capabilities:
     #[test]
     fn capabilities_install_parses_both_lists_verbatim_in_declaration_order() {
         let manifest = RuntimeManifest::from_yaml_str(&manifest_with_install(
-            "    skill: [code-review, \"style-*\"]\n    tool: [\"b-*\", a, \"*\"]\n",
+            "    skill: [ana/code-review, \"ana/style-*\"]\n    tool: [\"local/b-*\", local/a, \"murmur/*\", \"*\"]\n",
         ))
         .expect("an install block parses");
         assert_eq!(
             manifest.capabilities.unwrap().install,
             Some(InstallCapabilities {
-                skill: vec!["code-review".into(), "style-*".into()],
-                tool: vec!["b-*".into(), "a".into(), "*".into()],
+                skill: vec!["ana/code-review".into(), "ana/style-*".into()],
+                tool: vec![
+                    "local/b-*".into(),
+                    "local/a".into(),
+                    "murmur/*".into(),
+                    "*".into()
+                ],
             })
         );
     }
@@ -7215,23 +7352,24 @@ capabilities:
     /// kind.
     #[test]
     fn capabilities_install_accepts_either_list_alone() {
-        let skill_only = RuntimeManifest::from_yaml_str(&manifest_with_install("    skill: [a]\n"))
-            .expect("skill alone parses");
+        let skill_only =
+            RuntimeManifest::from_yaml_str(&manifest_with_install("    skill: [local/a]\n"))
+                .expect("skill alone parses");
         assert_eq!(
             skill_only.capabilities.unwrap().install,
             Some(InstallCapabilities {
-                skill: vec!["a".into()],
+                skill: vec!["local/a".into()],
                 tool: vec![],
             })
         );
         let tool_only =
-            RuntimeManifest::from_yaml_str(&manifest_with_install("    tool: [\"b-*\"]\n"))
+            RuntimeManifest::from_yaml_str(&manifest_with_install("    tool: [\"local/b-*\"]\n"))
                 .expect("tool alone parses");
         assert_eq!(
             tool_only.capabilities.unwrap().install,
             Some(InstallCapabilities {
                 skill: vec![],
-                tool: vec!["b-*".into()],
+                tool: vec!["local/b-*".into()],
             })
         );
     }
@@ -7270,23 +7408,68 @@ capabilities:
 
     #[test]
     fn capabilities_install_refuses_an_entry_outside_the_grammar_naming_it() {
-        for entry in ["a*b", "*x", "**", "Foo", "-a", "a/b", " "] {
+        for entry in [
+            "a*b", "*x", "**", "Foo", "-a", "a/b/c", " ", "*/x", "a/*x", "a/x*y", "A/x",
+        ] {
             for key in ["skill", "tool"] {
                 let block = format!("    {key}: [{entry:?}]\n");
                 let err = RuntimeManifest::from_yaml_str(&manifest_with_install(&block))
                     .expect_err("a bad entry is refused");
                 match &err {
-                    RuntimeManifestError::InvalidCapabilities { field, message } => {
-                        assert_eq!(field, &format!("capabilities.install.{key}"));
+                    RuntimeManifestError::InvalidArtifactName {
+                        field,
+                        message,
+                        hint,
+                    } => {
+                        assert_eq!(field, &format!("capabilities.install.{key}[0]"));
                         assert!(message.contains(&format!("{entry:?}")), "{message}");
                         assert!(
                             message.contains(crate::install_pattern::INSTALL_ENTRY_ACCEPTED_FORM),
                             "{message}"
                         );
+                        assert_eq!(hint, &None, "{entry:?}");
                     }
-                    other => panic!("{entry:?}: expected InvalidCapabilities, got {other:?}"),
+                    other => panic!("{entry:?}: expected InvalidArtifactName, got {other:?}"),
                 }
             }
+        }
+    }
+
+    /// An entry with no scope is refused at its index with the hint naming its scoped forms.
+    #[test]
+    fn capabilities_install_refuses_an_unscoped_entry_with_the_scoped_hint() {
+        for (entry, scoped) in [
+            ("tool-*", "local/tool-*"),
+            ("mur*", "local/mur*"),
+            ("tool-x", "local/tool-x"),
+            ("murmur-tool-editor", "murmur/tool-editor"),
+        ] {
+            let block = format!("    tool: [\"local/ok\", {entry:?}]\n");
+            let err = RuntimeManifest::from_yaml_str(&manifest_with_install(&block))
+                .expect_err("an unscoped entry is refused");
+            match &err {
+                RuntimeManifestError::InvalidArtifactName {
+                    field,
+                    message,
+                    hint,
+                } => {
+                    assert_eq!(field, "capabilities.install.tool[1]");
+                    assert_eq!(
+                        message,
+                        &format!(
+                            "entry {entry:?} is invalid ('{entry}' names no scope); expected {}",
+                            crate::install_pattern::INSTALL_ENTRY_ACCEPTED_FORM
+                        )
+                    );
+                    let hint = hint.as_deref().expect("an unscoped entry carries a hint");
+                    assert!(hint.contains(scoped), "{entry:?}: {hint}");
+                }
+                other => panic!("{entry:?}: expected InvalidArtifactName, got {other:?}"),
+            }
+            assert!(
+                err.to_string().contains("'capabilities.install.tool[1]'"),
+                "{err}"
+            );
         }
     }
 
@@ -7295,7 +7478,7 @@ capabilities:
     fn capabilities_install_on_an_artifact_entry_is_refused_on_every_role() {
         for runtime in ["tool", "hook", "driver", "skill"] {
             let yaml = format!(
-                "name: cap\nversion: 0.0.1\nartifacts:\n  - name: a\n    version: 0.1.0\n    \
+                "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/a\n    version: 0.1.0\n    \
                  runtime: {runtime}\n    capabilities:\n      install:\n        skill: [x]\n"
             );
             let err = RuntimeManifest::from_yaml_str(&yaml)
@@ -7315,7 +7498,7 @@ capabilities:
     #[test]
     fn capabilities_install_unknown_key_is_reported_by_path_and_grants_nothing() {
         let manifest = RuntimeManifest::from_yaml_str(&manifest_with_install(
-            "    skill: [a]\n    driver: [x]\n",
+            "    skill: [local/a]\n    driver: [x]\n",
         ))
         .expect("an unknown key beside a real entry is a warning, not a parse error");
         assert!(
@@ -7329,7 +7512,7 @@ capabilities:
         assert_eq!(
             manifest.capabilities.unwrap().install,
             Some(InstallCapabilities {
-                skill: vec!["a".into()],
+                skill: vec!["local/a".into()],
                 tool: vec![],
             })
         );
@@ -7340,7 +7523,7 @@ capabilities:
     /// A capsule manifest with one artifact entry carrying `capabilities: task_io: <block>`.
     fn manifest_with_task_io(runtime: &str, block: &str) -> String {
         format!(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: gate\n    version: 1.2.3\n    \
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/gate\n    version: 1.2.3\n    \
              runtime: {runtime}\n    capabilities:\n      task_io:\n{block}"
         )
     }
@@ -7369,7 +7552,7 @@ capabilities:
         );
 
         let absent = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: gate\n    version: 1.2.3\n    \
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/gate\n    version: 1.2.3\n    \
              runtime: hook\n",
         )
         .expect("no capabilities block parses");
@@ -7426,7 +7609,7 @@ capabilities:
     /// A capsule manifest with one artifact entry carrying `capabilities: conversation: <block>`.
     fn manifest_with_conversation(runtime: &str, block: &str) -> String {
         format!(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: memory\n    version: 1.2.3\n    \
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/memory\n    version: 1.2.3\n    \
              runtime: {runtime}\n    capabilities:\n      conversation:\n{block}"
         )
     }
@@ -7702,7 +7885,7 @@ capabilities:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -7712,7 +7895,7 @@ inference:
   transport: http
   model: test-model
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
     config:
       temperature: 0.2
       headers:
@@ -7733,7 +7916,7 @@ inference:
         assert_eq!(inference.transport, "http");
         assert_eq!(inference.model, "test-model");
         let driver = inference.driver.as_ref().expect("driver should be present");
-        assert_eq!(driver.artifact, "murmur-driver-anthropic");
+        assert_eq!(driver.artifact, "murmur/driver-anthropic");
         assert_eq!(
             driver.config,
             Some("{\"headers\":{\"x-test\":true},\"temperature\":0.2}".to_string())
@@ -7746,7 +7929,7 @@ inference:
     /// under the key.
     fn tool_gateway_manifest(block: &str) -> String {
         format!(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: web-search\n    version: 0.1.0\n    runtime: tool\n    gateway:{block}\n"
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/web-search\n    version: 0.1.0\n    runtime: tool\n    gateway:{block}\n"
         )
     }
 
@@ -7804,7 +7987,7 @@ inference:
     fn gateway_endpoint_without_scheme_is_refused() {
         let msg = gateway_endpoint_error("api.tavily.com");
         assert!(msg.contains("gateway.endpoint"), "{msg}");
-        assert!(msg.contains("artifact 'web-search'"), "{msg}");
+        assert!(msg.contains("artifact 'local/web-search'"), "{msg}");
         assert!(msg.contains("does not parse as a URL"), "{msg}");
     }
 
@@ -7840,7 +8023,7 @@ inference:
     #[test]
     fn gateway_endpoint_with_userinfo_is_refused() {
         let msg = gateway_endpoint_error("https://user:sk-in-url@api.example.com");
-        assert!(msg.contains("artifact 'web-search'"), "{msg}");
+        assert!(msg.contains("artifact 'local/web-search'"), "{msg}");
         assert!(msg.contains("carries userinfo before '@'"), "{msg}");
         assert!(msg.contains("host 'api.example.com'"), "{msg}");
         assert!(msg.contains("gateway.api_key"), "{msg}");
@@ -7874,7 +8057,7 @@ inference:
     #[test]
     fn gateway_endpoint_with_interpolation_is_refused() {
         let msg = gateway_endpoint_error("https://${PROVIDER_HOST}/v1");
-        assert!(msg.contains("artifact 'web-search'"), "{msg}");
+        assert!(msg.contains("artifact 'local/web-search'"), "{msg}");
         assert!(msg.contains("contains '${'"), "{msg}");
         assert!(msg.contains("not interpolated"), "{msg}");
     }
@@ -7910,7 +8093,7 @@ inference:
                 endpoint: refused,
             } => {
                 assert_eq!(*index, 0);
-                assert_eq!(name, "web-search");
+                assert_eq!(name, "local/web-search");
                 assert_eq!(refused, endpoint);
             }
             other => panic!("expected GatewayWithoutCredential, got {other:?}"),
@@ -7918,7 +8101,7 @@ inference:
         let msg = error.to_string();
         assert!(
             msg.contains(&format!(
-                "artifact 'web-search' declares gateway.endpoint '{endpoint}' but binds no \
+                "artifact 'local/web-search' declares gateway.endpoint '{endpoint}' but binds no \
                  credential"
             )),
             "{msg}"
@@ -8032,7 +8215,7 @@ inference:
             );
             assert!(
                 error.to_string().contains(
-                    "artifact 'web-search' declares both gateway.api_key and gateway.keyless: \
+                    "artifact 'local/web-search' declares both gateway.api_key and gateway.keyless: \
                      true; a gateway either presents a key or is keyless"
                 ),
                 "{error}"
@@ -8095,7 +8278,10 @@ inference:
                 msg.contains("without 'gateway.endpoint'"),
                 "{block:?}: {msg}"
             );
-            assert!(msg.contains("artifact 'web-search'"), "{block:?}: {msg}");
+            assert!(
+                msg.contains("artifact 'local/web-search'"),
+                "{block:?}: {msg}"
+            );
         }
     }
 
@@ -8114,12 +8300,12 @@ inference:
     #[test]
     fn gateway_on_skill_entry_is_refused() {
         let msg = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: notes\n    version: 0.1.0\n    runtime: skill\n    gateway:\n      endpoint: https://api.tavily.com\n      api_key: test-key\n",
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/notes\n    version: 0.1.0\n    runtime: skill\n    gateway:\n      endpoint: https://api.tavily.com\n      api_key: test-key\n",
         )
         .unwrap_err()
         .to_string();
         assert!(
-            msg.contains("artifact 'notes' declares 'gateway:'"),
+            msg.contains("artifact 'local/notes' declares 'gateway:'"),
             "{msg}"
         );
         assert!(msg.contains("runtime: skill"), "{msg}");
@@ -8128,7 +8314,7 @@ inference:
     #[test]
     fn gateway_on_hook_entry_is_accepted() {
         let manifest = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: grafana\n    version: 0.1.0\n    runtime: hook\n    gateway:\n      endpoint: https://grafana.example.com/otlp\n      api_key: glc_literal\n",
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/grafana\n    version: 0.1.0\n    runtime: hook\n    gateway:\n      endpoint: https://grafana.example.com/otlp\n      api_key: glc_literal\n",
         )
         .unwrap();
         assert!(manifest.artifacts[0].gateway.is_some());
@@ -8138,18 +8324,18 @@ inference:
     /// empty for none.
     fn http_driver_manifest(artifacts: &str) -> String {
         format!(
-            "name: cap\nversion: 0.0.1\nartifacts:{artifacts}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n"
+            "name: cap\nversion: 0.0.1\nartifacts:{artifacts}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur/driver-anthropic\n"
         )
     }
 
     #[test]
     fn http_driver_entry_without_gateway_endpoint_is_refused() {
         let msg = RuntimeManifest::from_yaml_str(&http_driver_manifest(
-            "\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver",
+            "\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver",
         ))
         .unwrap_err()
         .to_string();
-        assert!(msg.contains("'murmur-driver-anthropic'"), "{msg}");
+        assert!(msg.contains("'murmur/driver-anthropic'"), "{msg}");
         assert!(msg.contains("gateway.endpoint"), "{msg}");
     }
 
@@ -8165,17 +8351,17 @@ inference:
     #[test]
     fn gateway_on_unconfigured_driver_entry_is_refused() {
         let msg = RuntimeManifest::from_yaml_str(&http_driver_manifest(
-            "\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: test-key\n  - name: murmur-driver-openai\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.openai.com\n      api_key: test-key",
+            "\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: test-key\n  - name: murmur/driver-openai\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.openai.com\n      api_key: test-key",
         ))
         .unwrap_err()
         .to_string();
-        assert!(msg.contains("'murmur-driver-openai'"), "{msg}");
+        assert!(msg.contains("'murmur/driver-openai'"), "{msg}");
         assert!(
             msg.contains("accepted only on the entry inference.driver.artifact names"),
             "{msg}"
         );
 
-        let no_inference = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-openai\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.openai.com\n      api_key: test-key\n";
+        let no_inference = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-openai\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.openai.com\n      api_key: test-key\n";
         let msg = RuntimeManifest::from_yaml_str(no_inference)
             .unwrap_err()
             .to_string();
@@ -8185,17 +8371,17 @@ inference:
     #[test]
     fn gateway_on_driver_entry_under_process_transport_is_refused() {
         let msg = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: test-key\ninference:\n  transport: process\n  driver:\n    artifact: murmur-driver-anthropic\n",
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: test-key\ninference:\n  transport: process\n  driver:\n    artifact: murmur/driver-anthropic\n",
         )
         .unwrap_err()
         .to_string();
-        assert!(msg.contains("'murmur-driver-anthropic'"), "{msg}");
+        assert!(msg.contains("'murmur/driver-anthropic'"), "{msg}");
         assert!(msg.contains("transport: process"), "{msg}");
     }
 
     #[test]
     fn inference_api_key_is_refused_naming_gateway_api_key() {
-        let entry = "\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: test-key";
+        let entry = "\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: test-key";
         for value in ["${ANTHROPIC_API_KEY}", "sk-literal", "\"\""] {
             let manifest = http_driver_manifest(entry)
                 .replace("  model:", &format!("  api_key: {value}\n  model:"));
@@ -8205,7 +8391,7 @@ inference:
             assert!(msg.contains("was removed"), "{msg}");
             assert!(
                 msg.contains(
-                    "set gateway.api_key on the artifacts: entry 'murmur-driver-anthropic'"
+                    "set gateway.api_key on the artifacts: entry 'murmur/driver-anthropic'"
                 ),
                 "{msg}"
             );
@@ -8230,7 +8416,7 @@ inference:
     #[test]
     fn inference_endpoint_is_refused_naming_gateway_endpoint() {
         let manifest = http_driver_manifest(
-            "\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: test-key",
+            "\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: test-key",
         )
         .replace("  model:", "  endpoint: https://api.anthropic.com\n  model:");
         let msg = RuntimeManifest::from_yaml_str(&manifest)
@@ -8238,7 +8424,7 @@ inference:
             .to_string();
         assert!(msg.contains("'inference.endpoint'"), "{msg}");
         assert!(
-            msg.contains("set gateway.endpoint on the artifacts: entry 'murmur-driver-anthropic'"),
+            msg.contains("set gateway.endpoint on the artifacts: entry 'murmur/driver-anthropic'"),
             "{msg}"
         );
 
@@ -8268,17 +8454,17 @@ inference:
 
     #[test]
     fn referenced_env_variables_reads_gateway_api_key() {
-        let manifest = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: web-search\n    version: 0.1.0\n    gateway:\n      endpoint: https://api.tavily.com\n      api_key: ${TAVILY_API_KEY}\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: ${ANTHROPIC_API_KEY}\n  - name: literal\n    version: 0.1.0\n    gateway:\n      endpoint: https://example.com\n      api_key: not-a-reference\ninference:\n  model: m\n  driver:\n    artifact: murmur-driver-anthropic\n";
+        let manifest = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/web-search\n    version: 0.1.0\n    gateway:\n      endpoint: https://api.tavily.com\n      api_key: ${TAVILY_API_KEY}\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: ${ANTHROPIC_API_KEY}\n  - name: local/literal\n    version: 0.1.0\n    gateway:\n      endpoint: https://example.com\n      api_key: not-a-reference\ninference:\n  model: m\n  driver:\n    artifact: murmur/driver-anthropic\n";
         let referenced = referenced_env_variables(manifest);
         assert_eq!(
             referenced,
             vec![
                 ReferencedEnvVariable {
-                    field: "artifacts.murmur-driver-anthropic.gateway.api_key".to_string(),
+                    field: "artifacts.murmur/driver-anthropic.gateway.api_key".to_string(),
                     variable: "ANTHROPIC_API_KEY".to_string(),
                 },
                 ReferencedEnvVariable {
-                    field: "artifacts.web-search.gateway.api_key".to_string(),
+                    field: "artifacts.local/web-search.gateway.api_key".to_string(),
                     variable: "TAVILY_API_KEY".to_string(),
                 },
             ]
@@ -8295,7 +8481,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -8305,7 +8491,7 @@ inference:
   model: test-model
   system_prompt: "Always begin with CONFIRMED:"
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap();
@@ -8325,7 +8511,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -8337,7 +8523,7 @@ inference:
     model: compaction-model
     system_prompt: "task = X, currently editing Y, already tried Z."
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap();
@@ -8359,7 +8545,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -8370,7 +8556,7 @@ inference:
   compaction:
     model: compaction-model
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap();
@@ -8391,7 +8577,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -8403,7 +8589,7 @@ inference:
     model: compaction-model
     system_prompt_file: "compaction-instructions.md"
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap();
@@ -8426,7 +8612,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -8438,7 +8624,7 @@ inference:
     threshold: 0.5
     system_prompt_file: "compaction-instructions.md"
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap();
@@ -8463,7 +8649,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -8474,7 +8660,7 @@ inference:
   compaction:
     model: compaction-model
 {line}  driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#
             ))
             .unwrap()
@@ -8505,7 +8691,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -8519,7 +8705,7 @@ inference:
     system_prompt_file: "compaction-instructions.md"
     dump_summaries: true
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap()
@@ -8543,7 +8729,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -8556,7 +8742,7 @@ inference:
     system_prompt: "inline"
     system_prompt_file: "compaction-instructions.md"
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .expect_err("dump_summaries must not suppress the prompt-source exclusivity check");
@@ -8572,7 +8758,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -8584,7 +8770,7 @@ inference:
     dump_summaries: true
     threshold: 1.5
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .expect_err("dump_summaries must not suppress the threshold range check");
@@ -8605,7 +8791,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -8617,7 +8803,7 @@ inference:
     system_prompt: "inline"
     system_prompt_file: "compaction-instructions.md"
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .expect_err("both compaction prompt sources set must fail");
@@ -8645,7 +8831,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -8657,7 +8843,7 @@ inference:
   compaction:
     system_prompt_file: "compaction-instructions.md"
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap();
@@ -8677,7 +8863,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -8687,7 +8873,7 @@ inference:
   model: test-model
   system_prompt_file: "conventions.md"
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap();
@@ -8707,7 +8893,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -8718,7 +8904,7 @@ inference:
   system_prompt: "inline"
   system_prompt_file: "conventions.md"
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap_err();
@@ -8734,7 +8920,7 @@ inference:
     fn api_key_env_reference_parses_to_its_name_without_reading_the_environment() {
         let key = "MURMUR_TEST_INFERENCE_KEY_NEVER_SET";
         let yaml = format!(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${{{key}}}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n"
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${{{key}}}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur/driver-anthropic\n"
         );
 
         assert_eq!(
@@ -8776,7 +8962,7 @@ inference:
         // credential-shaped literal that secret scanners could flag.
         let literal = ["sk-", "ant-", "literal"].concat();
         let yaml = format!(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: {literal}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n"
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: {literal}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur/driver-anthropic\n"
         );
 
         assert_eq!(
@@ -8807,7 +8993,7 @@ inference:
             "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: process\n  command: claude\n  model: test-model\n  api_key: {}\n",
             ["sk-", "ant-", "secret"].concat()
         );
-        let http_without_model = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  transport: http\n  driver:\n    artifact: murmur-driver-anthropic\n";
+        let http_without_model = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  transport: http\n  driver:\n    artifact: murmur/driver-anthropic\n";
 
         for yaml in [process_with_key.as_str(), http_without_model] {
             let resolving = RuntimeManifest::from_yaml_str(yaml)
@@ -8825,17 +9011,17 @@ inference:
     /// does not parse at all.
     #[test]
     fn referenced_env_variables_reports_a_reference_and_nothing_else() {
-        let referencing = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${MURMUR_TEST_REFERENCED_KEY}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
+        let referencing = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${MURMUR_TEST_REFERENCED_KEY}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur/driver-anthropic\n";
         let referenced = referenced_env_variables(referencing);
         assert_eq!(referenced.len(), 1);
         assert_eq!(
             referenced[0].field,
-            "artifacts.murmur-driver-anthropic.gateway.api_key"
+            "artifacts.murmur/driver-anthropic.gateway.api_key"
         );
         assert!(referenced[0].is_gateway_credential());
         assert_eq!(referenced[0].variable, "MURMUR_TEST_REFERENCED_KEY");
 
-        let literal = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: not-a-reference\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
+        let literal = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: not-a-reference\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur/driver-anthropic\n";
         assert!(referenced_env_variables(literal).is_empty());
 
         let no_inference = "name: cap\nversion: 0.0.1\nartifacts: []\n";
@@ -8870,7 +9056,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: my-provider
+  - name: local/my-provider
     version: 1.0.0
     runtime: driver
 "#,
@@ -8887,7 +9073,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: foo
+  - name: local/foo
     version: 1.0.0
     runtime: unknown_type
 "#,
@@ -9034,7 +9220,7 @@ artifacts:
   - name: my-skill
     source: ./skills/my-skill
     runtime: skill
-  - name: my-tool
+  - name: local/my-tool
     version: 1.0.0
     runtime: tool
 "#,
@@ -9054,11 +9240,11 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: my-tool
+  - name: local/my-tool
     version: 1.0.0
     runtime: tool
     prompt_payload: true
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -9066,9 +9252,9 @@ artifacts:
       keyless: true
 inference:
   model: test-model
-  system_prompt_artifact: my-tool
+  system_prompt_artifact: local/my-tool
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap();
@@ -9082,11 +9268,11 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: my-skill
+  - name: local/my-skill
     version: 1.0.0
     runtime: skill
     prompt_payload: false
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -9094,9 +9280,9 @@ artifacts:
       keyless: true
 inference:
   model: test-model
-  system_prompt_artifact: my-skill
+  system_prompt_artifact: local/my-skill
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap_err();
@@ -9111,10 +9297,10 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: my-skill
+  - name: local/my-skill
     version: 1.0.0
     runtime: skill
-  - name: my-tool
+  - name: local/my-tool
     version: 1.0.0
     runtime: tool
 "#,
@@ -9163,7 +9349,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: my-skill
+  - name: local/my-skill
     runtime: skill
 "#,
         )
@@ -9187,7 +9373,7 @@ inference:
   transport: grpc
   model: test-model
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap_err();
@@ -9223,7 +9409,7 @@ inference:
         );
         assert!(msg.contains("inference.command"), "error was: {msg}");
         assert!(
-            msg.contains("murmur-driver-claude-code"),
+            msg.contains("murmur/driver-claude-code"),
             "error was: {msg}"
         );
     }
@@ -9248,7 +9434,7 @@ inference:
             "error was: {msg}"
         );
         assert!(
-            msg.contains("murmur-driver-claude-code"),
+            msg.contains("murmur/driver-claude-code"),
             "error was: {msg}"
         );
     }
@@ -9272,12 +9458,12 @@ inference:
     fn process_driver_manifest(entry: &str, inference_extra: &str) -> String {
         format!(
             "name: cap\nversion: 0.0.1\nartifacts:\n{entry}\ninference:\n  transport: process\n  \
-             driver:\n    artifact: fixture-process-driver\n{inference_extra}"
+             driver:\n    artifact: local/fixture-process-driver\n{inference_extra}"
         )
     }
 
     const PROCESS_DRIVER_ENTRY: &str =
-        "  - name: fixture-process-driver\n    version: 0.1.0\n    runtime: driver";
+        "  - name: local/fixture-process-driver\n    version: 0.1.0\n    runtime: driver";
 
     #[test]
     fn process_transport_accepts_driver() {
@@ -9290,7 +9476,7 @@ inference:
         let inference = manifest.inference.expect("inference should exist");
         assert_eq!(inference.transport, "process");
         let driver = inference.driver.expect("driver should be parsed");
-        assert_eq!(driver.artifact, "fixture-process-driver");
+        assert_eq!(driver.artifact, "local/fixture-process-driver");
         assert_eq!(driver.config.as_deref(), Some(r#"{"profile":"work"}"#));
         assert_eq!(
             inference.command.as_deref(),
@@ -9307,7 +9493,7 @@ inference:
         let inference = manifest.inference.expect("inference should exist");
         assert_eq!(
             inference.driver.map(|d| d.artifact).as_deref(),
-            Some("fixture-process-driver")
+            Some("local/fixture-process-driver")
         );
         assert!(inference.command.is_none());
         assert_eq!(inference.model, "");
@@ -9316,14 +9502,14 @@ inference:
     #[test]
     fn process_driver_entry_must_be_declared() {
         let msg = RuntimeManifest::from_yaml_str(&process_driver_manifest(
-            "  - name: other\n    version: 0.1.0\n    runtime: tool",
+            "  - name: local/other\n    version: 0.1.0\n    runtime: tool",
             "",
         ))
         .unwrap_err()
         .to_string();
         assert!(msg.contains("inference.driver.artifact"), "{msg}");
         assert!(
-            msg.contains("artifact 'fixture-process-driver' is not declared in artifacts:"),
+            msg.contains("artifact 'local/fixture-process-driver' is not declared in artifacts:"),
             "{msg}"
         );
     }
@@ -9331,7 +9517,7 @@ inference:
     #[test]
     fn process_driver_entry_must_be_runtime_driver() {
         let msg = RuntimeManifest::from_yaml_str(&process_driver_manifest(
-            "  - name: fixture-process-driver\n    version: 0.1.0\n    runtime: tool",
+            "  - name: local/fixture-process-driver\n    version: 0.1.0\n    runtime: tool",
             "",
         ))
         .unwrap_err()
@@ -9445,13 +9631,13 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-claude-code
+  - name: murmur/driver-claude-code
     version: 0.1.0
     runtime: driver
 inference:
   transport: process
   driver:
-    artifact: murmur-driver-claude-code
+    artifact: murmur/driver-claude-code
   model: claude-haiku-4-5-20251001
   max_session_tokens: 200000
 "#,
@@ -9471,13 +9657,13 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-claude-code
+  - name: murmur/driver-claude-code
     version: 0.1.0
     runtime: driver
 inference:
   transport: process
   driver:
-    artifact: murmur-driver-claude-code
+    artifact: murmur/driver-claude-code
   model: claude-haiku-4-5-20251001
   max_session_tokens: 0
 "#,
@@ -9499,7 +9685,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -9510,7 +9696,7 @@ inference:
   model: claude-opus-4-5
   max_session_tokens: 5000000000
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap();
@@ -9528,7 +9714,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -9538,7 +9724,7 @@ inference:
   transport: http
   model: claude-opus-4-5
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap();
@@ -9553,7 +9739,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -9564,7 +9750,7 @@ inference:
   model: claude-opus-4-5
   max_session_tokens: 0
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap_err();
@@ -9580,11 +9766,11 @@ inference:
     /// An http capsule manifest with `extra` appended to its `inference:` block.
     fn http_manifest_with_inference(extra: &str) -> String {
         format!(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    \
              version: 0.1.0\n    runtime: driver\n    gateway:\n      \
              endpoint: https://api.anthropic.com\n      api_key: test-key\n\
              inference:\n  transport: http\n  model: claude-opus-4-5\n  driver:\n    \
-             artifact: murmur-driver-anthropic\n{extra}"
+             artifact: murmur/driver-anthropic\n{extra}"
         )
     }
 
@@ -9663,7 +9849,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -9674,7 +9860,7 @@ inference:
   model: claude-opus-4-5
   max_tokens: 4096
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap();
@@ -9692,7 +9878,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -9702,7 +9888,7 @@ inference:
   transport: http
   model: claude-opus-4-5
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap();
@@ -9717,7 +9903,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -9728,7 +9914,7 @@ inference:
   model: claude-opus-4-5
   max_tokens: 0
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap_err();
@@ -9747,7 +9933,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -9758,7 +9944,7 @@ inference:
   model: claude-opus-4-5
   max_tokens: 999999
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap();
@@ -9775,7 +9961,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -9786,7 +9972,7 @@ inference:
   model: claude-opus-4-5
   max_tokens: 4096
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 context:
   max_tokens: 200000
 "#,
@@ -10391,7 +10577,7 @@ context:
     #[test]
     fn inference_max_turns_defaults_to_10() {
         let manifest = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n",
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  model: test-model\n  driver:\n    artifact: murmur/driver-anthropic\n",
         ).unwrap();
         assert_eq!(manifest.inference.unwrap().max_turns, 10);
     }
@@ -10399,7 +10585,7 @@ context:
     #[test]
     fn inference_max_turns_explicit_value() {
         let manifest = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  model: test-model\n  max_turns: 20\n  driver:\n    artifact: murmur-driver-anthropic\n",
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  model: test-model\n  max_turns: 20\n  driver:\n    artifact: murmur/driver-anthropic\n",
         ).unwrap();
         assert_eq!(manifest.inference.unwrap().max_turns, 20);
     }
@@ -10407,7 +10593,7 @@ context:
     #[test]
     fn inference_max_turns_zero_is_rejected() {
         let err = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  model: test-model\n  max_turns: 0\n  driver:\n    artifact: murmur-driver-anthropic\n",
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  model: test-model\n  max_turns: 0\n  driver:\n    artifact: murmur/driver-anthropic\n",
         ).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("inference.max_turns"), "error was: {msg}");
@@ -10582,7 +10768,7 @@ context:
     #[test]
     fn lifecycle_max_task_reopens_with_process_transport() {
         let manifest = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: fixture-process-driver\n    version: 0.1.0\n    runtime: driver\ninference:\n  transport: process\n  driver:\n    artifact: fixture-process-driver\nlifecycle:\n  max_task_reopens: 2\n",
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/fixture-process-driver\n    version: 0.1.0\n    runtime: driver\ninference:\n  transport: process\n  driver:\n    artifact: local/fixture-process-driver\nlifecycle:\n  max_task_reopens: 2\n",
         ).unwrap();
         assert_eq!(manifest.lifecycle.unwrap().max_task_reopens, 2);
     }
@@ -10590,7 +10776,7 @@ context:
     #[test]
     fn inference_max_task_reopens_is_rejected_under_http_transport() {
         let err = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  model: test-model\n  max_task_reopens: 3\n  driver:\n    artifact: murmur-driver-anthropic\n",
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  model: test-model\n  max_task_reopens: 3\n  driver:\n    artifact: murmur/driver-anthropic\n",
         ).unwrap_err();
         assert!(
             matches!(
@@ -10661,10 +10847,10 @@ context:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: my-skill
+  - name: local/my-skill
     version: 1.0.0
     runtime: skill
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -10672,9 +10858,9 @@ artifacts:
       keyless: true
 inference:
   model: test-model
-  system_prompt_artifact: my-skill
+  system_prompt_artifact: local/my-skill
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap();
@@ -10682,7 +10868,7 @@ inference:
         let inference = manifest.inference.unwrap();
         assert_eq!(
             inference.system_prompt_artifact,
-            Some("my-skill".to_string())
+            Some("local/my-skill".to_string())
         );
         assert!(inference.system_prompt.is_none());
         assert!(inference.system_prompt_file.is_none());
@@ -10695,10 +10881,10 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: my-skill
+  - name: local/my-skill
     version: 1.0.0
     runtime: skill
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -10707,9 +10893,9 @@ artifacts:
 inference:
   model: test-model
   system_prompt: "inline"
-  system_prompt_artifact: my-skill
+  system_prompt_artifact: local/my-skill
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap_err();
@@ -10725,10 +10911,10 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: my-tool
+  - name: local/my-tool
     version: 1.0.0
     runtime: tool
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -10736,9 +10922,9 @@ artifacts:
       keyless: true
 inference:
   model: test-model
-  system_prompt_artifact: my-tool
+  system_prompt_artifact: local/my-tool
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap_err();
@@ -10755,7 +10941,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -10765,7 +10951,7 @@ inference:
   model: test-model
   system_prompt_artifact: missing-skill
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap_err();
@@ -10782,10 +10968,10 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: my-skill
+  - name: local/my-skill
     version: 1.0.0
     runtime: skill
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: 0.1.0
     runtime: driver
     gateway:
@@ -10795,9 +10981,9 @@ inference:
   model: test-model
   system_prompt: "inline"
   system_prompt_file: "conventions.md"
-  system_prompt_artifact: my-skill
+  system_prompt_artifact: local/my-skill
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 "#,
         )
         .unwrap_err();
@@ -10815,7 +11001,7 @@ inference:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: telemetry-hook
+  - name: local/telemetry-hook
     version: 1.0.0
     runtime: hook
     capabilities:
@@ -10851,7 +11037,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: quiet-hook
+  - name: local/quiet-hook
     version: 1.0.0
     runtime: hook
 "#,
@@ -10871,7 +11057,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: scoped
+  - name: local/scoped
     version: 1.0.0
     runtime: {role}
     capabilities:
@@ -10909,7 +11095,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: plain-tool
+  - name: local/plain-tool
     version: 1.0.0
     runtime: tool
 "#,
@@ -10927,7 +11113,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: sneaky
+  - name: local/sneaky
     version: 1.0.0
     runtime: skill
     capabilities:
@@ -10962,7 +11148,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-tool-corpus
+  - name: murmur/tool-corpus
     version: 0.1.0
     runtime: tool
     config:
@@ -10989,7 +11175,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: git
+  - name: local/git
     version: 1.0.0
     runtime: tool
 "#,
@@ -11009,7 +11195,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: git
+  - name: local/git
     version: 1.0.0
     runtime: tool
     config:
@@ -11032,7 +11218,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: sneaky
+  - name: local/sneaky
     version: 1.0.0
     runtime: skill
     config:
@@ -11065,7 +11251,7 @@ version: 0.0.1
 config:
   who: capsule
 artifacts:
-  - name: git
+  - name: local/git
     version: 1.0.0
     runtime: tool
 "#;
@@ -11088,7 +11274,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-hook-grafana
+  - name: murmur/hook-grafana
     version: 1.0.0
     runtime: hook
     on_overflow: block
@@ -11108,7 +11294,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-hook-grafana
+  - name: murmur/hook-grafana
     version: 1.0.0
     runtime: hook
 "#,
@@ -11127,7 +11313,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: git
+  - name: local/git
     version: 1.0.0
     runtime: tool
     on_overflow: block
@@ -11155,7 +11341,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-hook-grafana
+  - name: murmur/hook-grafana
     version: 1.0.0
     runtime: hook
     on_overflow: spill
@@ -11175,7 +11361,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: murmur-hook-eval
+  - name: murmur/hook-eval
     version: 1.0.0
     runtime: hook
     on_overflow: drop
@@ -11200,7 +11386,7 @@ artifacts:
 name: cap
 version: 0.0.1
 artifacts:
-  - name: telemetry-hook
+  - name: local/telemetry-hook
     version: 1.0.0
     runtime: hook
     capabilities:
@@ -12029,7 +12215,7 @@ version: 0.1.0
 deploy:
   mur_version: "0.2.0"
 artifacts:
-  - name: notes-tool
+  - name: local/notes-tool
     version: 0.1.0
     runtime: tool
     capabilities:
@@ -12063,7 +12249,7 @@ capabilities:
     fn a_per_artifact_capability_block_carries_its_index_in_the_path() {
         assert_eq!(
             unknown_keys_of(
-                "name: cap\nversion: 0.1.0\nartifacts:\n  - name: t\n    version: 0.1.0\n    \
+                "name: cap\nversion: 0.1.0\nartifacts:\n  - name: local/t\n    version: 0.1.0\n    \
                  runtime: tool\n    capabilities:\n      shell:\n        allow:\n          - git\n        \
                  allwo:\n          - git\n"
             ),
@@ -12125,12 +12311,12 @@ capabilities:
     /// is build's business to reject, not the run path's.
     #[test]
     fn the_build_side_keys_change_nothing_the_run_path_reads() {
-        let body = "artifacts:\n  - name: notes-tool\n    version: 0.1.0\n    runtime: tool\n\
-                    \x20 - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: \
+        let body = "artifacts:\n  - name: local/notes-tool\n    version: 0.1.0\n    runtime: tool\n\
+                    \x20 - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: \
                     driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\n\
                     capabilities:\n  filesystem:\n    read_only:\n      - tests\n\
                     inference:\n  transport: http\n  model: test-model\n  driver:\n    \
-                    artifact: murmur-driver-anthropic\n";
+                    artifact: murmur/driver-anthropic\n";
         let plain = RuntimeManifest::from_yaml_str(&format!("name: cap\nversion: 0.1.0\n{body}"))
             .expect("fixture must parse");
         let with_build_keys = RuntimeManifest::from_yaml_str(&format!(
@@ -12386,7 +12572,7 @@ name: every-block
 version: 0.1.0
 probe_root: 1
 artifacts:
-  - name: t
+  - name: local/t
     version: 0.1.0
     runtime: tool
     probe_artifact: 1
@@ -12583,18 +12769,18 @@ control:
 mod control_tests {
     use super::*;
 
-    const TOOL_ENTRY: &str = "  - name: card-api\n    version: 0.1.0\n    runtime: tool\n    gateway:\n      endpoint: https://cards.example.com\n      api_key: ${CARD_TOKEN}\n";
+    const TOOL_ENTRY: &str = "  - name: local/card-api\n    version: 0.1.0\n    runtime: tool\n    gateway:\n      endpoint: https://cards.example.com\n      api_key: ${CARD_TOKEN}\n";
 
     /// An `http` agent capsule whose driver is keyed by `${DRIVER_KEY}` and whose `card-api` tool
     /// is keyed by `${CARD_TOKEN}`, with `control` spliced in at the top level.
     fn agent(transport: &str, control: &str) -> String {
         let driver = if transport == "http" {
-            "  - name: drv\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.example.com\n      api_key: ${DRIVER_KEY}\n"
+            "  - name: local/drv\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.example.com\n      api_key: ${DRIVER_KEY}\n"
         } else {
-            "  - name: drv\n    version: 0.1.0\n    runtime: driver\n"
+            "  - name: local/drv\n    version: 0.1.0\n    runtime: driver\n"
         };
         format!(
-            "name: cap\nversion: 0.0.1\nartifacts:\n{driver}{TOOL_ENTRY}inference:\n  transport: {transport}\n  model: m\n  driver:\n    artifact: drv\n{control}"
+            "name: cap\nversion: 0.0.1\nartifacts:\n{driver}{TOOL_ENTRY}inference:\n  transport: {transport}\n  model: m\n  driver:\n    artifact: local/drv\n{control}"
         )
     }
 
@@ -12696,7 +12882,7 @@ mod control_tests {
                 "http",
                 "control:\n  secrets: [DRIVER_KEY]\n",
                 "control.secrets",
-                "'DRIVER_KEY' keys the configured inference driver's gateway (artifacts.drv.gateway.api_key)",
+                "'DRIVER_KEY' keys the configured inference driver's gateway (artifacts.local/drv.gateway.api_key)",
             ),
             (
                 "http",
@@ -12762,13 +12948,14 @@ mod control_tests {
 mod driver_choice_tests {
     use super::*;
 
-    const DRV: &str = "  - name: drv\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.example.com\n      api_key: ${DRIVER_KEY}\n";
-    const ALT: &str = "  - name: alt\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://alt.example.com\n      api_key: ${ALT_KEY}\n";
-    const ALT_NO_GATEWAY: &str = "  - name: alt\n    version: 0.1.0\n    runtime: driver\n";
-    const TOOL: &str = "  - name: card-api\n    version: 0.1.0\n    runtime: tool\n";
-    const GPT: &str = "    - name: gpt\n      model: gpt-5\n      driver:\n        artifact: alt\n";
+    const DRV: &str = "  - name: local/drv\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.example.com\n      api_key: ${DRIVER_KEY}\n";
+    const ALT: &str = "  - name: local/alt\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://alt.example.com\n      api_key: ${ALT_KEY}\n";
+    const ALT_NO_GATEWAY: &str = "  - name: local/alt\n    version: 0.1.0\n    runtime: driver\n";
+    const TOOL: &str = "  - name: local/card-api\n    version: 0.1.0\n    runtime: tool\n";
+    const GPT: &str =
+        "    - name: gpt\n      model: gpt-5\n      driver:\n        artifact: local/alt\n";
     const HAIKU: &str =
-        "    - name: haiku\n      model: haiku\n      driver:\n        artifact: drv\n";
+        "    - name: haiku\n      model: haiku\n      driver:\n        artifact: local/drv\n";
     const SWITCHABLE: &str = "control:\n  settings: [inference.driver]\n";
 
     /// An `http` capsule on `drv` with model `m`, `artifacts` after `drv`, `alternates` as the
@@ -12780,7 +12967,7 @@ mod driver_choice_tests {
             format!("  alternates:\n{alternates}")
         };
         format!(
-            "name: cap\nversion: 0.0.1\nartifacts:\n{DRV}{artifacts}inference:\n  transport: http\n  model: m\n  driver:\n    artifact: drv\n{alternates}{control}"
+            "name: cap\nversion: 0.0.1\nartifacts:\n{DRV}{artifacts}inference:\n  transport: http\n  model: m\n  driver:\n    artifact: local/drv\n{alternates}{control}"
         )
     }
 
@@ -12806,12 +12993,12 @@ mod driver_choice_tests {
                     InferenceAlternate {
                         name: "gpt".to_string(),
                         model: "gpt-5".to_string(),
-                        driver: "alt".to_string(),
+                        driver: "local/alt".to_string(),
                     },
                     InferenceAlternate {
                         name: "haiku".to_string(),
                         model: "haiku".to_string(),
-                        driver: "drv".to_string(),
+                        driver: "local/drv".to_string(),
                     },
                 ]
             );
@@ -12879,7 +13066,10 @@ mod driver_choice_tests {
     #[test]
     fn driver_choice_alternate_on_the_primarys_driver_needs_no_gateway_of_its_own() {
         let manifest = RuntimeManifest::from_yaml_str(&capsule("", HAIKU, SWITCHABLE)).unwrap();
-        assert_eq!(manifest.inference.unwrap().alternates[0].driver, "drv");
+        assert_eq!(
+            manifest.inference.unwrap().alternates[0].driver,
+            "local/drv"
+        );
     }
 
     #[test]
@@ -12905,7 +13095,7 @@ mod driver_choice_tests {
 
     #[test]
     fn driver_choice_unknown_key_in_an_alternate_is_reported_at_its_block() {
-        let alternate = "    - name: gpt\n      model: gpt-5\n      temperature: 1\n      driver:\n        artifact: alt\n";
+        let alternate = "    - name: gpt\n      model: gpt-5\n      temperature: 1\n      driver:\n        artifact: local/alt\n";
         let manifest =
             RuntimeManifest::from_yaml_str(&capsule(ALT, alternate, SWITCHABLE)).unwrap();
         let keys: Vec<(&str, &str)> = manifest
@@ -12923,7 +13113,7 @@ mod driver_choice_tests {
         let alternate = |name: &str, model: &str, driver: &str| {
             format!("    - name: {name}\n      model: {model}\n      driver:\n        artifact: {driver}\n")
         };
-        let process = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: drv\n    version: 0.1.0\n    runtime: driver\ninference:\n  transport: process\n  driver:\n    artifact: drv\n";
+        let process = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/drv\n    version: 0.1.0\n    runtime: driver\ninference:\n  transport: process\n  driver:\n    artifact: local/drv\n";
         let cases: Vec<(String, &str, &str)> = vec![
             (
                 format!("{process}  alternates:\n{GPT}"),
@@ -12936,36 +13126,36 @@ mod driver_choice_tests {
                 "'inference.driver' is controllable only under inference.transport: http",
             ),
             (
-                capsule(ALT, &alternate("primary", "gpt-5", "alt"), SWITCHABLE),
+                capsule(ALT, &alternate("primary", "gpt-5", "local/alt"), SWITCHABLE),
                 "inference.alternates[0].name",
                 "'primary' is reserved",
             ),
             (
                 capsule(
                     ALT,
-                    &format!("{}{}", alternate("gpt", "gpt-5", "alt"), alternate("gpt", "gpt-4", "alt")),
+                    &format!("{}{}", alternate("gpt", "gpt-5", "local/alt"), alternate("gpt", "gpt-4", "local/alt")),
                     SWITCHABLE,
                 ),
                 "inference.alternates[1].name",
                 "'gpt' names more than one alternate",
             ),
             (
-                capsule(ALT, &alternate("GPT", "gpt-5", "alt"), SWITCHABLE),
+                capsule(ALT, &alternate("GPT", "gpt-5", "local/alt"), SWITCHABLE),
                 "inference.alternates[0].name",
                 "'GPT' is not a driver choice name",
             ),
             (
-                capsule(ALT, &alternate("5gpt", "gpt-5", "alt"), SWITCHABLE),
+                capsule(ALT, &alternate("5gpt", "gpt-5", "local/alt"), SWITCHABLE),
                 "inference.alternates[0].name",
                 "'5gpt' is not a driver choice name",
             ),
             (
-                capsule(ALT, &alternate(&format!("g{}", "x".repeat(63)), "gpt-5", "alt"), SWITCHABLE),
+                capsule(ALT, &alternate(&format!("g{}", "x".repeat(63)), "gpt-5", "local/alt"), SWITCHABLE),
                 "inference.alternates[0].name",
                 "is not a driver choice name",
             ),
             (
-                capsule(ALT, "    - name: gpt\n      model: \"\"\n      driver:\n        artifact: alt\n", SWITCHABLE),
+                capsule(ALT, "    - name: gpt\n      model: \"\"\n      driver:\n        artifact: local/alt\n", SWITCHABLE),
                 "inference.alternates[0].model",
                 "missing required field",
             ),
@@ -12975,42 +13165,42 @@ mod driver_choice_tests {
                 "missing required field",
             ),
             (
-                capsule("", &alternate("gpt", "gpt-5", "nowhere"), SWITCHABLE),
+                capsule("", &alternate("gpt", "gpt-5", "local/nowhere"), SWITCHABLE),
                 "inference.alternates[0].driver.artifact",
-                "artifact 'nowhere' is not declared in artifacts:",
+                "artifact 'local/nowhere' is not declared in artifacts:",
             ),
             (
-                capsule(TOOL, &alternate("gpt", "gpt-5", "card-api"), SWITCHABLE),
+                capsule(TOOL, &alternate("gpt", "gpt-5", "local/card-api"), SWITCHABLE),
                 "inference.alternates[0].driver.artifact",
-                "artifact 'card-api' is declared with runtime: tool",
+                "artifact 'local/card-api' is declared with runtime: tool",
             ),
             (
-                capsule(ALT_NO_GATEWAY, &alternate("gpt", "gpt-5", "alt"), SWITCHABLE),
+                capsule(ALT_NO_GATEWAY, &alternate("gpt", "gpt-5", "local/alt"), SWITCHABLE),
                 "inference.alternates[0].driver.artifact",
-                "artifact 'alt' declares no gateway.endpoint",
+                "artifact 'local/alt' declares no gateway.endpoint",
             ),
             (
                 capsule(
                     ALT,
-                    "    - name: gpt\n      model: gpt-5\n      driver:\n        artifact: alt\n        config:\n          thinking: enabled\n",
+                    "    - name: gpt\n      model: gpt-5\n      driver:\n        artifact: local/alt\n        config:\n          thinking: enabled\n",
                     SWITCHABLE,
                 ),
                 "inference.alternates[0].driver.config",
                 "is not valid on an alternate; inference.driver.config applies to every declared driver, and per-driver settings belong in that driver's artifacts[].config",
             ),
             (
-                capsule("", &alternate("same", "m", "drv"), SWITCHABLE),
+                capsule("", &alternate("same", "m", "local/drv"), SWITCHABLE),
                 "inference.alternates[0]",
-                "'same' is driver 'drv' with model 'm', which is the primary choice",
+                "'same' is driver 'local/drv' with model 'm', which is the primary choice",
             ),
             (
                 capsule(
                     ALT,
-                    &format!("{}{}", alternate("gpt", "gpt-5", "alt"), alternate("gpt-too", "gpt-5", "alt")),
+                    &format!("{}{}", alternate("gpt", "gpt-5", "local/alt"), alternate("gpt-too", "gpt-5", "local/alt")),
                     SWITCHABLE,
                 ),
                 "inference.alternates[1]",
-                "'gpt-too' is driver 'alt' with model 'gpt-5', which alternate 'gpt' already is",
+                "'gpt-too' is driver 'local/alt' with model 'gpt-5', which alternate 'gpt' already is",
             ),
             (
                 capsule(ALT, GPT, ""),
@@ -13325,14 +13515,14 @@ mod network_authentication_tests {
     fn network_authentication_is_refused_beside_spawn_allow() {
         let (field, message) = network_authentication_refusal(
             "network:\n  authentication:\n    scheme: bearer\ncapabilities:\n  spawn:\n    \
-             allow: [worker]\n",
+             allow: [local/worker]\n",
         );
         assert_eq!(field, "network.authentication");
         assert!(message.contains("capabilities.spawn.allow"), "{message}");
         assert!(message.contains("token"), "{message}");
         let error = RuntimeManifest::from_yaml_str(
             "name: cap\nversion: 0.1.0\nnetwork:\n  authentication:\n    scheme: bearer\n\
-             capabilities:\n  spawn:\n    allow: [worker]\n",
+             capabilities:\n  spawn:\n    allow: [local/worker]\n",
         )
         .unwrap_err()
         .to_string();
@@ -13434,5 +13624,116 @@ mod registry_block_tests {
             RuntimeManifest::from_yaml_str("name: cap\nversion: 0.0.1\nartifacts: []\n").unwrap();
         assert_eq!(manifest.name, "cap");
         assert_eq!(manifest.version, "0.0.1");
+    }
+}
+
+#[cfg(test)]
+mod scoped_name_tests {
+    use super::*;
+
+    fn name_refusal(yaml: &str) -> (String, String, Option<String>) {
+        match RuntimeManifest::from_yaml_str(yaml) {
+            Err(RuntimeManifestError::InvalidArtifactName {
+                field,
+                message,
+                hint,
+            }) => (field, message, hint),
+            other => panic!("expected InvalidArtifactName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scoped_name_a_bare_artifact_entry_is_refused_with_the_scoped_forms() {
+        let yaml = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: tool-editor\n    \
+                    version: 0.1.0\n    runtime: tool\n";
+        let (field, message, hint) = name_refusal(yaml);
+        assert_eq!(field, "artifacts[0].name");
+        assert_eq!(
+            message,
+            "'tool-editor' is not a full artifact name: an artifact is named <scope>/<name>"
+        );
+        assert_eq!(
+            hint.as_deref(),
+            Some(
+                "name it with its scope: 'murmur/tool-editor' for a Murmur default artifact, \
+                 '<owner>/tool-editor' for one published from github.com/<owner>, or \
+                 'local/tool-editor' for one installed from a .mur.zip file"
+            )
+        );
+        let rendered = RuntimeManifest::from_yaml_str(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            rendered.starts_with("murmur.yaml: invalid artifact name in 'artifacts[0].name': "),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn scoped_name_a_source_entry_keeps_its_bare_name() {
+        let bare = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: style\n    \
+                    source: ./skills/style\n    runtime: skill\n";
+        RuntimeManifest::from_yaml_str(bare).expect("a source: entry is named by its bare name");
+
+        let (field, message, hint) = name_refusal(&bare.replace("name: style", "name: ana/style"));
+        assert_eq!(field, "artifacts[0].name");
+        assert!(
+            message
+                .starts_with("'ana/style' declares 'source:', so it is named by its bare name; "),
+            "{message}"
+        );
+        assert_eq!(hint.as_deref(), Some("drop the scope: name it 'style'"));
+    }
+
+    #[test]
+    fn scoped_name_spawn_allow_refuses_a_bare_entry_and_a_shared_bare_part() {
+        let with_allow = |allow: &str| {
+            format!("name: cap\nversion: 0.0.1\ncapabilities:\n  spawn:\n    allow: [{allow}]\n")
+        };
+        let manifest = RuntimeManifest::from_yaml_str(&with_allow("local/worker, ana/reviewer"))
+            .expect("full names in two scopes with distinct bare parts parse");
+        assert_eq!(
+            manifest.capabilities.unwrap().spawn.unwrap().allow,
+            vec!["local/worker".to_string(), "ana/reviewer".to_string()]
+        );
+
+        let (field, message, hint) = name_refusal(&with_allow("worker"));
+        assert_eq!(field, "capabilities.spawn.allow[0]");
+        assert!(
+            message.contains("'worker' is not a full artifact name"),
+            "{message}"
+        );
+        assert!(hint.unwrap().contains("local/worker"));
+
+        let (field, message, hint) = name_refusal(&with_allow("local/worker, ana/worker"));
+        assert_eq!(field, "capabilities.spawn.allow[1]");
+        assert_eq!(
+            message,
+            "'local/worker' and 'ana/worker' share the name 'worker', which is how delegate-task \
+             offers a capsule to the model"
+        );
+        assert_eq!(
+            hint.as_deref(),
+            Some("keep one of 'local/worker' and 'ana/worker' in capabilities.spawn.allow")
+        );
+    }
+
+    #[test]
+    fn scoped_name_a_reference_by_bare_part_names_the_declared_entry() {
+        let yaml = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    \
+                    version: 0.1.0\n    runtime: driver\n    gateway:\n      \
+                    endpoint: https://api.anthropic.com\n      api_key: k\ninference:\n  \
+                    transport: http\n  model: m\n  driver:\n    artifact: driver-anthropic\n";
+        let message = RuntimeManifest::from_yaml_str(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains(
+                "artifact 'driver-anthropic' is not declared in artifacts: (the declared \
+                 'murmur/driver-anthropic' has that name; refer to it as \
+                 'murmur/driver-anthropic')"
+            ),
+            "{message}"
+        );
     }
 }

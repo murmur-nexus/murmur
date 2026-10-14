@@ -92,7 +92,7 @@ enum Commands {
         /// Show the global store (~/.murmur/artifacts/) instead of the project store
         #[arg(short = 'g', long)]
         global: bool,
-        /// Show artifacts from both the project store and the global store, with a SCOPE column
+        /// Show artifacts from both the project store and the global store, with a STORE column
         #[arg(long, conflicts_with = "global")]
         all: bool,
         /// Show only artifacts declaring a WIT interface whose name starts with this prefix,

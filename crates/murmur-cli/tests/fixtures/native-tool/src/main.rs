@@ -75,7 +75,7 @@ fn run(raw: &str) -> Value {
             .append(true)
             .open(log_path)
         {
-            let _ = writeln!(file, "murmur-tool-fixture: {operation}");
+            let _ = writeln!(file, "tool-fixture: {operation}");
         }
     }
 

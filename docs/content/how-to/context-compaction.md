@@ -17,7 +17,7 @@ The relevant manifest options are:
 
 ## Step 1 — create murmur.yaml with context.max_tokens and the compaction artifact
 
-Compaction requires two things: `context.max_tokens` set to match your model's actual context window, and `murmur-hook-compact` declared as a hook artifact. Create a `murmur.yaml` file:
+Compaction requires two things: `context.max_tokens` set to match your model's actual context window, and `murmur/hook-compact` declared as a hook artifact. Create a `murmur.yaml` file:
 
 === "Anthropic"
 
@@ -29,13 +29,13 @@ Compaction requires two things: `context.max_tokens` set to match your model's a
       max_tokens: {{ v.max_tokens_anthropic }}
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
           endpoint: https://api.anthropic.com
           api_key: ${ANTHROPIC_API_KEY}
-      - name: murmur-hook-compact
+      - name: murmur/hook-compact
         version: "{{ v.murmur_hook_compact }}"
         runtime: hook
 
@@ -43,7 +43,7 @@ Compaction requires two things: `context.max_tokens` set to match your model's a
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
     ```
 
 === "OpenAI"
@@ -56,13 +56,13 @@ Compaction requires two things: `context.max_tokens` set to match your model's a
       max_tokens: {{ v.max_tokens_openai }}
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
           endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
-      - name: murmur-hook-compact
+      - name: murmur/hook-compact
         version: "{{ v.murmur_hook_compact }}"
         runtime: hook
 
@@ -70,7 +70,7 @@ Compaction requires two things: `context.max_tokens` set to match your model's a
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
     ```
 
 === "DeepSeek"
@@ -83,13 +83,13 @@ Compaction requires two things: `context.max_tokens` set to match your model's a
       max_tokens: {{ v.max_tokens_deepseek }}
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
           endpoint: https://api.deepseek.com
           api_key: ${DEEPSEEK_API_KEY}
-      - name: murmur-hook-compact
+      - name: murmur/hook-compact
         version: "{{ v.murmur_hook_compact }}"
         runtime: hook
 
@@ -97,12 +97,12 @@ Compaction requires two things: `context.max_tokens` set to match your model's a
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
     ```
 
 `context.max_tokens` is a manifest value — the runtime does not query the API to discover the context window. Use the number from your model's documentation; most current frontier models support between 400,000 and 1,000,000 tokens.
 
-Using `runtime: hook` ensures the model never sees `murmur-hook-compact` as a callable tool — the runtime invokes it directly at fixed lifecycle points.
+Using `runtime: hook` ensures the model never sees `murmur/hook-compact` as a callable tool — the runtime invokes it directly at fixed lifecycle points.
 
 ---
 
@@ -119,10 +119,10 @@ mur install
 To install the compaction artifact directly without going through the manifest:
 
 ```bash
-mur install murmur-hook-compact@{{ v.murmur_hook_compact }}
+mur install murmur/hook-compact@{{ v.murmur_hook_compact }}
 ```
 
-Compaction is not built into the Murmur runtime — it is externalized as an artifact by design. Everything in Murmur is composable, including something as fundamental as how context is condensed. `murmur-hook-compact` is the default implementation: it summarizes the message history using the configured model and replaces it with a compact representation. But compaction strategy is not one-size-fits-all. A coding agent might benefit from keeping the full tool call history and compacting only prose; a research agent might maintain a structured memory store rather than a rolling summary. You can build any of these as a hook artifact, package it once, and swap it in by changing a single line in the manifest. The runtime does not care which artifact provides compaction — only that one is declared with `runtime: hook` and responds to the compaction lifecycle event.
+Compaction is not built into the Murmur runtime — it is externalized as an artifact by design. Everything in Murmur is composable, including something as fundamental as how context is condensed. `murmur/hook-compact` is the default implementation: it summarizes the message history using the configured model and replaces it with a compact representation. But compaction strategy is not one-size-fits-all. A coding agent might benefit from keeping the full tool call history and compacting only prose; a research agent might maintain a structured memory store rather than a rolling summary. You can build any of these as a hook artifact, package it once, and swap it in by changing a single line in the manifest. The runtime does not care which artifact provides compaction — only that one is declared with `runtime: hook` and responds to the compaction lifecycle event.
 
 ---
 
@@ -139,7 +139,7 @@ For long-running tasks where you want compaction to kick in earlier and leave he
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
       compaction:
         threshold: 0.85
     ```
@@ -151,7 +151,7 @@ For long-running tasks where you want compaction to kick in earlier and leave he
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
       compaction:
         threshold: 0.85
     ```
@@ -163,7 +163,7 @@ For long-running tasks where you want compaction to kick in earlier and leave he
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
       compaction:
         threshold: 0.85
     ```
@@ -359,7 +359,7 @@ compaction.
 | Manifest setting | Effect |
 |---|---|
 | `context.max_tokens: N` | Sets the token budget; required to enable compaction |
-| `murmur-hook-compact` with `runtime: hook` (or any hook bound to `on-compaction`) | Provides the compaction hook; required to enable compaction |
+| `murmur/hook-compact` with `runtime: hook` (or any hook bound to `on-compaction`) | Provides the compaction hook; required to enable compaction |
 | `inference.compaction.threshold: 0.85` | Compaction fires when session tokens reach 85% of the budget |
 | `inference.compaction.model: claude-haiku-4-5` | Uses a different (typically cheaper) model for compaction calls |
 | `inference.compaction.dump_summaries: true` | Appends every committed compaction's summary to `out/compaction-summaries.jsonl`; default `false` |

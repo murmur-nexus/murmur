@@ -1,97 +1,116 @@
 //! The entry grammar of `capabilities.install.skill` and `capabilities.install.tool`.
 //!
-//! An entry is one of three forms:
+//! An entry is one of four forms:
 //!
-//! - `*`, every artifact name;
-//! - `<prefix>*`, every artifact name that begins with `<prefix>`. The prefix is non-empty, uses
-//!   only artifact-name characters, and does not begin with `-`; it may end with `-`
-//!   (`review-*`);
-//! - an exact artifact name, as [`artifact_name_format_error`] accepts it.
+//! - `*`, every artifact of every scope;
+//! - `<scope>/*`, every artifact in one scope;
+//! - `<scope>/<prefix>*`, every artifact in `<scope>` whose name begins with `<prefix>`. The
+//!   prefix uses only artifact-name characters and does not begin with `-`; it may end with `-`
+//!   (`ana/review-*`);
+//! - an exact full name, as [`ArtifactName`] accepts it.
 //!
 //! The manifest parser validates entries with [`validate`], the runtime's pull gate decides a name
 //! with [`matches`], and the spawn referee compares a child's entries against its parent's with
 //! [`covers`]. `covers(parent, child)` holds only when every name `child` matches is also matched
-//! by `parent`.
+//! by `parent`; no entry but `*` reaches across scopes.
 
-use crate::build::{artifact_name_format_error, MAX_ARTIFACT_NAME_LEN};
+use crate::artifact_name::{prefix_part_error, unscoped_name_hint, ArtifactName};
+use crate::build::artifact_name_format_error;
 
 /// The accepted entry forms, quoted in every refusal of an entry.
 pub const INSTALL_ENTRY_ACCEPTED_FORM: &str =
-    "an artifact name (lowercase letters, digits and inner '-'), a prefix ending in a single \
-     trailing '*' (e.g. 'style-*'), or '*' alone";
+    "a full artifact name '<scope>/<name>', a scope and name prefix ending in a single trailing \
+     '*' (e.g. 'ana/style-*' or 'ana/*'), or '*' alone";
+
+/// Why an install entry is refused: the defect, and for an entry with no scope the hint naming
+/// its scoped forms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallEntryError {
+    pub reason: String,
+    pub hint: Option<String>,
+}
+
+impl InstallEntryError {
+    fn reason(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            hint: None,
+        }
+    }
+}
 
 enum Entry<'a> {
     Any,
-    Prefix(&'a str),
-    Exact(&'a str),
+    Prefix { scope: &'a str, prefix: &'a str },
+    Exact(ArtifactName),
 }
 
-fn classify(entry: &str) -> Result<Entry<'_>, String> {
+fn classify(entry: &str) -> Result<Entry<'_>, InstallEntryError> {
     if entry == "*" {
         return Ok(Entry::Any);
     }
-    if let Some(prefix) = entry.strip_suffix('*') {
-        if prefix.is_empty() {
-            return Err("the prefix before '*' is empty".to_string());
-        }
+    let Some((scope, rest)) = entry.split_once('/') else {
+        let bare = entry
+            .strip_suffix('*')
+            .unwrap_or(entry)
+            .trim_end_matches('-');
+        return Err(match artifact_name_format_error(bare) {
+            None => InstallEntryError {
+                reason: format!("'{entry}' names no scope"),
+                hint: Some(unscoped_name_hint(entry)),
+            },
+            Some(reason) => InstallEntryError::reason(format!("not an artifact name: {reason}")),
+        });
+    };
+    if let Some(reason) = artifact_name_format_error(scope) {
+        return Err(InstallEntryError::reason(format!("the scope {reason}")));
+    }
+    if let Some(prefix) = rest.strip_suffix('*') {
         if prefix.contains('*') {
-            return Err("'*' may appear only once, as the last character".to_string());
-        }
-        if prefix.chars().count() > MAX_ARTIFACT_NAME_LEN {
-            return Err(format!(
-                "the prefix must be at most {MAX_ARTIFACT_NAME_LEN} characters"
+            return Err(InstallEntryError::reason(
+                "'*' may appear only once, as the last character",
             ));
         }
-        if let Some(bad) = prefix
-            .chars()
-            .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-'))
-        {
-            return Err(format!(
-                "the prefix may contain only lowercase letters, digits and '-' (found {bad:?})"
-            ));
+        if let Some(reason) = prefix_part_error(prefix) {
+            return Err(InstallEntryError::reason(reason));
         }
-        if prefix.starts_with('-') {
-            return Err("the prefix must not start with '-'".to_string());
-        }
-        return Ok(Entry::Prefix(prefix));
+        return Ok(Entry::Prefix { scope, prefix });
     }
-    if entry.contains('*') {
-        return Err("'*' may appear only once, as the last character".to_string());
+    if rest.contains('*') {
+        return Err(InstallEntryError::reason(
+            "'*' may appear only once, as the last character",
+        ));
     }
-    match artifact_name_format_error(entry) {
-        Some(reason) => Err(format!("not an artifact name: {reason}")),
-        None => Ok(Entry::Exact(entry)),
-    }
+    ArtifactName::parse(entry)
+        .map(Entry::Exact)
+        .map_err(|error| InstallEntryError::reason(error.to_string()))
 }
 
-/// `Ok` when `entry` is one of the accepted forms, else the reason it is not.
+/// `Ok` when `entry` is one of the accepted forms, else why it is not.
 ///
 /// The reason describes the defect only; callers quote the entry and
-/// [`INSTALL_ENTRY_ACCEPTED_FORM`] around it.
-pub fn validate(entry: &str) -> Result<(), String> {
+/// [`INSTALL_ENTRY_ACCEPTED_FORM`] around it, and print the hint when there is one.
+pub fn validate(entry: &str) -> Result<(), InstallEntryError> {
     classify(entry).map(|_| ())
 }
 
-/// Whether the entry `pattern` admits the artifact `name`.
-///
-/// `false` whenever `name` is not a valid artifact name, including under `*`, and whenever
-/// `pattern` fails [`validate`].
-pub fn matches(pattern: &str, name: &str) -> bool {
-    if artifact_name_format_error(name).is_some() {
-        return false;
-    }
+/// Whether the entry `pattern` admits the artifact `name`. `false` whenever `pattern` fails
+/// [`validate`].
+pub fn matches(pattern: &str, name: &ArtifactName) -> bool {
     match classify(pattern) {
         Ok(Entry::Any) => true,
-        Ok(Entry::Prefix(prefix)) => name.starts_with(prefix),
-        Ok(Entry::Exact(exact)) => exact == name,
+        Ok(Entry::Prefix { scope, prefix }) => {
+            name.scope() == scope && name.name().starts_with(prefix)
+        }
+        Ok(Entry::Exact(exact)) => &exact == name,
         Err(_) => false,
     }
 }
 
 /// Whether the parent entry `parent` admits every name the child entry `child` admits.
 ///
-/// `*` covers everything; `p*` covers an exact name or a `q*` whose text begins with `p`; an exact
-/// name covers only itself. `false` when either side fails [`validate`].
+/// `*` covers everything; `s/p*` covers an exact `s/name` or an `s/q*` whose name begins with
+/// `p`; an exact name covers only itself. `false` when either side fails [`validate`].
 pub fn covers(parent: &str, child: &str) -> bool {
     let (Ok(parent), Ok(child)) = (classify(parent), classify(child)) else {
         return false;
@@ -99,53 +118,92 @@ pub fn covers(parent: &str, child: &str) -> bool {
     match (parent, child) {
         (Entry::Any, _) => true,
         (_, Entry::Any) => false,
-        (Entry::Prefix(p), Entry::Prefix(q)) => q.starts_with(p),
-        (Entry::Prefix(p), Entry::Exact(c)) => c.starts_with(p),
-        (Entry::Exact(_), Entry::Prefix(_)) => false,
-        (Entry::Exact(n), Entry::Exact(c)) => n == c,
+        (
+            Entry::Prefix { scope, prefix },
+            Entry::Prefix {
+                scope: child_scope,
+                prefix: child_prefix,
+            },
+        ) => scope == child_scope && child_prefix.starts_with(prefix),
+        (Entry::Prefix { scope, prefix }, Entry::Exact(name)) => {
+            name.scope() == scope && name.name().starts_with(prefix)
+        }
+        (Entry::Exact(_), Entry::Prefix { .. }) => false,
+        (Entry::Exact(name), Entry::Exact(child)) => name == child,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build::MAX_ARTIFACT_NAME_LEN;
+
+    fn name(text: &str) -> ArtifactName {
+        ArtifactName::parse(text).unwrap()
+    }
 
     #[test]
-    fn validate_accepts_the_three_forms() {
+    fn install_pattern_validate_accepts_the_four_forms() {
         for entry in [
             "*",
-            "style-*",
-            "s*",
-            "a1*",
-            "code-review",
-            "jq",
-            "a",
-            "x9-y",
+            "murmur/*",
+            "ana/tool-*",
+            "ana/t*",
+            "ana/tool-x",
+            "local/x",
+            "a1/x9-y",
         ] {
             assert!(validate(entry).is_ok(), "{entry:?} should be accepted");
         }
     }
 
     #[test]
-    fn validate_refuses_everything_else() {
-        let too_long_prefix = format!("{}*", "a".repeat(MAX_ARTIFACT_NAME_LEN + 1));
-        let too_long_name = "a".repeat(MAX_ARTIFACT_NAME_LEN + 1);
+    fn install_pattern_refuses_a_bare_entry_with_the_scoped_hint() {
+        for entry in [
+            "tool-*",
+            "mur*",
+            "tool-x",
+            "tool-editor",
+            "murmur-tool-editor",
+        ] {
+            let error = validate(entry).unwrap_err();
+            let hint = error
+                .hint
+                .unwrap_or_else(|| panic!("{entry:?} has no hint"));
+            assert!(hint.contains("local/"), "{entry:?}: {hint}");
+        }
+        let hint = validate("murmur-tool-editor").unwrap_err().hint.unwrap();
+        assert!(hint.contains("murmur/tool-editor"), "{hint}");
+    }
+
+    #[test]
+    fn install_pattern_validate_refuses_everything_else() {
+        let too_long_prefix = format!("a/{}*", "a".repeat(MAX_ARTIFACT_NAME_LEN + 1));
+        let too_long_name = format!("a/{}", "a".repeat(MAX_ARTIFACT_NAME_LEN + 1));
         for entry in [
             "",
             " ",
+            "*/x",
+            "*/*",
+            "a/*x",
+            "a/x*y",
+            "a/**",
             "a*b",
             "*x",
             "**",
-            "a**",
-            "Foo",
-            "Foo*",
-            "-a",
-            "-a*",
-            "a-",
-            "a/b",
-            "a/*",
+            "Foo/x",
+            "a/Foo",
+            "a/Foo*",
+            "a/-x",
+            "a/-x*",
+            "a/x-",
+            "a/b/c",
+            "a/b/*",
+            "/x",
+            "x/",
             "github:owner/repo",
             "a b",
+            "a/b c",
             "a:b",
             too_long_prefix.as_str(),
             too_long_name.as_str(),
@@ -155,60 +213,61 @@ mod tests {
     }
 
     #[test]
-    fn matches_case_table() {
+    fn install_pattern_matches_case_table() {
         let cases: &[(&str, &str, bool)] = &[
-            ("*", "anything", true),
-            ("*", "a", true),
-            ("*", "../escape", false),
-            ("*", "Upper", false),
-            ("*", "a/b", false),
-            ("*", "", false),
-            ("*", "github:owner/repo@v1", false),
-            ("style-*", "style-rust", true),
-            ("style-*", "style-", false),
-            ("style-*", "stylist", false),
-            ("style-*", "style", false),
-            ("style*", "styles", true),
-            ("style*", "style", true),
-            ("code-review", "code-review", true),
-            ("code-review", "code-review-2", false),
-            ("code-review", "code", false),
-            ("a*b", "axb", false),
-            ("Foo", "Foo", false),
+            ("*", "ana/anything", true),
+            ("*", "murmur/a", true),
+            ("murmur/*", "murmur/tool-git", true),
+            ("murmur/*", "ana/tool-git", false),
+            ("ana/style-*", "ana/style-rust", true),
+            ("ana/style-*", "ana/stylist", false),
+            ("ana/style-*", "ana/style", false),
+            ("ana/style-*", "bob/style-rust", false),
+            ("ana/style*", "ana/styles", true),
+            ("ana/style*", "ana/style", true),
+            ("ana/code-review", "ana/code-review", true),
+            ("ana/code-review", "bob/code-review", false),
+            ("ana/code-review", "ana/code-review-2", false),
+            ("a/x*y", "a/xzy", false),
+            ("code-review", "ana/code-review", false),
         ];
-        for (pattern, name, expected) in cases {
+        for (pattern, candidate, expected) in cases {
             assert_eq!(
-                matches(pattern, name),
+                matches(pattern, &name(candidate)),
                 *expected,
-                "matches({pattern:?}, {name:?})"
+                "matches({pattern:?}, {candidate:?})"
             );
         }
     }
 
     const COVER_CASES: &[(&str, &str, bool)] = &[
         ("*", "*", true),
-        ("*", "style-*", true),
-        ("*", "jq", true),
-        ("style-*", "*", false),
-        ("style-*", "style-*", true),
-        ("style-*", "style-rust*", true),
-        ("style-*", "style*", false),
-        ("style-*", "style-rust", true),
-        ("style-*", "stylist", false),
-        ("style*", "style-*", true),
-        ("style*", "styles", true),
-        ("jq", "jq", true),
-        ("jq", "yq", false),
-        ("jq", "jq*", false),
-        ("jq", "*", false),
-        ("j*", "jq", true),
-        ("a*b", "a", false),
-        ("*", "a*b", false),
-        ("Foo", "Foo", false),
+        ("*", "ana/style-*", true),
+        ("*", "ana/jq", true),
+        ("ana/*", "ana/style-*", true),
+        ("ana/*", "bob/*", false),
+        ("ana/*", "*", false),
+        ("ana/style-*", "*", false),
+        ("ana/style-*", "ana/style-*", true),
+        ("ana/style-*", "bob/style-*", false),
+        ("ana/style-*", "ana/style-rust*", true),
+        ("ana/style-*", "ana/style*", false),
+        ("ana/style-*", "ana/style-rust", true),
+        ("ana/style-*", "bob/style-rust", false),
+        ("ana/style-*", "ana/stylist", false),
+        ("ana/style*", "ana/style-*", true),
+        ("ana/jq", "ana/jq", true),
+        ("ana/jq", "bob/jq", false),
+        ("ana/jq", "ana/jq*", false),
+        ("ana/jq", "*", false),
+        ("ana/j*", "ana/jq", true),
+        ("a/x*y", "a/x", false),
+        ("*", "a/x*y", false),
+        ("jq", "jq", false),
     ];
 
     #[test]
-    fn covers_case_table() {
+    fn install_pattern_covers_case_table() {
         for (parent, child, expected) in COVER_CASES {
             assert_eq!(
                 covers(parent, child),
@@ -219,40 +278,39 @@ mod tests {
     }
 
     #[test]
-    fn a_covering_parent_matches_every_name_its_child_matches() {
-        let names = [
-            "a",
-            "jq",
-            "yq",
-            "style",
-            "style-",
-            "style-rust",
-            "style-rust-2",
-            "stylist",
-            "styles",
-            "code-review",
-            "lint-rs",
-            "x",
-            "Upper",
-            "../escape",
-            "",
-        ];
+    fn install_pattern_a_covering_parent_matches_every_name_its_child_matches() {
+        let names: Vec<ArtifactName> = [
+            "ana/a",
+            "ana/jq",
+            "bob/jq",
+            "ana/style",
+            "ana/style-rust",
+            "bob/style-rust",
+            "ana/style-rust-2",
+            "ana/stylist",
+            "ana/styles",
+            "murmur/code-review",
+            "local/x",
+        ]
+        .into_iter()
+        .map(name)
+        .collect();
         let entries: Vec<&str> = COVER_CASES
             .iter()
             .flat_map(|(p, c, _)| [*p, *c])
-            .chain(["lint-*", "code-review", "a"])
+            .chain(["murmur/*", "ana/code-review", "local/x"])
             .collect();
         for parent in &entries {
             for child in &entries {
                 if !covers(parent, child) {
                     continue;
                 }
-                for name in names {
-                    if matches(child, name) {
+                for candidate in &names {
+                    if matches(child, candidate) {
                         assert!(
-                            matches(parent, name),
+                            matches(parent, candidate),
                             "covers({parent:?}, {child:?}) holds but {parent:?} does not match \
-                             {name:?}, which {child:?} does"
+                             {candidate}, which {child:?} does"
                         );
                     }
                 }

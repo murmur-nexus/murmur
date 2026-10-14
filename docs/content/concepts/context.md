@@ -9,7 +9,7 @@ hard limit:
    crossed `inference.compaction.threshold`.
 3. Once crossed, the runtime fires the `on-compaction` lifecycle event with the full message
    history. The runtime picks the compaction hook by binding, so you configure no artifact name
-   anywhere — any hook bound to `on-compaction` receives the event. `murmur-hook-compact` is the
+   anywhere — any hook bound to `on-compaction` receives the event. `murmur/hook-compact` is the
    reference implementation.
 4. The hook returns a condensed message array; the runtime replaces the in-memory history and
    recounts tokens against it. Each returned `message.content` may be a plain summary string or

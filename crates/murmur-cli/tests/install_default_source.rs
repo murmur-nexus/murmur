@@ -1,4 +1,4 @@
-//! Which remote source a `name@version` install falls back to when the local store misses.
+//! Which remote source a `scope/name@version` install falls back to when the local store misses.
 //!
 //! With no config file at all, every form of `mur install` resolves against the built-in
 //! `official` source, `murmur-nexus/default-artifacts`, without writing a config file. A config
@@ -18,9 +18,12 @@ use murmur_artifact::{read_lockfile, sha256_hex};
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+/// The bare name the default source publishes the asset under.
 const NAME: &str = "default-source-tool";
+/// The full name it installs as: the default source serves the `murmur` scope.
+const FULL_NAME: &str = "murmur/default-source-tool";
 const VERSION: &str = "0.3.0";
-const ABSENT: &str = "absent-artifact@1.0.0";
+const ABSENT: &str = "murmur/absent-artifact@1.0.0";
 
 /// `mur` under the scratch `home`, run from `cwd`, with no GitHub token in reach.
 fn mur(home: &TempDir, cwd: &Path, api_base: &str) -> Command {
@@ -97,18 +100,18 @@ fn a_global_install_with_no_config_file_uses_the_built_in_source() {
     let release = published_release(staging.path());
 
     mur(&home, cwd.path(), &release.api_base)
-        .args(["install", "-g", &format!("{NAME}@{VERSION}")])
+        .args(["install", "-g", &format!("{FULL_NAME}@{VERSION}")])
         .assert()
         .success()
         .stdout(predicate::str::contains(format!(
-            "Installed {NAME}@{VERSION}"
+            "Installed {FULL_NAME}@{VERSION}"
         )));
 
     assert_asked_default_artifacts(&release);
     assert!(home
         .path()
         .join(format!(
-            ".murmur/artifacts/{NAME}/{VERSION}/{NAME}-{VERSION}.mur.zip"
+            ".murmur/artifacts/{FULL_NAME}/{VERSION}/{NAME}-{VERSION}.mur.zip"
         ))
         .exists());
     assert_no_config_written(&home);
@@ -121,7 +124,7 @@ fn a_manifest_install_with_no_config_file_uses_the_built_in_source() {
     let staging = tempfile::tempdir().unwrap();
     let release = published_release(staging.path());
     let sha256 = sha256_hex(&fs::read(staging.path().join(asset_name())).unwrap());
-    write_project(project.path(), NAME, VERSION);
+    write_project(project.path(), FULL_NAME, VERSION);
 
     mur(&home, project.path(), &release.api_base)
         .arg("install")
@@ -132,11 +135,11 @@ fn a_manifest_install_with_no_config_file_uses_the_built_in_source() {
     assert!(project
         .path()
         .join(format!(
-            ".murmur/artifacts/{NAME}/{VERSION}/{NAME}-{VERSION}.mur.zip"
+            ".murmur/artifacts/{FULL_NAME}/{VERSION}/{NAME}-{VERSION}.mur.zip"
         ))
         .exists());
     let lock = read_lockfile(&project.path().join("murmur.lock")).unwrap();
-    let entry = lock.artifact_for(NAME).unwrap();
+    let entry = lock.artifact_for(FULL_NAME).unwrap();
     assert_eq!(entry.resolved_version, VERSION);
     assert_eq!(entry.sha256.any.as_deref(), Some(sha256.as_str()));
     assert_no_config_written(&home);

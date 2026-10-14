@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_yaml::Value;
 use thiserror::Error;
 
-use crate::build::artifact_name_format_error;
+use crate::artifact_name::ArtifactName;
 use crate::manifest::describe_yaml_shape;
 use crate::registry::is_reserved_version;
 
@@ -101,9 +101,13 @@ pub enum RosterError {
         source: io::Error,
     },
     /// Every shape fault. The message starts with `roster.yaml`, names the key path, and names
-    /// the member when the fault is inside a member entry that has a usable name.
+    /// the member when the fault is inside a member entry that has a usable name. `hint` is set
+    /// when the fault has a fix of its own to name, as a bare `capsule:` does.
     #[error("{message}")]
-    Malformed { message: String },
+    Malformed {
+        message: String,
+        hint: Option<String>,
+    },
 }
 
 /// Read and parse the roster at `path`.
@@ -307,12 +311,11 @@ fn parse_member(index: usize, entry: &Value) -> Result<RosterMember, RosterError
     let capsule = match present(fields.get("capsule")) {
         None => return Err(fault(&format!("{path}.capsule"), label, "is required")),
         Some(Value::String(capsule)) => {
-            if let Some(problem) = artifact_name_format_error(capsule) {
-                return Err(fault(
-                    &format!("{path}.capsule"),
-                    label,
-                    &format!("'{capsule}' is not a valid artifact name: it {problem}"),
-                ));
+            if let Err(error) = ArtifactName::parse(capsule) {
+                return Err(RosterError::Malformed {
+                    message: fault_message(&format!("{path}.capsule"), label, &error.to_string()),
+                    hint: error.hint(),
+                });
             }
             capsule.clone()
         }
@@ -512,16 +515,23 @@ fn refuse_unknown_keys(
 }
 
 fn fault(key_path: &str, member: Option<&str>, problem: &str) -> RosterError {
+    malformed(fault_message(key_path, member, problem))
+}
+
+fn fault_message(key_path: &str, member: Option<&str>, problem: &str) -> String {
     let mut message = format!("{ROSTER_FILENAME}: {key_path}");
     if let Some(member) = member {
         let _ = write!(message, " (member '{member}')");
     }
     let _ = write!(message, ": {problem}");
-    malformed(message)
+    message
 }
 
 fn malformed(message: String) -> RosterError {
-    RosterError::Malformed { message }
+    RosterError::Malformed {
+        message,
+        hint: None,
+    }
 }
 
 #[cfg(test)]
@@ -531,14 +541,14 @@ mod tests {
     const S1: &str = "roster_version: 1
 members:
   - name: planner
-    capsule: planner
+    capsule: local/planner
     version: 0.3.0
     entry: true
   - name: coder
-    capsule: coder
+    capsule: local/coder
     version: 1.2.0
   - name: reviewer
-    capsule: reviewer
+    capsule: local/reviewer
     version: 0.9.0
 reachability:
   - from: planner
@@ -559,7 +569,7 @@ reachability:
     /// The refusal message for `input`, which must be refused.
     fn refusal(input: &str) -> String {
         match Roster::from_yaml_str(input) {
-            Err(RosterError::Malformed { message }) => message,
+            Err(RosterError::Malformed { message, .. }) => message,
             other => panic!("expected a Malformed refusal for:\n{input}\ngot {other:?}"),
         }
     }
@@ -586,9 +596,9 @@ reachability:
         assert_eq!(
             roster.members,
             vec![
-                member("planner", "planner", "0.3.0", true),
-                member("coder", "coder", "1.2.0", false),
-                member("reviewer", "reviewer", "0.9.0", false),
+                member("planner", "local/planner", "0.3.0", true),
+                member("coder", "local/coder", "1.2.0", false),
+                member("reviewer", "local/reviewer", "0.9.0", false),
             ]
         );
         assert_eq!(
@@ -609,7 +619,7 @@ reachability:
     #[test]
     fn absent_and_empty_reachability_are_closed_and_all_is_all() {
         let base =
-            "roster_version: 1\nmembers:\n  - {name: a, capsule: a, version: 1.0.0, entry: true}\n";
+            "roster_version: 1\nmembers:\n  - {name: a, capsule: local/a, version: 1.0.0, entry: true}\n";
         for tail in ["", "reachability: []\n", "reachability:\n"] {
             let roster = Roster::from_yaml_str(&format!("{base}{tail}")).unwrap();
             assert_eq!(roster.reachability, RosterReachability::Closed, "{tail:?}");
@@ -629,7 +639,7 @@ reachability:
             ("1.2.0-rc.1", "1.2.0-rc.1"),
         ] {
             let roster = Roster::from_yaml_str(&format!(
-                "roster_version: 1\nmembers:\n  - name: a\n    capsule: a\n    version: {written}\n"
+                "roster_version: 1\nmembers:\n  - name: a\n    capsule: local/a\n    version: {written}\n"
             ))
             .unwrap();
             assert_eq!(roster.members[0].version, read, "{written}");
@@ -639,8 +649,8 @@ reachability:
     #[test]
     fn shape_only_duplicates_entries_and_unknown_rule_names_parse() {
         let roster = Roster::from_yaml_str(
-            "roster_version: 1\nmembers:\n  - {name: coder, capsule: coder, version: 1.2.0}\n  \
-             - {name: coder, capsule: coder, version: 1.2.0}\nreachability:\n  - from: ghost\n    \
+            "roster_version: 1\nmembers:\n  - {name: coder, capsule: local/coder, version: 1.2.0}\n  \
+             - {name: coder, capsule: local/coder, version: 1.2.0}\nreachability:\n  - from: ghost\n    \
              to: [tester]\n",
         )
         .unwrap();
@@ -683,7 +693,7 @@ reachability:
                 &["reachability[1].skills", "unknown key"],
             ),
             (
-                S1.replace("    capsule: coder\n", ""),
+                S1.replace("    capsule: local/coder\n", ""),
                 &["members[1].capsule", "member 'coder'", "is required"],
             ),
             (
@@ -739,6 +749,37 @@ reachability:
                     "expected {needle:?} in {message:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn roster_refuses_a_bare_capsule_naming_the_member_with_the_scoped_hint() {
+        let input = S1.replace("capsule: local/planner", "capsule: crew-lead");
+        match Roster::from_yaml_str(&input) {
+            Err(RosterError::Malformed { message, hint }) => {
+                assert_eq!(
+                    message,
+                    "roster.yaml: members[0].capsule (member 'planner'): 'crew-lead' is not a full \
+                     artifact name: an artifact is named <scope>/<name>"
+                );
+                let hint = hint.expect("a bare capsule carries the scoped hint");
+                assert!(hint.contains("local/crew-lead"), "{hint}");
+                assert!(hint.contains("murmur/crew-lead"), "{hint}");
+            }
+            other => panic!("expected a Malformed refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roster_refuses_a_malformed_capsule_with_the_part_reason_and_no_hint() {
+        let input = S1.replace("capsule: local/coder", "capsule: a/b/c");
+        match Roster::from_yaml_str(&input) {
+            Err(RosterError::Malformed { message, hint }) => {
+                assert!(message.contains("members[1].capsule"), "{message}");
+                assert!(message.contains("exactly one '/'"), "{message}");
+                assert_eq!(hint, None);
+            }
+            other => panic!("expected a Malformed refusal, got {other:?}"),
         }
     }
 

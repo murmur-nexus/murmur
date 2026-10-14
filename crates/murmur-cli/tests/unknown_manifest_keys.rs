@@ -114,7 +114,7 @@ fn a_correct_manifest_warns_on_neither_surface() {
         r#"name: clean-capsule
 version: 0.1.0
 artifacts:
-  - name: notes-tool
+  - name: local/notes-tool
     version: 0.1.0
     runtime: tool
     capabilities:
@@ -361,7 +361,7 @@ fn a_capsule_with_an_unrecognized_key_still_launches() {
     fs::write(
         dir.path().join("murmur.yaml"),
         format!(
-            "name: capsule\nversion: 0.0.1\nartifacts:\n  - name: {TOOL_NAME}\n    version: \
+            "name: capsule\nversion: 0.0.1\nartifacts:\n  - name: local/{TOOL_NAME}\n    version: \
              {TOOL_VERSION}\ncapabilities:\n  filesystem:\n    read-only:\n      - tests\n"
         ),
     )

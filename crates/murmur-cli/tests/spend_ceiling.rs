@@ -33,7 +33,7 @@ use murmur_artifact::{load_runtime_manifest, ArtifactRuntime, ContainmentClass, 
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-const DRIVER: &str = "murmur-driver-anthropic";
+const DRIVER: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.0";
 /// `inference.max_tokens` in every manifest here, so each agent turn reserves exactly this much
 /// output.
@@ -471,6 +471,7 @@ fn stage_queue_capsule(home: &TempDir, manifest_path: &Path) -> capsule_runtime:
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),
+            capsule_artifact: None,
             capsule_component_bytes: Vec::new(),
             artifacts: requested_artifacts,
             allowlisted_tools: HashSet::new(),
@@ -928,7 +929,7 @@ fn compaction_manifest(endpoint: &str, inference_extra: &str, context_budget: bo
     format!(
         "name: spend-compaction\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    version: \
          {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      \
-         api_key: test-key\n  - name: compactor\n    version: 0.1.0\n    runtime: hook\n\
+         api_key: test-key\n  - name: local/compactor\n    version: 0.1.0\n    runtime: hook\n\
          {context}inference:\n  transport: http\n  model: test-model\n  max_tokens: \
          {MAX_OUTPUT}\n{inference_extra}  \
          compaction:\n    threshold: 0.01\n  driver:\n    artifact: {DRIVER}\n"
@@ -1147,7 +1148,7 @@ fn inferring_hook_manifest(endpoint: &str, inference_extra: &str) -> String {
     format!(
         "name: spend-inference-hook\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    version: \
          {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      \
-         api_key: test-key\n  - name: {INFERRING_HOOK}\n    version: 0.1.0\n    runtime: hook\n\
+         api_key: test-key\n  - name: local/{INFERRING_HOOK}\n    version: 0.1.0\n    runtime: hook\n\
          inference:\n  transport: http\n  model: test-model\n  max_tokens: {MAX_OUTPUT}\n\
          {inference_extra}  driver:\n    artifact: {DRIVER}\n"
     )
@@ -1249,10 +1250,10 @@ fn process_capsule(home: &TempDir, driver_wasm: &Path, inference_extra: &str) ->
     drop(artifacts);
 
     let project = project(&format!(
-        "name: spend-process\nversion: 0.1.0\nartifacts:\n  - name: fixture-process-driver\n    \
+        "name: spend-process\nversion: 0.1.0\nartifacts:\n  - name: local/fixture-process-driver\n    \
          version: 0.1.0\n    runtime: driver\ncapabilities:\n  env:\n    allow: [HOME, PATH, \
          FIXTURE_HARNESS_PROFILE]\ninference:\n  transport: process\n  driver:\n    artifact: \
-         fixture-process-driver\n  model: test-model\n{inference_extra}"
+         local/fixture-process-driver\n  model: test-model\n{inference_extra}"
     ));
     let harness = project.dir.path().join("fake-harness");
     fs::copy(

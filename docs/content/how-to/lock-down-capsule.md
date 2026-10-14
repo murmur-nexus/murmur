@@ -33,7 +33,7 @@ Create a `murmur.yaml` file. This version does the job — the agent has `bash`,
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-anthropic
+      - name: murmur/driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
         gateway:
@@ -49,7 +49,7 @@ Create a `murmur.yaml` file. This version does the job — the agent has `bash`,
       transport: http
       model: {{ v.model_anthropic }}
       driver:
-        artifact: murmur-driver-anthropic
+        artifact: murmur/driver-anthropic
     ```
 
 === "OpenAI"
@@ -59,7 +59,7 @@ Create a `murmur.yaml` file. This version does the job — the agent has `bash`,
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-openai
+      - name: murmur/driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
@@ -75,7 +75,7 @@ Create a `murmur.yaml` file. This version does the job — the agent has `bash`,
       transport: http
       model: {{ v.model_openai }}
       driver:
-        artifact: murmur-driver-openai
+        artifact: murmur/driver-openai
     ```
 
 === "DeepSeek"
@@ -85,7 +85,7 @@ Create a `murmur.yaml` file. This version does the job — the agent has `bash`,
     version: "0.1.0"
 
     artifacts:
-      - name: murmur-driver-deepseek
+      - name: murmur/driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
         gateway:
@@ -101,7 +101,7 @@ Create a `murmur.yaml` file. This version does the job — the agent has `bash`,
       transport: http
       model: {{ v.model_deepseek }}
       driver:
-        artifact: murmur-driver-deepseek
+        artifact: murmur/driver-deepseek
     ```
 
 There is no `filesystem.scope`, so the capsule works out of the whole session workdir, and `bash` can run any command against the entire machine. The rest of this guide applies specific capabilities to constrain what the agent can reach — without taking away its ability to do the coding task.
@@ -253,20 +253,20 @@ Add the WASM tools this agent uses to the `artifacts:` list, add the one extra h
 
 ```yaml
 artifacts:
-  - name: murmur-driver-anthropic
+  - name: murmur/driver-anthropic
     version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
     capabilities:
       network:
         allow: []
-  - name: murmur-tool-git
+  - name: murmur/tool-git
     version: "{{ v.murmur_tool_git }}"
     runtime: tool
     capabilities:
       network:
         allow:
           - https://github.com
-  - name: murmur-tool-editor
+  - name: murmur/tool-editor
     version: "{{ v.murmur_tool_editor }}"
     runtime: tool
     capabilities:

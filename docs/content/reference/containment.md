@@ -280,7 +280,7 @@ workdir under every class. Narrow one artifact by naming the subtree it needs on
 
 ```yaml
 artifacts:
-  - name: report-writer
+  - name: local/report-writer
     version: 0.1.0
     runtime: tool
     capabilities:

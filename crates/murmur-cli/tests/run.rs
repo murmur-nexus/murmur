@@ -18,7 +18,10 @@ use zip::{
     CompressionMethod, ZipWriter,
 };
 
+/// The tool name a script capsule calls the fixture by; [`TOOL_ARTIFACT`] is the full name its
+/// `.mur.zip` installs under.
 const TOOL_NAME: &str = "echo-tool";
+const TOOL_ARTIFACT: &str = "local/echo-tool";
 const TOOL_VERSION: &str = "0.1.0";
 
 #[test]
@@ -37,7 +40,7 @@ fn run_round_trip_writes_lock_and_uses_existing_lock_on_second_run() {
     let manifest_path = create_project(
         project.path(),
         "capsule-allowlisted.wasm",
-        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
         None,
     );
     common::install_artifact_to_project(project.path(), &artifact_path).success();
@@ -59,7 +62,7 @@ fn run_round_trip_writes_lock_and_uses_existing_lock_on_second_run() {
     let lock_path = project.path().join("murmur.lock");
     let lock = read_lockfile(&lock_path).unwrap();
     let entry = lock
-        .artifact_for(TOOL_NAME)
+        .artifact_for(TOOL_ARTIFACT)
         .expect("lock entry for echo-tool");
     assert_eq!(entry.resolved_version, TOOL_VERSION);
     assert!(!entry.sha256.any.as_deref().unwrap_or_default().is_empty());
@@ -69,7 +72,7 @@ fn run_round_trip_writes_lock_and_uses_existing_lock_on_second_run() {
     fs::write(
         &manifest_path,
         format!(
-            "name: capsule\nversion: 0.0.1\nartifacts:\n  - name: {TOOL_NAME}\n    version: 9.9.9\n"
+            "name: capsule\nversion: 0.0.1\nartifacts:\n  - name: {TOOL_ARTIFACT}\n    version: 9.9.9\n"
         ),
     )
     .unwrap();
@@ -105,7 +108,7 @@ fn run_unlisted_tool_call_returns_error_to_capsule_without_panic() {
     let manifest_path = create_project(
         project.path(),
         "capsule-unlisted.wasm",
-        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
         None,
     );
     common::install_artifact_to_project(project.path(), &artifact_path).success();
@@ -130,7 +133,7 @@ fn run_missing_artifact_fails_before_launch_with_clear_error() {
     let manifest_path = create_project(
         project.path(),
         "capsule-allowlisted.wasm",
-        "  - name: missing-tool\n    version: 0.0.1\n",
+        "  - name: local/missing-tool\n    version: 0.0.1\n",
         None,
     );
 
@@ -138,7 +141,7 @@ fn run_missing_artifact_fails_before_launch_with_clear_error() {
         .failure()
         .stderr(predicate::str::contains("E-RUN-008"))
         .stderr(predicate::str::contains(
-            "missing artifacts: missing-tool@0.0.1",
+            "missing artifacts: local/missing-tool@0.0.1",
         ))
         .stderr(predicate::str::contains("mur install"));
 
@@ -153,7 +156,7 @@ fn run_fails_with_e_run_008_when_artifact_not_installed() {
     let manifest_path = create_project(
         project.path(),
         "capsule-allowlisted.wasm",
-        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
         None,
     );
 
@@ -161,7 +164,7 @@ fn run_fails_with_e_run_008_when_artifact_not_installed() {
         .failure()
         .stderr(predicate::str::contains("E-RUN-008"))
         .stderr(predicate::str::contains(format!(
-            "missing artifacts: {TOOL_NAME}@{TOOL_VERSION}"
+            "missing artifacts: {TOOL_ARTIFACT}@{TOOL_VERSION}"
         )))
         .stderr(predicate::str::contains("mur install"));
 }
@@ -187,6 +190,9 @@ fn run_does_not_auto_pull_missing_artifact_even_when_source_chain_configured() {
     let project = tempfile::tempdir().unwrap();
 
     write_registry_source_config(home.path(), "acme/artifacts");
+    // A scope a source serves: a `local/` artifact is never asked of one, so naming one would
+    // prove nothing about the source chain.
+    const SOURCED: &str = "acme/echo-tool";
 
     // Bound but never accepted: proves `mur run` issues no request against the source chain.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -195,7 +201,7 @@ fn run_does_not_auto_pull_missing_artifact_even_when_source_chain_configured() {
     let manifest_path = create_project(
         project.path(),
         "capsule-allowlisted.wasm",
-        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        &format!("  - name: {SOURCED}\n    version: {TOOL_VERSION}\n"),
         None,
     );
 
@@ -213,11 +219,11 @@ fn run_does_not_auto_pull_missing_artifact_even_when_source_chain_configured() {
         .failure()
         .stderr(predicate::str::contains("E-RUN-008"))
         .stderr(predicate::str::contains(format!(
-            "missing artifacts: {TOOL_NAME}@{TOOL_VERSION}"
+            "missing artifacts: {SOURCED}@{TOOL_VERSION}"
         )));
 
     let installed_zip = project.path().join(format!(
-        ".murmur/artifacts/{TOOL_NAME}/{TOOL_VERSION}/{TOOL_NAME}-{TOOL_VERSION}.mur.zip"
+        ".murmur/artifacts/{SOURCED}/{TOOL_VERSION}/{TOOL_NAME}-{TOOL_VERSION}.mur.zip"
     ));
     assert!(
         !installed_zip.exists(),
@@ -241,7 +247,7 @@ fn second_run_detects_tampered_artifact_with_integrity_error() {
     let manifest_path = create_project(
         project.path(),
         "capsule-allowlisted.wasm",
-        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
         None,
     );
     common::install_artifact_to_project(project.path(), &artifact_path).success();
@@ -249,14 +255,14 @@ fn second_run_detects_tampered_artifact_with_integrity_error() {
     common::run_capsule(&home, &manifest_path).success();
 
     let installed_zip = project.path().join(format!(
-        ".murmur/artifacts/{TOOL_NAME}/{TOOL_VERSION}/{TOOL_NAME}-{TOOL_VERSION}.mur.zip"
+        ".murmur/artifacts/{TOOL_ARTIFACT}/{TOOL_VERSION}/{TOOL_NAME}-{TOOL_VERSION}.mur.zip"
     ));
     fs::write(installed_zip, b"tampered").unwrap();
 
     common::run_capsule(&home, &manifest_path)
         .failure()
         .stderr(predicate::str::contains(format!(
-            "artifact integrity check failed for {TOOL_NAME}@{TOOL_VERSION}"
+            "artifact integrity check failed for {TOOL_ARTIFACT}@{TOOL_VERSION}"
         )));
 }
 
@@ -276,7 +282,7 @@ fn run_disallowed_network_call_is_denied_without_panic() {
     let manifest_path = create_project(
         project.path(),
         "capsule-network-attempt.wasm",
-        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
         Some("  network:\n    allow:\n      - https://allowed.example.com\n"),
     );
     common::install_artifact_to_project(project.path(), &artifact_path).success();
@@ -311,7 +317,7 @@ fn run_allowlisted_network_host_is_not_denied() {
     let manifest_path = create_project(
         project.path(),
         "capsule-network-attempt.wasm",
-        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
         Some("  network:\n    allow:\n      - https://blocked.example.com\n"),
     );
     common::install_artifact_to_project(project.path(), &artifact_path).success();
@@ -347,7 +353,7 @@ fn run_env_echo(capabilities_yaml: Option<&str>, extra_env: &[(&str, &str)]) -> 
     let manifest_path = create_project(
         project.path(),
         "capsule-env-echo.wasm",
-        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
         capabilities_yaml,
     );
     common::install_artifact_to_project(project.path(), &artifact_path).success();
@@ -403,7 +409,7 @@ fn run_with_env_allowlisted_credential_var_is_refused() {
     let manifest_path = create_project(
         project.path(),
         "capsule-env-echo.wasm",
-        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
         Some("  env:\n    allow:\n      - GITHUB_TOKEN\n"),
     );
 
@@ -436,7 +442,7 @@ fn run_without_network_capabilities_denies_outbound_http() {
     let manifest_path = create_project(
         project.path(),
         "capsule-network-attempt.wasm",
-        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
         None,
     );
     common::install_artifact_to_project(project.path(), &artifact_path).success();
@@ -471,7 +477,7 @@ fn run_filesystem_escape_attempt_fails_and_does_not_write_outside_workdir() {
     let manifest_path = create_project(
         project.path(),
         "capsule-filesystem-escape.wasm",
-        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
         Some("  filesystem:\n    scope: .\n"),
     );
     common::install_artifact_to_project(project.path(), &artifact_path).success();
@@ -504,7 +510,7 @@ fn create_dotenv_project(project_dir: &Path, env_var: &str, artifacts: &str) -> 
     fs::write(
         project_dir.join("murmur.yaml"),
         format!(
-            "name: capsule\nversion: 0.0.1\nartifacts:\n  - name: dummy-driver\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${{{env_var}}}{artifacts}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: dummy-driver\n"
+            "name: capsule\nversion: 0.0.1\nartifacts:\n  - name: local/dummy-driver\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${{{env_var}}}{artifacts}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: local/dummy-driver\n"
         ),
     )
     .unwrap();
@@ -555,7 +561,7 @@ fn run_without_no_env_file_flag_loads_dotenv_and_reads_the_credential_from_it() 
     let manifest_path = create_dotenv_project(
         project.path(),
         "CI_TEST_VAR",
-        "\n  - name: missing-tool\n    version: 0.0.1",
+        "\n  - name: local/missing-tool\n    version: 0.0.1",
     );
 
     // No --no-env-file: .env is auto-loaded, so CI_TEST_VAR is in the environment `mur run`
@@ -573,7 +579,7 @@ fn run_without_no_env_file_flag_loads_dotenv_and_reads_the_credential_from_it() 
         .stderr(predicate::str::contains("environment variable CI_TEST_VAR"))
         .stderr(predicate::str::contains("E-MAN-003").not())
         .stderr(predicate::str::contains("E-RUN-008"))
-        .stderr(predicate::str::contains("missing-tool@0.0.1"));
+        .stderr(predicate::str::contains("local/missing-tool@0.0.1"));
 }
 
 /// A project declaring `echo-tool` with its artifact installed and no `murmur.lock` yet.
@@ -597,7 +603,7 @@ fn the_lock_mur_run_creates_marks_every_entry_operator() {
     let manifest_path = echo_tool_project(
         project.path(),
         fixture.path(),
-        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
     );
     let lock_path = project.path().join("murmur.lock");
     let _ = fs::remove_file(&lock_path);
@@ -624,12 +630,13 @@ fn the_lock_mur_run_creates_marks_every_entry_operator() {
 fn add_undeclared_runtime_pin(lock_path: &Path, session: &str) {
     let mut lock = read_lockfile(lock_path).unwrap();
     lock.artifacts.push(LockedArtifact {
-        name: "pulled-elsewhere".to_string(),
+        name: "local/pulled-elsewhere".to_string(),
         resolved_version: "3.0.0".to_string(),
         sha256: LockedSha256::any("pulled-hash".to_string()),
         origin: LockOrigin::Runtime {
             session: session.to_string(),
         },
+        owner_id: None,
     });
     write_lockfile_atomic(lock_path, &lock).unwrap();
 }
@@ -642,7 +649,7 @@ fn an_undeclared_runtime_pin_is_not_staged() {
     let manifest_path = echo_tool_project(
         project.path(),
         fixture.path(),
-        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
     );
     common::run_capsule(&home, &manifest_path).success();
     let lock_path = project.path().join("murmur.lock");
@@ -666,7 +673,7 @@ fn a_runtime_pin_declared_with_a_gateway_fails_with_e_run_043() {
     let manifest_path = echo_tool_project(
         project.path(),
         fixture.path(),
-        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
     );
     common::run_capsule(&home, &manifest_path).success();
     let lock_path = project.path().join("murmur.lock");
@@ -680,7 +687,7 @@ fn a_runtime_pin_declared_with_a_gateway_fails_with_e_run_043() {
         project.path(),
         "capsule-allowlisted.wasm",
         &format!(
-            "  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n    gateway:\n      endpoint: https://api.example.com\n      api_key: test-key\n"
+            "  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n    gateway:\n      endpoint: https://api.example.com\n      api_key: test-key\n"
         ),
         None,
     );
@@ -690,7 +697,7 @@ fn a_runtime_pin_declared_with_a_gateway_fails_with_e_run_043() {
         .stderr(predicate::str::contains("error[E-RUN-043]"))
         .stderr(predicate::str::contains("ses_puller"))
         .stderr(predicate::str::contains(format!(
-            "mur install {TOOL_NAME}@{TOOL_VERSION}"
+            "mur install {TOOL_ARTIFACT}@{TOOL_VERSION}"
         )));
     assert!(!project.path().join("workdir").exists());
 }
@@ -888,7 +895,7 @@ fn authenticated_parent_refused() {
     fs::write(
         &manifest,
         "name: auth-parent\nversion: 0.1.0\nartifacts: []\n\
-         capabilities:\n  spawn:\n    allow: [worker]\n\
+         capabilities:\n  spawn:\n    allow: [local/worker]\n\
          network:\n  authentication:\n    scheme: bearer\n",
     )
     .unwrap();

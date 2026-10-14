@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 use common::ScriptedServer;
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 /// One session's outcome: everything left in the accessible workdir, and the declaration the run

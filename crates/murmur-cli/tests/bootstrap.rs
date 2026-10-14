@@ -16,10 +16,13 @@ use zip::{
     CompressionMethod, ZipWriter,
 };
 
+/// The tool's name as the model calls it: the bare part of [`TOOL_ARTIFACT`].
 const TOOL_NAME: &str = "jsonl-line-count";
+/// The tool's full name, as the manifest declares it; installed from a `.mur.zip` file, so `local`.
+const TOOL_ARTIFACT: &str = "local/jsonl-line-count";
 const TOOL_VERSION: &str = "0.1.0";
-const DRIVER_ANTHROPIC_NAME: &str = "murmur-driver-anthropic";
-const DRIVER_OPENAI_NAME: &str = "murmur-driver-openai";
+const DRIVER_ANTHROPIC_NAME: &str = "local/murmur-driver-anthropic";
+const DRIVER_OPENAI_NAME: &str = "local/murmur-driver-openai";
 const DRIVER_VERSION: &str = "0.1.4";
 
 #[test]
@@ -361,11 +364,15 @@ fn bootstrap_missing_driver_artifact_fails_before_launch() {
     // Install the tool artifact into the project store so that check passes,
     // but do NOT install the driver — that's the artifact we expect to fail on.
     common::install_artifact_to_project(project.path(), &artifact_path).success();
+    // The install pins the tool alone in murmur.lock, and a lock that lacks a declared artifact
+    // refuses the run (E-RUN-003) before the store is checked. With no lock, the run checks the
+    // store for every declared artifact.
+    fs::remove_file(project.path().join("murmur.lock")).unwrap();
 
     common::run_capsule(&home, &manifest_path)
         .failure()
         .stderr(predicate::str::contains(
-            "missing artifacts: murmur-driver-anthropic@",
+            "missing artifacts: local/murmur-driver-anthropic@",
         ))
         .stderr(predicate::str::contains("run `mur install`"))
         .stderr(predicate::str::contains("error[E-RUN-008]"));
@@ -424,7 +431,7 @@ fn bootstrap_driver_excluded_from_tool_list() {
         "wasm artifact should appear in tools list"
     );
     assert!(
-        !tool_names.contains(&DRIVER_ANTHROPIC_NAME),
+        !tool_names.contains(&murmur_artifact::tool_name_of(DRIVER_ANTHROPIC_NAME)),
         "driver artifact should not appear in tools list"
     );
 }
@@ -730,7 +737,7 @@ fn create_agent_project(
     // No capsule.wasm — agent capsules are manifest-only.
 
     let mut artifacts_yaml = if include_tool_artifact {
-        format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n    runtime: tool\n")
+        format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n    runtime: tool\n")
     } else {
         String::new()
     };

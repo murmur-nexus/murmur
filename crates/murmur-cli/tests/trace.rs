@@ -6,7 +6,7 @@ use std::{fs, path::PathBuf};
 use capsule_runtime::launch_session;
 use serde_json::{json, Value};
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
+const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.7";
 
 // ── Response builders ────────────────────────────────────────────────────────

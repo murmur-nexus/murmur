@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 
 use murmur_artifact::{
     current_platform, load_roster, resolve_roster_path, roster_warning_link, sha256_hex,
-    LockedSha256, MurmurLock, Registry, RegistryError, Roster, RosterReachability, RuntimeManifest,
-    TaskAcceptance, ROSTER_FILENAME, W_ROS_001,
+    ArtifactName, LockedSha256, MurmurLock, Registry, RegistryError, Roster, RosterError,
+    RosterReachability, RuntimeManifest, TaskAcceptance, ROSTER_FILENAME, W_ROS_001,
 };
 use thiserror::Error;
 
@@ -107,7 +107,10 @@ pub enum RosterRefusal {
     /// `roster.yaml` is missing, unreadable or fails a shape rule. The message names the file and
     /// the key path.
     #[error("{message}")]
-    Malformed { message: String },
+    Malformed {
+        message: String,
+        hint: Option<String>,
+    },
     #[error("{ROSTER_FILENAME}: member name '{member}' is declared more than once")]
     DuplicateMember { member: String },
     #[error(
@@ -342,8 +345,15 @@ pub fn admit_roster_file(
     lock: Option<&MurmurLock>,
 ) -> Result<AdmittedRoster, RosterRefusal> {
     let path = resolve_roster_path(project_dir);
-    let roster = load_roster(&path).map_err(|error| RosterRefusal::Malformed {
-        message: error.to_string(),
+    let roster = load_roster(&path).map_err(|error| {
+        let hint = match &error {
+            RosterError::Malformed { hint, .. } => hint.clone(),
+            RosterError::NotFound { .. } | RosterError::Read { .. } => None,
+        };
+        RosterRefusal::Malformed {
+            message: error.to_string(),
+            hint,
+        }
     })?;
     let mut admitted = admit_roster(&roster, registry, lock)?;
     admitted.source = Some(path);
@@ -422,8 +432,10 @@ pub fn admit_roster(
             reason,
         };
 
+        let capsule = ArtifactName::parse(&member.capsule)
+            .map_err(|error| unresolvable(error.to_string()))?;
         let resolved = registry
-            .resolve_with_platform(&member.capsule, &member.version, Some(platform))
+            .resolve_with_platform(&capsule, &member.version, Some(platform))
             .map_err(|error| {
                 unresolvable(match error {
                     RegistryError::NotFound { .. } => {
@@ -579,14 +591,15 @@ mod tests {
         cursor.into_inner()
     }
 
-    /// Install a capsule whose packed `murmur.yaml` is `manifest_yaml`; returns its sha256.
+    /// Install capsule `local/<name>` whose packed `murmur.yaml` is `manifest_yaml`; returns its
+    /// sha256.
     fn install(store: &LocalRegistry, name: &str, version: &str, manifest_yaml: &str) -> String {
         let bytes = pack(manifest_yaml);
         let sha256 = sha256_hex(&bytes);
         store
             .store_installed_overwrite(
                 ArtifactMeta {
-                    name: name.to_string(),
+                    name: ArtifactName::from_parts("local", name).unwrap(),
                     version: version.to_string(),
                     runtime: RuntimeType::Wasm,
                     artifact_runtime: "capsule".to_string(),
@@ -602,10 +615,11 @@ mod tests {
         sha256
     }
 
+    /// Member `name`, running capsule `local/<name>`.
     fn member(name: &str, version: &str, entry: bool) -> RosterMember {
         RosterMember {
             name: name.to_string(),
-            capsule: name.to_string(),
+            capsule: format!("local/{name}"),
             version: version.to_string(),
             entry,
         }
@@ -630,10 +644,11 @@ mod tests {
         MurmurLock {
             lock_version: LOCK_VERSION,
             artifacts: vec![LockedArtifact {
-                name: name.to_string(),
+                name: format!("local/{name}"),
                 resolved_version: version.to_string(),
                 sha256: LockedSha256::any(sha256.to_string()),
                 origin: LockOrigin::Operator,
+                owner_id: None,
             }],
         }
     }
@@ -691,7 +706,10 @@ mod tests {
         assert_eq!(names, ["planner", "coder", "reviewer"]);
         for member in admitted.members() {
             assert_eq!(member.sha256, f.hashes[member.name.as_str()]);
-            assert_eq!(member.manifest.name, member.capsule);
+            assert_eq!(
+                member.manifest.name,
+                murmur_artifact::tool_name_of(&member.capsule)
+            );
             assert!(member.manifest.accepts_peer_tasks());
         }
         assert_eq!(admitted.entry().name, "planner");
@@ -1043,7 +1061,7 @@ mod tests {
                 member, coordinate, ..
             } => {
                 assert_eq!(member, "coder");
-                assert_eq!(coordinate, "coder@9.9.9");
+                assert_eq!(coordinate, "local/coder@9.9.9");
             }
             other => panic!("unexpected refusal {other:?}"),
         }
@@ -1055,7 +1073,7 @@ mod tests {
                 member, coordinate, ..
             } => {
                 assert_eq!(member, "coder");
-                assert_eq!(coordinate, "coder@1.2.0");
+                assert_eq!(coordinate, "local/coder@1.2.0");
             }
             other => panic!("unexpected refusal {other:?}"),
         }
@@ -1067,6 +1085,7 @@ mod tests {
         let artifact = f
             .store
             .root()
+            .join("local")
             .join("coder")
             .join("1.2.0")
             .join("coder-1.2.0.mur.zip");
@@ -1094,7 +1113,7 @@ mod tests {
                     conflict,
                 } => {
                     assert_eq!(member, "coder");
-                    assert_eq!(capsule, "coder");
+                    assert_eq!(capsule, "local/coder");
                     assert!(!conflict.is_empty());
                 }
                 other => panic!("unexpected refusal {other:?}"),
@@ -1126,7 +1145,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         assert!(matches!(
             admit_roster_file(project.path(), &f.store, None),
-            Err(RosterRefusal::Malformed { message }) if message.contains("roster.yaml not found")
+            Err(RosterRefusal::Malformed { message, .. }) if message.contains("roster.yaml not found")
         ));
 
         fs::write(
@@ -1136,12 +1155,12 @@ mod tests {
         .unwrap();
         assert!(matches!(
             admit_roster_file(project.path(), &f.store, None),
-            Err(RosterRefusal::Malformed { message }) if message.contains("roster_version")
+            Err(RosterRefusal::Malformed { message, .. }) if message.contains("roster_version")
         ));
 
         fs::write(
             resolve_roster_path(project.path()),
-            "roster_version: 1\nmembers:\n  - {name: planner, capsule: planner, version: 0.3.0, entry: true}\n",
+            "roster_version: 1\nmembers:\n  - {name: planner, capsule: local/planner, version: 0.3.0, entry: true}\n",
         )
         .unwrap();
         let admitted = admit_roster_file(project.path(), &f.store, None).unwrap();
@@ -1256,7 +1275,7 @@ mod tests {
             admitted.caller_overflows(),
             [CallerOverflow {
                 member: "reviewer".to_string(),
-                capsule: "reviewer".to_string(),
+                capsule: "local/reviewer".to_string(),
                 version: "1.0.0".to_string(),
                 callers: WORKERS.iter().map(ToString::to_string).collect(),
                 task_acceptance: TaskAcceptance::Queue,
@@ -1274,9 +1293,9 @@ mod tests {
         assert_eq!(caller_overflow_warning(&overflows[0]), TEN_CALLERS_WARNING);
         assert_eq!(
             caller_overflow_fix(&overflows[0]),
-            "reviewer (reviewer@1.0.0): set lifecycle.queue_depth: 9 in its murmur.yaml so all 10 \
-             members that may call it are held at once, or narrow its callers in roster.yaml \
-             (warning[W-ROS-001])"
+            "reviewer (local/reviewer@1.0.0): set lifecycle.queue_depth: 9 in its murmur.yaml so \
+             all 10 members that may call it are held at once, or narrow its callers in \
+             roster.yaml (warning[W-ROS-001])"
         );
     }
 
@@ -1347,7 +1366,7 @@ mod tests {
         );
         assert_eq!(
             caller_overflow_fix(overflow),
-            "coder (coder@1.0.0): set lifecycle.task_acceptance: queue and \
+            "coder (local/coder@1.0.0): set lifecycle.task_acceptance: queue and \
              lifecycle.queue_depth: 1 in its murmur.yaml so all 2 members that may call it are \
              held at once, or narrow its callers in roster.yaml (warning[W-ROS-001])"
         );
@@ -1372,9 +1391,9 @@ mod tests {
         );
         assert_eq!(
             caller_overflow_fix(&overflows[0]),
-            "idle (idle@1.0.0): set lifecycle.task_acceptance: queue and lifecycle.queue_depth: 1 \
-             in its murmur.yaml so the 1 member that may call it is held at once, or narrow its \
-             callers in roster.yaml (warning[W-ROS-001])"
+            "idle (local/idle@1.0.0): set lifecycle.task_acceptance: queue and \
+             lifecycle.queue_depth: 1 in its murmur.yaml so the 1 member that may call it is held \
+             at once, or narrow its callers in roster.yaml (warning[W-ROS-001])"
         );
     }
 

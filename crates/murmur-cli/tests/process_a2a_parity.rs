@@ -29,11 +29,11 @@ use zip::{
     CompressionMethod, ZipWriter,
 };
 
-const HTTP_DRIVER: &str = "murmur-driver-anthropic";
+const HTTP_DRIVER: &str = "local/murmur-driver-anthropic";
 const HTTP_DRIVER_VERSION: &str = "0.1.4";
-const STREAMING_DRIVER: &str = "streaming-driver";
-const TOOL_PROGRESS_DRIVER: &str = "tool-progress-driver";
-const PROCESS_DRIVER: &str = "fixture-process-driver";
+const STREAMING_DRIVER: &str = "local/streaming-driver";
+const TOOL_PROGRESS_DRIVER: &str = "local/tool-progress-driver";
+const PROCESS_DRIVER: &str = "local/fixture-process-driver";
 const VERSION: &str = "0.1.0";
 const TOOL: &str = "echo-tool";
 
@@ -58,9 +58,10 @@ fn create_tool_artifact(dir: &Path, wasm: &Path) -> PathBuf {
     path
 }
 
-/// A `runtime: driver` artifact named `name` holding the fixture component at `wasm`, relative to
+/// A `runtime: driver` artifact packed as the bare part of `name`, holding the fixture component at `wasm`, relative to
 /// the fixtures directory.
 fn create_fixture_driver_artifact(dir: &Path, name: &str, wasm: &str) -> PathBuf {
+    let name = murmur_artifact::tool_name_of(name);
     let path = dir.join(format!("{name}-{VERSION}.mur.zip"));
     let mut zip = ZipWriter::new(fs::File::create(&path).unwrap());
     let options: SimpleFileOptions =
@@ -114,7 +115,7 @@ impl DeclaredHook {
             ),
         );
         entries.push_str(&format!(
-            "  - name: {}\n    version: {VERSION}\n    runtime: hook\n",
+            "  - name: local/{}\n    version: {VERSION}\n    runtime: hook\n",
             self.name
         ));
     }
@@ -258,7 +259,7 @@ fn http_capsule(
             ),
         );
         entries.push_str(&format!(
-            "  - name: {TOOL}\n    version: {VERSION}\n    runtime: tool\n"
+            "  - name: local/{TOOL}\n    version: {VERSION}\n    runtime: tool\n"
         ));
     }
     if let Some(hook) = hook {
@@ -329,7 +330,7 @@ fn tool_progress_http_capsule(name: &str, mode: &str) -> Capsule {
     );
     let entries = format!(
         "  - name: {TOOL_PROGRESS_DRIVER}\n    version: {VERSION}\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:1\n      api_key: test-key\n\
-         \x20 - name: {TOOL}\n    version: {VERSION}\n    runtime: tool\n"
+         \x20 - name: local/{TOOL}\n    version: {VERSION}\n    runtime: tool\n"
     );
     let manifest = project.path().join("murmur.yaml");
     fs::write(
@@ -422,7 +423,7 @@ impl ProcessCapsule {
                 ),
             );
             entries.push_str(&format!(
-                "  - name: {TOOL}\n    version: {VERSION}\n    runtime: tool\n"
+                "  - name: local/{TOOL}\n    version: {VERSION}\n    runtime: tool\n"
             ));
         }
         if let Some(hook) = self.hook.as_ref() {
