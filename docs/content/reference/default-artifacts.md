@@ -168,7 +168,9 @@ can discover artifacts mid-session. It takes three inputs:
 | `registry` | no | Omit for the public index; `local` for the local artifact store; a URL or absolute path for a custom registry |
 | `limit` | no | Maximum results to return. Default: 10 |
 
-The public index is the same `artifacts-index.json` that [`mur search`](cli.md#mur-search) reads.
+The tool reads the public `artifacts-index.json` in the schema 1 format. [`mur search`](cli.md#mur-search)
+reads only the schema 2 [artifact index](artifact-index.md), so it refuses a schema 1 index with
+[`E-IDX-002`](diagnostics.md#e-idx-002).
 [`mur new`](cli.md#mur-new) declares this tool in the generator capsule it cold-boots, and fails
 with `E-RUN-008` if it is not installed first.
 

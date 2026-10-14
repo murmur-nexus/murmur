@@ -33,7 +33,8 @@ Every `mur` command, its flags, and what each one does.
 | `mur eval show` | Human-readable (or JSON) summary of a single `eval.jsonl` session |
 | `mur eval diff` | Side-by-side scorer comparison of two eval sessions |
 | `mur eval run` | Drive a multi-case dataset and collect `eval.jsonl` per run |
-| `mur search` | Search the public artifact index for artifacts matching a keyword |
+| `mur search` | Search an artifact index for artifacts matching a keyword |
+| `mur index` | Write the artifact index for one release's `.mur.zip` assets |
 | `mur topology` | Render capsule sessions as a DAG from Grafana Tempo OTel data |
 
 ---
@@ -3057,7 +3058,8 @@ The generated HTML is self-contained: all graph data is embedded as `window.TOPO
 
 ## `mur search`
 
-Search the public artifact index for artifacts matching a keyword.
+Search an [artifact index](artifact-index.md) for artifacts matching a keyword, and show each at the
+newest version that fits this `mur`.
 
 ```bash
 mur search <query> [--index <PATH|URL|local>] [--limit <n>]
@@ -3065,23 +3067,51 @@ mur search <query> [--index <PATH|URL|local>] [--limit <n>]
 
 | Argument / Flag | Default | Description |
 |---|---|---|
-| `<query>` | required | Case-insensitive keyword matched against artifact name, description, and tags |
+| `<query>` | required | Case-insensitive keyword matched against the artifact's full name `<scope>/<name>`, its description, and its tags. `""` matches every artifact |
 | `--index` | `registry.index_url`, else the public index URL | `local` lists the global store `~/.murmur/artifacts/`; a value starting `http://` or `https://` is fetched; any other value is a file path, relative to the working directory or absolute. `--registry` is refused with exit status 2 and a hint naming `--index` |
-| `--limit` | `10` | Maximum number of results to show |
+| `--limit` | `10` | Maximum number of rows to show |
 
-**Default behaviour (no `--index`):** fetches the public artifact index from the configured URL (default: the Murmur default-artifacts repository). Override the URL with `registry.index_url` in the effective (global + project-level, merged) config — see [Artifact index and custom registry URL](config.md#artifact-index-and-custom-registry-url) and [Configuration files](config.md#configuration-files).
+**Default behaviour (no `--index`):** fetches the artifact index from the configured URL (default:
+the Murmur default-artifacts repository). Override the URL with `registry.index_url` in the
+effective (global + project-level, merged) config — see
+[Artifact index and custom registry URL](config.md#artifact-index-and-custom-registry-url) and
+[Configuration files](config.md#configuration-files). The index must be schema 2; a schema 1 index
+is refused with [`E-IDX-002`](diagnostics.md#e-idx-002).
 
 **Output format:**
 
 ```text
-NAME              VERSION  RUNTIME  DESCRIPTION
-tool-git          {{ v.murmur_tool_git }}    tool     Structured git interface for Murmur capsules.
-driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   Anthropic Messages API inference driver for Murmur agent capsules.
+NAME                VERSION  RUNTIME  DESCRIPTION
+murmur/hook-old     —        hook     —
+murmur/tool-editor  0.7.0    tool     Read, write and patch files in the workdir.
+murmur/tool-git     0.2.0    tool     Structured git interface.
+
+murmur/hook-old: 1.0.0 needs murmur:hook/lifecycle@0.8.0, this mur serves murmur:hook@0.9.0
+murmur/tool-editor: 0.8.0 needs murmur:tool/run@0.2.0, this mur serves murmur:tool@0.1.0
+murmur/tool-git: 0.3.0 has no payload for linux-x86_64
 ```
 
-`NAME` is the name the index records, which is the artifact's bare name; an artifact listed in the default index installs as `murmur/<name>`. With `--index local`, `NAME` is the full name from the global store.
+| Column | Value |
+|---|---|
+| `NAME` | The full name, `<scope>/<name>`. From an index, the scope is the index's `scope` |
+| `VERSION` | The newest version that [fits](artifact-index.md#fit) this `mur` on this host, or `—` when none does |
+| `RUNTIME` | The artifact's role |
+| `DESCRIPTION` | The description, or `—` when there is none |
 
-When no artifacts match, prints `No results found.` and exits `0` (not an error).
+Under the table, each artifact whose newest version does not fit gets one line naming that
+version and the reason:
+
+| Line | Reason |
+|---|---|
+| `<scope>/<name>: <version> needs <interface>, this mur serves <package>@<version>` | The version names an interface at a version this `mur` does not serve. `(+N more)` follows when more than one interface is affected |
+| `<scope>/<name>: <version> needs <interface>, this mur serves no version of <package>` | This `mur` serves no version of the interface's package |
+| `<scope>/<name>: <version> has no payload for <platform>` | Every payload of the version is for another platform |
+
+With `--index local`, rows are the global store's artifacts under their full names. A version's
+interfaces are the ones its store record lists, or read from its payload when the record lists
+none, and its platforms are the ones it is installed for.
+
+When no artifacts match, prints `No results found.` and exits `0`.
 
 **Examples:**
 
@@ -3092,23 +3122,71 @@ mur search "git"
 # Search only locally installed artifacts
 mur search "editor" --index local
 
-# Use a private or custom index
-mur search "git" --index https://my-org.example.com/artifacts-index.json
+# Search another source's index
+mur search "git" --index https://github.com/ana/my-artifacts/releases/latest/download/artifacts-index.json
 
 # Read an index file in the working directory
 mur search "git" --index ./artifacts-index.json
 
 # Cap results at 3
-mur search "murmur" --limit 3
+mur search "tool" --limit 3
 ```
 
-**Error cases:**
+**Errors:**
 
-- Network unreachable or DNS failure → exits `1`; error message names the URL
-- Non-2xx HTTP response → exits `1`; error includes the HTTP status
-- Malformed JSON or missing `schema_version` → exits `1`; error describes the parse failure
-- Index file missing or unreadable → exits `1`; error names the path
-- Unsupported `schema_version` → exits `1`; error names the version found and the path or URL
+| Code | When |
+|---|---|
+| `E-IO-003` | The index file is missing or unreadable, the URL cannot be reached, or the server answers with a non-2xx status. The message names the path or URL |
+| [`E-IDX-002`](diagnostics.md#e-idx-002) | The index is not a schema 2 index: schema 1, another `schema_version`, not JSON, or a field that breaks the [format](artifact-index.md#fields). The message names the path or URL |
+
+---
+
+## `mur index`
+
+Write the [artifact index](artifact-index.md) for one release's `.mur.zip` assets.
+
+```bash
+mur index <DIR> --repo <OWNER/REPO> --release <TAG> [--merge <INDEX>] [-o <FILE>]
+```
+
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<DIR>` | required | Directory holding the release's assets. Every regular file directly in it whose name ends `.mur.zip` is indexed; every other entry is ignored |
+| `--repo` | required | The GitHub repository `<owner>/<repo>` the release belongs to. The index's scope is `murmur` for `murmur-nexus/default-artifacts`, otherwise the owner lowercased |
+| `--release` | required | The release tag holding the assets, recorded on every version in `<DIR>`. Must be non-empty with no whitespace |
+| `--merge` | none | An earlier schema 2 index of the same scope. Every version it lists that `<DIR>` does not hold is kept unchanged. May name the output file |
+| `-o`, `--output` | `artifacts-index.json` | File to write. Replaced whole, through a temporary file beside it, so a refusal leaves an existing file as it was |
+
+Each `.mur.zip` must hold a packed `murmur.yaml` whose `name:` and `version:` match its file name,
+`<name>-<version>.mur.zip`. A native payload carries its platform,
+`<name>-<version>-<platform>.mur.zip`; a WASM or static payload carries none. How each field is
+derived is under [How `mur index` derives each field](artifact-index.md#derivation).
+
+With `--merge`, a version both indexes hold is written from `<DIR>`. When its files differ from the
+ones the earlier index lists, it is counted as replaced.
+
+**Output:**
+
+```text
+Indexed 26 artifacts (36 versions) for scope murmur into artifacts-index.json; 10 versions kept from previous.json, 16 replaced
+```
+
+The part after `;` is printed only with `--merge`.
+
+**Example:**
+
+```bash
+mur index release --repo ana/my-artifacts --release v1.1.0 --merge previous/artifacts-index.json -o release/artifacts-index.json
+```
+
+**Errors:**
+
+| Code | When |
+|---|---|
+| [`E-IDX-001`](diagnostics.md#e-idx-001) | A `.mur.zip` in `<DIR>` cannot be indexed, or `<DIR>` holds none |
+| [`E-IDX-002`](diagnostics.md#e-idx-002) | The `--merge` index is not a schema 2 index |
+| [`E-IDX-003`](diagnostics.md#e-idx-003) | `--repo` or `--release` is unusable, or the `--merge` index has another scope |
+| `E-IO-003` | `<DIR>` or the `--merge` file cannot be read, or the output cannot be written |
 
 ---
 

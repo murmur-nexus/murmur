@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fs::File;
 use std::path::Path;
 
 use capsule_runtime::murmur_home::{audit_murmur_home, wide_entry_warning, HomeEntryState};
@@ -21,11 +20,10 @@ use murmur_artifact::{
     current_platform, effective_containment_floor, native_binary_verdict,
     parse_tool_implementation_from_yaml, read_runtime_manifest_text, registry_warning_link,
     resolve_manifest_path, resolve_roster_path, sha256_hex, warn_on_unknown_manifest_keys,
-    wit_contracts_from_artifact_bytes, wit_contracts_from_artifact_reader, ArtifactImplementation,
-    ArtifactMeta, ArtifactRuntime, ContractDirection, LocalRegistry, LockOrigin, MurmurLock,
-    NativeBinaryVerdict, PlatformMatch, Registry, ResolvedArtifact, RosterReachability,
-    RuntimeManifest, UnservedInterface, WitContracts, MANIFEST_FILENAME, ROSTER_FILENAME,
-    W_REG_001, W_REG_002, W_REG_003,
+    wit_contracts_from_artifact_bytes, ArtifactImplementation, ArtifactRuntime, ContractDirection,
+    LocalRegistry, LockOrigin, MurmurLock, NativeBinaryVerdict, PlatformMatch, Registry,
+    ResolvedArtifact, RosterReachability, RuntimeManifest, UnservedInterface, MANIFEST_FILENAME,
+    ROSTER_FILENAME, W_REG_001, W_REG_002, W_REG_003,
 };
 
 use crate::commands::install::find_project_root;
@@ -40,7 +38,7 @@ use crate::error::{
     CliError, E_CAP_002, E_CAP_004, E_CAP_005, E_CAP_006, E_CAP_014, E_CAP_015, E_CAP_016,
     E_IO_003, E_RUN_019,
 };
-use crate::stores::FallbackRegistry;
+use crate::stores::{installed_contracts, interface_label, served_phrase, FallbackRegistry};
 
 /// Whether an installed artifact's payload can run on the host doctor is checking for.
 ///
@@ -901,61 +899,6 @@ fn report_interface_versions(project: &LocalRegistry, global: &LocalRegistry) ->
     InterfaceFindings { stale }
 }
 
-/// The interfaces one installed artifact speaks: the `wit_contracts` its sidecar records when the
-/// key is present, otherwise derived from its payload.
-///
-/// The store derives the recorded value from the payload on every write, so a recorded value is
-/// used as is. The key is absent for a sidecar written before the field existed, which is the
-/// case derivation covers, and for a payload with no component, where derivation finds nothing
-/// after one zip central-directory read. Each payload is opened as a file and only its root wasm
-/// entry is read. A platform-tagged version directory holds one payload per platform, and their
-/// names are unioned.
-fn installed_contracts(registry: &LocalRegistry, meta: &ArtifactMeta) -> Option<WitContracts> {
-    if let Some(contracts) = &meta.wit_contracts {
-        return Some(contracts.clone());
-    }
-
-    let generic = registry.artifact_path_for(&meta.name, &meta.version);
-    let payloads = if generic.is_file() {
-        vec![generic]
-    } else {
-        let version_dir = generic.parent()?;
-        let prefix = format!("{}-{}-", meta.name, meta.version);
-        let mut tagged: Vec<_> = std::fs::read_dir(version_dir)
-            .ok()?
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".mur.zip"))
-            })
-            .collect();
-        tagged.sort();
-        tagged
-    };
-
-    let mut union: Option<WitContracts> = None;
-    for payload in payloads {
-        let Some(contracts) = File::open(&payload)
-            .ok()
-            .and_then(wit_contracts_from_artifact_reader)
-        else {
-            continue;
-        };
-        let merged = union.get_or_insert_with(WitContracts::default);
-        merged.exports.extend(contracts.exports);
-        merged.imports.extend(contracts.imports);
-    }
-    if let Some(merged) = &mut union {
-        for names in [&mut merged.exports, &mut merged.imports] {
-            names.sort();
-            names.dedup();
-        }
-    }
-    union
-}
-
 /// The unserved interfaces of one checklist artifact, as `stage_session` would resolve them from
 /// the same resolved bytes: the sidecar's recorded `wit_contracts`, or the payload's own when the
 /// sidecar has none.
@@ -967,22 +910,6 @@ fn resolved_unserved(resolved: &ResolvedArtifact) -> Vec<UnservedInterface> {
         .or_else(|| wit_contracts_from_artifact_bytes(&resolved.bytes))
         .map(|contracts| contracts.unserved_against(SERVED_WIT_PACKAGES))
         .unwrap_or_default()
-}
-
-/// An interface name as a doctor line shows it: as recorded, or marked when it carries no version.
-fn interface_label(interface: &UnservedInterface) -> String {
-    match interface.artifact_version {
-        Some(_) => interface.interface.clone(),
-        None => format!("{} (unversioned)", interface.interface),
-    }
-}
-
-/// What this `mur` serves of the interface's package, completing a doctor line.
-fn served_phrase(interface: &UnservedInterface) -> String {
-    match &interface.served_version {
-        Some(served) => format!("this mur serves {}@{served}", interface.package),
-        None => format!("this mur serves no version of {}", interface.package),
-    }
 }
 
 /// One line of the `Interface versions` block.

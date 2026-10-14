@@ -14,6 +14,7 @@ The manifest that ships inside a `.mur.zip`, read by `mur build` and `mur publis
 |---|---|---:|---|
 | `name` | string | yes | The artifact's bare name, without a scope. Lowercase letters, digits and inner hyphens (`[a-z0-9-]`, no leading or trailing `-`), non-empty, at most 100 characters. Anything else, a `/` included, fails the build with [`E-BLD-001`](diagnostics.md#e-bld-001). The artifact installs as `<scope>/<name>` — see [Artifact names](../concepts/registry.md#artifact-names). |
 | `version` | string | yes | `latest`, `stable` and `edge` are reserved and cannot be published (`E-REG-004`). |
+| `description` | string | no | What the artifact does. [`mur index`](cli.md#mur-index) records its first sentence as the artifact's description in the [artifact index](artifact-index.md). |
 | `runtime` | string | yes | The artifact's role. Two values change how it is packaged when `execution` is absent: `skill` packages as `static`, and `tool` with `implementation: native` packages as `native`. Everything else packages as `wasm`. |
 | `implementation` | `wasm \| native` | no | How a `runtime: tool` artifact is implemented. Default: `wasm`. |
 | `execution` | `wasm \| native \| static` | no | Declares the registry packaging type directly. When set it is authoritative for `mur publish` and overrides the derivation from `runtime` and `implementation`. Case-insensitive. An unrecognized value is a parse error. |

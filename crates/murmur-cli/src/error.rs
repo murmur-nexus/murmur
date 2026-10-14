@@ -140,6 +140,16 @@ pub const E_IO_001: &str = "E-IO-001"; // file or directory not found
 pub const E_IO_002: &str = "E-IO-002"; // permission denied (host, not capsule)
 pub const E_IO_003: &str = "E-IO-003"; // general I/O error
 
+// Artifact index
+pub const E_IDX_001: &str = "E-IDX-001"; // a file in the directory given to mur index cannot be indexed, or the directory holds no .mur.zip
+pub const E_IDX_002: &str = "E-IDX-002"; // an artifact index is not a schema 2 index this mur can read
+pub const E_IDX_003: &str = "E-IDX-003"; // mur index was not told a usable source: --repo or --release unusable, or --merge names another scope
+
+/// The hint on the `E-IDX-002` refusal of a schema 1 artifact index.
+pub(crate) const SCHEMA_1_INDEX_HINT: &str =
+    "this is a schema 1 artifact index, which this mur does not read; its publisher regenerates \
+     it with `mur index <dir> --repo <owner>/<repo> --release <tag>`";
+
 // Conversation records
 pub const E_CNV_001: &str = "E-CNV-001"; // no such record store or context id
 pub const E_CNV_002: &str = "E-CNV-002"; // context id is present under more than one record store

@@ -42,6 +42,7 @@ use commands::{
     },
     doctor::run_doctor,
     eval::{run_eval_diff, run_eval_run, run_eval_show, EvalCommand},
+    index::run_index,
     install::run_install,
     list::run_list,
     new_roster::run_new_roster,
@@ -145,6 +146,28 @@ enum Commands {
         /// Maximum number of results to show
         #[arg(long, default_value = "10")]
         limit: usize,
+    },
+    /// Write the artifact index for one release's .mur.zip assets
+    Index {
+        /// Directory holding the release's .mur.zip assets; other entries are ignored
+        dir: PathBuf,
+
+        /// GitHub repository the release belongs to; the index's scope comes from it by the rule
+        /// mur install github:<owner>/<repo> uses
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: String,
+
+        /// Release tag whose assets the files in DIR are
+        #[arg(long, value_name = "TAG")]
+        release: String,
+
+        /// Earlier schema 2 index whose versions not in DIR are kept; may be the output file
+        #[arg(long, value_name = "INDEX")]
+        merge: Option<PathBuf>,
+
+        /// File to write the index to
+        #[arg(short, long, value_name = "FILE", default_value = murmur_artifact::ARTIFACT_INDEX_FILE_NAME)]
+        output: PathBuf,
     },
     /// Check that every artifact declared in murmur.yaml is present locally
     Doctor {
@@ -637,6 +660,13 @@ fn main() {
             index,
             limit,
         } => run_search(&query, index.as_deref(), limit),
+        Commands::Index {
+            dir,
+            repo,
+            release,
+            merge,
+            output,
+        } => run_index(&dir, &repo, &release, merge.as_deref(), &output),
         Commands::Doctor { bind } => run_doctor(&bind),
         Commands::Build {
             source,
