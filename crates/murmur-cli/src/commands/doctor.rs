@@ -6,15 +6,16 @@ use capsule_runtime::murmur_home::{audit_murmur_home, wide_entry_warning, HomeEn
 use capsule_runtime::{
     caller_overflow_fix, caller_overflow_warning, capability_policy_from_runtime_manifest,
     check_egress_namespace, check_interpreted_entrypoints_reachable, check_roost_health,
-    check_staged_runtime_floor, detect_egress_namespace_blocker, detect_userns_grant, find_on_path,
-    inspect_installed_profile, inspect_profile_attachment, preopen_reports, read_only_advisory_for,
-    render_install, render_read_only, undeclarable_runtime_pin_role,
-    warn_on_gateway_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
-    warn_on_launch_only_gateway_credential, warn_on_secret_shaped_env_grants,
-    warn_on_unmetered_gateways, warn_on_unreachable_toolchain_helpers,
-    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, ArtifactRequest,
-    InstalledProfileState, ProfileAttachment, UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS,
-    SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256, SERVED_WIT_PACKAGES,
+    check_staged_runtime_floor, detect_egress_namespace_blocker, detect_landlock_abi,
+    detect_userns_grant, find_on_path, inspect_installed_profile, inspect_profile_attachment,
+    landlock_doctor_lines, preopen_reports, read_only_advisory_for, render_install,
+    render_read_only, undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
+    warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
+    warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
+    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
+    warn_on_workdir_exec, ArtifactRequest, InstalledProfileState, ProfileAttachment, UsernsGrant,
+    SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
+    SERVED_WIT_PACKAGES,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, native_binary_verdict,
@@ -265,6 +266,16 @@ fn report_binary_attachment(grant: Option<UsernsGrant>) {
              mechanism's design — a profile that matched everything would grant userns to \
              everything — so the next unusual location would fail exactly the same way."
         );
+    }
+}
+
+/// Prints the Landlock block: the kernel's ABI, the ABI a capsule's ruleset is built at, and what a
+/// capsule loses on this host below `capsule_runtime`'s target ABI. Informational, like the
+/// AppArmor block beside it: no diagnostic code and no effect on the exit status.
+fn report_landlock_abi() {
+    capsule_runtime::report_println!("Landlock");
+    for line in landlock_doctor_lines(detect_landlock_abi()) {
+        capsule_runtime::report_println!("  {line}");
     }
 }
 
@@ -1576,6 +1587,12 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // sealed` needs to know whether that came from the profile murmur ships or from the host's
     // unprivileged-userns hardening being switched off for every binary on the machine.
     report_userns_grant();
+
+    // Which Landlock ABI the kernel offers and which the runtime builds a capsule's ruleset at. A
+    // host question too, printed for every project: below ABI v2 a capsule cannot move a file
+    // between two folders of its own workdir, which breaks any tool that renames a file into place
+    // with no hint of why.
+    report_landlock_abi();
 
     // The modes of everything under `~/.murmur`, which holds provider credentials and deploy keys
     // whatever the project in front of doctor declares.

@@ -509,8 +509,9 @@ fn doctor_says_nothing_about_the_lock_when_no_lockfile_exists() {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
 
     assert!(stdout.contains("All checks passed."), "got:\n{stdout}");
+    // `Landlock` is the name of the host block every project prints, not lockfile output.
     assert!(
-        !stdout.contains("lock"),
+        !stdout.replace("Landlock", "").contains("lock"),
         "no lockfile means no lock-related output, got:\n{stdout}"
     );
 }
@@ -993,6 +994,32 @@ fn doctor_names_the_userns_grant_and_never_changes_the_exit_code() {
         stdout.contains("/etc/apparmor.d/mur-sealed:"),
         "the installed-profile comparison must be reported, got:\n{stdout}"
     );
+}
+
+/// The Landlock block is printed for every project, carries exactly the renderer's lines for this
+/// host's kernel ABI, and leaves the exit code alone.
+#[test]
+fn doctor_prints_the_landlock_block_and_never_changes_the_exit_code() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_project(project.path(), " []\n");
+
+    let assert = mur_doctor(&home, project.path()).success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+
+    let block: String = std::iter::once("Landlock".to_string())
+        .chain(
+            capsule_runtime::landlock_doctor_lines(capsule_runtime::detect_landlock_abi())
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        stdout.contains(&format!("{block}\n")),
+        "the Landlock block must print exactly the renderer's lines:\n{block}\ngot:\n{stdout}"
+    );
+    assert!(stdout.contains("All checks passed."), "got:\n{stdout}");
 }
 
 // ── The daemon a delegating capsule registers with ────────────────────────────

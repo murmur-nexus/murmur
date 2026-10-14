@@ -124,7 +124,7 @@ pub use network_policy::preopen_reports;
 // host reading is asserted from integration tests outside this crate. `find_on_path` is re-exported
 // so a caller outside this crate resolves a binary name the way the shell allowlist and the
 // invoked-binary report already resolve one, rather than open-coding the `PATH` walk again.
-pub use sandbox::{find_on_path, HostProbe};
+pub use sandbox::{detect_landlock_abi, find_on_path, landlock_doctor_lines, HostProbe};
 pub use sealed::{
     classify_installed_profile, classify_profile_attachment, inspect_installed_profile,
     inspect_profile_attachment, InstalledProfileState, ProfileAttachment, SealedBlocker,

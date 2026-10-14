@@ -235,6 +235,7 @@ Containment
   floor met: yes
   mechanism: landlock+seccomp
   userns grant: profile_confining
+  landlock ABI: 3
 
 Effective grants
   filesystem scope: <none>
@@ -263,6 +264,10 @@ The report shows *declared* network destinations, not resolved IP addresses — 
 `userns grant:` names where this host's permission to create an unprivileged user namespace comes
 from, and is `n/a` off Linux. See
 [Where the user namespace comes from](../reference/containment.md#userns-grant) for the values.
+
+`landlock ABI:` is the Landlock ABI the capsule's ruleset is built at, and is `n/a` when no Landlock
+domain is installed. Below 2, moving a file between two folders of the workdir fails with `EXDEV`.
+See [Which Landlock ABI the ruleset is built at](../reference/containment.md#landlock-abi).
 
 `mechanism:` is a stable name for the kernel enforcement the host actually provides:
 

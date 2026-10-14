@@ -45,39 +45,6 @@ Treat `capabilities.shell.allow` as advisory on a host below kernel 5.13.
 The `mechanism:` column is what `mur run --explain-scope` prints, and it always reports what the
 *host* can back — never what the session installed.
 
-### Where the user namespace comes from { #userns-grant }
-
-The Sealed tier and the capsule network namespace both need an unprivileged user namespace, and on
-an AppArmor host something has to permit one. `mur run --explain-scope` prints which permission is
-in effect on the line below `mechanism:`, and `--explain-scope --json` carries the same value as
-`userns_grant`:
-
-```text
-Containment
-  declared:  sealed
-  achieved:  sealed
-  floor met: yes
-  mechanism: mountns+pivot_root+landlock+seccomp
-  userns grant: profile_confining
-```
-
-| `userns grant:` | What permits the namespace | Scope of the permission |
-|---|---|---|
-| `apparmor_absent` | AppArmor is not enabled on this host | nothing was ever restricted; no profile is needed |
-| `profile_confining` | the shipped `mur-sealed` AppArmor profile is confining this binary | `mur` alone — the configuration murmur ships |
-| `restriction_disabled_host_wide` | `kernel.apparmor_restrict_unprivileged_userns` is `0` | every program on the machine; reported as [`W-SEC-013`](diagnostics.md#w-sec-013) |
-| `withheld` | nothing | `sealed` is refused with `E-CAP-003`, and a capsule that spawns a subprocess with `E-CAP-005` |
-
-The line is `n/a` off Linux, where AppArmor does not exist. The same value is written to
-`session_start.userns_grant` in
-[`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl), so a finished session's record
-distinguishes a `sealed` result obtained through the shipped profile from one obtained on a host
-whose unprivileged-userns hardening was switched off.
-
-A checkout build runs as `./target/debug/mur` or `./target/release/mur`, which no shipped profile
-attaches to. `sudo scripts/install-dev-apparmor.sh` generates and loads a profile for exactly those
-two paths, so building from source needs no host-wide sysctl.
-
 **What the Full tier grants.** The Landlock scope grants the capsule workdir a near-full access set
 **and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
 interpreter (dynamic loader), and the transitive closure of their shared libraries — so an
@@ -94,6 +61,8 @@ manifest declares [`capabilities.filesystem.workdir_exec: true`](#field-workdir-
 grant also withholds `Execute`, so nothing the capsule writes into its own workdir can be run under
 any name. That withholding *is* the exec column above: `capabilities.shell.allow` is enforced by
 granting `Execute` on exactly the allowlisted binaries' own paths and nowhere the capsule can write.
+The workdir grant does carry `Refer` and `Truncate`, so files move between its folders and the
+capsule can truncate its own files, on a kernel whose [Landlock ABI](#landlock-abi) has them.
 
 **What kernel-enforced filesystem scope covers, and what it does not.** Landlock mediates the
 operations that touch a file — `open`, `read`, `write`, `execve` — not path resolution. A `stat`,
@@ -125,6 +94,67 @@ unlisted binary, or connecting to a host outside `capabilities.network.allow`.
 
 These are kernel behaviours, so the only check that means anything is a run on a real host. The
 hand-run procedures that do that are listed under [Verification](#verification).
+
+### Where the user namespace comes from { #userns-grant }
+
+The Sealed tier and the capsule network namespace both need an unprivileged user namespace, and on
+an AppArmor host something has to permit one. `mur run --explain-scope` prints which permission is
+in effect on the line below `mechanism:`, and `--explain-scope --json` carries the same value as
+`userns_grant`:
+
+```text
+Containment
+  declared:  sealed
+  achieved:  sealed
+  floor met: yes
+  mechanism: mountns+pivot_root+landlock+seccomp
+  userns grant: profile_confining
+  landlock ABI: 3
+```
+
+| `userns grant:` | What permits the namespace | Scope of the permission |
+|---|---|---|
+| `apparmor_absent` | AppArmor is not enabled on this host | nothing was ever restricted; no profile is needed |
+| `profile_confining` | the shipped `mur-sealed` AppArmor profile is confining this binary | `mur` alone — the configuration murmur ships |
+| `restriction_disabled_host_wide` | `kernel.apparmor_restrict_unprivileged_userns` is `0` | every program on the machine; reported as [`W-SEC-013`](diagnostics.md#w-sec-013) |
+| `withheld` | nothing | `sealed` is refused with `E-CAP-003`, and a capsule that spawns a subprocess with `E-CAP-005` |
+
+The line is `n/a` off Linux, where AppArmor does not exist. The same value is written to
+`session_start.userns_grant` in
+[`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl), so a finished session's record
+distinguishes a `sealed` result obtained through the shipped profile from one obtained on a host
+whose unprivileged-userns hardening was switched off.
+
+A checkout build runs as `./target/debug/mur` or `./target/release/mur`, which no shipped profile
+attaches to. `sudo scripts/install-dev-apparmor.sh` generates and loads a profile for exactly those
+two paths, so building from source needs no host-wide sysctl.
+
+### Which Landlock ABI the ruleset is built at { #landlock-abi }
+
+On the Sealed and Full tiers the runtime builds the capsule's ruleset at the kernel's Landlock ABI,
+capped at v3. Two of the workdir's rights depend on it:
+
+| Ruleset ABI | Kernel | Moving or hard-linking a file between two workdir folders | `truncate(2)` on a host file outside the workdir |
+|---|---|---|---|
+| 1 | Linux 5.13–5.18 | fails with `EXDEV` (`Invalid cross-device link`) | not mediated: succeeds wherever the capsule's user may write |
+| 2 | Linux 5.19–6.1 | permitted (`Refer`) | not mediated |
+| 3 | Linux 6.2 and later | permitted (`Refer`) | refused (`Truncate`) |
+
+At ABI 1, tools that fall back to copy-and-delete (`mv`, `pip`, `git`) still work, and `uv` and
+other tools that rename atomically between folders fail. Nothing moves or links across the
+workdir boundary at any ABI.
+
+`mur run --explain-scope` prints the ABI on the `landlock ABI:` line below `userns grant:`, and
+`--explain-scope --json` and `session_start.effective_grants` in
+[`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl) carry it as `landlock_abi`. The
+value is `n/a`, or `null` in JSON, when no Landlock domain is installed. `mur doctor` prints the
+kernel's ABI and the ruleset ABI in its `Landlock` block, and says what this host loses below ABI 3:
+
+```text
+Landlock
+  kernel ABI: 8
+  ruleset ABI: 3 (the kernel's, capped at 3)
+```
 
 ---
 
@@ -308,8 +338,9 @@ session. It carries exactly the workdir's rights, so a binary written to `/tmp` 
 than one written to the workdir. `scoped` composes no root and binds nothing at `/tmp`, where it
 stays denied.
 
-**Every other device path is denied.** The capsule's Landlock domain declares the full ABI v1
-right-set for itself, so a path with no matching rule is refused rather than merely un-granted.
+**Every other device path is denied.** The capsule's Landlock domain declares every right of the
+[ABI it is built at](#landlock-abi), so a path with no matching rule is refused rather than merely
+un-granted.
 `/dev/random`, `/dev/full`, `/dev/tty`, `/dev/console`, `/dev/mem` and every raw block device stay
 denied, and a fourth device can appear only by editing the fixed set.
 
@@ -753,7 +784,7 @@ Each procedure lives in the murmur repository on the `main` branch; the name lin
 | [**Staged runtime bind mount**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/staged-runtime-bind-mount-manual-verification.md) | That a `capabilities.shell.staged_runtime` grant lands its pinned tree read-only inside the composed root at the same absolute path it has on the host, that a missing `source_path` refuses the session with `E-RUN-014` before any shell command runs, and that the same `pin` on two hosts yields the same interpreter with no `interpreter_runtime` grant anywhere. | Whenever the staging bind, the grant's Landlock rights, or the composed-root plan changes. |
 | [**Resource limits**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/resource-limits-manual-verification.md) | The three mechanisms bounding the native subprocess tree: `setrlimit(2)` per-process ceilings, the cgroup v2 scope (fork bomb, memory hog, CPU, I/O), and the periodic workdir-size check. Ten scenarios, including the `E-RUN-012` fail-closed launch refusal and the macOS gap behind `W-SEC-010`. | On a Linux host with systemd user cgroup delegation configured, whenever `capabilities.resources` enforcement or the cgroup delegation path changes. |
 | [**Subprocess fd hygiene**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/subprocess-fd-hygiene-verification.md) | The negative property that a descriptor open in the runtime process at spawn time is not visible inside the spawned child, across both spawn paths (shell tool and native tool), on both kernel tiers. Landlock cannot substitute for this: an inherited fd was opened before the ruleset existed. | Whenever either spawn path's pre-exec window changes. |
-| [**Workdir `Execute` rights and declared `workdir_exec`**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-exec-landlock-manual-verification.md) | That `capabilities.shell.allow` is *complete*: with the default `capabilities.filesystem.workdir_exec: false`, a binary planted in the session workdir under an allowlisted basename does not execute, because the workdir's Landlock rule carries no `Execute` right. Also the declared opt-in's whole visible surface — the binary runs, the achieved class drops to `advisory`, `--explain-scope` and `trace.jsonl` say so, and `containment: scoped` alongside it refuses with `E-CAP-003`. | Whenever the workdir grant's right set, the exec-grant derivation, or the tier→class mapping changes. |
+| [**Workdir `Execute` rights and declared `workdir_exec`**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-exec-landlock-manual-verification.md) | That `capabilities.shell.allow` is *complete*: with the default `capabilities.filesystem.workdir_exec: false`, a binary planted in the session workdir under an allowlisted basename does not execute, because the workdir's Landlock rule carries no `Execute` right. Also the declared opt-in's whole visible surface — the binary runs, the achieved class drops to `advisory`, `--explain-scope` and `trace.jsonl` say so, and `containment: scoped` alongside it refuses with `E-CAP-003`. Also the rest of the workdir's right set: files move and hard-link between its folders as real renames, nothing moves or links across its boundary, `truncate(2)` outside it is refused, `uv venv` and `uv pip install` succeed in it, and a ruleset built at ABI v1 fails those moves with `EXDEV`. | Whenever the workdir grant's right set, the exec-grant derivation, or the tier→class mapping changes. |
 | [**Shell-binary reachability under `sealed`**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/shell-binary-reachability-manual-verification.md) | That a `capabilities.shell.allow` grant which cannot actually *function* inside a composed root fails at launch rather than deep in a run: the `E-CAP-006` refusal for an interpreted entrypoint whose package tree nothing declared reaches, the `W-SEC-012` warning for a compiler driver whose `cc1`/`as`/`ld` helpers have no `Execute` grant, and the two negative controls — a system `/usr` interpreter that needs no grant, and a declared `interpreter_runtime` that makes a real compile succeed. | Whenever the reachability checks, the fixed sealed runtime tree's right set, or the known-driver registry changes. |
 | [**Workdir device-node escape**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-device-node-manual-verification.md) | That a capsule cannot create a character- or block-device node inside its own workdir and read the raw host filesystem through it, via the Landlock workdir grant withholding those rights and the shell child's capability drop. Also that FIFO and ordinary file creation still work, and that the child is left non-dumpable. | Whenever the workdir grant's right set, the child's capability drop, or the pre-exec hardening sequence changes. |
 | [**Unmediated `AF_UNIX` sockets**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/af-unix-sockets-manual-verification.md) | That a capsule cannot open a unix-domain socket by default and so cannot reach a host daemon socket such as `/var/run/docker.sock`; that `AF_NETLINK` and `AF_PACKET` are refused with and without the opt-in; that `capabilities.network.unix_sockets: true` really does hand the family back; and whether real workloads survive the default deny. | Whenever the `socket(2)`-domain rule, the `unix_sockets` opt-in, or the set of denied address families changes. |
