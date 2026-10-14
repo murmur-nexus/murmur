@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
     time::Instant,
 };
@@ -17,6 +18,7 @@ use crate::{
         DelegationLaunch, DelegationOrigin, DelegationPlane, DelegationRequest, DelegationStatus,
     },
     errors::RuntimeError,
+    network_namespace::SessionNetns,
     resource_plane::{self, SymlinkPolicy},
     sandbox,
     shell::{execute_shell, split_shell_words},
@@ -215,9 +217,30 @@ pub enum PlannedCall<'a> {
     },
 }
 
+/// Run the plan at `plan_path`. Its shell steps get a network namespace of their own, released
+/// when the plan ends.
 pub fn execute(plan_path: &Path, ctx: &SchedulerContext<'_>) -> ExecutionReport {
+    execute_with_netns(plan_path, ctx, None)
+}
+
+/// [`execute`] for a plan submitted inside a session: its shell steps run in that session's
+/// network namespace, so they reach a server the session's own commands started, and the plan
+/// leaves the namespace to the session when it ends.
+pub(crate) fn execute_in_session(
+    plan_path: &Path,
+    ctx: &SchedulerContext<'_>,
+    session_netns: Arc<SessionNetns>,
+) -> ExecutionReport {
+    execute_with_netns(plan_path, ctx, Some(session_netns))
+}
+
+fn execute_with_netns(
+    plan_path: &Path,
+    ctx: &SchedulerContext<'_>,
+    session_netns: Option<Arc<SessionNetns>>,
+) -> ExecutionReport {
     let started = Instant::now();
-    match execute_inner(plan_path, ctx, started) {
+    match execute_inner(plan_path, ctx, started, session_netns) {
         Ok(report) => report,
         // The only failures that reach here are a plan file that could not be read or parsed, so
         // there is no DAG to have described and no plan node for the summary to hang off.
@@ -257,6 +280,7 @@ fn execute_inner(
     plan_path: &Path,
     ctx: &SchedulerContext<'_>,
     started: Instant,
+    session_netns: Option<Arc<SessionNetns>>,
 ) -> Result<ExecutionReport, (String, String)> {
     let raw = fs::read_to_string(plan_path).map_err(|error| {
         (
@@ -359,6 +383,16 @@ fn execute_inner(
                 error,
             ));
         }
+    };
+    let owns_netns = session_netns.is_none();
+    let shell_enforcement = match session_netns {
+        Some(session_netns) => shell_enforcement.with_session_netns(session_netns),
+        None => shell_enforcement,
+    };
+    // Held to the end of this function, so every return from here on ends what the plan started.
+    let _plan_end = PlanEnd {
+        enforcement: &shell_enforcement,
+        owns_netns,
     };
 
     let mut results = HashMap::<String, StepResult>::new();
@@ -653,6 +687,25 @@ fn execute_inner(
         failed_step,
         canceled,
     })
+}
+
+/// Ends what a plan's shell steps started, on whichever path the plan returns by.
+///
+/// Kills the plan's own cgroup scope, so nothing a step backgrounded outlives the plan. Releases
+/// the network namespace only when the plan created it: a session's namespace belongs to the
+/// session, whose own commands may still be using it.
+struct PlanEnd<'a> {
+    enforcement: &'a sandbox::ShellEnforcement,
+    owns_netns: bool,
+}
+
+impl Drop for PlanEnd<'_> {
+    fn drop(&mut self) {
+        self.enforcement.kill_session_processes();
+        if self.owns_netns {
+            self.enforcement.session_netns.end();
+        }
+    }
 }
 
 // ── Trace emission ───────────────────────────────────────────────────────────
@@ -1730,6 +1783,94 @@ mod tests {
         assert!(!report.completed);
         assert_eq!(report.results[0].status, StepStatus::Failed);
         assert_eq!(report.results[0].error.as_deref(), Some("exit code 3"));
+    }
+
+    /// S9: a plan submitted inside a session runs its shell steps in that session's network
+    /// namespace, so a step reaches a server one of the session's own commands started — and the
+    /// plan leaves the namespace to the session when it ends.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn a_plan_shell_step_joins_the_session_namespace() {
+        if crate::cgroup::skip_without_host_support(
+            "plan::tests::a_plan_shell_step_joins_the_session_namespace",
+        ) {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string(), "nc".to_string(), "sleep".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let session = sandbox::ShellEnforcement::resolve(
+            &policy,
+            murmur_artifact::ContainmentClass::Scoped,
+            sandbox::HostProbe::probe(),
+        )
+        .unwrap();
+        let server = execute_shell(
+            "bash",
+            &[
+                "-c",
+                "(printf \"pong\\n\" | nc -N -l 127.0.0.1 8080) >/dev/null 2>&1 & echo $! > server.pid",
+            ],
+            &[],
+            dir.path(),
+            dir.path(),
+            &policy,
+            &session,
+        )
+        .expect("the session's server command runs");
+        assert_eq!(server.exit_code, 0, "stderr: {}", server.stderr);
+
+        let invoke = |_name: &str, _input: ToolInput| Ok(tool_result(ToolStatus::Passed, None));
+        let mut ctx = test_ctx(dir.path().to_path_buf(), &invoke);
+        ctx.capability_policy.shell_allow = policy.shell_allow.clone();
+        let plan = write_plan(
+            dir.path(),
+            json!({
+                "id": "p",
+                "steps": [{
+                    "id": "client",
+                    "shell": "bash -c 'for i in {1..50}; do exec 3<>/dev/tcp/127.0.0.1/8080 \
+                              2>/dev/null && break; sleep 0.1; done; read -r reply <&3; \
+                              echo \"$reply\"'",
+                }]
+            }),
+        );
+
+        let report = execute_in_session(&plan, &ctx, Arc::clone(&session.session_netns));
+        println!(
+            "plan completed: {}; step {} {:?} output {:?} error {:?}; session namespaces \
+             created: {}",
+            report.completed,
+            report.results[0].step_id,
+            report.results[0].status,
+            report.results[0].output.as_deref().map(str::trim),
+            report.results[0].error,
+            session.session_netns.creations()
+        );
+        assert!(report.completed, "{:?}", report.results);
+        assert_eq!(report.results[0].status, StepStatus::Success);
+        assert_eq!(
+            report.results[0].output.as_deref().map(str::trim),
+            Some("pong")
+        );
+        assert_eq!(session.session_netns.creations(), 1);
+
+        // The plan did not end the session's namespace: the session's next command still runs.
+        let after = execute_shell(
+            "bash",
+            &["-c", "true"],
+            &[],
+            dir.path(),
+            dir.path(),
+            &policy,
+            &session,
+        )
+        .expect("the session outlives the plan it submitted");
+        assert_eq!(after.exit_code, 0);
+        session.end_session();
     }
 
     /// A `shell` step is put to the same decision point, and a refused one starts no subprocess.

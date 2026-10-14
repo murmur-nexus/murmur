@@ -1,6 +1,6 @@
 # Network namespace + egress proxy — manual verification on a real Linux host
 
-!!! warning "Status: **PARTIAL — 2026-08-06.** Scenarios 1–5 and 7 pass through live capsule sessions on Ubuntu 24.04; scenario 7 covers the capability-grant reason only. Scenario 6's answer — `CAP_SYS_PTRACE` is not required — was measured with a user-namespace substitute for `docker run`; the two-arm `docker run` comparison has not been run."
+!!! warning "Status: **PARTIAL — 2026-10-14.** Scenarios 1–5 and 7 pass through live capsule sessions on Ubuntu 24.04; scenario 7 covers the capability-grant reason only. Scenarios 8–11 pass through integration tests and one scripted-model session; scenario 10 has not been run as two concurrent `mur run`s. Scenario 6's answer — `CAP_SYS_PTRACE` is not required — was measured with a user-namespace substitute for `docker run`; the two-arm `docker run` comparison has not been run."
 
     This procedure must be run by hand, on a real Linux host: a green `cargo build`, `cargo test`
     or `cargo clippy` says nothing about this boundary — see
@@ -12,7 +12,8 @@
 ## What is being verified { #what-this-verifies }
 
 A capsule's native subprocess tree — the shell tool, any interpreter it starts, anything either of
-them spawns — runs inside its own **network namespace**. The only way out of that namespace is a
+them spawns — runs inside its session's **network namespace**: one per session, shared by every
+shell call the session makes and by nothing outside it. The only way out of that namespace is a
 connection-level proxy in the runtime process that applies `capabilities.network.allow`. Both
 decisions are taken from kernel-held state: the namespace's routes and listeners decide where a
 connection can go, and nothing reads a destination out of the subprocess's memory. A host that
@@ -34,6 +35,10 @@ The property under test is negative and structural:
 | [5](#scenario-5) | `AF_UNIX` is refused by the `socket(2)` domain filter, which the network namespace does not replace |
 | [6](#scenario-6) | Whether a container still needs `CAP_SYS_PTRACE` |
 | [7](#scenario-7) | The launch refusal on a host that cannot create the namespace |
+| [8](#scenario-8) | A server started in one shell call answers a later call of the same session |
+| [9](#scenario-9) | A foreground server demoted after `lifecycle.shell_grace_secs` answers a later call |
+| [10](#scenario-10) | A second, concurrent `mur run` of the same capsule cannot reach the first one's server, and neither can the host |
+| [11](#scenario-11) | Nothing a session started is left running after it ends |
 
 ## What the automated suite does not establish { #what-this-deliberately-is-not }
 
@@ -41,12 +46,12 @@ The property under test is negative and structural:
   runs, so a test asserting "unlisted connect fails" would pass vacuously on every runner. The unit
   tests cover pure logic only — DNS message parsing, the allow decision, the derived listener-port
   set.
-- **Two Linux integration tests run the real mechanism when the host supports it:**
-  `kernel_tier_denies_network_connect_outside_allowlist` and
-  `kernel_tier_reaches_an_allowlisted_destination_through_the_egress_proxy`, in the
-  `capsule-runtime` crate. They are a regression guard: they check that the permitted path
-  functions and that one specific denial holds. They say nothing about DNS, UDP, `AF_UNIX` or the
-  refusal path.
+- **Linux integration tests run the real mechanism when the host supports it.** In the
+  `capsule-runtime` crate, `kernel_tier_denies_network_connect_outside_allowlist` and
+  `kernel_tier_reaches_an_allowlisted_destination_through_the_egress_proxy` check that the
+  permitted path functions and that one specific denial holds; the session-namespace tests listed
+  under [the 2026-10-14 run](#run-2026-10-14-session-namespace) check scenarios 8–11's claims. They
+  are a regression guard and say nothing about DNS, UDP, `AF_UNIX` or the refusal path.
 - **Reading the code is not evidence.** A structural boundary is observable from inside the
   sandbox; observe it.
 
@@ -103,7 +108,8 @@ Launch it and drive the checks below through real `bash` tool calls:
 systemd-run --user --scope --property=Delegate=yes -- mur run
 ```
 
-Every command in scenarios 1–5 runs **inside the capsule's shell tool**, not on the host.
+Every command in scenarios 1–5 and 8–11 runs **inside the capsule's shell tool**, not on the
+host, unless it is marked as a host command.
 
 ---
 
@@ -126,6 +132,9 @@ ip route show table all | cat
 
 **Expected:** `lo` is the only interface, and the routing table is the namespace's own — nothing
 resembling the host's default route via a physical interface.
+
+Every shell call of a session runs in the same namespace, so this holds in any call, not only the
+first: repeat the `curl` in a later call and expect the same `200`.
 
 ---
 
@@ -150,6 +159,9 @@ curl -sS -m 10 -o /dev/null http://93.184.216.34/ ; echo "exit=$?"
 **Expected:** non-zero. An address the runtime's own resolver never handed out is checked against
 the addresses the allowlist resolved to at launch, and nothing else. A port no allow entry implies
 has no listener in the namespace, so the connection is refused outright.
+
+This too holds in any call of the session: the denial is the namespace's, and the namespace is the
+same for every call.
 
 ---
 
@@ -387,6 +399,121 @@ needs no namespace and launches normally, even with the restriction on.
 
 ---
 
+## Scenario 8 — a server started in one call answers a later call { #scenario-8 }
+
+Call 1 starts a one-shot server in the background, with its output redirected so the call returns
+at once:
+
+```bash
+(printf 'pong\n' | nc -N -l 127.0.0.1 8080) >server.log 2>&1 & echo "started $!"
+```
+
+**Expected:** `started <pid>`, returned immediately.
+
+Call 2, a separate `bash` tool call:
+
+```bash
+nc -N -w 5 127.0.0.1 8080 </dev/null ; echo "exit=$?"
+```
+
+**Expected:** `pong` and `exit=0`. The same works for any server the capsule may run — with
+`python3` in `capabilities.shell.allow`, `python3 -m http.server 8080 >server.log 2>&1 &` in one
+call and `curl -sS localhost:8080 | head -3` in the next.
+
+A background process that keeps the call's stdout or stderr open holds the call until it exits,
+because the call returns once its output ends. Redirecting the server's output, as above, lets the
+call return. Without the redirect the call is moved to the background after
+`lifecycle.shell_grace_secs`, which is scenario 9.
+
+---
+
+## Scenario 9 — a demoted foreground server answers a later call { #scenario-9 }
+
+Add `lifecycle: {task_acceptance: queue, after_task: sleep, shell_grace_secs: 2}` to the scenario 0
+manifest, so the session outlives its task and the demotion is quick.
+
+Call 1 runs the server in the foreground:
+
+```bash
+printf 'pong\n' | nc -N -l 127.0.0.1 8080
+```
+
+**Expected:** after about two seconds, the turn gets a `wrk_<id>` handle saying the command is still
+running.
+
+Call 2:
+
+```bash
+nc -N -w 5 127.0.0.1 8080 </dev/null ; echo "exit=$?"
+```
+
+**Expected:** `pong` and `exit=0`. The demoted server then exits, and its completion arrives as a
+`completion`-origin task naming `logs/wrk_<id>.log` with `exit_code: 0`.
+
+---
+
+## Scenario 10 — a second session cannot reach the first one's server { #scenario-10 }
+
+Launch the scenario 0 capsule twice, in two terminals, so two sessions run at once.
+
+In session A:
+
+```bash
+nc -k -l 127.0.0.1 8080 >/dev/null 2>&1 & echo "started $!"
+```
+
+In session B:
+
+```bash
+nc -N -w 2 127.0.0.1 8080 </dev/null ; echo "exit=$?"
+```
+
+**Expected:** `nc: connect to 127.0.0.1 port 8080 (tcp) failed: Connection refused` and `exit=1`.
+Session B's `127.0.0.1` is its own namespace's loopback, where nothing listens on 8080.
+
+On the host, while session A still runs:
+
+```bash
+nc -z -w 2 127.0.0.1 8080 ; echo "exit=$?"
+```
+
+**Expected:** `exit=1`, refused: session A's server is not on the host's loopback either.
+
+In session A again:
+
+```bash
+nc -z -w 2 127.0.0.1 8080 ; echo "exit=$?"
+```
+
+**Expected:** `exit=0` — the server is there, for its own session.
+
+---
+
+## Scenario 11 — nothing outlives the session { #scenario-11 }
+
+In a session of the scenario 0 capsule:
+
+```bash
+nc -l 127.0.0.1 8080 >/dev/null 2>&1 &
+setsid sleep 300 >/dev/null 2>&1 &
+echo "started"
+```
+
+(`setsid` must be in `capabilities.shell.allow` for the second line.) Let the session end — its
+task finishing, or `Ctrl-C` — then, on the host:
+
+```bash
+pgrep -af 'nc -l 127.0.0.1 8080' ; echo "exit=$?"
+pgrep -af 'sleep 300' ; echo "exit=$?"
+```
+
+**Expected:** each prints nothing and `exit=1`. The session's end kills every process in its cgroup
+scope, which a backgrounded server and a `setsid` process are both in. A runtime killed with
+`SIGKILL` cannot do this: its processes keep running with no route off the host, and `pgrep` finds
+them.
+
+---
+
 ## Recording the result
 
 Record every run here: the host (distro, kernel, architecture, whether a container runtime is
@@ -402,6 +529,10 @@ anything not run; do not infer a result from a passing build.
 | [5](#scenario-5) | `AF_UNIX` refused by the socket-domain filter | **PASS** — Ubuntu 24.04, 2026-08-06, via `nc -U` | [Live sessions](#run-2026-08-06-live) |
 | [6](#scenario-6) | `CAP_SYS_PTRACE` required? | **NO** — Ubuntu 24.04, 2026-08-06, capability matrix with controls; `docker run` comparison PENDING | [Capability matrix](#run-2026-08-06-matrix) |
 | [7](#scenario-7) | `E-CAP-005` refusal, both reasons | **PASS** — Ubuntu 24.04, 2026-08-06, capability-grant reason only; kernel-support reason PENDING | [Live sessions](#run-2026-08-06-live), [repeat](#run-2026-08-06-repeat) |
+| [8](#scenario-8) | Server from one call answers the next | **PASS** — Ubuntu 24.04, 2026-10-14, integration tests and a scripted-model session | [Session namespace](#run-2026-10-14-session-namespace) |
+| [9](#scenario-9) | Demoted server answers a later call | **PASS** — Ubuntu 24.04, 2026-10-14, integration test | [Session namespace](#run-2026-10-14-session-namespace) |
+| [10](#scenario-10) | Second session and host cannot reach it | **PASS** — Ubuntu 24.04, 2026-10-14, integration test with two sessions in one process; two concurrent `mur run`s PENDING | [Session namespace](#run-2026-10-14-session-namespace) |
+| [11](#scenario-11) | Nothing outlives the session | **PASS** — Ubuntu 24.04, 2026-10-14, integration test and a scripted-model session | [Session namespace](#run-2026-10-14-session-namespace) |
 
 ### 2026-08-06 — integration tests on a bare host { #run-2026-08-06-integration }
 
@@ -557,12 +688,41 @@ FAILED
 a pass, so the capability was the deciding variable and configs 1–3 are a real negative. The
 two-arm `docker run` comparison in [6b](#scenario-6b) is PENDING.
 
+### 2026-10-14 — one namespace per session { #run-2026-10-14-session-namespace }
+
+**Host.** `Linux 7.0.0-28-generic`, x86_64, Ubuntu 24.04, bare metal, non-root (`uid=1000`), no
+container runtime. `kernel.apparmor_restrict_unprivileged_userns=0`, the `mur-sealed` profile
+loaded, cgroup v2 delegation available, OpenBSD `nc` at `/usr/bin/nc`.
+
+**What ran.** Integration tests that drive real `bash` and `nc` subprocesses through the runtime's
+shell path, each with a real session namespace, egress proxy and, where named, a real cgroup scope.
+None printed a `[SKIP-HOST]` or `skipping` line. One of them, in `murmur-cli`, is a whole agent
+session with a scripted model: the driver, the sandbox, the namespace and the scope were the
+production code, and only the model's replies were scripted.
+
+| Test | Scenarios | What it printed |
+|---|---|---|
+| `a_listener_started_by_one_command_answers_the_next` (`capsule-runtime`) | 8 | `tier KernelFull; command 1 exit 0 in 160 ms; command 2 exit 0 stdout "pong"; namespaces created: 1` |
+| `a_server_from_one_shell_call_answers_the_next` (`murmur-cli`, scripted model) | 8, 11 | turn 2's `tool_result`: `Exit code: 0` `Stdout: pong` `sleeper-alive`; `shell records: [0, 0]`; `/proc/<sleeper> after the session: absent` |
+| `a_demoted_server_stays_reachable_from_later_commands` | 9 | `demoted as wrk_01a13b7d…; client exit 0; completion wrk_01a13b7d… exit 0; log has ping: true` |
+| `two_sessions_do_not_share_loopback` | 10 | `port 46091; host connect: Connection refused (os error 111); B read "pong-b"; B's second client exit 1 stderr "bash: connect: Connection refused …"; A read "pong-a"` |
+| `the_session_proxy_serves_every_command` | 1, 2 | `first "pong" exit 0; unlisted exit 1 stderr "bash: connect: Connection refused …/dev/tcp/10.255.255.1/9: Connection refused"; third "pong" exit 0; namespaces created: 1` |
+| `concurrent_first_commands_share_one_namespace` | 8 | four commands started at once: `exit 0` each, three clients read `"pong"`; `namespaces created: 1` |
+| `ending_the_session_kills_everything_it_started` | 11 | `end_session took 152 ms; sleeper … gone: true; server … gone: true; cgroup.procs after: ""; next command: Err(… this session has ended …)` |
+| `cgroup::tests::killing_a_scope_without_cgroup_kill_empties_it` | 11, on a kernel without `cgroup.kill` | `members before: [3 pids]; fallback kill: Ok(()); empty: true; cgroup.procs after: []; bash: signal: 9 (SIGKILL)` |
+| `plan::tests::a_plan_shell_step_joins_the_session_namespace` | 8, from a plan step | `plan completed: true; step client Success output Some("pong"); session namespaces created: 1` |
+
+Scenario 10 ran as two sessions in one test process, not as two concurrent `mur run`s; the
+two-process run is PENDING. Scenario 9's completion was read off the runtime's own completion
+channel, not delivered to a live agent.
+
 ### Pending
 
 | Scenario | What remains | Needs |
 |---|---|---|
 | [6b](#scenario-6b) | The two-arm `docker run` comparison | A host with a container runtime |
 | [7](#scenario-7) | The kernel-support-missing reason | A host that can be set to `user.max_user_namespaces=0`, or a kernel built with `CONFIG_USER_NS=n` |
+| [10](#scenario-10) | Two concurrent `mur run`s of the same capsule, by hand | A real model or a hand-driven session in each of two terminals |
 
 ## Known limits { #known-limits }
 

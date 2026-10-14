@@ -1026,12 +1026,13 @@ fn lifecycle_a_command_still_running_at_exit_is_reported_to_the_operator() {
         "the report names the command as the model wrote it; report was: {report}"
     );
     assert!(
-        report.contains("state: still running after"),
-        "the report says how long it had been running; report was: {report}"
+        report.contains("state: killed at session end after"),
+        "the report says the session's end killed it, and how long it had been running; report \
+         was: {report}"
     );
     assert!(
-        report.contains(&format!("no logs/{work_id}.log will be written")),
-        "the report must not promise a file that never appears; report was: {report}"
+        report.contains(&format!("logs/{work_id}.log only if")),
+        "the report names the output file without promising it; report was: {report}"
     );
 }
 
@@ -1348,7 +1349,7 @@ fn lifecycle_queue_exit_task_md_still_reports_discarded_shell_work() {
         "report was: {report}"
     );
     assert!(
-        report.contains("state: still running after"),
+        report.contains("state: killed at session end after"),
         "report was: {report}"
     );
     assert!(

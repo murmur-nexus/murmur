@@ -6,11 +6,30 @@
 //! route off the host, so an unlisted destination is not "denied" by a filter that has to be
 //! consulted, it is simply unreachable.
 //!
+//! ## One namespace per session
+//!
+//! A session has exactly one network namespace, [`SessionNetns`], created the first time one of
+//! its commands is spawned and shared by every command after that. A server one shell call starts
+//! on `127.0.0.1:8080` is therefore reachable from the session's next call, and from nothing
+//! outside the session: two sessions are two `mur` processes, each with its own `SessionNetns`,
+//! and no interface hands one across a process boundary. A plan's shell steps run in the
+//! namespace of the session that submitted the plan.
+//!
+//! The namespace is built once by a dedicated *creator* child, forked for nothing else, which
+//! hands the parent the namespace's listening sockets and a descriptor for each of its two
+//! namespaces in one `SCM_RIGHTS` message and then exits. The namespace outlives the creator
+//! because the runtime holds those descriptors. Every command then enters it with
+//! [`join_session_netns`] — `setns(2)` into the user namespace, then into the network namespace —
+//! in its own `pre_exec` window, where it is single-threaded and still unfiltered. The runtime's
+//! own threads never call `setns` or `unshare`. The namespace is released when the session ends:
+//! [`SessionNetns::end`] stops the session's egress proxy and closes the descriptors, after
+//! `ShellEnforcement::end_session` has killed every process the session started.
+//!
 //! ## The syscall sequence
 //!
-//! Everything happens in the forked child's `pre_exec` window, before the seccomp filter (which
-//! denies `unshare`, `setns` and `socket(AF_NETLINK)` outright) and before [`crate::sealed`]'s
-//! composed root:
+//! Everything happens in the creator child, before any capsule code runs, and the join happens in
+//! each command's forked child before the seccomp filter (which denies `unshare`, `setns` and
+//! `socket(AF_NETLINK)` outright) and before [`crate::sealed`]'s composed root:
 //!
 //!   1. `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, then the identity `uid_map`/`gid_map` writes that
 //!      make the child the owner of both. The user namespace is not incidental: `CLONE_NEWNET`
@@ -31,10 +50,12 @@
 //!      schedule against a blackhole.
 //!   4. The listening sockets are created here, *inside* the namespace — one TCP listener per
 //!      port the allowlist implies, then one wildcard UDP :53 resolver socket — and handed back
-//!      to the parent in a single `SCM_RIGHTS` message. A socket belongs to the namespace it was
-//!      **created** in, not the one it is used from, which is the whole reason this inversion
-//!      works: the runtime serves them while staying in the host's namespace, with real internet
-//!      access for the upstream half.
+//!      to the parent in a single `SCM_RIGHTS` message, followed by the `/proc/self/ns/user` and
+//!      `/proc/self/ns/net` descriptors later commands join through. A socket belongs to the
+//!      namespace it was **created** in, not the one it is used from, which is the whole reason
+//!      this inversion works: the runtime serves them while staying in the host's namespace, with
+//!      real internet access for the upstream half. The listeners are held for the whole session,
+//!      so a server a command starts on one of those ports gets `EADDRINUSE`.
 //!
 //! ## Why this shape rather than the obvious ones
 //!
@@ -42,12 +63,22 @@
 //! **host's** network namespace, which means real root. This design needs no host privilege at
 //! all, which is what lets `mur` install per-user.
 //!
-//! *No proxy process inside the namespace.* `setns(2)` into the namespace from a thread of the
-//! runtime is not possible: it requires `CAP_SYS_ADMIN` in the caller's *own* user namespace, and
-//! an unprivileged multithreaded process cannot get it (`unshare(CLONE_NEWUSER)` requires a
-//! single-threaded process). Passing the listening sockets *out* inverts the problem and needs no
-//! privilege whatsoever. This was established empirically, not assumed — the `setns` route was
-//! tried first and returned `EPERM`.
+//! *No proxy process inside the namespace, and no holder process.* A multithreaded process cannot
+//! enter a user namespace: the runtime's own `setns(user_fd, CLONE_NEWUSER)` returns `EINVAL`, and
+//! returned `EPERM` from a runtime thread when the proxy was first built. A freshly forked child is
+//! single-threaded, and the euid that owns the session's user namespace holds every capability in
+//! it, so the same `setns` from a command's `pre_exec` window succeeds, followed by
+//! `setns(net_fd, CLONE_NEWNET)`. Measured on Linux 7.0 (Ubuntu 24.04, uid 1000,
+//! `apparmor_restrict_unprivileged_userns=0`, the `mur-sealed` profile loaded): two children that
+//! joined this way saw the same netns inode, and one reached a server the other started on
+//! `127.0.0.1`, while the parent's own connect to that address was refused. Passing the listening
+//! sockets *out* is what lets the proxy serve the namespace from the host's side with no privilege
+//! at all.
+//!
+//! A long-lived single-threaded holder that forked each command on request was the alternative.
+//! It would make every command its child rather than the runtime's, so every `Child` the shell
+//! path keys on would need a proxy layer, and it would re-implement `std::process::Command`'s spawn
+//! over a request protocol. Joining in `pre_exec` changes one step of the existing spawn instead.
 //!
 //! *No `iptables`/`nft`/`TPROXY`.* Nothing here needs a netfilter rule, so there is no dependency
 //! on netfilter modules being present, no `iptables` binary to shell out to, and no rule set that
@@ -67,10 +98,14 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 /// One TCP listener per allowlisted port, plus the single wildcard UDP :53 resolver socket.
-///
-/// Bounds the one `SCM_RIGHTS` message the child sends, and therefore the fixed stack buffers the
-/// `pre_exec` window builds it in.
 pub(crate) const MAX_NAMESPACE_SOCKETS: usize = crate::egress_proxy::MAX_EGRESS_TCP_PORTS + 1;
+
+/// Every descriptor the creator child sends: the namespace sockets, then the user and network
+/// namespace handles.
+///
+/// Bounds the one `SCM_RIGHTS` message, and therefore the fixed stack buffers the creator builds
+/// it in.
+pub(crate) const MAX_SESSION_NETNS_FDS: usize = MAX_NAMESPACE_SOCKETS + 2;
 
 // ---------------------------------------------------------------- blockers
 
@@ -295,7 +330,7 @@ pub(crate) struct CapsuleNetnsPlan {
 }
 
 impl CapsuleNetnsPlan {
-    /// Resolves the plan for one subprocess launch.
+    /// Resolves the plan for one session's namespace.
     #[cfg(target_os = "linux")]
     #[allow(unsafe_code)]
     pub(crate) fn resolve(tcp_ports: Vec<u16>) -> Self {
@@ -314,16 +349,155 @@ impl CapsuleNetnsPlan {
     }
 }
 
+// ---------------------------------------------------------------- the session's namespace
+
+/// One session's network namespace, created on first use and shared by every command after it.
+///
+/// Always held as `Arc<SessionNetns>` on [`crate::sandbox::ShellEnforcement`], so every clone of a
+/// session's enforcement — each tool call's, each demoted command's, a plan's — reaches the same
+/// namespace. Its state moves one way: not yet created, established, ended. An ended namespace is
+/// never recreated, so a command spawned after its session ended is refused rather than given a
+/// fresh namespace nobody will tear down.
+///
+/// Off Linux there is no namespace to create: the type exists so the session-end path needs no
+/// `cfg`, and it only ever moves from not yet created to ended.
+#[derive(Debug, Default)]
+pub(crate) struct SessionNetns {
+    state: std::sync::Mutex<SessionNetnsState>,
+    /// Successful creations, which a test compares against the commands it ran.
+    #[cfg(test)]
+    creations: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Debug, Default)]
+enum SessionNetnsState {
+    #[default]
+    NotYetCreated,
+    #[cfg(target_os = "linux")]
+    Established(linux::EstablishedNetns),
+    Ended,
+}
+
+/// What a command's `pre_exec` window needs to join its session's namespace: the user and network
+/// namespace descriptors.
+///
+/// Shares the session's descriptors rather than duplicating them, so they stay open for as long as
+/// the `Command` holding this does, even if the session ends between `establish` and the spawn: a
+/// join then enters a namespace whose processes are being killed, never a reused descriptor number.
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{create_capsule_netns, receive_namespace_sockets};
+#[derive(Debug, Clone)]
+pub(crate) struct SessionNetnsJoin {
+    user_ns: std::sync::Arc<std::os::fd::OwnedFd>,
+    net_ns: std::sync::Arc<std::os::fd::OwnedFd>,
+}
+
+#[cfg(target_os = "linux")]
+impl SessionNetnsJoin {
+    /// `(user_ns, net_ns)`, for [`join_session_netns`].
+    pub(crate) fn raw_fds(&self) -> (std::os::fd::RawFd, std::os::fd::RawFd) {
+        use std::os::fd::AsRawFd;
+        (self.user_ns.as_raw_fd(), self.net_ns.as_raw_fd())
+    }
+}
+
+impl SessionNetns {
+    /// A session whose namespace does not exist yet. Creates nothing.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The handles a command joins the session's namespace through, creating the namespace and
+    /// starting the session's egress proxy on the first call.
+    ///
+    /// Serialised on one mutex, so concurrent first commands create exactly one namespace. A
+    /// failed creation leaves the namespace not yet created and leaks nothing, so that command's
+    /// spawn fails and the next one tries again. `tcp_ports` and `policy` are read on the call
+    /// that creates the namespace; every later call is handed the namespace that call created.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn establish(
+        &self,
+        tcp_ports: &[u16],
+        policy: crate::egress_proxy::EgressPolicy,
+    ) -> Result<SessionNetnsJoin, String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*state {
+            SessionNetnsState::Established(established) => return Ok(established.join()),
+            SessionNetnsState::Ended => {
+                return Err(
+                    "sandbox: this session has ended, and its network namespace was released \
+                     with it; no further command runs in it"
+                        .to_string(),
+                )
+            }
+            SessionNetnsState::NotYetCreated => {}
+        }
+        let plan = CapsuleNetnsPlan::resolve(tcp_ports.to_vec());
+        let established = linux::create_session_netns(&plan)
+            .and_then(|created| created.serve(policy))
+            .map_err(|detail| {
+                format!("sandbox: could not create this session's network namespace: {detail}")
+            })?;
+        let join = established.join();
+        *state = SessionNetnsState::Established(established);
+        #[cfg(test)]
+        self.creations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(join)
+    }
+
+    /// Releases the namespace: stops the session's egress proxy and closes the namespace
+    /// descriptors. Idempotent, and final — [`Self::establish`] refuses every call after it.
+    ///
+    /// The namespace itself is gone once its last process is: the caller kills the session's
+    /// processes first (`ShellEnforcement::end_session`).
+    pub(crate) fn end(&self) {
+        let previous = std::mem::replace(
+            &mut *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SessionNetnsState::Ended,
+        );
+        #[cfg(target_os = "linux")]
+        if let SessionNetnsState::Established(established) = previous {
+            established.release();
+        }
+        #[cfg(not(target_os = "linux"))]
+        drop(previous);
+    }
+
+    /// How many namespaces this session has created: `0` before its first command, `1` after.
+    #[cfg(test)]
+    pub(crate) fn creations(&self) -> usize {
+        self.creations.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for SessionNetns {
+    /// The backstop for a session that never reached `end_session`: the proxy stops and the
+    /// descriptors close when the last enforcement holding this goes.
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::join_session_netns;
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod linux {
     use std::io;
-    use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::sync::Arc;
 
-    use super::{CapsuleNetnsPlan, EgressNamespaceProbe, EgressNamespaceSupport};
+    use super::{
+        CapsuleNetnsPlan, EgressNamespaceProbe, EgressNamespaceSupport, SessionNetnsJoin,
+        MAX_NAMESPACE_SOCKETS, MAX_SESSION_NETNS_FDS,
+    };
 
     // ------------------------------------------------------------ netlink constants
     //
@@ -426,53 +600,148 @@ mod linux {
         }
     }
 
-    // ------------------------------------------------------------ child-side construction
+    // ------------------------------------------------------------ the creator child
 
-    /// Builds the capsule's network namespace and hands its listening sockets to the parent.
+    /// The step of the namespace's construction that failed, as the creator reports it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum CreationStep {
+        Unshare = 1,
+        IdentityMaps = 2,
+        Loopback = 3,
+        LocalRoute = 4,
+        TcpListener = 5,
+        Resolver = 6,
+        NamespaceHandles = 7,
+        HandOff = 8,
+    }
+
+    impl CreationStep {
+        fn from_code(code: u32) -> Option<Self> {
+            Some(match code {
+                1 => Self::Unshare,
+                2 => Self::IdentityMaps,
+                3 => Self::Loopback,
+                4 => Self::LocalRoute,
+                5 => Self::TcpListener,
+                6 => Self::Resolver,
+                7 => Self::NamespaceHandles,
+                8 => Self::HandOff,
+                _ => return None,
+            })
+        }
+
+        fn describe(self) -> &'static str {
+            match self {
+                Self::Unshare => "unshare(CLONE_NEWUSER | CLONE_NEWNET)",
+                Self::IdentityMaps => "writing uid_map/gid_map",
+                Self::Loopback => "bringing lo up",
+                Self::LocalRoute => "installing the local default route",
+                Self::TcpListener => "binding a TCP listener inside the namespace",
+                Self::Resolver => "binding UDP 53 inside the namespace",
+                Self::NamespaceHandles => "opening /proc/self/ns/user and /proc/self/ns/net",
+                Self::HandOff => "handing the namespace to the runtime",
+            }
+        }
+    }
+
+    /// A failed step and the `errno` it left, carried out of the creator as a fixed-size record.
     ///
-    /// Runs in the forked child's `pre_exec` window, **before** the seccomp filter (which denies
-    /// `unshare` and `socket(AF_NETLINK)`) and before `sealed`'s composed root. The ordering
-    /// against `sealed` is load-bearing in a second way worth stating outright: `sealed` goes on
-    /// to `unshare(CLONE_NEWUSER | CLONE_NEWNS)` a *nested* user namespace, and a process in a
-    /// descendant user namespace holds no capabilities in the ancestor that owns this network
-    /// namespace. A `sealed` capsule therefore cannot reconfigure the namespace confining it —
-    /// verified by observing `SIOCSIFFLAGS` return `EPERM` from inside the nested namespace,
-    /// rather than assumed from the capability rules.
+    /// `Copy` and built from integers only, so the creator reports a failure without allocating.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct CreationFailure {
+        step: CreationStep,
+        errno: i32,
+    }
+
+    /// Bytes in an encoded [`CreationFailure`]: the step's code, then the `errno`.
+    const FAILURE_RECORD_LEN: usize = 8;
+
+    impl CreationFailure {
+        /// The failure of `step`, with the `errno` the failing call just left.
+        ///
+        /// # Safety
+        /// Reads the calling thread's `errno`; async-signal-safe.
+        unsafe fn at(step: CreationStep) -> Self {
+            // SAFETY: `__errno_location` returns the calling thread's own errno slot, which is
+            // always valid to read.
+            let errno = unsafe { *libc::__errno_location() };
+            Self { step, errno }
+        }
+
+        fn encode(self) -> [u8; FAILURE_RECORD_LEN] {
+            let mut record = [0u8; FAILURE_RECORD_LEN];
+            record[..4].copy_from_slice(&(self.step as u32).to_ne_bytes());
+            record[4..].copy_from_slice(&self.errno.to_ne_bytes());
+            record
+        }
+
+        fn decode(record: &[u8; FAILURE_RECORD_LEN]) -> Option<Self> {
+            let step = CreationStep::from_code(u32::from_ne_bytes([
+                record[0], record[1], record[2], record[3],
+            ]))?;
+            let errno = i32::from_ne_bytes([record[4], record[5], record[6], record[7]]);
+            Some(Self { step, errno })
+        }
+    }
+
+    impl std::fmt::Display for CreationFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "{} failed: {}",
+                self.step.describe(),
+                io::Error::from_raw_os_error(self.errno)
+            )
+        }
+    }
+
+    /// Builds the session's network namespace and hands it to the parent: its listening sockets,
+    /// then descriptors for its user and network namespaces, in one `SCM_RIGHTS` message ordered
+    /// `[tcp listeners…, udp53, user_ns, net_ns]`.
+    ///
+    /// Runs only in the creator child [`create_session_netns`] forks, which runs no capsule code,
+    /// installs no seccomp filter or Landlock domain and joins no cgroup scope; it `_exit`s as
+    /// soon as this returns. Commands join what this builds through [`join_session_netns`]. A
+    /// `sealed` command goes on to `unshare(CLONE_NEWUSER | CLONE_NEWNS)` a *nested* user
+    /// namespace, and a process in a descendant user namespace holds no capabilities in the
+    /// ancestor that owns this network namespace, so a `sealed` capsule cannot reconfigure the
+    /// namespace confining it — verified by observing `SIOCSIFFLAGS` return `EPERM` from inside the
+    /// nested namespace, rather than assumed from the capability rules.
     ///
     /// # Safety
-    /// Post-`fork()`, pre-`execve` child context only. Every call below is async-signal-safe and
-    /// nothing here allocates: `plan` was fully resolved in the parent.
-    pub(crate) unsafe fn create_capsule_netns(
+    /// Post-`fork()` child context only. Every call below is async-signal-safe and nothing here
+    /// allocates: `plan` was fully resolved in the parent, and a failure is a `Copy` record.
+    unsafe fn create_capsule_netns(
         plan: &CapsuleNetnsPlan,
         sock_fd: RawFd,
-    ) -> io::Result<()> {
+    ) -> Result<(), CreationFailure> {
         // SAFETY: forked-child context; the caller's `unsafe` contract covers this whole body.
         unsafe {
             if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) != 0 {
-                return Err(io::Error::other(
-                    "egress-netns: unshare(CLONE_NEWUSER | CLONE_NEWNET) failed",
-                ));
+                return Err(CreationFailure::at(CreationStep::Unshare));
             }
-            write_identity_maps(plan.uid, plan.gid)
-                .map_err(|()| io::Error::other("egress-netns: writing uid_map/gid_map failed"))?;
-            bring_loopback_up()
-                .map_err(|()| io::Error::other("egress-netns: bringing lo up failed"))?;
-            add_local_default_route().map_err(|()| {
-                io::Error::other("egress-netns: installing the local default route failed")
-            })?;
+            if write_identity_maps(plan.uid, plan.gid).is_err() {
+                return Err(CreationFailure::at(CreationStep::IdentityMaps));
+            }
+            if bring_loopback_up().is_err() {
+                return Err(CreationFailure::at(CreationStep::Loopback));
+            }
+            if add_local_default_route().is_err() {
+                return Err(CreationFailure::at(CreationStep::LocalRoute));
+            }
 
-            // One TCP listener per allowlisted port, then the resolver socket last — the order
-            // the parent's `start_egress_proxy` splits them back apart in.
-            let mut fds = [-1 as RawFd; super::MAX_NAMESPACE_SOCKETS];
+            // One TCP listener per allowlisted port, then the resolver socket — the order the
+            // parent's `start_egress_proxy` splits them back apart in — then the two namespace
+            // handles, which the parent takes off the end.
+            let mut fds = [-1 as RawFd; MAX_SESSION_NETNS_FDS];
             let mut count = 0usize;
 
             for port in &plan.tcp_ports {
                 let fd = bind_tcp_listener(*port);
                 if fd < 0 {
+                    let failure = CreationFailure::at(CreationStep::TcpListener);
                     close_all(&fds[..count]);
-                    return Err(io::Error::other(
-                        "egress-netns: binding a TCP listener inside the namespace failed",
-                    ));
+                    return Err(failure);
                 }
                 fds[count] = fd;
                 count += 1;
@@ -480,22 +749,235 @@ mod linux {
 
             let resolver = bind_dns_socket();
             if resolver < 0 {
+                let failure = CreationFailure::at(CreationStep::Resolver);
                 close_all(&fds[..count]);
-                return Err(io::Error::other(
-                    "egress-netns: binding UDP 53 inside the namespace failed",
-                ));
+                return Err(failure);
             }
             fds[count] = resolver;
             count += 1;
 
+            // Opened after the maps are written, so both name the namespaces this child now owns.
+            for namespace in [c"/proc/self/ns/user", c"/proc/self/ns/net"] {
+                let fd = libc::open(namespace.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+                if fd < 0 {
+                    let failure = CreationFailure::at(CreationStep::NamespaceHandles);
+                    close_all(&fds[..count]);
+                    return Err(failure);
+                }
+                fds[count] = fd;
+                count += 1;
+            }
+
             let sent = send_fds(sock_fd, &fds[..count]);
+            let failure = CreationFailure::at(CreationStep::HandOff);
             close_all(&fds[..count]);
-            sent.map_err(|()| {
-                io::Error::other(
-                    "egress-netns: handing the namespace sockets to the runtime failed",
-                )
+            sent.map_err(|()| failure)
+        }
+    }
+
+    /// Enters the session's namespaces: `setns(user_fd, CLONE_NEWUSER)`, then
+    /// `setns(net_fd, CLONE_NEWNET)`. Returns the `errno` of whichever failed.
+    ///
+    /// The order is required. Joining a network namespace needs `CAP_SYS_ADMIN` in the user
+    /// namespace that owns it, which the caller holds only once it is inside that user namespace;
+    /// joining the user namespace needs the caller to be single-threaded and its euid to own the
+    /// namespace, which a command's forked child is and does.
+    ///
+    /// # Safety
+    /// Post-`fork()`, pre-exec child context only. Both descriptors must be open; the
+    /// [`SessionNetnsJoin`] they came from keeps them so.
+    pub(crate) unsafe fn join_session_netns(user_fd: RawFd, net_fd: RawFd) -> io::Result<()> {
+        // SAFETY: `setns` takes two integers and dereferences nothing; `last_os_error` reads
+        // errno and does not allocate.
+        unsafe {
+            if libc::setns(user_fd, libc::CLONE_NEWUSER) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::setns(net_fd, libc::CLONE_NEWNET) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// What the creator handed over: the namespace sockets, ready for the egress proxy, and the
+    /// two namespace handles.
+    pub(super) struct CreatedNetns {
+        sockets: Vec<OwnedFd>,
+        user_ns: OwnedFd,
+        net_ns: OwnedFd,
+    }
+
+    impl CreatedNetns {
+        /// Starts the session's egress proxy on the namespace sockets.
+        ///
+        /// On failure the sockets and the namespace handles close here, which leaves no process
+        /// and no descriptor holding the namespace.
+        pub(super) fn serve(
+            self,
+            policy: crate::egress_proxy::EgressPolicy,
+        ) -> Result<EstablishedNetns, String> {
+            let proxy = crate::egress_proxy::start_egress_proxy(self.sockets, policy)
+                .map_err(|error| format!("starting the session's egress proxy failed: {error}"))?;
+            Ok(EstablishedNetns {
+                user_ns: Arc::new(self.user_ns),
+                net_ns: Arc::new(self.net_ns),
+                proxy,
             })
         }
+    }
+
+    /// An established session namespace: the two handles commands join through, and the proxy
+    /// serving its listeners.
+    #[derive(Debug)]
+    pub(super) struct EstablishedNetns {
+        user_ns: Arc<OwnedFd>,
+        net_ns: Arc<OwnedFd>,
+        proxy: crate::egress_proxy::EgressProxyHandle,
+    }
+
+    impl EstablishedNetns {
+        pub(super) fn join(&self) -> SessionNetnsJoin {
+            SessionNetnsJoin {
+                user_ns: Arc::clone(&self.user_ns),
+                net_ns: Arc::clone(&self.net_ns),
+            }
+        }
+
+        /// Stops the proxy and drops this session's hold on the namespace handles.
+        pub(super) fn release(self) {
+            self.proxy.shutdown();
+        }
+    }
+
+    /// Forks the creator child, waits for it, and takes what it handed over.
+    ///
+    /// The creator is a child of its own rather than a command's `pre_exec` step, so no command is
+    /// special: a command that fails cannot take the session's namespace with it, and creation
+    /// never depends on what any command is.
+    pub(super) fn create_session_netns(plan: &CapsuleNetnsPlan) -> Result<CreatedNetns, String> {
+        // Checked here because the creator indexes a fixed buffer of this size and must not be the
+        // place an oversized plan is discovered.
+        if plan.socket_count() > MAX_NAMESPACE_SOCKETS {
+            return Err(format!(
+                "{} namespace sockets requested, more than the {MAX_NAMESPACE_SOCKETS} one \
+                 hand-off carries",
+                plan.socket_count()
+            ));
+        }
+
+        let mut pair = [0i32; 2];
+        // SAFETY: `pair` is a 2-element stack array, exactly the size `socketpair` writes into.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                0,
+                pair.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "socketpair() for the namespace hand-off failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: both fds were just returned by the successful `socketpair` above and nothing
+        // else owns them.
+        let (parent_end, creator_end) =
+            unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
+        let creator_fd = creator_end.as_raw_fd();
+
+        // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the child
+        // touches nothing but async-signal-safe primitives. The child runs only
+        // `create_capsule_netns` — `unshare`, `prctl`, `open`/`write`/`close`, `socket`, `ioctl`,
+        // `bind`, `listen`, `setsockopt`, `sendto`/`recv`/`sendmsg` — then `send` and `_exit`,
+        // with no allocation, no locks and no stdio.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(format!(
+                "fork() for the namespace creator failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if pid == 0 {
+            // SAFETY: forked-child context, syscalls only; both branches end in `_exit`, so no
+            // destructor of the parent's state runs here.
+            unsafe {
+                match create_capsule_netns(plan, creator_fd) {
+                    Ok(()) => libc::_exit(0),
+                    Err(failure) => {
+                        let record = failure.encode();
+                        libc::send(creator_fd, record.as_ptr().cast(), record.len(), 0);
+                        libc::_exit(1);
+                    }
+                }
+            }
+        }
+        drop(creator_end);
+
+        let status = wait_for_creator(pid)?;
+        match receive_session_netns(parent_end.as_raw_fd(), plan.socket_count())? {
+            Received::Handles(mut fds) => {
+                let net_ns = fds.pop().expect("the count was checked on receipt");
+                let user_ns = fds.pop().expect("the count was checked on receipt");
+                Ok(CreatedNetns {
+                    sockets: fds,
+                    user_ns,
+                    net_ns,
+                })
+            }
+            Received::Failure(failure) => Err(failure.to_string()),
+            Received::Nothing => Err(format!(
+                "the namespace creator exited without handing anything over ({status})"
+            )),
+        }
+    }
+
+    /// Reaps the creator. The hand-off is read only afterwards: a `SOCK_DGRAM` pair reports no
+    /// end-of-file when its peer closes, so reading first would block forever on a creator that
+    /// died before sending, while the message a creator did send stays queued after it exits.
+    fn wait_for_creator(pid: libc::pid_t) -> Result<String, String> {
+        let mut status: libc::c_int = 0;
+        loop {
+            // SAFETY: `pid` is the creator just forked; `status` is a live local.
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if waited == pid {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(format!("waiting for the namespace creator failed: {error}"));
+            }
+        }
+        Ok(if libc::WIFEXITED(status) {
+            format!("exit status {}", libc::WEXITSTATUS(status))
+        } else if libc::WIFSIGNALED(status) {
+            format!("killed by signal {}", libc::WTERMSIG(status))
+        } else {
+            format!("wait status {status}")
+        })
+    }
+
+    /// Encodes and decodes a failure record as the creator and the parent do, rendered as the
+    /// parent renders it.
+    #[cfg(test)]
+    pub(super) fn describe_failure_record(step: u32, errno: i32) -> Option<String> {
+        let mut record = [0u8; FAILURE_RECORD_LEN];
+        record[..4].copy_from_slice(&step.to_ne_bytes());
+        record[4..].copy_from_slice(&errno.to_ne_bytes());
+        CreationFailure::decode(&record).map(|failure| {
+            assert_eq!(failure.encode(), record);
+            failure.to_string()
+        })
+    }
+
+    /// The creator's one message.
+    enum Received {
+        /// `[tcp listeners…, udp53, user_ns, net_ns]`, every one `CLOEXEC`.
+        Handles(Vec<OwnedFd>),
+        Failure(CreationFailure),
+        Nothing,
     }
 
     /// Writes `setgroups=deny` and the identity `uid_map`/`gid_map`, reopening the dumpable
@@ -739,31 +1221,29 @@ mod linux {
     unsafe fn close_all(fds: &[RawFd]) {
         for fd in fds {
             if *fd >= 0 {
-                // SAFETY: each entry was returned by a successful `socket` call above.
+                // SAFETY: each entry was returned by a successful `socket` or `open` call above.
                 unsafe { libc::close(*fd) };
             }
         }
     }
 
-    /// Enough room for [`super::MAX_NAMESPACE_SOCKETS`] descriptors plus the `cmsghdr`.
+    /// Enough room for [`MAX_SESSION_NETNS_FDS`] descriptors plus the `cmsghdr`.
     const CMSG_BUFFER_LEN: usize = 128;
 
-    // Not just a comment: `send_fds`/`receive_namespace_sockets` size `msg_controllen` from
-    // `libc::CMSG_SPACE(descriptor_bytes)`, independently of `CMSG_BUFFER_LEN`, so nothing before
-    // this diff stopped a future bump of `MAX_NAMESPACE_SOCKETS` (via
-    // `egress_proxy::MAX_EGRESS_TCP_PORTS`) from silently making that computed length exceed the
-    // fixed-size `CmsgBuffer` below — the CMSG macros would then write past its end. Pinned here
-    // at compile time instead of trusted to stay true.
+    // `send_fds`/`receive_session_netns` size `msg_controllen` from
+    // `libc::CMSG_SPACE(descriptor_bytes)`, independently of `CMSG_BUFFER_LEN`, so a bump of
+    // `MAX_SESSION_NETNS_FDS` (via `egress_proxy::MAX_EGRESS_TCP_PORTS`) could otherwise make that
+    // computed length exceed the fixed-size `CmsgBuffer` below, and the CMSG macros would then
+    // write past its end. Pinned at compile time instead.
     const _: () = assert!(
         // SAFETY: `CMSG_SPACE` is pure arithmetic on its argument (see libc's definition); it is
         // marked `unsafe` only for macro-generation consistency with pointer-taking neighbours
         // like `CMSG_DATA`, not because this call touches memory.
         unsafe {
-            libc::CMSG_SPACE((super::MAX_NAMESPACE_SOCKETS * std::mem::size_of::<RawFd>()) as u32)
-                as usize
+            libc::CMSG_SPACE((MAX_SESSION_NETNS_FDS * std::mem::size_of::<RawFd>()) as u32) as usize
         } <= CMSG_BUFFER_LEN,
-        "CMSG_BUFFER_LEN is too small to hold MAX_NAMESPACE_SOCKETS descriptors plus the cmsghdr; \
-         raise it to match"
+        "CMSG_BUFFER_LEN is too small to hold MAX_SESSION_NETNS_FDS descriptors plus the \
+         cmsghdr; raise it to match"
     );
 
     /// A `cmsghdr` buffer with the alignment the CMSG macros require.
@@ -774,7 +1254,8 @@ mod linux {
     #[repr(C, align(8))]
     struct CmsgBuffer([u8; CMSG_BUFFER_LEN]);
 
-    /// Sends every namespace socket to the parent in one `SCM_RIGHTS` message.
+    /// Sends every namespace socket and both namespace handles to the parent in one
+    /// `SCM_RIGHTS` message.
     ///
     /// One message rather than one per fd, so the parent's receive is a single unambiguous read:
     /// a partial hand-off would leave the proxy serving the endpoint but not the resolver, which
@@ -821,20 +1302,18 @@ mod linux {
         }
     }
 
-    /// Parent-side counterpart of [`send_fds`]: receives the namespace's listening sockets.
+    /// Parent-side counterpart of [`send_fds`]: takes the creator's one message off the queue.
     ///
-    /// Returns them in the order the child sent: one TCP listener per allowlisted port, then the
-    /// resolver socket. A count that does not match the plan is an error rather than a
-    /// best-effort start, because a proxy missing one of its sockets is a capsule whose network
-    /// half-works in a way nothing downstream would report.
-    pub(crate) fn receive_namespace_sockets(
-        sock_fd: RawFd,
-        expected: usize,
-    ) -> io::Result<Vec<OwnedFd>> {
-        // SAFETY: `sock_fd` is a valid connected unix socket; all buffers are live locals sized
-        // for the largest message the child can send, and the control buffer is 8-byte aligned.
+    /// Non-blocking, because the creator has already been reaped by the time this runs: whatever
+    /// it sent is queued, and an empty queue means it sent nothing. A descriptor count other than
+    /// `expected_sockets + 2` is an error rather than a best-effort start, because a proxy missing
+    /// one of its sockets is a capsule whose network half-works in a way nothing downstream would
+    /// report.
+    fn receive_session_netns(sock_fd: RawFd, expected_sockets: usize) -> Result<Received, String> {
+        // SAFETY: `sock_fd` is a valid unix socket; all buffers are live locals sized for the
+        // largest message the creator can send, and the control buffer is 8-byte aligned.
         unsafe {
-            let mut payload = [0u8; 1];
+            let mut payload = [0u8; FAILURE_RECORD_LEN];
             let mut iov = libc::iovec {
                 iov_base: payload.as_mut_ptr().cast(),
                 iov_len: payload.len(),
@@ -846,36 +1325,55 @@ mod linux {
             msg.msg_control = control.0.as_mut_ptr().cast();
             msg.msg_controllen = control.0.len() as _;
 
-            if libc::recvmsg(sock_fd, &mut msg, libc::MSG_CMSG_CLOEXEC) < 0 {
-                return Err(io::Error::last_os_error());
+            let received = libc::recvmsg(
+                sock_fd,
+                &mut msg,
+                libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+            );
+            if received < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(Received::Nothing);
+                }
+                return Err(format!("receiving the namespace hand-off failed: {error}"));
             }
+
             let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            if cmsg.is_null()
-                || (*cmsg).cmsg_level != libc::SOL_SOCKET
-                || (*cmsg).cmsg_type != libc::SCM_RIGHTS
-            {
-                return Err(io::Error::other(
-                    "egress-netns: the namespace sockets did not arrive as an SCM_RIGHTS message",
-                ));
+            if cmsg.is_null() {
+                if received as usize == FAILURE_RECORD_LEN {
+                    if let Some(failure) = CreationFailure::decode(&payload) {
+                        return Ok(Received::Failure(failure));
+                    }
+                }
+                return Ok(Received::Nothing);
+            }
+            if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
+                return Err(
+                    "the namespace hand-off did not arrive as an SCM_RIGHTS message".to_string(),
+                );
             }
             let bytes = (*cmsg).cmsg_len - libc::CMSG_LEN(0) as usize;
-            let received = bytes / std::mem::size_of::<RawFd>();
+            let count = bytes / std::mem::size_of::<RawFd>();
             let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
-            // Wrapped in `OwnedFd` before the count is checked, so a mismatched message closes
-            // its descriptors on the error path instead of leaking them.
-            let mut sockets = Vec::with_capacity(received);
-            for index in 0..received {
-                sockets.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(
+            // Wrapped in `OwnedFd` before anything is checked, so a mismatched or truncated
+            // message closes its descriptors on the error path instead of leaking them.
+            let mut fds = Vec::with_capacity(count);
+            for index in 0..count {
+                fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(
                     data.add(index),
                 )));
             }
-            if received != expected {
-                return Err(io::Error::other(
-                    "egress-netns: the runtime received a different number of namespace sockets \
-                     than the launch plan asked for",
+            if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+                return Err("the namespace hand-off was truncated".to_string());
+            }
+            if count != expected_sockets + 2 {
+                return Err(format!(
+                    "the namespace creator handed over {count} descriptors; {} were expected \
+                     ({expected_sockets} sockets and 2 namespace handles)",
+                    expected_sockets + 2
                 ));
             }
-            Ok(sockets)
+            Ok(Received::Handles(fds))
         }
     }
 }
@@ -1054,5 +1552,89 @@ mod tests {
             gid: 1000,
         };
         assert!(plan.socket_count() <= MAX_NAMESPACE_SOCKETS);
+        // The two namespace handles ride in the same message.
+        assert_eq!(MAX_SESSION_NETNS_FDS, MAX_NAMESPACE_SOCKETS + 2);
+    }
+
+    // ---- the session's namespace ---------------------------------------------------------
+
+    /// An ended session is never given a namespace, including one that never created one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_ended_session_refuses_to_create_a_namespace() {
+        let netns = SessionNetns::new();
+        netns.end();
+        let refusal = netns
+            .establish(
+                &[],
+                crate::egress_proxy::EgressPolicy::new(Vec::new(), Vec::new()),
+            )
+            .expect_err("an ended session creates nothing");
+        assert!(refusal.contains("session has ended"), "{refusal}");
+        assert_eq!(netns.creations(), 0);
+    }
+
+    /// One creation serves every later call, and the namespace it made is the one each call
+    /// is handed; ending it is final and repeatable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_session_creates_its_namespace_once_and_ends_it_for_good() {
+        if skip_without_egress_namespace(
+            "a_session_creates_its_namespace_once_and_ends_it_for_good",
+        ) {
+            return;
+        }
+        let policy = || crate::egress_proxy::EgressPolicy::new(Vec::new(), Vec::new());
+        let netns = SessionNetns::new();
+        assert_eq!(
+            netns.creations(),
+            0,
+            "nothing is created before it is needed"
+        );
+
+        let first = netns
+            .establish(&[], policy())
+            .expect("the namespace is created");
+        let second = netns
+            .establish(&[], policy())
+            .expect("the namespace is reused");
+        assert_eq!(netns.creations(), 1);
+        let inode = |fd: std::os::fd::RawFd| {
+            std::fs::metadata(format!("/proc/self/fd/{fd}"))
+                .map(|metadata| std::os::unix::fs::MetadataExt::ino(&metadata))
+                .unwrap()
+        };
+        assert_eq!(inode(first.raw_fds().1), inode(second.raw_fds().1));
+        let host_netns = std::fs::metadata("/proc/self/ns/net")
+            .map(|metadata| std::os::unix::fs::MetadataExt::ino(&metadata))
+            .unwrap();
+        assert_ne!(
+            inode(first.raw_fds().1),
+            host_netns,
+            "the session's namespace is not the runtime's own"
+        );
+
+        netns.end();
+        netns.end();
+        assert!(netns.establish(&[], policy()).is_err());
+        assert_eq!(
+            netns.creations(),
+            1,
+            "an ended namespace is never recreated"
+        );
+    }
+
+    /// The creator's failure record survives the round trip, so the parent names the step and
+    /// the errno rather than a bare exit status.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_creation_failure_names_its_step_and_errno() {
+        let text = linux::describe_failure_record(4, libc::EPERM).expect("a known step decodes");
+        assert!(
+            text.starts_with("installing the local default route failed:"),
+            "{text}"
+        );
+        assert!(text.contains("Operation not permitted"), "{text}");
+        assert_eq!(linux::describe_failure_record(99, 0), None);
     }
 }

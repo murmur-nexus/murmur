@@ -9,10 +9,9 @@ use serde_json::Value;
 
 /// One line per thing the cancel found in flight, in the order the capsule listed them.
 ///
-/// A detached shell command keeps its own lifecycle, so it is printed `running:`: whoever
-/// cancelled or stopped now knows what is still out there under no capsule's supervision. A
-/// delegation is printed `ended:`, because the cancelled task that started it ends its child once
-/// the residue has named it.
+/// A detached shell command is printed `running:`: a cancel leaves it running until its session
+/// ends, and a stop names it before the session's end kills it. A delegation is printed `ended:`,
+/// because the cancelled task that started it ends its child once the residue has named it.
 ///
 /// A part is either the residue item itself — the shape `murmur.StopSession` returns — or an A2A
 /// data part holding it, which is how `CancelTask` carries it. Both spellings describe the same

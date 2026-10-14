@@ -80,11 +80,24 @@ permitted/effective/inheritable sets, and sets `no_new_privs` before `execve`, s
 `mur run` does not hand the subprocess `CAP_MKNOD` (or `CAP_DAC_OVERRIDE`, or anything else) in the
 first place.
 
-Filesystem *and exec* scoping both use Landlock; network scoping uses the capsule's own network
+Filesystem *and exec* scoping both use Landlock; network scoping uses the session's network
 namespace plus an egress proxy; socket-family denial uses seccomp argument matching. Underneath all
 of them, the seccomp filter's default action is itself a deny — see
 [Default-deny syscall allowlist](#default-deny-syscall-allowlist) — so a syscall named by none of
 the mechanisms above is refused outright rather than falling through to an implicit allow.
+
+**One network namespace per session.** Every shell call and every `capabilities.shell.allow`
+binary a session runs shares that session's one network namespace:
+
+- `lo` is its only interface, and the egress proxy is its only way off the host.
+- A server one shell call starts on `127.0.0.1` answers the session's later calls, whether it was
+  backgrounded with `&` or demoted after
+  [`lifecycle.shell_grace_secs`](manifest.md#field-lifecycle).
+- Nothing outside the session reaches it: not the host, not a second `mur run` of the same capsule,
+  not a delegated child or another formation member, each of which has a namespace of its own.
+- A plan's shell steps run in the namespace of the session that submitted the plan.
+- When the session ends, every process it started is killed, backgrounded servers included, and
+  the namespace goes with them.
 
 Environment-only enforcement still gives you a synthetic `HOME` and strips credential-shaped
 environment variables before the subprocess spawns (see
@@ -551,6 +564,17 @@ that is bypassed, not the daemon.
   dual-stack name's real `AAAA` records are returned unchanged. A client that tries IPv6 first pays
   a fallback-to-IPv4 delay but is granted nothing. A capsule whose allowlisted host is IPv6-only
   cannot reach it.
+- **The proxy's ports are held for the whole session.** Each listener the allowlist implies sits
+  on `0.0.0.0:<port>` in the session's namespace from its first shell call to its end, so a server
+  a capsule starts on one of those ports — `443` under an `https://` allowlist entry, for example —
+  fails with `EADDRINUSE`. Pick a port no allow entry names.
+- **A loopback server is reachable from its own session only.** Later shell calls of the same
+  session reach it; the host, other sessions, delegated children and formation members get
+  `Connection refused`.
+- **A runtime killed with `SIGKILL` cannot end its session.** Its processes keep running inside the
+  namespace. The egress proxy died with the runtime, so they have no route off the host, but they
+  are not killed: find them with `pgrep` and end them by hand. Every other way a session ends,
+  including `SIGTERM`, kills them.
 - **The address→name binding has a lifetime.** A connection is matched to a name through the
   answer the runtime's own resolver gave. The binding lasts five minutes, longer than the
   60-second TTL the resolver puts on its answers. A client that caches an address far past its TTL

@@ -74,9 +74,9 @@ struct StoppedSession {
 /// End one running capsule: ask its door, then signal, then escalate, then remove its record.
 ///
 /// The order is the point. `murmur.StopSession` goes first because it is the only moment anything
-/// can ask the capsule what it leaves running — a detached shell command keeps its own lifecycle
-/// and a delegated child is still going, and the registries that know about either die with the
-/// process. Reaching for `kill` first would throw that account away.
+/// can ask the capsule what it was running — a detached shell command, which the session's end
+/// then kills, or a delegated child still going — and the registries that know about either die
+/// with the process. Reaching for `kill` first would throw that account away.
 ///
 /// A door that does not answer stops nothing: the two signalling steps still run, and the missing
 /// account is reported as missing. The session was ended either way; only the accounting is

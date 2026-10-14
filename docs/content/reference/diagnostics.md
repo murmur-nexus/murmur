@@ -2865,12 +2865,12 @@ Once per launch, on stderr and in the session's `logs/bootstrap.log`.
 [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs) is demoted: the turn gets a
 `wrk_` handle, and the exit code and output path arrive afterwards as a `completion`-origin task in
 the `bg` lane. Under the default lifecycle the session ends with the task that started the command,
-so the command keeps running with nothing reading its result. The compute is spent and the agent
-never learns the answer.
+and the session's end kills the command along with every other process the session started. The
+compute is spent and the agent never learns the answer.
 
-**What the runtime does about it:** nothing is refused and no exit code changes. The command still
-runs and still writes its output; only the completion has nowhere to land. At session end the
-discard is stated to the operator — see
+**What the runtime does about it:** nothing is refused and no exit code changes. The command runs
+until it finishes or the session ends, whichever comes first, and the completion has nowhere to
+land. At session end the kill is stated to the operator — see
 [When a session ends with a command still running](manifest.md#lifecycle-shell-grace-secs).
 
 **What to do:** declare a lifecycle that outlives the task which started the command.
@@ -2884,9 +2884,10 @@ lifecycle:
 
 The warning does not read `lifecycle.shell_grace_secs`, and no value of it silences the warning:
 `0` demotes on the first check after the spawn, so a low grace makes the discard more likely rather
-than less. A capsule that fires a command and deliberately does not wait — one that starts work and
-exits — is a legitimate shape, which is why this is a warning and not a refusal; silence it by not
-declaring `capabilities.shell.allow` on a capsule that runs no commands.
+than less. A capsule whose commands all finish inside the grace period never demotes one, which is
+why this is a warning and not a refusal. Work meant to outlive the task cannot be started and left
+behind: the session's end kills it. Silence the warning by not declaring
+`capabilities.shell.allow` on a capsule that runs no commands.
 
 
 ### W-SEC-023 — the session is not addressable { #w-sec-023 }

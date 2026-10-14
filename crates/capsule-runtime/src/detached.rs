@@ -298,9 +298,9 @@ impl DetachPolicy {
 /// written output log that no task will ever carry back.
 #[derive(Debug, Clone)]
 pub(crate) enum AbandonedDisposition {
-    /// Running when the session ended. No exit code exists, and no `logs/<work_id>.log` will be
-    /// written: [`crate::shell`] writes that file from the command's own runtime thread after
-    /// `child.wait()` returns, and that thread ends with the process.
+    /// Running when the session ended, and killed with it. No exit code reaches any task.
+    /// `logs/<work_id>.log` is written only if the command's own runtime thread reaps it and
+    /// writes the file before the process exits, so the report neither promises nor denies it.
     StillRunning {
         /// From spawn to the sweep, foreground portion included.
         running_ms: u64,
@@ -379,7 +379,8 @@ pub(crate) fn abandonment_report_text(session_id: &str, abandoned: &[AbandonedWo
     let mut text = format!(
         "[capsule-runtime] {count} background shell {plural} discarded at session end.\n\n\
          Session {session_id} ended while {count} demoted shell {plural} {} unaccounted for. \
-         Nothing was waited for and nothing was killed; what is known about each is below.\n",
+         Every process the session started was killed when it ended; what is known about each \
+         command is below.\n",
         if count == 1 { "was" } else { "were" }
     );
     for work in abandoned {
@@ -390,9 +391,10 @@ pub(crate) fn abandonment_report_text(session_id: &str, abandoned: &[AbandonedWo
         match &work.disposition {
             AbandonedDisposition::StillRunning { running_ms } => {
                 text.push_str(&format!(
-                    "state: still running after {running_ms} ms\n\
-                     result: none — no exit code, and no {} will be written, because the thread \
-                     that writes it ended with this session.\n",
+                    "state: killed at session end after {running_ms} ms\n\
+                     result: none — it was killed before it finished, so no task carries an exit \
+                     code. Whatever it wrote reaches {} only if the runtime wrote that file \
+                     before it exited.\n",
                     output_path_for(&work.work_id)
                 ));
             }
@@ -425,9 +427,10 @@ pub(crate) fn abandonment_report_text(session_id: &str, abandoned: &[AbandonedWo
         }
     }
     text.push_str(
-        "\nA command still running keeps running, detached from this session, with nothing \
-         reading its output. Declare lifecycle.task_acceptance: queue with lifecycle.after_task: \
-         sleep for a session that outlives its task and can be told the result instead.",
+        "\nA session's end kills every command it demoted and every process its shell calls \
+         started in the background. Declare lifecycle.task_acceptance: queue with \
+         lifecycle.after_task: sleep for a session that outlives its task and can be told the \
+         result instead.",
     );
     text
 }
@@ -936,12 +939,12 @@ mod tests {
         }
     }
 
-    /// A command still running is reported with the four things that are known about it, and is
-    /// told plainly that its output file will never exist — the runtime thread that writes it dies
-    /// with the process, so a report promising the file would send an operator looking for
-    /// something that never appears.
+    /// A command still running is reported with the four things that are known about it and as
+    /// killed, which the session's end did to it. Whether its output file exists depends on
+    /// whether the runtime wrote it before exiting, so the report names the file without
+    /// promising it.
     #[test]
-    fn a_still_running_command_is_reported_with_what_is_known_and_promises_no_file() {
+    fn a_still_running_command_is_reported_as_killed_with_what_is_known() {
         let text = abandonment_report_text("ses_abc", &[still_running("wrk_0a1b", 45_012)]);
 
         assert!(
@@ -953,14 +956,26 @@ mod tests {
         assert!(text.contains("binary: /usr/bin/bash"), "{text}");
         assert!(text.contains("command: sleep 45; echo done"), "{text}");
         assert!(
-            text.contains("state: still running after 45012 ms"),
+            text.contains("state: killed at session end after 45012 ms"),
             "{text}"
         );
+        assert!(text.contains("reaches logs/wrk_0a1b.log only if"), "{text}");
         assert!(
-            text.contains("no logs/wrk_0a1b.log will be written"),
-            "{text}"
+            !text.contains("will be written"),
+            "the file is neither promised nor denied: {text}"
         );
         assert!(!text.contains("exit_code:"), "no exit code exists: {text}");
+        for retired in [
+            "nothing was killed",
+            "Nothing was waited for",
+            "keeps running",
+        ] {
+            assert!(
+                !text.contains(retired),
+                "the session's end kills what it started, so the report must not say {retired:?}: \
+                 {text}"
+            );
+        }
     }
 
     /// The `FinishedTooLate` arm names the exit code, the status, the duration and the real
@@ -980,7 +995,7 @@ mod tests {
             text.contains("output: logs/wrk_0c2d.log (91 bytes, in the capsule workdir)"),
             "{text}"
         );
-        assert!(!text.contains("still running after"), "{text}");
+        assert!(!text.contains("killed at session end"), "{text}");
     }
 
     /// One block for the session, then one entry per command: a session that discarded several

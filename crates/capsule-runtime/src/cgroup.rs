@@ -579,9 +579,6 @@ pub fn requires_process_bounding(
 
 impl CgroupScope {
     /// Absolute path of this scope's directory.
-    // The scope's own path is read only by this module's tests, which assert the limit files
-    // systemd wrote under it; the launch path carries the descriptors it needs instead.
-    #[allow(dead_code)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -658,19 +655,147 @@ impl CgroupScope {
     }
 }
 
-impl Drop for CgroupScope {
-    /// Best-effort `rmdir` of the scope directory.
+impl CgroupScope {
+    /// Kill every process in this scope, whatever session or process group it put itself in.
     ///
-    /// A cgroup directory can only be removed once empty, so a lingering grandchild the runtime
-    /// never reaped keeps it alive. That is logged and moved past rather than retried in a loop:
-    /// blocking session teardown on a process the runtime does not control would turn a leaked
-    /// directory into a hung exit.
+    /// Writes `1` to `cgroup.kill` (Linux 5.14+), which `SIGKILL`s the whole scope in one kernel
+    /// operation that races no fork. Where that file does not exist, falls back to freezing the
+    /// scope, `SIGKILL`ing every pid `cgroup.procs` lists and thawing it, repeated until the scope
+    /// is empty or [`KILL_FALLBACK_DEADLINE`] has passed. Returns as soon as the signals are sent;
+    /// [`Self::wait_until_empty`] waits for the processes to be gone.
+    ///
+    /// The scope is a child of the delegated base, never the runtime's own cgroup, so the runtime
+    /// is never in what this kills.
+    pub(crate) fn kill_all(&self) -> std::io::Result<()> {
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            #[cfg(test)]
+            let forced = FORCE_KILL_FALLBACK.with(std::cell::Cell::get);
+            #[cfg(not(test))]
+            let forced = false;
+            if !forced {
+                match write_existing(&self.path.join("cgroup.kill"), "1") {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    written => return written,
+                }
+            }
+            self.kill_by_freezing()
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok(())
+    }
+
+    /// Whether `cgroup.procs` lists no process, polled until it does or `timeout` passes.
+    ///
+    /// An exited process leaves `cgroup.procs` when it exits, not when its parent reaps it, so
+    /// a killed command the runtime has not yet waited for does not hold this up.
+    pub(crate) fn wait_until_empty(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.member_pids().is_empty() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(KILL_POLL_INTERVAL);
+        }
+    }
+
+    /// Every pid `cgroup.procs` lists now. Empty when the file cannot be read, which is a scope
+    /// whose directory is already gone.
+    pub(crate) fn member_pids(&self) -> Vec<i32> {
+        if self.path.as_os_str().is_empty() {
+            return Vec::new();
+        }
+        std::fs::read_to_string(self.path.join("cgroup.procs"))
+            .map(|procs| {
+                procs
+                    .lines()
+                    .filter_map(|line| line.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `cgroup.kill` for a kernel that has none: freeze, `SIGKILL` each listed pid, thaw.
+    ///
+    /// Freezing first stops a listed process from forking a child the loop has not seen, and
+    /// keeps a pid from being reused between reading it and signalling it. A frozen task still
+    /// takes `SIGKILL`; it dies once thawed.
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    fn kill_by_freezing(&self) -> std::io::Result<()> {
+        let freeze = self.path.join("cgroup.freeze");
+        let deadline = std::time::Instant::now() + KILL_FALLBACK_DEADLINE;
+        loop {
+            let pids = self.member_pids();
+            if pids.is_empty() {
+                return Ok(());
+            }
+            // Best-effort: a kernel without the freezer still gets every listed pid killed.
+            let _ = write_existing(&freeze, "1");
+            for pid in pids {
+                // SAFETY: `kill` takes two integers and dereferences nothing.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            let _ = write_existing(&freeze, "0");
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::other(format!(
+                    "processes were still in {} after {} ms of SIGKILL",
+                    self.path.display(),
+                    KILL_FALLBACK_DEADLINE.as_millis()
+                )));
+            }
+            std::thread::sleep(KILL_POLL_INTERVAL);
+        }
+    }
+}
+
+/// How long [`CgroupScope::kill_all`]'s fallback keeps signalling a scope that is not yet empty.
+const KILL_FALLBACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often a kill or an emptiness wait re-reads `cgroup.procs`.
+const KILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Writes `value` to a control file that must already exist, so an absent file reads as
+/// `NotFound` rather than as a refused create.
+#[cfg(target_os = "linux")]
+fn write_existing(path: &Path, value: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    (&file).write_all(value.as_bytes())
+}
+
+// Forces `CgroupScope::kill_all` onto its freeze-and-signal fallback, as on a kernel with no
+// `cgroup.kill`. Read on the calling thread, so it reaches a `kill_all` the test calls itself.
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    pub(crate) static FORCE_KILL_FALLBACK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+impl Drop for CgroupScope {
+    /// Kills whatever is still in the scope, then removes the scope directory, best-effort.
+    ///
+    /// The backstop for a session that never reached `ShellEnforcement::end_session`, which has
+    /// already killed the scope on every ordinary path. A cgroup directory can only be removed
+    /// once empty, so the removal waits, bounded, for the kill to land; a scope still occupied
+    /// after that is logged and moved past rather than retried, because blocking teardown on a
+    /// process that will not die would turn a leaked directory into a hung exit.
     fn drop(&mut self) {
-        // Drop the descriptor before the rmdir so nothing holds the directory open.
-        self.procs_fd = None;
         if self.path.as_os_str().is_empty() {
             return;
         }
+        if !self.member_pids().is_empty() {
+            let _ = self.kill_all();
+            self.wait_until_empty(KILL_FALLBACK_DEADLINE);
+        }
+        // Drop the descriptor before the rmdir so nothing holds the directory open.
+        self.procs_fd = None;
         if let Err(error) = std::fs::remove_dir(&self.path) {
             crate::runtime_err!(
                 "[capsule-runtime] note: could not remove cgroup scope {} ({error}); \
@@ -1961,6 +2086,70 @@ mod tests {
             assert_eq!(io_max.reason, None);
             assert_eq!(io_max_warning(&io_max), None);
         }
+    }
+
+    /// On a kernel with no `cgroup.kill`, killing a scope freezes it, signals every member and
+    /// thaws it until it is empty — reaching a `setsid` process and a grandchild as surely as the
+    /// one-write kill does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn killing_a_scope_without_cgroup_kill_empties_it() {
+        if skip_without_host_support("killing_a_scope_without_cgroup_kill_empties_it") {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let scope = prepare_scope(
+            true,
+            &HostResourceLimits::default(),
+            "ses_kill_fallback",
+            temp.path(),
+        )
+        .expect("a delegated scope")
+        .scope
+        .expect("a required scope on Linux is never None");
+        let enforcement = crate::sandbox::ShellEnforcement {
+            cgroup_scope: Some(Arc::clone(&scope)),
+            ..crate::sandbox::ShellEnforcement::environment_only()
+        };
+        let mut command = std::process::Command::new("bash");
+        command
+            .args([
+                "-c",
+                "setsid sleep 300 >/dev/null 2>&1 & sleep 300 >/dev/null 2>&1 & wait",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::sandbox::attach_process_limits(&mut command, &enforcement);
+        let mut child = command.spawn().expect("bash spawns into the scope");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while scope.member_pids().len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scope never held bash and both sleepers: {:?}",
+                scope.member_pids()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let members = scope.member_pids();
+
+        FORCE_KILL_FALLBACK.with(|flag| flag.set(true));
+        let killed = scope.kill_all();
+        FORCE_KILL_FALLBACK.with(|flag| flag.set(false));
+        let emptied = scope.wait_until_empty(std::time::Duration::from_secs(2));
+        let status = child.wait().expect("bash is reaped");
+        println!(
+            "members before: {members:?}; fallback kill: {killed:?}; empty: {emptied}; \
+             cgroup.procs after: {:?}; bash: {status}",
+            scope.member_pids()
+        );
+        killed.expect("the fallback kill succeeds");
+        assert!(emptied, "the scope still holds {:?}", scope.member_pids());
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL)
+        );
     }
 
     /// Swap is bounded at zero whatever the manifest declares, beside a `memory.max` that is the

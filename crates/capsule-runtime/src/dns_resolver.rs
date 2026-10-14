@@ -187,8 +187,8 @@ impl DnsResolver {
     /// [`Self::lookup`] for a caller that is not itself async.
     ///
     /// Dispatches onto the resolver runtime and waits for the result rather than driving a runtime
-    /// on the calling thread: `sandbox::start_namespace_proxy` runs on a plain `std::thread` with
-    /// no ambient runtime, while the staging path that resolves `capabilities.network.allow` may
+    /// on the calling thread: the egress proxy's resolver runs on a plain `std::thread` with no
+    /// ambient runtime, while the staging path that resolves `capabilities.network.allow` may
     /// well be inside one, and starting a runtime from within a runtime panics. The wait is
     /// bounded by [`LOOKUP_DEADLINE`] because the task it waits on is. An async caller must use
     /// [`Self::lookup`]: blocking a resolver worker thread from inside it would deadlock.
