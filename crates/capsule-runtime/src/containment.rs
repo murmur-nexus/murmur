@@ -467,6 +467,13 @@ pub struct ScopeReport {
     pub shortfall_reason: Option<String>,
     /// The probed host tier, as a stable wire name.
     pub enforcement_tier: &'static str,
+    /// What [`Self::enforcement_tier`] confines, as stable wire names: always `shell`,
+    /// `plan-shell-steps` and `native-tools`, since all three are spawned through one enforcement
+    /// path.
+    ///
+    /// Always serialized, on the same terms as [`Self::workdir_exec`]: a consumer keys on its
+    /// presence, and a report without it comes from a runtime that does not confine native tools.
+    pub mechanism_covers: Vec<&'static str>,
     /// Where this host's permission to create an unprivileged user namespace comes from, as
     /// [`UsernsGrant::wire_name`], or `null` off Linux, where AppArmor does not exist and the
     /// question has no answer.
@@ -692,6 +699,10 @@ impl ScopeReport {
             out.push_str(&format!("  reason:    {reason}\n"));
         }
         out.push_str(&format!("  mechanism: {}\n", self.enforcement_tier));
+        out.push_str(&format!(
+            "  covers:    {}\n",
+            render_mechanism_covers(&self.mechanism_covers)
+        ));
         out.push_str(&format!(
             "  userns grant: {}\n",
             match self.userns_grant {
@@ -977,6 +988,7 @@ pub(crate) fn scope_report_for_tier(
         floor_met: shortfall_reason.is_none(),
         shortfall_reason,
         enforcement_tier: enforcement_tier_name(tier),
+        mechanism_covers: MECHANISM_COVERS.to_vec(),
         userns_grant,
         landlock_abi: crate::sandbox::ruleset_landlock_abi(landlock_kernel_abi, applied),
         // Copied straight through and never consulted above: `achieved` is already computed, and
@@ -1051,6 +1063,33 @@ pub(crate) fn scope_report_for_tier(
         // same object, and a field either of them worded for itself would make them differ.
         filesystem_boundary: filesystem_boundary(applied),
     }
+}
+
+/// The subprocess routes the session's enforcement tier confines, as
+/// [`ScopeReport::mechanism_covers`] reports them.
+pub(crate) const MECHANISM_COVERS: &[&str] = &["shell", "plan-shell-steps", "native-tools"];
+
+/// One [`MECHANISM_COVERS`] wire name as `--explain-scope` prints it.
+fn render_mechanism_covers(covers: &[&str]) -> String {
+    covers
+        .iter()
+        .map(|cover| match *cover {
+            "shell" => "shell commands",
+            "plan-shell-steps" => "plan shell steps",
+            "native-tools" => "native tools",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The wire name of the tier a native tool of a capsule declaring `declared` runs under on this
+/// host: the probed tier capped by the declared floor, which is what
+/// `ShellEnforcement::resolve` installs for every subprocess. Spelled as
+/// [`ScopeReport::enforcement_tier`] spells a tier.
+pub fn applied_mechanism(declared: ContainmentClass) -> &'static str {
+    let probe = crate::sandbox::HostProbe::probe();
+    enforcement_tier_name(crate::sandbox::applied_tier(probe.tier(), declared))
 }
 
 /// Stable wire name for a tier, so `--explain-scope --json` consumers see the mechanism rather
@@ -2802,6 +2841,38 @@ mod tests {
             Vec::new(),
             IoMaxReport::default(),
         )
+    }
+
+    /// Every tier names the same three subprocess routes it confines, on the line under
+    /// `mechanism:` and as an always-serialized JSON array a consumer can key on.
+    #[test]
+    fn the_mechanism_names_every_subprocess_route_it_covers() {
+        for tier in [
+            EnforcementTier::KernelSealed,
+            EnforcementTier::KernelFull,
+            EnforcementTier::KernelSeccompOnly,
+            EnforcementTier::EnvironmentOnly,
+        ] {
+            let report = boundary_report(ContainmentClass::Advisory, tier);
+            assert_eq!(
+                report.mechanism_covers,
+                vec!["shell", "plan-shell-steps", "native-tools"]
+            );
+
+            let rendered = report.render();
+            let mechanism = format!("  mechanism: {}\n", report.enforcement_tier);
+            let covers = "  covers:    shell commands, plan shell steps, native tools\n";
+            assert!(
+                rendered.contains(&format!("{mechanism}{covers}")),
+                "covers: must follow mechanism: directly:\n{rendered}"
+            );
+
+            let json = serde_json::to_string(&report).unwrap();
+            assert!(
+                json.contains(r#""mechanism_covers":["shell","plan-shell-steps","native-tools"]"#),
+                "{json}"
+            );
+        }
     }
 
     /// A host that mediates nothing says so, in the block an operator reads before the grants.

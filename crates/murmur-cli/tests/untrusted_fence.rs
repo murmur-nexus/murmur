@@ -346,6 +346,11 @@ fn hostile_tool_output_cannot_close_the_fence_early() {
 /// function, so the markers are byte-identical and only the source name differs.
 #[test]
 fn wasm_and_native_tool_results_carry_the_same_fence() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "wasm_and_native_tool_results_carry_the_same_fence",
+    ) {
+        return;
+    }
     let Some(native_binary) = common::fixture_native_tool_binary() else {
         eprintln!(
             "[SKIP] wasm_and_native_tool_results_carry_the_same_fence: no native fixture binary"

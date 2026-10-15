@@ -312,8 +312,9 @@ fn native_tool_dispatch_executes_binary_and_returns_result() {
     );
     common::publish_local(&home, &driver_artifact).success();
 
-    // Script creates a marker file so we can assert it actually ran.
-    let native_script = "#!/bin/sh\nmkdir -p native-ran\ntouch native-ran/marker.txt\necho '{\"status\":\"passed\",\"summary\":\"native ran ok\",\"data\":\"{}\",\"data_path\":null,\"truncated\":false,\"metadata\":[]}'\n";
+    // Script creates a marker file so we can assert it actually ran. Shell builtins only: a native
+    // tool runs in the capsule's sandbox, where `mkdir` or `touch` would need `shell.allow`.
+    let native_script = "#!/bin/sh\n: > native-ran-marker.txt\necho '{\"status\":\"passed\",\"summary\":\"native ran ok\",\"data\":\"{}\",\"data_path\":null,\"truncated\":false,\"metadata\":[]}'\n";
     let native_artifact = common::create_native_artifact(
         artifact_dir.path(),
         "test-native",
@@ -339,11 +340,7 @@ fn native_tool_dispatch_executes_binary_and_returns_result() {
     let launched = launch_session(staged, |_| {}).expect("launch should succeed");
 
     assert!(
-        launched
-            .workdir
-            .join("native-ran")
-            .join("marker.txt")
-            .exists(),
+        launched.workdir.join("native-ran-marker.txt").exists(),
         "native tool should have created the marker file"
     );
     assert!(

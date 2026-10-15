@@ -3,18 +3,19 @@ use std::path::Path;
 
 use capsule_runtime::murmur_home::{audit_murmur_home, wide_entry_warning, HomeEntryState};
 use capsule_runtime::{
-    caller_overflow_fix, caller_overflow_warning, capability_policy_from_runtime_manifest,
-    check_egress_namespace, check_interpreted_entrypoints_reachable, check_roost_health,
-    check_staged_runtime_floor, detect_egress_namespace_blocker, detect_landlock_abi,
-    detect_userns_grant, find_on_path, inspect_installed_profile, inspect_profile_attachment,
-    landlock_doctor_lines, preopen_reports, read_only_advisory_for, render_install,
-    render_read_only, served_wit_level, undeclarable_runtime_pin_role,
-    warn_on_gateway_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
-    warn_on_launch_only_gateway_credential, warn_on_secret_shaped_env_grants,
-    warn_on_unmetered_gateways, warn_on_unreachable_toolchain_helpers,
-    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, wit_levels,
-    ArtifactRequest, InstalledProfileState, ProfileAttachment, UsernsGrant,
-    SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
+    applied_mechanism, caller_overflow_fix, caller_overflow_warning,
+    capability_policy_from_runtime_manifest, check_egress_namespace,
+    check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
+    detect_egress_namespace_blocker, detect_landlock_abi, detect_userns_grant, find_on_path,
+    inspect_installed_profile, inspect_profile_attachment, landlock_doctor_lines, preopen_reports,
+    read_only_advisory_for, render_install, render_read_only, served_wit_level,
+    undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
+    warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
+    warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
+    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
+    warn_on_workdir_exec, wit_levels, ArtifactRequest, EgressNamespaceBlocker,
+    InstalledProfileState, ProfileAttachment, UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS,
+    SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, level_fit, native_binary_verdict,
@@ -104,6 +105,42 @@ fn check_artifact_platform(
             binary_platform: binary_platform.to_string(),
         },
     }
+}
+
+/// The `Native tools` block: each native tool the checklist identified, and the mechanism it runs
+/// under on this host. `mechanism` is the wire name `--explain-scope` spells a tier with, for the
+/// tier this capsule's declared floor installs here; `none` is a host with no kernel sandbox.
+fn render_native_tools(native_tools: &[String], mechanism: &str) -> String {
+    let mut out = String::from("Native tools\n");
+    for tool in native_tools {
+        if mechanism == "none" {
+            out.push_str(&format!(
+                "  - {tool}: runs with no kernel confinement on this host (rlimits only) \u{2014} a \
+                 per-artifact capabilities: block does not narrow it\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "  - {tool}: runs under {mechanism} with this capsule's capabilities.filesystem, \
+                 capabilities.network.allow and capabilities.shell.allow \u{2014} a per-artifact \
+                 capabilities: block does not narrow it\n"
+            ));
+        }
+    }
+    out
+}
+
+/// The `E-CAP-005` warning for a capsule that can spawn a native subprocess on a host that cannot
+/// give it a network namespace, or `None` when `mur run` would not refuse it for that.
+fn egress_namespace_warning(
+    can_spawn_subprocess: bool,
+    blocker: Option<EgressNamespaceBlocker>,
+) -> Option<String> {
+    let error = check_egress_namespace(can_spawn_subprocess, blocker).err()?;
+    Some(format!(
+        "[mur doctor] warning[{E_CAP_005}]: {error}\n  \
+         `mur run` will refuse this capsule on this host until that is resolved. Nothing in \
+         murmur.yaml can change it — the refusal is about this machine, not the manifest."
+    ))
 }
 
 /// The verdict for one installed artifact when `murmur.lock` is present. Mirrors the
@@ -1571,13 +1608,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // change the answer — so doctor asks it whenever the capsule declares a subprocess capability
     // at all, which is exactly what `mur run` does.
     //
-    // Deliberately narrower than `stage_session`'s own refusal ought to be: it does not count a
-    // native-implementation artifact with no `shell.allow`/`spawn.allow` declared, because that
-    // would need each declared artifact's own bundled implementation metadata resolved from the
-    // registry — doctor's artifact loop below does that, but only per-artifact and after this
-    // point, and duplicating it earlier just for this warning is not worth the restructuring. A
-    // native-artifact-only capsule on a host that can't build the namespace will not get this
-    // warning from `mur doctor`; it will only surface as a run-time failure from `mur run`.
+    // Here for `shell.allow` and `spawn.allow`. A native tool is the third route, and only the
+    // artifact loop below can tell one apart, so a capsule whose only route is a native tool is
+    // asked after it, the way `mur run` asks it in `launch` after staging.
     let capabilities = runtime_manifest.capabilities.as_ref();
     let shell_allows = capabilities
         .and_then(|caps| caps.shell.as_ref())
@@ -1586,14 +1619,10 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         .and_then(|caps| caps.spawn.as_ref())
         .is_some_and(|spawn| !spawn.allow.is_empty());
     let can_spawn_subprocess = shell_allows || spawn_allows;
-    if let Err(error) =
-        check_egress_namespace(can_spawn_subprocess, detect_egress_namespace_blocker())
+    if let Some(warning) =
+        egress_namespace_warning(can_spawn_subprocess, detect_egress_namespace_blocker())
     {
-        capsule_runtime::report_eprintln!(
-            "[mur doctor] warning[{E_CAP_005}]: {error}\n  \
-             `mur run` will refuse this capsule on this host until that is resolved. Nothing in \
-             murmur.yaml can change it — the refusal is about this machine, not the manifest."
-        );
+        capsule_runtime::report_eprintln!("{warning}");
     }
 
     // The daemon that capsule registers with at launch, gated on `spawn_allows` alone: a capsule
@@ -1704,6 +1733,8 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // `name@version` of every declared artifact the checklist failed for stale interfaces, so
     // the inventory adds no warning-tier `Fix:` for the same artifact.
     let mut interface_failed: HashSet<String> = HashSet::new();
+    // `name@version` of every declared artifact the checklist identified as a native tool.
+    let mut native_tools: Vec<String> = Vec::new();
 
     fixes.extend(env_requirements_findings.fixes);
     fixes.extend(roster_findings.fixes);
@@ -1764,6 +1795,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                             &resolved.bytes,
                             platform,
                         );
+                        if !matches!(platform_verdict, PlatformVerdict::Independent) {
+                            native_tools.push(ref_str.clone());
+                        }
                         // A binary this host cannot run is an error whether or not the store
                         // recorded a platform for it, and it is reported ahead of the missing
                         // tag: reinstalling fixes both, but only one of them stops `mur run`.
@@ -1921,6 +1955,22 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         }
     }
 
+    if !native_tools.is_empty() {
+        capsule_runtime::report_println!();
+        capsule_runtime::report_print!(
+            "{}",
+            render_native_tools(&native_tools, applied_mechanism(declared_floor))
+        );
+        // The half of the E-CAP-005 check above that needed this loop: a capsule whose only
+        // subprocess route is a native tool.
+        if !can_spawn_subprocess {
+            if let Some(warning) = egress_namespace_warning(true, detect_egress_namespace_blocker())
+            {
+                capsule_runtime::report_eprintln!("{warning}");
+            }
+        }
+    }
+
     capsule_runtime::report_println!();
 
     print_tally(total_pass, &fixes, &warnings);
@@ -1944,6 +1994,45 @@ mod tests {
             artifact_version: artifact_version.map(str::to_string),
             served_version: served_version.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn the_native_tools_block_names_each_tool_and_its_mechanism() {
+        let tools = vec!["local/tool-fixture@0.1.0".to_string()];
+        let confined = render_native_tools(&tools, "landlock+seccomp");
+        assert_eq!(
+            confined,
+            "Native tools\n  - local/tool-fixture@0.1.0: runs under landlock+seccomp with this \
+             capsule's capabilities.filesystem, capabilities.network.allow and \
+             capabilities.shell.allow \u{2014} a per-artifact capabilities: block does not \
+             narrow it\n"
+        );
+        let unconfined = render_native_tools(&tools, "none");
+        assert!(
+            unconfined.contains(
+                "local/tool-fixture@0.1.0: runs with no kernel confinement on this host \
+                 (rlimits only)"
+            ),
+            "{unconfined}"
+        );
+    }
+
+    /// A capsule whose only subprocess route is a native tool gets the same `E-CAP-005` warning
+    /// as one declaring `shell.allow`, on a host that cannot create the namespace.
+    #[test]
+    fn a_native_only_capsule_on_a_host_without_a_namespace_warns_e_cap_005() {
+        let blocker = Some(EgressNamespaceBlocker::KernelSupportMissing);
+        let warning = egress_namespace_warning(true, blocker).expect("a warning");
+        assert!(
+            warning.starts_with(&format!("[mur doctor] warning[{E_CAP_005}]: ")),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("`mur run` will refuse this capsule"),
+            "{warning}"
+        );
+        assert_eq!(egress_namespace_warning(true, None), None);
+        assert_eq!(egress_namespace_warning(false, blocker), None);
     }
 
     #[test]

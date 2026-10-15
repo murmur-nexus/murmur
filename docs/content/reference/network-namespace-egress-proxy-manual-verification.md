@@ -11,8 +11,8 @@
 
 ## What is being verified { #what-this-verifies }
 
-A capsule's native subprocess tree — the shell tool, any interpreter it starts, anything either of
-them spawns — runs inside its session's **network namespace**: one per session, shared by every
+A capsule's native subprocess tree — the shell tool, its native tools, any interpreter either
+starts, anything they spawn — runs inside its session's **network namespace**: one per session, shared by every
 shell call the session makes and by nothing outside it. The only way out of that namespace is a
 connection-level proxy in the runtime process that applies `capabilities.network.allow`. Both
 decisions are taken from kernel-held state: the namespace's routes and listeners decide where a

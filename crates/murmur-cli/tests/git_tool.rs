@@ -485,11 +485,11 @@ fn native_tool_dispatch_lists_entries_with_repo_base() {
     );
 }
 
-/// Test 5: an explicit `repo` outside the capsule workdir drives the operation, rather
-/// than the tool's CWD.
+/// Test 5: an explicit `repo` drives the operation, rather than the tool's CWD.
 ///
-/// The target directory lives in a separate temp dir the capsule knows nothing about, so
-/// the effect can only land there if `repo` was honoured.
+/// The base is a folder of the workdir, so the effect can only land there if `repo` was
+/// honoured. It is inside the workdir because a native tool runs in the capsule's sandbox, which
+/// refuses a write anywhere else (see `native_tool_confinement.rs`).
 #[test]
 fn native_tool_dispatch_with_explicit_repo() {
     if common::skip_without_host_support("native_tool_dispatch_with_explicit_repo") {
@@ -498,7 +498,6 @@ fn native_tool_dispatch_with_explicit_repo() {
     let home = TempDir::new().unwrap();
     let artifact_dir = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
-    let outside = TempDir::new().unwrap();
 
     if publish_driver_and_fixture_tool(&home, artifact_dir.path()).is_none() {
         eprintln!("[SKIP] native_tool_dispatch_with_explicit_repo: fixture tool not available");
@@ -511,8 +510,8 @@ fn native_tool_dispatch_with_explicit_repo() {
             TOOL_NAME,
             json!({
                 "operation": "create_dir",
-                "repo": outside.path().to_str().unwrap(),
-                "path": "made-outside",
+                "repo": "./explicit-base",
+                "path": "made-in-repo",
                 "label": "explicit-repo",
             }),
         ),
@@ -521,6 +520,7 @@ fn native_tool_dispatch_with_explicit_repo() {
 
     let staged = stage_fixture_tool_session(&home, project.path(), &server.endpoint);
     let workdir = staged.workdir.clone();
+    fs::create_dir_all(workdir.join("explicit-base")).unwrap();
     fs::write(
         workdir.join("task.md"),
         "Create a directory with an explicit repo.",
@@ -542,18 +542,18 @@ fn native_tool_dispatch_with_explicit_repo() {
     let result_text = common::extract_result_text(&tool_result);
 
     assert!(
-        result_text.contains("made-outside"),
+        result_text.contains("made-in-repo"),
         "tool result should mention the created directory; got:\n{result_text}"
     );
 
-    let created = outside.path().join("made-outside");
+    let created = workdir.join("explicit-base").join("made-in-repo");
     assert!(created.is_dir(), "directory should exist at {created:?}");
     assert_eq!(
         fs::read_to_string(created.join("label.txt")).unwrap(),
         "explicit-repo"
     );
     assert!(
-        !workdir.join("made-outside").exists(),
+        !workdir.join("made-in-repo").exists(),
         "with an explicit repo nothing should have been created relative to the CWD"
     );
 }

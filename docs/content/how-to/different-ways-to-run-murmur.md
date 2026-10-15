@@ -234,6 +234,7 @@ Containment
   achieved:  scoped
   floor met: yes
   mechanism: landlock+seccomp
+  covers:    shell commands, plan shell steps, native tools
   userns grant: profile_confining
   landlock ABI: 3
 
@@ -247,7 +248,8 @@ Effective grants
     - ana/hook-telemetry (hook): nothing preopened — no capabilities.filesystem.scope declared
   network allow: <none>
   unix sockets:     false
-  shell allow: <none>
+  shell allow:
+    - git
   spawn allow: <none>
   env allow: <none>
   plan submit:      false
@@ -277,6 +279,11 @@ See [Which Landlock ABI the ruleset is built at](../reference/containment.md#lan
 | `landlock+seccomp` | `scoped` | Landlock filesystem mediation plus the seccomp syscall allowlist over the host filesystem |
 | `seccomp-only` | `advisory` | Linux without a usable Landlock ABI: seccomp only, filesystem scope by convention |
 | `none` | `advisory` | No kernel sandboxing primitive (macOS and every non-Linux target) |
+
+`covers:` names what that mechanism confines: every shell command the model runs, every shell step
+of a submitted plan, and every native tool, such as `murmur/tool-git` here, which runs `git` because
+`shell allow:` names it. A native tool runs with the capsule's grants above; see
+[Native tools](../reference/containment.md#native-tools).
 
 Add `--json` for one machine-readable line instead, which is the same object `trace.jsonl` records as `effective_grants` on every session:
 

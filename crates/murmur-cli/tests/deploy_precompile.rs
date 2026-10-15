@@ -5,6 +5,8 @@
 //! Every deploy here goes to a [`LoopbackTarget`]: the real `mur deploy run` and the real target
 //! `mur`, with `ssh` and `scp` shimmed onto a temp dir. The capsule is an agent capsule whose
 //! anthropic driver reaches an in-test upstream, with one WASM tool and one native tool.
+//! The native tool needs the session's network namespace, so each test stands down with
+//! `[SKIP-HOST]` on a host that cannot create one.
 #![cfg(feature = "beta-mur-deploy")]
 
 #[path = "common/mod.rs"]
@@ -427,6 +429,11 @@ fn remote_deploy_dir(commands: &[String]) -> String {
 
 #[test]
 fn a_deploy_compiles_on_the_target_and_the_first_launch_loads_the_forms() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "a_deploy_compiles_on_the_target_and_the_first_launch_loads_the_forms",
+    ) {
+        return;
+    }
     let deployer = Deployer::new();
     let target = LoopbackTarget::new();
     let deployed = deployer.deploy(&target, &real_mur(), &[], None);
@@ -465,6 +472,11 @@ fn a_deploy_compiles_on_the_target_and_the_first_launch_loads_the_forms() {
 
 #[test]
 fn no_precompile_sends_every_command_but_the_compile() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "no_precompile_sends_every_command_but_the_compile",
+    ) {
+        return;
+    }
     let deployer = Deployer::new();
 
     let compiled = LoopbackTarget::new();
@@ -527,6 +539,11 @@ fn deploy_under_ceilings(
 
 #[test]
 fn a_ceiling_set_only_for_the_target_warns_and_the_launch_is_warm() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "a_ceiling_set_only_for_the_target_warns_and_the_launch_is_warm",
+    ) {
+        return;
+    }
     let deployer = Deployer::new();
     let target = LoopbackTarget::new();
     let (deployed, listing) = deploy_under_ceilings(&deployer, &target, None, Some(RAISED_CEILING));
@@ -554,6 +571,11 @@ fn a_ceiling_set_only_for_the_target_warns_and_the_launch_is_warm() {
 
 #[test]
 fn a_ceiling_set_only_on_this_machine_warns_and_the_launch_is_warm() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "a_ceiling_set_only_on_this_machine_warns_and_the_launch_is_warm",
+    ) {
+        return;
+    }
     let deployer = Deployer::new();
     let target = LoopbackTarget::new();
     let (deployed, _) = deploy_under_ceilings(&deployer, &target, Some(RAISED_CEILING), None);
@@ -571,6 +593,11 @@ fn a_ceiling_set_only_on_this_machine_warns_and_the_launch_is_warm() {
 
 #[test]
 fn an_aligned_ceiling_warns_nothing_and_the_launch_is_warm() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "an_aligned_ceiling_warns_nothing_and_the_launch_is_warm",
+    ) {
+        return;
+    }
     let deployer = Deployer::new();
     let target = LoopbackTarget::new();
     let (deployed, _) = deploy_under_ceilings(
@@ -590,6 +617,11 @@ fn an_aligned_ceiling_warns_nothing_and_the_launch_is_warm() {
 
 #[test]
 fn a_target_mur_without_precompile_warns_and_the_capsule_still_serves() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "a_target_mur_without_precompile_warns_and_the_capsule_still_serves",
+    ) {
+        return;
+    }
     let deployer = Deployer::new();
     let scripts = TempDir::new().unwrap();
     let old_mur = scripts.path().join("mur");
@@ -714,6 +746,9 @@ fn host_line(path: &str, key: &str) -> String {
 #[test]
 #[ignore = "measurement, run by hand with --ignored --nocapture"]
 fn measured_first_launch_after_a_deploy() {
+    if capsule_runtime::skip_without_egress_namespace("measured_first_launch_after_a_deploy") {
+        return;
+    }
     const TARGETS_PER_ARM: usize = 5;
     let mur = std::env::var_os("MURMUR_BENCH_TARGET_MUR")
         .map(PathBuf::from)

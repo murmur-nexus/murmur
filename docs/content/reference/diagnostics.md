@@ -16,7 +16,7 @@ section that explains it.
 | `E-CAP-002` | A `filesystem.scope` is not relative to the workdir, or escapes it via `..` | [E-CAP-002](#e-cap-002) |
 | `E-CAP-003` | Declared containment floor (`advisory`\|`scoped`\|`sealed`) is not achievable on this host | [E-CAP-003](#e-cap-003) |
 | `E-CAP-004` | `capabilities.shell.staged_runtime` is declared below an effective `sealed` containment floor | [E-CAP-004](#e-cap-004) |
-| `E-CAP-005` | This host cannot give the capsule's native subprocess tree its own network namespace, so `capabilities.network.allow` cannot be enforced for it | [E-CAP-005](#e-cap-005) |
+| `E-CAP-005` | This host cannot give the capsule's native subprocess tree — shell commands, spawned capsules and native tools — its own network namespace, so `capabilities.network.allow` cannot be enforced for it | [E-CAP-005](#e-cap-005) |
 | `E-CAP-006` | Nothing declared makes an allowlisted interpreted entrypoint's package tree reachable inside a `sealed` composed root | [E-CAP-006](#e-cap-006) |
 | `E-CAP-007` | an export root resolves outside the accessible workdir | [E-CAP-007](#e-cap-007) |
 | `E-CAP-008` | a persistent capsule declares `exports.peer_files` without a short enough `max_ttl` | [E-CAP-008](#e-cap-008) |
@@ -1228,6 +1228,15 @@ Two host conditions produce it, and the refusal text names which one:
 This applies to **every** Linux capsule that can spawn a subprocess, including one whose
 `capabilities.network.allow` is empty: with the namespace missing, an empty allowlist would mean
 unrestricted egress rather than none. There is no path that continues at reduced enforcement.
+
+A capsule spawns a subprocess through any of three routes, and `mur run` checks each at a
+different point:
+
+| Route | Checked |
+|---|---|
+| `capabilities.shell.allow` or `capabilities.spawn.allow` is non-empty | At staging, before any artifact is pulled |
+| A declared `runtime: tool` artifact ships a native implementation | At launch, once the artifacts are staged and before any component is instantiated |
+| A native tool pulled into the session by `manage.pull` | At that tool's first call, which fails with the same reason |
 
 It is not part of the containment ladder — every class needs the namespace equally — so neither
 raising nor lowering a declared floor changes this answer. `mur doctor` reports the same condition
@@ -2647,16 +2656,20 @@ ceiling entry it should sit under, or delete it if the drop was what you actuall
   `filesystem` and `state` ([`W-SEC-006`](#w-sec-006) is the hook-side twin of this case, where
   `task_io` is honored as well); or
 - a `runtime: tool` entry with a **native** (non-WASM) implementation declares `capabilities:` at
-  all. A native tool runs as a host subprocess under the capsule-wide shell sandbox, and
-  per-artifact narrowing applies only to WASM tools, so the whole block is inert.
+  all. A native tool runs under the capsule-wide `capabilities.filesystem`,
+  `capabilities.network.allow`, `capabilities.network.unix_sockets` and `capabilities.shell.allow`,
+  enforced by the same sandbox as a shell command; a per-artifact block does not narrow them.
 
-**Why it matters:** a declared-but-unenforced grant reads like a scoped artifact. In the native
-case in particular, the tool keeps the full capsule ceiling despite an entry that looks like it
-locked it down.
+```text
+[capsule-runtime] warning[W-SEC-008]: artifact 'local/tool-fixture' declares per-artifact 'capabilities:' but ships a native implementation — it runs under the capsule-wide capabilities, enforced by the same sandbox as shell commands, and this block does not narrow them (https://docs.murmur.nexus/reference/diagnostics/#w-sec-008)
+```
+
+**Why it matters:** a declared-but-unapplied grant reads like a scoped artifact. In the native
+case the tool keeps the whole capsule ceiling despite an entry that looks like it narrowed it.
 
 **What to do:** for an inert sub-key, remove it and declare it in the top-level `capabilities:`
-block instead. For a native tool, scope it through `capabilities.shell.*` on the capsule-wide
-block, or ship the tool as WASM if you need per-artifact narrowing.
+block instead. For a native tool, narrow the capsule-wide block itself, or ship the tool as WASM if
+it needs grants narrower than the rest of the capsule's.
 
 ---
 

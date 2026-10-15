@@ -1851,6 +1851,6 @@ file; each is a scoping decision this slice made explicitly.
   `/proc/self/*` therefore exist in the root but are not openable. This matches the existing
   `scoped` tier, which grants neither, so it is not a regression; it is worth knowing before
   debugging a pty failure.
-- **The composed root applies only to the shell-tool subprocess path.** `runtime::dispatch_native_tool`
-  attaches fd hygiene but not the full enforcement chain — a pre-existing, documented gap that
-  predates this work and is unchanged by it.
+- **The composed root applies to every subprocess path.** Shell commands, plan shell steps and
+  native tools are all spawned through `sandbox::prepare_enforcement`; see
+  [Native tools](containment.md#native-tools).
