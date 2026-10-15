@@ -13,17 +13,15 @@
 
 ## What this verifies
 
-Both of `capsule-runtime`'s subprocess spawn paths now mark every file descriptor at or above 3
-close-on-exec inside the forked child's `pre_exec` window, before anything else in that window
-runs:
+Every subprocess `capsule-runtime` spawns on a kernel tier marks every file descriptor at or
+above 3 close-on-exec inside the forked child's `pre_exec` window:
 
-| path | entry point | where the step runs |
+| Subprocess | Entry point | Where the step runs |
 |---|---|---|
-| shell tool | `shell::execute_shell` → `sandbox::prepare_enforcement` | first statement of `sandbox::linux_enforce::child_install_enforcement` |
-| native tool | `runtime::dispatch_native_tool` | `sandbox::apply_fd_hygiene`, a `pre_exec` closure attached before `.spawn()` |
+| shell tool | `shell::execute_shell` → `sandbox::prepare_enforcement` | `sandbox::linux_enforce::child_install_enforcement`, after the namespace join and composed root |
+| native tool | `runtime::dispatch_native_tool` → `sandbox::prepare_enforcement` | the same |
 
-Both call the same function, `sandbox::linux_enforce::mark_inherited_fds_cloexec`, so the two
-paths cannot drift apart on this dimension.
+Both go through `sandbox::prepare_enforcement`, so they cannot drift apart on this dimension.
 
 The property under test is a negative: **a descriptor open in the runtime process at spawn time
 must not be visible inside the spawned child**. Landlock cannot substitute for this. Landlock
@@ -34,7 +32,7 @@ workdir scope. On the `KernelSeccompOnly` tier there is no Landlock at all — w
 fd-hygiene step runs on both kernel tiers rather than only under `KernelFull`.
 
 Fds 0/1/2 are deliberately **excluded** and are expected to be present in every result below.
-That is the correct outcome, not a leak: both spawn paths install `Stdio::piped()` handles
+That is the correct outcome, not a leak: both subprocess kinds install `Stdio::piped()` handles
 before `pre_exec` runs precisely so the exec'd program inherits them and talks to the parent
 over them. See `sandbox::FD_HYGIENE_FIRST_FD` for the recorded decision.
 
@@ -347,15 +345,12 @@ pass.
 A probe that reports "clean" on a machine where it cannot see anything is worthless. Confirm the
 harness can detect the leak it is looking for by removing the fix and re-running.
 
-In `crates/capsule-runtime/src/sandbox.rs`, comment out the first statement of
-`linux_enforce::child_install_enforcement` and the `apply_fd_hygiene` call in
-`runtime::dispatch_native_tool`:
+In `crates/capsule-runtime/src/sandbox.rs`, comment out the `mark_inherited_fds_cloexec` call in
+`linux_enforce::child_install_enforcement`, which both subprocess kinds run:
 
 ```bash
 # in child_install_enforcement:
 #   // mark_inherited_fds_cloexec()?;
-# in dispatch_native_tool:
-#   // crate::sandbox::apply_fd_hygiene(&mut command);
 cargo build -p capsule-runtime --release
 ```
 
@@ -364,7 +359,7 @@ show fd 7 with a `LEAKED` line whose `first_bytes` is the host's name — provin
 crossed into the child, that the probe sees it, and (for the shell path) that Landlock's workdir
 scope did nothing to stop a descriptor that was already open.
 
-Restore the two lines and rebuild before recording any result.
+Restore the line and rebuild before recording any result.
 
 ---
 
@@ -392,11 +387,10 @@ page states an implemented mechanism and an **unverified** end-to-end result.
 Stated plainly, because it is a real, user-visible consequence rather than a footnote: on a
 Linux kernel older than 5.11, `close_range(3, ~0U, CLOSE_RANGE_CLOEXEC)` fails (`ENOSYS` before
 5.9, `EINVAL` for the flag on 5.9/5.10). The error propagates out of `pre_exec` and
-`Command::spawn()` fails, so **every shell-tool spawn on such a host now fails** rather than
+`Command::spawn()` fails, so **every shell-tool and native-tool spawn on such a host fails** rather than
 silently running without fd hygiene — on both the `KernelFull` and `KernelSeccompOnly` tiers.
 
 That is deliberate and it is this module's established fail-closed discipline:
 `drop_all_capabilities`, `install_seccomp_filter` and `apply_landlock_scope` all abort the spawn
 on an unexpected error rather than degrade to a weaker sandbox. A security property that
-silently omits itself when the kernel is old is not a property. The same applies to the native
-tool path via `sandbox::apply_fd_hygiene`.
+silently omits itself when the kernel is old is not a property.

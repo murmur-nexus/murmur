@@ -7,10 +7,19 @@ description: |
   directories underneath a `repo` base path so the native tool dispatch path
   can be exercised without reaching into a sibling artifact checkout.
 
-  | op           | inputs             | outputs                |
-  |--------------|--------------------|------------------------|
-  | create_dir   | repo?, path, label?| path, label            |
-  | list_entries | repo?, path?       | dir, entries:[]        |
+  | op           | inputs              | outputs                   |
+  |--------------|---------------------|---------------------------|
+  | create_dir   | repo?, path, label? | path, label               |
+  | list_entries | repo?, path?        | dir, entries:[]           |
+  | read         | path                | ok, contents or error     |
+  | write        | path, text          | ok or error               |
+  | connect      | host, port, send?   | ok, reply or error        |
+  | unix_socket  |                     | ok or error               |
+  | exec         | path, args?         | ok, code, stdout or error |
+  | netns        |                     | ok, netns or error        |
+
+  The last six are sandbox probes: they report the attempt's outcome in
+  `data` and always pass.
 
   repo: base directory the operation runs against. Defaults to the working
   directory.
@@ -18,11 +27,11 @@ description: |
 # Inline JSON, matching the style capsule-runtime uses for its own synthesised
 # shell tool manifests (crates/capsule-runtime/src/shell.rs). The `repo`
 # property is what the inventory -> input_schema mapping test asserts on.
-input_schema: '{"type":"object","properties":{"operation":{"type":"string","enum":["create_dir","list_entries"],"description":"Operation to perform."},"repo":{"type":"string","description":"Base directory the operation runs against. Defaults to the working directory."},"path":{"type":"string","description":"Path to create or list, resolved against repo."},"label":{"type":"string","description":"Optional marker text written into the created directory as label.txt."}},"required":["operation"]}'
+input_schema: '{"type":"object","properties":{"operation":{"type":"string","enum":["create_dir","list_entries","read","write","connect","unix_socket","exec","netns"],"description":"Operation to perform."},"repo":{"type":"string","description":"Base directory the operation runs against. Defaults to the working directory."},"path":{"type":"string","description":"Path to create or list, resolved against repo."},"label":{"type":"string","description":"Optional marker text written into the created directory as label.txt."},"text":{"type":"string","description":"Text the write probe writes."},"host":{"type":"string","description":"Host the connect probe connects to."},"port":{"type":"integer","description":"Port the connect probe connects to."},"send":{"type":"string","description":"Bytes the connect probe sends before reading."},"args":{"type":"array","items":{"type":"string"},"description":"Arguments for the exec probe."}},"required":["operation"]}'
 
 capabilities:
   filesystem:
-    # Declarative intent only, exactly as for the real native tools: the capsule
-    # runtime has no filesystem.allow enforcement.
+    # Not applied, exactly as for the real native tools: a native tool runs under
+    # the capsule-wide capabilities, which the runtime enforces.
     allow:
       - "."

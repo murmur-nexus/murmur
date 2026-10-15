@@ -123,6 +123,39 @@ impl ShellExecError {
     }
 }
 
+/// What a failed `spawn()` of a `command` that went through
+/// [`crate::sandbox::prepare_enforcement`] means, for every subprocess that does: shell commands,
+/// plan shell steps and native tools.
+///
+/// A failure inside the `pre_exec` enforcement setup reaches the caller only as a bare errno (std
+/// collapses a `pre_exec` `io::Error` to its `raw_os_error()`, defaulting to EINVAL). `command` is
+/// dropped first so the parent's captured copy of the diagnostic pipe's write end closes, letting
+/// the read see EOF; then the detail the child wrote replaces the undifferentiated
+/// "Invalid argument (os error 22)". `subject` names the spawn in that message (`shell`,
+/// `native tool`), and `spawn_error` is the error returned when the child wrote nothing.
+pub(crate) fn enforced_spawn_failure(
+    command: Command,
+    supervisor: &crate::sandbox::SupervisorHandle,
+    subject: &str,
+    spawn_error: String,
+) -> ShellExecError {
+    drop(command);
+    match supervisor.read_diagnostic() {
+        // A composed-root failure keeps its own variant rather than being flattened into a
+        // message: it means a host that *did* clear the pre-launch sealed probe then failed to
+        // build the root, which is a different event from a Landlock or seccomp step failing,
+        // points somewhere else, and ends the session instead of the tool call. See
+        // [`ShellExecError::session_fatal`].
+        Some(detail) if detail.contains(crate::sealed::SEALED_ROOT_FAILURE_PREFIX) => {
+            ShellExecError::SealedRootConstructionFailed { detail }
+        }
+        Some(detail) if !detail.is_empty() => ShellExecError::Failed(format!(
+            "sandbox: {subject} enforcement setup failed before exec: {detail}"
+        )),
+        _ => ShellExecError::Failed(spawn_error),
+    }
+}
+
 impl std::fmt::Display for ShellExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -291,27 +324,12 @@ pub(crate) fn run_shell(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            // A failure inside the `pre_exec` enforcement setup reaches us here only as a bare
-            // errno (std collapses a `pre_exec` `io::Error` to its `raw_os_error()`, defaulting to
-            // EINVAL). Drop `command` first so the parent's captured copy of the diagnostic pipe's
-            // write end closes (letting the read below see EOF), then fold any legible detail the
-            // child wrote into the returned error instead of the undifferentiated
-            // "Invalid argument (os error 22)".
-            drop(command);
-            return Err(match supervisor.read_diagnostic() {
-                // A composed-root failure keeps its own variant all the way out of here rather
-                // than being flattened into a message: it means a host that *did* clear the
-                // pre-launch sealed probe then failed to build the root, which is a different
-                // event from a Landlock or seccomp step failing, points somewhere else, and ends
-                // the session instead of the tool call. See [`ShellExecError::session_fatal`].
-                Some(detail) if detail.contains(crate::sealed::SEALED_ROOT_FAILURE_PREFIX) => {
-                    ShellExecError::SealedRootConstructionFailed { detail }
-                }
-                Some(detail) if !detail.is_empty() => ShellExecError::Failed(format!(
-                    "sandbox: shell enforcement setup failed before exec: {detail}"
-                )),
-                _ => ShellExecError::Failed(error.to_string()),
-            });
+            return Err(enforced_spawn_failure(
+                command,
+                &supervisor,
+                "shell",
+                error.to_string(),
+            ))
         }
     };
 

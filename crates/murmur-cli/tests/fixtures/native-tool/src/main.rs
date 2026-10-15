@@ -20,11 +20,24 @@
 //! Operations:
 //!   create_dir   — repo?, path (required), label?  -> {path, label}
 //!   list_entries — repo?, path?                    -> {dir, entries}
+//!
+//! Probe operations, for the sandbox tests. Each reports its outcome in `data`
+//! with `status: passed` whether the attempt succeeded or not, so a test reads
+//! the OS error text rather than a bare failure:
+//!   read        — path                    -> {ok, contents} | {ok: false, error}
+//!   write       — path, text              -> {ok}           | {ok: false, error}
+//!   connect     — host, port, send?       -> {ok, reply}    | {ok: false, error}
+//!   unix_socket —                         -> {ok}           | {ok: false, error}
+//!   exec        — path, args?             -> {ok, code, stdout} | {ok: false, error}
+//!   netns       —                         -> {ok, netns}    | {ok: false, error}
+//! A relative `path` resolves against the working directory.
 
 use std::{
     fs,
     io::{Read, Write},
+    net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use serde_json::{json, Value};
@@ -87,6 +100,12 @@ fn run(raw: &str) -> Value {
     match op.get("operation").and_then(Value::as_str).unwrap_or("") {
         "create_dir" => op_create_dir(&op, &base),
         "list_entries" => op_list_entries(&op, &base),
+        "read" => probe(op_read(&op)),
+        "write" => probe(op_write(&op)),
+        "connect" => probe(op_connect(&op)),
+        "unix_socket" => probe(op_unix_socket()),
+        "exec" => probe(op_exec(&op)),
+        "netns" => probe(op_netns()),
         other => failed(format!("unknown operation '{other}'")),
     }
 }
@@ -164,6 +183,94 @@ fn op_list_entries(op: &Value, base: &Path) -> Value {
             "entries": entries,
         },
     })
+}
+
+/// A probe's outcome as a passed result: `{ok: true, ..fields}` or `{ok: false, error}`.
+fn probe(outcome: Result<Value, String>) -> Value {
+    let data = match outcome {
+        Ok(Value::Object(mut fields)) => {
+            fields.insert("ok".to_string(), Value::Bool(true));
+            Value::Object(fields)
+        }
+        Ok(_) => json!({"ok": true}),
+        Err(error) => json!({"ok": false, "error": error}),
+    };
+    json!({"status": "passed", "summary": "probe ran", "data": data})
+}
+
+fn required_str<'a>(op: &'a Value, field: &str) -> Result<&'a str, String> {
+    op.get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing '{field}'"))
+}
+
+fn op_read(op: &Value) -> Result<Value, String> {
+    let path = required_str(op, "path")?;
+    let contents = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    Ok(json!({"contents": contents}))
+}
+
+fn op_write(op: &Value) -> Result<Value, String> {
+    let path = required_str(op, "path")?;
+    let text = op.get("text").and_then(Value::as_str).unwrap_or_default();
+    fs::write(path, text).map_err(|err| err.to_string())?;
+    Ok(json!({}))
+}
+
+fn op_connect(op: &Value) -> Result<Value, String> {
+    let host = required_str(op, "host")?;
+    let port = op
+        .get("port")
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+        .ok_or("missing 'port'")?;
+    let address = (host, port)
+        .to_socket_addrs()
+        .map_err(|err| err.to_string())?
+        .next()
+        .ok_or_else(|| format!("'{host}' resolved to no address"))?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .map_err(|err| err.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|err| err.to_string())?;
+    if let Some(send) = op.get("send").and_then(Value::as_str) {
+        stream
+            .write_all(send.as_bytes())
+            .map_err(|err| err.to_string())?;
+    }
+    let mut reply = String::new();
+    stream
+        .read_to_string(&mut reply)
+        .map_err(|err| err.to_string())?;
+    Ok(json!({"reply": reply}))
+}
+
+fn op_unix_socket() -> Result<Value, String> {
+    std::os::unix::net::UnixDatagram::unbound().map_err(|err| err.to_string())?;
+    Ok(json!({}))
+}
+
+fn op_exec(op: &Value) -> Result<Value, String> {
+    let path = required_str(op, "path")?;
+    let args: Vec<&str> = op
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|args| args.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let output = std::process::Command::new(path)
+        .args(args)
+        .output()
+        .map_err(|err| err.to_string())?;
+    Ok(json!({
+        "code": output.status.code(),
+        "stdout": String::from_utf8_lossy(&output.stdout),
+    }))
+}
+
+fn op_netns() -> Result<Value, String> {
+    let link = fs::read_link("/proc/self/ns/net").map_err(|err| err.to_string())?;
+    Ok(json!({"netns": link.to_string_lossy()}))
 }
 
 fn failed(summary: impl Into<String>) -> Value {

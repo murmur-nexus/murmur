@@ -2,8 +2,10 @@
 
 For tool artifacts, Murmur supports both:
 
-- **WASM tools** (preferred, stronger isolation)
-- **Native tools** (compatibility path, process-level boundary)
+| Kind | Runs as | Bounded by |
+|---|---|---|
+| **WASM tools** (preferred) | A WebAssembly component in the runtime process | Its own artifact entry's `capabilities:`, narrowed below the capsule's, on every platform |
+| **Native tools** | A host subprocess | The capsule-wide grants, enforced by the same kernel sandbox as a shell command; see [Native tools](../reference/containment.md#native-tools) |
 
 Tools reach the runtime through one of two invocation paths behind a single agent-facing
 contract: a **WASM path** (tool exposed through typed WIT interfaces) and a **native path**

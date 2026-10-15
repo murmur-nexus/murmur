@@ -473,8 +473,8 @@ Restore the delegation drop-in afterwards.
 
 ## Scenario 8 — native-implementation tool artifacts are bounded too { #scenario-8 }
 
-A native-implementation tool artifact gets the same rlimits and cgroup scope as a
-`capabilities.shell.allow` subprocess.
+A native-implementation tool artifact is spawned through the same path as a
+`capabilities.shell.allow` subprocess, so it gets the same rlimits and cgroup scope.
 
 With a native tool artifact installed (e.g. `murmur/tool-git`), run any task that invokes it and,
 while it runs, confirm it is inside the scope:
@@ -489,9 +489,9 @@ grep -E '^Max (open files|processes)' /proc/<pid>/limits
 columns. `Max processes` shows the value `mur` inherited, unchanged: a subprocess in a cgroup scope
 gets no `RLIMIT_NPROC`, and `cgroup_pids_max` bounds it instead.
 
-**Known and deliberate gap:** this path installs no seccomp filter and no Landlock scope; only the
-rlimits and the cgroup scope apply. Do not record the missing seccomp/Landlock here as a
-regression.
+The same spawn also installs the seccomp filter, the Landlock scope and the session's network
+namespace; [Native tools](containment.md#native-tools) describes them, and
+`crates/murmur-cli/tests/native_tool_confinement.rs` checks them.
 
 ---
 

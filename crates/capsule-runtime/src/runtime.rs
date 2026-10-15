@@ -87,7 +87,7 @@ use crate::{
     sealed::UsernsGrant,
     shell::{
         build_declared_env, build_shell_env, is_shell_interpreter, run_shell,
-        shell_tool_manifest_yaml, split_shell_words, ShellOutcome, ShellResult,
+        shell_tool_manifest_yaml, split_shell_words, ShellExecError, ShellOutcome, ShellResult,
     },
     spawn_credential::SpawnCredential,
     spend::{MachineLedger, SpendMeter},
@@ -1842,13 +1842,10 @@ pub fn stage_session(
     // that subprocess. See `RuntimeError::EgressNamespaceUnavailable` for why this refuses even
     // when the allowlist is empty.
     //
-    // Narrower than `cgroup::requires_process_bounding` on purpose, not by oversight: that check
-    // also fires for a capsule with a *native-implementation artifact* and neither `shell.allow`
-    // nor `spawn.allow`, but `has_native_artifact` comes from `staged.installed_artifacts`, which
-    // only exists after staging resolves the registry — i.e. after this very check has to have
-    // already run, per the "before any registry pull" rule above. A native-artifact-only capsule
-    // therefore does not get this refusal on a host that cannot build the namespace, and its
-    // artifact is launched without entering a network namespace at all.
+    // Counts `shell.allow` and `spawn.allow` only. A native tool is a subprocess route too, but
+    // whether the capsule has one is known only from `staged.installed_artifacts`, after the
+    // registry is resolved, so a capsule whose only route is a native tool is refused by `launch`
+    // instead (`check_native_artifact_egress_namespace`), still before anything is instantiated.
     crate::network_namespace::check_egress_namespace(
         !request.capability_policy.shell_allow.is_empty()
             || !request.capability_policy.spawn_allow.is_empty(),
@@ -2771,6 +2768,14 @@ fn launch(
             Some(murmur_artifact::ArtifactImplementation::Native)
         )
     });
+    // The `E-CAP-005` refusal `stage_session` could not make for a capsule whose only subprocess
+    // route is a native tool: whether it has one is known only now, after staging. Still ahead of
+    // the cgroup scope, the enforcement and every WASM instantiation, so no tool call is reached.
+    check_native_artifact_egress_namespace(
+        &staged.capability_policy,
+        has_native_artifact,
+        crate::network_namespace::detect_egress_namespace_blocker(),
+    )?;
     let requires_process_bounding =
         cgroup::requires_process_bounding(&staged.capability_policy, has_native_artifact);
     let prepared_scope = cgroup::prepare_scope(
@@ -5959,10 +5964,11 @@ fn warn_on_inert_tool_capabilities(
     }
 }
 
-/// A `runtime: tool` artifact with a native (non-WASM) implementation runs as a host
-/// subprocess under the capsule-wide shell/sandbox machinery, never through the WASI tool
-/// path per-artifact grants are applied on. Declaring one is therefore wholly inert, which is
-/// a sharper hazard than an inert sub-block and gets the same `W-SEC-008` treatment.
+/// A `runtime: tool` artifact with a native (non-WASM) implementation runs as a host subprocess
+/// under the capsule-wide grants, enforced by the same sandbox as a shell command, never through
+/// the WASI tool path per-artifact grants are applied on. A per-artifact block on one therefore
+/// narrows nothing, which is a sharper hazard than an inert sub-block and gets the same
+/// `W-SEC-008` treatment.
 fn warn_on_unenforceable_native_capabilities(
     artifact_name: &str,
     capabilities: Option<&murmur_artifact::Capabilities>,
@@ -5974,8 +5980,9 @@ fn warn_on_unenforceable_native_capabilities(
     let link = security_warning_link(W_SEC_008);
     crate::runtime_err!(
         "[capsule-runtime] warning[{W_SEC_008}]: artifact '{artifact_name}' declares \
-         per-artifact 'capabilities:' but ships a native implementation — narrowing applies \
-         only to WASM tools and drivers, so this grant is not enforced ({link})"
+         per-artifact 'capabilities:' but ships a native implementation — it runs under the \
+         capsule-wide capabilities, enforced by the same sandbox as shell commands, and this \
+         block does not narrow them ({link})"
     );
 }
 
@@ -8245,8 +8252,8 @@ impl CapsuleStoreState {
             })?;
             return running
                 .await
-                .map_err(|e| format!("native tool panicked: {e}"))?
-                .map(DispatchOutcome::tool);
+                .map_err(|e| format!("native tool panicked: {e}"))
+                .map(native_tool_outcome);
         }
 
         // Shell tool — run on the blocking pool, since waiting on the child process is a
@@ -10562,6 +10569,24 @@ fn write_shell_tool_manifests(workdir: &Path, shell_allow: &[String]) -> Result<
     Ok(())
 }
 
+/// Refuses with `E-CAP-005` a capsule whose only subprocess route is a native tool, on a host
+/// that cannot give it a network namespace.
+///
+/// A capsule declaring `shell.allow` or `spawn.allow` was already asked by `stage_session`, before
+/// any registry pull; `has_native_artifact` exists only after staging, so this is the half that
+/// check cannot make. Pure, with the host answer passed in.
+fn check_native_artifact_egress_namespace(
+    policy: &CapabilityPolicy,
+    has_native_artifact: bool,
+    blocker: Option<crate::network_namespace::EgressNamespaceBlocker>,
+) -> Result<(), RuntimeError> {
+    let checked_at_staging = !policy.shell_allow.is_empty() || !policy.spawn_allow.is_empty();
+    crate::network_namespace::check_egress_namespace(
+        has_native_artifact && !checked_at_staging,
+        blocker,
+    )
+}
+
 /// A session's guest environment as a native process gets it: without
 /// [`crate::formation::FORMATION_PEERS_ENV`]. A virtual callee address works only through the
 /// runtime's own egress, so the variable would name members a native process cannot reach.
@@ -10577,6 +10602,15 @@ pub(crate) fn native_env(guest_env: &[(String, String)]) -> Vec<(String, String)
 ///
 /// The binary receives the serialized ToolInput JSON on stdin and must write a valid
 /// ToolResult JSON object to stdout. The binary's working directory is the capsule workdir.
+///
+/// Spawned through [`sandbox::prepare_enforcement`], the one path every shell command takes, with
+/// the capsule-wide grants as its ceiling: it joins the session's network namespace, runs under
+/// the seccomp filter with its capabilities dropped, and on the Landlock tiers inside the
+/// capsule's Landlock scope (and composed root, on `sealed`). The only grant added for it is the
+/// exec closure of `binary_path` itself — see [`sandbox::ShellEnforcement::for_native_entrypoint`].
+///
+/// A setup failure keeps [`ShellExecError`]'s session-fatal distinction, so a `sealed` composed
+/// root that cannot be built ends the session here exactly as it does for a shell command.
 fn dispatch_native_tool(
     name: &str,
     input: murmur::tool::run::ToolInput,
@@ -10585,7 +10619,7 @@ fn dispatch_native_tool(
     session_workdir: &Path,
     policy: &CapabilityPolicy,
     enforcement: &sandbox::ShellEnforcement,
-) -> Result<murmur::tool::run::ToolResult, String> {
+) -> Result<murmur::tool::run::ToolResult, ShellExecError> {
     use std::{
         io::Write,
         process::{Command, Stdio},
@@ -10601,8 +10635,6 @@ fn dispatch_native_tool(
 
     let env = build_shell_env(policy, &[], session_workdir)?;
 
-    // Bound to a local before spawning (rather than chained straight into `.spawn()`) so a
-    // `pre_exec` step can be attached to it, mirroring `execute_shell`'s shape.
     let mut command = Command::new(binary_path);
     command
         .current_dir(accessible_workdir)
@@ -10612,39 +10644,37 @@ fn dispatch_native_tool(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // This path carries the same hard rlimits and the same cgroup membership as `execute_shell`,
-    // but installs no seccomp filter and no Landlock scope. That asymmetry is deliberate and
-    // open: a native-implementation artifact is bounded but not confined.
-    sandbox::attach_process_limits(&mut command, enforcement);
-    // Mark every fd >= 3 close-on-exec in the forked child, so this subprocess inherits only the
-    // stdio pipes configured just above and nothing that merely happened to be open in the
-    // runtime process. Fds 0/1/2 are deliberately excluded: this function writes the tool's
-    // `ToolInput` JSON to the child's stdin and parses its `ToolResult` JSON back off stdout, so
-    // stdio inheritance across `execve` is the point, not a leak — see
-    // `sandbox::FD_HYGIENE_FIRST_FD` for the full recorded decision.
-    //
-    // This is the shared helper `execute_shell`'s path also runs (as the first step of
-    // `sandbox::linux_enforce::child_install_enforcement`), so the two spawn paths cannot drift
-    // apart on this dimension. It takes no policy input — fd hygiene is unconditional — and it
-    // deliberately does not bring seccomp/Landlock enforcement with it; kernel sandboxing of
-    // native tool subprocesses remains the documented gap it was.
-    crate::sandbox::apply_fd_hygiene(&mut command);
+    // Fail-closed, as on the shell path: a setup failure returns here and nothing is spawned.
+    let supervisor = sandbox::prepare_enforcement(
+        &mut command,
+        &enforcement.for_native_entrypoint(binary_path),
+        accessible_workdir,
+        session_workdir,
+    )?;
 
     // Held until the tool has exited, so a shell command overlapping it in the scope does not
     // claim a counter delta this process could have caused.
     let _occupancy = enforcement.cgroup_scope.as_ref().map(|scope| scope.enter());
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("failed to spawn native tool '{name}': {e}"))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Err(crate::shell::enforced_spawn_failure(
+                command,
+                &supervisor,
+                "native tool",
+                format!("failed to spawn native tool '{name}': {error}"),
+            ))
+        }
+    };
 
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(input_json.as_bytes());
         // stdin closes when dropped, signalling EOF to the child
     }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("native tool '{name}' failed to complete: {e}"))?;
+    let output = child.wait_with_output().map_err(|e| {
+        ShellExecError::Failed(format!("native tool '{name}' failed to complete: {e}"))
+    })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -10712,6 +10742,28 @@ fn dispatch_native_tool(
             truncated: false,
             metadata: Vec::new(),
         }),
+    }
+}
+
+/// The dispatch outcome of one [`dispatch_native_tool`] call. A failure becomes an error tool
+/// result carrying its text, with `fatal` set when it ends the session, the way
+/// [`dispatch_shell_tool`] reports a failed shell command.
+fn native_tool_outcome(
+    result: Result<murmur::tool::run::ToolResult, ShellExecError>,
+) -> DispatchOutcome {
+    match result {
+        Ok(result) => DispatchOutcome::tool(result),
+        Err(error) => DispatchOutcome {
+            fatal: error.session_fatal(),
+            ..DispatchOutcome::tool(murmur::tool::run::ToolResult {
+                status: murmur::tool::run::Status::Error,
+                summary: Some("native tool execution failed".to_string()),
+                data: Some(error.to_string()),
+                data_path: None,
+                truncated: false,
+                metadata: Vec::new(),
+            })
+        },
     }
 }
 
@@ -17142,6 +17194,104 @@ inference:
             outcome.fatal.is_none(),
             "a disallowed binary is the capsule's problem, not the session's"
         );
+    }
+
+    /// The native-tool half of the composed-root failure path: a native tool goes through the
+    /// same `prepare_enforcement`, so a `sealed` root that cannot be built for it ends the session
+    /// (`E-RUN-014`) exactly as it does for a shell command. Any other setup failure is a tool
+    /// error naming the step that failed, not the bare errno `spawn()` collapses it to.
+    ///
+    /// Drives [`native_tool_outcome`] over [`dispatch_native_tool`], which is what the native
+    /// branch of `dispatch_agent_tool_unfenced` runs, so the `DispatchOutcome` mapping is covered.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_native_tool_composed_root_failure_is_session_fatal() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "a_native_tool_composed_root_failure_is_session_fatal",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let binary = write_env_echo_native_tool(tmp.path(), "echo-home", &["HOME"]);
+        let dispatch = |enforcement: &sandbox::ShellEnforcement| {
+            native_tool_outcome(dispatch_native_tool(
+                "echo-home",
+                murmur::tool::run::ToolInput {
+                    data: None,
+                    log_path: None,
+                },
+                &binary,
+                tmp.path(),
+                tmp.path(),
+                &CapabilityPolicy::default(),
+                enforcement,
+            ))
+        };
+
+        let sealed = {
+            let _guard = sandbox::ForceSealedRootFailureGuard::new();
+            dispatch(&sandbox::sealed_test_enforcement())
+        };
+        assert!(
+            matches!(sealed.result.status, murmur::tool::run::Status::Error),
+            "the failed call must still read as a failed call"
+        );
+        let data = sealed.result.data.as_deref().unwrap_or_default();
+        assert!(
+            data.contains("composed root"),
+            "the tool result must still say what happened: {data}"
+        );
+        let fatal = sealed
+            .fatal
+            .expect("a composed-root failure must be carried out as session-fatal");
+        assert!(
+            matches!(fatal, RuntimeError::SealedRootConstructionFailed { .. }),
+            "must be the variant murmur-cli maps to E-RUN-014: {fatal}"
+        );
+
+        sandbox::FORCE_LANDLOCK_FAILURE.with(|flag| flag.set(true));
+        let landlock = dispatch(&sandbox::ShellEnforcement {
+            tier: sandbox::EnforcementTier::KernelFull,
+            ..sandbox::ShellEnforcement::environment_only()
+        });
+        sandbox::FORCE_LANDLOCK_FAILURE.with(|flag| flag.set(false));
+        assert!(
+            landlock.fatal.is_none(),
+            "a Landlock setup failure ends the tool call, not the session: {:?}",
+            landlock.fatal
+        );
+        let data = landlock.result.data.as_deref().unwrap_or_default();
+        assert!(
+            data.contains("native tool enforcement setup failed before exec")
+                && data.contains("landlock"),
+            "the tool result must name the failed step: {data}"
+        );
+        assert!(
+            !data.contains("os error 22"),
+            "the bare errno must not stand in for the step: {data}"
+        );
+    }
+
+    /// `launch`'s half of `E-CAP-005`: a capsule whose only subprocess route is a native tool is
+    /// refused on a host that cannot give it a network namespace. A capsule with `shell.allow` is
+    /// not asked again here, because `stage_session` already asked it.
+    #[test]
+    fn a_native_only_capsule_needs_an_egress_namespace() {
+        let blocker = Some(crate::network_namespace::EgressNamespaceBlocker::KernelSupportMissing);
+        let native_only = CapabilityPolicy::default();
+
+        assert!(matches!(
+            check_native_artifact_egress_namespace(&native_only, true, blocker),
+            Err(RuntimeError::EgressNamespaceUnavailable { .. })
+        ));
+        assert!(check_native_artifact_egress_namespace(&native_only, false, blocker).is_ok());
+        assert!(check_native_artifact_egress_namespace(&native_only, true, None).is_ok());
+
+        let with_shell = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        assert!(check_native_artifact_egress_namespace(&with_shell, true, blocker).is_ok());
     }
 
     // ── the tool-result fence ───────────────────────────────────────────────

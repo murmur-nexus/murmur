@@ -168,6 +168,11 @@ The generator picks one of two shapes based on the task description.
         version: "{{ v.murmur_tool_git }}"
         runtime: tool
 
+    capabilities:
+      shell:
+        allow:
+          - git
+
     lifecycle:
       task_acceptance: single
       after_task: exit
@@ -195,6 +200,11 @@ The generator picks one of two shapes based on the task description.
         version: "{{ v.murmur_tool_git }}"
         runtime: tool
 
+    capabilities:
+      shell:
+        allow:
+          - git
+
     lifecycle:
       task_acceptance: single
       after_task: exit
@@ -221,6 +231,11 @@ The generator picks one of two shapes based on the task description.
       - name: murmur/tool-git
         version: "{{ v.murmur_tool_git }}"
         runtime: tool
+
+    capabilities:
+      shell:
+        allow:
+          - git
 
     lifecycle:
       task_acceptance: single
@@ -405,6 +420,7 @@ mur run --manifest murmur.yaml --task task.md
 | Validation | Generated YAML is validated before writing; nothing written if validation fails |
 | Inference config | Config file (`inference:` in `~/.murmur/config.yaml`) → env var (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) → interactive first-run wizard |
 | Generator artifacts | `murmur/driver-anthropic` (or `murmur/driver-openai`), `murmur/tool-registry-search`, `murmur/tool-editor` and `murmur/skill-create-manifest` must all be installed |
+| Artifact discovery | `murmur/tool-registry-search` is a native tool and runs in the generator capsule's sandbox; [What each native tool needs](../reference/default-artifacts.md#native-tool-needs) lists what it can reach |
 | `inference.model` | Defaults to `claude-haiku-4-5-20251001`; change it in the generated manifest if needed |
 
 ---

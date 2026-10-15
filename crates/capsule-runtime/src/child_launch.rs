@@ -1193,8 +1193,9 @@ pub(crate) fn start_process(launch: &ProcessLaunch<'_>) -> std::io::Result<Start
     if let Some(fd) = launch.inherit_fd {
         keep_across_exec(&mut command, fd);
     }
-    // No `apply_fd_hygiene` here: it fails the spawn outright on a kernel without
-    // `CLOSE_RANGE_CLOEXEC`, and a lifeline needs none, since both ends are created close-on-exec.
+    // No fd hygiene (`mark_inherited_fds_cloexec`) here: it fails the spawn outright on a kernel
+    // without `CLOSE_RANGE_CLOEXEC`, and a lifeline needs none, since both ends are created
+    // close-on-exec.
     // The lifeline's `pre_exec` is the last one registered.
     #[cfg(unix)]
     if let Some(lifeline) = launch.lifeline {
@@ -1601,7 +1602,7 @@ mod tests {
     fn start_process_registers_no_fd_hygiene() {
         let code = start_process_code();
         for name in [
-            "apply_fd_hygiene",
+            "prepare_enforcement",
             "mark_inherited_fds_cloexec",
             "close_range",
         ] {

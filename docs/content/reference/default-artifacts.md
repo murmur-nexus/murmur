@@ -174,6 +174,31 @@ reads only the schema 2 [artifact index](artifact-index.md), so it refuses a sch
 [`mur new`](cli.md#mur-new) declares this tool in the generator capsule it cold-boots, and fails
 with `E-RUN-008` if it is not installed first.
 
+### What each native tool needs { #native-tool-needs }
+
+Five of the tools above ship native implementations. Each runs in the capsule's own sandbox, with
+the capsule-wide grants — see [Native tools](containment.md#native-tools) — so what it needs is
+declared in the capsule's top-level `capabilities:` block, never on its own artifact entry:
+
+| Tool | Capsule grants it needs | `scoped` | `sealed` |
+|---|---|---|---|
+| `murmur/tool-git` | `git` in `capabilities.shell.allow`; the repository inside the workdir. `fetch`, `pull`, `push` and `clone` also need the remote's host in `capabilities.network.allow`, and run under the same rules as `git` in a shell command | Works | Works |
+| `murmur/tool-code-graph` | `repo_path` inside the workdir. It writes `<repo_path>/.murmur/code-graph.db` | Works | Works |
+| `murmur/tool-code-coverage` | `repo_path` and `coverage_dir` inside the workdir, and the index `murmur/tool-code-graph` built there | Works | Works |
+| `murmur/tool-test-report` | `input_path` (and `repo_path`, when given) inside the workdir | Works | Works |
+| `murmur/tool-registry-search` | `https://raw.githubusercontent.com` in `capabilities.network.allow` for the public index | Public index fails: see below | Public index fails: see below |
+
+Without `git` in `capabilities.shell.allow`, every `murmur/tool-git` operation fails with
+`failed to execute git: Permission denied (os error 13)`.
+
+`murmur/tool-registry-search` cannot reach the public index at any floor, or outside a sandbox:
+its build has no TLS backend, so every HTTPS fetch fails with
+`cannot make HTTPS request because no TLS backend is configured`. A build with one still needs the
+system trust store under `/etc/ssl`, which `sealed` provides and `scoped` refuses, and no
+`capabilities:` field grants a native tool read access outside the workdir. `registry: local`
+searches the store under the session's synthetic `HOME`, which is empty, never the operator's
+`~/.murmur/artifacts`.
+
 ---
 
 ## Skills

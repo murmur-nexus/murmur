@@ -2376,3 +2376,49 @@ fn doctor_reports_the_formations_directory_as_owner_only() {
         "{stderr}"
     );
 }
+
+/// A capsule declaring a native tool gets a `Native tools` block naming it and the mechanism it
+/// runs under on this host, spelled the way `mur run --explain-scope` spells a tier.
+#[test]
+fn doctor_names_each_native_tool_and_the_mechanism_it_runs_under() {
+    let home = TempDir::new().unwrap();
+    let artifacts = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let Some(binary) = common::fixture_native_tool_binary() else {
+        eprintln!("[SKIP] doctor_names_each_native_tool: the fixture tool could not be built");
+        return;
+    };
+    let manifest = fs::read(common::fixture_native_tool_manifest()).unwrap();
+    let artifact = common::create_native_tool_zip(
+        artifacts.path(),
+        common::FIXTURE_NATIVE_TOOL_NAME,
+        "0.1.0",
+        &manifest,
+        &binary,
+    );
+    common::publish_local(&home, &artifact).success();
+    create_project(
+        project.path(),
+        "  - name: local/tool-fixture\n    version: 0.1.0\n    runtime: tool\n",
+    );
+
+    let output = mur_doctor(&home, project.path()).get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    println!("{stdout}");
+
+    // No floor is declared, so the tier is this host's capped at `advisory`'s.
+    let mechanism = capsule_runtime::applied_mechanism(murmur_artifact::ContainmentClass::Advisory);
+    let line = if mechanism == "none" {
+        "  - local/tool-fixture@0.1.0: runs with no kernel confinement on this host (rlimits only)"
+            .to_string()
+    } else {
+        format!(
+            "  - local/tool-fixture@0.1.0: runs under {mechanism} with this capsule's \
+             capabilities.filesystem, capabilities.network.allow and capabilities.shell.allow"
+        )
+    };
+    assert!(
+        stdout.contains(&format!("Native tools\n{line}")),
+        "{stdout}"
+    );
+}

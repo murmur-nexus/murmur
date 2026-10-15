@@ -8,7 +8,7 @@ Use this path when:
 - a dependency stack is difficult to compile to WASM
 - you prefer a process-based tool runtime
 
-> Native tools trade off isolation compared to WASM tools. In Murmur docs/specs this is an explicit compatibility mode.
+> A native tool runs in the capsule's own subprocess sandbox, with the capsule-wide grants. A WASM tool can be narrowed below the capsule's grants on its own artifact entry; a native tool cannot. See [Native tools](../reference/containment.md#native-tools).
 
 ---
 
@@ -152,12 +152,27 @@ When the capsule invokes `py-echo-native`, the runtime executes the packaged bin
 
 The binary does not inherit the host's environment as-is: `HOME` is replaced with a session-scoped synthetic directory, credential-shaped variables (`GITHUB_TOKEN`, `*_API_KEY`, `AWS_*`, etc.) are stripped, and only a safe baseline (`PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TMPDIR`, `TEMP`, `TMP`, `CARGO_HOME`, `RUSTUP_HOME`, `TERM`) passes through — the same sanitization [shell tool subprocesses](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) get, applied regardless of whether the capsule declares `capabilities.shell.allow`.
 
+On Linux the binary also runs in the same sandbox as a shell command, with the capsule's grants:
+
+| The tool… | Needs |
+|---|---|
+| Reads or writes files | The files inside the session workdir. On the Full tier nothing outside it is readable or writable, including `/tmp` |
+| Runs another program | That program in `capabilities.shell.allow` |
+| Connects to a host | That host in `capabilities.network.allow` |
+
+A PyInstaller `--onefile` build unpacks itself into `$TMPDIR`, or `/tmp` when that is unset, before
+it runs your code. Under `scoped` that directory is outside the workdir and the write is refused.
+Under `sealed`, `/tmp` is a private directory inside the workdir and the build unpacks there.
+
 ---
 
 ## Common errors
 
 **Tool launches but fails with missing shared libraries**  
 Bundle dependencies into the executable (or run in an environment matching your target).
+
+**Tool fails with `Permission denied` on Linux**  
+The sandbox refused a file outside the workdir or a program outside `capabilities.shell.allow`. See the table in Step 7.
 
 **`runtime` mismatch in capsule manifest**  
 If the artifact is published as native, declare it with `runtime: native` in the capsule manifest.

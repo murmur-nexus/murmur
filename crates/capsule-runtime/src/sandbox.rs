@@ -1010,11 +1010,6 @@ pub(crate) fn resolve_sealed_bind_dirs(
     exec_allow_paths: &[PathBuf],
     policy: &CapabilityPolicy,
 ) -> Vec<PathBuf> {
-    let fixed: Vec<&Path> = crate::sealed::SEALED_RUNTIME_PATHS
-        .iter()
-        .map(Path::new)
-        .collect();
-
     let mut dirs: Vec<PathBuf> = Vec::new();
     let candidates = exec_allow_paths
         .iter()
@@ -1027,18 +1022,56 @@ pub(crate) fn resolve_sealed_bind_dirs(
         );
 
     for candidate in candidates {
-        if !candidate.is_absolute() {
-            continue;
-        }
-        if fixed.iter().any(|root| candidate.starts_with(root)) {
-            continue;
-        }
-        if dirs.contains(&candidate) {
-            continue;
-        }
-        dirs.push(candidate);
+        push_sealed_bind_dir(&mut dirs, candidate);
     }
     dirs
+}
+
+/// Adds `candidate` to `dirs` as an optional composed-root bind unless it is relative, already
+/// inside a fixed [`crate::sealed::SEALED_RUNTIME_PATHS`] entry, or already listed. The one filter
+/// [`resolve_sealed_bind_dirs`] and [`ShellEnforcement::for_native_entrypoint`] share.
+fn push_sealed_bind_dir(dirs: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidate.is_absolute() {
+        return;
+    }
+    if crate::sealed::SEALED_RUNTIME_PATHS
+        .iter()
+        .any(|root| candidate.starts_with(root))
+    {
+        return;
+    }
+    if dirs.contains(&candidate) {
+        return;
+    }
+    dirs.push(candidate);
+}
+
+/// The most bytes [`shebang_interpreter`] reads from the head of a native entrypoint. The
+/// kernel's own `#!` buffer (`BINPRM_BUF_SIZE`) is 256 bytes, so a longer line names nothing the
+/// kernel would run.
+const SHEBANG_READ_LIMIT: usize = 256;
+
+/// The interpreter the kernel runs when it execs the script at `entrypoint`: the first token of a
+/// leading `#!` line, when that token is an absolute path. `None` for an ELF binary, an unreadable
+/// file, a relative interpreter and a line with no token.
+///
+/// Reads at most [`SHEBANG_READ_LIMIT`] bytes, in the parent. Only the interpreter itself is
+/// named: for `#!/usr/bin/env python3` that is `env`, and `python3` is whatever `env` then finds,
+/// which needs its own `capabilities.shell.allow` entry like any other program a tool runs.
+pub(crate) fn shebang_interpreter(entrypoint: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+
+    let mut head = Vec::with_capacity(SHEBANG_READ_LIMIT);
+    std::fs::File::open(entrypoint)
+        .ok()?
+        .take(SHEBANG_READ_LIMIT as u64)
+        .read_to_end(&mut head)
+        .ok()?;
+    let line = head.strip_prefix(b"#!")?;
+    let line = line.split(|byte| *byte == b'\n').next().unwrap_or_default();
+    let token = std::str::from_utf8(line).ok()?.split_whitespace().next()?;
+    let interpreter = PathBuf::from(token);
+    interpreter.is_absolute().then_some(interpreter)
 }
 
 /// The `source_path` of each declared `capabilities.shell.staged_runtime` grant, as the composed
@@ -2152,6 +2185,40 @@ impl ShellEnforcement {
         self
     }
 
+    /// This enforcement for one native tool spawn: a clone whose exec allowlist also holds what
+    /// the kernel itself executes to start `entrypoint`.
+    ///
+    /// That is the entrypoint, the absolute interpreter on its `#!` line when it has one (see
+    /// [`shebang_interpreter`]), and the `PT_INTERP`/`DT_NEEDED` closure of each, from
+    /// [`resolve_landlock_grants`] — the native-tool counterpart of what `capabilities.shell.allow`
+    /// derives for a shell binary. The entrypoint needs its own `Execute` rule because it sits in
+    /// the session workdir, whose rule withholds `Execute` unless `filesystem.workdir_exec`. On
+    /// `KernelSealed` the interpreter's directory is also bound into the composed root when no
+    /// fixed runtime path carries it; the entrypoint needs no bind, because the root reproduces
+    /// the workdir at its own path.
+    ///
+    /// Nothing else is added. Whatever the tool reads or runs once started is granted by the
+    /// capsule, exactly as for a shell command. Every clone shares `session_netns`, so the tool
+    /// joins the session's one namespace and egress proxy.
+    pub(crate) fn for_native_entrypoint(&self, entrypoint: &Path) -> ShellEnforcement {
+        let interpreter = shebang_interpreter(entrypoint);
+        let mut seeds = vec![entrypoint.to_path_buf()];
+        seeds.extend(interpreter.clone());
+
+        let mut enforcement = self.clone();
+        enforcement
+            .landlock_grants
+            .extend(LandlockGrant::non_listable_files(resolve_landlock_grants(
+                &seeds,
+            )));
+        if self.tier == EnforcementTier::KernelSealed {
+            if let Some(dir) = interpreter.as_deref().and_then(Path::parent) {
+                push_sealed_bind_dir(&mut enforcement.sealed_bind_dirs, dir.to_path_buf());
+            }
+        }
+        enforcement
+    }
+
     /// End the session: kill every process it started, then release its network namespace.
     ///
     /// Killing goes through the cgroup scope, which every spawn joins before `execve` and no fork
@@ -2495,10 +2562,9 @@ pub(crate) fn sealed_test_enforcement() -> ShellEnforcement {
 ///
 /// Deliberately independent of the tier machinery above. Landlock and seccomp are Linux kernel
 /// primitives that exist on some hosts; `setrlimit` is POSIX and exists on all of them, and the
-/// cgroup self-move is a single `write(2)` to a descriptor the parent already opened. Splitting
-/// this out is what lets the two subprocess spawn paths converge: `execute_shell` gets it as
-/// part of `prepare_enforcement`, and `dispatch_native_tool` — which installs no seccomp or
-/// Landlock at all, a standing gap — gets it on its own.
+/// cgroup self-move is a single `write(2)` to a descriptor the parent already opened. So this is
+/// the whole of `prepare_enforcement` on `EnvironmentOnly` and off Linux, through which every
+/// shell command, plan shell step and native tool is spawned.
 ///
 /// Everything the returned closure does runs in the forked child between `fork` and `execve`,
 /// so it is restricted to syscalls: `getrlimit`/`setrlimit` pairs and one `write`. No
@@ -2533,14 +2599,14 @@ pub(crate) fn attach_process_limits(
 /// Lowest file descriptor the fd-hygiene step touches. Everything from here upward is marked
 /// close-on-exec in the forked child; fds 0, 1 and 2 are deliberately left alone.
 ///
-/// **Stdio is NOT marked close-on-exec, and is NOT reopened.** The `Stdio::piped()` handles both
-/// spawn paths install *before* `pre_exec` runs exist so the exec'd program inherits them across
-/// its own `execve` and talks to the parent over them — `execute_shell` reads the subprocess's
+/// **Stdio is NOT marked close-on-exec, and is NOT reopened.** The `Stdio::piped()` handles a
+/// spawn installs *before* `pre_exec` runs exist so the exec'd program inherits them across its
+/// own `execve` and talks to the parent over them — `execute_shell` reads the subprocess's
 /// stdout/stderr, and `dispatch_native_tool` additionally writes its `ToolInput` JSON to the
 /// subprocess's stdin and parses its `ToolResult` JSON back off stdout. Marking 0/1/2
 /// close-on-exec would leave the exec'd program with those descriptors closed, breaking every
-/// invocation on both paths, and there is nothing meaningful to reopen them onto: the pipes
-/// themselves are the intended destination. The gap this constant closes is everything *above*
+/// invocation, and there is nothing meaningful to reopen them onto: the pipes themselves are the
+/// intended destination. The gap this constant closes is everything *above*
 /// stdio, where inheritance was never intended and was only ever prevented by the empirical
 /// accident of nothing else happening to be open at spawn time.
 ///
@@ -2549,49 +2615,6 @@ pub(crate) fn attach_process_limits(
 /// module carry.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const FD_HYGIENE_FIRST_FD: u32 = 3;
-
-/// Non-Linux counterpart of [`apply_fd_hygiene`]: a documented no-op.
-///
-/// `close_range(2)` is Linux-only, and this mirrors the shape `prepare_enforcement` already
-/// uses on non-Linux targets — no `pre_exec` closure is installed at all, rather than one that
-/// does nothing. macOS is `EnforcementTier::EnvironmentOnly` by construction; there is no
-/// kernel primitive here to call.
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn apply_fd_hygiene(_command: &mut std::process::Command) {}
-
-/// Attaches the fd-hygiene step — mark every fd >= [`FD_HYGIENE_FIRST_FD`] close-on-exec — to a
-/// `Command` that is about to be spawned, for spawn paths that do **not** go through
-/// `prepare_enforcement`.
-///
-/// This exists so `runtime::dispatch_native_tool` (which has no `ShellEnforcement`, no tier and
-/// no kernel sandboxing of its own) gets exactly the same fd-inheritance guarantee
-/// `execute_shell` gets, without pulling the seccomp/Landlock apparatus into it. It is
-/// deliberately a free function over `&mut Command` taking no policy input: fd hygiene is
-/// unconditional — it is not derived from `CapabilityPolicy`, the manifest, or the enforcement
-/// tier, and there is no configuration under which a subprocess should inherit an fd the
-/// runtime did not deliberately hand it.
-///
-/// Do **not** call this on a `Command` that also goes through `prepare_enforcement`:
-/// `linux_enforce::child_install_enforcement` already performs the same step as its first
-/// statement, and `pre_exec` closures run in registration order, so a second one would be a
-/// redundant syscall rather than an additional guarantee.
-///
-/// On a kernel older than 5.11 this makes `.spawn()` itself fail — see
-/// [`linux_enforce::mark_inherited_fds_cloexec`] for that fail-closed consequence, which
-/// applies identically here.
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-pub(crate) fn apply_fd_hygiene(command: &mut std::process::Command) {
-    use std::os::unix::process::CommandExt;
-
-    // SAFETY: this closure runs in the forked child, after fork() but before execve() — the
-    // narrow pre_exec window where only async-signal-safe operations are permitted. Its body is
-    // a single `close_range(2)` syscall plus, on failure only, one `io::Error` construction: no
-    // allocation on the success path, no locks, no captured state at all.
-    unsafe {
-        command.pre_exec(linux_enforce::mark_inherited_fds_cloexec);
-    }
-}
 
 /// Installs kernel-level exec/network/filesystem enforcement into `command` so it applies to
 /// the spawned process and everything it forks/execs. The Landlock/seccomp half is a no-op when
@@ -3389,7 +3412,7 @@ mod linux_enforce {
     /// **Kernel range narrowing:** `close_range(2)` landed in Linux 5.9 and
     /// `CLOSE_RANGE_CLOEXEC` in Linux 5.11. On an older kernel this call fails (`ENOSYS`, or
     /// `EINVAL` for the flag on 5.9/5.10), the error propagates, and `Command::spawn()` fails —
-    /// so every shell spawn on a `KernelSeccompOnly` *or* `KernelFull` host with such a kernel
+    /// so every spawn on a `KernelSeccompOnly` *or* `KernelFull` host with such a kernel
     /// now fails rather than silently running without fd hygiene. That is deliberate and it is
     /// this module's established fail-closed discipline (`drop_all_capabilities`,
     /// `install_seccomp_filter` and `apply_landlock_scope` all abort the spawn on an unexpected
@@ -4798,12 +4821,12 @@ mod tests {
     /// enforcement, so it would read as evidence while proving nothing.
     ///
     /// It does catch the one silent, catastrophic edit: a `0` here marks stdio close-on-exec and
-    /// breaks every subprocess invocation on both spawn paths.
+    /// breaks every subprocess invocation.
     #[test]
     fn fd_hygiene_range_starts_above_stdio() {
         assert_eq!(
             FD_HYGIENE_FIRST_FD, 3,
-            "fd hygiene must start at 3 — 0/1/2 are the stdio pipes both spawn paths need to \
+            "fd hygiene must start at 3 — 0/1/2 are the stdio pipes every spawn needs to \
              survive execve"
         );
     }
@@ -6295,6 +6318,127 @@ mod tests {
                 PathBuf::from("/usr/bin/bash"),
             ]
         );
+    }
+
+    // ---- native tool entrypoints ------------------------------------------------------------
+
+    fn write_entrypoint(dir: &Path, name: &str, head: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, head).unwrap();
+        path
+    }
+
+    #[test]
+    fn shebang_interpreter_reads_the_absolute_interpreter_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases: &[(&[u8], Option<&str>)] = &[
+            (b"#!/bin/sh\necho hi\n", Some("/bin/sh")),
+            (b"#! /usr/bin/python3 -u\n", Some("/usr/bin/python3")),
+            // `env` is what the kernel runs; `python3` is found by `env` and needs its own grant.
+            (b"#!/usr/bin/env python3\n", Some("/usr/bin/env")),
+            (b"#!sh\n", None),
+            (b"#!\n", None),
+            (b"\x7fELF\x02\x01\x01", None),
+            (b"", None),
+        ];
+        for (index, (head, expected)) in cases.iter().enumerate() {
+            let path = write_entrypoint(dir.path(), &format!("tool-{index}"), head);
+            assert_eq!(
+                shebang_interpreter(&path),
+                expected.map(PathBuf::from),
+                "{:?}",
+                String::from_utf8_lossy(head)
+            );
+        }
+        assert_eq!(shebang_interpreter(&dir.path().join("missing")), None);
+
+        // A `#!` line longer than the kernel's own buffer names nothing past it.
+        let mut long = b"#!".to_vec();
+        long.extend(std::iter::repeat_n(b' ', SHEBANG_READ_LIMIT));
+        long.extend(b"/bin/sh\n");
+        let path = write_entrypoint(dir.path(), "long", &long);
+        assert_eq!(shebang_interpreter(&path), None);
+    }
+
+    /// The entrypoint and its interpreter are added as `Execute + ReadFile` file grants, and
+    /// nothing is taken away from the enforcement they extend.
+    #[test]
+    fn for_native_entrypoint_adds_the_entrypoint_and_its_interpreter_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let entrypoint = write_entrypoint(dir.path(), "tool", b"#!/bin/sh\ncat\n");
+        let existing = LandlockGrant {
+            path: PathBuf::from("/usr/bin/git"),
+            list_dir: false,
+            executable: true,
+        };
+        let base = ShellEnforcement {
+            tier: EnforcementTier::KernelFull,
+            landlock_grants: vec![existing.clone()],
+            ..ShellEnforcement::environment_only()
+        };
+
+        let native = base.for_native_entrypoint(&entrypoint);
+
+        assert_eq!(native.landlock_grants[0], existing);
+        let added: Vec<&LandlockGrant> = native.landlock_grants[1..].iter().collect();
+        let canonical_entrypoint = std::fs::canonicalize(&entrypoint).unwrap();
+        let canonical_sh = std::fs::canonicalize("/bin/sh").unwrap();
+        for wanted in [&canonical_entrypoint, &canonical_sh] {
+            assert!(
+                added.iter().any(|grant| &grant.path == wanted),
+                "{wanted:?} must be granted: {added:?}"
+            );
+        }
+        assert!(
+            added
+                .iter()
+                .all(|grant| grant.executable && !grant.list_dir),
+            "{added:?}"
+        );
+        // The closure is files, never a directory such as the workdir or /etc.
+        assert!(added.iter().all(|grant| !grant.path.is_dir()), "{added:?}");
+        assert!(native.sealed_bind_dirs.is_empty(), "not sealed: no binds");
+        assert!(
+            Arc::ptr_eq(&native.session_netns, &base.session_netns),
+            "a native spawn joins the session's own namespace"
+        );
+        assert_eq!(
+            base.landlock_grants.len(),
+            1,
+            "the session's grants are untouched"
+        );
+    }
+
+    /// On `KernelSealed`, an interpreter outside the fixed runtime paths has its directory bound
+    /// into the composed root as an optional bind; one inside them adds nothing.
+    #[test]
+    fn for_native_entrypoint_binds_an_interpreter_outside_the_runtime_paths_when_sealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = ShellEnforcement {
+            tier: EnforcementTier::KernelSealed,
+            ..ShellEnforcement::environment_only()
+        };
+
+        let system = write_entrypoint(dir.path(), "system", b"#!/bin/sh\n");
+        assert!(sealed
+            .for_native_entrypoint(&system)
+            .sealed_bind_dirs
+            .is_empty());
+
+        let custom = write_entrypoint(dir.path(), "custom", b"#!/opt/tools/bin/run\n");
+        assert_eq!(
+            sealed.for_native_entrypoint(&custom).sealed_bind_dirs,
+            vec![PathBuf::from("/opt/tools/bin")]
+        );
+
+        let scoped = ShellEnforcement {
+            tier: EnforcementTier::KernelFull,
+            ..ShellEnforcement::environment_only()
+        };
+        assert!(scoped
+            .for_native_entrypoint(&custom)
+            .sealed_bind_dirs
+            .is_empty());
     }
 
     // ---- `CAPSULE_DEVICE_GRANTS` (fixed device set) ----------------------------------------

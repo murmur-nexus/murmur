@@ -301,31 +301,41 @@ pub fn fixture_path(relative: &str) -> PathBuf {
 /// used both as the artifact name and as the binary name inside `bin/`.
 pub const FIXTURE_NATIVE_TOOL_NAME: &str = "tool-fixture";
 
-/// Build (once) and locate the fixture native tool binary.
+/// Build (once per test process) and locate the fixture native tool binary.
 ///
 /// Returns `None` — for the caller to turn into a clean skip — if the build
 /// cannot run or leaves nothing at the expected path. Unlike the WASM fixtures
 /// alongside it, this binary is host-native and therefore not portable across
 /// the project's platform targets, so it is compiled here rather than checked
-/// in. Output lands in the workspace target directory, so repeat runs reuse it.
+/// in. Output lands in the workspace target directory, so an unchanged fixture
+/// is not recompiled.
 pub fn fixture_native_tool_binary() -> Option<PathBuf> {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let manifest = fixture_path("native-tool/Cargo.toml");
     let target_dir = workspace_root.join("target").join("native-tool-fixture");
     let binary_path = target_dir.join("release").join(FIXTURE_NATIVE_TOOL_NAME);
 
-    if !binary_path.exists() {
+    // Built on every first call in the process, not only when the binary is missing: cargo's
+    // freshness check makes an unchanged fixture cheap, and a stale binary from before an edit
+    // to the fixture would otherwise be reused silently.
+    static BUILT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let built = *BUILT.get_or_init(|| {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "--manifest-path"])
             .arg(&manifest)
             .arg("--target-dir")
             .arg(&target_dir)
-            .status()
-            .ok()?;
-        if !status.success() {
-            eprintln!("[fixture] cargo build of {FIXTURE_NATIVE_TOOL_NAME} failed");
-            return None;
+            .status();
+        match status {
+            Ok(status) if status.success() => true,
+            _ => {
+                eprintln!("[fixture] cargo build of {FIXTURE_NATIVE_TOOL_NAME} failed");
+                false
+            }
         }
+    });
+    if !built {
+        return None;
     }
 
     // A build can exit 0 without producing the binary, so the caller gets a clean skip
@@ -404,7 +414,34 @@ pub fn stage_agent_session(
     project_dir: &Path,
     manifest_path: &Path,
 ) -> StagedSession {
-    stage_agent_session_inner(home, project_dir, manifest_path, None, None)
+    stage_agent_session_inner(
+        home,
+        project_dir,
+        manifest_path,
+        None,
+        None,
+        ContainmentClass::Advisory,
+    )
+}
+
+/// `stage_agent_session` with `floor` as the declared containment floor, the value `mur run`
+/// combines from the manifest, the workspace config and `--containment`, and with `workdir` as
+/// the accessible workdir when given, the shape `mur run --workdir` takes.
+pub fn stage_agent_session_at_floor(
+    home: &TempDir,
+    project_dir: &Path,
+    manifest_path: &Path,
+    floor: ContainmentClass,
+    workdir: Option<&Path>,
+) -> StagedSession {
+    stage_agent_session_inner(
+        home,
+        project_dir,
+        manifest_path,
+        None,
+        workdir.map(Path::to_path_buf),
+        floor,
+    )
 }
 
 /// `stage_agent_session` with an explicit accessible workdir, the shape `mur run --workdir` takes.
@@ -424,6 +461,7 @@ pub fn stage_agent_session_with_workdir(
         manifest_path,
         None,
         Some(workdir.to_path_buf()),
+        ContainmentClass::Advisory,
     )
 }
 
@@ -442,6 +480,7 @@ pub fn stage_agent_session_resuming(
         manifest_path,
         Some((from_session.to_string(), context_id.to_string())),
         None,
+        ContainmentClass::Advisory,
     )
 }
 
@@ -451,6 +490,7 @@ fn stage_agent_session_inner(
     manifest_path: &Path,
     resume: Option<(String, String)>,
     workdir: Option<PathBuf>,
+    floor: ContainmentClass,
 ) -> StagedSession {
     let runtime_manifest = load_runtime_manifest(manifest_path).unwrap();
 
@@ -514,7 +554,7 @@ fn stage_agent_session_inner(
             workdir,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
-            declared_containment_floor: ContainmentClass::Advisory,
+            declared_containment_floor: floor,
             exports: runtime_manifest.exports.clone(),
             control: None,
             door_authentication: None,

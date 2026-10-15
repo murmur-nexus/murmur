@@ -484,8 +484,11 @@ Rules:
   [Durable state](workdir.md#state-store).
 - **Only `network`, `filesystem` and `state` apply to a tool or driver.** `shell`, `spawn`, `env`,
   `limits`, `resources` and `containment` parse but are inert here and print
-  [`W-SEC-008`](diagnostics.md#w-sec-008), as does a grant on a tool with a **native** (non-WASM)
-  implementation, which never runs through the WASI tool path at all.
+  [`W-SEC-008`](diagnostics.md#w-sec-008), as does any block on a tool with a **native** (non-WASM)
+  implementation. A native tool runs under the capsule-wide `capabilities.filesystem`,
+  `capabilities.network` and `capabilities.shell.allow`, enforced by the same sandbox as a shell
+  command (see [Native tools](containment.md#native-tools)); the per-artifact block does not
+  narrow them.
 
 ##### Artifact config { #artifact-config }
 

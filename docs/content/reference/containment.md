@@ -1,7 +1,7 @@
 # Containment
 
-A containment class bounds what a capsule's shell subprocesses reach on the host, through kernel
-mechanisms the host has to provide. It does not bound what a WASM artifact does inside the workdir
+A containment class bounds what a capsule's subprocesses — shell commands, plan shell steps and
+native tools — reach on the host, through kernel mechanisms the host has to provide. It does not bound what a WASM artifact does inside the workdir
 — [What bounds a WASM artifact](#artifact-boundary) names the grant that does. This page covers the
 enforcement tier each host resolves to, the containment class a capsule can require of it, the
 fixed grants a contained capsule receives, and how each claim is checked.
@@ -18,8 +18,9 @@ fixed grants a contained capsule receives, and how each claim is checked.
 ## Subprocess enforcement tiers
 
 `W-SEC-001`, `W-SEC-002`, `W-SEC-003` and `W-SEC-005` all stem from one mechanism: at capsule
-launch the runtime probes the host and resolves an enforcement tier for shell subprocesses
-declared under `capabilities.shell.allow`. The probe is a live capability test — a Landlock
+launch the runtime probes the host and resolves an enforcement tier for the capsule's subprocesses:
+the binaries declared under `capabilities.shell.allow` and the capsule's
+[native tools](#native-tools). The probe is a live capability test — a Landlock
 ruleset really constructed, a namespace really created in a forked child — never a kernel version
 string.
 
@@ -43,7 +44,15 @@ capsule on a sealed-capable host runs on Full.
 Treat `capabilities.shell.allow` as advisory on a host below kernel 5.13.
 
 The `mechanism:` column is what `mur run --explain-scope` prints, and it always reports what the
-*host* can back — never what the session installed.
+*host* can back — never what the session installed. The `covers:` line under it names the
+subprocess routes that mechanism confines, and `--explain-scope --json` carries them as
+`mechanism_covers`:
+
+| `mechanism_covers` value | Route |
+|---|---|
+| `shell` | A `capabilities.shell.allow` binary the model calls |
+| `plan-shell-steps` | A shell step of a plan submitted through `submit-plan` |
+| `native-tools` | A `runtime: tool` artifact that ships a native implementation |
 
 **What the Full tier grants.** The Landlock scope grants the capsule workdir a near-full access set
 **and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
@@ -108,6 +117,58 @@ unlisted binary, or connecting to a host outside `capabilities.network.allow`.
 These are kernel behaviours, so the only check that means anything is a run on a real host. The
 hand-run procedures that do that are listed under [Verification](#verification).
 
+### Native tools { #native-tools }
+
+A `runtime: tool` artifact whose packed `murmur.yaml` says `implementation: native` is a host
+executable. It is spawned the way a `capabilities.shell.allow` command is: in the session's network
+namespace, under the same seccomp filter with its capabilities dropped, and, on the Full and Sealed
+tiers, inside the capsule's Landlock scope and composed root.
+
+| Tier | A native tool gets |
+|---|---|
+| Sealed | The composed root, Landlock, seccomp and the session's network namespace |
+| Full | Landlock, seccomp and the session's network namespace |
+| Seccomp-only | Seccomp and the session's network namespace; no filesystem or exec scope |
+| Environment-only | The synthetic `HOME`, the credential strip and the per-process rlimits; no kernel confinement |
+
+Its grants are the capsule's own: `capabilities.filesystem`, `capabilities.network.allow`,
+`capabilities.network.unix_sockets` and `capabilities.shell.allow` apply to it exactly as they apply
+to a shell command. The runtime adds one thing, the files the kernel itself executes to start the
+tool, each with read and execute and nothing else:
+
+1. The tool's entrypoint, `<session workdir>/tools/<name>/<name>`.
+2. For a script, the absolute interpreter on its `#!` line. On Sealed, that interpreter's
+   directory is bound into the composed root when no fixed runtime path already carries it.
+3. The ELF interpreter and shared-library closure of each.
+
+Everything else the tool reads, writes, runs or connects to has to be granted by the capsule:
+
+| The tool… | Needs |
+|---|---|
+| Runs another program, such as `git` | That program in `capabilities.shell.allow` |
+| Is a `#!/usr/bin/env python3` script | `python3` in `capabilities.shell.allow`: the `#!` grant covers `env` only |
+| Reads or writes a path outside the workdir | Nothing grants it on Full or Sealed; keep its inputs and outputs in the workdir |
+| Reaches a host | That host in `capabilities.network.allow`; the connection leaves through the egress proxy |
+| Reaches a server an earlier shell call started on `127.0.0.1` | Nothing: the tool shares the session's loopback |
+| Opens an `AF_UNIX` socket | `capabilities.network.unix_sockets: true` |
+
+What each [default artifact](default-artifacts.md#native-tool-needs) native tool needs is listed
+with the tools.
+
+A `capabilities:` block on a native tool's own artifact entry does not narrow these grants and
+prints [`W-SEC-008`](diagnostics.md#w-sec-008). A capsule whose only subprocess route is a native
+tool still needs a network namespace, and is refused with
+[`E-CAP-005`](diagnostics.md#e-cap-005) on a host that cannot create one. A sealed composed root
+that cannot be built for a native tool ends the session with
+`E-RUN-014` (see [Containment class](#field-containment)), as it does for a shell command.
+
+!!! warning "The entrypoint is in the writable workdir"
+    The tool's entrypoint sits in the session workdir, which the capsule can write. A capsule that
+    overwrites `tools/<name>/<name>` and then calls the tool runs code it wrote, which
+    [`workdir_exec: false`](#field-workdir-exec) otherwise forbids. That code runs inside the
+    capsule's own sandbox, with the capsule's own grants, so it reaches nothing a shell command
+    could not; but it is code the capsule chose, run under a tool's name.
+
 ### Where the user namespace comes from { #userns-grant }
 
 The Sealed tier and the capsule network namespace both need an unprivileged user namespace, and on
@@ -121,6 +182,7 @@ Containment
   achieved:  sealed
   floor met: yes
   mechanism: mountns+pivot_root+landlock+seccomp
+  covers:    shell commands, plan shell steps, native tools
   userns grant: profile_confining
   landlock ABI: 3
 ```
@@ -270,10 +332,10 @@ A containment class and a WASM artifact's own grants answer different questions:
 
 | Question | What answers it |
 |---|---|
-| Can this capsule reach my host? | [`capabilities.containment`](#field-containment) — the class the capsule's shell subprocesses run under |
+| Can this capsule reach my host? | [`capabilities.containment`](#field-containment) — the class the capsule's shell subprocesses and native tools run under |
 | Can this artifact reach outside its directory? | [`capabilities.filesystem.scope`](manifest.md#tool-capabilities) on that artifact's own entry |
 
-Under `sealed`, everything outside the composed root is absent to a shell subprocess. Inside the
+Under `sealed`, everything outside the composed root is absent to a shell subprocess or native tool. Inside the
 workdir, an artifact's reach is exactly what its own grants say, and the containment class leaves
 that unchanged: an artifact declaring no `capabilities.filesystem.scope` works out of the whole
 workdir under every class. Narrow one artifact by naming the subtree it needs on its entry:
@@ -309,7 +371,7 @@ capsule:
 
 | | Bounds | Declared by | Effect on the achieved class |
 |---|---|---|---|
-| Containment (`capabilities.containment`) | What the capsule's shell subprocesses reach outward — which host paths, hosts and binaries they can touch | Manifest, workspace config or `--containment`, strongest wins | It *is* the achieved class |
+| Containment (`capabilities.containment`) | What the capsule's shell subprocesses and native tools reach outward — which host paths, hosts and binaries they can touch | Manifest, workspace config or `--containment`, strongest wins | It *is* the achieved class |
 | Disclosure (`exports.files`) | What an operator reaches inward — which files an external process may read out of the workdir | The manifest's top-level `exports:` block | None |
 
 Declaring `exports.files` gives the agent no capability whatsoever: the runtime serves the files
@@ -807,7 +869,7 @@ Each procedure lives in the murmur repository on the `main` branch; the name lin
 | [**Sealed containment**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/sealed-containment-manual-verification.md) | The `sealed` class end to end: the `E-CAP-003` refusal when the AppArmor profile is absent, the composed root observed from inside a live capsule's shell tool (paths outside it return `ENOENT`, not `EACCES`), `"containment_achieved":"sealed"` in `trace.jsonl`, and the refusal to run at a weaker class inside a plain container. | Release gate for the `sealed` class. Re-run whenever the composed-root construction, the host probe, or the tier→class mapping changes. |
 | [**Staged runtime bind mount**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/staged-runtime-bind-mount-manual-verification.md) | That a `capabilities.shell.staged_runtime` grant lands its pinned tree read-only inside the composed root at the same absolute path it has on the host, that a missing `source_path` refuses the session with `E-RUN-014` before any shell command runs, and that the same `pin` on two hosts yields the same interpreter with no `interpreter_runtime` grant anywhere. | Whenever the staging bind, the grant's Landlock rights, or the composed-root plan changes. |
 | [**Resource limits**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/resource-limits-manual-verification.md) | The three mechanisms bounding the native subprocess tree: `setrlimit(2)` per-process ceilings, the cgroup v2 scope (fork bomb, memory hog, CPU, I/O), and the periodic workdir-size check. Ten scenarios, including the `E-RUN-012` fail-closed launch refusal and the macOS gap behind `W-SEC-010`. | On a Linux host with systemd user cgroup delegation configured, whenever `capabilities.resources` enforcement or the cgroup delegation path changes. |
-| [**Subprocess fd hygiene**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/subprocess-fd-hygiene-verification.md) | The negative property that a descriptor open in the runtime process at spawn time is not visible inside the spawned child, across both spawn paths (shell tool and native tool), on both kernel tiers. Landlock cannot substitute for this: an inherited fd was opened before the ruleset existed. | Whenever either spawn path's pre-exec window changes. |
+| [**Subprocess fd hygiene**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/subprocess-fd-hygiene-verification.md) | The negative property that a descriptor open in the runtime process at spawn time is not visible inside the spawned child, for shell commands and native tools, on both kernel tiers. Landlock cannot substitute for this: an inherited fd was opened before the ruleset existed. | Whenever the pre-exec window of the subprocess spawn changes. |
 | [**Workdir `Execute` rights and declared `workdir_exec`**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-exec-landlock-manual-verification.md) | That `capabilities.shell.allow` is *complete*: with the default `capabilities.filesystem.workdir_exec: false`, a binary planted in the session workdir under an allowlisted basename does not execute, because the workdir's Landlock rule carries no `Execute` right. Also the declared opt-in's whole visible surface — the binary runs, the achieved class drops to `advisory`, `--explain-scope` and `trace.jsonl` say so, and `containment: scoped` alongside it refuses with `E-CAP-003`. Also the rest of the workdir's right set: files move and hard-link between its folders as real renames, nothing moves or links across its boundary, `truncate(2)` outside it is refused, `uv venv` and `uv pip install` succeed in it, and a ruleset built at ABI v1 fails those moves with `EXDEV`. | Whenever the workdir grant's right set, the exec-grant derivation, or the tier→class mapping changes. |
 | [**Shell-binary reachability under `sealed`**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/shell-binary-reachability-manual-verification.md) | That a `capabilities.shell.allow` grant which cannot actually *function* inside a composed root fails at launch rather than deep in a run: the `E-CAP-006` refusal for an interpreted entrypoint whose package tree nothing declared reaches, the `W-SEC-012` warning for a compiler driver whose `cc1`/`as`/`ld` helpers have no `Execute` grant, and the two negative controls — a system `/usr` interpreter that needs no grant, and a declared `interpreter_runtime` that makes a real compile succeed. | Whenever the reachability checks, the fixed sealed runtime tree's right set, or the known-driver registry changes. |
 | [**Workdir device-node escape**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-device-node-manual-verification.md) | That a capsule cannot create a character- or block-device node inside its own workdir and read the raw host filesystem through it, via the Landlock workdir grant withholding those rights and the shell child's capability drop. Also that FIFO and ordinary file creation still work, and that the child is left non-dumpable. | Whenever the workdir grant's right set, the child's capability drop, or the pre-exec hardening sequence changes. |

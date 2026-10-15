@@ -170,7 +170,7 @@ The subprocess does not inherit your full host environment. It starts with a min
     `HOME` (and, on Windows, `USERPROFILE`) is never the real host home directory. The runtime always replaces it with a session-scoped directory (`<workdir>/.capsule-home`, created on demand) before the subprocess spawns. Neither `baseline_env` nor any environment override the agent supplies can restore the real host value — the synthetic path always wins. This is also why `cat ~/.ssh/id_rsa` inside a capsule answers *no such file* on every tier, including a host that denies nothing: test containment with an absolute path instead, per [Testing containment honestly](../reference/containment.md#testing-containment).
 
 !!! info "Native tool artifacts get the same treatment"
-    Everything in this step — the synthetic `HOME`, the credential-pattern strip list, `strip_env`, and `baseline_env` — also applies to `runtime: tool` artifacts declared with `implementation: native` (see [Python Tool Quickstart (Native)](../language-guides/python-native.md)), even if the capsule declares no `capabilities.shell.allow` entries at all. Both subprocess spawn paths build their environment through the same internal function, so there's no separate configuration surface for native tools.
+    Everything in this step — the synthetic `HOME`, the credential-pattern strip list, `strip_env`, and `baseline_env` — also applies to `runtime: tool` artifacts declared with `implementation: native` (see [Python Tool Quickstart (Native)](../language-guides/python-native.md)), even if the capsule declares no `capabilities.shell.allow` entries at all. A native tool is spawned the way a shell command is, in the same sandbox with the same environment, so there is no separate configuration surface for native tools.
 
 Use `strip_env` to remove baseline variables the agent doesn't need:
 
@@ -262,10 +262,6 @@ artifacts:
   - name: murmur/tool-git
     version: "{{ v.murmur_tool_git }}"
     runtime: tool
-    capabilities:
-      network:
-        allow:
-          - https://github.com
   - name: murmur/tool-editor
     version: "{{ v.murmur_tool_editor }}"
     runtime: tool
@@ -284,12 +280,13 @@ capabilities:
   shell:
     allow:
       - bash
+      - git
 ```
 
 The effective grant is the intersection of what an artifact declares and the ceiling — it can only ever subtract. Each block does one job:
 
 - **The driver** gets `network.allow: []` and reaches no host directly. Inference is unaffected: the runtime sends the driver's requests to the driver entry's `gateway.endpoint` itself and attaches `gateway.api_key` there, including for a driver call a hook's `run-inference` makes.
-- **The git tool** reaches only `github.com`.
+- **The git tool** is a native tool, so it takes no per-artifact block: it runs under the capsule ceiling in the same sandbox as `bash`. It can run `git` because the ceiling's `shell.allow` names it, and reach `github.com` because the ceiling's `network.allow` does. See [Native tools](../reference/containment.md#native-tools).
 - **The editor tool** gets `network.allow: []` — a real narrowing to zero outbound HTTP, distinct from omitting the key — and `filesystem.scope: repo`, which gives it only `<workdir>/repo` as its current directory. An absolute path, or one that escapes via `..`, fails at staging (`E-CAP-002`) before the tool runs.
 
 An artifact with **no** `capabilities:` block inherits the full ceiling. Grants are read only from your capsule manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`, so an untrusted artifact cannot scope itself up.
@@ -344,7 +341,7 @@ Each shell invocation the agent makes appears in `workdir/<session_id>/trace.jso
 Per-artifact grants resolve at staging, before the session workdir exists, so any capability warning goes to stderr as the run starts. Two are worth knowing:
 
 - **`W-SEC-007`** — a per-artifact `network.allow` entry the ceiling does not itself cover was dropped, not granted. Nothing is ever widened, but a tool that silently cannot reach a host it looks "granted" is hard to trace back to the manifest. See [W-SEC-007](../reference/diagnostics.md#w-sec-007).
-- **`W-SEC-008`** — a per-artifact block declared `shell`, `spawn`, `env`, `limits`, `resources` or `containment`, or sat on a tool with a native (non-WASM) implementation. Only `network` and `filesystem` narrow; the rest parse but are inert. Scope a native tool through the capsule-wide `capabilities.shell.*` block instead, or ship it as WASM if you need per-artifact narrowing. See [W-SEC-008](../reference/diagnostics.md#w-sec-008).
+- **`W-SEC-008`** — a per-artifact block declared `shell`, `spawn`, `env`, `limits`, `resources` or `containment`, or sat on a tool with a native (non-WASM) implementation. Only `network` and `filesystem` narrow; the rest parse but are inert. A native tool runs under the capsule-wide grants, enforced by the same sandbox as a shell command, and its per-artifact block does not narrow them: narrow the capsule-wide block itself, or ship the tool as WASM if it needs grants narrower than the rest of the capsule's. See [W-SEC-008](../reference/diagnostics.md#w-sec-008).
 
 Keep credentials out of the manifest itself. Reference them by environment variable — `gateway.api_key: ${ANTHROPIC_API_KEY}` on the driver's artifact entry, as every example above does — never as a literal string. A literal secret prints a [`W-SEC-004`](../reference/diagnostics.md#w-sec-004) warning and risks leaking into version control.
 
@@ -378,5 +375,6 @@ mur trace show
 | `filesystem.scope` on a WASM artifact | A real directory grant, enforced on every platform including macOS |
 | Bare host under a scheme-bound ceiling | Dropped with `W-SEC-007`; write the entry as specifically as the ceiling |
 | `shell`/`spawn`/`env`/`limits` in a per-artifact block | Parsed but inert; prints `W-SEC-008` |
+| Any per-artifact block on a native tool | Inert; prints `W-SEC-008`. The tool runs under the ceiling, in the same sandbox as `bash` |
 | `gateway.api_key: ${ENV_VAR}` | Keeps secrets out of the manifest; a literal triggers `W-SEC-004` |
 | Non-zero exit code | Passed back to the model as data; the session continues |
