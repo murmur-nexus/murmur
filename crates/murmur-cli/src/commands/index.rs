@@ -10,7 +10,9 @@ use murmur_artifact::{
 
 use crate::commands::search::read_index_file;
 use crate::error::{CliError, E_IDX_001, E_IDX_003, E_IO_003};
-use crate::source::{reserved_scope_hint, scope_of_github_repo, GithubScopeError};
+use crate::source::{
+    reserved_scope_hint, scope_of_github_repo, split_github_repo, GithubScopeError,
+};
 
 /// Index every `.mur.zip` directly in `dir` as release `release` of the GitHub repository `repo`,
 /// optionally keeping the versions of the earlier index `merge` that `dir` does not hold, and
@@ -81,12 +83,7 @@ pub(crate) fn run_index(
 
 /// The scope `--repo <owner>/<repo>` names, by the rule `mur install github:<owner>/<repo>` uses.
 fn repo_scope(repo: &str) -> Result<String, CliError> {
-    let usable_part =
-        |part: &str| !part.is_empty() && !part.chars().any(|c| c.is_whitespace() || c.is_control());
-    let Some((owner, name)) = repo
-        .split_once('/')
-        .filter(|(owner, name)| usable_part(owner) && usable_part(name) && !name.contains('/'))
-    else {
+    let Some((owner, name)) = split_github_repo(repo) else {
         return Err(CliError::new(
             E_IDX_003,
             format!("--repo '{repo}' is not a GitHub repository written <owner>/<repo>"),

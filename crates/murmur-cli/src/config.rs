@@ -305,7 +305,7 @@ fn merge_sources(global: Vec<SourceConfig>, project: Vec<SourceConfig>) -> Vec<S
 
 /// The scope `source` serves, or `None` when its `repo` is no `<owner>/<repo>` with a usable owner.
 pub(crate) fn source_scope(source: &SourceConfig) -> Option<String> {
-    let (owner, repo) = source.repo.as_deref()?.trim().split_once('/')?;
+    let (owner, repo) = crate::source::split_github_repo(source.repo.as_deref()?.trim())?;
     crate::source::scope_of_github_repo(owner, repo).ok()
 }
 

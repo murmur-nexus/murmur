@@ -35,7 +35,8 @@ pub(crate) const DEFAULT_ARTIFACTS_REPO: &str = "murmur-nexus/default-artifacts"
 /// [`MURMUR_SCOPE`] is held to it on every fetch, with or without a `murmur.lock`.
 pub(crate) const MURMUR_OWNER_ID: u64 = 190_196_424;
 
-/// The removed key that named the source asked first, when several could serve one name.
+/// A key read only to refuse it with `E-CFG-003`: a scope has one source, so there is no first
+/// source to name.
 pub(crate) const REMOVED_DEFAULT_KEY: &str = "registry.default";
 
 /// The keys of the removed source form, which named a source and its type rather than its
@@ -66,6 +67,15 @@ pub(crate) fn scope_of_github_repo(owner: &str, repo: &str) -> Result<String, Gi
         return Err(GithubScopeError::InvalidOwner { reason });
     }
     Ok(scope)
+}
+
+/// The owner and repository of `repo`, written `<owner>/<repo>`: exactly two parts, neither empty
+/// nor holding whitespace or a control character. Both go into request paths unencoded.
+pub(crate) fn split_github_repo(repo: &str) -> Option<(&str, &str)> {
+    let usable =
+        |part: &str| !part.is_empty() && !part.chars().any(|c| c.is_whitespace() || c.is_control());
+    repo.split_once('/')
+        .filter(|(owner, name)| usable(owner) && usable(name) && !name.contains('/'))
 }
 
 /// The hint under a reserved-scope refusal of a GitHub owner.
@@ -187,13 +197,9 @@ fn configured_source(
             SOURCE_FORM_HINT,
         ));
     };
-    let parts: Vec<&str> = repo_ref.split('/').collect();
-    let [owner, repo] = parts.as_slice() else {
+    let Some((owner, repo)) = split_github_repo(repo_ref) else {
         return Err(not_a_repository(file, at, repo_ref));
     };
-    if owner.is_empty() || repo.is_empty() {
-        return Err(not_a_repository(file, at, repo_ref));
-    }
     let scope = scope_of_github_repo(owner, repo).map_err(|error| match error {
         GithubScopeError::Reserved { scope } => CliError::with_hint(
             E_CFG_003,
@@ -211,8 +217,8 @@ fn configured_source(
     })?;
     Ok(ConfiguredSource {
         scope,
-        owner: (*owner).to_string(),
-        repo: (*repo).to_string(),
+        owner: owner.to_string(),
+        repo: repo.to_string(),
         token: entry.resolved_token(),
     })
 }
@@ -242,7 +248,7 @@ impl Sources {
     }
 
     /// The sources `mur deploy` uses: the global config file only.
-    #[cfg_attr(not(feature = "beta-mur-deploy"), allow(dead_code))]
+    #[cfg(any(feature = "beta-mur-deploy", test))]
     pub(crate) fn load_global() -> Result<Self, CliError> {
         Self::from_files(&[mur_config_path()?])
     }

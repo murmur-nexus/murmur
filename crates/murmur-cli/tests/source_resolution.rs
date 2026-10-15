@@ -171,7 +171,7 @@ fn stored(home: &Path, full: &str, version: &str, file: &str) -> Vec<u8> {
     fs::read(global_store(home).join(full).join(version).join(file)).unwrap()
 }
 
-// ─── S1: exact names ─────────────────────────────────────────────────────────
+// ─── exact names ─────────────────────────────────────────────────────────────
 
 #[test]
 fn a_name_resolves_to_exactly_its_own_file() {
@@ -314,7 +314,7 @@ fn a_version_or_name_the_index_does_not_list_is_refused() {
     assert!(!stub.downloaded_a_payload(), "{:?}", stub.paths());
 }
 
-// ─── S2: a source that claims another scope ─────────────────────────────────
+// ─── a source that claims another scope ─────────────────────────────────────
 
 #[test]
 fn an_index_claiming_another_scope_is_refused() {
@@ -389,7 +389,7 @@ fn an_index_claiming_another_scope_is_refused() {
     assert!(!stub.downloaded_a_payload(), "{:?}", stub.paths());
 }
 
-// ─── S3: owner identity ─────────────────────────────────────────────────────
+// ─── owner identity ─────────────────────────────────────────────────────────
 
 fn meta_owner_id(store: &Path, full: &str, version: &str, stem: &str) -> Option<u64> {
     let raw = fs::read_to_string(
@@ -552,7 +552,7 @@ fn the_murmur_scope_refuses_any_owner_but_its_own() {
     );
 }
 
-// ─── S4: newest fitting ──────────────────────────────────────────────────────
+// ─── newest fitting ──────────────────────────────────────────────────────────
 
 /// `murmur:tool/run` at the version this mur serves.
 fn served_tool_run() -> String {
@@ -764,7 +764,7 @@ fn an_unversioned_reference_installs_the_newest_version_that_fits() {
     }
 }
 
-// ─── S5: digests and packed identity ────────────────────────────────────────
+// ─── digests and packed identity ────────────────────────────────────────────
 
 #[test]
 fn a_payload_other_than_the_index_describes_is_refused() {
@@ -875,7 +875,7 @@ fn a_payload_other_than_the_index_describes_is_refused() {
     assert_contains(&stderr, &["declares name 'tool-other'"]);
 }
 
-// ─── S6: no config ───────────────────────────────────────────────────────────
+// ─── no config ───────────────────────────────────────────────────────────────
 
 #[test]
 fn the_murmur_scope_is_served_with_no_config_file() {
@@ -976,7 +976,7 @@ fn a_default_artifacts_entry_lends_the_built_in_source_its_token() {
     );
 }
 
-// ─── S7: config refusals ─────────────────────────────────────────────────────
+// ─── config refusals ─────────────────────────────────────────────────────────
 
 #[test]
 fn every_removed_config_form_is_refused_naming_the_file() {
@@ -1099,7 +1099,7 @@ fn config_set_refuses_the_removed_default_key() {
     assert!(!hint.contains("registry.default"), "{hint}");
 }
 
-// ─── S8: no schema 2 index ───────────────────────────────────────────────────
+// ─── no schema 2 index ───────────────────────────────────────────────────────
 
 #[test]
 fn a_source_without_a_schema_2_index_is_refused() {
@@ -1185,7 +1185,7 @@ fn a_source_without_a_schema_2_index_is_refused() {
     assert!(!stub.downloaded_a_payload(), "{:?}", stub.paths());
 }
 
-// ─── S9: platforms ───────────────────────────────────────────────────────────
+// ─── platforms ───────────────────────────────────────────────────────────────
 
 #[test]
 fn a_platform_payload_is_installed_by_its_exact_file_or_refused() {
@@ -1286,7 +1286,7 @@ fn all_platforms_installs_each_published_file_and_warns_for_the_rest() {
     );
 }
 
-// ─── S11: the github: form ───────────────────────────────────────────────────
+// ─── the github: form ────────────────────────────────────────────────────────
 
 #[test]
 fn a_github_release_install_records_and_checks_the_owner() {
