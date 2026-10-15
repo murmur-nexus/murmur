@@ -964,7 +964,8 @@ pub(crate) struct LandlockGrant {
     /// When set, the rule is added only if `path` still opens to this inode, and is otherwise
     /// dropped (shrink-not-fail). For a grant on a capsule-writable path: the capsule can replace
     /// the file, or a directory above it, with a symlink to any host binary, and an unpinned grant
-    /// would follow it and put `Execute` on that binary.
+    /// would follow it and put `Execute` on that binary. A pin tells one live file from another,
+    /// not new content from old: an inode number freed by a delete can be reused by the next file.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) pinned: Option<FileIdentity>,
 }
@@ -1114,8 +1115,9 @@ pub(crate) fn shebang_interpreter(image: &[u8]) -> Option<PathBuf> {
 /// the `PT_INTERP`/`DT_NEEDED` entries come from the runtime's own copy of the image, the
 /// dependency walk searches only absolute locations and neither grants nor reads a file under the
 /// accessible workdir, and the entrypoint's own grant is pinned to the inode the runtime wrote. A
-/// capsule that rewrites the entrypoint in place runs its own code under these grants; one that
-/// replaces the file loses the entrypoint's `Execute` rule.
+/// symlink or any other existing file put in the entrypoint's place loses its `Execute` rule. A
+/// capsule that rewrites the entrypoint runs its own code under these grants, including when it
+/// deletes the file and the filesystem hands a new one the freed inode number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeEntrypoint {
     path: PathBuf,
@@ -6721,6 +6723,9 @@ mod tests {
             .grant_count()
         };
         let installed_count = open(&grants);
+        // Holds the installed inode for the rest of the test. Freed, its number may be handed to
+        // the next file created on this filesystem, which would then match the pin.
+        std::fs::hard_link(&entrypoint, session.join("installed")).unwrap();
 
         std::fs::remove_file(&entrypoint).unwrap();
         std::os::unix::fs::symlink("/bin/sh", &entrypoint).unwrap();

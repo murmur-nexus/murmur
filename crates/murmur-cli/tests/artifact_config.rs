@@ -467,6 +467,11 @@ fn the_host_value_never_reaches_a_guest_however_a_manifest_allowlists_it() {
 /// from inside the block, which is asserted below rather than assumed.
 #[test]
 fn config_on_a_native_tool_warns_and_is_not_delivered() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "config_on_a_native_tool_warns_and_is_not_delivered",
+    ) {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let fixture = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();

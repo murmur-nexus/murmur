@@ -171,8 +171,8 @@ that cannot be built for a native tool ends the session with
     The tool's entrypoint sits in the session workdir, which the capsule can write. A capsule that
     overwrites `tools/<name>/<name>` in place and then calls the tool runs code it wrote, which
     [`workdir_exec: false`](#field-workdir-exec) otherwise forbids. That code runs with the grants
-    of the tool as installed: a new `#!` line or library entry adds none. A file put in the
-    entrypoint's place, including a symlink, has no execute grant, and the call fails.
+    of the tool as installed: a new `#!` line or library entry adds none. A symlink or another
+    existing file put in the entrypoint's place has no execute grant, and the call fails.
 
 ### Where the user namespace comes from { #userns-grant }
 
