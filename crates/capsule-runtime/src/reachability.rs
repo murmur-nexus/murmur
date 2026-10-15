@@ -179,23 +179,7 @@ pub struct ToolchainHelperReport {
 ///
 /// Pure apart from one bounded read, so it is unit-testable with tempfiles on any OS.
 pub(crate) fn shebang_interpreter_name(path: &Path) -> Option<String> {
-    use std::io::Read;
-
-    let mut head = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(SHEBANG_PROBE_BYTES)
-        .read_to_end(&mut head)
-        .ok()?;
-
-    let rest = head.strip_prefix(b"#!")?;
-    // The shebang is the first line and only the first line; a `\r` counts as a terminator so a
-    // CRLF-saved script does not yield an interpreter name with a stray carriage return glued on.
-    let line_end = rest
-        .iter()
-        .position(|&byte| byte == b'\n' || byte == b'\r')
-        .unwrap_or(rest.len());
-    let line = String::from_utf8_lossy(&rest[..line_end]);
+    let line = shebang_line(path, SHEBANG_PROBE_BYTES)?;
 
     let mut tokens = line.split_whitespace();
     let target = base_name(tokens.next()?)?;
@@ -212,6 +196,35 @@ pub(crate) fn shebang_interpreter_name(path: &Path) -> Option<String> {
         return base_name(token);
     }
     Some(target)
+}
+
+/// The text of the `#!` line at the head of `path`, after the `#!`, reading at most `limit` bytes.
+/// `None` when the file cannot be read or does not start with `#!`.
+///
+/// The shebang is the first line and only the first line; a `\r` counts as a terminator so a
+/// CRLF-saved script does not yield an interpreter with a stray carriage return glued on.
+pub(crate) fn shebang_line(path: &Path, limit: u64) -> Option<String> {
+    use std::io::Read;
+
+    let mut head = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(limit)
+        .read_to_end(&mut head)
+        .ok()?;
+
+    shebang_line_of(&head)
+}
+
+/// [`shebang_line`] over bytes already in hand: the text after a leading `#!` up to the first
+/// `\n` or `\r`, or `None` when `head` does not start with `#!`. The caller bounds `head`.
+pub(crate) fn shebang_line_of(head: &[u8]) -> Option<String> {
+    let rest = head.strip_prefix(b"#!")?;
+    let line_end = rest
+        .iter()
+        .position(|&byte| byte == b'\n' || byte == b'\r')
+        .unwrap_or(rest.len());
+    Some(String::from_utf8_lossy(&rest[..line_end]).into_owned())
 }
 
 /// Last path component of `raw`, as an owned `String`. `None` for an empty or root-only string,

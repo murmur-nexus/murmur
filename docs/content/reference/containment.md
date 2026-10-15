@@ -1,8 +1,9 @@
 # Containment
 
 A containment class bounds what a capsule's subprocesses — shell commands, plan shell steps and
-native tools — reach on the host, through kernel mechanisms the host has to provide. It does not bound what a WASM artifact does inside the workdir
-— [What bounds a WASM artifact](#artifact-boundary) names the grant that does. This page covers the
+native tools — reach on the host, through kernel mechanisms the host has to provide. It does not
+bound what a WASM artifact does inside the workdir — [What bounds a WASM
+artifact](#artifact-boundary) names the grant that does. This page covers the
 enforcement tier each host resolves to, the containment class a capsule can require of it, the
 fixed grants a contained capsule receives, and how each claim is checked.
 
@@ -134,12 +135,14 @@ tiers, inside the capsule's Landlock scope and composed root.
 Its grants are the capsule's own: `capabilities.filesystem`, `capabilities.network.allow`,
 `capabilities.network.unix_sockets` and `capabilities.shell.allow` apply to it exactly as they apply
 to a shell command. The runtime adds one thing, the files the kernel itself executes to start the
-tool, each with read and execute and nothing else:
+tool, each with read and execute and nothing else. It works them out once, when it installs the
+tool, from the artifact's own image, so nothing written to the workdir afterwards changes them:
 
 1. The tool's entrypoint, `<session workdir>/tools/<name>/<name>`.
 2. For a script, the absolute interpreter on its `#!` line. On Sealed, that interpreter's
    directory is bound into the composed root when no fixed runtime path already carries it.
-3. The ELF interpreter and shared-library closure of each.
+3. The ELF interpreter and shared-library closure of each, leaving out any file inside the
+   workdir.
 
 Everything else the tool reads, writes, runs or connects to has to be granted by the capsule:
 
@@ -147,7 +150,7 @@ Everything else the tool reads, writes, runs or connects to has to be granted by
 |---|---|
 | Runs another program, such as `git` | That program in `capabilities.shell.allow` |
 | Is a `#!/usr/bin/env python3` script | `python3` in `capabilities.shell.allow`: the `#!` grant covers `env` only |
-| Reads or writes a path outside the workdir | Nothing grants it on Full or Sealed; keep its inputs and outputs in the workdir |
+| Reads or writes a path outside the workdir | On Full and Sealed, keep its inputs and outputs in the workdir. Nothing grants a write outside it; the only read grant outside it is a [`capabilities.shell.interpreter_runtime`](manifest.md#field-capabilities) directory, which names a `shell.allow` binary and grants execute as well |
 | Reaches a host | That host in `capabilities.network.allow`; the connection leaves through the egress proxy |
 | Reaches a server an earlier shell call started on `127.0.0.1` | Nothing: the tool shares the session's loopback |
 | Opens an `AF_UNIX` socket | `capabilities.network.unix_sockets: true` |
@@ -164,10 +167,10 @@ that cannot be built for a native tool ends the session with
 
 !!! warning "The entrypoint is in the writable workdir"
     The tool's entrypoint sits in the session workdir, which the capsule can write. A capsule that
-    overwrites `tools/<name>/<name>` and then calls the tool runs code it wrote, which
-    [`workdir_exec: false`](#field-workdir-exec) otherwise forbids. That code runs inside the
-    capsule's own sandbox, with the capsule's own grants, so it reaches nothing a shell command
-    could not; but it is code the capsule chose, run under a tool's name.
+    overwrites `tools/<name>/<name>` in place and then calls the tool runs code it wrote, which
+    [`workdir_exec: false`](#field-workdir-exec) otherwise forbids. That code runs with the grants
+    of the tool as installed: a new `#!` line or library entry adds none. A file put in the
+    entrypoint's place, including a symlink, has no execute grant, and the call fails.
 
 ### Where the user namespace comes from { #userns-grant }
 

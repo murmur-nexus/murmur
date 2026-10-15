@@ -2447,7 +2447,8 @@ pub fn stage_session(
         write_tool_manifest(&workdir, name, manifest_yaml)?;
     }
 
-    install_native_binaries(&workdir, native_binaries, &full_names)?;
+    let native_entrypoints =
+        install_native_binaries(&workdir, &accessible_workdir, native_binaries, &full_names)?;
     install_skill_files(&workdir, skill_files)?;
 
     // Write generic manifests for any shell binary not already covered by a custom manifest.
@@ -2587,6 +2588,7 @@ pub fn stage_session(
         compiled_forms,
         capsule_component,
         tool_components,
+        native_entrypoints,
         process_driver: staged_process_driver,
         artifact_grants,
         hook_components,
@@ -3206,6 +3208,7 @@ fn launch(
         // Capture staged fields that move into the async block
         let hook_components = staged.hook_components;
         let tool_components = staged.tool_components;
+        let native_entrypoints = staged.native_entrypoints;
         let process_driver_for_state = staged.process_driver.clone();
         let artifact_grants = staged.artifact_grants;
         let allowlisted_tools = staged.allowlisted_tools.clone();
@@ -3503,6 +3506,7 @@ fn launch(
                         workdir: workdir.clone(),
                         accessible_workdir: accessible_workdir.clone(),
                         tool_components,
+                        native_entrypoints,
                         process_driver: process_driver_for_state.clone(),
                         artifact_grants,
                         allowlisted_tools,
@@ -4571,6 +4575,7 @@ fn launch(
         workdir: staged.workdir.clone(),
         accessible_workdir: staged.accessible_workdir.clone(),
         tool_components: staged.tool_components,
+        native_entrypoints: staged.native_entrypoints,
         // A script capsule runs no agent loop, so nothing here would ever drive a harness.
         process_driver: None,
         artifact_grants: staged.artifact_grants,
@@ -6543,6 +6548,10 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) workdir: PathBuf,
     pub(crate) accessible_workdir: PathBuf,
     pub(crate) tool_components: HashMap<String, Component>,
+    /// What each native tool installed in this session needs to start, keyed by tool name: from
+    /// [`StagedSession::native_entrypoints`], and added to by `manage.pull()`. A native tool is
+    /// dispatched only through its entry here; see [`sandbox::NativeEntrypoint`].
+    pub(crate) native_entrypoints: HashMap<String, sandbox::NativeEntrypoint>,
     /// The `transport: process` driver this session drives its harness through, shared from
     /// [`StagedSession::process_driver`]. `None` on every other transport, and on the
     /// script-capsule path, which runs no agent loop.
@@ -7038,12 +7047,14 @@ impl manage::Host for CapsuleStoreState {
                 // The binary is packed at `bin/<bare name>`, the artifact's own `name:`.
                 let binary = extract_native_binary(&tool, &version, &resolved.bytes)
                     .map_err(|err| err.to_string())?;
-                install_native_binaries(
+                let installed = install_native_binaries(
                     &self.workdir,
+                    &self.accessible_workdir,
                     vec![(tool.clone(), binary)],
                     &HashMap::from([(tool.clone(), name.clone())]),
                 )
                 .map_err(|err| err.to_string())?;
+                self.native_entrypoints.extend(installed);
                 (
                     ArtifactRuntime::Tool,
                     Some(ArtifactImplementation::Native),
@@ -7151,6 +7162,7 @@ impl manage::Host for CapsuleStoreState {
         // and stays, so a later pull of the same version is warm.
         let tool = murmur_artifact::tool_name_of(&name).to_string();
         self.tool_components.remove(&tool);
+        self.native_entrypoints.remove(&tool);
         self.installed_artifacts
             .retain(|artifact| artifact.name != name);
         self.removed_artifacts.insert(tool.clone());
@@ -7982,8 +7994,7 @@ impl CapsuleStoreState {
         {
             return as_tool();
         }
-        let native_bin = self.workdir.join("tools").join(name).join(name);
-        if native_bin.exists()
+        if self.native_entrypoints.contains_key(name)
             && !self.tool_components.contains_key(name)
             && !self.removed_artifacts.contains(name)
         {
@@ -8224,12 +8235,12 @@ impl CapsuleStoreState {
                 .map(DispatchOutcome::tool);
         }
 
-        // Native artifact: packaged binary in workdir/tools/<name>/<name>
-        let native_bin = self.workdir.join("tools").join(name).join(name);
-        if native_bin.exists()
-            && !self.tool_components.contains_key(name)
-            && !self.removed_artifacts.contains(name)
-        {
+        // Native artifact: a binary this session installed at workdir/tools/<name>/<name>. A file
+        // the capsule wrote there itself has no entry and is not dispatched as a native tool.
+        let native_entrypoint = self.native_entrypoints.get(name).cloned();
+        if let Some(native_entrypoint) = native_entrypoint.filter(|_| {
+            !self.tool_components.contains_key(name) && !self.removed_artifacts.contains(name)
+        }) {
             // On the blocking pool, like the shell branch: the wait on the child is a blocking
             // wait, and on the calling task it would stall every other future that task polls.
             let running = enforce_allowlist(&self.allowlisted_tools, name, || {
@@ -8242,7 +8253,7 @@ impl CapsuleStoreState {
                     dispatch_native_tool(
                         &name,
                         input,
-                        &native_bin,
+                        &native_entrypoint,
                         &accessible_workdir,
                         &session_workdir,
                         &policy,
@@ -9865,17 +9876,20 @@ fn write_tool_manifest_unchecked(
     })
 }
 
-/// Write each native tool's binary to `<workdir>/tools/<name>/<name>`, executable. `name` is the
-/// tool name; a refusal names the artifact by its full name from `full_names`.
+/// Write each native tool's binary to `<workdir>/tools/<name>/<name>`, executable, and return
+/// what each needs to start, keyed by `name`, derived from the bytes written rather than read back
+/// from the capsule-writable `accessible_workdir`. `name` is the tool name; a refusal names the
+/// artifact by its full name from `full_names`.
 ///
 /// Every image is classified against this host before the first one is written. A batch holding
 /// one unrunnable binary installs none of them: a refusal that had already written two of three
 /// tools would leave a workdir that is neither the state before staging nor the state after it.
 fn install_native_binaries(
     workdir: &Path,
+    accessible_workdir: &Path,
     native_binaries: Vec<(String, Vec<u8>)>,
     full_names: &HashMap<String, String>,
-) -> Result<(), RuntimeError> {
+) -> Result<HashMap<String, sandbox::NativeEntrypoint>, RuntimeError> {
     let host_platform = current_platform();
     for (name, bytes) in &native_binaries {
         if let NativeBinaryVerdict::Mismatch { binary_platform } =
@@ -9889,6 +9903,7 @@ fn install_native_binaries(
         }
     }
 
+    let mut entrypoints = HashMap::new();
     for (name, bytes) in native_binaries {
         let binary_path = workdir.join("tools").join(&name).join(&name);
         let Some(parent) = binary_path.parent() else {
@@ -9922,8 +9937,11 @@ fn install_native_binaries(
                 }
             })?;
         }
+        let entrypoint =
+            sandbox::NativeEntrypoint::derive(&binary_path, &bytes, accessible_workdir);
+        entrypoints.insert(name, entrypoint);
     }
-    Ok(())
+    Ok(entrypoints)
 }
 
 /// Resolve and read a local-source skill's `skill.md` bytes.
@@ -10607,14 +10625,14 @@ pub(crate) fn native_env(guest_env: &[(String, String)]) -> Vec<(String, String)
 /// the capsule-wide grants as its ceiling: it joins the session's network namespace, runs under
 /// the seccomp filter with its capabilities dropped, and on the Landlock tiers inside the
 /// capsule's Landlock scope (and composed root, on `sealed`). The only grant added for it is the
-/// exec closure of `binary_path` itself — see [`sandbox::ShellEnforcement::for_native_entrypoint`].
+/// exec closure of `entrypoint` itself — see [`sandbox::ShellEnforcement::for_native_entrypoint`].
 ///
 /// A setup failure keeps [`ShellExecError`]'s session-fatal distinction, so a `sealed` composed
 /// root that cannot be built ends the session here exactly as it does for a shell command.
 fn dispatch_native_tool(
     name: &str,
     input: murmur::tool::run::ToolInput,
-    binary_path: &Path,
+    entrypoint: &sandbox::NativeEntrypoint,
     accessible_workdir: &Path,
     session_workdir: &Path,
     policy: &CapabilityPolicy,
@@ -10635,7 +10653,7 @@ fn dispatch_native_tool(
 
     let env = build_shell_env(policy, &[], session_workdir)?;
 
-    let mut command = Command::new(binary_path);
+    let mut command = Command::new(entrypoint.path());
     command
         .current_dir(accessible_workdir)
         .env_clear()
@@ -10647,7 +10665,7 @@ fn dispatch_native_tool(
     // Fail-closed, as on the shell path: a setup failure returns here and nothing is spawned.
     let supervisor = sandbox::prepare_enforcement(
         &mut command,
-        &enforcement.for_native_entrypoint(binary_path),
+        &enforcement.for_native_entrypoint(entrypoint),
         accessible_workdir,
         session_workdir,
     )?;
@@ -14596,6 +14614,7 @@ inference:
             workdir: workdir.clone(),
             accessible_workdir: workdir,
             tool_components: HashMap::new(),
+            native_entrypoints: HashMap::new(),
             process_driver: None,
             artifact_grants: HashMap::new(),
             allowlisted_tools: HashSet::new(),
@@ -16534,6 +16553,11 @@ inference:
     /// Writes an executable shell script native-tool fixture that echoes the given env
     /// var names (space-separated `NAME=value`, empty string for an unset var) into the
     /// `data` field of a passing ToolResult JSON payload on stdout.
+    /// `binary` as the runtime records a native tool it installed in `workdir`.
+    fn installed_native_tool(binary: &Path, workdir: &Path) -> sandbox::NativeEntrypoint {
+        sandbox::NativeEntrypoint::derive(binary, &fs::read(binary).unwrap(), workdir)
+    }
+
     fn write_env_echo_native_tool(dir: &Path, name: &str, env_vars: &[&str]) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
@@ -16607,7 +16631,7 @@ inference:
                 data: None,
                 log_path: None,
             },
-            &binary,
+            &installed_native_tool(&binary, tmp.path()),
             tmp.path(),
             tmp.path(),
             &declaring,
@@ -17220,7 +17244,7 @@ inference:
                     data: None,
                     log_path: None,
                 },
-                &binary,
+                &installed_native_tool(&binary, tmp.path()),
                 tmp.path(),
                 tmp.path(),
                 &CapabilityPolicy::default(),
@@ -17575,6 +17599,10 @@ inference:
             tmp.path().join("murmur.lock"),
         );
         state.allowlisted_tools.insert("slow-native".to_string());
+        state.native_entrypoints.insert(
+            "slow-native".to_string(),
+            installed_native_tool(&native_bin, tmp.path()),
+        );
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -17647,7 +17675,7 @@ inference:
                 data: None,
                 log_path: None,
             },
-            &binary,
+            &installed_native_tool(&binary, tmp.path()),
             tmp.path(),
             tmp.path(),
             &policy,
@@ -17677,7 +17705,7 @@ inference:
                 data: None,
                 log_path: None,
             },
-            &binary,
+            &installed_native_tool(&binary, tmp.path()),
             tmp.path(),
             tmp.path(),
             &policy,
@@ -17706,7 +17734,7 @@ inference:
                 data: None,
                 log_path: None,
             },
-            &binary,
+            &installed_native_tool(&binary, tmp.path()),
             tmp.path(),
             tmp.path(),
             &policy,
@@ -17735,7 +17763,7 @@ inference:
                 data: None,
                 log_path: None,
             },
-            &binary,
+            &installed_native_tool(&binary, tmp.path()),
             tmp.path(),
             tmp.path(),
             &policy,
@@ -17768,7 +17796,7 @@ inference:
                 data: None,
                 log_path: None,
             },
-            &binary,
+            &installed_native_tool(&binary, tmp.path()),
             tmp.path(),
             tmp.path(),
             &policy,

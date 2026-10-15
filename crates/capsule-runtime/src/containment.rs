@@ -471,9 +471,8 @@ pub struct ScopeReport {
     /// `plan-shell-steps` and `native-tools`, since all three are spawned through one enforcement
     /// path.
     ///
-    /// Always serialized, on the same terms as [`Self::workdir_exec`]: the key's absence
-    /// identifies a runtime that predates confining native tools, which ran them with rlimits and
-    /// a cgroup only.
+    /// Always serialized, on the same terms as [`Self::workdir_exec`]: a consumer keys on its
+    /// presence, and a report without it comes from a runtime that does not confine native tools.
     pub mechanism_covers: Vec<&'static str>,
     /// Where this host's permission to create an unprivileged user namespace comes from, as
     /// [`UsernsGrant::wire_name`], or `null` off Linux, where AppArmor does not exist and the

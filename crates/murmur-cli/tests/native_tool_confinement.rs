@@ -343,7 +343,9 @@ fn a_native_tool_is_refused_outside_its_grants() {
         !outside.path().join("planted.txt").exists(),
         "the refused write must leave nothing on the host"
     );
-    assert_eq!(ran.probe("toolu_connect_unlisted")["ok"], false);
+    // Refused at once inside the session's namespace. Unconfined, the same connect leaves through
+    // the host's route and times out, so a bare `ok: false` would not tell the two apart.
+    assert_refused(&ran, "toolu_connect_unlisted", "Connection refused");
     assert_allowed(&ran, "toolu_write_inside");
     let read = assert_allowed(&ran, "toolu_read_inside");
     assert_eq!(read["contents"], "kept");
@@ -458,7 +460,9 @@ fn a_sealed_native_tool_cannot_see_outside_its_root() {
         !outside.path().join("planted.txt").exists(),
         "the refused write must leave nothing on the host"
     );
-    assert_eq!(ran.probe("toolu_connect_unlisted")["ok"], false);
+    // Refused at once inside the session's namespace. Unconfined, the same connect leaves through
+    // the host's route and times out, so a bare `ok: false` would not tell the two apart.
+    assert_refused(&ran, "toolu_connect_unlisted", "Connection refused");
     assert_allowed(&ran, "toolu_write_inside");
     assert_eq!(
         assert_allowed(&ran, "toolu_read_inside")["contents"],

@@ -118,6 +118,7 @@ Do this after the ceiling is minimal.
 - Per-artifact network entries must be at least as specific as the corresponding ceiling entry. Match scheme, host, and port exactly when possible.
 - Use per-artifact `filesystem.scope` to give each WASM tool only its required subtree.
 - Only per-artifact `network`, `filesystem` and `state` take effect on a tool or driver. Per-artifact `shell`, `spawn`, `env`, `limits`, `resources`, or `containment` entries are inert and trigger `W-SEC-008`; put subprocess controls at capsule scope or move the operation into WASM.
+- A native tool cannot be narrowed below the ceiling: any per-artifact block on it triggers `W-SEC-008`. On Linux it runs in the capsule's subprocess sandbox under the capsule-wide grants, so grant what it runs in `shell.allow` (for example `git` for `murmur/tool-git`) and the hosts it reaches in `network.allow`, and keep its inputs and outputs in the workdir.
 - Hooks start with no network, directory, or task visibility unless granted. Tools and drivers start from the opposite default by inheriting the ceiling. Audit unnarrowed tools and widened hooks.
 
 Example shape; adapt endpoints, scopes, artifact names, versions, and provider fields to the actual use case:

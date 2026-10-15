@@ -561,6 +561,9 @@ pub struct StagedSession {
     /// `None` for manifest-only agent capsules; `Some` for script capsules with a WASM component.
     pub(crate) capsule_component: Option<Component>,
     pub(crate) tool_components: HashMap<String, Component>,
+    /// What each native tool installed at staging needs to start, keyed by tool name. Derived
+    /// from the image the runtime wrote; see [`crate::sandbox::NativeEntrypoint`].
+    pub(crate) native_entrypoints: HashMap<String, crate::sandbox::NativeEntrypoint>,
     /// The process driver, for a `transport: process` session that named one. `None` on every
     /// other transport.
     pub(crate) process_driver: Option<Arc<StagedProcessDriver>>,
