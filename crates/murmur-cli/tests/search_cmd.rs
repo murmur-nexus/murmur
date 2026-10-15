@@ -140,6 +140,7 @@ fn publish_meta(home: &TempDir, name: &str) {
         description: None,
         tags: vec![],
         wit_contracts: None,
+        owner_id: None,
     };
     reg.publish(meta, b"fake").unwrap();
 }

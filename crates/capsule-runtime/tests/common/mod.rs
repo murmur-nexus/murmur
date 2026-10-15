@@ -152,6 +152,7 @@ fn publish_bytes(registry_root: &Path, name: &str, version: &str, bytes: &[u8]) 
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,
+                owner_id: None,
             },
             bytes,
         )

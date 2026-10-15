@@ -346,6 +346,7 @@ mod tests {
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,
+                owner_id: None,
             };
             self.registry.publish(meta, &bytes).unwrap().sha256
         }
@@ -480,6 +481,7 @@ mod tests {
             description: None,
             tags: Vec::new(),
             wit_contracts: None,
+            owner_id: None,
         }
     }
 

@@ -212,8 +212,9 @@ enum Commands {
     /// Install an artifact into the project store (.murmur/artifacts/) by default, or globally with -g.
     /// With no arguments, installs all manifest deps from murmur.yaml into the project store.
     Install {
-        /// Artifact reference: name@version (the global store, then the configured sources),
-        /// bare name (the sources), github:<owner>/<repo>@<tag>, or a local file path
+        /// Artifact reference: scope/name@version (the global store, then the scope's source),
+        /// scope/name (the newest version that fits, from the scope's source),
+        /// github:<owner>/<repo>@<tag>, or a local file path
         /// (./artifact.mur.zip). Omit to install all manifest deps from murmur.yaml.
         artifact: Option<String>,
 
@@ -222,7 +223,7 @@ enum Commands {
         global: bool,
 
         /// Download all platform variants and install into the global store (CI / roost seeding).
-        /// Requires a name@version artifact reference and a configured source chain.
+        /// Requires a scope/name@version artifact reference whose scope has a source.
         #[arg(long)]
         all_platforms: bool,
 

@@ -19,7 +19,7 @@ use predicates::prelude::*;
 
 /// The bare name the releases publish their assets under.
 const ARTIFACT: &str = "tool-git";
-/// The full name installed: the scope of the `acme/*` sources.
+/// The full name installed: the scope of the `acme/artifacts` source.
 const FULL_NAME: &str = "acme/tool-git";
 const VERSION: &str = "0.4.2";
 
@@ -69,6 +69,27 @@ impl Reply {
             body,
         }
     }
+
+    /// `GET /repos/acme/artifacts`.
+    fn repository() -> Self {
+        Self::ok("{\"owner\":{\"id\":4242,\"login\":\"acme\"}}".to_string())
+    }
+}
+
+/// A schema 2 index of the `acme` scope listing `ARTIFACT@VERSION` as asset 1 of release
+/// `v9.9.9`. Its digest is never checked: the payload's download is what each test refuses.
+fn index_json() -> String {
+    format!(
+        "{{\"schema_version\":2,\"scope\":\"acme\",\"artifacts\":[{{\"name\":\"{ARTIFACT}\",\"runtime\":\"tool\",\"tags\":[],\"versions\":[{{\"version\":\"{VERSION}\",\"release\":\"v9.9.9\",\"interfaces\":[],\"assets\":[{{\"file\":\"{ARTIFACT}-{VERSION}.mur.zip\",\"sha256\":\"{}\"}}]}}]}}]}}",
+        "0".repeat(64)
+    )
+}
+
+/// `releases/latest` of `acme/artifacts`: the payload as asset 1 and the index as asset 2.
+fn latest_release_json() -> String {
+    format!(
+        "{{\"tag_name\":\"v9.9.9\",\"assets\":[{{\"id\":1,\"name\":\"{ARTIFACT}-{VERSION}.mur.zip\"}},{{\"id\":2,\"name\":\"artifacts-index.json\"}}]}}"
+    )
 }
 
 /// A loopback GitHub API that answers each request path with `route(path)` and records the
@@ -156,10 +177,7 @@ fn write_config(home: &Path, config: &str) {
 }
 
 fn write_single_source_config(home: &Path) {
-    write_config(
-        home,
-        "registry:\n  default: official\n  sources:\n    - name: official\n      type: github\n      repo: acme/artifacts\n",
-    );
+    write_config(home, "registry:\n  sources:\n    - repo: acme/artifacts\n");
 }
 
 /// `mur` with `HOME`, the stub's API base, and `GITHUB_TOKEN` set to `token` or removed.
@@ -192,7 +210,8 @@ fn assert_nothing_installed(home: &Path) {
     assert!(!store.exists(), "{} was written", store.display());
 }
 
-/// S1: an unauthenticated rate limit is reported as unanswered, with the token hint.
+/// An unauthenticated rate limit on the owner lookup, the first request of an install, is
+/// reported as unanswered, with the token hint.
 #[test]
 fn an_unauthenticated_rate_limit_is_unanswered_and_names_the_token_fix() {
     let home = tempfile::tempdir().unwrap();
@@ -205,13 +224,40 @@ fn an_unauthenticated_rate_limit_is_unanswered_and_names_the_token_fix() {
         .assert()
         .failure();
     let stderr = stderr_of(&assert);
+    assert_rate_limited_without_a_token(&stderr);
+    assert_nothing_installed(home.path());
+}
 
+/// The same for a rate limit on `releases/latest`, after the owner lookup answered.
+#[test]
+fn a_rate_limited_release_lookup_is_unanswered_and_names_the_token_fix() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    write_single_source_config(home.path());
+    let stub = Stub::start(|path| {
+        if path == "/repos/acme/artifacts" {
+            Reply::repository()
+        } else {
+            Reply::rate_limited()
+        }
+    });
+
+    let assert = mur(home.path(), cwd.path(), &stub, None)
+        .args(["install", &format!("{FULL_NAME}@{VERSION}"), "-g"])
+        .assert()
+        .failure();
+    assert_rate_limited_without_a_token(&stderr_of(&assert));
+    assert_eq!(stub.authorizations().len(), 2);
+    assert_nothing_installed(home.path());
+}
+
+fn assert_rate_limited_without_a_token(stderr: &str) {
     for needle in [
         "E-REG-006",
-        "github:acme/artifacts",
-        "GitHub rate-limited the lookup",
+        "could not look up acme/tool-git@0.4.2: github:acme/artifacts did not answer",
         "rate limited by GitHub (HTTP 403, x-ratelimit-remaining: 0)",
         "API rate limit exceeded",
+        "resets in about",
         "minute",
         "GITHUB_TOKEN",
         "gh auth token",
@@ -228,10 +274,9 @@ fn an_unauthenticated_rate_limit_is_unanswered_and_names_the_token_fix() {
     ] {
         assert!(!stderr.contains(absent), "{absent} present in:\n{stderr}");
     }
-    assert_nothing_installed(home.path());
 }
 
-/// S2: when the rate-limited requests carried a token, the hint says that token is exhausted.
+/// When the rate-limited requests carried a token, the hint says that token is exhausted.
 #[test]
 fn a_rate_limit_with_a_token_gives_no_token_advice() {
     let home = tempfile::tempdir().unwrap();
@@ -262,7 +307,7 @@ fn a_rate_limit_with_a_token_gives_no_token_advice() {
     );
 }
 
-/// S3: a 403 that is not a rate limit is unanswered, but not rate limited and gets no token hint.
+/// A 403 that is not a rate limit is unanswered, but not rate limited and gets no token hint.
 #[test]
 fn a_saml_refusal_is_unanswered_without_rate_limit_advice() {
     let home = tempfile::tempdir().unwrap();
@@ -294,22 +339,19 @@ fn a_saml_refusal_is_unanswered_without_rate_limit_advice() {
     }
 }
 
-/// S5: a rate limit on the asset download, after the release lookup answered, is unanswered too.
+/// A rate limit on the payload's download, after the owner, release and index answered, is
+/// unanswered too.
 #[test]
 fn a_rate_limited_asset_download_is_unanswered() {
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
     write_single_source_config(home.path());
-    let stub = Stub::start(|path| {
-        if path.ends_with("/releases/latest") {
-            Reply::ok(format!(
-                "{{\"tag_name\":\"v9.9.9\",\"assets\":[{{\"id\":1,\"name\":\"{ARTIFACT}-{VERSION}.mur.zip\"}}]}}"
-            ))
-        } else if path.ends_with("/releases/assets/1") {
-            Reply::rate_limited()
-        } else {
-            Reply::not_found()
-        }
+    let stub = Stub::start(|path| match path {
+        "/repos/acme/artifacts" => Reply::repository(),
+        "/repos/acme/artifacts/releases/latest" => Reply::ok(latest_release_json()),
+        "/repos/acme/artifacts/releases/assets/2" => Reply::ok(index_json()),
+        "/repos/acme/artifacts/releases/assets/1" => Reply::rate_limited(),
+        _ => Reply::not_found(),
     });
 
     let assert = mur(home.path(), cwd.path(), &stub, None)
@@ -325,21 +367,22 @@ fn a_rate_limited_asset_download_is_unanswered() {
     assert_nothing_installed(home.path());
 }
 
-/// S6: one rate-limited source and one that answered "not found" still cannot claim the artifact
-/// is absent, and both sources get a line.
+/// A source that fails with a server error has not said whether it publishes the artifact: that
+/// is unanswered, with no rate-limit advice.
 #[test]
-fn a_chain_with_one_unanswered_source_is_unanswered() {
+fn a_source_failing_with_a_server_error_is_unanswered() {
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
-    write_config(
-        home.path(),
-        "registry:\n  default: first\n  sources:\n    - name: first\n      type: github\n      repo: acme/first\n    - name: second\n      type: github\n      repo: acme/second\n",
-    );
+    write_single_source_config(home.path());
     let stub = Stub::start(|path| {
-        if path.starts_with("/repos/acme/first/") {
-            Reply::rate_limited()
+        if path == "/repos/acme/artifacts" {
+            Reply::repository()
         } else {
-            Reply::not_found()
+            Reply {
+                status: "502 Bad Gateway",
+                headers: Vec::new(),
+                body: "{\"message\":\"Server Error\"}".to_string(),
+            }
         }
     });
 
@@ -349,25 +392,20 @@ fn a_chain_with_one_unanswered_source_is_unanswered() {
         .failure();
     let stderr = stderr_of(&assert);
 
-    assert!(stderr.contains("E-REG-006"), "{stderr}");
-    assert!(!stderr.contains("E-REG-001"), "{stderr}");
-    let first: Vec<&str> = stderr
-        .lines()
-        .filter(|line| line.contains("github:acme/first"))
-        .collect();
-    assert_eq!(first.len(), 1, "{stderr}");
-    assert!(first[0].contains("rate limited"), "{stderr}");
-    assert_eq!(
-        stderr
-            .lines()
-            .filter(|line| line.contains("github:acme/second"))
-            .count(),
-        1,
-        "{stderr}"
-    );
+    for needle in [
+        "E-REG-006",
+        "github:acme/artifacts did not answer — HTTP 502: Server Error",
+        "fix the source or its credentials",
+    ] {
+        assert!(stderr.contains(needle), "{needle} missing from:\n{stderr}");
+    }
+    for absent in ["E-REG-001", "rate limited", "GITHUB_TOKEN"] {
+        assert!(!stderr.contains(absent), "{absent} present in:\n{stderr}");
+    }
+    assert_nothing_installed(home.path());
 }
 
-/// S7: a bare `mur install` in a project reports each rate-limited artifact as unanswered.
+/// A bare `mur install` in a project reports each rate-limited artifact as unanswered.
 #[test]
 fn a_manifest_install_reports_every_rate_limited_artifact_as_unanswered() {
     let home = tempfile::tempdir().unwrap();
@@ -403,7 +441,7 @@ fn a_manifest_install_reports_every_rate_limited_artifact_as_unanswered() {
     assert!(!stderr.contains("mur doctor"), "{stderr}");
 }
 
-/// S8: an explicit `github:` URI that is rate limited is unanswered, not a general I/O error.
+/// An explicit `github:` URI that is rate limited is unanswered, not a general I/O error.
 #[test]
 fn a_rate_limited_explicit_uri_is_unanswered() {
     let home = tempfile::tempdir().unwrap();

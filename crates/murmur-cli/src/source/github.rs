@@ -1,16 +1,19 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::env;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use indicatif::ProgressBar;
-use murmur_artifact::{current_platform, split_platform_suffix, SUPPORTED_PLATFORMS};
+use murmur_artifact::{ArtifactIndex, ARTIFACT_FILE_SUFFIX, ARTIFACT_INDEX_FILE_NAME};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use ureq::Agent;
 
 use crate::http::blocking_agent;
 
-use super::{ArtifactSource, RateLimitSignal, SourceError, SourceResolution};
+use super::{ArtifactSource, PublishedIndex, RateLimitSignal, SourceError};
 
 // ── Per-thread download progress ─────────────────────────────────────────────
 //
@@ -36,231 +39,142 @@ pub fn pop_download_progress() {
     DL_PROGRESS.with(|cell| *cell.borrow_mut() = None);
 }
 
-pub struct GitHubSource {
-    source_name: String,
+/// One GitHub repository as the source of `scope`, through the REST API at
+/// `MUR_GITHUB_API_BASE` (default `https://api.github.com`).
+///
+/// The repository's owner, its latest release, its index and every other release looked up are
+/// each requested at most once and kept for the life of the command, so threads fetching
+/// artifacts of one scope at once share them.
+pub(crate) struct GitHubSource {
+    label: String,
     owner: String,
+    repo_name: String,
+    /// `<owner>/<repo>`.
     repo: String,
+    scope: String,
     token: Option<String>,
-    explicit_tag: Option<String>,
     client: Agent,
     api_base: String,
+    owner_id: OnceLock<Result<u64, SourceError>>,
+    latest: OnceLock<Result<GitHubRelease, SourceError>>,
+    index: OnceLock<Result<Arc<PublishedIndex>, SourceError>>,
+    /// Releases looked up by tag. Held across the request, so two threads asking for one tag make
+    /// one request.
+    tagged: Mutex<HashMap<String, Result<GitHubRelease, SourceError>>>,
 }
 
-pub struct GitHubDirectResolution {
+/// One `.mur.zip` asset of a release, as a `github:<owner>/<repo>@<tag>` install takes it.
+pub(crate) struct ReleasePayload {
+    pub file: String,
     pub bytes: Bytes,
-    pub tag: String,
-    /// Platform tag on the asset's own name, or `None` for an untagged asset.
-    pub platform: Option<String>,
 }
 
 impl GitHubSource {
-    pub fn from_config(name: &str, repo: &str, token: Option<String>) -> Result<Self, SourceError> {
-        let Some((owner, repository)) = repo.split_once('/') else {
-            return Err(SourceError::Config(format!(
-                "invalid github repo '{}' (expected owner/repo)",
-                repo
-            )));
-        };
-
-        if owner.trim().is_empty() || repository.trim().is_empty() {
-            return Err(SourceError::Config(format!(
-                "invalid github repo '{}' (expected owner/repo)",
-                repo
-            )));
-        }
-
-        let _ = name;
-
-        Ok(Self {
-            source_name: format!("github:{owner}/{repository}"),
-            owner: owner.to_string(),
-            repo: repository.to_string(),
-            token,
-            explicit_tag: None,
-            client: blocking_agent(std::time::Duration::from_secs(30)),
-            api_base: github_api_base(),
-        })
-    }
-
-    pub fn explicit(owner: &str, repo: &str, tag: &str, token: Option<String>) -> Self {
+    /// The source `owner/repo` for `scope`. Makes no request.
+    pub(crate) fn new(owner: &str, repo: &str, scope: &str, token: Option<String>) -> Self {
         Self {
-            source_name: format!("github:{owner}/{repo}"),
+            label: format!("github:{owner}/{repo}"),
             owner: owner.to_string(),
-            repo: repo.to_string(),
+            repo_name: repo.to_string(),
+            repo: format!("{owner}/{repo}"),
+            scope: scope.to_string(),
             token,
-            explicit_tag: Some(tag.to_string()),
             client: blocking_agent(std::time::Duration::from_secs(30)),
             api_base: github_api_base(),
+            owner_id: OnceLock::new(),
+            latest: OnceLock::new(),
+            index: OnceLock::new(),
+            tagged: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn resolve_all_release_assets_by_tag(
-        &self,
-    ) -> Result<Vec<GitHubDirectResolution>, SourceError> {
-        let Some(explicit_tag) = self.explicit_tag.as_deref() else {
-            return Err(SourceError::Config(
-                "github explicit resolution requires a tag".to_string(),
-            ));
-        };
-
-        let release = self.fetch_release_by_exact_tag(explicit_tag)?;
-        let zip_assets: Vec<_> = release
+    /// Every `.mur.zip` asset of release `tag`, downloaded.
+    pub(crate) fn release_payloads(&self, tag: &str) -> Result<Vec<ReleasePayload>, SourceError> {
+        let release = self.release(tag)?;
+        let assets: Vec<&GitHubReleaseAsset> = release
             .assets
             .iter()
-            .filter(|a| a.name.ends_with(".mur.zip"))
-            .cloned()
+            .filter(|asset| asset.name.ends_with(ARTIFACT_FILE_SUFFIX))
             .collect();
-
-        if zip_assets.is_empty() {
+        if assets.is_empty() {
             return Err(SourceError::NotFound(format!(
-                "no .mur.zip assets found in github release {}@{}",
-                self.repo_label(),
-                release.tag_name
+                "no {ARTIFACT_FILE_SUFFIX} assets found in github release {}@{tag}",
+                self.repo
             )));
         }
-
-        let tag = if release.tag_name.is_empty() {
-            explicit_tag.to_string()
-        } else {
-            release.tag_name.clone()
-        };
-
-        zip_assets
-            .iter()
+        assets
+            .into_iter()
             .map(|asset| {
-                let bytes = self.download_asset(asset)?;
-                Ok(GitHubDirectResolution {
-                    bytes,
-                    tag: tag.clone(),
-                    platform: asset_platform(&asset.name),
+                Ok(ReleasePayload {
+                    file: asset.name.clone(),
+                    bytes: self.download_asset(asset, true)?,
                 })
             })
             .collect()
     }
 
-    fn resolve_bare_internal(
-        &self,
-        artifact_name: &str,
-        version_hint: Option<&str>,
-    ) -> Result<SourceResolution, SourceError> {
-        let platform = current_platform();
-        if let Some(version) = version_hint {
-            // Primary: look in the release whose tag matches the artifact version.
-            // Use select_versioned_asset (exact name match) so that a workspace-level release
-            // tag (e.g. v0.3.33) that contains an older artifact zip (e.g. name-0.3.31.mur.zip)
-            // does not silently shadow the correct version from the latest release.
-            let (primary, primary_assets) = match self.fetch_release_by_version_hint(version) {
-                Ok(release) => {
-                    match select_versioned_asset(&release.assets, artifact_name, version, platform)
-                    {
-                        Some(selected) => {
-                            return self.resolve_selected(selected, release.tag_name);
+    fn latest_release(&self) -> Result<&GitHubRelease, SourceError> {
+        self.latest
+            .get_or_init(|| self.get_json(&self.repo_url("releases/latest")))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// Release `tag`: the latest release when it is that tag, else one lookup by tag.
+    fn release(&self, tag: &str) -> Result<GitHubRelease, SourceError> {
+        if let Some(Ok(latest)) = self.latest.get() {
+            if latest.tag_name == tag {
+                return Ok(latest.clone());
+            }
+        }
+        let mut tagged = self.tagged.lock().unwrap_or_else(|e| e.into_inner());
+        tagged
+            .entry(tag.to_string())
+            .or_insert_with(|| {
+                self.get_json(&self.repo_url(&format!("releases/tags/{tag}")))
+                    .map_err(|error| match error {
+                        SourceError::NotFound(_) => {
+                            SourceError::NotFound(format!("{} has no release {tag}", self.label))
                         }
-                        // Release found, artifact absent.
-                        None => (Some(release.tag_name.clone()), release.assets),
-                    }
-                }
-                Err(SourceError::NotFound(_)) => (None, Vec::new()), // no release with this tag
-                Err(e) => return Err(e),
-            };
-
-            // Fallback: the repo uses a monotonic release tag independent of artifact
-            // versions (e.g. v0.3.41 contains murmur-driver-openai@0.3.33).  Search the
-            // latest release for an asset whose name pins the requested version exactly:
-            //   {name}-{version}.mur.zip  or  {name}-{version}-{platform}.mur.zip
-            let latest = self.fetch_latest_release()?;
-            match select_versioned_asset(&latest.assets, artifact_name, version, platform) {
-                Some(selected) => self.resolve_selected(selected, latest.tag_name),
-                None => {
-                    let searched: Vec<&GitHubReleaseAsset> =
-                        primary_assets.iter().chain(latest.assets.iter()).collect();
-                    let release = format!(
-                        "release '{}'{} or latest '{}'",
-                        primary.as_deref().unwrap_or(version),
-                        if primary.is_none() {
-                            " (no such release)"
-                        } else {
-                            ""
-                        },
-                        latest.tag_name,
-                    );
-                    Err(SourceError::NotFound(no_asset_message(
-                        artifact_name,
-                        Some(version),
-                        platform,
-                        &searched,
-                        &release,
-                    )))
-                }
-            }
-        } else {
-            let release = self.fetch_latest_release()?;
-            let selected = select_asset_for_artifact(&release.assets, artifact_name, platform)
-                .ok_or_else(|| {
-                    let searched: Vec<&GitHubReleaseAsset> = release.assets.iter().collect();
-                    SourceError::NotFound(no_asset_message(
-                        artifact_name,
-                        None,
-                        platform,
-                        &searched,
-                        &format!("latest release '{}'", release.tag_name),
-                    ))
-                })?;
-            self.resolve_selected(selected, release.tag_name)
-        }
+                        error => error,
+                    })
+            })
+            .clone()
     }
 
-    /// Download the bytes of an asset the selection above chose, carrying its platform tag
-    /// through: which asset was picked is the only record of which platform the bytes are for.
-    fn resolve_selected(
-        &self,
-        selected: SelectedAsset,
-        tag: String,
-    ) -> Result<SourceResolution, SourceError> {
-        let bytes = self.download_asset(&selected.asset)?;
-        Ok(SourceResolution {
-            bytes,
-            resolved_version: tag,
-            platform: selected.platform.map(str::to_string),
-        })
+    fn read_index(&self) -> Result<Arc<PublishedIndex>, SourceError> {
+        let latest = self.latest_release().map_err(|error| match error {
+            SourceError::NotFound(_) => SourceError::NoIndex { release: None },
+            error => error,
+        })?;
+        let release = latest.tag_name.clone();
+        let Some(asset) = latest
+            .assets
+            .iter()
+            .find(|asset| asset.name == ARTIFACT_INDEX_FILE_NAME)
+        else {
+            return Err(SourceError::NoIndex {
+                release: Some(release),
+            });
+        };
+        let bytes = self.download_asset(asset, false)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let index = ArtifactIndex::from_json(&text).map_err(|error| SourceError::BadIndex {
+            release: release.clone(),
+            error,
+        })?;
+        Ok(Arc::new(PublishedIndex { release, index }))
     }
 
-    fn fetch_latest_release(&self) -> Result<GitHubRelease, SourceError> {
-        self.fetch_release_json(&format!(
-            "{}/repos/{}/{}/releases/latest",
-            self.api_base, self.owner, self.repo
-        ))
+    fn repo_url(&self, path: &str) -> String {
+        format!(
+            "{}/repos/{}/{}/{path}",
+            self.api_base, self.owner, self.repo_name
+        )
     }
 
-    fn fetch_release_by_version_hint(&self, version: &str) -> Result<GitHubRelease, SourceError> {
-        let mut tags = vec![version.to_string()];
-        if !version.starts_with('v') {
-            tags.push(format!("v{version}"));
-        }
-
-        let mut last_not_found = None;
-
-        for tag in tags {
-            match self.fetch_release_by_exact_tag(&tag) {
-                Ok(release) => return Ok(release),
-                Err(SourceError::NotFound(message)) => last_not_found = Some(message),
-                Err(other) => return Err(other),
-            }
-        }
-
-        Err(SourceError::NotFound(last_not_found.unwrap_or_else(|| {
-            format!("release tag '{version}' not found")
-        })))
-    }
-
-    fn fetch_release_by_exact_tag(&self, tag: &str) -> Result<GitHubRelease, SourceError> {
-        self.fetch_release_json(&format!(
-            "{}/repos/{}/{}/releases/tags/{}",
-            self.api_base, self.owner, self.repo, tag
-        ))
-    }
-
-    fn fetch_release_json(&self, url: &str) -> Result<GitHubRelease, SourceError> {
+    /// A JSON answer. A 404 is [`SourceError::NotFound`].
+    fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, SourceError> {
         let mut request = self
             .client
             .get(url)
@@ -277,7 +191,7 @@ impl GitHubSource {
 
         let status = response.status();
         if status == ureq::http::StatusCode::NOT_FOUND {
-            return Err(SourceError::NotFound("release not found".to_string()));
+            return Err(SourceError::NotFound(format!("{url} not found")));
         }
 
         if !status.is_success() {
@@ -286,20 +200,21 @@ impl GitHubSource {
 
         response
             .body_mut()
-            .read_json::<GitHubRelease>()
-            .map_err(|error| {
-                SourceError::Other(format!("invalid github release response: {error}"))
-            })
+            .read_json::<T>()
+            .map_err(|error| SourceError::Other(format!("invalid GitHub API response: {error}")))
     }
 
-    fn download_asset(&self, asset: &GitHubReleaseAsset) -> Result<Bytes, SourceError> {
+    /// `progress` streams the body through the thread's download progress bar, if one is
+    /// registered: a payload's, never the index's, so the bar counts one file.
+    fn download_asset(
+        &self,
+        asset: &GitHubReleaseAsset,
+        progress: bool,
+    ) -> Result<Bytes, SourceError> {
         // Use the GitHub API asset endpoint with Accept: application/octet-stream so that
         // auth is handled correctly for private repos. browser_download_url redirects to a
         // CDN and the Bearer token is stripped on the cross-host redirect.
-        let url = format!(
-            "{}/repos/{}/{}/releases/assets/{}",
-            self.api_base, self.owner, self.repo, asset.id
-        );
+        let url = self.repo_url(&format!("releases/assets/{}", asset.id));
 
         let mut request = self
             .client
@@ -324,7 +239,11 @@ impl GitHubSource {
         // it so indicatif can show live bytes/total and a progress bar.
         // ureq's BodyReader implements std::io::Read, and ProgressBar::wrap_read
         // wraps any Read to call pb.inc(n) for every chunk — no manual polling needed.
-        let pb: Option<ProgressBar> = DL_PROGRESS.with(|cell| cell.borrow().clone());
+        let pb: Option<ProgressBar> = if progress {
+            DL_PROGRESS.with(|cell| cell.borrow().clone())
+        } else {
+            None
+        };
         let content_length = response.body().content_length();
         if let Some(pb) = pb {
             if let Some(len) = content_length {
@@ -348,7 +267,7 @@ impl GitHubSource {
         }
     }
 
-    /// The error for a non-success response other than a release lookup's 404. `unreadable` is
+    /// The error for a non-success response other than a 404 of a JSON lookup. `unreadable` is
     /// the message used when the body cannot be read.
     fn http_failure(
         &self,
@@ -395,98 +314,61 @@ impl GitHubSource {
                 .filter(|value| !value.is_empty())
         })
     }
-
-    fn repo_label(&self) -> String {
-        format!("{}/{}", self.owner, self.repo)
-    }
 }
 
 impl ArtifactSource for GitHubSource {
-    fn name(&self) -> &str {
-        &self.source_name
+    fn label(&self) -> &str {
+        &self.label
     }
 
-    fn resolve_bare(&self, name: &str) -> Result<SourceResolution, SourceError> {
-        self.resolve_bare_internal(name, None)
+    fn repo(&self) -> &str {
+        &self.repo
     }
 
-    fn resolve_bare_with_version(
-        &self,
-        name: &str,
-        version: &str,
-    ) -> Result<SourceResolution, SourceError> {
-        if version == "latest" {
-            return self.resolve_bare_internal(name, None);
-        }
-        self.resolve_bare_internal(name, Some(version))
+    fn scope(&self) -> &str {
+        &self.scope
     }
 
-    fn resolve_bare_with_version_for_platform(
-        &self,
-        name: &str,
-        version: &str,
-        platform: &str,
-    ) -> Result<SourceResolution, SourceError> {
-        if version == "latest" {
-            let release = self.fetch_latest_release()?;
-            let selected =
-                select_asset_for_artifact(&release.assets, name, platform).ok_or_else(|| {
-                    let searched: Vec<&GitHubReleaseAsset> = release.assets.iter().collect();
-                    SourceError::NotFound(no_asset_message(
-                        name,
-                        None,
-                        platform,
-                        &searched,
-                        &format!("latest release '{}'", release.tag_name),
-                    ))
-                })?;
-            return self.resolve_selected(selected, release.tag_name);
-        }
+    /// `owner.id` of `GET /repos/<owner>/<repo>`, which a public repository answers without a
+    /// token.
+    fn owner_id(&self) -> Result<u64, SourceError> {
+        self.owner_id
+            .get_or_init(|| {
+                let url = format!("{}/repos/{}", self.api_base, self.repo);
+                self.get_json::<GitHubRepository>(&url)
+                    .map(|repository| repository.owner.id)
+            })
+            .clone()
+    }
 
-        // Primary: release tagged with the artifact version.
-        let (primary_tag, primary_assets) = match self.fetch_release_by_version_hint(version) {
-            Ok(release) => {
-                if let Some(selected) =
-                    select_versioned_asset(&release.assets, name, version, platform)
-                {
-                    return self.resolve_selected(selected, release.tag_name);
-                }
-                (Some(release.tag_name), release.assets) // release found, artifact absent
-            }
-            Err(SourceError::NotFound(_)) => (None, Vec::new()),
-            Err(e) => return Err(e),
-        };
+    fn index(&self) -> Result<Arc<PublishedIndex>, SourceError> {
+        self.index.get_or_init(|| self.read_index()).clone()
+    }
 
-        // Fallback: latest release with version-pinned asset name.
-        let latest = self.fetch_latest_release()?;
-        match select_versioned_asset(&latest.assets, name, version, platform) {
-            Some(selected) => self.resolve_selected(selected, latest.tag_name),
-            None => {
-                let searched: Vec<&GitHubReleaseAsset> =
-                    primary_assets.iter().chain(latest.assets.iter()).collect();
-                let release = format!(
-                    "release '{}'{} or latest '{}'",
-                    primary_tag.as_deref().unwrap_or(version),
-                    if primary_tag.is_none() {
-                        " (no such release)"
-                    } else {
-                        ""
-                    },
-                    latest.tag_name,
-                );
-                Err(SourceError::NotFound(no_asset_message(
-                    name,
-                    Some(version),
-                    platform,
-                    &searched,
-                    &release,
-                )))
-            }
-        }
+    fn fetch(&self, release: &str, file: &str) -> Result<Bytes, SourceError> {
+        let found = self.release(release)?;
+        let asset = found
+            .assets
+            .iter()
+            .find(|asset| asset.name == file)
+            .ok_or_else(|| {
+                SourceError::NotFound(format!("release {release} has no asset {file}"))
+            })?;
+        self.download_asset(asset, true)
     }
 }
 
 #[derive(Debug, Deserialize)]
+struct GitHubRepository {
+    owner: GitHubOwner,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubOwner {
+    id: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct GitHubRelease {
     #[serde(default)]
     tag_name: String,
@@ -498,144 +380,6 @@ struct GitHubRelease {
 struct GitHubReleaseAsset {
     id: u64,
     name: String,
-}
-
-/// An asset the selection chose, and the platform its name declared.
-///
-/// `platform` is `None` for an asset whose name carries no tag from `SUPPORTED_PLATFORMS` — a
-/// platform-independent payload. It is the selection's own answer, not the platform that was
-/// asked for, so an install records what it actually got.
-#[derive(Debug, Clone)]
-struct SelectedAsset {
-    asset: GitHubReleaseAsset,
-    platform: Option<&'static str>,
-}
-
-/// The platform tag on a release asset's name, or `None` when it carries none.
-fn asset_platform(asset_name: &str) -> Option<String> {
-    split_platform_suffix(asset_name).map(|(_, platform)| platform.to_string())
-}
-
-fn select_asset_for_artifact(
-    assets: &[GitHubReleaseAsset],
-    artifact_name: &str,
-    platform: &str,
-) -> Option<SelectedAsset> {
-    // Prefer a platform-tagged variant so native tool artifacts resolve to the correct binary.
-    // Pattern: <name>-<version>-<platform>.mur.zip  (e.g. murmur-tool-git-0.3.20-darwin-aarch64.mur.zip)
-    let platform_suffix = format!("-{platform}.mur.zip");
-    if let Some(asset) = assets.iter().find(|asset| {
-        asset.name.starts_with(&format!("{artifact_name}-"))
-            && asset.name.ends_with(&platform_suffix)
-    }) {
-        return Some(SelectedAsset {
-            asset: asset.clone(),
-            platform: SUPPORTED_PLATFORMS
-                .iter()
-                .copied()
-                .find(|supported| *supported == platform),
-        });
-    }
-
-    // Fall back to an exact unplatformed name (WASM artifacts), then any versioned variant that
-    // is itself unplatformed. Matching on name alone would hand back another platform's zip —
-    // a release carrying only darwin assets would resolve on a Linux host — so an asset whose
-    // name ends in a recognised platform tag is never returned for a different platform.
-    let exact = format!("{artifact_name}.mur.zip");
-    let prefix = format!("{artifact_name}-");
-    assets
-        .iter()
-        .find(|asset| {
-            asset.name == exact
-                || (asset.name.starts_with(&prefix)
-                    && asset.name.ends_with(".mur.zip")
-                    && split_platform_suffix(&asset.name).is_none())
-        })
-        .map(|asset| SelectedAsset {
-            asset: asset.clone(),
-            platform: None,
-        })
-}
-
-/// Find an asset that names a specific artifact version exactly.
-/// Used when falling back to the latest release in repos where the release tag
-/// is a monotonic build counter independent of individual artifact versions.
-///
-/// Matches (in order):
-///   {name}-{version}-{platform}.mur.zip   (native, platform-specific)
-///   {name}-{version}.mur.zip              (WASM, platform-independent)
-fn select_versioned_asset(
-    assets: &[GitHubReleaseAsset],
-    artifact_name: &str,
-    version: &str,
-    platform: &str,
-) -> Option<SelectedAsset> {
-    let platform_name = format!("{artifact_name}-{version}-{platform}.mur.zip");
-    if let Some(asset) = assets.iter().find(|a| a.name == platform_name) {
-        return Some(SelectedAsset {
-            asset: asset.clone(),
-            platform: SUPPORTED_PLATFORMS
-                .iter()
-                .copied()
-                .find(|supported| *supported == platform),
-        });
-    }
-    let generic_name = format!("{artifact_name}-{version}.mur.zip");
-    assets
-        .iter()
-        .find(|a| a.name == generic_name)
-        .map(|asset| SelectedAsset {
-            asset: asset.clone(),
-            platform: None,
-        })
-}
-
-/// The message for a release that publishes nothing this host can use: what was looked for,
-/// which platforms the release does publish for this artifact, and the two things an operator can
-/// do about it.
-///
-/// Single-line by contract: `SourceChainError::diagnosis` renders each source's reason on one
-/// indented line of the `E-REG-001` message.
-fn no_asset_message(
-    artifact_name: &str,
-    version: Option<&str>,
-    platform: &str,
-    assets: &[&GitHubReleaseAsset],
-    release: &str,
-) -> String {
-    let looked_for = match version {
-        Some(version) => format!("{artifact_name}-{version}-{platform}.mur.zip"),
-        None => format!("{artifact_name}-<version>-{platform}.mur.zip"),
-    };
-
-    let prefix = format!("{artifact_name}-");
-    let artifact_assets: Vec<&&GitHubReleaseAsset> = assets
-        .iter()
-        .filter(|asset| asset.name.starts_with(&prefix) && asset.name.ends_with(".mur.zip"))
-        .collect();
-
-    let mut published: Vec<String> = artifact_assets
-        .iter()
-        .filter_map(|asset| asset_platform(&asset.name))
-        .collect();
-    published.sort_unstable();
-    published.dedup();
-
-    // Distinguishing these two tells the operator whether the artifact is published at all or
-    // just not for this platform, which is the difference between a typo and a missing runner.
-    let publishes = if artifact_assets.is_empty() {
-        format!("this release publishes no asset for '{artifact_name}'")
-    } else if published.is_empty() {
-        format!("this release publishes {artifact_name} with no platform tag")
-    } else {
-        format!("this release publishes {}", published.join(", "))
-    };
-
-    format!(
-        "no asset for '{artifact_name}' on platform {platform} in {release} \u{2014} looked for \
-         '{looked_for}'; {publishes}; build it on this host with `mur build` then `mur install \
-         <path>`, or ask the publisher to release a {platform} asset"
-    )
 }
 
 /// The raw rate-limit header values of a GitHub response, `None` for a header that is absent.
@@ -920,189 +664,5 @@ mod tests {
             "{}",
             error.reason()
         );
-    }
-
-    fn assets(names: &[&str]) -> Vec<GitHubReleaseAsset> {
-        names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| GitHubReleaseAsset {
-                id: index as u64 + 1,
-                name: (*name).to_string(),
-            })
-            .collect()
-    }
-
-    /// An asset whose name carries a recognised platform tag is only ever returned for that
-    /// platform — matching on artifact name alone would hand a darwin zip to a Linux host.
-    #[test]
-    fn another_platforms_tagged_asset_is_never_selected() {
-        let release = assets(&["nativetool-0.1.0-darwin-aarch64.mur.zip"]);
-        assert!(select_asset_for_artifact(&release, "nativetool", "linux-x86_64").is_none());
-        assert!(select_asset_for_artifact(&release, "nativetool", "linux-aarch64").is_none());
-        assert!(select_asset_for_artifact(&release, "nativetool", "darwin-x86_64").is_none());
-    }
-
-    /// What that fallback exists for: a WASM artifact published under its plain versioned name
-    /// resolves on every host, and reports no platform.
-    #[test]
-    fn an_untagged_versioned_asset_resolves_for_any_platform() {
-        let release = assets(&["wasmtool-0.1.0.mur.zip"]);
-        for platform in SUPPORTED_PLATFORMS {
-            let selected = select_asset_for_artifact(&release, "wasmtool", platform)
-                .unwrap_or_else(|| panic!("no asset selected for {platform}"));
-            assert_eq!(selected.asset.name, "wasmtool-0.1.0.mur.zip");
-            assert_eq!(selected.platform, None);
-        }
-    }
-
-    #[test]
-    fn an_exact_unversioned_name_still_resolves() {
-        let release = assets(&["wasmtool.mur.zip"]);
-        let selected = select_asset_for_artifact(&release, "wasmtool", "linux-x86_64").unwrap();
-        assert_eq!(selected.asset.name, "wasmtool.mur.zip");
-        assert_eq!(selected.platform, None);
-    }
-
-    #[test]
-    fn this_platforms_tagged_asset_is_preferred_and_reports_its_platform() {
-        let release = assets(&[
-            "nativetool-0.1.0.mur.zip",
-            "nativetool-0.1.0-linux-x86_64.mur.zip",
-            "nativetool-0.1.0-darwin-aarch64.mur.zip",
-        ]);
-        let selected = select_asset_for_artifact(&release, "nativetool", "linux-x86_64").unwrap();
-        assert_eq!(selected.asset.name, "nativetool-0.1.0-linux-x86_64.mur.zip");
-        assert_eq!(selected.platform, Some("linux-x86_64"));
-    }
-
-    #[test]
-    fn the_versioned_selection_reports_which_of_its_two_names_matched() {
-        let tagged = assets(&["nativetool-0.1.0-linux-x86_64.mur.zip"]);
-        let selected = select_versioned_asset(&tagged, "nativetool", "0.1.0", "linux-x86_64")
-            .expect("tagged asset");
-        assert_eq!(selected.platform, Some("linux-x86_64"));
-
-        let generic = assets(&["wasmtool-0.1.0.mur.zip"]);
-        let selected =
-            select_versioned_asset(&generic, "wasmtool", "0.1.0", "linux-x86_64").expect("generic");
-        assert_eq!(selected.platform, None);
-
-        assert!(select_versioned_asset(&tagged, "nativetool", "0.1.0", "darwin-aarch64").is_none());
-    }
-
-    /// Both remedies the message must always carry.
-    fn carries_both_remedies(message: &str) {
-        assert!(
-            message.contains("mur build"),
-            "no local-build remedy: {message}"
-        );
-        assert!(
-            message.contains("ask the publisher"),
-            "no ask-the-publisher remedy: {message}"
-        );
-    }
-
-    fn message_for(
-        artifact_name: &str,
-        version: Option<&str>,
-        platform: &str,
-        release: &[GitHubReleaseAsset],
-    ) -> String {
-        let searched: Vec<&GitHubReleaseAsset> = release.iter().collect();
-        no_asset_message(
-            artifact_name,
-            version,
-            platform,
-            &searched,
-            "release 'v0.4.2'",
-        )
-    }
-
-    #[test]
-    fn the_miss_message_names_the_platform_and_what_the_release_does_publish() {
-        let release = assets(&[
-            "murmur-tool-git-0.4.2-darwin-aarch64.mur.zip",
-            "murmur-tool-git-0.4.2-linux-x86_64.mur.zip",
-            "some-other-tool-0.4.2-linux-aarch64.mur.zip",
-        ]);
-        let message = message_for("murmur-tool-git", Some("0.4.2"), "linux-aarch64", &release);
-        assert!(message.contains("linux-aarch64"), "{message}");
-        assert!(
-            message.contains("looked for 'murmur-tool-git-0.4.2-linux-aarch64.mur.zip'"),
-            "{message}"
-        );
-        assert!(
-            message.contains("darwin-aarch64, linux-x86_64"),
-            "{message}"
-        );
-        // Another artifact's assets are not this artifact's published platforms.
-        assert!(!message.contains("some-other-tool"), "{message}");
-        assert!(message.contains("release 'v0.4.2'"), "{message}");
-        carries_both_remedies(&message);
-        assert!(
-            !message.contains('\n'),
-            "message must be one line: {message}"
-        );
-    }
-
-    /// List order does not decide: a foreign-platform asset ahead of the untagged one is skipped.
-    #[test]
-    fn a_foreign_platforms_asset_is_never_returned_ahead_of_an_untagged_one() {
-        let release = assets(&[
-            "murmur-tool-git-0.4.2-darwin-aarch64.mur.zip",
-            "murmur-tool-git-0.4.2.mur.zip",
-        ]);
-        let selected =
-            select_asset_for_artifact(&release, "murmur-tool-git", "linux-aarch64").unwrap();
-        assert_eq!(selected.asset.name, "murmur-tool-git-0.4.2.mur.zip");
-        assert_eq!(selected.platform, None);
-    }
-
-    /// A release that carries the artifact for no platform this host can use resolves to nothing.
-    #[test]
-    fn a_darwin_only_release_has_no_asset_for_a_linux_host() {
-        let release = assets(&[
-            "murmur-tool-git-0.4.2-darwin-aarch64.mur.zip",
-            "murmur-tool-git-0.4.2-darwin-x86_64.mur.zip",
-        ]);
-        assert!(select_asset_for_artifact(&release, "murmur-tool-git", "linux-aarch64").is_none());
-
-        let message = message_for("murmur-tool-git", None, "linux-aarch64", &release);
-        assert!(
-            message.contains("this release publishes darwin-aarch64, darwin-x86_64"),
-            "{message}"
-        );
-        carries_both_remedies(&message);
-    }
-
-    /// Publishing nothing for the artifact reads differently from publishing it untagged: the
-    /// first is a name that is not in the release, the second is a platform that is not built.
-    #[test]
-    fn a_release_with_nothing_for_this_artifact_says_so() {
-        let release = assets(&["some-other-artifact-0.1.0-linux-aarch64.mur.zip"]);
-        let message = message_for("murmur-tool-git", None, "linux-aarch64", &release);
-        assert!(
-            message.contains("this release publishes no asset for 'murmur-tool-git'"),
-            "{message}"
-        );
-        carries_both_remedies(&message);
-    }
-
-    /// Reachable from a version-pinned miss: the release carries the artifact, but only under
-    /// untagged names for other versions, so there is no published-platform list to print.
-    #[test]
-    fn a_release_with_only_untagged_assets_says_there_is_no_tag() {
-        let release = assets(&["murmur-tool-git-0.4.1.mur.zip"]);
-        assert!(
-            select_versioned_asset(&release, "murmur-tool-git", "0.4.2", "linux-aarch64").is_none()
-        );
-
-        let message = message_for("murmur-tool-git", Some("0.4.2"), "linux-aarch64", &release);
-        assert!(
-            message.contains("this release publishes murmur-tool-git with no platform tag"),
-            "{message}"
-        );
-        carries_both_remedies(&message);
     }
 }

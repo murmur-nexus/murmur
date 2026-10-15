@@ -197,6 +197,7 @@ fn publish(registry: &Path, name: &str, body: &str) {
             description: None,
             tags: Vec::new(),
             wit_contracts: None,
+            owner_id: None,
         },
         &cursor.into_inner(),
     )

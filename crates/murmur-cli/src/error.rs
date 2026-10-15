@@ -21,6 +21,9 @@ pub const E_REG_004: &str = "E-REG-004"; // reserved version string
 pub const E_REG_005: &str = "E-REG-005"; // registry-resolved artifact conflicts with murmur.lock
 pub const E_REG_006: &str = "E-REG-006"; // a source did not answer an artifact lookup (rate limited, refused, unreachable, or misconfigured)
 pub const E_REG_007: &str = "E-REG-007"; // an artifact name on the command line is not scope/name
+pub const E_REG_008: &str = "E-REG-008"; // no source serves the artifact's scope
+pub const E_REG_009: &str = "E-REG-009"; // a source's index states a scope the source does not own
+pub const E_REG_010: &str = "E-REG-010"; // a scope's GitHub owner id is not the one recorded for it (murmur.lock, a stored payload, or compiled in for murmur)
 
 // Formation rosters
 pub const E_ROS_001: &str = "E-ROS-001"; // roster.yaml is missing, unreadable or malformed
@@ -159,6 +162,7 @@ pub const E_CNV_003: &str = "E-CNV-003"; // --keep is not a usable number of mes
 #[cfg(feature = "beta-mur-new")]
 pub const E_CFG_001: &str = "E-CFG-001"; // inference provider not configured; wizard requires TTY
 pub const E_CFG_002: &str = "E-CFG-002"; // `mur config set` given an unsupported dotted key
+pub const E_CFG_003: &str = "E-CFG-003"; // registry: in a config file cannot be used: a removed key, a repo that is not <owner>/<repo>, a reserved scope claimed, or two sources for one scope
 
 #[derive(Debug, Clone)]
 pub struct CliError {

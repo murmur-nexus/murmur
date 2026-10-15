@@ -610,14 +610,14 @@ mur install --all-platforms <scope/name@version>
 |---|---|
 | `mur install` (no args) | Reads `murmur.yaml` in or above CWD; fetches all declared artifacts in parallel into the project-local store (`.murmur/artifacts/` next to the manifest) |
 | `mur install <scope/name@version>` | Fetches a specific artifact into the project-local store. A `local/` artifact is taken from the global store only; no source is asked |
-| `mur install <scope/name>` | Fetches the latest release of an artifact from the configured sources |
+| `mur install <scope/name>` | Fetches the newest version that [fits this `mur`](installing-artifacts.md#version-selection) from the source of the scope |
 | `mur install github:<owner>/<repo>@<tag>` | Fetches every asset of a GitHub release into the project-local store, each under the repository's scope |
 | `mur install <path>` | Installs a `.mur.zip` file as `local/<name>`, `<name>` being the name its `murmur.yaml` declares |
 | `mur install -g <ref>` | Fetches into the global store (`~/.murmur/artifacts/`) |
 | `mur install --all-platforms <scope/name@version>` | Downloads all platform variants into the global store, filing each under its own platform tag; useful for CI and cross-platform build seeding |
 | `mur install --no-precompile` | Installs without compiling. Without the flag, `mur install` compiles each WASM tool, driver and hook it installs into [`~/.murmur/compiled/`](config.md#murmur-home-permissions), for this machine and this `mur` build, so the first `mur run` loads it instead of compiling it. With no arguments that includes each manifest artifact already in the store, and one whose compiled form is already there is not compiled again. A compile that fails does not fail the install or change its output; that artifact compiles on its first launch |
 
-`mur install` (no args) is the standard pre-run step. It reads `murmur.yaml`, resolves every artifact listed in it, and if an artifact is not in the global store it falls back to the configured source chain automatically. See [Resolution order](config.md#resolution-order). `--registry` is refused with exit status 2 and a hint naming that order.
+`mur install` (no args) is the standard pre-run step. It reads `murmur.yaml`, resolves every artifact listed in it, and if an artifact is not in the global store it fetches it from the [source of its scope](installing-artifacts.md#sources-and-scopes). See [Resolution order](config.md#resolution-order). `--registry` is refused with exit status 2 and a hint naming that order.
 
 Example — seed a project before running:
 
@@ -635,9 +635,9 @@ mur install murmur/tool-git@{{ v.murmur_tool_git }}
 Behavior:
 
 1. Resolve a `name@version` artifact from the global store `~/.murmur/artifacts/`
-2. On a hit, verify the bytes against the SHA-256 the global store records; on a miss, fall through to the configured source chain and download from there
+2. On a hit, verify the bytes against the SHA-256 the global store records; on a miss, look the artifact up in the index of its scope's source, download it, and check it against the index — see [Index resolution](installing-artifacts.md#index-resolution)
 3. Store into the project-local store (or global store with `-g`)
-4. Pin the name, resolved version and SHA-256 in `murmur.lock` as [`origin: operator`](workdir.md#lock-origin) — project installs only, since `-g` has no project to pin. An entry a capsule pinned through `manage.pull()` is adopted as operator-declared, with one line after the lock is written:
+4. Pin the name, resolved version, SHA-256 and, for a payload a source served, the scope's [owner id](installing-artifacts.md#owner-identity) in `murmur.lock` as [`origin: operator`](workdir.md#lock-origin) — project installs only, since `-g` has no project to pin. An entry a capsule pinned through `manage.pull()` is adopted as operator-declared, with one line after the lock is written:
 
     ```text
     Adopted ana/some-tool@1.2.3 as operator-declared (it was pulled at runtime by session ses_0190a1b2c3d4...)
@@ -3277,7 +3277,6 @@ These dotted keys are settable:
 
 | Key | Maps to |
 |---|---|
-| `registry.default` | `registry.default` |
 | `registry.index_url` | `registry.index_url` |
 | `inference.provider` | `inference.provider` |
 | `inference.model` | `inference.model` |
@@ -3292,8 +3291,8 @@ edit `registry.sources` by hand in the YAML file, and use
 Setting a key never clobbers other keys already present in the target file:
 
 ```bash
-mur config set registry.default official
-# Set registry.default in ./.murmur/config.yaml
+mur config set registry.index_url https://example.com/artifacts-index.json
+# Set registry.index_url in ./.murmur/config.yaml
 
 mur config set inference.model claude-haiku-4-5-20251001 -g
 # Set inference.model in ~/.murmur/config.yaml
@@ -3305,7 +3304,7 @@ nothing:
 ```bash
 mur config set nonsense.field value
 # error[E-CFG-002]: unsupported config key 'nonsense.field'
-#   hint: supported keys: registry.default, registry.index_url, inference.provider, inference.model, inference.api_key, inference.endpoint, credentials.<NAME>
+#   hint: supported keys: registry.index_url, inference.provider, inference.model, inference.api_key, inference.endpoint, credentials.<NAME>
 ```
 
 `credentials.<NAME>` without `-g`, or with a `NAME` outside the grammar, is refused with the same

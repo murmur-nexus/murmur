@@ -43,6 +43,7 @@ fn artifact_meta(
         description: None,
         tags: vec![],
         wit_contracts: None,
+        owner_id: None,
     }
 }
 

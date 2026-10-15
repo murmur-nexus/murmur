@@ -75,6 +75,7 @@ fn publish_fixture_tool(home: &TempDir, artifact_path: &Path) {
         description: None,
         tags: Vec::new(),
         wit_contracts: None,
+        owner_id: None,
     };
     registry.publish(meta, &bytes).unwrap();
 }

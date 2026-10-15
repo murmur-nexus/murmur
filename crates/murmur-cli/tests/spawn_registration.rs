@@ -140,6 +140,7 @@ impl CountingRoost {
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,
+                owner_id: None,
             },
             &cursor.into_inner(),
         )

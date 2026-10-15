@@ -10,7 +10,6 @@ use crate::{
 };
 
 const SUPPORTED_KEYS: &[&str] = &[
-    "registry.default",
     "registry.index_url",
     "inference.provider",
     "inference.model",
@@ -32,7 +31,7 @@ pub enum ConfigCommand {
     /// Set a config key. Writes the project-level file (<cwd>/.murmur/config.yaml) by
     /// default; use -g to write ~/.murmur/config.yaml instead.
     Set {
-        /// Dotted config key (registry.default, registry.index_url, inference.provider,
+        /// Dotted config key (registry.index_url, inference.provider,
         /// inference.model, inference.api_key, inference.endpoint, or credentials.<NAME> with -g)
         key: String,
 
@@ -145,7 +144,6 @@ fn apply_key(config: &mut MurConfig, key: &ConfigKey<'_>, value: &str) {
         ConfigKey::Scalar(key) => *key,
     };
     match key {
-        "registry.default" => config.registry.default = Some(value.to_string()),
         "registry.index_url" => config.registry.index_url = Some(value.to_string()),
         "inference.provider" | "inference.model" | "inference.api_key" | "inference.endpoint" => {
             let inference = config.inference.get_or_insert_with(Default::default);
@@ -166,6 +164,8 @@ mod tests {
     use super::*;
     use crate::config::test_env::{mode_of, set_mode, EnvGuard};
 
+    const INDEX_URL: &str = "https://example.com/artifacts-index.json";
+
     #[test]
     fn set_rejects_unknown_key() {
         let home = tempfile::tempdir().expect("home");
@@ -177,13 +177,30 @@ mod tests {
         assert!(!cwd.path().join(".murmur").join("config.yaml").exists());
     }
 
+    /// The removed key is no key at all: `mur config set` refuses it like any other unknown one,
+    /// and the list of supported keys does not offer it.
+    #[test]
+    fn set_refuses_the_removed_default_source_key() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _guard = EnvGuard::set_up(home.path(), cwd.path());
+
+        let key = crate::source::REMOVED_DEFAULT_KEY;
+        let err = run_config_set(key, "official", true).expect_err("should reject");
+        assert_eq!(err.code, E_CFG_002);
+        let hint = err.hint.unwrap_or_default();
+        assert!(hint.starts_with("supported keys: "), "{hint}");
+        assert!(!hint.contains(key), "{hint}");
+        assert!(!home.path().join(".murmur").exists());
+    }
+
     #[test]
     fn set_writes_project_file_by_default() {
         let home = tempfile::tempdir().expect("home");
         let cwd = tempfile::tempdir().expect("cwd");
         let _guard = EnvGuard::set_up(home.path(), cwd.path());
 
-        run_config_set("registry.default", "local", false).expect("set should succeed");
+        run_config_set("registry.index_url", INDEX_URL, false).expect("set should succeed");
 
         assert!(cwd.path().join(".murmur").join("config.yaml").exists());
         assert!(!home.path().join(".murmur").join("config.yaml").exists());
@@ -191,7 +208,7 @@ mod tests {
         let cfg = load_project_mur_config_if_exists()
             .expect("load")
             .expect("project config should exist");
-        assert_eq!(cfg.registry.default.as_deref(), Some("local"));
+        assert_eq!(cfg.registry.index_url.as_deref(), Some(INDEX_URL));
     }
 
     #[test]
@@ -200,7 +217,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let _guard = EnvGuard::set_up(home.path(), cwd.path());
 
-        run_config_set("registry.default", "local", true).expect("set should succeed");
+        run_config_set("registry.index_url", INDEX_URL, true).expect("set should succeed");
 
         assert!(home.path().join(".murmur").join("config.yaml").exists());
         assert!(!cwd.path().join(".murmur").join("config.yaml").exists());
@@ -219,7 +236,7 @@ mod tests {
         set_mode(&murmur, 0o755);
         std::fs::write(
             &config,
-            "registry:\n  default: official\ncredentials:\n  OTHER_KEY: keep-me\n",
+            "registry:\n  index_url: https://example.com/kept.json\ncredentials:\n  OTHER_KEY: keep-me\n",
         )
         .unwrap();
         set_mode(&config, 0o644);
@@ -231,7 +248,10 @@ mod tests {
         assert_eq!(mode_of(&config), 0o600);
         assert_ne!(std::fs::metadata(&config).unwrap().ino(), inode);
         let cfg = load_mur_config().expect("load");
-        assert_eq!(cfg.registry.default.as_deref(), Some("official"));
+        assert_eq!(
+            cfg.registry.index_url.as_deref(),
+            Some("https://example.com/kept.json")
+        );
         assert_eq!(cfg.credentials["OTHER_KEY"], "keep-me");
         assert_eq!(cfg.credentials["PROVIDER_KEY"], "v");
         let leftovers: Vec<_> = std::fs::read_dir(&murmur)
@@ -250,7 +270,7 @@ mod tests {
         std::fs::create_dir(&project).unwrap();
         set_mode(&project, 0o755);
 
-        run_config_set("registry.default", "local", false).expect("set should succeed");
+        run_config_set("registry.index_url", INDEX_URL, false).expect("set should succeed");
 
         assert_eq!(mode_of(&project), 0o755);
         assert!(!home.path().join(".murmur").exists());
@@ -262,13 +282,13 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let _guard = EnvGuard::set_up(home.path(), cwd.path());
 
-        run_config_set("registry.default", "local", false).expect("first set");
+        run_config_set("registry.index_url", INDEX_URL, false).expect("first set");
         run_config_set("inference.model", "claude-3-5-sonnet", false).expect("second set");
 
         let cfg = load_project_mur_config_if_exists()
             .expect("load")
             .expect("project config should exist");
-        assert_eq!(cfg.registry.default.as_deref(), Some("local"));
+        assert_eq!(cfg.registry.index_url.as_deref(), Some(INDEX_URL));
         assert_eq!(
             cfg.inference.as_ref().map(|i| i.model.as_str()),
             Some("claude-3-5-sonnet")
@@ -281,7 +301,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let _guard = EnvGuard::set_up(home.path(), cwd.path());
 
-        run_config_set("registry.default", "local", true).expect("scalar");
+        run_config_set("registry.index_url", INDEX_URL, true).expect("scalar");
         run_config_set("inference.model", "some-model", true).expect("scalar");
         run_config_set("credentials.PROVIDER_KEY", "first-value", true).expect("credential");
         run_config_set("credentials.OTHER_KEY", "other-value", true).expect("credential");
@@ -291,7 +311,7 @@ mod tests {
             std::fs::read_to_string(home.path().join(".murmur").join("config.yaml")).unwrap();
         assert!(written.contains("credentials:"), "{written}");
         let cfg = load_mur_config().expect("load");
-        assert_eq!(cfg.registry.default.as_deref(), Some("local"));
+        assert_eq!(cfg.registry.index_url.as_deref(), Some(INDEX_URL));
         assert_eq!(
             cfg.inference.as_ref().map(|i| i.model.as_str()),
             Some("some-model")

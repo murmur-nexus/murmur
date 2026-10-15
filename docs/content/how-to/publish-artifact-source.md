@@ -1,8 +1,9 @@
 # How to publish your own artifact source
 
 An artifact source is a GitHub repository whose releases carry `.mur.zip` assets and an
-`artifacts-index.json` that lists them. Anyone can install your artifacts with
-`mur install github:<owner>/<repo>@<tag>` and find them with `mur search`. Each release adds its
+`artifacts-index.json` that lists them. Anyone who names your repository as the source of your
+scope can install your artifacts with `mur install <owner>/<name>`, and find them with
+`mur search`. Each release adds its
 versions to the index and keeps every earlier version listed, so a `mur` that cannot run your
 newest version can still find an older one that fits it.
 
@@ -95,6 +96,30 @@ ana/tool-editor  0.7.0    tool     Read, write and patch files in the workdir.
 To search it without `--index`, set `registry.index_url` to that URL — see
 [Artifact index and custom registry URL](../reference/config.md#artifact-index-and-custom-registry-url).
 
+## Step 5 — install from your source
+
+Name the repository as the source of the `ana` scope in `~/.murmur/config.yaml`:
+
+```yaml
+registry:
+  sources:
+    - repo: ana/my-artifacts
+```
+
+Then install by full name. `mur install` reads `artifacts-index.json` from the latest release, so
+upload it with every release:
+
+```bash
+mur install ana/tool-editor
+```
+
+```text
+Installed ana/tool-editor@0.7.0 from github:ana/my-artifacts
+```
+
+The index's `scope` must be `ana`, which `mur index --repo ana/my-artifacts` writes. See
+[Sources and scopes](../reference/installing-artifacts.md#sources-and-scopes).
+
 ## Summary
 
 | Step | Command |
@@ -103,3 +128,4 @@ To search it without `--index`, set `registry.index_url` to that URL — see
 | Index | `mur index release --repo <owner>/<repo> --release <tag> --merge <previous index> -o release/artifacts-index.json` |
 | Publish | Upload every file in `release/` as an asset of `<tag>` |
 | Search | `mur search <query> --index https://github.com/<owner>/<repo>/releases/latest/download/artifacts-index.json` |
+| Install | `- repo: <owner>/<repo>` under `registry.sources`, then `mur install <owner>/<name>` |

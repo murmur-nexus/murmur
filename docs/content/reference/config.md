@@ -19,21 +19,21 @@ Where both files set a value, the effective config is built per field:
 
 | Field | Rule |
 |---|---|
-| `registry.default` | Project wins if non-empty, else global |
 | `registry.index_url` | Project wins if non-empty, else global |
 | `inference.provider`, `inference.model`, `inference.endpoint` | Project wins if non-empty, else global |
 | `inference.api_key` | Always the global value — see [`inference.api_key` is always global](#inferenceapi_key-is-always-global) |
 | `credentials` | Always the global map. A non-empty `credentials:` in the project file is ignored, with a warning naming that file — see [`credentials:` section](#credentials) |
-| `registry.sources` | Union by `name`: a project entry sharing a global entry's name replaces it in place (position preserved); a project entry with a new name is appended; global-only entries are never dropped |
+| `registry.sources` | Union by scope: a project entry for a scope the global file also serves replaces the global entry; every other entry of both files is kept |
 | `beta.enabled` | Union by value: global flags first, then any project-only flags appended, in the project file's order |
 | `containment` | **Strongest wins**: a project file may raise the class the global file asked for, never lower it. See [Containment class](containment.md#field-containment) |
 | `spend.machine_tokens_per_day` | **Lowest wins**: a project file may lower the ceiling, never raise it. See [`spend:` section](#spend) |
 
-The base of the merge is the global file, or the built-in default when
-`~/.murmur/config.yaml` is absent. That default is `registry.default: official` and a single
-GitHub source, `murmur-nexus/default-artifacts`. Once the global file exists it is the base in
-full: a key it omits is empty, not defaulted, so a global file that declares no
-`registry.sources` leaves `mur install` with an empty source chain.
+The base of the merge is the global file, or an empty config when `~/.murmur/config.yaml` is
+absent. The source of the `murmur` scope, `murmur-nexus/default-artifacts`, is built in and is
+not a `registry.sources` entry, so it is present with or without either file.
+
+`mur install` and `mur deploy` check each file's `registry:` section on its own before merging, and
+refuse one they cannot use with [`E-CFG-003`](diagnostics.md#e-cfg-003), naming that file.
 
 ### `inference:` section
 
@@ -225,9 +225,26 @@ leaves its owner permissions as they are, so a home closed with `chmod 500` stay
 
 | Key | Description |
 |---|---|
-| `default` | Name of the `sources` entry tried first when resolving an artifact by name. Built-in default: `official` |
 | `index_url` | Artifact index `mur search` fetches. See [Artifact index and custom registry URL](#artifact-index-and-custom-registry-url) |
-| `sources` | Sources `mur install` walks in order. See [Multiple sources and fallthrough](installing-artifacts.md#multiple-sources-and-fallthrough) |
+| `sources` | The source of each third-party scope, one entry per scope. Default: none. See [Sources and scopes](installing-artifacts.md#sources-and-scopes) |
+
+```yaml
+registry:
+  sources:
+    - repo: ana/artifacts
+      token: ${GITHUB_TOKEN}
+```
+
+Each `sources` entry has these keys:
+
+| Key | Required | Notes |
+|---|---:|---|
+| `repo` | yes | The GitHub repository, `<owner>/<repo>`. It serves the scope `<owner>`, lowercased. An owner of `local` or `murmur` is refused, except `murmur-nexus/default-artifacts` |
+| `token` | no | A GitHub token sent with the source's requests: `${VAR}`, `VAR`, or the literal token — see [Authentication](installing-artifacts.md#authentication). Default: `GITHUB_TOKEN` |
+
+An entry for `murmur-nexus/default-artifacts` only sets the token of the built-in `murmur` source.
+Two entries for one scope in one file, a `name`, `type` or `url` key on an entry, and a `default`
+key under `registry:` are refused with [`E-CFG-003`](diagnostics.md#e-cfg-003).
 
 ### `beta:` section
 
@@ -321,14 +338,14 @@ A run that cannot create or open the ledger refuses to start with
 | Consumer | Reads |
 |---|---|
 | Beta gating — which beta subcommands `mur --help` lists, and `mur beta list`'s enabled column | `beta.enabled` |
-| `mur install` source-chain resolution | `registry.default`, `registry.sources` |
+| `mur install` — the source of each scope | `registry.sources`, each file checked on its own |
 | `mur search` | `registry.index_url` |
 | `mur run`, `mur doctor` — the containment floor | `containment` |
 | `mur run` — the key for each `gateway.api_key: ${NAME}`, re-read while the capsule runs; `mur doctor` — whether to warn with `W-SEC-027` | `credentials`, from the global file only |
 | `mur run` — the machine spend ceiling; `mur run` and `mur doctor` — [`W-SEC-026`](diagnostics.md#w-sec-026) | `spend.machine_tokens_per_day` |
 
 `mur new` and `mur deploy` read `~/.murmur/config.yaml` only; a project-level file does not
-affect them.
+affect them. `mur deploy` builds each scope's source from that file's `registry.sources`.
 
 ---
 
@@ -359,21 +376,22 @@ with [`E-IDX-002`](diagnostics.md#e-idx-002).
 
 ## Resolution order { #resolution-order }
 
-`mur` reads artifacts from the stores on disk and the sources under `registry.sources`. A
+`mur` reads artifacts from the stores on disk and the [source of each scope](installing-artifacts.md#sources-and-scopes). A
 `murmur.yaml` does not choose between them: a top-level `registry:` key in one is refused with
 [`E-MAN-003`](diagnostics.md#e-man-003).
 
 | Command | Resolves from, in order |
 |---|---|
-| `mur install <scope>/<name>@<version>` | 1. The global store `~/.murmur/artifacts/`<br>2. Each source in `registry.sources`, asked for `<name>`. A `local/` artifact is never asked of a source |
-| `mur install` (no argument) | The same, for each artifact `murmur.yaml` declares |
-| `mur install <scope>/<name>` | Each source in `registry.sources`, asked for `<name>`, latest release |
+| `mur install <scope>/<name>@<version>` | 1. The global store `~/.murmur/artifacts/`<br>2. The source of `<scope>`, through its [index](installing-artifacts.md#index-resolution). A `local/` artifact is never asked of a source |
+| `mur install` (no argument) | 1. The project store<br>2. The global store<br>3. The source of the scope — for each artifact `murmur.yaml` declares |
+| `mur install <scope>/<name>` | The source of `<scope>`: the newest version that [fits this `mur`](installing-artifacts.md#version-selection) |
 | `mur install github:<owner>/<repo>@<tag>` | That repository's release |
 | `mur install <path>` | The file, installed as `local/<name>` |
 | `mur publish` | Writes into the global store, as `local/<name>` |
 | `mur run`, `mur doctor`, `mur eval` | 1. The project store `<project root>/.murmur/artifacts/`<br>2. The global store. Never a source |
 
-Sources are tried with the one `registry.default` names first, then the rest in the order listed;
-[Merge rules](#merge-rules) set which sources the chain holds. A `<scope>/<name>@<version>` that neither
-the global store nor any source has fails with `E-REG-001`.
+A scope has one source, so no other source is asked when it does not list an artifact: a
+`<scope>/<name>@<version>` that neither the global store nor the scope's source has fails with
+[`E-REG-001`](diagnostics.md#e-reg-001), and a scope with no source fails with
+[`E-REG-008`](diagnostics.md#e-reg-008).
 

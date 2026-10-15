@@ -5,7 +5,7 @@
 | Kind | What it is | Where it is configured |
 |---|---|---|
 | Store | A directory of installed `.mur.zip` artifacts on this machine: the project store `<project root>/.murmur/artifacts/` and the global store `~/.murmur/artifacts/`. See [Local artifact cache](../reference/installing-artifacts.md#local-artifact-cache) | Fixed paths |
-| Source | A GitHub repository whose releases carry `.mur.zip` assets. `murmur-nexus/default-artifacts` is built in | `registry.sources` in `~/.murmur/config.yaml` — see [Multiple sources and fallthrough](../reference/installing-artifacts.md#multiple-sources-and-fallthrough) |
+| Source | The GitHub repository a scope's owner publishes from, whose latest release carries an `artifacts-index.json` listing its `.mur.zip` assets. Each scope has one; `murmur-nexus/default-artifacts` is built in as the source of `murmur` | `registry.sources` in `~/.murmur/config.yaml` — see [Sources and scopes](../reference/installing-artifacts.md#sources-and-scopes) |
 
 `mur install` copies an artifact from a source, a store or a file into a store. `mur publish` writes
 an artifact you built into the global store. `mur run` reads the stores only, so a capsule launches
@@ -82,8 +82,10 @@ declares: installing one under a full name whose bare part differs is refused wi
 `mur install <scope>/<name>@<version>`, and `mur install` with no argument, check the global store before
 any source, so an artifact you published or installed with `-g` is copied rather than downloaded
 again. `mur run`, `mur doctor` and `mur eval` read the project store, then the global store, and
-never a source. Sources are tried with the one `registry.default` names first, then the rest in
-the order listed. The order for every form of `mur install` is in
+never a source. A scope has one source, and that source answers only for its own scope and only
+while its GitHub owner is the one recorded for it — see
+[Owner identity](../reference/installing-artifacts.md#owner-identity). The order for every form of
+`mur install` is in
 [Resolution order](../reference/config.md#resolution-order).
 
 A `murmur.yaml` does not choose where its artifacts come from: a top-level `registry:` key is

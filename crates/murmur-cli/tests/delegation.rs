@@ -377,6 +377,7 @@ fn publish_driver(registry_root: &Path) {
             description: None,
             tags: Vec::new(),
             wit_contracts: None,
+            owner_id: None,
         },
         &cursor.into_inner(),
     )
