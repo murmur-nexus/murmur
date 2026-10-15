@@ -16550,14 +16550,14 @@ inference:
         assert_eq!(fs::read(&pinned.lock_path).unwrap(), lock_before);
     }
 
-    /// Writes an executable shell script native-tool fixture that echoes the given env
-    /// var names (space-separated `NAME=value`, empty string for an unset var) into the
-    /// `data` field of a passing ToolResult JSON payload on stdout.
     /// `binary` as the runtime records a native tool it installed in `workdir`.
     fn installed_native_tool(binary: &Path, workdir: &Path) -> sandbox::NativeEntrypoint {
         sandbox::NativeEntrypoint::derive(binary, &fs::read(binary).unwrap(), workdir)
     }
 
+    /// Writes an executable shell script native-tool fixture that echoes the given env
+    /// var names (space-separated `NAME=value`, empty string for an unset var) into the
+    /// `data` field of a passing ToolResult JSON payload on stdout.
     fn write_env_echo_native_tool(dir: &Path, name: &str, env_vars: &[&str]) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
 

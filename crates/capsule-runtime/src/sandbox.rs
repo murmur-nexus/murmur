@@ -1112,10 +1112,10 @@ pub(crate) fn shebang_interpreter(image: &[u8]) -> Option<PathBuf> {
 ///
 /// The workdir is capsule-writable, so nothing here is read back from it: the `#!` interpreter and
 /// the `PT_INTERP`/`DT_NEEDED` entries come from the runtime's own copy of the image, the
-/// dependency walk neither grants nor reads a file under the accessible workdir, and the
-/// entrypoint's own grant is pinned to the inode the runtime wrote. A capsule that rewrites the
-/// entrypoint in place runs its own code under these grants; one that replaces the file loses the
-/// entrypoint's `Execute` rule.
+/// dependency walk searches only absolute locations and neither grants nor reads a file under the
+/// accessible workdir, and the entrypoint's own grant is pinned to the inode the runtime wrote. A
+/// capsule that rewrites the entrypoint in place runs its own code under these grants; one that
+/// replaces the file loses the entrypoint's `Execute` rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeEntrypoint {
     path: PathBuf,
@@ -1144,11 +1144,28 @@ impl NativeEntrypoint {
         let interpreter = shebang_interpreter(image);
         let mut seeds: Vec<PathBuf> = interpreter.iter().cloned().collect();
         if let Some(deps) = parse_elf_dependencies(image) {
-            seeds.extend(deps.interp.iter().map(PathBuf::from));
-            let origin_dir = path.parent().unwrap_or_else(|| Path::new("/"));
-            seeds.extend(deps.needed.iter().filter_map(|soname| {
-                resolve_soname(soname, origin_dir, &deps.runpaths, search_dirs)
-            }));
+            // Only absolute locations are searched. `$ORIGIN` is the entrypoint's own directory in
+            // the capsule-writable workdir, and a relative entry resolves against this process's
+            // working directory, which may be the workdir too: a symlink planted there would
+            // carry the lookup to any host file, and canonicalising it hides that from the
+            // exclusion below. A library the tool ships beside itself is readable through the
+            // workdir's own rule and needs no grant.
+            let absolute = |entry: &&String| Path::new(entry.as_str()).is_absolute();
+            seeds.extend(deps.interp.iter().filter(absolute).map(PathBuf::from));
+            let runpaths: Vec<String> = deps
+                .runpaths
+                .iter()
+                .filter(|entry| absolute(entry) && !entry.contains("ORIGIN"))
+                .cloned()
+                .collect();
+            seeds.extend(
+                deps.needed
+                    .iter()
+                    .filter(|soname| !soname.contains('/') || absolute(soname))
+                    .filter_map(|soname| {
+                        resolve_soname(soname, Path::new("/"), &runpaths, search_dirs)
+                    }),
+            );
         }
         let excluded = std::fs::canonicalize(accessible_workdir)
             .unwrap_or_else(|_| accessible_workdir.to_path_buf());
@@ -6647,7 +6664,16 @@ mod tests {
             ),
         )
         .unwrap();
-        let image = build_elf64(None, &["libplanted.so", "libsys.so"], Some("$ORIGIN"));
+        // A symlink next to the entrypoint: canonicalising it lands outside the workdir, so only
+        // refusing the `$ORIGIN` lookup itself keeps the host file out of the closure.
+        std::fs::write(outside.join("host-binary"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.join("host-binary"), tool_dir.join("liblinked.so"))
+            .unwrap();
+        let image = build_elf64(
+            None,
+            &["libplanted.so", "liblinked.so", "libsys.so"],
+            Some("$ORIGIN"),
+        );
         let entrypoint = tool_dir.join("tool");
         std::fs::write(&entrypoint, &image).unwrap();
 

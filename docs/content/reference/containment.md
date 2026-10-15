@@ -141,8 +141,10 @@ tool, from the artifact's own image, so nothing written to the workdir afterward
 1. The tool's entrypoint, `<session workdir>/tools/<name>/<name>`.
 2. For a script, the absolute interpreter on its `#!` line. On Sealed, that interpreter's
    directory is bound into the composed root when no fixed runtime path already carries it.
-3. The ELF interpreter and shared-library closure of each, leaving out any file inside the
-   workdir.
+3. The ELF interpreter and shared-library closure of each, found at absolute paths and in the
+   system library directories. A library the tool finds through `$ORIGIN`, or anywhere inside
+   the workdir, gets no grant; one shipped beside the tool is read through the workdir's own
+   access.
 
 Everything else the tool reads, writes, runs or connects to has to be granted by the capsule:
 
