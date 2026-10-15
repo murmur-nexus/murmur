@@ -128,7 +128,7 @@ section that explains it.
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
 | `E-TRC-001` | Trace file parse error (malformed JSON, missing required `session_start`, empty file); unknown event types are silently skipped. `mur trace show` reads a trace with no `session_end`, and skips a torn final line; `mur trace diff` and `mur trace report` refuse both, and a formation member's missing `session_end` names its formation and `mur trace show <formation-id>`. Also a `mur trace show --body` selector that names no recorded hash, or a hash whose body was never stored, a `--turn` that names several turns, `--body` or `--turn` with a formation id, and `mur trace steps` with a formation id, which names the `mur trace show <formation-id>` that lists its members and calls | [`trace.jsonl` schema](observability-schemas.md#session-trace-tracejsonl), [`mur trace show --body`](cli.md#mur-trace-show-body), [Listing a formation](cli.md#mur-trace-show-formation), [`mur trace steps`](cli.md#mur-trace-steps) |
 | `E-TRC-002` | No session found in the workdir, or a session selector matched none or several. Also a `frm_` argument to `mur trace show` that is not a formation id, or a formation no session under any searched root belongs to | [`mur trace`](cli.md#mur-trace), [Listing a formation](cli.md#mur-trace-show-formation) |
-| `E-WIT-LEVEL-001` | An artifact a launch stages does not fit the WIT level this `mur` serves | [E-WIT-LEVEL-001](#e-wit-level-001) |
+| `E-WIT-LEVEL-001` | A driver a launch stages does not fit the WIT level this `mur` serves | [E-WIT-LEVEL-001](#e-wit-level-001) |
 | `W-BLD-001` | A declaration names an archive entry the packer already fills | [W-BLD-001](#w-bld-001) |
 | `W-BLD-002` | `capsule.wasm` shadows another root `*.wasm` | [W-BLD-002](#w-bld-002) |
 | `W-BLD-003` | A compiled artifact packages build inputs | [W-BLD-003](#w-bld-003) |
@@ -724,7 +724,7 @@ The message ends with the path and the operating system's error.
 | `File exists` | A file is where the directory belongs |
 | `Permission denied` | The directory exists and this user may not list it |
 
-### E-WIT-LEVEL-001 — an artifact does not fit the served WIT level { #e-wit-level-001 }
+### E-WIT-LEVEL-001 — a driver does not fit the served WIT level { #e-wit-level-001 }
 
 `mur run`, `mur eval` and `mur new` refuse at staging, before any driver runs, when a driver names
 a `murmur:*` interface at a version other than the one the [WIT level](wit-levels.md) this `mur`

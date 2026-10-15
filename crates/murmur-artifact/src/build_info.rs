@@ -5,7 +5,7 @@
 //! build. An archive without one (packed by hand or by an older `mur`, or a payload fitting no
 //! WIT level) carries no label, and readers derive one from its interfaces.
 
-use std::io::{Cursor, Read, Seek};
+use std::io::Cursor;
 
 use serde_json::Value;
 use thiserror::Error;
@@ -57,14 +57,7 @@ pub struct BuildInfoError(pub String);
 /// The [`BUILD_INFO_FILE`] packed in a `.mur.zip`: `Ok(None)` when the bytes are not a zip or
 /// hold no such entry, an error when the entry is present but unreadable or malformed.
 pub fn build_info_from_artifact_bytes(bytes: &[u8]) -> Result<Option<BuildInfo>, BuildInfoError> {
-    build_info_from_artifact_reader(Cursor::new(bytes))
-}
-
-/// [`build_info_from_artifact_bytes`] over a seekable reader, typically an open `.mur.zip` file.
-pub fn build_info_from_artifact_reader<R: Read + Seek>(
-    reader: R,
-) -> Result<Option<BuildInfo>, BuildInfoError> {
-    let Ok(mut archive) = ZipArchive::new(reader) else {
+    let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
         return Ok(None);
     };
     if archive.index_for_name(BUILD_INFO_FILE).is_none() {

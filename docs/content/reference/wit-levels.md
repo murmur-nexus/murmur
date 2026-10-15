@@ -75,12 +75,6 @@ interfaces fit, or none.
 A recorded label above the served level reads `built at <N> (newer than this mur knows)` in
 `mur doctor`: the artifact was built by a newer `mur`.
 
-## Adding a level
-
-A change to any `murmur:*` package version appends the next level to `levels.txt`, listing every
-package at its new version. `crates/capsule-runtime/wit/VERSIONING.md`, under "WIT levels", lists
-what the change must touch and which checks enforce it.
-
 ## See also
 
 - [`mur version`](cli.md#mur-version): the served level and its package table.

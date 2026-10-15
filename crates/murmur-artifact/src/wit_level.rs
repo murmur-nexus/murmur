@@ -10,8 +10,6 @@
 //! [`parse_wit_levels`]. The file is append-only: a committed level is never edited, renumbered
 //! or reused, so a level number means the same package set on every `mur` that knows it.
 
-use std::fmt;
-
 use thiserror::Error;
 
 use crate::{UnservedInterface, WitContracts};
@@ -292,28 +290,10 @@ fn parse_package(line: usize, text: &str) -> Result<(String, String), WitLevelsE
 /// lists for one mismatched interface's package.
 #[must_use]
 pub fn level_has_phrase(level: u64, mismatch: &UnservedInterface) -> String {
-    LevelHas { level, mismatch }.to_string()
-}
-
-struct LevelHas<'a> {
-    level: u64,
-    mismatch: &'a UnservedInterface,
-}
-
-impl fmt::Display for LevelHas<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.mismatch.served_version {
-            Some(version) => write!(
-                f,
-                "level {} has {}@{version}",
-                self.level, self.mismatch.package
-            ),
-            None => write!(
-                f,
-                "level {} has no version of {}",
-                self.level, self.mismatch.package
-            ),
-        }
+    let package = &mismatch.package;
+    match &mismatch.served_version {
+        Some(version) => format!("level {level} has {package}@{version}"),
+        None => format!("level {level} has no version of {package}"),
     }
 }
 

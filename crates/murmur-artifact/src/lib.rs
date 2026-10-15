@@ -59,10 +59,7 @@ pub use build::{
     artifact_name_format_error, build_artifact, validate_artifact_name, BuildError, BuiltArtifact,
     MAX_ARTIFACT_NAME_LEN, PACKED_MANIFEST_ENTRY,
 };
-pub use build_info::{
-    build_info_from_artifact_bytes, build_info_from_artifact_reader, BuildInfo, BuildInfoError,
-    BUILD_INFO_FILE,
-};
+pub use build_info::{build_info_from_artifact_bytes, BuildInfo, BuildInfoError, BUILD_INFO_FILE};
 pub use build_lints::{
     build_warning_link, lint_build_warnings, BuildWarning, RESERVED_ROOT_ENTRIES, W_BLD_001,
     W_BLD_002, W_BLD_003,

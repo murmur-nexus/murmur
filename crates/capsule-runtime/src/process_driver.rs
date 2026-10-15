@@ -67,9 +67,17 @@ pub fn check_driver_interface(
                 expected,
             })
         }
-        "process" => {
-            level_mismatch(name, version, level, process_exports, Vec::new()).map_or(Ok(()), Err)
-        }
+        // Refuse even if every export fits the level: none is `expected`, so the driver must not
+        // pass.
+        "process" => Err(
+            level_mismatch(name, version, level, process_exports, Vec::new()).unwrap_or_else(
+                || RuntimeError::ProcessDriverInterfaceMissing {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    expected,
+                },
+            ),
+        ),
         "http" if !process_exports.is_empty() => {
             Err(RuntimeError::HttpDriverExportsProcessInterface {
                 name: name.to_string(),
