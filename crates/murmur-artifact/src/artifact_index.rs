@@ -19,10 +19,10 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::{
-    artifact::ArtifactError, artifact_name_format_error, is_reserved_version,
-    load_manifest_from_artifact_bytes, sha256_hex, split_platform_suffix,
-    wit_contracts_from_artifact_bytes, RuntimeType, UnservedInterface, WitContracts, LOCAL_SCOPE,
-    SUPPORTED_PLATFORMS,
+    artifact::ArtifactError, artifact_name_format_error, build_info_from_artifact_bytes,
+    is_reserved_version, level_fit, load_manifest_from_artifact_bytes, newest_fitting_level,
+    sha256_hex, split_platform_suffix, wit_contracts_from_artifact_bytes, LevelFit, RuntimeType,
+    UnservedInterface, WitContracts, WitLevel, BUILD_INFO_FILE, LOCAL_SCOPE, SUPPORTED_PLATFORMS,
 };
 
 /// The `schema_version` [`ArtifactIndex::from_json`] reads and [`ArtifactIndex::to_json`] writes.
@@ -135,12 +135,12 @@ pub struct MergeReport {
     pub replaced: usize,
 }
 
-/// Whether one version can run on a host serving a given interface table and platform.
+/// Whether one version can run on a host serving a given WIT level and platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionFit {
     Fits,
-    /// Its interfaces that the host does not serve at exactly the named version, in recorded
-    /// order. Never empty.
+    /// Its interfaces whose version is not the one the level lists for their package, in
+    /// recorded order. Never empty.
     Unserved(Vec<UnservedInterface>),
     /// Every payload is tagged for a platform other than this one.
     NoPayloadFor(String),
@@ -187,46 +187,37 @@ impl ArtifactIndex {
 }
 
 impl IndexedArtifact {
-    /// The newest version [`IndexedVersion::fit`] accepts for `served` and `platform`.
+    /// The newest version [`IndexedVersion::fit`] accepts for `level` and `platform`.
     #[must_use]
-    pub fn newest_fitting(
-        &self,
-        served: &[(&str, &str)],
-        platform: &str,
-    ) -> Option<&IndexedVersion> {
+    pub fn newest_fitting(&self, level: &WitLevel, platform: &str) -> Option<&IndexedVersion> {
         self.versions
             .iter()
-            .find(|version| version.fit(served, platform) == VersionFit::Fits)
+            .find(|version| version.fit(level, platform) == VersionFit::Fits)
     }
 }
 
 impl IndexedVersion {
     #[must_use]
-    pub fn fit(&self, served: &[(&str, &str)], platform: &str) -> VersionFit {
+    pub fn fit(&self, level: &WitLevel, platform: &str) -> VersionFit {
         version_fit(
             &self.interfaces,
             self.assets.iter().map(|asset| asset.platform.as_deref()),
-            served,
+            level,
             platform,
         )
     }
 }
 
-/// A version fits when every `murmur:` interface in `interfaces` is one `served` lists at exactly
-/// that version, and one of its payloads is untagged (`None`) or tagged `platform`. The interface
-/// check comes first, so a version failing both reports [`VersionFit::Unserved`].
+/// A version fits when its `interfaces` fit `level` ([`level_fit`]) and one of its payloads is
+/// untagged (`None`) or tagged `platform`. The interface check comes first, so a version failing
+/// both reports [`VersionFit::Unserved`].
 pub fn version_fit<'a>(
     interfaces: &[String],
     payload_platforms: impl IntoIterator<Item = Option<&'a str>>,
-    served: &[(&str, &str)],
+    level: &WitLevel,
     platform: &str,
 ) -> VersionFit {
-    let unserved = WitContracts {
-        exports: Vec::new(),
-        imports: interfaces.to_vec(),
-    }
-    .unserved_against(served);
-    if !unserved.is_empty() {
+    if let LevelFit::Mismatched(unserved) = level_fit(&interfaces_as_contracts(interfaces), level) {
         return VersionFit::Unserved(unserved);
     }
     let runs_here = payload_platforms
@@ -237,6 +228,22 @@ pub fn version_fit<'a>(
     } else {
         VersionFit::NoPayloadFor(platform.to_string())
     }
+}
+
+/// An index version's `interfaces`, which merge both directions, as contracts [`level_fit`]
+/// reads. Fit treats exports and imports alike, so which list they go in does not change it.
+fn interfaces_as_contracts(interfaces: &[String]) -> WitContracts {
+    WitContracts {
+        exports: Vec::new(),
+        imports: interfaces.to_vec(),
+    }
+}
+
+/// The built-at level of an index version that packs no label: the newest of `levels` its
+/// `interfaces` fit, `None` when they fit none.
+#[must_use]
+pub fn derived_built_at_level(interfaces: &[String], levels: &[WitLevel]) -> Option<u64> {
+    newest_fitting_level(&interfaces_as_contracts(interfaces), levels)
 }
 
 /// The `murmur:` names among `contracts`' exports and imports, sorted and deduplicated.
@@ -326,20 +333,27 @@ struct ScannedFile {
     sha256: String,
     interfaces: Vec<String>,
     description: Option<String>,
+    built_at_level: Option<u64>,
 }
 
 /// Index every `.mur.zip` regular file directly inside `dir`, recording `release` on every
 /// version. Every other entry is ignored.
 ///
+/// Each version's `built_at_level` is the label its files pack in `murmur-build.json`; a version
+/// whose files pack none gets the newest of `levels` its `interfaces` fit, and none when they fit
+/// no level.
+///
 /// Refuses the whole directory when any one file cannot be indexed (unreadable, no packed
-/// `murmur.yaml`, a name or version the registry would refuse, a file name that disagrees with
-/// the packed name, version or packaging type), when two files of one version disagree on their
-/// packed `runtime:` or packaging type, or when `dir` holds no such file. The result depends only
-/// on the files' names and bytes, never on directory order or file times.
+/// `murmur.yaml`, a malformed packed `murmur-build.json`, a name or version the registry would
+/// refuse, a file name that disagrees with the packed name, version or packaging type), when two
+/// files of one version disagree on their packed `runtime:`, packaging type or built-at level, or
+/// when `dir` holds no such file. The result depends only on the files' names and bytes and on
+/// `levels`, never on directory order or file times.
 pub fn index_directory(
     dir: &Path,
     scope: &str,
     release: &str,
+    levels: &[WitLevel],
 ) -> Result<ArtifactIndex, IndexBuildError> {
     if let Some(reason) = index_scope_error(scope) {
         return Err(IndexBuildError::InvalidScope {
@@ -386,6 +400,23 @@ pub fn index_directory(
             .or_default()
             .entry(scanned.version.clone())
             .or_default();
+        let labelled = files
+            .iter()
+            .find(|file| file.built_at_level.is_some() && scanned.built_at_level.is_some());
+        if let Some(first) = labelled.filter(|file| file.built_at_level != scanned.built_at_level) {
+            return Err(IndexBuildError::File {
+                file: scanned.path,
+                reason: format!(
+                    "its packed {BUILD_INFO_FILE} sets built_at_level {}, and {} of the same \
+                     {}@{} sets built_at_level {}",
+                    scanned.built_at_level.unwrap_or_default(),
+                    first.path,
+                    first.name,
+                    first.version,
+                    first.built_at_level.unwrap_or_default()
+                ),
+            });
+        }
         if let Some(first) = files.first() {
             if first.runtime != scanned.runtime || first.packaging != scanned.packaging {
                 return Err(IndexBuildError::File {
@@ -425,10 +456,14 @@ pub fn index_directory(
                         .collect();
                     interfaces.sort();
                     interfaces.dedup();
+                    let built_at_level = files
+                        .iter()
+                        .find_map(|file| file.built_at_level)
+                        .or_else(|| derived_built_at_level(&interfaces, levels));
                     IndexedVersion {
                         version,
                         release: release.to_string(),
-                        built_at_level: None,
+                        built_at_level,
                         interfaces,
                         assets: files
                             .into_iter()
@@ -525,6 +560,9 @@ fn scan_file(dir: &Path, file: String) -> Result<ScannedFile, IndexBuildError> {
     let interfaces = wit_contracts_from_artifact_bytes(&bytes)
         .map(|contracts| murmur_interfaces(&contracts))
         .unwrap_or_default();
+    let built_at_level = build_info_from_artifact_bytes(&bytes)
+        .map_err(|error| refuse(format!("its packed {BUILD_INFO_FILE} {error}")))?
+        .map(|info| info.built_at_level);
 
     Ok(ScannedFile {
         sha256: sha256_hex(&bytes),
@@ -537,6 +575,7 @@ fn scan_file(dir: &Path, file: String) -> Result<ScannedFile, IndexBuildError> {
         platform,
         interfaces,
         description: manifest.description,
+        built_at_level,
     })
 }
 
@@ -544,12 +583,14 @@ fn scan_file(dir: &Path, file: String) -> Result<ScannedFile, IndexBuildError> {
 /// scope.
 ///
 /// Every version `fresh` holds is taken from it. A version both hold with the same assets keeps
-/// `previous`'s `built_at_level`; one whose assets differ is counted as replaced. Every other
-/// version is kept verbatim. An artifact's own fields come from whichever index holds its newest
-/// version, `fresh` on a tie.
+/// `previous`'s `built_at_level` when it has one; one whose assets differ is counted as replaced.
+/// Every other version is kept verbatim, except that one with no `built_at_level` gets the newest
+/// of `levels` its `interfaces` fit. An artifact's own fields come from whichever index holds its
+/// newest version, `fresh` on a tie.
 pub fn merge_indexes(
     fresh: ArtifactIndex,
     previous: ArtifactIndex,
+    levels: &[WitLevel],
 ) -> Result<(ArtifactIndex, MergeReport), IndexBuildError> {
     if fresh.scope != previous.scope {
         return Err(IndexBuildError::ScopeMismatch {
@@ -581,12 +622,16 @@ pub fn merge_indexes(
                 .find(|version| version.version == old_version.version)
             {
                 Some(version) if version.assets == old_version.assets => {
-                    version.built_at_level = old_version.built_at_level;
+                    if old_version.built_at_level.is_some() {
+                        version.built_at_level = old_version.built_at_level;
+                    }
                 }
                 Some(_) => report.replaced += 1,
                 None => {
                     report.kept += 1;
-                    artifact.versions.push(old_version.clone());
+                    artifact
+                        .versions
+                        .push(kept_version(old_version.clone(), levels));
                 }
             }
         }
@@ -600,8 +645,13 @@ pub fn merge_indexes(
         }
         merged.insert(artifact.name.clone(), artifact);
     }
-    for (name, artifact) in earlier {
+    for (name, mut artifact) in earlier {
         report.kept += artifact.versions.len();
+        artifact.versions = artifact
+            .versions
+            .into_iter()
+            .map(|version| kept_version(version, levels))
+            .collect();
         merged.insert(name, artifact);
     }
 
@@ -613,6 +663,15 @@ pub fn merge_indexes(
         },
         report,
     ))
+}
+
+/// A version carried over from an earlier index, given the derived built-at level when it records
+/// none.
+fn kept_version(mut version: IndexedVersion, levels: &[WitLevel]) -> IndexedVersion {
+    if version.built_at_level.is_none() {
+        version.built_at_level = derived_built_at_level(&version.interfaces, levels);
+    }
+    version
 }
 
 /// Semver precedence, then build metadata, so two distinct versions never compare equal. A
@@ -926,9 +985,20 @@ mod tests {
 
     use super::*;
 
-    const SERVED: &[(&str, &str)] = &[("murmur:tool", "0.1.0"), ("murmur:hook", "0.9.0")];
+    fn levels() -> Vec<WitLevel> {
+        crate::parse_wit_levels("1 murmur:hook@0.9.0\n1 murmur:tool@0.1.0\n").unwrap()
+    }
+
+    fn served() -> WitLevel {
+        levels().remove(0)
+    }
 
     fn payload(manifest: &str, component: Option<&str>) -> Vec<u8> {
+        labelled(manifest, component, None)
+    }
+
+    /// A payload that also packs `label` as its `murmur-build.json`.
+    fn labelled(manifest: &str, component: Option<&str>, label: Option<&str>) -> Vec<u8> {
         let mut buf = Vec::new();
         {
             let mut zip = ZipWriter::new(Cursor::new(&mut buf));
@@ -939,6 +1009,11 @@ mod tests {
                 zip.start_file("capsule.wasm", SimpleFileOptions::default())
                     .unwrap();
                 zip.write_all(&wat::parse_str(wat).unwrap()).unwrap();
+            }
+            if let Some(label) = label {
+                zip.start_file(BUILD_INFO_FILE, SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(label.as_bytes()).unwrap();
             }
             zip.finish().unwrap();
         }
@@ -1189,19 +1264,19 @@ mod tests {
             &[("tool-x-1.0.0-darwin-aarch64.mur.zip", 'a')],
         );
         assert_eq!(
-            v.fit(SERVED, "linux-x86_64"),
+            v.fit(&served(), "linux-x86_64"),
             VersionFit::NoPayloadFor("linux-x86_64".to_string())
         );
-        assert_eq!(v.fit(SERVED, "darwin-aarch64"), VersionFit::Fits);
+        assert_eq!(v.fit(&served(), "darwin-aarch64"), VersionFit::Fits);
         v.interfaces = vec!["murmur:tool/run@9.9.9".to_string()];
-        match v.fit(SERVED, "linux-x86_64") {
+        match v.fit(&served(), "linux-x86_64") {
             VersionFit::Unserved(unserved) => {
                 assert_eq!(unserved[0].served_version.as_deref(), Some("0.1.0"))
             }
             other => panic!("{other:?}"),
         }
         let untagged = version("1.0.0", "v1", &[("tool-x-1.0.0.mur.zip", 'a')]);
-        assert_eq!(untagged.fit(SERVED, "linux-aarch64"), VersionFit::Fits);
+        assert_eq!(untagged.fit(&served(), "linux-aarch64"), VersionFit::Fits);
     }
 
     #[test]
@@ -1232,7 +1307,7 @@ mod tests {
                 version("0.2.0", "v0.3.0", &[("tool-x-0.2.0.mur.zip", 'd')]),
             ],
         )]);
-        let (merged, report) = merge_indexes(fresh, previous).unwrap();
+        let (merged, report) = merge_indexes(fresh, previous, &levels()).unwrap();
         assert_eq!(
             report,
             MergeReport {
@@ -1255,6 +1330,8 @@ mod tests {
             ]
         );
         assert_eq!(versions[2], kept);
+        // A kept version recording no level gets the derived one.
+        assert_eq!(merged.artifacts[0].versions[0].built_at_level, Some(1));
         assert!(ArtifactIndex::from_json(&merged.to_json()).is_ok());
     }
 
@@ -1270,7 +1347,7 @@ mod tests {
             vec![version("1.0.0", "v1", &[("tool-x-1.0.0.mur.zip", 'b')])],
         );
         older.description = Some("Fresh but older.".to_string());
-        let (merged, _) = merge_indexes(index(vec![older]), index(vec![newer])).unwrap();
+        let (merged, _) = merge_indexes(index(vec![older]), index(vec![newer]), &levels()).unwrap();
         assert_eq!(
             merged.artifacts[0].description.as_deref(),
             Some("Old but newest.")
@@ -1282,7 +1359,7 @@ mod tests {
         let mut previous = index(vec![]);
         previous.scope = "bob".to_string();
         assert!(matches!(
-            merge_indexes(index(vec![]), previous),
+            merge_indexes(index(vec![]), previous, &levels()),
             Err(IndexBuildError::ScopeMismatch { .. })
         ));
     }
@@ -1315,7 +1392,7 @@ mod tests {
         fs::write(dir.path().join("notes.txt"), "x").unwrap();
         fs::create_dir(dir.path().join("sub.mur.zip")).unwrap();
 
-        let built = index_directory(dir.path(), "ana", "v1.0.0").unwrap();
+        let built = index_directory(dir.path(), "ana", "v1.0.0", &levels()).unwrap();
         assert_eq!(built.artifacts.len(), 2);
         let echo = &built.artifacts[0];
         assert_eq!(echo.name, "tool-echo");
@@ -1323,6 +1400,7 @@ mod tests {
         assert_eq!(echo.tags, ["tool", "echo"]);
         assert_eq!(echo.versions[0].version, "0.10.0");
         assert_eq!(echo.versions[0].interfaces, ["murmur:tool/run@0.1.0"]);
+        assert_eq!(echo.versions[0].built_at_level, Some(1));
         assert_eq!(
             echo.versions[0].assets[0].sha256,
             sha256_hex(&tool("0.10.0"))
@@ -1336,6 +1414,7 @@ mod tests {
             .collect();
         assert_eq!(platforms, [Some("darwin-aarch64"), Some("linux-x86_64")]);
         assert!(nat.versions[0].interfaces.is_empty());
+        assert_eq!(nat.versions[0].built_at_level, Some(1));
         assert_eq!(ArtifactIndex::from_json(&built.to_json()).unwrap(), built);
     }
 
@@ -1371,11 +1450,20 @@ mod tests {
                 payload("name: tool-a\nversion: 0.1.0\nruntime: tool\n", None),
                 "runs on every platform",
             ),
+            (
+                "tool-a-0.1.0.mur.zip",
+                labelled(
+                    "name: tool-a\nversion: 0.1.0\nruntime: tool\n",
+                    None,
+                    Some("{\"built_at_level\": \"one\"}"),
+                ),
+                "its packed murmur-build.json sets built_at_level to \"one\"",
+            ),
         ];
         for (file, bytes, reason) in cases {
             let dir = tempfile::tempdir().unwrap();
             fs::write(dir.path().join(file), bytes).unwrap();
-            let error = index_directory(dir.path(), "ana", "v1").unwrap_err();
+            let error = index_directory(dir.path(), "ana", "v1", &levels()).unwrap_err();
             let text = error.to_string();
             assert!(
                 matches!(error, IndexBuildError::File { .. })
@@ -1391,8 +1479,65 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "x").unwrap();
         assert!(matches!(
-            index_directory(dir.path(), "ana", "v1"),
+            index_directory(dir.path(), "ana", "v1", &levels()),
             Err(IndexBuildError::NoArtifacts { .. })
         ));
+    }
+
+    #[test]
+    fn index_directory_writes_a_packed_label_and_derives_one_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = importing(&["murmur:tool/run@0.0.9"]);
+        // Packed labels are recorded as written, whatever the interfaces say.
+        fs::write(
+            dir.path().join("tool-a-0.2.0.mur.zip"),
+            labelled(
+                "name: tool-a\nversion: 0.2.0\nruntime: tool\n",
+                Some(&stale),
+                Some("{\"built_at_level\":1}\n"),
+            ),
+        )
+        .unwrap();
+        // No label, and interfaces fitting no level: no label at all.
+        fs::write(
+            dir.path().join("tool-a-0.1.0.mur.zip"),
+            payload(
+                "name: tool-a\nversion: 0.1.0\nruntime: tool\n",
+                Some(&stale),
+            ),
+        )
+        .unwrap();
+        let built = index_directory(dir.path(), "ana", "v1", &levels()).unwrap();
+        let versions = &built.artifacts[0].versions;
+        assert_eq!(versions[0].built_at_level, Some(1));
+        assert_eq!(versions[1].built_at_level, None);
+        assert!(built.to_json().contains("\"built_at_level\": 1"));
+    }
+
+    #[test]
+    fn index_directory_refuses_files_of_one_version_with_different_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = "name: tool-n\nversion: 1.0.0\nruntime: tool\nimplementation: native\n";
+        for (platform, level) in [("darwin-aarch64", 1), ("linux-x86_64", 2)] {
+            fs::write(
+                dir.path().join(format!("tool-n-1.0.0-{platform}.mur.zip")),
+                labelled(
+                    manifest,
+                    None,
+                    Some(&format!("{{\"built_at_level\":{level}}}")),
+                ),
+            )
+            .unwrap();
+        }
+        let text = index_directory(dir.path(), "ana", "v1", &levels())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains("tool-n-1.0.0-linux-x86_64.mur.zip")
+                && text.contains("tool-n-1.0.0-darwin-aarch64.mur.zip")
+                && text.contains("sets built_at_level 2")
+                && text.contains("sets built_at_level 1"),
+            "{text}"
+        );
     }
 }

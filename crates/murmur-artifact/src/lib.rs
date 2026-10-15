@@ -7,6 +7,7 @@ pub mod artifact_index;
 pub mod artifact_name;
 pub mod artifact_ref;
 pub mod build;
+pub mod build_info;
 pub mod build_lints;
 pub mod docs_url;
 pub mod dotenv;
@@ -27,6 +28,7 @@ pub mod security_warnings;
 pub mod trace_capture;
 pub mod unknown_manifest_keys;
 pub mod wit_contract;
+pub mod wit_level;
 pub mod zip_guard;
 
 /// Write one warning line to standard error. A refused write is dropped: a reader that closed
@@ -42,9 +44,9 @@ pub use artifact::{
     load_manifest_yaml_from_artifact_bytes, ArtifactError, DeclaredRuntime,
 };
 pub use artifact_index::{
-    asset_file_name, compare_versions, derived_tags, description_summary, index_directory,
-    index_scope_error, merge_indexes, murmur_interfaces, release_tag_error, version_fit,
-    ArtifactIndex, ArtifactIndexError, IndexBuildError, IndexedArtifact, IndexedAsset,
+    asset_file_name, compare_versions, derived_built_at_level, derived_tags, description_summary,
+    index_directory, index_scope_error, merge_indexes, murmur_interfaces, release_tag_error,
+    version_fit, ArtifactIndex, ArtifactIndexError, IndexBuildError, IndexedArtifact, IndexedAsset,
     IndexedVersion, MergeReport, VersionFit, ARTIFACT_FILE_SUFFIX, ARTIFACT_INDEX_FILE_NAME,
     ARTIFACT_INDEX_SCHEMA_VERSION, MURMUR_INTERFACE_PREFIX,
 };
@@ -54,8 +56,12 @@ pub use artifact_name::{
 };
 pub use artifact_ref::{ArtifactRef, ArtifactRefError};
 pub use build::{
-    artifact_name_format_error, build_artifact, validate_artifact_name, BuildError,
+    artifact_name_format_error, build_artifact, validate_artifact_name, BuildError, BuiltArtifact,
     MAX_ARTIFACT_NAME_LEN, PACKED_MANIFEST_ENTRY,
+};
+pub use build_info::{
+    build_info_from_artifact_bytes, build_info_from_artifact_reader, BuildInfo, BuildInfoError,
+    BUILD_INFO_FILE,
 };
 pub use build_lints::{
     build_warning_link, lint_build_warnings, BuildWarning, RESERVED_ROOT_ENTRIES, W_BLD_001,
@@ -138,6 +144,10 @@ pub use unknown_manifest_keys::{
 pub use wit_contract::{
     extract_wit_contracts, wit_contracts_from_artifact_bytes, wit_contracts_from_artifact_reader,
     wit_package_declarations, ContractDirection, UnservedInterface, WitContractError, WitContracts,
+};
+pub use wit_level::{
+    fitting_levels, level_fit, level_has_phrase, newest_fitting_level, parse_wit_levels, LevelFit,
+    WitLevel, WitLevelsError,
 };
 pub use zip_guard::{
     max_artifact_decompressed_bytes, read_zip_entry_capped, read_zip_entry_to_string_capped,

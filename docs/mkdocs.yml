@@ -83,6 +83,10 @@ plugins:
         reference/nexus-api.md: concepts/registry.md
 
 hooks:
+  # Replaces the marker on reference/wit-levels.md with the WIT level tables,
+  # generated from crates/capsule-runtime/wit/levels.txt and the v* release
+  # tags. Runs before agent_export.py so the agent mirrors get the tables too.
+  - hooks/wit_levels.py
   # Dumps fully-resolved page markdown to .agent-export/pages.json for the
   # leadtype agent-artifact build (scripts/agent-artifacts.mjs). Build-only;
   # does not alter rendered output.
@@ -209,6 +213,7 @@ nav:
       - Installing Artifacts: reference/installing-artifacts.md
       - Artifact Index: reference/artifact-index.md
       - WIT Interfaces: reference/wit-interfaces.md
+      - WIT Levels: reference/wit-levels.md
       - Roost API: reference/roost-api.md
   - Contributing:
       - Overview: contributing/index.md

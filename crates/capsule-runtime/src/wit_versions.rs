@@ -1,4 +1,9 @@
-//! The one version of each `murmur:*` WIT package this host serves.
+//! The one version of each `murmur:*` WIT package this host serves, and the WIT levels that
+//! number those sets.
+
+use std::sync::OnceLock;
+
+use murmur_artifact::{parse_wit_levels, WitLevel};
 
 /// Every `murmur:*` WIT package declared under `crates/capsule-runtime/wit/`, paired with the one
 /// version of it this host links and resolves, sorted by package name.
@@ -6,11 +11,12 @@
 /// These are the only versions the host accepts. Each interface is resolved or provided under
 /// exactly one instance name, with no fallback to any other version (see `wit/VERSIONING.md`), so
 /// a component naming any other version of one of these packages fails to instantiate.
-/// `mur doctor` compares every installed artifact's recorded interfaces against this table to name
-/// the ones a launch would refuse.
+/// It is the package set of [`served_wit_level`]; fit is decided against that level, never against
+/// this table directly.
 ///
-/// The tests below hold this table equal to the `package` declarations in the WIT tree and to
-/// every interface name the host resolves, so it moves with a version bump or fails the build.
+/// The tests below hold this table equal to the `package` declarations in the WIT tree, to every
+/// interface name the host resolves, and to the newest level in [`WIT_LEVELS_FILE`], so it moves
+/// with a version bump or fails the build.
 pub const SERVED_WIT_PACKAGES: &[(&str, &str)] = &[
     ("murmur:artifact-manager", "0.1.0"),
     ("murmur:capsule", "0.1.0"),
@@ -29,12 +35,34 @@ pub const SERVED_WIT_PACKAGES: &[(&str, &str)] = &[
     ("murmur:tool-registry", "0.1.0"),
 ];
 
+/// The repository path of the committed WIT level table, for messages that name it.
+pub const WIT_LEVELS_FILE: &str = "crates/capsule-runtime/wit/levels.txt";
+
+/// Every committed WIT level, oldest first, parsed once from [`WIT_LEVELS_FILE`].
+///
+/// The file is compiled in, and `wit_levels_file_parses` parses the same bytes, so a malformed
+/// table fails the test suite before it can reach this `expect`.
+pub fn wit_levels() -> &'static [WitLevel] {
+    static LEVELS: OnceLock<Vec<WitLevel>> = OnceLock::new();
+    LEVELS.get_or_init(|| {
+        parse_wit_levels(include_str!("../wit/levels.txt"))
+            .unwrap_or_else(|error| panic!("{WIT_LEVELS_FILE} is not a valid level table: {error}"))
+    })
+}
+
+/// The WIT level this host serves: the newest level in [`WIT_LEVELS_FILE`].
+pub fn served_wit_level() -> &'static WitLevel {
+    wit_levels()
+        .last()
+        .expect("parse_wit_levels refuses a table with no level")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
-    use super::SERVED_WIT_PACKAGES;
+    use super::{served_wit_level, wit_levels, SERVED_WIT_PACKAGES, WIT_LEVELS_FILE};
 
     fn served_set() -> BTreeSet<(String, String)> {
         SERVED_WIT_PACKAGES
@@ -111,5 +139,61 @@ mod tests {
                 .unwrap_or_else(|| panic!("{package}@{version} has no patch field"));
             assert_eq!(patch, "0", "{package}@{version} has a non-zero patch field");
         }
+    }
+
+    #[test]
+    fn wit_levels_file_parses() {
+        murmur_artifact::parse_wit_levels(include_str!("../wit/levels.txt"))
+            .unwrap_or_else(|error| panic!("{WIT_LEVELS_FILE}: {error}"));
+        assert!(!wit_levels().is_empty());
+    }
+
+    #[test]
+    fn wit_levels_served_level_is_level_1() {
+        assert_eq!(served_wit_level().level, 1);
+    }
+
+    /// The served table is the newest level's set. A version moved in one but not the other
+    /// fails here with the instruction for the bump: append the next level.
+    #[test]
+    fn wit_levels_newest_level_is_the_served_table() {
+        let newest = served_wit_level();
+        let level: BTreeSet<(String, String)> = newest.packages.iter().cloned().collect();
+        let served = served_set();
+        if level == served {
+            return;
+        }
+        let packages: BTreeSet<&str> = level
+            .iter()
+            .chain(served.iter())
+            .map(|(package, _)| package.as_str())
+            .collect();
+        let differences: Vec<String> = packages
+            .into_iter()
+            .filter_map(|package| {
+                let at_level = newest.version_of(package);
+                let in_table = SERVED_WIT_PACKAGES
+                    .iter()
+                    .find(|(p, _)| *p == package)
+                    .map(|(_, v)| *v);
+                (at_level != in_table).then(|| {
+                    format!(
+                        "  {package}: {} in level {} → {} in SERVED_WIT_PACKAGES",
+                        at_level.unwrap_or("absent"),
+                        newest.level,
+                        in_table.unwrap_or("absent")
+                    )
+                })
+            })
+            .collect();
+        let next = newest.level + 1;
+        panic!(
+            "SERVED_WIT_PACKAGES no longer equals WIT level {level} in {WIT_LEVELS_FILE}:\n{}\n\
+             append level {next} to {WIT_LEVELS_FILE}, listing every package at its new version \
+             (one `{next} <package>@<version>` line per package); never edit, renumber or reuse \
+             level {level}",
+            differences.join("\n"),
+            level = newest.level,
+        );
     }
 }

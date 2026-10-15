@@ -103,7 +103,7 @@ section that explains it.
 | `E-RUN-026` | `spend.machine_tokens_per_day` is set and the spend ledger under `~/.murmur/spend` cannot be used | [E-RUN-026](#e-run-026) |
 | `E-RUN-027` | The provider kept rejecting the inference credential after it was re-read | [E-RUN-027](#e-run-027) |
 | `E-RUN-028` | The running-capsule records under `~/.murmur/running/` could not be read | [E-RUN-028](#e-run-028) |
-| `E-RUN-029` | A driver does not speak the driver interface this host serves | [E-RUN-029](#e-run-029) |
+| `E-RUN-029` | A `transport: process` driver exports no version of the process interface, or a driver imports a `murmur:stream` interface that does not exist at the served version | [E-RUN-029](#e-run-029) |
 | `E-RUN-030` | The `transport: http` inference driver exports the process driver interface | [E-RUN-030](#e-run-030) |
 | `E-RUN-032` | A process driver could not be loaded with no grants, or described itself unusably | [E-RUN-032](#e-run-032) |
 | `E-RUN-033` | A `transport: process` turn failed — the harness reported it, or the runtime ended it at the turn limit | [E-RUN-033](#e-run-033) |
@@ -128,6 +128,7 @@ section that explains it.
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
 | `E-TRC-001` | Trace file parse error (malformed JSON, missing required `session_start`, empty file); unknown event types are silently skipped. `mur trace show` reads a trace with no `session_end`, and skips a torn final line; `mur trace diff` and `mur trace report` refuse both, and a formation member's missing `session_end` names its formation and `mur trace show <formation-id>`. Also a `mur trace show --body` selector that names no recorded hash, or a hash whose body was never stored, a `--turn` that names several turns, `--body` or `--turn` with a formation id, and `mur trace steps` with a formation id, which names the `mur trace show <formation-id>` that lists its members and calls | [`trace.jsonl` schema](observability-schemas.md#session-trace-tracejsonl), [`mur trace show --body`](cli.md#mur-trace-show-body), [Listing a formation](cli.md#mur-trace-show-formation), [`mur trace steps`](cli.md#mur-trace-steps) |
 | `E-TRC-002` | No session found in the workdir, or a session selector matched none or several. Also a `frm_` argument to `mur trace show` that is not a formation id, or a formation no session under any searched root belongs to | [`mur trace`](cli.md#mur-trace), [Listing a formation](cli.md#mur-trace-show-formation) |
+| `E-WIT-LEVEL-001` | An artifact a launch stages does not fit the WIT level this `mur` serves | [E-WIT-LEVEL-001](#e-wit-level-001) |
 | `W-BLD-001` | A declaration names an archive entry the packer already fills | [W-BLD-001](#w-bld-001) |
 | `W-BLD-002` | `capsule.wasm` shadows another root `*.wasm` | [W-BLD-002](#w-bld-002) |
 | `W-BLD-003` | A compiled artifact packages build inputs | [W-BLD-003](#w-bld-003) |
@@ -135,7 +136,7 @@ section that explains it.
 | `W-DEPLOY-002` | A deploy's target runs under a different `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES` from the deploying machine | [W-DEPLOY-002](#w-deploy-002) |
 | `W-REG-001` | An installed native artifact has no recorded platform | [W-REG-001](#w-reg-001) |
 | `W-REG-002` | A capsule in the spawn closure could not be inspected | [W-REG-002](#w-reg-002) |
-| `W-REG-003` | An installed artifact speaks an interface version this `mur` does not serve | [W-REG-003](#w-reg-003) |
+| `W-REG-003` | An installed artifact does not fit the WIT level this `mur` serves | [W-REG-003](#w-reg-003) |
 | `W-ROS-001` | A roster lets more members call a member than its `lifecycle` holds at once | [W-ROS-001](#w-ros-001) |
 | `W-RUN-001` | A turn stopped at the `inference.max_tokens` output cap | [W-RUN-001](#w-run-001) |
 | `W-RUN-002` | A `transport: process` harness reports a version its process driver was not tested against | [W-RUN-002](#w-run-002) |
@@ -723,36 +724,65 @@ The message ends with the path and the operating system's error.
 | `File exists` | A file is where the directory belongs |
 | `Permission denied` | The directory exists and this user may not list it |
 
-### E-RUN-029 — the driver does not speak the interface this host serves { #e-run-029 }
+### E-WIT-LEVEL-001 — an artifact does not fit the served WIT level { #e-wit-level-001 }
 
-`mur run` refuses at staging, before any driver runs. The runtime accepts one version of each
-driver interface, so a driver built against another one — including one an older `murmur.lock`
-pins — is refused until a release built against the served one is installed.
+`mur run`, `mur eval` and `mur new` refuse at staging, before any driver runs, when a driver names
+a `murmur:*` interface at a version other than the one the [WIT level](wit-levels.md) this `mur`
+serves lists for its package.
 
-| Driver | Refused when | Served interface |
-|---|---|---|
-| Every `runtime: driver` artifact the manifest declares, except a `transport: process` inference driver | It imports any `murmur:text` interface, or `murmur:stream/events` at another version | Imports [`murmur:stream/events@0.1.0`](wit-interfaces.md#stream-events) |
-| The `inference.driver` artifact of a `transport: process` capsule | It does not export the process interface | Exports `murmur:driver/process@0.3.0` |
+| Driver | Refused when |
+|---|---|
+| Every `runtime: driver` artifact the manifest declares, except a `transport: process` inference driver | It imports any `murmur:text` interface, or a `murmur:stream` interface at another version |
+| The `inference.driver` artifact of a `transport: process` capsule | It exports `murmur:driver/process` only at another version |
 
-For a stream-interface refusal, the message names the artifact, every import the host does not
-serve and `murmur:stream/events@0.1.0`:
-
-```text
-error[E-RUN-029]: artifact 'my-http-driver@1.0.0' imports murmur:text/chunks@0.1.0, which this host does not serve; a driver must import murmur:stream/events@0.1.0 in its place
-  hint: pin a release of my-http-driver built against murmur:stream/events@0.1.0 in murmur.yaml and run `mur install`, or rebuild it against that interface
-```
-
-For a process driver:
-
-| The artifact exports | Message ends | Hint |
-|---|---|---|
-| Another version of the interface | `; it exports murmur:driver/process@<version>, built against another version — rebuild it` | `` pin a release of <name> built against murmur:driver/process@0.3.0 in murmur.yaml, then run `mur install` — or rebuild <name> against murmur:driver/process@0.3.0 `` |
-| No version of it | `; a process driver must be built against the process-driver world` | `rebuild the driver against murmur:driver/process@0.3.0, or name a process driver` |
+The message names the artifact, the served level, and one clause per interface that does not fit:
 
 ```text
-error[E-RUN-029]: artifact 'my-process-driver@1.0.0' is the transport: process driver but does not export murmur:driver/process@0.3.0; it exports murmur:driver/process@0.2.0, built against another version — rebuild it
-  hint: pin a release of my-process-driver built against murmur:driver/process@0.3.0 in murmur.yaml, then run `mur install` — or rebuild my-process-driver against murmur:driver/process@0.3.0
+error[E-WIT-LEVEL-001]: artifact 'ana/process-driver@1.0.0' does not fit WIT level 1, the level this mur serves: it exports murmur:driver/process@0.2.0, and level 1 has murmur:driver@0.3.0
 ```
+
+A clause reads `it exports|imports <interface>, and level <N> has <package>@<version>`, or
+`…, and level <N> has no version of <package>` for a package the level does not list.
+
+The hint names the newest version of the artifact in its scope's source index that fits the
+served level. The index is read only after the launch is refused, and no payload is downloaded:
+
+| Situation | Hint |
+|---|---|
+| The index lists a version that fits | `` <scope>/<name>@<V> is the newest version in <source>'s index that fits level <N>; pin it in murmur.yaml and run `mur install` `` |
+| The index lists none that fits | `` no version of <scope>/<name> in <source>'s index fits level <N>; rebuild it against level <N>'s packages (`mur version` lists them) `` |
+| The index could not be read | `` the index of <source> could not be read (<reason>), so no fitting version can be named; run `mur search <scope>/<name>` once it answers, or rebuild it against level <N>'s packages (`mur version` lists them) `` |
+| No source serves the scope | `` no source serves the '<scope>' scope, so no index can name a version of <scope>/<name> that fits level <N>; add the repository it publishes from under registry.sources and run `mur search <scope>/<name>`, or rebuild it against level <N>'s packages (`mur version` lists them) `` |
+| The artifact was installed from a file (`local/`) | `` local/<name> was installed from a file, so no source's index can name a version of it that fits level <N>; rebuild it against level <N>'s packages (`mur version` lists them), then run `mur install <file>` on the rebuilt file `` |
+
+```text
+  hint: ana/process-driver@1.1.0 is the newest version in github:ana/drivers's index that fits level 1; pin it in murmur.yaml and run `mur install`
+  hint: no version of ana/process-driver in github:ana/drivers's index fits level 1; rebuild it against level 1's packages (`mur version` lists them)
+  hint: the index of github:ana/drivers could not be read (request failed: io: Connection refused), so no fitting version can be named; run `mur search ana/process-driver` once it answers, or rebuild it against level 1's packages (`mur version` lists them)
+  hint: no source serves the 'ana' scope, so no index can name a version of ana/process-driver that fits level 1; add the repository it publishes from under registry.sources and run `mur search ana/process-driver`, or rebuild it against level 1's packages (`mur version` lists them)
+  hint: local/process-driver was installed from a file, so no source's index can name a version of it that fits level 1; rebuild it against level 1's packages (`mur version` lists them), then run `mur install <file>` on the rebuilt file
+```
+
+`mur doctor` lists every installed artifact that does not fit, under its
+[WIT level block](cli.md#doctor-interface-versions).
+
+### E-RUN-029 — the driver does not speak the driver interface { #e-run-029 }
+
+`mur run` refuses at staging, before any driver runs, when a driver names no interface it could
+be served by at any level:
+
+| Driver | Refused when | Hint |
+|---|---|---|
+| The `inference.driver` artifact of a `transport: process` capsule | It exports no version of `murmur:driver/process`, so it is not a process driver | `rebuild the driver against murmur:driver/process@0.3.0, or name a process driver` |
+| Every `runtime: driver` artifact the manifest declares, except a `transport: process` inference driver | It imports a `murmur:stream` interface at the served package version under a name the package does not define, such as `murmur:stream/other@0.1.0` | `` rebuild <name> against murmur:stream/events@0.1.0, the stream interface this mur serves; pin a release built against it in murmur.yaml and run `mur install` `` |
+
+```text
+error[E-RUN-029]: artifact 'my-process-driver@1.0.0' is the transport: process driver but does not export murmur:driver/process@0.3.0; a process driver must be built against the process-driver world
+  hint: rebuild the driver against murmur:driver/process@0.3.0, or name a process driver
+```
+
+A driver at another version of either interface is
+[`E-WIT-LEVEL-001`](#e-wit-level-001), which is reported when a driver fails both checks.
 
 ### E-RUN-030 — the http driver is a process driver { #e-run-030 }
 
@@ -1650,6 +1680,7 @@ name: ana/my-tool    # E-BLD-001
 error[E-BLD-002]: requires_files entry '<entry>' has an unsafe path: <reason>
 error[E-BLD-002]: requires_files entry '<entry>' is a symlink (<path>); declare the file it points to instead
 error[E-BLD-002]: requires_files entries '<a>' and '<b>' both pack as the archive entry '<name>'
+error[E-BLD-002]: requires_files entry 'murmur-build.json' packs as the archive entry 'murmur-build.json', which is reserved for mur build
 ```
 
 Every `requires_files:` entry must be a plain relative path to a real file inside the source
@@ -1663,6 +1694,10 @@ directory, and the entries must not collide once they are inside the archive:
 - **No two declarations claiming one archive entry.** The archive name is a rewrite of the
   declared path (`\` → `/`), so two distinct files can otherwise land in the same slot, where
   one silently overwrites the other on unpack.
+
+- **No `murmur-build.json` at the archive root.** `mur build` writes that entry itself, with the
+  artifact's [built-at WIT level](wit-levels.md#built-at-level). The same name in a
+  `mur build --skill` input is refused too.
 
 A `requires_files:` entry that redundantly names `murmur.yaml` is *not* a collision — it is
 dropped before packing, and reported as [`W-BLD-001`](#w-bld-001) instead.
@@ -1827,6 +1862,8 @@ error[E-IDX-001]: release/tool-editor-0.7.0.mur.zip cannot be indexed: its file 
 | `a native payload names its platform` | Name the file `<name>-<version>-<platform>.mur.zip` |
 | `a wasm payload runs on every platform`, `a static payload …` | Drop the platform from the file name |
 | `it packs runtime '<a>' …, and <file> of the same <name>@<version> packs runtime '<b>'` | Build every platform's payload of one version from the same `murmur.yaml` |
+| `its packed murmur-build.json is not JSON …`, `… sets no built_at_level`, `… sets built_at_level to <value>, which is not a non-negative integer` | Rebuild the artifact with `mur build`, which writes the file |
+| `its packed murmur-build.json sets built_at_level <a>, and <file> of the same <name>@<version> sets built_at_level <b>` | Build every platform's payload of one version with the same `mur` |
 
 A directory with no `.mur.zip` directly inside it is refused too:
 
@@ -2108,17 +2145,18 @@ Three reasons:
 Install the capsule, or pin its version in `murmur.lock`, and `mur doctor` folds its declarations
 into the report.
 
-### W-REG-003 — an installed artifact speaks an interface version this mur does not serve { #w-reg-003 }
+### W-REG-003 — an installed artifact does not fit the WIT level this mur serves { #w-reg-003 }
 
 ```text
-Interface versions
+  installed:
+    ana/stale-hook@0.3.0   global    built at none (derived)   does not fit level 1
   ⚠  ana/stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
   mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/reference/diagnostics/#w-reg-003)
 ```
 
 An artifact is built against one version of each Murmur interface it uses, and this `mur` serves
-exactly one version of each. An installed artifact built against any other version does not load:
-`mur run` refuses it at launch. The common cause is upgrading `mur` past an interface change while
+the one set of versions its [WIT level](wit-levels.md) lists. An installed artifact that does not
+fit that level does not load. The common cause is upgrading `mur` past an interface change while
 the store still holds artifacts built for the older `mur`.
 
 Reinstalling the same version fetches the same build. Install a release of the artifact built

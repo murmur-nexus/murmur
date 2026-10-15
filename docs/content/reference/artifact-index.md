@@ -102,7 +102,7 @@ tool with one payload per platform:
 | `artifacts[].versions` | array | yes | At least one. Newest first by semver precedence; versions are unique |
 | `versions[].version` | string | yes | The packed `version:`. A semantic version; never `latest`, `stable` or `edge` |
 | `versions[].release` | string | yes | The tag of the release whose assets hold this version's files. No whitespace |
-| `versions[].built_at_level` | integer | no | The WIT level the version was built at. `mur index` never writes it, and `--merge` keeps a value an earlier index carries |
+| `versions[].built_at_level` | integer | no | The [WIT level](wit-levels.md#built-at-level) the version was built at. `mur index` writes the value the version's files pack in `murmur-build.json`, else derives the newest level its `interfaces` fit, and omits the key when they fit none. `--merge` keeps a value an earlier index carries, and derives one for a kept version that has none |
 | `versions[].interfaces` | array of strings | yes | Every `murmur:` interface the version's component exports or imports, across all its files. Sorted and unique; `[]` for a version with no component, such as a native tool or a skill |
 | `versions[].assets` | array | yes | At least one. One entry per payload file, sorted by `file` |
 | `assets[].file` | string | yes | The release asset's file name: `<name>-<version>.mur.zip`, or `<name>-<version>-<platform>.mur.zip` when `platform` is present |

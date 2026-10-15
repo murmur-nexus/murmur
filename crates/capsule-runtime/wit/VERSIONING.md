@@ -30,6 +30,35 @@ Current versions:
 `cargo test -p capsule-runtime wit_versions` fails until it matches the `package` declarations under
 `wit/`, and `mur doctor` compares installed artifacts against it.
 
+## WIT levels
+
+A WIT level is one number naming the exact set above. `levels.txt` in this directory lists every
+level, one `<level> <package>@<version>` line per package, each level listing every package. The
+newest level is the one this `mur` serves: `mur version` prints it, and load, install, search,
+`mur index` and `mur doctor` decide fit against it.
+
+The file is append-only. A committed level is never edited, renumbered or reused, so a level
+number names the same package set on every `mur` and in every artifact's `murmur-build.json`.
+
+A PR that moves any `murmur:*` package version must, in the same change:
+
+1. Move the `package` declaration in every `.wit` file that declares it.
+2. Move `SERVED_WIT_PACKAGES` in `src/wit_versions.rs` and the resolver constants it covers.
+3. Append level `N+1` to `levels.txt`, listing every package at its new version.
+4. Update the Current versions table above.
+
+What enforces it:
+
+| Check | Fails when |
+|---|---|
+| `cargo test -p capsule-runtime wit_levels` | `SERVED_WIT_PACKAGES` differs from the newest level, naming each differing package and the level to append |
+| `murmur_artifact::parse_wit_levels`, through the same tests | A level is numbered out of order or with a gap, lists a package twice or out of order, or equals the level before it |
+| `scripts/check-wit-versions.sh` (per PR) | The tree's declarations differ from the newest level |
+| `scripts/wit-versions-changed-since.sh <rev>` (release gate) | A level committed at `<rev>` was edited, renumbered or removed |
+
+The docs page `reference/wit-levels.md` generates its compatibility table from this file and the
+`v*` release tags at docs build time.
+
 `murmur:hook` started at `0.2.0` because its 9-function `lifecycle` interface
 already reflected one prior additive evolution — the original 7-function baseline
 plus `on-task-start`/`on-task-end`. Versioning retroactively named that step

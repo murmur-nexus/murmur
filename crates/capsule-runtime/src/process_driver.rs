@@ -5,7 +5,7 @@
 //! it on an empty WASI context with no Murmur host import, so a driver that reaches for anything
 //! else fails to load rather than running with less than it expected.
 
-use murmur_artifact::WitContracts;
+use murmur_artifact::{level_fit, LevelFit, WitContracts, WitLevel};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -28,11 +28,16 @@ pub const PROCESS_DRIVER_IFACE: &str = "murmur:driver/process@0.3.0";
 /// version is still recognised as a process driver.
 const PROCESS_DRIVER_IFACE_PREFIX: &str = "murmur:driver/process@";
 
-/// Checks the inference driver's exports against the transport that names it.
+/// Checks the inference driver's exports against the transport that names it and the WIT level
+/// this host serves.
 ///
-/// Under `process` the driver's exports must include [`PROCESS_DRIVER_IFACE`] under that exact
-/// name — a neighbouring version does not satisfy it, and other instances alongside it are
-/// ignored. Under `http` it must export no version of the process interface. `contracts` is what
+/// Under `process` the driver's exports must include the process interface at the version
+/// `level` lists for `murmur:driver` (for the served level, [`PROCESS_DRIVER_IFACE`]) under that
+/// exact name; other instances alongside it are ignored. A driver exporting the process interface
+/// only at other versions does not fit the level and is refused with
+/// [`RuntimeError::WitLevelMismatch`]; one exporting no version of it is not a process driver and
+/// is refused with [`RuntimeError::ProcessDriverInterfaceMissing`]. Under `http` it must export
+/// no version of the process interface. `contracts` is what
 /// [`murmur_artifact::extract_wit_contracts`] read out of the driver's wasm; `None` (a core
 /// module, or bytes it could not read) counts as exporting nothing. Any other transport passes.
 pub fn check_driver_interface(
@@ -40,6 +45,7 @@ pub fn check_driver_interface(
     name: &str,
     version: &str,
     contracts: Option<&WitContracts>,
+    level: &WitLevel,
 ) -> Result<(), RuntimeError> {
     let process_exports: Vec<String> = contracts
         .map(|c| {
@@ -50,14 +56,20 @@ pub fn check_driver_interface(
                 .collect()
         })
         .unwrap_or_default();
+    let expected = level_interface(level, "murmur:driver", "process")
+        .unwrap_or_else(|| PROCESS_DRIVER_IFACE.to_string());
     match transport {
-        "process" if process_exports.iter().any(|e| e == PROCESS_DRIVER_IFACE) => Ok(()),
-        "process" => Err(RuntimeError::ProcessDriverInterfaceMissing {
-            name: name.to_string(),
-            version: version.to_string(),
-            expected: PROCESS_DRIVER_IFACE.to_string(),
-            found: process_exports,
-        }),
+        "process" if process_exports.contains(&expected) => Ok(()),
+        "process" if process_exports.is_empty() => {
+            Err(RuntimeError::ProcessDriverInterfaceMissing {
+                name: name.to_string(),
+                version: version.to_string(),
+                expected,
+            })
+        }
+        "process" => {
+            level_mismatch(name, version, level, process_exports, Vec::new()).map_or(Ok(()), Err)
+        }
         "http" if !process_exports.is_empty() => {
             Err(RuntimeError::HttpDriverExportsProcessInterface {
                 name: name.to_string(),
@@ -76,11 +88,16 @@ const RETIRED_TEXT_IFACE_PREFIX: &str = "murmur:text/";
 /// Every instance of the `murmur:stream` package starts with this.
 const STREAM_IFACE_PREFIX: &str = "murmur:stream/";
 
-/// Checks a `runtime: driver` artifact's imports against the stream interface this host serves.
+/// Checks a `runtime: driver` artifact's imports against the stream interface of the WIT level
+/// this host serves.
 ///
 /// Refuses a component importing any `murmur:text/*` instance, or any `murmur:stream/*` instance
-/// other than exactly [`WIT_STREAM_EVENTS_IFACE`]: the host serves neither, so the driver would
-/// fail to instantiate on its first turn. `contracts` is what
+/// other than exactly `murmur:stream/events` at the version `level` lists (for the served level,
+/// [`WIT_STREAM_EVENTS_IFACE`]): the host serves neither, so the driver would fail to instantiate
+/// on its first turn. The imports among those that do not fit `level` are refused with
+/// [`RuntimeError::WitLevelMismatch`]; only when every one is at the level's version of its
+/// package, under an interface name that does not exist, is it
+/// [`RuntimeError::DriverStreamInterfaceNotServed`]. `contracts` is what
 /// [`murmur_artifact::extract_wit_contracts`] read out of the driver's wasm; `None`, and a
 /// component importing neither package, pass.
 ///
@@ -89,15 +106,17 @@ pub fn check_stream_interface(
     name: &str,
     version: &str,
     contracts: Option<&WitContracts>,
+    level: &WitLevel,
 ) -> Result<(), RuntimeError> {
-    let expected = crate::runtime::WIT_STREAM_EVENTS_IFACE;
+    let expected = level_interface(level, "murmur:stream", "events")
+        .unwrap_or_else(|| crate::runtime::WIT_STREAM_EVENTS_IFACE.to_string());
     let imported: Vec<String> = contracts
         .map(|c| {
             c.imports
                 .iter()
                 .filter(|import| {
                     import.starts_with(RETIRED_TEXT_IFACE_PREFIX)
-                        || (import.starts_with(STREAM_IFACE_PREFIX) && *import != expected)
+                        || (import.starts_with(STREAM_IFACE_PREFIX) && **import != expected)
                 })
                 .cloned()
                 .collect()
@@ -106,12 +125,76 @@ pub fn check_stream_interface(
     if imported.is_empty() {
         return Ok(());
     }
+    if let Some(mismatch) = level_mismatch(name, version, level, Vec::new(), imported.clone()) {
+        return Err(mismatch);
+    }
     Err(RuntimeError::DriverStreamInterfaceNotServed {
         name: name.to_string(),
         version: version.to_string(),
         imported,
-        expected: expected.to_string(),
+        expected,
     })
+}
+
+/// The one refusal of a driver both [`check_stream_interface`] and [`check_driver_interface`]
+/// checked: a level mismatch over any other, both checks' mismatches together (exports first)
+/// when each found one, and otherwise the stream check's refusal before the driver check's.
+pub(crate) fn driver_refusal(
+    stream: Result<(), RuntimeError>,
+    driver: Result<(), RuntimeError>,
+) -> Result<(), RuntimeError> {
+    match (stream, driver) {
+        (
+            Err(RuntimeError::WitLevelMismatch {
+                mismatched: imports,
+                ..
+            }),
+            Err(RuntimeError::WitLevelMismatch {
+                name,
+                version,
+                level,
+                mismatched: mut exports,
+            }),
+        ) => {
+            exports.extend(imports);
+            Err(RuntimeError::WitLevelMismatch {
+                name,
+                version,
+                level,
+                mismatched: exports,
+            })
+        }
+        (Err(_), Err(driver @ RuntimeError::WitLevelMismatch { .. })) => Err(driver),
+        (Err(stream), _) => Err(stream),
+        (Ok(()), driver) => driver,
+    }
+}
+
+/// `<package>/<interface>@<version>` at the version `level` lists for `package`, if it lists one.
+fn level_interface(level: &WitLevel, package: &str, interface: &str) -> Option<String> {
+    level
+        .version_of(package)
+        .map(|version| format!("{package}/{interface}@{version}"))
+}
+
+/// [`RuntimeError::WitLevelMismatch`] for the refused names among `exports` and `imports` that do
+/// not fit `level`, or `None` when every one of them does.
+fn level_mismatch(
+    name: &str,
+    version: &str,
+    level: &WitLevel,
+    exports: Vec<String>,
+    imports: Vec<String>,
+) -> Option<RuntimeError> {
+    match level_fit(&WitContracts { exports, imports }, level) {
+        LevelFit::Fits => None,
+        LevelFit::Mismatched(mismatched) => Some(RuntimeError::WitLevelMismatch {
+            name: name.to_string(),
+            version: version.to_string(),
+            level: level.level,
+            mismatched,
+        }),
+    }
 }
 
 /// Checks that every variable `description.required_env` names is declared in
@@ -420,7 +503,13 @@ pub fn launch_and_parse_process_driver_wasm(
 
 #[cfg(test)]
 mod tests {
+    use murmur_artifact::ContractDirection;
+
     use super::*;
+
+    fn served() -> &'static WitLevel {
+        crate::served_wit_level()
+    }
 
     fn contracts(exports: &[&str]) -> WitContracts {
         WitContracts {
@@ -432,19 +521,16 @@ mod tests {
     #[test]
     fn process_driver_interface_process_transport_accepts_the_process_export() {
         let c = contracts(&[PROCESS_DRIVER_IFACE]);
-        assert!(check_driver_interface("process", "d", "1.0.0", Some(&c)).is_ok());
+        assert!(check_driver_interface("process", "d", "1.0.0", Some(&c), served()).is_ok());
     }
 
     #[test]
     fn process_driver_interface_process_transport_refuses_a_tool_export() {
         let c = contracts(&["murmur:tool/run@0.1.0"]);
-        let err = check_driver_interface("process", "d", "1.0.0", Some(&c)).unwrap_err();
+        let err = check_driver_interface("process", "d", "1.0.0", Some(&c), served()).unwrap_err();
         match &err {
-            RuntimeError::ProcessDriverInterfaceMissing {
-                expected, found, ..
-            } => {
+            RuntimeError::ProcessDriverInterfaceMissing { expected, .. } => {
                 assert_eq!(expected, PROCESS_DRIVER_IFACE);
-                assert!(found.is_empty());
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -454,33 +540,75 @@ mod tests {
     }
 
     #[test]
-    fn process_driver_interface_process_transport_names_the_version_found() {
+    fn process_driver_interface_process_transport_refuses_another_version_as_a_level_mismatch() {
         let c = contracts(&["murmur:driver/process@0.0.1"]);
-        let err = check_driver_interface("process", "d", "1.0.0", Some(&c)).unwrap_err();
+        let err = check_driver_interface("process", "d", "1.0.0", Some(&c), served()).unwrap_err();
         match &err {
-            RuntimeError::ProcessDriverInterfaceMissing { found, .. } => {
-                assert_eq!(found, &vec!["murmur:driver/process@0.0.1".to_string()]);
+            RuntimeError::WitLevelMismatch {
+                level, mismatched, ..
+            } => {
+                assert_eq!(*level, served().level);
+                assert_eq!(mismatched.len(), 1);
+                assert_eq!(mismatched[0].interface, "murmur:driver/process@0.0.1");
+                assert_eq!(mismatched[0].direction, ContractDirection::Export);
             }
             other => panic!("unexpected error: {other:?}"),
         }
-        let message = err.to_string();
-        assert!(message.contains("murmur:driver/process@0.0.1"), "{message}");
-        assert!(message.contains("rebuild it"), "{message}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "artifact 'd@1.0.0' does not fit WIT level {0}, the level this mur serves: it \
+                 exports murmur:driver/process@0.0.1, and level {0} has murmur:driver@{1}",
+                served().level,
+                served().version_of("murmur:driver").unwrap()
+            )
+        );
+    }
+
+    /// The real level 1 and a synthetic level 2 that moves only `murmur:driver` to 0.4.0.
+    fn level_2() -> WitLevel {
+        let mut level = served().clone();
+        level.level = 2;
+        for (package, version) in &mut level.packages {
+            if package == "murmur:driver" {
+                *version = "0.4.0".to_string();
+            }
+        }
+        level
+    }
+
+    #[test]
+    fn process_driver_interface_follows_the_level_it_is_given() {
+        let c = contracts(&["murmur:driver/process@0.3.0"]);
+        assert!(check_driver_interface("process", "d", "1.0.0", Some(&c), served()).is_ok());
+        match check_driver_interface("process", "d", "1.0.0", Some(&c), &level_2()).unwrap_err() {
+            RuntimeError::WitLevelMismatch {
+                level, mismatched, ..
+            } => {
+                assert_eq!(level, 2);
+                assert_eq!(mismatched[0].direction, ContractDirection::Export);
+                assert_eq!(mismatched[0].package, "murmur:driver");
+                assert_eq!(mismatched[0].served_version.as_deref(), Some("0.4.0"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let stream = importing(&["murmur:stream/events@0.1.0"]);
+        assert!(check_stream_interface("d", "1.0.0", Some(&stream), &level_2()).is_ok());
     }
 
     #[test]
     fn process_driver_interface_process_transport_refuses_no_contracts() {
-        let err = check_driver_interface("process", "d", "1.0.0", None).unwrap_err();
+        let err = check_driver_interface("process", "d", "1.0.0", None, served()).unwrap_err();
         assert!(matches!(
             err,
-            RuntimeError::ProcessDriverInterfaceMissing { ref found, .. } if found.is_empty()
+            RuntimeError::ProcessDriverInterfaceMissing { .. }
         ));
     }
 
     #[test]
     fn process_driver_interface_http_transport_refuses_the_process_export() {
         let c = contracts(&[PROCESS_DRIVER_IFACE]);
-        let err = check_driver_interface("http", "d", "1.0.0", Some(&c)).unwrap_err();
+        let err = check_driver_interface("http", "d", "1.0.0", Some(&c), served()).unwrap_err();
         match &err {
             RuntimeError::HttpDriverExportsProcessInterface { name, exported, .. } => {
                 assert_eq!(name, "d");
@@ -493,7 +621,7 @@ mod tests {
     #[test]
     fn process_driver_interface_http_transport_accepts_a_tool_export() {
         let c = contracts(&["murmur:tool/run@0.1.0"]);
-        assert!(check_driver_interface("http", "d", "1.0.0", Some(&c)).is_ok());
+        assert!(check_driver_interface("http", "d", "1.0.0", Some(&c), served()).is_ok());
     }
 
     fn importing(imports: &[&str]) -> WitContracts {
@@ -510,53 +638,136 @@ mod tests {
             "murmur:text/chunks@0.1.0",
             "murmur:task/task@0.1.0",
         ]);
-        let err = check_stream_interface("d", "1.0.0", Some(&c)).unwrap_err();
+        let err = check_stream_interface("d", "1.0.0", Some(&c), served()).unwrap_err();
         match &err {
-            RuntimeError::DriverStreamInterfaceNotServed {
+            RuntimeError::WitLevelMismatch {
                 name,
                 version,
-                imported,
-                expected,
+                mismatched,
+                ..
             } => {
                 assert_eq!((name.as_str(), version.as_str()), ("d", "1.0.0"));
-                assert_eq!(imported, &vec!["murmur:text/chunks@0.1.0".to_string()]);
-                assert_eq!(expected, crate::runtime::WIT_STREAM_EVENTS_IFACE);
+                assert_eq!(mismatched.len(), 1);
+                assert_eq!(mismatched[0].interface, "murmur:text/chunks@0.1.0");
+                assert_eq!(mismatched[0].served_version, None);
             }
             other => panic!("unexpected error: {other:?}"),
         }
         let message = err.to_string();
         assert!(message.contains("'d@1.0.0'"), "{message}");
-        assert!(message.contains("murmur:text/chunks@0.1.0"), "{message}");
-        assert!(message.contains("murmur:stream/events@0.1.0"), "{message}");
+        assert!(
+            message.contains(
+                "it imports murmur:text/chunks@0.1.0, and level 1 has no version of murmur:text"
+            ),
+            "{message}"
+        );
     }
 
     #[test]
     fn stream_interface_refuses_another_version_of_murmur_stream() {
         let c = importing(&["murmur:stream/events@0.2.0"]);
-        let err = check_stream_interface("d", "1.0.0", Some(&c)).unwrap_err();
+        let err = check_stream_interface("d", "1.0.0", Some(&c), served()).unwrap_err();
         assert!(matches!(
             err,
-            RuntimeError::DriverStreamInterfaceNotServed { ref imported, .. }
-                if imported == &vec!["murmur:stream/events@0.2.0".to_string()]
+            RuntimeError::WitLevelMismatch { ref mismatched, .. }
+                if mismatched.len() == 1 && mismatched[0].interface == "murmur:stream/events@0.2.0"
         ));
+    }
+
+    /// An import at the served version of `murmur:stream` under an interface the package does not
+    /// define fits the level, so it is not a level mismatch: the interface does not exist.
+    #[test]
+    fn stream_interface_refuses_an_unknown_interface_at_the_served_version_as_not_served() {
+        let c = importing(&["murmur:stream/other@0.1.0"]);
+        let err = check_stream_interface("d", "1.0.0", Some(&c), served()).unwrap_err();
+        match &err {
+            RuntimeError::DriverStreamInterfaceNotServed {
+                imported, expected, ..
+            } => {
+                assert_eq!(imported, &vec!["murmur:stream/other@0.1.0".to_string()]);
+                assert_eq!(expected, crate::runtime::WIT_STREAM_EVENTS_IFACE);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        // With a level mismatch beside it, the mismatch is what is reported.
+        let both = importing(&["murmur:stream/other@0.1.0", "murmur:text/chunks@0.1.0"]);
+        assert!(matches!(
+            check_stream_interface("d", "1.0.0", Some(&both), served()).unwrap_err(),
+            RuntimeError::WitLevelMismatch { ref mismatched, .. }
+                if mismatched.len() == 1 && mismatched[0].interface == "murmur:text/chunks@0.1.0"
+        ));
+    }
+
+    #[test]
+    fn driver_refusal_reports_a_level_mismatch_over_any_other() {
+        let not_served = || {
+            check_stream_interface(
+                "d",
+                "1.0.0",
+                Some(&importing(&["murmur:stream/other@0.1.0"])),
+                served(),
+            )
+        };
+        let old_export = || {
+            check_driver_interface(
+                "process",
+                "d",
+                "1.0.0",
+                Some(&contracts(&["murmur:driver/process@0.2.0"])),
+                served(),
+            )
+        };
+        let text_import = || {
+            check_stream_interface(
+                "d",
+                "1.0.0",
+                Some(&importing(&["murmur:text/chunks@0.1.0"])),
+                served(),
+            )
+        };
+        let no_export = || check_driver_interface("process", "d", "1.0.0", None, served());
+
+        assert!(matches!(
+            driver_refusal(not_served(), old_export()),
+            Err(RuntimeError::WitLevelMismatch { .. })
+        ));
+        assert!(matches!(
+            driver_refusal(text_import(), no_export()),
+            Err(RuntimeError::WitLevelMismatch { .. })
+        ));
+        assert!(matches!(
+            driver_refusal(not_served(), no_export()),
+            Err(RuntimeError::DriverStreamInterfaceNotServed { .. })
+        ));
+        match driver_refusal(text_import(), old_export()) {
+            Err(RuntimeError::WitLevelMismatch { mismatched, .. }) => {
+                let names: Vec<&str> = mismatched.iter().map(|m| m.interface.as_str()).collect();
+                assert_eq!(
+                    names,
+                    ["murmur:driver/process@0.2.0", "murmur:text/chunks@0.1.0"]
+                );
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert!(driver_refusal(Ok(()), Ok(())).is_ok());
     }
 
     #[test]
     fn stream_interface_accepts_exactly_the_served_instance() {
         let c = importing(&["murmur:stream/events@0.1.0", "wasi:http/types@0.2.12"]);
-        assert!(check_stream_interface("d", "1.0.0", Some(&c)).is_ok());
+        assert!(check_stream_interface("d", "1.0.0", Some(&c), served()).is_ok());
     }
 
     #[test]
     fn stream_interface_accepts_a_component_with_no_murmur_import() {
         let c = importing(&["wasi:cli/environment@0.2.12"]);
-        assert!(check_stream_interface("d", "1.0.0", Some(&c)).is_ok());
-        assert!(check_stream_interface("d", "1.0.0", Some(&importing(&[]))).is_ok());
+        assert!(check_stream_interface("d", "1.0.0", Some(&c), served()).is_ok());
+        assert!(check_stream_interface("d", "1.0.0", Some(&importing(&[])), served()).is_ok());
     }
 
     #[test]
     fn stream_interface_accepts_no_contracts() {
-        assert!(check_stream_interface("d", "1.0.0", None).is_ok());
+        assert!(check_stream_interface("d", "1.0.0", None, served()).is_ok());
     }
 
     fn description(required_env: &[&str]) -> Description {

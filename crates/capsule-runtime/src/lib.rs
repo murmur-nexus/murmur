@@ -260,6 +260,6 @@ pub use workdir_writes::{
     render_runtime_writes, RuntimeWriteCondition, RuntimeWriteKind, RuntimeWriteReport,
     RuntimeWriteScope, SESSION_ID_PLACEHOLDER,
 };
-// The served version of each `murmur:*` package, which `mur doctor` compares installed artifacts
-// against.
-pub use wit_versions::SERVED_WIT_PACKAGES;
+// The served version of each `murmur:*` package, and the WIT levels: the committed, numbered sets
+// of those versions, the newest of which is the one this host serves.
+pub use wit_versions::{served_wit_level, wit_levels, SERVED_WIT_PACKAGES, WIT_LEVELS_FILE};

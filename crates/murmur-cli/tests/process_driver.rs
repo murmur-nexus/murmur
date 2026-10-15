@@ -242,8 +242,10 @@ fn a_driver_built_against_the_retired_version_is_refused() {
     let name = "local/retired-process-driver";
     let capsule = Capsule::process(name, &retired_wasm(), &["HOME"]);
     let text = capsule.run_refused();
-    assert!(text.contains("E-RUN-029"), "{text}");
-    assert!(text.contains("murmur:driver/process@0.3.0"), "{text}");
+    assert!(text.contains("error[E-WIT-LEVEL-001]"), "{text}");
+    assert!(!text.contains("E-RUN-029"), "{text}");
+    assert!(text.contains("does not fit WIT level 1"), "{text}");
+    assert!(text.contains("level 1 has murmur:driver@0.3.0"), "{text}");
     assert!(text.contains("murmur:driver/process@0.1.0"), "{text}");
     assert!(text.contains("rebuild"), "{text}");
 }
@@ -256,10 +258,12 @@ fn a_driver_built_against_0_2_0_is_refused_with_the_install_that_fixes_it() {
     let capsule = Capsule::process(name, &previous_wasm(), &["HOME"]);
     let text = capsule.run_refused();
     println!("{text}");
-    assert!(text.contains("E-RUN-029"), "{text}");
+    assert!(text.contains("error[E-WIT-LEVEL-001]"), "{text}");
+    assert!(!text.contains("E-RUN-029"), "{text}");
+    assert!(text.contains("does not fit WIT level 1"), "{text}");
     assert!(text.contains(&format!("'{name}@{VERSION}'")), "{text}");
     assert!(text.contains("murmur:driver/process@0.2.0"), "{text}");
-    assert!(text.contains("murmur:driver/process@0.3.0"), "{text}");
+    assert!(text.contains("level 1 has murmur:driver@0.3.0"), "{text}");
     assert!(text.contains("mur install"), "{text}");
 }
 
@@ -299,10 +303,17 @@ fn a_driver_built_against_murmur_text_is_refused_with_the_install_that_fixes_it(
     );
     let text = capsule.run_refused();
     println!("{text}");
-    assert!(text.contains("E-RUN-029"), "{text}");
+    assert!(text.contains("error[E-WIT-LEVEL-001]"), "{text}");
+    assert!(!text.contains("E-RUN-029"), "{text}");
+    assert!(text.contains("does not fit WIT level 1"), "{text}");
     assert!(text.contains(&format!("'{name}@{VERSION}'")), "{text}");
     assert!(text.contains("murmur:text/chunks@0.1.0"), "{text}");
-    assert!(text.contains("murmur:stream/events@0.1.0"), "{text}");
+    assert!(
+        text.contains(
+            "imports murmur:text/chunks@0.1.0, and level 1 has no version of murmur:text"
+        ),
+        "{text}"
+    );
     assert!(text.contains("mur install"), "{text}");
 }
 
@@ -332,11 +343,18 @@ fn a_declared_driver_that_is_not_the_inference_driver_is_refused_too() {
     common::publish_local(&capsule.home, &artifact).success();
     let text = capsule.run_refused();
     println!("{text}");
-    assert!(text.contains("E-RUN-029"), "{text}");
+    assert!(text.contains("error[E-WIT-LEVEL-001]"), "{text}");
+    assert!(!text.contains("E-RUN-029"), "{text}");
+    assert!(text.contains("does not fit WIT level 1"), "{text}");
     assert!(text.contains(&format!("'{second}@{VERSION}'")), "{text}");
     assert!(!text.contains(&format!("'{inference_driver}@")), "{text}");
     assert!(text.contains("murmur:text/chunks@0.1.0"), "{text}");
-    assert!(text.contains("murmur:stream/events@0.1.0"), "{text}");
+    assert!(
+        text.contains(
+            "imports murmur:text/chunks@0.1.0, and level 1 has no version of murmur:text"
+        ),
+        "{text}"
+    );
     assert!(text.contains("mur install"), "{text}");
 }
 

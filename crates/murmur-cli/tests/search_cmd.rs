@@ -141,6 +141,7 @@ fn publish_meta(home: &TempDir, name: &str) {
         tags: vec![],
         wit_contracts: None,
         owner_id: None,
+        built_at_level: None,
     };
     reg.publish(meta, b"fake").unwrap();
 }

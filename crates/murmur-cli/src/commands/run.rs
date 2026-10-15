@@ -817,7 +817,14 @@ pub(crate) fn run_run(
         }),
         stage_request,
     )
-    .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+    .map_err(|error| {
+        fail(
+            &session_id,
+            &workdir,
+            crate::wit_level::staging_error(error),
+            json,
+        )
+    })?;
     #[cfg(unix)]
     let mut staged = staged;
     #[cfg(unix)]

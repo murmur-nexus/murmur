@@ -726,7 +726,8 @@ fn an_unversioned_reference_installs_the_newest_version_that_fits() {
     assert_contains(
         &stderr,
         &[
-            "no version of ana/tool-none in github:ana/fits fits this mur",
+            "no version of ana/tool-none in github:ana/fits fits WIT level 1, the level this mur \
+             serves",
             &format!(
                 "ana/tool-none: 1.0.0 needs murmur:tool/run@9.9.9, this mur serves \
                  {package}@{version}"

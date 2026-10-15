@@ -184,6 +184,7 @@ fn source_meta(
         tags: Vec::new(),
         wit_contracts: None,
         owner_id: Some(owner_id),
+        built_at_level: None,
     }
 }
 
@@ -1104,6 +1105,7 @@ pub(crate) fn install_from_local_file(
         tags: Vec::new(),
         wit_contracts: None,
         owner_id: None,
+        built_at_level: None,
     };
     let pin = lock_pin(&meta, &sha256);
     store

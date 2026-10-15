@@ -102,6 +102,7 @@ fn publish_native_tool(home: &TempDir, artifact_dir: &Path, binary: &Path) {
                 tags: Vec::new(),
                 wit_contracts: None,
                 owner_id: None,
+                built_at_level: None,
             },
             &fs::read(&artifact_path).unwrap(),
         )

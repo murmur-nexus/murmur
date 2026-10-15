@@ -11,10 +11,13 @@ use zip::{
     CompressionMethod, ZipWriter,
 };
 
+use crate::build_info::{BuildInfo, BUILD_INFO_FILE};
 use crate::manifest::{load_manifest, refuse_retired_auth_block, Manifest, ManifestError};
 use crate::manifest_path::{resolve_manifest_path, MANIFEST_FILENAME};
 use crate::payload_shape::{select_root_wasm_from_entries, PayloadShapeError};
 use crate::registry::RuntimeType;
+use crate::wit_contract::extract_wit_contracts;
+use crate::wit_level::{newest_fitting_level, WitLevel};
 use crate::zip_guard::{sanitize_entry_path, ZipGuardError};
 
 /// The name the project manifest is stored under *inside* a `.mur.zip`.
@@ -103,6 +106,12 @@ pub enum BuildError {
     /// author sees at build time is the text the runtime would have printed at launch.
     #[error(transparent)]
     PayloadShape(#[from] PayloadShapeError),
+    /// A `requires_files:` entry packs as [`BUILD_INFO_FILE`], which only `mur build` writes.
+    #[error(
+        "requires_files entry '{declared}' packs as the archive entry '{BUILD_INFO_FILE}', which \
+         is reserved for mur build"
+    )]
+    ReservedBuildInfoEntry { declared: String },
     /// The manifest declares [`crate::RETIRED_AUTH_BLOCK`]. The runtime refuses such an artifact at
     /// launch whenever its entry declares `gateway:`, so it is never packed.
     #[error(transparent)]
@@ -132,8 +141,26 @@ pub(crate) struct PackedPlan {
     pub(crate) shadowed: Vec<ShadowedDeclaration>,
 }
 
+/// What [`build_artifact`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltArtifact {
+    pub path: PathBuf,
+    /// The level packed as [`BUILD_INFO_FILE`]: the newest of the `levels` given that the
+    /// payload fits. `None`, and no entry packed, when it fits none of them.
+    pub built_at_level: Option<u64>,
+}
+
+/// Pack `source_dir`'s manifest and `requires_files:` into `output_path`, then append
+/// [`BUILD_INFO_FILE`] naming the newest of `levels` the payload's `murmur:*` interfaces fit.
+///
+/// A payload with no component (a native tool, a skill, a core module) names no `murmur:*`
+/// interface and so fits every level. Every authored entry is packed byte for byte.
 #[must_use = "artifact path is needed for caller output and follow-up actions"]
-pub fn build_artifact(source_dir: &Path, output_path: &Path) -> Result<PathBuf, BuildError> {
+pub fn build_artifact(
+    source_dir: &Path,
+    output_path: &Path,
+    levels: &[WitLevel],
+) -> Result<BuiltArtifact, BuildError> {
     let manifest_path = resolve_manifest_path(source_dir);
     let manifest = load_manifest(&manifest_path)?;
     let manifest_yaml =
@@ -157,11 +184,13 @@ pub fn build_artifact(source_dir: &Path, output_path: &Path) -> Result<PathBuf, 
     // The shape check the runtime applies at launch, applied to the entry set about to be
     // written. An artifact whose payload cannot be selected is a build failure now rather than
     // a `mur run` failure later; the message is the runtime's, verbatim.
-    if manifest.registry_runtime() == RuntimeType::Wasm {
-        select_root_wasm_from_entries(
+    let root_wasm = if manifest.registry_runtime() == RuntimeType::Wasm {
+        Some(select_root_wasm_from_entries(
             plan.entries.iter().map(|entry| entry.archive_name.as_str()),
-        )?;
-    }
+        )?)
+    } else {
+        None
+    };
 
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).map_err(|source| BuildError::CreateOutput {
@@ -178,6 +207,7 @@ pub fn build_artifact(source_dir: &Path, output_path: &Path) -> Result<PathBuf, 
     let options: SimpleFileOptions =
         FileOptions::default().compression_method(CompressionMethod::Deflated);
 
+    let mut contracts = None;
     for entry in plan.entries {
         zip.start_file(&entry.archive_name, options)
             .map_err(|source| BuildError::Zip {
@@ -198,6 +228,23 @@ pub fn build_artifact(source_dir: &Path, output_path: &Path) -> Result<PathBuf, 
                 path: entry.source_path.display().to_string(),
                 source,
             })?;
+        if root_wasm.as_deref() == Some(entry.archive_name.as_str()) {
+            contracts = extract_wit_contracts(&content).ok().flatten();
+        }
+    }
+
+    let built_at_level = newest_fitting_level(&contracts.unwrap_or_default(), levels);
+    if let Some(built_at_level) = built_at_level {
+        zip.start_file(BUILD_INFO_FILE, options)
+            .map_err(|source| BuildError::Zip {
+                path: output_path.display().to_string(),
+                source,
+            })?;
+        zip.write_all(BuildInfo { built_at_level }.to_json().as_bytes())
+            .map_err(|source| BuildError::PackageFile {
+                path: output_path.display().to_string(),
+                source,
+            })?;
     }
 
     zip.finish().map_err(|source| BuildError::Zip {
@@ -205,7 +252,10 @@ pub fn build_artifact(source_dir: &Path, output_path: &Path) -> Result<PathBuf, 
         source,
     })?;
 
-    Ok(output_path.to_path_buf())
+    Ok(BuiltArtifact {
+        path: output_path.to_path_buf(),
+        built_at_level,
+    })
 }
 
 /// Decide the exact entry set `build_artifact` will write, rejecting anything unsafe.
@@ -272,6 +322,11 @@ pub(crate) fn plan_packed_entries(
     // silently overwrite the other on unpack.
     let mut claimed: HashMap<&str, &str> = HashMap::new();
     for entry in &entries {
+        if entry.archive_name == BUILD_INFO_FILE {
+            return Err(BuildError::ReservedBuildInfoEntry {
+                declared: entry.declared.clone(),
+            });
+        }
         if let Some(first) = claimed.insert(&entry.archive_name, &entry.declared) {
             return Err(BuildError::DuplicateArchiveEntry {
                 first: first.to_string(),
@@ -438,7 +493,7 @@ mod tests {
         fs::write(dir.path().join("skill.md"), "# Skill\nGuidance.\n").unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        build_artifact(dir.path(), &out).unwrap();
+        build_artifact(dir.path(), &out, &[]).unwrap();
 
         let file = std::fs::File::open(&out).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
@@ -460,7 +515,7 @@ mod tests {
         .unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        let err = build_artifact(dir.path(), &out).unwrap_err();
+        let err = build_artifact(dir.path(), &out, &[]).unwrap_err();
 
         let msg = err.to_string();
         assert!(
@@ -481,7 +536,7 @@ mod tests {
         fs::write(dir.path().join("tool.wasm"), b"\0asm").unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        let err = build_artifact(dir.path(), &out).unwrap_err();
+        let err = build_artifact(dir.path(), &out, &[]).unwrap_err();
         assert!(
             matches!(&err, BuildError::MissingRequiredFile { file, .. } if file == "config.json"),
             "expected MissingRequiredFile for config.json; got: {err}"
@@ -489,7 +544,8 @@ mod tests {
         assert!(!out.exists(), "no zip should be created on failure");
 
         fs::write(dir.path().join("config.json"), "{}\n").unwrap();
-        build_artifact(dir.path(), &out).expect("build succeeds once the declared file exists");
+        build_artifact(dir.path(), &out, &[])
+            .expect("build succeeds once the declared file exists");
     }
 
     #[test]
@@ -502,7 +558,8 @@ mod tests {
         .unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        build_artifact(dir.path(), &out).expect("explicit empty requires_files overrides default");
+        build_artifact(dir.path(), &out, &[])
+            .expect("explicit empty requires_files overrides default");
     }
 
     /// Names every entry in a built archive, in the order the packer wrote them.
@@ -535,7 +592,7 @@ mod tests {
         fs::write(dir.path().join(".DS_Store"), "junk").unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        build_artifact(dir.path(), &out).unwrap();
+        build_artifact(dir.path(), &out, &[]).unwrap();
 
         assert_eq!(
             entry_names(&out),
@@ -563,7 +620,7 @@ mod tests {
         fs::write(dir.path().join("assets/other.txt"), "not declared").unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        build_artifact(dir.path(), &out).unwrap();
+        build_artifact(dir.path(), &out, &[]).unwrap();
 
         assert_eq!(
             entry_names(&out),
@@ -594,7 +651,7 @@ mod tests {
         fs::write(dir.path().join("notes.txt"), "stray").unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        build_artifact(dir.path(), &out).expect("nothing declared is not an error");
+        build_artifact(dir.path(), &out, &[]).expect("nothing declared is not an error");
 
         assert_eq!(
             entry_names(&out),
@@ -616,7 +673,7 @@ mod tests {
         fs::write(dir.path().join("payload.bin"), "bytes").unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        build_artifact(dir.path(), &out).unwrap();
+        build_artifact(dir.path(), &out, &[]).unwrap();
 
         assert_eq!(
             entry_names(&out),
@@ -637,7 +694,7 @@ mod tests {
         .unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        let err = build_artifact(dir.path(), &out).unwrap_err();
+        let err = build_artifact(dir.path(), &out, &[]).unwrap_err();
 
         assert!(
             matches!(&err, BuildError::MissingRequiredFile { file, .. } if file == "murmur_hook_compact.wasm"),
@@ -659,7 +716,7 @@ mod tests {
         fs::write(dir.path().join("assets/file.txt"), "ok").unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        build_artifact(dir.path(), &out).unwrap();
+        build_artifact(dir.path(), &out, &[]).unwrap();
 
         let file = File::open(&out).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
@@ -714,7 +771,7 @@ mod tests {
         .unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        build_artifact(dir.path(), &out).unwrap();
+        build_artifact(dir.path(), &out, &[]).unwrap();
 
         let file = File::open(&out).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
@@ -755,7 +812,7 @@ mod tests {
         fs::write(dir.path().join("tool.wasm"), b"\0asm").unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        build_artifact(dir.path(), &out).unwrap();
+        build_artifact(dir.path(), &out, &[]).unwrap();
         let bytes = fs::read(&out).unwrap();
 
         let yaml = crate::artifact::load_manifest_yaml_from_artifact_bytes(&bytes).unwrap();
@@ -769,7 +826,7 @@ mod tests {
     // ── name format ─────────────────────────────────────────────────────────────────────
 
     /// Writes a manifest declaring `name` and builds it, returning the outcome.
-    fn build_named(name: &str) -> Result<PathBuf, BuildError> {
+    fn build_named(name: &str) -> Result<BuiltArtifact, BuildError> {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join(MANIFEST_FILENAME),
@@ -778,7 +835,7 @@ mod tests {
         .unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        let result = build_artifact(dir.path(), &out);
+        let result = build_artifact(dir.path(), &out, &[]);
         if result.is_err() {
             assert!(!out.exists(), "no zip should be created on failure");
         }
@@ -851,7 +908,7 @@ mod tests {
         .unwrap();
 
         let out = source.join("artifact.mur.zip");
-        let err = build_artifact(&source, &out).unwrap_err();
+        let err = build_artifact(&source, &out, &[]).unwrap_err();
 
         assert!(
             matches!(&err, BuildError::UnsafeRequiredPath { entry, reason } if entry == "../secret.txt" && reason.contains("'..'")),
@@ -870,7 +927,7 @@ mod tests {
         .unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        let err = build_artifact(dir.path(), &out).unwrap_err();
+        let err = build_artifact(dir.path(), &out, &[]).unwrap_err();
 
         assert!(
             matches!(&err, BuildError::UnsafeRequiredPath { entry, reason } if entry == "/etc/hosts" && reason.contains("absolute")),
@@ -893,7 +950,7 @@ mod tests {
         .unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        let err = build_artifact(dir.path(), &out).unwrap_err();
+        let err = build_artifact(dir.path(), &out, &[]).unwrap_err();
 
         assert!(
             matches!(&err, BuildError::SymlinkedRequiredFile { entry, .. } if entry == "link.txt"),
@@ -920,7 +977,7 @@ mod tests {
         .unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        let err = build_artifact(dir.path(), &out).unwrap_err();
+        let err = build_artifact(dir.path(), &out, &[]).unwrap_err();
 
         assert!(
             matches!(&err, BuildError::DuplicateArchiveEntry { entry, .. } if entry == "sub/payload.bin"),
@@ -942,7 +999,7 @@ mod tests {
         fs::write(dir.path().join("README.md"), "# docs\n").unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        let err = build_artifact(dir.path(), &out).unwrap_err();
+        let err = build_artifact(dir.path(), &out, &[]).unwrap_err();
 
         assert_eq!(
             err.to_string(),
@@ -964,7 +1021,7 @@ mod tests {
         fs::write(dir.path().join("alpha.wasm"), b"\0asm").unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        let err = build_artifact(dir.path(), &out).unwrap_err();
+        let err = build_artifact(dir.path(), &out, &[]).unwrap_err();
 
         assert_eq!(
             err.to_string(),
@@ -987,7 +1044,8 @@ mod tests {
         fs::write(dir.path().join("tool.wasm"), b"\0asm").unwrap();
 
         let out = dir.path().join("artifact.mur.zip");
-        build_artifact(dir.path(), &out).expect("capsule.wasm makes the selection unambiguous");
+        build_artifact(dir.path(), &out, &[])
+            .expect("capsule.wasm makes the selection unambiguous");
         assert_eq!(
             entry_names(&out),
             vec![
@@ -1010,9 +1068,132 @@ mod tests {
             fs::write(dir.path().join(MANIFEST_FILENAME), manifest).unwrap();
 
             let out = dir.path().join("artifact.mur.zip");
-            build_artifact(dir.path(), &out)
+            build_artifact(dir.path(), &out, &[])
                 .unwrap_or_else(|err| panic!("{manifest} should build; got: {err}"));
             assert_eq!(entry_names(&out), vec![PACKED_MANIFEST_ENTRY.to_string()]);
         }
+    }
+
+    /// Level 1 and a level 2 that moves only `murmur:tool`, enough to tell the newest fitting
+    /// level from the only one.
+    fn tool_levels() -> Vec<WitLevel> {
+        crate::parse_wit_levels("1 murmur:tool@0.0.9\n2 murmur:tool@0.1.0\n").unwrap()
+    }
+
+    fn tool_component(version: &str) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(component
+                 (core module $m (func (export "run")))
+                 (core instance $i (instantiate $m))
+                 (func $run (canon lift (core func $i "run")))
+                 (instance $iface (export "run" (func $run)))
+                 (export "murmur:tool/run@{version}" (instance $iface)))"#
+        ))
+        .unwrap()
+    }
+
+    fn read_entry(out: &Path, name: &str) -> Vec<u8> {
+        let mut archive = ZipArchive::new(File::open(out).unwrap()).unwrap();
+        let mut entry = archive.by_name(name).unwrap();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn build_tool(wasm: &[u8], levels: &[WitLevel]) -> (tempfile::TempDir, BuiltArtifact) {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            "name: tool-x\nversion: 0.1.0\nruntime: tool\nrequires_files:\n  - tool.wasm\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("tool.wasm"), wasm).unwrap();
+        let out = dir.path().join("artifact.mur.zip");
+        let built = build_artifact(dir.path(), &out, levels).unwrap();
+        (dir, built)
+    }
+
+    #[test]
+    fn build_labels_a_current_tool_with_the_newest_level_it_fits() {
+        let wasm = tool_component("0.1.0");
+        let (dir, built) = build_tool(&wasm, &tool_levels());
+        assert_eq!(built.built_at_level, Some(2));
+        assert_eq!(
+            entry_names(&built.path),
+            vec![
+                PACKED_MANIFEST_ENTRY.to_string(),
+                "tool.wasm".to_string(),
+                BUILD_INFO_FILE.to_string()
+            ]
+        );
+        assert_eq!(
+            read_entry(&built.path, BUILD_INFO_FILE),
+            b"{\"built_at_level\":2}\n"
+        );
+        // The authored entries are packed byte for byte, label or not.
+        assert_eq!(read_entry(&built.path, "tool.wasm"), wasm);
+        assert_eq!(
+            read_entry(&built.path, PACKED_MANIFEST_ENTRY),
+            fs::read(dir.path().join(MANIFEST_FILENAME)).unwrap()
+        );
+    }
+
+    #[test]
+    fn build_labels_an_older_tool_with_the_older_level_and_one_fitting_none_with_nothing() {
+        let (_dir, built) = build_tool(&tool_component("0.0.9"), &tool_levels());
+        assert_eq!(built.built_at_level, Some(1));
+        assert_eq!(
+            read_entry(&built.path, BUILD_INFO_FILE),
+            b"{\"built_at_level\":1}\n"
+        );
+
+        let (_dir, built) = build_tool(&tool_component("0.0.8"), &tool_levels());
+        assert_eq!(built.built_at_level, None);
+        assert_eq!(
+            entry_names(&built.path),
+            vec![PACKED_MANIFEST_ENTRY.to_string(), "tool.wasm".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_labels_a_skill_with_the_newest_level() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            "name: test-skill\nversion: 0.1.0\nruntime: skill\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("skill.md"), "# Skill\n").unwrap();
+        let out = dir.path().join("artifact.mur.zip");
+        let built = build_artifact(dir.path(), &out, &tool_levels()).unwrap();
+        assert_eq!(built.built_at_level, Some(2));
+        assert_eq!(
+            read_entry(&out, BUILD_INFO_FILE),
+            b"{\"built_at_level\":2}\n"
+        );
+    }
+
+    #[test]
+    fn build_refuses_an_authored_build_info_entry() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            "name: test-skill\nversion: 0.1.0\nruntime: skill\nrequires_files:\n  - skill.md\n  - murmur-build.json\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("skill.md"), "# Skill\n").unwrap();
+        fs::write(
+            dir.path().join("murmur-build.json"),
+            "{\"built_at_level\":9}",
+        )
+        .unwrap();
+        let out = dir.path().join("artifact.mur.zip");
+        let err = build_artifact(dir.path(), &out, &tool_levels()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "requires_files entry 'murmur-build.json' packs as the archive entry \
+             'murmur-build.json', which is reserved for mur build"
+        );
+        assert!(!out.exists());
     }
 }

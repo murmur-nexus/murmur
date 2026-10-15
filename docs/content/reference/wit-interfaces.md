@@ -864,7 +864,10 @@ name, and the difference is written to the trace as a `harness_note`.
 ## Package versioning
 
 Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract a compiled
-`.wasm` artifact was built against is readable from the component binary itself.
+`.wasm` artifact was built against is readable from the component binary itself. The whole set is
+numbered as a [WIT level](wit-levels.md): this table is the level `mur version` reports, and
+[WIT Levels](wit-levels.md#compatibility-table) lists every level and the `mur` releases that
+serve it.
 
 | Package | Version |
 |---|---|

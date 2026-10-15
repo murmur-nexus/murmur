@@ -85,3 +85,31 @@ wit_packages() {
 wit_files_declaring() {
     grep -rlE "^package ${1%%:*}:%?${1#*:}@" "$WIT_DIR" --include='*.wit'
 }
+
+# The committed WIT level table: `<level> <package>@<version>` per line, `#` comments. See
+# $WIT_LEVELS_FILE's own header and $WIT_DIR/VERSIONING.md for the append-only rule.
+WIT_LEVELS_FILE="$WIT_DIR/levels.txt"
+
+# wit_levels_lines
+#
+# Reads a levels.txt from stdin and writes its level lines as `<level> <package>@<version>`,
+# comments and blank lines dropped and runs of blanks squeezed to one space. Interpreting them is
+# the caller's; the Rust parser in murmur-artifact is what refuses a malformed table.
+wit_levels_lines() {
+    sed -e 's/#.*//' | awk 'NF { print $1, $2 }'
+}
+
+# wit_level_numbers
+#
+# Reads wit_levels_lines output from stdin and writes each level number once, ascending.
+wit_level_numbers() {
+    cut -d' ' -f1 | sort -n -u
+}
+
+# wit_level_set <level>
+#
+# Reads wit_levels_lines output from stdin and writes level <level>'s `<package>@<version>`
+# entries, sorted. Writes nothing when the table has no such level.
+wit_level_set() {
+    awk -v level="$1" '$1 == level { print $2 }' | sort
+}

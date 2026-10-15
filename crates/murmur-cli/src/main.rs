@@ -15,6 +15,7 @@ mod residue;
 mod session_address;
 mod source;
 mod stores;
+mod wit_level;
 
 use std::path::PathBuf;
 
@@ -55,6 +56,7 @@ use commands::{
     stop::run_stop,
     token::run_token,
     trace::{run_trace_diff, run_trace_report, run_trace_show, run_trace_steps, TraceCommand},
+    version::run_version,
     watch::run_watch,
 };
 
@@ -168,6 +170,12 @@ enum Commands {
         /// File to write the index to
         #[arg(short, long, value_name = "FILE", default_value = murmur_artifact::ARTIFACT_INDEX_FILE_NAME)]
         output: PathBuf,
+    },
+    /// Print this mur's version, the WIT level it serves and that level's package versions
+    Version {
+        /// Print one JSON object: mur_version, wit_level and packages
+        #[arg(long)]
+        json: bool,
     },
     /// Check that every artifact declared in murmur.yaml is present locally
     Doctor {
@@ -668,6 +676,10 @@ fn main() {
             merge,
             output,
         } => run_index(&dir, &repo, &release, merge.as_deref(), &output),
+        Commands::Version { json } => {
+            run_version(json);
+            Ok(())
+        }
         Commands::Doctor { bind } => run_doctor(&bind),
         Commands::Build {
             source,

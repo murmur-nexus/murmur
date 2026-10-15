@@ -24,13 +24,19 @@
 # teaches everyone to ignore it. .github/workflows/ci.yml keeps
 # check-wit-versions.sh as the per-PR check and gains nothing from this script.
 #
+# It also holds wit/levels.txt append-only: when <revision> has the file, every
+# level it lists must appear in the working tree's file with exactly the same
+# package set. A level edited, renumbered or removed since <revision> fails the
+# gate, naming the level. Appending levels is what a bump does, and passes.
+#
 # It reports and fails. It never rebuilds anything, never reads or writes
 # default-artifacts, and never creates a tag, a checkout or a temporary file:
 # the revision side is read straight out of the object store.
 #
 # Exit codes:
 #   0  nothing moved
-#   1  at least one package moved, was added, or was removed
+#   1  at least one package moved, was added, or was removed, or a level
+#      committed at <revision> was edited, renumbered or removed
 #   2  bad usage, unresolvable revision, wrong working directory, empty read
 
 set -eu
@@ -63,6 +69,36 @@ fi
 if ! now=$(wit_packages --worktree); then
     echo "error: no murmur:* package declarations found under $WIT_DIR" >&2
     exit 2
+fi
+
+# Every level committed at <rev> must be unchanged in the tree.
+if git cat-file -e "${rev}:${WIT_LEVELS_FILE}" 2>/dev/null; then
+    was_levels=$(git show "${rev}:${WIT_LEVELS_FILE}" | wit_levels_lines)
+    if [ -f "$WIT_LEVELS_FILE" ]; then
+        now_levels=$(wit_levels_lines < "$WIT_LEVELS_FILE")
+    else
+        now_levels=""
+    fi
+    edited=""
+    for level in $(printf '%s\n' "$was_levels" | wit_level_numbers); do
+        was_set=$(printf '%s\n' "$was_levels" | wit_level_set "$level")
+        now_set=$(printf '%s\n' "$now_levels" | wit_level_set "$level")
+        if [ -z "$now_set" ]; then
+            edited="${edited}    level $level: removed or renumbered since $rev
+"
+        elif [ "$was_set" != "$now_set" ]; then
+            edited="${edited}    level $level: its package set was edited since $rev
+"
+        fi
+    done
+    if [ -n "$edited" ]; then
+        echo "error: $WIT_LEVELS_FILE is append-only, and a level committed at $rev changed:" >&2
+        printf '%s' "$edited" >&2
+        echo >&2
+        echo "Restore every level as $rev has it, and append a new level for the new versions;" >&2
+        echo "never edit, renumber or reuse a committed level. See $WIT_DIR/VERSIONING.md." >&2
+        exit 1
+    fi
 fi
 
 names=$(printf '%s\n%s\n' "$was" "$now" | cut -d@ -f1 | sort -u)

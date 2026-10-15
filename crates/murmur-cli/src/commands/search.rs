@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use capsule_runtime::SERVED_WIT_PACKAGES;
+use capsule_runtime::served_wit_level;
 use murmur_artifact::{
     compare_versions, current_platform, murmur_interfaces, version_fit, ArtifactIndex,
     ArtifactIndexError, ArtifactMeta, LocalRegistry, Registry, VersionFit,
@@ -179,7 +179,7 @@ fn index_entries(index: ArtifactIndex, platform: &str) -> Vec<SearchEntry> {
             versions: artifact
                 .versions
                 .iter()
-                .map(|v| (v.version.clone(), v.fit(SERVED_WIT_PACKAGES, platform)))
+                .map(|v| (v.version.clone(), v.fit(served_wit_level(), platform)))
                 .collect(),
             runtime: artifact.runtime,
             description: artifact.description,
@@ -214,12 +214,12 @@ fn scan_local(platform: &str) -> Result<Vec<SearchEntry>, CliError> {
                         .map(|(os, arch)| format!("{os}-{arch}"))
                         .collect();
                     let fit = if tags.is_empty() {
-                        version_fit(&interfaces, [None], SERVED_WIT_PACKAGES, platform)
+                        version_fit(&interfaces, [None], served_wit_level(), platform)
                     } else {
                         version_fit(
                             &interfaces,
                             tags.iter().map(|tag| Some(tag.as_str())),
-                            SERVED_WIT_PACKAGES,
+                            served_wit_level(),
                             platform,
                         )
                     };
