@@ -608,6 +608,7 @@ mod tests {
                     tags: Vec::new(),
                     wit_contracts: None,
                     owner_id: None,
+                    built_at_level: None,
                 },
                 &bytes,
                 &sha256,

@@ -78,7 +78,8 @@ use crate::{
     otel::OtelEmitter,
     outgoing,
     process_driver::{
-        check_driver_interface, check_required_env, check_stream_interface, ProcessDriver,
+        check_driver_interface, check_required_env, check_stream_interface, driver_refusal,
+        ProcessDriver,
     },
     protected_paths::{ProtectedPathRefusal, ProtectedPaths},
     registration::SessionOutcome,
@@ -2116,6 +2117,7 @@ pub fn stage_session(
                     &full_name,
                     &resolved_version,
                     contracts.as_ref(),
+                    crate::served_wit_level(),
                 )?;
                 // A process driver is granted nothing: no `stage_artifact_grant`, and it never
                 // enters `tool_components`, so nothing can dispatch it as a tool.
@@ -2152,17 +2154,23 @@ pub fn stage_session(
                     .flatten();
                 // Every driver, not only the inference driver: a `switch_driver` target is
                 // dispatched through the same linker, which serves one stream interface.
-                check_stream_interface(&full_name, &resolved_version, contracts.as_ref())?;
-                if let Some((transport, _)) =
-                    inference_driver.filter(|(_, name)| *name == artifact.name)
-                {
-                    check_driver_interface(
+                let stream = check_stream_interface(
+                    &full_name,
+                    &resolved_version,
+                    contracts.as_ref(),
+                    crate::served_wit_level(),
+                );
+                let driver = match inference_driver.filter(|(_, name)| *name == artifact.name) {
+                    Some((transport, _)) => check_driver_interface(
                         transport,
                         &full_name,
                         &resolved_version,
                         contracts.as_ref(),
-                    )?;
-                }
+                        crate::served_wit_level(),
+                    ),
+                    None => Ok(()),
+                };
+                driver_refusal(stream, driver)?;
                 let tool_component = compiled_forms
                     .compile(&engine, &resolved.sha256, &tool_wasm)
                     .map_err(|err| RuntimeError::ToolComponentCompile {
@@ -13135,6 +13143,7 @@ inference:
                         tags: Vec::new(),
                         wit_contracts: None,
                         owner_id: None,
+                        built_at_level: None,
                     },
                     bytes: b"not-a-real-zip".to_vec().into(),
                     sha256: "definitely-wrong".to_string(),
@@ -13234,6 +13243,7 @@ inference:
                         tags: Vec::new(),
                         wit_contracts: None,
                         owner_id: None,
+                        built_at_level: None,
                     },
                     bytes: b"not-a-real-zip".to_vec().into(),
                     sha256: murmur_artifact::sha256_hex(b"not-a-real-zip"),
@@ -14061,6 +14071,7 @@ inference:
                         tags: Vec::new(),
                         wit_contracts: None,
                         owner_id: None,
+                        built_at_level: None,
                     },
                     &bytes,
                 )
@@ -14363,6 +14374,7 @@ inference:
                 tags: vec![],
                 wit_contracts: None,
                 owner_id: None,
+                built_at_level: None,
             },
             sha256: murmur_artifact::sha256_hex(&bytes),
             bytes: bytes.into(),
@@ -14714,6 +14726,7 @@ inference:
                     tags: Vec::new(),
                     wit_contracts: None,
                     owner_id: None,
+                    built_at_level: None,
                 },
                 bytes: self.bytes.clone().into(),
                 sha256: self.sha256.clone(),
@@ -15630,6 +15643,7 @@ inference:
                         tags: Vec::new(),
                         wit_contracts: None,
                         owner_id: None,
+                        built_at_level: None,
                     },
                     bytes: b"tampered-bytes".to_vec().into(),
                     sha256: "not-the-real-hash".to_string(),

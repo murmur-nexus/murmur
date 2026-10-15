@@ -105,7 +105,7 @@ The driver is resolved like any other artifact. `mur run` then checks it three t
 
 | Check | Refused with |
 |---|---|
-| The artifact exports the process driver interface | [`E-RUN-029`](../reference/diagnostics.md#e-run-029) |
+| The artifact exports the process driver interface at the version this `mur` serves | [`E-WIT-LEVEL-001`](../reference/diagnostics.md#e-wit-level-001) for another version, [`E-RUN-029`](../reference/diagnostics.md#e-run-029) for none |
 | It loads, and its `describe()` returns usable variable names | [`E-RUN-032`](../reference/diagnostics.md#e-run-032) |
 | Every variable `describe()` requires is declared in `capabilities.env.allow` | [`E-CAP-019`](../reference/diagnostics.md#e-cap-019) |
 

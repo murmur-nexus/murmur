@@ -113,6 +113,7 @@ pub(crate) fn run_publish(
         tags: Vec::new(),
         wit_contracts: None,
         owner_id: None,
+        built_at_level: None,
     };
 
     let global_store = LocalRegistry::from_default_home().map_err(CliError::from)?;

@@ -211,7 +211,7 @@ fn indexes_every_artifact_in_the_directory_from_the_files_themselves() {
     assert_matches_published_schema(&out);
     let text = fs::read_to_string(&out).unwrap();
     ArtifactIndex::from_json(&text).unwrap();
-    assert!(!text.contains("updated_at") && !text.contains("built_at_level"));
+    assert!(!text.contains("updated_at"), "{text}");
     assert!(!text.contains("wasi:"), "{text}");
 
     let index: Value = serde_json::from_str(&text).unwrap();
@@ -298,6 +298,19 @@ fn indexes_every_artifact_in_the_directory_from_the_files_themselves() {
     let native = artifact(&index, "tool-native");
     assert_eq!(native["versions"].as_array().unwrap().len(), 1);
     assert_eq!(native["versions"][0]["interfaces"], json!([]));
+
+    // None of these files packs a label, so each is derived from its interfaces: the newest level
+    // they fit, or none for the hook that fits no level.
+    let served = capsule_runtime::served_wit_level().level;
+    for name in ["echo-tool", "skill-notes", "tool-native"] {
+        for v in artifact(&index, name)["versions"].as_array().unwrap() {
+            assert_eq!(v["built_at_level"], json!(served), "{name}: {v}");
+        }
+    }
+    assert!(
+        hook["versions"][0].get("built_at_level").is_none(),
+        "{hook}"
+    );
     let platforms: Vec<&str> = native["versions"][0]["assets"]
         .as_array()
         .unwrap()
@@ -621,6 +634,79 @@ fn repo_and_release_are_required() {
     }
 }
 
+/// A packed `murmur-build.json` is written as it is, whatever the interfaces would derive; files of
+/// one version that pack different labels are refused.
+#[test]
+fn a_packed_label_is_written_and_two_labels_of_one_version_are_refused() {
+    let dir = TempDir::new().unwrap();
+    pack(
+        dir.path(),
+        "hook-old-0.3.0.mur.zip",
+        "name: hook-old\nversion: 0.3.0\nruntime: hook\n",
+        &[
+            ("hook.wasm", &wat::parse_str(UNSERVED_HOOK_WAT).unwrap()),
+            ("murmur-build.json", b"{\"built_at_level\":1}\n"),
+        ],
+    );
+    let out = TempDir::new().unwrap();
+    mur_index(
+        out.path(),
+        &[
+            dir.path().to_str().unwrap(),
+            "--repo",
+            "ana/r",
+            "--release",
+            "v1",
+            "-o",
+            "out.json",
+        ],
+    )
+    .success();
+    let path = out.path().join("out.json");
+    assert_matches_published_schema(&path);
+    let index: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        artifact(&index, "hook-old")["versions"][0]["built_at_level"],
+        json!(1)
+    );
+
+    let dir = TempDir::new().unwrap();
+    let manifest = "name: tool-n\nversion: 1.0.0\nruntime: tool\nimplementation: native\n";
+    for (platform, label) in [("darwin-aarch64", "1"), ("linux-x86_64", "2")] {
+        pack(
+            dir.path(),
+            &format!("tool-n-1.0.0-{platform}.mur.zip"),
+            manifest,
+            &[(
+                "murmur-build.json",
+                format!("{{\"built_at_level\":{label}}}").as_bytes(),
+            )],
+        );
+    }
+    let assert = mur_index(
+        out.path(),
+        &[
+            dir.path().to_str().unwrap(),
+            "--repo",
+            "ana/r",
+            "--release",
+            "v1",
+            "-o",
+            "two.json",
+        ],
+    )
+    .failure();
+    let stderr = stderr_of(&assert);
+    assert!(
+        stderr.contains("error[E-IDX-001]")
+            && stderr.contains("tool-n-1.0.0-linux-x86_64.mur.zip")
+            && stderr.contains("tool-n-1.0.0-darwin-aarch64.mur.zip")
+            && stderr.contains("its packed murmur-build.json sets built_at_level 2"),
+        "{stderr}"
+    );
+    assert!(!out.path().join("two.json").exists());
+}
+
 // ── --merge ───────────────────────────────────────────────────────────────────
 
 fn asset(file: &str, fill: char) -> Value {
@@ -705,7 +791,10 @@ fn merge_keeps_every_version_the_directory_does_not_hold() {
     let path = out.path().join("new.json");
     assert_matches_published_schema(&path);
     let new: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(artifact(&new, "tool-gone"), artifact(&old, "tool-gone"));
+    // Kept verbatim, but for the derived built-at level a version recording none is given.
+    let mut gone = artifact(&old, "tool-gone").clone();
+    gone["versions"][0]["built_at_level"] = json!(1);
+    assert_eq!(artifact(&new, "tool-gone"), &gone);
     let versions = artifact(&new, "tool-x")["versions"].as_array().unwrap();
     let listed: Vec<(&str, &str)> = versions
         .iter()

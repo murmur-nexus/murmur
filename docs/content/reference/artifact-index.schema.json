@@ -77,7 +77,7 @@
           "pattern": "^[^\\s\\x00-\\x1f\\x7f]+$"
         },
         "built_at_level": {
-          "description": "The WIT level the version was built at, when known.",
+          "description": "The WIT level the version was built at: the value its files pack in murmur-build.json, else the newest level its interfaces fit. Absent when they fit no level.",
           "type": "integer",
           "minimum": 0
         },

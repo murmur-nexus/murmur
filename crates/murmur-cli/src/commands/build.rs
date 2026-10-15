@@ -5,15 +5,16 @@ use std::{
 };
 
 use murmur_artifact::{
-    build_artifact, build_warning_link, lint_build_warnings, load_manifest, resolve_manifest_path,
-    scan_yaml_secrets, security_warning_link, W_SEC_004,
+    build_artifact, build_warning_link, lint_build_warnings, load_manifest, newest_fitting_level,
+    resolve_manifest_path, scan_yaml_secrets, security_warning_link, BuildInfo, WitContracts,
+    BUILD_INFO_FILE, W_SEC_004,
 };
 use zip::{
     write::{FileOptions, SimpleFileOptions},
     CompressionMethod, ZipArchive, ZipWriter,
 };
 
-use crate::error::{CliError, E_IO_001, E_IO_003, E_MAN_002, E_MAN_003};
+use crate::error::{CliError, E_BLD_002, E_IO_001, E_IO_003, E_MAN_002, E_MAN_003};
 
 pub(crate) fn run_build(
     source: &Path,
@@ -39,7 +40,11 @@ pub(crate) fn run_build(
                 &cwd,
                 summary,
             )?;
-            capsule_runtime::report_println!("Built artifact: {}", out.display());
+            capsule_runtime::report_println!(
+                "Built artifact: {}{}",
+                out.display(),
+                level_suffix(skill_built_at_level())
+            );
             Ok(())
         }
     }
@@ -75,10 +80,30 @@ fn run_build_standard(source: &Path, output_arg: Option<&Path>) -> Result<(), Cl
         );
     }
 
-    let artifact_path = build_artifact(source, &output_path).map_err(CliError::from)?;
+    let built = build_artifact(source, &output_path, capsule_runtime::wit_levels())
+        .map_err(CliError::from)?;
 
-    capsule_runtime::report_println!("Built artifact: {}", artifact_path.display());
+    capsule_runtime::report_println!(
+        "Built artifact: {}{}",
+        built.path.display(),
+        level_suffix(built.built_at_level)
+    );
     Ok(())
+}
+
+/// The ` (WIT level N)` the `Built artifact:` line ends with, or what it says when the payload
+/// fits no level and so packs no `murmur-build.json`.
+fn level_suffix(built_at_level: Option<u64>) -> String {
+    match built_at_level {
+        Some(level) => format!(" (WIT level {level})"),
+        None => " (fits no WIT level this mur knows)".to_string(),
+    }
+}
+
+/// A skill packs no component, so it names no `murmur:*` interface and is labelled with the
+/// newest level, the one this mur serves.
+fn skill_built_at_level() -> Option<u64> {
+    newest_fitting_level(&WitContracts::default(), capsule_runtime::wit_levels())
 }
 
 // Determines whether the --skill value is a path or a name.
@@ -376,12 +401,30 @@ pub(crate) fn build_skill_artifact(
         }
     };
 
+    if let Some((name, _)) = extra_files.iter().find(|(name, _)| name == BUILD_INFO_FILE) {
+        return Err(CliError::with_hint(
+            E_BLD_002,
+            format!(
+                "{name} in {} packs as the archive entry '{BUILD_INFO_FILE}', which is reserved \
+                 for mur build",
+                input.display()
+            ),
+            "remove it from the skill — mur build writes murmur-build.json itself",
+        ));
+    }
+
     let output_name = format!("{artifact_name}-{version}.mur.zip");
     let output_path = output_dir.join(&output_name);
     // Write to a temp file first, then rename — prevents a partial zip on failure.
     let tmp_path = output_dir.join(format!(".{output_name}.tmp"));
 
-    let write_result = write_skill_zip(&tmp_path, &manifest_bytes, &skill_md_bytes, &extra_files);
+    let write_result = write_skill_zip(
+        &tmp_path,
+        &manifest_bytes,
+        &skill_md_bytes,
+        &extra_files,
+        skill_built_at_level(),
+    );
 
     if let Err(e) = write_result {
         let _ = fs::remove_file(&tmp_path);
@@ -404,6 +447,7 @@ fn write_skill_zip(
     manifest_bytes: &[u8],
     skill_md_bytes: &[u8],
     extra_files: &[(String, Vec<u8>)],
+    built_at_level: Option<u64>,
 ) -> Result<(), CliError> {
     let output_file = fs::File::create(path).map_err(|e| {
         CliError::new(
@@ -431,6 +475,17 @@ fn write_skill_zip(
             .map_err(|e| CliError::new(E_IO_003, format!("zip error writing {name}: {e}")))?;
         zip.write_all(bytes)
             .map_err(|e| CliError::new(E_IO_003, format!("zip write error for {name}: {e}")))?;
+    }
+
+    if let Some(built_at_level) = built_at_level {
+        zip.start_file(BUILD_INFO_FILE, options).map_err(|e| {
+            CliError::new(
+                E_IO_003,
+                format!("zip error writing {BUILD_INFO_FILE}: {e}"),
+            )
+        })?;
+        zip.write_all(BuildInfo { built_at_level }.to_json().as_bytes())
+            .map_err(|e| CliError::new(E_IO_003, format!("zip write error: {e}")))?;
     }
 
     zip.finish()
@@ -494,6 +549,36 @@ mod tests {
         let entries = zip_entries(&zip_path);
         assert!(entries.contains(&"murmur.yaml".to_string()));
         assert!(entries.contains(&"skill.md".to_string()));
+        let level = capsule_runtime::served_wit_level().level;
+        assert_eq!(skill_built_at_level(), Some(level));
+        assert_eq!(
+            zip_entry_content(&zip_path, BUILD_INFO_FILE),
+            format!("{{\"built_at_level\":{level}}}\n")
+        );
+    }
+
+    #[test]
+    fn skill_build_refuses_an_authored_build_info_file() {
+        let src = tempdir().unwrap();
+        let out = tempdir().unwrap();
+        make_skill_dir(src.path(), "SKILL.md");
+        fs::write(src.path().join(BUILD_INFO_FILE), "{\"built_at_level\":9}").unwrap();
+
+        let error = build_skill_artifact(src.path(), Some("test-skill"), "0.1.0", out.path(), None)
+            .unwrap_err();
+        assert_eq!(error.code, E_BLD_002);
+        assert!(
+            error.message.contains("reserved for mur build"),
+            "{}",
+            error.message
+        );
+        assert!(!out.path().join("test-skill-0.1.0.mur.zip").exists());
+    }
+
+    #[test]
+    fn build_line_suffix_names_the_level_or_that_there_is_none() {
+        assert_eq!(level_suffix(Some(1)), " (WIT level 1)");
+        assert_eq!(level_suffix(None), " (fits no WIT level this mur knows)");
     }
 
     #[test]

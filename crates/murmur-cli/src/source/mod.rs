@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use capsule_runtime::SERVED_WIT_PACKAGES;
+use capsule_runtime::served_wit_level;
 use murmur_artifact::{
     artifact_name_format_error, load_manifest_from_artifact_bytes, sha256_hex, ArtifactIndex,
     ArtifactIndexError, ArtifactName, IndexedArtifact, IndexedAsset, IndexedVersion, Manifest,
@@ -693,7 +693,7 @@ pub(crate) fn resolve(
                 source: label.clone(),
                 name: name.clone(),
                 newest: newest.version.clone(),
-                fit: newest.fit(SERVED_WIT_PACKAGES, platform),
+                fit: newest.fit(served_wit_level(), platform),
             })
         })?,
     };
@@ -853,14 +853,14 @@ pub(crate) fn select_version<'a>(
     artifact.versions.iter().find(|v| v.version == version)
 }
 
-/// The newest version of `artifact` that fits this mur on `platform`: every `murmur:` interface it
-/// names is served at exactly that version, and one of its payloads runs on `platform`. The same
-/// predicate `mur search` lists by, so both name the same version.
+/// The newest version of `artifact` that fits this mur on `platform`: it fits the WIT level this
+/// mur serves, and one of its payloads runs on `platform`. The same predicate `mur search` lists
+/// by, so both name the same version.
 pub(crate) fn newest_fitting<'a>(
     artifact: &'a IndexedArtifact,
     platform: &str,
 ) -> Option<&'a IndexedVersion> {
-    artifact.newest_fitting(SERVED_WIT_PACKAGES, platform)
+    artifact.newest_fitting(served_wit_level(), platform)
 }
 
 /// The asset of `version` that `platform` runs: the one tagged for it, else the untagged one,
@@ -1027,9 +1027,13 @@ impl From<ResolveError> for CliError {
                 fit,
             } => {
                 let note = fit_note(name.as_str(), &newest, &fit).unwrap_or_default();
+                let level = served_wit_level().level;
                 CliError::with_hint(
                     E_REG_001,
-                    format!("no version of {name} in {source} fits this mur; the newest is {note}"),
+                    format!(
+                        "no version of {name} in {source} fits WIT level {level}, the level this \
+                         mur serves; the newest is {note}"
+                    ),
                     format!(
                         "name a version explicitly to install it without the fit check: mur \
                          install {name}@{newest}"
@@ -1380,11 +1384,10 @@ mod tests {
 
     /// The `murmur:tool/run` name this mur serves.
     fn served_tool_run() -> String {
-        let (package, version) = SERVED_WIT_PACKAGES
-            .iter()
-            .find(|(package, _)| *package == "murmur:tool")
+        let version = served_wit_level()
+            .version_of("murmur:tool")
             .expect("this mur serves murmur:tool");
-        format!("{package}/run@{version}")
+        format!("murmur:tool/run@{version}")
     }
 
     fn other_platform() -> &'static str {
@@ -1591,8 +1594,8 @@ mod tests {
         assert_eq!(cli.code, E_REG_001);
         assert!(
             cli.message.contains(
-                "fits this mur; the newest is ana/tool-none: 1.0.0 needs murmur:tool/run@9.9.9, \
-                 this mur serves murmur:tool@"
+                "fits WIT level 1, the level this mur serves; the newest is ana/tool-none: 1.0.0 \
+                 needs murmur:tool/run@9.9.9, this mur serves murmur:tool@"
             ),
             "{}",
             cli.message

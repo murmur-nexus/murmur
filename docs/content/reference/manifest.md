@@ -1671,7 +1671,7 @@ launch:
 
 | Check | Refused with |
 |---|---|
-| The artifact exports `murmur:driver/process@0.3.0` | [`E-RUN-029`](diagnostics.md#e-run-029) |
+| The artifact exports `murmur:driver/process` at the version the served [WIT level](wit-levels.md) lists | [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001) when it exports only another version; [`E-RUN-029`](diagnostics.md#e-run-029) when it exports none |
 | It instantiates with no grants, and `describe()` returns usable variable names | [`E-RUN-032`](diagnostics.md#e-run-032) |
 | Every variable `describe()` requires is declared in `capabilities.env.allow` | [`E-CAP-019`](diagnostics.md#e-cap-019) |
 | `describe()` reports usage, or no spend ceiling is in effect | [`E-RUN-038`](diagnostics.md#e-run-038) |

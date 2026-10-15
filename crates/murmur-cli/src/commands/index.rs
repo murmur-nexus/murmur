@@ -54,10 +54,11 @@ pub(crate) fn run_index(
         None => None,
     };
 
-    let fresh = index_directory(dir, &scope, release).map_err(build_error)?;
+    let levels = capsule_runtime::wit_levels();
+    let fresh = index_directory(dir, &scope, release, levels).map_err(build_error)?;
     let (index, merged) = match previous {
         Some((shown, previous)) => {
-            let (index, report) = merge_indexes(fresh, previous).map_err(build_error)?;
+            let (index, report) = merge_indexes(fresh, previous, levels).map_err(build_error)?;
             (index, Some((shown, report)))
         }
         None => (fresh, None),

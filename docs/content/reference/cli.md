@@ -13,6 +13,7 @@ Every `mur` command, its flags, and what each one does.
 | `mur precompile` | Compile WASM artifact files for this machine, so their first launch skips compiling |
 | `mur list` | List installed artifacts in the project or global store |
 | `mur doctor` | Check every artifact declared in `murmur.yaml` against the project and global stores |
+| `mur version` | Print this `mur`'s version, the WIT level it serves and that level's package versions |
 | `mur run` | Run a capsule with lockfile-aware artifact resolution |
 | `mur ps` | List the capsules running on this machine |
 | `mur token` | Print a door token of a running capsule |
@@ -464,7 +465,7 @@ mur build [source] [--output <path-or-dir>]
 
 ```bash
 mur build .
-# Built artifact: ./my-capsule-0.1.0.mur.zip
+# Built artifact: ./my-capsule-0.1.0.mur.zip (WIT level 1)
 ```
 
 - Reads `murmur.yaml` (requires `name` and `version` fields)
@@ -481,6 +482,18 @@ mur build .
   because the scope comes from where the artifact is installed from — see
   [Artifact names](../concepts/registry.md#artifact-names)
 - Output written **inside the source directory** unless `--output` is specified
+- Appends `murmur-build.json` to the archive, recording the artifact's
+  [built-at WIT level](wit-levels.md#built-at-level): the newest level this `mur` knows that the
+  packed component's `murmur:*` interfaces fit. A payload with no component fits every level. A
+  `requires_files:` entry packing as `murmur-build.json` is refused with
+  [`E-BLD-002`](diagnostics.md#e-bld-002)
+
+| `Built artifact:` line ends | Means |
+|---|---|
+| ` (WIT level <N>)` | `murmur-build.json` records level `<N>` |
+| ` (fits no WIT level this mur knows)` | The payload fits no level, and no `murmur-build.json` is packed |
+
+`mur build --skill` writes the same entry and the same line; a skill fits every level.
 
 ### Skill packaging (`--skill`)
 
@@ -790,7 +803,7 @@ In a project, it prints one checklist line per declared artifact:
 | `✓ name@version   local source` | Declared with a `source:` path; resolved from the filesystem at stage time, never checked against a store or a lockfile |
 | `✗ name@version   <platform>   — missing` | Resolved from neither store |
 | `✗ name@version   <platform>   — native binary is built for <binary-platform>, this host is <platform>` | The artifact holds a host executable this machine cannot run; `mur run` refuses it at staging with [`E-RUN-021`](diagnostics.md#e-run-021) |
-| `✗ name@version   — built against <interface>, this mur serves <package>@<version>` | The artifact names an interface version this `mur` does not serve, and `mur run` refuses it at launch. The line ends `this mur serves no version of <package>` when this `mur` has no such package, and `(+N more)` follows when the artifact names several. See [Interface versions](#doctor-interface-versions) |
+| `✗ name@version   — built against <interface>, this mur serves <package>@<version>` | The artifact names an interface version this `mur` does not serve, and `mur run` refuses it at launch. The line ends `this mur serves no version of <package>` when this `mur` has no such package, and `(+N more)` follows when the artifact names several. See [WIT level](#doctor-interface-versions) |
 
 Every green line means the artifact resolved from the project store (`.murmur/artifacts/`) or the global store (`~/.murmur/artifacts/`), and agrees with `murmur.lock` if one is present (see below). The host platform appears on a green line only for an artifact whose binary was identified and matched.
 
@@ -806,7 +819,7 @@ Ahead of the checklist it prints these blocks. None of them affects the exit cod
 | `Read-only paths` | The subtrees [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) protects, and whether that protection is enforced for every call the runtime can read as a write or advisory against a named interpreter |
 | `Install grant` | The `install skill` and `install tool` entries of [`capabilities.install`](manifest.md#field-install) |
 | `Memory bound` | [`capabilities.resources.cgroup_memory_bytes`](manifest.md#field-capabilities) and the two cgroup files a launch writes from it — see [Memory bound](#doctor-memory-bound) |
-| `Interface versions` | Installed artifacts built against an interface version this `mur` does not serve, printed only when there is something to report. See [Interface versions](#doctor-interface-versions) |
+| `WIT level` | The WIT level this `mur` serves and its packages, then every installed artifact with its built-at level and whether it fits. Always printed. See [WIT level](#doctor-interface-versions) |
 | `Artifact stores` | Each directory of the project or global store in the flat `<name>/<version>/` layout, which nothing reads, as `  global store: <path>: old layout, nothing reads it, safe to delete`. Printed only when there is one. See [Store layout](installing-artifacts.md#local-artifact-cache) |
 
 `Read-only paths` and `Install grant` print the same lines, in the same words, as [`mur run --explain-scope`](#mur-run).
@@ -1084,44 +1097,64 @@ Checking /path/to/murmur.yaml for linux-x86_64...
 Fix: declare `network.authentication` in the murmur.yaml of the capsule 'coder' runs and rebuild it, or remove the peer traffic from roster.yaml. A capsule that declares network.authentication cannot also declare capabilities.spawn.allow (E-MAN-003)
 ```
 
-### Interface versions { #doctor-interface-versions }
+### WIT level { #doctor-interface-versions }
 
-Just before the checklist, `mur doctor` checks every artifact installed in the project store
-(`.murmur/artifacts/`) and the global store (`~/.murmur/artifacts/`), declared or not. It names
-each one that speaks a Murmur interface at a version this `mur` does not serve. These are the
-interfaces in the `murmur:` namespace, in both directions: those the artifact provides and those
-it expects the host to provide. This `mur` serves exactly one version of each `murmur:` package
-and accepts no other, so `mur run` refuses such an artifact at launch.
+Just before the checklist, `mur doctor` prints the [WIT level](wit-levels.md) this `mur` serves
+and its package table, then every artifact installed in the project store
+(`.murmur/artifacts/`) and the global store (`~/.murmur/artifacts/`), declared or not, with its
+built-at level and whether it fits the served level. The block is always printed.
 
-| Compared | Not compared |
-|---|---|
-| Every `murmur:` interface name, against the one version this `mur` serves of its package. A name with no version is a mismatch | `wasi:` interfaces, which load against any compatible `0.2.x` version this `mur` provides. Interfaces in any other namespace |
+An artifact fits when every `murmur:` interface it names, exported or imported, is at exactly the
+version the served level lists for its package. `wasi:` interfaces and other namespaces are not
+compared. `mur run` refuses a driver that does not fit at launch, and a tool or hook that does not
+fit fails when it is first called.
 
-The interface versions come from the store's record of the artifact, which is written from the
-artifact's own bytes every time it is installed or published. When the record carries no
-interface list, it is read from the installed payload. The check never writes to either store.
+The interfaces come from the store's record of the artifact, written from its own bytes every time
+it is installed or published; when the record carries none, they are read from the installed
+payload. The check never writes to either store.
 
-**Output — a stale artifact this project does not declare:**
+**Output:**
 
 ```text
-Interface versions
-  ⚠  ana/stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
-  ⚠  ana/stale-hook@0.3.0   global    imports murmur:runtime/inference@0.3.0 — this mur serves murmur:runtime@0.4.0
+WIT level
+  this mur serves WIT level 1:
+    PACKAGE                  VERSION
+    murmur:artifact-manager  0.1.0
+    murmur:capsule           0.1.0
+    ...
+    murmur:tool-registry     0.1.0
+
+  installed:
+    local/built-tool@0.1.0   global    built at 1                fits level 1
+    local/notes@0.1.0        global    built at 1 (derived)      fits level 1
+    local/stale-hook@0.3.0   global    built at none (derived)   does not fit level 1
+  ⚠  local/stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
+  ⚠  local/stale-hook@0.3.0   global    imports murmur:runtime/inference@0.3.0 — this mur serves murmur:runtime@0.4.0
   mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/reference/diagnostics/#w-reg-003)
 
 Checking /path/to/murmur.yaml for linux-x86_64...
 
 0 checks passed, 0 errors found, 1 warning.
 
-Fix: mur install -g ana/stale-hook@<a release built against murmur:hook@0.9.0, murmur:runtime@0.4.0>
+Fix: mur install -g local/stale-hook@<a release built against murmur:hook@0.9.0, murmur:runtime@0.4.0>
 ```
 
 | Line | Meaning |
 |---|---|
-| `⚠ name@version   <project\|global>   <exports\|imports> <interface> — this mur serves <package>@<version>` | The artifact in that store speaks `<interface>`; this `mur` serves `<package>` only at `<version>` |
-| `… — this mur serves no version of <package>` | This `mur` has no package of that name at all |
+| `name@version   <project\|global>   built at <label>   fits level <N>` | The artifact fits the served level |
+| `…   does not fit level <N>` | It does not; one `⚠` line per interface follows the list |
+| `⚠ name@version   <project\|global>   <exports\|imports> <interface> — this mur serves <package>@<version>` | The artifact in that store names `<interface>`; this `mur` serves `<package>` only at `<version>` |
+| `… — this mur serves no version of <package>` | The served level has no package of that name |
 | `… <interface> (unversioned) — …` | The interface name carries no version |
+| `none installed` | Neither store holds an artifact |
 | `not checked (<project\|global> store): <error>` | The store's index could not be read, so nothing in it was checked. The exit code is unchanged |
+
+| Built-at label | Means |
+|---|---|
+| `<N>` | The level `mur build` recorded in the artifact's `murmur-build.json` |
+| `<N> (derived)` | The artifact records no level; `<N>` is the newest level this `mur` knows that its interfaces fit |
+| `none (derived)` | The artifact records no level, and its interfaces fit no level this `mur` knows |
+| `<N> (newer than this mur knows)` | The recorded level is above the served level: a newer `mur` built it |
 
 Which tier a stale artifact lands in depends on whether the next `mur run` of this project
 launches it:
@@ -1136,9 +1169,8 @@ launches is a warning. A declared one is an error because the next `mur run` ref
 declared artifact that already fails the [lock checks](#lock-integrity) shows only that failure,
 and an artifact declared with `source:` is not checked.
 
-The fix is always a release built against the versions this `mur` serves. Reinstalling the same
-version fetches the same build. The block prints nothing when every installed artifact speaks only
-served versions.
+The fix is always a release that fits the served level. Reinstalling the same version fetches the
+same build.
 
 ### Warnings
 
@@ -1147,7 +1179,7 @@ A finding that is worth reporting but is not a failure prints on its own checkli
 separately and the exit code ignores them, so a store that resolves everything it is asked for
 still exits `0`. [`W-REG-001`](diagnostics.md#w-reg-001) is the one warning the checklist reports.
 A stale artifact this project does not declare adds its `Fix:` line in the same way, from the
-[Interface versions](#doctor-interface-versions) block.
+[WIT level](#doctor-interface-versions) block.
 
 **Output — a native artifact with no recorded platform:**
 
@@ -3162,8 +3194,14 @@ Each `.mur.zip` must hold a packed `murmur.yaml` whose `name:` and `version:` ma
 `<name>-<version>-<platform>.mur.zip`; a WASM or static payload carries none. How each field is
 derived is under [How `mur index` derives each field](artifact-index.md#derivation).
 
-With `--merge`, a version both indexes hold is written from `<DIR>`. When its files differ from the
-ones the earlier index lists, it is counted as replaced.
+Each version's `built_at_level` is the level its files record in `murmur-build.json`. A version
+whose files record none gets the newest [WIT level](wit-levels.md) this `mur` knows that its
+`interfaces` fit, and no `built_at_level` when they fit none. Files of one version that record
+different levels are refused with [`E-IDX-001`](diagnostics.md#e-idx-001).
+
+With `--merge`, a version both indexes hold is written from `<DIR>`, keeping the earlier index's
+`built_at_level` when it has one. When its files differ from the ones the earlier index lists, it
+is counted as replaced. A kept version with no `built_at_level` is given the derived one.
 
 **Output:**
 
@@ -3187,6 +3225,60 @@ mur index release --repo ana/my-artifacts --release v1.1.0 --merge previous/arti
 | [`E-IDX-002`](diagnostics.md#e-idx-002) | The `--merge` index is not a schema 2 index |
 | [`E-IDX-003`](diagnostics.md#e-idx-003) | `--repo` or `--release` is unusable, or the `--merge` index has another scope |
 | `E-IO-003` | `<DIR>` or the `--merge` file cannot be read, or the output cannot be written |
+
+---
+
+## `mur version` { #mur-version }
+
+Print this `mur`'s version, the [WIT level](wit-levels.md) it serves, and that level's package
+versions.
+
+```bash
+mur version [--json]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--json` | off | Print one JSON object instead of text |
+
+**Output:**
+
+```text
+mur 1.0.0
+WIT level 1
+
+PACKAGE                  VERSION
+murmur:artifact-manager  0.1.0
+murmur:capsule           0.1.0
+...
+murmur:tool-registry     0.1.0
+```
+
+One row per package of the served level, in ascending order, each column padded to its widest cell
+plus two spaces.
+
+**Output (`--json`):** one pretty-printed object and a newline.
+
+```json
+{
+  "mur_version": "1.0.0",
+  "wit_level": 1,
+  "packages": [
+    {
+      "package": "murmur:artifact-manager",
+      "version": "0.1.0"
+    }
+  ]
+}
+```
+
+| Key | Type | Holds |
+|---|---|---|
+| `mur_version` | string | This `mur`'s version, as `mur --version` prints it |
+| `wit_level` | integer | The WIT level this `mur` serves |
+| `packages` | array | Every package of that level, ascending, each `{"package", "version"}` |
+
+`mur --version` prints `murmur-cli <version>` only.
 
 ---
 

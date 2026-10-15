@@ -246,6 +246,7 @@ fn install_as_printed(scratch: &Scratch, steps: &[String]) {
             tags: Vec::new(),
             wit_contracts: None,
             owner_id: None,
+            built_at_level: None,
         },
         &std::fs::read(&driver_zip).unwrap(),
     )

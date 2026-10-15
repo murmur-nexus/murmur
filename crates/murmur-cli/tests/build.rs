@@ -42,10 +42,15 @@ fn build_valid_fixture_creates_mur_zip_with_expected_layout() {
     names.sort();
 
     // The fixture also carries a README.md, which the manifest does not declare. A built
-    // artifact ships what `requires_files:` names and nothing else, so it stays behind.
+    // artifact ships what `requires_files:` names, plus the `murmur-build.json` `mur build`
+    // writes itself, so the README stays behind.
     assert_eq!(
         names,
-        vec!["murmur.yaml".to_string(), "tool.wasm".to_string()]
+        vec![
+            "murmur-build.json".to_string(),
+            "murmur.yaml".to_string(),
+            "tool.wasm".to_string()
+        ]
     );
 
     let mut manifest = String::new();

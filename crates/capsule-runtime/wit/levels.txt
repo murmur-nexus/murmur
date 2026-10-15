@@ -1,0 +1,28 @@
+# WIT levels: each level names one exact set of murmur:* WIT package versions.
+#
+# Line format: <level> <package>@<version>
+#   for example: 1 murmur:hook@0.9.0
+#
+# Every level lists every package, each once, in ascending package order. A
+# level whose set equals the level before it is refused. Levels are numbered
+# from 1 with no gap, and the newest level is the one this mur serves: it must
+# equal SERVED_WIT_PACKAGES in src/wit_versions.rs.
+#
+# Append the next level when any version changes; never edit, renumber or
+# reuse a committed level. See VERSIONING.md, "WIT levels".
+
+1 murmur:artifact-manager@0.1.0
+1 murmur:capsule@0.1.0
+1 murmur:conversation@0.2.0
+1 murmur:driver@0.3.0
+1 murmur:hook@0.9.0
+1 murmur:host@0.1.0
+1 murmur:message@0.1.0
+1 murmur:runtime@0.4.0
+1 murmur:runtime-guest@0.1.0
+1 murmur:shell@0.1.0
+1 murmur:stream@0.1.0
+1 murmur:task@0.1.0
+1 murmur:task-io@0.1.0
+1 murmur:tool@0.1.0
+1 murmur:tool-registry@0.1.0

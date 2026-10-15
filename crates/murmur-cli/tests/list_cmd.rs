@@ -44,6 +44,7 @@ fn artifact_meta(
         tags: vec![],
         wit_contracts: None,
         owner_id: None,
+        built_at_level: None,
     }
 }
 

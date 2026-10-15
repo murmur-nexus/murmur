@@ -178,7 +178,8 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     };
 
     // Stage the session (creates workdir, installs artifacts including skill.md).
-    let staged = stage_session(Arc::new(local_registry), stage_request).map_err(CliError::from)?;
+    let staged = stage_session(Arc::new(local_registry), stage_request)
+        .map_err(crate::wit_level::staging_error)?;
     let session_workdir = staged.workdir.clone();
 
     // Write the task prompt as task.md. The runtime reads this as the initial task when

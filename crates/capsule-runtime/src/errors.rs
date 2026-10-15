@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use murmur_artifact::{level_has_phrase, ContractDirection, UnservedInterface};
 use thiserror::Error;
 
 /// Where the reference docs state the cgroup delegation a subprocess-capable capsule needs on
@@ -711,20 +712,31 @@ pub enum RuntimeError {
         host_platform: String,
     },
 
-    /// The artifact a `transport: process` manifest names under `inference.driver` does not
-    /// export [`crate::process_driver::PROCESS_DRIVER_IFACE`]. `found` holds every
-    /// `murmur:driver/process@*` instance it does export, so a driver built against another
-    /// version is told which one it has; it is empty when the artifact exports none.
+    /// The artifact a `transport: process` manifest names under `inference.driver` exports no
+    /// version of the `murmur:driver/process` interface at all, so it is not a process driver.
+    /// One exporting another version is [`RuntimeError::WitLevelMismatch`] instead.
     #[error(
         "artifact '{name}@{version}' is the transport: process driver but does not export \
-         {expected}{}",
-        process_interface_found_tail(.found)
+         {expected}; a process driver must be built against the process-driver world"
     )]
     ProcessDriverInterfaceMissing {
         name: String,
         version: String,
         expected: String,
-        found: Vec<String>,
+    },
+
+    /// An artifact a launch stages names a `murmur:*` interface at a version other than the one
+    /// the WIT level this host serves lists for its package. `mismatched` holds every such
+    /// interface, in recorded order, and is never empty.
+    #[error(
+        "artifact '{name}@{version}' does not fit WIT level {level}, the level this mur serves: {}",
+        level_mismatch_clauses(*.level, .mismatched)
+    )]
+    WitLevelMismatch {
+        name: String,
+        version: String,
+        level: u64,
+        mismatched: Vec<UnservedInterface>,
     },
 
     /// The artifact a `transport: http` manifest names under `inference.driver` exports a
@@ -740,9 +752,10 @@ pub enum RuntimeError {
         exported: Vec<String>,
     },
 
-    /// A `runtime: driver` artifact imports a stream interface this host does not serve: a
-    /// `murmur:text/*` instance, retired with no fallback, or a `murmur:stream/*` instance at
-    /// another version than `expected`. `imported` holds every such import.
+    /// A `runtime: driver` artifact imports a `murmur:stream/*` instance at the served version of
+    /// the package under another interface name than `expected`, so it names an interface that
+    /// does not exist. `imported` holds every such import. A stream or `murmur:text/*` import at
+    /// another version is [`RuntimeError::WitLevelMismatch`] instead.
     #[error(
         "artifact '{name}@{version}' imports {}, which this host does not serve; a driver must \
          import {expected} in its place",
@@ -874,17 +887,24 @@ pub enum RuntimeError {
     Runtime(String),
 }
 
-/// The tail of [`RuntimeError::ProcessDriverInterfaceMissing`]'s message: which process
-/// interface versions the driver does export, or that it exports none.
-fn process_interface_found_tail(found: &[String]) -> String {
-    if found.is_empty() {
-        "; a process driver must be built against the process-driver world".to_string()
-    } else {
-        format!(
-            "; it exports {}, built against another version — rebuild it",
-            found.join(", ")
-        )
-    }
+/// The clauses of [`RuntimeError::WitLevelMismatch`]'s message, one per mismatched interface:
+/// `it exports <interface>, and level <N> has <package>@<version>`, joined with `; `.
+fn level_mismatch_clauses(level: u64, mismatched: &[UnservedInterface]) -> String {
+    mismatched
+        .iter()
+        .map(|mismatch| {
+            let direction = match mismatch.direction {
+                ContractDirection::Export => "exports",
+                ContractDirection::Import => "imports",
+            };
+            format!(
+                "it {direction} {}, and {}",
+                mismatch.interface,
+                level_has_phrase(level, mismatch)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The tail of [`RuntimeError::HarnessSessionGone`]'s message: where the session id that could

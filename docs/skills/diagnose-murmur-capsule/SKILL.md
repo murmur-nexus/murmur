@@ -27,7 +27,7 @@ Ask for or inspect what is available; do not demand everything before starting:
 
 1. The exact command and complete stdout/stderr, including warnings and hints.
 2. The relevant `murmur.yaml` sections and `murmur.lock`; redact secret values but keep key names and structure.
-3. Murmur version, OS, kernel, container/VM context, and whether the run is local or remote.
+3. Murmur version and the WIT level it serves (`mur version --json` prints both), OS, kernel, container/VM context, and whether the run is local or remote.
 4. Whether a session directory, workdir, bootstrap log, `trace.jsonl`, tool log, or hook log exists.
 5. For a behavioral complaint: expected behavior, observed behavior, and one concrete example.
 

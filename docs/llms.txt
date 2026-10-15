@@ -97,6 +97,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 - [Installing Artifacts](/reference/installing-artifacts.md): How the way you reference an artifact determines what gets fetched and where authentication comes from.
 - [Artifact Index](/reference/artifact-index.md): The `artifacts-index.json` format a source publishes and `mur search` reads — every version, its release, file digests and interfaces, and which version fits this `mur`.
 - [WIT Interfaces](/reference/wit-interfaces.md): Every WIT interface WASM artifacts use to talk to the runtime — who uses each one, and what it means for you.
+- [WIT Levels](/reference/wit-levels.md): The numbered sets of WIT package versions a mur serves, what fits a level, the built-at label, and which mur releases serve each level.
 - [Roost API](/reference/roost-api.md): `mur-roost`, the local daemon that spawns capsules on request — its health check, spawn, and poll endpoints.
 
 ## Contributing

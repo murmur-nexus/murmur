@@ -694,7 +694,15 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
         let staged = match stage_session(Arc::clone(&local_registry), stage_request) {
             Ok(s) => s,
             Err(error) => {
-                capsule_runtime::report_eprintln!("    stage failed: {error}");
+                let error = crate::wit_level::staging_error(error);
+                capsule_runtime::report_eprintln!(
+                    "    stage failed: error[{}]: {}",
+                    error.code,
+                    error.message
+                );
+                if let Some(hint) = &error.hint {
+                    capsule_runtime::report_eprintln!("      hint: {hint}");
+                }
                 case_results.push((
                     case.case_id.clone(),
                     "stage_failed".to_string(),

@@ -121,6 +121,7 @@ fn install_capsule(store_root: &Path, name: &str, version: &str, manifest_yaml: 
                 tags: Vec::new(),
                 wit_contracts: None,
                 owner_id: None,
+                built_at_level: None,
             },
             &bytes,
             &sha256,
@@ -759,7 +760,27 @@ fn s12_without_a_roster_doctor_prints_no_roster_block() {
     fs::remove_file(project.path().join("roster.yaml")).unwrap();
     let after = mur_doctor(&home, project.path());
     assert_eq!(after.stdout, block_free);
-    assert_eq!(after.stdout, without.stdout);
+    // Installing the members adds them to the `WIT level` block's installed list, and nothing
+    // else outside the roster block changes.
+    let without_installed = |stdout: &str| -> String {
+        let mut lines = Vec::new();
+        let mut in_list = false;
+        for line in stdout.lines() {
+            if line == "  installed:" {
+                in_list = true;
+            } else if in_list && line.is_empty() {
+                in_list = false;
+            }
+            if !in_list {
+                lines.push(line);
+            }
+        }
+        lines.join("\n")
+    };
+    assert_eq!(
+        without_installed(&after.stdout),
+        without_installed(&without.stdout)
+    );
 }
 
 #[test]

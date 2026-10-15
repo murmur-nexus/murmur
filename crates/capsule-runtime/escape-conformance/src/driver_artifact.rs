@@ -36,6 +36,7 @@ pub fn check_interface() -> Result<(), String> {
         DRIVER_NAME,
         DRIVER_VERSION,
         contracts.as_ref(),
+        capsule_runtime::served_wit_level(),
     )
     .map_err(|err| err.to_string())
 }

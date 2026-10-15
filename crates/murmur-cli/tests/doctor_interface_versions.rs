@@ -1,5 +1,6 @@
-//! `mur doctor`'s `Interface versions` check: every installed artifact naming a `murmur:`
-//! interface version this `mur` does not serve, against a real store under a temporary `HOME`.
+//! `mur doctor`'s `WIT level` block: the level this `mur` serves, and every installed artifact
+//! with its built-at label and whether it fits that level, against a real store under a temporary
+//! `HOME`.
 
 mod common;
 
@@ -88,10 +89,15 @@ fn stderr_of(assert: &assert_cmd::assert::Assert) -> String {
     String::from_utf8(assert.get_output().stderr.clone()).unwrap()
 }
 
-/// The two `Interface versions` lines the stale hook produces in the global store.
+/// The `WIT level` lines the stale hook produces in the global store: its entry, built at no level,
+/// and one line per mismatched interface.
 fn assert_stale_hook_lines(stdout: &str) {
     let hook_ref = format!("{HOOK}@{HOOK_VERSION}");
-    assert!(stdout.contains("Interface versions"), "{stdout}");
+    assert!(stdout.contains("WIT level\n"), "{stdout}");
+    let entry = installed_entry(stdout, &hook_ref);
+    assert!(entry.contains("global"), "{entry}");
+    assert!(entry.contains("built at none (derived)"), "{entry}");
+    assert!(entry.contains("does not fit level 1"), "{entry}");
     let export_line = stdout
         .lines()
         .find(|line| line.contains("exports murmur:hook/lifecycle@0.8.0"))
@@ -156,14 +162,44 @@ fn an_undeclared_stale_artifact_is_a_warning() {
     assert_stale_hook_warning(&stdout);
 }
 
+/// The installed-list line of `reference` in the `WIT level` block.
+fn installed_entry<'a>(stdout: &'a str, reference: &str) -> &'a str {
+    stdout
+        .lines()
+        .find(|line| line.starts_with("    ") && line.trim_start().starts_with(reference))
+        .unwrap_or_else(|| panic!("no entry for {reference}: {stdout}"))
+}
+
+/// `mur build` of a tool packing `wasm`, published to the global store.
+fn build_and_publish_tool(home: &TempDir, name: &str, wasm: &Path) {
+    let source = TempDir::new().unwrap();
+    fs::copy(wasm, source.path().join("tool.wasm")).unwrap();
+    fs::write(
+        source.path().join("murmur.yaml"),
+        format!("name: {name}\nversion: 0.1.0\nruntime: tool\nrequires_files:\n  - tool.wasm\n"),
+    )
+    .unwrap();
+    let output = source.path().join(format!("{name}-0.1.0.mur.zip"));
+    Command::cargo_bin("mur")
+        .unwrap()
+        .args(["build", source.path().to_str().unwrap(), "-o"])
+        .arg(&output)
+        .assert()
+        .success();
+    publish_local(home, &output).success();
+}
+
 #[test]
-fn current_artifacts_print_nothing() {
+fn the_block_lists_the_served_level_and_every_current_artifact_as_fitting() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let work = TempDir::new().unwrap();
     create_project(project.path(), " []");
     let echo_tool =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/run/components/echo-tool.wasm");
+    // Built by this mur, so it carries its label.
+    build_and_publish_tool(&home, "built-tool", &echo_tool);
+    // Packed by hand like an artifact built before the label: derived from its contracts.
     publish_local(
         &home,
         &create_tool_artifact(work.path(), "local/current-tool", "0.1.0", &echo_tool),
@@ -171,18 +207,92 @@ fn current_artifacts_print_nothing() {
     .success();
     publish_local(
         &home,
+        &create_tool_artifact(work.path(), "local/payload-tool", "0.1.0", &echo_tool),
+    )
+    .success();
+    edit_sidecar(&home, "local/payload-tool", "0.1.0", |meta| {
+        meta.as_object_mut().unwrap().remove("wit_contracts");
+    });
+    publish_local(
+        &home,
         &create_skill_artifact(work.path(), "local/current-skill", "0.1.0", "# guidance"),
     )
     .success();
+
+    let built = fs::read_to_string(sidecar_path(&home, "local/built-tool", "0.1.0")).unwrap();
+    assert!(built.contains("\"built_at_level\": 1"), "{built}");
+    let derived = fs::read_to_string(sidecar_path(&home, "local/current-tool", "0.1.0")).unwrap();
+    assert!(derived.contains("wit_contracts"), "{derived}");
+    assert!(!derived.contains("built_at_level"), "{derived}");
 
     let assert = mur_doctor(&home, project.path()).code(0);
     let stdout = stdout_of(&assert);
     let stderr = stderr_of(&assert);
     assert!(stdout.contains("All checks passed."), "{stdout}");
+    assert!(
+        stdout.contains("WIT level\n  this mur serves WIT level 1:\n    PACKAGE  "),
+        "{stdout}"
+    );
+    for (package, version) in SERVED_WIT_PACKAGES {
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.starts_with(&format!("    {package} "))
+                    && line.ends_with(version)),
+            "{package}: {stdout}"
+        );
+    }
+    for (reference, built_at) in [
+        ("local/built-tool@0.1.0", "built at 1 "),
+        ("local/current-tool@0.1.0", "built at 1 (derived)"),
+        ("local/payload-tool@0.1.0", "built at 1 (derived)"),
+        ("local/current-skill@0.1.0", "built at 1 (derived)"),
+    ] {
+        let entry = installed_entry(&stdout, reference);
+        assert!(entry.contains("global"), "{entry}");
+        assert!(entry.contains(built_at), "{entry}");
+        assert!(entry.ends_with("fits level 1"), "{entry}");
+    }
     for stream in [&stdout, &stderr] {
-        assert!(!stream.contains("Interface versions"), "{stream}");
         assert!(!stream.contains("W-REG-003"), "{stream}");
     }
+}
+
+#[test]
+fn empty_stores_say_none_installed() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    create_project(project.path(), " []");
+    let assert = mur_doctor(&home, project.path()).code(0);
+    let stdout = stdout_of(&assert);
+    assert!(
+        stdout.contains("  installed:\n    none installed\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_recorded_level_newer_than_this_mur_knows_is_named() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    create_project(project.path(), " []");
+    publish_local(
+        &home,
+        &create_skill_artifact(work.path(), "local/future-skill", "0.1.0", "# guidance"),
+    )
+    .success();
+    edit_sidecar(&home, "local/future-skill", "0.1.0", |meta| {
+        meta["built_at_level"] = serde_json::json!(99);
+    });
+    let assert = mur_doctor(&home, project.path()).code(0);
+    let stdout = stdout_of(&assert);
+    let entry = installed_entry(&stdout, "local/future-skill@0.1.0");
+    assert!(
+        entry.contains("built at 99 (newer than this mur knows)"),
+        "{entry}"
+    );
+    assert!(entry.ends_with("fits level 1"), "{entry}");
 }
 
 #[test]
@@ -303,7 +413,9 @@ fn recorded_contracts_win_over_the_payload() {
 
     let assert = mur_doctor(&home, project.path()).code(0);
     let stdout = stdout_of(&assert);
-    assert!(!stdout.contains("Interface versions"), "{stdout}");
+    assert!(!stdout.contains("W-REG-003"), "{stdout}");
+    let entry = installed_entry(&stdout, &format!("{HOOK}@{HOOK_VERSION}"));
+    assert!(entry.ends_with("fits level 1"), "{entry}");
     assert!(stdout.contains("All checks passed."), "{stdout}");
 }
 
@@ -317,9 +429,10 @@ fn an_unreadable_store_is_named_and_does_not_fail_doctor() {
 
     let assert = mur_doctor(&home, project.path()).code(0);
     let stdout = stdout_of(&assert);
-    assert!(stdout.contains("Interface versions"), "{stdout}");
+    assert!(stdout.contains("WIT level\n"), "{stdout}");
+    assert!(!stdout.contains("none installed"), "{stdout}");
     assert!(
-        stdout.contains("  not checked (global store): "),
+        stdout.contains("    not checked (global store): "),
         "{stdout}"
     );
     assert!(stdout.contains("All checks passed."), "{stdout}");

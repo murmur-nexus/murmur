@@ -21,7 +21,11 @@
 #      wit/README.md), and each is parsed independently, so nothing at build
 #      time catches one copy being left a version behind another.
 #
-#   2. The "Current versions" table in wit/VERSIONING.md lists exactly the
+#   2. The newest level in wit/levels.txt lists exactly the (package, version)
+#      pairs the tree declares. A bump that moves a declaration must append the
+#      next level; the WIT level a mur serves is that newest level.
+#
+#   3. The "Current versions" table in wit/VERSIONING.md lists exactly the
 #      (package, version) pairs the tree declares — no stale row, no missing row.
 #
 # Exits non-zero with a diff on any mismatch. Run it from the repo root.
@@ -60,7 +64,37 @@ if [ -n "$dupes" ]; then
     exit 1
 fi
 
-# 2. The documented table matches the tree. Rows look like:
+# 2. The newest WIT level matches the tree.
+if [ ! -f "$WIT_LEVELS_FILE" ]; then
+    echo "error: $WIT_LEVELS_FILE not found" >&2
+    exit 2
+fi
+level_lines=$(wit_levels_lines < "$WIT_LEVELS_FILE")
+newest=$(printf '%s\n' "$level_lines" | wit_level_numbers | tail -n 1)
+if [ -z "$newest" ]; then
+    echo "error: $WIT_LEVELS_FILE lists no level" >&2
+    exit 1
+fi
+newest_set=$(printf '%s\n' "$level_lines" | wit_level_set "$newest")
+if [ "$declared" != "$newest_set" ]; then
+    next=$((newest + 1))
+    echo "error: the tree's murmur:* package declarations no longer equal WIT level $newest in $WIT_LEVELS_FILE." >&2
+    echo >&2
+    printf '%s\n' "$declared" > /tmp/wit-declared.$$
+    printf '%s\n' "$newest_set" > /tmp/wit-level.$$
+    echo "  declared, and absent from level $newest:" >&2
+    comm -23 /tmp/wit-declared.$$ /tmp/wit-level.$$ | sed 's/^/    /' >&2
+    echo "  in level $newest, and not declared:" >&2
+    comm -13 /tmp/wit-declared.$$ /tmp/wit-level.$$ | sed 's/^/    /' >&2
+    rm -f /tmp/wit-declared.$$ /tmp/wit-level.$$
+    echo >&2
+    echo "Append level $next to $WIT_LEVELS_FILE, listing every package at its new version" >&2
+    echo "(one \`$next <package>@<version>\` line per package); never edit, renumber or reuse" >&2
+    echo "level $newest. See $POLICY, \"WIT levels\"." >&2
+    exit 1
+fi
+
+# 3. The documented table matches the tree. Rows look like:
 #     | `murmur:hook`            | `0.5.0`  |
 documented=$(sed -n 's/^| *`\(murmur:[a-z-]*\)` *| *`\([0-9]*\.[0-9]*\.[0-9]*\)` *|.*/\1@\2/p' \
     "$POLICY" | sort -u)
@@ -79,4 +113,4 @@ if [ "$declared" != "$documented" ]; then
 fi
 
 count=$(printf '%s\n' "$declared" | wc -l | tr -d ' ')
-echo "ok: $count murmur:* packages, each declared at one version and documented in VERSIONING.md"
+echo "ok: $count murmur:* packages, each declared at one version, equal to WIT level $newest and documented in VERSIONING.md"

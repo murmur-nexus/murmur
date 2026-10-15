@@ -25,6 +25,9 @@ pub const E_REG_008: &str = "E-REG-008"; // no source serves the artifact's scop
 pub const E_REG_009: &str = "E-REG-009"; // a source's index states a scope the source does not own
 pub const E_REG_010: &str = "E-REG-010"; // a scope's GitHub owner id is not the one recorded for it (murmur.lock, a stored payload, or compiled in for murmur)
 
+// WIT levels
+pub const E_WIT_LEVEL_001: &str = "E-WIT-LEVEL-001"; // an artifact a launch stages does not fit the WIT level this mur serves
+
 // Formation rosters
 pub const E_ROS_001: &str = "E-ROS-001"; // roster.yaml is missing, unreadable or malformed
 pub const E_ROS_002: &str = "E-ROS-002"; // a roster designates no entry member, or more than one
@@ -68,7 +71,7 @@ pub const E_RUN_024: &str = "E-RUN-024"; // a session could not be ended and is 
 pub const E_RUN_025: &str = "E-RUN-025"; // an artifact with a gateway: declares no usable upstream_auth: block
 pub const E_RUN_026: &str = "E-RUN-026"; // spend.machine_tokens_per_day is set and the spend ledger cannot be used
 pub const E_RUN_028: &str = "E-RUN-028"; // the running-capsule record directory could not be read
-pub const E_RUN_029: &str = "E-RUN-029"; // a driver does not speak the driver interface this host serves
+pub const E_RUN_029: &str = "E-RUN-029"; // a transport: process driver exports no process interface, or a driver imports a stream interface that does not exist at the served version
 pub const E_RUN_030: &str = "E-RUN-030"; // the transport: http inference driver exports the process driver interface
 pub const E_RUN_032: &str = "E-RUN-032"; // a process driver could not be loaded with no grants, or described itself unusably
 
@@ -659,40 +662,39 @@ impl From<RuntimeError> for CliError {
                      or remove gateway: from its entry",
                 )
             }
-            RuntimeError::ProcessDriverInterfaceMissing {
-                ref name,
-                ref found,
-                ..
-            } => {
-                // A driver that exports some other version of the interface is a process driver
-                // from before or after an interface bump: a release built against this one fixes
-                // it. One that exports none is not a process driver at all.
-                let hint = if found.is_empty() {
+            error @ RuntimeError::ProcessDriverInterfaceMissing { .. } => {
+                // It exports no version of the process interface, so it is not a process driver;
+                // no release built against another level would fix that.
+                CliError::with_hint(
+                    E_RUN_029,
+                    error.to_string(),
                     format!(
                         "rebuild the driver against {PROCESS_DRIVER_IFACE}, or name a process \
                          driver"
-                    )
-                } else {
-                    format!(
-                        "pin a release of {name} built against {PROCESS_DRIVER_IFACE} in \
-                         murmur.yaml, then run `mur install` — or rebuild {name} against \
-                         {PROCESS_DRIVER_IFACE}"
-                    )
-                };
-                CliError::with_hint(E_RUN_029, error.to_string(), hint)
+                    ),
+                )
             }
             RuntimeError::DriverStreamInterfaceNotServed {
                 ref name,
                 ref expected,
                 ..
             } => {
-                // A release of the driver built against the served stream interface fixes it.
+                // The import names an interface the served stream package does not define.
                 let hint = format!(
-                    "pin a release of {name} built against {expected} in murmur.yaml and run \
-                     `mur install`, or rebuild it against that interface"
+                    "rebuild {name} against {expected}, the stream interface this mur serves; \
+                     pin a release built against it in murmur.yaml and run `mur install`"
                 );
                 CliError::with_hint(E_RUN_029, error.to_string(), hint)
             }
+            RuntimeError::WitLevelMismatch {
+                ref name,
+                level,
+                ..
+            } => CliError::with_hint(
+                E_WIT_LEVEL_001,
+                error.to_string(),
+                crate::wit_level::search_hint(name, level),
+            ),
             error @ RuntimeError::HttpDriverExportsProcessInterface { .. } => CliError::with_hint(
                 E_RUN_030,
                 error.to_string(),
@@ -921,6 +923,12 @@ impl From<RegistryError> for CliError {
             RegistryError::InvalidInput(message) => {
                 CliError::new(E_IO_003, format!("registry error: {message}"))
             }
+            error @ RegistryError::InvalidBuildInfo { .. } => CliError::with_hint(
+                E_IO_003,
+                error.to_string(),
+                "murmur-build.json is written by `mur build`, never by hand; rebuild the artifact \
+                 with `mur build`, or ask its publisher to",
+            ),
             RegistryError::PackedNameMismatch {
                 name,
                 version,
@@ -1045,6 +1053,11 @@ impl From<BuildError> for CliError {
                     "requires_files entry '{entry}' is a symlink ({path}); declare the file it points to instead"
                 ),
                 "copy the target into the source directory, or declare its real path",
+            ),
+            error @ BuildError::ReservedBuildInfoEntry { .. } => CliError::with_hint(
+                E_BLD_002,
+                error.to_string(),
+                "remove it from requires_files: — mur build writes murmur-build.json itself",
             ),
             BuildError::DuplicateArchiveEntry {
                 first,

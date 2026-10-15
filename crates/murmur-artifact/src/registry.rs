@@ -14,6 +14,7 @@ use crate::{
     artifact::{declared_runtime_from_artifact_bytes, load_manifest_from_artifact_bytes},
     artifact_name::ArtifactName,
     build::artifact_name_format_error,
+    build_info::{build_info_from_artifact_bytes, BUILD_INFO_FILE},
     platform::split_platform_tag,
     wit_contract::{wit_contracts_from_artifact_bytes, WitContracts},
 };
@@ -87,6 +88,11 @@ pub struct ArtifactMeta {
     /// file, published locally, or pulled at runtime from another store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_id: Option<u64>,
+    /// The WIT level `mur build` packed in the artifact's `murmur-build.json`, read from the
+    /// artifact bytes by [`LocalRegistry`] on every write. Absent when the archive packs none:
+    /// built before the label existed, or fitting no level its builder knew.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_at_level: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +301,14 @@ impl LocalRegistry {
                 });
             }
         }
+        // Read before anything is written, so a malformed label leaves the store untouched.
+        let built_at_level = build_info_from_artifact_bytes(bytes)
+            .map_err(|error| RegistryError::InvalidBuildInfo {
+                name: meta.name.to_string(),
+                version: meta.version.clone(),
+                reason: error.to_string(),
+            })?
+            .map(|info| info.built_at_level);
         let dir = self.artifact_dir(&meta.name, &meta.version);
         fs::create_dir_all(&dir).map_err(|source| RegistryError::Io {
             path: dir.display().to_string(),
@@ -326,6 +340,7 @@ impl LocalRegistry {
         // drift from the artifact it describes.
         let mut meta = meta.clone();
         meta.wit_contracts = wit_contracts_from_artifact_bytes(bytes);
+        meta.built_at_level = built_at_level;
 
         let seed = unique_seed();
         let artifact_tmp = temp_path(&artifact_path, "zip", seed);
@@ -687,6 +702,14 @@ pub enum RegistryError {
     },
     #[error("reserved artifact version '{0}' is not allowed")]
     ReservedVersion(String),
+    /// The archive packs a `murmur-build.json` that does not hold a non-negative integer
+    /// `built_at_level`. `reason` completes "its murmur-build.json …".
+    #[error("artifact {name}@{version} cannot be stored: its packed {BUILD_INFO_FILE} {reason}")]
+    InvalidBuildInfo {
+        name: String,
+        version: String,
+        reason: String,
+    },
     #[error("{0}")]
     InvalidInput(String),
     #[error("artifact integrity mismatch for {name}@{version}: expected {expected}, got {actual}")]
@@ -889,6 +912,7 @@ fn derived_meta(
         tags: Vec::new(),
         wit_contracts: None,
         owner_id: None,
+        built_at_level: None,
     }
 }
 
@@ -1074,6 +1098,7 @@ mod tests {
             tags: vec!["test".to_string()],
             wit_contracts: None,
             owner_id: None,
+            built_at_level: None,
         }
     }
 
@@ -1254,6 +1279,7 @@ mod tests {
             tags: Vec::new(),
             wit_contracts: None,
             owner_id: None,
+            built_at_level: None,
         };
         registry.publish(meta, b"skill-zip-bytes").unwrap();
 
@@ -1410,6 +1436,7 @@ mod tests {
             tags: Vec::new(),
             wit_contracts: None,
             owner_id: None,
+            built_at_level: None,
         }
     }
 
@@ -1664,6 +1691,51 @@ mod tests {
             .contains("\"owner_id\": 1111"));
         let resolved = registry.resolve(&n("wasmtool"), "0.1.0").unwrap();
         assert_eq!(resolved.meta.owner_id, Some(1111));
+    }
+
+    #[test]
+    fn the_built_at_level_is_read_from_the_packed_build_info_on_every_write() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let manifest: (&str, &[u8]) = (
+            "murmur.yaml",
+            b"name: wasmtool\nversion: 0.1.0\nruntime: tool\n",
+        );
+        let path = registry.metadata_path_for(&n("wasmtool"), "0.1.0", None);
+
+        let unlabelled = zip_with(&[manifest]);
+        let mut meta = test_meta("wasmtool", "0.1.0");
+        meta.built_at_level = Some(9);
+        registry
+            .store_installed_overwrite(meta.clone(), &unlabelled, &sha256_hex(&unlabelled))
+            .unwrap();
+        assert!(!fs::read_to_string(&path)
+            .unwrap()
+            .contains("built_at_level"));
+
+        let labelled = zip_with(&[manifest, (BUILD_INFO_FILE, b"{\"built_at_level\":1}\n")]);
+        registry
+            .store_installed_overwrite(meta.clone(), &labelled, &sha256_hex(&labelled))
+            .unwrap();
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("\"built_at_level\": 1"));
+        let resolved = registry.resolve(&n("wasmtool"), "0.1.0").unwrap();
+        assert_eq!(resolved.meta.built_at_level, Some(1));
+
+        let malformed = zip_with(&[manifest, (BUILD_INFO_FILE, b"{\"built_at_level\":-1}")]);
+        let error = registry
+            .store_installed_overwrite(meta, &malformed, &sha256_hex(&malformed))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "artifact ana/wasmtool@0.1.0 cannot be stored: its packed murmur-build.json sets \
+             built_at_level to -1, which is not a non-negative integer"
+        );
+        assert_eq!(
+            registry.resolve(&n("wasmtool"), "0.1.0").unwrap().bytes,
+            labelled
+        );
     }
 
     // ── recorded runtime versus declared runtime ──────────────────────────────

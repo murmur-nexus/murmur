@@ -8,22 +8,23 @@ use capsule_runtime::{
     check_staged_runtime_floor, detect_egress_namespace_blocker, detect_landlock_abi,
     detect_userns_grant, find_on_path, inspect_installed_profile, inspect_profile_attachment,
     landlock_doctor_lines, preopen_reports, read_only_advisory_for, render_install,
-    render_read_only, undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
-    warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
-    warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
-    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
-    warn_on_workdir_exec, ArtifactRequest, InstalledProfileState, ProfileAttachment, UsernsGrant,
+    render_read_only, served_wit_level, undeclarable_runtime_pin_role,
+    warn_on_gateway_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
+    warn_on_launch_only_gateway_credential, warn_on_secret_shaped_env_grants,
+    warn_on_unmetered_gateways, warn_on_unreachable_toolchain_helpers,
+    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, wit_levels,
+    ArtifactRequest, InstalledProfileState, ProfileAttachment, UsernsGrant,
     SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
-    SERVED_WIT_PACKAGES,
 };
 use murmur_artifact::{
-    current_platform, effective_containment_floor, native_binary_verdict,
-    parse_tool_implementation_from_yaml, read_runtime_manifest_text, registry_warning_link,
-    resolve_manifest_path, resolve_roster_path, sha256_hex, warn_on_unknown_manifest_keys,
-    wit_contracts_from_artifact_bytes, ArtifactImplementation, ArtifactRuntime, ContractDirection,
-    LocalRegistry, LockOrigin, MurmurLock, NativeBinaryVerdict, PlatformMatch, Registry,
-    ResolvedArtifact, RosterReachability, RuntimeManifest, UnservedInterface, MANIFEST_FILENAME,
-    ROSTER_FILENAME, W_REG_001, W_REG_002, W_REG_003,
+    current_platform, effective_containment_floor, level_fit, native_binary_verdict,
+    newest_fitting_level, parse_tool_implementation_from_yaml, read_runtime_manifest_text,
+    registry_warning_link, resolve_manifest_path, resolve_roster_path, sha256_hex,
+    warn_on_unknown_manifest_keys, wit_contracts_from_artifact_bytes, ArtifactImplementation,
+    ArtifactRuntime, ContractDirection, LevelFit, LocalRegistry, LockOrigin, MurmurLock,
+    NativeBinaryVerdict, PlatformMatch, Registry, ResolvedArtifact, RosterReachability,
+    RuntimeManifest, UnservedInterface, WitContracts, MANIFEST_FILENAME, ROSTER_FILENAME,
+    W_REG_001, W_REG_002, W_REG_003,
 };
 
 use crate::commands::install::find_project_root;
@@ -818,7 +819,7 @@ struct StaleArtifact {
     unserved: Vec<UnservedInterface>,
 }
 
-/// What the `Interface versions` inventory found across both stores.
+/// What the `WIT level` inventory found across both stores.
 ///
 /// Its findings become warnings only after the checklist runs: an artifact the checklist already
 /// failed for the same stale interfaces gets no second, warning-tier `Fix:` line.
@@ -826,15 +827,26 @@ struct InterfaceFindings {
     stale: Vec<StaleArtifact>,
 }
 
-/// Print the `Interface versions` block: every artifact in either installed store that names a
-/// `murmur:` interface at a version other than the one [`SERVED_WIT_PACKAGES`] lists, one line per
-/// interface.
+/// One row of the `WIT level` block's installed list.
+struct InstalledRow {
+    reference: String,
+    scope: StoreScope,
+    built_at: String,
+    fits: bool,
+}
+
+/// Print the `WIT level` block: the level this mur serves and its package table, then every
+/// artifact in either installed store with its built-at label and whether it fits that level. An
+/// artifact that does not fit is followed by one line per mismatched interface, then the
+/// `W-REG-003` line.
 ///
-/// Prints nothing at all when every artifact is current and both stores could be listed. A store
-/// whose index cannot be read is named under the heading and skipped; that never changes the exit
-/// code. Reads only: neither store is written to, no registry is contacted, nothing is launched.
+/// Always printed. A store whose index cannot be read is named and skipped; that never changes
+/// the exit code. Reads only: neither store is written to, no registry is contacted, nothing is
+/// launched.
 fn report_interface_versions(project: &LocalRegistry, global: &LocalRegistry) -> InterfaceFindings {
+    let served = served_wit_level();
     let mut stale = Vec::new();
+    let mut rows: Vec<InstalledRow> = Vec::new();
     let mut unreadable = Vec::new();
 
     for (scope, registry) in [(StoreScope::Project, project), (StoreScope::Global, global)] {
@@ -845,32 +857,68 @@ fn report_interface_versions(project: &LocalRegistry, global: &LocalRegistry) ->
                 continue;
             }
         };
+        let mut seen: HashSet<String> = HashSet::new();
         for meta in index {
-            let Some(contracts) = installed_contracts(registry, &meta) else {
-                continue;
-            };
-            let unserved = contracts.unserved_against(SERVED_WIT_PACKAGES);
-            if unserved.is_empty() {
+            let reference = format!("{}@{}", meta.name, meta.version);
+            if !seen.insert(reference.clone()) {
                 continue;
             }
-            stale.push(StaleArtifact {
+            // A payload with no readable component names no `murmur:*` interface.
+            let contracts = installed_contracts(registry, &meta).unwrap_or_default();
+            let mismatched = match level_fit(&contracts, served) {
+                LevelFit::Fits => Vec::new(),
+                LevelFit::Mismatched(mismatched) => mismatched,
+            };
+            rows.push(InstalledRow {
+                reference,
                 scope,
-                name: meta.name.to_string(),
-                version: meta.version,
-                unserved,
+                built_at: built_at_label(meta.built_at_level, &contracts),
+                fits: mismatched.is_empty(),
             });
+            if !mismatched.is_empty() {
+                stale.push(StaleArtifact {
+                    scope,
+                    name: meta.name.to_string(),
+                    version: meta.version,
+                    unserved: mismatched,
+                });
+            }
         }
     }
 
-    if stale.is_empty() && unreadable.is_empty() {
-        return InterfaceFindings { stale };
+    capsule_runtime::report_println!("WIT level");
+    capsule_runtime::report_println!("  this mur serves WIT level {}:", served.level);
+    for line in crate::wit_level::package_table(served) {
+        capsule_runtime::report_println!("    {line}");
     }
-
-    capsule_runtime::report_println!("Interface versions");
+    capsule_runtime::report_println!();
+    capsule_runtime::report_println!("  installed:");
     for (scope, error) in &unreadable {
-        capsule_runtime::report_println!("  not checked ({} store): {error}", scope.label());
+        capsule_runtime::report_println!("    not checked ({} store): {error}", scope.label());
     }
-    let ref_width = stale
+    if rows.is_empty() && unreadable.is_empty() {
+        capsule_runtime::report_println!("    none installed");
+    }
+    let ref_width = rows
+        .iter()
+        .map(|row| row.reference.len())
+        .max()
+        .unwrap_or(0);
+    let built_width = rows.iter().map(|row| row.built_at.len()).max().unwrap_or(0);
+    for row in &rows {
+        let status = if row.fits {
+            format!("fits level {}", served.level)
+        } else {
+            format!("does not fit level {}", served.level)
+        };
+        capsule_runtime::report_println!(
+            "    {:<ref_width$}   {:<7}   built at {:<built_width$}   {status}",
+            row.reference,
+            row.scope.label(),
+            row.built_at,
+        );
+    }
+    let stale_width = stale
         .iter()
         .map(|artifact| artifact.name.len() + 1 + artifact.version.len())
         .max()
@@ -881,7 +929,7 @@ fn report_interface_versions(project: &LocalRegistry, global: &LocalRegistry) ->
                 "{}",
                 render_unserved_line(
                     &format!("{}@{}", artifact.name, artifact.version),
-                    ref_width,
+                    stale_width,
                     artifact.scope,
                     interface
                 )
@@ -899,20 +947,38 @@ fn report_interface_versions(project: &LocalRegistry, global: &LocalRegistry) ->
     InterfaceFindings { stale }
 }
 
-/// The unserved interfaces of one checklist artifact, as `stage_session` would resolve them from
-/// the same resolved bytes: the sidecar's recorded `wit_contracts`, or the payload's own when the
-/// sidecar has none.
+/// The built-at label of an installed artifact: the level its `murmur-build.json` recorded, or,
+/// when it recorded none, the newest level this mur knows that `contracts` fit, marked derived.
+fn built_at_label(recorded: Option<u64>, contracts: &WitContracts) -> String {
+    match recorded {
+        Some(level) if level > served_wit_level().level => {
+            format!("{level} (newer than this mur knows)")
+        }
+        Some(level) => level.to_string(),
+        None => match newest_fitting_level(contracts, wit_levels()) {
+            Some(level) => format!("{level} (derived)"),
+            None => "none (derived)".to_string(),
+        },
+    }
+}
+
+/// The mismatched interfaces of one checklist artifact, as `stage_session` would resolve them
+/// from the same resolved bytes: the sidecar's recorded `wit_contracts`, or the payload's own when
+/// the sidecar has none, against the WIT level this mur serves.
 fn resolved_unserved(resolved: &ResolvedArtifact) -> Vec<UnservedInterface> {
-    resolved
+    let contracts = resolved
         .meta
         .wit_contracts
         .clone()
         .or_else(|| wit_contracts_from_artifact_bytes(&resolved.bytes))
-        .map(|contracts| contracts.unserved_against(SERVED_WIT_PACKAGES))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    match level_fit(&contracts, served_wit_level()) {
+        LevelFit::Fits => Vec::new(),
+        LevelFit::Mismatched(mismatched) => mismatched,
+    }
 }
 
-/// One line of the `Interface versions` block.
+/// One line of the `WIT level` block: one mismatched interface of one installed artifact.
 fn render_unserved_line(
     artifact_ref: &str,
     ref_width: usize,

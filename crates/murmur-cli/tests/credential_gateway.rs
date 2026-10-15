@@ -903,6 +903,7 @@ fn gateway_on_native_tool_refuses() {
                 tags: Vec::new(),
                 wit_contracts: None,
                 owner_id: None,
+                built_at_level: None,
             },
             &fs::read(&artifact).unwrap(),
         )

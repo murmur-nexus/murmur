@@ -117,6 +117,7 @@ fn store_as(root: &Path, name: &str, version: &str, zip: &Path) {
                 tags: Vec::new(),
                 wit_contracts: None,
                 owner_id: None,
+                built_at_level: None,
             },
             &bytes,
             &sha256_hex(&bytes),
