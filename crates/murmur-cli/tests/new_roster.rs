@@ -245,6 +245,7 @@ fn install_as_printed(scratch: &Scratch, steps: &[String]) {
             description: None,
             tags: Vec::new(),
             wit_contracts: None,
+            owner_id: None,
         },
         &std::fs::read(&driver_zip).unwrap(),
     )
@@ -825,23 +826,22 @@ fn with_no_config_the_members_name_anthropic() {
 /// printed key step runs before the driver install, and the config it writes names the default
 /// source the install then resolves from.
 #[test]
-fn the_key_step_comes_first_and_writes_the_default_registry_source() {
+/// The key step writes the first config file. The `murmur` scope's source is built in, so the
+/// file names no source and the `mur install -g` step after it still reaches the default
+/// artifacts.
+fn the_key_step_comes_first_and_writes_no_registry_source() {
     let scratch = Scratch::new();
     let new = scratch.run(&["new", "--roster", "crew"]);
     new.assert_code(0);
     let steps = next_steps(&new.stdout);
     assert!(steps[1].starts_with("mur install -g "), "{steps:?}");
+    assert!(steps[1].contains("murmur/"), "{steps:?}");
     assert!(!scratch.config_path().exists());
     store_key(&scratch, &steps[0], "ANTHROPIC_API_KEY");
     let config: serde_yaml::Value =
         serde_yaml::from_str(&std::fs::read_to_string(scratch.config_path()).unwrap()).unwrap();
-    let sources = config["registry"]["sources"].as_sequence().unwrap();
-    assert!(
-        sources
-            .iter()
-            .any(|source| source["repo"].as_str() == Some("murmur-nexus/default-artifacts")),
-        "{config:?}"
-    );
+    assert!(config["registry"]["sources"].is_null(), "{config:?}");
+    assert!(config["registry"]["default"].is_null(), "{config:?}");
     assert_eq!(
         config["credentials"]["ANTHROPIC_API_KEY"].as_str(),
         Some(TEST_KEY)

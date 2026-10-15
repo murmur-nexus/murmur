@@ -17,7 +17,7 @@ use std::{
 };
 
 use assert_cmd::{assert::Assert, Command};
-use common::github_release::MockRelease;
+use common::github_release::{publish_dir, MockGitHub};
 use murmur_artifact::{
     read_lockfile, sha256_hex, write_lockfile_atomic, ArtifactMeta, ArtifactName, LocalRegistry,
     LockOrigin, LockedArtifact, LockedSha256, MurmurLock, Registry, RuntimeType, LOCK_VERSION,
@@ -116,6 +116,7 @@ fn store_as(root: &Path, name: &str, version: &str, zip: &Path) {
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,
+                owner_id: None,
             },
             &bytes,
             &sha256_hex(&bytes),
@@ -496,14 +497,28 @@ fn packed_tool(dir: &Path, packed: &str, version: &str, file_name: &str) -> Vec<
     fs::read(renamed).unwrap()
 }
 
+/// `home`'s config naming `ana/artifacts` as the source of the `ana` scope.
+fn ana_source_config(home: &TempDir) {
+    let dir = home.path().join(".murmur");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("config.yaml"),
+        "registry:\n  sources:\n    - repo: ana/artifacts\n",
+    )
+    .unwrap();
+}
+
 #[test]
-fn a_scoped_install_asks_the_sources_for_the_bare_name_and_stores_the_full_one() {
+fn a_scoped_install_asks_its_scopes_source_for_the_bare_name_and_stores_the_full_one() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let staging = tempfile::tempdir().unwrap();
     agent_manifest(project.path(), "", "");
-    let bytes = packed_tool(staging.path(), "tool-x", "1.0.0", "tool-x-1.0.0.mur.zip");
-    let release = MockRelease::start("v1.0.0", vec![("tool-x-1.0.0.mur.zip".to_string(), bytes)]);
+    ana_source_config(&home);
+    packed_tool(staging.path(), "tool-x", "1.0.0", "tool-x-1.0.0.mur.zip");
+    let release = MockGitHub::start();
+    release.repository("ana/artifacts", 1111);
+    publish_dir(&release, "ana/artifacts", "v1.0.0", staging.path());
 
     mur(&home, project.path(), &release.api_base)
         .args(["install", "--no-precompile", "ana/tool-x@1.0.0"])
@@ -517,13 +532,11 @@ fn a_scoped_install_asks_the_sources_for_the_bare_name_and_stores_the_full_one()
         .exists());
     let lock = read_lockfile(&project.path().join("murmur.lock")).unwrap();
     assert!(lock.artifact_for("ana/tool-x").is_some());
-    // The release lists one asset, `tool-x-1.0.0.mur.zip`, so fetching it means the source was
-    // asked for the bare name.
+    // The index lists the bare name, `tool-x`, so fetching its file means the source was asked
+    // for the bare name.
+    let asset = release.asset_path("ana/artifacts", "v1.0.0", "tool-x-1.0.0.mur.zip");
     assert!(
-        release
-            .paths()
-            .iter()
-            .any(|path| path.ends_with("/releases/assets/1")),
+        release.paths().contains(&asset),
         "the asset named by the bare name was fetched: {:?}",
         release.paths()
     );
@@ -531,16 +544,19 @@ fn a_scoped_install_asks_the_sources_for_the_bare_name_and_stores_the_full_one()
 
 #[test]
 fn a_github_release_is_stored_under_the_scope_of_its_repository() {
-    for (owner, repo, scope) in [
-        ("ana", "repo", "ana"),
-        ("murmur-nexus", "default-artifacts", "murmur"),
+    for (owner, repo, scope, owner_id) in [
+        ("ana", "repo", "ana", 1111),
+        ("murmur-nexus", "default-artifacts", "murmur", 190_196_424),
     ] {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let staging = tempfile::tempdir().unwrap();
         let first = packed_tool(staging.path(), "tool-x", "1.0.0", "tool-x-1.0.0.mur.zip");
         let second = packed_tool(staging.path(), "tool-y", "2.0.0", "tool-y-2.0.0.mur.zip");
-        let release = MockRelease::start_tagged(
+        let release = MockGitHub::start();
+        release.repository(&format!("{owner}/{repo}"), owner_id);
+        release.release(
+            &format!("{owner}/{repo}"),
             "v1",
             vec![
                 ("tool-x-1.0.0.mur.zip".to_string(), first),
@@ -579,8 +595,38 @@ fn an_asset_packed_under_another_name_is_refused_and_stores_nothing() {
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
     let staging = tempfile::tempdir().unwrap();
+    ana_source_config(&home);
     let bytes = packed_tool(staging.path(), "tool-y", "1.0.0", "tool-x-1.0.0.mur.zip");
-    let release = MockRelease::start("v1.0.0", vec![("tool-x-1.0.0.mur.zip".to_string(), bytes)]);
+    // `mur index` refuses a file whose name disagrees with its packed name, so this index is
+    // written by hand, with the file's real digest.
+    let index = json!({
+        "schema_version": 2,
+        "scope": "ana",
+        "artifacts": [{
+            "name": "tool-x",
+            "runtime": "tool",
+            "tags": ["tool"],
+            "versions": [{
+                "version": "1.0.0",
+                "release": "v1.0.0",
+                "interfaces": [],
+                "assets": [{ "file": "tool-x-1.0.0.mur.zip", "sha256": sha256_hex(&bytes) }],
+            }],
+        }],
+    });
+    let release = MockGitHub::start();
+    release.repository("ana/artifacts", 1111);
+    release.release(
+        "ana/artifacts",
+        "v1.0.0",
+        vec![
+            ("tool-x-1.0.0.mur.zip".to_string(), bytes),
+            (
+                "artifacts-index.json".to_string(),
+                serde_json::to_vec(&index).unwrap(),
+            ),
+        ],
+    );
 
     let assert = mur(&home, cwd.path(), &release.api_base)
         .args(["install", "-g", "--no-precompile", "ana/tool-x@1.0.0"])

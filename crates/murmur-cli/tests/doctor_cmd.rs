@@ -200,6 +200,7 @@ fn install_capsule(store_root: &Path, name: &str, version: &str, manifest_yaml: 
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,
+                owner_id: None,
             },
             &bytes,
             &sha256,

@@ -155,10 +155,9 @@ pub fn assert_dead_within(pid: i32, limit: std::time::Duration) {
     panic!("the harness (pid {pid}) was still alive after {limit:?}");
 }
 
-/// Write `home/.murmur/config.yaml` with `registry.sources: []`, the config that names no remote
-/// source. A `name@version` missing from the local store then fails with `E-REG-001` without
-/// building a source, where a home with no config file at all falls back to the built-in
-/// `official` GitHub source.
+/// Write `home/.murmur/config.yaml` with `registry.sources: []`, the config that gives no
+/// third-party scope a source. Only the built-in `murmur` scope still has one, so a miss in any
+/// other scope fails with `E-REG-008` without a request.
 pub fn write_no_source_config(home: &Path) {
     let dir = home.join(".murmur");
     fs::create_dir_all(&dir).unwrap();
@@ -1057,6 +1056,7 @@ pub fn publish_to_store(
             description: None,
             tags: Vec::new(),
             wit_contracts: None,
+            owner_id: None,
         },
         &cursor.into_inner(),
     )

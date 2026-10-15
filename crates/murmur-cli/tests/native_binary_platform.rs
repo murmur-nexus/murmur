@@ -105,6 +105,7 @@ fn publish_to_home(home: &TempDir, artifact_path: &Path) {
         description: None,
         tags: Vec::new(),
         wit_contracts: None,
+        owner_id: None,
     };
     registry
         .publish(meta, &fs::read(artifact_path).unwrap())

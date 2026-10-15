@@ -75,28 +75,12 @@ pub struct SpendConfig {
     pub machine_tokens_per_day: Option<u64>,
 }
 
-/// The default artifact source is a Rust literal compiled into the `murmur-cli`
-/// binary — it is never fetched over the network at install time or any other
-/// point. `load_mur_config`/
-/// `load_mur_config_if_exists` only ever read this value's override from a local
-/// file (`~/.murmur/config.yaml`) via `fs::read_to_string`; if that file is
-/// absent, this literal is used as-is. Do not change this impl to read a value
-/// obtained from an HTTP call, environment-provided URL, or any other
-/// network-reachable source.
+/// No file at all reads as this: no third-party source, which leaves only the built-in `murmur`
+/// source (see [`crate::source::Sources`]).
 impl Default for MurConfig {
     fn default() -> Self {
         Self {
-            registry: RegistryConfig {
-                default: Some("official".to_string()),
-                sources: vec![SourceConfig {
-                    name: "official".to_string(),
-                    r#type: SourceType::GitHub,
-                    repo: Some(crate::source::DEFAULT_ARTIFACTS_REPO.to_string()),
-                    url: None,
-                    token: None,
-                }],
-                index_url: None,
-            },
+            registry: RegistryConfig::default(),
             inference: None,
             beta: BetaConfig::default(),
             containment: None,
@@ -129,25 +113,37 @@ impl InferenceConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct RegistryConfig {
-    pub default: Option<String>,
-    #[serde(default)]
+    /// The removed `default:` key, read so that building the sources can refuse it by name
+    /// (`E-CFG-003`) while commands that never build them still load the file. Kept on a rewrite
+    /// for the same reason.
+    #[serde(default, rename = "default", skip_serializing_if = "Option::is_none")]
+    pub removed_default: Option<serde_yaml::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<SourceConfig>,
     /// Override URL for the public artifact index fetched by `mur search`.
     /// Key: registry.index_url in ~/.murmur/config.yaml
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// One `registry.sources` entry: the GitHub repository that serves its owner's scope.
+///
+/// `name`, `type` and `url` are the removed keys of the earlier source form, read and kept only so
+/// that building the sources can refuse them by name (`E-CFG-003`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SourceConfig {
-    pub name: String,
-    pub r#type: SourceType,
-    #[serde(default)]
+    /// `<owner>/<repo>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
+    /// A GitHub token, written as `${VAR}`, `VAR` or the literal token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<serde_yaml::Value>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub removed_type: Option<serde_yaml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<serde_yaml::Value>,
 }
 
 impl SourceConfig {
@@ -163,12 +159,6 @@ impl SourceConfig {
 
         env::var(raw).ok().or_else(|| Some(raw.to_string()))
     }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum SourceType {
-    GitHub,
 }
 
 pub fn load_mur_config() -> Result<MurConfig, CliError> {
@@ -205,9 +195,7 @@ pub fn load_effective_mur_config() -> Result<MurConfig, CliError> {
 
 /// Same as `load_effective_mur_config`, but returns `None` when neither the global nor
 /// the project-level file exists (mirrors `load_mur_config_if_exists`'s None/Some contract),
-/// for call sites that must not read the built-in default's values as settings the operator
-/// chose. Registry lookups use `load_effective_mur_config`, so a machine with no config file
-/// still installs from the built-in source.
+/// for call sites that must not read the default's values as settings the operator chose.
 pub fn load_effective_mur_config_if_any_exists() -> Result<Option<MurConfig>, CliError> {
     let global_opt = load_mur_config_if_exists()?;
     let project_opt = load_project_mur_config_if_exists()?;
@@ -238,7 +226,10 @@ pub fn merge_mur_configs(global: MurConfig, project: Option<MurConfig>) -> MurCo
 
     MurConfig {
         registry: RegistryConfig {
-            default: pick_non_empty(project.registry.default, global.registry.default),
+            removed_default: project
+                .registry
+                .removed_default
+                .or(global.registry.removed_default),
             sources: merge_sources(global.registry.sources, project.registry.sources),
             index_url: pick_non_empty(project.registry.index_url, global.registry.index_url),
         },
@@ -293,21 +284,29 @@ fn pick_non_empty(project: Option<String>, global: Option<String>) -> Option<Str
     }
 }
 
-/// Union of `registry.sources`, de-duplicated by `name`: a project entry replaces a global
-/// entry with the same name, a project entry with a new name is appended, and every global
-/// entry the project doesn't mention is kept (global ordering first, new names appended).
+/// Union of `registry.sources` by scope: a project entry replaces the global entry for the same
+/// scope, a project entry for a new scope is appended, and every global entry the project does not
+/// replace is kept. An entry naming no usable repository has no scope and is kept as it is, for
+/// [`crate::source::Sources`] to refuse.
 fn merge_sources(global: Vec<SourceConfig>, project: Vec<SourceConfig>) -> Vec<SourceConfig> {
     let mut merged = global;
     for source in project {
+        let scope = source_scope(&source);
         match merged
             .iter_mut()
-            .find(|existing| existing.name == source.name)
+            .find(|existing| scope.is_some() && source_scope(existing) == scope)
         {
             Some(existing) => *existing = source,
             None => merged.push(source),
         }
     }
     merged
+}
+
+/// The scope `source` serves, or `None` when its `repo` is no `<owner>/<repo>` with a usable owner.
+pub(crate) fn source_scope(source: &SourceConfig) -> Option<String> {
+    let (owner, repo) = crate::source::split_github_repo(source.repo.as_deref()?.trim())?;
+    crate::source::scope_of_github_repo(owner, repo).ok()
 }
 
 /// Union of `beta.enabled`, de-duplicated by string value: global flags first, then any
@@ -403,7 +402,7 @@ pub(crate) fn is_literal_inference_api_key(value: &str) -> bool {
     !value.is_empty() && parse_env_reference(value).is_none()
 }
 
-fn read_mur_config_file(config_path: &Path) -> Result<Option<MurConfig>, CliError> {
+pub(crate) fn read_mur_config_file(config_path: &Path) -> Result<Option<MurConfig>, CliError> {
     if !config_path.exists() {
         return Ok(None);
     }
@@ -632,25 +631,19 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_source_is_compiled_in_literal_not_fetched() {
+    fn no_config_file_names_no_third_party_source() {
         let config = MurConfig::default();
-
-        assert_eq!(config.registry.default.as_deref(), Some("official"));
-        assert_eq!(config.registry.sources.len(), 1);
-
-        let source = &config.registry.sources[0];
-        assert_eq!(source.name, "official");
-        assert_eq!(source.r#type, SourceType::GitHub);
-        assert_eq!(
-            source.repo.as_deref(),
-            Some("murmur-nexus/default-artifacts")
-        );
-        assert_eq!(source.url, None);
-        assert_eq!(source.token, None);
+        assert!(config.registry.sources.is_empty());
+        assert!(config.registry.removed_default.is_none());
+        let rendered = serde_yaml::to_string(&config).unwrap();
+        assert!(!rendered.contains("sources"), "{rendered}");
     }
 
+    /// The removed keys are read rather than refused here: only building the sources refuses
+    /// them, so a command that never builds them still loads the file, and rewriting the file
+    /// keeps them for that refusal.
     #[test]
-    fn local_config_file_overrides_compiled_in_default() {
+    fn a_config_file_with_removed_registry_keys_still_loads_and_keeps_them() {
         let _guard = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved_home = env::var_os("HOME");
 
@@ -659,14 +652,7 @@ mod tests {
         fs::create_dir_all(&murmur_dir).expect("failed to create .murmur dir");
         fs::write(
             murmur_dir.join("config.yaml"),
-            r#"
-registry:
-  default: official
-  sources:
-    - name: official
-      type: github
-      repo: some-user/custom-artifacts
-"#,
+            "registry:\n  default: official\n  sources:\n    - name: official\n      type: github\n      repo: some-user/custom-artifacts\n      url: https://example.com\n",
         )
         .expect("failed to write config.yaml");
 
@@ -687,71 +673,83 @@ registry:
         }
 
         let config = result.expect("load_mur_config should succeed");
-        assert_eq!(
-            config.registry.sources[0].repo.as_deref(),
-            Some("some-user/custom-artifacts")
-        );
+        let source = &config.registry.sources[0];
+        assert_eq!(source.repo.as_deref(), Some("some-user/custom-artifacts"));
+        assert!(config.registry.removed_default.is_some());
+        assert!(source.name.is_some() && source.removed_type.is_some() && source.url.is_some());
+
+        let rendered = serde_yaml::to_string(&config).unwrap();
+        for key in [
+            "default: official",
+            "name: official",
+            "type: github",
+            "url: ",
+        ] {
+            assert!(rendered.contains(key), "{key} missing from {rendered}");
+        }
     }
 
-    fn source(name: &str, repo: &str) -> SourceConfig {
+    fn source(repo: &str) -> SourceConfig {
         SourceConfig {
-            name: name.to_string(),
-            r#type: SourceType::GitHub,
             repo: Some(repo.to_string()),
-            url: None,
-            token: None,
+            ..SourceConfig::default()
         }
+    }
+
+    fn repos(config: &MurConfig) -> Vec<&str> {
+        config
+            .registry
+            .sources
+            .iter()
+            .map(|source| source.repo.as_deref().unwrap_or("-"))
+            .collect()
     }
 
     #[test]
     fn merge_with_no_project_config_returns_global_unchanged() {
-        let global = MurConfig::default();
+        let mut global = MurConfig::default();
+        global.registry.sources = vec![source("ana/a")];
         let merged = merge_mur_configs(global.clone(), None);
-        assert_eq!(merged.registry.default, global.registry.default);
-        assert_eq!(merged.registry.sources.len(), global.registry.sources.len());
+        assert_eq!(repos(&merged), ["ana/a"]);
         assert_eq!(merged.beta.enabled, global.beta.enabled);
     }
 
     #[test]
-    fn merge_scalar_override_registry_default() {
-        let global = MurConfig::default();
+    fn merge_sources_appends_a_project_source_for_a_new_scope() {
+        let mut global = MurConfig::default();
+        global.registry.sources = vec![source("ana/a")];
         let mut project = MurConfig::default();
-        project.registry.default = Some("local".to_string());
-        project.registry.sources = vec![];
+        project.registry.sources = vec![source("bob/b")];
 
         let merged = merge_mur_configs(global, Some(project));
 
-        assert_eq!(merged.registry.default.as_deref(), Some("local"));
-        // untouched global source survives
-        assert_eq!(merged.registry.sources.len(), 1);
-        assert_eq!(merged.registry.sources[0].name, "official");
+        assert_eq!(repos(&merged), ["ana/a", "bob/b"]);
     }
 
     #[test]
-    fn merge_sources_union_appends_new_name() {
+    fn merge_sources_replaces_the_global_source_of_the_same_scope() {
         let mut global = MurConfig::default();
-        global.registry.sources = vec![source("official", "a/b")];
+        global.registry.sources = vec![source("ana/a"), source("bob/b")];
         let mut project = MurConfig::default();
-        project.registry.sources = vec![source("mine", "me/repo")];
+        project.registry.sources = vec![source("Ana/c")];
 
         let merged = merge_mur_configs(global, Some(project));
 
-        assert_eq!(merged.registry.sources.len(), 2);
-        assert!(merged.registry.sources.iter().any(|s| s.name == "official"));
-        assert!(merged.registry.sources.iter().any(|s| s.name == "mine"));
+        assert_eq!(repos(&merged), ["Ana/c", "bob/b"]);
     }
 
+    /// An entry with no usable repository has no scope, so it replaces nothing and is kept for
+    /// building the sources to refuse.
     #[test]
-    fn merge_sources_override_by_name_replaces_not_duplicates() {
+    fn merge_sources_keeps_an_entry_with_no_scope() {
         let mut global = MurConfig::default();
-        global.registry.sources = vec![source("official", "a/b")];
+        global.registry.sources = vec![source("ana/a")];
         let mut project = MurConfig::default();
-        project.registry.sources = vec![source("official", "fork/b")];
+        project.registry.sources = vec![SourceConfig::default(), source("ana")];
 
         let merged = merge_mur_configs(global, Some(project));
 
-        assert_eq!(merged.registry.sources.len(), 1);
-        assert_eq!(merged.registry.sources[0].repo.as_deref(), Some("fork/b"));
+        assert_eq!(repos(&merged), ["ana/a", "-", "ana"]);
     }
 
     #[test]
@@ -985,7 +983,7 @@ registry:
 
         // Absent key stays absent on the way back out, so writing a config file never
         // silently pins a floor the operator did not ask for.
-        let bare: MurConfig = serde_yaml::from_str("registry:\n  default: official\n").unwrap();
+        let bare: MurConfig = serde_yaml::from_str("registry:\n  index_url: x\n").unwrap();
         assert_eq!(bare.containment, None);
         assert!(!serde_yaml::to_string(&bare)
             .unwrap()
@@ -1049,7 +1047,7 @@ registry:
         fs::create_dir_all(&murmur_dir).expect("failed to create .murmur dir");
         fs::write(
             murmur_dir.join("config.yaml"),
-            "registry:\n  default: official\n",
+            "registry:\n  index_url: https://example.com/index.json\n",
         )
         .expect("failed to write config.yaml");
 
@@ -1075,7 +1073,7 @@ registry:
 
         let baseline = baseline.expect("load_mur_config should succeed");
         let effective = effective.expect("load_effective_mur_config should succeed");
-        assert_eq!(baseline.registry.default, effective.registry.default);
+        assert_eq!(baseline.registry.index_url, effective.registry.index_url);
         assert_eq!(
             baseline.registry.sources.len(),
             effective.registry.sources.len()

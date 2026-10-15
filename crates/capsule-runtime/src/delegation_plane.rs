@@ -1531,6 +1531,7 @@ mod tests {
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,
+                owner_id: None,
             },
             &zipped.into_inner(),
         )

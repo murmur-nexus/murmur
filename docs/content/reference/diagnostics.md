@@ -37,6 +37,7 @@ section that explains it.
 | `E-CNV-003` | `mur conversation truncate --keep` is not a usable number of messages to keep | [E-CNV-003](#e-cnv-003) |
 | `E-CFG-001` | No inference provider configured and wizard cannot run in non-interactive mode | [`mur new`](cli.md#mur-new) |
 | `E-CFG-002` | `mur config set` given an unsupported dotted key | [`mur config`](cli.md#mur-config) |
+| `E-CFG-003` | `registry:` in a config file cannot be used: a removed `default:` key, a source's `name:`, `type:` or `url:`, a `repo` that is not `<owner>/<repo>`, a reserved scope claimed, or two sources for one scope | [E-CFG-003](#e-cfg-003) |
 | `E-DEPLOY-001` | No `--host` given, or an `--env` value is not `KEY=VALUE` | [`mur deploy run`](cli.md#mur-deploy-run) |
 | `E-DEPLOY-003` | SSH connection or remote command failed | [`mur deploy run`](cli.md#mur-deploy-run) |
 | `E-DEPLOY-004` | Capsule did not emit usable startup JSON within 120s | [`mur deploy run`](cli.md#mur-deploy-run) |
@@ -44,7 +45,7 @@ section that explains it.
 | `E-EVAL-001` | Eval file parse error (malformed JSON, unknown `record_type`, missing required field); message includes `:line:` number | [`eval.jsonl` schema](observability-schemas.md#structured-evaluation-evaljsonl) |
 | `E-EVAL-002` | No eval file found for the session named on the command line | [`mur eval`](cli.md#mur-eval) |
 | `E-IDX-001` | A file in the directory given to `mur index` cannot be indexed, or the directory holds no `.mur.zip` | [E-IDX-001](#e-idx-001) |
-| `E-IDX-002` | An artifact index is not a schema 2 index this `mur` reads: schema 1, another schema, not JSON, or invalid | [E-IDX-002](#e-idx-002) |
+| `E-IDX-002` | An artifact index is not a schema 2 index this `mur` reads: schema 1, another schema, not JSON, or invalid; or a source's latest release has no index | [E-IDX-002](#e-idx-002) |
 | `E-IDX-003` | `mur index` was not given a usable source: `--repo` or `--release` is unusable, or `--merge` names an index of another scope | [E-IDX-003](#e-idx-003) |
 | `E-IO-001` | File or directory not found | — |
 | `E-IO-002` | Permission denied on a host path (the host's own permissions, not a capsule capability) | — |
@@ -56,13 +57,16 @@ section that explains it.
 | `E-NEW-002` | The name given to `mur new --roster`, or a capsule name derived from it, is not an artifact name | [`mur new --roster`](cli.md#mur-new-roster) |
 | `E-NEW-003` | The directory `mur new --roster` would write already exists | [`mur new --roster`](cli.md#mur-new-roster-writing) |
 | `E-NEW-004` | `inference.provider` in `~/.murmur/config.yaml` names a provider `mur new --roster` has no driver for | [`mur new --roster`](cli.md#mur-new-roster-provider) |
-| `E-REG-001` | Every source asked answered that it has no such artifact, or no asset of it for the host platform; or a `local/` artifact is not in the store, and no source serves the `local` scope | [`mur install`](cli.md#mur-install) |
-| `E-REG-002` | Installed artifact bytes do not match the sha256 recorded for them, or an artifact's packed `name:` is not the bare part of the name it is installed as | [E-REG-002](#e-reg-002) |
+| `E-REG-001` | The scope's index lists no such name, no such version, or no payload of it for the host platform, or no version that fits this `mur`; or a `local/` artifact is not in the store, and no source serves the `local` scope | [E-REG-001](#e-reg-001) |
+| `E-REG-002` | Artifact bytes do not match the sha256 recorded for them or listed in the source's index, or an artifact's packed `name:` or `version:` is not the one it is installed as | [E-REG-002](#e-reg-002) |
 | `E-REG-003` | An artifact of that name and version is already published | [`mur publish`](cli.md#mur-publish) |
-| `E-REG-004` | Reserved version string (`latest`, `stable`, `edge`) | [`mur publish`](cli.md#mur-publish) |
+| `E-REG-004` | Reserved version string (`latest`, `stable`, `edge`), given to `mur publish` or `mur install` | [`mur install`](cli.md#mur-install) |
 | `E-REG-005` | A registry-resolved artifact's version or hash, or a [roster member's](roster.md#murmur-lock), disagrees with the `murmur.lock` entry | [Lockfile](workdir.md#lockfile-murmurlock) |
-| `E-REG-006` | A source did not answer an artifact lookup — rate limited, refused, unreachable, or misconfigured — so whether it publishes the artifact is not known | [E-REG-006](#e-reg-006) |
+| `E-REG-006` | A source did not answer an artifact lookup — rate limited, refused or unreachable — so whether it publishes the artifact is not known | [E-REG-006](#e-reg-006) |
 | `E-REG-007` | An artifact name on the command line is not `<scope>/<name>`, or a `github:` owner claims a reserved scope | [E-REG-007](#e-reg-007) |
+| `E-REG-008` | No source serves the artifact's scope | [E-REG-008](#e-reg-008) |
+| `E-REG-009` | A source's index states a scope the source does not own | [E-REG-009](#e-reg-009) |
+| `E-REG-010` | A scope's GitHub owner id is not the one recorded for it in `murmur.lock`, in the stored payload, or compiled in for `murmur` | [E-REG-010](#e-reg-010) |
 | `E-ROS-001` | `roster.yaml` is missing, unreadable, or does not have the roster shape, or names a member's capsule by a bare name | [E-ROS-001](#e-ros-001) |
 | `E-ROS-002` | A roster marks no member `entry: true`, or more than one | [E-ROS-002](#e-ros-002) |
 | `E-ROS-003` | Two roster members share one `name` | [E-ROS-003](#e-ros-003) |
@@ -1775,6 +1779,31 @@ reverse. To run under this machine's value, pass the `--env` the warning gives.
 
 ---
 
+## Config errors
+
+### E-CFG-003 — a config file's `registry:` section cannot be used { #e-cfg-003 }
+
+`mur install` and `mur deploy` build each scope's [source](installing-artifacts.md#sources-and-scopes)
+from the `registry:` section of every config file they read, and refuse a section they cannot use,
+naming the file. Nothing is requested or written. Other commands do not read `registry:`.
+
+```text
+error[E-CFG-003]: /home/ana/.murmur/config.yaml sets registry.default, which this mur no longer reads: each scope has exactly one source, so there is no first source to choose
+  hint: delete registry.default; a source is one registry.sources entry, `- repo: <owner>/<repo>` with an optional `token:`; it serves the scope named by its owner, and the murmur scope is always served by murmur-nexus/default-artifacts
+```
+
+| Message names | Fix |
+|---|---|
+| `sets registry.default` | Delete the key |
+| `registry.sources[N] sets name:`, `type:` or `url:` | Delete those keys and keep `repo:` and `token:` |
+| `registry.sources[N] names no repo` | Add `repo: <owner>/<repo>` |
+| `repo '…' is not a GitHub repository written <owner>/<repo>` | Write the repository as `<owner>/<repo>` |
+| `repo '…' claims the reserved scope 'local'` or `'murmur'` | Remove the entry. Only `murmur-nexus/default-artifacts` serves `murmur`, and an entry naming it may only set its `token:` |
+| `repo '…' names no usable scope` | The owner is not a valid scope; name another repository |
+| `registry.sources[N] (…) and registry.sources[M] (…) both serve scope '…'` | Keep one of them |
+
+---
+
 ## Index errors
 
 `mur index` writes an [artifact index](artifact-index.md) and `mur search` reads one. A refused
@@ -1823,6 +1852,15 @@ error[E-IDX-002]: artifact index https://raw.githubusercontent.com/ana/my-artifa
 | `is not valid JSON: …` | The file is not JSON, or is truncated |
 | `is not a valid schema 2 index: <location> <reason>` | A field breaks the [format](artifact-index.md#fields); `<location>` names it, such as `artifacts[0].versions[1].assets is missing` |
 
+`mur install` reads a source's index from its latest release, so a release with no
+`artifacts-index.json` is refused too. Its publisher writes and uploads one — see
+[How to publish your own artifact source](../how-to/publish-artifact-source.md):
+
+```text
+error[E-IDX-002]: github:ana/artifacts publishes no artifacts-index.json on its latest release v2, so ana/tool-git@1.0.0 cannot be looked up
+  hint: its publisher writes the index with `mur index <dir> --repo ana/artifacts --release v2` and uploads artifacts-index.json to release v2
+```
+
 ### E-IDX-003 — `mur index` was not given a usable source { #e-idx-003 }
 
 `--repo` must be a GitHub repository `<owner>/<repo>` whose owner is a valid scope, and
@@ -1845,6 +1883,27 @@ error[E-IDX-003]: --merge previous.json indexes scope 'bob', and --repo ana/tool
 
 ## Registry errors
 
+### E-REG-001 — the source does not list the artifact { #e-reg-001 }
+
+The scope's source answered, and its [index](installing-artifacts.md#index-resolution) lists no
+artifact of that exact name, no such version, or no payload of the version for this platform:
+
+```text
+error[E-REG-001]: could not resolve ana/tool-git@2.0.0: the index of github:ana/artifacts lists ana/tool-git at 1.0.0, 0.9.0
+  hint: name one of those versions, or omit the version to install the newest that fits this mur: mur install ana/tool-git
+```
+
+| Message | Fix |
+|---|---|
+| `lists no artifact '<name>'` | Check the name. A name matches exactly: `tool-git` is not `tool-git-validate` |
+| `lists <scope>/<name> at <versions>` | Name one of the listed versions, or leave the version out |
+| `has no payload of it for <platform>; it publishes …` | Build it on this host with `mur build` and install the file, or ask the publisher to release that platform's asset |
+| `no version of <scope>/<name> in <source> fits this mur; the newest is …` | The reference named no version and no version [fits](installing-artifacts.md#version-selection); name one to install it without the check |
+| `the index of <source> lists it as <file> on release <tag>, and …` | The index and the releases disagree; the publisher regenerates the index |
+
+A `local/` artifact missing from the store is refused with the same code; no source serves the
+`local` scope.
+
 ### E-REG-002 — an artifact's bytes or name do not match { #e-reg-002 }
 
 Installed bytes that do not hash to the sha256 [`murmur.lock`](workdir.md#lockfile-murmurlock)
@@ -1853,6 +1912,19 @@ records for them are refused:
 ```text
 error[E-REG-002]: artifact integrity check failed for ana/tool-x@1.0.0
   hint: artifact on disk does not match murmur.lock — re-publish or delete the lock
+```
+
+A payload fetched from a source is checked against the source's index before anything is stored.
+A digest or a packed `version:` other than the index lists is refused:
+
+```text
+error[E-REG-002]: tool-git-1.0.0.mur.zip from github:ana/artifacts has sha256 bbe05ded0b5b42985748292a0d20b482c73d5e7f346a275c80f0d45b4386a038, and its index lists sha256 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+  hint: the payload is not the one the index describes, so nothing was stored; its publisher regenerates the index, or the download was altered on the way
+```
+
+```text
+error[E-REG-002]: tool-git-1.0.0.mur.zip from github:ana/artifacts packs version '1.0.1', and its index lists it as ana/tool-git@1.0.0
+  hint: the asset was built before its version was set, so nothing was stored; its publisher rebuilds it and regenerates the index
 ```
 
 An artifact is filed under the bare name its own `murmur.yaml` declares — see
@@ -1866,19 +1938,18 @@ error[E-REG-002]: artifact ana/tool-x@1.0.0 declares name 'tool-y' in its murmur
 
 ### E-REG-006 — a source did not answer the lookup { #e-reg-006 }
 
-`mur install`, `mur install --all-platforms` and `mur deploy run` look an artifact up in each
-source of the [source chain](installing-artifacts.md#multiple-sources-and-fallthrough). When no
-source produces it and at least one source failed to answer, the install fails with `E-REG-006`
-rather than [`E-REG-001`](cli.md#mur-install): one source may publish the artifact. Each source
-gets one line with what it returned:
+`mur install`, `mur install --all-platforms` and `mur deploy run` ask the
+[source of the artifact's scope](installing-artifacts.md#sources-and-scopes). When that source fails
+to answer a request, the install fails with `E-REG-006` rather than
+[`E-REG-001`](#e-reg-001): the source may publish the artifact. The message gives what the source
+returned:
 
 ```text
-error[E-REG-006]: could not look up 'driver-anthropic': GitHub rate-limited the lookup, so whether a source publishes the artifact is not known
-  github:murmur-nexus/default-artifacts — rate limited by GitHub (HTTP 403, x-ratelimit-remaining: 0): API rate limit exceeded for 203.0.113.7. — resets in about 41 minutes
-  hint: set GITHUB_TOKEN to any GitHub token, for example `export GITHUB_TOKEN=$(gh auth token)`, or point the source's `token:` in config.yaml at a variable you already export, such as `token: ${GH_TOKEN}` — GitHub allows 60 unauthenticated API requests an hour and each artifact lookup can spend four; see https://docs.murmur.nexus/reference/installing-artifacts/
+error[E-REG-006]: could not look up murmur/driver-anthropic@1.0.0: github:murmur-nexus/default-artifacts did not answer — rate limited by GitHub (HTTP 403, x-ratelimit-remaining: 0): API rate limit exceeded for 203.0.113.7. — resets in about 41 minutes
+  hint: set GITHUB_TOKEN to any GitHub token, for example `export GITHUB_TOKEN=$(gh auth token)`, or point the source's `token:` in config.yaml at a variable you already export, such as `token: ${GH_TOKEN}` — GitHub allows 60 unauthenticated API requests an hour and the first artifact of a scope can spend five; see https://docs.murmur.nexus/reference/installing-artifacts/
 ```
 
-The parenthesis on a `rate limited` line names what identified the rate limit:
+The parenthesis after `rate limited` names what identified the rate limit:
 
 | Shown | Identified by |
 |---|---|
@@ -1889,13 +1960,12 @@ The parenthesis on a `rate limited` line names what identified the rate limit:
 
 An explicit `mur install github:<owner>/<repo>@<tag>` reports a rate limit the same way.
 
-| Source line | Meaning | Fix |
+| After `did not answer —` | Meaning | Fix |
 |---|---|---|
 | `rate limited by GitHub`, requests sent without a token | The anonymous limit for this IP address is spent | Export `GITHUB_TOKEN`, or set `token:` on the source — see [Rate limits](installing-artifacts.md#rate-limits) |
-| `rate limited by GitHub`, requests sent with a token | The token's own limit is spent | Retry after the reset the line shows |
+| `rate limited by GitHub`, requests sent with a token | The token's own limit is spent | Retry after the reset the message shows |
 | `HTTP 401` or `HTTP 403` without `rate limited` | GitHub refused the token — for example, an organization's SAML enforcement, or a revoked token | Authorize or replace the token |
 | `HTTP 5xx`, `request failed: …` | GitHub or the network did not answer | Retry |
-| `invalid github repo …`, ``missing `repo` …`` | The source entry is misconfigured | Fix the entry in the [`registry:` section](config.md#registry-section) |
 
 ### E-REG-007 — a command-line artifact name is not `<scope>/<name>` { #e-reg-007 }
 
@@ -1922,6 +1992,59 @@ refused:
 error[E-REG-007]: github:local/repo cannot be installed: 'local' is a reserved scope
   hint: 'local' names artifacts installed from a .mur.zip file and 'murmur' names those from murmur-nexus/default-artifacts; no GitHub owner can claim either
 ```
+
+### E-REG-008 — no source serves the scope { #e-reg-008 }
+
+Each scope has one [source](installing-artifacts.md#sources-and-scopes). `murmur` is built in; any
+other scope needs a `registry.sources` entry naming a repository its owner publishes from. A scope
+with none is refused before any request:
+
+```text
+error[E-REG-008]: no source serves the 'ana' scope, so ana/tool-x@1.0.0 cannot be looked up
+  hint: add the GitHub repository 'ana' publishes from to ~/.murmur/config.yaml or the project's .murmur/config.yaml:
+    registry:
+      sources:
+        - repo: ana/<repository>
+```
+
+### E-REG-009 — a source's index names another scope { #e-reg-009 }
+
+A source answers only for the scope of its owner, so the `scope` of its
+[index](artifact-index.md) must be that scope. An index naming another one is refused, and nothing
+is downloaded beyond it:
+
+```text
+error[E-REG-009]: github:ana/claims-bob publishes an index for scope 'bob', and it serves scope 'ana'
+  hint: a source answers only for the scope of its owner, so nothing was installed; its publisher regenerates the index with `mur index <dir> --repo ana/claims-bob --release <tag>`
+```
+
+Only `murmur-nexus/default-artifacts` may publish an index for `murmur`:
+
+```text
+error[E-REG-009]: github:murmur-nexus/other publishes an index for scope 'murmur', which only murmur-nexus/default-artifacts serves; this source serves scope 'murmur-nexus'
+```
+
+### E-REG-010 — a scope's owner has changed { #e-reg-010 }
+
+A scope is tied to the numeric id of the GitHub account that owns it — see
+[Owner identity](installing-artifacts.md#owner-identity). An install whose source answers with
+another id than the one recorded for the scope is refused before anything is downloaded, written
+or pinned:
+
+```text
+error[E-REG-010]: the owner of scope 'ana' has changed: github:ana/artifacts is now owned by GitHub account id 2222, and murmur.lock records owner id 1111 (entry ana/tool-git)
+  hint: the GitHub account that owned the scope was renamed and its name registered again by someone else, or the repository changed hands; if you trust the new owner, delete the 'ana' entries from murmur.lock and install again
+```
+
+| Recorded in | Message |
+|---|---|
+| `murmur.lock` | `… murmur.lock records owner id <id> (entry <name>)` |
+| The `.meta.json` of a payload the global store serves to a project install | `<name>@<version> in the global store was installed from GitHub account id <id>, and murmur.lock records owner id …` |
+| `mur` itself, for `murmur` | `scope 'murmur' is owned by GitHub account id 190196424, the owner of murmur-nexus/default-artifacts, and github:murmur-nexus/default-artifacts answered with owner id <id>` |
+
+To trust the new owner, delete the scope's entries from `murmur.lock` and install again. The
+`murmur` scope's id cannot be changed: a different one means the request did not reach GitHub's own
+`murmur-nexus/default-artifacts`, for example through `MUR_GITHUB_API_BASE`.
 
 ---
 

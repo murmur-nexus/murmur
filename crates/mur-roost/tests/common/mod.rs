@@ -84,6 +84,7 @@ pub fn publish_capsule(registry_root: &Path, name: &str, version: &str, body: &s
                 description: None,
                 tags: Vec::new(),
                 wit_contracts: None,
+                owner_id: None,
             },
             &cursor.into_inner(),
         )

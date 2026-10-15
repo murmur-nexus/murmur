@@ -1,9 +1,9 @@
-//! Which remote source a `scope/name@version` install falls back to when the local store misses.
+//! The built-in source of the `murmur` scope, `murmur-nexus/default-artifacts`.
 //!
-//! With no config file at all, every form of `mur install` resolves against the built-in
-//! `official` source, `murmur-nexus/default-artifacts`, without writing a config file. A config
-//! file with `registry.sources: []` names no source, so the same miss fails with `E-REG-001`
-//! and opens no connection.
+//! With no config file at all, every form of `mur install` resolves a `murmur/` artifact against
+//! it without writing a config file. A config file with `registry.sources: []` still has it: the
+//! empty list means no third-party scope has a source, so a miss in such a scope fails with
+//! `E-REG-008` and opens no connection.
 //!
 //! The GitHub API is a loopback stub reached through `MUR_GITHUB_API_BASE`.
 
@@ -13,7 +13,7 @@ mod common;
 use std::{fs, io::ErrorKind, net::TcpListener, path::Path, time::Duration};
 
 use assert_cmd::Command;
-use common::github_release::{wasm_tool_zip, MockRelease};
+use common::github_release::{publish_dir, wasm_tool_zip, MockGitHub};
 use murmur_artifact::{read_lockfile, sha256_hex};
 use predicates::prelude::*;
 use tempfile::TempDir;
@@ -23,7 +23,9 @@ const NAME: &str = "default-source-tool";
 /// The full name it installs as: the default source serves the `murmur` scope.
 const FULL_NAME: &str = "murmur/default-source-tool";
 const VERSION: &str = "0.3.0";
-const ABSENT: &str = "murmur/absent-artifact@1.0.0";
+const ABSENT: &str = "ana/absent-artifact@1.0.0";
+const DEFAULT_REPO: &str = "murmur-nexus/default-artifacts";
+const MURMUR_OWNER_ID: u64 = 190_196_424;
 
 /// `mur` under the scratch `home`, run from `cwd`, with no GitHub token in reach.
 fn mur(home: &TempDir, cwd: &Path, api_base: &str) -> Command {
@@ -51,18 +53,22 @@ fn asset_name() -> String {
     format!("{NAME}-{VERSION}.mur.zip")
 }
 
-/// A release publishing `NAME@VERSION` as its only asset, built under `staging`.
-fn published_release(staging: &Path) -> MockRelease {
-    let bytes = fs::read(wasm_tool_zip(staging, NAME, VERSION)).unwrap();
-    MockRelease::start(&format!("v{VERSION}"), vec![(asset_name(), bytes)])
+/// The default source publishing `NAME@VERSION` and its index, built under `staging`.
+fn published_release(staging: &Path) -> MockGitHub {
+    wasm_tool_zip(staging, NAME, VERSION);
+    let stub = MockGitHub::start();
+    stub.repository(DEFAULT_REPO, MURMUR_OWNER_ID);
+    publish_dir(&stub, DEFAULT_REPO, &format!("v{VERSION}"), staging);
+    stub
 }
 
-fn assert_asked_default_artifacts(release: &MockRelease) {
-    let paths = release.paths();
+fn assert_asked_default_artifacts(stub: &MockGitHub) {
+    let paths = stub.paths();
     assert!(
-        paths
-            .iter()
-            .any(|path| path.contains("/repos/murmur-nexus/default-artifacts/")),
+        !paths.is_empty()
+            && paths
+                .iter()
+                .all(|path| path.starts_with("/repos/murmur-nexus/default-artifacts")),
         "the lookup went to the built-in source; requests: {paths:?}"
     );
 }
@@ -97,17 +103,17 @@ fn a_global_install_with_no_config_file_uses_the_built_in_source() {
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
     let staging = tempfile::tempdir().unwrap();
-    let release = published_release(staging.path());
+    let stub = published_release(staging.path());
 
-    mur(&home, cwd.path(), &release.api_base)
+    mur(&home, cwd.path(), &stub.api_base)
         .args(["install", "-g", &format!("{FULL_NAME}@{VERSION}")])
         .assert()
         .success()
         .stdout(predicate::str::contains(format!(
-            "Installed {FULL_NAME}@{VERSION}"
+            "Installed {FULL_NAME}@{VERSION} from github:{DEFAULT_REPO}"
         )));
 
-    assert_asked_default_artifacts(&release);
+    assert_asked_default_artifacts(&stub);
     assert!(home
         .path()
         .join(format!(
@@ -122,16 +128,16 @@ fn a_manifest_install_with_no_config_file_uses_the_built_in_source() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let staging = tempfile::tempdir().unwrap();
-    let release = published_release(staging.path());
+    let stub = published_release(staging.path());
     let sha256 = sha256_hex(&fs::read(staging.path().join(asset_name())).unwrap());
     write_project(project.path(), FULL_NAME, VERSION);
 
-    mur(&home, project.path(), &release.api_base)
+    mur(&home, project.path(), &stub.api_base)
         .arg("install")
         .assert()
         .success();
 
-    assert_asked_default_artifacts(&release);
+    assert_asked_default_artifacts(&stub);
     assert!(project
         .path()
         .join(format!(
@@ -142,11 +148,27 @@ fn a_manifest_install_with_no_config_file_uses_the_built_in_source() {
     let entry = lock.artifact_for(FULL_NAME).unwrap();
     assert_eq!(entry.resolved_version, VERSION);
     assert_eq!(entry.sha256.any.as_deref(), Some(sha256.as_str()));
+    assert_eq!(entry.owner_id, Some(MURMUR_OWNER_ID));
     assert_no_config_written(&home);
 }
 
 #[test]
-fn a_global_install_with_an_empty_source_list_fails_without_a_lookup() {
+fn an_empty_source_list_still_serves_the_murmur_scope() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    let stub = published_release(staging.path());
+    common::write_no_source_config(home.path());
+
+    mur(&home, cwd.path(), &stub.api_base)
+        .args(["install", "-g", &format!("{FULL_NAME}@{VERSION}")])
+        .assert()
+        .success();
+    assert_asked_default_artifacts(&stub);
+}
+
+#[test]
+fn a_global_install_in_an_unserved_scope_fails_without_a_lookup() {
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
     common::write_no_source_config(home.path());
@@ -156,20 +178,18 @@ fn a_global_install_with_an_empty_source_list_fails_without_a_lookup() {
         .args(["install", "-g", ABSENT])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("error[E-REG-001]"))
+        .stderr(predicate::str::contains("error[E-REG-008]"))
         .stderr(predicate::str::contains(format!(
-            "artifact {ABSENT} not found in registry"
+            "no source serves the 'ana' scope, so {ABSENT} cannot be looked up"
         )))
-        .stderr(predicate::str::contains(
-            "hint: configure a registry.sources entry",
-        ))
+        .stderr(predicate::str::contains("- repo: ana/<repository>"))
         .stderr(predicate::str::contains("E-REG-006").not());
 
     assert!(!was_connected(&listener), "no source was asked");
 }
 
 #[test]
-fn a_manifest_install_with_an_empty_source_list_fails_without_a_lookup() {
+fn a_manifest_install_in_an_unserved_scope_fails_without_a_lookup() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     common::write_no_source_config(home.path());
@@ -187,9 +207,9 @@ fn a_manifest_install_with_an_empty_source_list_fails_without_a_lookup() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(printed.contains("error[E-REG-001]"), "{printed}");
+    assert!(printed.contains("error[E-REG-008]"), "{printed}");
     assert!(
-        printed.contains(&format!("artifact {ABSENT} not found in registry")),
+        printed.contains(&format!("{ABSENT} cannot be looked up")),
         "{printed}"
     );
     assert!(!printed.contains("E-REG-006"), "{printed}");

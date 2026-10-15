@@ -1,7 +1,7 @@
 //! What an install records about the platform a payload is for, end to end.
 //!
-//! The source-chain half runs against a mock GitHub API (`MUR_GITHUB_API_BASE`, the same
-//! mechanism the unit tests in `src/source/mod.rs` use); the store half calls `mur publish` /
+//! The source half runs against a mock GitHub API (`MUR_GITHUB_API_BASE`) whose releases carry an
+//! index `mur index` wrote; the store half calls `mur publish` /
 //! `mur install` against a temporary `HOME`. Both halves run on one host: a foreign platform is
 //! whichever member of `SUPPORTED_PLATFORMS` this host is not, never a second machine.
 
@@ -14,7 +14,7 @@ use std::{
 };
 
 use assert_cmd::Command;
-use common::github_release::{wasm_tool_zip, MockRelease};
+use common::github_release::{publish_dir, release_assets, wasm_tool_zip, MockGitHub};
 use murmur_artifact::{
     current_platform, read_lockfile, sha256_hex, write_lockfile_atomic, ArtifactName,
     LocalRegistry, LockOrigin, LockedArtifact, LockedSha256, MurmurLock, PlatformMatch, Registry,
@@ -25,8 +25,8 @@ use tempfile::TempDir;
 
 /// The bare name: the artifact's packed `name:` and the stem of every asset and store file.
 const NAME: &str = "nativetool";
-/// The full name a source-chain install files it under: the scope of the `acme/artifacts`
-/// source the tests configure.
+/// The full name a source install files it under: the scope of the `acme/artifacts` source the
+/// tests configure.
 const SOURCED_NAME: &str = "acme/nativetool";
 /// The full name it is filed under when installed from its `.mur.zip` file.
 const LOCAL_NAME: &str = "local/nativetool";
@@ -67,9 +67,17 @@ fn write_registry_source_config(home: &Path) {
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(
         config_dir.join("config.yaml"),
-        "registry:\n  default: official\n  sources:\n    - name: official\n      type: github\n      repo: acme/artifacts\n",
+        "registry:\n  sources:\n    - repo: acme/artifacts\n",
     )
     .unwrap();
+}
+
+/// `acme/artifacts` publishing every `.mur.zip` in `dir` as release `v<VERSION>`, with its index.
+fn acme_release(dir: &Path) -> MockGitHub {
+    let stub = MockGitHub::start();
+    stub.repository("acme/artifacts", 4242);
+    publish_dir(&stub, "acme/artifacts", &format!("v{VERSION}"), dir);
+    stub
 }
 
 fn mur(home: &TempDir) -> Command {
@@ -98,19 +106,7 @@ fn all_platforms_install_files_each_platform_beside_the_other() {
     );
     let linux_bytes = fs::read(&linux).unwrap();
     let darwin_bytes = fs::read(&darwin).unwrap();
-    let release = MockRelease::start(
-        &format!("v{VERSION}"),
-        vec![
-            (
-                format!("{NAME}-{VERSION}-linux-x86_64.mur.zip"),
-                linux_bytes.clone(),
-            ),
-            (
-                format!("{NAME}-{VERSION}-darwin-aarch64.mur.zip"),
-                darwin_bytes.clone(),
-            ),
-        ],
-    );
+    let release = acme_release(staging.path());
 
     mur(&home)
         .env("MUR_GITHUB_API_BASE", &release.api_base)
@@ -187,7 +183,11 @@ fn a_github_release_files_each_platform_asset_under_the_owners_scope() {
     let linux = fs::read(native_zip(staging.path(), &linux_name, "linux")).unwrap();
     let darwin = fs::read(native_zip(staging.path(), &darwin_name, "darwin")).unwrap();
     let wasm = fs::read(wasm_tool_zip(staging.path(), "wasmtool", VERSION)).unwrap();
-    let release = MockRelease::start_tagged(
+    // An explicit release needs no index: it takes every `.mur.zip` the release lists.
+    let release = MockGitHub::start();
+    release.repository("Acme/artifacts", 4242);
+    release.release(
+        "Acme/artifacts",
         &format!("v{VERSION}"),
         vec![
             (linux_name.clone(), linux),
@@ -250,10 +250,7 @@ fn a_wasm_artifact_installs_untagged_and_resolves_for_any_platform() {
 
     let artifact = wasm_tool_zip(staging.path(), "wasmtool", VERSION);
     let bytes = fs::read(&artifact).unwrap();
-    let release = MockRelease::start(
-        &format!("v{VERSION}"),
-        vec![(format!("wasmtool-{VERSION}.mur.zip"), bytes.clone())],
-    );
+    let release = acme_release(staging.path());
 
     mur(&home)
         .env("MUR_GITHUB_API_BASE", &release.api_base)
@@ -309,18 +306,13 @@ fn a_release_without_this_platforms_asset_fails_naming_the_platform() {
     write_registry_source_config(home.path());
 
     let other = foreign_platform();
-    let artifact = native_zip(
+    native_zip(
         staging.path(),
         &format!("{NAME}-{VERSION}-{other}.mur.zip"),
         "foreign",
     );
-    let release = MockRelease::start(
-        &format!("v{VERSION}"),
-        vec![(
-            format!("{NAME}-{VERSION}-{other}.mur.zip"),
-            fs::read(&artifact).unwrap(),
-        )],
-    );
+    assert_eq!(release_assets(staging.path()).len(), 1);
+    let release = acme_release(staging.path());
 
     mur(&home)
         .env("MUR_GITHUB_API_BASE", &release.api_base)
@@ -330,7 +322,7 @@ fn a_release_without_this_platforms_asset_fails_naming_the_platform() {
         .failure()
         .stderr(predicate::str::contains(current_platform()))
         .stderr(predicate::str::contains(other))
-        .stderr(predicate::str::contains("this release publishes"));
+        .stderr(predicate::str::contains(format!("it publishes {other}")));
 
     assert!(
         !project

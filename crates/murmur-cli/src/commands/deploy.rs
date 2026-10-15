@@ -18,9 +18,8 @@ use rayon::prelude::*;
 use uuid::Uuid;
 
 use crate::{
-    config::load_mur_config,
     error::{CliError, E_IO_001, E_IO_003},
-    source::SourceChain,
+    source::Sources,
 };
 
 use super::deploy_state::{append_deployment, DeploymentRecord};
@@ -101,8 +100,8 @@ pub(crate) enum DeployCommand {
 
 // ─── artifact staging for deploy ─────────────────────────────────────────────
 
-/// An artifact that has been resolved locally or fetched from the source chain,
-/// ready to upload to the remote VM.
+/// An artifact that has been resolved locally or fetched from its scope's source, ready to upload
+/// to the remote VM.
 #[derive(Debug)]
 pub(crate) struct StagedArtifact {
     pub name: ArtifactName,
@@ -124,20 +123,21 @@ impl StagedArtifact {
     }
 }
 
-/// Resolve an artifact for `target_platform`, either from the local registry or by
-/// fetching from the source chain.
+/// Resolve an artifact for `target_platform`, either from the local registry or by fetching it
+/// from its scope's source.
 ///
 /// Step A: check local registry for a platform-specific or WASM generic file.
-/// Step B: if Step A misses, fetch from the source chain with the target platform.
-/// Fetched artifacts are cached at the platform-specific local path.
+/// Step B: if Step A misses, resolve it through the scope's index for the target platform, with
+/// the same checks `mur install` makes. Deploy reads no `murmur.lock`, so only the built-in
+/// `murmur` owner is checked. Fetched artifacts are cached at the platform-specific local path.
 pub(crate) fn ensure_artifact_for_deploy(
     name: &ArtifactName,
     version: &str,
     target_platform: &str,
     local_registry: &LocalRegistry,
-    chain: &crate::source::SourceChain,
+    sources: &Sources,
 ) -> Result<StagedArtifact, crate::error::CliError> {
-    use crate::error::{E_IO_003, E_REG_001};
+    use crate::error::E_REG_001;
     use murmur_artifact::{current_platform, Registry, RegistryError, RuntimeType};
 
     let platform_specific_path =
@@ -163,77 +163,68 @@ pub(crate) fn ensure_artifact_for_deploy(
         Err(RegistryError::NotFound { .. }) => {}
         Err(e) => return Err(crate::error::CliError::from(e)),
     }
-    // No source serves the `local` scope, so a miss is final and nothing is contacted.
-    if name.is_local() {
-        return Err(crate::error::local_store_miss(name, Some(version)));
-    }
 
-    // Step B — fetch from source chain with explicit target platform
-    match chain.resolve_bare_for_platform(name.name(), version, target_platform) {
-        Ok(resolved) => {
-            let bytes = resolved.bytes.to_vec();
-            let sha256 = murmur_artifact::sha256_hex(&bytes);
-
-            let manifest =
-                murmur_artifact::load_manifest_from_artifact_bytes(&bytes).map_err(|e| {
-                    crate::error::CliError::new(
-                        E_IO_003,
-                        format!(
-                            "{name}@{version} ({target_platform}) is not a valid .mur.zip: {e}"
-                        ),
+    // Step B — the scope's source, for the target platform. `local/` has none, and is refused
+    // without a request.
+    let source = sources.source_for(name, Some(version))?;
+    let resolved =
+        match crate::source::resolve(&*source, name, Some(version), target_platform, None) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let error = crate::error::CliError::from(error);
+                let headline = if error.code == E_REG_001 {
+                    format!(
+                        "artifact {name}@{version} not found locally or in {}",
+                        source.label()
                     )
-                })?;
-            let runtime = manifest.registry_runtime();
-            // Cached through the registry rather than written by hand, so the cached payload
-            // carries the metadata every other resolve reads — including which platform it is
-            // for, which for a cross-platform deploy is not this host's.
-            local_registry
-                .store_installed_overwrite(
-                    murmur_artifact::ArtifactMeta {
-                        name: name.clone(),
-                        version: version.to_string(),
-                        runtime,
-                        artifact_runtime: manifest.runtime.clone(),
-                        platforms: match (
-                            runtime,
-                            murmur_artifact::split_platform_tag(target_platform),
-                        ) {
-                            (RuntimeType::Native, Some((os, arch))) => {
-                                vec![(os.to_string(), arch.to_string())]
-                            }
-                            _ => Vec::new(),
-                        },
-                        description: None,
-                        tags: Vec::new(),
-                        wit_contracts: None,
-                    },
-                    &bytes,
-                    &sha256,
-                )
-                .map_err(crate::error::CliError::from)?;
+                } else {
+                    format!("artifact {name}@{version} is not in the local store")
+                };
+                return Err(crate::error::CliError {
+                    code: error.code,
+                    message: format!("{headline}\n  {}", error.message),
+                    hint: error.hint,
+                });
+            }
+        };
 
-            Ok(StagedArtifact {
+    let runtime = resolved.manifest.registry_runtime();
+    // Cached through the registry rather than written by hand, so the cached payload carries the
+    // metadata every other resolve reads — including which platform it is for, which for a
+    // cross-platform deploy is not this host's, and the owner id of the source that served it.
+    local_registry
+        .store_installed_overwrite(
+            murmur_artifact::ArtifactMeta {
                 name: name.clone(),
                 version: version.to_string(),
-                bytes,
-                sha256,
-                platform: (runtime == RuntimeType::Native).then(|| target_platform.to_string()),
-            })
-        }
-        Err(chain_err) => {
-            let diagnosis = chain_err.diagnosis();
-            let headline = if diagnosis.code == E_REG_001 {
-                format!("artifact {name}@{version} not found locally or in any source")
-            } else {
-                format!("artifact {name}@{version} is not in the local store")
-            };
-            Err(crate::error::CliError {
-                code: diagnosis.code,
-                message: format!("{headline}\n  source chain: {}", diagnosis.message),
-                hint: diagnosis.hint,
-            })
-        }
-    }
+                runtime,
+                artifact_runtime: resolved.manifest.runtime.clone(),
+                platforms: match (
+                    runtime,
+                    murmur_artifact::split_platform_tag(target_platform),
+                ) {
+                    (RuntimeType::Native, Some((os, arch))) => {
+                        vec![(os.to_string(), arch.to_string())]
+                    }
+                    _ => Vec::new(),
+                },
+                description: None,
+                tags: Vec::new(),
+                wit_contracts: None,
+                owner_id: Some(resolved.owner_id),
+            },
+            &resolved.bytes,
+            &resolved.sha256,
+        )
+        .map_err(crate::error::CliError::from)?;
+
+    Ok(StagedArtifact {
+        name: name.clone(),
+        version: version.to_string(),
+        bytes: resolved.bytes.to_vec(),
+        sha256: resolved.sha256,
+        platform: (runtime == RuntimeType::Native).then(|| target_platform.to_string()),
+    })
 }
 
 // ─── staging cleanup guard ────────────────────────────────────────────────────
@@ -1044,8 +1035,7 @@ pub(crate) fn run_deploy(
         load_runtime_manifest(&manifest_path).map_err(super::runtime_manifest_error_to_cli)?;
     let artifact_refs = collect_deploy_artifacts(&runtime_manifest);
     let local_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
-    let mur_config = load_mur_config()?;
-    let chain = SourceChain::from_config(&mur_config);
+    let sources = Sources::load_global()?;
     let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let manifest_files = collect_manifest_files(&runtime_manifest, manifest_dir)?;
 
@@ -1223,7 +1213,7 @@ pub(crate) fn run_deploy(
         );
     }
 
-    // LocalRegistry and SourceChain are Send + Sync; rayon par_iter collects
+    // LocalRegistry and Sources are Send + Sync; rayon par_iter collects
     // results in original order — staged[i] == artifact_refs[i] == dl_spinners[i].
     let dl_raw: Vec<Result<StagedArtifact, CliError>> = artifact_refs
         .par_iter()
@@ -1241,8 +1231,13 @@ pub(crate) fn run_deploy(
                 crate::source::github::push_download_progress(pb.clone());
             }
 
-            let result =
-                ensure_artifact_for_deploy(name, version, target_platform, &local_registry, &chain);
+            let result = ensure_artifact_for_deploy(
+                name,
+                version,
+                target_platform,
+                &local_registry,
+                &sources,
+            );
 
             if !is_cached {
                 crate::source::github::pop_download_progress();
@@ -2452,8 +2447,7 @@ mod tests {
 
     #[test]
     fn parallel_resolution_returns_all_six_artifacts() {
-        use crate::config::SourceConfig;
-        use crate::source::{ArtifactSource, SourceChain, SourceError, SourceResolution};
+        use crate::source::Sources;
         use murmur_artifact::{sha256_hex, ArtifactMeta, LocalRegistry, RuntimeType};
         use std::io::Write;
         use zip::{
@@ -2473,16 +2467,6 @@ mod tests {
             zip.write_all(b"fake-wasm").unwrap();
             zip.finish().unwrap();
             cursor.into_inner()
-        }
-
-        struct NeverCalled;
-        impl ArtifactSource for NeverCalled {
-            fn name(&self) -> &str {
-                "never-called"
-            }
-            fn resolve_bare(&self, _: &str) -> Result<SourceResolution, SourceError> {
-                panic!("source chain must not be called when all artifacts are cached")
-            }
         }
 
         let dir = tempdir().unwrap();
@@ -2512,6 +2496,7 @@ mod tests {
                         description: None,
                         tags: Vec::new(),
                         wit_contracts: None,
+                        owner_id: None,
                     },
                     &bytes,
                     &sha256,
@@ -2519,16 +2504,14 @@ mod tests {
                 .unwrap();
         }
 
-        let chain = SourceChain::from_sources_for_test(
-            vec![Box::new(NeverCalled)],
-            Vec::<SourceConfig>::new(),
-        );
+        // No source at all: every artifact must come from the store.
+        let sources = Sources::from_sources(Vec::new());
 
         let results: Vec<Result<StagedArtifact, CliError>> = pairs
             .par_iter()
             .map(|(name, version)| {
                 let name = ArtifactName::parse(name).unwrap();
-                ensure_artifact_for_deploy(&name, version, "linux-x86_64", &registry, &chain)
+                ensure_artifact_for_deploy(&name, version, "linux-x86_64", &registry, &sources)
             })
             .collect();
 
@@ -2722,15 +2705,8 @@ mod tests {
 
     #[cfg(feature = "beta-mur-deploy")]
     mod ensure_artifact {
-        use std::{
-            io::Write,
-            sync::{
-                atomic::{AtomicBool, Ordering},
-                Arc,
-            },
-        };
+        use std::{io::Write, sync::Arc};
 
-        use bytes::Bytes;
         use murmur_artifact::{current_platform, ArtifactMeta, LocalRegistry, RuntimeType};
         use tempfile::tempdir;
         use zip::{
@@ -2738,10 +2714,7 @@ mod tests {
             CompressionMethod, ZipWriter,
         };
 
-        use crate::{
-            config::SourceConfig,
-            source::{ArtifactSource, SourceChain, SourceError, SourceResolution},
-        };
+        use crate::source::{memory::MemorySource, ArtifactSource, Sources};
 
         use super::super::ensure_artifact_for_deploy;
         use murmur_artifact::{sha256_hex, ArtifactName};
@@ -2788,10 +2761,10 @@ mod tests {
             cursor.into_inner()
         }
 
-        /// A chain with no sources: every fetch misses without touching the network, so a test
-        /// can tell "resolved locally" from "fell through to the fetch step" unambiguously.
-        fn unreachable_chain() -> SourceChain {
-            SourceChain::from_sources_for_test(Vec::new(), Vec::<SourceConfig>::new())
+        /// No source for any scope: a fetch is refused without a request, so a test can tell
+        /// "resolved locally" from "fell through to the fetch step" unambiguously.
+        fn no_sources() -> Sources {
+            Sources::from_sources(Vec::new())
         }
 
         fn store_wasm(registry: &LocalRegistry, name: &ArtifactName, version: &str, bytes: &[u8]) {
@@ -2807,6 +2780,7 @@ mod tests {
                         description: None,
                         tags: Vec::new(),
                         wit_contracts: None,
+                        owner_id: None,
                     },
                     bytes,
                     &sha256,
@@ -2871,50 +2845,14 @@ mod tests {
             std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
         }
 
-        struct MockSource {
-            result: Result<Vec<u8>, SourceError>,
-            called: Arc<AtomicBool>,
-        }
-
-        impl ArtifactSource for MockSource {
-            fn name(&self) -> &str {
-                "mock"
-            }
-
-            fn resolve_bare(&self, _name: &str) -> Result<SourceResolution, SourceError> {
-                self.called.store(true, Ordering::SeqCst);
-                self.result.clone().map(|bytes| SourceResolution {
-                    bytes: Bytes::from(bytes),
-                    resolved_version: "0.0.0".to_string(),
-                    platform: None,
-                })
-            }
-
-            fn resolve_bare_with_version_for_platform(
-                &self,
-                _name: &str,
-                _version: &str,
-                platform: &str,
-            ) -> Result<SourceResolution, SourceError> {
-                self.called.store(true, Ordering::SeqCst);
-                self.result.clone().map(|bytes| SourceResolution {
-                    bytes: Bytes::from(bytes),
-                    resolved_version: "0.0.0".to_string(),
-                    platform: Some(platform.to_string()),
-                })
-            }
-        }
-
-        fn mock_chain(result: Result<Vec<u8>, SourceError>) -> (SourceChain, Arc<AtomicBool>) {
-            let called = Arc::new(AtomicBool::new(false));
-            let chain = SourceChain::from_sources_for_test(
-                vec![Box::new(MockSource {
-                    result,
-                    called: called.clone(),
-                })],
-                Vec::<SourceConfig>::new(),
-            );
-            (chain, called)
+        /// The `ana` scope's source, `ana/artifacts`, holding what `publish` puts on release
+        /// `v1`. The returned handle shows what was fetched.
+        fn ana_sources(publish: impl FnOnce(&mut MemorySource)) -> (Sources, Arc<MemorySource>) {
+            let mut source = MemorySource::new("ana/artifacts", "ana", 1111, "v1");
+            publish(&mut source);
+            let source = Arc::new(source);
+            let shared: Arc<dyn ArtifactSource> = source.clone();
+            (Sources::from_sources(vec![shared]), source)
         }
 
         #[test]
@@ -2924,12 +2862,10 @@ mod tests {
             let bytes = make_zip("my-tool", "1.0.0");
             store_wasm(&registry, &tool(), "1.0.0", &bytes);
 
-            let (chain, called) = mock_chain(Err(SourceError::NotFound(
-                "should not be called".to_string(),
-            )));
+            let (sources, source) = ana_sources(|_| {});
 
             let staged =
-                ensure_artifact_for_deploy(&tool(), "1.0.0", "linux-x86_64", &registry, &chain)
+                ensure_artifact_for_deploy(&tool(), "1.0.0", "linux-x86_64", &registry, &sources)
                     .unwrap();
 
             assert_eq!(staged.name, tool());
@@ -2937,8 +2873,8 @@ mod tests {
             assert_eq!(staged.version, "1.0.0");
             assert_eq!(staged.bytes, bytes);
             assert!(
-                !called.load(Ordering::SeqCst),
-                "source chain must not be called for local WASM"
+                source.fetched().is_empty(),
+                "the source must not be asked for a local WASM payload"
             );
         }
 
@@ -2948,17 +2884,22 @@ mod tests {
             let registry = LocalRegistry::new(dir.path());
             let bytes = make_zip("my-tool", "1.0.0");
 
-            let (chain, called) = mock_chain(Ok(bytes.clone()));
+            let (sources, source) = ana_sources(|source| {
+                source.publish("v1", "my-tool", "1.0.0", None, &[], bytes.clone());
+            });
 
             let staged =
-                ensure_artifact_for_deploy(&tool(), "1.0.0", "linux-x86_64", &registry, &chain)
+                ensure_artifact_for_deploy(&tool(), "1.0.0", "linux-x86_64", &registry, &sources)
                     .unwrap();
 
             assert_eq!(staged.bytes, bytes);
-            assert!(
-                called.load(Ordering::SeqCst),
-                "source chain must be called when artifact is missing"
+            assert_eq!(
+                source.fetched(),
+                [("v1".to_string(), "my-tool-1.0.0.mur.zip".to_string())]
             );
+            let meta = std::fs::read_to_string(registry.metadata_path_for(&tool(), "1.0.0", None))
+                .unwrap();
+            assert!(meta.contains("\"owner_id\": 1111"), "{meta}");
         }
 
         #[test]
@@ -2976,17 +2917,39 @@ mod tests {
             );
 
             let linux_bytes = make_native_zip("my-tool", "1.0.0", b"linux-binary");
-            let (chain, called) = mock_chain(Ok(linux_bytes.clone()));
+            let (sources, source) = ana_sources(|source| {
+                source
+                    .publish(
+                        "v1",
+                        "my-tool",
+                        "1.0.0",
+                        Some("darwin-aarch64"),
+                        &[],
+                        darwin_bytes.clone(),
+                    )
+                    .publish(
+                        "v1",
+                        "my-tool",
+                        "1.0.0",
+                        Some("linux-x86_64"),
+                        &[],
+                        linux_bytes.clone(),
+                    );
+            });
 
             let staged =
-                ensure_artifact_for_deploy(&tool(), "1.0.0", "linux-x86_64", &registry, &chain)
+                ensure_artifact_for_deploy(&tool(), "1.0.0", "linux-x86_64", &registry, &sources)
                     .unwrap();
 
             assert_eq!(staged.bytes, linux_bytes);
             assert_eq!(staged.platform.as_deref(), Some("linux-x86_64"));
-            assert!(
-                called.load(Ordering::SeqCst),
-                "chain must be called to fetch the linux variant"
+            assert_eq!(
+                source.fetched(),
+                [(
+                    "v1".to_string(),
+                    "my-tool-1.0.0-linux-x86_64.mur.zip".to_string()
+                )],
+                "the target platform's payload is fetched by its exact file name"
             );
 
             let cached = registry.artifact_path_for_platform(&tool(), "1.0.0", "linux-x86_64");
@@ -3001,18 +2964,16 @@ mod tests {
             let bytes = make_native_zip("my-tool", "1.0.0", b"native-binary");
             store_native_at_generic_path(&registry, &tool(), "1.0.0", &bytes);
 
-            let (chain, called) = mock_chain(Err(SourceError::NotFound(
-                "should not be called".to_string(),
-            )));
+            let (sources, source) = ana_sources(|_| {});
 
             let target = current_platform();
             let staged =
-                ensure_artifact_for_deploy(&tool(), "1.0.0", target, &registry, &chain).unwrap();
+                ensure_artifact_for_deploy(&tool(), "1.0.0", target, &registry, &sources).unwrap();
 
             assert_eq!(staged.bytes, bytes);
             assert!(
-                !called.load(Ordering::SeqCst),
-                "chain must not be called for same-platform native"
+                source.fetched().is_empty(),
+                "the source must not be asked for a same-platform native payload"
             );
         }
 
@@ -3021,16 +2982,18 @@ mod tests {
             let dir = tempdir().unwrap();
             let registry = LocalRegistry::new(dir.path());
 
-            let (chain, _) = mock_chain(Err(SourceError::NotFound("404".to_string())));
+            let (sources, _) = ana_sources(|_| {});
 
             let err = ensure_artifact_for_deploy(
                 &ArtifactName::parse("ana/missing-tool").unwrap(),
                 "9.9.9",
                 "linux-x86_64",
                 &registry,
-                &chain,
+                &sources,
             )
             .unwrap_err();
+
+            assert_eq!(err.code, crate::error::E_REG_001);
 
             assert!(
                 err.message.contains("missing-tool"),
@@ -3050,14 +3013,23 @@ mod tests {
         fn a_local_artifact_missing_from_the_store_is_refused_without_asking_a_source() {
             let dir = tempdir().unwrap();
             let registry = LocalRegistry::new(dir.path());
-            let (chain, called) = mock_chain(Ok(make_zip("my-tool", "1.0.0")));
+            let (sources, source) = ana_sources(|source| {
+                source.publish(
+                    "v1",
+                    "my-tool",
+                    "1.0.0",
+                    None,
+                    &[],
+                    make_zip("my-tool", "1.0.0"),
+                );
+            });
 
             let err = ensure_artifact_for_deploy(
                 &ArtifactName::parse("local/my-tool").unwrap(),
                 "1.0.0",
                 "linux-x86_64",
                 &registry,
-                &chain,
+                &sources,
             )
             .unwrap_err();
 
@@ -3075,7 +3047,7 @@ mod tests {
                 )
             );
             assert!(
-                !called.load(Ordering::SeqCst),
+                source.fetched().is_empty(),
                 "no source may be asked for a local/ artifact"
             );
         }
@@ -3097,14 +3069,9 @@ mod tests {
             store_native_at_platform_path(&registry, &tool(), "1.0.0", host, &host_bytes);
             store_native_at_platform_path(&registry, &tool(), "1.0.0", target, &target_bytes);
 
-            let staged = ensure_artifact_for_deploy(
-                &tool(),
-                "1.0.0",
-                target,
-                &registry,
-                &unreachable_chain(),
-            )
-            .unwrap();
+            let staged =
+                ensure_artifact_for_deploy(&tool(), "1.0.0", target, &registry, &no_sources())
+                    .unwrap();
 
             assert_eq!(staged.bytes, target_bytes);
             assert_eq!(staged.sha256, sha256_hex(&target_bytes));
@@ -3127,16 +3094,12 @@ mod tests {
             let bytes = make_native_zip("my-tool", "1.0.0", b"this-host");
             store_native_at_generic_path(&registry, &tool(), "1.0.0", &bytes);
 
-            let err = ensure_artifact_for_deploy(
-                &tool(),
-                "1.0.0",
-                target,
-                &registry,
-                &unreachable_chain(),
-            )
-            .unwrap_err();
+            let (sources, _) = ana_sources(|_| {});
+            let err = ensure_artifact_for_deploy(&tool(), "1.0.0", target, &registry, &sources)
+                .unwrap_err();
             assert!(
-                err.message.contains("not found locally or in any source"),
+                err.message
+                    .contains("not found locally or in github:ana/artifacts"),
                 "expected a fetch attempt, got: {}",
                 err.message
             );
@@ -3194,16 +3157,26 @@ mod tests {
             store_native_recorded_as_wasm(&registry, &tool(), "1.0.0", &host_bytes);
 
             let target_bytes = make_native_zip("my-tool", "1.0.0", b"the-target");
-            let (chain, called) = mock_chain(Ok(target_bytes.clone()));
+            let (sources, source) = ana_sources(|source| {
+                source.publish(
+                    "v1",
+                    "my-tool",
+                    "1.0.0",
+                    Some(target),
+                    &[],
+                    target_bytes.clone(),
+                );
+            });
 
             let staged =
-                ensure_artifact_for_deploy(&tool(), "1.0.0", target, &registry, &chain).unwrap();
+                ensure_artifact_for_deploy(&tool(), "1.0.0", target, &registry, &sources).unwrap();
 
             assert_eq!(staged.bytes, target_bytes);
             assert_ne!(staged.bytes, host_bytes);
-            assert!(
-                called.load(Ordering::SeqCst),
-                "chain must be called to fetch the target platform's binary"
+            assert_eq!(
+                source.fetched().len(),
+                1,
+                "the source must be asked for the target platform's binary"
             );
             assert!(
                 registry

@@ -392,6 +392,31 @@ impl MurmurLock {
         }
     }
 
+    /// Record `owner_id` on `name`'s entry. Returns `false`, changing nothing, when there is no
+    /// such entry.
+    pub fn set_owner_id(&mut self, name: &str, owner_id: u64) -> bool {
+        match self.artifacts.iter_mut().find(|entry| entry.name == name) {
+            Some(entry) => {
+                entry.owner_id = Some(owner_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The first entry in `scope` that records an owner id other than `owner_id`, or `None` when
+    /// every entry of the scope records `owner_id` or none at all.
+    #[must_use]
+    pub fn owner_conflict(&self, scope: &str, owner_id: u64) -> Option<&LockedArtifact> {
+        self.artifacts.iter().find(|entry| {
+            entry.owner_id.is_some_and(|recorded| recorded != owner_id)
+                && entry
+                    .name
+                    .split_once('/')
+                    .is_some_and(|(entry_scope, _)| entry_scope == scope)
+        })
+    }
+
     /// Delete `name`'s entry and return it, or `None` when there is none. Every other entry is
     /// left untouched and in its order, so the rewritten file differs by that entry alone.
     ///
@@ -1090,5 +1115,61 @@ mod tests {
             .conflict_with("0.1.0", &LockedSha256::any("wasm-hash"))
             .unwrap();
         assert!(shape_change.contains("per-platform"), "{shape_change}");
+    }
+
+    fn owned_lock() -> MurmurLock {
+        let mut lock = MurmurLock {
+            lock_version: LOCK_VERSION,
+            artifacts: Vec::new(),
+        };
+        for name in [
+            "ana/tool-git",
+            "ana/tool-git-validate",
+            "anabel/tool-x",
+            "bob/tool-y",
+        ] {
+            lock.upsert(
+                name,
+                "1.0.0",
+                LockedSha256::any("abc"),
+                LockOrigin::Operator,
+            );
+        }
+        lock
+    }
+
+    #[test]
+    fn set_owner_id_records_the_id_on_that_entry_alone() {
+        let mut lock = owned_lock();
+        assert!(lock.set_owner_id("ana/tool-git", 1111));
+        assert!(!lock.set_owner_id("ana/absent", 1111));
+        assert_eq!(
+            lock.artifact_for("ana/tool-git").unwrap().owner_id,
+            Some(1111)
+        );
+        assert_eq!(
+            lock.artifact_for("ana/tool-git-validate").unwrap().owner_id,
+            None
+        );
+    }
+
+    #[test]
+    fn owner_conflict_names_an_entry_of_the_scope_recording_another_id() {
+        let mut lock = owned_lock();
+        assert!(
+            lock.owner_conflict("ana", 2222).is_none(),
+            "no id recorded yet"
+        );
+        lock.set_owner_id("ana/tool-git-validate", 1111);
+        lock.set_owner_id("anabel/tool-x", 2222);
+        lock.set_owner_id("bob/tool-y", 3333);
+
+        assert!(lock.owner_conflict("ana", 1111).is_none());
+        let conflict = lock.owner_conflict("ana", 2222).unwrap();
+        assert_eq!(conflict.name, "ana/tool-git-validate");
+        assert_eq!(conflict.owner_id, Some(1111));
+        // A scope is matched whole: `anabel` is not `ana`.
+        assert!(lock.owner_conflict("anabel", 2222).is_none());
+        assert_eq!(lock.owner_conflict("bob", 1111).unwrap().name, "bob/tool-y");
     }
 }

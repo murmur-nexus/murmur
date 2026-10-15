@@ -10,7 +10,7 @@ use murmur_artifact::{
 use crate::{
     config,
     error::{CliError, E_IDX_002, E_IO_003, SCHEMA_1_INDEX_HINT},
-    stores::{installed_contracts, interface_label, served_phrase},
+    stores::installed_contracts,
 };
 
 // The default public artifact index URL. Overridable via ~/.murmur/config.yaml key
@@ -41,26 +41,7 @@ impl SearchEntry {
     /// when it is.
     fn note(&self) -> Option<String> {
         let (version, fit) = self.versions.first()?;
-        let name = &self.full_name;
-        match fit {
-            VersionFit::Fits => None,
-            VersionFit::Unserved(unserved) => {
-                let first = &unserved[0];
-                let more = if unserved.len() > 1 {
-                    format!(" (+{} more)", unserved.len() - 1)
-                } else {
-                    String::new()
-                };
-                Some(format!(
-                    "{name}: {version} needs {}, {}{more}",
-                    interface_label(first),
-                    served_phrase(first)
-                ))
-            }
-            VersionFit::NoPayloadFor(platform) => {
-                Some(format!("{name}: {version} has no payload for {platform}"))
-            }
-        }
+        crate::source::fit_note(&self.full_name, version, fit)
     }
 
     fn matches(&self, query_lower: &str) -> bool {

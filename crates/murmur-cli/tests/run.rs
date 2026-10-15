@@ -169,32 +169,24 @@ fn run_fails_with_e_run_008_when_artifact_not_installed() {
         .stderr(predicate::str::contains("mur install"));
 }
 
-/// `mur run` does not auto-pull. Commit 3f5c85b ("fix: remove offline flag") deleted the
-/// `--offline` flag and, with it, `ensure_artifacts_available_locally` — the path that used to
-/// consult the configured registry source chain and fetch missing artifacts mid-run. Installing
-/// is now exclusively `mur install`'s job; `mur run` only ever checks.
-///
-/// This test pins that removal: even with a source chain configured, a missing artifact fails
-/// fast with E-RUN-008 and no network request is made. It replaces the former
-/// `run_auto_pulls_missing_artifact_when_source_chain_configured`, which still asserted the
-/// removed behavior and hung — its mock server blocked in `accept()` forever waiting on a
-/// request `mur run` no longer makes.
+/// `mur run` does not auto-pull: installing is `mur install`'s job, and `mur run` only ever
+/// checks. Even with a source configured for the artifact's scope, a missing artifact fails fast
+/// with E-RUN-008 and no network request is made.
 ///
 /// `MUR_GITHUB_API_BASE` points at a bound-but-never-served listener: nothing accepts, so any
 /// regression that reintroduces a pull hangs on connect rather than silently passing. The
-/// GitHub source's real request/response behavior is covered by the unit tests in
-/// `crates/murmur-cli/src/source/mod.rs`, which have their own mock server.
+/// GitHub source's real request/response behavior is covered by `tests/source_resolution.rs`.
 #[test]
-fn run_does_not_auto_pull_missing_artifact_even_when_source_chain_configured() {
+fn run_does_not_auto_pull_missing_artifact_even_when_its_scope_has_a_source() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
     write_registry_source_config(home.path(), "acme/artifacts");
     // A scope a source serves: a `local/` artifact is never asked of one, so naming one would
-    // prove nothing about the source chain.
+    // prove nothing about the sources.
     const SOURCED: &str = "acme/echo-tool";
 
-    // Bound but never accepted: proves `mur run` issues no request against the source chain.
+    // Bound but never accepted: proves `mur run` issues no request against a source.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let api_base = format!("http://{}", listener.local_addr().unwrap());
 
@@ -766,9 +758,7 @@ fn write_registry_source_config(home: &Path, repo: &str) {
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(
         config_dir.join("config.yaml"),
-        format!(
-            "registry:\n  default: official\n  sources:\n    - name: official\n      type: github\n      repo: {repo}\n"
-        ),
+        format!("registry:\n  sources:\n    - repo: {repo}\n"),
     )
     .unwrap();
 }

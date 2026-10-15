@@ -82,6 +82,11 @@ pub struct ArtifactMeta {
     /// component — a native binary, a skill, a core module, or a payload that does not parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wit_contracts: Option<WitContracts>,
+    /// GitHub's numeric id of the account that owned the artifact's scope when it was fetched
+    /// from that scope's source. Absent for a payload no source served: one installed from a
+    /// file, published locally, or pulled at runtime from another store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -883,6 +888,7 @@ fn derived_meta(
         description: None,
         tags: Vec::new(),
         wit_contracts: None,
+        owner_id: None,
     }
 }
 
@@ -1067,6 +1073,7 @@ mod tests {
             description: Some("demo".to_string()),
             tags: vec!["test".to_string()],
             wit_contracts: None,
+            owner_id: None,
         }
     }
 
@@ -1246,6 +1253,7 @@ mod tests {
             description: None,
             tags: Vec::new(),
             wit_contracts: None,
+            owner_id: None,
         };
         registry.publish(meta, b"skill-zip-bytes").unwrap();
 
@@ -1401,6 +1409,7 @@ mod tests {
             description: None,
             tags: Vec::new(),
             wit_contracts: None,
+            owner_id: None,
         }
     }
 
@@ -1623,6 +1632,38 @@ mod tests {
         let index = registry.list_index().unwrap();
         assert_eq!(index.len(), 1);
         assert!(index[0].wit_contracts.is_none());
+        assert!(index[0].owner_id.is_none());
+    }
+
+    #[test]
+    fn the_owner_id_is_written_beside_the_payload_only_when_known() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let bytes = zip_with(&[
+            (
+                "murmur.yaml",
+                b"name: wasmtool\nversion: 0.1.0\nruntime: tool\n",
+            ),
+            ("tool.wasm", b"\0asm"),
+        ]);
+        let sha256 = sha256_hex(&bytes);
+        let path = registry.metadata_path_for(&n("wasmtool"), "0.1.0", None);
+
+        registry
+            .store_installed_overwrite(test_meta("wasmtool", "0.1.0"), &bytes, &sha256)
+            .unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("owner_id"));
+
+        let mut meta = test_meta("wasmtool", "0.1.0");
+        meta.owner_id = Some(1111);
+        registry
+            .store_installed_overwrite(meta, &bytes, &sha256)
+            .unwrap();
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("\"owner_id\": 1111"));
+        let resolved = registry.resolve(&n("wasmtool"), "0.1.0").unwrap();
+        assert_eq!(resolved.meta.owner_id, Some(1111));
     }
 
     // ── recorded runtime versus declared runtime ──────────────────────────────
