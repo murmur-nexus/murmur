@@ -21,6 +21,9 @@ pub struct Manifest {
     /// `runtime: skill` and to an empty list for every other role. An explicit value — including
     /// an empty list — always wins over that default.
     pub requires_files: Vec<String>,
+    /// The packed `description:` text as written, block scalars included; `None` when the
+    /// manifest has no string `description:`.
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -138,6 +141,7 @@ impl Manifest {
         let execution = optional_runtime_type(root, "execution")?;
         let requires_files = optional_string_seq(root, "requires_files")?
             .unwrap_or_else(|| default_requires_files(&runtime));
+        let description = optional_string(root, "description");
 
         Ok(Self {
             name,
@@ -146,6 +150,7 @@ impl Manifest {
             implementation,
             execution,
             requires_files,
+            description,
         })
     }
 }

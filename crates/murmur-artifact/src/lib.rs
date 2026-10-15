@@ -3,6 +3,7 @@
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 pub mod artifact;
+pub mod artifact_index;
 pub mod artifact_name;
 pub mod artifact_ref;
 pub mod build;
@@ -39,6 +40,13 @@ pub use artifact::{
     declared_runtime_from_artifact_bytes, load_manifest_from_artifact,
     load_manifest_from_artifact_bytes, load_manifest_yaml_from_artifact,
     load_manifest_yaml_from_artifact_bytes, ArtifactError, DeclaredRuntime,
+};
+pub use artifact_index::{
+    asset_file_name, compare_versions, derived_tags, description_summary, index_directory,
+    index_scope_error, merge_indexes, murmur_interfaces, release_tag_error, version_fit,
+    ArtifactIndex, ArtifactIndexError, IndexBuildError, IndexedArtifact, IndexedAsset,
+    IndexedVersion, MergeReport, VersionFit, ARTIFACT_FILE_SUFFIX, ARTIFACT_INDEX_FILE_NAME,
+    ARTIFACT_INDEX_SCHEMA_VERSION, MURMUR_INTERFACE_PREFIX,
 };
 pub use artifact_name::{
     prefix_part_error, unscoped_name_hint, ArtifactName, ArtifactNameError, LOCAL_SCOPE,

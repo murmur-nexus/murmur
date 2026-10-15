@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.murmur.nexus/reference/artifact-index.schema.json",
+  "title": "Murmur artifact index, schema 2",
+  "description": "The artifacts-index.json a Murmur artifact source publishes: every version it serves of every artifact. Written by `mur index`; read by `mur search`. Sorting and the agreement between an asset's file name and its artifact, version and platform are checked by mur and are not expressible here.",
+  "type": "object",
+  "required": ["schema_version", "scope", "artifacts"],
+  "properties": {
+    "schema_version": {
+      "description": "Always the number 2.",
+      "const": 2
+    },
+    "scope": {
+      "description": "The scope every artifact in the index is named under. Never `local`.",
+      "allOf": [
+        { "$ref": "#/$defs/part" },
+        { "not": { "const": "local" } }
+      ]
+    },
+    "artifacts": {
+      "description": "Sorted by name in byte order; names are unique.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifact" }
+    }
+  },
+  "$defs": {
+    "part": {
+      "description": "One part of an artifact name: lowercase ASCII letters, digits and `-`, not starting or ending with `-`, at most 100 characters.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["name", "runtime", "tags", "versions"],
+      "properties": {
+        "name": {
+          "description": "The bare name packed in the artifact's murmur.yaml.",
+          "$ref": "#/$defs/part"
+        },
+        "runtime": {
+          "description": "The packed `runtime:` of the newest version.",
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "description": "The first sentence of the newest version's packed `description:`.",
+          "type": "string",
+          "minLength": 1
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "versions": {
+          "description": "Newest first by semver precedence; versions are unique.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/version" }
+        }
+      }
+    },
+    "version": {
+      "type": "object",
+      "required": ["version", "release", "interfaces", "assets"],
+      "properties": {
+        "version": {
+          "description": "A semantic version; never `latest`, `stable` or `edge`.",
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+        },
+        "release": {
+          "description": "The release tag whose assets hold this version's files.",
+          "type": "string",
+          "pattern": "^[^\\s\\x00-\\x1f\\x7f]+$"
+        },
+        "built_at_level": {
+          "description": "The WIT level the version was built at, when known.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "interfaces": {
+          "description": "Every `murmur:` interface the version's component exports or imports, sorted and unique.",
+          "type": "array",
+          "items": { "type": "string", "pattern": "^murmur:" },
+          "uniqueItems": true
+        },
+        "assets": {
+          "description": "Sorted by file; one per payload file.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/asset" }
+        }
+      }
+    },
+    "asset": {
+      "type": "object",
+      "required": ["file", "sha256"],
+      "properties": {
+        "file": {
+          "description": "`<name>-<version>.mur.zip`, or `<name>-<version>-<platform>.mur.zip` when `platform` is present.",
+          "type": "string",
+          "pattern": "\\.mur\\.zip$"
+        },
+        "platform": {
+          "enum": ["darwin-aarch64", "darwin-x86_64", "linux-aarch64", "linux-x86_64"]
+        },
+        "sha256": {
+          "description": "SHA-256 of the file's bytes, as 64 lowercase hexadecimal characters.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

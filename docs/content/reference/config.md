@@ -334,8 +334,8 @@ affect them.
 
 ## Artifact index and custom registry URL
 
-`mur search` fetches a static JSON catalog, `artifacts-index.json`. The default is the copy in
-the Murmur default-artifacts repository:
+`mur search` fetches a static JSON catalog, the [artifact index](artifact-index.md)
+`artifacts-index.json`. The default is the copy in the Murmur default-artifacts repository:
 
 ```text
 https://raw.githubusercontent.com/murmur-nexus/default-artifacts/refs/heads/main/artifacts-index.json
@@ -352,36 +352,8 @@ registry:
 
 `registry.index_url` applies to every `mur search` invocation that does not pass `--index`.
 
-**`artifacts-index.json` shape:**
-
-```json
-{
-  "schema_version": "1",
-  "updated_at": "2026-06-07T00:00:00Z",
-  "artifacts": [
-    {
-      "name": "tool-git",
-      "version": "1.0.0",
-      "runtime": "tool",
-      "description": "Structured git interface for Murmur capsules.",
-      "tags": ["tool", "git"],
-      "platforms": ["darwin-aarch64", "linux-aarch64", "linux-x86_64"]
-    }
-  ]
-}
-```
-
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `schema_version` | string | yes | Must be `"1"`. Any other value fails the search with `E-IO-003` |
-| `updated_at` | string | yes | ISO 8601 UTC timestamp of the last regeneration |
-| `artifacts` | array | yes | One entry per published artifact |
-| `name` | string | yes | Artifact name, matching `name:` in its `murmur.yaml`: the bare name, without a scope |
-| `version` | string | yes | SemVer string |
-| `runtime` | string | yes | `driver`, `hook`, `tool`, or `skill` |
-| `description` | string | no | Short description from `murmur.yaml`. `mur search` matches the query against it and prints an em dash when it is absent |
-| `tags` | array[string] | no | Keyword tags matched against the query. Defaults to empty |
-| `platforms` | array[string] | no | e.g. `darwin-aarch64`. Defaults to empty; skill artifacts have none |
+The index must be a schema 2 [artifact index](artifact-index.md); `mur search` refuses any other
+with [`E-IDX-002`](diagnostics.md#e-idx-002).
 
 ---
 

@@ -11,6 +11,13 @@
 an artifact you built into the global store. `mur run` reads the stores only, so a capsule launches
 with exactly what was installed and never reaches the network for an artifact.
 
+A source can publish an [artifact index](../reference/artifact-index.md), `artifacts-index.json`,
+beside its release assets. It lists every version the source serves, with the release holding each
+one, the SHA-256 of each file, and the `murmur:` interfaces each version needs. That is how
+[`mur search`](../reference/cli.md#mur-search) shows, for each artifact, the newest version that runs
+on this `mur`. [`mur index`](../reference/cli.md#mur-index) writes the index from the release's files;
+see [Publish your own artifact source](../how-to/publish-artifact-source.md).
+
 `mur install <scope>/<name>@<version>` asks each source for the bare `<name>` and stores what it
 finds under the full name you gave. The releases `murmur-nexus/default-artifacts` publishes name
 their assets with a `murmur-` prefix, so `murmur/murmur-tool-git@0.2.0` resolves from it and

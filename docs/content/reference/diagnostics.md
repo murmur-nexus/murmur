@@ -43,6 +43,9 @@ section that explains it.
 | `E-DEPLOY-006` | The pinned `mur` release could not be fetched from GitHub | [`mur deploy run`](cli.md#mur-deploy-run) |
 | `E-EVAL-001` | Eval file parse error (malformed JSON, unknown `record_type`, missing required field); message includes `:line:` number | [`eval.jsonl` schema](observability-schemas.md#structured-evaluation-evaljsonl) |
 | `E-EVAL-002` | No eval file found for the session named on the command line | [`mur eval`](cli.md#mur-eval) |
+| `E-IDX-001` | A file in the directory given to `mur index` cannot be indexed, or the directory holds no `.mur.zip` | [E-IDX-001](#e-idx-001) |
+| `E-IDX-002` | An artifact index is not a schema 2 index this `mur` reads: schema 1, another schema, not JSON, or invalid | [E-IDX-002](#e-idx-002) |
+| `E-IDX-003` | `mur index` was not given a usable source: `--repo` or `--release` is unusable, or `--merge` names an index of another scope | [E-IDX-003](#e-idx-003) |
 | `E-IO-001` | File or directory not found | — |
 | `E-IO-002` | Permission denied on a host path (the host's own permissions, not a capsule capability) | — |
 | `E-IO-003` | General I/O error (read/write failure), including a write to standard output that failed for a reason other than its reader going away | [Piped output](cli.md#piped-output) |
@@ -1769,6 +1772,74 @@ The target's `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES` — the value in the deplo
 default — is not this machine's. The target compiled and the capsule runs under the target's value,
 so the first launch is still warm, but an artifact that extracts here may be refused there, or the
 reverse. To run under this machine's value, pass the `--env` the warning gives.
+
+---
+
+## Index errors
+
+`mur index` writes an [artifact index](artifact-index.md) and `mur search` reads one. A refused
+`mur index` writes nothing and leaves an existing output file as it was.
+
+### E-IDX-001 — a file cannot be indexed { #e-idx-001 }
+
+`mur index` refuses the whole directory when one `.mur.zip` in it cannot be indexed, naming the
+file and the reason:
+
+```text
+error[E-IDX-001]: release/tool-editor-0.7.0.mur.zip cannot be indexed: its file name does not match its packed name 'tool-editor' and version '0.6.0': expected tool-editor-0.6.0.mur.zip, or tool-editor-0.6.0-<platform>.mur.zip with <platform> one of darwin-aarch64, darwin-x86_64, linux-aarch64, linux-x86_64
+```
+
+| Reason | Fix |
+|---|---|
+| `it is not a zip archive`, `it holds no packed murmur.yaml`, `its packed murmur.yaml is invalid` | Rebuild the artifact with `mur build` |
+| `its packed name '<name>' …` | Give the artifact a valid `name:` — see [Artifact names](../concepts/registry.md#artifact-names) |
+| `its packed version '<v>' is not a semantic version`, `… is reserved` | Set `version:` to a semantic version such as `1.0.0` |
+| `its file name does not match its packed name … and version …` | Rename the file to `<name>-<version>.mur.zip`, or rebuild it |
+| `a native payload names its platform` | Name the file `<name>-<version>-<platform>.mur.zip` |
+| `a wasm payload runs on every platform`, `a static payload …` | Drop the platform from the file name |
+| `it packs runtime '<a>' …, and <file> of the same <name>@<version> packs runtime '<b>'` | Build every platform's payload of one version from the same `murmur.yaml` |
+
+A directory with no `.mur.zip` directly inside it is refused too:
+
+```text
+error[E-IDX-001]: release holds no .mur.zip file to index
+```
+
+### E-IDX-002 — not a schema 2 artifact index { #e-idx-002 }
+
+`mur search`, and `mur index --merge`, read only a schema 2 [artifact index](artifact-index.md).
+A schema 1 index, whose `schema_version` is `1` as a string or a number, is refused with a hint
+for its publisher:
+
+```text
+error[E-IDX-002]: artifact index https://raw.githubusercontent.com/ana/my-artifacts/main/artifacts-index.json is a schema 1 index
+  hint: this is a schema 1 artifact index, which this mur does not read; its publisher regenerates it with `mur index <dir> --repo <owner>/<repo> --release <tag>`
+```
+
+| Message ends with | Cause |
+|---|---|
+| `is a schema 1 index` | The index's publisher has not regenerated it with `mur index` |
+| `has schema_version <value>, and this mur reads only schema 2` | Another schema version |
+| `is not valid JSON: …` | The file is not JSON, or is truncated |
+| `is not a valid schema 2 index: <location> <reason>` | A field breaks the [format](artifact-index.md#fields); `<location>` names it, such as `artifacts[0].versions[1].assets is missing` |
+
+### E-IDX-003 — `mur index` was not given a usable source { #e-idx-003 }
+
+`--repo` must be a GitHub repository `<owner>/<repo>` whose owner is a valid scope, and
+`--release` a tag with no whitespace. The scope comes from `--repo` by the rule
+`mur install github:<owner>/<repo>@<tag>` uses, so the reserved scopes `local` and `murmur` are
+refused, except `murmur` for `murmur-nexus/default-artifacts`:
+
+```text
+error[E-IDX-003]: --repo 'murmur/tools' would index under 'murmur', a reserved scope
+  hint: 'local' names artifacts installed from a .mur.zip file and 'murmur' names those from murmur-nexus/default-artifacts; no GitHub owner can claim either
+```
+
+An index given to `--merge` must have the scope `--repo` names:
+
+```text
+error[E-IDX-003]: --merge previous.json indexes scope 'bob', and --repo ana/tools names scope 'ana'
+```
 
 ---
 

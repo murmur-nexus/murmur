@@ -14,6 +14,7 @@ pub(crate) mod deploy_state;
 pub(crate) mod destroy;
 pub(crate) mod doctor;
 pub(crate) mod eval;
+pub(crate) mod index;
 pub(crate) mod install;
 pub(crate) mod list;
 #[cfg(feature = "beta-mur-new")]
