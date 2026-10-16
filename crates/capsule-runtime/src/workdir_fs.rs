@@ -252,6 +252,24 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Makes [`WorkdirRoot::anchor_fd`] ignore `st_nlink`, as on a platform whose `fstat` does not
+    /// report a removed directory, so a test reaches [`WorkdirRoot::retry_if_removed`] alone.
+    static NLINK_UNRELIABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn nlink_unreliable() -> bool {
+    #[cfg(test)]
+    {
+        NLINK_UNRELIABLE.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// Arms [`BEFORE_RENAME`] for the next `write_file` on this thread.
 #[cfg(test)]
 pub(crate) fn before_next_rename(hook: impl FnOnce() + 'static) {
@@ -298,13 +316,15 @@ impl WorkdirRoot {
     pub fn session_beneath(&self, session_id: &str) -> Result<Self, WorkdirError> {
         let rel = format!(".murmur/{session_id}");
         let segments = self.segments(&rel, WorkdirOperation::CreateDir)?;
-        let held = self.walk(
-            &rel,
-            &segments,
-            segments.len(),
-            WorkdirOperation::CreateDir,
-            Some(DEFAULT_DIR_MODE),
-        )?;
+        let held = self.retry_if_removed(|| {
+            self.walk(
+                &rel,
+                &segments,
+                segments.len(),
+                WorkdirOperation::CreateDir,
+                Some(DEFAULT_DIR_MODE),
+            )
+        })?;
         let Some(Held::Opened(fd)) = held else {
             unreachable!("a walk that creates always reaches its last segment")
         };
@@ -398,7 +418,7 @@ impl WorkdirRoot {
         bytes: &[u8],
         mode: u32,
     ) -> Result<(), WorkdirError> {
-        self.write_file_inner(rel.as_ref(), bytes, mode, false)
+        self.retry_if_removed(|| self.write_file_inner(rel.as_ref(), bytes, mode, false))
     }
 
     fn write_file_inner(
@@ -463,7 +483,7 @@ impl WorkdirRoot {
         bytes: &[u8],
         mode: u32,
     ) -> Result<(), WorkdirError> {
-        self.write_file_inner(rel.as_ref(), bytes, mode, true)
+        self.retry_if_removed(|| self.write_file_inner(rel.as_ref(), bytes, mode, true))
     }
 
     /// Truncates and rewrites the regular file at `rel` in place, creating it with `mode` if
@@ -479,7 +499,7 @@ impl WorkdirRoot {
         let rel = rel.as_ref().to_string_lossy();
         let op = WorkdirOperation::Write;
         let flags = OFlags::WRONLY | OFlags::CREATE;
-        let mut file = self.open_regular(&rel, op, flags, mode, true)?;
+        let mut file = self.retry_if_removed(|| self.open_regular(&rel, op, flags, mode, true))?;
         file.set_len(0).map_err(|source| self.io(&rel, source))?;
         file.write_all(bytes)
             .map_err(|source| self.io(&rel, source))
@@ -493,7 +513,9 @@ impl WorkdirRoot {
     pub fn open_append(&self, rel: impl AsRef<Path>, mode: u32) -> Result<File, WorkdirError> {
         let rel = rel.as_ref().to_string_lossy();
         let flags = OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE;
-        self.open_regular(&rel, WorkdirOperation::Append, flags, mode, true)
+        self.retry_if_removed(|| {
+            self.open_regular(&rel, WorkdirOperation::Append, flags, mode, true)
+        })
     }
 
     /// The bytes of the regular file at `rel`, or `None` when it or a parent is absent.
@@ -549,7 +571,7 @@ impl WorkdirRoot {
         let rel = rel.as_ref().to_string_lossy();
         let op = WorkdirOperation::CreateDir;
         let segments = self.segments(&rel, op)?;
-        self.walk(&rel, &segments, segments.len(), op, Some(mode))
+        self.retry_if_removed(|| self.walk(&rel, &segments, segments.len(), op, Some(mode)))
             .map(|_| ())
     }
 
@@ -855,33 +877,75 @@ impl WorkdirRoot {
         }
     }
 
-    /// The anchor's descriptor. Before a call that creates, a directory found removed — `fstat`
-    /// reports no links to it — is reached again by its [`Origin`] and the new descriptor held
-    /// from then on.
+    /// The anchor's descriptor. Before a call that creates, a directory `fstat` reports removed
+    /// (no links to it) is reached again by its [`Origin`] and the new descriptor held from then
+    /// on.
     fn anchor_fd(&self, creating: bool) -> Result<Arc<OwnedFd>, WorkdirError> {
         let mut held = self.anchor.fd.lock().unwrap_or_else(|e| e.into_inner());
-        let removed = creating && rustix::fs::fstat(&**held).is_ok_and(|stat| stat.st_nlink == 0);
+        let removed = creating
+            && !nlink_unreliable()
+            && rustix::fs::fstat(&**held).is_ok_and(|stat| stat.st_nlink == 0);
         if removed {
-            let fresh = match &self.anchor.origin {
-                Origin::Path => {
-                    std::fs::create_dir_all(&self.anchor.path)
-                        .map_err(|source| self.io("", source))?;
-                    open_by_path(&self.anchor.path)?
-                }
-                Origin::Beneath { from, rel } => {
-                    let op = WorkdirOperation::CreateDir;
-                    let segments = from.segments(rel, op)?;
-                    let walked =
-                        from.walk(rel, &segments, segments.len(), op, Some(DEFAULT_DIR_MODE))?;
-                    let Some(Held::Opened(fd)) = walked else {
-                        unreachable!("a walk that creates always reaches its last segment")
-                    };
-                    fd
-                }
-            };
-            *held = Arc::new(fresh);
+            *held = Arc::new(self.reach_again()?);
         }
         Ok(Arc::clone(&held))
+    }
+
+    /// Runs a creating `call`, and runs it once more when it failed `NotFound` because the held
+    /// directory was removed, after reaching that directory again by its [`Origin`].
+    ///
+    /// `fstat` does not reveal a removed directory on every platform — Darwin keeps its link
+    /// count above zero — so [`Self::anchor_fd`]'s check alone would leave a removed root
+    /// creating into a directory that no longer exists. A directory that was moved, not removed,
+    /// stays held: writes follow it, never the name it used to have.
+    fn retry_if_removed<T>(
+        &self,
+        call: impl Fn() -> Result<T, WorkdirError>,
+    ) -> Result<T, WorkdirError> {
+        match call() {
+            Err(error) if error.is_not_found() && self.reach_again_if_removed()? => call(),
+            result => result,
+        }
+    }
+
+    /// Whether the held directory was removed, found by creating a uniquely named directory in
+    /// it and removing it again; when it was, the root holds the directory reached again.
+    fn reach_again_if_removed(&self) -> Result<bool, WorkdirError> {
+        let mut held = self.anchor.fd.lock().unwrap_or_else(|e| e.into_inner());
+        let probe = format!(".{}.probe", uuid::Uuid::now_v7().simple());
+        match rustix::fs::mkdirat(&**held, probe.as_str(), Mode::RWXU) {
+            Ok(()) => {
+                let _ = rustix::fs::unlinkat(&**held, probe.as_str(), AtFlags::REMOVEDIR);
+                Ok(false)
+            }
+            Err(Errno::NOENT) => {
+                *held = Arc::new(self.reach_again()?);
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// The anchor's directory reached again from its [`Origin`], created if missing: by its host
+    /// path for a root opened by path, and by a no-follow walk from the parent root otherwise.
+    fn reach_again(&self) -> Result<OwnedFd, WorkdirError> {
+        match &self.anchor.origin {
+            Origin::Path => {
+                std::fs::create_dir_all(&self.anchor.path).map_err(|source| self.io("", source))?;
+                open_by_path(&self.anchor.path)
+            }
+            Origin::Beneath { from, rel } => {
+                let op = WorkdirOperation::CreateDir;
+                let segments = from.segments(rel, op)?;
+                let walked = from.retry_if_removed(|| {
+                    from.walk(rel, &segments, segments.len(), op, Some(DEFAULT_DIR_MODE))
+                })?;
+                let Some(Held::Opened(fd)) = walked else {
+                    unreachable!("a walk that creates always reaches its last segment")
+                };
+                Ok(fd)
+            }
+        }
     }
 
     fn display(&self, rel: &str) -> String {
@@ -1308,35 +1372,82 @@ mod tests {
 
     #[test]
     fn a_removed_session_directory_is_walked_to_again_before_a_write() {
+        for nlink_unreliable in [false, true] {
+            NLINK_UNRELIABLE.with(|cell| cell.set(nlink_unreliable));
+            let fixture = fixture();
+            let session = fixture.root.session_beneath("ses_test").unwrap();
+            std::fs::remove_dir_all(fixture.workdir.join(".murmur")).unwrap();
+
+            session
+                .write_file("out/result.txt", b"answer", 0o644)
+                .unwrap();
+            session
+                .open_append("logs/bootstrap.log", 0o644)
+                .unwrap()
+                .write_all(b"line\n")
+                .unwrap();
+
+            assert_eq!(
+                std::fs::read(fixture.workdir.join(".murmur/ses_test/out/result.txt")).unwrap(),
+                b"answer"
+            );
+            assert!(fixture
+                .workdir
+                .join(".murmur/ses_test/logs/bootstrap.log")
+                .is_file());
+            assert!(fixture.root.take_refusals().is_empty());
+        }
+        NLINK_UNRELIABLE.with(|cell| cell.set(false));
+    }
+
+    /// A session directory moved aside, not removed, stays the one written to, with no probe
+    /// left behind in it.
+    #[test]
+    fn a_moved_session_directory_is_still_the_one_written_to() {
+        NLINK_UNRELIABLE.with(|cell| cell.set(true));
         let fixture = fixture();
         let session = fixture.root.session_beneath("ses_test").unwrap();
-        std::fs::remove_dir_all(fixture.workdir.join(".murmur")).unwrap();
+        std::fs::rename(
+            fixture.workdir.join(".murmur"),
+            fixture.workdir.join("moved"),
+        )
+        .unwrap();
 
         session
             .write_file("out/result.txt", b"answer", 0o644)
             .unwrap();
 
+        NLINK_UNRELIABLE.with(|cell| cell.set(false));
         assert_eq!(
-            std::fs::read(fixture.workdir.join(".murmur/ses_test/out/result.txt")).unwrap(),
+            std::fs::read(fixture.workdir.join("moved/ses_test/out/result.txt")).unwrap(),
             b"answer"
         );
-        assert!(fixture.root.take_refusals().is_empty());
+        assert!(!fixture.workdir.join(".murmur").exists());
+        let names: Vec<_> = std::fs::read_dir(fixture.workdir.join("moved/ses_test"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["out"]);
     }
 
     #[test]
     fn a_removed_session_directory_replaced_by_a_link_is_refused() {
-        let fixture = fixture();
-        let session = fixture.root.session_beneath("ses_test").unwrap();
-        std::fs::remove_dir_all(fixture.workdir.join(".murmur")).unwrap();
-        std::os::unix::fs::symlink(&fixture.outside, fixture.workdir.join(".murmur")).unwrap();
-        let before = fixture.outside_snapshot();
+        for nlink_unreliable in [false, true] {
+            NLINK_UNRELIABLE.with(|cell| cell.set(nlink_unreliable));
+            let fixture = fixture();
+            let session = fixture.root.session_beneath("ses_test").unwrap();
+            std::fs::remove_dir_all(fixture.workdir.join(".murmur")).unwrap();
+            std::os::unix::fs::symlink(&fixture.outside, fixture.workdir.join(".murmur")).unwrap();
+            let before = fixture.outside_snapshot();
 
-        let error = session
-            .write_file("out/result.txt", b"answer", 0o644)
-            .unwrap_err();
+            let error = session
+                .write_file("out/result.txt", b"answer", 0o644)
+                .unwrap_err();
 
-        assert_eq!(refusal_of(&error).refused_at, ".murmur");
-        assert_eq!(fixture.outside_snapshot(), before);
+            assert_eq!(refusal_of(&error).refused_at, ".murmur");
+            assert_eq!(fixture.outside_snapshot(), before);
+        }
+        NLINK_UNRELIABLE.with(|cell| cell.set(false));
     }
 
     #[test]
