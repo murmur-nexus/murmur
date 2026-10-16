@@ -70,17 +70,6 @@ pub enum WorkdirOperation {
 }
 
 impl WorkdirOperation {
-    /// The string `Serialize` emits.
-    pub fn wire_name(self) -> &'static str {
-        match self {
-            Self::Write => "write",
-            Self::Append => "append",
-            Self::Read => "read",
-            Self::CreateDir => "create_dir",
-            Self::Remove => "remove",
-        }
-    }
-
     fn verb(self) -> &'static str {
         match self {
             Self::Write => "write",
@@ -98,8 +87,8 @@ impl WorkdirOperation {
 pub enum RefusalReason {
     /// `refused_at` is a symbolic link.
     Symlink,
-    /// The append target is a regular file with more than one name, so it may also be a file
-    /// outside the workdir.
+    /// A file being appended to or rewritten in place has more than one name, so it may also be
+    /// a file outside the workdir.
     HardLink,
     /// The target is a FIFO, socket, device node or directory where a regular file belongs.
     NotARegularFile,
@@ -107,24 +96,13 @@ pub enum RefusalReason {
     InvalidComponent,
 }
 
-impl RefusalReason {
-    /// The string `Serialize` emits.
-    pub fn wire_name(self) -> &'static str {
-        match self {
-            Self::Symlink => "symlink",
-            Self::HardLink => "hard_link",
-            Self::NotARegularFile => "not_a_regular_file",
-            Self::InvalidComponent => "invalid_component",
-        }
-    }
-}
-
 /// One refused call. `path` and `refused_at` are relative to the accessible workdir.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkdirRefusal {
     /// The path the runtime meant to touch.
     pub path: String,
-    /// The component found to be a link or the wrong file type.
+    /// The component found to be a link or the wrong file type; the whole path for an invalid
+    /// component.
     pub refused_at: String,
     pub operation: WorkdirOperation,
     pub reason: RefusalReason,
@@ -156,7 +134,8 @@ pub enum WorkdirError {
     /// The call met a link or the wrong file type and did nothing. Already latched.
     #[error("{0}")]
     Refused(WorkdirRefusal),
-    /// The call failed for an ordinary I/O reason. `path` is relative to the accessible workdir.
+    /// The call failed for an ordinary I/O reason. `path` is in [`WorkdirRoot::display_path`]'s
+    /// form, or the host path when a root opened by path could not be opened.
     #[error("{path}: {source}")]
     Io {
         path: String,
@@ -166,14 +145,6 @@ pub enum WorkdirError {
 }
 
 impl WorkdirError {
-    /// The refusal, when this error is one.
-    pub fn refusal(&self) -> Option<&WorkdirRefusal> {
-        match self {
-            Self::Refused(refusal) => Some(refusal),
-            Self::Io { .. } => None,
-        }
-    }
-
     /// Whether the call failed because the path does not exist.
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound)
@@ -886,7 +857,7 @@ impl WorkdirRoot {
 
     /// The anchor's descriptor. Before a call that creates, a directory found removed — `fstat`
     /// reports no links to it — is reached again by its [`Origin`] and the new descriptor held
-    /// from then on, which is what writing beneath it by path used to do implicitly.
+    /// from then on.
     fn anchor_fd(&self, creating: bool) -> Result<Arc<OwnedFd>, WorkdirError> {
         let mut held = self.anchor.fd.lock().unwrap_or_else(|e| e.into_inner());
         let removed = creating && rustix::fs::fstat(&**held).is_ok_and(|stat| stat.st_nlink == 0);
@@ -964,6 +935,13 @@ mod tests {
 
     const SENTINEL: &[u8] = b"operator data";
 
+    fn refusal_of(error: &WorkdirError) -> &WorkdirRefusal {
+        match error {
+            WorkdirError::Refused(refusal) => refusal,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     fn fixture() -> Fixture {
         let temp = tempfile::tempdir().unwrap();
         let workdir = temp.path().join("workdir");
@@ -1006,9 +984,7 @@ mod tests {
             entries
         }
 
-        /// Plants the three links every operation is checked against, for target `name`
-        /// inside `dir` (relative): a link at the target to the sentinel, a link at the parent
-        /// to `outside/`, and a dangling link at the target to a not-yet-existing outside file.
+        /// Plants a link at `rel` to the sentinel, creating its parent directories.
         fn link_at_target(&self, rel: &str) {
             let host = self.workdir.join(rel);
             std::fs::create_dir_all(host.parent().unwrap()).unwrap();
@@ -1307,7 +1283,7 @@ mod tests {
         let error = session
             .write_file("plans/plan-1.json", b"{}", 0o644)
             .unwrap_err();
-        let refusal = error.refusal().unwrap();
+        let refusal = refusal_of(&error);
         assert_eq!(refusal.path, ".murmur/ses_test/plans/plan-1.json");
         assert_eq!(refusal.refused_at, ".murmur/ses_test/plans");
         assert_eq!(
@@ -1324,7 +1300,7 @@ mod tests {
         let fixture = fixture();
         symlink(&fixture.outside, fixture.workdir.join(".murmur")).unwrap();
         let error = fixture.root.session_beneath("ses_test").unwrap_err();
-        let refusal = error.refusal().unwrap();
+        let refusal = refusal_of(&error);
         assert_eq!(refusal.refused_at, ".murmur");
         assert_eq!(refusal.operation, WorkdirOperation::CreateDir);
         assert_eq!(std::fs::read_dir(&fixture.outside).unwrap().count(), 1);
@@ -1359,7 +1335,7 @@ mod tests {
             .write_file("out/result.txt", b"answer", 0o644)
             .unwrap_err();
 
-        assert_eq!(error.refusal().unwrap().refused_at, ".murmur");
+        assert_eq!(refusal_of(&error).refused_at, ".murmur");
         assert_eq!(fixture.outside_snapshot(), before);
     }
 
@@ -1430,7 +1406,7 @@ mod tests {
             .root
             .overwrite_in_place(".mur-etc/group", b"x", 0o644)
             .unwrap_err();
-        assert_eq!(error.refusal().unwrap().reason, RefusalReason::Symlink);
+        assert_eq!(refusal_of(&error).reason, RefusalReason::Symlink);
         assert_eq!(std::fs::read(&fixture.sentinel).unwrap(), SENTINEL);
     }
 
@@ -1460,27 +1436,24 @@ mod tests {
             serde_json::to_string(&refusal).unwrap(),
             r#"{"path":"task.md","refused_at":"task.md","operation":"create_dir","reason":"not_a_regular_file"}"#
         );
-        for op in [
-            WorkdirOperation::Write,
-            WorkdirOperation::Append,
-            WorkdirOperation::Read,
-            WorkdirOperation::CreateDir,
-            WorkdirOperation::Remove,
+        for (op, wire) in [
+            (WorkdirOperation::Write, "write"),
+            (WorkdirOperation::Append, "append"),
+            (WorkdirOperation::Read, "read"),
+            (WorkdirOperation::CreateDir, "create_dir"),
+            (WorkdirOperation::Remove, "remove"),
         ] {
-            assert_eq!(
-                serde_json::to_value(op).unwrap(),
-                serde_json::json!(op.wire_name())
-            );
+            assert_eq!(serde_json::to_value(op).unwrap(), serde_json::json!(wire));
         }
-        for reason in [
-            RefusalReason::Symlink,
-            RefusalReason::HardLink,
-            RefusalReason::NotARegularFile,
-            RefusalReason::InvalidComponent,
+        for (reason, wire) in [
+            (RefusalReason::Symlink, "symlink"),
+            (RefusalReason::HardLink, "hard_link"),
+            (RefusalReason::NotARegularFile, "not_a_regular_file"),
+            (RefusalReason::InvalidComponent, "invalid_component"),
         ] {
             assert_eq!(
                 serde_json::to_value(reason).unwrap(),
-                serde_json::json!(reason.wire_name())
+                serde_json::json!(wire)
             );
         }
     }

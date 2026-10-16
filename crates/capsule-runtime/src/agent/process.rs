@@ -567,9 +567,10 @@ impl Drop for FilesDir {
     }
 }
 
-/// Mode of a run's files directory, and of each file in it: owner-only, because a file the
-/// driver asks for can carry a credential the harness reads.
+/// Mode of a run's files directory: owner-only, because a file the driver asks for can carry a
+/// credential the harness reads.
 const FILES_DIR_MODE: u32 = 0o700;
+/// Mode of each file in it, owner-only for the same reason.
 const DRIVER_FILE_MODE: u32 = 0o600;
 
 /// Write the plan's files into the run's private directory, each readable only by this user.

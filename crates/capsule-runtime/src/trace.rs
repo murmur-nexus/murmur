@@ -1050,9 +1050,8 @@ pub(crate) const TASK_FAILED_REOPEN_BUDGET_EXHAUSTED: &str = "reopen_budget_exha
 /// reason is the error's own text.
 pub(crate) const TASK_FAILED_RUNTIME_ERROR: &str = "runtime_error";
 
-/// `task_failed.cause` for a task ended because a runtime write, read, create or removal inside
-/// the workdir met a symbolic link or the wrong file type. Always preceded by one
-/// `workdir_path_refused` line per refusal.
+/// `task_failed.cause` for a task ended because a runtime write, append, read, create or removal
+/// inside the workdir was refused. Always preceded by one `workdir_path_refused` line per refusal.
 pub(crate) const TASK_FAILED_WORKDIR_PATH_REFUSED: &str = "workdir_path_refused";
 
 /// `inference.error_code` when the provider refused the inference credential: it answered `401`
@@ -1136,8 +1135,8 @@ struct InferenceLine<'a> {
 /// and unbounded; the whole of it stays in `out/result.txt`.
 pub(crate) const MAX_TASK_FAILURE_REASON_BYTES: usize = 2_000;
 
-/// One runtime write, append, read, create or removal inside the workdir that met a symbolic link
-/// or the wrong file type and did nothing. Written whatever `trace.capture` is; parented to the
+/// One runtime write, append, read, create or removal inside the workdir that was refused and did
+/// nothing. Written whatever `trace.capture` is; parented to the
 /// task node in a task and to the session node outside one.
 #[derive(Serialize)]
 struct WorkdirPathRefusedEvent<'a> {
@@ -1151,8 +1150,8 @@ struct WorkdirPathRefusedEvent<'a> {
     /// The path the runtime meant to touch, relative to the accessible workdir.
     path: &'a str,
     operation: crate::workdir_fs::WorkdirOperation,
-    /// The component found to be a link or the wrong file type, relative to the accessible
-    /// workdir.
+    /// The component that was refused, relative to the accessible workdir; the whole path for an
+    /// invalid component.
     refused_at: &'a str,
     reason: crate::workdir_fs::RefusalReason,
 }

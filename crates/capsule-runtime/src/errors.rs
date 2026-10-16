@@ -112,7 +112,8 @@ pub enum RuntimeError {
     },
 
     /// A runtime write, append, read, create or removal inside the capsule's workdir met a
-    /// symbolic link, or the wrong file type, and did nothing. `mur` renders it as `E-RUN-050`.
+    /// symbolic link, a hard-linked or non-regular file, or an invalid path component, and did
+    /// nothing. `mur` renders it as `E-RUN-050`.
     #[error("{refusal}")]
     WorkdirPathRefused {
         refusal: crate::workdir_fs::WorkdirRefusal,
@@ -966,8 +967,8 @@ impl RuntimeError {
     }
 }
 
-/// A refusal is [`RuntimeError::WorkdirPathRefused`]; an I/O failure is
-/// [`RuntimeError::CreateWorkdir`], which is what every `?` on a directory creation means.
+/// A refusal is [`RuntimeError::WorkdirPathRefused`]; any I/O failure is
+/// [`RuntimeError::CreateWorkdir`]. Use [`RuntimeError::from_workdir`] where that variant is wrong.
 impl From<crate::workdir_fs::WorkdirError> for RuntimeError {
     fn from(error: crate::workdir_fs::WorkdirError) -> Self {
         Self::from_workdir(error, |path, source| Self::CreateWorkdir { path, source })

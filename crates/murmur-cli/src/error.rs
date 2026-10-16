@@ -95,7 +95,7 @@ pub const E_RUN_046: &str = "E-RUN-046"; // a formation member tried to launch a
 pub const E_RUN_047: &str = "E-RUN-047"; // the capsule's bytes hash differently from the sha256 admission bound it to
 pub const E_RUN_048: &str = "E-RUN-048"; // `mur token` named a session whose door is public, which minted no token
 pub const E_RUN_049: &str = "E-RUN-049"; // `mur token --credential` named a credential the session did not mint
-pub const E_RUN_050: &str = "E-RUN-050"; // a runtime write, read, create or removal inside the workdir met a symbolic link
+pub const E_RUN_050: &str = "E-RUN-050"; // a runtime write, read, create or removal inside the workdir met a symbolic link or the wrong kind of file
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed

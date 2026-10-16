@@ -161,20 +161,7 @@ fn resolve_versioned_iface<T>(
 /// A link at `task.md` is no task: reading it is refused, which latches the refusal, and the next
 /// task to start fails on it at activation.
 fn pending_task_input(accessible_root: &WorkdirRoot) -> Option<u64> {
-    match accessible_root.entry_kind(TASK_INPUT_FILE) {
-        Ok(Some(EntryKind::File)) => Some(
-            accessible_root
-                .file_len(TASK_INPUT_FILE)
-                .ok()
-                .flatten()
-                .unwrap_or(0),
-        ),
-        Ok(Some(EntryKind::Symlink)) => {
-            let _ = accessible_root.read_file(TASK_INPUT_FILE, 0);
-            None
-        }
-        _ => None,
-    }
+    accessible_root.file_len(TASK_INPUT_FILE).ok().flatten()
 }
 
 /// The directory this session's siblings sit in, held open: `.murmur` beneath the accessible
@@ -10025,8 +10012,8 @@ fn write_staged_file(
 /// workdir has none, so the agent can reference it by relative path from `"."`, with the source's
 /// mode as `fs::copy` would.
 ///
-/// An existing regular file is kept. A link where the copy would go is refused, which fails the
-/// launch; any other failure warns and the launch goes on, as a missing copy always has.
+/// Anything already there other than a link is kept. A link where the copy would go is refused,
+/// which fails the launch; any other failure warns and the launch goes on.
 fn copy_manifest_into_workdir(
     manifest_dir: &Path,
     accessible_root: &WorkdirRoot,
@@ -21970,9 +21957,8 @@ inference:
         });
     }
 
-    /// A continuation that restarts reads its task from `task.md` rewritten through the one
-    /// helper the reopen path uses, so the link a capsule planted there is refused on the same
-    /// terms: latched, nothing written outside, and the next attempt's checkpoint ends the task.
+    /// A continuation that restarts rewrites `task.md` through the helper the reopen path uses,
+    /// so a link planted there is refused and latched, and nothing outside is written.
     #[tokio::test(flavor = "multi_thread")]
     async fn workdir_path_refused_on_continuation() {
         let planted = Planted::new();

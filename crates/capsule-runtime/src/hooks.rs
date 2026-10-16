@@ -2133,8 +2133,8 @@ fn build_wasi_ctx(
 /// Appends `error` to `logs/hook-<hook_name>.log`. A refused append is on `workdir`'s refusal
 /// latch; nothing else is reported.
 ///
-/// On the blocking pool, as `tokio::fs` does its work: the await is a yield point, so a drain
-/// racing an async hook's worker gets the thread between that worker's calls.
+/// Runs on the blocking pool so the `.await` yields: a checkpoint draining the latch can run
+/// between an async hook worker's calls.
 async fn log_hook_error(workdir: &WorkdirRoot, hook_name: &str, error: &str) {
     use std::io::Write;
     let root = workdir.clone();

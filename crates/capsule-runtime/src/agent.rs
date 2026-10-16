@@ -4371,7 +4371,7 @@ pub(crate) fn fresh_task_text(
     inference: &InferenceConfig,
     accessible_workdir: &WorkdirRoot,
 ) -> String {
-    match accessible_workdir.read_to_string("task.md") {
+    match accessible_workdir.read_to_string(crate::runtime::TASK_INPUT_FILE) {
         Ok(Some(text)) => text,
         Ok(None) if inference.transport != "process" => accessible_workdir
             .read_to_string("input.txt")

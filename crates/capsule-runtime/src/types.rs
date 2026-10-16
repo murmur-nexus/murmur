@@ -689,8 +689,11 @@ impl StagedSession {
     /// Writes `bytes` as the task input, `task.md` in the accessible workdir, with no link
     /// followed: a link at `task.md` is refused rather than written through.
     pub fn write_task_input(&self, bytes: &[u8]) -> Result<(), crate::workdir_fs::WorkdirError> {
-        self.accessible_root
-            .write_file("task.md", bytes, crate::workdir_fs::DEFAULT_FILE_MODE)
+        self.accessible_root.write_file(
+            crate::runtime::TASK_INPUT_FILE,
+            bytes,
+            crate::workdir_fs::DEFAULT_FILE_MODE,
+        )
     }
 
     /// Hands this session the credential it will present to the spawning daemon.

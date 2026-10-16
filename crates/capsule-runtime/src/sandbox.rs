@@ -2996,10 +2996,9 @@ fn ensure_sealed_tmp_store(
 /// nothing the parent could have done for it.
 ///
 /// The rewrite is in place ([`crate::workdir_fs::WorkdirRoot::overwrite_in_place`] truncates; it
-/// does not replace). The Landlock rule the earlier caller took is bound to the file's inode, so
-/// writing a fresh file over the path would leave that rule pointing at an inode the composed root
-/// no longer binds — `/etc/passwd` mounted and `EACCES`. A link at either file, or at the staging
-/// directory, is refused rather than written through.
+/// does not replace): Landlock grants the file by inode and the composed root binds it by path, so
+/// replacing the file would leave `/etc/passwd` bound but denied (`EACCES`). A link at either
+/// file, or at the staging directory, is refused rather than written through.
 #[cfg(target_os = "linux")]
 fn ensure_sealed_identity_files(
     session_workdir: &crate::workdir_fs::WorkdirRoot,

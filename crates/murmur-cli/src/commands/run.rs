@@ -1394,13 +1394,11 @@ mod tests {
     }
 
     #[test]
-    fn write_input_file_path_copies_contents() {
+    fn task_input_from_a_file_path_is_its_contents() {
         let src_dir = tempdir().unwrap();
-        let dst_dir = tempdir().unwrap();
 
         let src = src_dir.path().join("task.md");
         fs::write(&src, "hello from file").unwrap();
-        let _ = dst_dir;
 
         assert_eq!(
             task_input_bytes(src.to_str().unwrap()).unwrap(),
@@ -1409,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn write_input_inline_text_written_verbatim() {
+    fn task_input_inline_text_is_verbatim() {
         assert_eq!(
             task_input_bytes("Run: echo hello").unwrap(),
             b"Run: echo hello"
@@ -1417,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn write_input_empty_string_creates_empty_file() {
+    fn task_input_empty_string_is_empty() {
         assert_eq!(task_input_bytes("").unwrap(), b"");
     }
 

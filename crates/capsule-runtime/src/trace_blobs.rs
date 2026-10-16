@@ -45,10 +45,8 @@ impl BlobStore {
     /// Store `bytes` as `<blobs>/<sha256>`, where `sha256` is the caller's already-computed
     /// lowercase-hex digest of exactly those bytes.
     ///
-    /// A path that already exists is left alone rather than rewritten: the name *is* the content,
-    /// so a second write of the same body has nothing new to say, and the ten-turn case where one
-    /// unchanged system prompt is hashed on every turn costs one file and one `exists` check per
-    /// turn thereafter.
+    /// A blob already stored is left alone rather than rewritten: its name is its content, so a
+    /// body repeated on every turn is written once.
     ///
     /// A link at `blobs/` or at the blob's name is refused, never taken as "already stored".
     pub(crate) async fn put(&self, sha256: &str, bytes: &[u8]) -> std::io::Result<()> {

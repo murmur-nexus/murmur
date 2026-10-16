@@ -104,28 +104,28 @@ both in the session workdir.
 ## Links inside the workdir { #links-inside-the-workdir }
 
 The runtime never follows a symbolic link inside the accessible workdir or the session workdir.
-Every path in the two tables above, and every file the runtime reads to decide what to do next,
-is reached one directory at a time from the workdir itself, and a link anywhere on the way is
-refused rather than followed. The directory passed to `--workdir` may itself be reached through a
-link; only what lies beneath it is checked.
+Every path in the two tables above, and every file the runtime reads to decide what to do next, is
+reached one directory at a time from the workdir itself, and a link anywhere on the way is refused.
+Nothing outside the workdir is written, read or removed through one. The directory passed to
+`--workdir` may itself be reached through a link; only what lies beneath it is checked.
 
 | The runtime refuses | When it would |
 |---|---|
 | A symbolic link at any directory on the way to a path, or at the path itself | Write, append to, read, create, or remove it |
 | A FIFO, socket, device node or directory where a regular file belongs | Append to or read it |
-| A regular file with a second hard link | Append to it |
+| A regular file with a second hard link | Append to it, or rewrite it in place |
 
-A refused write is never retried another way, and nothing outside the workdir is written, read or
-removed. What a refusal does depends on when it happens:
+Under `--workdir`, keep `task.md`, `murmur.yaml` and `.murmur` in that directory as real files and
+directories: a link at any of them stops the launch, or fails the first task.
+
+What a refusal does depends on when it happens:
 
 | When | What happens |
 |---|---|
 | Staging: `mur run --task`, the `murmur.yaml` copy, installing tools and skills, `MURMUR.md`, the `.murmur/<session-id>` directory | The launch fails with [`E-RUN-050`](diagnostics.md#e-run-050), naming the path and the link |
-| During a task, on any transport | A [`workdir_path_refused`](observability-schemas.md#workdir-path-refused) trace line for each refusal, then `task_failed` with cause `workdir_path_refused`, then `task_end` with `exit_status: failed`. No further request is sent to the model for that task, and an A2A task ends `failed` with the refusal as its status message |
+| During a task, on any transport | A [`workdir_path_refused`](observability-schemas.md#workdir-path-refused) trace line for each refusal, then `task_failed` with cause `workdir_path_refused`, then `task_end` with `exit_status: failed`. No further request is sent to the model for that task. An A2A task ends `failed` with the refusal as its status message, and `mur run --task` exits with [`E-RUN-050`](diagnostics.md#e-run-050) |
 | A tool's own write — a submitted plan, `fetch-peer-file`, `manage.pull()` or `manage.remove()` | The tool call returns an error naming the path, and the task then fails as above |
 | Between tasks | The next task to start fails as above before it reads its task or sends a request |
-
-A capsule with no links in its workdir runs exactly as it would otherwise.
 
 ---
 

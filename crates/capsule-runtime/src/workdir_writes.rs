@@ -773,9 +773,7 @@ mod tests {
     /// Every source file with a production `workdir.join(...)` or [`HELPER_WRITES`] call is in
     /// `SCANNED`.
     ///
-    /// Without this, a new module writing into a workdir would be invisible to the scans above
-    /// and the declaration would go quietly stale, which is the exact failure this whole module
-    /// exists to close.
+    /// Without this, a new module writing into a workdir escapes the scans above.
     #[test]
     fn every_source_file_that_joins_a_workdir_is_scanned() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -957,6 +955,9 @@ mod tests {
         "set_permissions(",
         "remove_file(",
         "remove_dir_all(",
+        "remove_dir(",
+        "hard_link(",
+        "symlink(",
         "read_to_string(",
         "read(",
     ];
@@ -964,6 +965,7 @@ mod tests {
     /// Raw opens and existence checks, matched wherever they appear.
     const RAW_FS_CALLS: &[&str] = &[
         "File::create(",
+        "File::options(",
         "OpenOptions::new(",
         "File::open(",
         "try_exists(",

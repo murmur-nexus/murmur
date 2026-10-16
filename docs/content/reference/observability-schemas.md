@@ -756,7 +756,7 @@ terminal `task_end`
 | Field | Type | Notes |
 |---|---|---|
 | `task_id` | string | The task in progress. Absent for the run a launch makes from `input.txt` when no task arrived, which has no `task_start` |
-| `turn` | u32 | The turn that failed, 0-based. Absent when the failure is the task's rather than one turn's: `reopen_budget_exhausted` and `runtime_error` |
+| `turn` | u32 | The turn that failed, 0-based. Absent when the failure is the task's rather than one turn's: `reopen_budget_exhausted`, `runtime_error` and `workdir_path_refused` |
 | `cause` | string | Why the attempt failed, from the table below |
 | `reason` | string | What went wrong, in words: the driver's or provider's error text, the refusal, the runtime error. A `driver_error` reason has every credential value the session holds replaced with `[redacted]`, as `out/result.txt` does. At most 2,000 bytes; the whole text is in `out/result.txt`. For a launch that ends `failed`, this is the reason [`E-RUN-040`](diagnostics.md#e-run-040) prints |
 
@@ -778,7 +778,7 @@ Written whatever [`trace.capture`](manifest.md#field-trace) is. A task that ende
 
 **`workdir_path_refused`**{ #workdir-path-refused } — written once for each path the runtime refused
 to write, append to, read, create or remove because it met a symbolic link or the wrong kind of
-file inside the workdir. See [Links inside the workdir](workdir.md#links-inside-the-workdir)
+file inside the workdir. See [Links inside the workdir](workdir.md#links-inside-the-workdir).
 
 | Field | Type | Notes |
 |---|---|---|
