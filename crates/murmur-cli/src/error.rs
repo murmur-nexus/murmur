@@ -283,8 +283,8 @@ impl From<RuntimeError> for CliError {
             ),
             RuntimeError::ArtifactNotFound { name, version } => CliError::with_hint(
                 E_REG_001,
-                format!("artifact {name}@{version} not found in registry"),
-                "run `mur publish` first, or check registry config in murmur.yaml",
+                format!("artifact {name}@{version} is not in the store"),
+                format!("install it: mur install {name}@{version}"),
             ),
             RuntimeError::ArtifactIntegrityFailed { name, version } => CliError::with_hint(
                 E_REG_002,
@@ -350,6 +350,9 @@ impl From<RuntimeError> for CliError {
                 E_IO_003,
                 format!("failed to create workdir at {path}: {source}"),
             ),
+            error @ RuntimeError::ToolNameNotAComponent { .. } => {
+                CliError::new(E_MAN_003, error.to_string())
+            }
             RuntimeError::WriteToolManifest { path, source } => CliError::new(
                 E_IO_003,
                 format!("failed to write tool manifest at {path}: {source}"),
@@ -908,11 +911,11 @@ impl From<RegistryError> for CliError {
         match error {
             RegistryError::NotFound { name, version } => CliError::new(
                 E_REG_001,
-                format!("artifact {name}@{version} not found in registry"),
+                format!("artifact {name}@{version} is not in the store"),
             ),
             RegistryError::Conflict { name, version } => CliError::with_hint(
                 E_REG_003,
-                format!("artifact {name}@{version} already exists in registry"),
+                format!("artifact {name}@{version} already exists in the store"),
                 "use a new version string or remove the existing artifact",
             ),
             RegistryError::ReservedVersion(version) => CliError::with_hint(

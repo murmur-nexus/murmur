@@ -310,7 +310,7 @@ fn a_version_or_name_the_index_does_not_list_is_refused() {
         "E-REG-001",
         &[&store],
     );
-    assert_contains(&stderr, &["ana/tool-gi@1.0.0", "no artifact 'tool-gi'"]);
+    assert_contains(&stderr, &["ana/tool-gi@1.0.0", "lists no ana/tool-gi"]);
     assert!(!stub.downloaded_a_payload(), "{:?}", stub.paths());
 }
 
@@ -732,21 +732,29 @@ fn an_unversioned_reference_installs_the_newest_version_that_fits() {
                 "ana/tool-none: 1.0.0 needs murmur:tool/run@9.9.9, this mur serves \
                  {package}@{version}"
             ),
-            "hint: name a version explicitly",
-            "mur install ana/tool-none@1.0.0",
+            "hint: https://docs.murmur.nexus/reference/wit-levels/ lists which mur release serves \
+             which WIT level",
         ],
     );
+    assert!(!stderr.contains("without the fit check"), "{stderr}");
 
-    // An explicit version installs as asked.
-    let assert = install(
-        home.path(),
-        project.path(),
-        &stub,
-        &["-g", "ana/tool-x@0.3.0"],
-    )
-    .assert()
-    .success();
-    assert_contains(&stdout_of(&assert), &["Installed ana/tool-x@0.3.0"]);
+    // An explicit version is held to the same level.
+    stub.clear_requests();
+    let stderr = refused(
+        install(
+            home.path(),
+            project.path(),
+            &stub,
+            &["-g", "ana/tool-x@0.3.0"],
+        ),
+        "E-WIT-LEVEL-001",
+        &[&global_store(home.path())],
+    );
+    assert_contains(
+        &stderr,
+        &["'ana/tool-x@0.3.0'", "mur install ana/tool-x@0.1.1"],
+    );
+    assert!(!stub.downloaded_a_payload(), "{:?}", stub.paths());
 
     for reserved in ["latest", "stable", "edge"] {
         stub.clear_requests();
@@ -763,6 +771,171 @@ fn an_unversioned_reference_installs_the_newest_version_that_fits() {
         assert_contains(&stderr, &["omit the version", "mur install ana/tool-x"]);
         assert!(stub.paths().is_empty(), "{:?}", stub.paths());
     }
+}
+
+/// `ana/artifacts` listing `ana/tool-x` at 1.0.0, which fits, and 2.0.0, which names
+/// `murmur:tool/run@9.9.9`, a version the served level does not have.
+fn two_tool_x_versions(stub: &MockGitHub) {
+    let staging = tempfile::tempdir().unwrap();
+    let dir = staging.path();
+    stub.repository(ANA, 1111);
+    publish_hand_index(
+        stub,
+        ANA,
+        "ana",
+        "v1",
+        vec![(
+            "tool-x",
+            vec![
+                (
+                    "2.0.0",
+                    vec!["murmur:tool/run@9.9.9".to_string()],
+                    vec![(
+                        None,
+                        "tool-x-2.0.0.mur.zip".to_string(),
+                        zip_of(dir, "tool-x", "2.0.0"),
+                    )],
+                ),
+                (
+                    "1.0.0",
+                    vec![served_tool_run()],
+                    vec![(
+                        None,
+                        "tool-x-1.0.0.mur.zip".to_string(),
+                        zip_of(dir, "tool-x", "1.0.0"),
+                    )],
+                ),
+            ],
+        )],
+    );
+}
+
+/// `ana/tool-x@2.0.0` exporting `murmur:tool/run@9.9.9`, stored in `store` as a `mur` with no
+/// install fit check stored it.
+fn seed_unfitting_tool_x(store: &Path) {
+    let staging = tempfile::tempdir().unwrap();
+    let file = staging.path().join("tool-x-2.0.0.mur.zip");
+    let component = wat::parse_str(
+        r#"(component (instance $i) (export "murmur:tool/run@9.9.9" (instance $i)))"#,
+    )
+    .unwrap();
+    write_zip(
+        &file,
+        "name: tool-x\nversion: 2.0.0\nruntime: tool\n",
+        &[("tool.wasm", &component)],
+    );
+    let meta = murmur_artifact::ArtifactMeta {
+        name: murmur_artifact::ArtifactName::parse("ana/tool-x").unwrap(),
+        version: "2.0.0".to_string(),
+        runtime: murmur_artifact::RuntimeType::Wasm,
+        artifact_runtime: "tool".to_string(),
+        platforms: Vec::new(),
+        description: None,
+        tags: Vec::new(),
+        wit_contracts: None,
+        owner_id: Some(1111),
+        built_at_level: None,
+    };
+    murmur_artifact::Registry::publish(
+        &murmur_artifact::LocalRegistry::new(store),
+        meta,
+        &fs::read(&file).unwrap(),
+    )
+    .unwrap();
+}
+
+/// The refusal every non-fitting install gives: the artifact and its interface, the served level,
+/// and the newest version the index lists that fits.
+fn assert_does_not_fit(stderr: &str) {
+    assert_contains(
+        stderr,
+        &[
+            "error[E-WIT-LEVEL-001]: artifact 'ana/tool-x@2.0.0' does not fit WIT level 1, the \
+             level this mur serves: ",
+            "murmur:tool/run@9.9.9",
+            "hint: ana/tool-x@1.0.0 is the newest version in github:ana/artifacts's index that \
+             fits level 1; pin it in murmur.yaml and run `mur install`, or run `mur install \
+             ana/tool-x@1.0.0`",
+        ],
+    );
+}
+
+#[test]
+fn an_explicit_version_that_does_not_fit_is_refused_before_anything_is_fetched() {
+    let stub = MockGitHub::start();
+    two_tool_x_versions(&stub);
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    write_config(home.path(), ANA_CONFIG);
+    let global = global_store(home.path());
+
+    // From the source, by name and by --all-platforms: the index is read, no payload is.
+    for args in [
+        &["-g", "ana/tool-x@2.0.0"][..],
+        &["--all-platforms", "ana/tool-x@2.0.0"][..],
+    ] {
+        stub.clear_requests();
+        let stderr = refused(
+            install(home.path(), cwd.path(), &stub, args),
+            "E-WIT-LEVEL-001",
+            &[&global],
+        );
+        assert_does_not_fit(&stderr);
+        assert!(!stub.downloaded_a_payload(), "{args:?}: {:?}", stub.paths());
+        assert!(!global.exists(), "{args:?} created the global store");
+    }
+
+    // A project pinning 2.0.0: nothing fetched, no lock, no project store.
+    let project = tempfile::tempdir().unwrap();
+    write_project(project.path(), &[("ana/tool-x", "2.0.0")]);
+    stub.clear_requests();
+    let stderr = refused(
+        install(home.path(), project.path(), &stub, &[]),
+        "E-WIT-LEVEL-001",
+        &[&global],
+    );
+    assert_does_not_fit(&stderr);
+    assert!(!stub.downloaded_a_payload(), "{:?}", stub.paths());
+    assert!(!project.path().join(".murmur").exists());
+    assert!(!project.path().join("murmur.lock").exists());
+
+    // The global store already holding 2.0.0, for `-g` and for the project's pin.
+    seed_unfitting_tool_x(&global);
+    for (cwd, args) in [
+        (cwd.path(), &["-g", "ana/tool-x@2.0.0"][..]),
+        (project.path(), &[][..]),
+    ] {
+        stub.clear_requests();
+        let stderr = refused(
+            install(home.path(), cwd, &stub, args),
+            "E-WIT-LEVEL-001",
+            &[&global],
+        );
+        assert_does_not_fit(&stderr);
+        assert!(!stub.downloaded_a_payload(), "{args:?}: {:?}", stub.paths());
+    }
+    assert!(!project.path().join(".murmur").exists());
+    assert!(!project.path().join("murmur.lock").exists());
+
+    // The project store holding it.
+    seed_unfitting_tool_x(&project.path().join(".murmur/artifacts"));
+    let project_store = project.path().join(".murmur/artifacts");
+    let stderr = refused(
+        install(home.path(), project.path(), &stub, &[]),
+        "E-WIT-LEVEL-001",
+        &[&global, &project_store],
+    );
+    assert_does_not_fit(&stderr);
+    assert!(!project.path().join("murmur.lock").exists());
+
+    // The version that fits installs.
+    let assert = install(home.path(), cwd.path(), &stub, &["-g", "ana/tool-x@1.0.0"])
+        .assert()
+        .success();
+    assert_contains(
+        &stdout_of(&assert),
+        &["Installed ana/tool-x@1.0.0 from github:ana/artifacts"],
+    );
 }
 
 // ─── digests and packed identity ────────────────────────────────────────────

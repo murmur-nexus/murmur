@@ -9,6 +9,8 @@
 //! Extraction is best-effort by design. A native tool, a skill, a core module, or a payload
 //! that does not parse simply has nothing to record; that is not an error, and
 //! [`wit_contracts_from_artifact_bytes`] is total for exactly that reason.
+//! [`read_component_contracts`] is the strict reader, for a payload packaged as wasm, where a
+//! missing or unreadable component is a defect of the artifact.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -20,7 +22,10 @@ use thiserror::Error;
 use wasmparser::{Encoding, Parser, Payload};
 use zip::ZipArchive;
 
-use crate::{payload_shape::select_root_wasm_in_archive, zip_guard};
+use crate::{
+    payload_shape::{select_root_wasm_in_archive, PayloadShapeError},
+    zip_guard,
+};
 
 /// The versioned WIT interface names a component declares, in both directions.
 ///
@@ -209,6 +214,72 @@ pub fn wit_contracts_from_artifact_reader<R: Read + Seek>(reader: R) -> Option<W
     let mut archive = ZipArchive::new(reader).ok()?;
     let wasm = read_root_wasm_from_archive(&mut archive)?;
     extract_wit_contracts(&wasm).ok().flatten()
+}
+
+/// Why a `.mur.zip` yields no component to read WIT contracts from. Each displays as a clause
+/// that names the root wasm entry when one was selected.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ComponentReadError {
+    #[error("it is not a zip archive ({0})")]
+    NotAZip(String),
+    #[error("it has no root .wasm entry (expected capsule.wasm or one root *.wasm)")]
+    NoRootWasm,
+    #[error("its root .wasm entries are ambiguous: {}, and none is capsule.wasm", names.join(", "))]
+    AmbiguousRootWasm { names: Vec<String> },
+    #[error("its root .wasm entry {name} is over the {limit}-byte decompression cap")]
+    OverDecompressionCap { name: String, limit: u64 },
+    #[error("its root .wasm entry {name} cannot be read: {reason}")]
+    Unreadable { name: String, reason: String },
+    #[error("its root .wasm entry {name} is a core module, not a component")]
+    CoreModule { name: String },
+    #[error("its root .wasm entry {name} does not parse as a component: {reason}")]
+    NotAComponent { name: String, reason: String },
+}
+
+/// The WIT contracts of the component packed inside a `.mur.zip`, or why there is none.
+///
+/// The strict counterpart of [`wit_contracts_from_artifact_bytes`], for a caller that expects a
+/// component — a payload packaged as wasm — and must refuse one it cannot read rather than
+/// record it as declaring nothing.
+pub fn read_component_contracts(artifact_bytes: &[u8]) -> Result<WitContracts, ComponentReadError> {
+    let mut archive = ZipArchive::new(Cursor::new(artifact_bytes))
+        .map_err(|error| ComponentReadError::NotAZip(error.to_string()))?;
+    let name = select_root_wasm_in_archive(&mut archive).map_err(|error| match error {
+        PayloadShapeError::MissingRootWasm => ComponentReadError::NoRootWasm,
+        PayloadShapeError::MultipleRootWasm { names } => {
+            ComponentReadError::AmbiguousRootWasm { names }
+        }
+    })?;
+    let wasm = zip_guard::read_zip_entry_capped(
+        &mut archive,
+        &name,
+        zip_guard::max_artifact_decompressed_bytes(),
+    )
+    .map_err(|error| match error {
+        zip_guard::ZipGuardError::DecompressionCeilingExceeded { limit, .. } => {
+            ComponentReadError::OverDecompressionCap {
+                name: name.clone(),
+                limit,
+            }
+        }
+        other => ComponentReadError::Unreadable {
+            name: name.clone(),
+            reason: other.to_string(),
+        },
+    })?;
+    match extract_wit_contracts(&wasm) {
+        Ok(Some(contracts)) => Ok(contracts),
+        Ok(None) => Err(ComponentReadError::CoreModule { name }),
+        // wasmparser pretty-prints some reasons across lines; the refusal is one line.
+        Err(WitContractError::Parse(error)) => Err(ComponentReadError::NotAComponent {
+            name,
+            reason: error
+                .to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        }),
+    }
 }
 
 fn read_root_wasm_from_archive<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Option<Vec<u8>> {
@@ -422,6 +493,51 @@ mod tests {
         .is_none());
         let module = component(r#"(module (func (export "f")))"#);
         assert!(wit_contracts_from_artifact_bytes(&zip_with(&[("tool.wasm", &module)])).is_none());
+    }
+
+    #[test]
+    fn the_strict_reader_reads_a_packed_component() {
+        let archive = zip_with(&[("capsule.wasm", &component(EXPORTING_COMPONENT))]);
+        assert_eq!(
+            read_component_contracts(&archive).ok(),
+            wit_contracts_from_artifact_bytes(&archive)
+        );
+    }
+
+    #[test]
+    fn the_strict_reader_names_why_a_payload_holds_no_component() {
+        assert!(matches!(
+            read_component_contracts(b"not-a-zip-at-all"),
+            Err(ComponentReadError::NotAZip(_))
+        ));
+        assert_eq!(
+            read_component_contracts(&zip_with(&[("skill.md", b"# guidance")])),
+            Err(ComponentReadError::NoRootWasm)
+        );
+        assert_eq!(
+            read_component_contracts(&zip_with(&[("a.wasm", b"\0asm"), ("b.wasm", b"\0asm")])),
+            Err(ComponentReadError::AmbiguousRootWasm {
+                names: vec!["a.wasm".to_string(), "b.wasm".to_string()]
+            })
+        );
+        let module = component("(module)");
+        let error = read_component_contracts(&zip_with(&[("capsule.wasm", &module)])).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "its root .wasm entry capsule.wasm is a core module, not a component"
+        );
+        let error =
+            read_component_contracts(&zip_with(&[("capsule.wasm", b"not wasm")])).unwrap_err();
+        assert!(
+            matches!(&error, ComponentReadError::NotAComponent { name, .. } if name == "capsule.wasm"),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with("its root .wasm entry capsule.wasm does not parse as a component: "),
+            "{error}"
+        );
     }
 
     #[test]

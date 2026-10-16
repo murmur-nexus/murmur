@@ -467,20 +467,15 @@ pub(crate) fn resolve_exec_allowlist(shell_allow: &[String]) -> Vec<PathBuf> {
     resolve_exec_allowlist_in(shell_allow, &path_dirs)
 }
 
-/// Testable core of `resolve_exec_allowlist`, with the `PATH` directory list injected. For a
-/// bare name, every executable `PATH` match is included (not just the first): all of them are
-/// binaries the operator's launch-time `PATH` exposes under that allowlisted name, and on
-/// merged-`/usr` distros `/bin/x` and `/usr/bin/x` canonicalize to the same entry anyway.
+/// Testable core of `resolve_exec_allowlist`, with the `PATH` directory list injected. Every
+/// entry is a bare binary name (the manifest refuses any other, `E-MAN-003`), and every
+/// executable `PATH` match is included (not just the first): all of them are binaries the
+/// operator's launch-time `PATH` exposes under that allowlisted name, and on merged-`/usr` distros
+/// `/bin/x` and `/usr/bin/x` canonicalize to the same entry anyway.
 fn resolve_exec_allowlist_in(shell_allow: &[String], path_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut resolved = std::collections::BTreeSet::new();
     for entry in shell_allow {
         if entry.is_empty() {
-            continue;
-        }
-        if entry.contains('/') {
-            if let Ok(canonical) = std::fs::canonicalize(entry) {
-                resolved.insert(canonical);
-            }
             continue;
         }
         for dir in path_dirs {
@@ -6047,14 +6042,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_exec_allowlist_canonicalizes_path_entries_through_symlinks() {
+    fn resolve_exec_allowlist_canonicalizes_path_matches_through_symlinks() {
         let temp = tempfile::tempdir().unwrap();
         let real = temp.path().join("real-tool");
         make_executable(&real, "#!/bin/sh\nexit 0\n");
-        let link = temp.path().join("link-tool");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        std::os::unix::fs::symlink(&real, bin_dir.join("link-tool")).unwrap();
 
-        let resolved = resolve_exec_allowlist_in(&[link.to_string_lossy().into_owned()], &[]);
+        let resolved = resolve_exec_allowlist_in(&["link-tool".to_string()], &[bin_dir]);
         assert_eq!(resolved, vec![std::fs::canonicalize(&real).unwrap()]);
     }
 

@@ -24,7 +24,7 @@ four on every PR; the rest are release-time only.
 
 | Gate | Command |
 | --- | --- |
-| Test suite | `./scripts/test.sh` — not bare `cargo test`; the beta features compile out otherwise |
+| Test suite | `./scripts/test.sh`, which passes `--features beta-all` — not bare `cargo test`; the beta features compile out otherwise. CI also runs `cargo nextest run --profile ci -p murmur-cli --test new_roster` with no features, the build releases ship |
 | Check | `cargo check --workspace --all-targets` |
 | Lint | `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
 | Supply chain | `cargo deny check advisories bans licenses` |

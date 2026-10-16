@@ -530,6 +530,139 @@ fn a_file_that_cannot_be_indexed_refuses_the_directory() {
     assert_refused(empty.path(), &[], "E-IDX-001", &["holds no .mur.zip file"]);
 }
 
+// ── a wasm payload must carry a readable component ────────────────────────────
+
+/// Index a directory holding one `runtime: tool` payload, `tool-w-0.1.0.mur.zip`, packing
+/// `entries`, and expect `E-IDX-001` naming the file and `reason`.
+fn assert_component_refused(entries: &[(&str, &[u8])], env: Option<(&str, &str)>, reason: &str) {
+    let dir = TempDir::new().unwrap();
+    pack(
+        dir.path(),
+        "tool-w-0.1.0.mur.zip",
+        "name: tool-w\nversion: 0.1.0\nruntime: tool\n",
+        entries,
+    );
+    let out = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let mut command = Command::cargo_bin("mur").unwrap();
+    command
+        .env("HOME", home.path())
+        .current_dir(out.path())
+        .args([
+            "index",
+            dir.path().to_str().unwrap(),
+            "--repo",
+            "ana/artifacts",
+            "--release",
+            "v1",
+            "--output",
+            "artifacts-index.json",
+        ]);
+    if let Some((key, value)) = env {
+        command.env(key, value);
+    }
+    let assert = command.assert().code(1);
+    let stderr = stderr_of(&assert);
+    for needle in [
+        "error[E-IDX-001]",
+        "tool-w-0.1.0.mur.zip",
+        "its wasm payload cannot be read as a component: ",
+        reason,
+    ] {
+        assert!(stderr.contains(needle), "missing {needle:?} in {stderr}");
+    }
+    assert_eq!(entries_of(out.path()), Vec::<String>::new());
+}
+
+#[test]
+fn a_wasm_payload_with_no_wasm_entry_is_refused() {
+    assert_component_refused(
+        &[("README.md", b"no component")],
+        None,
+        "it has no root .wasm entry (expected capsule.wasm or one root *.wasm)",
+    );
+}
+
+#[test]
+fn a_wasm_payload_whose_wasm_does_not_parse_is_refused() {
+    assert_component_refused(
+        &[("capsule.wasm", b"not wasm")],
+        None,
+        "its root .wasm entry capsule.wasm does not parse as a component: ",
+    );
+}
+
+#[test]
+fn a_wasm_payload_holding_a_core_module_is_refused() {
+    assert_component_refused(
+        &[("capsule.wasm", &wat::parse_str("(module)").unwrap())],
+        None,
+        "its root .wasm entry capsule.wasm is a core module, not a component",
+    );
+}
+
+#[test]
+fn a_wasm_payload_with_ambiguous_root_entries_is_refused() {
+    let echo = fixture_bytes("run/components/echo-tool.wasm");
+    assert_component_refused(
+        &[("a.wasm", &echo), ("b.wasm", &echo)],
+        None,
+        "its root .wasm entries are ambiguous: a.wasm, b.wasm, and none is capsule.wasm",
+    );
+}
+
+#[test]
+fn a_wasm_payload_over_the_decompression_cap_is_refused() {
+    assert_component_refused(
+        &[(
+            "capsule.wasm",
+            &fixture_bytes("run/components/echo-tool.wasm"),
+        )],
+        Some(("MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES", "64")),
+        "its root .wasm entry capsule.wasm is over the 64-byte decompression cap",
+    );
+}
+
+/// Only a wasm payload is expected to carry a component: a skill and a native payload index with
+/// no interfaces.
+#[test]
+fn a_skill_or_native_payload_without_wasm_still_indexes() {
+    let dir = TempDir::new().unwrap();
+    pack(
+        dir.path(),
+        "skill-notes-0.1.0.mur.zip",
+        "name: skill-notes\nversion: 0.1.0\nruntime: skill\n",
+        &[("skill.md", b"# Notes\n")],
+    );
+    pack_native(dir.path(), "tool-native", "1.0.0", "linux-x86_64");
+    let out = TempDir::new().unwrap();
+    mur_index(
+        out.path(),
+        &[
+            dir.path().to_str().unwrap(),
+            "--repo",
+            "ana/artifacts",
+            "--release",
+            "v1",
+            "--output",
+            "artifacts-index.json",
+        ],
+    )
+    .success();
+    let index: Value =
+        serde_json::from_slice(&fs::read(out.path().join("artifacts-index.json")).unwrap())
+            .unwrap();
+    let artifacts = index["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 2);
+    for artifact in artifacts {
+        assert_eq!(
+            artifact["versions"][0]["interfaces"],
+            json!([]),
+            "{artifact}"
+        );
+    }
+}
+
 // ── --repo and --release ──────────────────────────────────────────────────────
 
 #[test]
@@ -752,7 +885,10 @@ fn merge_dir() -> TempDir {
             dir.path(),
             &format!("tool-x-{version}.mur.zip"),
             &format!("name: tool-x\nversion: {version}\nruntime: tool\n"),
-            &[],
+            &[(
+                "capsule.wasm",
+                &fixture_bytes("run/components/echo-tool.wasm"),
+            )],
         );
     }
     dir

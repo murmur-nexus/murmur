@@ -51,7 +51,7 @@ A source answers through the `artifacts-index.json` asset of its latest release,
 1. Read the owner's numeric GitHub id and check it — see [Owner identity](#owner-identity).
 2. Read the index from the latest release. A missing, schema 1 or invalid index is refused with [`E-IDX-002`](diagnostics.md#e-idx-002).
 3. Check that the index's `scope` is the source's scope. An index naming another scope is refused with [`E-REG-009`](diagnostics.md#e-reg-009).
-4. Find the artifact whose `name` is `<name>` exactly, and its version `<version>` exactly. `tool-git` never matches `tool-git-validate`, and `1.0.0` never matches `v1.0.0`.
+4. Find the artifact whose `name` is `<name>` exactly, and its version `<version>` exactly. `tool-git` never matches `tool-git-validate`, and `1.0.0` never matches `v1.0.0`. A version that does not fit this `mur` is refused here with [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001) — see [Version selection](#version-selection).
 5. Choose the asset whose `platform` is the host's, else the untagged one. Another platform's asset is never chosen.
 6. Download that asset's `file` from the version's `release`.
 7. Check its SHA-256 against the index's `sha256`, and its packed `name:` and `version:` against the reference. A difference is refused with [`E-REG-002`](diagnostics.md#e-reg-002) and nothing is stored.
@@ -67,14 +67,32 @@ A platform tag in an asset is the publisher's declaration of which platform thos
 
 ### Version selection { #version-selection }
 
+A version fits this `mur` when every `murmur:` interface it names is one the [WIT level](wit-levels.md) this `mur` serves lists at that exact version. The same rule [`mur search`](cli.md#mur-search) lists by.
+
 | Reference | Version installed |
 |---|---|
-| `<scope>/<name>@<version>` | `<version>`, as asked, whether or not it fits this `mur` |
-| `<scope>/<name>` | The newest version in the index that fits this `mur`: every `murmur:` interface it names is one this `mur` serves at that exact version, and it has a payload for this platform. The same rule [`mur search`](cli.md#mur-search) lists by |
+| `<scope>/<name>@<version>` | `<version>`, when it fits. One that does not is refused with [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001) before anything is fetched or written, naming each interface that does not fit and the newest version in the index that does |
+| `<scope>/<name>` | The newest version in the index that fits and has a payload for this platform |
 
 When no version fits, the install is refused with [`E-REG-001`](diagnostics.md#e-reg-001), naming the newest version and the first interface this `mur` does not serve.
 
-`mur install` with no argument, `mur install --all-platforms` and `mur deploy` resolve each artifact the same way.
+The fit is checked on every install that resolves an artifact by name, wherever its bytes come from:
+
+| Install | Checked against |
+|---|---|
+| `mur install <scope>/<name>@<version>` | The stored payload's interfaces when the global store holds it, else the version's `interfaces` in the index, read before the payload is downloaded |
+| `mur install --all-platforms <scope>/<name>@<version>` | The version's `interfaces` in the index |
+| `mur install` with no argument | Each version `murmur.yaml` pins: the project store's payload, the global store's, or the index's `interfaces`. One that does not fit refuses the whole install, and nothing is written |
+
+These install the bytes they are given without the check; a launch refuses a driver among them that does not fit:
+
+| Install | Why |
+|---|---|
+| `mur install ./<file>.mur.zip` | The file is installed as handed over; no index can name a version that fits |
+| `mur install github:<owner>/<repo>@<tag>` | Every asset of the release is installed as published, with no index read |
+| `mur publish` | The file is stored as built |
+| `mur deploy` | It resolves for the `mur` the target runs, pinned by `deploy.mur_version`, whose level this `mur` cannot know |
+| A runtime pull (`manage.pull()`) | The capsule's own grant decides what it may install |
 
 ## Owner identity { #owner-identity }
 

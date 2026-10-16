@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use crate::{
     artifact::{declared_runtime_from_artifact_bytes, load_manifest_from_artifact_bytes},
+    artifact_index::{asset_file_name, metadata_file_name, payload_stem, sha256_file_name},
     artifact_name::ArtifactName,
     build::artifact_name_format_error,
     build_info::{build_info_from_artifact_bytes, BUILD_INFO_FILE},
@@ -171,13 +172,13 @@ impl LocalRegistry {
     #[must_use]
     pub fn artifact_path_for(&self, name: &ArtifactName, version: &str) -> PathBuf {
         self.artifact_dir(name, version)
-            .join(format!("{}-{version}.mur.zip", name.name()))
+            .join(asset_file_name(name.name(), version, None))
     }
 
     #[must_use]
     pub fn sha256_path_for(&self, name: &ArtifactName, version: &str) -> PathBuf {
         self.artifact_dir(name, version)
-            .join(format!("{}-{version}.sha256", name.name()))
+            .join(sha256_file_name(name.name(), version, None))
     }
 
     /// Path for a platform-specific artifact variant (e.g.
@@ -190,18 +191,22 @@ impl LocalRegistry {
         platform: &str,
     ) -> PathBuf {
         self.artifact_dir(name, version)
-            .join(format!("{}-{version}-{platform}.mur.zip", name.name()))
+            .join(asset_file_name(name.name(), version, Some(platform)))
     }
 
+    /// Path of the sha256 beside a platform-specific artifact variant.
     #[must_use]
-    fn sha256_path_for_platform(
+    pub fn sha256_path_for_platform(
         &self,
         name: &ArtifactName,
         version: &str,
         platform: &str,
     ) -> PathBuf {
-        self.artifact_dir(name, version)
-            .join(format!("{}-{version}-{platform}.sha256", name.name()))
+        self.artifact_dir(name, version).join(sha256_file_name(
+            name.name(),
+            version,
+            Some(platform),
+        ))
     }
 
     /// `<root>/<scope>/<name>/<version>`. The file names inside carry the bare name only.
@@ -222,12 +227,8 @@ impl LocalRegistry {
         version: &str,
         platform: Option<&str>,
     ) -> PathBuf {
-        let bare = name.name();
-        let file_name = match platform {
-            Some(platform) => format!("{bare}-{version}-{platform}.meta.json"),
-            None => format!("{bare}-{version}.meta.json"),
-        };
-        self.artifact_dir(name, version).join(file_name)
+        self.artifact_dir(name, version)
+            .join(metadata_file_name(name.name(), version, platform))
     }
 
     /// The top-level directories of this store in the flat layout that predates scopes, sorted:
@@ -568,7 +569,7 @@ impl LocalRegistry {
         // each payload.
         let mut payloads: Vec<PathBuf> = Vec::new();
         let mut sidecars: Vec<PathBuf> = Vec::new();
-        let prefix = format!("{}-{version}", name.name());
+        let prefix = payload_stem(name.name(), version, None);
         for file_name in read_file_names(version_dir)? {
             let Some(tail) = file_name.strip_prefix(&prefix) else {
                 continue;
@@ -685,7 +686,7 @@ fn dir_name(path: &Path) -> Option<String> {
 
 #[derive(Debug, Error)]
 pub enum RegistryError {
-    #[error("artifact {name}@{version} not found")]
+    #[error("artifact {name}@{version} is not in the store")]
     NotFound { name: String, version: String },
     #[error("artifact {name}@{version} already exists")]
     Conflict { name: String, version: String },

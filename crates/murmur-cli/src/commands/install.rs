@@ -4,15 +4,17 @@ use std::{
 };
 
 use capsule_runtime::precompile::Precompiler;
+use capsule_runtime::served_wit_level;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use murmur_artifact::{
-    current_platform, is_reserved_version, load_manifest_from_artifact_bytes,
+    current_platform, is_reserved_version, level_fit, load_manifest_from_artifact_bytes,
     load_runtime_manifest, read_lockfile, registry_warning_link, resolve_manifest_path, sha256_hex,
-    split_platform_suffix, split_platform_tag, verify_sha256, write_lockfile_atomic, ArtifactMeta,
-    ArtifactName, ArtifactRef, ArtifactRefError, LocalRegistry, LockOrigin, LockedSha256,
-    LockfileError, Manifest, MurmurLock, Platform, Registry, RegistryError, ResolvedArtifact,
-    RuntimeType, LOCAL_SCOPE, LOCK_VERSION, MANIFEST_FILENAME, SUPPORTED_PLATFORMS, W_REG_001,
+    split_platform_suffix, split_platform_tag, verify_sha256, wit_contracts_from_artifact_bytes,
+    write_lockfile_atomic, ArtifactMeta, ArtifactName, ArtifactRef, ArtifactRefError, LevelFit,
+    LocalRegistry, LockOrigin, LockedSha256, LockfileError, Manifest, MurmurLock, Platform,
+    Registry, RegistryError, ResolvedArtifact, RuntimeType, VersionFit, LOCAL_SCOPE, LOCK_VERSION,
+    MANIFEST_FILENAME, SUPPORTED_PLATFORMS, W_REG_001,
 };
 use rayon::prelude::*;
 
@@ -22,9 +24,11 @@ use crate::{
         E_REG_004, E_REG_005, E_REG_006,
     },
     source::{
-        check_owner, check_stored_owner, github::GitHubSource, github_scope, resolve,
-        unanswered_hint, ArtifactSource, ResolveError, Resolved, SourceError, Sources,
+        check_owner, check_stored_owner, github::GitHubSource, github_scope, newest_fitting,
+        resolve, select_version, unanswered_hint, ArtifactSource, ExplicitVersion, ResolveError,
+        Resolved, SourceError, Sources,
     },
+    wit_level::{index_level_mismatch, level_mismatch},
 };
 
 use super::runtime_manifest_error_to_cli;
@@ -259,7 +263,6 @@ fn install_github_release(
     lock_path: Option<&Path>,
     precompiler: Option<&Precompiler>,
 ) -> Result<(), CliError> {
-    // Refused before any request: a reserved scope cannot be claimed by an owner.
     let scope = github_scope(owner, repo)?;
     let token = Sources::load()?.token_for(owner, repo);
     let source = GitHubSource::new(owner, repo, &scope, token);
@@ -278,7 +281,13 @@ fn install_github_release(
     };
 
     let owner_id = source.owner_id().map_err(unanswered)?;
-    check_owner(&source, owner_id, lock.as_ref()).map_err(CliError::from)?;
+    check_owner(
+        &source,
+        owner_id,
+        lock.as_ref(),
+        &format!("github:{owner}/{repo}@{tag}"),
+    )
+    .map_err(CliError::from)?;
     let payloads = source.release_payloads(tag).map_err(unanswered)?;
     for payload in payloads {
         let manifest = load_manifest_from_artifact_bytes(&payload.bytes).map_err(|error| {
@@ -382,24 +391,67 @@ pub(crate) fn run_install(
     all_platforms: bool,
     no_precompile: bool,
 ) -> Result<(), CliError> {
-    if all_platforms {
-        return run_install_all_platforms(artifact_ref, no_precompile);
-    }
-
     // Refusals that need no store come first, so a refused install creates nothing.
-    match artifact_ref {
-        Some(ref_str) => refuse_malformed_ref(ref_str)?,
-        None if !global => {
-            let manifest_path = resolve_manifest_path(&find_project_root()?);
-            load_runtime_manifest(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
-        }
-        None => {}
+    let parsed = artifact_ref.map(InstallRef::parse).transpose()?;
+    if all_platforms {
+        return run_install_all_platforms(parsed, no_precompile);
+    }
+    if parsed.is_none() && !global {
+        let manifest_path = resolve_manifest_path(&find_project_root()?);
+        load_runtime_manifest(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
     }
     let (store, project_root) = determine_store(global)?;
 
-    match artifact_ref {
+    match parsed {
         None => install_manifest_deps(&store, &project_root, no_precompile),
-        Some(ref_str) => install_single(ref_str, &store, project_root.as_deref(), no_precompile),
+        Some(parsed) => install_single(parsed, &store, project_root.as_deref(), no_precompile),
+    }
+}
+
+/// What `mur install <ref>` names, read from the reference's text alone.
+enum InstallRef {
+    /// A `.mur.zip` on this filesystem, installed as `local/<packed name>`.
+    File(String),
+    /// `github:<owner>/<repo>@<tag>`: every `.mur.zip` of that release, in the owner's scope.
+    GitHubRelease {
+        owner: String,
+        repo: String,
+        tag: String,
+    },
+    /// `<scope>/<name>[@<version>]`, resolved through the stores and the scope's source.
+    Name {
+        name: ArtifactName,
+        version: Option<String>,
+    },
+}
+
+impl InstallRef {
+    /// `E-REG-007` for a reference that names an artifact by anything but a full name,
+    /// `E-REG-004` for a reserved version, and the reserved-scope refusal of a `github:` owner.
+    fn parse(text: &str) -> Result<Self, CliError> {
+        if is_local_path(text) {
+            return Ok(Self::File(text.to_string()));
+        }
+        if text.contains(':') {
+            let parsed = ArtifactRef::parse(text).map_err(|error| match error {
+                ArtifactRefError::Name(error) => artifact_name_error(error),
+                other => CliError::new(E_IO_003, other.to_string()),
+            })?;
+            let ArtifactRef::GitHub { owner, repo, tag } = parsed else {
+                return Err(CliError::new(
+                    E_IO_003,
+                    format!("unsupported artifact reference '{text}'"),
+                ));
+            };
+            // Refused before any request: a reserved scope cannot be claimed by an owner.
+            github_scope(&owner, &repo)?;
+            return Ok(Self::GitHubRelease { owner, repo, tag });
+        }
+        let (name, version) = parse_name_ref(text)?;
+        Ok(Self::Name {
+            name,
+            version: version.map(str::to_string),
+        })
     }
 }
 
@@ -431,7 +483,9 @@ pub(crate) fn find_project_root() -> Result<PathBuf, CliError> {
     }
 }
 
-/// Returns (store, project_root). project_root is None when global=true.
+/// Returns (store, project_root). project_root is None when global=true. Creates nothing: the
+/// store's first write creates its directory, so an install refused before it leaves the project
+/// as it was.
 fn determine_store(global: bool) -> Result<(LocalRegistry, Option<PathBuf>), CliError> {
     if global {
         let store = LocalRegistry::from_default_home().map_err(CliError::from)?;
@@ -439,59 +493,41 @@ fn determine_store(global: bool) -> Result<(LocalRegistry, Option<PathBuf>), Cli
     } else {
         let project_root = find_project_root()?;
         let store_path = project_root.join(".murmur").join("artifacts");
-        std::fs::create_dir_all(&store_path).map_err(|e| {
-            CliError::new(
-                E_IO_003,
-                format!(
-                    "failed to create project store at {}: {e}",
-                    store_path.display()
-                ),
-            )
-        })?;
         Ok((LocalRegistry::new(store_path), Some(project_root)))
     }
 }
 
 fn install_single(
-    artifact_ref: &str,
+    parsed: InstallRef,
     store: &LocalRegistry,
     project_root: Option<&Path>,
     no_precompile: bool,
 ) -> Result<(), CliError> {
     let lock_path = project_root.map(|r| r.join("murmur.lock"));
-    if is_local_path(artifact_ref) {
-        let precompiler = build_precompiler(no_precompile, project_root);
-        return install_from_local_file(
-            artifact_ref,
-            store,
-            lock_path.as_deref(),
-            precompiler.as_ref(),
-        );
-    }
-
-    if artifact_ref.contains(':') {
-        let parsed = ArtifactRef::parse(artifact_ref).map_err(|error| match error {
-            ArtifactRefError::Name(error) => artifact_name_error(error),
-            other => CliError::new(E_IO_003, other.to_string()),
-        })?;
-        let ArtifactRef::GitHub { owner, repo, tag } = &parsed else {
-            return Err(CliError::new(
-                E_IO_003,
-                format!("unsupported artifact reference '{artifact_ref}'"),
-            ));
-        };
-        let precompiler = build_precompiler(no_precompile, project_root);
-        return install_github_release(
-            owner,
-            repo,
-            tag,
-            store,
-            lock_path.as_deref(),
-            precompiler.as_ref(),
-        );
-    }
-
-    let (name, version) = parse_name_ref(artifact_ref)?;
+    let (name, version) = match parsed {
+        InstallRef::File(path) => {
+            let precompiler = build_precompiler(no_precompile, project_root);
+            return install_from_local_file(
+                &path,
+                store,
+                lock_path.as_deref(),
+                precompiler.as_ref(),
+            );
+        }
+        InstallRef::GitHubRelease { owner, repo, tag } => {
+            let precompiler = build_precompiler(no_precompile, project_root);
+            return install_github_release(
+                &owner,
+                &repo,
+                &tag,
+                store,
+                lock_path.as_deref(),
+                precompiler.as_ref(),
+            );
+        }
+        InstallRef::Name { name, version } => (name, version),
+    };
+    let version = version.as_deref();
     let lock = match &lock_path {
         Some(lock_path) => read_lock_if_any(lock_path)?,
         None => None,
@@ -502,6 +538,7 @@ fn install_single(
         let global_store = LocalRegistry::from_default_home().map_err(CliError::from)?;
         match global_store.resolve_with_platform(&name, version, Some(current_platform())) {
             Ok(resolved) => {
+                check_stored_fit(&name, version, &resolved)?;
                 return install_from_global_store(
                     &name,
                     version,
@@ -522,8 +559,15 @@ fn install_single(
 
     let sources = Sources::load()?;
     let source = sources.source_for(&name, version)?;
-    let resolved = resolve(&*source, &name, version, current_platform(), lock.as_ref())
-        .map_err(CliError::from)?;
+    let resolved = resolve(
+        &*source,
+        &name,
+        version,
+        ExplicitVersion::FitChecked,
+        current_platform(),
+        lock.as_ref(),
+    )
+    .map_err(CliError::from)?;
     let precompiler = build_precompiler(no_precompile, project_root);
     install_resolved(
         store,
@@ -532,6 +576,28 @@ fn install_single(
         lock_path.as_deref(),
         precompiler.as_ref(),
     )
+}
+
+/// `E-WIT-LEVEL-001` when the payload a store holds as `name@version` does not fit the WIT level
+/// this mur serves, read from the contracts its sidecar records, else from its component. A
+/// payload with no component (a native tool, a skill) fits.
+fn check_stored_fit(
+    name: &ArtifactName,
+    version: &str,
+    held: &ResolvedArtifact,
+) -> Result<(), CliError> {
+    let contracts = held
+        .meta
+        .wit_contracts
+        .clone()
+        .or_else(|| wit_contracts_from_artifact_bytes(&held.bytes));
+    let Some(contracts) = contracts else {
+        return Ok(());
+    };
+    match level_fit(&contracts, served_wit_level()) {
+        LevelFit::Fits => Ok(()),
+        LevelFit::Mismatched(mismatched) => Err(level_mismatch(name.as_str(), version, mismatched)),
+    }
 }
 
 /// Copy `name@version`, which the global store holds as `resolved`, into `store` and pin it. No
@@ -639,6 +705,7 @@ fn install_manifest_deps(
         .map(|(a, name)| held_payload(name, &a.version, store, &global_store))
         .collect();
     check_owners(&full_names, &artifacts, &held, &sources, lock.as_ref())?;
+    check_fits(&full_names, &artifacts, &held, &sources)?;
 
     // ── Progress styles (matches deploy.rs exactly) ───────────────────────────
     let multi = MultiProgress::new();
@@ -981,7 +1048,65 @@ fn check_owners(
                     continue;
                 };
                 if let Ok(owner_id) = source.owner_id() {
-                    check_owner(&*source, owner_id, lock).map_err(CliError::from)?;
+                    check_owner(
+                        &*source,
+                        owner_id,
+                        lock,
+                        &format!("{name}@{}", artifact.version),
+                    )
+                    .map_err(CliError::from)?;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// `E-WIT-LEVEL-001` for the whole install when a pinned version does not fit the WIT level this
+/// mur serves, wherever its payload would come from: a store's payload is read for its contracts,
+/// and a source's index for the version's `interfaces`, before anything is fetched or written. A
+/// version a source's index cannot be read for is left for its own fetch to report.
+fn check_fits(
+    names: &[ArtifactName],
+    artifacts: &[&murmur_artifact::RuntimeArtifact],
+    held: &[Result<Held, CliError>],
+    sources: &Sources,
+) -> Result<(), CliError> {
+    for ((name, artifact), held) in names.iter().zip(artifacts).zip(held) {
+        match held {
+            Ok(Held::Project(held) | Held::Global(held)) => {
+                check_stored_fit(name, &artifact.version, held)?;
+            }
+            Ok(Held::Source) => {
+                let Some(source) = sources.for_scope(name.scope()) else {
+                    continue;
+                };
+                let Ok(published) = source.index() else {
+                    continue;
+                };
+                let Some(listed) = published
+                    .index
+                    .artifacts
+                    .iter()
+                    .find(|listed| listed.name == name.name())
+                else {
+                    continue;
+                };
+                let Some(version) = select_version(listed, &artifact.version) else {
+                    continue;
+                };
+                if let VersionFit::Unserved(mismatched) =
+                    version.fit(served_wit_level(), current_platform())
+                {
+                    return Err(index_level_mismatch(
+                        name.as_str(),
+                        &artifact.version,
+                        mismatched,
+                        source.label(),
+                        newest_fitting(listed, current_platform())
+                            .map(|fits| fits.version.as_str()),
+                    ));
                 }
             }
             Err(_) => {}
@@ -1032,8 +1157,15 @@ fn fetch_and_store(
         }
         Held::Source => {
             let source = sources.source_for(name, Some(version))?;
-            let resolved = resolve(&*source, name, Some(version), current_platform(), lock)
-                .map_err(CliError::from)?;
+            let resolved = resolve(
+                &*source,
+                name,
+                Some(version),
+                ExplicitVersion::FitChecked,
+                current_platform(),
+                lock,
+            )
+            .map_err(CliError::from)?;
             let meta = source_meta(
                 name,
                 version,
@@ -1159,24 +1291,42 @@ fn local_file_platform(path_str: &str) -> Result<String, CliError> {
 }
 
 fn run_install_all_platforms(
-    artifact_ref: Option<&str>,
+    parsed: Option<InstallRef>,
     no_precompile: bool,
 ) -> Result<(), CliError> {
-    let Some(ref_str) = artifact_ref else {
-        return Err(CliError::new(
-            E_IO_003,
-            "--all-platforms requires an artifact reference (scope/name@version)",
-        ));
+    let (name, version) = match parsed {
+        None => {
+            return Err(CliError::new(
+                E_IO_003,
+                "--all-platforms requires an artifact reference (scope/name@version)",
+            ))
+        }
+        Some(InstallRef::Name {
+            name,
+            version: Some(version),
+        }) => (name, version),
+        Some(_) => {
+            return Err(CliError::new(
+                E_IO_003,
+                "artifact reference must be in the format <scope/name@version>",
+            ))
+        }
     };
-
-    let (name, version) = parse_versioned_ref(ref_str)?;
+    let version = version.as_str();
     let sources = Sources::load()?;
     let source = sources.source_for(&name, Some(version))?;
 
     let global_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
 
     for platform in ALL_PLATFORMS {
-        let resolved = match resolve(&*source, &name, Some(version), platform, None) {
+        let resolved = match resolve(
+            &*source,
+            &name,
+            Some(version),
+            ExplicitVersion::FitChecked,
+            platform,
+            None,
+        ) {
             Ok(resolved) => resolved,
             Err(error) if matches!(*error, ResolveError::NoPayloadFor { .. }) => {
                 capsule_runtime::report_eprintln!(
@@ -1229,25 +1379,6 @@ fn is_local_path(s: &str) -> bool {
         || (s.contains('/') && s.ends_with(".mur.zip"))
 }
 
-/// `E-REG-007` for a reference that names an artifact by anything but a full name, `E-REG-004`
-/// for a reserved version, and the reserved-scope refusal of a `github:` owner, all decided on the
-/// text alone.
-fn refuse_malformed_ref(artifact_ref: &str) -> Result<(), CliError> {
-    if is_local_path(artifact_ref) {
-        return Ok(());
-    }
-    if artifact_ref.starts_with("github:") {
-        if let Ok(ArtifactRef::GitHub { owner, repo, .. }) = ArtifactRef::parse(artifact_ref) {
-            github_scope(&owner, &repo)?;
-        }
-        return Ok(());
-    }
-    if artifact_ref.contains(':') {
-        return Ok(());
-    }
-    parse_name_ref(artifact_ref).map(|_| ())
-}
-
 /// `<scope>/<name>[@<version>]`. The name is refused with `E-REG-007` when it is not a full name,
 /// and a reserved version with `E-REG-004`: the index lists no such version, and leaving the
 /// version out already asks for the newest that fits.
@@ -1275,18 +1406,6 @@ fn parse_name_ref(input: &str) -> Result<(ArtifactName, Option<&str>), CliError>
         }
     }
     Ok((name, version))
-}
-
-/// `<scope>/<name>@<version>`, refused as [`parse_name_ref`] refuses, and `E-IO-003` with no
-/// version.
-fn parse_versioned_ref(input: &str) -> Result<(ArtifactName, &str), CliError> {
-    match parse_name_ref(input)? {
-        (name, Some(version)) => Ok((name, version)),
-        (_, None) => Err(CliError::new(
-            E_IO_003,
-            "artifact reference must be in the format <scope/name@version>",
-        )),
-    }
 }
 
 fn store_display(store: &LocalRegistry) -> String {

@@ -1,11 +1,12 @@
-//! What `mur` says when an artifact a launch stages does not fit the WIT level it serves.
+//! What `mur` says when an artifact a launch stages, or an install names, does not fit the WIT
+//! level it serves.
 //!
-//! The runtime decides the refusal ([`RuntimeError::WitLevelMismatch`]) and has no index to name
-//! a version that would fit. This module asks the artifact's own source for one, and only once a
-//! launch has been refused for exactly that reason.
+//! The refusal is [`RuntimeError::WitLevelMismatch`], `E-WIT-LEVEL-001`. Its hint names the newest
+//! version of the artifact its own source's index lists that fits; the source is asked only once
+//! an artifact has been refused for exactly that reason.
 
-use capsule_runtime::RuntimeError;
-use murmur_artifact::{current_platform, ArtifactName, WitLevel};
+use capsule_runtime::{served_wit_level, RuntimeError};
+use murmur_artifact::{current_platform, ArtifactName, UnservedInterface, WitLevel};
 
 use crate::error::CliError;
 use crate::source::{newest_fitting, Sources};
@@ -56,6 +57,57 @@ pub(crate) fn staging_error(error: RuntimeError) -> CliError {
     cli_error
 }
 
+/// `E-WIT-LEVEL-001` for `full_name@version`, whose `mismatched` interfaces the served level does
+/// not have, with the hint naming the newest fitting version from its source's index.
+pub(crate) fn level_mismatch(
+    full_name: &str,
+    version: &str,
+    mismatched: Vec<UnservedInterface>,
+) -> CliError {
+    staging_error(RuntimeError::WitLevelMismatch {
+        name: full_name.to_string(),
+        version: version.to_string(),
+        level: served_wit_level().level,
+        mismatched,
+    })
+}
+
+/// [`level_mismatch`] for a version read from the index of `source`, which lists `fitting` as the
+/// newest version that fits; the index is not asked for again.
+pub(crate) fn index_level_mismatch(
+    full_name: &str,
+    version: &str,
+    mismatched: Vec<UnservedInterface>,
+    source: &str,
+    fitting: Option<&str>,
+) -> CliError {
+    let level = served_wit_level().level;
+    let mut error = CliError::from(RuntimeError::WitLevelMismatch {
+        name: full_name.to_string(),
+        version: version.to_string(),
+        level,
+        mismatched,
+    });
+    error.hint = Some(index_hint(full_name, source, fitting, level));
+    error
+}
+
+/// The hint naming `fitting`, the newest version of `full_name` the index of `source` lists that
+/// fits `level`, or saying that none does.
+fn index_hint(full_name: &str, source: &str, fitting: Option<&str>, level: u64) -> String {
+    match fitting {
+        Some(version) => format!(
+            "{full_name}@{version} is the newest version in {source}'s index that fits level \
+             {level}; pin it in murmur.yaml and run `mur install`, or run `mur install \
+             {full_name}@{version}`"
+        ),
+        None => format!(
+            "no version of {full_name} in {source}'s index fits level {level}; rebuild it against \
+             level {level}'s packages (`mur version` lists them)"
+        ),
+    }
+}
+
 /// The hint naming the newest version of `full_name` its source's index lists that fits `level`,
 /// or saying why none can be named.
 fn fitting_hint(full_name: &str, level: u64) -> String {
@@ -104,23 +156,16 @@ fn fitting_hint(full_name: &str, level: u64) -> String {
         .iter()
         .find(|artifact| artifact.name == name.name())
         .and_then(|artifact| newest_fitting(artifact, current_platform()));
-    match fitting {
-        Some(version) => format!(
-            "{full_name}@{} is the newest version in {label}'s index that fits level {level}; pin \
-             it in murmur.yaml and run `mur install`",
-            version.version
-        ),
-        None => format!(
-            "no version of {full_name} in {label}'s index fits level {level}; rebuild it against \
-             level {level}'s packages (`mur version` lists them)"
-        ),
-    }
+    index_hint(
+        full_name,
+        label,
+        fitting.map(|version| version.version.as_str()),
+        level,
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use capsule_runtime::served_wit_level;
-
     use super::*;
 
     #[test]

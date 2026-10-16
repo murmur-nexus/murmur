@@ -632,16 +632,21 @@ that is bypassed, not the daemon.
   a fallback-to-IPv4 delay but is granted nothing. A capsule whose allowlisted host is IPv6-only
   cannot reach it.
 - **The proxy's ports are held for the whole session.** Each listener the allowlist implies sits
-  on `0.0.0.0:<port>` in the session's namespace from its first shell call to its end, so a server
-  a capsule starts on one of those ports — `443` under an `https://` allowlist entry, for example —
-  fails with `EADDRINUSE`. Pick a port no allow entry names.
+  on `0.0.0.0:<port>` in the session's namespace from its first shell call to its end. That
+  listener is the session's egress path: every outbound connection in the namespace lands on the
+  local listener for its destination port. A server bound to one of those ports would receive the
+  session's own outbound connections to allowlisted hosts on that port, so the ports are never
+  released between commands. A server a capsule starts on one of them — `443` under an `https://`
+  allowlist entry, for example — fails with `EADDRINUSE`. Pick a port no allow entry names.
 - **A loopback server is reachable from its own session only.** Later shell calls of the same
   session reach it; the host, other sessions, delegated children and formation members get
   `Connection refused`.
-- **A runtime killed with `SIGKILL` cannot end its session.** Its processes keep running inside the
-  namespace. The egress proxy died with the runtime, so they have no route off the host, but they
-  are not killed: find them with `pgrep` and end them by hand. Every other way a session ends,
-  including `SIGTERM`, kills them.
+- **A runtime killed with `SIGKILL` still ends its session's processes.** Each session's cgroup
+  scope has a watcher process that kills everything in the scope as soon as the runtime is gone,
+  however it died: `SIGKILL`, the OOM killer, or a crash. Processes still escape when the host
+  itself goes down, when the watcher is killed too (for example by a `SIGKILL` sent to every
+  process of the user), and on macOS, which has no cgroups. Find those with `pgrep` and end them
+  by hand.
 - **The address→name binding has a lifetime.** A connection is matched to a name through the
   answer the runtime's own resolver gave. The binding lasts five minutes, longer than the
   60-second TTL the resolver puts on its answers. A client that caches an address far past its TTL

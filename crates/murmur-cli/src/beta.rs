@@ -47,3 +47,87 @@ pub fn compiled_beta_features() -> Vec<BetaFeature> {
 
     features
 }
+
+#[cfg(test)]
+mod tests {
+    /// The `[features]` table of `crates/murmur-cli/Cargo.toml` as `(name, enabled features)`,
+    /// one entry per `name = [ … ]` line; comments and other tables are skipped.
+    fn cargo_features() -> Vec<(String, Vec<String>)> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        let text = std::fs::read_to_string(path).expect("read murmur-cli's Cargo.toml");
+        let mut in_features = false;
+        let mut features = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_features = line == "[features]";
+                continue;
+            }
+            if !in_features || line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (name, list) = line
+                .split_once('=')
+                .unwrap_or_else(|| panic!("a [features] line without '=': {line}"));
+            let list = list.trim();
+            let inner = list
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+                .unwrap_or_else(|| {
+                    panic!("feature {} is not a one-line list: {list}", name.trim())
+                });
+            let enabled = inner
+                .split(',')
+                .map(|item| item.trim().trim_matches('"').to_string())
+                .filter(|item| !item.is_empty())
+                .collect();
+            features.push((name.trim().to_string(), enabled));
+        }
+        features
+    }
+
+    #[test]
+    fn beta_features_are_all_in_beta_all() {
+        let features = cargo_features();
+        let beta_all = features
+            .iter()
+            .find(|(name, _)| name == "beta-all")
+            .map(|(_, enabled)| enabled.clone())
+            .expect("crates/murmur-cli/Cargo.toml defines no beta-all feature");
+        let beta: Vec<&String> = features
+            .iter()
+            .map(|(name, _)| name)
+            .filter(|name| name.starts_with("beta-") && *name != "beta-all")
+            .collect();
+        assert!(!beta.is_empty(), "no beta-* feature found in [features]");
+        for name in beta {
+            assert!(
+                beta_all.contains(name),
+                "beta feature {name} is not in beta-all's list in crates/murmur-cli/Cargo.toml; \
+                 add it there so CI builds and tests it"
+            );
+        }
+    }
+
+    #[cfg(feature = "beta-all")]
+    #[test]
+    fn beta_features_in_beta_all_register_themselves() {
+        let registered: Vec<&str> = super::compiled_beta_features()
+            .iter()
+            .map(|feature| feature.name)
+            .collect();
+        for (name, _) in cargo_features() {
+            let Some(short) = name.strip_prefix("beta-") else {
+                continue;
+            };
+            if short == "all" {
+                continue;
+            }
+            assert!(
+                registered.contains(&short),
+                "beta feature {name} is enabled but compiled_beta_features() does not register \
+                 '{short}'; push it there under #[cfg(feature = \"{name}\")]"
+            );
+        }
+    }
+}
