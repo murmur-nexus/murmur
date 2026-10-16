@@ -331,14 +331,14 @@ fn serve(stream: TcpStream, state: &Arc<Mutex<State>>) {
 }
 
 /// A minimal wasm tool artifact, `dir/<name>-<version>.mur.zip`, packed under the bare part of
-/// `name`.
+/// `name`. Its `tool.wasm` is an empty component: one `mur index` reads, declaring no interface.
 pub fn wasm_tool_zip(dir: &Path, name: &str, version: &str) -> PathBuf {
     let name = murmur_artifact::tool_name_of(name);
     let path = dir.join(format!("{name}-{version}.mur.zip"));
     write_zip(
         &path,
         &format!("name: {name}\nversion: {version}\nruntime: tool\n"),
-        &[("tool.wasm", b"\0asm\x01\0\0\0".as_slice())],
+        &[("tool.wasm", &wat::parse_str("(component)").unwrap())],
     );
     path
 }

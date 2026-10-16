@@ -508,9 +508,11 @@ pgrep -af 'sleep 300' ; echo "exit=$?"
 ```
 
 **Expected:** each prints nothing and `exit=1`. The session's end kills every process in its cgroup
-scope, which a backgrounded server and a `setsid` process are both in. A runtime killed with
-`SIGKILL` cannot do this: its processes keep running with no route off the host, and `pgrep` finds
-them.
+scope, which a backgrounded server and a `setsid` process are both in.
+
+Repeat with the runtime killed instead: start the same three lines, then `kill -KILL <pid of mur>`
+from another terminal. **Expected:** the same — each `pgrep` prints nothing and `exit=1` within a
+second. The scope's watcher process kills the scope once the runtime is gone.
 
 ---
 

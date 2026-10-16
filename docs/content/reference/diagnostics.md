@@ -128,7 +128,7 @@ section that explains it.
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
 | `E-TRC-001` | Trace file parse error (malformed JSON, missing required `session_start`, empty file); unknown event types are silently skipped. `mur trace show` reads a trace with no `session_end`, and skips a torn final line; `mur trace diff` and `mur trace report` refuse both, and a formation member's missing `session_end` names its formation and `mur trace show <formation-id>`. Also a `mur trace show --body` selector that names no recorded hash, or a hash whose body was never stored, a `--turn` that names several turns, `--body` or `--turn` with a formation id, and `mur trace steps` with a formation id, which names the `mur trace show <formation-id>` that lists its members and calls | [`trace.jsonl` schema](observability-schemas.md#session-trace-tracejsonl), [`mur trace show --body`](cli.md#mur-trace-show-body), [Listing a formation](cli.md#mur-trace-show-formation), [`mur trace steps`](cli.md#mur-trace-steps) |
 | `E-TRC-002` | No session found in the workdir, or a session selector matched none or several. Also a `frm_` argument to `mur trace show` that is not a formation id, or a formation no session under any searched root belongs to | [`mur trace`](cli.md#mur-trace), [Listing a formation](cli.md#mur-trace-show-formation) |
-| `E-WIT-LEVEL-001` | A driver a launch stages does not fit the WIT level this `mur` serves | [E-WIT-LEVEL-001](#e-wit-level-001) |
+| `E-WIT-LEVEL-001` | A driver a launch stages, or an artifact version `mur install` names, does not fit the WIT level this `mur` serves | [E-WIT-LEVEL-001](#e-wit-level-001) |
 | `W-BLD-001` | A declaration names an archive entry the packer already fills | [W-BLD-001](#w-bld-001) |
 | `W-BLD-002` | `capsule.wasm` shadows another root `*.wasm` | [W-BLD-002](#w-bld-002) |
 | `W-BLD-003` | A compiled artifact packages build inputs | [W-BLD-003](#w-bld-003) |
@@ -224,6 +224,23 @@ error[E-MAN-003]: murmur.yaml: invalid artifact name in 'artifacts[0].name': 'to
 | `capabilities.spawn.allow: [local/worker, ana/worker]` | `delegate-task` offers each capsule to the model by its bare part, so two entries may not share one |
 | `capabilities.install.tool: ["tool-*"]` | An install entry names its scope: `ana/tool-*`, `ana/*`, an exact full name, or `*` |
 | `inference.driver.artifact: driver-anthropic` beside a declared `murmur/driver-anthropic` | `inference.driver.artifact` names the entry as written; the message names the declared entry to refer to |
+
+A `capabilities.shell.allow` entry is a bare binary name, the one the session looks up on `PATH`.
+An entry that is anything else is refused when the manifest is read, before anything is staged or
+installed — see [Shell allow](manifest.md#shell-allow):
+
+```text
+error[E-MAN-003]: murmur.yaml: invalid capability config for 'capabilities.shell.allow[1]': '/opt/uv/bin/uv' is a path; an entry is a bare binary name
+  hint: name the binary bare (uv, not /opt/uv/bin/uv) and put its directory on PATH for mur run: PATH=/opt/uv/bin:$PATH mur run …
+```
+
+| Entry | Reason in the message |
+|---|---|
+| `/opt/uv/bin/uv`, `bin/uv` | `is a path` |
+| `.`, `..` | `names a directory` |
+| `""` | `is empty` |
+| `"a b"` | `contains whitespace` |
+| An entry holding a NUL character | `contains a NUL byte` |
 
 A top-level `registry:` key is refused by every command that reads a `murmur.yaml`, before any
 other field is checked. Artifacts resolve from the stores and the sources in
@@ -724,11 +741,22 @@ The message ends with the path and the operating system's error.
 | `File exists` | A file is where the directory belongs |
 | `Permission denied` | The directory exists and this user may not list it |
 
-### E-WIT-LEVEL-001 — a driver does not fit the served WIT level { #e-wit-level-001 }
+### E-WIT-LEVEL-001 — an artifact does not fit the served WIT level { #e-wit-level-001 }
 
-`mur run`, `mur eval` and `mur new` refuse at staging, before any driver runs, when a driver names
-a `murmur:*` interface at a version other than the one the [WIT level](wit-levels.md) this `mur`
-serves lists for its package.
+An artifact fits the [WIT level](wit-levels.md) this `mur` serves when every `murmur:*` interface
+it names is at the version the level lists for its package. Two commands refuse one that does not:
+
+| Command | Refuses |
+|---|---|
+| `mur install` | A version it resolves by name, before anything is fetched or written: `<scope>/<name>@<version>`, `--all-platforms <scope>/<name>@<version>`, and each version `murmur.yaml` pins when run with no argument, whether its payload would come from the project store, the global store or the scope's source |
+| `mur run`, `mur eval`, `mur new` | A driver, at staging, before any driver runs |
+
+`mur install ./<file>.mur.zip`, `mur install github:<owner>/<repo>@<tag>`, `mur publish`,
+`mur deploy` and a runtime pull install the bytes as given; a launch refuses a driver among them
+that does not fit. A version left out of `mur install <scope>/<name>` is always the newest that
+fits.
+
+At staging:
 
 | Driver | Refused when |
 |---|---|
@@ -738,25 +766,33 @@ serves lists for its package.
 The message names the artifact, the served level, and one clause per interface that does not fit:
 
 ```text
+error[E-WIT-LEVEL-001]: artifact 'ana/tool-x@2.0.0' does not fit WIT level 1, the level this mur serves: it names murmur:tool/run@9.9.9, and level 1 has murmur:tool@0.1.0
+  hint: ana/tool-x@1.0.0 is the newest version in github:ana/artifacts's index that fits level 1; pin it in murmur.yaml and run `mur install`, or run `mur install ana/tool-x@1.0.0`
+```
+
+```text
 error[E-WIT-LEVEL-001]: artifact 'ana/process-driver@1.0.0' does not fit WIT level 1, the level this mur serves: it exports murmur:driver/process@0.2.0, and level 1 has murmur:driver@0.3.0
 ```
 
 A clause reads `it exports|imports <interface>, and level <N> has <package>@<version>`, or
-`…, and level <N> has no version of <package>` for a package the level does not list.
+`…, and level <N> has no version of <package>` for a package the level does not list. When
+`mur install` refuses a version from the source's index rather than from a stored payload, the
+clause reads `it names <interface>`: the index lists a version's interfaces without saying which
+it exports and which it imports.
 
 The hint names the newest version of the artifact in its scope's source index that fits the
-served level. The index is read only after the launch is refused, and no payload is downloaded:
+served level. Finding it downloads no payload:
 
 | Situation | Hint |
 |---|---|
-| The index lists a version that fits | `` <scope>/<name>@<V> is the newest version in <source>'s index that fits level <N>; pin it in murmur.yaml and run `mur install` `` |
+| The index lists a version that fits | `` <scope>/<name>@<V> is the newest version in <source>'s index that fits level <N>; pin it in murmur.yaml and run `mur install`, or run `mur install <scope>/<name>@<V>` `` |
 | The index lists none that fits | `` no version of <scope>/<name> in <source>'s index fits level <N>; rebuild it against level <N>'s packages (`mur version` lists them) `` |
 | The index could not be read | `` the index of <source> could not be read (<reason>), so no fitting version can be named; run `mur search <scope>/<name>` once it answers, or rebuild it against level <N>'s packages (`mur version` lists them) `` |
 | No source serves the scope | `` no source serves the '<scope>' scope, so no index can name a version of <scope>/<name> that fits level <N>; add the repository it publishes from under registry.sources and run `mur search <scope>/<name>`, or rebuild it against level <N>'s packages (`mur version` lists them) `` |
 | The artifact was installed from a file (`local/`) | `` local/<name> was installed from a file, so no source's index can name a version of it that fits level <N>; rebuild it against level <N>'s packages (`mur version` lists them), then run `mur install <file>` on the rebuilt file `` |
 
 ```text
-  hint: ana/process-driver@1.1.0 is the newest version in github:ana/drivers's index that fits level 1; pin it in murmur.yaml and run `mur install`
+  hint: ana/process-driver@1.1.0 is the newest version in github:ana/drivers's index that fits level 1; pin it in murmur.yaml and run `mur install`, or run `mur install ana/process-driver@1.1.0`
   hint: no version of ana/process-driver in github:ana/drivers's index fits level 1; rebuild it against level 1's packages (`mur version` lists them)
   hint: the index of github:ana/drivers could not be read (request failed: io: Connection refused), so no fitting version can be named; run `mur search ana/process-driver` once it answers, or rebuild it against level 1's packages (`mur version` lists them)
   hint: no source serves the 'ana' scope, so no index can name a version of ana/process-driver that fits level 1; add the repository it publishes from under registry.sources and run `mur search ana/process-driver`, or rebuild it against level 1's packages (`mur version` lists them)
@@ -1870,9 +1906,22 @@ error[E-IDX-001]: release/tool-editor-0.7.0.mur.zip cannot be indexed: its file 
 | `its file name does not match its packed name … and version …` | Rename the file to `<name>-<version>.mur.zip`, or rebuild it |
 | `a native payload names its platform` | Name the file `<name>-<version>-<platform>.mur.zip` |
 | `a wasm payload runs on every platform`, `a static payload …` | Drop the platform from the file name |
+| `its wasm payload cannot be read as a component: it has no root .wasm entry …`, `… its root .wasm entries are ambiguous: …` | A wasm payload carries its component as `capsule.wasm` or as its one root `*.wasm`; rebuild it with `mur build` |
+| `its wasm payload cannot be read as a component: its root .wasm entry <file> is a core module, not a component` | Build the payload as a component (`--target wasm32-wasip2`), then `mur build` |
+| `its wasm payload cannot be read as a component: its root .wasm entry <file> does not parse as a component: …` | The file is not wasm, or is truncated; rebuild it |
+| `its wasm payload cannot be read as a component: its root .wasm entry <file> is over the <N>-byte decompression cap` | The component is larger than `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES` allows |
 | `it packs runtime '<a>' …, and <file> of the same <name>@<version> packs runtime '<b>'` | Build every platform's payload of one version from the same `murmur.yaml` |
 | `its packed murmur-build.json is not JSON …`, `… sets no built_at_level`, `… sets built_at_level to <value>, which is not a non-negative integer` | Rebuild the artifact with `mur build`, which writes the file |
 | `its packed murmur-build.json sets built_at_level <a>, and <file> of the same <name>@<version> sets built_at_level <b>` | Build every platform's payload of one version with the same `mur` |
+
+A payload whose packaging is wasm must carry a component `mur index` can read, because the index
+records the interfaces it names, and an empty list would fit every `mur`:
+
+```text
+error[E-IDX-001]: release/tool-w-0.1.0.mur.zip cannot be indexed: its wasm payload cannot be read as a component: its root .wasm entry capsule.wasm is a core module, not a component
+```
+
+A native payload and a skill carry no component and are indexed with no interfaces.
 
 A directory with no `.mur.zip` directly inside it is refused too:
 
@@ -1899,7 +1948,8 @@ error[E-IDX-002]: artifact index https://raw.githubusercontent.com/ana/my-artifa
 | `is not a valid schema 2 index: <location> <reason>` | A field breaks the [format](artifact-index.md#fields); `<location>` names it, such as `artifacts[0].versions[1].assets is missing` |
 
 `mur install` reads a source's index from its latest release, so a release with no
-`artifacts-index.json` is refused too. Its publisher writes and uploads one — see
+`artifacts-index.json`, or one carrying a schema 1 index, is refused too, naming the artifact being
+resolved. Its publisher writes and uploads one — see
 [How to publish your own artifact source](../how-to/publish-artifact-source.md):
 
 ```text
@@ -1941,14 +1991,29 @@ error[E-REG-001]: could not resolve ana/tool-git@2.0.0: the index of github:ana/
 
 | Message | Fix |
 |---|---|
-| `lists no artifact '<name>'` | Check the name. A name matches exactly: `tool-git` is not `tool-git-validate` |
+| `the index of <source> (release <tag>) lists no <scope>/<name>` | Check the name. A name matches exactly: `ana/tool-git` is not `ana/tool-git-validate` |
 | `lists <scope>/<name> at <versions>` | Name one of the listed versions, or leave the version out |
 | `has no payload of it for <platform>; it publishes …` | Build it on this host with `mur build` and install the file, or ask the publisher to release that platform's asset |
-| `no version of <scope>/<name> in <source> fits this mur; the newest is …` | The reference named no version and no version [fits](installing-artifacts.md#version-selection); name one to install it without the check |
+| `no version of <scope>/<name> in <source> fits WIT level <N>, the level this mur serves; the newest is …` | The reference named no version and no version [fits](installing-artifacts.md#version-selection); the hint links the [WIT levels](wit-levels.md) page, which lists the `mur` release serving each level |
 | `the index of <source> lists it as <file> on release <tag>, and …` | The index and the releases disagree; the publisher regenerates the index |
 
+An explicit version that is listed but does not fit is refused with
+[`E-WIT-LEVEL-001`](#e-wit-level-001).
+
 A `local/` artifact missing from the store is refused with the same code; no source serves the
-`local` scope.
+`local` scope:
+
+```text
+error[E-REG-001]: artifact local/tool-gi@1.0.0 is not in the store, and no source serves the 'local' scope
+  hint: a local/ artifact is installed from its .mur.zip file: mur install ./tool-gi-1.0.0.mur.zip
+```
+
+A launch whose `murmur.yaml` names an artifact neither store holds is refused at staging:
+
+```text
+error[E-REG-001]: artifact ana/tool-gi@1.0.0 is not in the store
+  hint: install it: mur install ana/tool-gi@1.0.0
+```
 
 ### E-REG-002 — an artifact's bytes or name do not match { #e-reg-002 }
 
@@ -1964,7 +2029,7 @@ A payload fetched from a source is checked against the source's index before any
 A digest or a packed `version:` other than the index lists is refused:
 
 ```text
-error[E-REG-002]: tool-git-1.0.0.mur.zip from github:ana/artifacts has sha256 bbe05ded0b5b42985748292a0d20b482c73d5e7f346a275c80f0d45b4386a038, and its index lists sha256 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+error[E-REG-002]: could not resolve ana/tool-git@1.0.0: tool-git-1.0.0.mur.zip from github:ana/artifacts has sha256 bbe05ded0b5b42985748292a0d20b482c73d5e7f346a275c80f0d45b4386a038, and its index lists sha256 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
   hint: the payload is not the one the index describes, so nothing was stored; its publisher regenerates the index, or the download was altered on the way
 ```
 
@@ -2060,14 +2125,14 @@ A source answers only for the scope of its owner, so the `scope` of its
 is downloaded beyond it:
 
 ```text
-error[E-REG-009]: github:ana/claims-bob publishes an index for scope 'bob', and it serves scope 'ana'
+error[E-REG-009]: could not resolve ana/tool-x@1.0.0: github:ana/claims-bob publishes an index for scope 'bob', and it serves scope 'ana'
   hint: a source answers only for the scope of its owner, so nothing was installed; its publisher regenerates the index with `mur index <dir> --repo ana/claims-bob --release <tag>`
 ```
 
 Only `murmur-nexus/default-artifacts` may publish an index for `murmur`:
 
 ```text
-error[E-REG-009]: github:murmur-nexus/other publishes an index for scope 'murmur', which only murmur-nexus/default-artifacts serves; this source serves scope 'murmur-nexus'
+error[E-REG-009]: could not resolve murmur-nexus/tool-x@1.0.0: github:murmur-nexus/other publishes an index for scope 'murmur', which only murmur-nexus/default-artifacts serves; this source serves scope 'murmur-nexus'
 ```
 
 ### E-REG-010 — a scope's owner has changed { #e-reg-010 }
@@ -2078,7 +2143,7 @@ another id than the one recorded for the scope is refused before anything is dow
 or pinned:
 
 ```text
-error[E-REG-010]: the owner of scope 'ana' has changed: github:ana/artifacts is now owned by GitHub account id 2222, and murmur.lock records owner id 1111 (entry ana/tool-git)
+error[E-REG-010]: could not resolve ana/tool-git@1.0.0: the owner of scope 'ana' has changed: github:ana/artifacts is now owned by GitHub account id 2222, and murmur.lock records owner id 1111 (entry ana/tool-git)
   hint: the GitHub account that owned the scope was renamed and its name registered again by someone else, or the repository changed hands; if you trust the new owner, delete the 'ana' entries from murmur.lock and install again
 ```
 
@@ -2086,7 +2151,7 @@ error[E-REG-010]: the owner of scope 'ana' has changed: github:ana/artifacts is 
 |---|---|
 | `murmur.lock` | `… murmur.lock records owner id <id> (entry <name>)` |
 | The `.meta.json` of a payload the global store serves to a project install | `<name>@<version> in the global store was installed from GitHub account id <id>, and murmur.lock records owner id …` |
-| `mur` itself, for `murmur` | `scope 'murmur' is owned by GitHub account id 190196424, the owner of murmur-nexus/default-artifacts, and github:murmur-nexus/default-artifacts answered with owner id <id>` |
+| `mur` itself, for `murmur` | `… scope 'murmur' is owned by GitHub account id 190196424, the owner of murmur-nexus/default-artifacts, and github:murmur-nexus/default-artifacts answered with owner id <id>` |
 
 To trust the new owner, delete the scope's entries from `murmur.lock` and install again. The
 `murmur` scope's id cannot be changed: a different one means the request did not reach GitHub's own

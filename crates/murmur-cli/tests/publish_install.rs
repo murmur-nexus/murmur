@@ -108,7 +108,7 @@ fn local_publish_rejects_duplicate_but_install_overwrites() {
         .failure()
         .stderr(predicate::str::contains("error[E-REG-003]:"))
         .stderr(predicate::str::contains(
-            "artifact local/asymmetry@0.0.2 already exists in registry",
+            "artifact local/asymmetry@0.0.2 already exists in the store",
         ));
 
     run_install_local("local/asymmetry@0.0.2", &home)

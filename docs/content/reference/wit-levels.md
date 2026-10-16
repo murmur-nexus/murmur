@@ -36,7 +36,7 @@ Where fit is decided:
 | Command | What it does with fit |
 |---|---|
 | `mur run`, `mur eval`, `mur new` | Refuse a driver that does not fit the served level with [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001), naming the newest version in its source's index that fits |
-| `mur install <scope>/<name>` | Installs the newest version that fits the served level and has a payload for this platform. `<scope>/<name>@<version>` installs that version without the fit check |
+| `mur install <scope>/<name>` | Installs the newest version that fits the served level and has a payload for this platform. `<scope>/<name>@<version>`, `--all-platforms` and a no-argument install refuse a version that does not fit with [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001) before anything is fetched — see [Version selection](installing-artifacts.md#version-selection) |
 | `mur search` | Lists the newest version of each artifact that fits the served level |
 | `mur index` | Writes each version's built-at level |
 | `mur doctor` | Lists every installed artifact with its built-at level and whether it fits ([WIT level block](cli.md#doctor-interface-versions)) |

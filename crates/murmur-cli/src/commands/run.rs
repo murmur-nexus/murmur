@@ -806,10 +806,8 @@ pub(crate) fn run_run(
         formation_member,
     };
 
-    // Stage against project-then-global, the same order `check_artifacts_installed` just
-    // pre-flighted. Handing staging only the project store made the two disagree: an artifact
-    // published to the global store passed the check and then failed to stage, surfacing as
-    // `E-REG-001 not found in registry` for something `mur list` could see.
+    // Stage against project-then-global, the order `check_artifacts_installed` pre-flights in,
+    // so an artifact only the global store holds stages as surely as it passed the check.
     let staged = stage_session(
         Arc::new(FallbackRegistry {
             primary: local_registry,

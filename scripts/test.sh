@@ -4,8 +4,9 @@
 #
 # Why this exists rather than a bare `cargo test --workspace`:
 #
-#   * `topology_cmd` and `deploy_cmd` compile out entirely without their beta features, so a bare
-#     run silently skips both files rather than reporting them.
+#   * `topology_cmd`, `deploy_cmd` and the `mur new <task>` tests compile out entirely without their
+#     beta features, so a bare run silently skips them rather than reporting them. `beta-all` turns
+#     on every beta feature.
 #
 # The runtime refuses to launch a subprocess-capable capsule without a delegated cgroup v2 scope
 # (fail-closed; see crates/capsule-runtime/src/cgroup.rs). Each test binary asks systemd for its
@@ -19,7 +20,7 @@
 #         scripts/test.sh -p capsule-runtime          # narrow to one crate
 set -uo pipefail
 
-FEATURES="beta-mur-topology beta-mur-deploy"
+FEATURES="beta-all"
 cd "$(dirname "$0")/.."
 
 exec cargo test --workspace --no-fail-fast --features "$FEATURES" "$@"

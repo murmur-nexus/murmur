@@ -50,3 +50,9 @@ failure-output = "immediate-final"
 # because the job counts the `[SKIP-HOST]` and `[SKIP]` lines in it.
 path = "junit.xml"
 store-success-output = true
+
+[profile.ci-default-build]
+# CI's featureless `murmur-cli` step, which runs after the full run. Inheriting `ci` keeps its
+# retries and timeouts; its own name keeps its JUnit report under target/nextest/ci-default-build/,
+# so the full run's target/nextest/ci/junit.xml, which the job uploads and counts skips in, survives.
+inherits = "ci"

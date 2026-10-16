@@ -2336,9 +2336,8 @@ pub fn stage_session(
         })
         .map(Arc::new);
     let (gateways, unresolved_credentials) = stage_gateways(
-        request.inference.as_ref(),
-        &request.artifacts,
-        request.credentials_file.as_deref(),
+        &request,
+        &full_names,
         &installed_manifests,
         &installed_artifacts,
         &spend,
@@ -7231,17 +7230,23 @@ fn gateway_for_store(
 /// [`UnresolvedCredential`] so its choices are staged unavailable.
 ///
 /// A `${NAME}` that `injected` declares resolves to an injected credential reading that store,
-/// and neither `credentials_file` nor the environment is consulted for it.
+/// and neither `request.credentials_file` nor the environment is consulted for it.
+///
+/// `request` names artifacts by tool name; `full_names` is the session's tool name → full name
+/// map, the name every refusal and credential uses.
 fn stage_gateways(
-    inference: Option<&InferenceConfig>,
-    artifacts: &[ArtifactRequest],
-    credentials_file: Option<&Path>,
+    request: &StageRequest,
+    full_names: &HashMap<String, String>,
     installed_manifests: &[(String, String)],
     installed_artifacts: &[InstalledArtifactSummary],
     spend: &Arc<SpendMeter>,
     injected: Option<&Arc<crate::control_plane::InjectedSecrets>>,
 ) -> Result<(GatewayTable, Vec<UnresolvedCredential>), RuntimeError> {
-    let http_inference = inference.filter(|inference| inference.transport == "http");
+    let credentials_file = request.credentials_file.as_deref();
+    let http_inference = request
+        .inference
+        .as_ref()
+        .filter(|inference| inference.transport == "http");
     let inference_driver = http_inference
         .and_then(|inference| inference.driver.as_ref())
         .map(|driver| driver.artifact.as_str());
@@ -7257,16 +7262,15 @@ fn stage_gateways(
         .unwrap_or_default();
     let mut table = GatewayTable::default();
     let mut unresolved = Vec::new();
-    for artifact in artifacts {
+    for artifact in &request.artifacts {
         let Some(declared) = artifact.gateway.as_ref() else {
             continue;
         };
+        // What leaves the session names the artifact as the manifest wrote it.
+        let full_name = crate::tool_names::full_name_of(full_names, &artifact.name);
         let installed = installed_artifacts
             .iter()
-            .find(|installed| murmur_artifact::tool_name_of(&installed.name) == artifact.name);
-        // What leaves the session names the artifact as the manifest wrote it.
-        let full_name =
-            installed.map_or(artifact.name.as_str(), |installed| installed.name.as_str());
+            .find(|installed| installed.name == full_name);
         if declared.api_key.is_none() && !declared.keyless {
             return Err(RuntimeError::GatewayWithoutCredential {
                 name: full_name.to_string(),
@@ -9858,22 +9862,33 @@ fn write_tool_manifest_unchecked(
     name: &str,
     manifest_yaml: &str,
 ) -> Result<(), RuntimeError> {
-    let manifest_path = workdir.join("tools").join(name).join(PACKED_MANIFEST_ENTRY);
-    let Some(parent) = manifest_path.parent() else {
-        return Err(RuntimeError::Runtime(format!(
-            "failed to derive parent for tool manifest path {}",
-            manifest_path.display()
-        )));
-    };
+    write_tool_manifest_at(&tool_manifest_path(workdir, name)?, manifest_yaml)
+}
 
-    fs::create_dir_all(parent).map_err(|source| RuntimeError::WriteToolManifest {
+/// `<workdir>/tools/<name>/murmur.yaml`. Errors unless `name` is one normal path component:
+/// `Path::join` with an absolute name discards `workdir`, and `..` climbs out of `tools/`, so
+/// either would write on the host outside the workdir.
+fn tool_manifest_path(workdir: &Path, name: &str) -> Result<PathBuf, RuntimeError> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => {
+            Ok(workdir.join("tools").join(name).join(PACKED_MANIFEST_ENTRY))
+        }
+        _ => Err(RuntimeError::ToolNameNotAComponent {
+            name: name.to_string(),
+        }),
+    }
+}
+
+fn write_tool_manifest_at(manifest_path: &Path, manifest_yaml: &str) -> Result<(), RuntimeError> {
+    let write_error = |source| RuntimeError::WriteToolManifest {
         path: manifest_path.display().to_string(),
         source,
-    })?;
-    fs::write(&manifest_path, manifest_yaml).map_err(|source| RuntimeError::WriteToolManifest {
-        path: manifest_path.display().to_string(),
-        source,
-    })
+    };
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent).map_err(write_error)?;
+    }
+    fs::write(manifest_path, manifest_yaml).map_err(write_error)
 }
 
 /// Write each native tool's binary to `<workdir>/tools/<name>/<name>`, executable, and return
@@ -10553,37 +10568,20 @@ const SUBMIT_PLAN_TOOL_MANIFEST: &str = concat!(
     "'\n",
 );
 
+/// Write each allowed binary's shell tool manifest, `<workdir>/tools/<binary>/murmur.yaml`, unless
+/// one is there already. Every name is checked before the first write, so a refused name leaves
+/// the workdir as it was.
 fn write_shell_tool_manifests(workdir: &Path, shell_allow: &[String]) -> Result<(), RuntimeError> {
-    for binary in shell_allow {
-        let manifest_path = workdir
-            .join("tools")
-            .join(binary)
-            .join(PACKED_MANIFEST_ENTRY);
-
+    let paths = shell_allow
+        .iter()
+        .map(|binary| Ok((binary, tool_manifest_path(workdir, binary)?)))
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+    for (binary, manifest_path) in paths {
         if manifest_path.exists() {
             continue;
         }
-
-        let Some(parent) = manifest_path.parent() else {
-            return Err(RuntimeError::Runtime(format!(
-                "failed to derive parent for shell manifest path {}",
-                manifest_path.display()
-            )));
-        };
-
-        fs::create_dir_all(parent).map_err(|source| RuntimeError::WriteToolManifest {
-            path: manifest_path.display().to_string(),
-            source,
-        })?;
-
-        fs::write(&manifest_path, shell_tool_manifest_yaml(binary)).map_err(|source| {
-            RuntimeError::WriteToolManifest {
-                path: manifest_path.display().to_string(),
-                source,
-            }
-        })?;
+        write_tool_manifest_at(&manifest_path, &shell_tool_manifest_yaml(binary))?;
     }
-
     Ok(())
 }
 
@@ -11694,6 +11692,98 @@ pub(crate) use tests::{
 #[cfg(test)]
 mod tests {
     use murmur_artifact::LockedArtifact;
+
+    // ── shell tool manifests stay inside workdir/tools/ ──────────────────────
+
+    /// Every path under `root`, relative and sorted.
+    fn tree_of(root: &std::path::Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                found.push(path.strip_prefix(root).unwrap().display().to_string());
+                if path.is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn a_shell_tool_manifest_is_written_under_the_workdirs_tools() {
+        let scratch = tempfile::tempdir().unwrap();
+        let workdir = scratch.path().join("workdir");
+        std::fs::create_dir(&workdir).unwrap();
+        super::write_shell_tool_manifests(&workdir, &["bash".to_string(), "jq".to_string()])
+            .unwrap();
+        assert_eq!(
+            tree_of(scratch.path()),
+            [
+                "workdir",
+                "workdir/tools",
+                "workdir/tools/bash",
+                "workdir/tools/bash/murmur.yaml",
+                "workdir/tools/jq",
+                "workdir/tools/jq/murmur.yaml",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_shell_tool_manifest_name_that_is_not_one_component_writes_nothing() {
+        for (bad, first_ok) in [
+            ("ABS", true),
+            ("..", true),
+            ("../escape", false),
+            ("bin/uv", false),
+            (".", false),
+            ("", false),
+        ] {
+            let scratch = tempfile::tempdir().unwrap();
+            let workdir = scratch.path().join("workdir");
+            std::fs::create_dir(&workdir).unwrap();
+            let bad = if bad == "ABS" {
+                scratch.path().join("host/bin/uv").display().to_string()
+            } else {
+                bad.to_string()
+            };
+            let allow = if first_ok {
+                vec!["bash".to_string(), bad.clone()]
+            } else {
+                vec![bad.clone()]
+            };
+            let error = super::write_shell_tool_manifests(&workdir, &allow).unwrap_err();
+            assert!(
+                matches!(&error, crate::RuntimeError::ToolNameNotAComponent { name } if *name == bad),
+                "{bad:?}: {error}"
+            );
+            assert_eq!(
+                tree_of(scratch.path()),
+                ["workdir"],
+                "{bad:?} wrote something"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_tool_manifest_path_check_also_guards_runtime_provided_tools() {
+        let scratch = tempfile::tempdir().unwrap();
+        let workdir = scratch.path().join("workdir");
+        std::fs::create_dir(&workdir).unwrap();
+        let outside = scratch.path().join("host").display().to_string();
+        for bad in [outside.as_str(), "..", "../x"] {
+            let error =
+                super::write_tool_manifest_unchecked(&workdir, bad, "name: x\n").unwrap_err();
+            assert!(
+                matches!(error, crate::RuntimeError::ToolNameNotAComponent { .. }),
+                "{bad:?}: {error}"
+            );
+        }
+        assert_eq!(tree_of(scratch.path()), ["workdir"]);
+    }
 
     // ── delegate-task's synthetic manifest ───────────────────────────────────
 

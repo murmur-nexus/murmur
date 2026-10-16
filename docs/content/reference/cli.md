@@ -622,7 +622,7 @@ mur install --all-platforms <scope/name@version>
 | Form | Behavior |
 |---|---|
 | `mur install` (no args) | Reads `murmur.yaml` in or above CWD; fetches all declared artifacts in parallel into the project-local store (`.murmur/artifacts/` next to the manifest) |
-| `mur install <scope/name@version>` | Fetches a specific artifact into the project-local store. A `local/` artifact is taken from the global store only; no source is asked |
+| `mur install <scope/name@version>` | Fetches a specific artifact into the project-local store. A `local/` artifact is taken from the global store only; no source is asked. A version that does not [fit this `mur`](installing-artifacts.md#version-selection) is refused with [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001) before anything is fetched |
 | `mur install <scope/name>` | Fetches the newest version that [fits this `mur`](installing-artifacts.md#version-selection) from the source of the scope |
 | `mur install github:<owner>/<repo>@<tag>` | Fetches every asset of a GitHub release into the project-local store, each under the repository's scope |
 | `mur install <path>` | Installs a `.mur.zip` file as `local/<name>`, `<name>` being the name its `murmur.yaml` declares |
@@ -630,7 +630,7 @@ mur install --all-platforms <scope/name@version>
 | `mur install --all-platforms <scope/name@version>` | Downloads all platform variants into the global store, filing each under its own platform tag; useful for CI and cross-platform build seeding |
 | `mur install --no-precompile` | Installs without compiling. Without the flag, `mur install` compiles each WASM tool, driver and hook it installs into [`~/.murmur/compiled/`](config.md#murmur-home-permissions), for this machine and this `mur` build, so the first `mur run` loads it instead of compiling it. With no arguments that includes each manifest artifact already in the store, and one whose compiled form is already there is not compiled again. A compile that fails does not fail the install or change its output; that artifact compiles on its first launch |
 
-`mur install` (no args) is the standard pre-run step. It reads `murmur.yaml`, resolves every artifact listed in it, and if an artifact is not in the global store it fetches it from the [source of its scope](installing-artifacts.md#sources-and-scopes). See [Resolution order](config.md#resolution-order). `--registry` is refused with exit status 2 and a hint naming that order.
+`mur install` (no args) is the standard pre-run step. It reads `murmur.yaml`, resolves every artifact listed in it, and if an artifact is not in the global store it fetches it from the [source of its scope](installing-artifacts.md#sources-and-scopes). A pinned version that does not fit this `mur` refuses the whole install before anything is fetched or written. An install refused for any reason before its first write leaves the project as it was, with no `.murmur/artifacts/` created. See [Resolution order](config.md#resolution-order). `--registry` is refused with exit status 2 and a hint naming that order.
 
 Example — seed a project before running:
 
@@ -3191,8 +3191,10 @@ mur index <DIR> --repo <OWNER/REPO> --release <TAG> [--merge <INDEX>] [-o <FILE>
 
 Each `.mur.zip` must hold a packed `murmur.yaml` whose `name:` and `version:` match its file name,
 `<name>-<version>.mur.zip`. A native payload carries its platform,
-`<name>-<version>-<platform>.mur.zip`; a WASM or static payload carries none. How each field is
-derived is under [How `mur index` derives each field](artifact-index.md#derivation).
+`<name>-<version>-<platform>.mur.zip`; a WASM or static payload carries none. A WASM payload must
+carry a component `mur index` can read — its `capsule.wasm` or one root `*.wasm` — or it is refused
+with [`E-IDX-001`](diagnostics.md#e-idx-001) naming why. How each field is derived is under
+[How `mur index` derives each field](artifact-index.md#derivation).
 
 Each version's `built_at_level` is the level its files record in `murmur-build.json`. A version
 whose files record none gets the newest [WIT level](wit-levels.md) this `mur` knows that its
