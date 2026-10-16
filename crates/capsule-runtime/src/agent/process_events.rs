@@ -21,12 +21,7 @@
 //! number itself and never advances it, and a streamed fragment or a started call opens one where
 //! it opens no turn.
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use murmur_artifact::{security_warning_link, W_SEC_031};
 use serde_json::Value;
@@ -48,6 +43,7 @@ use crate::{
 
 use super::process::RunSession;
 use super::process_a2a::A2aStream;
+use crate::workdir_fs::WorkdirRoot;
 
 /// The billing mode the process transport exists for. Compared as a plain string: what any other
 /// value means is the harness's business, and the runtime only reports that it is not this one.
@@ -171,7 +167,7 @@ struct OpenTurn {
 /// ever reads is the result it writes out.
 pub(super) struct ProcessEventSink<'a> {
     /// The internal session workdir, where `out/result.txt` goes.
-    workdir: PathBuf,
+    workdir: WorkdirRoot,
     /// This attempt's remaining turn budget, already net of the turns earlier attempts spent.
     max_turns: u32,
     /// The task-wide ceiling, `inference.max_turns` as declared, which a run that opens one turn
@@ -234,7 +230,7 @@ fn turn_budget_exceeded_message(turn: u32, ceiling: u32, used_before: u32) -> St
 impl<'a> ProcessEventSink<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        workdir: &Path,
+        workdir: &WorkdirRoot,
         max_turns: u32,
         task_max_turns: u32,
         first_turn: u32,
@@ -244,7 +240,7 @@ impl<'a> ProcessEventSink<'a> {
         gateways: GatewayTable,
     ) -> Self {
         Self {
-            workdir: workdir.to_path_buf(),
+            workdir: workdir.clone(),
             max_turns,
             task_max_turns,
             turns: 0,
@@ -265,7 +261,7 @@ impl<'a> ProcessEventSink<'a> {
     }
 
     /// The internal session workdir this run writes `out/result.txt` into.
-    pub(super) fn workdir(&self) -> &Path {
+    pub(super) fn workdir(&self) -> &WorkdirRoot {
         &self.workdir
     }
 
@@ -886,6 +882,7 @@ pub(super) fn failure_kind_name(kind: FailureKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
     use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
     use super::*;
@@ -983,7 +980,10 @@ mod tests {
         async fn new(max_turns: u32) -> Self {
             Self::threading(
                 max_turns,
-                Arc::new(HarnessSessionMap::new(None, Path::new("/tmp"))),
+                Arc::new(HarnessSessionMap::new(
+                    None,
+                    &crate::workdir_fs::WorkdirRoot::open(Path::new("/tmp")).unwrap(),
+                )),
             )
             .await
         }
@@ -1016,7 +1016,7 @@ mod tests {
             let engine = crate::runtime::build_engine().unwrap();
             let hooks = HookRuntime::new(
                 &engine,
-                &workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 &workdir,
                 Vec::new(),
                 crate::hooks::SessionContextData {
@@ -1034,7 +1034,7 @@ mod tests {
             .await
             .unwrap();
             let trace = TraceWriter::open(
-                &workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 "ses_test".to_string(),
                 "cap".to_string(),
                 "0.1.0".to_string(),
@@ -1063,7 +1063,12 @@ mod tests {
             )
             .await
             .unwrap();
-            let otel = OtelEmitter::new(None, &workdir, "cap".to_string(), "0.1.0".to_string());
+            let otel = OtelEmitter::new(
+                None,
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+                "cap".to_string(),
+                "0.1.0".to_string(),
+            );
             let policy = HarnessSessionPolicy {
                 map: Arc::clone(&map),
                 context_id: Some(CONTEXT.to_string()),
@@ -1109,7 +1114,7 @@ mod tests {
         async fn feed(&mut self, events: Vec<Event>) -> SinkOutcome {
             let session = RunSession::new(&self.plan, &self.policy, HARNESS, "fixture-driver");
             let mut sink = ProcessEventSink::new(
-                &self.workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
                 self.max_turns,
                 self.task_max_turns,
                 self.first_turn,
@@ -1132,7 +1137,7 @@ mod tests {
         async fn feed_then_go_quiet(&mut self, events: Vec<Event>) {
             let session = RunSession::new(&self.plan, &self.policy, HARNESS, "fixture-driver");
             let mut sink = ProcessEventSink::new(
-                &self.workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
                 self.max_turns,
                 self.task_max_turns,
                 self.first_turn,
@@ -2693,7 +2698,10 @@ mod tests {
         h.feed(vec![session_started("named-but-empty")]).await;
         assert_eq!(h.carried, None);
 
-        let map = Arc::new(HarnessSessionMap::new(None, Path::new("/tmp")));
+        let map = Arc::new(HarnessSessionMap::new(
+            None,
+            &crate::workdir_fs::WorkdirRoot::open(Path::new("/tmp")).unwrap(),
+        ));
         map.put(CONTEXT, "remembered", HARNESS, "fixture-driver");
         let mut h = Harness::threading(10, map).await;
         h.feed(vec![Event::TurnFailed(TurnFailure {
@@ -2720,7 +2728,10 @@ mod tests {
     /// the entry exactly as it was so the next task fails the same way.
     #[tokio::test]
     async fn harness_session_a_resume_the_harness_never_acknowledged_fails_as_gone() {
-        let map = Arc::new(HarnessSessionMap::new(None, Path::new("/tmp")));
+        let map = Arc::new(HarnessSessionMap::new(
+            None,
+            &crate::workdir_fs::WorkdirRoot::open(Path::new("/tmp")).unwrap(),
+        ));
         map.put(CONTEXT, "remembered", HARNESS, "fixture-driver");
         let mut h = Harness::threading(10, map).await;
         assert_eq!(h.planned_id, "remembered");
@@ -2749,7 +2760,10 @@ mod tests {
     /// An expired login is not a missing conversation.
     #[tokio::test]
     async fn harness_session_an_auth_failure_on_a_resume_is_still_a_turn_failure() {
-        let map = Arc::new(HarnessSessionMap::new(None, Path::new("/tmp")));
+        let map = Arc::new(HarnessSessionMap::new(
+            None,
+            &crate::workdir_fs::WorkdirRoot::open(Path::new("/tmp")).unwrap(),
+        ));
         map.put(CONTEXT, "remembered", HARNESS, "fixture-driver");
         let mut h = Harness::threading(10, map).await;
 
@@ -2770,7 +2784,10 @@ mod tests {
 
     #[tokio::test]
     async fn harness_session_a_resumed_turn_that_ends_keeps_its_id() {
-        let map = Arc::new(HarnessSessionMap::new(None, Path::new("/tmp")));
+        let map = Arc::new(HarnessSessionMap::new(
+            None,
+            &crate::workdir_fs::WorkdirRoot::open(Path::new("/tmp")).unwrap(),
+        ));
         map.put(CONTEXT, "remembered", HARNESS, "fixture-driver");
         let mut h = Harness::threading(10, map).await;
         assert_eq!(h.planned_id, "remembered");

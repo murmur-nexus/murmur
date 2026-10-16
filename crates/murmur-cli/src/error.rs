@@ -95,6 +95,7 @@ pub const E_RUN_046: &str = "E-RUN-046"; // a formation member tried to launch a
 pub const E_RUN_047: &str = "E-RUN-047"; // the capsule's bytes hash differently from the sha256 admission bound it to
 pub const E_RUN_048: &str = "E-RUN-048"; // `mur token` named a session whose door is public, which minted no token
 pub const E_RUN_049: &str = "E-RUN-049"; // `mur token --credential` named a credential the session did not mint
+pub const E_RUN_050: &str = "E-RUN-050"; // a runtime write, read, create or removal inside the workdir met a symbolic link
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -346,6 +347,15 @@ impl From<RuntimeError> for CliError {
             RuntimeError::CapsuleCompile(message) => {
                 CliError::new(E_RUN_001, format!("failed to compile capsule component: {message}"))
             }
+            RuntimeError::WorkdirPathRefused { refusal } => CliError::with_hint(
+                E_RUN_050,
+                refusal.to_string(),
+                format!(
+                    "the runtime never follows a link inside the workdir; replace {} with a \
+                     regular file or directory, or remove it, and run again",
+                    refusal.refused_at
+                ),
+            ),
             RuntimeError::CreateWorkdir { path, source } => CliError::new(
                 E_IO_003,
                 format!("failed to create workdir at {path}: {source}"),
@@ -1290,6 +1300,32 @@ fn extract_interface_name(message: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_workdir_path_refusal_maps_to_e_run_050_naming_the_path_and_the_link() {
+        let cli = CliError::from(RuntimeError::WorkdirPathRefused {
+            refusal: capsule_runtime::WorkdirRefusal {
+                path: ".murmur/ses_a/plans/plan-1.json".to_string(),
+                refused_at: ".murmur/ses_a/plans".to_string(),
+                operation: capsule_runtime::WorkdirOperation::Write,
+                reason: capsule_runtime::RefusalReason::Symlink,
+            },
+        });
+        assert_eq!(cli.code, E_RUN_050);
+        assert_eq!(
+            cli.message,
+            "refused to write .murmur/ses_a/plans/plan-1.json: .murmur/ses_a/plans is a \
+             symbolic link inside the workdir"
+        );
+        assert!(
+            cli.hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains(".murmur/ses_a/plans"),
+            "{:?}",
+            cli.hint
+        );
+    }
 
     #[test]
     fn runtime_origin_refusal_maps_to_e_run_043() {

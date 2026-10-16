@@ -26,6 +26,7 @@ use serde_json::Value;
 
 use crate::bindings::hook::murmur::conversation::read::{Message, MessagePage};
 use crate::errors::RuntimeError;
+use crate::workdir_fs::WorkdirRoot;
 
 /// Directory under the murmur home holding every record, one subdirectory per record name.
 pub(crate) const CONVERSATION_ROOT_DIR: &str = "conversations";
@@ -193,7 +194,7 @@ pub(crate) struct ConversationRecord {
     /// `<home>/.murmur/conversations/<record>/<context-id>`.
     dir: PathBuf,
     /// Session directory the failures are reported into, beside stderr.
-    workdir: PathBuf,
+    workdir: WorkdirRoot,
     /// The capsule this record's header names, or `None` for a capsule that declares no
     /// `context.retain` — which writes no header at all. See [`Self::ensure_header`].
     capsule: Option<String>,
@@ -221,7 +222,7 @@ impl ConversationRecord {
     pub(crate) fn open(
         root: &Path,
         context_id: &str,
-        workdir: &Path,
+        workdir: &WorkdirRoot,
         capsule: Option<&str>,
     ) -> Option<Self> {
         if crate::state_store::validate_store_name(context_id).is_err() {
@@ -236,7 +237,7 @@ impl ConversationRecord {
         }
         Some(Self {
             dir: root.join(context_id),
-            workdir: workdir.to_path_buf(),
+            workdir: workdir.clone(),
             capsule: capsule.map(str::to_string),
             header_ensured: false,
             recorded: HashSet::new(),
@@ -448,7 +449,7 @@ impl RecordCache {
     /// The runtime is the record's only writer and only ever appends, so a file whose length is
     /// unchanged holds the same bytes and the parse above it still stands. A missing file is an
     /// empty record of length 0, exactly as a read of one is.
-    fn messages(&mut self, path: &Path, workdir: &Path) -> Result<&[Value], String> {
+    fn messages(&mut self, path: &Path, workdir: &WorkdirRoot) -> Result<&[Value], String> {
         let len = match std::fs::metadata(path) {
             Ok(metadata) => metadata.len(),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
@@ -488,7 +489,7 @@ impl RecordCache {
 pub(crate) fn page(
     cache: &mut RecordCache,
     path: Option<&Path>,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     cursor: Option<&str>,
     limit: u32,
 ) -> Result<MessagePage, String> {
@@ -554,7 +555,11 @@ fn empty_page() -> MessagePage {
 /// naming the path and the 1-based line number, and every line after it, in this read and in the
 /// reader's later ones, is silent. One such line is worth one log entry however many times the
 /// reader goes back to the file.
-fn read_record(path: &Path, workdir: &Path, reported: &mut bool) -> Result<Vec<Value>, String> {
+fn read_record(
+    path: &Path,
+    workdir: &WorkdirRoot,
+    reported: &mut bool,
+) -> Result<Vec<Value>, String> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -638,7 +643,7 @@ pub(crate) fn ensure_context_dirs(dir: &Path) -> Result<(), String> {
 }
 
 /// Both places an operator looks for what the runtime did with a record. Never fatal.
-pub(crate) fn report(workdir: &Path, message: &str) {
+pub(crate) fn report(workdir: &WorkdirRoot, message: &str) {
     crate::runtime_err!("[capsule-runtime] {message}");
     crate::agent::append_bootstrap_log(workdir, message);
 }
@@ -668,7 +673,13 @@ mod tests {
         let path = root.join("ctx_1").join(RECORD_FILE_NAME);
         crate::murmur_home::wide_file(&path, "", 0o644);
 
-        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path(), None).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            None,
+        )
+        .unwrap();
         record.append(&[message(&id_at(1), "user", "hello")]);
 
         assert_eq!(crate::murmur_home::mode_of(&path), 0o600);
@@ -682,8 +693,13 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/shared");
 
-        let mut record =
-            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         record.append(&[message(&id_at(1), "user", "hello")]);
 
         assert_eq!(crate::murmur_home::mode_of(&record.path()), 0o600);
@@ -700,8 +716,13 @@ mod tests {
         let old = serde_json::to_string(&message(&id_at(1), "user", "old")).unwrap();
         crate::murmur_home::wide_file(&path, &format!("{old}\n"), 0o644);
 
-        let mut record =
-            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         record.append(&[message(&id_at(2), "user", "new")]);
 
         assert!(read_header(&path).is_some(), "the record was adopted");
@@ -735,7 +756,13 @@ mod tests {
         }
         let workdir = tempfile::tempdir().unwrap();
         let root = record_root("shared").unwrap();
-        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path(), None).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            None,
+        )
+        .unwrap();
         record.append(&[message(&id_at(1), "user", "hello")]);
         assert!(record.path().exists());
     }
@@ -748,8 +775,13 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/shared");
 
-        let mut record =
-            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         record.append(&[message(&id_at(1), "user", "hello")]);
 
         let raw = std::fs::read_to_string(record.path()).unwrap();
@@ -770,21 +802,38 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/c");
 
-        let mut record =
-            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         record.append(&[
             message(&id_at(1), "user", "one"),
             message(&id_at(2), "assistant", "two"),
         ]);
         let path = record.path();
 
-        let mut reader =
-            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut reader = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         let loaded = reader.load();
         assert_eq!(loaded.len(), 2, "the header is not a message: {loaded:?}");
 
         let mut cache = RecordCache::default();
-        let page = page(&mut cache, Some(&path), workdir.path(), None, 100).unwrap();
+        let page = page(
+            &mut cache,
+            Some(&path),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            None,
+            100,
+        )
+        .unwrap();
         assert_eq!(page.total, 2);
         assert_eq!(page.messages.len(), 2);
     }
@@ -810,8 +859,13 @@ mod tests {
         std::fs::write(&path, &headerless).unwrap();
         assert!(read_header(&path).is_none(), "unowned before the append");
 
-        let mut record =
-            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         record.append(&[message(&id_at(3), "user", "three")]);
 
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -846,8 +900,13 @@ mod tests {
         };
         std::fs::write(&path, header_line(&header).unwrap()).unwrap();
 
-        let mut record =
-            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         record.append(&[message(&id_at(7), "user", "seven")]);
 
         assert_eq!(read_header(&path).unwrap(), header);
@@ -861,12 +920,22 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/capsule");
 
-        let mut first =
-            ConversationRecord::open(&root, "ctx_fixed", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut first = ConversationRecord::open(
+            &root,
+            "ctx_fixed",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         first.append(&[message(&id_at(1), "user", "hello")]);
 
-        let mut second =
-            ConversationRecord::open(&root, "ctx_fixed", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut second = ConversationRecord::open(
+            &root,
+            "ctx_fixed",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         let loaded = second.load();
         assert_eq!(loaded.len(), 1);
         assert_eq!(
@@ -894,8 +963,13 @@ mod tests {
         let conversations = home.path().join("conversations");
         let root = conversations.join("capsule");
 
-        let mut record =
-            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         assert!(!conversations.exists(), "opening a record creates nothing");
 
         record.append(&[message(&id_at(1), "user", "hello")]);
@@ -921,7 +995,7 @@ mod tests {
                 ConversationRecord::open(
                     &home.path().join("conversations/c"),
                     context_id,
-                    workdir.path(),
+                    &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                     Some(CAPSULE)
                 )
                 .is_none(),
@@ -937,8 +1011,13 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/capsule");
-        let mut record =
-            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         let written: Vec<Value> = (1..=5)
             .map(|n| message(&id_at(n), "user", &format!("m{n}")))
             .collect();
@@ -951,7 +1030,7 @@ mod tests {
             let page = page(
                 &mut RecordCache::default(),
                 Some(&path),
-                workdir.path(),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 cursor.as_deref(),
                 2,
             )
@@ -977,8 +1056,13 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/capsule");
-        let mut record =
-            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         record.append(
             &(1..=120)
                 .map(|n| message(&id_at(n), "user", "m"))
@@ -990,7 +1074,7 @@ mod tests {
             page(
                 &mut RecordCache::default(),
                 Some(&path),
-                workdir.path(),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 None,
                 0
             )
@@ -1003,7 +1087,7 @@ mod tests {
             page(
                 &mut RecordCache::default(),
                 Some(&path),
-                workdir.path(),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 None,
                 u32::MAX
             )
@@ -1021,8 +1105,13 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/capsule");
-        let mut record =
-            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         record.append(&[message(&id_at(1), "user", "m")]);
         let path = record.path();
 
@@ -1031,7 +1120,7 @@ mod tests {
                 page(
                     &mut RecordCache::default(),
                     Some(&path),
-                    workdir.path(),
+                    &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                     Some(cursor),
                     10
                 )
@@ -1053,7 +1142,14 @@ mod tests {
             .join("conversations/capsule/ctx_1/conversation.jsonl");
 
         for path in [None, Some(missing.as_path())] {
-            let page = page(&mut RecordCache::default(), path, workdir.path(), None, 10).unwrap();
+            let page = page(
+                &mut RecordCache::default(),
+                path,
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+                None,
+                10,
+            )
+            .unwrap();
             assert!(page.messages.is_empty());
             assert_eq!(page.next_cursor, None);
             assert_eq!(page.total, 0);
@@ -1067,26 +1163,49 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/capsule");
-        let mut record =
-            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         record.append(&[message(&id_at(1), "user", "a")]);
         let path = record.path();
 
         let mut cache = RecordCache::default();
         assert_eq!(
-            page(&mut cache, Some(&path), workdir.path(), None, 10)
-                .unwrap()
-                .total,
+            page(
+                &mut cache,
+                Some(&path),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+                None,
+                10
+            )
+            .unwrap()
+            .total,
             1
         );
-        assert!(page(&mut cache, None, workdir.path(), None, 10)
-            .unwrap()
-            .messages
-            .is_empty());
+        assert!(page(
+            &mut cache,
+            None,
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            None,
+            10
+        )
+        .unwrap()
+        .messages
+        .is_empty());
         assert_eq!(
-            page(&mut cache, Some(&path), workdir.path(), None, 10)
-                .unwrap()
-                .total,
+            page(
+                &mut cache,
+                Some(&path),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+                None,
+                10
+            )
+            .unwrap()
+            .total,
             1
         );
         assert_eq!(cache.reads(), 1, "the parse survived the empty read");
@@ -1112,7 +1231,7 @@ mod tests {
         let page = page(
             &mut RecordCache::default(),
             Some(&path),
-            workdir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             None,
             10,
         )
@@ -1145,8 +1264,13 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(&blocker, "").unwrap();
 
-        let mut record =
-            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         let first = message(&id_at(1), "user", "a");
         let second = message(&id_at(2), "assistant", "b");
         record.append(std::slice::from_ref(&first));
@@ -1179,8 +1303,13 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/capsule");
-        let mut record =
-            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let mut record = ConversationRecord::open(
+            &root,
+            "ctx_1",
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            Some(CAPSULE),
+        )
+        .unwrap();
         record.append(
             &(1..=250)
                 .map(|n| message(&id_at(n), "user", "m"))
@@ -1196,7 +1325,7 @@ mod tests {
             let page = page(
                 &mut cache,
                 Some(&path),
-                workdir.path(),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 cursor.as_deref(),
                 25,
             )
@@ -1226,7 +1355,7 @@ mod tests {
             let page = page(
                 &mut cache,
                 Some(&path),
-                workdir.path(),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 cursor.as_deref(),
                 25,
             )
@@ -1266,7 +1395,7 @@ mod tests {
             let page = page(
                 &mut cache,
                 Some(&path),
-                workdir.path(),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 cursor.as_deref(),
                 2,
             )

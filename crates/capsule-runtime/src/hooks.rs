@@ -15,6 +15,7 @@ use murmur_artifact::{
 };
 use tokio::sync::mpsc;
 
+use crate::workdir_fs::{WorkdirRoot, DEFAULT_FILE_MODE};
 use crate::{
     artifact_config::ARTIFACT_CONFIG_ENV,
     bindings::hook::exports::murmur::hook::lifecycle::{
@@ -102,7 +103,7 @@ pub(crate) const FAULT_ARM_SEED_REJECTED: &str = "seed-rejected";
 
 pub(crate) struct HookRuntime {
     /// Session directory — used for error log paths and mounted as "." in hook WASI contexts.
-    workdir: PathBuf,
+    workdir: WorkdirRoot,
     blocking_hooks: Vec<HookInstance>,
     /// One entry per `execution_mode: async` hook: its queue and the worker draining it. The
     /// instance itself lives inside that worker, instantiated once at [`Self::new`] exactly
@@ -683,7 +684,7 @@ pub(crate) struct HookEnvVars<'a> {
 /// and uses a temporary current-thread runtime internally.
 pub(crate) fn dispatch_stage(
     engine: &wasmtime::Engine,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     staged_hooks: &[StagedHookArtifact],
     shell_allow: Vec<String>,
     env_vars: &HookEnvVars<'_>,
@@ -719,21 +720,13 @@ pub(crate) fn dispatch_stage(
                         // `on-stage` honors only `write-manifests`.
                         if let HookOutput::WriteManifests(manifests) = output {
                             for m in manifests {
-                                let dir = workdir.join("tools").join(&m.binary_name);
-                                if let Err(e) = std::fs::create_dir_all(&dir) {
-                                    log_hook_error(
-                                        workdir,
-                                        &staged.name,
-                                        &format!(
-                                            "failed to create tool dir for {}: {e}",
-                                            m.binary_name
-                                        ),
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                                let manifest_path = dir.join(PACKED_MANIFEST_ENTRY);
-                                if let Err(e) = std::fs::write(&manifest_path, &m.content) {
+                                // A refusal here is on the latch `stage_session` drains, which
+                                // fails the launch.
+                                if let Err(e) = workdir.write_file(
+                                    format!("tools/{}/{PACKED_MANIFEST_ENTRY}", m.binary_name),
+                                    m.content.as_bytes(),
+                                    DEFAULT_FILE_MODE,
+                                ) {
                                     log_hook_error(
                                         workdir,
                                         &staged.name,
@@ -766,7 +759,7 @@ pub(crate) fn dispatch_stage(
 
 async fn call_stage_once(
     engine: &wasmtime::Engine,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     staged: &StagedHookArtifact,
     evt: &StageEvent,
     env_vars: &HookEnvVars<'_>,
@@ -809,8 +802,13 @@ async fn call_stage_once(
     let state = HookStoreState {
         limits: limits.limiter(),
         table: ResourceTable::new(),
-        wasi: build_wasi_ctx(workdir, env_vars, &staged.grant, staged.gateway.as_deref())
-            .map_err(|e| e.to_string())?,
+        wasi: build_wasi_ctx(
+            workdir.path(),
+            env_vars,
+            &staged.grant,
+            staged.gateway.as_deref(),
+        )
+        .map_err(|e| e.to_string())?,
         http: WasiHttpCtx::new(),
         http_hooks: NetworkPolicyHooks {
             network_allow_rules: staged.grant.network_allow_rules.clone(),
@@ -895,7 +893,7 @@ impl HookRuntime {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         engine: &wasmtime::Engine,
-        workdir: &Path,
+        workdir: &WorkdirRoot,
         accessible_workdir: &Path,
         staged_hooks: Vec<StagedHookArtifact>,
         context: SessionContextData,
@@ -932,7 +930,7 @@ impl HookRuntime {
                         instance,
                         rx,
                         context.clone(),
-                        workdir.to_path_buf(),
+                        workdir.clone(),
                         fault_tx.clone(),
                     ));
                     async_hooks.push(AsyncHookQueue {
@@ -956,7 +954,7 @@ impl HookRuntime {
         });
 
         Ok(Self {
-            workdir: workdir.to_path_buf(),
+            workdir: workdir.clone(),
             blocking_hooks,
             async_hooks,
             fault_tx,
@@ -1117,7 +1115,11 @@ impl HookRuntime {
     /// Dispatch `event` to all bound hooks. Returns every artifact emitted by
     /// any blocking hook via `HookOutput::Artifact`, in hook-registration order.
     /// An empty `Vec` means no hook produced an artifact for this event.
-    pub(crate) async fn emit(&mut self, workdir: &Path, event: HookEvent) -> Vec<HookArtifact> {
+    pub(crate) async fn emit(
+        &mut self,
+        workdir: &WorkdirRoot,
+        event: HookEvent,
+    ) -> Vec<HookArtifact> {
         self.dispatch(workdir, event).await.artifacts
     }
 
@@ -1162,7 +1164,7 @@ impl HookRuntime {
     /// written as a refusal rather than left to that fact.
     pub(crate) async fn decide(
         &mut self,
-        workdir: &Path,
+        workdir: &WorkdirRoot,
         turn: u32,
         call: &ResolvedCall,
     ) -> CallDecision {
@@ -1294,7 +1296,7 @@ impl HookRuntime {
     /// the rest; a per-hook error is still logged and the loop still continues regardless
     /// of which field the caller reads. Event-keyed side effects (the running
     /// token/tool-call/shell-call totals) run here so all events funnel through one place.
-    async fn dispatch(&mut self, workdir: &Path, event: HookEvent) -> DispatchOutcome {
+    async fn dispatch(&mut self, workdir: &WorkdirRoot, event: HookEvent) -> DispatchOutcome {
         if let HookEvent::Inference {
             input_tokens,
             output_tokens,
@@ -2003,7 +2005,7 @@ async fn run_async_hook_worker(
     mut instance: HookInstance,
     mut jobs: mpsc::Receiver<AsyncHookJob>,
     context: SessionContextData,
-    workdir: PathBuf,
+    workdir: WorkdirRoot,
     faults: mpsc::UnboundedSender<DispatchFault>,
 ) {
     while let Some(job) = jobs.recv().await {
@@ -2128,24 +2130,24 @@ fn build_wasi_ctx(
     Ok(builder.build())
 }
 
-async fn log_hook_error(workdir: &Path, hook_name: &str, error: &str) {
-    use tokio::io::AsyncWriteExt;
-    let log_dir = workdir.join("logs");
-    let _ = tokio::fs::create_dir_all(&log_dir).await;
-    let path: PathBuf = log_dir.join(format!("hook-{hook_name}.log"));
+/// Appends `error` to `logs/hook-<hook_name>.log`. A refused append is on `workdir`'s refusal
+/// latch; nothing else is reported.
+///
+/// On the blocking pool, as `tokio::fs` does its work: the await is a yield point, so a drain
+/// racing an async hook's worker gets the thread between that worker's calls.
+async fn log_hook_error(workdir: &WorkdirRoot, hook_name: &str, error: &str) {
+    use std::io::Write;
+    let root = workdir.clone();
+    let hook_name = hook_name.to_string();
     let line = format!("{error}\n");
-    if let Ok(mut file) = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await
-    {
-        let _ = file.write_all(line.as_bytes()).await;
-        // `tokio::fs::File` buffers, and dropping it does NOT flush — without this the
-        // line reaches disk only if the runtime happens to get around to it, which made
-        // "the hook error was logged" a coin flip for anything reading the file back.
-        let _ = file.flush().await;
-    }
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(mut file) =
+            root.open_append(format!("logs/hook-{hook_name}.log"), DEFAULT_FILE_MODE)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    })
+    .await;
 }
 
 /// Hook runtimes other modules' tests drive the compaction path through.
@@ -2188,7 +2190,7 @@ pub(crate) mod test_support {
     ) -> HookRuntime {
         HookRuntime::new(
             engine,
-            workdir,
+            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             workdir,
             vec![tests::staged_double_named(
                 "caller",
@@ -2369,7 +2371,7 @@ mod tests {
     ) -> Result<HookRuntime, RuntimeError> {
         HookRuntime::new(
             engine,
-            workdir,
+            &WorkdirRoot::open(workdir).unwrap(),
             accessible,
             staged,
             SessionContextData {
@@ -2420,7 +2422,7 @@ mod tests {
             // function is absent it is skipped before any wasm call, so no error is logged.
             hooks
                 .emit(
-                    session.path(),
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                     HookEvent::TaskStart {
                         task_id: "tsk_1".to_string(),
                         context_id: "ctx_1".to_string(),
@@ -2434,7 +2436,7 @@ mod tests {
                 .await;
             hooks
                 .emit(
-                    session.path(),
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                     HookEvent::TaskEnd {
                         task_id: "tsk_1".to_string(),
                         exit_status: "ok".to_string(),
@@ -2546,12 +2548,17 @@ mod tests {
                 .expect("all doubles export the six required fns and instantiate");
 
             // once before the loop
-            hooks.emit(session.path(), HookEvent::SessionStart).await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    HookEvent::SessionStart,
+                )
+                .await;
             // three tasks, each a start / one inference / end trio
             for t in 0..3u32 {
                 hooks
                     .emit(
-                        session.path(),
+                        &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                         HookEvent::TaskStart {
                             task_id: format!("tsk_{t}"),
                             context_id: format!("ctx_{t}"),
@@ -2565,7 +2572,7 @@ mod tests {
                     .await;
                 hooks
                     .emit(
-                        session.path(),
+                        &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                         HookEvent::Inference {
                             turn: 0,
                             input_tokens: 0,
@@ -2580,7 +2587,7 @@ mod tests {
                     .await;
                 hooks
                     .emit(
-                        session.path(),
+                        &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                         HookEvent::TaskEnd {
                             task_id: format!("tsk_{t}"),
                             exit_status: "ok".to_string(),
@@ -2596,7 +2603,7 @@ mod tests {
             );
             hooks
                 .emit(
-                    session.path(),
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                     HookEvent::SessionEnd {
                         total_turns,
                         exit_status: "ok".to_string(),
@@ -3431,7 +3438,7 @@ mod tests {
 
         hooks
             .emit(
-                session,
+                &crate::workdir_fs::WorkdirRoot::open(session).unwrap(),
                 HookEvent::Shell {
                     turn: 1,
                     binary: binary.to_string(),
@@ -3523,7 +3530,7 @@ mod tests {
             model: "manifest-model".to_string(),
             engine: engine.clone(),
             accessible_workdir: accessible.path().to_path_buf(),
-            workdir: accessible.path().to_path_buf(),
+            workdir: WorkdirRoot::open(accessible.path()).unwrap(),
             inference_env: Vec::new(),
             capability_policy: crate::types::CapabilityPolicy::default(),
             network_allow_rules: Vec::new(),
@@ -3539,7 +3546,7 @@ mod tests {
         let artifacts = rt.block_on(async {
             let mut hooks = HookRuntime::new(
                 &engine,
-                session.path(),
+                &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                 accessible.path(),
                 vec![staged_double_named(
                     "caller",
@@ -3560,7 +3567,12 @@ mod tests {
             )
             .await
             .expect("a hook importing murmur:runtime/inference must link");
-            hooks.emit(session.path(), inference_event()).await
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    inference_event(),
+                )
+                .await
         });
 
         assert_eq!(artifacts.len(), 1, "the hook returns run-inference's text");
@@ -3595,7 +3607,12 @@ mod tests {
             )
             .await
             .expect("the import is defined even with no driver, so the hook links");
-            hooks.emit(session.path(), inference_event()).await
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    inference_event(),
+                )
+                .await
         });
 
         assert_eq!(artifacts.len(), 1);
@@ -3634,7 +3651,12 @@ mod tests {
             )
             .await
             .expect("the import is defined under process transport, so the hook links");
-            let artifacts = hooks.emit(session.path(), inference_event()).await;
+            let artifacts = hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    inference_event(),
+                )
+                .await;
             (
                 artifacts,
                 hooks.drain_inference_records(),
@@ -3839,7 +3861,12 @@ mod tests {
 
             // Returns at all == the spinning guest was interrupted; without the deadline the
             // await below would never complete.
-            hooks.emit(session.path(), HookEvent::SessionStart).await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    HookEvent::SessionStart,
+                )
+                .await;
         });
 
         let spinner_log =
@@ -4012,7 +4039,12 @@ mod tests {
             )
             .await
             .expect("a tokens-importing hook instantiates like any other");
-            hooks.emit(session.path(), HookEvent::SessionStart).await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    HookEvent::SessionStart,
+                )
+                .await;
         });
 
         let expected = crate::agent::count_tokens(TOKEN_PROBE);
@@ -4043,7 +4075,7 @@ mod tests {
 
         dispatch_stage(
             &engine,
-            session.path(),
+            &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
             std::slice::from_ref(&staged),
             Vec::new(),
             &HookEnvVars::default(),
@@ -4118,7 +4150,7 @@ mod tests {
         on_stage.config.binding = HookBinding::OnStage;
         dispatch_stage(
             &engine,
-            session.path(),
+            &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
             std::slice::from_ref(&on_stage),
             Vec::new(),
             &HookEnvVars::default(),
@@ -4133,10 +4165,15 @@ mod tests {
                     .await
                     .expect("a task-io-importing hook instantiates like any other");
 
-            hooks.emit(session.path(), HookEvent::SessionStart).await;
             hooks
                 .emit(
-                    session.path(),
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    HookEvent::SessionStart,
+                )
+                .await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                     HookEvent::TaskStart {
                         task_id: "tsk_1".to_string(),
                         context_id: "ctx_1".to_string(),
@@ -4151,7 +4188,12 @@ mod tests {
 
             // What `run_task_with_reopens` does around one attempt of the agent loop.
             hooks.begin_task_attempt("task text".to_string(), "task text".to_string());
-            hooks.emit(session.path(), inference_event()).await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    inference_event(),
+                )
+                .await;
             hooks.record_task_output("the result");
             hooks
                 .dispatch_task_end("tsk_1".to_string(), "ok".to_string())
@@ -4160,7 +4202,7 @@ mod tests {
 
             hooks
                 .emit(
-                    session.path(),
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                     HookEvent::SessionEnd {
                         total_turns: 1,
                         exit_status: "ok".to_string(),
@@ -4316,7 +4358,7 @@ mod tests {
         rt.block_on(async {
             let mut hooks = HookRuntime::new(
                 &engine,
-                session.path(),
+                &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                 accessible.path(),
                 vec![staged],
                 SessionContextData {
@@ -4445,7 +4487,7 @@ mod tests {
         let reason = rt.block_on(async {
             let mut hooks = HookRuntime::new(
                 &engine,
-                session.path(),
+                &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                 accessible.path(),
                 vec![staged],
                 SessionContextData {
@@ -4941,7 +4983,7 @@ mod tests {
         rt.block_on(async {
             let _ = call_stage_once(
                 &engine,
-                workdir.path(),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 &staged,
                 &StageEvent {
                     shell_allow: Vec::new(),
@@ -5448,7 +5490,7 @@ artifacts:
         .expect("task-start double instantiates");
         hooks
             .emit(
-                session,
+                &crate::workdir_fs::WorkdirRoot::open(session).unwrap(),
                 HookEvent::TaskStart {
                     task_id: "tsk_1".to_string(),
                     context_id: "ctx_1".to_string(),
@@ -5717,7 +5759,12 @@ artifacts:
             .await
             .expect("double instantiates");
 
-            let artifacts = hooks.emit(session.path(), tool_call_event()).await;
+            let artifacts = hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    tool_call_event(),
+                )
+                .await;
             assert!(
                 artifacts.is_empty(),
                 "an unsupported arm commits nothing, exactly as `none` would"
@@ -5770,7 +5817,12 @@ artifacts:
             .await
             .expect("double instantiates");
 
-            hooks.emit(session.path(), tool_call_event()).await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    tool_call_event(),
+                )
+                .await;
             assert!(
                 hooks.drain_dispatch_faults().is_empty(),
                 "`none` must never buffer a fault"
@@ -5808,7 +5860,12 @@ artifacts:
             .await
             .expect("double instantiates");
 
-            let artifacts = hooks.emit(session.path(), inference_event()).await;
+            let artifacts = hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    inference_event(),
+                )
+                .await;
             assert_eq!(artifacts.len(), 1, "the honored artifact arm is committed");
             assert!(
                 hooks.drain_dispatch_faults().is_empty(),
@@ -5893,7 +5950,7 @@ artifacts:
 
         dispatch_stage(
             &engine,
-            workdir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             std::slice::from_ref(&staged),
             Vec::new(),
             &HookEnvVars::default(),
@@ -5932,7 +5989,7 @@ artifacts:
 
         dispatch_stage(
             &engine,
-            workdir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             std::slice::from_ref(&staged),
             Vec::new(),
             &HookEnvVars::default(),
@@ -5969,7 +6026,12 @@ artifacts:
                 new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
                     .await
                     .expect("async double instantiates");
-            hooks.emit(session.path(), tool_call_event()).await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    tool_call_event(),
+                )
+                .await;
             hooks.drain_async_hooks().await;
             hooks.drain_dispatch_faults()
         });
@@ -6407,11 +6469,21 @@ artifacts:
                 new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
                     .await
                     .expect("async double instantiates once, at new");
-            hooks.emit(session.path(), HookEvent::SessionStart).await;
-            hooks.emit(session.path(), tool_call_event()).await;
             hooks
                 .emit(
-                    session.path(),
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    HookEvent::SessionStart,
+                )
+                .await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    tool_call_event(),
+                )
+                .await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                     HookEvent::SessionEnd {
                         total_turns: 1,
                         exit_status: "ok".to_string(),
@@ -6443,12 +6515,27 @@ artifacts:
                 new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
                     .await
                     .expect("async double instantiates");
-            hooks.emit(session.path(), tool_call_event()).await;
-            hooks.emit(session.path(), HookEvent::SessionStart).await;
-            hooks.emit(session.path(), tool_call_event()).await;
             hooks
                 .emit(
-                    session.path(),
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    tool_call_event(),
+                )
+                .await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    HookEvent::SessionStart,
+                )
+                .await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    tool_call_event(),
+                )
+                .await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                     HookEvent::SessionEnd {
                         total_turns: 2,
                         exit_status: "ok".to_string(),
@@ -6608,7 +6695,12 @@ artifacts:
             )
             .await
             .expect("env-probe double instantiates");
-            hooks.emit(session.path(), HookEvent::SessionStart).await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    HookEvent::SessionStart,
+                )
+                .await;
             hooks.drain_async_hooks().await;
         });
 
@@ -6644,7 +6736,12 @@ artifacts:
             )
             .await
             .expect("env-probe double instantiates");
-            hooks.emit(session.path(), HookEvent::SessionStart).await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    HookEvent::SessionStart,
+                )
+                .await;
             hooks.drain_async_hooks().await;
         });
 
@@ -6787,11 +6884,21 @@ artifacts:
                         new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
                             .await
                             .expect("async double instantiates");
-                    hooks.emit(session.path(), HookEvent::SessionStart).await;
-                    hooks.emit(session.path(), tool_call_event()).await;
                     hooks
                         .emit(
-                            session.path(),
+                            &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                            HookEvent::SessionStart,
+                        )
+                        .await;
+                    hooks
+                        .emit(
+                            &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                            tool_call_event(),
+                        )
+                        .await;
+                    hooks
+                        .emit(
+                            &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                             HookEvent::SessionEnd {
                                 total_turns: 1,
                                 exit_status: "ok".to_string(),
@@ -6842,8 +6949,18 @@ artifacts:
             )
             .await
             .expect("the spin double instantiates");
-            hooks.emit(session.path(), HookEvent::SessionStart).await;
-            hooks.emit(session.path(), HookEvent::SessionStart).await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    HookEvent::SessionStart,
+                )
+                .await;
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    HookEvent::SessionStart,
+                )
+                .await;
             hooks
                 .drain_async_hooks_within(Duration::from_millis(50))
                 .await;
@@ -6886,7 +7003,12 @@ artifacts:
                     .await
                     .expect("async double instantiates");
             for _ in 0..(ASYNC_HOOK_QUEUE_DEPTH + surplus) {
-                hooks.emit(session.path(), tool_call_event()).await;
+                hooks
+                    .emit(
+                        &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                        tool_call_event(),
+                    )
+                    .await;
             }
             let dropped = hooks.async_hooks[0].dropped;
             (dropped, hooks.drain_dispatch_faults())
@@ -6932,11 +7054,16 @@ artifacts:
                     .await
                     .expect("async double instantiates");
             for _ in 0..(ASYNC_HOOK_QUEUE_DEPTH + surplus) {
-                hooks.emit(session.path(), tool_call_event()).await;
+                hooks
+                    .emit(
+                        &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                        tool_call_event(),
+                    )
+                    .await;
             }
             hooks
                 .emit(
-                    session.path(),
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                     HookEvent::SessionEnd {
                         total_turns: 0,
                         exit_status: "ok".to_string(),
@@ -6980,7 +7107,7 @@ artifacts:
                     .expect("async double instantiates");
             hooks
                 .emit(
-                    session.path(),
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
                     HookEvent::SessionEnd {
                         total_turns: 0,
                         exit_status: "ok".to_string(),

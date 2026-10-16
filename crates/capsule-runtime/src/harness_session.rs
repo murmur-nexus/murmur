@@ -25,6 +25,8 @@ use std::{
     sync::Mutex,
 };
 
+use crate::workdir_fs::WorkdirRoot;
+
 /// The map file inside `<record>/<context-id>/`, beside where `conversation.jsonl` would be.
 pub(crate) const HARNESS_SESSION_FILE_NAME: &str = "harness-session.json";
 
@@ -69,7 +71,7 @@ pub(crate) struct HarnessSessionEntry {
 pub(crate) struct HarnessSessionMap {
     root: Option<PathBuf>,
     /// The session workdir every survived failure is reported into, beside stderr.
-    workdir: PathBuf,
+    workdir: WorkdirRoot,
     /// Context id → the session id this launch last saw for it.
     seen: Mutex<HashMap<String, String>>,
     /// A write failure is reported once and then survived silently: an unwritable home must not
@@ -78,10 +80,10 @@ pub(crate) struct HarnessSessionMap {
 }
 
 impl HarnessSessionMap {
-    pub(crate) fn new(root: Option<PathBuf>, workdir: &Path) -> Self {
+    pub(crate) fn new(root: Option<PathBuf>, workdir: &WorkdirRoot) -> Self {
         Self {
             root,
-            workdir: workdir.to_path_buf(),
+            workdir: workdir.clone(),
             seen: Mutex::new(HashMap::new()),
             failure_reported: Mutex::new(false),
         }
@@ -203,7 +205,7 @@ pub(crate) fn resolve_harness_session_root(
     context: Option<&murmur_artifact::ContextConfig>,
     capsule_name: &str,
     inference: &murmur_artifact::InferenceConfig,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
 ) -> Option<PathBuf> {
     if inference.transport != "process" {
         return None;
@@ -287,9 +289,11 @@ mod tests {
     const DRIVER: &str = "fixture-process-driver";
 
     fn map_in(home: &Path) -> HarnessSessionMap {
+        let session = home.join("session");
+        std::fs::create_dir_all(&session).unwrap();
         HarnessSessionMap::new(
             Some(home.join(".murmur/conversations/capsule")),
-            &home.join("session"),
+            &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
         )
     }
 
@@ -315,7 +319,10 @@ mod tests {
 
     #[test]
     fn a_context_id_that_is_not_a_path_segment_gets_no_file() {
-        let map = HarnessSessionMap::new(Some(PathBuf::from("/root")), Path::new("/tmp"));
+        let map = HarnessSessionMap::new(
+            Some(PathBuf::from("/root")),
+            &crate::workdir_fs::WorkdirRoot::open(Path::new("/tmp")).unwrap(),
+        );
         assert_eq!(map.entry_path("../escape"), None);
         assert_eq!(map.entry_path(".hidden"), None);
         assert!(map.entry_path("ctx_1").is_some());
@@ -323,7 +330,10 @@ mod tests {
 
     #[test]
     fn a_launch_with_no_root_still_threads_in_memory() {
-        let map = HarnessSessionMap::new(None, Path::new("/tmp"));
+        let map = HarnessSessionMap::new(
+            None,
+            &crate::workdir_fs::WorkdirRoot::open(Path::new("/tmp")).unwrap(),
+        );
         assert_eq!(map.root(), None);
         assert_eq!(map.entry_path("ctx_1"), None);
         map.put("ctx_1", "sess-1", HARNESS, DRIVER);
@@ -333,13 +343,19 @@ mod tests {
 
     #[test]
     fn forgetting_a_context_with_no_entry_drops_nothing() {
-        let map = HarnessSessionMap::new(None, Path::new("/tmp"));
+        let map = HarnessSessionMap::new(
+            None,
+            &crate::workdir_fs::WorkdirRoot::open(Path::new("/tmp")).unwrap(),
+        );
         assert_eq!(map.forget("ctx_1"), None);
     }
 
     #[test]
     fn a_launch_with_no_root_still_forgets_in_memory() {
-        let map = HarnessSessionMap::new(None, Path::new("/tmp"));
+        let map = HarnessSessionMap::new(
+            None,
+            &crate::workdir_fs::WorkdirRoot::open(Path::new("/tmp")).unwrap(),
+        );
         map.put("ctx_1", "sess-1", HARNESS, DRIVER);
         assert_eq!(map.forget("ctx_1").as_deref(), Some("sess-1"));
         assert_eq!(map.get("ctx_1"), None);
@@ -348,7 +364,10 @@ mod tests {
 
     #[test]
     fn an_empty_session_id_is_not_remembered() {
-        let map = HarnessSessionMap::new(None, Path::new("/tmp"));
+        let map = HarnessSessionMap::new(
+            None,
+            &crate::workdir_fs::WorkdirRoot::open(Path::new("/tmp")).unwrap(),
+        );
         map.put("ctx_1", "", HARNESS, DRIVER);
         assert_eq!(map.get("ctx_1"), None);
     }
@@ -439,7 +458,10 @@ mod tests {
         let workdir = dir.path().join("session");
         std::fs::create_dir_all(&workdir).unwrap();
 
-        let map = HarnessSessionMap::new(Some(blocked.clone()), &workdir);
+        let map = HarnessSessionMap::new(
+            Some(blocked.clone()),
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+        );
         map.put("ctx_1", "sess-1", HARNESS, DRIVER);
         map.put("ctx_1", "sess-2", HARNESS, DRIVER);
 

@@ -2534,7 +2534,7 @@ pub(crate) fn aggregate_bounding_warning(
 
 /// Fires at every launch, not just once.
 pub(crate) fn warn_for_missing_aggregate_bounding(
-    workdir: &Path,
+    workdir: &crate::workdir_fs::WorkdirRoot,
     requires_bounding: bool,
     has_scope: bool,
 ) {
@@ -2554,7 +2554,7 @@ pub(crate) fn warn_for_missing_aggregate_bounding(
 /// Fires at every launch, not just once.
 pub(crate) fn warn_for_enforcement_tier(
     tier: EnforcementTier,
-    workdir: &Path,
+    workdir: &crate::workdir_fs::WorkdirRoot,
     policy: &CapabilityPolicy,
 ) {
     if let Some((code, message)) = tier_warning(tier, policy.shell_allow.is_empty()) {
@@ -2760,7 +2760,7 @@ pub(crate) fn prepare_enforcement(
     command: &mut std::process::Command,
     enforcement: &ShellEnforcement,
     _accessible_workdir: &Path,
-    _session_workdir: &Path,
+    _session_workdir: &crate::workdir_fs::WorkdirRoot,
 ) -> Result<SupervisorHandle, String> {
     #[cfg(test)]
     forced_prepare_failure()?;
@@ -2783,7 +2783,7 @@ pub(crate) fn prepare_enforcement(
     command: &mut std::process::Command,
     enforcement: &ShellEnforcement,
     accessible_workdir: &Path,
-    session_workdir: &Path,
+    session_workdir: &crate::workdir_fs::WorkdirRoot,
 ) -> Result<SupervisorHandle, String> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
@@ -2971,15 +2971,16 @@ fn landlock_device_grants(tier: EnforcementTier) -> Vec<CapsuleDeviceGrant> {
 /// See [`crate::sealed::SEALED_TMP_DIR_NAME`] for why `/tmp` is workdir-backed rather than a second
 /// tmpfs.
 #[cfg(target_os = "linux")]
-fn ensure_sealed_tmp_store(session_workdir: &Path) -> Result<PathBuf, String> {
-    let tmp_store = session_workdir.join(crate::sealed::SEALED_TMP_DIR_NAME);
-    std::fs::create_dir_all(&tmp_store).map_err(|error| {
-        format!(
-            "sealed: failed to create the workdir-backed /tmp store at {}: {error}",
-            tmp_store.display()
-        )
-    })?;
-    Ok(tmp_store)
+fn ensure_sealed_tmp_store(
+    session_workdir: &crate::workdir_fs::WorkdirRoot,
+) -> Result<PathBuf, String> {
+    use crate::sealed::SEALED_TMP_DIR_NAME;
+    session_workdir
+        .create_dir_all(SEALED_TMP_DIR_NAME, crate::workdir_fs::DEFAULT_DIR_MODE)
+        .map_err(|error| {
+            format!("sealed: failed to create the workdir-backed /tmp store: {error}")
+        })?;
+    Ok(session_workdir.host_path(SEALED_TMP_DIR_NAME))
 }
 
 /// Writes (idempotently) the synthetic `/etc/passwd`/`/etc/group` the composed root binds in place
@@ -2994,38 +2995,38 @@ fn ensure_sealed_tmp_store(session_workdir: &Path) -> Result<PathBuf, String> {
 /// content* is work the parent can do, and this module's rule is that the `pre_exec` window does
 /// nothing the parent could have done for it.
 ///
-/// The rewrite is deliberately in place (`fs::write` truncates; it does not replace). The Landlock
-/// rule the earlier caller took is bound to the file's inode, so writing a fresh file over the path
-/// would leave that rule pointing at an inode the composed root no longer binds — `/etc/passwd`
-/// mounted and `EACCES`.
+/// The rewrite is in place ([`crate::workdir_fs::WorkdirRoot::overwrite_in_place`] truncates; it
+/// does not replace). The Landlock rule the earlier caller took is bound to the file's inode, so
+/// writing a fresh file over the path would leave that rule pointing at an inode the composed root
+/// no longer binds — `/etc/passwd` mounted and `EACCES`. A link at either file, or at the staging
+/// directory, is refused rather than written through.
 #[cfg(target_os = "linux")]
-fn ensure_sealed_identity_files(session_workdir: &Path) -> Result<Vec<PathBuf>, String> {
-    use std::os::unix::fs::MetadataExt;
-
-    let staging = session_workdir.join(crate::sealed::SEALED_ETC_STAGING_DIR_NAME);
-    std::fs::create_dir_all(&staging).map_err(|error| {
-        format!(
-            "sealed: failed to create the synthetic /etc staging directory at {}: {error}",
-            staging.display()
+fn ensure_sealed_identity_files(
+    session_workdir: &crate::workdir_fs::WorkdirRoot,
+) -> Result<Vec<PathBuf>, String> {
+    use crate::sealed::SEALED_ETC_STAGING_DIR_NAME;
+    session_workdir
+        .create_dir_all(
+            SEALED_ETC_STAGING_DIR_NAME,
+            crate::workdir_fs::DEFAULT_DIR_MODE,
         )
-    })?;
+        .map_err(|error| {
+            format!("sealed: failed to create the synthetic /etc staging directory: {error}")
+        })?;
 
     // The workdir was created by this process, so its owner is the identity the capsule's
     // subprocesses run as — no `getuid(2)` FFI needed under `#![deny(unsafe_code)]`.
-    let owner = std::fs::metadata(session_workdir).map_err(|error| {
-        format!(
-            "sealed: failed to stat the session workdir {} for the capsule's uid/gid: {error}",
-            session_workdir.display()
-        )
+    let (uid, gid) = session_workdir.owner().map_err(|error| {
+        format!("sealed: failed to stat the session workdir for the capsule's uid/gid: {error}")
     })?;
     // The same string `build_shell_env` puts in `$HOME`, from the same constant, resolved against
     // the same directory: the synthetic home lives in the session workdir, so a `pw_dir` composed
     // against the accessible one would name a directory that does not exist.
-    let home = session_workdir.join(crate::shell::SYNTHETIC_HOME_DIR_NAME);
+    let home = session_workdir.host_path(crate::shell::SYNTHETIC_HOME_DIR_NAME);
     let home = home.to_string_lossy().into_owned();
     let identity = crate::sealed::SealedAccountIdentity {
-        uid: owner.uid(),
-        gid: owner.gid(),
+        uid,
+        gid,
         home: &home,
     };
 
@@ -3034,15 +3035,22 @@ fn ensure_sealed_identity_files(session_workdir: &Path) -> Result<Vec<PathBuf>, 
         let Some(file) = entry.synthetic else {
             continue;
         };
-        let path = crate::sealed::synthetic_etc_source(session_workdir, file);
-        std::fs::write(&path, file.render(&identity)?).map_err(|error| {
-            format!(
-                "sealed: failed to write the synthetic {} at {}: {error}",
-                entry.path,
-                path.display()
+        session_workdir
+            .overwrite_in_place(
+                format!("{SEALED_ETC_STAGING_DIR_NAME}/{}", file.file_name()),
+                file.render(&identity)?.as_bytes(),
+                crate::workdir_fs::DEFAULT_FILE_MODE,
             )
-        })?;
-        written.push(path);
+            .map_err(|error| {
+                format!(
+                    "sealed: failed to write the synthetic {}: {error}",
+                    entry.path
+                )
+            })?;
+        written.push(crate::sealed::synthetic_etc_source(
+            session_workdir.path(),
+            file,
+        ));
     }
     Ok(written)
 }
@@ -3066,7 +3074,7 @@ fn ensure_sealed_identity_files(session_workdir: &Path) -> Result<Vec<PathBuf>, 
 #[cfg(target_os = "linux")]
 fn build_sealed_root(
     accessible_workdir: &Path,
-    session_workdir: &Path,
+    session_workdir: &crate::workdir_fs::WorkdirRoot,
     extra_read_only: &[PathBuf],
     staged_runtime_read_only: &[PathBuf],
 ) -> Result<crate::sealed::SealedRootSpec, String> {
@@ -3108,7 +3116,7 @@ fn build_sealed_root(
 
     let plan = sealed::plan_composed_root(
         accessible_workdir,
-        session_workdir,
+        session_workdir.path(),
         &base,
         extra_read_only,
         staged_runtime_read_only,
@@ -4254,7 +4262,7 @@ mod linux_enforce {
     /// would leave `/tmp` mounted-but-denied, which is precisely the defect the rule exists to fix.
     pub(super) fn open_landlock_fds(
         accessible_workdir: &Path,
-        session_workdir: &Path,
+        session_workdir: &crate::workdir_fs::WorkdirRoot,
         landlock_grants: &[LandlockGrant],
         device_grants: &[super::CapsuleDeviceGrant],
         workdir_exec: bool,
@@ -5888,8 +5896,8 @@ mod tests {
                 "for i in $(seq 1 40); do sleep 0.2 & done; wait; ulimit -Hu; ulimit -Hn",
             ],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -5922,8 +5930,8 @@ mod tests {
                 "node",
                 &["-e", script],
                 &[],
-                temp.path(),
-                temp.path(),
+                &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+                &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
                 &policy,
                 &enforcement,
             )
@@ -5972,8 +5980,8 @@ mod tests {
                 "bash",
                 &["-c", "ulimit -Hu"],
                 &[],
-                temp.path(),
-                temp.path(),
+                &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+                &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
                 &policy,
                 &enforcement,
             )
@@ -6712,7 +6720,7 @@ mod tests {
         let open = |grants: &[LandlockGrant]| {
             linux_enforce::open_landlock_fds(
                 accessible.path(),
-                &session,
+                &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
                 grants,
                 &[],
                 false,
@@ -7094,7 +7102,11 @@ mod tests {
     #[test]
     fn warn_for_missing_aggregate_bounding_writes_the_code_and_link_to_bootstrap_log() {
         let temp = tempfile::tempdir().unwrap();
-        warn_for_missing_aggregate_bounding(temp.path(), true, false);
+        warn_for_missing_aggregate_bounding(
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            true,
+            false,
+        );
         let log = bootstrap_log_contents(temp.path());
 
         if cfg!(target_os = "linux") {
@@ -7124,7 +7136,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         warn_for_enforcement_tier(
             EnforcementTier::KernelFull,
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &warning_test_policy(),
         );
         let log = bootstrap_log_contents(temp.path());
@@ -7153,7 +7165,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         warn_for_enforcement_tier(
             EnforcementTier::KernelFull,
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &CapabilityPolicy::default(),
         );
         assert_eq!(
@@ -7168,7 +7180,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         warn_for_enforcement_tier(
             EnforcementTier::KernelSeccompOnly,
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &warning_test_policy(),
         );
         let log = bootstrap_log_contents(temp.path());
@@ -7195,7 +7207,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         warn_for_enforcement_tier(
             EnforcementTier::EnvironmentOnly,
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &warning_test_policy(),
         );
         let log = bootstrap_log_contents(temp.path());
@@ -7250,8 +7262,8 @@ mod tests {
                 "bash",
                 &["-c", &script],
                 &[],
-                temp.path(),
-                temp.path(),
+                &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+                &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
                 &policy,
                 &ShellEnforcement::environment_only(),
             )
@@ -7272,8 +7284,8 @@ mod tests {
             "bash",
             &["-c", &script],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &ShellEnforcement::environment_only(),
         )
@@ -7476,7 +7488,7 @@ mod linux_integration_tests {
         let session = session_workdir_under(accessible.path());
         let fds = linux_enforce::open_landlock_fds(
             accessible.path(),
-            &session,
+            &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
             &[],
             &[],
             false,
@@ -7514,7 +7526,7 @@ mod linux_integration_tests {
             let session = session_workdir_under(accessible.path());
             let fds = linux_enforce::open_landlock_fds(
                 accessible.path(),
-                &session,
+                &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
                 &[],
                 &[],
                 false,
@@ -7551,7 +7563,7 @@ mod linux_integration_tests {
         let session = session_workdir_under(accessible.path());
         let fds = linux_enforce::open_landlock_fds(
             accessible.path(),
-            &session,
+            &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
             &[],
             &[],
             false,
@@ -7595,7 +7607,7 @@ mod linux_integration_tests {
             let session = session_workdir_under(accessible.path());
             let fds = linux_enforce::open_landlock_fds(
                 accessible.path(),
-                &session,
+                &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
                 &[],
                 &[],
                 false,
@@ -7632,11 +7644,13 @@ mod linux_integration_tests {
 
         let accessible = tempfile::tempdir().unwrap();
         let session = session_workdir_under(accessible.path());
-        let written = ensure_sealed_identity_files(&session).unwrap();
+        let written =
+            ensure_sealed_identity_files(&crate::workdir_fs::WorkdirRoot::open(&session).unwrap())
+                .unwrap();
         let env = crate::shell::build_shell_env(
             &crate::types::CapabilityPolicy::default(),
             &[],
-            &session,
+            &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
         )
         .unwrap();
 
@@ -7663,6 +7677,94 @@ mod linux_integration_tests {
             Some(owner.gid().to_string().as_str()),
             "gid field of the capsule's own group",
         );
+    }
+
+    /// A workdir root over `accessible`'s session directory beside an `outside/` directory holding
+    /// one sentinel file.
+    fn sealed_planted() -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        crate::workdir_fs::WorkdirRoot,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let accessible = dir.path().join("work");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&accessible).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("sentinel.txt"), b"operator data").unwrap();
+        let root = crate::workdir_fs::WorkdirRoot::open(&accessible)
+            .unwrap()
+            .session_beneath("ses_sandbox_tests")
+            .unwrap();
+        (dir, root.path().to_path_buf(), outside, root)
+    }
+
+    fn assert_outside_untouched(outside: &Path) {
+        assert_eq!(
+            std::fs::read(outside.join("sentinel.txt")).unwrap(),
+            b"operator data"
+        );
+        assert_eq!(
+            std::fs::read_dir(outside).unwrap().count(),
+            1,
+            "outside/ gained an entry"
+        );
+    }
+
+    /// `.mur-etc/passwd` linked to an outside file, and `.mur-etc` or `.mur-tmp` linked to an
+    /// outside directory: each staging call fails naming the path and writes nothing outside.
+    #[test]
+    fn workdir_path_refused_sealed_staging() {
+        let etc = crate::sealed::SEALED_ETC_STAGING_DIR_NAME;
+        let tmp = crate::sealed::SEALED_TMP_DIR_NAME;
+        for (link, to_dir) in [
+            (format!("{etc}/passwd"), false),
+            (etc.to_string(), true),
+            (tmp.to_string(), true),
+        ] {
+            let (_dir, session, outside, root) = sealed_planted();
+            let at = session.join(&link);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            let target = if to_dir {
+                outside.clone()
+            } else {
+                outside.join("sentinel.txt")
+            };
+            std::os::unix::fs::symlink(&target, &at).unwrap();
+
+            let error = if link == tmp {
+                ensure_sealed_tmp_store(&root).unwrap_err()
+            } else {
+                ensure_sealed_identity_files(&root).unwrap_err()
+            };
+
+            assert!(error.contains(&link), "{link}: {error}");
+            assert_outside_untouched(&outside);
+            let refusals = root.take_refusals();
+            assert_eq!(refusals.len(), 1, "{refusals:?}");
+            assert_eq!(
+                refusals[0].refused_at,
+                format!(".murmur/ses_sandbox_tests/{link}")
+            );
+        }
+    }
+
+    /// With no link present, staging twice rewrites `.mur-etc/passwd` in place: the inode a
+    /// Landlock rule was bound to on the first call is the file the second call leaves.
+    #[test]
+    fn workdir_path_refused_sealed_keeps_the_inode_with_no_link() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_dir, session, _outside, root) = sealed_planted();
+        let passwd = session
+            .join(crate::sealed::SEALED_ETC_STAGING_DIR_NAME)
+            .join("passwd");
+        ensure_sealed_identity_files(&root).unwrap();
+        let first = std::fs::metadata(&passwd).unwrap().ino();
+        ensure_sealed_identity_files(&root).unwrap();
+        assert_eq!(std::fs::metadata(&passwd).unwrap().ino(), first);
+        assert!(root.take_refusals().is_empty());
     }
 
     /// Pure content check on the right-set the composed root's `/tmp` rule carries: no kernel call,
@@ -7725,7 +7827,7 @@ mod linux_integration_tests {
             &mut command,
             &enforcement,
             Path::new("/tmp"),
-            Path::new("/tmp"),
+            &crate::workdir_fs::WorkdirRoot::open(Path::new("/tmp")).unwrap(),
         )
         .expect("environment_only must never fail");
         assert!(matches!(supervisor, SupervisorHandle::Noop));
@@ -7776,8 +7878,8 @@ mod linux_integration_tests {
             "bash",
             &["-c", "exit 7"],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -7828,8 +7930,8 @@ mod linux_integration_tests {
             "bash",
             &["-c", "ls"],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -7890,8 +7992,8 @@ mod linux_integration_tests {
             "bash",
             &["-c", &script],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -7973,8 +8075,8 @@ mod linux_integration_tests {
             "bash",
             &["-c", &script],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -8033,8 +8135,8 @@ mod linux_integration_tests {
             "bash",
             &["-c", "cat /etc/hostname"],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -8103,8 +8205,8 @@ mod linux_integration_tests {
             "bash",
             &["-c", script],
             &[],
-            workdir,
-            workdir,
+            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             policy,
             enforcement,
         )
@@ -8492,8 +8594,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "bash",
             &["-c", "echo landlock-grant-ok | cat"],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -8560,8 +8662,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "bash",
             &["-c", &script],
             &[],
-            workdir.path(),
-            workdir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -8642,8 +8744,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "bash",
             &["-c", "echo t > /tmp/probe && cat /tmp/probe && id -un"],
             &[],
-            accessible.path(),
-            &session,
+            &crate::workdir_fs::WorkdirRoot::open(accessible.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
             &policy,
             &enforcement,
         )
@@ -8742,8 +8844,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "bash",
             &["-c", &format!("cat '{}'", module.display())],
             &[],
-            workdir.path(),
-            workdir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -8760,8 +8862,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "bash",
             &["-c", &format!("ls '{}'", stdlib.path().display())],
             &[],
-            workdir.path(),
-            workdir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -8817,8 +8919,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "bash",
             &["-c", &format!("ls '{}'", stdlib.display())],
             &[],
-            workdir.path(),
-            workdir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -8836,8 +8938,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "bash",
             &["-c", &format!("ls '{}'", parent.path().display())],
             &[],
-            workdir.path(),
-            workdir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -8905,8 +9007,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                 "bash",
                 &["-c", &command],
                 &[],
-                workdir.path(),
-                workdir.path(),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 &policy,
                 enforcement,
             )
@@ -9011,8 +9113,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                 "bash",
                 &["-c", &format!("cat '{}'", bundle.display())],
                 &[],
-                workdir.path(),
-                workdir.path(),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 &policy,
                 enforcement,
             )
@@ -9114,7 +9216,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             &mut command,
             &kernel_full_empty_grants(),
             &missing,
-            &missing,
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
         )
         .expect_err("an unresolvable workdir must fail before fork()");
         assert!(
@@ -9152,8 +9254,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "bash",
             &["-c", &script],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             enforcement,
         )
@@ -9372,8 +9474,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "bash",
             &["-c", script],
             &[],
-            workdir,
-            workdir,
+            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             policy,
             enforcement,
         )
@@ -9471,8 +9573,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "nc",
             &["-l", "127.0.0.1", "8080"],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
             Some(DetachPolicy {

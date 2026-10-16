@@ -406,7 +406,7 @@ fn launch_bounded(
         .to_string();
 
     launch_child_capsule(ChildLaunchRequest {
-        parent_accessible_workdir: parent_dir.to_path_buf(),
+        parent_accessible_root: capsule_runtime::WorkdirRoot::open(parent_dir).unwrap(),
         capsule_name: name.to_string(),
         capsule_version: "0.1.0".to_string(),
         grant: SpawnApproval::new(approval),

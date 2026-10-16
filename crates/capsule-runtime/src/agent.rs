@@ -7,7 +7,6 @@ mod process_events;
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::{
     collections::HashMap,
-    fs,
     io::Write,
     path::{Path, PathBuf},
     sync::LazyLock,
@@ -44,10 +43,12 @@ use crate::{
         FailedInference, TraceWriter, WireCapture, INFERENCE_ERROR_DRIVER_FAILED,
         INFERENCE_ERROR_MALFORMED_RESPONSE, TASK_FAILED_COMPACTION_HOOK,
         TASK_FAILED_CREDENTIAL_REJECTED, TASK_FAILED_DRIVER_ERROR, TASK_FAILED_INPUT_TIMEOUT,
-        TASK_FAILED_MALFORMED_RESPONSE,
+        TASK_FAILED_MALFORMED_RESPONSE, TASK_FAILED_WORKDIR_PATH_REFUSED,
     },
     types::ResumeMode,
+    workdir_fs::{EntryKind, WorkdirRoot, DEFAULT_FILE_MODE},
 };
+use murmur_artifact::PACKED_MANIFEST_ENTRY;
 
 /// Output cap sent to the driver when `inference.max_tokens` is absent from the manifest.
 /// Applied exactly once, at the `AgentRunConfig` population site in runtime.rs.
@@ -652,7 +653,7 @@ fn user_message((text, fence_source): (String, Option<String>)) -> Value {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agent_loop(
     store_state: &mut CapsuleStoreState,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     // `max_turns` here is what this attempt has left of the task's budget, and bounds its loop.
     inference: &InferenceConfig,
     // The task-wide ceiling, `inference.max_turns` as declared: what a message about running out
@@ -665,7 +666,7 @@ pub(crate) async fn run_agent_loop(
     otel: &mut OtelEmitter,
     task_id: Option<String>,
     sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    accessible_workdir: &Path,
+    accessible_workdir: &WorkdirRoot,
     name: &str,
     version: &str,
     mode: ConversationMode,
@@ -684,11 +685,17 @@ pub(crate) async fn run_agent_loop(
     // A fresh attempt with nothing to say fails before either transport starts: the http path
     // would otherwise load history, which may compact through the driver, and then send an empty
     // user message. The raw text is checked, because an untrusted task's fence is never empty.
-    if continuation.is_none()
+    let blank_task = continuation.is_none()
         && fresh_task_text(inference, accessible_workdir)
             .trim()
-            .is_empty()
-    {
+            .is_empty();
+    // The attempt-start checkpoint, on both transports: a `task.md` that is a link reads as blank
+    // and is refused, and the refusal, not the blank task, is what ends the attempt.
+    if let Some((error, reason)) = fail_on_workdir_refusals(store_state, trace).await {
+        thread.ending = Some(AttemptEnding::failed(reason));
+        return Err(error);
+    }
+    if blank_task {
         return Err(RuntimeError::AgentLoopFailed(
             EMPTY_TASK_REFUSAL.to_string(),
         ));
@@ -781,9 +788,15 @@ pub(crate) async fn run_agent_loop(
         return Err(RuntimeError::DriverNotConfigured);
     }
 
-    let driver_dir = workdir.join("tools").join(driver_name);
-    if !driver_dir.exists() {
-        return Err(RuntimeError::DriverNotInstalled(driver_name.clone()));
+    match workdir.entry_kind(format!("tools/{driver_name}")) {
+        Ok(Some(EntryKind::Directory)) => {}
+        Ok(Some(EntryKind::Symlink)) => {
+            // Read through to latch the refusal; the checkpoint before the first request fails
+            // the task on it.
+            let _ = workdir.read_to_string(format!("tools/{driver_name}/{PACKED_MANIFEST_ENTRY}"));
+        }
+        Ok(_) => return Err(RuntimeError::DriverNotInstalled(driver_name.clone())),
+        Err(_) => {}
     }
 
     // A call id the driver settled on an earlier attempt of this task may start again on this
@@ -1178,6 +1191,14 @@ pub(crate) async fn run_agent_loop(
         // so `session_tokens` tracks live occupancy rather than lifetime throughput — the
         // same notion `try_compact_via_hooks` resets it to after a replace-context commit.
         session_tokens = input_tokens;
+
+        // The checkpoint before every inference request: a refusal latched since the last one —
+        // by this turn's inventory read, a hook's log, an idle-time write — ends the attempt
+        // here, and nothing more is sent to the provider for this task.
+        if let Some((error, reason)) = fail_on_workdir_refusals(store_state, trace).await {
+            *ending = Some(AttemptEnding::failed(reason));
+            return Err(error);
+        }
 
         // Emit "working" status BEFORE the LLM inference call returns (liveness signal)
         if let Some(task) = &stream_task {
@@ -1964,6 +1985,16 @@ pub(crate) async fn run_agent_loop(
                         })),
                         fence_source,
                     ));
+
+                    // The checkpoint after every tool dispatch: a call that met a link in the
+                    // workdir — a plan file, a fetched peer file, a pulled artifact — has already
+                    // answered the model with its error, and the task ends on it here.
+                    if let Some((error, reason)) =
+                        fail_on_workdir_refusals(store_state, trace).await
+                    {
+                        *ending = Some(AttemptEnding::failed(reason));
+                        return Err(error);
+                    }
                 }
 
                 let turn_start = messages.len();
@@ -2094,6 +2125,42 @@ fn max_turns_exceeded_message(ceiling: u32, agent_turns: u32, hook_calls: u32) -
     )
 }
 
+/// The refusal checkpoint: drains the session's refusal latch and, when it held anything, ends
+/// the attempt on it.
+///
+/// Writes one `workdir_path_refused` line per distinct refusal, then one `task_failed` with cause
+/// [`TASK_FAILED_WORKDIR_PATH_REFUSED`] whose `reason` is every refusal's text, and returns the
+/// [`RuntimeError::WorkdirPathRefused`] the attempt ends with and that same text for its `failed`
+/// status. `None`, with nothing written, when nothing was refused since the last drain.
+pub(crate) async fn fail_on_workdir_refusals(
+    store_state: &CapsuleStoreState,
+    trace: &mut TraceWriter,
+) -> Option<(RuntimeError, String)> {
+    let mut refusals = store_state.accessible_root.take_refusals();
+    let mut seen = Vec::with_capacity(refusals.len());
+    refusals.retain(|refusal| {
+        let fresh = !seen.contains(refusal);
+        if fresh {
+            seen.push(refusal.clone());
+        }
+        fresh
+    });
+    let first = refusals.first()?.clone();
+    for refusal in &refusals {
+        let _ = trace.write_workdir_path_refused(refusal).await;
+    }
+    let reason = refusals
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let _ = trace
+        .write_task_failed(None, TASK_FAILED_WORKDIR_PATH_REFUSED, &reason)
+        .await;
+    let _ = trace.flush().await;
+    Some((RuntimeError::WorkdirPathRefused { refusal: first }, reason))
+}
+
 /// End one attempt because it failed: the driver call, the response, the compaction hook or the
 /// task's input wait.
 ///
@@ -2112,7 +2179,7 @@ async fn finish_failed_turn(
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     ending: &mut Option<AttemptEnding>,
     turn: u32,
     cause: &str,
@@ -2134,7 +2201,7 @@ async fn finish_no_answer_turn(
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     ending: &mut Option<AttemptEnding>,
     reason: &str,
 ) -> Result<AgentLoopExit, RuntimeError> {
@@ -2274,7 +2341,7 @@ async fn finish_spend_refused_turn(
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     ending: &mut Option<AttemptEnding>,
     turn: u32,
     refusal: &SpendRefusal,
@@ -2396,7 +2463,7 @@ async fn finish_completed_turn(
     record: Option<&mut crate::conversation::ConversationRecord>,
     messages: &mut Vec<Value>,
     content: Vec<Value>,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     mode: ConversationMode,
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
     task_id: Option<&str>,
@@ -2590,7 +2657,7 @@ async fn write_hook_inference_record(
 pub(crate) struct CallGate<'a> {
     hooks: &'a mut HookRuntime,
     trace: &'a mut TraceWriter,
-    workdir: &'a Path,
+    workdir: &'a WorkdirRoot,
     turn: u32,
 }
 
@@ -2598,7 +2665,7 @@ impl<'a> CallGate<'a> {
     pub(crate) fn new(
         hooks: &'a mut HookRuntime,
         trace: &'a mut TraceWriter,
-        workdir: &'a Path,
+        workdir: &'a WorkdirRoot,
         turn: u32,
     ) -> Self {
         Self {
@@ -3005,7 +3072,7 @@ fn extract_compaction_summary_text(messages: &[Value]) -> String {
 /// accumulate rather than overwrite. Callers treat a failure here as non-fatal.
 fn dump_compaction_summary(
     enabled: bool,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     turn: u32,
     tokens_before: u32,
     tokens_after: u32,
@@ -3015,8 +3082,6 @@ fn dump_compaction_summary(
         return Ok(());
     }
     let summary = extract_compaction_summary_text(messages);
-    let out_dir = workdir.join("out");
-    fs::create_dir_all(&out_dir).map_err(|e| format!("failed to create output directory: {e}"))?;
     let line = serde_json::to_string(&json!({
         "turn": turn,
         "tokens_before": tokens_before,
@@ -3024,10 +3089,8 @@ fn dump_compaction_summary(
         "summary": summary,
     }))
     .map_err(|e| format!("failed to encode compaction summary: {e}"))?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(out_dir.join("compaction-summaries.jsonl"))
+    let mut file = workdir
+        .open_append("out/compaction-summaries.jsonl", DEFAULT_FILE_MODE)
         .map_err(|e| format!("failed to open compaction summary log: {e}"))?;
     file.write_all(line.as_bytes())
         .and_then(|()| file.write_all(b"\n"))
@@ -3066,7 +3129,7 @@ fn has_unresolved_tool_call(messages: &[Value]) -> bool {
 /// record the decline is not a reason to end a session that is otherwise still running.
 async fn record_compaction_declined(
     trace: &mut TraceWriter,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     turn: u32,
     tokens: u32,
     reason: &str,
@@ -3090,7 +3153,7 @@ pub(crate) async fn try_compact_via_hooks(
     store_state: &mut CapsuleStoreState,
     turn: usize,
     context_window: u32,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &OtelEmitter,
@@ -3435,7 +3498,7 @@ fn append_to_record(
 /// of a conversation it cannot see and duplicates it.
 pub(crate) fn prior_history_tokens(
     conversation_root: Option<&Path>,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     mode: &ConversationMode,
     context_id: Option<&str>,
     resume: bool,
@@ -3466,7 +3529,7 @@ pub(crate) fn prior_history_tokens(
 async fn record_seed_rejection(
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     hook_name: &str,
     proposed_tokens: u64,
     budget_tokens: u64,
@@ -3522,7 +3585,7 @@ pub(crate) async fn apply_seed_context(
     session_tokens: &mut u32,
     occupancy: &ContextOccupancy<'_>,
     store_state: &mut CapsuleStoreState,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &OtelEmitter,
@@ -3699,7 +3762,7 @@ pub(crate) async fn apply_seed_context(
 async fn summarize_seed_overflow(
     front: &[Value],
     front_tokens: u64,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &OtelEmitter,
@@ -4199,7 +4262,7 @@ fn build_augmented_system_prompt(
 /// becomes the new `last_logged`. The log is the only thing this decides: every request carries
 /// its full array regardless.
 pub(crate) fn log_tool_inventory(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     heading: &str,
     tools: &[Value],
     last_logged: &mut Option<String>,
@@ -4215,15 +4278,10 @@ pub(crate) fn log_tool_inventory(
     Ok(())
 }
 
-pub(crate) fn append_bootstrap_log(workdir: &Path, message: &str) {
-    let log_dir = workdir.join("logs");
-    let _ = fs::create_dir_all(&log_dir);
-    let log_path = log_dir.join("bootstrap.log");
-    if let Ok(mut file) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
+/// Appends `message` and a newline to `logs/bootstrap.log`. Never fails: a refused append is on
+/// `workdir`'s refusal latch, which fails the task at its next checkpoint.
+pub(crate) fn append_bootstrap_log(workdir: &WorkdirRoot, message: &str) {
+    if let Ok(mut file) = workdir.open_append("logs/bootstrap.log", DEFAULT_FILE_MODE) {
         let _ = file.write_all(message.as_bytes());
         let _ = file.write_all(b"\n");
     }
@@ -4306,14 +4364,22 @@ pub(crate) fn fence_task_payload(
 /// back to `input.txt`, and yields `""` when neither exists. This is the one reader of task text
 /// for both transports, so the check that refuses a blank task and the message a transport sends
 /// can never read different files.
-pub(crate) fn fresh_task_text(inference: &InferenceConfig, accessible_workdir: &Path) -> String {
-    let task_md = fs::read_to_string(accessible_workdir.join("task.md"));
-    if inference.transport == "process" {
-        return task_md.unwrap_or_default();
+///
+/// A refused read — `task.md` a link, or not a regular file — yields `""` and is on
+/// `accessible_workdir`'s refusal latch; it never falls back to `input.txt`.
+pub(crate) fn fresh_task_text(
+    inference: &InferenceConfig,
+    accessible_workdir: &WorkdirRoot,
+) -> String {
+    match accessible_workdir.read_to_string("task.md") {
+        Ok(Some(text)) => text,
+        Ok(None) if inference.transport != "process" => accessible_workdir
+            .read_to_string("input.txt")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        Ok(None) | Err(_) => String::new(),
     }
-    task_md
-        .or_else(|_| fs::read_to_string(accessible_workdir.join("input.txt")))
-        .unwrap_or_default()
 }
 
 /// Why a fresh attempt whose task text is blank fails without a request.
@@ -4342,26 +4408,28 @@ fn credential_failure(store_state: &CapsuleStoreState, choice: &DriverChoice) ->
 /// `out/result.txt` directly, without recording task output. A terminal path that returns `Err`
 /// without producing result text never reaches here, and the output stays unset — the truthful
 /// pairing with the `exit-status: failed` the hook sees.
-fn record_result(hooks: &HookRuntime, workdir: &Path, value: &str) -> Result<(), String> {
+fn record_result(hooks: &HookRuntime, workdir: &WorkdirRoot, value: &str) -> Result<(), String> {
     hooks.record_task_output(value);
     write_result(workdir, value)
 }
 
-pub(crate) fn write_result(workdir: &Path, value: &str) -> Result<(), String> {
-    let out_dir = workdir.join("out");
-    fs::create_dir_all(&out_dir).map_err(|e| format!("failed to create output directory: {e}"))?;
-    fs::write(out_dir.join("result.txt"), value)
+pub(crate) fn write_result(workdir: &WorkdirRoot, value: &str) -> Result<(), String> {
+    workdir
+        .write_file("out/result.txt", value.as_bytes(), DEFAULT_FILE_MODE)
         .map_err(|e| format!("failed to write result output: {e}"))
 }
 
 pub(crate) fn write_result_for_task(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     task_id: &str,
     value: &str,
 ) -> Result<(), String> {
-    let out_dir = workdir.join("out");
-    fs::create_dir_all(&out_dir).map_err(|e| format!("failed to create output directory: {e}"))?;
-    fs::write(out_dir.join(format!("result_{task_id}.txt")), value)
+    workdir
+        .write_file(
+            format!("out/result_{task_id}.txt"),
+            value.as_bytes(),
+            DEFAULT_FILE_MODE,
+        )
         .map_err(|e| format!("failed to write per-task result: {e}"))
 }
 
@@ -4378,6 +4446,7 @@ fn extract_text_content(content: &[Value]) -> String {
 mod tests {
     use super::*;
     use crate::spend::SpendLimit;
+    use std::fs;
 
     fn refusal(limit: SpendLimit, ceiling: u64) -> SpendRefusal {
         SpendRefusal {
@@ -5070,7 +5139,7 @@ forgery: {prompt}"
     /// get real blobs without launching a session.
     async fn content_capture_writer(dir: &std::path::Path) -> crate::trace::TraceWriter {
         crate::trace::TraceWriter::open(
-            dir,
+            &crate::workdir_fs::WorkdirRoot::open(dir).unwrap(),
             "ses_test".to_string(),
             "cap".to_string(),
             "1.0.0".to_string(),
@@ -6441,7 +6510,7 @@ forgery: {prompt}"
 
         dump_compaction_summary(
             true,
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             17,
             81501,
             334,
@@ -6471,7 +6540,7 @@ forgery: {prompt}"
 
         dump_compaction_summary(
             true,
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             17,
             81501,
             334,
@@ -6482,7 +6551,7 @@ forgery: {prompt}"
 
         dump_compaction_summary(
             true,
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             34,
             79000,
             512,
@@ -6509,7 +6578,7 @@ forgery: {prompt}"
 
         dump_compaction_summary(
             false,
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             17,
             81501,
             334,
@@ -6643,7 +6712,10 @@ forgery: {prompt}"
         fs::write(dir.path().join("task.md"), "from task.md").unwrap();
         fs::write(dir.path().join("input.txt"), "from input.txt").unwrap();
         assert_eq!(
-            fresh_task_text(&inference_on("http"), dir.path()),
+            fresh_task_text(
+                &inference_on("http"),
+                &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap()
+            ),
             "from task.md"
         );
     }
@@ -6653,7 +6725,10 @@ forgery: {prompt}"
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("input.txt"), "from input.txt").unwrap();
         assert_eq!(
-            fresh_task_text(&inference_on("http"), dir.path()),
+            fresh_task_text(
+                &inference_on("http"),
+                &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap()
+            ),
             "from input.txt"
         );
     }
@@ -6661,7 +6736,13 @@ forgery: {prompt}"
     #[test]
     fn fresh_task_text_on_http_is_empty_when_neither_file_exists() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(fresh_task_text(&inference_on("http"), dir.path()), "");
+        assert_eq!(
+            fresh_task_text(
+                &inference_on("http"),
+                &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap()
+            ),
+            ""
+        );
     }
 
     /// The process transport sends `task.md` alone, so `input.txt` must not make its task look
@@ -6670,10 +6751,19 @@ forgery: {prompt}"
     fn fresh_task_text_on_process_ignores_input_txt() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("input.txt"), "from input.txt").unwrap();
-        assert_eq!(fresh_task_text(&inference_on("process"), dir.path()), "");
+        assert_eq!(
+            fresh_task_text(
+                &inference_on("process"),
+                &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap()
+            ),
+            ""
+        );
         fs::write(dir.path().join("task.md"), "from task.md").unwrap();
         assert_eq!(
-            fresh_task_text(&inference_on("process"), dir.path()),
+            fresh_task_text(
+                &inference_on("process"),
+                &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap()
+            ),
             "from task.md"
         );
     }
@@ -6683,9 +6773,12 @@ forgery: {prompt}"
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("task.md"), "  \n\t \n").unwrap();
         for transport in ["http", "process"] {
-            assert!(fresh_task_text(&inference_on(transport), dir.path())
-                .trim()
-                .is_empty());
+            assert!(fresh_task_text(
+                &inference_on(transport),
+                &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap()
+            )
+            .trim()
+            .is_empty());
         }
     }
 
@@ -6696,9 +6789,12 @@ forgery: {prompt}"
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("task.md"), "   ").unwrap();
         fs::write(dir.path().join("input.txt"), "from input.txt").unwrap();
-        assert!(fresh_task_text(&inference_on("http"), dir.path())
-            .trim()
-            .is_empty());
+        assert!(fresh_task_text(
+            &inference_on("http"),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap()
+        )
+        .trim()
+        .is_empty());
     }
 
     /// Measurement harness, not a check: prints the runtime's own count of the tools and system
@@ -6724,7 +6820,11 @@ forgery: {prompt}"
         let max_output_tokens = var("MAX_TOKENS")
             .and_then(|n| n.parse().ok())
             .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
-        let tools = inventory::build_tool_inventory(std::path::Path::new(&workdir), None, &[]);
+        let tools = inventory::build_tool_inventory(
+            &crate::workdir_fs::WorkdirRoot::open(std::path::Path::new(&workdir)).unwrap(),
+            None,
+            &[],
+        );
         let system = build_augmented_system_prompt(
             &name,
             &version,

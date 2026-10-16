@@ -1,7 +1,5 @@
 use std::{
     collections::BTreeMap,
-    fs,
-    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -10,6 +8,7 @@ use crate::{
     artifact_config::ARTIFACT_CONFIG_ENV,
     detached::{DetachPolicy, DetachedDispatchInfo},
     types::CapabilityPolicy,
+    workdir_fs::{WorkdirRoot, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE},
 };
 
 const MAX_SHELL_OUTPUT_BYTES: usize = 16 * 1024;
@@ -267,8 +266,8 @@ pub(crate) fn run_shell(
     binary: &str,
     args: &[&str],
     env_overrides: &[(String, String)],
-    accessible_workdir: &Path,
-    session_workdir: &Path,
+    accessible_workdir: &WorkdirRoot,
+    session_workdir: &WorkdirRoot,
     policy: &CapabilityPolicy,
     enforcement: &crate::sandbox::ShellEnforcement,
     detach: Option<DetachPolicy>,
@@ -293,7 +292,7 @@ pub(crate) fn run_shell(
     let mut command = Command::new(binary);
     command
         .args(args)
-        .current_dir(accessible_workdir)
+        .current_dir(accessible_workdir.path())
         .env_clear()
         .envs(env)
         .stdout(Stdio::piped())
@@ -306,7 +305,7 @@ pub(crate) fn run_shell(
     let supervisor = crate::sandbox::prepare_enforcement(
         &mut command,
         enforcement,
-        accessible_workdir,
+        accessible_workdir.path(),
         session_workdir,
     )?;
 
@@ -360,7 +359,7 @@ pub(crate) fn run_shell(
                                 readers,
                                 DemotionContext {
                                     policy: detach.expect("the detach policy was matched above"),
-                                    accessible_workdir: accessible_workdir.to_path_buf(),
+                                    accessible_workdir: accessible_workdir.clone(),
                                     invoked_binary: binary.to_string(),
                                     resolved_binary,
                                     args: args.iter().map(|arg| (*arg).to_string()).collect(),
@@ -437,8 +436,8 @@ pub(crate) fn execute_shell(
     binary: &str,
     args: &[&str],
     env_overrides: &[(String, String)],
-    accessible_workdir: &Path,
-    session_workdir: &Path,
+    accessible_workdir: &WorkdirRoot,
+    session_workdir: &WorkdirRoot,
     policy: &CapabilityPolicy,
     enforcement: &crate::sandbox::ShellEnforcement,
 ) -> Result<ShellResult, ShellExecError> {
@@ -512,7 +511,7 @@ struct DemotionContext {
     policy: DetachPolicy,
     /// Where the command ran, and where its `logs/<work-id>.log` goes — the path the completion
     /// reports back, workdir-relative.
-    accessible_workdir: PathBuf,
+    accessible_workdir: WorkdirRoot,
     /// The name as invoked, which is what the log header records.
     invoked_binary: String,
     /// The same name resolved to a path where the host `PATH` named one — what the trace and the
@@ -625,8 +624,10 @@ fn demote(
                 None => failure,
             });
         }
-        let output_bytes = std::fs::metadata(accessible_workdir.join(&output_path))
-            .map(|metadata| metadata.len())
+        let output_bytes = accessible_workdir
+            .file_len(&output_path)
+            .ok()
+            .flatten()
             .unwrap_or(0);
 
         policy
@@ -724,7 +725,7 @@ pub(crate) fn attribute_resource_limit(
 pub(crate) fn build_shell_env(
     policy: &CapabilityPolicy,
     env_overrides: &[(String, String)],
-    session_workdir: &Path,
+    session_workdir: &WorkdirRoot,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut env = BTreeMap::new();
 
@@ -860,15 +861,11 @@ pub(crate) fn build_declared_env(policy: &CapabilityPolicy) -> BTreeMap<String, 
     env
 }
 
-fn synthetic_home_dir(session_workdir: &Path) -> Result<std::path::PathBuf, String> {
-    let home = session_workdir.join(SYNTHETIC_HOME_DIR_NAME);
-    fs::create_dir_all(&home).map_err(|error| {
-        format!(
-            "failed to create synthetic home directory {}: {error}",
-            home.display()
-        )
-    })?;
-    Ok(home)
+fn synthetic_home_dir(session_workdir: &WorkdirRoot) -> Result<std::path::PathBuf, String> {
+    session_workdir
+        .create_dir_all(SYNTHETIC_HOME_DIR_NAME, DEFAULT_DIR_MODE)
+        .map_err(|error| format!("failed to create synthetic home directory: {error}"))?;
+    Ok(session_workdir.host_path(SYNTHETIC_HOME_DIR_NAME))
 }
 
 fn env_name_matches_pattern(pattern: &str, key: &str) -> bool {
@@ -893,7 +890,7 @@ fn env_name_matches_pattern(pattern: &str, key: &str) -> bool {
 /// [`MAX_SHELL_OUTPUT_BYTES`] passes a `shell-<ms>` stem, and a demoted command passes its work
 /// id. A reader that finds either file reads the same header, `Stdout:` and `Stderr:` sections.
 fn write_shell_output_log(
-    accessible_workdir: &Path,
+    accessible_workdir: &WorkdirRoot,
     file_stem: &str,
     binary: &str,
     args: &[&str],
@@ -901,13 +898,7 @@ fn write_shell_output_log(
     stdout: &str,
     stderr: &str,
 ) -> Result<String, String> {
-    let logs_dir = accessible_workdir.join("logs");
-    fs::create_dir_all(&logs_dir)
-        .map_err(|error| format!("failed to create shell logs directory: {error}"))?;
-
-    let filename = format!("{file_stem}.log");
-    let relative_path = format!("logs/{filename}");
-    let path = logs_dir.join(&filename);
+    let relative_path = format!("logs/{file_stem}.log");
 
     let command = if args.is_empty() {
         binary.to_string()
@@ -919,14 +910,16 @@ fn write_shell_output_log(
         "Command: {command}\nExit code: {exit_code}\n\nStdout:\n{stdout}\n\nStderr:\n{stderr}\n"
     );
 
-    fs::write(&path, content)
-        .map_err(|error| format!("failed to write shell log {}: {error}", path.display()))?;
+    accessible_workdir
+        .write_file(&relative_path, content.as_bytes(), DEFAULT_FILE_MODE)
+        .map_err(|error| format!("failed to write shell log: {error}"))?;
 
     Ok(relative_path)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
     use tempfile::tempdir;
 
     use super::*;
@@ -955,8 +948,8 @@ mod tests {
             "bash",
             &["-c", "ulimit -Hn"],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -1017,8 +1010,8 @@ mod tests {
             "python3",
             &["-c", script],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -1070,8 +1063,8 @@ mod tests {
                 "echo marker > \"$HOME/probe\" && cat \"$HOME/probe\" && pwd",
             ],
             &[],
-            accessible.path(),
-            &session,
+            &crate::workdir_fs::WorkdirRoot::open(accessible.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
             &policy,
             &ShellEnforcement::environment_only(),
         )
@@ -1110,8 +1103,8 @@ mod tests {
             "bash",
             &["-c", "exit 3"],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &ShellEnforcement::environment_only(),
         )
@@ -1128,8 +1121,8 @@ mod tests {
             "bash",
             &["-c", "echo hi"],
             &[],
-            Path::new("."),
-            Path::new("."),
+            &crate::workdir_fs::WorkdirRoot::open(Path::new(".")).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(Path::new(".")).unwrap(),
             &policy,
             &ShellEnforcement::environment_only(),
         )
@@ -1150,8 +1143,8 @@ mod tests {
             "bash",
             &["-c", "exit 42"],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &ShellEnforcement::environment_only(),
         )
@@ -1174,8 +1167,8 @@ mod tests {
             "bash",
             &["-c", "exit 0"],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &ShellEnforcement::environment_only(),
         )
@@ -1216,8 +1209,8 @@ mod tests {
             "./local-tool",
             &[],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &ShellEnforcement::environment_only(),
         )
@@ -1235,7 +1228,12 @@ mod tests {
         let temp = tempdir().unwrap();
         let policy = CapabilityPolicy::default();
 
-        let env = build_shell_env(&policy, &[], temp.path()).unwrap();
+        let env = build_shell_env(
+            &policy,
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+        )
+        .unwrap();
 
         let expected_home = temp.path().join(".capsule-home");
         assert_eq!(
@@ -1252,23 +1250,33 @@ mod tests {
     #[test]
     fn build_shell_env_reports_synthetic_home_creation_failure() {
         let temp = tempdir().unwrap();
-        let blocking_file = temp.path().join("blocked");
-        std::fs::write(&blocking_file, b"not a directory").unwrap();
-        let workdir = blocking_file.join("subdir");
+        // A file where the synthetic home belongs, so it cannot be created.
+        std::fs::write(
+            temp.path().join(SYNTHETIC_HOME_DIR_NAME),
+            b"not a directory",
+        )
+        .unwrap();
         let policy = CapabilityPolicy::default();
 
-        let error = build_shell_env(&policy, &[], &workdir).unwrap_err();
+        let error = build_shell_env(
+            &policy,
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+        )
+        .unwrap_err();
 
-        let expected_home = workdir.join(".capsule-home");
-        assert!(error.contains(&expected_home.to_string_lossy().into_owned()));
+        assert!(error.contains(SYNTHETIC_HOME_DIR_NAME), "{error}");
     }
 
     #[test]
     fn execute_shell_does_not_spawn_when_synthetic_home_creation_fails() {
         let temp = tempdir().unwrap();
-        let blocking_file = temp.path().join("blocked");
-        std::fs::write(&blocking_file, b"not a directory").unwrap();
-        let workdir = blocking_file.join("subdir");
+        std::fs::write(
+            temp.path().join(SYNTHETIC_HOME_DIR_NAME),
+            b"not a directory",
+        )
+        .unwrap();
+        let workdir = temp.path().to_path_buf();
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
             ..CapabilityPolicy::default()
@@ -1278,8 +1286,8 @@ mod tests {
             "bash",
             &["-c", "echo should-not-run"],
             &[],
-            &workdir,
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             &policy,
             &ShellEnforcement::environment_only(),
         )
@@ -1300,8 +1308,8 @@ mod tests {
             "bash",
             &["-c", "echo -n $HOME"],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &ShellEnforcement::environment_only(),
         )
@@ -1326,7 +1334,12 @@ mod tests {
             ("SAFE_VAR".to_string(), "kept".to_string()),
         ];
 
-        let env = build_shell_env(&policy, &overrides, temp.path()).unwrap();
+        let env = build_shell_env(
+            &policy,
+            &overrides,
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+        )
+        .unwrap();
 
         assert!(!env.contains_key("AWS_ACCESS_KEY_ID"));
         assert!(!env.contains_key("DOCKER_AUTH_CONFIG"));
@@ -1361,7 +1374,12 @@ mod tests {
             ..CapabilityPolicy::default()
         };
         let declared = build_declared_env(&policy);
-        let shell = build_shell_env(&policy, &[], temp.path()).unwrap();
+        let shell = build_shell_env(
+            &policy,
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+        )
+        .unwrap();
         std::env::remove_var(FORMATION_LIFELINE_ENV);
         assert!(
             !declared.contains_key(FORMATION_LIFELINE_ENV),
@@ -1385,7 +1403,12 @@ mod tests {
             ..CapabilityPolicy::default()
         };
         let declared = build_declared_env(&policy);
-        let shell = build_shell_env(&policy, &[], temp.path()).unwrap();
+        let shell = build_shell_env(
+            &policy,
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+        )
+        .unwrap();
         std::env::remove_var(SPAWNER_LIFELINE_ENV);
         assert!(!declared.contains_key(SPAWNER_LIFELINE_ENV), "{declared:?}");
         assert!(!shell.contains_key(SPAWNER_LIFELINE_ENV), "{shell:?}");
@@ -1468,7 +1491,12 @@ mod tests {
         };
         let overrides = vec![("HOME".to_string(), "/tmp/guest-controlled".to_string())];
 
-        let env = build_shell_env(&policy, &overrides, temp.path()).unwrap();
+        let env = build_shell_env(
+            &policy,
+            &overrides,
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+        )
+        .unwrap();
 
         let expected_home = temp.path().join(".capsule-home");
         assert_eq!(
@@ -1483,7 +1511,12 @@ mod tests {
         let policy = CapabilityPolicy::default();
 
         std::env::set_var("CARGO_HOME", "/fake/cargo/home");
-        let env = build_shell_env(&policy, &[], temp.path()).unwrap();
+        let env = build_shell_env(
+            &policy,
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+        )
+        .unwrap();
         std::env::remove_var("CARGO_HOME");
 
         assert_eq!(env.get("CARGO_HOME"), Some(&"/fake/cargo/home".to_string()));
@@ -1498,7 +1531,12 @@ mod tests {
         };
         let overrides = vec![("MYCOMPANY_SECRET".to_string(), "leaked".to_string())];
 
-        let env = build_shell_env(&policy, &overrides, temp.path()).unwrap();
+        let env = build_shell_env(
+            &policy,
+            &overrides,
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+        )
+        .unwrap();
 
         assert!(!env.contains_key("MYCOMPANY_SECRET"));
     }
@@ -1670,8 +1708,8 @@ mod tests {
             // kill it; without the demotion the call would return only when it exited.
             &["-c", "sleep 5"],
             &[],
-            temp.path(),
-            temp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &ShellEnforcement::environment_only(),
             Some(DetachPolicy {

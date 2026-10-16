@@ -393,17 +393,22 @@ pub fn render_runtime_writes(writes: &[RuntimeWriteReport]) -> String {
 mod tests {
     use super::*;
 
-    /// The source files carrying a production `workdir.join(...)`, each scanned by
-    /// [`every_workdir_write_is_declared_or_exempted`].
+    /// The source files carrying a production `workdir.join(...)` or a [`WorkdirRoot`] write,
+    /// each scanned by [`every_workdir_write_is_declared_or_exempted`] and by
+    /// [`no_workdir_file_bypasses_the_no_follow_helper`].
     ///
-    /// `plan.rs` has no production occurrence today and is scanned anyway, so a plan step that
-    /// grows one is covered without anybody remembering to widen this list.
+    /// `plan.rs` and `delegation_plane.rs` have no production write of their own and are scanned
+    /// anyway: both read a workdir for a decision, so a raw call either grows is caught without
+    /// anybody remembering to widen this list.
+    ///
+    /// [`WorkdirRoot`]: crate::workdir_fs::WorkdirRoot
     const SCANNED: &[(&str, &str)] = &[
         ("agent.rs", include_str!("agent.rs")),
         ("agent/inventory.rs", include_str!("agent/inventory.rs")),
         ("agent/process.rs", include_str!("agent/process.rs")),
         ("child_launch.rs", include_str!("child_launch.rs")),
         ("delegation.rs", include_str!("delegation.rs")),
+        ("delegation_plane.rs", include_str!("delegation_plane.rs")),
         ("hooks.rs", include_str!("hooks.rs")),
         ("murmur_md.rs", include_str!("murmur_md.rs")),
         ("otel.rs", include_str!("otel.rs")),
@@ -418,6 +423,7 @@ mod tests {
         ("tool_annotations.rs", include_str!("tool_annotations.rs")),
         ("trace.rs", include_str!("trace.rs")),
         ("trace_blobs.rs", include_str!("trace_blobs.rs")),
+        ("types.rs", include_str!("types.rs")),
     ];
 
     /// Constant names a `workdir.join(...)` may name, paired with the constant itself.
@@ -439,6 +445,9 @@ mod tests {
             crate::shell::SYNTHETIC_HOME_DIR_NAME,
         ),
         ("FILES_DIR_NAME", crate::agent::process::FILES_DIR_NAME),
+        ("TASK_INPUT_FILE", crate::runtime::TASK_INPUT_FILE),
+        ("TRACE_FILE_NAME", crate::trace::TRACE_FILE_NAME),
+        ("CHILDREN_DIR", crate::child_launch::CHILDREN_DIR),
     ];
 
     /// Entry names the scanner resolves that are deliberately not declared, each with the reason.
@@ -491,30 +500,46 @@ mod tests {
         ),
         (
             "runtime.rs",
-            "&relative",
-            "A resource path a tool call named, resolved to check it is inside the workdir \
-             before the file is read.",
-        ),
-        (
-            "runtime.rs",
             "&stored_path",
             "Where a redeemed peer handle's bytes go, composed by `peer_handoff::stored_path_for` \
              under `peer-in/`. Declared through that directory's own entry, which is the name a \
              consumer excludes.",
         ),
         (
+            "runtime.rs",
+            "rel",
+            "`write_staged_file`'s path, `tools/<name>/<file>`, composed by each of its callers. \
+             Declared through the `tools` entry.",
+        ),
+        (
             "shell.rs",
-            "&output_path",
-            "A demoted command's own log path, `logs/<work-id>.log`, composed by \
-             `detached::output_path_for` and joined here only to measure the file's size. \
-             Declared through the `logs` entry.",
+            "&relative_path",
+            "A command's full-output log, `logs/<stem>.log`, composed on the line above. Declared \
+             through the `logs` entry.",
+        ),
+        (
+            "child_launch.rs",
+            "rel",
+            "One child's directory, `.murmur/children/<name>-<16 hex>`, composed by \
+             `child_workdir_rel`. Declared through the `.murmur/children` entry.",
+        ),
+        (
+            "child_launch.rs",
+            "child_workdir_rel(capsule_name)",
+            "The host path of the same child directory, for the child's `--workdir` argument. \
+             Declared through the `.murmur/children` entry.",
         ),
         (
             "delegation.rs",
-            "format!( \".{COMPLETION_FILE}.{}.tmp\", uuid::Uuid::now_v7().simple() )",
-            "The temporary file `completion.json` is written through and renamed from. It exists \
-             only between two syscalls in the same function, so a consumer diffing a finished \
-             run never sees it.",
+            "completion_path(workdir)",
+            "`completion.json` in a delegated child's own directory, which is the child's \
+             accessible workdir. Declared through the `completion.json` entry.",
+        ),
+        (
+            "trace.rs",
+            "trace",
+            "A resumed-from session's `trace.jsonl`, relative to the directory every session of \
+             this workdir sits in. Declared through the `.murmur/<session-id>` entry.",
         ),
     ];
 
@@ -530,6 +555,45 @@ mod tests {
         }
     }
 
+    /// The source text between the `(` that ends at `open` and its matching `)`.
+    fn parenthesised(source: &str, open: usize) -> &str {
+        let bytes = source.as_bytes();
+        let mut depth = 1usize;
+        let mut index = open;
+        while index < bytes.len() && depth > 0 {
+            match bytes[index] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            index += 1;
+        }
+        assert!(depth == 0, "unbalanced parentheses in a scanned call");
+        &source[open..index - 1]
+    }
+
+    /// `text` collapsed to one line: an argument's line breaks and indentation are `rustfmt`'s
+    /// business, and a table row that had to reproduce them would fail on a reflow.
+    fn one_line(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The first top-level argument of an argument list.
+    fn first_argument(arguments: &str) -> &str {
+        let mut depth = 0i32;
+        let mut in_string = false;
+        for (index, character) in arguments.char_indices() {
+            match character {
+                '"' => in_string = !in_string,
+                '(' | '[' | '{' if !in_string => depth += 1,
+                ')' | ']' | '}' if !in_string => depth -= 1,
+                ',' if !in_string && depth == 0 => return &arguments[..index],
+                _ => {}
+            }
+        }
+        arguments
+    }
+
     /// Every `workdir.join(<arg>)` in `source`, as the argument's source text.
     ///
     /// The receiver is matched on its `workdir` suffix rather than by name, which is what makes
@@ -537,7 +601,6 @@ mod tests {
     /// `parent_accessible_workdir\n    .join(` all one case.
     fn workdir_join_arguments(source: &str) -> Vec<String> {
         let mut found = Vec::new();
-        let bytes = source.as_bytes();
         let mut cursor = 0;
         while let Some(offset) = source[cursor..].find(".join(") {
             let start = cursor + offset;
@@ -545,41 +608,71 @@ mod tests {
             if !source[..start].trim_end().ends_with("workdir") {
                 continue;
             }
-            let mut depth = 1usize;
-            let mut index = cursor;
-            while index < bytes.len() && depth > 0 {
-                match bytes[index] {
-                    b'(' => depth += 1,
-                    b')' => depth -= 1,
-                    _ => {}
-                }
-                index += 1;
-            }
-            assert!(
-                depth == 0,
-                "unbalanced parentheses after a join into a workdir"
-            );
-            // Collapsed to one line: an argument's line breaks and indentation are `rustfmt`'s
-            // business, and a table row that had to reproduce them would fail on a reflow.
-            found.push(
-                source[cursor..index - 1]
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
+            found.push(one_line(parenthesised(source, cursor)));
         }
         found
     }
 
-    /// The entry name a `workdir.join(...)` argument stands for, or `None` when the source text
-    /// cannot say — a variable, a field access, a formatted string.
-    fn resolve_entry_name(argument: &str) -> Option<String> {
-        if let Some(rest) = argument.strip_prefix('"') {
-            return rest.split_once('"').map(|(literal, _)| literal.to_string());
+    /// The [`crate::workdir_fs::WorkdirRoot`] methods that create something beneath a root.
+    const HELPER_WRITES: &[&str] = &[
+        ".write_file(",
+        ".write_file_exact_mode(",
+        ".overwrite_in_place(",
+        ".open_append(",
+        ".create_dir_all(",
+    ];
+
+    /// The relative-path argument of every [`HELPER_WRITES`] call in `source`, as source text.
+    ///
+    /// A `.create_dir_all(` straight after `fs` is `std::fs`'s, a raw call
+    /// [`no_workdir_file_bypasses_the_no_follow_helper`] judges instead.
+    fn helper_write_arguments(source: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for method in HELPER_WRITES {
+            let mut cursor = 0;
+            while let Some(offset) = source[cursor..].find(method) {
+                let start = cursor + offset;
+                cursor = start + method.len();
+                if source[..start].ends_with("fs") {
+                    continue;
+                }
+                found.push(one_line(first_argument(parenthesised(source, cursor))));
+            }
         }
-        let last = argument.rsplit("::").next().unwrap_or(argument);
-        let is_constant_name = !last.is_empty()
-            && last
+        found
+    }
+
+    /// The entry name — the first path segment — a path argument stands for, or `None` when the
+    /// source text cannot say: a variable, a field access, a format string that opens with a
+    /// value rather than a name.
+    ///
+    /// A literal, a `format!` whose string opens with a literal segment or with a named constant
+    /// (`format!("{BLOB_DIR_NAME}/{sha}")`), and a named constant all resolve.
+    fn resolve_entry_name(argument: &str) -> Option<String> {
+        let argument = argument.trim_start_matches('&');
+        let argument = argument
+            .strip_prefix("format!(")
+            .map(str::trim_start)
+            .unwrap_or(argument);
+        let resolved = if let Some(rest) = argument.strip_prefix('"') {
+            let (literal, _) = rest.split_once('"')?;
+            match literal.strip_prefix('{') {
+                Some(inner) => resolve_constant(argument, inner.split_once('}')?.0)?,
+                None if literal.starts_with('{') => return None,
+                None => literal.split('{').next()?.to_string(),
+            }
+        } else {
+            resolve_constant(argument, argument.rsplit("::").next().unwrap_or(argument))?
+        };
+        let first = resolved.split('/').next()?.to_string();
+        (!first.is_empty()).then_some(first)
+    }
+
+    /// The value of the constant `name` in [`CONSTANTS`], or `None` when `name` is not a constant
+    /// name at all. Panics on a constant name the table does not pair with a value.
+    fn resolve_constant(argument: &str, name: &str) -> Option<String> {
+        let is_constant_name = !name.is_empty()
+            && name
                 .chars()
                 .all(|character| character.is_ascii_uppercase() || character == '_');
         if !is_constant_name {
@@ -588,12 +681,12 @@ mod tests {
         Some(
             CONSTANTS
                 .iter()
-                .find(|(name, _)| *name == last)
+                .find(|(constant, _)| *constant == name)
                 .unwrap_or_else(|| {
                     panic!(
-                        "a workdir.join({argument}) names the constant {last}, which this test's \
-                         CONSTANTS table does not pair with a value. Add \
-                         (\"{last}\", <path to the constant>) so a rename or a value change is \
+                        "a workdir write ({argument}) names the constant {name}, which this \
+                         test's CONSTANTS table does not pair with a value. Add \
+                         (\"{name}\", <path to the constant>) so a rename or a value change is \
                          caught here rather than silently accepted."
                     )
                 })
@@ -605,8 +698,9 @@ mod tests {
     /// Every entry the runtime writes into a workdir is declared by [`DECLARED_WRITES`] or
     /// exempted here with a written reason.
     ///
-    /// The input is the runtime's own source text rather than a list somebody maintains, so a
-    /// developer who adds a `workdir.join("...")` fails this test until they decide which it is.
+    /// The input is the runtime's own source text rather than a list somebody maintains: every
+    /// `workdir.join(...)` and the path of every [`HELPER_WRITES`] call. A developer who adds
+    /// either fails this test until they decide which it is.
     #[test]
     fn every_workdir_write_is_declared_or_exempted() {
         let declared: Vec<&str> = DECLARED_WRITES
@@ -615,20 +709,29 @@ mod tests {
             .collect();
 
         let mut scanned = 0usize;
+        let mut dynamic_rows_used = vec![false; DYNAMIC_EXEMPT.len()];
         for (file, source) in SCANNED {
-            for argument in workdir_join_arguments(production_text(source)) {
+            let text = production_text(source);
+            let arguments = workdir_join_arguments(text)
+                .into_iter()
+                .chain(helper_write_arguments(text));
+            for argument in arguments {
                 scanned += 1;
                 let Some(entry) = resolve_entry_name(&argument) else {
-                    assert!(
+                    let row =
                         DYNAMIC_EXEMPT
                             .iter()
-                            .any(|(exempt_file, exempt_argument, _)| exempt_file == file
-                                && *exempt_argument == argument),
-                        "{file} writes workdir.join({argument}) into a workdir, and the argument \
-                         is neither a string literal nor a named constant, so this test cannot \
-                         say what it names. Add ({file:?}, {argument:?}, <written reason>) to \
-                         this test's DYNAMIC_EXEMPT table."
+                            .position(|(exempt_file, exempt_argument, _)| {
+                                exempt_file == file && *exempt_argument == argument
+                            });
+                    assert!(
+                        row.is_some(),
+                        "{file} writes ({argument}) into a workdir, and the argument is neither \
+                         a string literal nor a named constant, so this test cannot say what it \
+                         names. Add ({file:?}, {argument:?}, <written reason>) to this test's \
+                         DYNAMIC_EXEMPT table."
                     );
+                    dynamic_rows_used[row.unwrap()] = true;
                     continue;
                 };
                 assert!(
@@ -645,11 +748,19 @@ mod tests {
 
         // A scanner that silently stopped matching would otherwise pass by finding nothing.
         assert!(
-            scanned >= 50,
-            "the workdir.join scan found only {scanned} occurrences across {} files, far below \
+            scanned >= 40,
+            "the workdir write scan found only {scanned} occurrences across {} files, far below \
              what the runtime has — the scanner is broken, not the runtime",
             SCANNED.len()
         );
+
+        for ((file, argument, _), used) in DYNAMIC_EXEMPT.iter().zip(dynamic_rows_used) {
+            assert!(
+                used,
+                "DYNAMIC_EXEMPT row ({file:?}, {argument:?}) matches no write in {file}; remove \
+                 it so the table names only what the runtime does"
+            );
+        }
 
         for (name, _) in EXEMPT {
             assert!(
@@ -659,10 +770,11 @@ mod tests {
         }
     }
 
-    /// Every source file with a production `workdir.join(...)` is in `SCANNED`.
+    /// Every source file with a production `workdir.join(...)` or [`HELPER_WRITES`] call is in
+    /// `SCANNED`.
     ///
-    /// Without this, a new module writing into a workdir would be invisible to the scan above and
-    /// the declaration would go quietly stale, which is the exact failure this whole module
+    /// Without this, a new module writing into a workdir would be invisible to the scans above
+    /// and the declaration would go quietly stale, which is the exact failure this whole module
     /// exists to close.
     #[test]
     fn every_source_file_that_joins_a_workdir_is_scanned() {
@@ -680,16 +792,19 @@ mod tests {
                 }
                 if path.extension().is_some_and(|extension| extension == "rs") {
                     checked += 1;
-                    // This module's own prose and failure messages quote the pattern being
-                    // searched for; it declares the writes rather than performing any.
+                    // This module's own prose and failure messages quote the patterns being
+                    // searched for, and `workdir_fs.rs` is the helper itself.
                     if path
                         .file_name()
-                        .is_some_and(|name| name == "workdir_writes.rs")
+                        .is_some_and(|name| name == "workdir_writes.rs" || name == "workdir_fs.rs")
                     {
                         continue;
                     }
                     let source = std::fs::read_to_string(&path).unwrap();
-                    if workdir_join_arguments(production_text(&source)).is_empty() {
+                    let text = production_text(&source);
+                    if workdir_join_arguments(text).is_empty()
+                        && helper_write_arguments(text).is_empty()
+                    {
                         continue;
                     }
                     let relative = path
@@ -711,6 +826,274 @@ mod tests {
             checked >= 40,
             "walked only {checked} source files under src/ — the walk is broken"
         );
+    }
+
+    /// Every raw filesystem call in a scanned file, with the reason its path is not beneath the
+    /// accessible workdir or the session directory, keyed by file and enclosing function.
+    ///
+    /// A row covers every listed call in that function. Anything a capsule's commands can reach
+    /// goes through [`crate::workdir_fs::WorkdirRoot`] instead, and has no row here.
+    const RAW_FS_EXEMPT: &[(&str, &str, &str)] = &[
+        (
+            "recipes.rs",
+            "read_file",
+            "Reads a capsule-authored recipe file to show what a build-tool call runs. The path \
+             is canonicalized and confined to the workdir by `confine` first, links inside the \
+             workdir are followed by design, and nothing is written or decided beyond the text \
+             shown.",
+        ),
+        (
+            "recipes.rs",
+            "read_makefile",
+            "Tests whether an `include`d recipe file exists before `read_file` confines and \
+             reads it.",
+        ),
+        (
+            "recipes.rs",
+            "read_justfile",
+            "Tests whether an `import`ed recipe file exists before `read_file` confines and \
+             reads it.",
+        ),
+        (
+            "recipes.rs",
+            "resolve_make",
+            "Picks which of make's default file names exists, beneath a directory `confine` \
+             already resolved inside the workdir.",
+        ),
+        (
+            "recipes.rs",
+            "resolve_just",
+            "Picks which of just's default file names exists, on `resolve_make`'s terms.",
+        ),
+        (
+            "resource_plane.rs",
+            "open_no_follow",
+            "The resource plane's own reads of files the capsule exported, under its own \
+             `SymlinkPolicy`; it resolves and confines every path itself and writes nothing.",
+        ),
+        (
+            "resource_plane.rs",
+            "list_export_files",
+            "The resource plane's listing of a declared export root, on `open_no_follow`'s \
+             terms.",
+        ),
+        (
+            "runtime.rs",
+            "check_resume_launchable",
+            "A conversation record or harness-session file under `~/.murmur/conversations`, \
+             outside every workdir.",
+        ),
+        (
+            "runtime.rs",
+            "copy_manifest_into_workdir",
+            "Reads the project's `murmur.yaml` from the manifest directory; the copy into the \
+             workdir goes through `WorkdirRoot`.",
+        ),
+        (
+            "runtime.rs",
+            "load_local_skill_md",
+            "A local skill source named relative to the manifest directory, read before any \
+             workdir exists.",
+        ),
+        (
+            "runtime.rs",
+            "read_prompt_file",
+            "A prompt file named relative to the manifest directory.",
+        ),
+        (
+            "runtime.rs",
+            "stage_session",
+            "The operator's `--workdir` itself, checked by path before it is opened as the \
+             accessible root, and `<manifest dir>/workdir/<session id>`, created before any root \
+             exists. Nothing beneath either is touched by path.",
+        ),
+        (
+            "sandbox.rs",
+            "build_sealed_root",
+            "Host directories offered as the composed root's base, outside every workdir.",
+        ),
+        (
+            "sandbox.rs",
+            "open_o_path",
+            "An `O_PATH` handle for a Landlock rule, opened from a host path the grant names; it \
+             reads and writes nothing.",
+        ),
+        (
+            "sandbox.rs",
+            "resolve_landlock_grants_outside",
+            "The ELF images of host binaries and libraries a shell grant names, read for their \
+             dependencies.",
+        ),
+        (
+            "sandbox.rs",
+            "resolve_soname",
+            "Host library search directories, outside every workdir.",
+        ),
+        (
+            "sealed.rs",
+            "inspect_installed_profile",
+            "The host's installed AppArmor profile under `/etc/apparmor.d`.",
+        ),
+        (
+            "sealed.rs",
+            "inspect_profile_attachment",
+            "`/proc/self/attr/current`, the runtime's own AppArmor attachment.",
+        ),
+        (
+            "sealed.rs",
+            "read_trimmed",
+            "Host settings under `/sys` and `/proc`.",
+        ),
+    ];
+
+    /// `std::fs` / `tokio::fs` functions that touch a path, matched only straight after `fs::`
+    /// so a [`crate::workdir_fs::WorkdirRoot`] method of the same name is never mistaken for one.
+    const RAW_FS_FUNCTIONS: &[&str] = &[
+        "write(",
+        "copy(",
+        "rename(",
+        "create_dir_all(",
+        "create_dir(",
+        "set_permissions(",
+        "remove_file(",
+        "remove_dir_all(",
+        "read_to_string(",
+        "read(",
+    ];
+
+    /// Raw opens and existence checks, matched wherever they appear.
+    const RAW_FS_CALLS: &[&str] = &[
+        "File::create(",
+        "OpenOptions::new(",
+        "File::open(",
+        "try_exists(",
+    ];
+
+    /// Path predicates, matched unless the receiver is a metadata or file-type value, which has
+    /// already been read from a descriptor or a directory entry.
+    const RAW_FS_PREDICATES: &[&str] = &[".exists()", ".is_file()", ".is_dir()"];
+
+    /// The function the byte at `at` sits in: the nearest preceding `fn <name>`.
+    fn enclosing_fn(source: &str, at: usize) -> &str {
+        let before = &source[..at];
+        let mut cursor = before.len();
+        while let Some(index) = before[..cursor].rfind("fn ") {
+            cursor = index;
+            let boundary = index == 0
+                || !before.as_bytes()[index - 1].is_ascii_alphanumeric()
+                    && before.as_bytes()[index - 1] != b'_';
+            let name: String = before[index + 3..]
+                .chars()
+                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                .collect();
+            if boundary && !name.is_empty() {
+                return &before[index + 3..index + 3 + name.len()];
+            }
+        }
+        "<file level>"
+    }
+
+    /// Every raw filesystem call in `source`, as `(enclosing fn, call)`.
+    fn raw_fs_calls(source: &str) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for function in RAW_FS_FUNCTIONS {
+            let pattern = format!("fs::{function}");
+            for (at, _) in source.match_indices(&pattern) {
+                found.push((enclosing_fn(source, at).to_string(), pattern.clone()));
+            }
+        }
+        for call in RAW_FS_CALLS {
+            for (at, _) in source.match_indices(call) {
+                found.push((enclosing_fn(source, at).to_string(), call.to_string()));
+            }
+        }
+        for predicate in RAW_FS_PREDICATES {
+            for (at, _) in source.match_indices(predicate) {
+                let receiver = source[..at]
+                    .trim_end()
+                    .rsplit(|character: char| {
+                        !(character.is_ascii_alphanumeric() || "_().".contains(character))
+                    })
+                    .next()
+                    .unwrap_or_default();
+                let last = receiver
+                    .trim_end_matches("()")
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or_default();
+                if matches!(last, "meta" | "metadata" | "file_type") {
+                    continue;
+                }
+                found.push((enclosing_fn(source, at).to_string(), predicate.to_string()));
+            }
+        }
+        found
+    }
+
+    /// No scanned file touches a path with a raw filesystem call unless [`RAW_FS_EXEMPT`] says
+    /// why that path is outside every workdir — and no row of that table outlives the call it
+    /// excuses.
+    ///
+    /// A raw call resolves every component of its path, so a link the capsule planted anywhere on
+    /// the way redirects it; [`crate::workdir_fs::WorkdirRoot`] is the one way the runtime
+    /// touches a path beneath a workdir.
+    #[test]
+    fn no_workdir_file_bypasses_the_no_follow_helper() {
+        let mut rows_used = vec![false; RAW_FS_EXEMPT.len()];
+        for (file, source) in SCANNED {
+            for (function, call) in raw_fs_calls(production_text(source)) {
+                let row = RAW_FS_EXEMPT
+                    .iter()
+                    .position(|(exempt_file, exempt_fn, _)| {
+                        exempt_file == file && *exempt_fn == function
+                    });
+                let Some(row) = row else {
+                    panic!(
+                        "{file}: `{function}` calls `{call}` directly. A path beneath the \
+                         accessible workdir or the session directory goes through WorkdirRoot \
+                         (crate::workdir_fs), which follows no link; a path outside every \
+                         workdir gets a ({file:?}, {function:?}, <why it is not beneath a \
+                         workdir>) row in RAW_FS_EXEMPT."
+                    );
+                };
+                rows_used[row] = true;
+            }
+        }
+        for ((file, function, _), used) in RAW_FS_EXEMPT.iter().zip(rows_used) {
+            assert!(
+                used,
+                "RAW_FS_EXEMPT row ({file:?}, {function:?}) matches no raw filesystem call — \
+                 the call is gone or moved; remove or re-key the row"
+            );
+        }
+    }
+
+    #[test]
+    fn the_raw_call_scanner_names_the_function_and_the_call() {
+        let source = "fn staged() {\n    let _ = std::fs::write(self.workdir.join(\"plans\").join(\"x\"), b\"\");\n}\nfn helper(root: &WorkdirRoot) {\n    root.write_file(\"plans/x\", b\"\", 0o644);\n    if metadata.is_file() {}\n}\n";
+        assert_eq!(
+            raw_fs_calls(source),
+            vec![("staged".to_string(), "fs::write(".to_string())]
+        );
+        assert_eq!(
+            helper_write_arguments(source),
+            vec!["\"plans/x\"".to_string()]
+        );
+        assert_eq!(resolve_entry_name("\"plans/x\"").as_deref(), Some("plans"));
+        assert_eq!(
+            resolve_entry_name("format!(\"{BLOB_DIR_NAME}/{sha256}\")").as_deref(),
+            Some("blobs")
+        );
+        assert_eq!(
+            resolve_entry_name("format!(\"tools/{name}/x\")").as_deref(),
+            Some("tools")
+        );
+        assert_eq!(
+            resolve_entry_name("CHILDREN_DIR").as_deref(),
+            Some(".murmur")
+        );
+        assert_eq!(resolve_entry_name("&rel"), None);
+        assert_eq!(resolve_entry_name("format!(\"{}/x\", a)"), None);
     }
 
     /// Sealed is the one condition that changes the reported set, and it adds nothing a consumer

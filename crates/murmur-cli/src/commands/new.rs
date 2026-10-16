@@ -180,11 +180,12 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     // Stage the session (creates workdir, installs artifacts including skill.md).
     let staged = stage_session(Arc::new(local_registry), stage_request)
         .map_err(crate::wit_level::staging_error)?;
-    let session_workdir = staged.workdir.clone();
+    let session_root = staged.session_root.clone();
 
     // Write the task prompt as task.md. The runtime reads this as the initial task when
     // task_acceptance: single and task.md exists — no A2A handshake needed.
-    fs::write(session_workdir.join("task.md"), &task_prompt)
+    staged
+        .write_task_input(task_prompt.as_bytes())
         .map_err(|e| CliError::new(E_IO_003, format!("failed to write task prompt: {e}")))?;
 
     capsule_runtime::report_eprintln!("mur new: generating manifest...");
@@ -195,19 +196,30 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     launch_session(staged, |_url| {}).map_err(CliError::from)?;
 
     // Read the manifest written by the agent via write_file("out/murmur.yaml").
-    let manifest_path = session_workdir.join("out").join("murmur.yaml");
-    if !manifest_path.exists() {
-        let agent_output = fs::read_to_string(session_workdir.join("out").join("result.txt"))
-            .unwrap_or_else(|_| "(no output captured)".to_string());
-        return Err(CliError::new(
-            "E-NEW-001",
-            format!(
-                "generator agent did not produce out/murmur.yaml\nagent output:\n{agent_output}"
-            ),
-        ));
-    }
-    let manifest_yaml = fs::read_to_string(&manifest_path)
-        .map_err(|e| CliError::new(E_IO_003, format!("failed to read out/murmur.yaml: {e}")))?;
+    // Read through the session root, so a link the generator left there is refused rather than
+    // followed.
+    let manifest_yaml = match session_root.read_to_string("out/murmur.yaml") {
+        Ok(Some(manifest_yaml)) => manifest_yaml,
+        Ok(None) => {
+            let agent_output = session_root
+                .read_to_string("out/result.txt")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "(no output captured)".to_string());
+            return Err(CliError::new(
+                "E-NEW-001",
+                format!(
+                    "generator agent did not produce out/murmur.yaml\nagent output:\n{agent_output}"
+                ),
+            ));
+        }
+        Err(e) => {
+            return Err(CliError::new(
+                E_IO_003,
+                format!("failed to read out/murmur.yaml: {e}"),
+            ))
+        }
+    };
 
     // Validate structure before touching CWD.
     if std::env::var("MUR_DEBUG_MANIFEST").is_ok() {

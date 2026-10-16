@@ -559,8 +559,8 @@ mod tests {
             "bash",
             &["-c", script],
             &[],
-            workdir,
-            workdir,
+            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             &bash_policy(),
             &ShellEnforcement::environment_only(),
             Some(DetachPolicy {

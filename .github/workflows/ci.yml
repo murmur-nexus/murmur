@@ -273,7 +273,7 @@ jobs:
         # proves nothing about what the kernel answers.
         if: matrix.target == 'aarch64-apple-darwin'
         # Quoted: a plain scalar ending in `:` reads as a mapping key.
-        run: 'cargo test -p capsule-runtime --lib running::'
+        run: 'cargo test -p capsule-runtime --lib -- running:: workdir_fs::'
 
   release-targets-in-ci:
     name: release-targets-in-ci

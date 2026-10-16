@@ -142,7 +142,9 @@ fn probe(shared: &Path) -> ! {
     wait_for_closed_pipe(&shared.join(CLOSED));
 
     // A directory of this case's own, so the refused lines land in a file nothing else wrote.
-    diagnostic::set_diagnostic_workdir(&shared.join("session"));
+    let session = shared.join("session");
+    std::fs::create_dir_all(&session).expect("create the session directory");
+    diagnostic::set_diagnostic_workdir(&capsule_runtime::WorkdirRoot::open(&session).unwrap());
 
     // The two writers that can run after the readiness line: `child_launch`'s delegated-child
     // drain relays every line its child says through `raw_to_stdout`, and every other diagnostic

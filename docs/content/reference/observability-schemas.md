@@ -32,6 +32,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `session_start` | Nothing — its `event_id` is the session node |
 | `task_start` | The session node. Its `event_id` is the task node |
 | `task_end`, `task_reopened`, `task_continued`, `task_canceled`, `task_failed`, `context_seed` | The task node, or the session node for a `task_failed` written outside any task |
+| `workdir_path_refused` | The task node, or the session node outside any task |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
@@ -768,11 +769,31 @@ terminal `task_end`
 | `input_timeout` | A `request-input` wait passed [`lifecycle.input_timeout_secs`](manifest.md#lifecycle-input-timeout-secs) with no answer. The attempt makes no further inference call |
 | `reopen_budget_exhausted` | An `on-task-end` hook still asked to reopen the task after `lifecycle.max_task_reopens` or `inference.max_turns` was spent. The reason names the limit |
 | `runtime_error` | The attempt ended in any other error, for example a [`transport: process`](manifest.md#transport-process) failure (`E-RUN-033`–`E-RUN-036`). The reason is the error's text |
+| `workdir_path_refused` | The runtime met a symbolic link, or the wrong kind of file, inside the workdir, and refused the write, read, create or removal. Preceded by one [`workdir_path_refused`](#workdir-path-refused) line per refusal. The reason is every refusal's text, joined with `; ` |
 
 Written whatever [`trace.capture`](manifest.md#field-trace) is. A task that ended `ok`,
 `max_turns_reached`, `spend_ceiling_reached` or `canceled` has no `task_failed` line: its
 `task_end` status, a [`spend_ceiling_reached`](#spend-ceiling-reached) line or a
 [`task_canceled`](#task-canceled) line already says what happened.
+
+**`workdir_path_refused`**{ #workdir-path-refused } — written once for each path the runtime refused
+to write, append to, read, create or remove because it met a symbolic link or the wrong kind of
+file inside the workdir. See [Links inside the workdir](workdir.md#links-inside-the-workdir)
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The task in progress. Absent outside a task |
+| `path` | string | The path the runtime meant to touch, relative to the accessible workdir, with the real session id |
+| `operation` | string | `write`, `append`, `read`, `create_dir` or `remove` |
+| `refused_at` | string | The part of `path` found to be a link or the wrong kind of file, relative to the accessible workdir |
+| `reason` | string | `symlink`, `hard_link`, `not_a_regular_file` or `invalid_component` |
+
+Written whatever [`trace.capture`](manifest.md#field-trace) is, before the
+[`task_failed`](#task-failed) with cause `workdir_path_refused` that ends the task:
+
+```json
+{"event_type":"workdir_path_refused","event_id":"evt_01a142aa41ec77c0b1e8188aaae1057d","parent_id":"evt_01a142aa41eb7b80afc03940d4eb02ad","session_id":"ses_01a142aa414e7080a922ff3d88fd476e","timestamp":1792119816684,"task_id":"tsk_01a142aa41eb7b80afc0392fe989e57f","path":"task.md","operation":"write","refused_at":"task.md","reason":"symlink"}
+```
 
 **`task_reopened`** — written once per reopen, between two agent-loop attempts of the same task,
 when a blocking `on-task-end` hook (`commit_policy: reopen-task`) returns `reopen-task(reason)` and
@@ -1087,7 +1108,7 @@ refused
 | `stored_path` | string \| null | Where the bytes landed, relative to the accessible workdir. `null` on any non-`ok` outcome |
 | `bytes` | u64 \| null | Bytes stored. `null` on any non-`ok` outcome |
 | `sha256` | string \| null | SHA-256 (lowercase hex) of the bytes stored. `null` on any non-`ok` outcome |
-| `outcome` | string | `"ok"`, `"peer_not_allowed"`, `"peer_unreachable"`, `"etag_mismatch"`, `"io_error"`, or the peer's own [error code](resource-plane.md#redeem) |
+| `outcome` | string | `"ok"`, `"peer_not_allowed"`, `"peer_unreachable"`, `"etag_mismatch"`, `"io_error"`, `"path_refused"` — `peer-in/` or the stored name is a link inside the workdir, and nothing was written — or the peer's own [error code](resource-plane.md#redeem) |
 | `reason` | string \| null | `null` on `"ok"`; one sentence otherwise |
 
 `peer_handle_mint` and `peer_file_fetch` come from the agent loop; `peer_handle_redeem` is written

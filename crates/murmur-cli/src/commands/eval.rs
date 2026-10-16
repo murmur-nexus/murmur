@@ -738,8 +738,10 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
         // Copy case task to workdir/task.md
         let task_path = Path::new(&case.task_path);
         if task_path.exists() {
-            let dst = staged.workdir.join("task.md");
-            if let Err(e) = fs::copy(task_path, &dst) {
+            let copied = fs::read(task_path)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| staged.write_task_input(&bytes).map_err(|e| e.to_string()));
+            if let Err(e) = copied {
                 capsule_runtime::report_eprintln!("    warning: failed to copy task file: {e}");
             }
         } else if !case.task_path.is_empty() {

@@ -1,10 +1,9 @@
 use std::{
-    fs,
     io::Write,
-    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::workdir_fs::WorkdirRoot;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -16,7 +15,8 @@ use tokio::net::TcpStream;
 /// When `endpoint` is `None` every method is a no-op.
 pub(crate) struct OtelEmitter {
     endpoint: Option<String>,
-    log_path: PathBuf,
+    /// The session root `logs/otel.log` is appended to.
+    workdir: WorkdirRoot,
     capsule_name: String,
     capsule_version: String,
     // ── Per-session state; reset by begin_session() ──
@@ -34,14 +34,13 @@ impl OtelEmitter {
     /// Create an emitter. `begin_session` must be called before any emit.
     pub(crate) fn new(
         endpoint: Option<String>,
-        workdir: &Path,
+        workdir: &WorkdirRoot,
         capsule_name: String,
         capsule_version: String,
     ) -> Self {
-        let log_path = workdir.join("logs").join("otel.log");
         Self {
             endpoint,
-            log_path,
+            workdir: workdir.clone(),
             capsule_name,
             capsule_version,
             trace_id: new_trace_id(),
@@ -356,12 +355,9 @@ impl OtelEmitter {
     }
 
     fn log_err(&self, msg: &str) {
-        let parent = self.log_path.parent().unwrap_or(Path::new("."));
-        let _ = fs::create_dir_all(parent);
-        if let Ok(mut f) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)
+        if let Ok(mut f) = self
+            .workdir
+            .open_append("logs/otel.log", crate::workdir_fs::DEFAULT_FILE_MODE)
         {
             let ts = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -571,7 +567,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut emitter = OtelEmitter::new(
             Some("http://localhost:4318".to_string()),
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             "test-capsule".to_string(),
             "1.0.0".to_string(),
         );
@@ -589,7 +585,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut emitter = OtelEmitter::new(
             None,
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             "test-capsule".to_string(),
             "1.0.0".to_string(),
         );
@@ -603,7 +599,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut emitter = OtelEmitter::new(
             None, // no-op; we only test the flag
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             "c".to_string(),
             "v".to_string(),
         );
@@ -621,7 +617,12 @@ mod tests {
     fn noop_when_endpoint_is_none() {
         // Nothing panics; no network call attempted
         let dir = tempfile::tempdir().unwrap();
-        let emitter = OtelEmitter::new(None, dir.path(), "c".to_string(), "v".to_string());
+        let emitter = OtelEmitter::new(
+            None,
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            "c".to_string(),
+            "v".to_string(),
+        );
         // All emit methods guard on endpoint.is_none() before any async work
         assert!(emitter.endpoint.is_none());
     }
@@ -629,7 +630,12 @@ mod tests {
     #[test]
     fn outgoing_traceparent_none_when_no_endpoint() {
         let dir = tempfile::tempdir().unwrap();
-        let mut emitter = OtelEmitter::new(None, dir.path(), "c".to_string(), "v".to_string());
+        let mut emitter = OtelEmitter::new(
+            None,
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            "c".to_string(),
+            "v".to_string(),
+        );
         emitter.begin_session(None);
         assert!(emitter.outgoing_traceparent().is_none());
     }
@@ -639,7 +645,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut emitter = OtelEmitter::new(
             Some("http://localhost:4318".to_string()),
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             "c".to_string(),
             "v".to_string(),
         );
@@ -662,7 +668,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut emitter = OtelEmitter::new(
             Some("http://localhost:4318".to_string()),
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             "c".to_string(),
             "v".to_string(),
         );

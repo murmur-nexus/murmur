@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
     thread,
     time::Instant,
@@ -25,6 +24,7 @@ use crate::{
     spawn_credential::SpawnCredential,
     trace::{PlanEndRecord, PlanStepRecord, PlanStepShape, PlanTraceAppender},
     types::CapabilityPolicy,
+    workdir_fs::WorkdirRoot,
 };
 
 pub mod condition;
@@ -132,11 +132,11 @@ pub trait PlanTask: Sync {
 pub struct SchedulerContext<'a> {
     /// The directory a `shell` step runs in and a `tool` step resolves a `data_path` against —
     /// the capsule's own workdir, which under `--workdir` is the operator's directory.
-    pub accessible_workdir: PathBuf,
+    pub accessible_workdir: WorkdirRoot,
     /// `<accessible_workdir>/.murmur/<session id>/` under `--workdir`, and the same path as
     /// [`Self::accessible_workdir`] without it. Where a `shell` step's synthetic `$HOME` and, on
     /// a sealed host, its `/tmp` and `/etc` staging live.
-    pub session_workdir: PathBuf,
+    pub session_workdir: WorkdirRoot,
     pub capability_policy: CapabilityPolicy,
     pub installed_tools: HashSet<String>,
     pub capsule_versions: HashMap<String, String>,
@@ -282,12 +282,29 @@ fn execute_inner(
     started: Instant,
     session_netns: Option<Arc<SessionNetns>>,
 ) -> Result<ExecutionReport, (String, String)> {
-    let raw = fs::read_to_string(plan_path).map_err(|error| {
-        (
-            "plan".to_string(),
-            format!("failed to read plan file {}: {error}", plan_path.display()),
-        )
-    })?;
+    // Read through the session root, never by path: the plan file is runtime-written, beneath a
+    // directory the capsule's own commands can write.
+    let relative = plan_path
+        .strip_prefix(ctx.session_workdir.path())
+        .unwrap_or(plan_path);
+    let raw = match ctx.session_workdir.read_to_string(relative) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => {
+            return Err((
+                "plan".to_string(),
+                format!(
+                    "failed to read plan file {}: it does not exist",
+                    plan_path.display()
+                ),
+            ))
+        }
+        Err(error) => {
+            return Err((
+                "plan".to_string(),
+                format!("failed to read plan file: {error}"),
+            ))
+        }
+    };
     let plan: PlanFile = serde_json::from_str(&raw).map_err(|error| {
         (
             "plan".to_string(),
@@ -340,7 +357,7 @@ fn execute_inner(
         crate::cgroup::requires_process_bounding(&ctx.capability_policy, false),
         &ctx.capability_policy.resources,
         &plan.id,
-        &ctx.accessible_workdir,
+        ctx.accessible_workdir.path(),
     ) {
         // The plan's own `io.max` outcome is dropped here rather than reported: this scope is a
         // second one, created for the plan's shell steps inside a session whose `session_start`
@@ -1096,7 +1113,7 @@ fn dispatch_tool_step(
             let verdict = if matches!(result.status, ToolStatus::Passed) {
                 match tool_step_output(
                     name,
-                    &ctx.accessible_workdir,
+                    ctx.accessible_workdir.path(),
                     result.data,
                     result.data_path.as_deref(),
                 ) {
@@ -1498,6 +1515,7 @@ fn tool_step_output(
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
     use std::{
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -1531,8 +1549,8 @@ mod tests {
         gate_step: &'a (dyn Fn(&PlannedCall<'_>) -> Option<String> + Sync),
     ) -> SchedulerContext<'a> {
         SchedulerContext {
-            accessible_workdir: workdir.clone(),
-            session_workdir: workdir,
+            accessible_workdir: WorkdirRoot::open(&workdir).unwrap(),
+            session_workdir: WorkdirRoot::open(&workdir).unwrap(),
             capability_policy: CapabilityPolicy {
                 shell_allow: vec!["bash".to_string()],
                 spawn_allow: vec!["worker".to_string()],
@@ -1819,8 +1837,8 @@ mod tests {
                 "(printf \"pong\\n\" | nc -N -l 127.0.0.1 8080) >/dev/null 2>&1 & echo $! > server.pid",
             ],
             &[],
-            dir.path(),
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             &policy,
             &session,
         )
@@ -1867,8 +1885,8 @@ mod tests {
             "bash",
             &["-c", "true"],
             &[],
-            dir.path(),
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             &policy,
             &session,
         )

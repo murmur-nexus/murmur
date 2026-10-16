@@ -52,6 +52,7 @@ use crate::errors::RuntimeError;
 use crate::formation::FormationId;
 use crate::http_client::http_json;
 use crate::spawn_credential::{SpawnApproval, SpawnCredential, SPAWN_CREDENTIAL_HEADER};
+use crate::workdir_fs::WorkdirRoot;
 
 /// The deadline a session delegates under when nothing declares one.
 ///
@@ -314,9 +315,10 @@ pub struct DelegationPlane {
     roost_url: String,
     /// This session's credential, read exactly once per delegation into one request header.
     credential: SpawnCredential,
-    /// The parent's accessible workdir. Child directories are composed beneath it, which is what
-    /// keeps a child inside the single preopen the parent's WASI layer already has.
-    accessible_workdir: PathBuf,
+    /// The parent's accessible workdir. Child directories are created beneath it, which is what
+    /// keeps a child inside the single preopen the parent's WASI layer already has, and every
+    /// read of a child's files goes through it.
+    accessible_workdir: WorkdirRoot,
     /// This plane's bound on the wait for an answer: the declared
     /// `lifecycle.delegation_deadline_secs`, or [`DELEGATION_TIMEOUT_ENV`] where it names a
     /// positive number of seconds. Read once at construction so every delegation in a session is
@@ -360,7 +362,7 @@ impl DelegationPlane {
     pub fn new(
         roost_url: String,
         credential: SpawnCredential,
-        accessible_workdir: PathBuf,
+        accessible_workdir: WorkdirRoot,
         session_id: String,
         declared_deadline: Duration,
         registry: std::sync::Arc<dyn murmur_artifact::Registry>,
@@ -447,7 +449,7 @@ impl DelegationPlane {
     /// A child's directory named from the parent's accessible workdir, which is the only root the
     /// parent's own tools address.
     fn workdir_relative(&self, workdir: &Path) -> String {
-        workdir_relative_to(workdir, &self.accessible_workdir)
+        workdir_relative_to(workdir, self.accessible_workdir.path())
     }
 
     /// Ask the daemon whether this session may spawn that capsule, and take the approval back.
@@ -508,7 +510,7 @@ impl DelegationPlane {
     ) -> Result<ChildLaunchRequest, RuntimeError> {
         let completion_deadline = report_to.as_ref().map(|_| self.result_timeout);
         Ok(ChildLaunchRequest {
-            parent_accessible_workdir: self.accessible_workdir.clone(),
+            parent_accessible_root: self.accessible_workdir.clone(),
             capsule_name: request.capsule.clone(),
             capsule_version: request.version.clone(),
             grant,
@@ -919,7 +921,12 @@ impl DelegationPlane {
                         .and_then(|artifact| artifact.first_text())
                         .filter(|text| !text.is_empty())
                         .map(str::to_string);
-                    let found = read_child_result(&child.workdir, &child.session_id, &task_id);
+                    let found = read_child_result(
+                        &child.parent_root,
+                        &child.workdir_rel,
+                        &child.session_id,
+                        &task_id,
+                    );
                     let mut result = outcome(
                         DelegationStatus::Completed,
                         &child.session_id,
@@ -927,11 +934,8 @@ impl DelegationPlane {
                             .or_else(|| found.as_ref().map(|(_, text)| text.clone()))
                             .unwrap_or_default(),
                     );
-                    result.result_path = found.and_then(|(path, _)| {
-                        path.strip_prefix(&self.accessible_workdir)
-                            .ok()
-                            .map(|path| path.to_string_lossy().replace('\\', "/"))
-                    });
+                    result.result_path =
+                        found.map(|(path, _)| path.to_string_lossy().replace('\\', "/"));
                     return result;
                 }
                 TaskState::Failed | TaskState::Rejected => {
@@ -1061,7 +1065,8 @@ fn end_for_canceled_task(
         crate::runtime_err!("[capsule-runtime] delegation {delegation_id}: {error}");
     }
     crate::delegation::record_terminated(
-        &child.workdir,
+        &child.parent_root,
+        &child.workdir_rel,
         crate::delegation::DelegationOutcome {
             delegation_id: delegation_id.to_string(),
             capsule_name: request.capsule.clone(),
@@ -1082,15 +1087,23 @@ fn end_for_canceled_task(
 /// Where a finished child left its answer, and what it says.
 ///
 /// The candidate list is [`crate::delegation::child_result_candidates`], so the file this plane
-/// reads and the file the completion watcher names are found by one rule.
-fn read_child_result(
+/// reads and the file the completion watcher names are found by one rule. `child_workdir` is
+/// relative to `root`, and so is the returned path. A link where a candidate belongs is refused
+/// and latched on `root`, and its target is never read.
+pub(crate) fn read_child_result(
+    root: &WorkdirRoot,
     child_workdir: &Path,
     session_id: &str,
     task_id: &str,
 ) -> Option<(PathBuf, String)> {
     crate::delegation::child_result_candidates(child_workdir, session_id, task_id)
         .into_iter()
-        .find_map(|path| std::fs::read_to_string(&path).ok().map(|text| (path, text)))
+        .find_map(|path| {
+            root.read_to_string(&path)
+                .ok()
+                .flatten()
+                .map(|text| (path, text))
+        })
 }
 
 /// `(output, truncated)`, with `output` cut by [`bound_output`] when it is over
@@ -1216,7 +1229,7 @@ mod tests {
             // Nothing here is reachable: every case below refuses before a request is built.
             "http://127.0.0.1:1".to_string(),
             SpawnCredential::new("msc1.test".to_string()),
-            PathBuf::from("/tmp"),
+            crate::workdir_fs::WorkdirRoot::open(&PathBuf::from("/tmp")).unwrap(),
             "ses_parent".to_string(),
             DELEGATION_RESULT_TIMEOUT,
             std::sync::Arc::new(murmur_artifact::LocalRegistry::new("/tmp")),
@@ -1554,7 +1567,7 @@ mod tests {
         DelegationPlane::new(
             "http://127.0.0.1:1".to_string(),
             SpawnCredential::new("msc1.test".to_string()),
-            PathBuf::from("/tmp"),
+            crate::workdir_fs::WorkdirRoot::open(&PathBuf::from("/tmp")).unwrap(),
             "ses_parent".to_string(),
             DELEGATION_RESULT_TIMEOUT,
             std::sync::Arc::new(murmur_artifact::LocalRegistry::new(store.path())),
@@ -1713,8 +1726,8 @@ through that constructor rather than composing a second request literal."
         assert_eq!(stepped.completion_deadline, None);
 
         assert_eq!(
-            started.parent_accessible_workdir,
-            stepped.parent_accessible_workdir
+            started.parent_accessible_root.path(),
+            stepped.parent_accessible_root.path()
         );
         assert_eq!(started.capsule_name, stepped.capsule_name);
         assert_eq!(started.capsule_version, stepped.capsule_version);
@@ -1851,7 +1864,7 @@ through that constructor rather than composing a second request literal."
         let plane = DelegationPlane::new(
             "http://127.0.0.1:7700/".to_string(),
             SpawnCredential::new("msc1.test".to_string()),
-            PathBuf::from("/tmp"),
+            crate::workdir_fs::WorkdirRoot::open(&PathBuf::from("/tmp")).unwrap(),
             "ses_parent".to_string(),
             DELEGATION_RESULT_TIMEOUT,
             std::sync::Arc::new(murmur_artifact::LocalRegistry::new("/tmp")),

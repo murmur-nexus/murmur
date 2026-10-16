@@ -903,3 +903,159 @@ fn authenticated_parent_refused() {
     assert!(stderr.contains("network.authentication"), "{stderr}");
     assert!(stderr.contains("capabilities.spawn.allow"), "{stderr}");
 }
+
+/// A `--workdir` beside an `outside/` directory holding one sentinel file, and a script capsule
+/// project that completes on its own.
+struct LinkedWorkdir {
+    home: tempfile::TempDir,
+    _fixture: tempfile::TempDir,
+    _project: tempfile::TempDir,
+    root: tempfile::TempDir,
+    manifest_path: PathBuf,
+}
+
+impl LinkedWorkdir {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let artifact_path = create_tool_artifact(
+            fixture.path(),
+            TOOL_NAME,
+            TOOL_VERSION,
+            &fixture_component("echo-tool.wasm"),
+        );
+        let manifest_path = create_project(
+            project.path(),
+            "capsule-allowlisted.wasm",
+            &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
+            None,
+        );
+        common::install_artifact_to_project(project.path(), &artifact_path).success();
+        fs::create_dir_all(root.path().join("work")).unwrap();
+        fs::create_dir_all(root.path().join("outside")).unwrap();
+        fs::write(root.path().join("outside/sentinel.txt"), "operator data").unwrap();
+        Self {
+            home,
+            _fixture: fixture,
+            _project: project,
+            root,
+            manifest_path,
+        }
+    }
+
+    fn workdir(&self) -> PathBuf {
+        self.root.path().join("work")
+    }
+
+    fn outside(&self) -> PathBuf {
+        self.root.path().join("outside")
+    }
+
+    fn link(&self, target: &Path, rel: &str) {
+        std::os::unix::fs::symlink(target, self.workdir().join(rel)).unwrap();
+    }
+
+    fn run(&self, task: &str) -> assert_cmd::assert::Assert {
+        Command::cargo_bin("mur")
+            .unwrap()
+            .env("HOME", self.home.path())
+            .args([
+                "run",
+                "--manifest",
+                self.manifest_path.to_str().unwrap(),
+                "--workdir",
+                self.workdir().to_str().unwrap(),
+                "--task",
+                task,
+                "--verbose",
+            ])
+            .assert()
+    }
+
+    /// The sentinel kept its bytes and `outside/` holds nothing else.
+    fn assert_outside_unchanged(&self) {
+        assert_eq!(
+            fs::read_to_string(self.outside().join("sentinel.txt")).unwrap(),
+            "operator data"
+        );
+        let names: Vec<_> = fs::read_dir(self.outside())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("sentinel.txt")]);
+    }
+}
+
+/// `--task` into a `task.md` that is a link: the launch exits with `E-RUN-050` naming it, and the
+/// file the link names keeps its bytes.
+#[test]
+fn workdir_path_refused_at_launch_for_a_task_md_link() {
+    let linked = LinkedWorkdir::new();
+    linked.link(&linked.outside().join("sentinel.txt"), "task.md");
+
+    linked
+        .run("x")
+        .failure()
+        .stderr(predicate::str::contains("E-RUN-050"))
+        .stderr(predicate::str::contains(
+            "refused to write task.md: task.md is a symbolic link inside the workdir",
+        ));
+
+    linked.assert_outside_unchanged();
+}
+
+/// A `.murmur` that is a link to an outside directory: the session directory is never created
+/// through it.
+#[test]
+fn workdir_path_refused_at_launch_for_a_murmur_link() {
+    let linked = LinkedWorkdir::new();
+    linked.link(&linked.outside(), ".murmur");
+
+    linked
+        .run("x")
+        .failure()
+        .stderr(predicate::str::contains("E-RUN-050"))
+        .stderr(predicate::str::contains(
+            ".murmur is a symbolic link inside the workdir",
+        ));
+
+    linked.assert_outside_unchanged();
+}
+
+/// A `murmur.yaml` that is a dangling link into `outside/`: the manifest copy is refused rather
+/// than creating the file the link names.
+#[test]
+fn workdir_path_refused_at_launch_for_a_dangling_manifest_link() {
+    let linked = LinkedWorkdir::new();
+    linked.link(&linked.outside().join("not-yet.yaml"), "murmur.yaml");
+
+    linked
+        .run("x")
+        .failure()
+        .stderr(predicate::str::contains("E-RUN-050"))
+        .stderr(predicate::str::contains(
+            "murmur.yaml is a symbolic link inside the workdir",
+        ));
+
+    linked.assert_outside_unchanged();
+}
+
+/// With no link anywhere, the same `--workdir` launch runs to completion and writes its task.
+#[test]
+fn workdir_path_with_no_links_runs_to_completion() {
+    let linked = LinkedWorkdir::new();
+
+    linked
+        .run("the task")
+        .success()
+        .stdout(predicate::str::contains("status:  ok"));
+
+    assert_eq!(
+        fs::read_to_string(linked.workdir().join("task.md")).unwrap(),
+        "the task"
+    );
+    assert!(linked.workdir().join("murmur.yaml").is_file());
+    linked.assert_outside_unchanged();
+}

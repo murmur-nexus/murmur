@@ -275,7 +275,7 @@ impl Parent {
     ) -> Result<LaunchedChild, capsule_runtime::RuntimeError> {
         let (grant, _) = self.approve(name);
         launch_child_capsule(ChildLaunchRequest {
-            parent_accessible_workdir: self.dir().to_path_buf(),
+            parent_accessible_root: capsule_runtime::WorkdirRoot::open(self.dir()).unwrap(),
             capsule_name: name.to_string(),
             capsule_version: "0.1.0".to_string(),
             grant,
@@ -481,7 +481,7 @@ fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
     // spawner adds and no watcher runs.
     let (grant, _) = parent.approve("local/child-b");
     let delegated = launch_child_capsule(ChildLaunchRequest {
-        parent_accessible_workdir: parent.dir().to_path_buf(),
+        parent_accessible_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
         capsule_name: "local/child-b".to_string(),
         capsule_version: "0.1.0".to_string(),
         grant,
@@ -525,7 +525,7 @@ fn a_child_joins_its_parents_formation_with_or_without_a_spawner() {
     for (name, spawner) in [("local/child-a", Some(lineage)), ("local/child-b", None)] {
         let (grant, _) = parent.approve(name);
         let child = launch_child_capsule(ChildLaunchRequest {
-            parent_accessible_workdir: parent.dir().to_path_buf(),
+            parent_accessible_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
             capsule_name: name.to_string(),
             capsule_version: "0.1.0".to_string(),
             grant,
@@ -743,7 +743,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
     let approval = grant.expose().to_string();
 
     let child = launch_child_capsule(ChildLaunchRequest {
-        parent_accessible_workdir: parent.dir().to_path_buf(),
+        parent_accessible_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
         capsule_name: "local/child-leak".to_string(),
         capsule_version: "0.1.0".to_string(),
         grant,
@@ -798,7 +798,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
     // And not in a refusal: registering with a daemon that is not there names the daemon and the
     // reason, and nothing else.
     let error = launch_child_capsule(ChildLaunchRequest {
-        parent_accessible_workdir: parent.dir().to_path_buf(),
+        parent_accessible_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
         capsule_name: "local/child-leak".to_string(),
         capsule_version: "0.1.0".to_string(),
         grant: SpawnApproval::new(approval.clone()),
@@ -985,7 +985,7 @@ fn a_child_holds_its_own_spawner_lifeline_read_end_and_no_formation_lifeline() {
     std::env::set_var(FORMATION_LIFELINE_ENV, "4097");
     std::env::set_var(SPAWNER_LIFELINE_ENV, "4098");
     let launched = launch_child_capsule(ChildLaunchRequest {
-        parent_accessible_workdir: parent.dir().to_path_buf(),
+        parent_accessible_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
         capsule_name: "local/child-handed".to_string(),
         capsule_version: "0.1.0".to_string(),
         grant,

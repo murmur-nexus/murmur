@@ -1198,7 +1198,7 @@ mod tests {
             let (plane, token) =
                 ControlPlane::declared(SESSION.to_string(), Arc::clone(&state)).unwrap();
             let appender = ResourceTraceAppender::open(
-                workdir.path(),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 SESSION.to_string(),
                 "evt_session".to_string(),
             )
@@ -1810,7 +1810,7 @@ mod tests {
         let (plane, token) =
             ControlPlane::declared(SESSION.to_string(), Arc::clone(&state)).unwrap();
         let appender = ResourceTraceAppender::open(
-            workdir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             SESSION.to_string(),
             "evt_session".to_string(),
         )

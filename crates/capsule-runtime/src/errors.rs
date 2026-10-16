@@ -111,6 +111,13 @@ pub enum RuntimeError {
         source: std::io::Error,
     },
 
+    /// A runtime write, append, read, create or removal inside the capsule's workdir met a
+    /// symbolic link, or the wrong file type, and did nothing. `mur` renders it as `E-RUN-050`.
+    #[error("{refusal}")]
+    WorkdirPathRefused {
+        refusal: crate::workdir_fs::WorkdirRefusal,
+    },
+
     #[error("failed to write tool manifest at {path}: {source}")]
     WriteToolManifest {
         path: String,
@@ -940,6 +947,30 @@ impl RuntimeError {
             path: path.display().to_string(),
             message: message.into(),
         }
+    }
+}
+
+impl RuntimeError {
+    /// `error` as a runtime error: a refusal is [`Self::WorkdirPathRefused`], and an I/O failure
+    /// whatever `io` makes of its path and source.
+    pub(crate) fn from_workdir(
+        error: crate::workdir_fs::WorkdirError,
+        io: impl FnOnce(String, std::io::Error) -> Self,
+    ) -> Self {
+        match error {
+            crate::workdir_fs::WorkdirError::Refused(refusal) => {
+                Self::WorkdirPathRefused { refusal }
+            }
+            crate::workdir_fs::WorkdirError::Io { path, source } => io(path, source),
+        }
+    }
+}
+
+/// A refusal is [`RuntimeError::WorkdirPathRefused`]; an I/O failure is
+/// [`RuntimeError::CreateWorkdir`], which is what every `?` on a directory creation means.
+impl From<crate::workdir_fs::WorkdirError> for RuntimeError {
+    fn from(error: crate::workdir_fs::WorkdirError) -> Self {
+        Self::from_workdir(error, |path, source| Self::CreateWorkdir { path, source })
     }
 }
 
