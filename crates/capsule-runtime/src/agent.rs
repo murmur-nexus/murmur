@@ -685,10 +685,8 @@ pub(crate) async fn run_agent_loop(
     // A fresh attempt with nothing to say fails before either transport starts: the http path
     // would otherwise load history, which may compact through the driver, and then send an empty
     // user message. The raw text is checked, because an untrusted task's fence is never empty.
-    let blank_task = continuation.is_none()
-        && fresh_task_text(inference, accessible_workdir)
-            .trim()
-            .is_empty();
+    let blank_task =
+        continuation.is_none() && fresh_task_text(&store_state.runtime_root).trim().is_empty();
     // The attempt-start checkpoint, on both transports: a `task.md` that is a link reads as blank
     // and is refused, and the refusal, not the blank task, is what ends the attempt.
     if let Some((error, reason)) = fail_on_workdir_refusals(store_state, trace).await {
@@ -788,12 +786,14 @@ pub(crate) async fn run_agent_loop(
         return Err(RuntimeError::DriverNotConfigured);
     }
 
-    match workdir.entry_kind(format!("tools/{driver_name}")) {
+    let runtime_root = store_state.runtime_root.clone();
+    match runtime_root.entry_kind(format!("tools/{driver_name}")) {
         Ok(Some(EntryKind::Directory)) => {}
         Ok(Some(EntryKind::Symlink)) => {
             // Read through to latch the refusal; the checkpoint before the first request fails
             // the task on it.
-            let _ = workdir.read_to_string(format!("tools/{driver_name}/{PACKED_MANIFEST_ENTRY}"));
+            let _ =
+                runtime_root.read_to_string(format!("tools/{driver_name}/{PACKED_MANIFEST_ENTRY}"));
         }
         Ok(_) => return Err(RuntimeError::DriverNotInstalled(driver_name.clone())),
         Err(_) => {}
@@ -814,7 +814,7 @@ pub(crate) async fn run_agent_loop(
     // `inference.tool_refresh` names, or at the call after the model's own pull or removal —
     // see `HeldInventory::refresh_before_call`.
     let mut inventory = HeldInventory::build(
-        workdir,
+        &runtime_root,
         system_prompt_artifact,
         &store_state.installed_artifacts,
         store_state.installed_generation,
@@ -967,12 +967,9 @@ pub(crate) async fn run_agent_loop(
                 }
             }
 
-            // task.md lives in accessible_workdir (where the agent's own tools are preopened),
-            // not workdir (the internal `.murmur/<session_id>` bookkeeping dir) — reading from
-            // workdir here finds no task, so the attempt is refused as empty.
             let task_message = task_user_message(
                 store_state.current_task_provenance,
-                fresh_task_text(inference, accessible_workdir),
+                fresh_task_text(&store_state.runtime_root),
             );
             append_to_record(record.as_mut(), std::slice::from_ref(&task_message));
             messages.push(task_message);
@@ -1121,7 +1118,7 @@ pub(crate) async fn run_agent_loop(
         // The one point the tool array can change: before the payload is built, so the occupancy
         // count, the spend admission and the request all carry the same array.
         let refresh = inventory.refresh_before_call(
-            workdir,
+            &runtime_root,
             system_prompt_artifact,
             &store_state.installed_artifacts,
             inference.tool_refresh,
@@ -4226,6 +4223,10 @@ reading the file tells you, so a plan written before that reading is a guess —
 perfectly and do the wrong work. Read first, decide, and submit a plan only for the steps that \
 follow from what you found.";
 
+/// Where the agent finds the files the runtime owns, in the `[Capsule]` block and the
+/// `transport: process` system prompt. A constant, so neither prefix carries a per-launch path.
+pub(crate) const RUNTIME_DIR_NOTICE: &str = "Runtime files: MURMUR.md, task.md, murmur.yaml and the installed tools are in a directory you can read and cannot change — $MURMUR_RUNTIME_DIR in a shell command, murmur-runtime/ in a file tool.";
+
 /// Builds the always-present `[Capsule]` context block prepended to `system_prompt`
 /// (which may be absent) for the http-driver transport. Runs unconditionally for every
 /// agent capsule so `MURMUR_MD_TRUST_NOTICE` and `UNTRUSTED_CONTENT_NOTICE` reach the model
@@ -4266,7 +4267,7 @@ fn build_augmented_system_prompt(
         String::new()
     };
     let context = format!(
-        "[Capsule]\nName: {name}\nVersion: {version}\n{member}Manifest: murmur.yaml (in your workdir)\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}{plan}\n\n"
+        "[Capsule]\nName: {name}\nVersion: {version}\n{member}{RUNTIME_DIR_NOTICE}\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}{plan}\n\n"
     );
     format!("{context}{base}")
 }
@@ -4371,34 +4372,23 @@ pub(crate) fn fence_task_payload(
     }
 }
 
-/// The task text a fresh attempt on `inference`'s transport would send, read from
-/// `accessible_workdir` and unfenced.
+/// The task text a fresh attempt would send, read from the runtime directory's `task.md` and
+/// unfenced, or `""` when there is none.
 ///
-/// The `process` transport reads `task.md` alone. Every other transport reads `task.md`, falls
-/// back to `input.txt`, and yields `""` when neither exists. This is the one reader of task text
-/// for both transports, so the check that refuses a blank task and the message a transport sends
-/// can never read different files.
-///
-/// A refused read — `task.md` a link, or not a regular file — yields `""` and is on
-/// `accessible_workdir`'s refusal latch; it never falls back to `input.txt`.
-pub(crate) fn fresh_task_text(
-    inference: &InferenceConfig,
-    accessible_workdir: &WorkdirRoot,
-) -> String {
-    match accessible_workdir.read_to_string(crate::runtime::TASK_INPUT_FILE) {
-        Ok(Some(text)) => text,
-        Ok(None) if inference.transport != "process" => accessible_workdir
-            .read_to_string("input.txt")
-            .ok()
-            .flatten()
-            .unwrap_or_default(),
-        Ok(None) | Err(_) => String::new(),
-    }
+/// This is the one reader of task text for both transports, so the check that refuses a blank
+/// task and the message a transport sends can never read different files. The workdir's own
+/// `task.md` or `input.txt` reaches it only through the import at session start.
+pub(crate) fn fresh_task_text(runtime_root: &WorkdirRoot) -> String {
+    runtime_root
+        .read_to_string(crate::runtime::TASK_INPUT_FILE)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
 }
 
 /// Why a fresh attempt whose task text is blank fails without a request.
 pub(crate) const EMPTY_TASK_REFUSAL: &str =
-    "the task is empty; nothing was sent to the model (write the task to task.md, pass --task, or send a non-empty message)";
+    "the task is empty; nothing was sent to the model (pass --task, put the task in task.md in the workdir before launch, or send a non-empty message)";
 
 /// A credential rejection the gateway recorded for the request a driver just failed, reported as
 /// `E-RUN-027` with its hint, or `None` when there is none.
@@ -4577,7 +4567,12 @@ mod tests {
             build_augmented_system_prompt("my-capsule", "1.0.0", None, Some("custom"), false),
             "the block must be a pure function of capsule identity and manifest prompt"
         );
-        assert!(prompt.starts_with("[Capsule]\nName: my-capsule\nVersion: 1.0.0\nManifest: murmur.yaml (in your workdir)\n"));
+        assert!(prompt.starts_with(&format!(
+            "[Capsule]\nName: my-capsule\nVersion: 1.0.0\n{RUNTIME_DIR_NOTICE}\n"
+        )));
+        assert!(!prompt.contains("Manifest: murmur.yaml (in your workdir)"));
+        assert!(!prompt.contains("/.murmur/"), "got:\n{prompt}");
+        assert!(!prompt.contains("ses_"), "got:\n{prompt}");
     }
 
     /// A formation member's block names its roster name right after its version. The roster fixes
@@ -4590,8 +4585,8 @@ mod tests {
             prompt,
             format!(
                 "[Capsule]\nName: s4-worker\nVersion: 0.1.0\nFormation member: a1 (your name in \
-                 this formation; other members may run the same capsule)\nManifest: murmur.yaml \
-                 (in your workdir)\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}\n\ncustom"
+                 this formation; other members may run the same capsule)\n{RUNTIME_DIR_NOTICE}\n\
+                 {MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}\n\ncustom"
             )
         );
         assert_eq!(
@@ -4674,14 +4669,24 @@ forgery: {prompt}"
         assert_eq!(
             build_augmented_system_prompt("my-capsule", "1.0.0", None, Some("custom"), false),
             format!(
-                "[Capsule]\nName: my-capsule\nVersion: 1.0.0\nManifest: murmur.yaml (in your \
-                 workdir)\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}\n\ncustom"
+                "[Capsule]\nName: my-capsule\nVersion: 1.0.0\n{RUNTIME_DIR_NOTICE}\n\
+                 {MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}\n\ncustom"
             )
         );
         assert_eq!(
             process::build_process_system_prompt(None, false),
-            format!("{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}")
+            format!("{RUNTIME_DIR_NOTICE}\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}")
         );
+    }
+
+    /// The notice names both ways in and no path: it is part of both transports' prompt prefix.
+    #[test]
+    fn augmented_system_prompt_runtime_dir_notice_is_a_constant_naming_both_ways_in() {
+        assert!(RUNTIME_DIR_NOTICE.contains("$MURMUR_RUNTIME_DIR"));
+        assert!(RUNTIME_DIR_NOTICE.contains("murmur-runtime/"));
+        assert!(!RUNTIME_DIR_NOTICE.contains("/home"));
+        assert!(!RUNTIME_DIR_NOTICE.contains(".murmur"));
+        assert!(process::build_process_system_prompt(Some("x"), true).contains(RUNTIME_DIR_NOTICE));
     }
 
     /// The load-bearing half of the guidance is the refusal, so it is pinned: a model told only
@@ -5170,6 +5175,7 @@ forgery: {prompt}"
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                 crate::cgroup::IoMaxReport::default(),
             ),
             murmur_artifact::TraceCapture::Content,
@@ -6702,113 +6708,25 @@ forgery: {prompt}"
         }
     }
 
-    fn inference_on(transport: &str) -> InferenceConfig {
-        InferenceConfig {
-            transport: transport.to_string(),
-            model: "test-model".to_string(),
-            driver: None,
-            command: None,
-            compaction: None,
-            system_prompt: None,
-            system_prompt_file: None,
-            system_prompt_artifact: None,
-            max_turns: 10,
-            max_tokens: None,
-            max_session_tokens: None,
-            tool_refresh: murmur_artifact::ToolRefresh::Compaction,
-            alternates: Vec::new(),
-        }
-    }
-
     #[test]
-    fn fresh_task_text_on_http_prefers_task_md() {
+    fn fresh_task_text_reads_the_runtime_directory_task_md_and_never_input_txt() {
         let dir = tempfile::tempdir().unwrap();
+        let root = crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap();
+        fs::write(dir.path().join("input.txt"), "from input.txt").unwrap();
+        assert_eq!(fresh_task_text(&root), "");
         fs::write(dir.path().join("task.md"), "from task.md").unwrap();
-        fs::write(dir.path().join("input.txt"), "from input.txt").unwrap();
-        assert_eq!(
-            fresh_task_text(
-                &inference_on("http"),
-                &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap()
-            ),
-            "from task.md"
-        );
-    }
-
-    #[test]
-    fn fresh_task_text_on_http_falls_back_to_input_txt() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("input.txt"), "from input.txt").unwrap();
-        assert_eq!(
-            fresh_task_text(
-                &inference_on("http"),
-                &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap()
-            ),
-            "from input.txt"
-        );
-    }
-
-    #[test]
-    fn fresh_task_text_on_http_is_empty_when_neither_file_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            fresh_task_text(
-                &inference_on("http"),
-                &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap()
-            ),
-            ""
-        );
-    }
-
-    /// The process transport sends `task.md` alone, so `input.txt` must not make its task look
-    /// non-blank to the check that guards it.
-    #[test]
-    fn fresh_task_text_on_process_ignores_input_txt() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("input.txt"), "from input.txt").unwrap();
-        assert_eq!(
-            fresh_task_text(
-                &inference_on("process"),
-                &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap()
-            ),
-            ""
-        );
-        fs::write(dir.path().join("task.md"), "from task.md").unwrap();
-        assert_eq!(
-            fresh_task_text(
-                &inference_on("process"),
-                &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap()
-            ),
-            "from task.md"
-        );
+        assert_eq!(fresh_task_text(&root), "from task.md");
     }
 
     #[test]
     fn fresh_task_text_that_is_only_whitespace_trims_to_blank() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("task.md"), "  \n\t \n").unwrap();
-        for transport in ["http", "process"] {
-            assert!(fresh_task_text(
-                &inference_on(transport),
-                &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap()
-            )
-            .trim()
-            .is_empty());
-        }
-    }
-
-    /// A `task.md` that exists is the task, blank or not: `input.txt` is a fallback for a missing
-    /// `task.md`, not for an empty one, so a blank `--task` is refused rather than replaced.
-    #[test]
-    fn fresh_task_text_on_http_does_not_fall_back_past_a_blank_task_md() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("task.md"), "   ").unwrap();
-        fs::write(dir.path().join("input.txt"), "from input.txt").unwrap();
-        assert!(fresh_task_text(
-            &inference_on("http"),
-            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap()
-        )
-        .trim()
-        .is_empty());
+        assert!(
+            fresh_task_text(&crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap())
+                .trim()
+                .is_empty()
+        );
     }
 
     /// Measurement harness, not a check: prints the runtime's own count of the tools and system

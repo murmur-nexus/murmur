@@ -4717,6 +4717,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             crate::cgroup::IoMaxReport::default(),
         )
     }
@@ -5219,6 +5220,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                 crate::cgroup::IoMaxReport::default(),
             );
             let dir = tempfile::tempdir().unwrap();
@@ -5275,6 +5277,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             crate::cgroup::IoMaxReport::default(),
         );
         assert!(
@@ -5331,7 +5334,9 @@ mod tests {
                 role: "tool".to_string(),
                 scope: None,
                 surface: crate::containment::PreopenSurface::WholeWorkdir,
+                runtime_dir_read_only: true,
             }],
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             crate::cgroup::IoMaxReport::default(),
         );
 
@@ -5393,6 +5398,7 @@ mod tests {
                 "role": "tool",
                 "scope": null,
                 "surface": "whole-workdir",
+                "runtime_dir_read_only": true,
             }])
         );
         assert_eq!(events[0]["containment_declared"], "scoped");

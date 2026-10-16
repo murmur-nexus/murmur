@@ -24,7 +24,7 @@ places no dependency between them.
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `id` | string | yes | Names the plan in the report and in [`trace.jsonl`](observability-schemas.md). It never names a file: the runtime writes the plan to `plans/plan-<n>.json` in the [session workdir](workdir.md), numbered per session |
+| `id` | string | yes | Names the plan in the report and in [`trace.jsonl`](observability-schemas.md). It never names a file: the runtime writes the plan to `plans/plan-<n>.json` in the session's [runtime directory](workdir.md#runtime-directory), numbered per session, and reads it back from there when it runs. The capsule's commands can read the file and cannot change it |
 | `steps` | list<step> | yes | Runs in dependency order. An empty list is a plan that completes having done nothing |
 
 ### Step

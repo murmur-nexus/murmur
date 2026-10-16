@@ -710,7 +710,7 @@ fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
     assert_eq!(
         names.join(","),
         "FIXTURE_BRIDGE_TOKEN,FIXTURE_BRIDGE_TOOLS,FIXTURE_BRIDGE_URL,FIXTURE_FILES,\
-         FIXTURE_HARNESS_PROFILE,HOME,PATH",
+         FIXTURE_HARNESS_PROFILE,HOME,MURMUR_RUNTIME_DIR,PATH",
         "{env_note}"
     );
     assert!(
@@ -726,10 +726,11 @@ fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
     parts.next();
     assert_eq!(parts.next(), Some("drwx------"), "{files_note}");
     let files_dir = PathBuf::from(parts.next().unwrap());
+    // The run's files sit beside the session's runtime directory, outside the workdir.
+    let sessions = capsule.home.path().join(".murmur").join("sessions");
     assert!(
-        files_dir.starts_with(&run.workdir),
-        "{files_dir:?} is not under {:?}",
-        run.workdir
+        files_dir.starts_with(&sessions) && !files_dir.starts_with(&run.workdir),
+        "{files_dir:?} is not under {sessions:?}"
     );
     assert!(
         !files_dir.exists(),
@@ -746,6 +747,7 @@ fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
             "FIXTURE_FILES",
             "FIXTURE_HARNESS_PROFILE",
             "HOME",
+            "MURMUR_RUNTIME_DIR",
             "PATH"
         ])
     );

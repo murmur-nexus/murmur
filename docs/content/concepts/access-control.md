@@ -151,7 +151,7 @@ is and is not identified is in [Read-only paths](../reference/manifest.md#read-o
 
 ## Untrusted publisher text
 
-Tool and skill descriptions rendered into [`MURMUR.md`](session-loop.md#murmurmd) are
+Tool and skill descriptions rendered into [`MURMUR.md`](session-loop.md#murmur-md) are
 publisher-controlled, untrusted text: the runtime
 sanitizes them (collapsing newlines, stripping control characters, truncating length) before
 rendering, and `MURMUR.md` states explicitly that this file is machine-generated inventory

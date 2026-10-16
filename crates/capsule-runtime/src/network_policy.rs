@@ -570,11 +570,16 @@ where
             (_, false) => PreopenSurface::WholeWorkdir,
         };
 
+        // Exactly the condition `runtime::runtime_dir_preopen` gives a tool the read-only
+        // `murmur-runtime/` preopen on.
+        let runtime_dir_read_only =
+            matches!(runtime, murmur_artifact::ArtifactRuntime::Tool) && scope.is_none();
         reports.push(PreopenReport {
             artifact: name.to_string(),
             role: runtime.as_str().to_string(),
             scope,
             surface,
+            runtime_dir_read_only,
         });
     }
 
@@ -1123,18 +1128,21 @@ mod tests {
                     role: "tool".to_string(),
                     scope: None,
                     surface: PreopenSurface::WholeWorkdir,
+                    runtime_dir_read_only: true,
                 },
                 PreopenReport {
                     artifact: "anthropic-driver".to_string(),
                     role: "driver".to_string(),
                     scope: None,
                     surface: PreopenSurface::WholeWorkdir,
+                    runtime_dir_read_only: false,
                 },
                 PreopenReport {
                     artifact: "telemetry-hook".to_string(),
                     role: "hook".to_string(),
                     scope: None,
                     surface: PreopenSurface::Nothing,
+                    runtime_dir_read_only: false,
                 },
             ]
         );
@@ -1163,12 +1171,14 @@ mod tests {
                     role: "tool".to_string(),
                     scope: Some("cache".to_string()),
                     surface: PreopenSurface::ScopedSubtree,
+                    runtime_dir_read_only: false,
                 },
                 PreopenReport {
                     artifact: "telemetry-hook".to_string(),
                     role: "hook".to_string(),
                     scope: Some("hook-state".to_string()),
                     surface: PreopenSurface::ScopedSubtree,
+                    runtime_dir_read_only: false,
                 },
             ]
         );

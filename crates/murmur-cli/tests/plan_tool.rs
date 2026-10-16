@@ -284,10 +284,9 @@ fn a_submitted_plan_runs_its_steps_in_dependency_order_and_reports_both() {
         );
     }
 
-    // The plan file is named from the session's own counter, never from the model's plan id.
-    let plan_file = workdir.join("plans").join("plan-1.json");
-    let written: Value = serde_json::from_str(&fs::read_to_string(&plan_file).unwrap()).unwrap();
-    assert_eq!(written, two_step_plan(), "{plan_file:?}");
+    // The plan file is written into the session's runtime directory, never into the workdir,
+    // and is gone with the session. `runtime_dir.rs` reads it back from inside a run.
+    assert!(!workdir.join("plans").exists());
 
     // The interpolation, as the scheduler recorded it: `b` was dispatched with `a`'s real output
     // in place of the reference.

@@ -162,12 +162,9 @@ fn resolve_versioned_iface<T>(
     instance.get_export_index(&mut *store, None, versioned)
 }
 
-/// The size of the `task.md` waiting in the accessible workdir, or `None` when there is none.
-///
-/// A link at `task.md` is no task: reading it is refused, which latches the refusal, and the next
-/// task to start fails on it at activation.
-fn pending_task_input(accessible_root: &WorkdirRoot) -> Option<u64> {
-    accessible_root.file_len(TASK_INPUT_FILE).ok().flatten()
+/// The size of the `task.md` waiting in the runtime directory, or `None` when there is none.
+fn pending_task_input(runtime_root: &WorkdirRoot) -> Option<u64> {
+    runtime_root.file_len(TASK_INPUT_FILE).ok().flatten()
 }
 
 /// The directory this session's siblings sit in, held open: `.murmur` beneath the accessible
@@ -189,20 +186,82 @@ fn sibling_sessions_root(
 /// inside the workdir and nothing was written.
 const PEER_FETCH_PATH_REFUSED: &str = "path_refused";
 
-/// Rewrites `task.md` as `text`, the original task plus `what` has added, for a restarted attempt
-/// to read. A refusal is latched, and the next attempt's checkpoint fails the task before it
-/// starts; any other failure is reported and the task goes on.
-fn rewrite_task_input(accessible_workdir: &WorkdirRoot, text: &str, what: &str) {
-    if let Err(e) =
-        accessible_workdir.write_file(TASK_INPUT_FILE, text.as_bytes(), DEFAULT_FILE_MODE)
-    {
+/// Rewrites the runtime directory's `task.md` as `text`, the original task plus `what` has added,
+/// for a restarted attempt to read. A refusal is latched, and the next attempt's checkpoint fails
+/// the task before it starts; any other failure is reported and the task goes on.
+fn rewrite_task_input(runtime_root: &WorkdirRoot, text: &str, what: &str) {
+    if let Err(e) = runtime_root.write_file(TASK_INPUT_FILE, text.as_bytes(), DEFAULT_FILE_MODE) {
         crate::runtime_err!("[capsule-runtime] failed to inject {what} into task.md: {e}");
     }
 }
 
-/// The task input file in the accessible workdir: what `mur run --task` writes, what an A2A
-/// message is written to, and what a fresh attempt reads.
+/// The task input file in the runtime directory: what `mur run --task` writes, what an A2A
+/// message is written to, and what a fresh attempt reads. The workdir file of the same name is
+/// read once, by [`import_task_input`].
 pub(crate) const TASK_INPUT_FILE: &str = "task.md";
+
+/// The task file a launch on any transport but `process` also accepts from the workdir when it
+/// has no `task.md`.
+pub(crate) const LEGACY_TASK_INPUT_FILE: &str = "input.txt";
+
+/// The largest operator task [`import_task_input`] reads from the workdir.
+const MAX_IMPORTED_TASK_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Copies the operator's task from the accessible workdir into the runtime directory, when the
+/// runtime directory has none: `task.md`, else `input.txt` except under `transport: process`.
+///
+/// The one read of a task from the workdir. The workdir file is left where it is and never read
+/// again. A link there is refused and latched, and the next task to start fails on it.
+fn import_task_input(
+    accessible_root: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
+    inference: &InferenceConfig,
+) {
+    if runtime_root
+        .file_len(TASK_INPUT_FILE)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return;
+    }
+    let task = match accessible_root.read_file(TASK_INPUT_FILE, MAX_IMPORTED_TASK_BYTES) {
+        Ok(None) if inference.transport != "process" => {
+            accessible_root.read_file(LEGACY_TASK_INPUT_FILE, MAX_IMPORTED_TASK_BYTES)
+        }
+        read => read,
+    };
+    match task {
+        Ok(Some(bytes)) => {
+            if let Err(error) = runtime_root.write_file(TASK_INPUT_FILE, &bytes, DEFAULT_FILE_MODE)
+            {
+                crate::runtime_err!(
+                    "[capsule-runtime] failed to import the task into the runtime directory: \
+                     {error}"
+                );
+            }
+        }
+        Ok(None) | Err(WorkdirError::Refused(_)) => {}
+        Err(error) => crate::runtime_err!("[capsule-runtime] failed to read the task: {error}"),
+    }
+}
+
+/// Refuses an accessible workdir whose `(st_dev, st_ino)` is not `expected`, the directory a
+/// delegating parent created, before anything is written beneath it.
+fn check_workdir_identity(
+    accessible_root: &WorkdirRoot,
+    expected: (u64, u64),
+) -> Result<(), RuntimeError> {
+    let found = accessible_root.identity()?;
+    if found == expected {
+        return Ok(());
+    }
+    Err(RuntimeError::WorkdirIdentityMismatch {
+        workdir: accessible_root.path().display().to_string(),
+        expected: format!("{}:{}", expected.0, expected.1),
+        found: format!("{}:{}", found.0, found.1),
+    })
+}
 
 /// Run one task's agent loop, honoring `on-task-end` `reopen-task` control decisions.
 ///
@@ -232,7 +291,7 @@ pub(crate) const TASK_INPUT_FILE: &str = "task.md";
 /// `task_reopened` record says which of the two the next attempt gets (`attempt_context`) and
 /// how many turns it is handed (`turns_remaining`).
 ///
-/// Either way `accessible_workdir/task.md` is rewritten as the original content plus every
+/// Either way the runtime directory's `task.md` is rewritten as the original content plus every
 /// reopen's feedback so far ([`build_reopen_task_md`]): it is `murmur:task-io/read`'s
 /// `as-given` form, and the input to a restart. Reopening shares one cumulative turn budget
 /// with the original attempt: each attempt is handed only `max_turns - task_turns()` turns, so
@@ -309,7 +368,8 @@ async fn run_task_with_reopens(
     // Original task content, captured once before any feedback is appended, so repeated
     // reopens re-inject a fresh copy of every feedback item rather than compounding. A refused
     // read is latched and fails the first attempt at its own checkpoint.
-    let original_task = accessible_workdir
+    let runtime_root = state.runtime_root.clone();
+    let original_task = runtime_root
         .read_to_string(TASK_INPUT_FILE)
         .ok()
         .flatten()
@@ -546,7 +606,7 @@ async fn run_task_with_reopens(
                         );
                         if !thread.can_continue(&inference.transport) {
                             rewrite_task_input(
-                                accessible_workdir,
+                                &runtime_root,
                                 &rewritten,
                                 "handed-off work's outcomes",
                             );
@@ -685,7 +745,7 @@ async fn run_task_with_reopens(
                         &member_answers,
                         &delegation_outcomes,
                     );
-                    rewrite_task_input(accessible_workdir, &rewritten, "reopen feedback");
+                    rewrite_task_input(&runtime_root, &rewritten, "reopen feedback");
                     as_given = rewritten;
                     continue;
                 }
@@ -1772,12 +1832,26 @@ pub fn stage_session(
     // Derived only so the refusal can name *which* part of the sealed mechanism is missing —
     // the AppArmor profile, `CAP_SYS_ADMIN` inside a container, or the kernel itself.
     let sealed_blocker = host_probe.sealed_blocker();
-    let achieved_containment = achieved_containment_class(enforcement_tier, workdir_exec);
+    // The second input that caps the achieved class: a runtime directory inside the workdir the
+    // capsule's commands write is one they can change. Decided from the two paths alone, before
+    // anything is created.
+    let runtime_dir_placement = crate::runtime_dir::runtime_dir_placement(
+        &request
+            .workdir
+            .clone()
+            .unwrap_or_else(|| request.manifest_dir.join("workdir")),
+    );
+    let achieved_containment = achieved_containment_class(
+        enforcement_tier,
+        workdir_exec,
+        runtime_dir_placement.inside_workdir,
+    );
     check_containment_floor(
         request.declared_containment_floor,
         achieved_containment,
         sealed_blocker,
         workdir_exec,
+        runtime_dir_placement.inside(),
     )?;
     // The complete grant set this session is about to run under, in exactly the shape
     // `mur run --explain-scope --json` prints — same builder, same policy, same declared floor,
@@ -1875,6 +1949,7 @@ pub fn stage_session(
         state_stores,
         configured_artifacts,
         preopens,
+        &runtime_dir_placement,
         // Not established at stage time: whether the declared `io.max` ceiling applies is known
         // only once the cgroup scope has been created, which `launch_session` does. Left at
         // `NotProbed` here so the staged report claims nothing, and overwritten from
@@ -1920,13 +1995,13 @@ pub fn stage_session(
     // that subprocess. See `RuntimeError::EgressNamespaceUnavailable` for why this refuses even
     // when the allowlist is empty.
     //
-    // Counts `shell.allow` and `spawn.allow` only. A native tool is a subprocess route too, but
-    // whether the capsule has one is known only from `staged.installed_artifacts`, after the
-    // registry is resolved, so a capsule whose only route is a native tool is refused by `launch`
+    // Counts `shell.allow`, `spawn.allow` and `install.tool`, whose pattern can match a native
+    // tool a pull installs. A declared native tool is a subprocess route too, but whether the
+    // capsule has one is known only from `staged.installed_artifacts`, after the registry is
+    // resolved, so a capsule whose only route is a declared native tool is refused by `launch`
     // instead (`check_native_artifact_egress_namespace`), still before anything is instantiated.
     crate::network_namespace::check_egress_namespace(
-        !request.capability_policy.shell_allow.is_empty()
-            || !request.capability_policy.spawn_allow.is_empty(),
+        has_subprocess_route_at_staging(&request.capability_policy),
         crate::network_namespace::detect_egress_namespace_blocker(),
     )?;
     // Lowered here, in the same pre-registry-pull seam and for the same reason a state store name
@@ -1944,6 +2019,9 @@ pub fn stage_session(
     // once, before anything else happens. Ordered after the refusals above so a manifest that is
     // going to be rejected outright is not first warned about.
     warn_on_workdir_exec(workdir_exec);
+    // Past the floor check, so it fires only for a launch that goes ahead with a runtime directory
+    // its commands can change.
+    warn_on_runtime_dir_inside_workdir(&runtime_dir_placement);
     // Ordered beside the other capsule-wide declarations whose cost the operator should read
     // before the session starts, and after the refusals above so a manifest that will be rejected
     // is not first warned about.
@@ -2523,12 +2601,28 @@ pub fn stage_session(
     // directory is reached from it with no link followed, and every staging write below goes
     // through one of the two roots.
     let accessible_root = WorkdirRoot::open(&accessible_workdir)?;
+    // A delegated child's `--workdir` must be the directory its parent created: one swapped for a
+    // link under `.murmur/children` between that creation and this open is refused before
+    // anything is written beneath it.
+    if let Some(expected) = request.expected_workdir_identity {
+        check_workdir_identity(&accessible_root, expected)?;
+    }
+    // Created before the first write of this staging, and removed when the value drops: on a
+    // refusal below, at the end of `launch`, or with a `StagedSession` that is never launched.
+    let runtime_dir_guard = crate::runtime_dir::RuntimeDir::create(
+        &runtime_dir_placement.sessions_dir,
+        &session_id,
+        &accessible_root,
+    )
+    .map_err(|reason| RuntimeError::RuntimeDirUnavailable { reason })?;
+    let runtime_dirs = runtime_dir_guard.roots().clone();
+    let runtime_root = runtime_dirs.runtime.clone();
     let session_root = if request.workdir.is_some() {
         accessible_root.session_beneath(&session_id)?
     } else {
         accessible_root.clone()
     };
-    session_root.create_dir_all("tools", DEFAULT_DIR_MODE)?;
+    runtime_root.create_dir_all("tools", DEFAULT_DIR_MODE)?;
 
     // Armed as soon as the directory exists rather than in `launch`, so the staging warnings
     // below this line have somewhere to land when stderr has already been closed. Everything
@@ -2536,26 +2630,26 @@ pub fn stage_session(
     diagnostic::set_diagnostic_workdir(&session_root);
 
     for (name, manifest_yaml) in &installed_manifests {
-        write_tool_manifest(&session_root, name, manifest_yaml)?;
+        write_tool_manifest(&runtime_root, name, manifest_yaml)?;
     }
 
     let native_entrypoints = install_native_binaries(
-        &session_root,
+        &runtime_root,
         &accessible_workdir,
         native_binaries,
         &full_names,
     )?;
-    install_skill_files(&session_root, skill_files)?;
+    install_skill_files(&runtime_root, skill_files)?;
 
     // Write generic manifests for any shell binary not already covered by a custom manifest.
-    write_shell_tool_manifests(&session_root, &request.capability_policy.shell_allow)?;
+    write_shell_tool_manifests(&runtime_root, &request.capability_policy.shell_allow)?;
 
     // The two peer-handoff tools, written on exactly the terms the shell manifests above are:
     // a synthetic `tools/<name>/murmur.yaml` that `build_tool_inventory` picks up unchanged,
     // paired with a dispatch branch in `dispatch_agent_tool_async`. Each is written **only** when
     // its grant is declared, so an undeclared capsule's model never sees the tool exists.
     write_peer_handoff_tool_manifests(
-        &session_root,
+        &runtime_root,
         exports_peer_files.is_some(),
         !request.capability_policy.peer_fetch_allow.is_empty(),
     )?;
@@ -2563,12 +2657,12 @@ pub fn stage_session(
     // And the delegation tool, on the same terms again. Its schema is built rather than fixed:
     // the `capsule` property's `enum` is this capsule's own `capabilities.spawn.allow`, so the
     // model is offered the names the operator granted and cannot name anything else.
-    write_delegate_task_tool_manifest(&session_root, &request.capability_policy.spawn_allow)?;
+    write_delegate_task_tool_manifest(&runtime_root, &request.capability_policy.spawn_allow)?;
 
     // And the member-call tool, whose grant is the roster: written only for a formation member
     // the roster lets call another, its schema's `enum` the members it may call.
-    write_member_call_tool_manifest(&session_root, request.formation_member.as_deref())?;
-    write_end_without_answer_tool_manifest(&session_root, request.formation_member.as_deref())?;
+    write_member_call_tool_manifest(&runtime_root, request.formation_member.as_deref())?;
+    write_end_without_answer_tool_manifest(&runtime_root, request.formation_member.as_deref())?;
     warn_on_member_calls_without_egress(
         &session_root,
         request.formation_member.as_deref(),
@@ -2577,11 +2671,11 @@ pub fn stage_session(
 
     // And the plan tool, on the same terms once more. Its schema is fixed rather than built: a
     // plan reaches this session's own tools, so there is no granted list to fold into it.
-    write_submit_plan_tool_manifest(&session_root, request.capability_policy.plan_submit)?;
+    write_submit_plan_tool_manifest(&runtime_root, request.capability_policy.plan_submit)?;
     // And the two artifact tools, for a capsule granted `capabilities.install` whose model is
     // driven by the http agent loop, the one loop that dispatches them.
     artifact_change::write_artifact_change_tool_manifests(
-        &session_root,
+        &runtime_root,
         &request.capability_policy,
         request
             .inference
@@ -2589,7 +2683,7 @@ pub fn stage_session(
             .is_some_and(|inference| inference.transport == "http"),
     )?;
     write_switch_driver_tool_manifest(
-        &session_root,
+        &runtime_root,
         control
             .as_ref()
             .filter(|control| {
@@ -2609,7 +2703,7 @@ pub fn stage_session(
         ToolAnnotationMap::default()
     } else {
         warn_on_unannotated_tool_schemas(&installed_manifests);
-        ToolAnnotationMap::from_workdir(&session_root)
+        ToolAnnotationMap::from_runtime_dir(&runtime_root)
     };
 
     // Dispatch on-stage hooks synchronously now that manifests are in place.
@@ -2621,6 +2715,7 @@ pub fn stage_session(
     dispatch_stage(
         &engine,
         &session_root,
+        &runtime_root,
         &hook_components,
         request.capability_policy.shell_allow.clone(),
         &stage_env,
@@ -2638,7 +2733,8 @@ pub fn stage_session(
             capsule_url: String::new(),
         };
         murmur_md::write_murmur_md(
-            &session_root,
+            &runtime_root,
+            &accessible_workdir,
             Some(inference),
             request.context.as_ref(),
             has_compaction_hook(&hook_components),
@@ -2648,11 +2744,9 @@ pub fn stage_session(
         );
     }
 
-    // When --workdir is used, copy the project manifest to the accessible workdir so the agent
-    // can reference it by relative path from ".".
-    if request.workdir.is_some() {
-        copy_manifest_into_workdir(&request.manifest_dir, &accessible_root)?;
-    }
+    // The project manifest, beside `MURMUR.md`, for the agent to read; nothing is copied into
+    // the workdir.
+    copy_manifest_into_runtime_dir(&request.manifest_dir, &runtime_root)?;
 
     // Every refusal latched while staging — including one a best-effort writer above swallowed,
     // such as `MURMUR.md` or an `on-stage` hook's manifest — fails the launch. No trace exists
@@ -2670,6 +2764,10 @@ pub fn stage_session(
         accessible_workdir,
         accessible_root,
         session_root,
+        runtime_dir: runtime_dir_guard.path().to_path_buf(),
+        runtime_root,
+        runtime_dirs,
+        runtime_dir_guard: Some(runtime_dir_guard),
         manifest_dir: request.manifest_dir,
         capsule_artifact: request.capsule_artifact.unwrap_or_else(|| {
             format!("{}/{}", murmur_artifact::LOCAL_SCOPE, request.capsule_name)
@@ -2805,6 +2903,12 @@ fn launch(
     // caller launching a session staged by some earlier process, and a process that stages
     // several sessions before launching one of them.
     diagnostic::set_diagnostic_workdir(&staged.session_root);
+    // Removes the session's runtime directory on every return from this function. The forced
+    // exits a second `SIGTERM` or the teardown deadline take remove it through the session's
+    // `ShellEnforcement` first.
+    let runtime_dir_owner =
+        crate::runtime_dir::SharedRuntimeDir::new(staged.runtime_dir_guard.take());
+    let _remove_runtime_dir = runtime_dir_owner.remove_on_drop();
 
     // A lifeline winds the process down, so only a launch that owns the process may hold one, and
     // only an agent session — the one kind with a door, and so the one kind a formation has as a
@@ -2915,7 +3019,8 @@ fn launch(
         staged.host_probe,
     )
     .map_err(RuntimeError::Runtime)?
-    .with_host_bounding(cgroup_scope, workdir_guard);
+    .with_host_bounding(cgroup_scope, workdir_guard)
+    .with_runtime_dir(staged.runtime_dirs.clone(), Some(runtime_dir_owner.clone()));
     // Ends the session on every path out of this function, an error return included: every path
     // that ends normally ends it explicitly first, and a second end is a no-op.
     let _session_end = sandbox::EndSessionOnDrop::new(shell_enforcement.clone());
@@ -2938,7 +3043,11 @@ fn launch(
         let workdir = staged.workdir.clone();
         let session_root = staged.session_root.clone();
         let accessible_root = staged.accessible_root.clone();
-        let system_prompt = resolve_system_prompt(&staged.manifest_dir, &session_root, inference)?;
+        let runtime_root = staged.runtime_root.clone();
+        // Before anything decides whether there is a task: the one read of the operator's task
+        // from the workdir.
+        import_task_input(&accessible_root, &runtime_root, inference);
+        let system_prompt = resolve_system_prompt(&staged.manifest_dir, &runtime_root, inference)?;
         let compaction_system_prompt =
             resolve_compaction_system_prompt(&staged.manifest_dir, inference.compaction.as_ref())?;
         let session_id = staged.session_id.clone();
@@ -3139,7 +3248,8 @@ fn launch(
         all_env.push(("MURMUR_CAPSULE_URL".to_string(), capsule_url.clone()));
 
         murmur_md::write_murmur_md(
-            &session_root,
+            &runtime_root,
+            &staged.accessible_workdir,
             Some(inference),
             staged.context.as_ref(),
             has_compaction_hook(&staged.hook_components),
@@ -3407,7 +3517,7 @@ fn launch(
             // site serves both.
             let tools_declared = agent::inventory::tool_names(
                 &agent::inventory::build_tool_inventory(
-                    &session_root,
+                    &runtime_root,
                     inference.system_prompt_artifact.as_deref(),
                     &installed_artifacts,
                 ),
@@ -3589,6 +3699,9 @@ fn launch(
                             None,
                             &all_env,
                             &capability_policy,
+                            // The capsule's own store runs no tool, so it is not handed the
+                            // runtime directory.
+                            None,
                         )?,
                         http: WasiHttpCtx::new(),
                         // The capsule's own store holds no gateway: it is no artifact, and a
@@ -3615,6 +3728,8 @@ fn launch(
                         accessible_workdir: accessible_workdir.clone(),
                         session_root: session_root.clone(),
                         accessible_root: accessible_root.clone(),
+                        runtime_root: runtime_root.clone(),
+                        runtime_dirs: staged.runtime_dirs.clone(),
                         tool_components,
                         native_entrypoints,
                         process_driver: process_driver_for_state.clone(),
@@ -3875,7 +3990,7 @@ fn launch(
                             match effective_lifecycle.task_acceptance {
                                 TaskAcceptance::None => {
                                     // Does not accept incoming tasks; run from task.md if present
-                                    if let Some(bytes) = pending_task_input(&accessible_root) {
+                                    if let Some(bytes) = pending_task_input(&runtime_root) {
                                         let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
                                         let context_id = task_context_id(supplied_context_id.as_deref());
                                         let provenance =
@@ -3960,7 +4075,7 @@ fn launch(
                                     }
                                 }
                                 TaskAcceptance::Single | TaskAcceptance::Queue => {
-                                    if let Some(bytes) = pending_task_input(&accessible_root) {
+                                    if let Some(bytes) = pending_task_input(&runtime_root) {
                                         // A `task.md` runs before any A2A message is waited for.
                                         let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
                                         let context_id = task_context_id(supplied_context_id.as_deref());
@@ -4048,7 +4163,7 @@ fn launch(
                                         }
                                         // Queue+sleep: remove task.md so the next iteration
                                         // falls through to the wait for queued tasks.
-                                        let _ = accessible_root.remove_file(TASK_INPUT_FILE);
+                                        let _ = runtime_root.remove_file(TASK_INPUT_FILE);
                                         continue 'task_loop;
                                     }
                                     // Wait for the next task from the mpsc channel. Reached with
@@ -4161,16 +4276,13 @@ fn launch(
                                                 Ok(Woke::Terminating) => break 'task_loop,
                                                 Ok(Woke::Task(Some(task))) => task,
                                                 Ok(Woke::Task(None)) => break 'task_loop,
-                                                // A `task.md` would have run above, so what can
-                                                // still give this launch a task is a file already
-                                                // in the accessible workdir, in practice
-                                                // `input.txt`. Without one there is nothing to
-                                                // send, so the model is never called.
+                                                // A `task.md` in the runtime directory would have
+                                                // run above, imported from the workdir's
+                                                // `task.md` or `input.txt` included. Without one
+                                                // there is nothing to send, so the model is never
+                                                // called.
                                                 Err(_elapsed)
-                                                    if agent::fresh_task_text(
-                                                        inference,
-                                                        &accessible_root,
-                                                    )
+                                                    if agent::fresh_task_text(&runtime_root)
                                                     .trim()
                                                     .is_empty() =>
                                                 {
@@ -4180,7 +4292,7 @@ fn launch(
                                                     break 'task_loop;
                                                 }
                                                 Err(_elapsed) => {
-                                                    crate::runtime_err!("[capsule-runtime] no A2A message received within {idle_timeout_secs}s; running the task in input.txt");
+                                                    crate::runtime_err!("[capsule-runtime] no A2A message received within {idle_timeout_secs}s; running the task in task.md");
                                                     otel.begin_session(None);
                                                     state.current_traceparent = otel.outgoing_traceparent();
                                                     let failures_before =
@@ -4279,7 +4391,7 @@ fn launch(
                         };
                         // A refusal here is latched; `run_task_with_reopens` fails the task on it
                         // before anything is sent for it.
-                        if let Err(e) = accessible_root.write_file(
+                        if let Err(e) = runtime_root.write_file(
                             TASK_INPUT_FILE,
                             incoming.message_text.as_bytes(),
                             DEFAULT_FILE_MODE,
@@ -4417,7 +4529,7 @@ fn launch(
                                 // Queue+sleep: clear task.md and wait for next task. A peer's
                                 // task reports its own outcome through `GetTask` and its
                                 // stream; it does not decide how a long-lived session ends.
-                                let _ = accessible_root.remove_file(TASK_INPUT_FILE);
+                                let _ = runtime_root.remove_file(TASK_INPUT_FILE);
                                 continue 'task_loop;
                             }
                         }
@@ -4589,6 +4701,7 @@ fn launch(
             .watch(move || {
                 crate::runtime_err!("{SPAWNER_LIFELINE_CLOSED}; ending the run");
                 ending.end_session();
+                ending.remove_runtime_dir();
                 std::process::exit(143);
             })
             .map_err(|error| RuntimeError::SpawnerLifelineUnreadable {
@@ -4649,6 +4762,9 @@ fn launch(
             None,
             &inference_env,
             &staged.capability_policy,
+            // A script capsule reads its task, like a whole-workdir tool reads `MURMUR.md`, from
+            // the read-only runtime directory at `murmur-runtime/`.
+            Some(&staged.runtime_dir),
         )?,
         http: WasiHttpCtx::new(),
         http_hooks: NetworkPolicyHooks {
@@ -4683,6 +4799,8 @@ fn launch(
         accessible_workdir: staged.accessible_workdir.clone(),
         session_root: staged.session_root.clone(),
         accessible_root: staged.accessible_root.clone(),
+        runtime_root: staged.runtime_root.clone(),
+        runtime_dirs: staged.runtime_dirs.clone(),
         tool_components: staged.tool_components,
         native_entrypoints: staged.native_entrypoints,
         // A script capsule runs no agent loop, so nothing here would ever drive a harness.
@@ -5154,7 +5272,7 @@ fn read_prompt_file(manifest_dir: &Path, path: &str) -> Result<String, (PathBuf,
 
 fn resolve_system_prompt(
     manifest_dir: &Path,
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     inference: &murmur_artifact::InferenceConfig,
 ) -> Result<Option<String>, RuntimeError> {
     if let Some(prompt) = inference.system_prompt.as_ref() {
@@ -5175,7 +5293,7 @@ fn resolve_system_prompt(
             name: art_name.clone(),
             source,
         };
-        return match workdir.read_to_string(format!("tools/{art_name}/skill.md")) {
+        return match runtime_root.read_to_string(format!("tools/{art_name}/skill.md")) {
             Ok(Some(text)) => Ok(Some(text)),
             Ok(None) => Err(unreadable(std::io::ErrorKind::NotFound.into())),
             Err(error) => Err(RuntimeError::from_workdir(error, |_, source| {
@@ -5422,6 +5540,26 @@ pub fn warn_on_workdir_exec(workdir_exec: bool) {
          there can run regardless of capabilities.shell.allow; this capsule reports containment \
          class 'advisory' on every host, including a Landlock-capable one ({link})"
     );
+}
+
+/// Prints `W-SEC-033` once when the session's runtime directory lies inside its workdir. A launch
+/// that reaches here runs below a `scoped` floor, so its achieved class is already `advisory`.
+fn warn_on_runtime_dir_inside_workdir(placement: &crate::runtime_dir::RuntimeDirPlacement) {
+    if placement.inside_workdir {
+        crate::runtime_err!(
+            "[capsule-runtime] {}",
+            crate::runtime_dir::runtime_dir_inside_warning(placement)
+        );
+    }
+}
+
+/// Whether `stage_session` can already tell the capsule may start a native subprocess: a
+/// `shell.allow`, a `spawn.allow` or an `install.tool` grant, whose pattern can match a native
+/// tool a pull installs.
+fn has_subprocess_route_at_staging(policy: &CapabilityPolicy) -> bool {
+    !policy.shell_allow.is_empty()
+        || !policy.spawn_allow.is_empty()
+        || !policy.install_tool.is_empty()
 }
 
 /// One credential-shaped entry of `capabilities.env.allow` that reaches every WASM guest.
@@ -6192,6 +6330,7 @@ fn build_wasi_ctx(
     config_json: Option<&str>,
     extra_env: &[(String, String)],
     policy: &CapabilityPolicy,
+    runtime_dir: Option<&Path>,
 ) -> Result<WasiCtx, RuntimeError> {
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
@@ -6220,6 +6359,18 @@ fn build_wasi_ctx(
         builder
             .preopened_dir(state_dir, STATE_PREOPEN_NAME, FsPerms::ReadWrite)
             .map_err(|err| RuntimeError::wasi(state_dir.to_path_buf(), err.to_string()))?;
+    }
+
+    // Read-only: the guest reads `MURMUR.md`, `task.md`, plans and installed tools there and
+    // changes none of them.
+    if let Some(runtime_dir) = runtime_dir {
+        builder
+            .preopened_dir(
+                runtime_dir,
+                crate::runtime_dir::RUNTIME_DIR_GUEST_PATH,
+                FsPerms::ReadOnly,
+            )
+            .map_err(|err| RuntimeError::wasi(runtime_dir.to_path_buf(), err.to_string()))?;
     }
 
     Ok(builder.build())
@@ -6666,6 +6817,12 @@ pub(crate) struct CapsuleStoreState {
     /// [`StagedSession::session_root`]: the session directory, through which every runtime read
     /// and write beneath it goes. Its host path is `session_root.path()`.
     pub(crate) session_root: WorkdirRoot,
+    /// [`StagedSession::runtime_root`]: the runtime directory, through which every runtime read
+    /// and write of `tools/`, `MURMUR.md`, `task.md`, `murmur.yaml` and `plans/` goes.
+    pub(crate) runtime_root: WorkdirRoot,
+    /// [`StagedSession::runtime_dirs`]: the runtime directory with its `sealed-etc/` and
+    /// `harness/` siblings.
+    pub(crate) runtime_dirs: crate::runtime_dir::RuntimeDirRoots,
     /// [`StagedSession::accessible_root`]. Its refusal latch is the session's: the agent loop's
     /// checkpoints drain it through here.
     pub(crate) accessible_root: WorkdirRoot,
@@ -7090,7 +7247,7 @@ impl manage::Host for CapsuleStoreState {
             murmur_artifact::tool_name_of(&name)
         );
         let manifest_content = self
-            .session_root
+            .runtime_root
             .read_to_string(&rel)
             .map_err(|err| format!("failed to read {err}"))?
             .ok_or_else(|| format!("failed to read {rel}: it does not exist"))?;
@@ -7480,6 +7637,10 @@ fn stage_spend_meter(
 pub(crate) struct ToolInvokeEnv<'a> {
     pub(crate) engine: &'a Engine,
     pub(crate) accessible_workdir: &'a Path,
+    /// The session's runtime directory, preopened read-only at `murmur-runtime/`, for a
+    /// `runtime: tool` with no `capabilities.filesystem.scope`; `None` for every other guest.
+    /// Decided by [`CapsuleStoreState::runtime_dir_preopen`].
+    pub(crate) runtime_dir: Option<&'a Path>,
     pub(crate) inference_env: &'a [(String, String)],
     pub(crate) capability_policy: &'a CapabilityPolicy,
     /// The capsule-wide ceiling. What actually gets enforced is this, clamped by
@@ -7550,6 +7711,7 @@ pub(crate) async fn invoke_tool_component(
     let ToolInvokeEnv {
         engine,
         accessible_workdir,
+        runtime_dir,
         inference_env,
         capability_policy,
         network_allow_rules,
@@ -7707,6 +7869,7 @@ pub(crate) async fn invoke_tool_component(
             config_json,
             &guest_env,
             capability_policy,
+            runtime_dir,
         )
         .map_err(|err| format!("failed to build WASI context for tool '{name}': {err}"))?,
         http: WasiHttpCtx::new(),
@@ -7886,6 +8049,21 @@ impl CapsuleStoreState {
             .await
     }
 
+    /// The runtime directory `name`'s guest is preopened into read-only, at `murmur-runtime/`:
+    /// for a `runtime: tool` whose entry declares no `capabilities.filesystem.scope`, which also
+    /// holds the whole workdir at `"."`. A driver, and a tool confined to a subtree, gets none.
+    fn runtime_dir_preopen(&self, name: &str) -> Option<&Path> {
+        let is_tool = self.installed_artifacts.iter().any(|artifact| {
+            murmur_artifact::tool_name_of(&artifact.name) == name
+                && artifact.runtime == ArtifactRuntime::Tool
+        });
+        let scoped = self
+            .artifact_grants
+            .get(name)
+            .is_some_and(|grant| grant.filesystem_scope.is_some());
+        (is_tool && !scoped).then(|| self.runtime_root.path())
+    }
+
     async fn dispatch_component_with_env(
         &self,
         name: &str,
@@ -7901,6 +8079,7 @@ impl CapsuleStoreState {
             ToolInvokeEnv {
                 engine: &self.engine,
                 accessible_workdir: &self.accessible_workdir,
+                runtime_dir: self.runtime_dir_preopen(name),
                 inference_env,
                 capability_policy: &self.capability_policy,
                 network_allow_rules: &self.network_allow_rules,
@@ -7967,12 +8146,7 @@ impl CapsuleStoreState {
         {
             return as_tool();
         }
-        match resolve_shell_call(
-            name,
-            input,
-            &self.accessible_workdir,
-            &self.capability_policy,
-        ) {
+        match resolve_shell_call(name, input, &self.accessible_root, &self.capability_policy) {
             Some(ResolvedShellCall {
                 binary,
                 command,
@@ -8046,7 +8220,7 @@ impl CapsuleStoreState {
         }
         let manifest: Value = serde_yaml::from_str(
             &self
-                .session_root
+                .runtime_root
                 .read_to_string(format!("tools/{name}/{PACKED_MANIFEST_ENTRY}"))
                 .ok()??,
         )
@@ -8294,11 +8468,11 @@ impl CapsuleStoreState {
         // Skill artifact: return skill.md content as the tool result (no WASM dispatch).
         // Works in capsules with no shell/file capabilities — the runtime reads the file.
         let skill_md = format!("tools/{name}/skill.md");
-        if !matches!(self.session_root.entry_kind(&skill_md), Ok(None)) {
+        if !matches!(self.runtime_root.entry_kind(&skill_md), Ok(None)) {
             // A link where the skill's `skill.md` was staged is refused here, latched, and fails
             // the task at the checkpoint after this call.
             let content = self
-                .session_root
+                .runtime_root
                 .read_to_string(&skill_md)
                 .map_err(|e| format!("failed to read skill '{name}': {e}"))?
                 .ok_or_else(|| format!("failed to read skill '{name}': skill.md is gone"))?;
@@ -9039,7 +9213,7 @@ impl CapsuleStoreState {
         // `validate_plan` checks a `tool` step against. `submit-plan` is left out so a plan
         // naming it is refused for what it is rather than for the tool being absent.
         let installed_tools: HashSet<String> = self
-            .session_root
+            .runtime_root
             .list_dir("tools")
             .ok()
             .flatten()
@@ -9065,6 +9239,7 @@ impl CapsuleStoreState {
         let session_netns = Arc::clone(&self.shell_enforcement.session_netns);
         let scheduler_workdir = self.accessible_root.clone();
         let scheduler_session_workdir = self.session_root.clone();
+        let scheduler_runtime_dir = self.runtime_dirs.clone();
         let session_id = self.session_id.clone();
         // The conversation this plan was submitted from, named on the `MURMUR_SPAWNER` handle
         // every `capsule` step injects into its child — the same value `delegate-task` names.
@@ -9126,6 +9301,7 @@ impl CapsuleStoreState {
             let ctx = crate::plan::SchedulerContext {
                 accessible_workdir: scheduler_workdir,
                 session_workdir: scheduler_session_workdir,
+                runtime_dir: scheduler_runtime_dir,
                 capability_policy,
                 installed_tools,
                 // A `capsule` step's version is the daemon's question, not this session's: the
@@ -9248,7 +9424,7 @@ impl CapsuleStoreState {
             PlanRequest::Gate(call, reply) => {
                 let verdict = match gate {
                     Some(gate) => {
-                        let resolved = call.resolve(&self.accessible_workdir);
+                        let resolved = call.resolve(&self.accessible_root);
                         // A refusal that could not be recorded refuses anyway: an unaudited call
                         // is the thing the decision point exists to prevent.
                         match gate.check(self, &resolved).await {
@@ -9288,7 +9464,7 @@ impl CapsuleStoreState {
         }
     }
 
-    /// Write one submitted plan into `<workdir>/plans/plan-<n>.json` and return its path.
+    /// Write one submitted plan into `<runtime dir>/plans/plan-<n>.json` and return its path.
     ///
     /// `n` is this session's own counter and the plan's `id` reaches no part of the name: the id
     /// is model-supplied, and a file named from it could collide or traverse.
@@ -9298,7 +9474,7 @@ impl CapsuleStoreState {
     ) -> Result<PathBuf, String> {
         let ordinal = self.plan_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let body = serde_json::Value::Object(plan.clone()).to_string();
-        self.session_root
+        self.runtime_root
             .write_file(
                 format!("plans/plan-{ordinal}.json"),
                 body.as_bytes(),
@@ -9306,7 +9482,7 @@ impl CapsuleStoreState {
             )
             .map_err(|error| format!("'{SUBMIT_PLAN_TOOL}' could not write the plan: {error}"))?;
         Ok(self
-            .session_root
+            .runtime_root
             .host_path(format!("plans/plan-{ordinal}.json")))
     }
 
@@ -9802,7 +9978,7 @@ pub(crate) fn describe_stripped_env_allow_entries(entries: &[StrippedEnvAllowEnt
 /// runtime would otherwise overwrite the synthetic manifest and lose every call to the
 /// interception in `dispatch_agent_tool_unfenced`.
 fn write_tool_manifest(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     name: &str,
     manifest_yaml: &str,
 ) -> Result<(), RuntimeError> {
@@ -9811,7 +9987,7 @@ fn write_tool_manifest(
             name: name.to_string(),
         });
     }
-    write_tool_manifest_unchecked(workdir, name, manifest_yaml)
+    write_tool_manifest_unchecked(runtime_root, name, manifest_yaml)
 }
 
 /// Write one runtime-provided tool's synthetic `murmur.yaml`, carrying the inverse guard.
@@ -9820,7 +9996,7 @@ fn write_tool_manifest(
 /// routed through here without being added to the list fails loudly instead of shipping shadowable
 /// by an artifact of the same name.
 fn write_runtime_provided_tool_manifest(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     name: &str,
     manifest_yaml: &str,
 ) -> Result<(), RuntimeError> {
@@ -9829,24 +10005,24 @@ fn write_runtime_provided_tool_manifest(
             name: name.to_string(),
         });
     }
-    write_tool_manifest_unchecked(workdir, name, manifest_yaml)
+    write_tool_manifest_unchecked(runtime_root, name, manifest_yaml)
 }
 
 /// The write both guarded entry points share, once their opposite name checks have passed.
 fn write_tool_manifest_unchecked(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     name: &str,
     manifest_yaml: &str,
 ) -> Result<(), RuntimeError> {
     write_staged_file(
-        workdir,
+        runtime_root,
         &tool_manifest_rel(name)?,
         manifest_yaml.as_bytes(),
         None,
     )
 }
 
-/// `tools/<name>/murmur.yaml`, relative to the session workdir. Errors unless `name` is one normal
+/// `tools/<name>/murmur.yaml`, relative to the runtime directory. Errors unless `name` is one normal
 /// path component: an absolute name, `..` or a nested name would put the manifest somewhere other
 /// than `tools/<name>/`.
 fn tool_manifest_rel(name: &str) -> Result<String, RuntimeError> {
@@ -9865,32 +10041,30 @@ fn tool_manifest_rel(name: &str) -> Result<String, RuntimeError> {
 /// `std`'s default less the umask otherwise. A link on the way is
 /// [`RuntimeError::WorkdirPathRefused`]; any other failure is [`RuntimeError::WriteToolManifest`].
 fn write_staged_file(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     rel: &str,
     bytes: &[u8],
     mode: Option<u32>,
 ) -> Result<(), RuntimeError> {
     match mode {
-        Some(mode) => workdir.write_file_exact_mode(rel, bytes, mode),
-        None => workdir.write_file(rel, bytes, DEFAULT_FILE_MODE),
+        Some(mode) => runtime_root.write_file_exact_mode(rel, bytes, mode),
+        None => runtime_root.write_file(rel, bytes, DEFAULT_FILE_MODE),
     }
     .map_err(|error| {
         RuntimeError::from_workdir(error, |_, source| RuntimeError::WriteToolManifest {
-            path: workdir.host_path(rel).display().to_string(),
+            path: runtime_root.host_path(rel).display().to_string(),
             source,
         })
     })
 }
 
-/// Copies the project's `murmur.yaml` from `manifest_dir` into the accessible workdir when the
-/// workdir has none, so the agent can reference it by relative path from `"."`, with the source's
-/// mode as `fs::copy` would.
+/// Copies the project's `murmur.yaml` from `manifest_dir` into the runtime directory, with the
+/// source's mode as `fs::copy` would, for the agent to read beside `MURMUR.md`.
 ///
-/// Anything already there other than a link is kept. A link where the copy would go is refused,
-/// which fails the launch; any other failure warns and the launch goes on.
-fn copy_manifest_into_workdir(
+/// A refusal fails the launch; any other failure warns and the launch goes on.
+fn copy_manifest_into_runtime_dir(
     manifest_dir: &Path,
-    accessible_root: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
 ) -> Result<(), RuntimeError> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -9898,20 +10072,16 @@ fn copy_manifest_into_workdir(
     let Ok(bytes) = fs::read(&src) else {
         return Ok(());
     };
-    match accessible_root.entry_kind(MANIFEST_FILENAME) {
-        Ok(None) | Ok(Some(EntryKind::Symlink)) => {}
-        Ok(Some(_)) => return Ok(()),
-        Err(error) => return Err(error.into()),
-    }
     let mode = fs::metadata(&src)
         .map(|metadata| metadata.permissions().mode() & 0o7777)
         .unwrap_or(DEFAULT_FILE_MODE);
-    match accessible_root.write_file_exact_mode(MANIFEST_FILENAME, &bytes, mode) {
+    match runtime_root.write_file_exact_mode(MANIFEST_FILENAME, &bytes, mode) {
         Ok(()) => Ok(()),
         Err(WorkdirError::Refused(refusal)) => Err(RuntimeError::WorkdirPathRefused { refusal }),
         Err(error) => {
             crate::runtime_err!(
-                "[capsule-runtime] warning: failed to copy {MANIFEST_FILENAME} to workdir: {error}"
+                "[capsule-runtime] warning: failed to copy {MANIFEST_FILENAME} to the runtime \
+                 directory: {error}"
             );
             Ok(())
         }
@@ -9921,16 +10091,16 @@ fn copy_manifest_into_workdir(
 /// Mode of an installed native binary: executable by everyone, writable by its owner.
 const NATIVE_BINARY_MODE: u32 = 0o755;
 
-/// Write each native tool's binary to `<workdir>/tools/<name>/<name>`, executable, and return
-/// what each needs to start, keyed by `name`, derived from the bytes written rather than read back
-/// from the capsule-writable `accessible_workdir`. `name` is the tool name; a refusal names the
+/// Write each native tool's binary to `<runtime dir>/tools/<name>/<name>`, executable, and return
+/// what each needs to start, keyed by `name`, derived from the bytes written rather than read back.
+/// `accessible_workdir` is the capsule-writable tree the dependency walk stays out of. `name` is the tool name; a refusal names the
 /// artifact by its full name from `full_names`.
 ///
 /// Every image is classified against this host before the first one is written. A batch holding
 /// one unrunnable binary installs none of them: a refusal that had already written two of three
 /// tools would leave a workdir that is neither the state before staging nor the state after it.
 fn install_native_binaries(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     accessible_workdir: &Path,
     native_binaries: Vec<(String, Vec<u8>)>,
     full_names: &HashMap<String, String>,
@@ -9951,8 +10121,8 @@ fn install_native_binaries(
     let mut entrypoints = HashMap::new();
     for (name, bytes) in native_binaries {
         let rel = format!("tools/{name}/{name}");
-        write_staged_file(workdir, &rel, &bytes, Some(NATIVE_BINARY_MODE))?;
-        let binary_path = workdir.host_path(&rel);
+        write_staged_file(runtime_root, &rel, &bytes, Some(NATIVE_BINARY_MODE))?;
+        let binary_path = runtime_root.host_path(&rel);
         let entrypoint =
             sandbox::NativeEntrypoint::derive(&binary_path, &bytes, accessible_workdir);
         entrypoints.insert(name, entrypoint);
@@ -10015,11 +10185,16 @@ fn find_skill_md_in_dir(dir: &Path) -> Result<Option<std::path::PathBuf>, Runtim
 }
 
 fn install_skill_files(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     skill_files: Vec<(String, Vec<u8>)>,
 ) -> Result<(), RuntimeError> {
     for (name, bytes) in skill_files {
-        write_staged_file(workdir, &format!("tools/{name}/skill.md"), &bytes, None)?;
+        write_staged_file(
+            runtime_root,
+            &format!("tools/{name}/skill.md"),
+            &bytes,
+            None,
+        )?;
     }
     Ok(())
 }
@@ -10067,16 +10242,20 @@ fn check_queue_has_room(lifecycle: &LifecycleConfig) -> Result<(), RuntimeError>
 /// Writes the synthetic tool manifests for the two peer-handoff tools, each only when its own
 /// grant is declared.
 fn write_peer_handoff_tool_manifests(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     can_mint: bool,
     can_fetch: bool,
 ) -> Result<(), RuntimeError> {
     if can_mint {
-        write_runtime_provided_tool_manifest(workdir, SHARE_FILE_TOOL, SHARE_FILE_TOOL_MANIFEST)?;
+        write_runtime_provided_tool_manifest(
+            runtime_root,
+            SHARE_FILE_TOOL,
+            SHARE_FILE_TOOL_MANIFEST,
+        )?;
     }
     if can_fetch {
         write_runtime_provided_tool_manifest(
-            workdir,
+            runtime_root,
             FETCH_PEER_FILE_TOOL,
             FETCH_PEER_FILE_TOOL_MANIFEST,
         )?;
@@ -10129,14 +10308,14 @@ const FETCH_PEER_FILE_TOOL_MANIFEST: &str = concat!(
 /// and from `session_start`'s `tools_declared` — the grant governs the tool's existence rather
 /// than its success.
 fn write_delegate_task_tool_manifest(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     spawn_allow: &[String],
 ) -> Result<(), RuntimeError> {
     if spawn_allow.is_empty() {
         return Ok(());
     }
     write_runtime_provided_tool_manifest(
-        workdir,
+        runtime_root,
         DELEGATE_TASK_TOOL,
         &delegate_task_tool_manifest(spawn_allow),
     )
@@ -10231,7 +10410,7 @@ fn delegate_task_result_data(
 /// file, so `call-member` is absent from their tool inventory and from `session_start`'s
 /// `tools_declared`.
 fn write_member_call_tool_manifest(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     formation: Option<&FormationMember>,
 ) -> Result<(), RuntimeError> {
     let callees: Vec<&str> = formation
@@ -10241,7 +10420,7 @@ fn write_member_call_tool_manifest(
         return Ok(());
     }
     write_runtime_provided_tool_manifest(
-        workdir,
+        runtime_root,
         MEMBER_CALL_TOOL,
         &member_call_tool_manifest(&callees),
     )
@@ -10253,7 +10432,7 @@ pub(crate) const MEMBER_CALL_TOOL: &str = "call-member";
 /// Writes the end-without-answer tool's synthetic manifest, under exactly `call-member`'s grant: a
 /// formation member with at least one callee.
 fn write_end_without_answer_tool_manifest(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     formation: Option<&FormationMember>,
 ) -> Result<(), RuntimeError> {
     if formation.is_none_or(|formation| formation.callees().next().is_none()) {
@@ -10265,7 +10444,7 @@ fn write_end_without_answer_tool_manifest(
         "required": ["reason"],
     });
     write_runtime_provided_tool_manifest(
-        workdir,
+        runtime_root,
         END_WITHOUT_ANSWER_TOOL,
         &native_tool_manifest_yaml(
             END_WITHOUT_ANSWER_TOOL,
@@ -10323,13 +10502,13 @@ fn member_call_tool_manifest(callees: &[&str]) -> String {
 /// inventory and from `session_start`'s `tools_declared` — the grant governs the tool's existence
 /// rather than its success, exactly as [`write_delegate_task_tool_manifest`] does.
 fn write_submit_plan_tool_manifest(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     plan_submit: bool,
 ) -> Result<(), RuntimeError> {
     if !plan_submit {
         return Ok(());
     }
-    write_runtime_provided_tool_manifest(workdir, SUBMIT_PLAN_TOOL, SUBMIT_PLAN_TOOL_MANIFEST)
+    write_runtime_provided_tool_manifest(runtime_root, SUBMIT_PLAN_TOOL, SUBMIT_PLAN_TOOL_MANIFEST)
 }
 
 /// Writes the driver-switch tool's synthetic manifest, only for a capsule whose
@@ -10339,14 +10518,14 @@ fn write_submit_plan_tool_manifest(
 /// inventory and from `session_start`'s `tools_declared`. The description lists every choice with
 /// its model, and the schema names the choices, so the model sees what it may select.
 fn write_switch_driver_tool_manifest(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     choices: Option<&crate::driver_choice::DriverChoices>,
 ) -> Result<(), RuntimeError> {
     let Some(choices) = choices else {
         return Ok(());
     };
     write_runtime_provided_tool_manifest(
-        workdir,
+        runtime_root,
         SWITCH_DRIVER_TOOL,
         &switch_driver_tool_manifest(choices),
     )
@@ -10493,7 +10672,7 @@ impl GatedStepCall {
     /// directly. `script` is therefore set only for the `-c` form that actually reaches a shell —
     /// which is exactly the distinction `ProtectedPaths::check_shell` draws between a body whose
     /// redirections are live and an argv where `>` is a literal argument.
-    fn resolve(&self, workdir: &Path) -> ResolvedCall {
+    fn resolve(&self, workdir: &WorkdirRoot) -> ResolvedCall {
         match self {
             Self::Tool { name, input_json } => ResolvedCall::Tool {
                 tool_name: name.clone(),
@@ -10562,7 +10741,7 @@ const SUBMIT_PLAN_TOOL_MANIFEST: &str = concat!(
 /// there already. Every name is checked before the first write, so a refused name leaves the
 /// workdir as it was.
 fn write_shell_tool_manifests(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     shell_allow: &[String],
 ) -> Result<(), RuntimeError> {
     let rels = shell_allow
@@ -10572,11 +10751,11 @@ fn write_shell_tool_manifests(
     for (binary, rel) in rels {
         // A custom manifest already staged is kept. A link where one would be is not "already
         // staged": the write below refuses it.
-        if let Ok(Some(EntryKind::File)) = workdir.entry_kind(&rel) {
+        if let Ok(Some(EntryKind::File)) = runtime_root.entry_kind(&rel) {
             continue;
         }
         write_staged_file(
-            workdir,
+            runtime_root,
             &rel,
             shell_tool_manifest_yaml(binary).as_bytes(),
             None,
@@ -10596,7 +10775,7 @@ fn check_native_artifact_egress_namespace(
     has_native_artifact: bool,
     blocker: Option<crate::network_namespace::EgressNamespaceBlocker>,
 ) -> Result<(), RuntimeError> {
-    let checked_at_staging = !policy.shell_allow.is_empty() || !policy.spawn_allow.is_empty();
+    let checked_at_staging = has_subprocess_route_at_staging(policy);
     crate::network_namespace::check_egress_namespace(
         has_native_artifact && !checked_at_staging,
         blocker,
@@ -10649,7 +10828,7 @@ fn dispatch_native_tool(
 
     enforcement.check_workdir_budget()?;
 
-    let env = build_shell_env(policy, &[], session_workdir)?;
+    let env = build_shell_env(policy, &[], session_workdir, enforcement.runtime_dir_path())?;
 
     let mut command = Command::new(entrypoint.path());
     command
@@ -10817,7 +10996,7 @@ pub(crate) struct ResolvedShellCall {
 pub(crate) fn resolve_shell_call(
     name: &str,
     input: &murmur::tool::run::ToolInput,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     policy: &CapabilityPolicy,
 ) -> Option<ResolvedShellCall> {
     resolve_shell_call_inner(name, input, workdir, policy).ok()
@@ -10829,7 +11008,7 @@ pub(crate) fn resolve_shell_call(
 fn resolve_shell_call_inner(
     name: &str,
     input: &murmur::tool::run::ToolInput,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     policy: &CapabilityPolicy,
 ) -> Result<ResolvedShellCall, String> {
     if !policy.shell_allow.iter().any(|allowed| allowed == name) {
@@ -10875,7 +11054,7 @@ fn dispatch_shell_tool(
     enforcement: &sandbox::ShellEnforcement,
     detach: Option<DetachPolicy>,
 ) -> DispatchOutcome {
-    let resolved = match resolve_shell_call_inner(name, &input, accessible_workdir.path(), policy) {
+    let resolved = match resolve_shell_call_inner(name, &input, accessible_workdir, policy) {
         Ok(resolved) => resolved,
         Err(error) => {
             return DispatchOutcome::tool(murmur::tool::run::ToolResult {
@@ -11389,6 +11568,7 @@ async fn run_termination(
                 if sigterms > 1 {
                     // An exit runs no teardown, so the session's processes are killed first.
                     shell_enforcement.end_session();
+                    shell_enforcement.remove_runtime_dir();
                     std::process::exit(143);
                 }
                 TerminationCause::Sigterm
@@ -11473,6 +11653,7 @@ fn begin_termination(
     std::thread::spawn(move || {
         std::thread::sleep(TERMINATE_TEARDOWN_DEADLINE);
         ending.end_session();
+        ending.remove_runtime_dir();
         std::process::exit(143);
     });
 }
@@ -13428,6 +13609,7 @@ inference:
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -13529,6 +13711,7 @@ inference:
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -13619,6 +13802,7 @@ inference:
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -13708,6 +13892,7 @@ inference:
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -13858,6 +14043,7 @@ inference:
         let project = tempfile::tempdir().unwrap();
         let request = StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: project.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -13965,6 +14151,7 @@ inference:
 
         StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: project.to_path_buf(),
             capsule_name: "test".to_string(),
@@ -14018,7 +14205,7 @@ inference:
 
         let staged = stage_session(Arc::new(LocalSourceOnlyRegistry), request).unwrap();
         let installed = staged
-            .workdir
+            .runtime_dir
             .join("tools")
             .join("my-skill")
             .join("skill.md");
@@ -14033,7 +14220,8 @@ inference:
         assert_eq!(staged.installed_artifacts.len(), 1);
         assert_eq!(staged.installed_artifacts[0].version, "local");
         // MURMUR.md (written during staging) lists the skill as callable.
-        let murmur_md = fs::read_to_string(staged.workdir.join("MURMUR.md")).unwrap();
+        let murmur_md = fs::read_to_string(staged.runtime_dir.join("MURMUR.md")).unwrap();
+        assert!(!staged.workdir.join("MURMUR.md").exists());
         assert!(
             murmur_md.contains("**my-skill**"),
             "MURMUR.md missing skill listing:\n{murmur_md}"
@@ -14490,6 +14678,7 @@ inference:
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             crate::cgroup::IoMaxReport::default(),
         );
 
@@ -14785,6 +14974,7 @@ inference:
             None,
             &[],
             &CapabilityPolicy::default(),
+            None,
         )
         .unwrap();
         // One root for both, as `stage_session` holds them without `--workdir`: one latch.
@@ -14813,6 +15003,14 @@ inference:
             spend: Arc::new(SpendMeter::unlimited()),
             compiled_forms: CompiledForms::new(&engine, &workdir),
             engine,
+            // The runtime directory is the same directory too, so a test reads what staging wrote
+            // where it always did.
+            runtime_root: root.clone(),
+            runtime_dirs: crate::runtime_dir::RuntimeDirRoots::new(
+                root.clone(),
+                root.clone(),
+                root.clone(),
+            ),
             session_root: root.clone(),
             accessible_root: root,
             accessible_workdir: workdir,
@@ -15490,6 +15688,7 @@ inference:
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                 crate::cgroup::IoMaxReport::default(),
             ),
             murmur_artifact::TraceCapture::Meta,
@@ -16902,6 +17101,7 @@ inference:
             &declaring,
             &native_env(&agent),
             &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            None,
         )
         .unwrap();
         let binary = write_env_echo_native_tool(tmp.path(), "echo-peers", &[name]);
@@ -16947,7 +17147,7 @@ inference:
                 data: Some(r#"{"command":"printf x > out.txt"}"#.to_string()),
                 log_path: None,
             },
-            tmp.path(),
+            &WorkdirRoot::open(tmp.path()).unwrap(),
             &policy,
         )
         .expect("a declared binary with a usable command resolves");
@@ -16957,7 +17157,7 @@ inference:
             command: "bash -c 'printf x > out.txt'".to_string(),
             argv: vec!["-c".to_string(), "printf x > out.txt".to_string()],
         }
-        .resolve(tmp.path());
+        .resolve(&WorkdirRoot::open(tmp.path()).unwrap());
 
         let ResolvedCall::Shell {
             binary,
@@ -17284,8 +17484,13 @@ inference:
             log_path: None,
         };
 
-        let resolved =
-            resolve_shell_call("bash", &input, tmp.path(), &policy).expect("bash resolves");
+        let resolved = resolve_shell_call(
+            "bash",
+            &input,
+            &WorkdirRoot::open(tmp.path()).unwrap(),
+            &policy,
+        )
+        .expect("bash resolves");
         let outcome = dispatch_shell_tool(
             "bash",
             input,
@@ -17323,7 +17528,7 @@ inference:
                 data: Some(r#"{"command":"-s http://example.com"}"#.to_string()),
                 log_path: None,
             },
-            tmp.path(),
+            &WorkdirRoot::open(tmp.path()).unwrap(),
             &policy,
         )
         .expect("curl resolves");
@@ -17348,7 +17553,7 @@ inference:
                 data: Some(r#"{"command":"--version"}"#.to_string()),
                 log_path: None,
             },
-            tmp.path(),
+            &WorkdirRoot::open(tmp.path()).unwrap(),
             &policy,
         )
         .is_none());
@@ -17358,7 +17563,7 @@ inference:
                 data: Some(r#"{"nope":1}"#.to_string()),
                 log_path: None,
             },
-            tmp.path(),
+            &WorkdirRoot::open(tmp.path()).unwrap(),
             &policy,
         )
         .is_none());
@@ -17383,8 +17588,13 @@ inference:
             log_path: None,
         };
 
-        let resolved =
-            resolve_shell_call("just", &input, tmp.path(), &policy).expect("just resolves");
+        let resolved = resolve_shell_call(
+            "just",
+            &input,
+            &WorkdirRoot::open(tmp.path()).unwrap(),
+            &policy,
+        )
+        .expect("just resolves");
         let outcome = dispatch_shell_tool(
             "just",
             input,
@@ -17598,6 +17808,152 @@ inference:
         assert!(check_native_artifact_egress_namespace(&with_shell, true, blocker).is_ok());
     }
 
+    /// `install.tool` can match a native tool a pull installs, so it is a subprocess route at
+    /// staging; `install.skill` installs nothing that runs. A capsule refused at staging for its
+    /// install grant is not refused a second time after it.
+    #[test]
+    fn native_artifact_egress_counts_install_tool_at_staging_and_not_twice() {
+        let blocker = Some(crate::network_namespace::EgressNamespaceBlocker::KernelSupportMissing);
+        let tool_grant = CapabilityPolicy {
+            install_tool: vec!["local/tool-*".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let skill_grant = CapabilityPolicy {
+            install_skill: vec!["local/skill-*".to_string()],
+            ..CapabilityPolicy::default()
+        };
+
+        assert!(has_subprocess_route_at_staging(&tool_grant));
+        assert!(!has_subprocess_route_at_staging(&skill_grant));
+        assert!(matches!(
+            crate::network_namespace::check_egress_namespace(
+                has_subprocess_route_at_staging(&tool_grant),
+                blocker
+            ),
+            Err(RuntimeError::EgressNamespaceUnavailable { .. })
+        ));
+        assert!(crate::network_namespace::check_egress_namespace(
+            has_subprocess_route_at_staging(&skill_grant),
+            blocker
+        )
+        .is_ok());
+        // Already refused at staging, so `launch` does not ask again.
+        assert!(check_native_artifact_egress_namespace(&tool_grant, true, blocker).is_ok());
+        assert!(matches!(
+            check_native_artifact_egress_namespace(&skill_grant, true, blocker),
+            Err(RuntimeError::EgressNamespaceUnavailable { .. })
+        ));
+    }
+
+    /// The accessible workdir a delegated child opened is the directory its parent created, or
+    /// the launch is refused before anything is written beneath it.
+    #[test]
+    fn workdir_identity_refuses_a_directory_the_parent_did_not_create() {
+        use std::os::unix::fs::MetadataExt;
+
+        let created = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let meta = fs::metadata(created.path()).unwrap();
+        let identity = (meta.dev(), meta.ino());
+        let root = WorkdirRoot::open(created.path()).unwrap();
+        assert!(check_workdir_identity(&root, identity).is_ok());
+
+        let other_root = WorkdirRoot::open(other.path()).unwrap();
+        match check_workdir_identity(&other_root, identity) {
+            Err(RuntimeError::WorkdirIdentityMismatch {
+                workdir,
+                expected,
+                found,
+            }) => {
+                assert_eq!(workdir, other.path().display().to_string());
+                assert_eq!(expected, format!("{}:{}", identity.0, identity.1));
+                assert_ne!(found, expected);
+            }
+            other => panic!("expected a mismatch, got {other:?}"),
+        }
+        assert_eq!(fs::read_dir(other.path()).unwrap().count(), 0);
+    }
+
+    /// The identity flag round-trips and refuses anything that is not `<dev>:<ino>`.
+    #[test]
+    fn workdir_identity_flag_parses_dev_and_ino() {
+        let identity = (2049, 1234567);
+        assert_eq!(
+            crate::child_launch::parse_workdir_identity(
+                &crate::child_launch::format_workdir_identity(identity)
+            ),
+            Ok(identity)
+        );
+        for bad in ["", "12", "a:b", "1:2:3", ":4"] {
+            assert!(
+                crate::child_launch::parse_workdir_identity(bad).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// The operator's task is imported once: `task.md` first, `input.txt` only off the process
+    /// transport, nothing over a task the runtime directory already holds, and a link is refused
+    /// rather than read.
+    #[test]
+    fn import_task_input_copies_the_operator_task_into_the_runtime_directory_once() {
+        let workdir = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let accessible_root = WorkdirRoot::open(workdir.path()).unwrap();
+        let runtime_root = WorkdirRoot::open(runtime.path()).unwrap();
+        let http = InferenceConfig {
+            transport: "http".into(),
+            ..task_io_inference_config()
+        };
+        let process = InferenceConfig {
+            transport: "process".into(),
+            ..task_io_inference_config()
+        };
+
+        fs::write(workdir.path().join("input.txt"), "from input.txt").unwrap();
+        import_task_input(&accessible_root, &runtime_root, &process);
+        assert!(!runtime.path().join("task.md").exists());
+        import_task_input(&accessible_root, &runtime_root, &http);
+        assert_eq!(
+            fs::read_to_string(runtime.path().join("task.md")).unwrap(),
+            "from input.txt"
+        );
+
+        fs::write(workdir.path().join("task.md"), "from task.md").unwrap();
+        import_task_input(&accessible_root, &runtime_root, &http);
+        assert_eq!(
+            fs::read_to_string(runtime.path().join("task.md")).unwrap(),
+            "from input.txt",
+            "a task the runtime directory holds is never replaced by an import"
+        );
+        fs::remove_file(runtime.path().join("task.md")).unwrap();
+        import_task_input(&accessible_root, &runtime_root, &http);
+        assert_eq!(
+            fs::read_to_string(runtime.path().join("task.md")).unwrap(),
+            "from task.md"
+        );
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("task.md")).unwrap(),
+            "from task.md",
+            "the operator's file is left where it is"
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret"), "operator data").unwrap();
+        fs::remove_file(workdir.path().join("task.md")).unwrap();
+        fs::remove_file(runtime.path().join("task.md")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret"),
+            workdir.path().join("task.md"),
+        )
+        .unwrap();
+        import_task_input(&accessible_root, &runtime_root, &http);
+        assert!(!runtime.path().join("task.md").exists());
+        let refusals = accessible_root.take_refusals();
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert_eq!(refusals[0].path, "task.md");
+    }
+
     // ── the tool-result fence ───────────────────────────────────────────────
 
     fn tool_result_with(
@@ -17803,6 +18159,7 @@ inference:
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                     crate::cgroup::IoMaxReport::default(),
                 ),
                 murmur_artifact::TraceCapture::Meta,
@@ -18415,7 +18772,8 @@ inference:
                 None,
                 None,
                 &[],
-                &CapabilityPolicy::default()
+                &CapabilityPolicy::default(),
+                None
             )
             .is_err(),
             "an unscoped tool preopens the workdir, which must exist"
@@ -18427,6 +18785,7 @@ inference:
             None,
             &[],
             &CapabilityPolicy::default(),
+            None,
         )
         .expect("an existing workdir preopens as before");
         assert!(
@@ -18449,6 +18808,7 @@ inference:
             None,
             &[],
             &CapabilityPolicy::default(),
+            None,
         )
         .expect("a granted scope is created and preopened");
 
@@ -18471,7 +18831,7 @@ inference:
         std::fs::write(root.path().join("cache"), b"not a directory").unwrap();
 
         let policy = CapabilityPolicy::default();
-        let err = match build_wasi_ctx(root.path(), Some("cache"), None, None, &[], &policy) {
+        let err = match build_wasi_ctx(root.path(), Some("cache"), None, None, &[], &policy, None) {
             Ok(_) => panic!("an uncreatable scope must fail loudly"),
             Err(err) => err,
         };
@@ -18501,6 +18861,7 @@ inference:
             invoke_tool_component(
                 ToolInvokeEnv {
                     engine: &engine,
+                    runtime_dir: None,
                     accessible_workdir: workdir.path(),
                     inference_env: &[],
                     capability_policy: &CapabilityPolicy::default(),
@@ -18546,6 +18907,7 @@ inference:
             invoke_tool_component(
                 ToolInvokeEnv {
                     engine: &engine,
+                    runtime_dir: None,
                     accessible_workdir: workdir.path(),
                     inference_env: &[],
                     capability_policy: &CapabilityPolicy::default(),
@@ -19150,6 +19512,7 @@ inference:
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                 crate::cgroup::IoMaxReport::default(),
             ),
             murmur_artifact::TraceCapture::Meta,
@@ -19588,6 +19951,7 @@ inference:
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                 crate::cgroup::IoMaxReport::default(),
             ),
             murmur_artifact::TraceCapture::Meta,
@@ -22439,6 +22803,7 @@ inference:
 
         crate::murmur_md::write_murmur_md(
             &state.session_root,
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -22462,16 +22827,7 @@ inference:
     fn workdir_path_refused_read_absent_task_is_empty_and_unrefused() {
         let planted = Planted::new();
         let state = planted.state();
-        for transport in ["http", "process"] {
-            let inference = InferenceConfig {
-                transport: transport.into(),
-                ..task_io_inference_config()
-            };
-            assert_eq!(
-                agent::fresh_task_text(&inference, &state.accessible_root),
-                ""
-            );
-        }
+        assert_eq!(agent::fresh_task_text(&state.runtime_root), "");
         assert!(state.accessible_root.take_refusals().is_empty());
     }
 

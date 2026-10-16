@@ -361,20 +361,32 @@ fn two_callees_work_at_once_each_in_its_own_directory() {
     await_task_start(&reviewer_dir.join(".murmur"), "reviewer");
     project.await_requests("worker", 1);
     project.await_requests("reviewer", 1);
-    let read =
-        |path: PathBuf| std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
-    assert_eq!(read(project.path().join("task.md")), LEAD_TASK);
-    assert_eq!(read(worker_dir.join("task.md")), WORKER_TASK);
-    assert_eq!(read(reviewer_dir.join("task.md")), REVIEWER_TASK);
+    // Each callee was handed its own task, in its own session's runtime directory: nothing is
+    // written into a member's workdir for it.
+    let task_of = |member: &str| common::last_user_text(&project.model(member).requests()[0]);
+    assert!(
+        task_of("worker").contains(WORKER_TASK),
+        "{}",
+        task_of("worker")
+    );
+    assert!(
+        task_of("reviewer").contains(REVIEWER_TASK),
+        "{}",
+        task_of("reviewer")
+    );
+    assert!(!worker_dir.join("task.md").exists());
+    assert!(!reviewer_dir.join("task.md").exists());
 
     release_worker.send(()).unwrap();
     release_reviewer.send(()).unwrap();
     let status = launcher.wait();
     assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
-    assert_eq!(read(project.path().join("task.md")), LEAD_TASK);
+    // The callees' tasks did not replace the lead's.
+    let requests = project.model("lead").requests();
+    assert!(common::last_user_text(&requests[0]).contains(LEAD_TASK));
+    assert!(!project.path().join("task.md").exists());
 
     // Lead's last request carries the whole conversation: both answers, each under its member.
-    let requests = project.model("lead").requests();
     let last = requests.last().unwrap().to_string();
     for (member, answer) in [("worker", "WORKER-ANSWER"), ("reviewer", "REVIEWER-ANSWER")] {
         let fenced = format!("<untrusted-content source=member:{member}>\\n{answer}");

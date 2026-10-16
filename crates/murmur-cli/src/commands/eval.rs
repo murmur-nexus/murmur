@@ -691,6 +691,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             formation_id: None,
             formation_member: None,
             source_supply: source_supply.clone(),
+            expected_workdir_identity: None,
         };
 
         let staged = match stage_session(Arc::clone(&local_registry), stage_request) {
@@ -737,7 +738,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             }
         }
 
-        // Copy case task to workdir/task.md
+        // Copy the case task into the runtime directory's task.md
         let task_path = Path::new(&case.task_path);
         if task_path.exists() {
             let copied = fs::read(task_path)

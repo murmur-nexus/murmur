@@ -1231,7 +1231,7 @@ mur run --roster [<path>] [--task <path-or-text>] [--json]
 | `--capsule` | — | Run an installed artifact by its full name, `<scope>/<name>`, instead of a project directory; a bare name is refused with [`E-REG-007`](diagnostics.md#e-reg-007). Requires `--capsule-version`, and cannot be combined with an explicitly given `--manifest`. The capsule is resolved from the project store and then the global store, and staged from the artifact bytes in memory: no `murmur.yaml` is read from disk, and no `murmur.lock` is read or written. This is the form a parent capsule's runtime launches a delegated child on |
 | `--capsule-version` | — | Version of the `--capsule` artifact. Required with `--capsule` |
 | `--spawn-grant-stdin` | off | Read one line from standard input as this launch's spawn approval, and present it when the session registers with `mur-roost`. Set by a parent capsule's runtime when it launches a delegated child. Standard input rather than an argument or an environment variable, both of which any process running as the same user can read out of `/proc` |
-| `--task` | — | Written to the capsule workdir as `task.md` before launch. An existing file path is copied; any other value is written verbatim as UTF-8 text |
+| `--task` | — | Written as `task.md` in the session's [runtime directory](workdir.md#runtime-directory) before launch; the workdir is left alone. An existing file path is copied; any other value is written verbatim as UTF-8 text |
 | `--context` | a fresh `ctx_…` per task | Context id this run's task runs under. Two runs given the same id continue one [conversation record](workdir.md#the-conversation-record), whichever session directory each got. One path segment: no `/`, no `.` or `..`, not absolute, not starting with a dot — anything else refuses the launch with [`E-CAP-011`](diagnostics.md#e-cap-011) |
 | `--resume` | `@1` when the flag is given with no value | Session whose conversation this run continues, as a [session address](#session-addresses). Resolves that session's context id and runs under it, so it is `--context` with the id looked up for you. Loads the [conversation record](workdir.md#the-conversation-record) — or, under [`transport: process`](manifest.md#transport-process), hands the harness the session id that context's [harness session map](workdir.md#harness-session-map) holds — even when the capsule declares `lifecycle.conversation: stateless`. A context with neither refuses the launch with [`E-RUN-017`](diagnostics.md#e-run-017). Passing it together with `--context` refuses the launch with [`E-RUN-015`](diagnostics.md#e-run-015). Reads the named session's `trace.jsonl` only as far as its first task, so a session whose process was killed — leaving the file ending mid-record — still resumes. [`mur trace show`](#mur-trace-show) over that same file skips the torn last line and says so |
 | `--resume-mode` | `full` | How `--resume` puts the loaded conversation in front of the model. `full` loads the record verbatim; `compact` runs the capsule's `on-compaction` hook over it first and continues from the summary, which is the answer when the conversation would not fit the context window at all. `full` is often the cheaper of the two: a verbatim reload can hit the provider's prompt cache, while compaction changes the prefix from the first altered token, guarantees a cache miss, and costs an extra inference call to produce the summary. `compact` with no hook bound to `on-compaction` refuses the launch with [`E-RUN-018`](diagnostics.md#e-run-018), and `compact` under [`transport: process`](manifest.md#transport-process) — where the harness holds the history and murmur has none to summarize — with [`E-RUN-037`](diagnostics.md#e-run-037) |
@@ -1312,7 +1312,7 @@ Current runtime constraints:
 - `mur run` accepts all four artifact runtimes: `tool`, `driver`, `hook`, and `skill`
 - `tool` artifacts are exposed as model-callable tools; `driver`, `hook`, and `skill` artifacts are staged for runtime use but are hidden from the model's tool inventory
 - `tool` artifacts are offered to the model under their bare name, the part after the `/`: `murmur/tool-git` is the tool `tool-git`. Two declared artifacts with one bare name are refused with [`E-CAP-020`](diagnostics.md#e-cap-020)
-- `skill` artifacts install `skill.md` to `tools/<name>/skill.md` in the workdir, `<name>` being the bare name; the agent reads them voluntarily via filesystem access
+- `skill` artifacts install `skill.md` to `tools/<name>/skill.md` in the session's [runtime directory](workdir.md#runtime-directory), `<name>` being the bare name; the agent reads them by calling the skill, or at `$MURMUR_RUNTIME_DIR/tools/<name>/skill.md`
 - Capsule component discovery:
   - prefers `capsule.wasm`
   - otherwise requires exactly one root `*.wasm`
@@ -3006,13 +3006,13 @@ mur eval run <capsule-dir> --dataset <dataset.jsonl>
 | Field | Required | Description |
 |---|---|---|
 | `case_id` | yes | Identifier passed as `MURMUR_CASE_ID` to hooks; appears in `dataset_run` records |
-| `task_path` | yes | File to copy into the capsule's `workdir/task.md` before session launch |
+| `task_path` | yes | File to copy into the session's `task.md` before launch |
 | `expected` | no | Scorer-defined; ignored by current deterministic scorers; reserved for future `llm_judge` |
 
 **What happens per case:**
 
 1. Stages the capsule session with `case_id` and `dataset_id` injected into the hook environment.
-2. Copies `task_path` to `workdir/task.md`. If the file does not exist, a warning is printed and the session runs without it.
+2. Copies `task_path` to `task.md` in the session's [runtime directory](workdir.md#runtime-directory). If the file does not exist, a warning is printed and the session runs without it.
 3. Launches the session.
 4. Reads `workdir/eval.jsonl` from the resulting session workdir.
 5. Prints a result line: `result: pass|fail|no_scores  session: <id>`.

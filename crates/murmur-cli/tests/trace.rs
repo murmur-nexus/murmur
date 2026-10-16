@@ -676,10 +676,15 @@ fn session_start_effective_grants_match_explain_scope_json() {
 
     let manifest_path = create_grants_manifest(project.path(), &server.endpoint);
 
-    // The read-only diagnostic first: it stages nothing, so it cannot disturb the run below.
+    // Staged first, so the diagnostic below runs under the home this process stages under: the
+    // runtime directory's path is the one field that names the home.
+    let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
+    let process_home = std::env::var_os("HOME").expect("staging set HOME");
+
+    // The read-only diagnostic stages nothing, so it cannot disturb the run below.
     let explain_stdout = assert_cmd::Command::cargo_bin("mur")
         .unwrap()
-        .env("HOME", home.path())
+        .env("HOME", &process_home)
         .current_dir(project.path())
         .args([
             "run",
@@ -696,7 +701,6 @@ fn session_start_effective_grants_match_explain_scope_json() {
     let explain_report: Value =
         serde_json::from_str(String::from_utf8(explain_stdout).unwrap().trim()).unwrap();
 
-    let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
     let workdir = staged.workdir.clone();
     fs::write(workdir.join("task.md"), "Report and stop.").unwrap();
 

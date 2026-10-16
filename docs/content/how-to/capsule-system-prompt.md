@@ -158,7 +158,8 @@ inference:
   system_prompt_artifact: local/code-review-conventions
 ```
 
-At launch, the runtime reads `workdir/tools/code-review-conventions/skill.md` and uses that content as the system prompt for every inference turn. The skill is **not** added to the callable tool inventory — it is already in context and would double-inject if called.
+At launch, the runtime reads the skill's `skill.md` from the session's
+[runtime directory](../reference/workdir.md#runtime-directory) and uses that content as the system prompt for every inference turn. The skill is **not** added to the callable tool inventory — it is already in context and would double-inject if called.
 
 `MURMUR.md` notes the binding so the agent is aware:
 

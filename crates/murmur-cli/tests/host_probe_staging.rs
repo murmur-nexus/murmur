@@ -59,6 +59,7 @@ fn requested_from(manifest: &RuntimeManifest) -> Vec<ArtifactRequest> {
 fn stage_request(capsule_dir: &TempDir, manifest: &RuntimeManifest) -> StageRequest {
     StageRequest {
         source_supply: None,
+        expected_workdir_identity: None,
         credentials_file: None,
         manifest_dir: capsule_dir.path().to_path_buf(),
         capsule_name: manifest.name.clone(),

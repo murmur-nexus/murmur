@@ -685,6 +685,7 @@ pub(crate) struct HookEnvVars<'a> {
 pub(crate) fn dispatch_stage(
     engine: &wasmtime::Engine,
     workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     staged_hooks: &[StagedHookArtifact],
     shell_allow: Vec<String>,
     env_vars: &HookEnvVars<'_>,
@@ -722,7 +723,7 @@ pub(crate) fn dispatch_stage(
                             for m in manifests {
                                 // A refusal here is on the latch `stage_session` drains, which
                                 // fails the launch.
-                                if let Err(e) = workdir.write_file(
+                                if let Err(e) = runtime_root.write_file(
                                     format!("tools/{}/{PACKED_MANIFEST_ENTRY}", m.binary_name),
                                     m.content.as_bytes(),
                                     DEFAULT_FILE_MODE,
@@ -4076,6 +4077,7 @@ mod tests {
         dispatch_stage(
             &engine,
             &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
             std::slice::from_ref(&staged),
             Vec::new(),
             &HookEnvVars::default(),
@@ -4150,6 +4152,7 @@ mod tests {
         on_stage.config.binding = HookBinding::OnStage;
         dispatch_stage(
             &engine,
+            &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
             std::slice::from_ref(&on_stage),
             Vec::new(),
@@ -5951,6 +5954,7 @@ artifacts:
         dispatch_stage(
             &engine,
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             std::slice::from_ref(&staged),
             Vec::new(),
             &HookEnvVars::default(),
@@ -5989,6 +5993,7 @@ artifacts:
 
         dispatch_stage(
             &engine,
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             std::slice::from_ref(&staged),
             Vec::new(),

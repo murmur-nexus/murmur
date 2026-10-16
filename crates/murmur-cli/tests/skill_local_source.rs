@@ -84,6 +84,7 @@ fn local_source_file_path_installs_skill_md() {
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -123,7 +124,7 @@ fn local_source_file_path_installs_skill_md() {
     .unwrap();
 
     let installed = staged
-        .workdir
+        .runtime_dir
         .join("tools")
         .join("my-skill")
         .join("skill.md");
@@ -156,6 +157,7 @@ fn local_source_directory_path_finds_skill_md_case_insensitively() {
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -194,7 +196,11 @@ fn local_source_directory_path_finds_skill_md_case_insensitively() {
     )
     .unwrap();
 
-    let installed = staged.workdir.join("tools").join("other").join("skill.md");
+    let installed = staged
+        .runtime_dir
+        .join("tools")
+        .join("other")
+        .join("skill.md");
     assert!(installed.exists(), "skill.md not installed from directory");
     assert_eq!(fs::read_to_string(&installed).unwrap(), "# Dir Skill\n");
 }
@@ -239,6 +245,7 @@ fn local_source_coexists_with_registry_skill() {
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -278,13 +285,13 @@ fn local_source_coexists_with_registry_skill() {
     .unwrap();
 
     assert!(staged
-        .workdir
+        .runtime_dir
         .join("tools")
         .join("reg-skill")
         .join("skill.md")
         .exists());
     assert!(staged
-        .workdir
+        .runtime_dir
         .join("tools")
         .join("local-skill")
         .join("skill.md")

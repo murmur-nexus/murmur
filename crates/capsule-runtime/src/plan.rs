@@ -137,6 +137,10 @@ pub struct SchedulerContext<'a> {
     /// [`Self::accessible_workdir`] without it. Where a `shell` step's synthetic `$HOME` and, on
     /// a sealed host, its `/tmp` and `/etc` staging live.
     pub session_workdir: WorkdirRoot,
+    /// The session's runtime directory and its siblings: the plan file is read from
+    /// `runtime/plans/`, and every `shell` step is told the directory through
+    /// `$MURMUR_RUNTIME_DIR` and may read it and not change it, as the session's own commands may.
+    pub runtime_dir: crate::runtime_dir::RuntimeDirRoots,
     pub capability_policy: CapabilityPolicy,
     pub installed_tools: HashSet<String>,
     pub capsule_versions: HashMap<String, String>,
@@ -282,12 +286,13 @@ fn execute_inner(
     started: Instant,
     session_netns: Option<Arc<SessionNetns>>,
 ) -> Result<ExecutionReport, (String, String)> {
-    // Read through the session root, never by path: the plan file is runtime-written, beneath a
-    // directory the capsule's own commands can write.
+    // Read through the runtime directory's root, never by path, from the directory no capsule
+    // command can write: the plan that runs is the plan that was validated.
+    let runtime_root = &ctx.runtime_dir.runtime;
     let relative = plan_path
-        .strip_prefix(ctx.session_workdir.path())
+        .strip_prefix(runtime_root.path())
         .unwrap_or(plan_path);
-    let raw = match ctx.session_workdir.read_to_string(relative) {
+    let raw = match runtime_root.read_to_string(relative) {
         Ok(Some(raw)) => raw,
         Ok(None) => {
             return Err((
@@ -389,7 +394,9 @@ fn execute_inner(
         ctx.capability_policy.containment_floor,
         sandbox::HostProbe::probe(),
     ) {
-        Ok(enforcement) => enforcement.with_host_bounding(cgroup_scope, workdir_guard),
+        Ok(enforcement) => enforcement
+            .with_host_bounding(cgroup_scope, workdir_guard)
+            .with_runtime_dir(ctx.runtime_dir.clone(), None),
         Err(error) => {
             let error = format!("failed to resolve shell subprocess sandbox enforcement: {error}");
             return Ok(refused_before_any_step(
@@ -1554,6 +1561,11 @@ mod tests {
         SchedulerContext {
             accessible_workdir: WorkdirRoot::open(&workdir).unwrap(),
             session_workdir: WorkdirRoot::open(&workdir).unwrap(),
+            runtime_dir: crate::runtime_dir::RuntimeDirRoots::new(
+                WorkdirRoot::open(&workdir).unwrap(),
+                WorkdirRoot::open(&workdir).unwrap(),
+                WorkdirRoot::open(&workdir).unwrap(),
+            ),
             capability_policy: CapabilityPolicy {
                 shell_allow: vec!["bash".to_string()],
                 spawn_allow: vec!["worker".to_string()],

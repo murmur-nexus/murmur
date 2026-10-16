@@ -79,6 +79,7 @@ pub mod retention;
 pub mod roster;
 pub mod running;
 pub mod runtime;
+pub mod runtime_dir;
 pub(crate) mod sandbox;
 pub mod sealed;
 pub mod security;
@@ -111,15 +112,19 @@ pub use artifact_config::{
 pub use artifact_supply::{SourceSupply, SourcedArtifact};
 pub use containment::{
     applied_mechanism, check_containment_floor, containment_shortfall_reason,
-    detect_achieved_containment, detect_sealed_blocker, detect_userns_grant, explain_scope,
-    install_from_places, read_only_advisory_for, render_install, render_read_only,
-    ExportsFilesReport, FilesystemBoundaryReport, FilesystemRestriction, PreopenReport,
-    PreopenSurface, ScopeReport, StateStoreReport,
+    detect_achieved_containment, detect_sealed_blocker, detect_userns_grant, doctor_runtime_dir,
+    explain_scope, install_from_places, read_only_advisory_for, render_install, render_read_only,
+    render_runtime_dir, ExportsFilesReport, FilesystemBoundaryReport, FilesystemRestriction,
+    PreopenReport, PreopenSurface, RuntimeDirReport, ScopeReport, StateStoreReport,
 };
 pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
 pub use network_namespace::{
     check_egress_namespace, detect_egress_namespace_blocker, skip_without_egress_namespace,
     EgressNamespaceBlocker,
+};
+pub use runtime_dir::{
+    runtime_dir_inside_warning, runtime_dir_placement, RuntimeDirPlacement, RUNTIME_DIR_ENV,
+    RUNTIME_DIR_GUEST_PATH,
 };
 // `network_policy` is a private module; `preopen_reports` is re-exported because `mur run
 // --explain-scope` and `mur doctor` both resolve the preopen set the same way `stage_session`
@@ -154,8 +159,9 @@ pub use a2a::{
     A2A_VERSION_HEADER,
 };
 pub use child_launch::{
-    child_workdir_for, launch_child_capsule, ChildLaunchRequest, LaunchedChild, MUR_BINARY_ENV,
-    READINESS_TOKENS_FLAG,
+    child_workdir_for, format_workdir_identity, launch_child_capsule, parse_workdir_identity,
+    ChildLaunchRequest, LaunchedChild, MUR_BINARY_ENV, READINESS_TOKENS_FLAG,
+    WORKDIR_IDENTITY_FLAG,
 };
 // The delegation types and constants stay module-qualified beyond these: `Spawner` and
 // `SpawnerHandle` are what a caller of `launch_child_capsule` composes, and the rest of the

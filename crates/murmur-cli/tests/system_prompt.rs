@@ -272,16 +272,18 @@ fn cli_system_prompt_overrides_a_prompt_file_that_does_not_exist() {
 
 /// Overriding a `system_prompt_artifact` has to reach the two readers that never went through
 /// prompt resolution: the callable tool inventory, which excluded the skill, and MURMUR.md,
-/// which labelled it as bound. Both follow from clearing the field CLI-side.
+/// which labelled it as bound. Both follow from clearing the field CLI-side. MURMUR.md is read
+/// from inside the run, where it lives: in the runtime directory, removed when the session ends.
 #[test]
 fn cli_system_prompt_restores_an_overridden_prompt_artifact_to_the_inventory() {
     // Baseline: the manifest declaration alone binds the skill and hides it from the inventory.
-    let baseline = CliFixture::new(vec![one_turn_response()]);
-    let manifest_path = baseline
-        .write_manifest_with_skill(&format!("  system_prompt_artifact: local/{SKILL_NAME}\n"));
-    let baseline_workdir = baseline.run_ok(&manifest_path, &[]);
+    let baseline = CliFixture::new(read_murmur_md_responses());
+    let manifest_path = baseline.write_manifest_with_skill_and_bash(&format!(
+        "  system_prompt_artifact: local/{SKILL_NAME}\n"
+    ));
+    baseline.run_ok(&manifest_path, &[]);
 
-    let baseline_system = baseline.only_system_field();
+    let baseline_system = baseline.first_system_field();
     assert!(
         baseline_system.contains("Always answer in haiku."),
         "the skill's own text should be the system prompt; got:\n{baseline_system}"
@@ -290,15 +292,20 @@ fn cli_system_prompt_restores_an_overridden_prompt_artifact_to_the_inventory() {
         !tool_names(&baseline.requests()[0]).contains(&SKILL_NAME.to_string()),
         "a bound skill is not separately callable"
     );
-    assert!(murmur_md(&baseline_workdir).contains("bound as system prompt"));
+    let baseline_murmur_md = baseline.murmur_md();
+    assert!(
+        baseline_murmur_md.contains("bound as system prompt"),
+        "{baseline_murmur_md}"
+    );
 
     // Overridden: the skill is an ordinary callable skill again.
-    let fixture = CliFixture::new(vec![one_turn_response()]);
-    let manifest_path = fixture
-        .write_manifest_with_skill(&format!("  system_prompt_artifact: local/{SKILL_NAME}\n"));
+    let fixture = CliFixture::new(read_murmur_md_responses());
+    let manifest_path = fixture.write_manifest_with_skill_and_bash(&format!(
+        "  system_prompt_artifact: local/{SKILL_NAME}\n"
+    ));
     let workdir = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
 
-    let system_field = fixture.only_system_field();
+    let system_field = fixture.first_system_field();
     assert!(system_field.contains("CLI prompt"));
     assert!(
         !system_field.contains("Always answer in haiku."),
@@ -308,12 +315,37 @@ fn cli_system_prompt_restores_an_overridden_prompt_artifact_to_the_inventory() {
         tool_names(&fixture.requests()[0]).contains(&SKILL_NAME.to_string()),
         "the released skill should be back in the callable inventory"
     );
-    let murmur_md = murmur_md(&workdir);
+    let murmur_md = fixture.murmur_md();
+    assert!(murmur_md.contains("# MURMUR.md"), "{murmur_md}");
     assert!(
         !murmur_md.contains("bound as system prompt"),
         "MURMUR.md must not still call the skill bound; got:\n{murmur_md}"
     );
     assert_eq!(session_start(&workdir)["system_prompt_source"], "cli");
+}
+
+/// A turn that prints the runtime directory's MURMUR.md, then one that ends.
+fn read_murmur_md_responses() -> Vec<String> {
+    vec![
+        json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "test-model",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_murmur_md",
+                "name": "bash",
+                // `$(<file)` is bash's own read: no other binary needs granting.
+                "input": {"command": "echo \"$(<\"$MURMUR_RUNTIME_DIR/MURMUR.md\")\""}
+            }],
+            "stop_reason": "tool_use",
+            "stop_sequence": Value::Null,
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })
+        .to_string(),
+        one_turn_response(),
+    ]
 }
 
 /// The flag applies to a manifest that declared no prompt of its own — there is nothing to
@@ -529,14 +561,16 @@ impl CliFixture {
 
     /// A manifest that also declares the `house-style` skill, for the `system_prompt_artifact`
     /// tests.
-    fn write_manifest_with_skill(&self, inference_extra: &str) -> PathBuf {
+    /// A manifest declaring the skill, with `bash` granted, and `inference_extra` under
+    /// `inference:`.
+    fn write_manifest_with_skill_and_bash(&self, inference_extra: &str) -> PathBuf {
         let manifest_path = create_agent_manifest_full(
             self.project.path(),
             &self.server.endpoint,
             &format!(
                 "  - name: local/{SKILL_NAME}\n    version: {SKILL_VERSION}\n    runtime: skill\n"
             ),
-            "",
+            "  shell:\n    allow:\n      - bash\n",
             inference_extra,
             "",
         );
@@ -549,6 +583,18 @@ impl CliFixture {
         self.install(&skill);
         self.install_driver();
         manifest_path
+    }
+
+    /// The system field of the first request.
+    fn first_system_field(&self) -> String {
+        common::system_text(&self.server.requests()[0]["system"])
+            .expect("system field should be present")
+    }
+
+    /// The MURMUR.md the `read_murmur_md_responses` turn printed.
+    fn murmur_md(&self) -> String {
+        common::tool_result_text(&self.server.requests(), "toolu_murmur_md")
+            .expect("the MURMUR.md turn ran")
     }
 
     fn write_manifest_with_trailer(&self, inference_extra: &str, trailer: &str) -> PathBuf {
@@ -632,10 +678,6 @@ fn session_start(workdir: &Path) -> Value {
         .collect();
     assert_eq!(starts.len(), 1, "expected one session_start record");
     starts.into_iter().next().unwrap()
-}
-
-fn murmur_md(workdir: &Path) -> String {
-    fs::read_to_string(workdir.join("MURMUR.md")).unwrap()
 }
 
 fn tool_names(request: &Value) -> Vec<String> {

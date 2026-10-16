@@ -552,7 +552,6 @@ fn tokens_stay_out_of_the_session() {
     }
 
     assert!(workdir.join("trace.jsonl").exists());
-    assert!(workdir.join("MURMUR.md").exists());
     let stderr = run.stderr();
     for token in &tokens {
         assert_eq!(

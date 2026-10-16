@@ -96,6 +96,7 @@ pub const E_RUN_047: &str = "E-RUN-047"; // the capsule's bytes hash differently
 pub const E_RUN_048: &str = "E-RUN-048"; // `mur token` named a session whose door is public, which minted no token
 pub const E_RUN_049: &str = "E-RUN-049"; // `mur token --credential` named a credential the session did not mint
 pub const E_RUN_050: &str = "E-RUN-050"; // a runtime write, read, create or removal inside the workdir met a symbolic link or the wrong kind of file
+pub const E_RUN_051: &str = "E-RUN-051"; // a delegated child's --workdir is not the directory its parent created
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -356,6 +357,16 @@ impl From<RuntimeError> for CliError {
                     refusal.refused_at
                 ),
             ),
+            error @ RuntimeError::WorkdirIdentityMismatch { .. } => CliError::with_hint(
+                E_RUN_051,
+                error.to_string(),
+                "the delegating capsule's workdir changed under .murmur/children between the \
+                 directory's creation and this launch; nothing was written"
+                    .to_string(),
+            ),
+            error @ RuntimeError::RuntimeDirUnavailable { .. } => {
+                CliError::new(E_IO_003, error.to_string())
+            }
             RuntimeError::CreateWorkdir { path, source } => CliError::new(
                 E_IO_003,
                 format!("failed to create workdir at {path}: {source}"),

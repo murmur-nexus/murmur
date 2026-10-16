@@ -1,8 +1,9 @@
 # Runtime-provided tools
 
 A runtime-provided tool is an entry in the agent's tool inventory with no artifact behind it. The
-runtime writes its `murmur.yaml` into `workdir/tools/<name>/` while the session is staged, and
-answers the call itself.
+runtime writes its `murmur.yaml` into `tools/<name>/` in the session's
+[runtime directory](workdir.md#runtime-directory) while the session is staged, and answers the call
+itself.
 
 The model sees no difference. A runtime-provided tool has the same manifest shape, appears in the
 same inventory, and is called the same way as a tool artifact. What differs is where it comes from
@@ -36,7 +37,7 @@ hash-verified, and no entry appears for them in `murmur.lock` or in `mur list`.
 is consulted. The allowlist governs which tool *artifacts* may run; it has no say over these nine.
 
 **The gate is whether the manifest file was written at all.** With the grant absent, staging writes
-nothing under `workdir/tools/<name>/`, so:
+nothing under `tools/<name>/`, so:
 
 - The tool is absent from the inventory the model is sent.
 - It is absent from `session_start`'s `tools_declared` in [`trace.jsonl`](observability-schemas.md).

