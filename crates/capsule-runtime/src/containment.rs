@@ -556,8 +556,9 @@ pub struct ScopeReport {
     /// this capsule's own tools, shell allowlist and spawn grant without a turn in between.
     pub plan_submit: bool,
     /// `capabilities.install.skill`, verbatim: which skill artifacts a pull (`manage.pull`,
-    /// `pull-artifact`) may install into the session. Always serialized, an empty list included, on [`Self::plan_submit`]'s
-    /// terms: an absent key identifies a runtime that predates the grant.
+    /// `pull-artifact`) may install into the session. Always serialized, an empty list included,
+    /// on [`Self::plan_submit`]'s terms: an absent key identifies a runtime that predates the
+    /// grant.
     ///
     /// It opens no host resource of its own. A pulled skill adds text to what the model reads and
     /// gains no grant.
@@ -910,7 +911,7 @@ pub fn render_install(
 /// [`ScopeReport::install_from`] for `policy`: empty without an install grant.
 #[must_use]
 pub fn install_from_places(policy: &CapabilityPolicy) -> Vec<String> {
-    if policy.install_skill.is_empty() && policy.install_tool.is_empty() {
+    if !crate::install_grant::is_granted(policy) {
         return Vec::new();
     }
     let mut places = vec!["stores".to_string()];

@@ -245,7 +245,7 @@ Past the grant, a refusal opens with one of three further tokens:
 |---|---|---|
 | `not-found:` | No allowed place holds the version | `not-found: 'murmur/tool-editor@1.0.0' is in neither the project store nor the global store, and capabilities.install.from is [stores], so this capsule fetches from no source` |
 | `does-not-fit:` | The payload's interfaces do not fit the served level | `does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-editor@2.0.0' does not fit WIT level 1, the level this mur serves: …; murmur/tool-editor@1.0.0 is the newest version in the global store that fits level 1` |
-| `not-fetched:` | The scope's source could not be read or failed a check, or the scope's owner id differs from the one `murmur.lock` records | `not-fetched: [E-REG-010] the owner of scope 'ana' has changed: …` |
+| `not-fetched:` | The scope's source could not be read or failed a check, or the scope's owner id differs from the one `murmur.lock` records | `not-fetched: [E-REG-010] could not resolve ana/tool-editor@0.3.0: the owner of scope 'ana' has changed: …` |
 
 A version or hash that conflicts with an existing `murmur.lock` pin is refused with
 `murmur.lock conflict for '<name>': …`. A refused pull writes nothing: no file under `tools/`, no

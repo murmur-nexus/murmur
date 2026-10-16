@@ -60,7 +60,7 @@ Create a `murmur.yaml` file for a coding capsule that runs `git` and `cargo`, an
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
-          endpoint: https://api.openai.com
+          endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
 
     capabilities:
@@ -177,7 +177,7 @@ While the tool was installed, `murmur.lock` held its pin, written by the runtime
     owner_id: 190196424
 ```
 
-`origin: runtime` and `session` say which session pulled it. `owner_id` is the GitHub account that owns the `murmur` scope; a later pull or install from another owner of the scope is refused. The removal deleted the entry. An artifact the capsule pulled and kept stays pinned for the next launch.
+`origin: runtime` and `session` say which session pulled it. `owner_id` is the GitHub account that owns the `murmur` scope; a later pull or install from another owner of the scope is refused. The removal deleted the entry. An artifact the capsule pulled and did not remove keeps its pin, but the next launch stages it only if `murmur.yaml` declares it — see [Pin origin](../reference/workdir.md#lock-origin).
 
 Read the trace:
 

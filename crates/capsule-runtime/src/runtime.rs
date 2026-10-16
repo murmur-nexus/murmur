@@ -6687,8 +6687,9 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
     /// How many times this session's installed set has changed since launch. `0` at
     /// construction and moved by exactly one by every pull and removal (`manage.*` or the agent's
-    /// `pull-artifact` / `remove-artifact`) that changes the installed set; a refused call leaves it alone. A `remove` whose directory
-    /// cannot be deleted still moves it, since the name is already out of the session. The agent
+    /// `pull-artifact` / `remove-artifact`) that changes the installed set; a refused call leaves
+    /// it alone. A removal whose directory cannot be deleted still moves it, since the name is
+    /// already out of the session. The agent
     /// loop compares it with the generation its held tool array was built at
     /// (`agent::inventory::HeldInventory`), so any path that adds or removes an artifact under
     /// `workdir/tools/` must move it too, or the model is never offered the change.
@@ -6697,7 +6698,8 @@ pub(crate) struct CapsuleStoreState {
     /// [`StagedSession::installed_artifacts`] at construction and never changed. A removal
     /// refuses every one of them: the next launch fails without their `murmur.lock` entries.
     pub(crate) declared_artifacts: HashSet<String>,
-    /// The names a removal took out of this session and no later pull reinstalled. `invoke()` and the agent-loop dispatch refuse a call to one with
+    /// The names a removal took out of this session and no later pull reinstalled. `invoke()`
+    /// and the agent-loop dispatch refuse a call to one with
     /// [`crate::artifact_removal::called_after_removal`].
     pub(crate) removed_artifacts: HashSet<String>,
     /// The tool names whose malformed `input_schema` has already been named in `W-RUN-004` this
