@@ -1674,7 +1674,7 @@ mod tests {
         assert!(
             cli.message.starts_with(
                 "artifact 'ana/tool-x@0.3.0' does not fit WIT level 1, the level this mur serves: \
-                 it imports murmur:tool/run@9.9.9"
+                 it names murmur:tool/run@9.9.9, and level 1 has murmur:tool@0.1.0"
             ),
             "{}",
             cli.message

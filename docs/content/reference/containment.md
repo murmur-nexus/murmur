@@ -643,10 +643,9 @@ that is bypassed, not the daemon.
   `Connection refused`.
 - **A runtime killed with `SIGKILL` still ends its session's processes.** Each session's cgroup
   scope has a watcher process that kills everything in the scope as soon as the runtime is gone,
-  however it died: `SIGKILL`, the OOM killer, or a crash. Processes still escape when the host
-  itself goes down, when the watcher is killed too (for example by a `SIGKILL` sent to every
-  process of the user), and on macOS, which has no cgroups. Find those with `pgrep` and end them
-  by hand.
+  however it died: `SIGKILL`, the OOM killer, or a crash. Processes outlive the runtime when the
+  watcher is killed too (for example by a `SIGKILL` sent to every process of the user), and on
+  macOS, which has no cgroups. Find those with `pgrep` and end them by hand.
 - **The address→name binding has a lifetime.** A connection is matched to a name through the
   answer the runtime's own resolver gave. The binding lasts five minutes, longer than the
   60-second TTL the resolver puts on its answers. A client that caches an address far past its TTL

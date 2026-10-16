@@ -991,19 +991,9 @@ mod tests {
 
     #[test]
     fn generator_pins_match_the_docs() {
-        let mkdocs =
-            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/mkdocs.yml"))
-                .unwrap();
         for artifact in &GENERATOR_ARTIFACTS {
             let docs_key = artifact.name.replace(['/', '-'], "_");
-            let prefix = format!("{docs_key}:");
-            let docs = mkdocs
-                .lines()
-                .map(str::trim)
-                .find_map(|line| line.strip_prefix(prefix.as_str()))
-                .unwrap_or_else(|| panic!("no {docs_key} in docs/mkdocs.yml"))
-                .trim()
-                .trim_matches('"');
+            let docs = crate::published_pins::docs_pin(&docs_key);
             assert_eq!(
                 artifact.version, docs,
                 "the generator pins {}@{}, and docs/mkdocs.yml extra.v.{docs_key} is {docs}",

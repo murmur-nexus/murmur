@@ -67,7 +67,7 @@ A platform tag in an asset is the publisher's declaration of which platform thos
 
 ### Version selection { #version-selection }
 
-A version fits this `mur` when every `murmur:` interface it names is one the [WIT level](wit-levels.md) this `mur` serves lists at that exact version. The same rule [`mur search`](cli.md#mur-search) lists by.
+A version fits this `mur` when every `murmur:` interface it names is one the [WIT level](wit-levels.md) this `mur` serves lists at that exact version. [`mur search`](cli.md#mur-search) lists by the same rule.
 
 | Reference | Version installed |
 |---|---|

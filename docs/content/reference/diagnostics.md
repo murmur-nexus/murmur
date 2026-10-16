@@ -766,7 +766,7 @@ At staging:
 The message names the artifact, the served level, and one clause per interface that does not fit:
 
 ```text
-error[E-WIT-LEVEL-001]: artifact 'ana/tool-x@2.0.0' does not fit WIT level 1, the level this mur serves: it imports murmur:tool/run@9.9.9, and level 1 has murmur:tool@0.1.0
+error[E-WIT-LEVEL-001]: artifact 'ana/tool-x@2.0.0' does not fit WIT level 1, the level this mur serves: it names murmur:tool/run@9.9.9, and level 1 has murmur:tool@0.1.0
   hint: ana/tool-x@1.0.0 is the newest version in github:ana/artifacts's index that fits level 1; pin it in murmur.yaml and run `mur install`, or run `mur install ana/tool-x@1.0.0`
 ```
 
@@ -775,11 +775,13 @@ error[E-WIT-LEVEL-001]: artifact 'ana/process-driver@1.0.0' does not fit WIT lev
 ```
 
 A clause reads `it exports|imports <interface>, and level <N> has <package>@<version>`, or
-`…, and level <N> has no version of <package>` for a package the level does not list.
+`…, and level <N> has no version of <package>` for a package the level does not list. When
+`mur install` refuses a version from the source's index rather than from a stored payload, the
+clause reads `it names <interface>`: the index lists a version's interfaces without saying which
+it exports and which it imports.
 
 The hint names the newest version of the artifact in its scope's source index that fits the
-served level. The index is read only after the install or launch is refused, or already in hand
-from the install's own lookup, and no payload is downloaded:
+served level. Finding it downloads no payload:
 
 | Situation | Hint |
 |---|---|

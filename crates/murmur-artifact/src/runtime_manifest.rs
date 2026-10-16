@@ -4704,11 +4704,6 @@ fn parse_state_capabilities(raw: RawStateCapabilities) -> StateCapabilities {
     }
 }
 
-/// Lower and validate `capabilities.shell.interpreter_runtime`. Every rejection is an
-/// [`RuntimeManifestError::InvalidCapabilities`] naming the offending value, matching the rest
-/// of this file's "structurally present but semantically invalid" reporting. Nothing here can
-/// expand a whole install prefix: each grant names specific directories, and each directory
-/// carries an explicit `list_dir` the author had to write — enumerability is never inferred.
 /// Why `entry` is not a `capabilities.shell.allow` entry, which must be one path component: the
 /// binary's name, looked up on `PATH`, and the name of the tool the model calls. `None` for a
 /// bare binary name.
@@ -4728,6 +4723,11 @@ fn shell_allow_entry_error(entry: &str) -> Option<&'static str> {
     }
 }
 
+/// Lower and validate `capabilities.shell.interpreter_runtime`. Every rejection is an
+/// [`RuntimeManifestError::InvalidCapabilities`] naming the offending value, matching the rest
+/// of this file's "structurally present but semantically invalid" reporting. Nothing here can
+/// expand a whole install prefix: each grant names specific directories, and each directory
+/// carries an explicit `list_dir` the author had to write — enumerability is never inferred.
 fn parse_interpreter_runtime(
     allow: &[String],
     raw_grants: Vec<RawInterpreterRuntimeGrant>,

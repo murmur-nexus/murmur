@@ -84,6 +84,14 @@ fn docs_artifact_pins(mkdocs: &str) -> Vec<(String, String)> {
     pins
 }
 
+/// The `extra.v.<key>` pin `docs/mkdocs.yml` holds, such as `murmur_tool_editor`'s.
+pub(crate) fn docs_pin(key: &str) -> String {
+    docs_artifact_pins(&repo_file("docs/mkdocs.yml"))
+        .into_iter()
+        .find_map(|(pinned, version)| (pinned == key).then_some(version))
+        .unwrap_or_else(|| panic!("docs/mkdocs.yml has no extra.v.{key}"))
+}
+
 /// `murmur_tool_editor` → `murmur/tool-editor`.
 fn docs_key_artifact(key: &str) -> String {
     let rest = key.strip_prefix("murmur_").expect("a murmur_ key");

@@ -2301,7 +2301,7 @@ Every way a session ends — its task finishing, `SIGTERM`, a spawner or formati
 the commands it moved to the background. A runtime that is itself killed — `SIGKILL` or an
 out-of-memory kill — takes them with it on Linux: the session's cgroup scope has a watcher process
 that kills everything in it once the runtime is gone (see
-[Network reach limits](containment.md#network-reach-limits) for what still escapes). Either way,
+[Network reach limits](containment.md#network-reach-limits) for when they outlive it). Either way,
 nothing of their results survives: no exit code, no `logs/<work_id>.log`, no record of whether
 they finished. The work is a full run's compute spent for nothing, so
 `lifecycle.shell_grace_secs` is also a decision about how much compute one lost host can waste.

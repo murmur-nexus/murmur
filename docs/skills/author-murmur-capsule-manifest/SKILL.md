@@ -337,6 +337,8 @@ capabilities:
       - python3
 ```
 
+Each entry is a bare binary name, found on the `PATH` `mur run` starts with. A path such as `/opt/uv/bin/uv` is refused with `E-MAN-003` when the manifest is read; name the binary `uv` and put `/opt/uv/bin` on `PATH` instead.
+
 Prefer a structured Murmur tool over a raw binary when both accomplish the same job. Add shell only when the workload needs the general host executable.
 
 Use `strip_env` to remove sensitive/unnecessary subprocess environment variables. Keep only the baseline environment genuinely required by allowed commands.

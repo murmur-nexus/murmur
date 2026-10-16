@@ -6,9 +6,11 @@
 //! an artifact has been refused for exactly that reason.
 
 use capsule_runtime::{served_wit_level, RuntimeError};
-use murmur_artifact::{current_platform, ArtifactName, UnservedInterface, WitLevel};
+use murmur_artifact::{
+    current_platform, level_has_phrase, ArtifactName, UnservedInterface, WitLevel,
+};
 
-use crate::error::CliError;
+use crate::error::{CliError, E_WIT_LEVEL_001};
 use crate::source::{newest_fitting, Sources};
 
 /// The `PACKAGE  VERSION` table of `level`, one row per package in ascending order, each column
@@ -74,6 +76,10 @@ pub(crate) fn level_mismatch(
 
 /// [`level_mismatch`] for a version read from the index of `source`, which lists `fitting` as the
 /// newest version that fits; the index is not asked for again.
+///
+/// An index's `interfaces` merge exports and imports, so each clause reads `it names <interface>`:
+/// rendering [`RuntimeError::WitLevelMismatch`] here would claim a direction the index never
+/// recorded.
 pub(crate) fn index_level_mismatch(
     full_name: &str,
     version: &str,
@@ -82,14 +88,25 @@ pub(crate) fn index_level_mismatch(
     fitting: Option<&str>,
 ) -> CliError {
     let level = served_wit_level().level;
-    let mut error = CliError::from(RuntimeError::WitLevelMismatch {
-        name: full_name.to_string(),
-        version: version.to_string(),
-        level,
-        mismatched,
-    });
-    error.hint = Some(index_hint(full_name, source, fitting, level));
-    error
+    let clauses = mismatched
+        .iter()
+        .map(|mismatch| {
+            format!(
+                "it names {}, and {}",
+                mismatch.interface,
+                level_has_phrase(level, mismatch)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    CliError::with_hint(
+        E_WIT_LEVEL_001,
+        format!(
+            "artifact '{full_name}@{version}' does not fit WIT level {level}, the level this mur \
+             serves: {clauses}"
+        ),
+        index_hint(full_name, source, fitting, level),
+    )
 }
 
 /// The hint naming `fitting`, the newest version of `full_name` the index of `source` lists that

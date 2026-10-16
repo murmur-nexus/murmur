@@ -881,6 +881,8 @@ fn an_explicit_version_that_does_not_fit_is_refused_before_anything_is_fetched()
             &[&global],
         );
         assert_does_not_fit(&stderr);
+        // An index records no direction, so the clause claims none.
+        assert_contains(&stderr, &["it names murmur:tool/run@9.9.9"]);
         assert!(!stub.downloaded_a_payload(), "{args:?}: {:?}", stub.paths());
         assert!(!global.exists(), "{args:?} created the global store");
     }
@@ -912,6 +914,8 @@ fn an_explicit_version_that_does_not_fit_is_refused_before_anything_is_fetched()
             &[&global],
         );
         assert_does_not_fit(&stderr);
+        // A stored payload's component says which way it names the interface.
+        assert_contains(&stderr, &["it exports murmur:tool/run@9.9.9"]);
         assert!(!stub.downloaded_a_payload(), "{args:?}: {:?}", stub.paths());
     }
     assert!(!project.path().join(".murmur").exists());

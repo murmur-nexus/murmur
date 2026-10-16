@@ -894,7 +894,9 @@ impl ScopeWatcher {
             freeze: raw(&freeze),
             procs: raw(&procs),
         };
-        // Sorted and deduplicated here, before the fork: the child keeps exactly these.
+        // Sorted here, before the fork: the child keeps exactly these. The entries are distinct:
+        // Rust's startup opens 0-2 when they are closed, so every descriptor opened above is 3 or
+        // higher, and the child's `dup2` onto 0-2 replaces none of them.
         let mut keep = [-1 as libc::c_int; 7];
         let mut kept = 0;
         for fd in [
