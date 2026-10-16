@@ -19,6 +19,7 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
+            source_supply: None,
             credentials_file: None,
             manifest_dir: project.path().to_path_buf(),
             capsule_name: "test-no-driver".to_string(),

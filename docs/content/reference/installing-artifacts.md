@@ -92,7 +92,7 @@ These install the bytes they are given without the check; a launch refuses a dri
 | `mur install github:<owner>/<repo>@<tag>` | Every asset of the release is installed as published, with no index read |
 | `mur publish` | The file is stored as built |
 | `mur deploy` | It resolves for the `mur` the target runs, pinned by `deploy.mur_version`, whose level this `mur` cannot know |
-| A runtime pull (`manage.pull()`) | The capsule's own grant decides what it may install |
+| A runtime pull (`manage.pull()`, `pull-artifact`) | The capsule's own grant decides what it may install, and `capabilities.install.from` whether it may fetch from a source |
 
 ## Owner identity { #owner-identity }
 

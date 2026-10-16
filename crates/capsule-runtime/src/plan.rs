@@ -881,11 +881,14 @@ fn validate_plan(plan: &PlanFile, ctx: &SchedulerContext<'_>) -> Result<(), (Str
                         ),
                     ));
                 }
-                // The agent's own switch, and ending its task without an answer, are decisions
-                // it makes in a turn, which a plan step is not: the step would change the model,
-                // or end the task, under the turn that submitted the plan.
+                // The agent's own switch, ending its task without an answer, and pulling or
+                // removing an artifact are decisions it makes in a turn, which a plan step is
+                // not: the step would change the model, end the task, or change the session's
+                // tools under the turn that submitted the plan.
                 if tool == crate::runtime::SWITCH_DRIVER_TOOL
                     || tool == crate::runtime::END_WITHOUT_ANSWER_TOOL
+                    || tool == crate::runtime::PULL_ARTIFACT_TOOL
+                    || tool == crate::runtime::REMOVE_ARTIFACT_TOOL
                 {
                     return Err((
                         step.id.clone(),
@@ -1597,7 +1600,8 @@ mod tests {
     }
 
     /// The tools that are a turn's own decisions — switching the model, ending the task without
-    /// an answer — are refused as plan steps, before any step runs.
+    /// an answer, pulling or removing an artifact — are refused as plan steps, before any step
+    /// runs.
     #[test]
     fn a_turn_s_own_decisions_are_not_callable_from_a_plan() {
         let dir = tempdir().unwrap();
@@ -1608,6 +1612,8 @@ mod tests {
         for tool in [
             crate::runtime::SWITCH_DRIVER_TOOL,
             crate::runtime::END_WITHOUT_ANSWER_TOOL,
+            crate::runtime::PULL_ARTIFACT_TOOL,
+            crate::runtime::REMOVE_ARTIFACT_TOOL,
         ] {
             let plan: PlanFile = serde_json::from_value(json!({
                 "id": "p", "steps": [{"id": "s1", "tool": tool, "input": {"reason": "none"}}],

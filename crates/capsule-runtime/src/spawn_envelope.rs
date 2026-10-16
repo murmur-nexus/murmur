@@ -57,6 +57,7 @@ pub enum EnvelopeAxis {
     StateStore,
     InstallSkill,
     InstallTool,
+    InstallFrom,
     Containment,
 }
 
@@ -76,6 +77,7 @@ impl EnvelopeAxis {
             Self::StateStore => "capabilities.state.store",
             Self::InstallSkill => "capabilities.install.skill",
             Self::InstallTool => "capabilities.install.tool",
+            Self::InstallFrom => "capabilities.install.from",
             Self::Containment => "capabilities.containment",
         }
     }
@@ -177,6 +179,9 @@ pub struct SpawnEnvelope {
     pub install_skill: Vec<String>,
     /// `capabilities.install.tool`, verbatim, compared on [`Self::install_skill`]'s terms.
     pub install_tool: Vec<String>,
+    /// Whether `capabilities.install.from` names `sources`: a pull may fetch from a scope's
+    /// GitHub source, which a parent without it never does.
+    pub install_from_sources: bool,
     /// `capabilities.containment`. The one axis where more is *safer*, so it is the one axis
     /// compared with `>=` rather than by containment of a set — see [`Self::contains`].
     pub containment_floor: ContainmentClass,
@@ -203,6 +208,7 @@ impl SpawnEnvelope {
             state_stores: declared_state_stores(manifest),
             install_skill: policy.install_skill,
             install_tool: policy.install_tool,
+            install_from_sources: policy.install_from_sources,
             containment_floor: policy.containment_floor,
         }
     }
@@ -265,6 +271,9 @@ impl SpawnEnvelope {
         }
         if let Some(entry) = first_uncovered_install(&self.install_tool, &child.install_tool) {
             return Err(violation(EnvelopeAxis::InstallTool, entry));
+        }
+        if child.install_from_sources && !self.install_from_sources {
+            return Err(violation(EnvelopeAxis::InstallFrom, "sources".to_string()));
         }
         if child.containment_floor < self.containment_floor {
             return Err(EnvelopeViolation {
@@ -602,6 +611,29 @@ mod tests {
         let violation = parent.contains(&child_tool).unwrap_err();
         assert_eq!(violation.axis, EnvelopeAxis::InstallTool);
         assert_eq!(violation.entry, "local/style-rust");
+    }
+
+    /// `capabilities.install.from: [stores, sources]` reaches a scope's GitHub source; a child
+    /// declaring it under a parent that pulls from the stores alone is refused naming the key.
+    #[test]
+    fn a_child_fetching_from_sources_is_refused_under_a_parent_that_does_not() {
+        let stores = envelope("capabilities:\n  install:\n    tool: [\"*\"]\n");
+        let sources =
+            envelope("capabilities:\n  install:\n    tool: [\"*\"]\n    from: [stores, sources]\n");
+        assert!(!stores.install_from_sources && sources.install_from_sources);
+
+        let violation = stores.contains(&sources).unwrap_err();
+        assert_eq!(violation.axis, EnvelopeAxis::InstallFrom);
+        assert_eq!(violation.entry, "sources");
+        assert!(
+            violation.to_string().starts_with(
+                "capabilities.install.from: the child declares 'sources', which its parent does \
+                 not hold"
+            ),
+            "{violation}"
+        );
+        assert_eq!(sources.contains(&stores), Ok(()));
+        assert_eq!(sources.contains(&sources), Ok(()));
     }
 
     /// A child that declares no install block holds none, whatever its parent holds.

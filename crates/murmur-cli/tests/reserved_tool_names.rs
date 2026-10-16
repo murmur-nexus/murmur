@@ -1,5 +1,5 @@
-//! The four tool names the runtime answers itself are not available to artifacts, and a capsule
-//! that declares one is refused before anything is resolved, pulled or created.
+//! The tool names the runtime answers itself are not available to artifacts, and a capsule that
+//! declares one is refused before anything is resolved, pulled or created.
 //!
 //! Every case here runs the real `mur` binary against an empty artifact store. That the store is
 //! empty is the measurement: a missing-artifact error would mean the refusal came from the
@@ -128,6 +128,51 @@ fn the_refusal_does_not_depend_on_the_grant_that_provides_the_tool() {
                 "artifact '{}' has the tool name '{name}'",
                 common::local(name)
             )));
+    }
+}
+
+/// Every name the runtime answers itself, in the order `E-CAP-013` lists them.
+const ALL_RESERVED: [&str; 9] = [
+    "share-file",
+    "fetch-peer-file",
+    "delegate-task",
+    "submit-plan",
+    "switch-driver",
+    "call-member",
+    "end-without-answer",
+    "pull-artifact",
+    "remove-artifact",
+];
+
+/// The two artifact tools are reserved under any scope: an artifact a capsule declared, or one it
+/// pulled, could otherwise take the name the runtime answers a pull or a removal under.
+#[test]
+fn the_artifact_tools_are_reserved_under_any_scope() {
+    let home = tempfile::tempdir().unwrap();
+    for (full_name, tool) in [
+        ("local/pull-artifact", "pull-artifact"),
+        ("ana/remove-artifact", "remove-artifact"),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let path = manifest(project.path(), tool, "");
+        let yaml = fs::read_to_string(&path)
+            .unwrap()
+            .replace(&common::local(tool), full_name);
+        fs::write(&path, yaml).unwrap();
+
+        let assert = run(&home, &path)
+            .failure()
+            .stderr(predicate::str::contains("error[E-CAP-013]"))
+            .stderr(predicate::str::contains(format!(
+                "artifact '{full_name}' has the tool name '{tool}', which collides with a tool \
+                 the runtime provides itself"
+            )));
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        assert!(
+            stderr.contains(&ALL_RESERVED.join(", ")),
+            "the refusal lists all nine names: {stderr}"
+        );
+        assert!(!stderr.contains("E-REG-001"), "{stderr}");
     }
 }
 

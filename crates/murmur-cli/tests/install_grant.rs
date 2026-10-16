@@ -218,3 +218,99 @@ fn an_unscoped_install_entry_is_refused_with_its_scoped_forms() {
         }
     }
 }
+
+/// The `install from:` line, or `None` when a surface prints none.
+fn install_from_line(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("install from:"))
+        .map(str::to_string)
+}
+
+/// `capabilities.install.from` is printed by both surfaces in one voice and carried in the JSON
+/// report, `[]` for a capsule with no install grant, which prints no line.
+#[test]
+fn install_from_is_printed_by_both_surfaces_and_carried_in_json() {
+    let home = TempDir::new().unwrap();
+    for (from, line, json) in [
+        (
+            "",
+            Some("  install from: stores"),
+            serde_json::json!(["stores"]),
+        ),
+        (
+            "    from: [stores]\n",
+            Some("  install from: stores"),
+            serde_json::json!(["stores"]),
+        ),
+        (
+            "    from: [stores, sources]\n",
+            Some("  install from: stores, sources"),
+            serde_json::json!(["stores", "sources"]),
+        ),
+        (
+            "    from: [sources, stores]\n",
+            Some("  install from: stores, sources"),
+            serde_json::json!(["stores", "sources"]),
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        project(dir.path(), &format!("{DECLARED}{from}"));
+        let from_run = explain_scope(&home, dir.path(), &[]);
+        assert_eq!(install_from_line(&from_run).as_deref(), line, "{from_run}");
+        assert!(
+            from_run.contains(&format!("{DECLARED_LINES}{}\n", line.unwrap())),
+            "the line follows the install lists: {from_run}"
+        );
+        assert_eq!(
+            install_from_line(&doctor_stdout(&home, dir.path())).as_deref(),
+            line
+        );
+        let report: serde_json::Value =
+            serde_json::from_str(explain_scope(&home, dir.path(), &["--json"]).trim()).unwrap();
+        assert_eq!(report["install_from"], json, "{from:?}");
+    }
+
+    let silent = TempDir::new().unwrap();
+    project(silent.path(), "");
+    assert_eq!(
+        install_from_line(&explain_scope(&home, silent.path(), &[])),
+        None
+    );
+    assert_eq!(
+        install_from_line(&doctor_stdout(&home, silent.path())),
+        None
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(explain_scope(&home, silent.path(), &["--json"]).trim()).unwrap();
+    assert_eq!(report["install_from"], serde_json::json!([]));
+}
+
+/// A list without `stores`, an empty one, a duplicate and an unknown place are each refused,
+/// naming the key and the accepted values.
+#[test]
+fn install_from_refuses_every_other_list() {
+    for list in ["[]", "[sources]", "[stores, stores]", "[github]"] {
+        let home = TempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
+        project(dir.path(), &format!("{DECLARED}    from: {list}\n"));
+        let output = mur(
+            &home,
+            dir.path(),
+            &["run", "--manifest", "murmur.yaml", "--explain-scope"],
+        )
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("capabilities.install.from"),
+            "{list}: {stderr}"
+        );
+        assert!(
+            stderr.contains("expected [stores] or [stores, sources]"),
+            "{list}: {stderr}"
+        );
+    }
+}

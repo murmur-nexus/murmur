@@ -1484,6 +1484,37 @@ pub struct InstallCapabilities {
     pub skill: Vec<String>,
     /// Entries admitting tool artifacts, WASM or native alike.
     pub tool: Vec<String>,
+    /// `capabilities.install.from`: where a pull may find what it installs.
+    pub from: InstallFrom,
+}
+
+/// `capabilities.install.from`: the places a pull is answered from. Absent is
+/// [`InstallFrom::Stores`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InstallFrom {
+    /// `[stores]`: the project store, then the global store. A pull fetches nothing.
+    #[default]
+    Stores,
+    /// `[stores, sources]`: the stores first, then the GitHub source of the artifact's scope,
+    /// fetched by the runtime itself and written to no store.
+    StoresAndSources,
+}
+
+impl InstallFrom {
+    /// Whether a pull may fetch from a scope's source.
+    #[must_use]
+    pub fn sources(self) -> bool {
+        self == Self::StoresAndSources
+    }
+
+    /// The list as a manifest writes it, without brackets: `stores` or `stores, sources`.
+    #[must_use]
+    pub fn as_list(self) -> &'static str {
+        match self {
+            Self::Stores => "stores",
+            Self::StoresAndSources => "stores, sources",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2302,6 +2333,8 @@ struct RawInstallCapabilities {
     skill: Vec<String>,
     #[serde(default)]
     tool: Vec<String>,
+    #[serde(default)]
+    from: Option<Vec<String>>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2913,7 +2946,7 @@ impl RawBlock for RawPlanCapabilities {
 }
 
 impl RawBlock for RawInstallCapabilities {
-    const KNOWN_KEYS: &'static [&'static str] = &["skill", "tool"];
+    const KNOWN_KEYS: &'static [&'static str] = &["skill", "tool", "from"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
@@ -3601,6 +3634,7 @@ impl RuntimeManifest {
         }
         let capabilities = parse_capabilities(raw.capabilities)?;
         let inference = parse_inference(raw.inference)?;
+        refuse_install_under_process_transport(capabilities.as_ref(), inference.as_ref())?;
         validate_driver_gateways(&artifacts, inference.as_ref())?;
         validate_driver_choices(&artifacts, inference.as_ref())?;
         validate_process_driver_entry(&artifacts, inference.as_ref())?;
@@ -4683,9 +4717,70 @@ fn parse_install(raw: RawInstallCapabilities) -> Result<InstallCapabilities, Run
             })?;
         }
     }
+    let from = match raw.from {
+        None => InstallFrom::Stores,
+        Some(list) => parse_install_from(&list)?,
+    };
     Ok(InstallCapabilities {
         skill: raw.skill,
         tool: raw.tool,
+        from,
+    })
+}
+
+/// Refuse `capabilities.install` on a `transport: process` capsule: the pull and remove tools are
+/// offered through the http agent loop's tool array, which that transport never sends.
+fn refuse_install_under_process_transport(
+    capabilities: Option<&Capabilities>,
+    inference: Option<&InferenceConfig>,
+) -> Result<(), RuntimeManifestError> {
+    let installs = capabilities.is_some_and(|capabilities| capabilities.install.is_some());
+    let process = inference.is_some_and(|inference| inference.transport == "process");
+    if installs && process {
+        return Err(RuntimeManifestError::InvalidCapabilities {
+            field: "capabilities.install".to_string(),
+            message: "is not valid with transport: process; the harness owns its tool list, so a \
+                      pulled artifact could never reach it"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The values `capabilities.install.from` accepts, as its refusals name them.
+const INSTALL_FROM_ACCEPTED: &str = "[stores] or [stores, sources]";
+
+/// Lower `capabilities.install.from`: `stores` is required, `sources` optional, each at most
+/// once and in either order.
+fn parse_install_from(list: &[String]) -> Result<InstallFrom, RuntimeManifestError> {
+    let refuse = |message: String| RuntimeManifestError::InvalidCapabilities {
+        field: "capabilities.install.from".to_string(),
+        message: format!("{message}; expected {INSTALL_FROM_ACCEPTED}"),
+    };
+    if list.is_empty() {
+        return Err(refuse("is empty".to_string()));
+    }
+    let (mut stores, mut sources) = (false, false);
+    for entry in list {
+        let seen = match entry.as_str() {
+            "stores" => &mut stores,
+            "sources" => &mut sources,
+            other => return Err(refuse(format!("names {other:?}, which is not a place"))),
+        };
+        if *seen {
+            return Err(refuse(format!("names {entry:?} twice")));
+        }
+        *seen = true;
+    }
+    if !stores {
+        return Err(refuse(
+            "does not name stores, which every pull is answered from first".to_string(),
+        ));
+    }
+    Ok(if sources {
+        InstallFrom::StoresAndSources
+    } else {
+        InstallFrom::Stores
     })
 }
 
@@ -7434,6 +7529,7 @@ capabilities:
                     "murmur/*".into(),
                     "*".into()
                 ],
+                from: InstallFrom::Stores,
             })
         );
     }
@@ -7450,6 +7546,7 @@ capabilities:
             Some(InstallCapabilities {
                 skill: vec!["local/a".into()],
                 tool: vec![],
+                from: InstallFrom::Stores,
             })
         );
         let tool_only =
@@ -7460,6 +7557,7 @@ capabilities:
             Some(InstallCapabilities {
                 skill: vec![],
                 tool: vec!["local/b-*".into()],
+                from: InstallFrom::Stores,
             })
         );
     }
@@ -7471,6 +7569,97 @@ capabilities:
         )
         .expect("a capabilities block without install parses");
         assert_eq!(manifest.capabilities.unwrap().install, None);
+    }
+
+    fn install_from(list: &str) -> Result<InstallFrom, RuntimeManifestError> {
+        RuntimeManifest::from_yaml_str(&manifest_with_install(&format!(
+            "    tool: [\"murmur/tool-*\"]\n    from: {list}\n"
+        )))
+        .map(|manifest| manifest.capabilities.unwrap().install.unwrap().from)
+    }
+
+    #[test]
+    fn install_from_absent_is_stores() {
+        let manifest =
+            RuntimeManifest::from_yaml_str(&manifest_with_install("    tool: [local/a]\n"))
+                .unwrap();
+        assert_eq!(
+            manifest.capabilities.unwrap().install.unwrap().from,
+            InstallFrom::Stores
+        );
+    }
+
+    #[test]
+    fn install_from_accepts_stores_alone_and_with_sources_in_either_order() {
+        assert_eq!(install_from("[stores]").unwrap(), InstallFrom::Stores);
+        assert_eq!(
+            install_from("[stores, sources]").unwrap(),
+            InstallFrom::StoresAndSources
+        );
+        assert_eq!(
+            install_from("[sources, stores]").unwrap(),
+            InstallFrom::StoresAndSources
+        );
+        assert_eq!(InstallFrom::StoresAndSources.as_list(), "stores, sources");
+        assert!(InstallFrom::StoresAndSources.sources());
+        assert!(!InstallFrom::Stores.sources());
+    }
+
+    #[test]
+    fn install_from_refuses_empty_sourceless_duplicate_and_unknown_lists() {
+        for (list, why) in [
+            ("[]", "is empty"),
+            ("[sources]", "does not name stores"),
+            ("[stores, stores]", "names \"stores\" twice"),
+            ("[github]", "names \"github\", which is not a place"),
+        ] {
+            match install_from(list) {
+                Err(RuntimeManifestError::InvalidCapabilities { field, message }) => {
+                    assert_eq!(field, "capabilities.install.from", "{list}");
+                    assert!(message.contains(why), "{list}: {message}");
+                    assert!(
+                        message.contains("expected [stores] or [stores, sources]"),
+                        "{list}: {message}"
+                    );
+                }
+                other => panic!("{list}: expected InvalidCapabilities, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn install_from_is_no_unknown_key() {
+        let manifest = RuntimeManifest::from_yaml_str(&manifest_with_install(
+            "    tool: [local/a]\n    from: [stores]\n",
+        ))
+        .unwrap();
+        assert!(
+            manifest
+                .unknown_keys
+                .iter()
+                .all(|key| key.block_path != "capabilities.install"),
+            "{:?}",
+            manifest.unknown_keys
+        );
+    }
+
+    #[test]
+    fn install_from_capabilities_install_is_refused_under_transport_process() {
+        let yaml = "name: cap\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  install:\n    \
+                    tool: [\"murmur/tool-*\"]\ninference:\n  transport: process\n  \
+                    command: claude\n  model: claude-haiku-4-5-20251001\n  driver:\n    \
+                    artifact: murmur/driver-claude-code\n";
+        match RuntimeManifest::from_yaml_str(yaml) {
+            Err(RuntimeManifestError::InvalidCapabilities { field, message }) => {
+                assert_eq!(field, "capabilities.install");
+                assert_eq!(
+                    message,
+                    "is not valid with transport: process; the harness owns its tool list, so \
+                     a pulled artifact could never reach it"
+                );
+            }
+            other => panic!("expected InvalidCapabilities, got {other:?}"),
+        }
     }
 
     /// A block that names nothing is refused rather than read as "grant nothing": omitting the
@@ -7604,6 +7793,7 @@ capabilities:
             Some(InstallCapabilities {
                 skill: vec!["local/a".into()],
                 tool: vec![],
+                from: InstallFrom::Stores,
             })
         );
     }

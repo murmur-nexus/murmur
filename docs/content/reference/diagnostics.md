@@ -129,7 +129,7 @@ section that explains it.
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
 | `E-TRC-001` | Trace file parse error (malformed JSON, missing required `session_start`, empty file); unknown event types are silently skipped. `mur trace show` reads a trace with no `session_end`, and skips a torn final line; `mur trace diff` and `mur trace report` refuse both, and a formation member's missing `session_end` names its formation and `mur trace show <formation-id>`. Also a `mur trace show --body` selector that names no recorded hash, or a hash whose body was never stored, a `--turn` that names several turns, `--body` or `--turn` with a formation id, and `mur trace steps` with a formation id, which names the `mur trace show <formation-id>` that lists its members and calls | [`trace.jsonl` schema](observability-schemas.md#session-trace-tracejsonl), [`mur trace show --body`](cli.md#mur-trace-show-body), [Listing a formation](cli.md#mur-trace-show-formation), [`mur trace steps`](cli.md#mur-trace-steps) |
 | `E-TRC-002` | No session found in the workdir, or a session selector matched none or several. Also a `frm_` argument to `mur trace show` that is not a formation id, or a formation no session under any searched root belongs to | [`mur trace`](cli.md#mur-trace), [Listing a formation](cli.md#mur-trace-show-formation) |
-| `E-WIT-LEVEL-001` | A driver a launch stages, or an artifact version `mur install` names, does not fit the WIT level this `mur` serves | [E-WIT-LEVEL-001](#e-wit-level-001) |
+| `E-WIT-LEVEL-001` | A driver a launch stages, an artifact version `mur install` names, or a version a runtime pull resolves, does not fit the WIT level this `mur` serves | [E-WIT-LEVEL-001](#e-wit-level-001) |
 | `W-BLD-001` | A declaration names an archive entry the packer already fills | [W-BLD-001](#w-bld-001) |
 | `W-BLD-002` | `capsule.wasm` shadows another root `*.wasm` | [W-BLD-002](#w-bld-002) |
 | `W-BLD-003` | A compiled artifact packages build inputs | [W-BLD-003](#w-bld-003) |
@@ -752,10 +752,23 @@ it names is at the version the level lists for its package. Two commands refuse 
 | `mur install` | A version it resolves by name, before anything is fetched or written: `<scope>/<name>@<version>`, `--all-platforms <scope>/<name>@<version>`, and each version `murmur.yaml` pins when run with no argument, whether its payload would come from the project store, the global store or the scope's source |
 | `mur run`, `mur eval`, `mur new` | A driver, at staging, before any driver runs |
 
-`mur install ./<file>.mur.zip`, `mur install github:<owner>/<repo>@<tag>`, `mur publish`,
-`mur deploy` and a runtime pull install the bytes as given; a launch refuses a driver among them
-that does not fit. A version left out of `mur install <scope>/<name>` is always the newest that
-fits.
+`mur install ./<file>.mur.zip`, `mur install github:<owner>/<repo>@<tag>`, `mur publish` and
+`mur deploy` install the bytes as given; a launch refuses a driver among them that does not fit. A
+version left out of `mur install <scope>/<name>` is always the newest that fits.
+
+A runtime pull — `manage.pull()` or the [`pull-artifact`](runtime-provided-tools.md#pull-artifact)
+tool — refuses a version that does not fit before anything is written, as a tool error or a
+`manage.pull` error opening `does-not-fit:`. Its hint names the newest version that fits in the
+places the pull may use, or says none does:
+
+```text
+does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-editor@2.0.0' does not fit WIT level 1, the level this mur serves: it imports murmur:tool-registry/invoke@9.9.9, and level 1 has murmur:tool-registry@0.1.0; murmur/tool-editor@1.0.0 is the newest version in the global store that fits level 1
+```
+
+| Situation | Hint |
+|---|---|
+| An allowed place holds a version that fits | `<scope>/<name>@<V> is the newest version in <the project store \| the global store \| github:<owner>/<repo>> that fits level <N>` |
+| None does | `no version of <scope>/<name> in <places> fits level <N>` |
 
 At staging:
 
@@ -1296,7 +1309,7 @@ different point:
 |---|---|
 | `capabilities.shell.allow` or `capabilities.spawn.allow` is non-empty | At staging, before any artifact is pulled |
 | A declared `runtime: tool` artifact ships a native implementation | At launch, once the artifacts are staged and before any component is instantiated |
-| A native tool pulled into the session by `manage.pull` | At that tool's first call, which fails with the same reason |
+| A native tool pulled into the session by `manage.pull` or `pull-artifact` | At that tool's first call, which fails with the same reason |
 
 It is not part of the containment ladder — every class needs the namespace equally — so neither
 raising nor lowering a declared floor changes this answer. `mur doctor` reports the same condition
@@ -1491,20 +1504,20 @@ rather than refused. See [Read-only paths](manifest.md#read-only-paths).
 
 ### E-CAP-013 — an artifact claims a runtime-provided tool name { #e-cap-013 }
 
-`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member` and
-`end-without-answer` are answered by the runtime itself, so no artifact may have one of them as its
-tool name, the part of its full name after the `/`. `murmur/delegate-task` is refused as
-`delegate-task` would be:
+`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member`,
+`end-without-answer`, `pull-artifact` and `remove-artifact` are answered by the runtime itself, so
+no artifact may have one of them as its tool name, the part of its full name after the `/`.
+`ana/pull-artifact` is refused as `pull-artifact` would be:
 
 ```text
-error[E-CAP-013]: artifact 'murmur/delegate-task' has the tool name 'delegate-task', which collides with a tool the runtime provides itself; the reserved names are share-file, fetch-peer-file, delegate-task, submit-plan, switch-driver, call-member, end-without-answer
+error[E-CAP-013]: artifact 'ana/pull-artifact' has the tool name 'pull-artifact', which collides with a tool the runtime provides itself; the reserved names are share-file, fetch-peer-file, delegate-task, submit-plan, switch-driver, call-member, end-without-answer, pull-artifact, remove-artifact
   hint: the runtime answers these names itself, so an artifact under one of them would be shadowed at dispatch whatever the tool allowlist said. Rename the artifact, or drop the dependency if the runtime-provided tool is what you wanted — see https://docs.murmur.nexus/reference/runtime-provided-tools/
 ```
 
 The check runs at staging, ahead of every artifact in the manifest, so no artifact is resolved,
 pulled or hash-verified and no session directory is created. `mur run --explain-scope` refuses the
-same manifest by the same code. An in-session `manage.pull()` of one of these names is refused the
-same way, and the running capsule receives that refusal as an error string.
+same manifest by the same code. An in-session pull of one of these names, by `manage.pull()` or by
+`pull-artifact`, is refused the same way, and the capsule receives that refusal as an error string.
 
 Shell binary names are not reserved: they come from `capabilities.shell.allow`. See
 [Runtime-provided tools](runtime-provided-tools.md#reserved-names).

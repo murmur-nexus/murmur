@@ -555,17 +555,22 @@ pub struct ScopeReport {
     /// *how much* of every other grant one model turn can reach: a plan runs many steps against
     /// this capsule's own tools, shell allowlist and spawn grant without a turn in between.
     pub plan_submit: bool,
-    /// `capabilities.install.skill`, verbatim: which skill artifacts `manage.pull` may install
-    /// into the session. Always serialized, an empty list included, on [`Self::plan_submit`]'s
+    /// `capabilities.install.skill`, verbatim: which skill artifacts a pull (`manage.pull`,
+    /// `pull-artifact`) may install into the session. Always serialized, an empty list included, on [`Self::plan_submit`]'s
     /// terms: an absent key identifies a runtime that predates the grant.
     ///
     /// It opens no host resource of its own. A pulled skill adds text to what the model reads and
     /// gains no grant.
     pub install_skill: Vec<String>,
-    /// `capabilities.install.tool`, verbatim: which tool artifacts, WASM or native, `manage.pull`
-    /// may install. Always serialized, on [`Self::install_skill`]'s terms. A pulled tool runs on
-    /// this capsule's own grants and gains none of its own.
+    /// `capabilities.install.tool`, verbatim: which tool artifacts, WASM or native, a pull may
+    /// install. Always serialized, on [`Self::install_skill`]'s terms. A pulled tool joins the
+    /// dispatch allowlist, runs on this capsule's own grants and gains none of its own.
     pub install_tool: Vec<String>,
+    /// `capabilities.install.from`: `["stores"]`, or `["stores", "sources"]` when a pull the
+    /// stores cannot answer is fetched from the scope's GitHub source. `[]` for a capsule with no
+    /// install grant, which pulls from nowhere. Always serialized, on [`Self::install_skill`]'s
+    /// terms.
+    pub install_from: Vec<String>,
     /// Every host directory a `capabilities.shell.interpreter_runtime` grant opens, rendered as
     /// `<binary>: <dir>[ (list_dir)]`. These are the paths outside the workdir that stay
     /// reachable even at `scoped`.
@@ -745,7 +750,11 @@ impl ScopeReport {
         push_list(&mut out, "spawn allow", &self.spawn_allow);
         push_list(&mut out, "env allow", &self.env_allow);
         out.push_str(&format!("  plan submit:      {}\n", self.plan_submit));
-        out.push_str(&render_install(&self.install_skill, &self.install_tool));
+        out.push_str(&render_install(
+            &self.install_skill,
+            &self.install_tool,
+            &self.install_from,
+        ));
         push_list(
             &mut out,
             "interpreter runtime",
@@ -876,17 +885,39 @@ pub fn render_read_only(read_only_paths: &[String], advisory_for: &[String]) -> 
     out
 }
 
-/// The `install skill` and `install tool` lines of the scope report: which skills and tools
-/// `manage.pull` may install, `<none>` for a list the capsule left empty.
+/// The `install skill`, `install tool` and `install from` lines of the scope report: which
+/// skills and tools a pull may install, `<none>` for a list the capsule left empty, and the
+/// places it may install them from (`install from: stores` or `install from: stores, sources`),
+/// printed only for a capsule holding an install grant.
 ///
 /// Shared by [`ScopeReport::render`] and by `mur doctor`, on [`render_read_only`]'s terms. Ends
 /// with a newline.
 #[must_use]
-pub fn render_install(install_skill: &[String], install_tool: &[String]) -> String {
+pub fn render_install(
+    install_skill: &[String],
+    install_tool: &[String],
+    install_from: &[String],
+) -> String {
     let mut out = String::new();
     push_list(&mut out, "install skill", install_skill);
     push_list(&mut out, "install tool", install_tool);
+    if !install_from.is_empty() {
+        out.push_str(&format!("  install from: {}\n", install_from.join(", ")));
+    }
     out
+}
+
+/// [`ScopeReport::install_from`] for `policy`: empty without an install grant.
+#[must_use]
+pub fn install_from_places(policy: &CapabilityPolicy) -> Vec<String> {
+    if policy.install_skill.is_empty() && policy.install_tool.is_empty() {
+        return Vec::new();
+    }
+    let mut places = vec!["stores".to_string()];
+    if policy.install_from_sources {
+        places.push("sources".to_string());
+    }
+    places
 }
 
 /// The `Not protected here` block: one line per statement in
@@ -1028,6 +1059,7 @@ pub(crate) fn scope_report_for_tier(
         plan_submit: policy.plan_submit,
         install_skill: policy.install_skill.clone(),
         install_tool: policy.install_tool.clone(),
+        install_from: install_from_places(policy),
         interpreter_runtime_grants: policy
             .shell_interpreter_runtime
             .iter()
@@ -2767,6 +2799,7 @@ mod tests {
             ("plan_submit", "plan_submit"),
             ("install_skill", "install_skill"),
             ("install_tool", "install_tool"),
+            ("install_from_sources", "install_from"),
             ("containment_floor", "declared_containment"),
         ];
 

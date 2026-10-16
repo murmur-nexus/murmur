@@ -1,14 +1,17 @@
-//! The `capabilities.install` gate on `murmur:artifact-manager/manage.pull`.
+//! The `capabilities.install` gate on every runtime pull: `murmur:artifact-manager/manage.pull`
+//! on the script path and the `pull-artifact` tool on the agent path, which share one
+//! implementation (`CapsuleStoreState::pull_artifact`).
 //!
 //! A pull is decided in two halves. [`refuse_before_resolve`] needs only the requested name and
-//! version and runs before the registry is read, so an ungranted capsule, a name that is not a
-//! full `<scope>/<name>` (a bare name, a path, a `github:` reference), a version that is not one
-//! path segment and a name no entry matches never reach the registry. The version check is part of the grant: the
-//! registry joins both arguments into a path, so a version such as `1.0.0/../../x` would resolve
-//! outside the granted name's directory.
+//! version and runs before any store or source is read, so an ungranted capsule, a name that is
+//! not a full `<scope>/<name>` (a bare name, a path, a `github:` reference), a version that is
+//! not one path segment and a name no entry matches never reach either. The version check is part
+//! of the grant: the registry joins both arguments into a path, so a version such as
+//! `1.0.0/../../x` would resolve outside the granted name's directory.
 //! [`refuse_after_resolve`] needs the resolved [`ArtifactMeta`], because whether a name is a skill
 //! or a tool is a property of the payload, and runs before `murmur.lock` is read and before
-//! anything is written or compiled.
+//! anything is written or compiled. A source pull decides the same tier from the index first
+//! ([`InstallTier::of_indexed`]), so a refused source pull requests no asset.
 //!
 //! Every refusal is a string beginning [`NOT_GRANTED`], the token `murmur:conversation/read`
 //! answers an ungranted hook with: a refused pull is a value the calling component branches on,
@@ -16,9 +19,10 @@
 //! whose [`murmur_artifact::install_pattern::covers`] the spawn referee compares install grants
 //! with.
 //!
-//! A pull that passes gains no grant: the pulled artifact has no `artifact_grants` entry, no
-//! gateway and no place in the `invoke()` allowlist, and its bundled `murmur.yaml` is never read
-//! into one. It dispatches on the session's own [`CapabilityPolicy`].
+//! A pulled tool joins the session's dispatch allowlist, so `invoke()` and the agent loop reach
+//! it, and leaves it again on removal. That is all it gains: no `artifact_grants` entry and no
+//! gateway, and its bundled `murmur.yaml` is never read into a grant. It dispatches on the
+//! session's own [`CapabilityPolicy`].
 
 use murmur_artifact::install_pattern;
 use murmur_artifact::{tool_name_of, ArtifactMeta, ArtifactName, ArtifactNameError, RuntimeType};
@@ -50,14 +54,25 @@ impl InstallTier {
         }
     }
 
-    fn key(self) -> &'static str {
+    /// The tier of an artifact a source's index lists, from its packed role and whether a
+    /// payload is platform-tagged, which only a native binary is. A tagged skill, and any role
+    /// but `skill` or `tool`, is never pullable.
+    pub(crate) fn of_indexed(role: &str, platform_tagged: bool) -> Option<Self> {
+        match (role, platform_tagged) {
+            ("skill", false) => Some(Self::Skill),
+            ("tool", _) => Some(Self::Tool),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn key(self) -> &'static str {
         match self {
             Self::Skill => "skill",
             Self::Tool => "tool",
         }
     }
 
-    fn entries(self, policy: &CapabilityPolicy) -> &[String] {
+    pub(crate) fn entries(self, policy: &CapabilityPolicy) -> &[String] {
         match self {
             Self::Skill => &policy.install_skill,
             Self::Tool => &policy.install_tool,
@@ -81,11 +96,12 @@ pub(crate) fn name_refusal(error: &ArtifactNameError) -> String {
 
 /// Decide pulling `name` at `version` without the registry: the parsed full name to go on and
 /// resolve, or the refusal. Checks, in order: the session holds a grant; `name` is a full
-/// `<scope>/<name>`; `version` is one path segment; some entry of either list matches `name`.
+/// `<scope>/<name>`; `version`, when given, is one path segment; some entry of either list
+/// matches `name`.
 pub(crate) fn refuse_before_resolve(
     policy: &CapabilityPolicy,
     name: &str,
-    version: &str,
+    version: Option<&str>,
 ) -> Result<ArtifactName, String> {
     if !is_granted(policy) {
         return Err(format!(
@@ -95,7 +111,9 @@ pub(crate) fn refuse_before_resolve(
     }
     let artifact_name = ArtifactName::parse(name).map_err(|error| name_refusal(&error))?;
     // The store-name rule is the crate's one "single path segment" check.
-    if crate::state_store::validate_store_name(version).is_err() {
+    if let Some(version) =
+        version.filter(|version| crate::state_store::validate_store_name(version).is_err())
+    {
         return Err(format!(
             "{NOT_GRANTED} '{version}' is not an artifact version (it must be one path segment); \
              capabilities.install reaches only what the session's registry holds under '{name}'"
@@ -170,17 +188,26 @@ pub(crate) fn refuse_after_resolve(
 pub(crate) fn describe(policy: &CapabilityPolicy) -> String {
     if is_granted(policy) {
         format!(
-            "install skill: {}; install tool: {}; search is not implemented",
+            "install skill: {}; install tool: {}; install from: {}",
             render_entries(&policy.install_skill),
-            render_entries(&policy.install_tool)
+            render_entries(&policy.install_tool),
+            install_from(policy)
         )
     } else {
-        "pull and remove: not granted (no capabilities.install); search is not implemented"
-            .to_string()
+        "pull, remove and search: not granted (no capabilities.install)".to_string()
     }
 }
 
-fn granted_lists(policy: &CapabilityPolicy) -> String {
+/// `capabilities.install.from` as a manifest lists it, without brackets.
+pub(crate) fn install_from(policy: &CapabilityPolicy) -> &'static str {
+    if policy.install_from_sources {
+        murmur_artifact::InstallFrom::StoresAndSources.as_list()
+    } else {
+        murmur_artifact::InstallFrom::Stores.as_list()
+    }
+}
+
+pub(crate) fn granted_lists(policy: &CapabilityPolicy) -> String {
     format!(
         "skill: {}; tool: {}",
         render_entries(&policy.install_skill),
@@ -188,7 +215,7 @@ fn granted_lists(policy: &CapabilityPolicy) -> String {
     )
 }
 
-fn render_entries(entries: &[String]) -> String {
+pub(crate) fn render_entries(entries: &[String]) -> String {
     if entries.is_empty() {
         "<none>".to_string()
     } else {
@@ -320,7 +347,7 @@ mod tests {
             self.publish_at(name, VERSION, runtime, role, bytes)
         }
 
-        fn publish_at(
+        pub(crate) fn publish_at(
             &self,
             name: &str,
             version: &str,
@@ -728,12 +755,12 @@ mod tests {
     }
 
     #[test]
-    fn a_pulled_artifact_gains_no_grant_of_its_own() {
+    fn a_pulled_tool_joins_the_allowlist_and_gains_no_grant_of_its_own() {
         under_scratch_home("inner_a_pulled_artifact_gains_no_grant_of_its_own");
     }
 
     #[test]
-    #[ignore = "run by a_pulled_artifact_gains_no_grant_of_its_own"]
+    #[ignore = "run by a_pulled_tool_joins_the_allowlist_and_gains_no_grant_of_its_own"]
     fn inner_a_pulled_artifact_gains_no_grant_of_its_own() {
         if !crate::murmur_home::in_scratch_home() {
             return;
@@ -776,8 +803,59 @@ mod tests {
         assert!(!state.artifact_grants.contains_key("wasm-tool"));
         assert!(state.gateways.for_artifact("wasm-tool").is_none());
         assert!(state.gateways.inference().is_none());
-        assert_eq!(state.allowlisted_tools, allowlist_before);
-        assert!(!state.allowlisted_tools.contains("wasm-tool"));
+        // The one thing a pulled tool gains: its tool name in the dispatch allowlist.
+        let mut allowlist_expected = allowlist_before;
+        allowlist_expected.insert("wasm-tool".to_string());
+        assert_eq!(state.allowlisted_tools, allowlist_expected);
+    }
+
+    #[test]
+    fn a_pulled_wasm_tool_is_reached_by_invoke() {
+        under_scratch_home("inner_a_pulled_wasm_tool_is_reached_by_invoke");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "run by a_pulled_wasm_tool_is_reached_by_invoke"]
+    async fn inner_a_pulled_wasm_tool_is_reached_by_invoke() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let echo = fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../murmur-cli/tests/fixtures/run/components/echo-tool.wasm"
+        ))
+        .unwrap();
+        let project = Project::new();
+        project.publish(
+            "local/echo",
+            RuntimeType::Wasm,
+            "tool",
+            wasm_tool_zip("local/echo", &echo),
+        );
+        let mut state = project.session(&[], &["local/echo"]);
+        let input = || crate::bindings::host::murmur::tool::run::ToolInput {
+            data: Some("hello".to_string()),
+            log_path: None,
+        };
+        use crate::bindings::host::murmur::tool_registry::invoke::Host as _;
+
+        let refused = state.invoke("echo".to_string(), input()).unwrap_err();
+        assert_eq!(refused, "tool 'echo' is not declared in manifest allowlist");
+
+        pull(&mut state, "local/echo").expect("a granted tool pulls");
+        assert!(state.allowlisted_tools.contains("echo"));
+        let result = state
+            .invoke("echo".to_string(), input())
+            .expect("invoke reaches the pulled tool");
+        assert_eq!(result.data.as_deref(), Some("hello"));
+
+        manage::Host::remove(&mut state, "local/echo".to_string()).unwrap();
+        assert!(!state.allowlisted_tools.contains("echo"));
+        let refused = state.invoke("echo".to_string(), input()).unwrap_err();
+        assert_eq!(
+            refused,
+            "tool 'echo' was removed from this session; it can no longer be called"
+        );
     }
 
     #[test]
@@ -824,7 +902,7 @@ mod tests {
             .capabilities;
         assert_eq!(
             capabilities,
-            "pull and remove: not granted (no capabilities.install); search is not implemented"
+            "pull, remove and search: not granted (no capabilities.install)"
         );
 
         let mut granted = project.session(&["local/a"], &[]);
@@ -833,7 +911,7 @@ mod tests {
             .capabilities;
         assert_eq!(
             capabilities,
-            "install skill: local/a; install tool: <none>; search is not implemented"
+            "install skill: local/a; install tool: <none>; install from: stores"
         );
     }
 
@@ -960,7 +1038,7 @@ mod tests {
         };
         let jq = ArtifactName::parse("local/jq").unwrap();
         assert_eq!(
-            refuse_before_resolve(&policy, "local/stylist", VERSION).unwrap_err(),
+            refuse_before_resolve(&policy, "local/stylist", Some(VERSION)).unwrap_err(),
             "not-granted: 'local/stylist' matches no capabilities.install entry (skill: \
              local/code-review, local/style-*; tool: local/jq)"
         );
@@ -975,20 +1053,21 @@ mod tests {
              only skills and tools"
         );
         assert_eq!(
-            refuse_before_resolve(&CapabilityPolicy::default(), "local/jq", VERSION).unwrap_err(),
+            refuse_before_resolve(&CapabilityPolicy::default(), "local/jq", Some(VERSION))
+                .unwrap_err(),
             "not-granted: this capsule declares no capabilities.install, so pulling 'local/jq' is \
              refused"
         );
-        assert!(refuse_before_resolve(&policy, "Upper", VERSION)
+        assert!(refuse_before_resolve(&policy, "Upper", Some(VERSION))
             .unwrap_err()
             .starts_with("not-granted: 'Upper' is not a valid artifact name: "));
         assert_eq!(
-            refuse_before_resolve(&policy, "local/jq", "../1.0.0").unwrap_err(),
+            refuse_before_resolve(&policy, "local/jq", Some("../1.0.0")).unwrap_err(),
             "not-granted: '../1.0.0' is not an artifact version (it must be one path segment); \
              capabilities.install reaches only what the session's registry holds under 'local/jq'"
         );
         assert_eq!(
-            refuse_before_resolve(&policy, "local/style-rust", VERSION),
+            refuse_before_resolve(&policy, "local/style-rust", Some(VERSION)),
             Ok(ArtifactName::parse("local/style-rust").unwrap())
         );
         assert_eq!(

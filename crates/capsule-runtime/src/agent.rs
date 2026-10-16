@@ -32,7 +32,7 @@ use crate::{
     origin::{TaskProvenance, TrustClass},
     otel::OtelEmitter,
     protected_paths::ProtectedPathRefusal,
-    runtime::CapsuleStoreState,
+    runtime::{CapsuleStoreState, PULL_ARTIFACT_TOOL, REMOVE_ARTIFACT_TOOL},
     spend::SpendRefusal,
     stream_events::settle_started_calls,
     streaming::{
@@ -811,7 +811,8 @@ pub(crate) async fn run_agent_loop(
     // Built once per attempt and held across its turns, for prompt caching: the serialized tool
     // array heads the prefix the provider matches its cache on, so every call sends the same
     // bytes until an artifact installed mid-session is released onto it at the boundary
-    // `inference.tool_refresh` names — see `HeldInventory::refresh_before_call`.
+    // `inference.tool_refresh` names, or at the call after the model's own pull or removal —
+    // see `HeldInventory::refresh_before_call`.
     let mut inventory = HeldInventory::build(
         workdir,
         system_prompt_artifact,
@@ -883,6 +884,9 @@ pub(crate) async fn run_agent_loop(
     // cleared by the tool-array decision before each call, so a commit made after a response
     // releases a pending install onto the call that follows it.
     let mut compaction_committed = false;
+    // Set by a `pull-artifact` or `remove-artifact` call that changed the installed set, and
+    // taken by the next call's refresh: the model calls what it pulled on its very next turn.
+    let mut agent_changed = false;
 
     // Current context occupancy, not a running total: every turn assigns its own
     // full-context input count before anything reads it. The initial value is what a seed
@@ -1123,6 +1127,7 @@ pub(crate) async fn run_agent_loop(
             inference.tool_refresh,
             store_state.installed_generation,
             std::mem::take(&mut compaction_committed),
+            std::mem::take(&mut agent_changed),
         );
         if let Some(refresh) = refresh {
             trace
@@ -1724,11 +1729,12 @@ pub(crate) async fn run_agent_loop(
                     // than being derived at the push below: one push serves both arms, and only
                     // the arm knows whether what it produced is a fenced tool result, a skill
                     // result read off disk, or the runtime's own dispatch-failure message.
+                    let generation_before = store_state.installed_generation;
                     let dispatched = match refused {
                         Some(refusal) => Err(refusal),
                         None => {
                             store_state
-                                .dispatch_agent_tool_async(
+                                .dispatch_agent_tool_exclusive(
                                     &tool_name,
                                     ToolInput {
                                         data: Some(input_json.clone()),
@@ -1739,6 +1745,14 @@ pub(crate) async fn run_agent_loop(
                                 .await
                         }
                     };
+                    if tool_name == PULL_ARTIFACT_TOOL || tool_name == REMOVE_ARTIFACT_TOOL {
+                        agent_changed |= store_state.installed_generation != generation_before;
+                        for pulled in std::mem::take(&mut store_state.pending_artifact_pulls) {
+                            trace.write_artifact_pulled(&pulled).await.map_err(|e| {
+                                RuntimeError::AgentLoopFailed(format!("trace write failed: {e}"))
+                            })?;
+                        }
+                    }
                     let (is_error, text, fence_source) = match dispatched {
                         Ok(mut outcome) => {
                             // Taken before the result is consumed below; acted on at the end of

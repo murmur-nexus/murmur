@@ -169,6 +169,7 @@ fn stage_request(project_dir: &Path, manifest: &RuntimeManifest) -> StageRequest
     allowlisted_tools.insert(TOOL_ARTIFACT.to_string());
 
     StageRequest {
+        source_supply: None,
         credentials_file: None,
         manifest_dir: project_dir.to_path_buf(),
         capsule_name: manifest.name.clone(),

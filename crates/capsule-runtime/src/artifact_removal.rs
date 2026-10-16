@@ -1,5 +1,6 @@
-//! The bound on `murmur:artifact-manager/manage.remove`: a capsule removes only an artifact it
-//! pulled.
+//! The bound on removing an artifact mid-session — `murmur:artifact-manager/manage.remove` on the
+//! script path, the `remove-artifact` tool on the http agent loop, both
+//! `CapsuleStoreState::remove_artifact`: a capsule removes only an artifact it pulled.
 //!
 //! # The bound
 //!
@@ -20,15 +21,16 @@
 //!
 //! Every refusal is a string beginning [`NOT_REMOVABLE`], or [`NOT_GRANTED`] for a capsule with
 //! no `capabilities.install` or a name outside the artifact-name rule: the same token and
-//! wording `manage.pull` refuses with. A refusal is a value the guest branches on, never a trap,
+//! wording a pull refuses with. A refusal is a value the guest branches on, never a trap,
 //! and is decided before anything changes. A name the session has not installed, including a
 //! `shell.allow` binary `manage.list` shows, is `Ok(false)` rather than a refusal.
 //!
 //! # Order of effects
 //!
-//! After [`refuse_before_lock`] and [`refuse_against_lock`] pass, `manage::Host::remove` writes
+//! After [`refuse_before_lock`] and [`refuse_against_lock`] pass, `remove_artifact` writes
 //! `murmur.lock` without the entry, then updates the session (`tool_components`,
-//! `installed_artifacts`, `removed_artifacts`, `installed_generation`), then deletes
+//! `native_entrypoints`, `allowlisted_tools`, `installed_artifacts`, `removed_artifacts`,
+//! `installed_generation`), then deletes
 //! `workdir/tools/<name>/`. A lock write that fails leaves everything unchanged. A directory that
 //! cannot be deleted is reported with [`undeletable_directory`], and the name is already out of
 //! the session and the lock, so dispatch refuses it. The compiled form under
@@ -37,12 +39,21 @@
 //!
 //! # In-flight calls
 //!
-//! `manage` is linked only on the script-capsule path, where the guest is the only caller and
-//! `remove` runs on `&mut CapsuleStoreState`. Every dispatch borrows that store for its whole
-//! duration, so no call of any tool is in flight on it when `remove` runs. An instance already
-//! built holds its own reference-counted `Component`; removal applies to calls that start after
-//! it. A `remove` reachable from the agent path, where dispatches run concurrently on a shared
-//! store, has no such guarantee and must decide what an in-flight call of the removed name sees.
+//! A pull and a remove take the session exclusively: both run on `&mut CapsuleStoreState`, and
+//! every dispatch borrows that store for its whole duration, so no call of any tool is in flight
+//! on it when either runs.
+//!
+//! - On the script path the guest is the only caller, and each host call returns before the next.
+//! - The http agent loop runs a turn's calls one at a time, in the order the model listed them,
+//!   awaiting each before it starts the next. A call listed before a `remove-artifact` completes
+//!   on the artifact as it was; one listed after it is refused with [`called_after_removal`].
+//! - The process-transport tool bridge and plan steps dispatch concurrently on a shared store and
+//!   cannot reach either tool: the shared dispatch answers both names with an error and changes
+//!   nothing, and `plan::validate_plan` refuses them as steps.
+//! - A native tool's process never outlives its call, so no process of a removed tool runs on.
+//!
+//! An instance already built holds its own reference-counted `Component`; removal applies to
+//! calls that start after it.
 //!
 //! # What the model and the guest see
 //!
@@ -54,8 +65,10 @@
 //! Conversation history is never rewritten. Every earlier `tool_use` and `tool_result`, in the
 //! history, the conversation record and the trace, records what happened, and rewriting them
 //! would break the durable record and the prompt-cache prefix. A held tool array is not shrunk by
-//! `remove`: removal moves `installed_generation`, and the array drops the name at the next
-//! rebuild `inference.tool_refresh` releases, because the rebuild reads `workdir/tools/`.
+//! the removal itself: removal moves `installed_generation`, and the array drops the name at the
+//! next rebuild, because the rebuild reads `workdir/tools/`. After the model's own
+//! `remove-artifact` that is its next call; after `manage.remove` it is the boundary
+//! `inference.tool_refresh` releases.
 //!
 //! No trace line records a removal, and the WIT signature `remove(name) -> result<bool, string>`
 //! is unchanged.
@@ -137,9 +150,7 @@ pub(crate) fn refuse_against_lock(name: &str, lock: &MurmurLock) -> Option<Strin
 
 /// What `invoke()` and the agent-loop dispatch return for a call to a name this session removed.
 pub(crate) fn called_after_removal(name: &str) -> String {
-    format!(
-        "tool '{name}' was removed from this session by manage.remove; it can no longer be called"
-    )
+    format!("tool '{name}' was removed from this session; it can no longer be called")
 }
 
 /// The error for a removal whose lock write and session update succeeded but whose directory
@@ -385,9 +396,16 @@ mod tests {
         let binary = project.installed("local/native-tool").join("native-tool");
         assert!(binary.is_file());
 
+        assert!(state.allowlisted_tools.contains("native-tool"));
+
         assert_eq!(remove(&mut state, "local/native-tool"), Ok(true));
 
         assert!(!binary.exists());
+        assert!(
+            !state.allowlisted_tools.contains("native-tool"),
+            "a removal takes the pulled tool out of the dispatch allowlist"
+        );
+        assert!(!state.native_entrypoints.contains_key("native-tool"));
         assert_gone(&project, &mut state, "local/native-tool");
     }
 
@@ -442,7 +460,7 @@ mod tests {
             assert_eq!(remove(&mut state, name), Ok(true));
             let tool = tool_name_of(name);
             let refusal = format!(
-                "tool '{tool}' was removed from this session by manage.remove; it can no longer \
+                "tool '{tool}' was removed from this session; it can no longer \
                  be called"
             );
             assert_eq!(dispatch(&state, tool).await, Err(refusal.clone()));

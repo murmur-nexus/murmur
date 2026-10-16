@@ -839,6 +839,7 @@ impl Parent {
         let staged = stage_session(
             Arc::new(LocalRegistry::new(&suite.registry)),
             StageRequest {
+                source_supply: None,
                 credentials_file: None,
                 // An empty context is a per-message fact, not a launch-scoped one: `--context`
                 // refuses one, while an A2A `contextId` of `""` is taken as the conversation. So
@@ -1097,6 +1098,7 @@ fn stage_request(
     runtime_manifest: &murmur_artifact::RuntimeManifest,
 ) -> StageRequest {
     StageRequest {
+        source_supply: None,
         credentials_file: None,
         manifest_dir: project.to_path_buf(),
         capsule_name: runtime_manifest.name.clone(),

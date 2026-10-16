@@ -57,9 +57,12 @@ pub(crate) struct DispatchOutcome {
     /// [`crate::runtime::CapsuleStoreState::dispatch_agent_tool_async`] after the fence's closing
     /// marker, so the model reads them as the runtime's rather than as the tool's data.
     ///
-    /// `Some` on exactly two outcomes:
+    /// `Some` on these outcomes:
     ///
     /// * a `call-member` call that started, carrying [`crate::member_call::started_note`];
+    /// * an accepted `end-without-answer`;
+    /// * a pull through `pull-artifact`, and a `remove-artifact` that removed something, each
+    ///   saying when the tool list changes;
     /// * a shell call that finished and whose failure was attributed to a
     ///   `capabilities.resources` limit, carrying [`crate::resources::resource_limit_line`].
     ///
@@ -275,18 +278,22 @@ pub struct CapabilityPolicy {
     /// session's tool dispatch, its shell allowlist and its spawn grant, so a plan reaches exactly
     /// what the model could already call one call at a time.
     pub plan_submit: bool,
-    /// From `capabilities.install.skill`: the entries naming which skill artifacts
-    /// `manage.pull` may install into this session, verbatim and in declaration order. Empty by
-    /// default, which is deny. With [`Self::install_tool`] also empty, every pull is refused.
+    /// From `capabilities.install.skill`: the entries naming which skill artifacts a pull
+    /// (`manage.pull` or the `pull-artifact` tool) may install into this session, verbatim and in
+    /// declaration order. Empty by default, which is deny. With [`Self::install_tool`] also
+    /// empty, every pull is refused.
     ///
     /// A pulled skill gains no grant of its own; see `install_grant`.
     pub install_skill: Vec<String>,
     /// From `capabilities.install.tool`: the entries naming which tool artifacts, WASM or native,
-    /// `manage.pull` may install, verbatim and in declaration order. Empty by default, which is
-    /// deny.
+    /// a pull may install, verbatim and in declaration order. Empty by default, which is deny.
     ///
-    /// A pulled tool dispatches on this policy's own ceiling and gains no grant of its own.
+    /// A pulled tool joins the session's dispatch allowlist and dispatches on this policy's own
+    /// ceiling; it gains no grant of its own.
     pub install_tool: Vec<String>,
+    /// From `capabilities.install.from`: `true` for `[stores, sources]`, under which a pull the
+    /// stores cannot answer is fetched from the scope's GitHub source. `false` by default.
+    pub install_from_sources: bool,
     /// `capabilities.limits.deadline_seconds` exactly as the manifest declared it — `None`
     /// when it declared nothing. Retained undefaulted alongside the fully-resolved `limits`
     /// above purely so hook calls can apply their own, lower default without mistaking an
@@ -485,6 +492,10 @@ pub struct StageRequest {
     /// guest is handed its callees' names, and the runtime's egress resolves and authorizes calls
     /// to them. No native process and no delegated child is handed any of it.
     pub formation_member: Option<Arc<FormationMember>>,
+    /// Where a pull the stores cannot answer is fetched from, for a capsule granted
+    /// `capabilities.install.from: [stores, sources]`. `None` fetches from no source: every pull
+    /// is answered by the stores alone.
+    pub source_supply: Option<Arc<dyn crate::artifact_supply::SourceSupply>>,
 }
 
 /// The `transport: process` driver this session runs its harness through, compiled and described
@@ -563,7 +574,7 @@ pub struct StagedSession {
     pub(crate) forget_session: bool,
     pub(crate) engine: Engine,
     /// The compiled-form cache handle built for [`Self::engine`] and the capsule's writable root.
-    /// A mid-session `manage.pull()` compiles through it, so a pulled component is stored and
+    /// A mid-session pull compiles through it, so a pulled component is stored and
     /// looked up under the same name a staged one is.
     pub(crate) compiled_forms: crate::compiled_forms::CompiledForms,
     /// `None` for manifest-only agent capsules; `Some` for script capsules with a WASM component.
@@ -642,9 +653,13 @@ pub struct StagedSession {
     /// own `exports.peer_tasks` by [`murmur_artifact::Exports::accepts_peer_tasks`]. `false`
     /// answers every peer-origin request on the door with `403 peer_not_accepted`.
     pub(crate) accepts_peer_tasks: bool,
-    /// Registry used to resolve this session's artifacts, retained so `manage.pull()` can
+    /// Registry used to resolve this session's artifacts, retained so a pull can
     /// resolve additional artifacts at runtime after staging has completed.
     pub(crate) registry: Arc<dyn Registry>,
+    /// Copied from [`StageRequest::source_supply`]: where a runtime pull the stores cannot answer
+    /// is fetched from. `None` unless the capsule declared `capabilities.install.from: [stores,
+    /// sources]` and the launcher supplied one.
+    pub(crate) source_supply: Option<Arc<dyn crate::artifact_supply::SourceSupply>>,
     /// Keeps this session's epoch ticker running: without it no epoch deadline set on any
     /// store built from `engine` can ever fire. Held here (rather than detached) so ticking
     /// stops when the session's `StagedSession` drops. `launch_session` moves the other
@@ -802,6 +817,7 @@ pub fn capability_policy_from_runtime_manifest(
     let install = caps.and_then(|c| c.install.as_ref());
     let install_skill = install.map(|i| i.skill.clone()).unwrap_or_default();
     let install_tool = install.map(|i| i.tool.clone()).unwrap_or_default();
+    let install_from_sources = install.is_some_and(|i| i.from.sources());
 
     // Recorded, never applied: see `CapabilityPolicy::state_declared`.
     let state_declared = caps.is_some_and(|c| c.state.is_some());
@@ -881,6 +897,7 @@ pub fn capability_policy_from_runtime_manifest(
         plan_submit,
         install_skill,
         install_tool,
+        install_from_sources,
         declared_deadline_seconds,
     }
 }

@@ -467,6 +467,7 @@ fn stage_queue_capsule(home: &TempDir, manifest_path: &Path) -> capsule_runtime:
             home.path().join(".murmur").join("artifacts"),
         )),
         StageRequest {
+            source_supply: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),

@@ -108,7 +108,7 @@ pub use runtime_manifest::{
     ConversationCapabilities, ConversationMode, DeployConfig, DoorCredential, EnvCapabilities,
     EvalConfig, ExportMode, Exports, FileExport, FilesystemCapabilities, HookBinding,
     HookCommitPolicy, HookConfig, HookExecutionMode, HookOverflowPolicy, InferenceAlternate,
-    InferenceConfig, InferenceDriver, InstallCapabilities, InterpreterRuntimeDir,
+    InferenceConfig, InferenceDriver, InstallCapabilities, InstallFrom, InterpreterRuntimeDir,
     InterpreterRuntimeGrant, LifecycleConfig, LifecycleOverride, NetworkAuthentication,
     NetworkCapabilities, NetworkConfig, ObservabilityConfig, ParseContainmentClassError,
     PeerFetchCapabilities, PeerFilesExport, PeerTasksExport, PlanCapabilities,
