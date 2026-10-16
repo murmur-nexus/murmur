@@ -148,6 +148,19 @@ pub trait Registry: Send + Sync {
 
     fn publish(&self, meta: ArtifactMeta, bytes: &[u8]) -> Result<PublishResult, RegistryError>;
     fn list_index(&self) -> Result<Vec<ArtifactMeta>, RegistryError>;
+
+    /// Every `name@version` this registry can resolve, one row each: the rows a version-less
+    /// runtime pull chooses among. A registry over several stores lists the union.
+    fn list_stored(&self) -> Result<Vec<ArtifactMeta>, RegistryError> {
+        self.list_index()
+    }
+
+    /// Which store `name@version` resolves from, as a message names it (`project store`,
+    /// `global store`), or `None` for a registry that does not name its stores.
+    fn held_in(&self, name: &ArtifactName, version: &str) -> Option<String> {
+        let _ = (name, version);
+        None
+    }
 }
 
 #[derive(Debug, Clone)]

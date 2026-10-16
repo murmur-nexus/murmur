@@ -553,6 +553,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
         .and_then(|e| e.dataset_id.clone());
 
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
+    let source_supply = crate::source::supply::CliSourceSupply::for_policy(&capability_policy)?;
 
     let mut allowlisted_tools = HashSet::new();
     let mut requested_artifacts: Vec<ArtifactRequest> = Vec::new();
@@ -689,6 +690,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
+            source_supply: source_supply.clone(),
         };
 
         let staged = match stage_session(Arc::clone(&local_registry), stage_request) {

@@ -55,7 +55,45 @@ impl Registry for FallbackRegistry {
     fn list_index(&self) -> Result<Vec<ArtifactMeta>, RegistryError> {
         self.primary.list_index()
     }
+
+    /// Both stores' rows, the project store's winning on the same `name@version`, as a resolve
+    /// would.
+    fn list_stored(&self) -> Result<Vec<ArtifactMeta>, RegistryError> {
+        let mut stored = self.primary.list_index()?;
+        for meta in self.secondary.list_index()? {
+            if !stored
+                .iter()
+                .any(|held| held.name == meta.name && held.version == meta.version)
+            {
+                stored.push(meta);
+            }
+        }
+        Ok(stored)
+    }
+
+    /// `project store` when the project store holds `name@version`, else `global store` when the
+    /// global one does: the store a resolve takes it from.
+    fn held_in(&self, name: &ArtifactName, version: &str) -> Option<String> {
+        let holds = |store: &LocalRegistry| {
+            store
+                .artifact_path_for(name, version)
+                .parent()
+                .is_some_and(std::path::Path::is_dir)
+        };
+        if holds(&self.primary) {
+            Some(PROJECT_STORE.to_string())
+        } else if holds(&self.secondary) {
+            Some(GLOBAL_STORE.to_string())
+        } else {
+            None
+        }
+    }
 }
+
+/// How a pull's `fetched_from` and its messages name the project store.
+pub(crate) const PROJECT_STORE: &str = "project store";
+/// How a pull's `fetched_from` and its messages name the global store.
+pub(crate) const GLOBAL_STORE: &str = "global store";
 
 /// The interfaces one installed artifact speaks: the `wit_contracts` its sidecar records when the
 /// key is present, otherwise derived from its payload.

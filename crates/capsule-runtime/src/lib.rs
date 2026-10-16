@@ -14,6 +14,7 @@ pub mod alloc_bench;
 pub mod artifact;
 pub mod artifact_config;
 pub(crate) mod artifact_removal;
+pub mod artifact_supply;
 pub mod bindings;
 pub(crate) mod cancel;
 pub(crate) mod cgroup;
@@ -107,12 +108,13 @@ pub use artifact_config::{
     configured_artifact_names, lower_artifact_config, ARTIFACT_CONFIG_ENV,
     MAX_ARTIFACT_CONFIG_BYTES,
 };
+pub use artifact_supply::{SourceSupply, SourcedArtifact};
 pub use containment::{
     applied_mechanism, check_containment_floor, containment_shortfall_reason,
     detect_achieved_containment, detect_sealed_blocker, detect_userns_grant, explain_scope,
-    read_only_advisory_for, render_install, render_read_only, ExportsFilesReport,
-    FilesystemBoundaryReport, FilesystemRestriction, PreopenReport, PreopenSurface, ScopeReport,
-    StateStoreReport,
+    install_from_places, read_only_advisory_for, render_install, render_read_only,
+    ExportsFilesReport, FilesystemBoundaryReport, FilesystemRestriction, PreopenReport,
+    PreopenSurface, ScopeReport, StateStoreReport,
 };
 pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
 pub use network_namespace::{

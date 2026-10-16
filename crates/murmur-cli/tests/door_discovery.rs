@@ -281,6 +281,7 @@ fn launch(task_acceptance: TaskAcceptance, exports: Option<&str>) -> Capsule {
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
+            source_supply: None,
             credentials_file: None,
             manifest_dir: project.clone(),
             capsule_name: runtime_manifest.name.clone(),

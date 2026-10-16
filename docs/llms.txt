@@ -43,6 +43,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 - [Give a capsule memory](/how-to/give-capsule-memory.md): By default every task starts from nothing; how to carry context across tasks.
 - [Enable context compaction](/how-to/context-compaction.md): Turning on automatic history condensation for sessions that run many turns.
 - [Decompose tasks recursively within a single capsule](/how-to/task-decomposition-single-capsule.md): Using the first turn as a router that identifies steps and dispatches each as a sub-task.
+- [Let a coding capsule pull the tools it needs](/how-to/self-healing-coding-capsule.md): Granting `capabilities.install` so the model lists, pulls, calls and removes tools mid-session with `pull-artifact` and `remove-artifact`.
 
 ### Security & Composition
 

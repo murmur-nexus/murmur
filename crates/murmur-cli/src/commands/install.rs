@@ -168,7 +168,7 @@ fn print_adoptions(adoptions: &[String]) {
 
 /// The [`ArtifactMeta`] of a payload a source served as `name@version`, recording the asset's
 /// `platform` and the source's `owner_id`.
-fn source_meta(
+pub(crate) fn source_meta(
     name: &ArtifactName,
     version: &str,
     manifest: &Manifest,

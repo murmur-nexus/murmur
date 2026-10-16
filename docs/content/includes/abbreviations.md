@@ -83,3 +83,5 @@
 *[inference.max_turns]: model steps one task may take · a message or a tool call is one turn
 
 *[capabilities.env.allow]: environment variable names the harness subprocess may see · the whole environment it gets · process transport only
+*[capabilities.install.tool]: tool artifacts a running capsule may pull · exact name | scope/prefix* | *
+*[capabilities.install.from]: stores: project then global store · default | stores, sources: also scope's GitHub source

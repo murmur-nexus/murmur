@@ -14,7 +14,7 @@ version each one carries.
 | [`murmur:tool/run`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/tool.wit) | Exported by tool and driver components | The entrypoint the runtime calls to run a tool or an inference driver |
 | [`murmur:tool-registry/invoke`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/tool-registry.wit) | Imported by capsule components | Call an allowlisted tool by name |
 | [`murmur:capsule/run`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/capsule.wit) | Exported by capsule components | The capsule entrypoint |
-| [`murmur:artifact-manager/manage`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/artifact-manager.wit) | Provided by the runtime to capsule components | List, describe, pull and remove artifacts during a session |
+| [`murmur:artifact-manager/manage`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/artifact-manager.wit) | Provided by the runtime to capsule components | List, describe, search, pull and remove artifacts during a session |
 | [`murmur:shell/execute`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/shell-execute.wit) | Implemented natively by the runtime | Run an allowlisted shell binary |
 | [`murmur:message/send`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/message/send.wit) | Provided by the runtime to capsule components | Send an A2A task to a peer capsule |
 | [`murmur:task/task`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-task/task.wit) | Imported by tool components | Pause the agent loop and wait for external input |
@@ -196,9 +196,11 @@ An omitted number is absent from the trace event, never written as `0`.
 ## `murmur:artifact-manager/manage`
 
 Lets a capsule component inspect and install artifacts mid-session: `list` and `describe` report
-what is installed, `diagnostics` returns the session id alongside that list, `pull` installs a
-new artifact, and `remove` uninstalls one the capsule pulled. `search` is unimplemented: calling it
-returns an error.
+what is installed, `diagnostics` returns the session id alongside that list, `search` lists what
+the capsule may pull, `pull` installs a new artifact, and `remove` uninstalls one the capsule
+pulled. An agent capsule makes the same pulls and removals through the
+[`pull-artifact` and `remove-artifact`](runtime-provided-tools.md#pull-artifact) tools; both paths
+run one implementation and make the same checks.
 
 Every function takes and returns artifacts by full name, `<scope>/<name>` — see
 [Artifact names](../concepts/registry.md#artifact-names). The signatures are unchanged: a name is a
@@ -209,15 +211,18 @@ which for a bare name carries the hint naming its scoped forms:
 not-granted: 'tool-x' is not a full artifact name: an artifact is named <scope>/<name>; name it with its scope: 'murmur/tool-x' for a Murmur default artifact, '<owner>/tool-x' for one published from github.com/<owner>, or 'local/tool-x' for one installed from a .mur.zip file
 ```
 
-`pull` resolves an artifact from the session's registry, verifies its bytes against the registry
-hash and any pinned `murmur.lock` entry, then installs it under `<workdir>/tools/<name>/`, `<name>`
-being the bare part of its full name, and
-updates `murmur.lock`. A new entry is pinned as [`origin: runtime`](workdir.md#lock-origin) with
-the id of the pulling session, which the runtime supplies itself; an entry that already exists
-keeps its origin. A hash mismatch, or a version or hash that conflicts with an existing
-`murmur.lock` pin, returns an error before anything is written. A pulled artifact is immediately
-visible to `list()` and `describe()`. A pulled WASM tool is callable via `invoke()` only when the
-manifest's `artifacts` list declares it.
+`pull(name, version)` takes a required version. It resolves the artifact from the project store,
+then the global store; under [`capabilities.install.from: [stores, sources]`](manifest.md#field-install)
+a version neither store holds is fetched from the scope's GitHub source, with the checks
+`mur install` makes, and written to no store. It verifies the bytes against the reported hash,
+checks that the payload fits the [WIT level](wit-levels.md#fit) this `mur` serves, checks the
+scope's owner id against `murmur.lock`, then installs it under `<workdir>/tools/<name>/`, `<name>`
+being the bare part of its full name, and updates `murmur.lock`. A new entry is pinned as
+[`origin: runtime`](workdir.md#lock-origin) with the id of the pulling session, which the runtime
+supplies itself, and with the scope's `owner_id` when the source or the stored payload records
+one; an entry that already exists keeps its origin. A pulled artifact is immediately visible to
+`list()` and `describe()`, and a pulled tool joins the dispatch allowlist, so `invoke()` reaches
+it.
 
 `pull` requires the capsule's [`capabilities.install`](manifest.md#field-install) grant. A pull
 the grant does not admit returns an error string beginning `not-granted:`, which names the
@@ -234,21 +239,42 @@ refusal is about a name. The checks run in this order:
 | 6 | The artifact is not a skill or a tool — a `driver`, a `hook`, or a role that disagrees with its payload | Yes |
 | 7 | No entry in the list for the artifact's own kind matches the name | Yes |
 
-A refused pull writes nothing: no file under `tools/`, no `murmur.lock` change, and no compiled
-form. `diagnostics` states the grant in `runtime-state.capabilities`, as
-`install skill: <entries>; install tool: <entries>`, or as `pull and remove: not granted` when the
-capsule declares none.
+Past the grant, a refusal opens with one of three further tokens:
 
-A pulled artifact reaches the tool list an `http` agent's model is offered at the boundary
+| Token | Refused when | Example |
+|---|---|---|
+| `not-found:` | No allowed place holds the version | `not-found: 'murmur/tool-editor@1.0.0' is in neither the project store nor the global store, and capabilities.install.from is [stores], so this capsule fetches from no source` |
+| `does-not-fit:` | The payload's interfaces do not fit the served level | `does-not-fit: [E-WIT-LEVEL-001] artifact 'murmur/tool-editor@2.0.0' does not fit WIT level 1, the level this mur serves: …; murmur/tool-editor@1.0.0 is the newest version in the global store that fits level 1` |
+| `not-fetched:` | The scope's source could not be read or failed a check, or the scope's owner id differs from the one `murmur.lock` records | `not-fetched: [E-REG-010] could not resolve ana/tool-editor@0.3.0: the owner of scope 'ana' has changed: …` |
+
+A version or hash that conflicts with an existing `murmur.lock` pin is refused with
+`murmur.lock conflict for '<name>': …`. A refused pull writes nothing: no file under `tools/`, no
+`murmur.lock` change, no store change and no compiled form. `diagnostics` states the grant in
+`runtime-state.capabilities`, as `install skill: <entries>; install tool: <entries>; install
+from: <stores | stores, sources>`, or as `pull, remove and search: not granted` when the capsule
+declares none.
+
+A script capsule's pull reaches the tool list an `http` agent's model is offered at the boundary
 [`inference.tool_refresh`](manifest.md#inference-tool-refresh) names: the next inference call
 under `immediate`, or the first call after a compaction under the default `compaction`, and at the
-start of the next task under either. It is offered marked untrusted, there and on every later
+start of the next task under either. An agent's own `pull-artifact` reaches it at its next call. It is offered marked untrusted, there and on every later
 launch whose `murmur.yaml` declares it, until `mur install` adopts its pin — see
 [Artifact origin](../concepts/access-control.md#artifact-origin).
 
 A successful pull writes one [`artifact_pulled`](observability-schemas.md#session-trace-tracejsonl)
-line to the session's `trace.jsonl`, naming the artifact, its origin and its trust class; a refused
-or failed pull writes none.
+line to the session's `trace.jsonl`, naming the artifact, its origin, its trust class, where it
+was fetched from and, when known, the scope's owner id; a refused or failed pull writes none.
+
+### `search` { #manage-search }
+
+`search(query)` takes an exact full name or an [install pattern](manifest.md#install-entries) —
+`*`, `<scope>/*`, `<scope>/<prefix>*` — and returns one `artifact-summary` per artifact it reaches
+that this capsule may pull, at most 50, sorted by name. Its `version` is the version a pull
+without one would choose, or its newest held version when none fits. It lists artifacts whose name
+the query matches and an entry of their own kind's install list also matches, held in an allowed
+place: the stores, and under `from: [stores, sources]` the indexes of the scopes the query and the
+grant reach. Hooks and drivers are never listed. A query that is neither a name nor a pattern, or
+that reaches no granted name, is refused with `not-granted:`. It installs nothing.
 
 A pulled WASM artifact is compiled once per version and kept in
 [`~/.murmur/compiled`](config.md#murmur-home-permissions), shared with `mur run`, so a later pull
@@ -275,7 +301,7 @@ A removal deletes the artifact from every place `pull` put it:
 | `<workdir>/tools/<name>/`, `<name>` being the bare part | Deleted: the manifest, `skill.md` and the native binary |
 | `list()` and `describe()` | The name is gone. `describe()` returns `artifact '<name>' is not installed` |
 | `murmur.lock` | The entry is deleted. Every other entry is rewritten unchanged |
-| `invoke()` | A call to the name returns `tool '<name>' was removed from this session by manage.remove; it can no longer be called` |
+| `invoke()` | The name leaves the dispatch allowlist. A call to it returns `tool '<name>' was removed from this session; it can no longer be called` |
 | `~/.murmur/compiled` | Kept, so pulling the same version again skips compiling it. A compiled form not read in 30 days is deleted, as [`~/.murmur/compiled`](config.md#murmur-home-permissions) describes |
 
 The checks run in this order, and a refused removal changes nothing:

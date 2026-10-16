@@ -881,8 +881,8 @@ struct A2aSendEvent {
     trust: String,
 }
 
-/// A successful `manage.pull()`: the artifact a running capsule fetched and pinned in
-/// `murmur.lock`. A refused or failed pull writes nothing.
+/// A successful pull, by `manage.pull()` or `pull-artifact`: the artifact a running capsule
+/// fetched and pinned in `murmur.lock`. A refused or failed pull writes nothing.
 #[derive(Serialize)]
 struct ArtifactPulledEvent {
     event_type: &'static str,
@@ -901,6 +901,13 @@ struct ArtifactPulledEvent {
     /// same pin recorded another. `null` for an `"operator"` entry.
     session: Option<String>,
     trust: &'static str,
+    /// Where the payload came from: `"project store"`, `"global store"` or
+    /// `"github:<owner>/<repo>"`.
+    fetched_from: String,
+    /// GitHub's numeric id of the scope's owner, written to the lock entry beside the pin.
+    /// Absent when neither the source nor the stored payload records one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_id: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -2117,8 +2124,9 @@ impl TraceWriter {
     }
 
     /// Records that the tool array the http agent loop sends changed before this call:
-    /// `trigger` is why (`"immediate"` or `"compaction"`), `added` and `removed` the sorted
-    /// names that entered and left it, and `tools` every name it now offers, in array order.
+    /// `trigger` is why (`"compaction"`, `"agent"` or `"immediate"`), `added` and `removed` the
+    /// sorted names that entered and left it, and `tools` every name it now offers, in array
+    /// order.
     ///
     /// Written before the call is sent, so it precedes the turn's `inference` line and hangs off
     /// the task, as `control_applied` does.
@@ -2723,14 +2731,16 @@ impl TraceWriter {
         self.write_event(&event).await
     }
 
-    /// Records a successful `manage.pull()` of `artifact`, as the store summarised it after the
-    /// lock was written. Parented to the session node when `session_start` was written through
-    /// this writer, and to nothing otherwise — the script path drains these through a writer it
-    /// opens after the guest returns, as it does its buffered `a2a_send` lines.
+    /// Records a successful pull of `pulled` (`manage.pull()` or `pull-artifact`), as the store
+    /// summarised it after the lock was written. Parented to the session node when
+    /// `session_start` was written through this writer, and to nothing otherwise — the script
+    /// path drains these through a writer it opens after the guest returns, as it does its
+    /// buffered `a2a_send` lines.
     pub(crate) async fn write_artifact_pulled(
         &mut self,
-        artifact: &InstalledArtifactSummary,
+        pulled: &crate::runtime::PulledArtifact,
     ) -> std::io::Result<()> {
+        let artifact = &pulled.summary;
         let session = match &artifact.origin {
             LockOrigin::Runtime { session } => Some(session.clone()),
             LockOrigin::Operator => None,
@@ -2747,6 +2757,8 @@ impl TraceWriter {
             origin: artifact.origin.as_str(),
             session,
             trust: crate::origin::artifact_trust(&artifact.origin).as_str(),
+            fetched_from: pulled.fetched_from.clone(),
+            owner_id: pulled.owner_id,
         };
         self.write_event(&event).await
     }
@@ -6466,9 +6478,13 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_artifact_pulled(&runtime_summary("pulled-style", ArtifactRuntime::Skill))
-            .await
-            .unwrap();
+        w.write_artifact_pulled(&pulled(
+            runtime_summary("pulled-style", ArtifactRuntime::Skill),
+            "global store",
+            None,
+        ))
+        .await
+        .unwrap();
         w.write_task_end("tsk_1", "ok", 0).await.unwrap();
         w.write_session_end("ok").await.unwrap();
         w.flush().await.unwrap();
@@ -6529,6 +6545,20 @@ mod tests {
         InstalledArtifactSummary {
             origin: LockOrigin::Operator,
             ..runtime_summary(name, runtime)
+        }
+    }
+
+    /// A pull of `summary` from `fetched_from`, with `owner_id` when the place records one.
+    fn pulled(
+        summary: InstalledArtifactSummary,
+        fetched_from: &str,
+        owner_id: Option<u64>,
+    ) -> crate::runtime::PulledArtifact {
+        crate::runtime::PulledArtifact {
+            summary,
+            fetched_from: fetched_from.to_string(),
+            owner_id,
+            notes: Vec::new(),
         }
     }
 
@@ -6607,16 +6637,25 @@ mod tests {
     }
 
     /// Every key is written, `session` included: `null` when the lock entry is the operator's.
+    /// `owner_id` is written only when the place the payload came from records one.
     #[tokio::test]
     async fn runtime_origin_artifact_pulled_writes_every_key() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_artifact_pulled(&runtime_summary("pulled-style", ArtifactRuntime::Skill))
-            .await
-            .unwrap();
-        w.write_artifact_pulled(&operator_summary("fetcher", ArtifactRuntime::Tool))
-            .await
-            .unwrap();
+        w.write_artifact_pulled(&pulled(
+            runtime_summary("pulled-style", ArtifactRuntime::Skill),
+            "github:ana/artifacts",
+            Some(4242),
+        ))
+        .await
+        .unwrap();
+        w.write_artifact_pulled(&pulled(
+            operator_summary("fetcher", ArtifactRuntime::Tool),
+            "project store",
+            None,
+        ))
+        .await
+        .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -6628,6 +6667,8 @@ mod tests {
         assert_eq!(runtime["origin"], "runtime");
         assert_eq!(runtime["session"], "ses_puller");
         assert_eq!(runtime["trust"], "untrusted");
+        assert_eq!(runtime["fetched_from"], "github:ana/artifacts");
+        assert_eq!(runtime["owner_id"], 4242);
         assert!(
             runtime["parent_id"].is_null(),
             "no session_start was written"
@@ -6638,6 +6679,8 @@ mod tests {
         assert_eq!(operator["origin"], "operator");
         assert!(operator.get("session").is_some_and(Value::is_null));
         assert_eq!(operator["trust"], "trusted");
+        assert_eq!(operator["fetched_from"], "project store");
+        assert!(operator.get("owner_id").is_none());
     }
 
     /// A hook's `run-inference` record is a product of the turn it ran inside, not a turn of

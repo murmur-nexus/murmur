@@ -124,7 +124,7 @@ What a refusal does depends on when it happens:
 |---|---|
 | Staging: `mur run --task`, the `murmur.yaml` copy, installing tools and skills, `MURMUR.md`, the `.murmur/<session-id>` directory | The launch fails with [`E-RUN-050`](diagnostics.md#e-run-050), naming the path and the link |
 | During a task, on any transport | A [`workdir_path_refused`](observability-schemas.md#workdir-path-refused) trace line for each refusal, then `task_failed` with cause `workdir_path_refused`, then `task_end` with `exit_status: failed`. No further request is sent to the model for that task. An A2A task ends `failed` with the refusal as its status message, and `mur run --task` exits with [`E-RUN-050`](diagnostics.md#e-run-050) |
-| A tool's own write — a submitted plan, `fetch-peer-file`, `manage.pull()` or `manage.remove()` | The tool call returns an error naming the path, and the task then fails as above |
+| A tool's own write — a submitted plan, `fetch-peer-file`, `manage.pull()`, `pull-artifact`, `manage.remove()` or `remove-artifact` | The tool call returns an error naming the path, and the task then fails as above |
 | Between tasks | The next task to start fails as above before it reads its task or sends a request |
 
 ---
@@ -476,7 +476,8 @@ artifacts:
 
 `lock_version` must be `3`. Each entry's `name` is the artifact's full name, `<scope>/<name>` —
 see [Artifact names](../concepts/registry.md#artifact-names). An entry may carry `owner_id`,
-GitHub's numeric id of the scope's owner, written only when known.
+GitHub's numeric id of the scope's owner, written only when known: by `mur install` from a source,
+and by a runtime pull whose source or stored payload records one.
 
 An entry carries exactly one of two hash shapes:
 
@@ -502,8 +503,8 @@ to the lock. A platform the entry has no key for is not a disagreement.
 | `mur run` | Creates `murmur.lock` when none exists. Once present, only verifies against it — an existing entry is never refreshed |
 | `mur eval` | As `mur run`, once for the whole dataset run |
 | `mur install` | Upserts an entry for each artifact it installs successfully, preserving the rest. An artifact installed from a file is pinned as `local/<name>`. Skipped for `-g` (no project directory) and for `--all-platforms`, which installs into the global store |
-| `manage.pull()` | The same verify-then-upsert, from a running capsule rather than the CLI. Pins a new entry as `origin: runtime` — see [Pin origin](#lock-origin) |
-| `manage.remove()` | Deletes one `origin: runtime` entry the manifest does not declare, and rewrites every other entry unchanged — see [Pin origin](#lock-origin) |
+| `manage.pull()`, [`pull-artifact`](runtime-provided-tools.md#pull-artifact) | The same verify-then-upsert, from a running capsule rather than the CLI. Pins a new entry as `origin: runtime` and sets `owner_id` when the source or the stored payload records one; a pull whose owner id differs from one the lock records for the scope is refused — see [Pin origin](#lock-origin) |
+| `manage.remove()`, [`remove-artifact`](runtime-provided-tools.md#remove-artifact) | Deletes one `origin: runtime` entry the manifest does not declare, and rewrites every other entry unchanged — see [Pin origin](#lock-origin) |
 
 An upsert adds this platform's key beside the keys already there. It replaces the whole `sha256`
 block only when everything in it is stale: a different `resolved_version`, or a change between the
@@ -513,7 +514,7 @@ block only when everything in it is stale: a different `resolved_version`, or a 
 
 | Key | Values | Written | Notes |
 |---|---|---|---|
-| `origin` | `operator`, `runtime` | Always | `operator`: written by `mur install`, or by the `mur run` or `mur eval` that created the lock. `runtime`: written by a running capsule through `manage.pull()`. An entry with no `origin` key reads as `operator` |
+| `origin` | `operator`, `runtime` | Always | `operator`: written by `mur install`, or by the `mur run` or `mur eval` that created the lock. `runtime`: written by a running capsule through `manage.pull()` or `pull-artifact`. An entry with no `origin` key reads as `operator` |
 | `session` | A session id (`ses_…`) | Only for `origin: runtime` | The session whose capsule pulled the artifact. Required and non-blank for `runtime`; refused on `operator` |
 
 Each writer sets the origin like this:
@@ -522,8 +523,8 @@ Each writer sets the origin like this:
 |---|---|---|
 | `mur run` / `mur eval` creating the lock | `origin: operator` | — (they never rewrite an existing lock) |
 | `mur install` | `origin: operator` | Becomes `origin: operator` and `session` is dropped; `mur install` [prints one line](cli.md#mur-install) for each runtime pin it adopts |
-| `manage.pull()` | `origin: runtime` with the pulling session | Origin left exactly as it was |
-| `manage.remove()` | — | An `origin: runtime` entry is deleted, whichever session pulled it. An `origin: operator` entry is never deleted |
+| `manage.pull()`, `pull-artifact` | `origin: runtime` with the pulling session | Origin left exactly as it was |
+| `manage.remove()`, `remove-artifact` | — | An `origin: runtime` entry is deleted, whichever session pulled it. An `origin: operator` entry is never deleted |
 
 A pull never turns an operator pin into a runtime one, and never relabels an earlier pull with its
 own session.

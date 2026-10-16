@@ -7,15 +7,15 @@ use capsule_runtime::{
     capability_policy_from_runtime_manifest, check_egress_namespace,
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
     detect_egress_namespace_blocker, detect_landlock_abi, detect_userns_grant, find_on_path,
-    inspect_installed_profile, inspect_profile_attachment, landlock_doctor_lines, preopen_reports,
-    read_only_advisory_for, render_install, render_read_only, served_wit_level,
-    undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
-    warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
-    warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
-    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
-    warn_on_workdir_exec, wit_levels, ArtifactRequest, EgressNamespaceBlocker,
-    InstalledProfileState, ProfileAttachment, UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS,
-    SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
+    inspect_installed_profile, inspect_profile_attachment, install_from_places,
+    landlock_doctor_lines, preopen_reports, read_only_advisory_for, render_install,
+    render_read_only, served_wit_level, undeclarable_runtime_pin_role,
+    warn_on_gateway_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
+    warn_on_launch_only_gateway_credential, warn_on_secret_shaped_env_grants,
+    warn_on_unmetered_gateways, warn_on_unreachable_toolchain_helpers,
+    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, wit_levels,
+    ArtifactRequest, EgressNamespaceBlocker, InstalledProfileState, ProfileAttachment, UsernsGrant,
+    SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, level_fit, native_binary_verdict,
@@ -587,7 +587,8 @@ fn report_read_only(policy: &capsule_runtime::CapabilityPolicy) {
     capsule_runtime::report_println!();
 }
 
-/// Prints which skills and tools `capabilities.install` lets `manage.pull` install into a session.
+/// Prints which skills and tools `capabilities.install` lets a pull install into a session, and
+/// from where.
 ///
 /// Rendered by `render_install`, the same function `ScopeReport::render` calls, so `mur doctor`
 /// and `mur run --explain-scope` state the grant in one voice. A report, never a verdict: an
@@ -596,7 +597,11 @@ fn report_install(policy: &capsule_runtime::CapabilityPolicy) {
     capsule_runtime::report_println!("Install grant");
     capsule_runtime::report_print!(
         "{}",
-        render_install(&policy.install_skill, &policy.install_tool)
+        render_install(
+            &policy.install_skill,
+            &policy.install_tool,
+            &install_from_places(policy)
+        )
     );
     capsule_runtime::report_println!();
 }

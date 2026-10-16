@@ -83,6 +83,7 @@ fn local_source_file_path_installs_skill_md() {
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
+            source_supply: None,
             credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -154,6 +155,7 @@ fn local_source_directory_path_finds_skill_md_case_insensitively() {
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
+            source_supply: None,
             credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -236,6 +238,7 @@ fn local_source_coexists_with_registry_skill() {
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
+            source_supply: None,
             credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),

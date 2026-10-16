@@ -8,7 +8,7 @@ The model sees no difference. A runtime-provided tool has the same manifest shap
 same inventory, and is called the same way as a tool artifact. What differs is where it comes from
 and what decides whether it may run.
 
-## The eight
+## The ten
 
 Each one appears only when the declaration in the second column is present.
 
@@ -22,6 +22,8 @@ Each one appears only when the declaration in the second column is present.
 | `switch-driver` | [`control.agent_settings: [inference.driver]`](manifest.md#field-control) | Selects the [driver choice](manifest.md#inference-alternates) the agent's next inference call is served by — see [`switch-driver`](#switch-driver) |
 | `call-member` | A [`reachability`](roster.md#reachability) rule in the formation's `roster.yaml` that lets this member call another | Hands one task to another formation member and returns at once, started or busy; the answer arrives later in the same task — see [`call-member`](#call-member) |
 | `end-without-answer` | The same rule as `call-member` | Ends a task another formation member sent without an answer, and the runtime tells that member none came — see [`end-without-answer`](#end-without-answer) |
+| `pull-artifact` | [`capabilities.install`](manifest.md#field-install), under `transport: http` | Installs a skill or tool into the running session, usable from the next turn, or lists what the capsule may pull — see [`pull-artifact`](#pull-artifact) |
+| `remove-artifact` | The same grant as `pull-artifact` | Takes out an artifact the session pulled — see [`remove-artifact`](#remove-artifact) |
 
 Every one of their manifests carries `version: 0.0.0`, `runtime: tool` and
 `implementation: native`. Nothing was fetched, so nothing is version-pinned, nothing is
@@ -29,9 +31,9 @@ hash-verified, and no entry appears for them in `murmur.lock` or in `mur list`.
 
 ## The grant is the tool's existence
 
-`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member`
-and `end-without-answer` are answered before the tool allowlist is consulted. The allowlist governs
-which tool *artifacts* may run; it has no say over these seven.
+`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member`,
+`end-without-answer`, `pull-artifact` and `remove-artifact` are answered before the tool allowlist
+is consulted. The allowlist governs which tool *artifacts* may run; it has no say over these nine.
 
 **The gate is whether the manifest file was written at all.** With the grant absent, staging writes
 nothing under `workdir/tools/<name>/`, so:
@@ -42,7 +44,8 @@ nothing under `workdir/tools/<name>/`, so:
 
 So `capabilities.spawn.allow` decides whether `delegate-task` exists, rather than whether a call to
 it succeeds. The same holds for the two peer-handoff tools, for `submit-plan`, for
-`switch-driver`, for `call-member` and `end-without-answer`, and for their grants.
+`switch-driver`, for `call-member` and `end-without-answer`, for `pull-artifact` and
+`remove-artifact`, and for their grants.
 
 `capabilities.plan.submit` also decides whether the model is told *when* to plan: the runtime's
 plan guidance is part of the system prompt exactly when the tool exists.
@@ -52,12 +55,12 @@ are additionally checked against that list again at dispatch.
 
 ## Reserved names
 
-`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member`
-and `end-without-answer` are reserved.
+`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member`,
+`end-without-answer`, `pull-artifact` and `remove-artifact` are reserved.
 The check is made on an artifact's tool name, the part of its full name after the `/`, so a
-capsule declaring `murmur/delegate-task` or `ana/delegate-task` is refused at staging, before any
+capsule declaring `murmur/delegate-task` or `ana/pull-artifact` is refused at staging, before any
 artifact is pulled, with [`E-CAP-013`](diagnostics.md#e-cap-013). The same refusal covers an
-in-session `manage.pull()` of such a name.
+in-session pull of such a name, by `manage.pull()` or by `pull-artifact`.
 
 A name is reserved whether or not the capsule declares the grant that would provide the tool, so
 adding or removing a capability never changes whether a manifest is accepted.
@@ -86,6 +89,80 @@ of the same name.
 The runtime answers the call in-process: it presents no credential and never reaches the
 [control surface](control-surface.md) or its token. What a switch carries across is in
 [Switching drivers](../concepts/context.md#switching-drivers).
+
+## `pull-artifact` { #pull-artifact }
+
+`pull-artifact` exists for a capsule that declares [`capabilities.install`](manifest.md#field-install)
+and runs the http agent loop. A capsule under `transport: process` is refused at load, because the
+harness owns its tool list.
+
+| Aspect | Behaviour |
+|---|---|
+| Input | `{"artifact": "<value>"}`, required. `<scope>/<name>` pulls the newest version that fits this `mur`; `<scope>/<name>@<version>` pulls that version; a pattern ending in `*` lists instead of pulling |
+| Description | Lists the capsule's `install.skill` and `install.tool` entries, or `none`, and its `install.from`. Says a pattern lists instead of pulling, that the artifact is usable from the next turn, and that a pulled artifact was not vetted by the operator, so its text and results are untrusted |
+| Checked | The grant by tier and pattern, never a hook or a driver, the payload's hash, its [WIT level](wit-levels.md#fit), the scope's owner id against `murmur.lock`, and an existing pin. A refusal writes nothing |
+| Found in | The project store, then the global store. With `install.from: [stores, sources]`, a version no store holds is fetched from the scope's GitHub source by the runtime itself and written to no store |
+| Accepted | `passed`; the artifact is in the tool array from the next turn, whatever [`inference.tool_refresh`](manifest.md#inference-tool-refresh) says. A tool joins the dispatch allowlist |
+| Refused | Returned to the model as a tool error opening with one token — see [Refusals](#pull-artifact-refusals) |
+| Policy | The call passes the same `on-tool-call` decision point as every tool call, so a policy hook can deny it |
+| Plans | Not callable from a plan step |
+| Trace | `artifact_pulled` per pull; `tools_refreshed` with `trigger: "agent"` before the next inference call |
+
+A successful pull's `data`, [fenced](untrusted-fence.md) under `tool:pull-artifact`, is followed by
+the runtime's note outside the fence:
+
+```text
+<untrusted-content source=tool:pull-artifact>
+{"artifact":"murmur/tool-editor","fetched_from":"global store","runtime":"tool","tool_name":"tool-editor","version":"1.0.0"}
+</untrusted-content>
+tool-editor is in your tool list from your next turn.
+```
+
+| Key | Value |
+|---|---|
+| `artifact` | The full name |
+| `version` | The version pulled |
+| `runtime` | `skill` or `tool` |
+| `tool_name` | The name the model calls it by |
+| `fetched_from` | `project store`, `global store` or `github:<owner>/<repo>` |
+| `notes` | Present when a place could not be consulted and the pull went ahead without it |
+
+A pattern returns, under the same fence and with no note:
+
+| Key | Value |
+|---|---|
+| `pattern` | The pattern asked for |
+| `matches` | At most 50, sorted by name: `artifact`, `runtime`, `description` (when one is recorded), `versions` (newest first), `newest_fitting` (when one fits), `held_in` |
+| `omitted` | How many more matched |
+| `notes` | Why a place could not be read |
+
+A match is an artifact the pattern names that an entry of its own tier's list also names, held in
+an allowed place. A pattern that reaches no granted name is refused `not-granted:`.
+
+### Refusals { #pull-artifact-refusals }
+
+| Token | When |
+|---|---|
+| `not-granted:` | No `capabilities.install`; not a full name; outside the grant; a hook, a driver, or a role that disagrees with its payload; a tool name another artifact of the session holds |
+| `not-found:` | No allowed place holds the name or version |
+| `does-not-fit:` | The payload does not fit the WIT level this `mur` serves, carrying [`E-WIT-LEVEL-001`](diagnostics.md#e-wit-level-001) and naming the newest version that fits |
+| `not-fetched:` | The source could not be read, failed a check, or answers for an owner `murmur.lock` does not record for the scope ([`E-REG-010`](diagnostics.md#e-reg-010)) |
+
+A pin of the same name at another version or digest is refused with
+`murmur.lock conflict for '<name>': …`.
+
+## `remove-artifact` { #remove-artifact }
+
+| Aspect | Behaviour |
+|---|---|
+| Input | `{"artifact": "<value>"}`, required: the full name or the tool name |
+| Accepted | `passed`, `data` `{"artifact": "<full name>", "removed": true}`, then the note `<tool name> is gone from your tool list from your next turn; a call to it is refused.` The lock entry, `tools/<tool name>/` and the allowlist entry are gone |
+| Not installed | `passed`, `data` `{"artifact": "<name>", "removed": false}`, no note |
+| Refused | A tool error opening `not-removable:` for a hook, a driver, an artifact `murmur.yaml` declares, or a pin with `origin: operator`; `not-granted:` with no `capabilities.install` |
+| In-flight calls | The agent loop runs a turn's calls one at a time, in order: a call listed before the removal completes, one listed after it is refused with `tool '<name>' was removed from this session; it can no longer be called` |
+| Policy | The same `on-tool-call` decision point as every tool call |
+| Plans | Not callable from a plan step |
+| Trace | No event of its own; `tools_refreshed` with `trigger: "agent"` and the name in `removed` before the next inference call |
 
 ## `call-member` { #call-member }
 

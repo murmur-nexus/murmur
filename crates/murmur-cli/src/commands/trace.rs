@@ -352,7 +352,8 @@ impl SkillCallEvent {
     }
 }
 
-/// One `artifact_pulled` record: an artifact a running capsule fetched through `manage.pull()`.
+/// One `artifact_pulled` record: an artifact a running capsule fetched through `manage.pull()` or
+/// `pull-artifact`.
 #[derive(Debug, Deserialize)]
 struct ArtifactPulledEvent {
     name: String,
@@ -363,6 +364,9 @@ struct ArtifactPulledEvent {
     origin: String,
     #[serde(default)]
     trust: String,
+    /// Absent on a trace written before the field existed.
+    #[serde(default)]
+    fetched_from: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1444,8 +1448,13 @@ fn skill_call_show_entry(rec: &SkillCallRecord) -> String {
 
 /// One `artifact_pulled` record's row under `mur trace show`'s `Pulled at runtime` section.
 fn artifact_pulled_show_row(e: &ArtifactPulledEvent) -> String {
+    let from = e
+        .fetched_from
+        .as_deref()
+        .map(|from| format!("  from {from}"))
+        .unwrap_or_default();
     format!(
-        "  {}@{}  {}  {}/{}",
+        "  {}@{}  {}  {}/{}{from}",
         e.name, e.version, e.runtime, e.origin, e.trust
     )
 }
@@ -5835,6 +5844,19 @@ mod tests {
         assert_eq!(
             artifact_pulled_show_row(&e),
             "  pulled-style@0.1.0  skill  runtime/untrusted"
+        );
+
+        let line = line.replace(
+            r#""trust":"untrusted"}"#,
+            r#""trust":"untrusted","fetched_from":"github:ana/artifacts","owner_id":4242}"#,
+        );
+        let TraceEvent::ArtifactPulled(e) = serde_json::from_str::<TraceEvent>(&line).unwrap()
+        else {
+            panic!("an artifact_pulled line parses as ArtifactPulled");
+        };
+        assert_eq!(
+            artifact_pulled_show_row(&e),
+            "  pulled-style@0.1.0  skill  runtime/untrusted  from github:ana/artifacts"
         );
     }
 

@@ -165,22 +165,44 @@ pub(crate) fn build_tool_inventory(
 /// it was built at.
 ///
 /// The array is the head of the prefix every provider matches its prompt cache on, so it is
-/// held byte-for-byte across calls and rebuilt only at the boundary `inference.tool_refresh`
-/// names, once `CapsuleStoreState::installed_generation` has moved past the held one.
+/// held byte-for-byte across calls and rebuilt, once `CapsuleStoreState::installed_generation`
+/// has moved past the held one, only at the boundary `inference.tool_refresh` names or at the
+/// call after the model's own `pull-artifact` or `remove-artifact`.
 pub(crate) struct HeldInventory {
     tools: Vec<Value>,
     generation: u64,
+}
+
+/// What released a rebuild of the held tool array, as `tools_refreshed.trigger` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshCause {
+    /// A compaction committed since the previous call, whatever `inference.tool_refresh` says:
+    /// that call's message history was already a full cache miss.
+    Compaction,
+    /// The model itself pulled or removed an artifact on the previous turn, whatever
+    /// `inference.tool_refresh` says: it asked for the change and calls the result next.
+    Agent,
+    /// `inference.tool_refresh: immediate`, for a change the agent did not make: this call pays
+    /// the miss for the refresh alone.
+    Immediate,
+}
+
+impl RefreshCause {
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::Compaction => "compaction",
+            Self::Agent => "agent",
+            Self::Immediate => "immediate",
+        }
+    }
 }
 
 /// A rebuild that changed the bytes the next call sends. The new array is
 /// [`HeldInventory::tools`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InventoryRefresh {
-    /// What released the rebuild. [`ToolRefresh::Compaction`] whenever a compaction committed
-    /// since the previous call, whatever the declared trigger, because that call's message
-    /// history was already a full cache miss; [`ToolRefresh::Immediate`] only when this call
-    /// pays the miss for the refresh alone.
-    pub(crate) trigger: ToolRefresh,
+    /// What released the rebuild.
+    pub(crate) trigger: RefreshCause,
     /// Names offered now and not before, sorted.
     pub(crate) added: Vec<String>,
     /// Names offered before and not now, sorted.
@@ -215,8 +237,10 @@ impl HeldInventory {
     }
 
     /// The pre-call decision: rebuild the array when `current_generation` has moved past the
-    /// held one and either `trigger` is [`ToolRefresh::Immediate`] or `compaction_committed`
-    /// says a compaction replaced the context since the previous call.
+    /// held one and `compaction_committed` says a compaction replaced the context since the
+    /// previous call, `agent_changed` says the model's own `pull-artifact` or `remove-artifact`
+    /// call moved it, or `trigger` is [`ToolRefresh::Immediate`]. The cause is the first of those
+    /// that holds.
     ///
     /// An unchanged generation reads nothing from disk. A change the trigger does not release
     /// stays pending: the held generation is not advanced, so the next eligible call still sees
@@ -225,6 +249,7 @@ impl HeldInventory {
     ///
     /// `installed` must be the session's installed artifacts as they stand now, pulls included:
     /// a runtime-origin entry the rebuild offers is marked from it exactly as at launch.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn refresh_before_call(
         &mut self,
         workdir: &WorkdirRoot,
@@ -233,14 +258,17 @@ impl HeldInventory {
         trigger: ToolRefresh,
         current_generation: u64,
         compaction_committed: bool,
+        agent_changed: bool,
     ) -> Option<InventoryRefresh> {
         if current_generation == self.generation {
             return None;
         }
         let released_by = if compaction_committed {
-            ToolRefresh::Compaction
+            RefreshCause::Compaction
+        } else if agent_changed {
+            RefreshCause::Agent
         } else if trigger == ToolRefresh::Immediate {
-            ToolRefresh::Immediate
+            RefreshCause::Immediate
         } else {
             return None;
         };

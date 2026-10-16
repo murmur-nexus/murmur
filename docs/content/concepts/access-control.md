@@ -222,10 +222,14 @@ and a **trust class** derived from it:
 | Lock origin | Written by | Trust |
 |---|---|---|
 | `operator` | `mur install`, or the `mur run` / `mur eval` that created the lock. A `source:` skill and an artifact staged with no lock read as `operator` too | `trusted` |
-| `runtime` | A running capsule's [`manage.pull()`](../reference/wit-interfaces.md#murmurartifact-managermanage) | `untrusted` |
+| `runtime` | A running capsule's pull: a script capsule's [`manage.pull()`](../reference/wit-interfaces.md#murmurartifact-managermanage), or an agent's [`pull-artifact`](../reference/runtime-provided-tools.md#pull-artifact) call | `untrusted` |
 
-The runtime's own tools (`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`) have no
-pin and are `operator`.
+The [runtime-provided tools](../reference/runtime-provided-tools.md) have no pin and are
+`operator`.
+
+A pull from a scope's GitHub source, under `capabilities.install.from: [stores, sources]`, also
+records the scope's owner id beside the pin, so a later pull or install from another owner of the
+same scope is refused.
 
 An `untrusted` artifact reaches the model marked on every surface it can reach it through:
 
@@ -246,7 +250,9 @@ The tool array is sent beside the conversation rather than inside it, so a compa
 replaces the conversation leaves the marker in place.
 
 The class is a marker, not a control: a marked artifact is staged, offered and dispatched exactly
-as an operator one is, under the same grants. A skill and a tool are marked alike. The marker
+as an operator one is, under the same grants. A pulled tool joins the dispatch allowlist and gains
+nothing else. An `on-tool-call` policy hook decides on a `pull-artifact` call as on any other, so
+an operator can gate what an agent pulls. A skill and a tool are marked alike. The marker
 persists on every launch until `mur install <name>@<version>` adopts the pin as `operator`;
 pulling an artifact the operator already pinned at the same version leaves the pin `operator`.
 

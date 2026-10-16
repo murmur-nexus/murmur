@@ -3,6 +3,7 @@
 //! `artifacts-index.json` on its latest release.
 
 pub(crate) mod github;
+pub(crate) mod supply;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -300,6 +301,11 @@ impl Sources {
     /// The one source of `scope`, or `None` when no source serves it.
     pub(crate) fn for_scope(&self, scope: &str) -> Option<Arc<dyn ArtifactSource>> {
         self.by_scope.get(scope).cloned()
+    }
+
+    /// Every scope a source serves, sorted.
+    pub(crate) fn scopes(&self) -> Vec<String> {
+        self.by_scope.keys().cloned().collect()
     }
 
     /// The source of `name`'s scope. `local/` is refused as it always is, and a scope no source

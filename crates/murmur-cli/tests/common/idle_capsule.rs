@@ -162,6 +162,7 @@ fn stage_agent(
     stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
+            source_supply: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),

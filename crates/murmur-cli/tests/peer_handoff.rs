@@ -440,6 +440,7 @@ fn stage_request(
     port: u16,
 ) -> StageRequest {
     StageRequest {
+        source_supply: None,
         credentials_file: None,
         manifest_dir: project.to_path_buf(),
         capsule_name: runtime_manifest.name.clone(),

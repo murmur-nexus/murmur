@@ -33,6 +33,12 @@ use wasmtime_wasi_http::{
     WasiHttpView,
 };
 
+mod artifact_change;
+
+pub(crate) use artifact_change::{
+    exclusive_only, PulledArtifact, PULL_ARTIFACT_TOOL, REMOVE_ARTIFACT_TOOL,
+};
+
 use crate::{
     a2a::{A2aTask, IncomingTask, TaskRegistry, TaskState},
     agent::{self, AgentLoopExit},
@@ -2572,6 +2578,16 @@ pub fn stage_session(
     // And the plan tool, on the same terms once more. Its schema is fixed rather than built: a
     // plan reaches this session's own tools, so there is no granted list to fold into it.
     write_submit_plan_tool_manifest(&session_root, request.capability_policy.plan_submit)?;
+    // And the two artifact tools, for a capsule granted `capabilities.install` whose model is
+    // driven by the http agent loop, the one loop that dispatches them.
+    artifact_change::write_artifact_change_tool_manifests(
+        &session_root,
+        &request.capability_policy,
+        request
+            .inference
+            .as_ref()
+            .is_some_and(|inference| inference.transport == "http"),
+    )?;
     write_switch_driver_tool_manifest(
         &session_root,
         control
@@ -2714,6 +2730,7 @@ pub fn stage_session(
         exports_peer_files,
         accepts_peer_tasks,
         registry,
+        source_supply: request.source_supply,
         _epoch_ticker: epoch_ticker,
         // Minted by the daemon at registration, which `launch_session` performs — it names a
         // session id, and staging is what mints one.
@@ -3342,6 +3359,7 @@ fn launch(
         let trace_system_prompt = system_prompt.clone();
         let system_prompt_overridden = staged.system_prompt_overridden;
         let registry_for_pull = Arc::clone(&staged.registry);
+        let source_supply_for_pull = staged.source_supply.clone();
         let compiled_forms_for_pull = staged.compiled_forms.clone();
         let lock_path_for_pull = staged.manifest_dir.join("murmur.lock");
 
@@ -3629,6 +3647,7 @@ fn launch(
                         a2a_chunks_emitted: Arc::new(AtomicBool::new(false)),
                         a2a_tool_calls: Arc::default(),
                         registry: registry_for_pull,
+                        source_supply: source_supply_for_pull,
                         compiled_forms: compiled_forms_for_pull,
                         lock_path: lock_path_for_pull,
                         driver_continuation_id: None,
@@ -4700,6 +4719,7 @@ fn launch(
         a2a_chunks_emitted: Arc::new(AtomicBool::new(false)),
         a2a_tool_calls: Arc::default(),
         registry: Arc::clone(&staged.registry),
+        source_supply: staged.source_supply.clone(),
         lock_path: staged.manifest_dir.join("murmur.lock"),
         driver_continuation_id: None,
         driver_continuation_context_id: None,
@@ -4799,7 +4819,7 @@ async fn drain_script_trace_buffers(
     capsule_name: &str,
     capsule_version: &str,
     scope_report: &crate::containment::ScopeReport,
-    pulls: Vec<InstalledArtifactSummary>,
+    pulls: Vec<PulledArtifact>,
     sends: Vec<PendingA2aSend>,
 ) {
     if pulls.is_empty() && sends.is_empty() {
@@ -6636,7 +6656,7 @@ pub(crate) struct CapsuleStoreState {
     /// it; hooks' `run-inference` and the gateway hold clones of the same account.
     pub(crate) spend: Arc<SpendMeter>,
     pub(crate) engine: Engine,
-    /// Shared from [`StagedSession::compiled_forms`]. `manage.pull()` compiles through it rather
+    /// Shared from [`StagedSession::compiled_forms`]. A pull compiles through it rather
     /// than a handle built from [`Self::workdir`]: it carries the capsule writable root every
     /// session directory is created in, which the per-session `workdir` does not.
     pub(crate) compiled_forms: CompiledForms,
@@ -6651,7 +6671,7 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) accessible_root: WorkdirRoot,
     pub(crate) tool_components: HashMap<String, Component>,
     /// What each native tool installed in this session needs to start, keyed by tool name: from
-    /// [`StagedSession::native_entrypoints`], and added to by `manage.pull()`. A native tool is
+    /// [`StagedSession::native_entrypoints`], and added to by a pull. A native tool is
     /// dispatched only through its entry here; see [`sandbox::NativeEntrypoint`].
     pub(crate) native_entrypoints: HashMap<String, sandbox::NativeEntrypoint>,
     /// The `transport: process` driver this session drives its harness through, shared from
@@ -6661,22 +6681,25 @@ pub(crate) struct CapsuleStoreState {
     /// Per-artifact narrowing keyed by artifact name, moved over from
     /// [`StagedSession::artifact_grants`]. A name absent here dispatches on the full ceiling.
     pub(crate) artifact_grants: HashMap<String, ToolCapabilityGrant>,
+    /// The tool names dispatch reaches as artifacts: the declared tools, plus each tool a pull
+    /// installed, until a removal takes it out.
     pub(crate) allowlisted_tools: HashSet<String>,
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
     /// How many times this session's installed set has changed since launch. `0` at
-    /// construction and moved by exactly one by every `manage.pull()` and `manage.remove()` that
-    /// changes the installed set; a refused call leaves it alone. A `remove` whose directory
-    /// cannot be deleted still moves it, since the name is already out of the session. The agent
+    /// construction and moved by exactly one by every pull and removal (`manage.*` or the agent's
+    /// `pull-artifact` / `remove-artifact`) that changes the installed set; a refused call leaves
+    /// it alone. A removal whose directory cannot be deleted still moves it, since the name is
+    /// already out of the session. The agent
     /// loop compares it with the generation its held tool array was built at
     /// (`agent::inventory::HeldInventory`), so any path that adds or removes an artifact under
     /// `workdir/tools/` must move it too, or the model is never offered the change.
     pub(crate) installed_generation: u64,
     /// The names `murmur.yaml` declares under `artifacts:`, taken from
-    /// [`StagedSession::installed_artifacts`] at construction and never changed. `manage.remove()`
+    /// [`StagedSession::installed_artifacts`] at construction and never changed. A removal
     /// refuses every one of them: the next launch fails without their `murmur.lock` entries.
     pub(crate) declared_artifacts: HashSet<String>,
-    /// The names `manage.remove()` removed in this session and no later `manage.pull()`
-    /// reinstalled. `invoke()` and the agent-loop dispatch refuse a call to one with
+    /// The names a removal took out of this session and no later pull reinstalled. `invoke()`
+    /// and the agent-loop dispatch refuse a call to one with
     /// [`crate::artifact_removal::called_after_removal`].
     pub(crate) removed_artifacts: HashSet<String>,
     /// The tool names whose malformed `input_schema` has already been named in `W-RUN-004` this
@@ -6690,13 +6713,14 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) session_id: String,
     /// Buffered outgoing A2A send events — drained into trace.jsonl after the capsule run.
     pub(crate) pending_a2a_events: Vec<PendingA2aSend>,
-    /// One summary per successful `manage.pull()`, as `installed_artifacts` records it after the
-    /// pull, awaiting its `artifact_pulled` trace line. A refused or failed pull pushes nothing.
+    /// One record per successful pull, as `installed_artifacts` records it after the pull,
+    /// awaiting its `artifact_pulled` trace line. A refused or failed pull pushes nothing.
     ///
-    /// Only the script-capsule path links `manage` and drains this, after the guest's `run`
-    /// returns ([`drain_script_trace_buffers`]). A path that makes `manage.pull()` reachable
-    /// anywhere else must drain it there too, or its pulls go unrecorded.
-    pub(crate) pending_artifact_pulls: Vec<InstalledArtifactSummary>,
+    /// Drained by both paths a pull is reachable from: the script-capsule path after the guest's
+    /// `run` returns ([`drain_script_trace_buffers`]), and the http agent loop after each
+    /// `pull-artifact` call. A path that makes a pull reachable anywhere else must drain it there
+    /// too, or its pulls go unrecorded.
+    pub(crate) pending_artifact_pulls: Vec<PulledArtifact>,
     pub(crate) capability_policy: CapabilityPolicy,
     /// The lowered `capabilities.filesystem.read_only` surface, built and validated once at
     /// staging. Empty for every capsule that declared nothing, and
@@ -6761,9 +6785,12 @@ pub(crate) struct CapsuleStoreState {
     /// during the current task attempt. Reset when an http attempt begins; only the driver turn's
     /// dispatch carries it.
     pub(crate) a2a_tool_calls: Arc<Mutex<ToolCallProgress>>,
-    /// Registry used to resolve additional artifacts requested at runtime via `manage.pull()`.
+    /// The stores a runtime pull (`manage.pull()`, `pull-artifact`) resolves against first.
     pub(crate) registry: Arc<dyn Registry>,
-    /// Path to this session's `murmur.lock`, consulted and updated by `manage.pull()`.
+    /// [`StagedSession::source_supply`]: the scope sources a pull the stores cannot answer is
+    /// fetched from, when `capabilities.install.from` names `sources`.
+    pub(crate) source_supply: Option<Arc<dyn crate::artifact_supply::SourceSupply>>,
+    /// Path to this session's `murmur.lock`, consulted and updated by every pull and removal.
     pub(crate) lock_path: PathBuf,
     // ── Stateful-driver continuation ───────────────────────────────────
     /// Continuation id most recently returned by the inference driver via
@@ -7071,226 +7098,45 @@ impl manage::Host for CapsuleStoreState {
         read_artifact_info_from_manifest(&manifest_content, &rel, summary)
     }
 
+    /// What `query` reaches that this capsule may pull: an exact full name or an install
+    /// pattern, one summary per artifact at the version a pull without one would choose (its
+    /// newest held version when none fits).
     fn search(&mut self, query: String) -> Result<Vec<manage::ArtifactSummary>, String> {
-        Err(format!("not implemented (query: {query})"))
+        let listing = self.list_pullable(&query)?;
+        Ok(listing
+            .matches
+            .into_iter()
+            .map(|listed| manage::ArtifactSummary {
+                version: listed
+                    .newest_fitting
+                    .or_else(|| listed.versions.first().cloned())
+                    .unwrap_or_default(),
+                name: listed.artifact,
+                runtime: if listed.native {
+                    manage::RuntimeType::Native
+                } else {
+                    manage::RuntimeType::Wasm
+                },
+            })
+            .collect())
     }
 
+    /// A version is required here, as the WIT signature has it; `pull-artifact` may omit one.
     fn pull(&mut self, name: String, version: String) -> Result<manage::ArtifactSummary, String> {
-        // 0. The capsule's own `capabilities.install` grant, decided on the name and version
-        // alone, so a refused request never reaches the registry.
-        let artifact_name =
-            crate::install_grant::refuse_before_resolve(&self.capability_policy, &name, &version)?;
-        // The tool name this pull would stage under, refused when another artifact of this
-        // session already answers to it: the model could not tell the two apart.
-        let tool = artifact_name.name().to_string();
-        crate::install_grant::refuse_tool_name_taken(&artifact_name, &self.installed_artifacts)?;
-
-        // 1. Resolve + verify against the registry's own self-reported hash.
-        let resolved = self
-            .registry
-            .resolve_with_platform(&artifact_name, &version, Some(current_platform()))
-            .map_err(|err| format!("failed to resolve {name}@{version}: {err}"))?;
-
-        verify_sha256(&name, &version, &resolved.bytes, &resolved.sha256).map_err(|_| {
-            format!("artifact integrity check failed for {name}@{version}: registry-reported hash does not match downloaded bytes")
-        })?;
-
-        // The grant's tier half: whether the payload is a skill or a tool is known only once
-        // resolved, and it is decided before the lock is read or anything is written or compiled.
-        if let Some(refusal) = crate::install_grant::refuse_after_resolve(
-            &self.capability_policy,
-            &artifact_name,
-            &resolved.meta,
-        ) {
-            return Err(refusal);
-        }
-
-        // 2. Cross-check against any existing murmur.lock pin — a runtime pull must never
-        // silently override what's already pinned for this artifact.
-        let mut lock = match read_lockfile(&self.lock_path) {
-            Ok(lock) => lock,
-            Err(LockfileError::NotFound(_)) => MurmurLock {
-                lock_version: LOCK_VERSION,
-                artifacts: Vec::new(),
-            },
-            Err(err) => return Err(format!("failed to read murmur.lock: {err}")),
-        };
-
-        // An entry that has no key for this platform yet is not a conflict — it is a platform
-        // nobody has installed on before.
-        let incoming_sha256 = LockedSha256::for_resolved(&resolved, current_platform());
-
-        if let Some(existing) = lock.artifact_for(&name) {
-            if let Some(conflict) = existing.conflict_with(&version, &incoming_sha256) {
-                return Err(format!(
-                    "murmur.lock conflict for '{name}': {conflict} — refusing to override a \
-                     pinned artifact at runtime"
-                ));
-            }
-        }
-
-        // 3. Extract murmur.yaml, dispatch extraction by runtime type, and write files under
-        // <workdir>/tools/<name>/ — no disk writes happen before steps 1-2 succeed.
-        let manifest_yaml = extract_manifest_yaml(&name, &version, &resolved.bytes)
-            .map_err(|err| err.to_string())?;
-        write_tool_manifest(&self.session_root, &tool, &manifest_yaml)
-            .map_err(|err| err.to_string())?;
-
-        let (artifact_runtime, implementation, wasm_component) = match resolved.meta.runtime {
-            RuntimeType::Wasm => {
-                let wasm_bytes = extract_root_wasm(&name, &version, &resolved.bytes)
-                    .map_err(|err| err.to_string())?;
-                let component = self
-                    .compiled_forms
-                    .compile(&self.engine, &resolved.sha256, &wasm_bytes)
-                    .map_err(|err| format!("failed to compile pulled component '{name}': {err}"))?;
-                (
-                    ArtifactRuntime::Tool,
-                    Some(ArtifactImplementation::Wasm),
-                    Some(component),
-                )
-            }
-            RuntimeType::Native => {
-                // The binary is packed at `bin/<bare name>`, the artifact's own `name:`.
-                let binary = extract_native_binary(&tool, &version, &resolved.bytes)
-                    .map_err(|err| err.to_string())?;
-                let installed = install_native_binaries(
-                    &self.session_root,
-                    &self.accessible_workdir,
-                    vec![(tool.clone(), binary)],
-                    &HashMap::from([(tool.clone(), name.clone())]),
-                )
-                .map_err(|err| err.to_string())?;
-                self.native_entrypoints.extend(installed);
-                (
-                    ArtifactRuntime::Tool,
-                    Some(ArtifactImplementation::Native),
-                    None,
-                )
-            }
-            RuntimeType::Static => {
-                let skill_md = extract_skill_md(&name, &version, &resolved.bytes)
-                    .map_err(|err| err.to_string())?;
-                install_skill_files(&self.session_root, vec![(tool.clone(), skill_md)])
-                    .map_err(|err| err.to_string())?;
-                (ArtifactRuntime::Skill, None, None)
-            }
-        };
-
-        // 4. Files are on disk — now, and only now, update murmur.lock. The origin is this
-        // store's own session: the guest has no input to it. A runtime upsert keeps an existing
-        // entry's origin, so an operator pin stays operator and an earlier pull keeps its
-        // session — which makes the entry's origin now its previous one, or ours if it is new.
-        let pulled_by = LockOrigin::Runtime {
-            session: self.session_id.clone(),
-        };
-        let origin = lock
-            .upsert(&name, &version, incoming_sha256, pulled_by.clone())
-            .unwrap_or(pulled_by);
-        write_lockfile_atomic(&self.lock_path, &lock)
-            .map_err(|err| format!("failed to write murmur.lock: {err}"))?;
-
-        // 5. Reflect the pulled artifact in in-memory session state so list()/describe() (and,
-        // for WASM tools, invoke()) see it immediately.
-        if let Some(component) = wasm_component {
-            self.tool_components.insert(tool.clone(), component);
-        }
-
-        let summary = InstalledArtifactSummary {
-            name: name.clone(),
-            version: version.clone(),
-            runtime: artifact_runtime,
-            implementation,
-            origin,
-        };
-        if let Some(existing) = self
-            .installed_artifacts
-            .iter_mut()
-            .find(|artifact| artifact.name == name)
-        {
-            *existing = summary.clone();
-        } else {
-            self.installed_artifacts.push(summary.clone());
-        }
-        self.removed_artifacts.remove(&tool);
-        self.installed_generation += 1;
-        self.pending_artifact_pulls.push(summary.clone());
-
+        let pulled = self.pull_artifact(&name, Some(&version))?;
         Ok(manage::ArtifactSummary {
-            name,
-            version,
-            runtime: runtime_type_to_wit(&summary.runtime, summary.implementation.as_ref()),
+            name: pulled.summary.name,
+            version: pulled.summary.version,
+            runtime: runtime_type_to_wit(
+                &pulled.summary.runtime,
+                pulled.summary.implementation.as_ref(),
+            ),
         })
     }
 
-    /// Removes an artifact this capsule pulled, under the bound [`crate::artifact_removal`]
-    /// states. `Ok(false)` when the session has not installed `name`; every refusal is an `Err`
-    /// decided before anything changes.
-    ///
-    /// Runs on `&mut self`, which every dispatch on this store borrows for its whole duration, so
-    /// no tool call is in flight when it runs; an instance already built keeps its own
-    /// `Component`, and removal applies to calls that start after it. Conversation history is
-    /// never rewritten: earlier calls of `name` stay in the history, the conversation record and
-    /// the trace, and a later call is answered with
-    /// [`crate::artifact_removal::called_after_removal`].
+    /// [`CapsuleStoreState::remove_artifact`].
     fn remove(&mut self, name: String) -> Result<bool, String> {
-        if crate::artifact_removal::refuse_before_lock(
-            &self.capability_policy,
-            &name,
-            &self.installed_artifacts,
-            &self.declared_artifacts,
-        )?
-        .is_none()
-        {
-            return Ok(false);
-        }
-
-        // Read now rather than trusted from the pull: `mur install` may have adopted the entry as
-        // an operator pin while the session ran. A missing file is a lock with no entries, which
-        // the check refuses.
-        let mut lock = match read_lockfile(&self.lock_path) {
-            Ok(lock) => lock,
-            Err(LockfileError::NotFound(_)) => MurmurLock {
-                lock_version: LOCK_VERSION,
-                artifacts: Vec::new(),
-            },
-            Err(err) => return Err(format!("failed to read murmur.lock: {err}")),
-        };
-        if let Some(refusal) = crate::artifact_removal::refuse_against_lock(&name, &lock) {
-            return Err(refusal);
-        }
-
-        // 1. The lock first: a failed write leaves the session and the workdir untouched.
-        lock.remove(&name);
-        write_lockfile_atomic(&self.lock_path, &lock)
-            .map_err(|err| format!("failed to write murmur.lock: {err}"))?;
-
-        // 2. The session. The compiled form under `~/.murmur/compiled` is shared across sessions
-        // and stays, so a later pull of the same version is warm.
-        let tool = murmur_artifact::tool_name_of(&name).to_string();
-        self.tool_components.remove(&tool);
-        self.native_entrypoints.remove(&tool);
-        self.installed_artifacts
-            .retain(|artifact| artifact.name != name);
-        self.removed_artifacts.insert(tool.clone());
-        self.installed_generation += 1;
-
-        // 3. The files: manifest, `skill.md`, native binary.
-        // Removed by descriptor beneath the session root: a link at `tools` or at the tool's
-        // directory is refused, never followed into what it names.
-        let rel = format!("tools/{tool}");
-        match self.session_root.remove_dir_all(&rel) {
-            Ok(()) => Ok(true),
-            Err(err) if err.is_not_found() => Ok(true),
-            Err(WorkdirError::Refused(refusal)) => Err(refusal.to_string()),
-            Err(WorkdirError::Io { source, .. }) => {
-                Err(crate::artifact_removal::undeletable_directory(
-                    &name,
-                    &self.session_root.host_path(&rel),
-                    &source,
-                ))
-            }
-        }
+        self.remove_artifact(&name)
     }
 
     fn diagnostics(&mut self) -> Result<manage::RuntimeState, String> {
@@ -8110,6 +7956,8 @@ impl CapsuleStoreState {
             || name == END_WITHOUT_ANSWER_TOOL
             || name == SUBMIT_PLAN_TOOL
             || name == SWITCH_DRIVER_TOOL
+            || name == PULL_ARTIFACT_TOOL
+            || name == REMOVE_ARTIFACT_TOOL
         {
             return as_tool();
         }
@@ -8353,6 +8201,11 @@ impl CapsuleStoreState {
                 .await
                 .map(DispatchOutcome::tool);
         }
+        // They change the session, which this shared borrow cannot; the http agent loop answers
+        // them through `dispatch_agent_tool_exclusive` before this table is reached.
+        if name == PULL_ARTIFACT_TOOL || name == REMOVE_ARTIFACT_TOOL {
+            return Err(exclusive_only(name));
+        }
 
         // Native artifact: a binary this session installed at workdir/tools/<name>/<name>. A file
         // the capsule wrote there itself has no entry and is not dispatched as a native tool.
@@ -8431,7 +8284,7 @@ impl CapsuleStoreState {
             .map_err(|e| format!("shell tool panicked: {e}"));
         }
 
-        // A name `manage.remove()` took out of the session. Without this, the skill branch
+        // A name a removal took out of the session. Without this, the skill branch
         // would serve a `skill.md` a failed deletion left behind, and the WASM branch would
         // answer with a not-found error.
         if self.removed_artifacts.contains(name) {
@@ -9835,7 +9688,7 @@ impl WasiHttpView for ToolStoreState {
 /// Shell binary names are deliberately absent: they are operator-chosen through
 /// `capabilities.shell.allow`, so there is no fixed set to reserve, and
 /// `write_shell_tool_manifests` already yields to an artifact manifest that is already on disk.
-pub(crate) const RESERVED_TOOL_NAMES: [&str; 7] = [
+pub(crate) const RESERVED_TOOL_NAMES: [&str; 9] = [
     SHARE_FILE_TOOL,
     FETCH_PEER_FILE_TOOL,
     DELEGATE_TASK_TOOL,
@@ -9843,6 +9696,8 @@ pub(crate) const RESERVED_TOOL_NAMES: [&str; 7] = [
     SWITCH_DRIVER_TOOL,
     MEMBER_CALL_TOOL,
     END_WITHOUT_ANSWER_TOOL,
+    PULL_ARTIFACT_TOOL,
+    REMOVE_ARTIFACT_TOOL,
 ];
 
 /// Whether `name` is answered by the runtime itself rather than by an artifact.
@@ -12425,7 +12280,7 @@ mod tests {
     fn the_reserved_set_covers_every_runtime_provided_tool() {
         assert_eq!(
             super::RESERVED_TOOL_NAMES.len(),
-            7,
+            9,
             "a new runtime-provided tool must be added to RESERVED_TOOL_NAMES, and this arity \
              raised, before its writer can succeed"
         );
@@ -12437,6 +12292,8 @@ mod tests {
             super::SWITCH_DRIVER_TOOL,
             super::MEMBER_CALL_TOOL,
             super::END_WITHOUT_ANSWER_TOOL,
+            super::PULL_ARTIFACT_TOOL,
+            super::REMOVE_ARTIFACT_TOOL,
         ] {
             assert!(
                 super::is_reserved_tool_name(name),
@@ -13570,6 +13427,7 @@ inference:
 
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
+            source_supply: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -13670,6 +13528,7 @@ inference:
 
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
+            source_supply: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -13759,6 +13618,7 @@ inference:
 
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
+            source_supply: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -13847,6 +13707,7 @@ inference:
 
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
+            source_supply: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -13996,6 +13857,7 @@ inference:
 
         let project = tempfile::tempdir().unwrap();
         let request = StageRequest {
+            source_supply: None,
             credentials_file: None,
             manifest_dir: project.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -14102,6 +13964,7 @@ inference:
         };
 
         StageRequest {
+            source_supply: None,
             credentials_file: None,
             manifest_dir: project.to_path_buf(),
             capsule_name: "test".to_string(),
@@ -14541,10 +14404,10 @@ inference:
         };
         assert_eq!(state.artifact_origin(PULLED_SKILL_TOOL), pulled_by);
         assert_eq!(state.pending_artifact_pulls.len(), 1);
-        assert_eq!(state.pending_artifact_pulls[0].name, PULLED_SKILL);
-        assert_eq!(state.pending_artifact_pulls[0].origin, pulled_by);
+        assert_eq!(state.pending_artifact_pulls[0].summary.name, PULLED_SKILL);
+        assert_eq!(state.pending_artifact_pulls[0].summary.origin, pulled_by);
         assert_eq!(
-            state.pending_artifact_pulls[0].runtime,
+            state.pending_artifact_pulls[0].summary.runtime,
             ArtifactRuntime::Skill
         );
     }
@@ -14573,7 +14436,10 @@ inference:
             state.artifact_origin(PULLED_SKILL_TOOL),
             LockOrigin::Operator
         );
-        assert_eq!(state.pending_artifact_pulls[0].origin, LockOrigin::Operator);
+        assert_eq!(
+            state.pending_artifact_pulls[0].summary.origin,
+            LockOrigin::Operator
+        );
         let outcome = call_skill(&state, PULLED_SKILL_TOOL);
         assert_eq!(outcome.fence_source, None);
         assert_eq!(outcome.result.data.as_deref(), Some(PULLED_SKILL_MD));
@@ -14982,6 +14848,7 @@ inference:
             a2a_chunks_emitted: Arc::new(AtomicBool::new(false)),
             a2a_tool_calls: Arc::default(),
             registry,
+            source_supply: None,
             lock_path,
             driver_continuation_id: None,
             driver_continuation_context_id: None,
@@ -15288,9 +15155,13 @@ inference:
                 ToolRefresh::Immediate,
                 state.installed_generation,
                 false,
+                false,
             )
             .expect("an immediate trigger rebuilds on the next call");
-        assert_eq!(refresh.trigger, ToolRefresh::Immediate);
+        assert_eq!(
+            refresh.trigger,
+            crate::agent::inventory::RefreshCause::Immediate
+        );
         assert_eq!(refresh.added, vec!["aaa-late-skill"]);
         assert!(refresh.removed.is_empty());
         assert_eq!(refresh.offered, vec!["aaa-late-skill", "zzz-existing-tool"]);
@@ -15369,6 +15240,7 @@ inference:
                 ToolRefresh::Compaction,
                 state.installed_generation,
                 false,
+                false,
             );
             assert_eq!(refresh, None);
             assert_eq!(
@@ -15385,9 +15257,13 @@ inference:
                 ToolRefresh::Compaction,
                 state.installed_generation,
                 true,
+                false,
             )
             .expect("the call after a committed compaction carries the rebuilt array");
-        assert_eq!(refresh.trigger, ToolRefresh::Compaction);
+        assert_eq!(
+            refresh.trigger,
+            crate::agent::inventory::RefreshCause::Compaction
+        );
         assert_eq!(refresh.added, vec!["aaa-late-skill"]);
         assert!(refresh.removed.is_empty());
 
@@ -15399,9 +15275,52 @@ inference:
                 ToolRefresh::Compaction,
                 state.installed_generation,
                 false,
+                false,
             ),
             None
         );
+    }
+
+    /// The model's own pull is released at its next call whatever the trigger, and named
+    /// `agent`; a committed compaction since the previous call outranks it.
+    #[test]
+    fn inventory_an_agent_change_is_released_at_the_next_call_under_any_trigger() {
+        use crate::agent::inventory::{HeldInventory, RefreshCause};
+        use murmur_artifact::ToolRefresh;
+
+        for (trigger, compaction, cause) in [
+            (ToolRefresh::Compaction, false, RefreshCause::Agent),
+            (ToolRefresh::Immediate, false, RefreshCause::Agent),
+            (ToolRefresh::Compaction, true, RefreshCause::Compaction),
+        ] {
+            let (_project, workdir, mut state) = late_skill_fixture();
+            let root = crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap();
+            let mut held = HeldInventory::build(
+                &root,
+                None,
+                &state.installed_artifacts,
+                state.installed_generation,
+            );
+            pull_late_skill(&mut state);
+
+            let refresh = held
+                .refresh_before_call(
+                    &root,
+                    None,
+                    &state.installed_artifacts,
+                    trigger,
+                    state.installed_generation,
+                    compaction,
+                    true,
+                )
+                .expect("an agent change rebuilds on the next call");
+            assert_eq!(refresh.trigger, cause, "{trigger:?} / {compaction}");
+            assert_eq!(refresh.trigger.wire_name(), cause.wire_name());
+            assert_eq!(refresh.added, vec!["aaa-late-skill"]);
+        }
+        assert_eq!(RefreshCause::Agent.wire_name(), "agent");
+        assert_eq!(RefreshCause::Compaction.wire_name(), "compaction");
+        assert_eq!(RefreshCause::Immediate.wire_name(), "immediate");
     }
 
     /// The rebuilt array is exactly what a fresh launch build of the same workdir produces,
@@ -15424,6 +15343,7 @@ inference:
             &state.installed_artifacts,
             murmur_artifact::ToolRefresh::Immediate,
             state.installed_generation,
+            false,
             false,
         )
         .expect("rebuilt");
@@ -15470,6 +15390,7 @@ inference:
                 ToolRefresh::Immediate,
                 state.installed_generation,
                 false,
+                false,
             ),
             None
         );
@@ -15487,6 +15408,7 @@ inference:
                 ToolRefresh::Immediate,
                 state.installed_generation,
                 true,
+                false,
             ),
             None
         );
@@ -15520,6 +15442,7 @@ inference:
                         trigger,
                         state.installed_generation,
                         compaction_committed,
+                        false,
                     ),
                     None
                 );
@@ -15967,6 +15890,7 @@ inference:
             &state.installed_artifacts,
             murmur_artifact::ToolRefresh::Immediate,
             state.installed_generation,
+            false,
             false,
         )
         .expect("an immediate trigger rebuilds on the next call");

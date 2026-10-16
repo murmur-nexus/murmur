@@ -127,6 +127,7 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
         .map_err(|e| CliError::new(E_IO_003, format!("failed to write generator manifest: {e}")))?;
 
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
+    let source_supply = crate::source::supply::CliSourceSupply::for_policy(&capability_policy)?;
     let mut allowlisted_tools = HashSet::new();
     for artifact in &runtime_manifest.artifacts {
         if artifact.runtime == ArtifactRuntime::Tool {
@@ -175,6 +176,7 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
         machine_tokens_per_day: None,
         formation_id: None,
         formation_member: None,
+        source_supply,
     };
 
     // Stage the session (creates workdir, installs artifacts including skill.md).

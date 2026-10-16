@@ -756,6 +756,11 @@ pub(crate) fn run_run(
         })?
     };
 
+    // Read only for a capsule that may fetch from a source; a config file that cannot be read
+    // then fails the launch rather than the first pull.
+    let source_supply = crate::source::supply::CliSourceSupply::for_policy(&capability_policy)
+        .map_err(|error| fail(&session_id, &workdir, error, json))?;
+
     let stage_request = StageRequest {
         credentials_file: crate::config::mur_config_path().ok(),
         manifest_dir: project_dir.clone(),
@@ -804,6 +809,7 @@ pub(crate) fn run_run(
         machine_tokens_per_day,
         formation_id,
         formation_member,
+        source_supply,
     };
 
     // Stage against project-then-global, the order `check_artifacts_installed` pre-flights in,
