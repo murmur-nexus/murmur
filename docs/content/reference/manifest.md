@@ -2038,7 +2038,18 @@ the same terms. Omit the key to deliver no variable.
 
 ### Shell allow
 
-- Each entry is a bare binary name (`bash`, `jq`) — paths are not supported.
+- Each entry is a bare binary name (`bash`, `jq`): one path component, with no `/`, no
+  whitespace, and not `.` or `..`. The session runs the binary of that name on the `PATH` `mur run`
+  starts with.
+- An entry that is not a bare name is refused with
+  [`E-MAN-003`](diagnostics.md#e-man-003) when the manifest is read, before anything is staged or
+  installed. To allow a binary outside the usual `PATH`, name it bare and put its directory on
+  `PATH` for `mur run`:
+
+  ```bash
+  PATH=/opt/uv/bin:$PATH mur run --task "…"
+  ```
+
 - A `capabilities.shell` block present with an empty `allow` list is rejected at parse time.
 - A synthetic tool manifest is written to `workdir/tools/<binary>/murmur.yaml` at session start for
   each listed binary; the agent discovers these alongside artifact-backed tools.
@@ -2287,12 +2298,13 @@ the exit code alone does not.
 #### What a backgrounded command costs when the host dies
 
 Every way a session ends — its task finishing, `SIGTERM`, a spawner or formation ending it — kills
-the commands it moved to the background. A runtime that is itself killed — `SIGKILL`, an
-out-of-memory kill, a host that goes away — kills nothing: its commands keep running with nothing
-reading their output and no route off the host, and nothing of their results survives: no exit
-code, no `logs/<work_id>.log`, no record of whether they finished. The work is a full run's compute
-spent for nothing, so `lifecycle.shell_grace_secs` is also a decision about how much compute one
-lost host can waste.
+the commands it moved to the background. A runtime that is itself killed — `SIGKILL` or an
+out-of-memory kill — takes them with it on Linux: the session's cgroup scope has a watcher process
+that kills everything in it once the runtime is gone (see
+[Network reach limits](containment.md#network-reach-limits) for when they outlive it). Either way,
+nothing of their results survives: no exit code, no `logs/<work_id>.log`, no record of whether
+they finished. The work is a full run's compute spent for nothing, so
+`lifecycle.shell_grace_secs` is also a decision about how much compute one lost host can waste.
 
 The record of the demotion does survive. The `shell_detached` line is written and flushed at the
 moment the command moves to the background, so a `SIGKILL` or a process crash keeps it, and

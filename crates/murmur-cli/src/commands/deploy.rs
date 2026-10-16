@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -114,11 +114,19 @@ pub(crate) struct StagedArtifact {
 }
 
 impl StagedArtifact {
-    /// `<name>-<version>[-<platform>]`, the store's leaf file name without its extension.
-    fn file_stem(&self) -> String {
+    /// Where `store` files this payload.
+    fn payload_path_in(&self, store: &LocalRegistry) -> PathBuf {
         match &self.platform {
-            Some(platform) => format!("{}-{}-{platform}", self.name.name(), self.version),
-            None => format!("{}-{}", self.name.name(), self.version),
+            Some(platform) => store.artifact_path_for_platform(&self.name, &self.version, platform),
+            None => store.artifact_path_for(&self.name, &self.version),
+        }
+    }
+
+    /// Where `store` files this payload's sha256.
+    fn sha256_path_in(&self, store: &LocalRegistry) -> PathBuf {
+        match &self.platform {
+            Some(platform) => store.sha256_path_for_platform(&self.name, &self.version, platform),
+            None => store.sha256_path_for(&self.name, &self.version),
         }
     }
 }
@@ -167,26 +175,32 @@ pub(crate) fn ensure_artifact_for_deploy(
     // Step B — the scope's source, for the target platform. `local/` has none, and is refused
     // without a request.
     let source = sources.source_for(name, Some(version))?;
-    let resolved =
-        match crate::source::resolve(&*source, name, Some(version), target_platform, None) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let error = crate::error::CliError::from(error);
-                let headline = if error.code == E_REG_001 {
-                    format!(
-                        "artifact {name}@{version} not found locally or in {}",
-                        source.label()
-                    )
-                } else {
-                    format!("artifact {name}@{version} is not in the local store")
-                };
-                return Err(crate::error::CliError {
-                    code: error.code,
-                    message: format!("{headline}\n  {}", error.message),
-                    hint: error.hint,
-                });
-            }
-        };
+    let resolved = match crate::source::resolve(
+        &*source,
+        name,
+        Some(version),
+        crate::source::ExplicitVersion::AsAsked,
+        target_platform,
+        None,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let error = crate::error::CliError::from(error);
+            let headline = if error.code == E_REG_001 {
+                format!(
+                    "artifact {name}@{version} not found locally or in {}",
+                    source.label()
+                )
+            } else {
+                format!("artifact {name}@{version} is not in the local store")
+            };
+            return Err(crate::error::CliError {
+                code: error.code,
+                message: format!("{headline}\n  {}", error.message),
+                hint: error.hint,
+            });
+        }
+    };
 
     let runtime = resolved.manifest.registry_runtime();
     // Cached through the registry rather than written by hand, so the cached payload carries the
@@ -838,23 +852,17 @@ fn abandon_step(pb: &ProgressBar, style: &ProgressStyle, msg: impl Into<String>)
     pb.abandon_with_message(msg.into());
 }
 
-/// The target's global-store directory of the artifact `name@version`,
-/// `/root/.murmur/artifacts/<scope>/<name>/<version>`, the layout the target's `mur` reads.
-fn remote_store_dir(name: &ArtifactName, version: &str) -> String {
-    format!(
-        "/root/.murmur/artifacts/{}/{}/{version}",
-        name.scope(),
-        name.name()
-    )
+/// The target's global store, the one its `mur` reads; deploy runs it as root.
+fn remote_store() -> LocalRegistry {
+    LocalRegistry::new("/root/.murmur/artifacts")
 }
 
 /// The path deploy uploads `artifact`'s payload to, and the target compiles it from.
 fn remote_payload_path(artifact: &StagedArtifact) -> String {
-    format!(
-        "{}/{}.mur.zip",
-        remote_store_dir(&artifact.name, &artifact.version),
-        artifact.file_stem()
-    )
+    artifact
+        .payload_path_in(&remote_store())
+        .display()
+        .to_string()
 }
 
 /// The start of every command that runs `mur` on the target: it exports the deploy's `.env`, when
@@ -1523,12 +1531,20 @@ pub(crate) fn run_deploy(
         }
 
         // Write all staging files to disk first (fast, sequential).
+        // The staging directory is laid out as a store, so each file's local and remote paths
+        // come from the same builders.
+        let staging_store = LocalRegistry::new(&staging_dir);
         for artifact in &staged {
-            let stem = artifact.file_stem();
-            std::fs::write(staging_dir.join(format!("{stem}.mur.zip")), &artifact.bytes)
+            let staged_zip = artifact.payload_path_in(&staging_store);
+            if let Some(parent) = staged_zip.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    CliError::new(E_IO_003, format!("staging {}: {e}", artifact.name))
+                })?;
+            }
+            std::fs::write(&staged_zip, &artifact.bytes)
                 .map_err(|e| CliError::new(E_IO_003, format!("staging {}: {e}", artifact.name)))?;
             std::fs::write(
-                staging_dir.join(format!("{stem}.sha256")),
+                artifact.sha256_path_in(&staging_store),
                 artifact.sha256.as_bytes(),
             )
             .map_err(|e| {
@@ -1573,25 +1589,28 @@ pub(crate) fn run_deploy(
                 });
 
                 let result = (|| {
-                    let stem = artifact.file_stem();
-                    let staged_zip = staging_dir.join(format!("{stem}.mur.zip"));
-                    let staged_sha = staging_dir.join(format!("{stem}.sha256"));
-                    let remote_dir = remote_store_dir(&artifact.name, &artifact.version);
+                    let staging_store = LocalRegistry::new(&staging_dir);
+                    let remote_store = remote_store();
+                    let remote_zip = artifact.payload_path_in(&remote_store);
+                    let remote_dir = remote_zip
+                        .parent()
+                        .map(|dir| dir.display().to_string())
+                        .unwrap_or_default();
                     ssh_exec(host, key_ref, ssh_user, &format!("mkdir -p {remote_dir}"))?;
                     scp_upload(
                         host,
                         key_ref,
                         ssh_user,
-                        &staged_zip.to_string_lossy(),
-                        &remote_payload_path(artifact),
+                        &artifact.payload_path_in(&staging_store).to_string_lossy(),
+                        &remote_zip.to_string_lossy(),
                         false,
                     )?;
                     scp_upload(
                         host,
                         key_ref,
                         ssh_user,
-                        &staged_sha.to_string_lossy(),
-                        &format!("{remote_dir}/{stem}.sha256"),
+                        &artifact.sha256_path_in(&staging_store).to_string_lossy(),
+                        &artifact.sha256_path_in(&remote_store).to_string_lossy(),
                         false,
                     )?;
                     Ok(())
@@ -2398,31 +2417,24 @@ mod tests {
     // ─── staging path ─────────────────────────────────────────────────────────
 
     #[test]
-    fn staging_path_uses_deployment_dir_with_clean_filename() {
-        let home = tempdir().unwrap();
-        let deployment_id = "abc123-test-deployment-id";
-        let staging_dir = home
-            .path()
-            .join(".murmur")
-            .join("deploy_staging")
-            .join(deployment_id);
-
-        let stem = "murmur-driver-openai-0.3.33";
-        let zip_path = staging_dir.join(format!("{stem}.mur.zip"));
-        let sha_path = staging_dir.join(format!("{stem}.sha256"));
-
-        let zip_name = zip_path.file_name().unwrap().to_str().unwrap();
-        let sha_name = sha_path.file_name().unwrap().to_str().unwrap();
-
-        assert_eq!(zip_name, "murmur-driver-openai-0.3.33.mur.zip");
-        assert_eq!(sha_name, "murmur-driver-openai-0.3.33.sha256");
-        assert!(
-            !zip_name.contains(deployment_id),
-            "filename must not contain deployment UUID: {zip_name}"
+    fn staging_lays_payloads_out_as_a_store_under_the_deployment_dir() {
+        let staging_dir = std::path::PathBuf::from("/h/.murmur/deploy_staging/abc123-deployment");
+        let store = LocalRegistry::new(&staging_dir);
+        let generic = staged("murmur/driver-openai", "0.9.0", None);
+        assert_eq!(
+            generic.payload_path_in(&store),
+            staging_dir.join("murmur/driver-openai/0.9.0/driver-openai-0.9.0.mur.zip")
         );
-        assert!(
-            !sha_name.contains(deployment_id),
-            "filename must not contain deployment UUID: {sha_name}"
+        assert_eq!(
+            generic.sha256_path_in(&store),
+            staging_dir.join("murmur/driver-openai/0.9.0/driver-openai-0.9.0.sha256")
+        );
+        let native = staged("ana/tool-x", "1.0.0", Some("linux-x86_64"));
+        assert_eq!(
+            native.sha256_path_in(&remote_store()),
+            std::path::Path::new(
+                "/root/.murmur/artifacts/ana/tool-x/1.0.0/tool-x-1.0.0-linux-x86_64.sha256"
+            )
         );
     }
 

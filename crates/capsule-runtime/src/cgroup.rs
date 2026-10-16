@@ -52,6 +52,17 @@
 //! with a `W-SEC-010` warning; refusing every launch on the primary development platform for a
 //! kernel feature that platform will never have would be a policy, not a protection.
 //!
+//! ## A scope outlives no runtime
+//!
+//! Each scope [`CgroupScope::create`] makes on Linux has a watcher: a process forked from the
+//! runtime that blocks reading a pipe whose write end only the runtime holds. When the read
+//! returns end-of-file — the scope's `Drop` closed it, or the kernel closed it because the runtime
+//! died by any means, `SIGKILL` and the OOM killer included — the watcher kills the scope and
+//! exits. A parent-death signal would reach only a direct child, and a backgrounded server is a
+//! grandchild; the pipe reaches every death at once. The watcher stays in the runtime's own
+//! cgroup, never in the scope it kills, and holds none of the runtime's other descriptors, so it
+//! keeps no pipe from reaching end-of-file and no port bound.
+//!
 //! ## Cross-platform shape
 //!
 //! Following `sandbox.rs`: the types here are defined unconditionally and stay type-checked and
@@ -230,6 +241,10 @@ pub(crate) struct CgroupScope {
     /// one call. Behind its own `Arc` so a [`ScopeOccupancy`] can outlive the borrow it was
     /// taken from and move to a demoted command's thread.
     occupancy: Arc<Occupancy>,
+    /// The process that kills the scope once the runtime is gone. `None` off Linux and for a
+    /// scope with no directory.
+    #[cfg(target_os = "linux")]
+    watcher: Option<ScopeWatcher>,
 }
 
 /// The scope's occupancy counters.
@@ -797,8 +812,13 @@ impl Drop for CgroupScope {
             let _ = self.kill_all();
             self.wait_until_empty(KILL_FALLBACK_DEADLINE);
         }
-        // Drop the descriptor before the rmdir so nothing holds the directory open.
+        // Drop the descriptor before the rmdir so nothing holds the directory open, and reap the
+        // watcher, which holds its own descriptors on the scope's files until it exits.
         self.procs_fd = None;
+        #[cfg(target_os = "linux")]
+        {
+            self.watcher = None;
+        }
         if let Err(error) = std::fs::remove_dir(&self.path) {
             crate::runtime_err!(
                 "[capsule-runtime] note: could not remove cgroup scope {} ({error}); \
@@ -806,6 +826,376 @@ impl Drop for CgroupScope {
                 self.path.display()
             );
         }
+    }
+}
+
+/// The process that kills one scope once nothing holds its lifeline's write end open.
+///
+/// [`Self::spawn`] forks it from the runtime; dropping this closes the write end and reaps it.
+/// See the module documentation, "A scope outlives no runtime".
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ScopeWatcher {
+    /// The lifeline's write end. Opened `O_CLOEXEC`, so no program the runtime execs holds a copy,
+    /// and the watcher closes the copy it inherited: its read sees end-of-file exactly when this
+    /// is closed or the runtime is gone.
+    lifeline: std::sync::Mutex<Option<std::os::fd::OwnedFd>>,
+    pid: libc::pid_t,
+}
+
+/// The descriptors a watcher kills its scope through, opened by the runtime before the fork:
+/// `cgroup.kill` where the kernel has it, else `cgroup.freeze` (when present) and `cgroup.procs`
+/// for the freeze-and-signal loop [`CgroupScope::kill_all`] falls back to.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct WatcherKill {
+    kill: libc::c_int,
+    freeze: libc::c_int,
+    procs: libc::c_int,
+}
+
+#[cfg(target_os = "linux")]
+impl ScopeWatcher {
+    /// Fork the watcher of the scope at `scope`. Everything it needs is opened here, in the
+    /// runtime, so the forked child — one thread of a multithreaded process — runs only
+    /// async-signal-safe syscalls on descriptors and stack buffers that already exist.
+    #[allow(unsafe_code)]
+    fn spawn(scope: &Path) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        #[cfg(test)]
+        let forced = FORCE_KILL_FALLBACK.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let forced = false;
+        let kill = if forced {
+            None
+        } else {
+            open_if_present(&scope.join("cgroup.kill"), libc::O_WRONLY)?
+        };
+        let (freeze, procs) = match kill {
+            Some(_) => (None, None),
+            None => (
+                open_if_present(&scope.join("cgroup.freeze"), libc::O_WRONLY)?,
+                Some(open_with(&scope.join("cgroup.procs"), libc::O_RDONLY)?),
+            ),
+        };
+        let devnull = open_with(Path::new("/dev/null"), libc::O_RDWR)?;
+
+        let mut ends = [0 as libc::c_int; 2];
+        // SAFETY: `ends` is a two-element array, the size `pipe2` writes into.
+        if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: both descriptors were just returned by the successful `pipe2` above and nothing
+        // else owns them.
+        let (read_end, write_end) =
+            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+
+        let raw = |fd: &Option<OwnedFd>| fd.as_ref().map_or(-1, AsRawFd::as_raw_fd);
+        let plan = WatcherKill {
+            kill: raw(&kill),
+            freeze: raw(&freeze),
+            procs: raw(&procs),
+        };
+        // Sorted here, before the fork: the child keeps exactly these. The entries are distinct:
+        // Rust's startup opens 0-2 when they are closed, so every descriptor opened above is 3 or
+        // higher, and the child's `dup2` onto 0-2 replaces none of them.
+        let mut keep = [-1 as libc::c_int; 7];
+        let mut kept = 0;
+        for fd in [
+            0,
+            1,
+            2,
+            read_end.as_raw_fd(),
+            plan.kill,
+            plan.freeze,
+            plan.procs,
+        ] {
+            if fd >= 0 {
+                keep[kept] = fd;
+                kept += 1;
+            }
+        }
+        keep[..kept].sort_unstable();
+        let devnull_fd = devnull.as_raw_fd();
+        let read_fd = read_end.as_raw_fd();
+        let deadline_ns = KILL_FALLBACK_DEADLINE.as_nanos() as i64;
+
+        // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the child
+        // touches nothing but async-signal-safe primitives. The child runs only `dup2`,
+        // `close_range`/`close`, `setpgid`, `sigaction`, `read`, `lseek`, `write`, `kill`,
+        // `clock_gettime` and `nanosleep` on descriptors and stack values prepared above, then
+        // `_exit`: no allocation, no locks, no stdio, no destructor.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if pid == 0 {
+            // SAFETY: forked-child context; `watch` ends in `_exit` and never returns.
+            unsafe { watch(devnull_fd, &keep[..kept], read_fd, plan, deadline_ns) }
+        }
+        Ok(Self {
+            lifeline: std::sync::Mutex::new(Some(write_end)),
+            pid,
+        })
+    }
+
+    /// Close the lifeline's write end, as the runtime's death would, without reaping.
+    #[cfg(test)]
+    fn cut_lifeline(&self) {
+        self.lifeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ScopeWatcher {
+    /// Closes the lifeline, so the watcher kills the scope (by now empty, on every path through
+    /// [`CgroupScope`]'s `Drop`) and exits, then reaps it.
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        self.lifeline
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let mut status = 0;
+        loop {
+            // SAFETY: `self.pid` is the watcher this value forked; `status` is a live local.
+            let waited = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+            if waited >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return;
+            }
+        }
+    }
+}
+
+/// `path` opened with `flags | O_CLOEXEC`.
+#[cfg(target_os = "linux")]
+fn open_with(path: &Path, flags: libc::c_int) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(flags & libc::O_ACCMODE != libc::O_WRONLY)
+        .write(flags & libc::O_ACCMODE != libc::O_RDONLY)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(path)
+        .map(std::os::fd::OwnedFd::from)
+}
+
+/// [`open_with`], or `None` for a control file this kernel does not expose.
+#[cfg(target_os = "linux")]
+fn open_if_present(
+    path: &Path,
+    flags: libc::c_int,
+) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+    match open_with(path, flags) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The watcher's whole life, in the forked child: hold no descriptor but `keep`, leave the
+/// runtime's process group, ignore the signals a terminal or launcher sends a group, block until
+/// the lifeline reads end-of-file, kill the scope, exit.
+///
+/// # Safety
+///
+/// Called only in a child just forked by [`ScopeWatcher::spawn`], with `keep` sorted and holding
+/// 0, 1, 2, `read_fd` and every descriptor `plan` names. Never returns.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+unsafe fn watch(
+    devnull: libc::c_int,
+    keep: &[libc::c_int],
+    read_fd: libc::c_int,
+    plan: WatcherKill,
+    deadline_ns: i64,
+) -> ! {
+    // SAFETY (whole body): every call is an async-signal-safe syscall on descriptors the parent
+    // opened before the fork or on stack values; nothing allocates or takes a lock.
+    unsafe {
+        // Standard streams onto /dev/null, so no pipe of the runtime's stays open through them.
+        for target in 0..3 {
+            libc::dup2(devnull, target);
+        }
+        let mut low: libc::c_uint = 0;
+        for &fd in keep {
+            let fd = fd as libc::c_uint;
+            if fd > low {
+                close_range(low, fd - 1);
+            }
+            low = fd + 1;
+        }
+        close_range(low, libc::c_uint::MAX);
+
+        libc::setpgid(0, 0);
+        let mut ignore: libc::sigaction = std::mem::zeroed();
+        ignore.sa_sigaction = libc::SIG_IGN;
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGPIPE] {
+            libc::sigaction(signal, &ignore, std::ptr::null_mut());
+        }
+
+        let mut byte = [0u8; 1];
+        loop {
+            let read = libc::read(read_fd, byte.as_mut_ptr().cast(), 1);
+            if read == 0 {
+                break;
+            }
+            if read < 0 && *libc::__errno_location() != libc::EINTR {
+                break;
+            }
+        }
+
+        kill_scope(plan, deadline_ns);
+        libc::_exit(0)
+    }
+}
+
+/// Close every descriptor in `low..=high`: `close_range(2)`, else one `close` per descriptor up to
+/// the open-files limit, for a kernel older than 5.9.
+///
+/// # Safety
+///
+/// Async-signal-safe; called only from [`watch`].
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+unsafe fn close_range(low: libc::c_uint, high: libc::c_uint) {
+    // SAFETY: integer arguments only.
+    unsafe {
+        if libc::syscall(libc::SYS_close_range, low, high, 0 as libc::c_uint) == 0 {
+            return;
+        }
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        let ceiling = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+            limit.rlim_cur.min(libc::c_uint::MAX as libc::rlim_t) as libc::c_uint
+        } else {
+            1 << 20
+        };
+        let mut fd = low;
+        while fd <= high && fd < ceiling {
+            libc::close(fd as libc::c_int);
+            fd += 1;
+        }
+    }
+}
+
+/// [`CgroupScope::kill_all`] for the watcher: one write to `cgroup.kill`, else freeze, `SIGKILL`
+/// every pid `cgroup.procs` lists, thaw, until none is listed or `deadline_ns` has passed.
+///
+/// # Safety
+///
+/// Async-signal-safe; called only from [`watch`].
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+unsafe fn kill_scope(plan: WatcherKill, deadline_ns: i64) {
+    // SAFETY: syscalls on the descriptors `plan` names and on stack values.
+    unsafe {
+        if plan.kill >= 0 {
+            write_control(plan.kill, b"1");
+            return;
+        }
+        let start = monotonic_ns();
+        loop {
+            if plan.freeze >= 0 {
+                write_control(plan.freeze, b"1");
+            }
+            let signalled = signal_listed(plan.procs);
+            if plan.freeze >= 0 {
+                write_control(plan.freeze, b"0");
+            }
+            if signalled == 0 || monotonic_ns() - start >= deadline_ns {
+                return;
+            }
+            let pause = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: KILL_POLL_INTERVAL.as_nanos() as libc::c_long,
+            };
+            libc::nanosleep(&pause, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Write `value` at the start of the control file `fd`.
+///
+/// # Safety
+///
+/// Async-signal-safe.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+unsafe fn write_control(fd: libc::c_int, value: &[u8]) {
+    // SAFETY: `value` is a live slice for the duration of the call.
+    unsafe {
+        libc::lseek(fd, 0, libc::SEEK_SET);
+        libc::write(fd, value.as_ptr().cast(), value.len());
+    }
+}
+
+/// `SIGKILL` every pid the `cgroup.procs` descriptor `procs` lists now, read from its start into a
+/// stack buffer and parsed as it arrives. Returns how many were signalled.
+///
+/// # Safety
+///
+/// Async-signal-safe.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+unsafe fn signal_listed(procs: libc::c_int) -> usize {
+    // SAFETY: reads into a stack buffer of the length passed; `kill` takes integers.
+    unsafe {
+        if procs < 0 || libc::lseek(procs, 0, libc::SEEK_SET) < 0 {
+            return 0;
+        }
+        let mut buf = [0u8; 512];
+        let mut pid: libc::pid_t = 0;
+        let mut digits = false;
+        let mut signalled = 0;
+        loop {
+            let read = libc::read(procs, buf.as_mut_ptr().cast(), buf.len());
+            if read < 0 && *libc::__errno_location() == libc::EINTR {
+                continue;
+            }
+            if read <= 0 {
+                break;
+            }
+            for &byte in &buf[..read as usize] {
+                if byte.is_ascii_digit() {
+                    pid = pid
+                        .saturating_mul(10)
+                        .saturating_add(libc::pid_t::from(byte - b'0'));
+                    digits = true;
+                } else {
+                    if digits && pid > 0 {
+                        libc::kill(pid, libc::SIGKILL);
+                        signalled += 1;
+                    }
+                    pid = 0;
+                    digits = false;
+                }
+            }
+        }
+        if digits && pid > 0 {
+            libc::kill(pid, libc::SIGKILL);
+            signalled += 1;
+        }
+        signalled
+    }
+}
+
+/// `CLOCK_MONOTONIC` in nanoseconds.
+///
+/// # Safety
+///
+/// Async-signal-safe.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+unsafe fn monotonic_ns() -> i64 {
+    // SAFETY: `now` is a live local `clock_gettime` writes into.
+    unsafe {
+        let mut now: libc::timespec = std::mem::zeroed();
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+        now.tv_sec as i64 * 1_000_000_000 + now.tv_nsec as i64
     }
 }
 
@@ -984,6 +1374,7 @@ impl CgroupScope {
             path,
             procs_fd: None,
             occupancy: Arc::default(),
+            watcher: None,
         };
 
         for limit in scope_limits(limits) {
@@ -1000,11 +1391,19 @@ impl CgroupScope {
             )
         })?;
 
+        let watcher = ScopeWatcher::spawn(&scope.path).map_err(|error| {
+            format!(
+                "could not start the watcher that kills {} if the runtime dies: {error}",
+                scope.path.display()
+            )
+        })?;
+
         Ok((
             Self {
                 path: scope.take_path(),
                 procs_fd: Some(procs_fd),
                 occupancy: Arc::default(),
+                watcher: Some(watcher),
             },
             io_max,
         ))
@@ -2144,6 +2543,207 @@ mod tests {
         );
     }
 
+    /// A required scope holding a `bash` that started a `setsid` sleeper and a plain one, once all
+    /// three are in it. `fallback` makes the scope's watcher use the freeze-and-signal loop.
+    #[cfg(target_os = "linux")]
+    fn scope_with_sleepers(
+        session: &str,
+        fallback: bool,
+    ) -> (Arc<CgroupScope>, std::process::Child) {
+        let temp = tempfile::tempdir().unwrap();
+        FORCE_KILL_FALLBACK.with(|flag| flag.set(fallback));
+        let scope = prepare_scope(true, &HostResourceLimits::default(), session, temp.path());
+        FORCE_KILL_FALLBACK.with(|flag| flag.set(false));
+        let scope = scope
+            .expect("a delegated scope")
+            .scope
+            .expect("a required scope on Linux is never None");
+        let enforcement = crate::sandbox::ShellEnforcement {
+            cgroup_scope: Some(Arc::clone(&scope)),
+            ..crate::sandbox::ShellEnforcement::environment_only()
+        };
+        let mut command = std::process::Command::new("bash");
+        command
+            .args([
+                "-c",
+                "setsid sleep 300 >/dev/null 2>&1 & sleep 300 >/dev/null 2>&1 & wait",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::sandbox::attach_process_limits(&mut command, &enforcement);
+        let child = command.spawn().expect("bash spawns into the scope");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while scope.member_pids().len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scope never held bash and both sleepers: {:?}",
+                scope.member_pids()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        (scope, child)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn watcher_of(scope: &CgroupScope) -> &ScopeWatcher {
+        scope
+            .watcher
+            .as_ref()
+            .expect("a scope on Linux has a watcher")
+    }
+
+    /// Closing the lifeline is what the kernel does when the runtime dies: the watcher empties the
+    /// scope with no `Drop`, no `kill_all` and no call from the runtime.
+    #[cfg(target_os = "linux")]
+    fn assert_a_cut_lifeline_empties_the_scope(test_name: &str, fallback: bool) {
+        if skip_without_host_support(test_name) {
+            return;
+        }
+        let (scope, mut child) = scope_with_sleepers(test_name, fallback);
+        let members = scope.member_pids();
+        watcher_of(&scope).cut_lifeline();
+        assert!(
+            scope.wait_until_empty(std::time::Duration::from_secs(5)),
+            "the watcher left {:?} of {members:?} in the scope",
+            scope.member_pids()
+        );
+        for pid in members {
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists()
+                    || std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                        .is_ok_and(|stat| stat.contains(") Z ")),
+                "{pid} is still running"
+            );
+        }
+        let status = child.wait().expect("bash is reaped");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_watcher_kills_the_scope_through_cgroup_kill_when_the_lifeline_closes() {
+        assert_a_cut_lifeline_empties_the_scope(
+            "scope_watcher_kills_the_scope_through_cgroup_kill_when_the_lifeline_closes",
+            false,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_watcher_kills_the_scope_by_freezing_when_the_lifeline_closes() {
+        assert_a_cut_lifeline_empties_the_scope(
+            "scope_watcher_kills_the_scope_by_freezing_when_the_lifeline_closes",
+            true,
+        );
+    }
+
+    /// The watcher sits outside the scope it kills, in a process group of its own, holding
+    /// `/dev/null` on 0–2, its lifeline's read end and the scope's control files — none of this
+    /// process's descriptors.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn scope_watcher_holds_only_its_own_descriptors_outside_the_scope() {
+        if skip_without_host_support(
+            "scope_watcher_holds_only_its_own_descriptors_outside_the_scope",
+        ) {
+            return;
+        }
+        // A descriptor of this process's own that the watcher must not hold.
+        let own = tempfile::tempfile().unwrap();
+        let own_target = std::fs::read_link(format!(
+            "/proc/self/fd/{}",
+            std::os::fd::AsRawFd::as_raw_fd(&own)
+        ))
+        .unwrap();
+        let (scope, mut child) = scope_with_sleepers("ses_watcher_fds", false);
+        let pid = watcher_of(&scope).pid;
+
+        let fd_dir = format!("/proc/{pid}/fd");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let targets = loop {
+            let targets: Vec<(String, PathBuf)> = std::fs::read_dir(&fd_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let target = std::fs::read_link(entry.path()).ok()?;
+                    Some((entry.file_name().to_string_lossy().into_owned(), target))
+                })
+                .collect();
+            let settled = targets.iter().all(|(_, target)| {
+                target == Path::new("/dev/null")
+                    || target.to_string_lossy().starts_with("pipe:")
+                    || target.starts_with(scope.path())
+            });
+            if settled || std::time::Instant::now() >= deadline {
+                break targets;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut numbers: Vec<u32> = targets
+            .iter()
+            .map(|(name, _)| name.parse().unwrap())
+            .collect();
+        numbers.sort_unstable();
+        assert!(numbers.starts_with(&[0, 1, 2]), "{targets:?}");
+        for (name, target) in &targets {
+            assert_ne!(target, &own_target, "fd {name}");
+            if ["0", "1", "2"].contains(&name.as_str()) {
+                assert_eq!(target, Path::new("/dev/null"), "fd {name}");
+            } else {
+                assert!(
+                    target.to_string_lossy().starts_with("pipe:")
+                        || target.starts_with(scope.path()),
+                    "fd {name} -> {}",
+                    target.display()
+                );
+            }
+        }
+        let pipes = targets
+            .iter()
+            .filter(|(_, target)| target.to_string_lossy().starts_with("pipe:"))
+            .count();
+        assert_eq!(pipes, 1, "the lifeline is its only pipe: {targets:?}");
+
+        assert!(!scope.member_pids().contains(&pid));
+        // SAFETY: `getpgid` takes an integer and dereferences nothing.
+        assert_eq!(
+            unsafe { libc::getpgid(pid) },
+            pid,
+            "a process group of its own"
+        );
+
+        scope.kill_all().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// Dropping the scope reaps its watcher: a second wait finds no such child.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn scope_watcher_is_reaped_when_the_scope_drops() {
+        if skip_without_host_support("scope_watcher_is_reaped_when_the_scope_drops") {
+            return;
+        }
+        let (scope, mut child) = scope_with_sleepers("ses_watcher_reaped", false);
+        let pid = watcher_of(&scope).pid;
+        let path = scope.path().to_path_buf();
+        drop(Arc::try_unwrap(scope).expect("the test holds the only reference"));
+        child.wait().unwrap();
+        let mut status = 0;
+        // SAFETY: `pid` is an integer and `status` a live local.
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert_eq!(waited, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(!path.exists(), "the scope directory is removed");
+    }
+
     /// Swap is bounded at zero whatever the manifest declares, beside a `memory.max` that is the
     /// declared ceiling itself.
     #[test]
@@ -2285,6 +2885,8 @@ mod tests {
             path: PathBuf::new(),
             procs_fd: None,
             occupancy: Arc::default(),
+            #[cfg(target_os = "linux")]
+            watcher: None,
         }
     }
 

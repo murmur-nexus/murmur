@@ -46,8 +46,8 @@ name: my-capsule
 version: "1.0.0"
 
 artifacts:
-  - name: murmur-driver-anthropic
-    version: "1.0.0"
+  - name: murmur/driver-anthropic
+    version: "0.10.0"
     runtime: driver
     gateway:
       endpoint: https://api.anthropic.com
@@ -57,7 +57,7 @@ inference:
   transport: http
   model: claude-haiku-4-5
   driver:
-    artifact: murmur-driver-anthropic
+    artifact: murmur/driver-anthropic
 ```
 
 ### Run the capsule

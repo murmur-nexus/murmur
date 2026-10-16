@@ -14,7 +14,8 @@ use capsule_runtime::served_wit_level;
 use murmur_artifact::{
     artifact_name_format_error, load_manifest_from_artifact_bytes, sha256_hex, ArtifactIndex,
     ArtifactIndexError, ArtifactName, IndexedArtifact, IndexedAsset, IndexedVersion, Manifest,
-    MurmurLock, RegistryError, VersionFit, ARTIFACT_INDEX_FILE_NAME, MURMUR_SCOPE, RESERVED_SCOPES,
+    MurmurLock, RegistryError, UnservedInterface, VersionFit, ARTIFACT_INDEX_FILE_NAME,
+    MURMUR_SCOPE, RESERVED_SCOPES,
 };
 
 use crate::config::{
@@ -509,7 +510,7 @@ pub(crate) enum ResolveError {
         source: String,
         release: String,
         target: String,
-        name: String,
+        name: ArtifactName,
     },
     /// The index lists the artifact, not at this version.
     VersionNotListed {
@@ -525,6 +526,15 @@ pub(crate) enum ResolveError {
         version: String,
         platform: String,
         published: Vec<String>,
+    },
+    /// An explicitly named version does not fit the WIT level this mur serves. `fitting` is the
+    /// newest version the same index lists that does.
+    DoesNotFit {
+        source: String,
+        name: ArtifactName,
+        version: String,
+        mismatched: Vec<UnservedInterface>,
+        fitting: Option<String>,
     },
     /// No version of an unversioned reference fits this mur; `newest` is the newest listed.
     NoneFits {
@@ -552,18 +562,22 @@ pub(crate) enum ResolveError {
     BadIndex {
         source: String,
         repo: String,
+        target: String,
         release: String,
         error: ArtifactIndexError,
     },
     /// The index names a scope the source does not own.
     ScopeClaimed {
         source: String,
+        target: String,
         claimed: String,
         scope: String,
     },
-    /// The scope's GitHub owner is not the one recorded for it.
+    /// The scope's GitHub owner is not the one recorded for it. `target` is what was being
+    /// resolved when the owner was asked.
     OwnerChanged {
         source: String,
+        target: String,
         scope: String,
         current: u64,
         recorded: RecordedOwner,
@@ -571,6 +585,7 @@ pub(crate) enum ResolveError {
     /// The payload's digest is not the one the index lists.
     Digest {
         source: String,
+        target: String,
         file: String,
         expected: String,
         actual: String,
@@ -592,9 +607,21 @@ pub(crate) enum ResolveError {
     /// The payload is not a readable `.mur.zip`.
     Unreadable {
         source: String,
+        target: String,
         file: String,
         error: String,
     },
+}
+
+/// Whether [`resolve`] holds an explicitly named version to the WIT level this mur serves. A
+/// version left out is always the newest that fits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExplicitVersion {
+    /// Refused with [`ResolveError::DoesNotFit`] before anything is fetched: an install on this
+    /// host.
+    FitChecked,
+    /// Fetched as asked: a deploy, for a target `mur` whose level this one cannot know.
+    AsAsked,
 }
 
 /// `<scope>/<name>@<version>`, or `<scope>/<name>` for an unversioned reference.
@@ -611,12 +638,14 @@ fn target(name: &ArtifactName, version: Option<&str>) -> String {
 ///
 /// Checked in order, each before anything further is requested: the owner id against `lock` and,
 /// for the [`MURMUR_SCOPE`], against [`MURMUR_OWNER_ID`]; the index's scope against the
-/// source's; then, once the payload is fetched, its SHA-256 against the index and its packed
-/// `name:` and `version:` against what was asked.
+/// source's; under [`ExplicitVersion::FitChecked`], an explicit `version`'s interfaces against the
+/// served WIT level; then, once the payload is fetched, its SHA-256 against the index and its
+/// packed `name:` and `version:` against what was asked.
 pub(crate) fn resolve(
     source: &dyn ArtifactSource,
     name: &ArtifactName,
     version: Option<&str>,
+    explicit: ExplicitVersion,
     platform: &str,
     lock: Option<&MurmurLock>,
 ) -> Result<Resolved, Box<ResolveError>> {
@@ -637,6 +666,7 @@ pub(crate) fn resolve(
             SourceError::BadIndex { release, error } => ResolveError::BadIndex {
                 source: label.clone(),
                 repo: source.repo().to_string(),
+                target: wanted.clone(),
                 release,
                 error,
             },
@@ -649,12 +679,13 @@ pub(crate) fn resolve(
     };
 
     let owner_id = source.owner_id().map_err(unanswered)?;
-    check_owner(source, owner_id, lock)?;
+    check_owner(source, owner_id, lock, &wanted)?;
 
     let published = source.index().map_err(unanswered)?;
     if published.index.scope != source.scope() {
         return Err(Box::new(ResolveError::ScopeClaimed {
             source: label,
+            target: wanted,
             claimed: published.index.scope.clone(),
             scope: source.scope().to_string(),
         }));
@@ -670,7 +701,7 @@ pub(crate) fn resolve(
                 source: label.clone(),
                 release: published.release.clone(),
                 target: wanted.clone(),
-                name: name.name().to_string(),
+                name: name.clone(),
             })
         })?;
 
@@ -697,6 +728,18 @@ pub(crate) fn resolve(
             })
         })?,
     };
+
+    if version.is_some() && explicit == ExplicitVersion::FitChecked {
+        if let VersionFit::Unserved(mismatched) = chosen.fit(served_wit_level(), platform) {
+            return Err(Box::new(ResolveError::DoesNotFit {
+                source: label,
+                name: name.clone(),
+                version: chosen.version.clone(),
+                mismatched,
+                fitting: newest_fitting(artifact, platform).map(|fits| fits.version.clone()),
+            }));
+        }
+    }
 
     let asset = select_asset(chosen, platform).ok_or_else(|| {
         Box::new(ResolveError::NoPayloadFor {
@@ -729,6 +772,7 @@ pub(crate) fn resolve(
     if actual != asset.sha256 {
         return Err(Box::new(ResolveError::Digest {
             source: label,
+            target: wanted,
             file: asset.file.clone(),
             expected: asset.sha256.clone(),
             actual,
@@ -738,6 +782,7 @@ pub(crate) fn resolve(
     let manifest = load_manifest_from_artifact_bytes(&bytes).map_err(|error| {
         Box::new(ResolveError::Unreadable {
             source: label.clone(),
+            target: wanted.clone(),
             file: asset.file.clone(),
             error: error.to_string(),
         })
@@ -788,15 +833,17 @@ fn recorded_conflict(
 }
 
 /// `E-REG-010` unless `owner_id`, what `source` answered for its repository's owner, is the owner
-/// its scope is held to.
+/// its scope is held to. `target` names what is being resolved, for the message.
 pub(crate) fn check_owner(
     source: &dyn ArtifactSource,
     owner_id: u64,
     lock: Option<&MurmurLock>,
+    target: &str,
 ) -> Result<(), Box<ResolveError>> {
     match recorded_conflict(source.scope(), owner_id, lock) {
         Some(recorded) => Err(Box::new(ResolveError::OwnerChanged {
             source: source.label().to_string(),
+            target: target.to_string(),
             scope: source.scope().to_string(),
             current: owner_id,
             recorded,
@@ -892,6 +939,9 @@ const TOKEN_RATE_LIMIT_HINT: &str = "the token sent with these requests has exha
 const UNANSWERED_HINT: &str = "the source's answer is shown above; fix the source or its \
      credentials and retry";
 
+/// The page listing which `mur` release serves which WIT level.
+const WIT_LEVELS_PAGE: &str = murmur_artifact::docs_reference_url!("wit-levels/");
+
 const OWNER_CHANGED_HINT: &str = "the GitHub account that owned the scope was renamed and its \
      name registered again by someone else, or the repository changed hands";
 
@@ -975,7 +1025,7 @@ impl From<ResolveError> for CliError {
                 E_REG_001,
                 format!(
                     "could not resolve {target}: the index of {source} (release {release}) lists \
-                     no artifact '{name}'"
+                     no {name}"
                 ),
                 "check the name: it must be one the scope's index lists exactly",
             ),
@@ -1034,12 +1084,32 @@ impl From<ResolveError> for CliError {
                         "no version of {name} in {source} fits WIT level {level}, the level this \
                          mur serves; the newest is {note}"
                     ),
-                    format!(
-                        "name a version explicitly to install it without the fit check: mur \
-                         install {name}@{newest}"
-                    ),
+                    match fit {
+                        VersionFit::NoPayloadFor(platform) => format!(
+                            "build it on this host with `mur build` then `mur install <path>`, or \
+                             ask its publisher to release a {platform} asset"
+                        ),
+                        VersionFit::Fits | VersionFit::Unserved(_) => format!(
+                            "{WIT_LEVELS_PAGE} lists which mur release serves which WIT level; \
+                             run one that serves the level {name} was built at, or ask its \
+                             publisher to rebuild it against level {level}"
+                        ),
+                    },
                 )
             }
+            ResolveError::DoesNotFit {
+                source,
+                name,
+                version,
+                mismatched,
+                fitting,
+            } => crate::wit_level::index_level_mismatch(
+                name.as_str(),
+                &version,
+                mismatched,
+                &source,
+                fitting.as_deref(),
+            ),
             ResolveError::AssetMissing {
                 source,
                 target,
@@ -1076,6 +1146,7 @@ impl From<ResolveError> for CliError {
             ResolveError::BadIndex {
                 source,
                 repo,
+                target,
                 release,
                 error,
             } => {
@@ -1086,26 +1157,28 @@ impl From<ResolveError> for CliError {
                 CliError::with_hint(
                     E_IDX_002,
                     format!(
-                        "artifact index {ARTIFACT_INDEX_FILE_NAME} of {source} release {release} \
-                         {error}"
+                        "could not resolve {target}: artifact index {ARTIFACT_INDEX_FILE_NAME} of \
+                         {source} release {release} {error}"
                     ),
                     hint,
                 )
             }
             ResolveError::ScopeClaimed {
                 source,
+                target,
                 claimed,
                 scope,
             } => {
                 let message = if claimed == MURMUR_SCOPE {
                     format!(
-                        "{source} publishes an index for scope '{claimed}', which only \
-                         {DEFAULT_ARTIFACTS_REPO} serves; this source serves scope '{scope}'"
+                        "could not resolve {target}: {source} publishes an index for scope \
+                         '{claimed}', which only {DEFAULT_ARTIFACTS_REPO} serves; this source \
+                         serves scope '{scope}'"
                     )
                 } else {
                     format!(
-                        "{source} publishes an index for scope '{claimed}', and it serves scope \
-                         '{scope}'"
+                        "could not resolve {target}: {source} publishes an index for scope \
+                         '{claimed}', and it serves scope '{scope}'"
                     )
                 };
                 CliError::with_hint(
@@ -1121,6 +1194,7 @@ impl From<ResolveError> for CliError {
             }
             ResolveError::OwnerChanged {
                 source,
+                target,
                 scope,
                 current,
                 recorded,
@@ -1128,9 +1202,9 @@ impl From<ResolveError> for CliError {
                 RecordedOwner::BuiltIn => CliError::with_hint(
                     E_REG_010,
                     format!(
-                        "scope '{scope}' is owned by GitHub account id {MURMUR_OWNER_ID}, the \
-                         owner of {DEFAULT_ARTIFACTS_REPO}, and {source} answered with owner id \
-                         {current}"
+                        "could not resolve {target}: scope '{scope}' is owned by GitHub account id \
+                         {MURMUR_OWNER_ID}, the owner of {DEFAULT_ARTIFACTS_REPO}, and {source} \
+                         answered with owner id {current}"
                     ),
                     "that owner id is compiled into mur, so no other account can serve the \
                      murmur scope; check that MUR_GITHUB_API_BASE is unset and that \
@@ -1139,9 +1213,9 @@ impl From<ResolveError> for CliError {
                 RecordedOwner::Lock { entry, owner_id } => CliError::with_hint(
                     E_REG_010,
                     format!(
-                        "the owner of scope '{scope}' has changed: {source} is now owned by \
-                         GitHub account id {current}, and murmur.lock records owner id \
-                         {owner_id} (entry {entry})"
+                        "could not resolve {target}: the owner of scope '{scope}' has changed: \
+                         {source} is now owned by GitHub account id {current}, and murmur.lock \
+                         records owner id {owner_id} (entry {entry})"
                     ),
                     format!(
                         "{OWNER_CHANGED_HINT}; if you trust the new owner, delete the \
@@ -1151,14 +1225,15 @@ impl From<ResolveError> for CliError {
             },
             ResolveError::Digest {
                 source,
+                target,
                 file,
                 expected,
                 actual,
             } => CliError::with_hint(
                 E_REG_002,
                 format!(
-                    "{file} from {source} has sha256 {actual}, and its index lists sha256 \
-                     {expected}"
+                    "could not resolve {target}: {file} from {source} has sha256 {actual}, and \
+                     its index lists sha256 {expected}"
                 ),
                 "the payload is not the one the index describes, so nothing was stored; its \
                  publisher regenerates the index, or the download was altered on the way",
@@ -1189,11 +1264,15 @@ impl From<ResolveError> for CliError {
             }),
             ResolveError::Unreadable {
                 source,
+                target,
                 file,
                 error,
             } => CliError::new(
                 E_IO_003,
-                format!("{file} from {source} is not a valid .mur.zip artifact: {error}"),
+                format!(
+                    "could not resolve {target}: {file} from {source} is not a valid .mur.zip \
+                     artifact: {error}"
+                ),
             ),
         }
     }
@@ -1437,7 +1516,14 @@ mod tests {
         full: &str,
         version: Option<&str>,
     ) -> Result<Resolved, Box<ResolveError>> {
-        resolve(source, &name(full), version, current_platform(), None)
+        resolve(
+            source,
+            &name(full),
+            version,
+            ExplicitVersion::FitChecked,
+            current_platform(),
+            None,
+        )
     }
 
     #[test]
@@ -1455,7 +1541,7 @@ mod tests {
 
         let error = resolve_in(&source, "ana/tool-gi", Some("1.0.0")).unwrap_err();
         assert!(
-            matches!(&*error, ResolveError::NameNotListed { name, .. } if name == "tool-gi"),
+            matches!(&*error, ResolveError::NameNotListed { name, .. } if name.as_str() == "ana/tool-gi"),
             "{error:?}"
         );
     }
@@ -1570,13 +1656,48 @@ mod tests {
             resolve_in(&source, "ana/tool-x", None).unwrap().version,
             "0.1.1"
         );
-        // An explicit version is fetched as asked.
-        assert_eq!(
-            resolve_in(&source, "ana/tool-x", Some("0.3.0"))
-                .unwrap()
-                .version,
-            "0.3.0"
+        // An explicit version that does not fit is refused before anything is fetched, naming
+        // the newest that does.
+        let fetched_before = source.fetched().len();
+        let error = resolve_in(&source, "ana/tool-x", Some("0.3.0")).unwrap_err();
+        assert!(
+            matches!(
+                &*error,
+                ResolveError::DoesNotFit { version, fitting: Some(fitting), .. }
+                    if version == "0.3.0" && fitting == "0.1.1"
+            ),
+            "{error:?}"
         );
+        assert_eq!(source.fetched().len(), fetched_before);
+        let cli = CliError::from(error);
+        assert_eq!(cli.code, crate::error::E_WIT_LEVEL_001);
+        assert!(
+            cli.message.starts_with(
+                "artifact 'ana/tool-x@0.3.0' does not fit WIT level 1, the level this mur serves: \
+                 it names murmur:tool/run@9.9.9, and level 1 has murmur:tool@0.1.0"
+            ),
+            "{}",
+            cli.message
+        );
+        assert_eq!(
+            cli.hint.as_deref(),
+            Some(
+                "ana/tool-x@0.1.1 is the newest version in github:ana/fits's index that fits \
+                 level 1; pin it in murmur.yaml and run `mur install`, or run `mur install \
+                 ana/tool-x@0.1.1`"
+            )
+        );
+        // A deploy fetches it as asked.
+        let resolved = resolve(
+            &source,
+            &name("ana/tool-x"),
+            Some("0.3.0"),
+            ExplicitVersion::AsAsked,
+            current_platform(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(resolved.version, "0.3.0");
     }
 
     #[test]
@@ -1600,11 +1721,11 @@ mod tests {
             "{}",
             cli.message
         );
+        let hint = cli.hint.unwrap();
         assert!(
-            cli.hint
-                .unwrap()
-                .contains("mur install ana/tool-none@1.0.0"),
-            "the hint names an explicit version"
+            hint.contains("https://docs.murmur.nexus/reference/wit-levels/")
+                && !hint.contains("mur install ana/tool-none@1.0.0"),
+            "the hint points at the WIT levels page, not at an explicit version: {hint}"
         );
         assert!(source.fetched().is_empty());
     }
@@ -1617,7 +1738,8 @@ mod tests {
         assert_eq!(cli.code, E_REG_009);
         assert_eq!(
             cli.message,
-            "github:ana/artifacts publishes an index for scope 'bob', and it serves scope 'ana'"
+            "could not resolve ana/tool-git@1.0.0: github:ana/artifacts publishes an index for \
+             scope 'bob', and it serves scope 'ana'"
         );
         assert!(source.fetched().is_empty());
     }
@@ -1629,8 +1751,10 @@ mod tests {
         let cli = CliError::from(resolve_in(&source, "ana/tool-git", Some("1.0.0")).unwrap_err());
         assert_eq!(cli.code, E_REG_002);
         assert!(
-            cli.message
-                .starts_with("tool-git-1.0.0.mur.zip from github:ana/artifacts has sha256"),
+            cli.message.starts_with(
+                "could not resolve ana/tool-git@1.0.0: tool-git-1.0.0.mur.zip from \
+                     github:ana/artifacts has sha256"
+            ),
             "{}",
             cli.message
         );
@@ -1682,6 +1806,7 @@ mod tests {
             &source,
             &name("ana/tool-git-validate"),
             Some("1.0.0"),
+            ExplicitVersion::FitChecked,
             current_platform(),
             Some(&lock),
         )
@@ -1690,8 +1815,9 @@ mod tests {
         assert_eq!(cli.code, E_REG_010);
         assert_eq!(
             cli.message,
-            "the owner of scope 'ana' has changed: github:ana/artifacts is now owned by GitHub \
-             account id 2222, and murmur.lock records owner id 1111 (entry ana/tool-git)"
+            "could not resolve ana/tool-git-validate@1.0.0: the owner of scope 'ana' has changed: \
+             github:ana/artifacts is now owned by GitHub account id 2222, and murmur.lock records \
+             owner id 1111 (entry ana/tool-git)"
         );
         assert!(source.fetched().is_empty());
     }
@@ -1893,5 +2019,169 @@ mod tests {
             }),
             UNANSWERED_HINT
         );
+    }
+
+    /// Every resolution error for `ana/tool-gi@1.0.0`, as the user reads it.
+    fn every_resolve_error() -> Vec<ResolveError> {
+        let source = "github:ana/artifacts".to_string();
+        let target = "ana/tool-gi@1.0.0".to_string();
+        let tool = name("ana/tool-gi");
+        let version = "1.0.0".to_string();
+        let file = "tool-gi-1.0.0.mur.zip".to_string();
+        vec![
+            ResolveError::Unanswered {
+                source: source.clone(),
+                target: target.clone(),
+                error: SourceError::Other("timed out".into()),
+            },
+            ResolveError::RepositoryMissing {
+                source: source.clone(),
+                target: target.clone(),
+            },
+            ResolveError::NameNotListed {
+                source: source.clone(),
+                release: "v2".into(),
+                target: target.clone(),
+                name: tool.clone(),
+            },
+            ResolveError::VersionNotListed {
+                source: source.clone(),
+                name: tool.clone(),
+                version: version.clone(),
+                listed: vec!["0.9.0".into()],
+            },
+            ResolveError::NoPayloadFor {
+                source: source.clone(),
+                name: tool.clone(),
+                version: version.clone(),
+                platform: "linux-x86_64".into(),
+                published: vec!["darwin-aarch64".into()],
+            },
+            ResolveError::DoesNotFit {
+                source: source.clone(),
+                name: tool.clone(),
+                version: version.clone(),
+                mismatched: Vec::new(),
+                fitting: Some("0.9.0".into()),
+            },
+            ResolveError::NoneFits {
+                source: source.clone(),
+                name: tool.clone(),
+                newest: version.clone(),
+                fit: VersionFit::NoPayloadFor("linux-x86_64".into()),
+            },
+            ResolveError::AssetMissing {
+                source: source.clone(),
+                target: target.clone(),
+                release: "v2".into(),
+                file: file.clone(),
+                reason: "it is gone".into(),
+            },
+            ResolveError::NoIndex {
+                source: source.clone(),
+                repo: "ana/artifacts".into(),
+                target: target.clone(),
+                release: Some("v2".into()),
+            },
+            ResolveError::BadIndex {
+                source: source.clone(),
+                repo: "ana/artifacts".into(),
+                target: target.clone(),
+                release: "v2".into(),
+                error: ArtifactIndexError::Schema1,
+            },
+            ResolveError::ScopeClaimed {
+                source: source.clone(),
+                target: target.clone(),
+                claimed: "bob".into(),
+                scope: "ana".into(),
+            },
+            ResolveError::OwnerChanged {
+                source: source.clone(),
+                target: target.clone(),
+                scope: "ana".into(),
+                current: 2222,
+                recorded: RecordedOwner::Lock {
+                    entry: "ana/tool-git".into(),
+                    owner_id: 1111,
+                },
+            },
+            ResolveError::OwnerChanged {
+                source: source.clone(),
+                target: target.clone(),
+                scope: "ana".into(),
+                current: 2222,
+                recorded: RecordedOwner::BuiltIn,
+            },
+            ResolveError::Digest {
+                source: source.clone(),
+                target: target.clone(),
+                file: file.clone(),
+                expected: "a".repeat(64),
+                actual: "b".repeat(64),
+            },
+            ResolveError::PackedVersion {
+                source: source.clone(),
+                file: file.clone(),
+                name: tool.clone(),
+                version: version.clone(),
+                packed: "1.0.1".into(),
+            },
+            ResolveError::PackedName {
+                name: tool.clone(),
+                version: version.clone(),
+                packed: "tool-gx".into(),
+            },
+            ResolveError::Unreadable {
+                source,
+                target,
+                file,
+                error: "not a zip".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn full_name_in_errors_of_every_resolution() {
+        for error in every_resolve_error() {
+            let cli = CliError::from(error.clone());
+            let text = format!("{}\n{}", cli.message, cli.hint.clone().unwrap_or_default());
+            assert!(cli.message.contains("ana/tool-gi"), "{error:?}: {text}");
+            assert!(!text.contains("'tool-gi'"), "{error:?}: {text}");
+            assert!(!text.contains("registry config"), "{error:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn full_name_in_errors_of_the_store() {
+        let tool = name("ana/tool-gi");
+        let not_found = CliError::from(RegistryError::NotFound {
+            name: tool.to_string(),
+            version: "1.0.0".into(),
+        });
+        assert_eq!(
+            not_found.message,
+            "artifact ana/tool-gi@1.0.0 is not in the store"
+        );
+        let staging = CliError::from(capsule_runtime::RuntimeError::ArtifactNotFound {
+            name: tool.to_string(),
+            version: "1.0.0".into(),
+        });
+        assert_eq!(staging.code, E_REG_001);
+        assert_eq!(
+            staging.message,
+            "artifact ana/tool-gi@1.0.0 is not in the store"
+        );
+        assert_eq!(
+            staging.hint.as_deref(),
+            Some("install it: mur install ana/tool-gi@1.0.0")
+        );
+        let local = local_store_miss(&name("local/tool-gi"), Some("1.0.0"));
+        let local_text = format!("{}\n{}", local.message, local.hint.unwrap_or_default());
+        assert!(local.message.contains("local/tool-gi"), "{local_text}");
+        for text in [&not_found.message, &staging.message, &local_text] {
+            assert!(!text.contains("'tool-gi'"), "{text}");
+            assert!(!text.contains("registry"), "{text}");
+        }
     }
 }

@@ -44,7 +44,7 @@ pub fn component(name: &str) -> PathBuf {
 /// **Only when it is absent.** `cargo build -p murmur-cli --bin mur` uplifts over
 /// `target/<profile>/mur`, the one path every suite in the workspace reads, and it carries no
 /// Cargo features. A workspace run has already put a binary there built with whatever features
-/// that run asked for — `--features "beta-mur-topology beta-mur-deploy"` on CI — so building
+/// that run asked for — `--features beta-all` on CI — so building
 /// unconditionally would replace it with a featureless one, and every suite ordered after this
 /// crate would find a `mur` whose gated subcommands had gone.
 ///

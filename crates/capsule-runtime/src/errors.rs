@@ -55,7 +55,7 @@ pub const E_RUN_036: &str = "E-RUN-036";
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
-    #[error("artifact {name}@{version} not found in registry")]
+    #[error("artifact {name}@{version} is not in the store")]
     ArtifactNotFound { name: String, version: String },
 
     #[error("artifact integrity check failed for {name}@{version}")]
@@ -118,6 +118,15 @@ pub enum RuntimeError {
     WorkdirPathRefused {
         refusal: crate::workdir_fs::WorkdirRefusal,
     },
+
+    /// A tool name that is not one normal path component, so its staged manifest would land
+    /// outside `workdir/tools/`.
+    #[error(
+        "tool name '{}' is not a bare name, so its manifest would be written outside the \
+         workdir's tools/ directory",
+        name.escape_debug()
+    )]
+    ToolNameNotAComponent { name: String },
 
     #[error("failed to write tool manifest at {path}: {source}")]
     WriteToolManifest {

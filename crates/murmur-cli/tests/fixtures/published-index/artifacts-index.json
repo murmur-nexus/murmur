@@ -1,0 +1,697 @@
+{
+  "schema_version": 2,
+  "scope": "murmur",
+  "artifacts": [
+    {
+      "name": "driver-anthropic",
+      "runtime": "driver",
+      "description": "Anthropic Messages API inference driver for Murmur agent capsules.",
+      "tags": [
+        "driver",
+        "inference",
+        "anthropic"
+      ],
+      "versions": [
+        {
+          "version": "0.10.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:stream/events@0.1.0",
+            "murmur:tool/run@0.1.0"
+          ],
+          "assets": [
+            {
+              "file": "driver-anthropic-0.10.0.mur.zip",
+              "sha256": "a986f907441e790d0fc73fb40f7f6dddb449cf2d1a4df13f78a30f5491b5380d"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "driver-claude-code",
+      "runtime": "driver",
+      "description": "Process driver for Claude Code.",
+      "tags": [
+        "driver",
+        "inference",
+        "claude",
+        "code"
+      ],
+      "versions": [
+        {
+          "version": "0.4.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:driver/process@0.3.0"
+          ],
+          "assets": [
+            {
+              "file": "driver-claude-code-0.4.0.mur.zip",
+              "sha256": "dc05993ff9d055994d4dbb486da81823d73896dc12a89268c2e04ed22d046d75"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "driver-deepseek",
+      "runtime": "driver",
+      "description": "DeepSeek inference driver — deepseek-v4-flash and deepseek-v4-pro with thinking mode",
+      "tags": [
+        "driver",
+        "inference",
+        "deepseek"
+      ],
+      "versions": [
+        {
+          "version": "0.8.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:stream/events@0.1.0",
+            "murmur:tool/run@0.1.0"
+          ],
+          "assets": [
+            {
+              "file": "driver-deepseek-0.8.0.mur.zip",
+              "sha256": "f79ae9881f1c93af86ef4ccc48f97759c9dc6c8b82c2041b01d7c390d6d3a7f3"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "driver-moonshotai",
+      "runtime": "driver",
+      "description": "Moonshot AI inference driver — kimi-k3 on the Chat Completions surface, with reasoning_effort and response_format config keys",
+      "tags": [
+        "driver",
+        "inference",
+        "moonshotai"
+      ],
+      "versions": [
+        {
+          "version": "0.7.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:stream/events@0.1.0",
+            "murmur:tool/run@0.1.0"
+          ],
+          "assets": [
+            {
+              "file": "driver-moonshotai-0.7.0.mur.zip",
+              "sha256": "28d4feb764bcbe09264ef2c96d7feb65a4ef1e8e05389860f242d28d74935315"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "driver-openai",
+      "runtime": "driver",
+      "description": "OpenAI inference driver for Murmur agent capsules — Chat Completions, with Responses API for gpt-5 and later models.",
+      "tags": [
+        "driver",
+        "inference",
+        "openai"
+      ],
+      "versions": [
+        {
+          "version": "0.9.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:stream/events@0.1.0",
+            "murmur:tool/run@0.1.0"
+          ],
+          "assets": [
+            {
+              "file": "driver-openai-0.9.0.mur.zip",
+              "sha256": "995db97d1edcb0dc172d27fa3c98746b16d58efb766b9e03d88da1c42cd1b2a6"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hook-compact",
+      "runtime": "hook",
+      "description": "Summarises conversation history when the session token threshold is reached.",
+      "tags": [
+        "hook",
+        "compact"
+      ],
+      "versions": [
+        {
+          "version": "0.8.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:hook/lifecycle@0.9.0",
+            "murmur:runtime/inference@0.4.0"
+          ],
+          "assets": [
+            {
+              "file": "hook-compact-0.8.0.mur.zip",
+              "sha256": "c65c606b00371e8a4f75142d798de203c441178e0fada4648f0c451e15bd3dba"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hook-debug",
+      "runtime": "hook",
+      "description": "Writes hook lifecycle events to hook-debug.jsonl in the capsule workdir.",
+      "tags": [
+        "hook",
+        "debug"
+      ],
+      "versions": [
+        {
+          "version": "0.7.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:hook/lifecycle@0.9.0"
+          ],
+          "assets": [
+            {
+              "file": "hook-debug-0.7.0.mur.zip",
+              "sha256": "05d43e7c03c63450c76ff624cde20d316ffac7af7012608ed545062514a94f04"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hook-diff-summary",
+      "runtime": "hook",
+      "description": "Snapshots files before each editor tool call and emits a structured unified-diff summary as an artifact event at end of turn.",
+      "tags": [
+        "hook",
+        "diff",
+        "summary"
+      ],
+      "versions": [
+        {
+          "version": "0.8.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:hook/lifecycle@0.9.0"
+          ],
+          "assets": [
+            {
+              "file": "hook-diff-summary-0.8.0.mur.zip",
+              "sha256": "35109355a3055b03e383b6c050e3bde9f1fb8c5accf551eed3d2e913945d8019"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hook-eval",
+      "runtime": "hook",
+      "description": "Structured evaluation hook — scores capsule sessions against configured scorers and writes eval.jsonl.",
+      "tags": [
+        "hook",
+        "eval"
+      ],
+      "versions": [
+        {
+          "version": "0.8.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:hook/lifecycle@0.9.0"
+          ],
+          "assets": [
+            {
+              "file": "hook-eval-0.8.0.mur.zip",
+              "sha256": "cab78d23b280d35cb9fa6a3e13a05e0a040648af9c27d84969be5c7f00339973"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hook-grafana",
+      "runtime": "hook",
+      "description": "Emits OTel spans to a Grafana Tempo OTLP/HTTP endpoint for each capsule lifecycle event.",
+      "tags": [
+        "hook",
+        "grafana"
+      ],
+      "versions": [
+        {
+          "version": "0.8.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:hook/lifecycle@0.9.0"
+          ],
+          "assets": [
+            {
+              "file": "hook-grafana-0.8.0.mur.zip",
+              "sha256": "1340f921ff7da455418f81b7c023b001b939158247e50f75256f453bbe565989"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hook-memory",
+      "runtime": "hook",
+      "description": "Seeds a task with the relevant part of the conversation that came before it — pages the runtime's durable conversation record read-only, selects a budget-bounded chronological slice, and stamps each seeded message with the record message it came from.",
+      "tags": [
+        "hook",
+        "memory"
+      ],
+      "versions": [
+        {
+          "version": "0.9.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:conversation/read@0.2.0",
+            "murmur:hook/lifecycle@0.9.0",
+            "murmur:runtime/tokens@0.4.0",
+            "murmur:task-io/read@0.1.0"
+          ],
+          "assets": [
+            {
+              "file": "hook-memory-0.9.0.mur.zip",
+              "sha256": "6240fd8e40884747bdb68018f1f7197ea0be87bd6e396f6a33006be679533920"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hook-regression-verifier",
+      "runtime": "hook",
+      "description": "Watches a task's test runs, and at task end reopens the task when a change broke previously-passing tests (including wholesale \"collection failure\" module breaks).",
+      "tags": [
+        "hook",
+        "regression",
+        "verifier"
+      ],
+      "versions": [
+        {
+          "version": "0.6.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:hook/lifecycle@0.9.0"
+          ],
+          "assets": [
+            {
+              "file": "hook-regression-verifier-0.6.0.mur.zip",
+              "sha256": "a14fae7bfc0d8a2472e545d2653517837581b7bd042866be36e704786b2f4b58"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hook-shell-desc",
+      "runtime": "hook",
+      "description": "Returns enriched tool manifests for common shell binaries at staging time.",
+      "tags": [
+        "hook",
+        "shell",
+        "desc"
+      ],
+      "versions": [
+        {
+          "version": "0.6.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:hook/lifecycle@0.9.0"
+          ],
+          "assets": [
+            {
+              "file": "hook-shell-desc-0.6.0.mur.zip",
+              "sha256": "e530435546db10df8a3116376e3174c756aeb89656fd42848a7a556c93530add"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "skill-create-manifest",
+      "runtime": "skill",
+      "description": "Skill artifact: complete knowledge for generating valid murmur manifest files",
+      "tags": [
+        "skill",
+        "create",
+        "manifest"
+      ],
+      "versions": [
+        {
+          "version": "0.1.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [],
+          "assets": [
+            {
+              "file": "skill-create-manifest-0.1.0.mur.zip",
+              "sha256": "3f081a9ffabba0ece368f7e56c1a445198d1139002ef97fc3a901abe00a89716"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "skill-investigation-checkpoint",
+      "runtime": "skill",
+      "description": "Skill artifact: the investigations convention for checkpoints/decisions.json — record and reuse investigative verdicts (ruled-out/confirmed/uncertain) across a session",
+      "tags": [
+        "skill",
+        "investigation",
+        "checkpoint"
+      ],
+      "versions": [
+        {
+          "version": "0.2.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [],
+          "assets": [
+            {
+              "file": "skill-investigation-checkpoint-0.2.0.mur.zip",
+              "sha256": "e8baed8a2b47a0e3bf6af68f21e2d17a6ffad569ed00fef27e4eef012320ec99"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool-code-coverage",
+      "runtime": "tool",
+      "description": "Spectrum-based fault localization (Ochiai / Tarantula) over a Rust repository",
+      "tags": [
+        "tool",
+        "code",
+        "coverage"
+      ],
+      "versions": [
+        {
+          "version": "0.1.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [],
+          "assets": [
+            {
+              "file": "tool-code-coverage-0.1.0-darwin-aarch64.mur.zip",
+              "platform": "darwin-aarch64",
+              "sha256": "afa258ef1bacc7f7f09e266ee72851be285c74342e401a80701d21036ea7da80"
+            },
+            {
+              "file": "tool-code-coverage-0.1.0-linux-x86_64.mur.zip",
+              "platform": "linux-x86_64",
+              "sha256": "c50dc386f72a5e5a2cb06bf935460145c7902bfc3868b367c547372b81c17385"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool-code-graph",
+      "runtime": "tool",
+      "description": "Indexes a Rust and/or Python repository into a SQLite-backed symbol/edge graph",
+      "tags": [
+        "tool",
+        "code",
+        "graph"
+      ],
+      "versions": [
+        {
+          "version": "0.2.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [],
+          "assets": [
+            {
+              "file": "tool-code-graph-0.2.0-darwin-aarch64.mur.zip",
+              "platform": "darwin-aarch64",
+              "sha256": "4f27d6a609962eb2d32fecab0520def8f75956de0e4c716f2a8919b815064c54"
+            },
+            {
+              "file": "tool-code-graph-0.2.0-linux-x86_64.mur.zip",
+              "platform": "linux-x86_64",
+              "sha256": "75b6c4792a83d71ea164a1bd6966573290986d736d44fb2a7d8631189aafaaba"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool-corpus",
+      "runtime": "tool",
+      "description": "Append-only record store for Murmur capsules.",
+      "tags": [
+        "tool",
+        "corpus"
+      ],
+      "versions": [
+        {
+          "version": "0.3.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:tool/run@0.1.0"
+          ],
+          "assets": [
+            {
+              "file": "tool-corpus-0.3.0.mur.zip",
+              "sha256": "7aac5c641a82c16999627381420322c53860b979e439632f39a2513465799a06"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool-create",
+      "runtime": "tool",
+      "description": "Scaffolds a new tool artifact directory with murmur.yaml, stub implementation, and README.md.",
+      "tags": [
+        "tool",
+        "create"
+      ],
+      "versions": [
+        {
+          "version": "0.5.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:tool/run@0.1.0"
+          ],
+          "assets": [
+            {
+              "file": "tool-create-0.5.0.mur.zip",
+              "sha256": "b9be13a60860b29feb113c378b62f1890c3211c7f3211097c08b27d31f0773c3"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool-editor",
+      "runtime": "tool",
+      "description": "Structured file editing interface for Murmur capsules.",
+      "tags": [
+        "tool",
+        "editor"
+      ],
+      "versions": [
+        {
+          "version": "0.6.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:tool/run@0.1.0"
+          ],
+          "assets": [
+            {
+              "file": "tool-editor-0.6.0.mur.zip",
+              "sha256": "fab03fef2d0325fdb97aea496f0e871a8e66cced74c74bd1dd978a04eda4f5a3"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool-git",
+      "runtime": "tool",
+      "description": "Structured git interface for Murmur capsules.",
+      "tags": [
+        "tool",
+        "git"
+      ],
+      "versions": [
+        {
+          "version": "0.2.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [],
+          "assets": [
+            {
+              "file": "tool-git-0.2.0-darwin-aarch64.mur.zip",
+              "platform": "darwin-aarch64",
+              "sha256": "b197bca09698e8a8ec7658f66208193a309d1675b8756a0dfc6acc368595ec7e"
+            },
+            {
+              "file": "tool-git-0.2.0-linux-x86_64.mur.zip",
+              "platform": "linux-x86_64",
+              "sha256": "e9bbd88e3db8efef0597b0ad135607edca3d811d582586726dd570d2717c5a75"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool-registry-search",
+      "runtime": "tool",
+      "description": "Search the Murmur artifact registry for artifacts matching a keyword.",
+      "tags": [
+        "tool",
+        "registry",
+        "search"
+      ],
+      "versions": [
+        {
+          "version": "0.1.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [],
+          "assets": [
+            {
+              "file": "tool-registry-search-0.1.0-darwin-aarch64.mur.zip",
+              "platform": "darwin-aarch64",
+              "sha256": "019fcae13f2f1f058b6e49b97e4b4ca41ffb86a47728e5701d590b1763061fff"
+            },
+            {
+              "file": "tool-registry-search-0.1.0-linux-x86_64.mur.zip",
+              "platform": "linux-x86_64",
+              "sha256": "5cedca4b7767d2e38d7dc99a6eeddd0d5a940096a4fa2d8451b318b136e11367"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool-report",
+      "runtime": "tool",
+      "description": "State this capsule's own conclusion where a consumer can find it.",
+      "tags": [
+        "tool",
+        "report"
+      ],
+      "versions": [
+        {
+          "version": "0.2.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:tool/run@0.1.0"
+          ],
+          "assets": [
+            {
+              "file": "tool-report-0.2.0.mur.zip",
+              "sha256": "62a7439da9e9d04f999337bf3ae431db1287c3f142baba1bb3eeccf761863e9a"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool-request-input",
+      "runtime": "tool",
+      "description": "Pauses the agent loop and requests external input via A2A.",
+      "tags": [
+        "tool",
+        "request",
+        "input"
+      ],
+      "versions": [
+        {
+          "version": "0.2.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:task/task@0.1.0",
+            "murmur:tool/run@0.1.0"
+          ],
+          "assets": [
+            {
+              "file": "tool-request-input-0.2.0.mur.zip",
+              "sha256": "6c6db366a14a0ce5b889a108938e94d6b85259e4bd05ef536f507d31b79ca904"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool-tavily",
+      "runtime": "tool",
+      "description": "Search the web with Tavily and return a bounded, fenced text result — the Tavily key is bound by the operator and attached by the runtime, never held by the tool.",
+      "tags": [
+        "tool",
+        "tavily"
+      ],
+      "versions": [
+        {
+          "version": "0.2.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [
+            "murmur:tool/run@0.1.0"
+          ],
+          "assets": [
+            {
+              "file": "tool-tavily-0.2.0.mur.zip",
+              "sha256": "179d5e604dae5456b1adbdfafb15a4941be9425d30bdc61489f5d3a2c7fa70de"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool-test-report",
+      "runtime": "tool",
+      "description": "Parses a raw test-runner output file (already captured on disk by the agent's",
+      "tags": [
+        "tool",
+        "test",
+        "report"
+      ],
+      "versions": [
+        {
+          "version": "0.1.0",
+          "release": "v0.24.0",
+          "built_at_level": 1,
+          "interfaces": [],
+          "assets": [
+            {
+              "file": "tool-test-report-0.1.0-darwin-aarch64.mur.zip",
+              "platform": "darwin-aarch64",
+              "sha256": "89a55d6e02ac26852b96a55d599a241df27d91c98755cdcfe4a703c3d686a374"
+            },
+            {
+              "file": "tool-test-report-0.1.0-linux-x86_64.mur.zip",
+              "platform": "linux-x86_64",
+              "sha256": "2b9d8a81539adc58f6a104018598fc300287b6afa7eda93ee5afd2a52afc2ddd"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

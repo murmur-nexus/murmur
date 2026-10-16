@@ -18,6 +18,7 @@ use std::{
 use assert_cmd::Command;
 use capsule_runtime::served_wit_level;
 use common::github_release::{mur_index, release_assets, MockGitHub};
+use murmur_artifact::{ArtifactMeta, ArtifactName, LocalRegistry, Registry, RuntimeType};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -68,6 +69,27 @@ fn build_current(dir: &Path) {
 /// labelled them.
 fn pack_previous(dir: &Path) -> PathBuf {
     common::create_driver_artifact_with_auth(dir, "process-driver", "1.0.0", &previous_wasm(), "")
+}
+
+/// Put `file`, built against a level this mur does not serve, in `home`'s global store as
+/// `ana/process-driver@1.0.0` from owner 1111, as a `mur` with no install fit check stored it:
+/// `mur install` refuses to.
+fn seed_global(home: &Path, file: &Path) {
+    let meta = ArtifactMeta {
+        name: ArtifactName::parse("ana/process-driver").unwrap(),
+        version: "1.0.0".to_string(),
+        runtime: RuntimeType::Wasm,
+        artifact_runtime: "driver".to_string(),
+        platforms: Vec::new(),
+        description: None,
+        tags: Vec::new(),
+        wit_contracts: None,
+        owner_id: Some(1111),
+        built_at_level: None,
+    };
+    LocalRegistry::new(home.join(".murmur/artifacts"))
+        .publish(meta, &fs::read(file).unwrap())
+        .unwrap();
 }
 
 /// Publish every `.mur.zip` in `dir` as release `tag` of `REPO`, with its `mur index` output.
@@ -147,7 +169,7 @@ fn a_launch_names_the_newest_version_of_the_driver_that_fits() {
     stub.repository(REPO, 1111);
     let staging = TempDir::new().unwrap();
     build_current(staging.path());
-    pack_previous(staging.path());
+    let previous = pack_previous(staging.path());
     let index = publish(&stub, "v2", staging.path());
 
     // The built artifact's label is in the index as written; the hand-packed one fits no level,
@@ -159,15 +181,7 @@ fn a_launch_names_the_newest_version_of_the_driver_that_fits() {
     assert!(versions[1].get("built_at_level").is_none(), "{versions}");
 
     let (home, project) = fixture("ana/process-driver");
-    mur(home.path(), project.path(), &stub.api_base)
-        .args([
-            "install",
-            "--no-precompile",
-            "-g",
-            "ana/process-driver@1.0.0",
-        ])
-        .assert()
-        .success();
+    seed_global(home.path(), &previous);
     assert!(sidecar(home.path(), "ana/process-driver", "1.0.0")["meta"]
         .get("built_at_level")
         .is_none());
@@ -183,7 +197,8 @@ fn a_launch_names_the_newest_version_of_the_driver_that_fits() {
         hint(&stderr),
         format!(
             "ana/process-driver@1.1.0 is the newest version in github:ana/drivers's index that \
-             fits level {}; pin it in murmur.yaml and run `mur install`",
+             fits level {}; pin it in murmur.yaml and run `mur install`, or run `mur install \
+             ana/process-driver@1.1.0`",
             served_wit_level().level
         )
     );
@@ -195,19 +210,11 @@ fn a_launch_says_when_no_version_in_the_index_fits() {
     let stub = MockGitHub::start();
     stub.repository(REPO, 1111);
     let staging = TempDir::new().unwrap();
-    pack_previous(staging.path());
+    let previous = pack_previous(staging.path());
     publish(&stub, "v1", staging.path());
 
     let (home, project) = fixture("ana/process-driver");
-    mur(home.path(), project.path(), &stub.api_base)
-        .args([
-            "install",
-            "--no-precompile",
-            "-g",
-            "ana/process-driver@1.0.0",
-        ])
-        .assert()
-        .success();
+    seed_global(home.path(), &previous);
 
     stub.clear_requests();
     let stderr = run_refused(
@@ -232,19 +239,11 @@ fn a_launch_says_when_the_index_cannot_be_read() {
     let stub = MockGitHub::start();
     stub.repository(REPO, 1111);
     let staging = TempDir::new().unwrap();
-    pack_previous(staging.path());
+    let previous = pack_previous(staging.path());
     publish(&stub, "v1", staging.path());
 
     let (home, project) = fixture("ana/process-driver");
-    mur(home.path(), project.path(), &stub.api_base)
-        .args([
-            "install",
-            "--no-precompile",
-            "-g",
-            "ana/process-driver@1.0.0",
-        ])
-        .assert()
-        .success();
+    seed_global(home.path(), &previous);
 
     // A port nothing listens on.
     let closed = {
@@ -301,19 +300,11 @@ fn a_launch_says_when_no_source_serves_the_scope() {
     let stub = MockGitHub::start();
     stub.repository(REPO, 1111);
     let staging = TempDir::new().unwrap();
-    pack_previous(staging.path());
+    let previous = pack_previous(staging.path());
     publish(&stub, "v1", staging.path());
 
     let (home, project) = fixture("ana/process-driver");
-    mur(home.path(), project.path(), &stub.api_base)
-        .args([
-            "install",
-            "--no-precompile",
-            "-g",
-            "ana/process-driver@1.0.0",
-        ])
-        .assert()
-        .success();
+    seed_global(home.path(), &previous);
     fs::remove_file(home.path().join(".murmur/config.yaml")).unwrap();
 
     stub.clear_requests();

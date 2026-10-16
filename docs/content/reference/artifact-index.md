@@ -124,7 +124,7 @@ files are published.
 | `runtime` | The packed `runtime:` of the newest version |
 | `description` | The first non-empty line of the newest version's packed `description:`, cut after the first `.`, `!` or `?` that ends the line or is followed by a space |
 | `tags` | The role tags of `runtime`, then each `-`-separated word of the name except `murmur`, without repeats |
-| `interfaces` | The `murmur:` names the version's components export and import |
+| `interfaces` | The `murmur:` names the version's components export and import. A WASM payload whose component cannot be read is refused rather than given `[]`; a native or static payload has none |
 | `file`, `platform` | The file name |
 | `sha256` | The file's bytes |
 

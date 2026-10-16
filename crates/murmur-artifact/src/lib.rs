@@ -45,10 +45,11 @@ pub use artifact::{
 };
 pub use artifact_index::{
     asset_file_name, compare_versions, derived_built_at_level, derived_tags, description_summary,
-    index_directory, index_scope_error, merge_indexes, murmur_interfaces, release_tag_error,
-    version_fit, ArtifactIndex, ArtifactIndexError, IndexBuildError, IndexedArtifact, IndexedAsset,
-    IndexedVersion, MergeReport, VersionFit, ARTIFACT_FILE_SUFFIX, ARTIFACT_INDEX_FILE_NAME,
-    ARTIFACT_INDEX_SCHEMA_VERSION, MURMUR_INTERFACE_PREFIX,
+    index_directory, index_scope_error, merge_indexes, metadata_file_name, murmur_interfaces,
+    release_tag_error, sha256_file_name, version_fit, ArtifactIndex, ArtifactIndexError,
+    IndexBuildError, IndexedArtifact, IndexedAsset, IndexedVersion, MergeReport, VersionFit,
+    ARTIFACT_FILE_SUFFIX, ARTIFACT_INDEX_FILE_NAME, ARTIFACT_INDEX_SCHEMA_VERSION,
+    MURMUR_INTERFACE_PREFIX,
 };
 pub use artifact_name::{
     prefix_part_error, unscoped_name_hint, ArtifactName, ArtifactNameError, LOCAL_SCOPE,
@@ -139,8 +140,9 @@ pub use unknown_manifest_keys::{
     warn_on_unknown_manifest_keys, UnknownManifestKey,
 };
 pub use wit_contract::{
-    extract_wit_contracts, wit_contracts_from_artifact_bytes, wit_contracts_from_artifact_reader,
-    wit_package_declarations, ContractDirection, UnservedInterface, WitContractError, WitContracts,
+    extract_wit_contracts, read_component_contracts, wit_contracts_from_artifact_bytes,
+    wit_contracts_from_artifact_reader, wit_package_declarations, ComponentReadError,
+    ContractDirection, UnservedInterface, WitContractError, WitContracts,
 };
 pub use wit_level::{
     fitting_levels, level_fit, level_has_phrase, newest_fitting_level, parse_wit_levels, LevelFit,

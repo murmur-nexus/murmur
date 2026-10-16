@@ -373,18 +373,54 @@ fn run_wizard() -> Result<InferenceConfig, CliError> {
     Ok(config)
 }
 
-fn build_meta_manifest(config: &InferenceConfig) -> String {
-    // The generator capsule's own driver pins, independent of `Provider::driver_version`.
-    let (provider, driver_version) = match config.provider.as_str() {
-        "openai" => (&OPENAI, "0.3.34"),
-        _ => (&ANTHROPIC, "0.3.33"),
+/// A tool or skill the generator capsule declares besides its driver.
+pub(crate) struct GeneratorArtifact {
+    pub(crate) name: &'static str,
+    /// The `extra.v` value `docs/mkdocs.yml` holds for this artifact (`murmur/tool-editor` →
+    /// `murmur_tool_editor`), which a unit test keeps equal.
+    pub(crate) version: &'static str,
+    pub(crate) runtime: &'static str,
+}
+
+/// The generator capsule's tools and skill, in the order its manifest declares them. Its driver
+/// is the provider's, at [`Provider::driver_version`].
+pub(crate) const GENERATOR_ARTIFACTS: [GeneratorArtifact; 3] = [
+    GeneratorArtifact {
+        name: "murmur/tool-registry-search",
+        version: "0.1.0",
+        runtime: "tool",
+    },
+    GeneratorArtifact {
+        name: "murmur/tool-editor",
+        version: "0.6.0",
+        runtime: "tool",
+    },
+    GeneratorArtifact {
+        name: "murmur/skill-create-manifest",
+        version: "0.1.0",
+        runtime: "skill",
+    },
+];
+
+pub(crate) fn build_meta_manifest(config: &InferenceConfig) -> String {
+    let provider: &Provider = match config.provider.as_str() {
+        "openai" => &OPENAI,
+        _ => &ANTHROPIC,
     };
-    let (driver_name, default_endpoint) = (provider.driver, provider.default_endpoint);
     let endpoint = if config.endpoint.is_empty() {
-        default_endpoint
+        provider.default_endpoint
     } else {
         config.endpoint.as_str()
     };
+    let others: String = GENERATOR_ARTIFACTS
+        .iter()
+        .map(|artifact| {
+            format!(
+                "  - name: {}\n    version: \"{}\"\n    runtime: {}\n",
+                artifact.name, artifact.version, artifact.runtime
+            )
+        })
+        .collect();
 
     format!(
         r#"name: murmur-manifest-generator
@@ -396,16 +432,7 @@ artifacts:
     gateway:
       endpoint: {endpoint}
       api_key: {META_MANIFEST_KEY_PLACEHOLDER}
-  - name: murmur/tool-registry-search
-    version: "0.4.13"
-    runtime: tool
-  - name: murmur/tool-editor
-    version: "0.4.4"
-    runtime: tool
-  - name: murmur/skill-create-manifest
-    version: "0.1.1"
-    runtime: skill
-lifecycle:
+{others}lifecycle:
   task_acceptance: single
   after_task: exit
 inference:
@@ -413,9 +440,8 @@ inference:
   driver:
     artifact: {driver_name}
 "#,
-        driver_name = driver_name,
-        driver_version = driver_version,
-        endpoint = endpoint,
+        driver_name = provider.driver,
+        driver_version = provider.driver_version,
         model = config.model,
     )
 }
@@ -505,7 +531,7 @@ mod tests {
         };
         let yaml = build_meta_manifest(&config);
         assert!(
-            yaml.contains("murmur-driver-anthropic"),
+            yaml.contains("name: murmur/driver-anthropic"),
             "should use anthropic driver"
         );
         assert!(
@@ -517,7 +543,7 @@ mod tests {
             "should use model"
         );
         assert!(
-            !yaml.contains("murmur-driver-openai"),
+            !yaml.contains("murmur/driver-openai"),
             "should not reference openai driver"
         );
     }
@@ -532,7 +558,7 @@ mod tests {
         };
         let yaml = build_meta_manifest(&config);
         assert!(
-            yaml.contains("murmur-driver-openai"),
+            yaml.contains("name: murmur/driver-openai"),
             "should use openai driver"
         );
         assert!(
@@ -541,7 +567,7 @@ mod tests {
         );
         assert!(yaml.contains("gpt-5.6-luna"), "should use model");
         assert!(
-            !yaml.contains("murmur-driver-anthropic"),
+            !yaml.contains("murmur/driver-anthropic"),
             "should not reference anthropic driver"
         );
     }
@@ -619,7 +645,7 @@ mod tests {
         let driver = runtime_manifest
             .artifacts
             .iter()
-            .find(|artifact| artifact.name == "murmur-driver-anthropic")
+            .find(|artifact| artifact.name == "murmur/driver-anthropic")
             .expect("the driver entry is declared");
         assert_eq!(
             driver
@@ -705,7 +731,7 @@ mod tests {
         let driver_key = runtime_manifest
             .artifacts
             .iter()
-            .find(|artifact| artifact.name == "murmur-driver-anthropic")
+            .find(|artifact| artifact.name == "murmur/driver-anthropic")
             .and_then(|artifact| artifact.gateway.as_ref())
             .and_then(|gateway| gateway.api_key.clone());
         assert_eq!(
@@ -882,7 +908,7 @@ mod tests {
         let prompt = build_task_prompt("summarise a document", Some("local"), &anthropic_inf());
         assert!(
             prompt.contains("\"registry\":\"local\""),
-            "task prompt should embed the --index value under the `registry` input key of murmur-tool-registry-search"
+            "task prompt should embed the --index value under the `registry` input key of murmur/tool-registry-search"
         );
     }
 
@@ -895,38 +921,56 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_meta_manifest_anthropic_uses_fixed_driver_version() {
-        let yaml = build_meta_manifest(&anthropic_inf());
-        assert!(yaml.contains("0.3.33"), "anthropic driver must be 0.3.33");
-        assert!(
-            !yaml.contains("0.3.32"),
-            "must not reference old anthropic driver 0.3.32"
-        );
+    /// The `version:` of the artifact entry named `name` in a generator manifest.
+    fn declared_version(yaml: &str, name: &str) -> Option<String> {
+        RuntimeManifest::from_yaml_str(yaml)
+            .expect("the generator manifest parses")
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.name == name)
+            .map(|artifact| artifact.version.clone())
     }
 
     #[test]
-    fn build_meta_manifest_openai_uses_fixed_driver_version() {
-        let yaml = build_meta_manifest(&openai_inf());
-        assert!(yaml.contains("0.3.34"), "openai driver must be 0.3.34");
-        assert!(
-            !yaml.contains("0.3.33"),
-            "must not reference old openai driver 0.3.33"
-        );
+    fn build_meta_manifest_pins_the_providers_driver_version() {
+        for (config, provider) in [(anthropic_inf(), &ANTHROPIC), (openai_inf(), &OPENAI)] {
+            let yaml = build_meta_manifest(&config);
+            assert_eq!(
+                declared_version(&yaml, provider.driver).as_deref(),
+                Some(provider.driver_version),
+                "the {} generator pins {} at Provider::driver_version",
+                config.provider,
+                provider.driver
+            );
+            assert!(
+                yaml.contains(&format!("    artifact: {}\n", provider.driver)),
+                "inference.driver.artifact names {}",
+                provider.driver
+            );
+        }
     }
 
     #[test]
     fn build_meta_manifest_includes_tool_editor() {
         for config in [anthropic_inf(), openai_inf()] {
             let yaml = build_meta_manifest(&config);
-            assert!(
-                yaml.contains("murmur-tool-editor"),
-                "must include murmur-tool-editor ({} provider)",
+            assert_eq!(
+                declared_version(&yaml, "murmur/tool-editor").as_deref(),
+                Some(GENERATOR_ARTIFACTS[1].version),
+                "must include murmur/tool-editor ({} provider)",
                 config.provider
             );
-            assert!(
-                yaml.contains("0.4.4"),
-                "must include murmur-tool-editor@0.4.4 ({} provider)",
+        }
+    }
+
+    #[test]
+    fn build_meta_manifest_includes_tool_registry_search() {
+        for config in [anthropic_inf(), openai_inf()] {
+            let yaml = build_meta_manifest(&config);
+            assert_eq!(
+                declared_version(&yaml, "murmur/tool-registry-search").as_deref(),
+                Some(GENERATOR_ARTIFACTS[0].version),
+                "must include murmur/tool-registry-search ({} provider)",
                 config.provider
             );
         }
@@ -936,20 +980,36 @@ mod tests {
     fn build_meta_manifest_includes_skill_create_manifest() {
         for config in [anthropic_inf(), openai_inf()] {
             let yaml = build_meta_manifest(&config);
-            assert!(
-                yaml.contains("murmur-skill-create-manifest"),
-                "must include murmur-skill-create-manifest ({} provider)",
-                config.provider
-            );
-            assert!(
-                yaml.contains("0.1.1"),
-                "must include murmur-skill-create-manifest@0.1.1 ({} provider)",
-                config.provider
-            );
-            assert!(
-                yaml.contains("runtime: skill"),
+            let manifest = RuntimeManifest::from_yaml_str(&yaml).expect("parses");
+            let skill = manifest
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.name == "murmur/skill-create-manifest")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "must include murmur/skill-create-manifest ({} provider)",
+                        config.provider
+                    )
+                });
+            assert_eq!(skill.version, GENERATOR_ARTIFACTS[2].version);
+            assert_eq!(
+                skill.runtime,
+                ArtifactRuntime::Skill,
                 "must have runtime: skill entry ({} provider)",
                 config.provider
+            );
+        }
+    }
+
+    #[test]
+    fn generator_pins_match_the_docs() {
+        for artifact in &GENERATOR_ARTIFACTS {
+            let docs_key = artifact.name.replace(['/', '-'], "_");
+            let docs = crate::published_pins::docs_pin(&docs_key);
+            assert_eq!(
+                artifact.version, docs,
+                "the generator pins {}@{}, and docs/mkdocs.yml extra.v.{docs_key} is {docs}",
+                artifact.name, artifact.version
             );
         }
     }
@@ -984,7 +1044,7 @@ mod tests {
             "prompt must instruct agent to call read_file"
         );
         assert!(
-            prompt.contains("tools/murmur-skill-create-manifest/skill.md"),
+            prompt.contains("tools/skill-create-manifest/skill.md"),
             "prompt must reference skill.md path"
         );
     }

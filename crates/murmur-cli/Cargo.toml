@@ -65,6 +65,9 @@ beta = []
 beta-mur-new = ["beta"]
 beta-mur-deploy = ["beta"]
 beta-mur-topology = ["beta"]
+# Every beta feature, the set CI and scripts/test.sh build and test; `beta_features` fails when a
+# `beta-*` feature is missing from it.
+beta-all = ["beta-mur-new", "beta-mur-deploy", "beta-mur-topology"]
 # beta-blueprint = ["beta"]
 # beta-dag-topology = ["beta"]
 # Mutually exclusive in effect, not in Cargo: `--all-features` turns both on, and

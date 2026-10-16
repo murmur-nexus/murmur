@@ -65,13 +65,13 @@ jobs:
         with:
           tool: cargo-nextest@0.9.146
       - name: Build the test binaries
-        # `--features` pulls in `topology_cmd` and `deploy_cmd`, which are `#![cfg(feature = ...)]`
-        # files and contribute zero tests without it. The run below passes the same packages and
-        # features, so nextest's own build finds everything fresh; a `Compiling` line in its output
-        # means the two have drifted apart. `--timings` records each crate's build time.
+        # `beta-all` turns on every beta feature, which pulls in `topology_cmd`, `deploy_cmd` and the
+        # `mur new <task>` tests, gated on their features and contributing zero tests without them.
+        # The run below passes the same packages and features, so nextest's own build finds
+        # everything fresh; a `Compiling` line in its output means the two have drifted apart.
+        # `--timings` records each crate's build time.
         run: |
-          cargo test --workspace --no-run --timings \
-            --features "beta-mur-topology beta-mur-deploy"
+          cargo test --workspace --no-run --timings --features beta-all
       - name: Run the workspace test suite
         # nextest runs the tests of every binary in parallel, each in its own process, rather
         # than one binary after another. The `ci` profile in .config/nextest.toml retries a
@@ -79,8 +79,14 @@ jobs:
         # running after five minutes, does not stop at the first failure, and writes the JUnit
         # report the next steps read. The workspace has no doctests, which nextest does not run.
         run: |
-          cargo nextest run --profile ci --workspace \
-            --features "beta-mur-topology beta-mur-deploy"
+          cargo nextest run --profile ci --workspace --features beta-all
+      - name: Test the build releases ship
+        # Release builds pass no features, and every step above passes `beta-all`, so this is the
+        # only step that compiles the featureless `murmur-cli`. It runs `new_roster`, whose
+        # `the_default_build_has_only_the_roster_form` is compiled only without `beta-mur-new`. Its
+        # profile is `ci`'s under another name, so its JUnit report does not replace the full run's.
+        run: |
+          cargo nextest run --profile ci-default-build -p murmur-cli --test new_roster
       - name: Upload the test report and build timings
         if: always()
         uses: actions/upload-artifact@v4

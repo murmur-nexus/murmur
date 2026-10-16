@@ -1822,6 +1822,19 @@ pub enum RuntimeManifestError {
         MANIFEST_FILENAME
     )]
     InvalidCapabilities { field: String, message: String },
+    /// A `capabilities.shell.allow` entry that is not one bare binary name. `reason` completes
+    /// "'<entry>' …".
+    #[error(
+        "{}: invalid capability config for 'capabilities.shell.allow[{index}]': '{}' {reason}; \
+         an entry is a bare binary name",
+        MANIFEST_FILENAME,
+        entry.escape_debug()
+    )]
+    ShellAllowEntry {
+        index: usize,
+        entry: String,
+        reason: &'static str,
+    },
     #[error(
         "{}: invalid exports config for '{field}': {message}",
         MANIFEST_FILENAME
@@ -4429,6 +4442,15 @@ fn parse_capabilities(
                     message: "must contain at least one binary".to_string(),
                 });
             }
+            for (index, entry) in raw_shell.allow.iter().enumerate() {
+                if let Some(reason) = shell_allow_entry_error(entry) {
+                    return Err(RuntimeManifestError::ShellAllowEntry {
+                        index,
+                        entry: entry.clone(),
+                        reason,
+                    });
+                }
+            }
 
             let interpreter_runtime =
                 parse_interpreter_runtime(&raw_shell.allow, raw_shell.interpreter_runtime)?;
@@ -4679,6 +4701,25 @@ fn parse_install(raw: RawInstallCapabilities) -> Result<InstallCapabilities, Run
 fn parse_state_capabilities(raw: RawStateCapabilities) -> StateCapabilities {
     StateCapabilities {
         store: raw.store.map(|store| store.trim().to_string()),
+    }
+}
+
+/// Why `entry` is not a `capabilities.shell.allow` entry, which must be one path component: the
+/// binary's name, looked up on `PATH`, and the name of the tool the model calls. `None` for a
+/// bare binary name.
+fn shell_allow_entry_error(entry: &str) -> Option<&'static str> {
+    if entry.is_empty() {
+        Some("is empty")
+    } else if entry.contains('\0') {
+        Some("contains a NUL byte")
+    } else if entry.contains('/') {
+        Some("is a path")
+    } else if entry == "." || entry == ".." {
+        Some("names a directory")
+    } else if entry.chars().any(char::is_whitespace) {
+        Some("contains whitespace")
+    } else {
+        None
     }
 }
 
@@ -7153,6 +7194,55 @@ capabilities:
         let msg = err.to_string();
         assert!(msg.contains("capabilities.shell.allow"));
         assert!(msg.contains("at least one"));
+    }
+
+    fn shell_allow_error(entry: &str) -> String {
+        let yaml = format!(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  shell:\n    allow: [bash, {}]\n",
+            serde_json::to_string(entry).unwrap()
+        );
+        RuntimeManifest::from_yaml_str(&yaml)
+            .expect_err(&format!("{entry:?} must be refused"))
+            .to_string()
+    }
+
+    #[test]
+    fn shell_allow_refuses_an_entry_that_is_not_a_bare_name() {
+        for (entry, reason) in [
+            ("/tmp/uv-tool/bin/uv", "is a path"),
+            ("bin/uv", "is a path"),
+            ("..", "names a directory"),
+            (".", "names a directory"),
+            ("", "is empty"),
+            ("a b", "contains whitespace"),
+            ("uv\t", "contains whitespace"),
+            ("uv\0", "contains a NUL byte"),
+        ] {
+            let message = shell_allow_error(entry);
+            assert!(
+                message.contains("'capabilities.shell.allow[1]'"),
+                "{entry:?}: {message}"
+            );
+            assert!(
+                message.contains(&format!(
+                    "'{}' {reason}; an entry is a bare binary name",
+                    entry.escape_debug()
+                )),
+                "{entry:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_allow_accepts_bare_names() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  shell:\n    allow: [bash, python3.12, git-lfs, \"c++\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.capabilities.unwrap().shell.unwrap().allow,
+            ["bash", "python3.12", "git-lfs", "c++"]
+        );
     }
 
     #[test]

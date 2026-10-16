@@ -21,7 +21,7 @@ use thiserror::Error;
 use crate::{
     artifact::ArtifactError, artifact_name_format_error, build_info_from_artifact_bytes,
     is_reserved_version, level_fit, load_manifest_from_artifact_bytes, newest_fitting_level,
-    sha256_hex, split_platform_suffix, wit_contracts_from_artifact_bytes, LevelFit, RuntimeType,
+    read_component_contracts, sha256_hex, split_platform_suffix, LevelFit, RuntimeType,
     UnservedInterface, WitContracts, WitLevel, BUILD_INFO_FILE, LOCAL_SCOPE, SUPPORTED_PLATFORMS,
 };
 
@@ -276,12 +276,35 @@ pub fn release_tag_error(tag: &str) -> Option<&'static str> {
     }
 }
 
-/// The asset file name for one payload: `<name>-<version>[-<platform>].mur.zip`.
+/// The file name of one payload, as a release asset and in a store's version directory:
+/// `<name>-<version>[-<platform>].mur.zip`, `name` the bare part.
 #[must_use]
 pub fn asset_file_name(name: &str, version: &str, platform: Option<&str>) -> String {
+    format!(
+        "{}{ARTIFACT_FILE_SUFFIX}",
+        payload_stem(name, version, platform)
+    )
+}
+
+/// The file name of the sha256 a store keeps beside the payload [`asset_file_name`] names:
+/// `<name>-<version>[-<platform>].sha256`.
+#[must_use]
+pub fn sha256_file_name(name: &str, version: &str, platform: Option<&str>) -> String {
+    format!("{}.sha256", payload_stem(name, version, platform))
+}
+
+/// The file name of the metadata sidecar a store keeps beside the payload [`asset_file_name`]
+/// names: `<name>-<version>[-<platform>].meta.json`.
+#[must_use]
+pub fn metadata_file_name(name: &str, version: &str, platform: Option<&str>) -> String {
+    format!("{}.meta.json", payload_stem(name, version, platform))
+}
+
+/// `<name>-<version>[-<platform>]`, the part of a payload's file name before its extension.
+pub(crate) fn payload_stem(name: &str, version: &str, platform: Option<&str>) -> String {
     match platform {
-        Some(platform) => format!("{name}-{version}-{platform}{ARTIFACT_FILE_SUFFIX}"),
-        None => format!("{name}-{version}{ARTIFACT_FILE_SUFFIX}"),
+        Some(platform) => format!("{name}-{version}-{platform}"),
+        None => format!("{name}-{version}"),
     }
 }
 
@@ -557,9 +580,17 @@ fn scan_file(dir: &Path, file: String) -> Result<ScannedFile, IndexBuildError> {
         _ => {}
     }
 
-    let interfaces = wit_contracts_from_artifact_bytes(&bytes)
-        .map(|contracts| murmur_interfaces(&contracts))
-        .unwrap_or_default();
+    // Only a wasm payload carries a component; a native or static one declares no interface.
+    let interfaces = match packaging {
+        RuntimeType::Wasm => read_component_contracts(&bytes)
+            .map(|contracts| murmur_interfaces(&contracts))
+            .map_err(|error| {
+                refuse(format!(
+                    "its wasm payload cannot be read as a component: {error}"
+                ))
+            })?,
+        RuntimeType::Native | RuntimeType::Static => Vec::new(),
+    };
     let built_at_level = build_info_from_artifact_bytes(&bytes)
         .map_err(|error| refuse(format!("its packed {BUILD_INFO_FILE} {error}")))?
         .map(|info| info.built_at_level);
@@ -1454,10 +1485,24 @@ mod tests {
                 "tool-a-0.1.0.mur.zip",
                 labelled(
                     "name: tool-a\nversion: 0.1.0\nruntime: tool\n",
-                    None,
+                    Some("(component)"),
                     Some("{\"built_at_level\": \"one\"}"),
                 ),
                 "its packed murmur-build.json sets built_at_level to \"one\"",
+            ),
+            (
+                "tool-a-0.1.0.mur.zip",
+                payload("name: tool-a\nversion: 0.1.0\nruntime: tool\n", None),
+                "its wasm payload cannot be read as a component: it has no root .wasm entry",
+            ),
+            (
+                "tool-a-0.1.0.mur.zip",
+                payload(
+                    "name: tool-a\nversion: 0.1.0\nruntime: tool\n",
+                    Some("(module)"),
+                ),
+                "its wasm payload cannot be read as a component: its root .wasm entry \
+                 capsule.wasm is a core module, not a component",
             ),
         ];
         for (file, bytes, reason) in cases {

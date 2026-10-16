@@ -109,7 +109,9 @@ extra:
     # Artifact versions from the latest default-artifacts release (v0.24.0).
     # Kept by hand: when a release ships, copy the versions from its
     # artifacts-index.json. A pin missing from the latest release fails
-    # `mur install` with E-REG-001.
+    # `mur install` with E-REG-001. murmur-cli's published_pins tests check
+    # every murmur_* pin against the committed copy of that index,
+    # crates/murmur-cli/tests/fixtures/published-index/artifacts-index.json.
     murmur_driver_anthropic: "0.10.0"
     murmur_driver_claude_code: "0.4.0"
     murmur_driver_deepseek: "0.8.0"

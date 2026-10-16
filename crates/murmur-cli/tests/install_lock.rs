@@ -401,6 +401,71 @@ fn a_version_2_lock_is_refused_with_the_regenerate_text_and_left_untouched() {
         .exists());
 }
 
+/// Every path under `root`, relative and sorted.
+fn tree_of(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            found.push(path.strip_prefix(root).unwrap().display().to_string());
+            if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// An install refused before its first write leaves the project exactly as it was: no
+/// `.murmur/artifacts/`, no lock change.
+#[test]
+fn a_refused_install_creates_no_project_store() {
+    let cases: [(&str, Option<&str>, Option<&str>); 3] = [
+        ("E-RUN-003", Some("lock_version: 2\nartifacts: []\n"), None),
+        ("E-CFG-003", None, Some("registry:\n  default: x\n")),
+        ("E-REG-008", None, None),
+    ];
+    for (code, lock, config) in cases {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join("murmur.yaml"),
+            "name: p\nversion: 0.0.1\nartifacts:\n  - name: bob/tool-x\n    version: 1.0.0\n    runtime: tool\n",
+        )
+        .unwrap();
+        if let Some(lock) = lock {
+            fs::write(project.path().join("murmur.lock"), lock).unwrap();
+        }
+        if let Some(config) = config {
+            fs::create_dir_all(home.path().join(".murmur")).unwrap();
+            fs::write(home.path().join(".murmur/config.yaml"), config).unwrap();
+        }
+        let before = tree_of(project.path());
+        for assert in [
+            run_install_manifest_deps(&home, project.path()),
+            run_install_project("bob/tool-x@1.0.0", &home, project.path()),
+        ] {
+            let output = assert.code(1).get_output().clone();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(text.contains(&format!("error[{code}]")), "{code}: {text}");
+            assert_eq!(tree_of(project.path()), before, "{code}: {text}");
+            assert!(!project.path().join(".murmur").exists(), "{code}");
+        }
+        if let Some(lock) = lock {
+            assert_eq!(
+                fs::read_to_string(project.path().join("murmur.lock")).unwrap(),
+                lock
+            );
+        }
+    }
+}
+
 /// A version 3 entry still carrying a bare name is refused naming that entry.
 #[test]
 fn a_version_3_lock_entry_with_a_bare_name_is_refused_naming_it() {

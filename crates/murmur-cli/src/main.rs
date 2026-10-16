@@ -11,6 +11,8 @@ mod error;
 mod formation_trace;
 mod http;
 mod live_address;
+#[cfg(test)]
+mod published_pins;
 mod residue;
 mod session_address;
 mod source;

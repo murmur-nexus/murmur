@@ -109,6 +109,9 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
             E_MAN_003,
             format!("{MANIFEST_FILENAME}: invalid capability config for '{field}': {message}"),
         ),
+        error @ RuntimeManifestError::ShellAllowEntry { .. } => {
+            CliError::with_hint(E_MAN_003, error.to_string(), SHELL_ALLOW_ENTRY_HINT)
+        }
         RuntimeManifestError::InvalidExports { field, message } => CliError::new(
             E_MAN_003,
             format!("{MANIFEST_FILENAME}: invalid exports config for '{field}': {message}"),
@@ -174,6 +177,11 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
         ),
     }
 }
+
+/// The hint under a `capabilities.shell.allow` entry that is not a bare binary name. The
+/// session finds each allowed binary on the `PATH` `mur run` was started with.
+const SHELL_ALLOW_ENTRY_HINT: &str = "name the binary bare (uv, not /opt/uv/bin/uv) and put its \
+     directory on PATH for mur run: PATH=/opt/uv/bin:$PATH mur run …";
 
 /// The hint under a credential scope that names a retired door method: the scope to write instead,
 /// or, for a method no scope gates, that the credential lists nothing for it.

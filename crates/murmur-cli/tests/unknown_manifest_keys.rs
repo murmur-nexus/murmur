@@ -179,7 +179,6 @@ fn a_top_level_mur_version_is_refused_with_a_hint_naming_deploy_mur_version() {
         let output = Command::cargo_bin("mur")
             .unwrap()
             .env("HOME", home.path())
-            .env_remove("NEXUS_API_KEY")
             .current_dir(dir.path())
             .args(args)
             .assert()
@@ -202,6 +201,71 @@ fn a_top_level_mur_version_is_refused_with_a_hint_naming_deploy_mur_version() {
                 .lines()
                 .any(|line| line.contains("hint:") && line.contains("deploy.mur_version")),
             "{args:?}: {stderr}"
+        );
+    }
+}
+
+/// A `capabilities.shell.allow` entry that is not a bare binary name is refused before anything is
+/// staged or installed, on every surface that loads the project manifest, and nothing is created
+/// at the path it names.
+#[test]
+fn a_shell_allow_entry_that_is_not_a_bare_name_is_refused_on_every_surface() {
+    let home = TempDir::new().unwrap();
+    let scratch = TempDir::new().unwrap();
+    let absolute = scratch.path().join("bin/uv").display().to_string();
+    for (entry, reason) in [
+        (absolute.as_str(), "is a path"),
+        ("bin/uv", "is a path"),
+        ("..", "names a directory"),
+        (".", "names a directory"),
+        ("", "is empty"),
+        ("a b", "contains whitespace"),
+    ] {
+        let dir = TempDir::new().unwrap();
+        project(
+            dir.path(),
+            &format!(
+                "name: c\nversion: 0.1.0\ncapabilities:\n  shell:\n    allow: [bash, {}]\n",
+                serde_json::to_string(entry).unwrap()
+            ),
+        );
+        for args in [
+            &["run", "--manifest", "murmur.yaml", "--explain-scope"][..],
+            &["doctor"],
+            &["install"],
+        ] {
+            let output = Command::cargo_bin("mur")
+                .unwrap()
+                .env("HOME", home.path())
+                .current_dir(dir.path())
+                .args(args)
+                .assert()
+                .code(1)
+                .get_output()
+                .stderr
+                .clone();
+            let stderr = String::from_utf8(output).unwrap();
+            assert!(stderr.contains("error[E-MAN-003]"), "{args:?}: {stderr}");
+            assert!(
+                stderr.contains(&format!(
+                    "invalid capability config for 'capabilities.shell.allow[1]': '{entry}' \
+                     {reason}; an entry is a bare binary name"
+                )),
+                "{args:?} {entry:?}: {stderr}"
+            );
+            assert!(
+                stderr.contains("hint: name the binary bare")
+                    && stderr.contains("PATH=/opt/uv/bin:$PATH mur run"),
+                "{args:?}: {stderr}"
+            );
+        }
+        assert!(
+            !scratch.path().join("bin").exists(),
+            "{entry:?} created a path"
+        );
+        assert!(
+            !dir.path().join(".murmur").exists(),
+            "{entry:?} created .murmur"
         );
     }
 }

@@ -343,13 +343,7 @@ pub(crate) fn build_skill_artifact(
     } else {
         infer_name_from_path(input)
     };
-    if artifact_name.contains('/') {
-        return Err(CliError::from(
-            murmur_artifact::BuildError::ScopedArtifactName {
-                name: artifact_name,
-            },
-        ));
-    }
+    murmur_artifact::validate_artifact_name(&artifact_name).map_err(CliError::from)?;
 
     let manifest_bytes = match manifest_bytes_opt {
         Some(bytes) => {

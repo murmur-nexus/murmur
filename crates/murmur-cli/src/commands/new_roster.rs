@@ -1286,29 +1286,14 @@ Next:
         );
     }
 
-    /// The `extra.v.<key>` value in `docs/mkdocs.yml`.
-    fn docs_version(mkdocs: &str, key: &str) -> String {
-        let prefix = format!("{key}:");
-        let line = mkdocs
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with(&prefix))
-            .unwrap_or_else(|| panic!("no {key} in docs/mkdocs.yml"));
-        line[prefix.len()..].trim().trim_matches('"').to_string()
-    }
-
     #[test]
     fn driver_pins_match_the_docs() {
-        let mkdocs =
-            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/mkdocs.yml"))
-                .unwrap();
+        use crate::published_pins::docs_pin;
+
         assert_eq!(
             ANTHROPIC.driver_version,
-            docs_version(&mkdocs, "murmur_driver_anthropic")
+            docs_pin("murmur_driver_anthropic")
         );
-        assert_eq!(
-            OPENAI.driver_version,
-            docs_version(&mkdocs, "murmur_driver_openai")
-        );
+        assert_eq!(OPENAI.driver_version, docs_pin("murmur_driver_openai"));
     }
 }
