@@ -15,7 +15,7 @@ use std::{
 use capsule_runtime::{
     bindings::host::murmur::tool::run::{Status as ToolStatus, ToolInput, ToolResult},
     plan::{self, PlannedCall, SchedulerContext, StepStatus},
-    CapabilityPolicy, SpawnCredential, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER,
+    CapabilityPolicy, SpawnCredential, WorkdirRoot, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER,
 };
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
@@ -53,8 +53,8 @@ fn ctx_gated<'a>(
     gate_step: &'a (dyn Fn(&PlannedCall<'_>) -> Option<String> + Sync),
 ) -> SchedulerContext<'a> {
     SchedulerContext {
-        accessible_workdir: workdir.clone(),
-        session_workdir: workdir,
+        accessible_workdir: WorkdirRoot::open(&workdir).unwrap(),
+        session_workdir: WorkdirRoot::open(&workdir).unwrap(),
         capability_policy: CapabilityPolicy {
             shell_allow: vec!["bash".to_string(), "printf".to_string()],
             spawn_allow: vec!["local/worker".to_string()],
@@ -1427,7 +1427,7 @@ fn traced_ctx<'a>(
 
 fn appender(workdir: &Path) -> capsule_runtime::PlanTraceAppender {
     capsule_runtime::PlanTraceAppender::open(
-        workdir,
+        &WorkdirRoot::open(workdir).unwrap(),
         TEST_SESSION.to_string(),
         TEST_SESSION_EVENT.to_string(),
     )

@@ -107,7 +107,7 @@ pub(crate) struct HookInferenceCtx {
     pub(crate) engine: Engine,
     pub(crate) accessible_workdir: PathBuf,
     /// The session's bookkeeping directory, where a credential failure writes `out/result.txt`.
-    pub(crate) workdir: PathBuf,
+    pub(crate) workdir: crate::workdir_fs::WorkdirRoot,
     pub(crate) inference_env: Vec<(String, String)>,
     pub(crate) capability_policy: CapabilityPolicy,
     pub(crate) network_allow_rules: Vec<NetworkAllowRule>,
@@ -820,7 +820,7 @@ mod tests {
             model: "manifest-model".to_string(),
             engine: engine.clone(),
             accessible_workdir: workdir.to_path_buf(),
-            workdir: workdir.to_path_buf(),
+            workdir: crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             inference_env: Vec::new(),
             capability_policy: CapabilityPolicy::default(),
             network_allow_rules: Vec::new(),

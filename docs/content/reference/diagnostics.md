@@ -123,6 +123,7 @@ section that explains it.
 | `E-RUN-047` | An installed capsule's bytes no longer hash to the sha256 roster admission bound its member to | [E-RUN-047](#e-run-047) |
 | `E-RUN-048` | `mur token` named a session whose door is public, which minted no token | [E-RUN-048](#e-run-048) |
 | `E-RUN-049` | `mur token --credential` named a credential the session did not mint | [E-RUN-049](#e-run-049) |
+| `E-RUN-050` | The runtime met a symbolic link, or the wrong kind of file, inside the workdir — while staging the session, or during the task `mur run` ran | [E-RUN-050](#e-run-050) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -1220,6 +1221,29 @@ error[E-RUN-049]: ses_019f01a940ce7761854e768ecbe3d399 minted no credential 'adm
 
 Pass one of the listed names. A credential added to `network.authentication.credentials` after
 launch is minted by the next launch, not this one.
+
+### E-RUN-050 — a link inside the workdir { #e-run-050 }
+
+The runtime met a symbolic link, or the wrong kind of file, inside the workdir, refused to write,
+read, create or remove through it, and wrote nothing outside the workdir. `mur run` reports this
+code in two cases:
+
+| When | Typical paths |
+|---|---|
+| Staging the session, before the capsule starts | `task.md` written by `--task`, the `murmur.yaml` copy, the `.murmur/<session-id>` directory |
+| During the task `mur run` ran, after the capsule created a link | `out/result.txt`, `logs/bootstrap.log`, `plans/`, `peer-in/`, anything under `tools/` |
+
+The message names the path and the part of it that is the link:
+
+```text
+error[E-RUN-050]: refused to write task.md: task.md is a symbolic link inside the workdir
+  hint: the runtime never follows a link inside the workdir; replace task.md with a regular file or directory, or remove it, and run again
+```
+
+Remove the link, or replace it with the regular file or directory it stands in for. A refusal during
+a task also writes a [`workdir_path_refused`](observability-schemas.md#workdir-path-refused) trace
+line naming the path, and an A2A task that meets one ends `failed` with the refusal as its status
+message; see [Links inside the workdir](workdir.md#links-inside-the-workdir).
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 

@@ -3156,8 +3156,8 @@ mod tests {
                 "bash",
                 &["-c", &command],
                 &[],
-                workdir.path(),
-                workdir.path(),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 &policy,
                 &enforcement,
             )

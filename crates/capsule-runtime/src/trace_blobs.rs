@@ -5,7 +5,7 @@
 //! literal thing the driver received. Every other capture mode writes nothing here and the
 //! directory never appears.
 
-use std::path::{Path, PathBuf};
+use crate::workdir_fs::{EntryKind, WorkdirRoot, DEFAULT_FILE_MODE};
 
 /// Directory holding one session's blobs, beside its `trace.jsonl`.
 pub(crate) const BLOB_DIR_NAME: &str = "blobs";
@@ -24,38 +24,42 @@ const BLOB_DIR_MODE: u32 = 0o700;
 /// Session-scoped and never pruned: a blob is readable exactly as long as its session directory
 /// is.
 pub(crate) struct BlobStore {
-    dir: PathBuf,
+    /// The session root `blobs/` is created beneath.
+    root: WorkdirRoot,
 }
 
 impl BlobStore {
     /// A store rooted at `<session_workdir>/blobs`. Creates nothing; see [`Self::put`].
-    pub(crate) fn new(session_workdir: &Path) -> Self {
+    pub(crate) fn new(session_workdir: &WorkdirRoot) -> Self {
         Self {
-            dir: session_workdir.join(BLOB_DIR_NAME),
+            root: session_workdir.clone(),
         }
     }
 
     /// The directory this store writes into, whether or not it exists yet.
     #[cfg(test)]
-    pub(crate) fn dir(&self) -> &Path {
-        &self.dir
+    pub(crate) fn dir(&self) -> std::path::PathBuf {
+        self.root.host_path(BLOB_DIR_NAME)
     }
 
     /// Store `bytes` as `<blobs>/<sha256>`, where `sha256` is the caller's already-computed
     /// lowercase-hex digest of exactly those bytes.
     ///
-    /// A path that already exists is left alone rather than rewritten: the name *is* the content,
-    /// so a second write of the same body has nothing new to say, and the ten-turn case where one
-    /// unchanged system prompt is hashed on every turn costs one file and one `exists` check per
-    /// turn thereafter.
+    /// A blob already stored is left alone rather than rewritten: its name is its content, so a
+    /// body repeated on every turn is written once.
+    ///
+    /// A link at `blobs/` or at the blob's name is refused, never taken as "already stored".
     pub(crate) async fn put(&self, sha256: &str, bytes: &[u8]) -> std::io::Result<()> {
-        let path = self.dir.join(sha256);
-        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        if self.root.entry_kind(format!("{BLOB_DIR_NAME}/{sha256}"))? == Some(EntryKind::File) {
             return Ok(());
         }
-        crate::state_store::ensure_private_dir(&self.dir, BLOB_DIR_MODE)
-            .map_err(std::io::Error::other)?;
-        tokio::fs::write(&path, bytes).await
+        self.root.create_dir_all(BLOB_DIR_NAME, BLOB_DIR_MODE)?;
+        self.root.write_file(
+            format!("{BLOB_DIR_NAME}/{sha256}"),
+            bytes,
+            DEFAULT_FILE_MODE,
+        )?;
+        Ok(())
     }
 }
 
@@ -68,7 +72,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let store = BlobStore::new(dir.path());
+        let store = BlobStore::new(&WorkdirRoot::open(dir.path()).unwrap());
         assert!(!store.dir().exists(), "nothing is created before a write");
 
         let body = b"the literal bytes";
@@ -88,7 +92,7 @@ mod tests {
     #[tokio::test]
     async fn put_never_rewrites_an_existing_blob() {
         let dir = tempfile::tempdir().unwrap();
-        let store = BlobStore::new(dir.path());
+        let store = BlobStore::new(&WorkdirRoot::open(dir.path()).unwrap());
         let body = b"once";
         let sha = murmur_artifact::sha256_hex(body);
 

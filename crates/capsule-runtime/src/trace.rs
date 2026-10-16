@@ -1,13 +1,10 @@
-use std::{
-    path::Path,
-    time::{Instant, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use murmur_artifact::{ContainmentClass, LockOrigin, TraceCapture};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::{AsyncWriteExt, BufWriter},
 };
 
@@ -20,7 +17,11 @@ use crate::{
     origin::{TaskProvenance, TrustClass},
     trace_blobs::BlobStore,
     types::InstalledArtifactSummary,
+    workdir_fs::{WorkdirRoot, DEFAULT_FILE_MODE},
 };
+
+/// A session's trace file, directly under its session root.
+pub(crate) const TRACE_FILE_NAME: &str = "trace.jsonl";
 
 pub(crate) struct TraceWriter {
     writer: BufWriter<File>,
@@ -1049,6 +1050,10 @@ pub(crate) const TASK_FAILED_REOPEN_BUDGET_EXHAUSTED: &str = "reopen_budget_exha
 /// reason is the error's own text.
 pub(crate) const TASK_FAILED_RUNTIME_ERROR: &str = "runtime_error";
 
+/// `task_failed.cause` for a task ended because a runtime write, append, read, create or removal
+/// inside the workdir was refused. Always preceded by one `workdir_path_refused` line per refusal.
+pub(crate) const TASK_FAILED_WORKDIR_PATH_REFUSED: &str = "workdir_path_refused";
+
 /// `inference.error_code` when the provider refused the inference credential: it answered `401`
 /// and the gateway's re-read and resend were refused too. The record's `error` is the runtime's
 /// own `E-RUN-027` message, never the provider's body.
@@ -1129,6 +1134,27 @@ struct InferenceLine<'a> {
 /// The most `task_failed.reason` carries, in bytes. A driver's error text is provider-supplied
 /// and unbounded; the whole of it stays in `out/result.txt`.
 pub(crate) const MAX_TASK_FAILURE_REASON_BYTES: usize = 2_000;
+
+/// One runtime write, append, read, create or removal inside the workdir that was refused and did
+/// nothing. Written whatever `trace.capture` is; parented to the
+/// task node in a task and to the session node outside one.
+#[derive(Serialize)]
+struct WorkdirPathRefusedEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    /// The path the runtime meant to touch, relative to the accessible workdir.
+    path: &'a str,
+    operation: crate::workdir_fs::WorkdirOperation,
+    /// The component that was refused, relative to the accessible workdir; the whole path for an
+    /// invalid component.
+    refused_at: &'a str,
+    reason: crate::workdir_fs::RefusalReason,
+}
 
 /// A task attempt failed, and why. Written once per failing attempt, before its task's
 /// `task_end`, by whichever part of the runtime saw the failure.
@@ -1864,7 +1890,7 @@ impl DelegationEvent {
 impl TraceWriter {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open(
-        workdir: &Path,
+        workdir: &WorkdirRoot,
         session_id: String,
         capsule_name: String,
         capsule_version: String,
@@ -1879,11 +1905,7 @@ impl TraceWriter {
         spawned_by: Option<String>,
         spawn_delegation_id: Option<String>,
     ) -> std::io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(workdir.join("trace.jsonl"))
-            .await?;
+        let file = File::from_std(workdir.open_append(TRACE_FILE_NAME, DEFAULT_FILE_MODE)?);
         // `"cli"` wins over `"none"` when the override cleared the prompt: the operator passed
         // `--system-prompt ""`, which is a decision worth recording, not an absence.
         let system_prompt_source = match (system_prompt_overridden, system_prompt.is_some()) {
@@ -2900,6 +2922,26 @@ impl TraceWriter {
         self.write_event(&event).await
     }
 
+    /// Record one refusal the workdir helper latched.
+    pub(crate) async fn write_workdir_path_refused(
+        &mut self,
+        refusal: &crate::workdir_fs::WorkdirRefusal,
+    ) -> std::io::Result<()> {
+        let event = WorkdirPathRefusedEvent {
+            event_type: "workdir_path_refused",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: self.active_task_id.clone(),
+            path: &refusal.path,
+            operation: refusal.operation,
+            refused_at: &refusal.refused_at,
+            reason: refusal.reason,
+        };
+        self.write_event(&event).await
+    }
+
     /// The `reason` of the last `task_failed` line this writer wrote, or `None` before the first.
     pub(crate) fn last_task_failure(&self) -> Option<&str> {
         self.last_task_failure.as_deref()
@@ -3713,15 +3755,11 @@ pub struct ResourceTraceAppender {
 
 impl ResourceTraceAppender {
     pub async fn open(
-        workdir: &Path,
+        workdir: &WorkdirRoot,
         session_id: String,
         session_event_id: String,
     ) -> std::io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(workdir.join("trace.jsonl"))
-            .await?;
+        let file = File::from_std(workdir.open_append(TRACE_FILE_NAME, DEFAULT_FILE_MODE)?);
         Ok(Self {
             file: tokio::sync::Mutex::new(file),
             session_id,
@@ -4223,15 +4261,21 @@ pub(crate) struct PriorSessionTraceAppender {
 }
 
 impl PriorSessionTraceAppender {
-    /// `trace_path` is the prior session's `trace.jsonl`. Errors when it cannot be opened for
-    /// appending, which the caller reports rather than reporting work it could not mark.
+    /// `trace` is the prior session's `trace.jsonl`, relative to `sessions_root`. Errors when it
+    /// cannot be read or opened for appending, which the caller reports rather than reporting work
+    /// it could not mark.
     pub(crate) async fn open(
-        trace_path: &Path,
+        sessions_root: &WorkdirRoot,
+        trace: &str,
         session_id: String,
         session_event_id: Option<String>,
     ) -> std::io::Result<Self> {
-        let terminate_torn_tail = !ends_with_newline(trace_path)?;
-        let file = OpenOptions::new().append(true).open(trace_path).await?;
+        let contents = sessions_root
+            .read_file(trace, u64::MAX)?
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        // An empty file counts as terminated: there is no record for an appended line to run into.
+        let terminate_torn_tail = contents.last().is_some_and(|last| *last != b'\n');
+        let file = File::from_std(sessions_root.open_append(trace, DEFAULT_FILE_MODE)?);
         Ok(Self {
             file,
             session_id,
@@ -4276,22 +4320,6 @@ impl PriorSessionTraceAppender {
         self.terminate_torn_tail = false;
         Ok(())
     }
-}
-
-/// Whether the file's last byte is a newline. An empty file counts as terminated: there is no
-/// record for an appended line to run into.
-fn ends_with_newline(path: &Path) -> std::io::Result<bool> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut file = std::fs::File::open(path)?;
-    let length = file.metadata()?.len();
-    if length == 0 {
-        return Ok(true);
-    }
-    file.seek(SeekFrom::End(-1))?;
-    let mut last = [0u8; 1];
-    file.read_exact(&mut last)?;
-    Ok(last[0] == b'\n')
 }
 
 pub(crate) fn timestamp_ms() -> u64 {
@@ -4455,14 +4483,11 @@ pub struct PlanTraceAppender {
 
 impl PlanTraceAppender {
     pub fn open(
-        workdir: &Path,
+        workdir: &WorkdirRoot,
         session_id: String,
         session_event_id: String,
     ) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(workdir.join("trace.jsonl"))?;
+        let file = workdir.open_append(TRACE_FILE_NAME, DEFAULT_FILE_MODE)?;
         Ok(Self {
             file: std::sync::Mutex::new(file),
             session_id,
@@ -4649,6 +4674,7 @@ mod tests {
     };
     use murmur_artifact::{ArtifactRuntime, InterpreterRuntimeDir, InterpreterRuntimeGrant};
     use serde_json::Value;
+    use std::path::Path;
 
     use crate::origin::TaskOrigin;
 
@@ -4698,9 +4724,14 @@ mod tests {
     async fn a_demotion_marker_that_cannot_be_written_does_not_fail_the_demotion() {
         let dir = tempfile::tempdir().unwrap();
         // `/dev/full` opens and fails every write with `ENOSPC`, which is the one way to get a
-        // trace handle that is valid and unwritable without root.
-        std::os::unix::fs::symlink("/dev/full", dir.path().join("trace.jsonl")).unwrap();
+        // trace handle that is valid and unwritable without root. Swapped in under the writer,
+        // because a link at `trace.jsonl` is refused when the writer opens it.
         let mut writer = make_writer(dir.path()).await;
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        writer.writer = BufWriter::new(File::from_std(full));
         let info = demotion_info();
 
         assert!(
@@ -4820,7 +4851,7 @@ mod tests {
         system_prompt_overridden: bool,
     ) -> TraceWriter {
         TraceWriter::open(
-            dir,
+            &crate::workdir_fs::WorkdirRoot::open(dir).unwrap(),
             "test-session-id".to_string(),
             "test-capsule".to_string(),
             "1.0.0".to_string(),
@@ -5094,7 +5125,7 @@ mod tests {
     async fn session_start_records_workdir_exec_next_to_the_class_it_forced() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = TraceWriter::open(
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             "test-session-id".to_string(),
             "test-capsule".to_string(),
             "1.0.0".to_string(),
@@ -5130,7 +5161,7 @@ mod tests {
     async fn session_start_records_declared_and_achieved_containment_separately() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = TraceWriter::open(
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             "test-session-id".to_string(),
             "test-capsule".to_string(),
             "1.0.0".to_string(),
@@ -5180,7 +5211,7 @@ mod tests {
             );
             let dir = tempfile::tempdir().unwrap();
             let mut w = TraceWriter::open(
-                dir.path(),
+                &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
                 "test-session-id".to_string(),
                 "test-capsule".to_string(),
                 "1.0.0".to_string(),
@@ -5294,7 +5325,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let mut w = TraceWriter::open(
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             "test-session-id".to_string(),
             "test-capsule".to_string(),
             "1.0.0".to_string(),
@@ -7496,10 +7527,19 @@ mod tests {
         let session = "ses_0000000000004000800000000000plan".to_string();
         let node = "evt_0000000000004000800000000000node".to_string();
 
-        let plan = PlanTraceAppender::open(plan_dir.path(), session.clone(), node.clone()).unwrap();
-        let tool = ResourceTraceAppender::open(tool_dir.path(), session.clone(), node.clone())
-            .await
-            .unwrap();
+        let plan = PlanTraceAppender::open(
+            &crate::workdir_fs::WorkdirRoot::open(plan_dir.path()).unwrap(),
+            session.clone(),
+            node.clone(),
+        )
+        .unwrap();
+        let tool = ResourceTraceAppender::open(
+            &crate::workdir_fs::WorkdirRoot::open(tool_dir.path()).unwrap(),
+            session.clone(),
+            node.clone(),
+        )
+        .await
+        .unwrap();
 
         plan.write_delegation_start("dlg_abc123", "worker", "0.1.0", "ses_child", ".murmur/c");
         tool.write_delegation_start("dlg_abc123", "worker", "0.1.0", "ses_child", ".murmur/c")
@@ -7570,9 +7610,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session = "ses_0000000000004000800000000child".to_string();
         let node = "evt_0000000000004000800000000000node".to_string();
-        let appender = ResourceTraceAppender::open(dir.path(), session.clone(), node.clone())
-            .await
-            .unwrap();
+        let appender = ResourceTraceAppender::open(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            session.clone(),
+            node.clone(),
+        )
+        .await
+        .unwrap();
 
         appender
             .write_spawner_ended(Some("ses_parent"), Some("dlg_abc123"))

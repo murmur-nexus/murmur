@@ -736,3 +736,137 @@ fn a_user_origin_task_line_carries_no_fence_key() {
         "the recorded task is verbatim: {task_line}"
     );
 }
+
+/// Starts `staged` on a thread and sends it one A2A `SendMessage` carrying `text`, returning what
+/// the launch returned once the session has ended.
+fn send_one_task(
+    staged: capsule_runtime::StagedSession,
+    text: &str,
+) -> Result<capsule_runtime::LaunchResult, capsule_runtime::RuntimeError> {
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    let handle = std::thread::spawn(move || {
+        launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        })
+    });
+    let capsule_url = url_rx
+        .recv_timeout(common::CAPSULE_URL_WAIT)
+        .expect("timed out waiting for capsule_url");
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "SendMessage",
+        "params": {
+            "configuration": {"returnImmediately": true},
+            "message": {
+                "messageId": "msg-workdir-path",
+                "role": "ROLE_USER",
+                "parts": [{"text": text, "mediaType": "text/plain"}]
+            }
+        }
+    })
+    .to_string();
+    let response = http_post_json(&capsule_url, "/", &body);
+    assert_eq!(
+        response["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
+        "{response}"
+    );
+    handle.join().expect("launch thread should not panic")
+}
+
+/// Every line of `workdir`'s `trace.jsonl`.
+fn trace_events(workdir: &Path) -> Vec<Value> {
+    fs::read_to_string(workdir.join("trace.jsonl"))
+        .expect("trace.jsonl should exist")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect()
+}
+
+/// With no link in the workdir, an A2A task writes its `task.md` and completes.
+#[test]
+fn workdir_path_happy_path_writes_task_md_and_completes() {
+    if common::skip_without_host_support("workdir_path_happy_path_writes_task_md_and_completes") {
+        return;
+    }
+    let server = end_turn_server("done");
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+    let staged = stage_agent(&home, &manifest_path);
+    let workdir = staged.workdir.clone();
+
+    send_one_task(staged, "the task text").expect("the session runs");
+
+    assert_eq!(
+        fs::read_to_string(workdir.join("task.md")).unwrap(),
+        "the task text"
+    );
+    assert_eq!(server.requests().len(), 1);
+    let events = trace_events(&workdir);
+    assert!(events
+        .iter()
+        .all(|event| event["event_type"] != "workdir_path_refused"));
+    let end = events
+        .iter()
+        .find(|event| event["event_type"] == "task_end")
+        .expect("task_end");
+    assert_eq!(end["exit_status"], "ok", "{end}");
+}
+
+/// `task.md` replaced by a link to an outside sentinel after staging: the A2A task's write is
+/// refused, the sentinel keeps its bytes, the trace records the refusal and then the failure,
+/// and the provider is never asked anything for the task.
+#[test]
+fn workdir_path_refused_for_an_a2a_task_md_link() {
+    if common::skip_without_host_support("workdir_path_refused_for_an_a2a_task_md_link") {
+        return;
+    }
+    let server = end_turn_server("never sent");
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+    let staged = stage_agent(&home, &manifest_path);
+    let workdir = staged.accessible_workdir.clone();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel.txt");
+    fs::write(&sentinel, "operator data").unwrap();
+    std::os::unix::fs::symlink(&sentinel, workdir.join("task.md")).unwrap();
+
+    let _ = send_one_task(staged, "overwrite the sentinel");
+
+    assert_eq!(fs::read_to_string(&sentinel).unwrap(), "operator data");
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+    assert!(server.requests().is_empty(), "the provider was asked");
+
+    let events = trace_events(&workdir);
+    let types: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["event_type"].as_str())
+        .collect();
+    let at = |ty: &str| {
+        types
+            .iter()
+            .position(|found| *found == ty)
+            .unwrap_or_else(|| panic!("no {ty} in {types:?}"))
+    };
+    assert!(
+        at("workdir_path_refused") < at("task_failed") && at("task_failed") < at("task_end"),
+        "{types:?}"
+    );
+    // A link at `task.md` when the session starts is refused as a pending task too, so the
+    // write's line is the one asserted on.
+    let refusal = events
+        .iter()
+        .find(|event| {
+            event["event_type"] == "workdir_path_refused" && event["operation"] == "write"
+        })
+        .unwrap_or_else(|| panic!("no refused write in {types:?}"));
+    assert_eq!(refusal["path"], "task.md", "{refusal}");
+    assert_eq!(refusal["refused_at"], "task.md", "{refusal}");
+    assert_eq!(refusal["reason"], "symlink", "{refusal}");
+    assert!(refusal["task_id"].as_str().is_some(), "{refusal}");
+    let failed = &events[at("task_failed")];
+    assert_eq!(failed["cause"], "workdir_path_refused", "{failed}");
+    assert!(
+        failed["reason"].as_str().unwrap().contains("task.md"),
+        "{failed}"
+    );
+    assert_eq!(events[at("task_end")]["exit_status"], "failed");
+}

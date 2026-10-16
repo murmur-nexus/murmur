@@ -461,7 +461,10 @@ pub(crate) fn io_max_warning(report: &IoMaxReport) -> Option<(&'static str, Stri
 }
 
 /// Fires at every launch, not just once.
-pub(crate) fn warn_for_unenforced_io_max(workdir: &Path, report: &IoMaxReport) {
+pub(crate) fn warn_for_unenforced_io_max(
+    workdir: &crate::workdir_fs::WorkdirRoot,
+    report: &IoMaxReport,
+) {
     if let Some((code, message)) = io_max_warning(report) {
         let link = murmur_artifact::security_warning_link(code);
         crate::runtime_err!("[capsule-runtime] warning[{code}]: {message} ({link})");

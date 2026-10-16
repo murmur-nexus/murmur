@@ -105,6 +105,7 @@ use crate::{
         LaunchResult, ResolvedLockArtifact, ResumeMode, ResumeRequest, StageRequest,
         StagedHookArtifact, StagedProcessDriver, StagedSession,
     },
+    workdir_fs::{EntryKind, WorkdirError, WorkdirRoot, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE},
 };
 
 /// Versioned instance export name a guest built against the semver'd
@@ -154,6 +155,48 @@ fn resolve_versioned_iface<T>(
 ) -> Option<wasmtime::component::ComponentExportIndex> {
     instance.get_export_index(&mut *store, None, versioned)
 }
+
+/// The size of the `task.md` waiting in the accessible workdir, or `None` when there is none.
+///
+/// A link at `task.md` is no task: reading it is refused, which latches the refusal, and the next
+/// task to start fails on it at activation.
+fn pending_task_input(accessible_root: &WorkdirRoot) -> Option<u64> {
+    accessible_root.file_len(TASK_INPUT_FILE).ok().flatten()
+}
+
+/// The directory this session's siblings sit in, held open: `.murmur` beneath the accessible
+/// workdir under `--workdir`, reached with no link followed, and the directory holding the
+/// accessible workdir without it, which is the operator's. Refusals beneath either land on the
+/// session's latch. `None` when it cannot be opened.
+fn sibling_sessions_root(
+    accessible_root: &WorkdirRoot,
+    session_root: &WorkdirRoot,
+) -> Option<WorkdirRoot> {
+    if session_root.path() != accessible_root.path() {
+        accessible_root.open_beneath(".murmur").ok().flatten()
+    } else {
+        WorkdirRoot::open_sharing_latch(accessible_root.path().parent()?, accessible_root).ok()
+    }
+}
+
+/// `peer_file_fetch.outcome` when the stored path, or a directory on the way to it, is a link
+/// inside the workdir and nothing was written.
+const PEER_FETCH_PATH_REFUSED: &str = "path_refused";
+
+/// Rewrites `task.md` as `text`, the original task plus `what` has added, for a restarted attempt
+/// to read. A refusal is latched, and the next attempt's checkpoint fails the task before it
+/// starts; any other failure is reported and the task goes on.
+fn rewrite_task_input(accessible_workdir: &WorkdirRoot, text: &str, what: &str) {
+    if let Err(e) =
+        accessible_workdir.write_file(TASK_INPUT_FILE, text.as_bytes(), DEFAULT_FILE_MODE)
+    {
+        crate::runtime_err!("[capsule-runtime] failed to inject {what} into task.md: {e}");
+    }
+}
+
+/// The task input file in the accessible workdir: what `mur run --task` writes, what an A2A
+/// message is written to, and what a fresh attempt reads.
+pub(crate) const TASK_INPUT_FILE: &str = "task.md";
 
 /// Run one task's agent loop, honoring `on-task-end` `reopen-task` control decisions.
 ///
@@ -216,7 +259,7 @@ fn resolve_versioned_iface<T>(
 #[allow(clippy::too_many_arguments)]
 async fn run_task_with_reopens(
     state: &mut CapsuleStoreState,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     inference: &InferenceConfig,
     max_task_reopens: u32,
     system_prompt: Option<String>,
@@ -226,7 +269,7 @@ async fn run_task_with_reopens(
     otel: &mut OtelEmitter,
     agent_task_id: Option<String>,
     sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    accessible_workdir: &Path,
+    accessible_workdir: &WorkdirRoot,
     capsule_name: &str,
     capsule_version: &str,
     mode: ConversationMode,
@@ -236,11 +279,34 @@ async fn run_task_with_reopens(
     // This task's cancel flag, or `None` on the `task.md` paths, which run no A2A task.
     cancel: Option<crate::cancel::CancelSignal>,
 ) -> Result<AgentLoopExit, RuntimeError> {
-    let task_md_path = accessible_workdir.join("task.md");
+    // The activation checkpoint: a refusal latched before the task began — its own `task.md`
+    // write, or an idle-time write since the last task — fails it before anything reads the task
+    // or sends a request for it.
+    if let Some((error, reason)) = agent::fail_on_workdir_refusals(state, trace).await {
+        end_task(
+            state,
+            hooks,
+            trace,
+            workdir,
+            &mode,
+            trace_task_id,
+            "failed",
+            0,
+            agent_task_id.as_deref(),
+            context_id,
+            &sse,
+            agent::AttemptEnding::failed(reason),
+        )
+        .await;
+        return Err(error);
+    }
     // Original task content, captured once before any feedback is appended, so repeated
-    // reopens re-inject a fresh copy of every feedback item rather than compounding.
-    let original_task = tokio::fs::read_to_string(&task_md_path)
-        .await
+    // reopens re-inject a fresh copy of every feedback item rather than compounding. A refused
+    // read is latched and fails the first attempt at its own checkpoint.
+    let original_task = accessible_workdir
+        .read_to_string(TASK_INPUT_FILE)
+        .ok()
+        .flatten()
         .unwrap_or_default();
     // Every reopen's (hook_name, reason) so far — all re-injected on each reopen.
     let mut feedback: Vec<(String, String)> = Vec::new();
@@ -332,8 +398,16 @@ async fn run_task_with_reopens(
             .member_calls
             .as_ref()
             .and_then(|calls| calls.declined());
-        let (result, ending) = apply_decline(result, thread.ending.take(), declined.as_deref());
+        let (mut result, ending) = apply_decline(result, thread.ending.take(), declined.as_deref());
         thread.ending = ending;
+        // The attempt-end checkpoint, on both transports: a refusal latched while the attempt ran
+        // — a result write, a harness run's files, a best-effort log — fails the task, whatever
+        // the attempt itself returned. One the loop already drained surfaces as its error.
+        if let Some((error, reason)) = agent::fail_on_workdir_refusals(state, trace).await {
+            result = Err(error);
+            thread.ending = Some(agent::AttemptEnding::failed(reason));
+        }
+        let refused = matches!(result, Err(RuntimeError::WorkdirPathRefused { .. }));
 
         // Stands in for work between `task_canceled` and `task_end` — a slow `on-task-end` hook —
         // so a test can hold a capsule in that window. Absent from release builds.
@@ -367,7 +441,6 @@ async fn run_task_with_reopens(
         // so one round of handed-off work costs one turn whatever the arrival timing; any other
         // ending leaves its calls behind and ends its delegations. With no turn left nothing could
         // read an outcome, so the attempt does not wait for one.
-        let mut result = result;
         let calls = state.member_calls.clone();
         let delegations = Arc::clone(&state.live_delegations);
         let (calls_outstanding, calls_arrived) =
@@ -466,14 +539,11 @@ async fn run_task_with_reopens(
                             &delegation_outcomes,
                         );
                         if !thread.can_continue(&inference.transport) {
-                            if let Err(e) =
-                                tokio::fs::write(&task_md_path, rewritten.as_bytes()).await
-                            {
-                                crate::runtime_err!(
-                                    "[capsule-runtime] failed to inject handed-off work's \
-                                     outcomes into task.md: {e}"
-                                );
-                            }
+                            rewrite_task_input(
+                                accessible_workdir,
+                                &rewritten,
+                                "handed-off work's outcomes",
+                            );
                         }
                         as_given = rewritten;
                         continuation = Some(agent::Continuation::Outcomes(messages.join("\n\n")));
@@ -555,7 +625,8 @@ async fn run_task_with_reopens(
         // dispatched above with exit status `canceled` — but re-running work a person just
         // stopped is the defect this refusal exists to prevent.
         let canceled = matches!(result, Ok(AgentLoopExit::Canceled));
-        match reopen.filter(|_| !canceled) {
+        // Nor is a refused one: the refused operation is never retried.
+        match reopen.filter(|_| !canceled && !refused) {
             Some(TaskReopen { hook_name, reason }) => {
                 // A hook wants more. Honor it only if a reopen remains in the budget AND
                 // turns remain under the ceiling; otherwise the request is exhausted and
@@ -608,11 +679,7 @@ async fn run_task_with_reopens(
                         &member_answers,
                         &delegation_outcomes,
                     );
-                    if let Err(e) = tokio::fs::write(&task_md_path, rewritten.as_bytes()).await {
-                        crate::runtime_err!(
-                            "[capsule-runtime] failed to inject reopen feedback into task.md: {e}"
-                        );
-                    }
+                    rewrite_task_input(accessible_workdir, &rewritten, "reopen feedback");
                     as_given = rewritten;
                     continue;
                 }
@@ -690,7 +757,7 @@ async fn end_task(
     state: &CapsuleStoreState,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     mode: &ConversationMode,
     trace_task_id: &str,
     exit_status: &str,
@@ -791,7 +858,7 @@ fn unregistered_ending(task_id: &str, context_id: &str, ending: &agent::AttemptE
 /// Through [`agent::write_result`] rather than the task-output funnel: the cancelled attempt's
 /// task-io output was cleared when the attempt began, and stays unset. A failed write is reported
 /// on stderr and in the bootstrap log, and changes nothing about the task's ending.
-fn write_canceled_result(workdir: &Path, mode: &ConversationMode, task_id: Option<&str>) {
+fn write_canceled_result(workdir: &WorkdirRoot, mode: &ConversationMode, task_id: Option<&str>) {
     let text = crate::cancel::CANCELED_RESULT_TEXT;
     let mut failures = Vec::new();
     if let Err(error) = agent::write_result(workdir, text) {
@@ -1121,7 +1188,12 @@ async fn deliver_delegation(
     mut delegation: crate::cancel::LiveDelegation,
 ) -> crate::delegation::OutcomeNotice {
     release_finished_child(delegation.child.take()).await;
-    match crate::delegation::read_completion(&delegation.workdir) {
+    // The child's directory as the parent's own tools address it, read beneath the parent's
+    // accessible root with no link followed.
+    match crate::delegation::read_completion(
+        &state.accessible_root,
+        Path::new(&delegation.child_workdir),
+    ) {
         Some(outcome) => {
             write_delegation_end(
                 state,
@@ -2432,33 +2504,52 @@ pub fn stage_session(
         crate::resource_plane::check_peer_files_root(&accessible_workdir, export)?;
     }
 
-    fs::create_dir_all(workdir.join("tools")).map_err(|source| RuntimeError::CreateWorkdir {
-        path: workdir.display().to_string(),
-        source,
-    })?;
+    // Without `--workdir` the accessible workdir is a fresh directory under the manifest
+    // directory, created by path because nothing beneath it exists yet for a capsule to have
+    // planted anything in. With it, the operator's directory already exists.
+    if request.workdir.is_none() {
+        fs::create_dir_all(&accessible_workdir).map_err(|source| RuntimeError::CreateWorkdir {
+            path: accessible_workdir.display().to_string(),
+            source,
+        })?;
+    }
+    // Opened by path, links above it included: the path is the operator's choice. The session
+    // directory is reached from it with no link followed, and every staging write below goes
+    // through one of the two roots.
+    let accessible_root = WorkdirRoot::open(&accessible_workdir)?;
+    let session_root = if request.workdir.is_some() {
+        accessible_root.session_beneath(&session_id)?
+    } else {
+        accessible_root.clone()
+    };
+    session_root.create_dir_all("tools", DEFAULT_DIR_MODE)?;
 
     // Armed as soon as the directory exists rather than in `launch`, so the staging warnings
     // below this line have somewhere to land when stderr has already been closed. Everything
     // warned about above it fires before any session directory exists and reaches stderr alone.
-    diagnostic::set_diagnostic_workdir(&workdir);
+    diagnostic::set_diagnostic_workdir(&session_root);
 
     for (name, manifest_yaml) in &installed_manifests {
-        write_tool_manifest(&workdir, name, manifest_yaml)?;
+        write_tool_manifest(&session_root, name, manifest_yaml)?;
     }
 
-    let native_entrypoints =
-        install_native_binaries(&workdir, &accessible_workdir, native_binaries, &full_names)?;
-    install_skill_files(&workdir, skill_files)?;
+    let native_entrypoints = install_native_binaries(
+        &session_root,
+        &accessible_workdir,
+        native_binaries,
+        &full_names,
+    )?;
+    install_skill_files(&session_root, skill_files)?;
 
     // Write generic manifests for any shell binary not already covered by a custom manifest.
-    write_shell_tool_manifests(&workdir, &request.capability_policy.shell_allow)?;
+    write_shell_tool_manifests(&session_root, &request.capability_policy.shell_allow)?;
 
     // The two peer-handoff tools, written on exactly the terms the shell manifests above are:
     // a synthetic `tools/<name>/murmur.yaml` that `build_tool_inventory` picks up unchanged,
     // paired with a dispatch branch in `dispatch_agent_tool_async`. Each is written **only** when
     // its grant is declared, so an undeclared capsule's model never sees the tool exists.
     write_peer_handoff_tool_manifests(
-        &workdir,
+        &session_root,
         exports_peer_files.is_some(),
         !request.capability_policy.peer_fetch_allow.is_empty(),
     )?;
@@ -2466,23 +2557,23 @@ pub fn stage_session(
     // And the delegation tool, on the same terms again. Its schema is built rather than fixed:
     // the `capsule` property's `enum` is this capsule's own `capabilities.spawn.allow`, so the
     // model is offered the names the operator granted and cannot name anything else.
-    write_delegate_task_tool_manifest(&workdir, &request.capability_policy.spawn_allow)?;
+    write_delegate_task_tool_manifest(&session_root, &request.capability_policy.spawn_allow)?;
 
     // And the member-call tool, whose grant is the roster: written only for a formation member
     // the roster lets call another, its schema's `enum` the members it may call.
-    write_member_call_tool_manifest(&workdir, request.formation_member.as_deref())?;
-    write_end_without_answer_tool_manifest(&workdir, request.formation_member.as_deref())?;
+    write_member_call_tool_manifest(&session_root, request.formation_member.as_deref())?;
+    write_end_without_answer_tool_manifest(&session_root, request.formation_member.as_deref())?;
     warn_on_member_calls_without_egress(
-        &workdir,
+        &session_root,
         request.formation_member.as_deref(),
         &request.capability_policy.network_allow,
     );
 
     // And the plan tool, on the same terms once more. Its schema is fixed rather than built: a
     // plan reaches this session's own tools, so there is no granted list to fold into it.
-    write_submit_plan_tool_manifest(&workdir, request.capability_policy.plan_submit)?;
+    write_submit_plan_tool_manifest(&session_root, request.capability_policy.plan_submit)?;
     write_switch_driver_tool_manifest(
-        &workdir,
+        &session_root,
         control
             .as_ref()
             .filter(|control| {
@@ -2502,7 +2593,7 @@ pub fn stage_session(
         ToolAnnotationMap::default()
     } else {
         warn_on_unannotated_tool_schemas(&installed_manifests);
-        ToolAnnotationMap::from_workdir(&workdir)
+        ToolAnnotationMap::from_workdir(&session_root)
     };
 
     // Dispatch on-stage hooks synchronously now that manifests are in place.
@@ -2513,7 +2604,7 @@ pub fn stage_session(
     };
     dispatch_stage(
         &engine,
-        &workdir,
+        &session_root,
         &hook_components,
         request.capability_policy.shell_allow.clone(),
         &stage_env,
@@ -2531,7 +2622,7 @@ pub fn stage_session(
             capsule_url: String::new(),
         };
         murmur_md::write_murmur_md(
-            &workdir,
+            &session_root,
             Some(inference),
             request.context.as_ref(),
             has_compaction_hook(&hook_components),
@@ -2544,15 +2635,14 @@ pub fn stage_session(
     // When --workdir is used, copy the project manifest to the accessible workdir so the agent
     // can reference it by relative path from ".".
     if request.workdir.is_some() {
-        let src = request.manifest_dir.join(MANIFEST_FILENAME);
-        let dst = accessible_workdir.join(MANIFEST_FILENAME);
-        if src.exists() && !dst.exists() {
-            if let Err(e) = fs::copy(&src, &dst) {
-                crate::runtime_err!(
-                    "[capsule-runtime] warning: failed to copy {MANIFEST_FILENAME} to workdir: {e}"
-                );
-            }
-        }
+        copy_manifest_into_workdir(&request.manifest_dir, &accessible_root)?;
+    }
+
+    // Every refusal latched while staging — including one a best-effort writer above swallowed,
+    // such as `MURMUR.md` or an `on-stage` hook's manifest — fails the launch. No trace exists
+    // yet to record it in.
+    if let Some(refusal) = accessible_root.take_refusals().into_iter().next() {
+        return Err(RuntimeError::WorkdirPathRefused { refusal });
     }
 
     // Resolve lifecycle: manifest config + any override
@@ -2562,6 +2652,8 @@ pub fn stage_session(
         session_id,
         workdir,
         accessible_workdir,
+        accessible_root,
+        session_root,
         manifest_dir: request.manifest_dir,
         capsule_artifact: request.capsule_artifact.unwrap_or_else(|| {
             format!("{}/{}", murmur_artifact::LOCAL_SCOPE, request.capsule_name)
@@ -2695,7 +2787,7 @@ fn launch(
     // closed. `stage_session` arms the same directory once it creates it; this also covers a
     // caller launching a session staged by some earlier process, and a process that stages
     // several sessions before launching one of them.
-    diagnostic::set_diagnostic_workdir(&staged.workdir);
+    diagnostic::set_diagnostic_workdir(&staged.session_root);
 
     // A lifeline winds the process down, so only a launch that owns the process may hold one, and
     // only an agent session — the one kind with a door, and so the one kind a formation has as a
@@ -2793,10 +2885,10 @@ fn launch(
     staged.scope_report.io_max = prepared_scope.io_max.clone();
     // `io.max` is the one cgroup limit a host is not refused for, so a declared ceiling that did
     // not apply has to be *said* here or the manifest and the scope report both go on implying it.
-    cgroup::warn_for_unenforced_io_max(&staged.workdir, &prepared_scope.io_max);
+    cgroup::warn_for_unenforced_io_max(&staged.session_root, &prepared_scope.io_max);
     let cgroup_scope = prepared_scope.scope;
     let workdir_guard = Some(resources::WorkdirGuard::spawn(
-        &staged.workdir,
+        &staged.session_root,
         staged.capability_policy.resources.workdir_max_bytes,
     ));
 
@@ -2827,7 +2919,9 @@ fn launch(
 
     if let Some(ref inference) = staged.inference {
         let workdir = staged.workdir.clone();
-        let system_prompt = resolve_system_prompt(&staged.manifest_dir, &workdir, inference)?;
+        let session_root = staged.session_root.clone();
+        let accessible_root = staged.accessible_root.clone();
+        let system_prompt = resolve_system_prompt(&staged.manifest_dir, &session_root, inference)?;
         let compaction_system_prompt =
             resolve_compaction_system_prompt(&staged.manifest_dir, inference.compaction.as_ref())?;
         let session_id = staged.session_id.clone();
@@ -2870,7 +2964,7 @@ fn launch(
                 staged.context.as_ref(),
                 &staged.capsule_name,
                 inference,
-                &workdir,
+                &session_root,
             ),
             // Ownership is claimed only by a capsule that declares a record policy: without one
             // there is nothing retention needs the header for, and an upgrading capsule's record
@@ -2889,9 +2983,9 @@ fn launch(
                         staged.context.as_ref(),
                         &staged.capsule_name,
                         inference,
-                        &workdir,
+                        &session_root,
                     ),
-                    &workdir,
+                    &session_root,
                 ))
             }),
             formation_member: staged
@@ -3028,7 +3122,7 @@ fn launch(
         all_env.push(("MURMUR_CAPSULE_URL".to_string(), capsule_url.clone()));
 
         murmur_md::write_murmur_md(
-            &workdir,
+            &session_root,
             Some(inference),
             staged.context.as_ref(),
             has_compaction_hook(&staged.hook_components),
@@ -3039,16 +3133,16 @@ fn launch(
 
         sandbox::warn_for_enforcement_tier(
             shell_enforcement.tier,
-            &workdir,
+            &session_root,
             &staged.capability_policy,
         );
         sandbox::warn_for_missing_aggregate_bounding(
-            &workdir,
+            &session_root,
             requires_process_bounding,
             shell_enforcement.cgroup_scope.is_some(),
         );
         warn_for_unreachable_shell_completions(
-            &workdir,
+            &session_root,
             !staged.capability_policy.shell_allow.is_empty(),
             &staged.lifecycle,
         );
@@ -3191,7 +3285,7 @@ fn launch(
                 crate::delegation_plane::DelegationPlane::new(
                     roost_url.to_string(),
                     credential,
-                    accessible_workdir.clone(),
+                    accessible_root.clone(),
                     session_id.clone(),
                     std::time::Duration::from_secs(effective_lifecycle.delegation_deadline_secs),
                     Arc::clone(&staged.registry),
@@ -3251,12 +3345,6 @@ fn launch(
         let compiled_forms_for_pull = staged.compiled_forms.clone();
         let lock_path_for_pull = staged.manifest_dir.join("murmur.lock");
 
-        // task.md must live where the agent's own tools are preopened (accessible_workdir),
-        // not the internal `.murmur/<session_id>` bookkeeping dir (workdir) — otherwise this
-        // pre-seed check misses a `--task`-written file and the agent's own read of task.md
-        // 404s even after a task was delivered.
-        let workdir_task_md = accessible_workdir.join("task.md");
-
         // Extra copies retained for the LaunchResult returned after block_on consumes the others.
         let session_id_ret = session_id.clone();
         let workdir_ret = workdir.clone();
@@ -3268,7 +3356,7 @@ fn launch(
         // hook workers therefore run on this thread; the A2A door does not.
         let loop_result: Result<LaunchEnding, RuntimeError> = rt.block_on(async move {
             let mut trace = TraceWriter::open(
-                &workdir,
+                &session_root,
                 session_id.clone(),
                 capsule_name.clone(),
                 capsule_version.clone(),
@@ -3284,7 +3372,11 @@ fn launch(
                 trace_spawn_delegation_id,
             )
             .await
-            .map_err(|e| RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")))?;
+            .map_err(|e| match session_root.take_refusals().into_iter().next() {
+                // A link at `trace.jsonl`: refused, with no trace to record it in.
+                Some(refusal) => RuntimeError::WorkdirPathRefused { refusal },
+                None => RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")),
+            })?;
             trace.set_spend_ceilings(spend.session_ceiling(), spend.machine_ceiling());
 
             // The session frame is written once per launch, around the task loop, so it frames
@@ -3297,7 +3389,7 @@ fn launch(
             // site serves both.
             let tools_declared = agent::inventory::tool_names(
                 &agent::inventory::build_tool_inventory(
-                    &workdir,
+                    &session_root,
                     inference.system_prompt_artifact.as_deref(),
                     &installed_artifacts,
                 ),
@@ -3330,7 +3422,7 @@ fn launch(
             // operator remembers to invoke a command does not run.
             apply_retention(
                 &mut trace,
-                &workdir,
+                &session_root,
                 &session_id,
                 trace_retain.as_ref(),
                 context_retain.as_ref(),
@@ -3345,7 +3437,7 @@ fn launch(
             // A trace that cannot be opened must not make the plane unserveable — the read is
             // still refused or served correctly, it is only unrecorded.
             let resource_trace = crate::trace::ResourceTraceAppender::open(
-                &workdir,
+                &session_root,
                 session_id.clone(),
                 trace.session_event_id().to_string(),
             )
@@ -3389,7 +3481,7 @@ fn launch(
             // on blocking threads, so they cannot be lent the agent loop's own writer. A trace
             // that cannot be opened leaves a plan unrecorded and still runs it.
             let plan_trace = crate::trace::PlanTraceAppender::open(
-                &workdir,
+                &session_root,
                 session_id.clone(),
                 trace.session_event_id().to_string(),
             )
@@ -3419,7 +3511,7 @@ fn launch(
 
             let mut otel = OtelEmitter::new(
                 otel_endpoint.clone(),
-                &workdir,
+                &session_root,
                 capsule_name.clone(),
                 capsule_version.clone(),
             );
@@ -3502,8 +3594,9 @@ fn launch(
                         gateways,
                         spend,
                         engine: engine.clone(),
-                        workdir: workdir.clone(),
                         accessible_workdir: accessible_workdir.clone(),
+                        session_root: session_root.clone(),
+                        accessible_root: accessible_root.clone(),
                         tool_components,
                         native_entrypoints,
                         process_driver: process_driver_for_state.clone(),
@@ -3587,7 +3680,7 @@ fn launch(
                                     model: inference_model.clone(),
                                     engine: state.engine.clone(),
                                     accessible_workdir: state.accessible_workdir.clone(),
-                                    workdir: state.workdir.clone(),
+                                    workdir: state.session_root.clone(),
                                     inference_env: state.inference_env.clone(),
                                     capability_policy: state.capability_policy.clone(),
                                     network_allow_rules: state.network_allow_rules.clone(),
@@ -3605,7 +3698,7 @@ fn launch(
                     // Create hooks ONCE — session_start fires once per capsule lifetime
                     let mut hooks = HookRuntime::new(
                         &engine,
-                        &workdir,
+                        &session_root,
                         &accessible_workdir,
                         hook_components,
                         SessionContextData {
@@ -3632,7 +3725,7 @@ fn launch(
                     // on-session-start fires ONCE per launch, before the task loop —
                     // regardless of task_acceptance. For queue capsules this is the single
                     // session boundary that the per-task on-task-start events nest inside.
-                    hooks.emit(&workdir, HookEvent::SessionStart).await;
+                    hooks.emit(&session_root, HookEvent::SessionStart).await;
 
                     // The session is addressable from here, and this is where it says so. A
                     // caller that sees the URL reads the record and then probes the door, so the
@@ -3651,7 +3744,7 @@ fn launch(
                     // until the task loop has ended: a record that outlived its session would
                     // resolve an address onto a port nothing holds. Only the agent path reaches
                     // here; a script capsule binds nothing and is never addressable.
-                    let _running_record = write_running_record(&running_record, &workdir);
+                    let _running_record = write_running_record(&running_record, &session_root);
                     on_url(&capsule_url);
 
                     // Every run this loop makes on the launch's behalf is folded in; an
@@ -3681,12 +3774,13 @@ fn launch(
                     // on every clean exit. The one over-report is a graceful exit whose own
                     // `write_shell_abandoned` failed, which reads here as unplanned death; for
                     // accounting that is the right direction to be wrong in.
-                    if let (Some(from_session), Some(sessions_root)) =
-                        (reconcile_from_session.as_deref(), workdir.parent())
-                    {
+                    if let (Some(from_session), Some(sessions_root)) = (
+                        reconcile_from_session.as_deref(),
+                        sibling_sessions_root(&accessible_root, &session_root),
+                    ) {
                         if let Some(report) =
                             crate::detached_reconcile::reconcile_prior_session(
-                                sessions_root,
+                                &sessions_root,
                                 from_session,
                                 &session_id,
                                 &task_context_id(supplied_context_id.as_deref()),
@@ -3762,13 +3856,9 @@ fn launch(
                             match effective_lifecycle.task_acceptance {
                                 TaskAcceptance::None => {
                                     // Does not accept incoming tasks; run from task.md if present
-                                    if workdir_task_md.exists() {
+                                    if let Some(bytes) = pending_task_input(&accessible_root) {
                                         let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
                                         let context_id = task_context_id(supplied_context_id.as_deref());
-                                        let bytes = tokio::fs::metadata(&workdir_task_md)
-                                            .await
-                                            .map(|m| m.len())
-                                            .unwrap_or(0);
                                         let provenance =
                                             TaskProvenance::derive(TaskOrigin::User, None);
                                         let _ = trace
@@ -3792,7 +3882,7 @@ fn launch(
                                                 u64::from(context_window),
                                                 agent::prior_history_tokens(
                                                     run_config.conversation_root.as_deref(),
-                                                    &workdir,
+                                                    &session_root,
                                                     &conversation_mode,
                                                     Some(&context_id),
                                                     run_config.resume.is_some(),
@@ -3811,7 +3901,7 @@ fn launch(
                                         let failures_before = trace.task_failures_written();
                                         let result = run_task_with_reopens(
                                             &mut state,
-                                            &workdir,
+                                            &session_root,
                                             inference,
                                             effective_lifecycle.max_task_reopens,
                                             system_prompt.clone(),
@@ -3821,7 +3911,7 @@ fn launch(
                                             &mut otel,
                                             None,
                                             None,
-                                            &accessible_workdir,
+                                            &accessible_root,
                                             &capsule_name,
                                             &capsule_version,
                                             conversation_mode.clone(),
@@ -3851,14 +3941,10 @@ fn launch(
                                     }
                                 }
                                 TaskAcceptance::Single | TaskAcceptance::Queue => {
-                                    if workdir_task_md.exists() {
+                                    if let Some(bytes) = pending_task_input(&accessible_root) {
                                         // A `task.md` runs before any A2A message is waited for.
                                         let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
                                         let context_id = task_context_id(supplied_context_id.as_deref());
-                                        let bytes = tokio::fs::metadata(&workdir_task_md)
-                                            .await
-                                            .map(|m| m.len())
-                                            .unwrap_or(0);
                                         let provenance =
                                             TaskProvenance::derive(TaskOrigin::User, None);
                                         let _ = trace
@@ -3882,7 +3968,7 @@ fn launch(
                                                 u64::from(context_window),
                                                 agent::prior_history_tokens(
                                                     run_config.conversation_root.as_deref(),
-                                                    &workdir,
+                                                    &session_root,
                                                     &conversation_mode,
                                                     Some(&context_id),
                                                     run_config.resume.is_some(),
@@ -3898,7 +3984,7 @@ fn launch(
                                         let failures_before = trace.task_failures_written();
                                         let result = run_task_with_reopens(
                                             &mut state,
-                                            &workdir,
+                                            &session_root,
                                             inference,
                                             effective_lifecycle.max_task_reopens,
                                             system_prompt.clone(),
@@ -3908,7 +3994,7 @@ fn launch(
                                             &mut otel,
                                             None,
                                             None,
-                                            &accessible_workdir,
+                                            &accessible_root,
                                             &capsule_name,
                                             &capsule_version,
                                             conversation_mode.clone(),
@@ -3943,7 +4029,7 @@ fn launch(
                                         }
                                         // Queue+sleep: remove task.md so the next iteration
                                         // falls through to the wait for queued tasks.
-                                        let _ = tokio::fs::remove_file(&workdir_task_md).await;
+                                        let _ = accessible_root.remove_file(TASK_INPUT_FILE);
                                         continue 'task_loop;
                                     }
                                     // Wait for the next task from the mpsc channel. Reached with
@@ -4064,7 +4150,7 @@ fn launch(
                                                 Err(_elapsed)
                                                     if agent::fresh_task_text(
                                                         inference,
-                                                        &accessible_workdir,
+                                                        &accessible_root,
                                                     )
                                                     .trim()
                                                     .is_empty() =>
@@ -4082,7 +4168,7 @@ fn launch(
                                                         trace.task_failures_written();
                                                     let result = agent::run_agent_loop(
                                                         &mut state,
-                                                        &workdir,
+                                                        &session_root,
                                                         inference,
                                                         inference.max_turns,
                                                         system_prompt,
@@ -4092,7 +4178,7 @@ fn launch(
                                                         &mut otel,
                                                         None,
                                                         None,
-                                                        &accessible_workdir,
+                                                        &accessible_root,
                                                         &capsule_name,
                                                         &capsule_version,
                                                         conversation_mode.clone(),
@@ -4172,9 +4258,13 @@ fn launch(
                             .await;
                             continue 'task_loop;
                         };
-                        if let Err(e) =
-                            tokio::fs::write(&workdir_task_md, &incoming.message_text).await
-                        {
+                        // A refusal here is latched; `run_task_with_reopens` fails the task on it
+                        // before anything is sent for it.
+                        if let Err(e) = accessible_root.write_file(
+                            TASK_INPUT_FILE,
+                            incoming.message_text.as_bytes(),
+                            DEFAULT_FILE_MODE,
+                        ) {
                             crate::runtime_err!(
                                 "[capsule-runtime] failed to write A2A message to task.md: {e}"
                             );
@@ -4214,7 +4304,7 @@ fn launch(
                                 u64::from(context_window),
                                 agent::prior_history_tokens(
                                     run_config.conversation_root.as_deref(),
-                                    &workdir,
+                                    &session_root,
                                     &conversation_mode,
                                     Some(&incoming.context_id),
                                     run_config.resume.is_some(),
@@ -4237,7 +4327,7 @@ fn launch(
                         let failures_before = trace.task_failures_written();
                         let loop_result = run_task_with_reopens(
                             &mut state,
-                            &workdir,
+                            &session_root,
                             inference,
                             effective_lifecycle.max_task_reopens,
                             system_prompt.clone(),
@@ -4247,7 +4337,7 @@ fn launch(
                             &mut otel,
                             Some(incoming.task_id.clone()),
                             Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
-                            &accessible_workdir,
+                            &accessible_root,
                             &capsule_name,
                             &capsule_version,
                             conversation_mode.clone(),
@@ -4308,7 +4398,7 @@ fn launch(
                                 // Queue+sleep: clear task.md and wait for next task. A peer's
                                 // task reports its own outcome through `GetTask` and its
                                 // stream; it does not decide how a long-lived session ends.
-                                let _ = tokio::fs::remove_file(&workdir_task_md).await;
+                                let _ = accessible_root.remove_file(TASK_INPUT_FILE);
                                 continue 'task_loop;
                             }
                         }
@@ -4344,7 +4434,7 @@ fn launch(
                     let session_total_turns = hooks.total_turns();
                     hooks
                         .emit(
-                            &workdir,
+                            &session_root,
                             HookEvent::SessionEnd {
                                 total_turns: session_total_turns,
                                 exit_status: session_exit_status.to_string(),
@@ -4427,7 +4517,7 @@ fn launch(
                     if !abandoned.is_empty() {
                         let report = detached::abandonment_report_text(&session_id, &abandoned);
                         crate::runtime_err!("{report}");
-                        agent::append_bootstrap_log(&workdir, &report);
+                        agent::append_bootstrap_log(&session_root, &report);
                         for work in &abandoned {
                             let _ = trace
                                 .write_shell_abandoned(
@@ -4571,8 +4661,9 @@ fn launch(
         spend: Arc::clone(&staged.spend),
         engine: staged.engine.clone(),
         compiled_forms: staged.compiled_forms.clone(),
-        workdir: staged.workdir.clone(),
         accessible_workdir: staged.accessible_workdir.clone(),
+        session_root: staged.session_root.clone(),
+        accessible_root: staged.accessible_root.clone(),
         tool_components: staged.tool_components,
         native_entrypoints: staged.native_entrypoints,
         // A script capsule runs no agent loop, so nothing here would ever drive a harness.
@@ -4672,7 +4763,7 @@ fn launch(
     let pending_pulls = std::mem::take(&mut store.data_mut().pending_artifact_pulls);
     let pending_sends = std::mem::take(&mut store.data_mut().pending_a2a_events);
     rt.block_on(drain_script_trace_buffers(
-        &staged.workdir,
+        &staged.session_root,
         &staged.session_id,
         &staged.capsule_name,
         &staged.capsule_version,
@@ -4703,7 +4794,7 @@ pub(crate) type PendingA2aSend = (String, String, String, String, Option<String>
 /// the guest's `run` returned, and parent to nothing. No trace file is opened when both buffers
 /// are empty. A write failure is dropped: the run it describes has already succeeded.
 async fn drain_script_trace_buffers(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     session_id: &str,
     capsule_name: &str,
     capsule_version: &str,
@@ -4820,7 +4911,7 @@ fn running_record_for(
 /// rather than by session address.
 fn write_running_record(
     record: &running::RunningRecord,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
 ) -> Option<running::RunningGuard> {
     match running::RunningGuard::write(record) {
         Ok(guard) => Some(guard),
@@ -4945,9 +5036,9 @@ struct DelegationReport {
     session_id: String,
     /// The child's own directory — where `completion.json` goes, and the root the completion's
     /// `result_path` is relative to.
-    accessible_workdir: PathBuf,
+    accessible_root: WorkdirRoot,
     /// This session's directory beneath it, the other place the runtime writes `out/result.txt`.
-    session_workdir: PathBuf,
+    session_root: WorkdirRoot,
     started: Instant,
     status: crate::delegation::DelegationStatus,
 }
@@ -4960,8 +5051,8 @@ impl DelegationReport {
             capsule_name: staged.capsule_artifact.clone(),
             capsule_version: staged.capsule_version.clone(),
             session_id: staged.session_id.clone(),
-            accessible_workdir: staged.accessible_workdir.clone(),
-            session_workdir: staged.workdir.clone(),
+            accessible_root: staged.accessible_root.clone(),
+            session_root: staged.session_root.clone(),
             started: Instant::now(),
             status: crate::delegation::DelegationStatus::Error,
         })
@@ -4975,21 +5066,16 @@ impl DelegationReport {
     ///
     /// Two places, one rule: a script capsule writes into its own preopen, which is the
     /// accessible workdir, and the agent loop writes into this session's directory beneath it.
-    /// `None` when neither exists — a terminal path that failed without result text legitimately
-    /// writes no file.
+    /// `None` when neither is a regular file — a terminal path that failed without result text
+    /// legitimately writes no file, and a link where the file would be is never named.
     fn result_path(&self) -> Option<String> {
-        let relative = Path::new("out").join("result.txt");
-        if self.accessible_workdir.join(&relative).is_file() {
-            return Some("out/result.txt".to_string());
+        let relative = "out/result.txt";
+        let is_file =
+            |root: &WorkdirRoot| matches!(root.entry_kind(relative), Ok(Some(EntryKind::File)));
+        if is_file(&self.accessible_root) {
+            return Some(relative.to_string());
         }
-        let session_result = self.session_workdir.join(&relative);
-        if session_result.is_file() {
-            return session_result
-                .strip_prefix(&self.accessible_workdir)
-                .ok()
-                .map(|path| path.to_string_lossy().replace('\\', "/"));
-        }
-        None
+        is_file(&self.session_root).then(|| self.session_root.display_path(relative))
     }
 }
 
@@ -5015,7 +5101,7 @@ impl Drop for DelegationReport {
             session_id: self.session_id.clone(),
             status: self.status,
             result_path: self.result_path(),
-            workdir: self.accessible_workdir.display().to_string(),
+            workdir: self.accessible_root.path().display().to_string(),
             duration_ms: self
                 .started
                 .elapsed()
@@ -5029,7 +5115,13 @@ impl Drop for DelegationReport {
             delivered: false,
             delivery_error: None,
         };
-        crate::delegation::report_completion(&handle, &address, outcome, &self.accessible_workdir);
+        crate::delegation::report_completion(
+            &handle,
+            &address,
+            outcome,
+            &self.accessible_root,
+            Path::new(""),
+        );
     }
 }
 
@@ -5042,7 +5134,7 @@ fn read_prompt_file(manifest_dir: &Path, path: &str) -> Result<String, (PathBuf,
 
 fn resolve_system_prompt(
     manifest_dir: &Path,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     inference: &murmur_artifact::InferenceConfig,
 ) -> Result<Option<String>, RuntimeError> {
     if let Some(prompt) = inference.system_prompt.as_ref() {
@@ -5059,13 +5151,17 @@ fn resolve_system_prompt(
     }
 
     if let Some(art_name) = inference.system_prompt_artifact.as_ref() {
-        let skill_path = workdir.join("tools").join(art_name).join("skill.md");
-        return fs::read_to_string(&skill_path).map(Some).map_err(|source| {
-            RuntimeError::SystemPromptArtifactRead {
-                name: art_name.clone(),
-                source,
-            }
-        });
+        let unreadable = |source| RuntimeError::SystemPromptArtifactRead {
+            name: art_name.clone(),
+            source,
+        };
+        return match workdir.read_to_string(format!("tools/{art_name}/skill.md")) {
+            Ok(Some(text)) => Ok(Some(text)),
+            Ok(None) => Err(unreadable(std::io::ErrorKind::NotFound.into())),
+            Err(error) => Err(RuntimeError::from_workdir(error, |_, source| {
+                unreadable(source)
+            })),
+        };
     }
 
     Ok(None)
@@ -5131,7 +5227,7 @@ outbound connections on this platform.";
 /// name `"bash"` and `policy.network_allow` is non-empty. The check is an exact match on the
 /// literal `"bash"`, not `shell::is_shell_interpreter` (which also matches `sh`/`zsh`/`fish`/
 /// `dash`/`ksh`) — a deliberate scope limit matching C-7's own scoping, not an oversight.
-pub(crate) fn warn_if_bash_network_bypass(workdir: &Path, policy: &CapabilityPolicy) {
+pub(crate) fn warn_if_bash_network_bypass(workdir: &WorkdirRoot, policy: &CapabilityPolicy) {
     let has_bash = policy.shell_allow.iter().any(|binary| binary == "bash");
     if has_bash && !policy.network_allow.is_empty() {
         let link = security_warning_link(W_SEC_003);
@@ -5189,7 +5285,7 @@ pub(crate) fn member_calls_without_egress_warning(
 /// `W-RUN-008` once at staging, to stderr and `logs/bootstrap.log`, for a member whose calls its
 /// own egress grant would refuse. The launch goes ahead: the member may still be called.
 fn warn_on_member_calls_without_egress(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     formation: Option<&FormationMember>,
     network_allow: &[String],
 ) {
@@ -5235,7 +5331,7 @@ pub(crate) fn unreachable_shell_completions_warning(
 
 /// Fires at every launch, not just once.
 pub(crate) fn warn_for_unreachable_shell_completions(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     can_run_shell: bool,
     lifecycle: &LifecycleConfig,
 ) {
@@ -6544,8 +6640,15 @@ pub(crate) struct CapsuleStoreState {
     /// than a handle built from [`Self::workdir`]: it carries the capsule writable root every
     /// session directory is created in, which the per-session `workdir` does not.
     pub(crate) compiled_forms: CompiledForms,
-    pub(crate) workdir: PathBuf,
+    /// The accessible workdir's host path, for display, preopens and subprocess arguments. Every
+    /// runtime read and write beneath it goes through [`Self::accessible_root`].
     pub(crate) accessible_workdir: PathBuf,
+    /// [`StagedSession::session_root`]: the session directory, through which every runtime read
+    /// and write beneath it goes. Its host path is `session_root.path()`.
+    pub(crate) session_root: WorkdirRoot,
+    /// [`StagedSession::accessible_root`]. Its refusal latch is the session's: the agent loop's
+    /// checkpoints drain it through here.
+    pub(crate) accessible_root: WorkdirRoot,
     pub(crate) tool_components: HashMap<String, Component>,
     /// What each native tool installed in this session needs to start, keyed by tool name: from
     /// [`StagedSession::native_entrypoints`], and added to by `manage.pull()`. A native tool is
@@ -6955,13 +7058,17 @@ impl manage::Host for CapsuleStoreState {
             return Err(format!("artifact '{name}' is not installed"));
         };
 
-        let manifest_path = self
-            .workdir
-            .join("tools")
-            .join(murmur_artifact::tool_name_of(&name))
-            .join(PACKED_MANIFEST_ENTRY);
+        let rel = format!(
+            "tools/{}/{PACKED_MANIFEST_ENTRY}",
+            murmur_artifact::tool_name_of(&name)
+        );
+        let manifest_content = self
+            .session_root
+            .read_to_string(&rel)
+            .map_err(|err| format!("failed to read {err}"))?
+            .ok_or_else(|| format!("failed to read {rel}: it does not exist"))?;
 
-        read_artifact_info_from_manifest(&manifest_path, summary)
+        read_artifact_info_from_manifest(&manifest_content, &rel, summary)
     }
 
     fn search(&mut self, query: String) -> Result<Vec<manage::ArtifactSummary>, String> {
@@ -7026,7 +7133,8 @@ impl manage::Host for CapsuleStoreState {
         // <workdir>/tools/<name>/ — no disk writes happen before steps 1-2 succeed.
         let manifest_yaml = extract_manifest_yaml(&name, &version, &resolved.bytes)
             .map_err(|err| err.to_string())?;
-        write_tool_manifest(&self.workdir, &tool, &manifest_yaml).map_err(|err| err.to_string())?;
+        write_tool_manifest(&self.session_root, &tool, &manifest_yaml)
+            .map_err(|err| err.to_string())?;
 
         let (artifact_runtime, implementation, wasm_component) = match resolved.meta.runtime {
             RuntimeType::Wasm => {
@@ -7047,7 +7155,7 @@ impl manage::Host for CapsuleStoreState {
                 let binary = extract_native_binary(&tool, &version, &resolved.bytes)
                     .map_err(|err| err.to_string())?;
                 let installed = install_native_binaries(
-                    &self.workdir,
+                    &self.session_root,
                     &self.accessible_workdir,
                     vec![(tool.clone(), binary)],
                     &HashMap::from([(tool.clone(), name.clone())]),
@@ -7063,7 +7171,7 @@ impl manage::Host for CapsuleStoreState {
             RuntimeType::Static => {
                 let skill_md = extract_skill_md(&name, &version, &resolved.bytes)
                     .map_err(|err| err.to_string())?;
-                install_skill_files(&self.workdir, vec![(tool.clone(), skill_md)])
+                install_skill_files(&self.session_root, vec![(tool.clone(), skill_md)])
                     .map_err(|err| err.to_string())?;
                 (ArtifactRuntime::Skill, None, None)
             }
@@ -7168,13 +7276,20 @@ impl manage::Host for CapsuleStoreState {
         self.installed_generation += 1;
 
         // 3. The files: manifest, `skill.md`, native binary.
-        let dir = self.workdir.join("tools").join(&tool);
-        match fs::remove_dir_all(&dir) {
+        // Removed by descriptor beneath the session root: a link at `tools` or at the tool's
+        // directory is refused, never followed into what it names.
+        let rel = format!("tools/{tool}");
+        match self.session_root.remove_dir_all(&rel) {
             Ok(()) => Ok(true),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
-            Err(err) => Err(crate::artifact_removal::undeletable_directory(
-                &name, &dir, &err,
-            )),
+            Err(err) if err.is_not_found() => Ok(true),
+            Err(WorkdirError::Refused(refusal)) => Err(refusal.to_string()),
+            Err(WorkdirError::Io { source, .. }) => {
+                Err(crate::artifact_removal::undeletable_directory(
+                    &name,
+                    &self.session_root.host_path(&rel),
+                    &source,
+                ))
+            }
         }
     }
 
@@ -8081,13 +8196,13 @@ impl CapsuleStoreState {
         {
             return None;
         }
-        let manifest_path = self
-            .workdir
-            .join("tools")
-            .join(name)
-            .join(PACKED_MANIFEST_ENTRY);
-        let manifest: Value =
-            serde_yaml::from_str(&fs::read_to_string(manifest_path).ok()?).ok()?;
+        let manifest: Value = serde_yaml::from_str(
+            &self
+                .session_root
+                .read_to_string(format!("tools/{name}/{PACKED_MANIFEST_ENTRY}"))
+                .ok()??,
+        )
+        .ok()?;
         if !matches!(
             crate::agent::inventory::staged_manifest_runtime(&manifest),
             ArtifactRuntime::Tool
@@ -8250,7 +8365,7 @@ impl CapsuleStoreState {
             let running = enforce_allowlist(&self.allowlisted_tools, name, || {
                 let name = name.to_string();
                 let accessible_workdir = self.accessible_workdir.clone();
-                let session_workdir = self.workdir.clone();
+                let session_workdir = self.session_root.clone();
                 let policy = self.capability_policy.clone();
                 let enforcement = self.shell_enforcement.clone();
                 Ok(tokio::task::spawn_blocking(move || {
@@ -8280,8 +8395,8 @@ impl CapsuleStoreState {
             .any(|allowed| allowed == name)
         {
             let name = name.to_string();
-            let accessible_workdir = self.accessible_workdir.clone();
-            let session_workdir = self.workdir.clone();
+            let accessible_workdir = self.accessible_root.clone();
+            let session_workdir = self.session_root.clone();
             let env_overrides = native_env(&self.inference_env);
             let policy = self.capability_policy.clone();
             let enforcement = self.shell_enforcement.clone();
@@ -8325,10 +8440,15 @@ impl CapsuleStoreState {
 
         // Skill artifact: return skill.md content as the tool result (no WASM dispatch).
         // Works in capsules with no shell/file capabilities — the runtime reads the file.
-        let skill_md_path = self.workdir.join("tools").join(name).join("skill.md");
-        if skill_md_path.exists() {
-            let content = fs::read_to_string(&skill_md_path)
-                .map_err(|e| format!("failed to read skill '{name}': {e}"))?;
+        let skill_md = format!("tools/{name}/skill.md");
+        if !matches!(self.session_root.entry_kind(&skill_md), Ok(None)) {
+            // A link where the skill's `skill.md` was staged is refused here, latched, and fails
+            // the task at the checkpoint after this call.
+            let content = self
+                .session_root
+                .read_to_string(&skill_md)
+                .map_err(|e| format!("failed to read skill '{name}': {e}"))?
+                .ok_or_else(|| format!("failed to read skill '{name}': skill.md is gone"))?;
             return Ok(DispatchOutcome::skill(murmur::tool::run::ToolResult {
                 status: murmur::tool::run::Status::Passed,
                 summary: Some(format!("Skill {name} guidance")),
@@ -9065,12 +9185,15 @@ impl CapsuleStoreState {
         // Every directory under `tools/` is a tool this session can dispatch, which is what
         // `validate_plan` checks a `tool` step against. `submit-plan` is left out so a plan
         // naming it is refused for what it is rather than for the tool being absent.
-        let installed_tools: HashSet<String> = fs::read_dir(self.workdir.join("tools"))
+        let installed_tools: HashSet<String> = self
+            .session_root
+            .list_dir("tools")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
             .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|entry| entry.path().is_dir())
-            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|(_, kind)| *kind == EntryKind::Directory)
+            .map(|(name, _)| name)
             .filter(|name| name != SUBMIT_PLAN_TOOL)
             .collect();
 
@@ -9087,8 +9210,8 @@ impl CapsuleStoreState {
         let capability_policy = self.capability_policy.clone();
         // The plan's shell steps are this session's commands, so they run in its namespace.
         let session_netns = Arc::clone(&self.shell_enforcement.session_netns);
-        let scheduler_workdir = self.accessible_workdir.clone();
-        let scheduler_session_workdir = self.workdir.clone();
+        let scheduler_workdir = self.accessible_root.clone();
+        let scheduler_session_workdir = self.session_root.clone();
         let session_id = self.session_id.clone();
         // The conversation this plan was submitted from, named on the `MURMUR_SPAWNER` handle
         // every `capsule` step injects into its child — the same value `delegate-task` names.
@@ -9320,19 +9443,18 @@ impl CapsuleStoreState {
         &self,
         plan: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<PathBuf, String> {
-        let plans_dir = self.workdir.join("plans");
-        fs::create_dir_all(&plans_dir)
-            .map_err(|error| format!("'{SUBMIT_PLAN_TOOL}' could not create plans/: {error}"))?;
         let ordinal = self.plan_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let plan_path = plans_dir.join(format!("plan-{ordinal}.json"));
         let body = serde_json::Value::Object(plan.clone()).to_string();
-        fs::write(&plan_path, body).map_err(|error| {
-            format!(
-                "'{SUBMIT_PLAN_TOOL}' could not write {}: {error}",
-                plan_path.display()
+        self.session_root
+            .write_file(
+                format!("plans/plan-{ordinal}.json"),
+                body.as_bytes(),
+                DEFAULT_FILE_MODE,
             )
-        })?;
-        Ok(plan_path)
+            .map_err(|error| format!("'{SUBMIT_PLAN_TOOL}' could not write the plan: {error}"))?;
+        Ok(self
+            .session_root
+            .host_path(format!("plans/plan-{ordinal}.json")))
     }
 
     /// The audience a handle for `peer` must be minted for, read off that peer's own agent card.
@@ -9464,18 +9586,18 @@ impl CapsuleStoreState {
         // a hint read out of the token's own unverified payload.
         let basename = crate::peer_handoff::decode_payload_unverified(&handle).map(|p| p.p);
         let stored_path = crate::peer_handoff::stored_path_for(&handle_id, basename.as_deref());
-        let absolute = self.accessible_workdir.join(&stored_path);
-        if let Some(parent) = absolute.parent() {
-            if let Err(error) = fs::create_dir_all(parent) {
-                let reason = format!("failed to create {}: {error}", parent.display());
-                self.trace_fetch(&peer, &handle_id, None, "io_error", Some(reason.clone()))
-                    .await;
-                return Err(format!("'{FETCH_PEER_FILE_TOOL}' failed: {reason}"));
-            }
-        }
-        if let Err(error) = fs::write(&absolute, &response.body) {
+        // Through the accessible root with no link followed: `peer-in` or the stored name being a
+        // link is `path_refused`, and no byte of the body lands anywhere.
+        if let Err(error) =
+            self.accessible_root
+                .write_file(&stored_path, &response.body, DEFAULT_FILE_MODE)
+        {
+            let outcome = match error {
+                WorkdirError::Refused(_) => PEER_FETCH_PATH_REFUSED,
+                WorkdirError::Io { .. } => "io_error",
+            };
             let reason = format!("failed to write {stored_path}: {error}");
-            self.trace_fetch(&peer, &handle_id, None, "io_error", Some(reason.clone()))
+            self.trace_fetch(&peer, &handle_id, None, outcome, Some(reason.clone()))
                 .await;
             return Err(format!("'{FETCH_PEER_FILE_TOOL}' failed: {reason}"));
         }
@@ -9603,15 +9725,14 @@ fn json_tool_result(summary: String, data: serde_json::Value) -> murmur::tool::r
     }
 }
 
+/// `manifest_content` is the staged manifest, read from `manifest_rel` beneath the session root.
 fn read_artifact_info_from_manifest(
-    manifest_path: &Path,
+    manifest_content: &str,
+    manifest_rel: &str,
     fallback: &InstalledArtifactSummary,
 ) -> Result<manage::ArtifactInfo, String> {
-    let manifest_content = fs::read_to_string(manifest_path)
-        .map_err(|err| format!("failed to read {}: {err}", manifest_path.display()))?;
-
-    let value: Value = serde_yaml::from_str(&manifest_content)
-        .map_err(|err| format!("failed to parse {}: {err}", manifest_path.display()))?;
+    let value: Value = serde_yaml::from_str(manifest_content)
+        .map_err(|err| format!("failed to parse {manifest_rel}: {err}"))?;
 
     let root = value.as_mapping();
 
@@ -9826,7 +9947,7 @@ pub(crate) fn describe_stripped_env_allow_entries(entries: &[StrippedEnvAllowEnt
 /// runtime would otherwise overwrite the synthetic manifest and lose every call to the
 /// interception in `dispatch_agent_tool_unfenced`.
 fn write_tool_manifest(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     name: &str,
     manifest_yaml: &str,
 ) -> Result<(), RuntimeError> {
@@ -9844,7 +9965,7 @@ fn write_tool_manifest(
 /// routed through here without being added to the list fails loudly instead of shipping shadowable
 /// by an artifact of the same name.
 fn write_runtime_provided_tool_manifest(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     name: &str,
     manifest_yaml: &str,
 ) -> Result<(), RuntimeError> {
@@ -9858,21 +9979,26 @@ fn write_runtime_provided_tool_manifest(
 
 /// The write both guarded entry points share, once their opposite name checks have passed.
 fn write_tool_manifest_unchecked(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     name: &str,
     manifest_yaml: &str,
 ) -> Result<(), RuntimeError> {
-    write_tool_manifest_at(&tool_manifest_path(workdir, name)?, manifest_yaml)
+    write_staged_file(
+        workdir,
+        &tool_manifest_rel(name)?,
+        manifest_yaml.as_bytes(),
+        None,
+    )
 }
 
-/// `<workdir>/tools/<name>/murmur.yaml`. Errors unless `name` is one normal path component:
-/// `Path::join` with an absolute name discards `workdir`, and `..` climbs out of `tools/`, so
-/// either would write on the host outside the workdir.
-fn tool_manifest_path(workdir: &Path, name: &str) -> Result<PathBuf, RuntimeError> {
+/// `tools/<name>/murmur.yaml`, relative to the session workdir. Errors unless `name` is one normal
+/// path component: an absolute name, `..` or a nested name would put the manifest somewhere other
+/// than `tools/<name>/`.
+fn tool_manifest_rel(name: &str) -> Result<String, RuntimeError> {
     let mut components = Path::new(name).components();
     match (components.next(), components.next()) {
         (Some(std::path::Component::Normal(_)), None) => {
-            Ok(workdir.join("tools").join(name).join(PACKED_MANIFEST_ENTRY))
+            Ok(format!("tools/{name}/{PACKED_MANIFEST_ENTRY}"))
         }
         _ => Err(RuntimeError::ToolNameNotAComponent {
             name: name.to_string(),
@@ -9880,16 +10006,65 @@ fn tool_manifest_path(workdir: &Path, name: &str) -> Result<PathBuf, RuntimeErro
     }
 }
 
-fn write_tool_manifest_at(manifest_path: &Path, manifest_yaml: &str) -> Result<(), RuntimeError> {
-    let write_error = |source| RuntimeError::WriteToolManifest {
-        path: manifest_path.display().to_string(),
-        source,
-    };
-    if let Some(parent) = manifest_path.parent() {
-        fs::create_dir_all(parent).map_err(write_error)?;
+/// Writes one staged file under `tools/`, with no link followed: `mode` is exact when given, and
+/// `std`'s default less the umask otherwise. A link on the way is
+/// [`RuntimeError::WorkdirPathRefused`]; any other failure is [`RuntimeError::WriteToolManifest`].
+fn write_staged_file(
+    workdir: &WorkdirRoot,
+    rel: &str,
+    bytes: &[u8],
+    mode: Option<u32>,
+) -> Result<(), RuntimeError> {
+    match mode {
+        Some(mode) => workdir.write_file_exact_mode(rel, bytes, mode),
+        None => workdir.write_file(rel, bytes, DEFAULT_FILE_MODE),
     }
-    fs::write(manifest_path, manifest_yaml).map_err(write_error)
+    .map_err(|error| {
+        RuntimeError::from_workdir(error, |_, source| RuntimeError::WriteToolManifest {
+            path: workdir.host_path(rel).display().to_string(),
+            source,
+        })
+    })
 }
+
+/// Copies the project's `murmur.yaml` from `manifest_dir` into the accessible workdir when the
+/// workdir has none, so the agent can reference it by relative path from `"."`, with the source's
+/// mode as `fs::copy` would.
+///
+/// Anything already there other than a link is kept. A link where the copy would go is refused,
+/// which fails the launch; any other failure warns and the launch goes on.
+fn copy_manifest_into_workdir(
+    manifest_dir: &Path,
+    accessible_root: &WorkdirRoot,
+) -> Result<(), RuntimeError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let src = manifest_dir.join(MANIFEST_FILENAME);
+    let Ok(bytes) = fs::read(&src) else {
+        return Ok(());
+    };
+    match accessible_root.entry_kind(MANIFEST_FILENAME) {
+        Ok(None) | Ok(Some(EntryKind::Symlink)) => {}
+        Ok(Some(_)) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let mode = fs::metadata(&src)
+        .map(|metadata| metadata.permissions().mode() & 0o7777)
+        .unwrap_or(DEFAULT_FILE_MODE);
+    match accessible_root.write_file_exact_mode(MANIFEST_FILENAME, &bytes, mode) {
+        Ok(()) => Ok(()),
+        Err(WorkdirError::Refused(refusal)) => Err(RuntimeError::WorkdirPathRefused { refusal }),
+        Err(error) => {
+            crate::runtime_err!(
+                "[capsule-runtime] warning: failed to copy {MANIFEST_FILENAME} to workdir: {error}"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Mode of an installed native binary: executable by everyone, writable by its owner.
+const NATIVE_BINARY_MODE: u32 = 0o755;
 
 /// Write each native tool's binary to `<workdir>/tools/<name>/<name>`, executable, and return
 /// what each needs to start, keyed by `name`, derived from the bytes written rather than read back
@@ -9900,7 +10075,7 @@ fn write_tool_manifest_at(manifest_path: &Path, manifest_yaml: &str) -> Result<(
 /// one unrunnable binary installs none of them: a refusal that had already written two of three
 /// tools would leave a workdir that is neither the state before staging nor the state after it.
 fn install_native_binaries(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     accessible_workdir: &Path,
     native_binaries: Vec<(String, Vec<u8>)>,
     full_names: &HashMap<String, String>,
@@ -9920,38 +10095,9 @@ fn install_native_binaries(
 
     let mut entrypoints = HashMap::new();
     for (name, bytes) in native_binaries {
-        let binary_path = workdir.join("tools").join(&name).join(&name);
-        let Some(parent) = binary_path.parent() else {
-            return Err(RuntimeError::Runtime(format!(
-                "failed to derive parent for native binary path {}",
-                binary_path.display()
-            )));
-        };
-        fs::create_dir_all(parent).map_err(|source| RuntimeError::WriteToolManifest {
-            path: binary_path.display().to_string(),
-            source,
-        })?;
-        fs::write(&binary_path, &bytes).map_err(|source| RuntimeError::WriteToolManifest {
-            path: binary_path.display().to_string(),
-            source,
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&binary_path)
-                .map_err(|source| RuntimeError::WriteToolManifest {
-                    path: binary_path.display().to_string(),
-                    source,
-                })?
-                .permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&binary_path, perms).map_err(|source| {
-                RuntimeError::WriteToolManifest {
-                    path: binary_path.display().to_string(),
-                    source,
-                }
-            })?;
-        }
+        let rel = format!("tools/{name}/{name}");
+        write_staged_file(workdir, &rel, &bytes, Some(NATIVE_BINARY_MODE))?;
+        let binary_path = workdir.host_path(&rel);
         let entrypoint =
             sandbox::NativeEntrypoint::derive(&binary_path, &bytes, accessible_workdir);
         entrypoints.insert(name, entrypoint);
@@ -10014,25 +10160,11 @@ fn find_skill_md_in_dir(dir: &Path) -> Result<Option<std::path::PathBuf>, Runtim
 }
 
 fn install_skill_files(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     skill_files: Vec<(String, Vec<u8>)>,
 ) -> Result<(), RuntimeError> {
     for (name, bytes) in skill_files {
-        let skill_path = workdir.join("tools").join(&name).join("skill.md");
-        let Some(parent) = skill_path.parent() else {
-            return Err(RuntimeError::Runtime(format!(
-                "failed to derive parent for skill.md path {}",
-                skill_path.display()
-            )));
-        };
-        fs::create_dir_all(parent).map_err(|source| RuntimeError::WriteToolManifest {
-            path: skill_path.display().to_string(),
-            source,
-        })?;
-        fs::write(&skill_path, &bytes).map_err(|source| RuntimeError::WriteToolManifest {
-            path: skill_path.display().to_string(),
-            source,
-        })?;
+        write_staged_file(workdir, &format!("tools/{name}/skill.md"), &bytes, None)?;
     }
     Ok(())
 }
@@ -10080,7 +10212,7 @@ fn check_queue_has_room(lifecycle: &LifecycleConfig) -> Result<(), RuntimeError>
 /// Writes the synthetic tool manifests for the two peer-handoff tools, each only when its own
 /// grant is declared.
 fn write_peer_handoff_tool_manifests(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     can_mint: bool,
     can_fetch: bool,
 ) -> Result<(), RuntimeError> {
@@ -10142,7 +10274,7 @@ const FETCH_PEER_FILE_TOOL_MANIFEST: &str = concat!(
 /// and from `session_start`'s `tools_declared` — the grant governs the tool's existence rather
 /// than its success.
 fn write_delegate_task_tool_manifest(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     spawn_allow: &[String],
 ) -> Result<(), RuntimeError> {
     if spawn_allow.is_empty() {
@@ -10244,7 +10376,7 @@ fn delegate_task_result_data(
 /// file, so `call-member` is absent from their tool inventory and from `session_start`'s
 /// `tools_declared`.
 fn write_member_call_tool_manifest(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     formation: Option<&FormationMember>,
 ) -> Result<(), RuntimeError> {
     let callees: Vec<&str> = formation
@@ -10266,7 +10398,7 @@ pub(crate) const MEMBER_CALL_TOOL: &str = "call-member";
 /// Writes the end-without-answer tool's synthetic manifest, under exactly `call-member`'s grant: a
 /// formation member with at least one callee.
 fn write_end_without_answer_tool_manifest(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     formation: Option<&FormationMember>,
 ) -> Result<(), RuntimeError> {
     if formation.is_none_or(|formation| formation.callees().next().is_none()) {
@@ -10335,7 +10467,10 @@ fn member_call_tool_manifest(callees: &[&str]) -> String {
 /// A capsule that declares nothing gets no file, so `submit-plan` is absent from its tool
 /// inventory and from `session_start`'s `tools_declared` — the grant governs the tool's existence
 /// rather than its success, exactly as [`write_delegate_task_tool_manifest`] does.
-fn write_submit_plan_tool_manifest(workdir: &Path, plan_submit: bool) -> Result<(), RuntimeError> {
+fn write_submit_plan_tool_manifest(
+    workdir: &WorkdirRoot,
+    plan_submit: bool,
+) -> Result<(), RuntimeError> {
     if !plan_submit {
         return Ok(());
     }
@@ -10349,7 +10484,7 @@ fn write_submit_plan_tool_manifest(workdir: &Path, plan_submit: bool) -> Result<
 /// inventory and from `session_start`'s `tools_declared`. The description lists every choice with
 /// its model, and the schema names the choices, so the model sees what it may select.
 fn write_switch_driver_tool_manifest(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     choices: Option<&crate::driver_choice::DriverChoices>,
 ) -> Result<(), RuntimeError> {
     let Some(choices) = choices else {
@@ -10568,19 +10703,29 @@ const SUBMIT_PLAN_TOOL_MANIFEST: &str = concat!(
     "'\n",
 );
 
-/// Write each allowed binary's shell tool manifest, `<workdir>/tools/<binary>/murmur.yaml`, unless
-/// one is there already. Every name is checked before the first write, so a refused name leaves
-/// the workdir as it was.
-fn write_shell_tool_manifests(workdir: &Path, shell_allow: &[String]) -> Result<(), RuntimeError> {
-    let paths = shell_allow
+/// Write each allowed binary's shell tool manifest, `tools/<binary>/murmur.yaml`, unless one is
+/// there already. Every name is checked before the first write, so a refused name leaves the
+/// workdir as it was.
+fn write_shell_tool_manifests(
+    workdir: &WorkdirRoot,
+    shell_allow: &[String],
+) -> Result<(), RuntimeError> {
+    let rels = shell_allow
         .iter()
-        .map(|binary| Ok((binary, tool_manifest_path(workdir, binary)?)))
+        .map(|binary| Ok((binary, tool_manifest_rel(binary)?)))
         .collect::<Result<Vec<_>, RuntimeError>>()?;
-    for (binary, manifest_path) in paths {
-        if manifest_path.exists() {
+    for (binary, rel) in rels {
+        // A custom manifest already staged is kept. A link where one would be is not "already
+        // staged": the write below refuses it.
+        if let Ok(Some(EntryKind::File)) = workdir.entry_kind(&rel) {
             continue;
         }
-        write_tool_manifest_at(&manifest_path, &shell_tool_manifest_yaml(binary))?;
+        write_staged_file(
+            workdir,
+            &rel,
+            shell_tool_manifest_yaml(binary).as_bytes(),
+            None,
+        )?;
     }
     Ok(())
 }
@@ -10632,7 +10777,7 @@ fn dispatch_native_tool(
     input: murmur::tool::run::ToolInput,
     entrypoint: &sandbox::NativeEntrypoint,
     accessible_workdir: &Path,
-    session_workdir: &Path,
+    session_workdir: &WorkdirRoot,
     policy: &CapabilityPolicy,
     enforcement: &sandbox::ShellEnforcement,
 ) -> Result<murmur::tool::run::ToolResult, ShellExecError> {
@@ -10868,14 +11013,14 @@ fn resolve_shell_call_inner(
 fn dispatch_shell_tool(
     name: &str,
     input: murmur::tool::run::ToolInput,
-    accessible_workdir: &Path,
-    session_workdir: &Path,
+    accessible_workdir: &WorkdirRoot,
+    session_workdir: &WorkdirRoot,
     env_overrides: &[(String, String)],
     policy: &CapabilityPolicy,
     enforcement: &sandbox::ShellEnforcement,
     detach: Option<DetachPolicy>,
 ) -> DispatchOutcome {
-    let resolved = match resolve_shell_call_inner(name, &input, accessible_workdir, policy) {
+    let resolved = match resolve_shell_call_inner(name, &input, accessible_workdir.path(), policy) {
         Ok(resolved) => resolved,
         Err(error) => {
             return DispatchOutcome::tool(murmur::tool::run::ToolResult {
@@ -11068,7 +11213,7 @@ fn resolve_conversation_root(
     context: Option<&ContextConfig>,
     capsule_name: &str,
     inference: &murmur_artifact::InferenceConfig,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
 ) -> Option<PathBuf> {
     if inference.transport == "process" {
         return None;
@@ -11103,7 +11248,7 @@ fn resolve_conversation_root(
 #[allow(clippy::too_many_arguments)]
 async fn apply_retention(
     trace: &mut TraceWriter,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     session_id: &str,
     trace_retain: Option<&murmur_artifact::TraceRetainConfig>,
     context_retain: Option<&murmur_artifact::ContextRetainConfig>,
@@ -11117,7 +11262,7 @@ async fn apply_retention(
 
     let now_ms = crate::retention::now_ms();
 
-    if let (Some(policy), Some(sessions_root)) = (trace_retain, workdir.parent()) {
+    if let (Some(policy), Some(sessions_root)) = (trace_retain, workdir.path().parent()) {
         let pruned = crate::retention::prune_sessions(sessions_root, session_id, policy, now_ms);
         for reason in [
             crate::trace::RETENTION_REASON_MAX_SESSIONS,
@@ -11717,8 +11862,11 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let workdir = scratch.path().join("workdir");
         std::fs::create_dir(&workdir).unwrap();
-        super::write_shell_tool_manifests(&workdir, &["bash".to_string(), "jq".to_string()])
-            .unwrap();
+        super::write_shell_tool_manifests(
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+            &["bash".to_string(), "jq".to_string()],
+        )
+        .unwrap();
         assert_eq!(
             tree_of(scratch.path()),
             [
@@ -11755,7 +11903,11 @@ mod tests {
             } else {
                 vec![bad.clone()]
             };
-            let error = super::write_shell_tool_manifests(&workdir, &allow).unwrap_err();
+            let error = super::write_shell_tool_manifests(
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+                &allow,
+            )
+            .unwrap_err();
             assert!(
                 matches!(&error, crate::RuntimeError::ToolNameNotAComponent { name } if *name == bad),
                 "{bad:?}: {error}"
@@ -11775,8 +11927,12 @@ mod tests {
         std::fs::create_dir(&workdir).unwrap();
         let outside = scratch.path().join("host").display().to_string();
         for bad in [outside.as_str(), "..", "../x"] {
-            let error =
-                super::write_tool_manifest_unchecked(&workdir, bad, "name: x\n").unwrap_err();
+            let error = super::write_tool_manifest_unchecked(
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+                bad,
+                "name: x\n",
+            )
+            .unwrap_err();
             assert!(
                 matches!(error, crate::RuntimeError::ToolNameNotAComponent { .. }),
                 "{bad:?}: {error}"
@@ -11872,10 +12028,18 @@ mod tests {
     #[test]
     fn an_ungranted_capsule_is_written_no_delegation_tool() {
         let dir = tempfile::tempdir().unwrap();
-        super::write_delegate_task_tool_manifest(dir.path(), &[]).unwrap();
+        super::write_delegate_task_tool_manifest(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            &[],
+        )
+        .unwrap();
         assert!(!dir.path().join("tools").join("delegate-task").exists());
 
-        super::write_delegate_task_tool_manifest(dir.path(), &["worker".to_string()]).unwrap();
+        super::write_delegate_task_tool_manifest(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            &["worker".to_string()],
+        )
+        .unwrap();
         assert!(dir
             .path()
             .join("tools")
@@ -11951,7 +12115,11 @@ mod tests {
     #[test]
     fn the_written_delegation_manifest_says_the_call_returns_on_start() {
         let dir = tempfile::tempdir().unwrap();
-        super::write_delegate_task_tool_manifest(dir.path(), &["worker".to_string()]).unwrap();
+        super::write_delegate_task_tool_manifest(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            &["worker".to_string()],
+        )
+        .unwrap();
         let written = std::fs::read_to_string(
             dir.path()
                 .join("tools")
@@ -12032,10 +12200,18 @@ mod tests {
     #[test]
     fn an_ungranted_capsule_is_written_no_plan_tool() {
         let dir = tempfile::tempdir().unwrap();
-        super::write_submit_plan_tool_manifest(dir.path(), false).unwrap();
+        super::write_submit_plan_tool_manifest(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            false,
+        )
+        .unwrap();
         assert!(!dir.path().join("tools").join("submit-plan").exists());
 
-        super::write_submit_plan_tool_manifest(dir.path(), true).unwrap();
+        super::write_submit_plan_tool_manifest(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            true,
+        )
+        .unwrap();
         assert!(dir
             .path()
             .join("tools")
@@ -12120,9 +12296,17 @@ mod tests {
     #[test]
     fn driver_choice_an_ungranted_capsule_is_written_no_switch_tool() {
         let dir = tempfile::tempdir().unwrap();
-        super::write_switch_driver_tool_manifest(dir.path(), None).unwrap();
+        super::write_switch_driver_tool_manifest(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            None,
+        )
+        .unwrap();
         assert!(!dir.path().join("tools").join("switch-driver").exists());
-        super::write_switch_driver_tool_manifest(dir.path(), Some(&switchable_choices())).unwrap();
+        super::write_switch_driver_tool_manifest(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            Some(&switchable_choices()),
+        )
+        .unwrap();
         assert!(dir
             .path()
             .join("tools")
@@ -12271,7 +12455,11 @@ mod tests {
     #[test]
     fn an_artifact_manifest_write_refuses_a_reserved_name() {
         let dir = tempfile::tempdir().unwrap();
-        super::write_delegate_task_tool_manifest(dir.path(), &["worker".to_string()]).unwrap();
+        super::write_delegate_task_tool_manifest(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            &["worker".to_string()],
+        )
+        .unwrap();
         let synthetic = dir
             .path()
             .join("tools")
@@ -12280,8 +12468,12 @@ mod tests {
         let before = std::fs::read_to_string(&synthetic).unwrap();
 
         for name in super::RESERVED_TOOL_NAMES {
-            let error = super::write_tool_manifest(dir.path(), name, "name: impostor\n")
-                .expect_err("a reserved name must not be written as an artifact manifest");
+            let error = super::write_tool_manifest(
+                &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+                name,
+                "name: impostor\n",
+            )
+            .expect_err("a reserved name must not be written as an artifact manifest");
             assert!(
                 matches!(error, RuntimeError::ReservedToolName { .. }),
                 "got {error:?}"
@@ -12310,9 +12502,12 @@ mod tests {
     #[test]
     fn a_runtime_provided_write_refuses_an_unreserved_name() {
         let dir = tempfile::tempdir().unwrap();
-        let error =
-            super::write_runtime_provided_tool_manifest(dir.path(), "summon-task", "name: x\n")
-                .expect_err("an unreserved name must not be written as a runtime-provided tool");
+        let error = super::write_runtime_provided_tool_manifest(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            "summon-task",
+            "name: x\n",
+        )
+        .expect_err("an unreserved name must not be written as a runtime-provided tool");
         assert!(
             matches!(error, RuntimeError::RuntimeProvidedToolNotReserved { .. }),
             "got {error:?}"
@@ -12618,7 +12813,11 @@ inference:
     #[test]
     fn warn_for_unreachable_shell_completions_writes_the_code_and_link_to_bootstrap_log() {
         let temp = TempDir::new().unwrap();
-        warn_for_unreachable_shell_completions(temp.path(), true, &LifecycleConfig::default());
+        warn_for_unreachable_shell_completions(
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            true,
+            &LifecycleConfig::default(),
+        );
         let log = bootstrap_log_contents(temp.path());
 
         assert!(log.contains(W_SEC_022), "log was: {log}");
@@ -12919,8 +13118,12 @@ inference:
     #[test]
     fn resolve_system_prompt_returns_none_when_nothing_is_declared() {
         let tmp = TempDir::new().unwrap();
-        let resolved =
-            resolve_system_prompt(tmp.path(), tmp.path(), &inference_without_prompt()).unwrap();
+        let resolved = resolve_system_prompt(
+            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &inference_without_prompt(),
+        )
+        .unwrap();
         assert_eq!(resolved, None);
     }
 
@@ -12931,7 +13134,12 @@ inference:
             system_prompt: Some("Be terse.".to_string()),
             ..inference_without_prompt()
         };
-        let resolved = resolve_system_prompt(tmp.path(), tmp.path(), &inference).unwrap();
+        let resolved = resolve_system_prompt(
+            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &inference,
+        )
+        .unwrap();
         assert_eq!(resolved.as_deref(), Some("Be terse."));
     }
 
@@ -12948,8 +13156,12 @@ inference:
             system_prompt_file: Some("conventions.md".to_string()),
             ..inference_without_prompt()
         };
-        let resolved =
-            resolve_system_prompt(manifest_dir.path(), workdir.path(), &inference).unwrap();
+        let resolved = resolve_system_prompt(
+            manifest_dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            &inference,
+        )
+        .unwrap();
         assert_eq!(resolved.as_deref(), Some("  Be terse.\n"));
     }
 
@@ -12960,7 +13172,11 @@ inference:
             system_prompt_file: Some("missing-conventions.md".to_string()),
             ..inference_without_prompt()
         };
-        match resolve_system_prompt(tmp.path(), tmp.path(), &inference) {
+        match resolve_system_prompt(
+            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &inference,
+        ) {
             Err(RuntimeError::SystemPromptFileRead { path, .. }) => {
                 assert!(path.ends_with("missing-conventions.md"), "got {path}");
             }
@@ -12983,8 +13199,12 @@ inference:
             system_prompt_artifact: Some("house-style".to_string()),
             ..inference_without_prompt()
         };
-        let resolved =
-            resolve_system_prompt(manifest_dir.path(), workdir.path(), &inference).unwrap();
+        let resolved = resolve_system_prompt(
+            manifest_dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            &inference,
+        )
+        .unwrap();
         assert_eq!(resolved.as_deref(), Some("# House style\nBe terse."));
     }
 
@@ -12995,7 +13215,11 @@ inference:
             system_prompt_artifact: Some("house-style".to_string()),
             ..inference_without_prompt()
         };
-        match resolve_system_prompt(tmp.path(), tmp.path(), &inference) {
+        match resolve_system_prompt(
+            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &inference,
+        ) {
             Err(RuntimeError::SystemPromptArtifactRead { name, .. }) => {
                 assert_eq!(name, "house-style");
             }
@@ -13015,7 +13239,12 @@ inference:
             system_prompt_artifact: None,
             ..inference_without_prompt()
         };
-        let resolved = resolve_system_prompt(tmp.path(), tmp.path(), &inference).unwrap();
+        let resolved = resolve_system_prompt(
+            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &inference,
+        )
+        .unwrap();
         assert_eq!(resolved.as_deref(), Some("CLI prompt"));
     }
 
@@ -13027,7 +13256,10 @@ inference:
             network_allow: vec!["https://api.example.com".to_string()],
             ..Default::default()
         };
-        warn_if_bash_network_bypass(tmp.path(), &policy);
+        warn_if_bash_network_bypass(
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &policy,
+        );
         let log = bootstrap_log_contents(tmp.path());
         assert!(log.contains("bash"), "log should mention bash: {log}");
         assert!(log.contains("network"), "log should mention network: {log}");
@@ -13144,7 +13376,10 @@ inference:
             network_allow: vec!["https://api.example.com".to_string()],
             ..Default::default()
         };
-        warn_if_bash_network_bypass(tmp.path(), &policy);
+        warn_if_bash_network_bypass(
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &policy,
+        );
         assert!(bootstrap_log_contents(tmp.path()).is_empty());
     }
 
@@ -13156,14 +13391,20 @@ inference:
             network_allow: Vec::new(),
             ..Default::default()
         };
-        warn_if_bash_network_bypass(tmp.path(), &policy);
+        warn_if_bash_network_bypass(
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &policy,
+        );
         assert!(bootstrap_log_contents(tmp.path()).is_empty());
     }
 
     #[test]
     fn neither_declared_does_not_warn() {
         let tmp = TempDir::new().unwrap();
-        warn_if_bash_network_bypass(tmp.path(), &CapabilityPolicy::default());
+        warn_if_bash_network_bypass(
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &CapabilityPolicy::default(),
+        );
         assert!(bootstrap_log_contents(tmp.path()).is_empty());
     }
 
@@ -13175,7 +13416,10 @@ inference:
             network_allow: vec!["https://api.example.com".to_string()],
             ..Default::default()
         };
-        warn_if_bash_network_bypass(tmp.path(), &policy);
+        warn_if_bash_network_bypass(
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &policy,
+        );
         assert!(
             bootstrap_log_contents(tmp.path()).is_empty(),
             "exact match on \"bash\" literal must not fire for other shell interpreters like sh"
@@ -14385,7 +14629,7 @@ inference:
 
         let empty = tempfile::tempdir().unwrap();
         rt.block_on(drain_script_trace_buffers(
-            empty.path(),
+            &crate::workdir_fs::WorkdirRoot::open(empty.path()).unwrap(),
             "ses_test",
             "cap",
             "0.0.1",
@@ -14396,7 +14640,7 @@ inference:
         assert!(!empty.path().join("trace.jsonl").exists());
 
         rt.block_on(drain_script_trace_buffers(
-            &project.workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&project.workdir).unwrap(),
             "ses_test",
             "cap",
             "0.0.1",
@@ -14439,7 +14683,7 @@ inference:
         let mut state = project.session();
         pull_skill(&mut state).unwrap();
         install_skill_files(
-            &project.workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&project.workdir).unwrap(),
             vec![("house-style".to_string(), b"Be terse.".to_vec())],
         )
         .unwrap();
@@ -14677,6 +14921,8 @@ inference:
             &CapabilityPolicy::default(),
         )
         .unwrap();
+        // One root for both, as `stage_session` holds them without `--workdir`: one latch.
+        let root = WorkdirRoot::open(&workdir).unwrap();
         CapsuleStoreState {
             limits: crate::limits::ExecutionLimits::default().limiter(),
             table: ResourceTable::new(),
@@ -14701,7 +14947,8 @@ inference:
             spend: Arc::new(SpendMeter::unlimited()),
             compiled_forms: CompiledForms::new(&engine, &workdir),
             engine,
-            workdir: workdir.clone(),
+            session_root: root.clone(),
+            accessible_root: root,
             accessible_workdir: workdir,
             tool_components: HashMap::new(),
             native_entrypoints: HashMap::new(),
@@ -14878,7 +15125,7 @@ inference:
                     version: version.to_string(),
                     runtime: self.runtime,
                     artifact_runtime: match self.runtime {
-                        RuntimeType::Wasm => "tool",
+                        RuntimeType::Wasm | RuntimeType::Native => "tool",
                         _ => "skill",
                     }
                     .to_string(),
@@ -15017,7 +15264,7 @@ inference:
         let (_project, workdir, mut state) = late_skill_fixture();
 
         let mut held = HeldInventory::build(
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             None,
             &state.installed_artifacts,
             state.installed_generation,
@@ -15035,7 +15282,7 @@ inference:
 
         let refresh = held
             .refresh_before_call(
-                &workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 None,
                 &state.installed_artifacts,
                 ToolRefresh::Immediate,
@@ -15105,7 +15352,7 @@ inference:
         let (_project, workdir, mut state) = late_skill_fixture();
 
         let mut held = HeldInventory::build(
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             None,
             &state.installed_artifacts,
             state.installed_generation,
@@ -15116,7 +15363,7 @@ inference:
 
         for _ in 0..3 {
             let refresh = held.refresh_before_call(
-                &workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 None,
                 &state.installed_artifacts,
                 ToolRefresh::Compaction,
@@ -15132,7 +15379,7 @@ inference:
 
         let refresh = held
             .refresh_before_call(
-                &workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 None,
                 &state.installed_artifacts,
                 ToolRefresh::Compaction,
@@ -15146,7 +15393,7 @@ inference:
 
         assert_eq!(
             held.refresh_before_call(
-                &workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 None,
                 &state.installed_artifacts,
                 ToolRefresh::Compaction,
@@ -15165,14 +15412,14 @@ inference:
         let (_project, workdir, mut state) = late_skill_fixture();
 
         let mut held = HeldInventory::build(
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             None,
             &state.installed_artifacts,
             state.installed_generation,
         );
         pull_late_skill(&mut state);
         held.refresh_before_call(
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             None,
             &state.installed_artifacts,
             murmur_artifact::ToolRefresh::Immediate,
@@ -15181,7 +15428,11 @@ inference:
         )
         .expect("rebuilt");
 
-        let fresh = build_tool_inventory(&workdir, None, &state.installed_artifacts);
+        let fresh = build_tool_inventory(
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+            None,
+            &state.installed_artifacts,
+        );
         assert_eq!(
             serde_json::to_string(held.tools()).unwrap(),
             serde_json::to_string(&fresh).unwrap()
@@ -15202,7 +15453,7 @@ inference:
 
         let prompt_skill = Some("aaa-late-skill");
         let mut held = HeldInventory::build(
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             prompt_skill,
             &state.installed_artifacts,
             state.installed_generation,
@@ -15213,7 +15464,7 @@ inference:
 
         assert_eq!(
             held.refresh_before_call(
-                &workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 prompt_skill,
                 &state.installed_artifacts,
                 ToolRefresh::Immediate,
@@ -15230,7 +15481,7 @@ inference:
         fs::remove_dir_all(workdir.join("tools").join("zzz-existing-tool")).unwrap();
         assert_eq!(
             held.refresh_before_call(
-                &workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 prompt_skill,
                 &state.installed_artifacts,
                 ToolRefresh::Immediate,
@@ -15251,7 +15502,7 @@ inference:
         let (_project, workdir, state) = late_skill_fixture();
 
         let mut held = HeldInventory::build(
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             None,
             &state.installed_artifacts,
             state.installed_generation,
@@ -15263,7 +15514,7 @@ inference:
             for compaction_committed in [false, true] {
                 assert_eq!(
                     held.refresh_before_call(
-                        &workdir,
+                        &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                         None,
                         &state.installed_artifacts,
                         trigger,
@@ -15299,7 +15550,7 @@ inference:
     /// `inference` line carries the `tools_sha` of the array that call sent.
     async fn tool_refresh_trace(workdir: &Path) -> TraceWriter {
         TraceWriter::open(
-            workdir,
+            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             "ses_test".to_string(),
             "cap".to_string(),
             "0.1.0".to_string(),
@@ -15378,7 +15629,12 @@ inference:
                 None => no_hooks(&state.engine, &workdir).await,
             };
             let mut trace = tool_refresh_trace(&workdir).await;
-            let otel = OtelEmitter::new(None, &workdir, "cap".to_string(), "0.1.0".to_string());
+            let otel = OtelEmitter::new(
+                None,
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+                "cap".to_string(),
+                "0.1.0".to_string(),
+            );
             let occupancy = ContextOccupancy {
                 model: "test-model",
                 max_output_tokens: 1024,
@@ -15400,7 +15656,7 @@ inference:
                 &mut state,
                 3,
                 100,
-                &workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 &mut hooks,
                 &mut trace,
                 &otel,
@@ -15473,7 +15729,12 @@ inference:
             let mut trace = tool_refresh_trace(workdir).await;
             trace.set_tool_refresh(Some(trigger.wire_name()));
             trace.write_session_start(3, Vec::new()).await.unwrap();
-            let otel = OtelEmitter::new(None, workdir, "cap".to_string(), "0.1.0".to_string());
+            let otel = OtelEmitter::new(
+                None,
+                &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
+                "cap".to_string(),
+                "0.1.0".to_string(),
+            );
             let hooks = crate::hooks::test_support::no_hooks(&state.engine, workdir).await;
             Self {
                 workdir: workdir.to_path_buf(),
@@ -15518,7 +15779,7 @@ inference:
             // An attempt that runs out of turns is not what any caller asserts on.
             let _ = run_task_with_reopens(
                 state,
-                &self.workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
                 &self.inference,
                 0,
                 None,
@@ -15528,7 +15789,7 @@ inference:
                 &mut self.otel,
                 None,
                 None,
-                &self.workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
                 "cap",
                 "0.1.0",
                 ConversationMode::Stateless,
@@ -15687,13 +15948,13 @@ inference:
         let (_project, workdir, mut state) = late_skill_fixture();
 
         let mut held = HeldInventory::build(
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             None,
             &state.installed_artifacts,
             state.installed_generation,
         );
         crate::agent::log_tool_inventory(
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             "Installed tools",
             held.tools(),
             &mut state.logged_tool_inventory,
@@ -15701,7 +15962,7 @@ inference:
         .unwrap();
         pull_late_skill(&mut state);
         held.refresh_before_call(
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             None,
             &state.installed_artifacts,
             murmur_artifact::ToolRefresh::Immediate,
@@ -15710,7 +15971,7 @@ inference:
         )
         .expect("an immediate trigger rebuilds on the next call");
         crate::agent::log_tool_inventory(
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             "Refreshed tools",
             held.tools(),
             &mut state.logged_tool_inventory,
@@ -16713,7 +16974,12 @@ inference:
         // the host, and the shell tool and a native tool are not handed the session's value.
         let declared = build_declared_env(&declaring);
         let tmp = TempDir::new().unwrap();
-        let shell = build_shell_env(&declaring, &native_env(&agent), tmp.path()).unwrap();
+        let shell = build_shell_env(
+            &declaring,
+            &native_env(&agent),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+        )
+        .unwrap();
         let binary = write_env_echo_native_tool(tmp.path(), "echo-peers", &[name]);
         let native = dispatch_native_tool(
             "echo-peers",
@@ -16723,7 +16989,7 @@ inference:
             },
             &installed_native_tool(&binary, tmp.path()),
             tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &declaring,
             &sandbox::ShellEnforcement::environment_only(),
         );
@@ -16801,8 +17067,8 @@ inference:
                 data: Some(r#"{"command":"echo hi"}"#.to_string()),
                 log_path: None,
             },
-            tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &[],
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
@@ -16866,8 +17132,8 @@ inference:
                 ),
                 log_path: None,
             },
-            tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &[],
             &policy,
             &enforcement,
@@ -16914,8 +17180,8 @@ inference:
                 data: Some(r#"{"command":"echo hi"}"#.to_string()),
                 log_path: None,
             },
-            tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &[],
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
@@ -16977,8 +17243,8 @@ inference:
                 data: Some(input.to_string()),
                 log_path: None,
             },
-            tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &[],
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
@@ -17024,8 +17290,8 @@ inference:
                 data: Some(r#"{"command":"-d ."}"#.to_string()),
                 log_path: None,
             },
-            tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &[],
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
@@ -17066,8 +17332,8 @@ inference:
                 data: Some(r#"{"command":"echo hi"}"#.to_string()),
                 log_path: None,
             },
-            tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &[],
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
@@ -17099,8 +17365,8 @@ inference:
         let outcome = dispatch_shell_tool(
             "bash",
             input,
-            tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &[],
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
@@ -17198,8 +17464,8 @@ inference:
         let outcome = dispatch_shell_tool(
             "just",
             input,
-            tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &[],
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
@@ -17254,8 +17520,8 @@ inference:
                 data: Some(r#"{"command":"echo hi"}"#.to_string()),
                 log_path: None,
             },
-            tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &[],
             &policy,
             &sandbox::sealed_test_enforcement(),
@@ -17291,8 +17557,8 @@ inference:
                 data: Some(r#"{"command":"echo hi"}"#.to_string()),
                 log_path: None,
             },
-            tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &[],
             // Empty allowlist: `execute_shell` refuses before spawning anything.
             &CapabilityPolicy::default(),
@@ -17336,7 +17602,7 @@ inference:
                 },
                 &installed_native_tool(&binary, tmp.path()),
                 tmp.path(),
-                tmp.path(),
+                &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
                 &CapabilityPolicy::default(),
                 enforcement,
             ))
@@ -17586,8 +17852,8 @@ inference:
                     data: Some(r#"{"command":"echo hi"}"#.to_string()),
                     log_path: None,
                 },
-                &workdir,
-                &workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 &[],
                 &policy,
                 &sandbox::ShellEnforcement::environment_only(),
@@ -17596,7 +17862,7 @@ inference:
             let shell = outcome.shell.expect("the shell call reports itself");
 
             let mut trace = TraceWriter::open(
-                &workdir,
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 "ses_test".to_string(),
                 "cap".to_string(),
                 "0.1.0".to_string(),
@@ -17767,7 +18033,7 @@ inference:
             },
             &installed_native_tool(&binary, tmp.path()),
             tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
         )
@@ -17797,7 +18063,7 @@ inference:
             },
             &installed_native_tool(&binary, tmp.path()),
             tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
         )
@@ -17826,7 +18092,7 @@ inference:
             },
             &installed_native_tool(&binary, tmp.path()),
             tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
         )
@@ -17855,7 +18121,7 @@ inference:
             },
             &installed_native_tool(&binary, tmp.path()),
             tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
         )
@@ -17888,7 +18154,7 @@ inference:
             },
             &installed_native_tool(&binary, tmp.path()),
             tmp.path(),
-            tmp.path(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
         )
@@ -18943,7 +19209,7 @@ inference:
     /// A trace writer over `workdir/trace.jsonl`, as the reopen scenarios open it.
     async fn reopen_scenario_trace(workdir: &Path) -> TraceWriter {
         TraceWriter::open(
-            workdir,
+            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             "ses_test".to_string(),
             "cap".to_string(),
             "0.1.0".to_string(),
@@ -18996,7 +19262,7 @@ inference:
         };
         HookRuntime::new(
             &state.engine,
-            workdir,
+            &state.session_root,
             workdir,
             vec![staged_hook],
             SessionContextData {
@@ -19057,7 +19323,10 @@ inference:
         let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel(1024);
         let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(1024)));
         let mut trace = reopen_scenario_trace(workdir).await;
-        let mut otel = OtelEmitter::new(None, workdir, "cap".to_string(), "0.1.0".to_string());
+        let session_root = state.session_root.clone();
+        let accessible_root = state.accessible_root.clone();
+        let mut otel =
+            OtelEmitter::new(None, &session_root, "cap".to_string(), "0.1.0".to_string());
 
         // Caller resets per-task counters via write_task_start before the reopen loop.
         trace
@@ -19075,7 +19344,7 @@ inference:
 
         let result = run_task_with_reopens(
             state,
-            workdir,
+            &session_root,
             inference,
             max_task_reopens,
             None,
@@ -19085,7 +19354,7 @@ inference:
             &mut otel,
             streamed.then(|| "tsk_1".to_string()),
             streamed.then(|| (sse_tx.clone(), Arc::clone(&sse_buffer))),
-            workdir,
+            &accessible_root,
             "cap",
             "0.1.0",
             mode,
@@ -19121,7 +19390,7 @@ inference:
             result: result.map(|_| ()),
             events,
             record,
-            task_md: fs::read_to_string(workdir.join("task.md")).unwrap(),
+            task_md: fs::read_to_string(workdir.join("task.md")).unwrap_or_default(),
             frames: buffered_frames(&sse_buffer),
             result_txt: fs::read_to_string(workdir.join("out").join("result.txt"))
                 .unwrap_or_default(),
@@ -19378,7 +19647,7 @@ inference:
         };
 
         let mut trace = TraceWriter::open(
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             "ses_test".to_string(),
             "cap".to_string(),
             "0.1.0".to_string(),
@@ -19407,7 +19676,12 @@ inference:
         )
         .await
         .unwrap();
-        let mut otel = OtelEmitter::new(None, &workdir, "cap".to_string(), "0.1.0".to_string());
+        let mut otel = OtelEmitter::new(
+            None,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+            "cap".to_string(),
+            "0.1.0".to_string(),
+        );
 
         let staged_hook = StagedHookArtifact {
             name: "gatekeeper".to_string(),
@@ -19433,7 +19707,7 @@ inference:
 
         let mut hooks = HookRuntime::new(
             &state.engine,
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             &workdir,
             vec![staged_hook],
             SessionContextData {
@@ -19483,7 +19757,7 @@ inference:
 
         let result = run_task_with_reopens(
             &mut state,
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             &inference,
             max_task_reopens,
             None,
@@ -19493,7 +19767,7 @@ inference:
             &mut otel,
             None,
             None,
-            &workdir,
+            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             "cap",
             "0.1.0",
             ConversationMode::Stateless,
@@ -19957,7 +20231,11 @@ inference:
         std::fs::write(out.join("result.txt"), "an earlier answer").unwrap();
         std::fs::write(out.join("result_tsk_a.txt"), "interim 42").unwrap();
 
-        write_canceled_result(dir.path(), &ConversationMode::Threaded, Some("tsk_a"));
+        write_canceled_result(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            &ConversationMode::Threaded,
+            Some("tsk_a"),
+        );
         let read = |name: &str| std::fs::read_to_string(out.join(name)).unwrap();
         assert_eq!(read("result.txt"), crate::cancel::CANCELED_RESULT_TEXT);
         assert_eq!(
@@ -19971,8 +20249,16 @@ inference:
 
         // A stateless conversation keeps no per-task file, and a task.md task has no task id.
         let dir = tempfile::tempdir().unwrap();
-        write_canceled_result(dir.path(), &ConversationMode::Stateless, Some("tsk_b"));
-        write_canceled_result(dir.path(), &ConversationMode::Threaded, None);
+        write_canceled_result(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            &ConversationMode::Stateless,
+            Some("tsk_b"),
+        );
+        write_canceled_result(
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
+            &ConversationMode::Threaded,
+            None,
+        );
         let out = dir.path().join("out");
         assert_eq!(
             std::fs::read_to_string(out.join("result.txt")).unwrap(),
@@ -20050,7 +20336,7 @@ inference:
             model: "test-model".to_string(),
             engine: state.engine.clone(),
             accessible_workdir: workdir.clone(),
-            workdir: workdir.clone(),
+            workdir: crate::workdir_fs::WorkdirRoot::open(&workdir.clone()).unwrap(),
             inference_env: Vec::new(),
             capability_policy: CapabilityPolicy::default(),
             network_allow_rules: Vec::new(),
@@ -20784,7 +21070,7 @@ inference:
         let dir = tempfile::tempdir().unwrap();
         let map = Arc::new(crate::harness_session::HarnessSessionMap::new(
             None,
-            dir.path(),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
         ));
         map.put(
             "ctx_1",
@@ -20861,7 +21147,7 @@ inference:
     }
 
     fn stage_tool_manifest(state: &CapsuleStoreState, name: &str, manifest: &str) {
-        let dir = state.workdir.join("tools").join(name);
+        let dir = state.session_root.path().join("tools").join(name);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(PACKED_MANIFEST_ENTRY), manifest).unwrap();
     }
@@ -20973,12 +21259,17 @@ inference:
     fn check_required_fields_skips_a_name_that_is_not_a_plain_directory_name() {
         let (_dir, state) = required_fields_state();
         let requiring = manifest_with_schema(None, EDITOR_SCHEMA);
-        fs::write(state.workdir.join(PACKED_MANIFEST_ENTRY), &requiring).unwrap();
+        fs::write(
+            state.session_root.path().join(PACKED_MANIFEST_ENTRY),
+            &requiring,
+        )
+        .unwrap();
         stage_tool_manifest(&state, "nested", &requiring);
-        fs::create_dir_all(state.workdir.join("tools/nested/inner")).unwrap();
+        fs::create_dir_all(state.session_root.path().join("tools/nested/inner")).unwrap();
         fs::write(
             state
-                .workdir
+                .session_root
+                .path()
                 .join("tools/nested/inner")
                 .join(PACKED_MANIFEST_ENTRY),
             &requiring,
@@ -21021,7 +21312,7 @@ inference:
     fn check_required_fields_skips_an_absent_or_unparsable_manifest() {
         let (_dir, state) = required_fields_state();
         assert_eq!(refused(&state, "absent", serde_json::json!({})), None);
-        fs::create_dir_all(state.workdir.join("tools/no-manifest")).unwrap();
+        fs::create_dir_all(state.session_root.path().join("tools/no-manifest")).unwrap();
         assert_eq!(refused(&state, "no-manifest", serde_json::json!({})), None);
         stage_tool_manifest(&state, "not-yaml", "input_schema: [unclosed\n  :::");
         assert_eq!(refused(&state, "not-yaml", serde_json::json!({})), None);
@@ -21518,6 +21809,807 @@ inference:
         assert!(!refused_planner.contains("127.0.0.1"), "{refused_planner}");
         assert_eq!(door.requests().len(), 1);
     }
+
+    // ── Links inside the workdir: every runtime path refuses them ─────────────
+
+    /// What an outside file holds before, and must hold after, every scenario below.
+    const OPERATOR_DATA: &[u8] = b"operator data";
+
+    /// A workdir beside an `outside/` directory holding one sentinel file the capsule could aim a
+    /// link at.
+    struct Planted {
+        dir: tempfile::TempDir,
+        workdir: PathBuf,
+        outside: PathBuf,
+        sentinel: PathBuf,
+    }
+
+    impl Planted {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let workdir = dir.path().join("work");
+            let outside = dir.path().join("outside");
+            fs::create_dir_all(workdir.join("tools")).unwrap();
+            fs::create_dir_all(&outside).unwrap();
+            let sentinel = outside.join("sentinel.txt");
+            fs::write(&sentinel, OPERATOR_DATA).unwrap();
+            Self {
+                dir,
+                workdir,
+                outside,
+                sentinel,
+            }
+        }
+
+        fn link(&self, target: &Path, rel: &str) {
+            let at = self.workdir.join(rel);
+            fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(target, at).unwrap();
+        }
+
+        /// The sentinel is untouched and `outside/` holds exactly the `expected` names.
+        fn assert_outside_is(&self, expected: &[&str]) {
+            assert_eq!(fs::read(&self.sentinel).unwrap(), OPERATOR_DATA);
+            let mut names: Vec<String> = fs::read_dir(&self.outside)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            assert_eq!(names, expected, "outside/ changed");
+        }
+
+        fn assert_outside_unchanged(&self) {
+            self.assert_outside_is(&["sentinel.txt"]);
+        }
+
+        fn state(&self) -> CapsuleStoreState {
+            build_test_state(
+                Arc::new(FakeSkillRegistry::new(Vec::new())),
+                self.workdir.clone(),
+                self.dir.path().join("murmur.lock"),
+            )
+        }
+    }
+
+    /// The one distinct refusal the session's latch holds.
+    fn only_refusal(state: &CapsuleStoreState) -> crate::workdir_fs::WorkdirRefusal {
+        let mut refusals = state.accessible_root.take_refusals();
+        refusals.dedup();
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        refusals.remove(0)
+    }
+
+    /// The trace's refusal lines, then its `task_failed`, then its `task_end`, in that order, one
+    /// refusal naming `path` written as `operation`.
+    fn assert_failed_on_refusal(events: &[serde_json::Value], path: &str, operation: &str) {
+        let types: Vec<&str> = events
+            .iter()
+            .filter_map(|event| event["event_type"].as_str())
+            .collect();
+        let refused = types
+            .iter()
+            .position(|ty| *ty == "workdir_path_refused")
+            .unwrap_or_else(|| panic!("no workdir_path_refused line: {types:?}"));
+        let failed = types
+            .iter()
+            .position(|ty| *ty == "task_failed")
+            .unwrap_or_else(|| panic!("no task_failed line: {types:?}"));
+        let ended = types
+            .iter()
+            .rposition(|ty| *ty == "task_end")
+            .unwrap_or_else(|| panic!("no task_end line: {types:?}"));
+        assert!(refused < failed && failed < ended, "{types:?}");
+        let refusals = of_type(events, "workdir_path_refused");
+        assert!(
+            refusals
+                .iter()
+                .any(|line| line["path"] == path && line["operation"] == operation),
+            "{refusals:?}"
+        );
+        for line in &refusals {
+            assert_eq!(line["task_id"], "tsk_1");
+            assert_eq!(line["reason"], "symlink");
+        }
+        let failure = &of_type(events, "task_failed")[0];
+        assert_eq!(failure["cause"], "workdir_path_refused");
+        assert!(
+            failure["reason"].as_str().unwrap().contains(path),
+            "{failure}"
+        );
+        assert_eq!(events[ended]["exit_status"], "failed");
+    }
+
+    /// A process-transport harness that, on each spawn, counts itself in `spawns` and runs
+    /// `plant` before ending its turn with `body`.
+    fn write_planting_harness(dir: &Path, plant: &str, body: &str) -> PathBuf {
+        let script = dir.join("planting-harness");
+        let spawns = dir.join("spawns");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = \"--version\" ]; then echo \"fake-harness 1.0.0\"; exit 0; fi\n\
+                 echo x >> '{}'\n\
+                 read -r _\n\
+                 {plant}\n\
+                 {body}",
+                spawns.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&script);
+        script
+    }
+
+    fn harness_spawns(dir: &Path) -> usize {
+        fs::read_to_string(dir.join("spawns"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    /// Task `tsk_1` over `planted`'s workdir on the process transport, through
+    /// `run_task_with_reopens`, with the `gatekeeper` hook reopening `reopen_limit` times.
+    async fn run_planted_process_task(
+        planted: &Planted,
+        harness: &Path,
+        reopen_limit: u32,
+        setup: impl FnOnce(&mut CapsuleStoreState),
+    ) -> ReopenRun {
+        let inference = InferenceConfig {
+            transport: "process".into(),
+            driver: Some(murmur_artifact::InferenceDriver {
+                artifact: "fixture-process-driver".to_string(),
+                config: None,
+            }),
+            ..task_io_inference_config()
+        };
+        let mut state = planted.state();
+        state.process_driver = Some(staged_fixture_driver(&state.engine, harness));
+        setup(&mut state);
+        let mut hooks = reopen_scenario_hooks(&state, &planted.workdir, reopen_limit).await;
+        let run_config = reopen_scenario_run_config(0, None, None);
+        drive_reopen_scenario(
+            &mut state,
+            &planted.workdir,
+            &inference,
+            5,
+            run_config,
+            &mut hooks,
+            ConversationMode::Stateless,
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// Task `tsk_1` on the http transport, its driver double answering `response` on every call,
+    /// with a conversation record under `planted`'s directory.
+    async fn run_planted_http_task(
+        planted: &Planted,
+        response: &'static str,
+        setup: impl FnOnce(&mut CapsuleStoreState),
+    ) -> ReopenRun {
+        let mut state = planted.state();
+        fs::create_dir_all(planted.workdir.join("tools").join("mock-driver")).unwrap();
+        let driver =
+            crate::inference_import::test_support::driver_double(&state.engine, 0, response);
+        state
+            .tool_components
+            .insert("mock-driver".to_string(), driver);
+        setup(&mut state);
+        let inference = InferenceConfig {
+            transport: "http".into(),
+            driver: Some(murmur_artifact::InferenceDriver {
+                artifact: "mock-driver".to_string(),
+                config: None,
+            }),
+            max_turns: 5,
+            ..task_io_inference_config()
+        };
+        let mut hooks = reopen_scenario_hooks(&state, &planted.workdir, 0).await;
+        let run_config =
+            reopen_scenario_run_config(0, Some(planted.dir.path().join("conversations")), None);
+        drive_reopen_scenario(
+            &mut state,
+            &planted.workdir,
+            &inference,
+            5,
+            run_config,
+            &mut hooks,
+            ConversationMode::Stateless,
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// A link the harness plants at `task.md` during the first attempt is refused when the reopen
+    /// rewrites it: the sentinel keeps its bytes, the task fails on the refusal, and no second
+    /// attempt starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workdir_path_refused_on_reopen() {
+        let planted = Planted::new();
+        fs::write(planted.workdir.join("task.md"), REOPEN_TASK).unwrap();
+        let harness = write_planting_harness(
+            planted.dir.path(),
+            &format!(
+                "rm -f '{task}'; ln -s '{sentinel}' '{task}'",
+                task = planted.workdir.join("task.md").display(),
+                sentinel = planted.sentinel.display()
+            ),
+            "echo \"text done\"\necho \"end done\"\n",
+        );
+
+        let run = run_planted_process_task(&planted, &harness, 1, |_| {}).await;
+
+        planted.assert_outside_unchanged();
+        assert!(run.result.is_err(), "{:?}", run.result);
+        assert_failed_on_refusal(&run.events, "task.md", "write");
+        assert_eq!(harness_spawns(planted.dir.path()), 1, "no further attempt");
+        assert_eq!(count_type(&run.events, "task_reopened"), 1);
+    }
+
+    /// Registers delegation `dlg_1` for task `tsk_1` once that task is in scope and `planted` is
+    /// a link, and marks its outcome arrived — what a child posting its completion during the
+    /// attempt does.
+    fn arrive_during_attempt(live: Arc<crate::cancel::LiveDelegations>, planted: PathBuf) {
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let is_link = |path: &Path| {
+                fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+            };
+            while live.task_id().as_deref() != Some("tsk_1") || !is_link(&planted) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "tsk_1 never came into scope"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(live.register(
+                "dlg_1".to_string(),
+                crate::cancel::LiveDelegation {
+                    task_id: "tsk_1".to_string(),
+                    workdir: PathBuf::from("/unused"),
+                    capsule: "local/worker".to_string(),
+                    version: "0.1.0".to_string(),
+                    child_session_id: "ses_child".to_string(),
+                    child_workdir: ".murmur/children/worker-1".to_string(),
+                    started: std::time::Instant::now(),
+                    child: None,
+                    arrived: false,
+                },
+            ));
+            live.arrive("dlg_1");
+        });
+    }
+
+    /// A continuation that restarts rewrites `task.md` through the helper the reopen path uses,
+    /// so a link planted there is refused and latched, and nothing outside is written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workdir_path_refused_on_continuation() {
+        let planted = Planted::new();
+        planted.link(&planted.sentinel, "task.md");
+        let state = planted.state();
+
+        rewrite_task_input(&state.accessible_root, "do it\n\noutcomes", "outcomes");
+
+        planted.assert_outside_unchanged();
+        let refusal = only_refusal(&state);
+        assert_eq!(refusal.path, "task.md");
+        assert_eq!(
+            refusal.operation,
+            crate::workdir_fs::WorkdirOperation::Write
+        );
+    }
+
+    /// A continuation that resumes a harness session never touches `task.md`: the link a capsule
+    /// planted there during the first attempt is neither followed nor needed, and the task
+    /// completes on the continued attempt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workdir_path_refused_on_continuation_never_follows_a_resumed_task_md() {
+        let planted = Planted::new();
+        fs::write(planted.workdir.join("task.md"), REOPEN_TASK).unwrap();
+        let harness = write_planting_harness(
+            planted.dir.path(),
+            &format!(
+                "rm -f '{task}'; ln -s '{sentinel}' '{task}'; sleep 1",
+                task = planted.workdir.join("task.md").display(),
+                sentinel = planted.sentinel.display()
+            ),
+            "echo \"text done\"\necho \"end done\"\n",
+        );
+        let child = ".murmur/children/worker-1";
+        fs::create_dir_all(planted.workdir.join(child)).unwrap();
+        let outcome = crate::delegation::DelegationOutcome {
+            delegation_id: "dlg_1".to_string(),
+            capsule_name: "local/worker".to_string(),
+            capsule_version: "0.1.0".to_string(),
+            session_id: "ses_child".to_string(),
+            status: crate::delegation::DelegationStatus::Ok,
+            result_path: None,
+            workdir: planted.workdir.join(child).display().to_string(),
+            duration_ms: 1,
+            detail: None,
+            reported_by: crate::delegation::Reporter::Child,
+            delivered: true,
+            delivery_error: None,
+        };
+        fs::write(
+            planted.workdir.join(child).join("completion.json"),
+            serde_json::to_string(&outcome).unwrap(),
+        )
+        .unwrap();
+
+        let task_md = planted.workdir.join("task.md");
+        let run = run_planted_process_task(&planted, &harness, 0, |state| {
+            arrive_during_attempt(Arc::clone(&state.live_delegations), task_md);
+        })
+        .await;
+
+        planted.assert_outside_unchanged();
+        assert_eq!(
+            count_type(&run.events, "task_continued"),
+            1,
+            "{:?}",
+            run.events
+        );
+        assert_eq!(count_type(&run.events, "workdir_path_refused"), 0);
+        assert!(run.result.is_ok(), "{:?}", run.result);
+    }
+
+    /// The `skill.md`-and-manifest artifact the pull scenarios below publish.
+    fn my_skill_artifact() -> Vec<u8> {
+        zip_with_files(&[
+            (
+                PACKED_MANIFEST_ENTRY,
+                b"name: my-skill\nversion: 1.0.0\nruntime: skill\n",
+            ),
+            ("skill.md", b"# guidance"),
+        ])
+    }
+
+    /// A skill pulled into a `tools/` that is a link, into a tool directory that is one, or onto a
+    /// file that is one: the pull fails naming the path, nothing lands outside, the refusal is
+    /// latched, and `murmur.lock` is never written.
+    #[test]
+    fn workdir_path_refused_tools_pull_of_a_skill() {
+        for (link, refused_at) in [
+            ("tools", "tools"),
+            ("tools/my-skill", "tools/my-skill"),
+            ("tools/my-skill/skill.md", "tools/my-skill/skill.md"),
+            ("tools/my-skill/murmur.yaml", "tools/my-skill/murmur.yaml"),
+        ] {
+            let planted = Planted::new();
+            fs::remove_dir(planted.workdir.join("tools")).unwrap();
+            let target = if link.ends_with(".md") || link.ends_with(".yaml") {
+                planted.sentinel.clone()
+            } else {
+                planted.outside.clone()
+            };
+            planted.link(&target, link);
+            let lock_path = planted.dir.path().join("murmur.lock");
+            let mut state = build_test_state(
+                Arc::new(FakeSkillRegistry::new(my_skill_artifact())),
+                planted.workdir.clone(),
+                lock_path.clone(),
+            );
+            grant_install(&mut state, &["local/my-skill"], &[]);
+
+            let error = manage::Host::pull(&mut state, "local/my-skill".into(), "1.0.0".into())
+                .expect_err("the pull is refused");
+
+            assert!(error.contains(refused_at), "{link}: {error}");
+            planted.assert_outside_unchanged();
+            assert_eq!(only_refusal(&state).refused_at, refused_at, "{link}");
+            assert!(!lock_path.exists(), "{link}: murmur.lock was written");
+        }
+    }
+
+    /// A native tool's binary installed onto a link is refused the same way.
+    #[test]
+    fn workdir_path_refused_tools_pull_of_a_native_tool() {
+        let binary = fs::read("/bin/true").expect("a host binary to install");
+        let artifact = zip_with_files(&[
+            (
+                PACKED_MANIFEST_ENTRY,
+                b"name: native-tool\nversion: 1.0.0\nruntime: native\n",
+            ),
+            ("bin/native-tool", &binary),
+        ]);
+        let planted = Planted::new();
+        planted.link(&planted.sentinel, "tools/native-tool/native-tool");
+        let lock_path = planted.dir.path().join("murmur.lock");
+        let mut state = build_test_state(
+            Arc::new(FakeSkillRegistry {
+                runtime: RuntimeType::Native,
+                ..FakeSkillRegistry::new(artifact)
+            }),
+            planted.workdir.clone(),
+            lock_path.clone(),
+        );
+        grant_install(&mut state, &[], &["local/native-tool"]);
+
+        let error = manage::Host::pull(&mut state, "local/native-tool".into(), "1.0.0".into())
+            .expect_err("the pull is refused");
+
+        assert!(error.contains("tools/native-tool/native-tool"), "{error}");
+        planted.assert_outside_unchanged();
+        assert_eq!(
+            only_refusal(&state).refused_at,
+            "tools/native-tool/native-tool"
+        );
+        assert!(!lock_path.exists());
+    }
+
+    /// A dangling link where a shell tool's synthetic manifest goes is not "already staged".
+    #[test]
+    fn workdir_path_refused_tools_shell_manifest() {
+        let planted = Planted::new();
+        planted.link(
+            &planted.outside.join("not-yet.yaml"),
+            "tools/bash/murmur.yaml",
+        );
+        let state = planted.state();
+
+        let error = write_shell_tool_manifests(&state.session_root, &["bash".to_string()])
+            .expect_err("the manifest write is refused");
+
+        match error {
+            RuntimeError::WorkdirPathRefused { refusal } => {
+                assert_eq!(refusal.path, "tools/bash/murmur.yaml");
+                assert_eq!(refusal.refused_at, "tools/bash/murmur.yaml");
+            }
+            other => panic!("{other:?}"),
+        }
+        planted.assert_outside_unchanged();
+    }
+
+    /// `manage.remove()` with `tools` swapped for a link to a directory holding a same-named
+    /// subdirectory removes nothing there.
+    #[test]
+    fn workdir_path_refused_tools_remove() {
+        let planted = Planted::new();
+        let mut state = build_test_state(
+            Arc::new(FakeSkillRegistry::new(my_skill_artifact())),
+            planted.workdir.clone(),
+            planted.dir.path().join("murmur.lock"),
+        );
+        grant_install(&mut state, &["local/my-skill"], &[]);
+        manage::Host::pull(&mut state, "local/my-skill".into(), "1.0.0".into()).unwrap();
+        fs::create_dir_all(planted.outside.join("my-skill")).unwrap();
+        fs::write(planted.outside.join("my-skill/keep.txt"), OPERATOR_DATA).unwrap();
+        fs::rename(
+            planted.workdir.join("tools"),
+            planted.dir.path().join("moved-tools"),
+        )
+        .unwrap();
+        planted.link(&planted.outside, "tools");
+
+        let error = manage::Host::remove(&mut state, "local/my-skill".into())
+            .expect_err("the removal is refused");
+
+        assert!(error.contains("tools"), "{error}");
+        assert_eq!(
+            fs::read(planted.outside.join("my-skill/keep.txt")).unwrap(),
+            OPERATOR_DATA
+        );
+        assert_eq!(only_refusal(&state).refused_at, "tools");
+    }
+
+    /// A submitted plan written into a `plans` that is a link, or onto a plan file that is one:
+    /// a tool error naming the path, nothing outside changed, the refusal latched.
+    #[test]
+    fn workdir_path_refused_plan() {
+        for (link, refused_at) in [
+            ("plans", "plans"),
+            ("plans/plan-1.json", "plans/plan-1.json"),
+        ] {
+            let planted = Planted::new();
+            let target = if link == "plans" {
+                planted.outside.clone()
+            } else {
+                planted.sentinel.clone()
+            };
+            planted.link(&target, link);
+            let state = planted.state();
+            let plan = serde_json::json!({"id": "p", "steps": []});
+
+            let error = state
+                .write_plan_file(plan.as_object().unwrap())
+                .expect_err("the plan write is refused");
+
+            assert!(error.contains(refused_at), "{error}");
+            planted.assert_outside_unchanged();
+            assert_eq!(only_refusal(&state).refused_at, refused_at);
+        }
+    }
+
+    /// A peer that answers every request with `body`, on a fresh port.
+    async fn answering_peer(body: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// A fetched peer file stored into a `peer-in` that is a link, or onto a stored name that is
+    /// one: no byte outside, a tool error, `peer_file_fetch` traced `path_refused`, the refusal
+    /// latched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workdir_path_refused_peer_in() {
+        const BODY: &[u8] = b"peer bytes";
+        let handle = "hdl.payload.sig";
+        let stored = crate::peer_handoff::stored_path_for(
+            &crate::peer_handoff::handle_id(handle),
+            crate::peer_handoff::decode_payload_unverified(handle)
+                .map(|payload| payload.p)
+                .as_deref(),
+        );
+        for (link, refused_at) in [("peer-in", "peer-in"), (stored.as_str(), stored.as_str())] {
+            let planted = Planted::new();
+            let peer = answering_peer(BODY).await;
+            let mut state = planted.state();
+            let target = if link == "peer-in" {
+                planted.outside.clone()
+            } else {
+                planted.sentinel.clone()
+            };
+            planted.link(&target, link);
+            state.peer_fetch_rules = crate::network_policy::parse_network_allow_rules(&[peer
+                .trim_start_matches("http://")
+                .to_string()])
+            .unwrap();
+            state.peer_trace = Some(Arc::new(
+                crate::trace::ResourceTraceAppender::open(
+                    &state.session_root,
+                    "ses_test".to_string(),
+                    "evt_session".to_string(),
+                )
+                .await
+                .unwrap(),
+            ));
+
+            let error = state
+                .dispatch_fetch_peer_file(murmur::tool::run::ToolInput {
+                    data: Some(serde_json::json!({"peer": peer, "handle": handle}).to_string()),
+                    log_path: None,
+                })
+                .await
+                .expect_err("the store is refused");
+
+            assert!(error.contains(refused_at), "{error}");
+            planted.assert_outside_unchanged();
+            assert_eq!(only_refusal(&state).refused_at, refused_at);
+            let trace = fs::read_to_string(planted.workdir.join("trace.jsonl")).unwrap();
+            let fetch: serde_json::Value = trace
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|line| line["event_type"] == "peer_file_fetch")
+                .expect("the fetch is traced");
+            assert_eq!(fetch["outcome"], "path_refused", "{fetch}");
+        }
+    }
+
+    /// `out/result.txt` and `out/result_<task>.txt` written into an `out` that is a link, or onto
+    /// a file that is one, are refused and nothing outside changes.
+    #[test]
+    fn workdir_path_refused_result_writes() {
+        type Write = fn(&crate::workdir_fs::WorkdirRoot) -> Result<(), String>;
+        let writes: [(&str, Write); 2] = [
+            ("out/result.txt", |root| agent::write_result(root, "answer")),
+            ("out/result_tsk_a.txt", |root| {
+                agent::write_result_for_task(root, "tsk_a", "answer")
+            }),
+        ];
+        for (path, write) in writes {
+            for (link, refused_at) in [("out", "out"), (path, path)] {
+                let planted = Planted::new();
+                let target = if link == "out" {
+                    planted.outside.clone()
+                } else {
+                    planted.sentinel.clone()
+                };
+                planted.link(&target, link);
+                let state = planted.state();
+
+                let error = write(&state.session_root).expect_err("the write is refused");
+
+                assert!(error.contains(refused_at), "{error}");
+                planted.assert_outside_unchanged();
+                assert_eq!(only_refusal(&state).refused_at, refused_at);
+            }
+        }
+    }
+
+    /// An agent-loop task whose answer would land on a planted `out/result.txt` ends `failed` on
+    /// the refusal, not `completed`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workdir_path_refused_result_of_an_agent_loop_task() {
+        let planted = Planted::new();
+        fs::write(planted.workdir.join("task.md"), REOPEN_TASK).unwrap();
+        planted.link(&planted.sentinel, "out/result.txt");
+
+        let run = run_planted_http_task(&planted, HTTP_REOPEN_RESPONSE, |_| {}).await;
+
+        planted.assert_outside_unchanged();
+        assert!(
+            matches!(run.result, Err(RuntimeError::WorkdirPathRefused { .. })),
+            "{:?}",
+            run.result
+        );
+        assert_failed_on_refusal(&run.events, "out/result.txt", "write");
+    }
+
+    /// A `task.md` that is a link to a secret fails the attempt before any request: the secret
+    /// reaches no request, no trace line and no result.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workdir_path_refused_read_of_task_md() {
+        let planted = Planted::new();
+        fs::write(&planted.sentinel, b"SECRET-TOKEN").unwrap();
+        planted.link(&planted.sentinel, "task.md");
+
+        let run = run_planted_http_task(&planted, HTTP_REOPEN_RESPONSE, |_| {}).await;
+
+        assert_eq!(fs::read(&planted.sentinel).unwrap(), b"SECRET-TOKEN");
+        assert_eq!(
+            count_type(&run.events, "inference"),
+            0,
+            "a request was sent"
+        );
+        assert_failed_on_refusal(&run.events, "task.md", "read");
+        let trace = fs::read_to_string(planted.workdir.join("trace.jsonl")).unwrap();
+        assert!(!trace.contains("SECRET-TOKEN"));
+        assert!(!run.result_txt.contains("SECRET-TOKEN"));
+    }
+
+    /// A child's result file that is a link to a secret is never read into the parent's
+    /// delegation outcome, and the refusal is the parent's.
+    #[test]
+    fn workdir_path_refused_read_of_a_child_result() {
+        let planted = Planted::new();
+        fs::write(&planted.sentinel, b"SECRET-TOKEN").unwrap();
+        let child = ".murmur/children/worker-1";
+        planted.link(&planted.sentinel, &format!("{child}/out/result.txt"));
+        let state = planted.state();
+
+        let found = crate::delegation_plane::read_child_result(
+            &state.accessible_root,
+            Path::new(child),
+            "ses_child",
+            "tsk_1",
+        );
+
+        assert!(found.is_none(), "{found:?}");
+        assert_eq!(
+            only_refusal(&state).refused_at,
+            format!("{child}/out/result.txt")
+        );
+    }
+
+    /// A staged `skill.md` that is a link to a secret is left out of `MURMUR.md`.
+    #[test]
+    fn workdir_path_refused_read_of_a_skill_into_murmur_md() {
+        let planted = Planted::new();
+        fs::write(&planted.sentinel, b"SECRET-TOKEN").unwrap();
+        fs::create_dir_all(planted.workdir.join("tools/x")).unwrap();
+        fs::write(
+            planted.workdir.join("tools/x/murmur.yaml"),
+            "name: x\nversion: 0.1.0\nruntime: skill\n",
+        )
+        .unwrap();
+        planted.link(&planted.sentinel, "tools/x/skill.md");
+        let state = planted.state();
+
+        crate::murmur_md::write_murmur_md(
+            &state.session_root,
+            None,
+            None,
+            false,
+            &CapabilityPolicy::default(),
+            &CapsuleIdentity {
+                capsule_name: "cap".to_string(),
+                capsule_version: "0.1.0".to_string(),
+                session_id: "ses_test".to_string(),
+                capsule_url: String::new(),
+            },
+            None,
+        );
+
+        let murmur_md = fs::read_to_string(planted.workdir.join("MURMUR.md")).unwrap();
+        assert!(!murmur_md.contains("SECRET-TOKEN"));
+        assert_eq!(only_refusal(&state).refused_at, "tools/x/skill.md");
+    }
+
+    /// No `task.md` and no `input.txt` read as an empty task, with nothing refused.
+    #[test]
+    fn workdir_path_refused_read_absent_task_is_empty_and_unrefused() {
+        let planted = Planted::new();
+        let state = planted.state();
+        for transport in ["http", "process"] {
+            let inference = InferenceConfig {
+                transport: transport.into(),
+                ..task_io_inference_config()
+            };
+            assert_eq!(
+                agent::fresh_task_text(&inference, &state.accessible_root),
+                ""
+            );
+        }
+        assert!(state.accessible_root.take_refusals().is_empty());
+    }
+
+    /// A shell command answering every turn: it replaces `logs/bootstrap.log` with a link to the
+    /// sentinel and makes the conversation record unwritable, so the record's failure report — a
+    /// best-effort bootstrap-log append — meets the link after the tool has run.
+    fn bootstrap_link_planting_response(planted: &Planted) -> &'static str {
+        let record = planted.dir.path().join("conversations/ctx_1");
+        let command = format!(
+            "mkdir -p logs && rm -f logs/bootstrap.log && ln -s '{sentinel}' logs/bootstrap.log \
+             && rm -f '{record}/{file}' && rmdir '{record}' && touch '{record}'",
+            sentinel = planted.sentinel.display(),
+            record = record.display(),
+            file = crate::conversation::RECORD_FILE_NAME,
+        );
+        let response = serde_json::json!({
+            "stop_reason": "tool_call",
+            "content": [{
+                "type": "tool_call",
+                "id": "c1",
+                "name": "bash",
+                "input": {"command": command},
+            }],
+        });
+        Box::leak(response.to_string().into_boxed_str())
+    }
+
+    /// A best-effort append that meets a link planted mid-task is latched, and the next
+    /// checkpoint fails the task before another inference request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workdir_path_refused_latch_mid_task() {
+        let planted = Planted::new();
+        fs::write(planted.workdir.join("task.md"), REOPEN_TASK).unwrap();
+        let response = bootstrap_link_planting_response(&planted);
+
+        let run = run_planted_http_task(&planted, response, |state| {
+            state.capability_policy.shell_allow = vec!["bash".to_string()];
+        })
+        .await;
+
+        planted.assert_outside_unchanged();
+        assert_eq!(count_type(&run.events, "inference"), 1, "{:?}", run.events);
+        assert_failed_on_refusal(&run.events, "logs/bootstrap.log", "append");
+    }
+
+    /// A refusal latched while no task runs fails the next task at activation, before it reads
+    /// its task or sends a request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workdir_path_refused_latch_while_idle() {
+        let planted = Planted::new();
+        fs::write(planted.workdir.join("task.md"), REOPEN_TASK).unwrap();
+        planted.link(&planted.sentinel, "logs/bootstrap.log");
+
+        let run = run_planted_http_task(&planted, HTTP_REOPEN_RESPONSE, |state| {
+            agent::append_bootstrap_log(&state.session_root, "an idle-time warning");
+        })
+        .await;
+
+        planted.assert_outside_unchanged();
+        assert_eq!(count_type(&run.events, "inference"), 0);
+        assert_failed_on_refusal(&run.events, "logs/bootstrap.log", "append");
+    }
 }
 
 #[cfg(test)]
@@ -21536,7 +22628,11 @@ mod member_call_tests {
     }
 
     fn tools_declared(workdir: &Path) -> Vec<String> {
-        agent::inventory::tool_names(&agent::inventory::build_tool_inventory(workdir, None, &[]))
+        agent::inventory::tool_names(&agent::inventory::build_tool_inventory(
+            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
+            None,
+            &[],
+        ))
     }
 
     /// One request as a stand-in door received it.
@@ -21649,7 +22745,7 @@ mod member_call_tests {
         state.member_calls = Some(calls);
         state.peer_trace = Some(Arc::new(
             crate::trace::ResourceTraceAppender::open(
-                workdir,
+                &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
                 "ses_test".to_string(),
                 "evt_session".to_string(),
             )
@@ -21680,7 +22776,7 @@ mod member_call_tests {
     fn call_member_exists_only_for_a_member_with_callees() {
         let with = tempfile::tempdir().unwrap();
         write_member_call_tool_manifest(
-            with.path(),
+            &crate::workdir_fs::WorkdirRoot::open(with.path()).unwrap(),
             Some(&member(&["worker", "reviewer"], "http://localhost:1")),
         )
         .unwrap();
@@ -21732,7 +22828,11 @@ mod member_call_tests {
         let callee = FormationMember::from_bundle(authority.member_bundle("worker", &[]));
         for formation in [Some(&callee), None] {
             let without = tempfile::tempdir().unwrap();
-            write_member_call_tool_manifest(without.path(), formation).unwrap();
+            write_member_call_tool_manifest(
+                &crate::workdir_fs::WorkdirRoot::open(without.path()).unwrap(),
+                formation,
+            )
+            .unwrap();
             assert!(!without.path().join("tools").join(MEMBER_CALL_TOOL).exists());
             assert!(!tools_declared(without.path()).contains(&MEMBER_CALL_TOOL.to_string()));
         }
@@ -22172,7 +23272,7 @@ mod member_call_tests {
         let scope = state.live_delegations.scope_task("tsk_caller");
         state.peer_trace = Some(Arc::new(
             crate::trace::ResourceTraceAppender::open(
-                workdir,
+                &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
                 "ses_test".to_string(),
                 "evt_session".to_string(),
             )
@@ -23194,8 +24294,16 @@ mod member_call_tests {
     fn end_without_answer_exists_exactly_where_call_member_does() {
         let with = tempfile::tempdir().unwrap();
         let caller = member(&["worker"], "http://localhost:1");
-        write_member_call_tool_manifest(with.path(), Some(&caller)).unwrap();
-        write_end_without_answer_tool_manifest(with.path(), Some(&caller)).unwrap();
+        write_member_call_tool_manifest(
+            &crate::workdir_fs::WorkdirRoot::open(with.path()).unwrap(),
+            Some(&caller),
+        )
+        .unwrap();
+        write_end_without_answer_tool_manifest(
+            &crate::workdir_fs::WorkdirRoot::open(with.path()).unwrap(),
+            Some(&caller),
+        )
+        .unwrap();
         let manifest: serde_yaml::Value = serde_yaml::from_str(
             &std::fs::read_to_string(
                 with.path()
@@ -23233,8 +24341,16 @@ mod member_call_tests {
         let callee = FormationMember::from_bundle(authority.member_bundle("worker", &[]));
         for formation in [Some(&callee), None] {
             let without = tempfile::tempdir().unwrap();
-            write_member_call_tool_manifest(without.path(), formation).unwrap();
-            write_end_without_answer_tool_manifest(without.path(), formation).unwrap();
+            write_member_call_tool_manifest(
+                &crate::workdir_fs::WorkdirRoot::open(without.path()).unwrap(),
+                formation,
+            )
+            .unwrap();
+            write_end_without_answer_tool_manifest(
+                &crate::workdir_fs::WorkdirRoot::open(without.path()).unwrap(),
+                formation,
+            )
+            .unwrap();
             assert!(!without.path().join("tools").exists());
             let declared = tools_declared(without.path());
             assert!(!declared.contains(&MEMBER_CALL_TOOL.to_string()));

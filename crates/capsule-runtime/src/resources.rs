@@ -517,7 +517,7 @@ pub(crate) struct WorkdirGuard {
 impl WorkdirGuard {
     /// Spawn the checker thread for `workdir`. The returned handle owns the latch; dropping the
     /// last clone stops the thread within one interval.
-    pub(crate) fn spawn(workdir: &Path, max_bytes: u64) -> Arc<Self> {
+    pub(crate) fn spawn(workdir: &crate::workdir_fs::WorkdirRoot, max_bytes: u64) -> Arc<Self> {
         let guard = Arc::new(Self {
             max_bytes,
             breach: Mutex::new(None),
@@ -528,7 +528,7 @@ impl WorkdirGuard {
         // covers the reverse (guard dropped while the thread is mid-sleep). Same both-ends shape
         // as `limits::EpochTicker`.
         let weak = Arc::downgrade(&guard);
-        let workdir = workdir.to_path_buf();
+        let workdir = workdir.clone();
         thread::spawn(move || loop {
             thread::sleep(WORKDIR_CHECK_INTERVAL);
             let Some(guard) = weak.upgrade() else {
@@ -537,7 +537,7 @@ impl WorkdirGuard {
             if guard.stop.load(Ordering::Relaxed) || guard.breach().is_some() {
                 break;
             }
-            let observed = directory_size_bytes(&workdir);
+            let observed = directory_size_bytes(workdir.path());
             if observed > guard.max_bytes {
                 guard.record_breach(&workdir, observed);
                 break;
@@ -552,7 +552,7 @@ impl WorkdirGuard {
         self.breach.lock().ok().and_then(|breach| *breach)
     }
 
-    fn record_breach(&self, workdir: &Path, observed_bytes: u64) {
+    fn record_breach(&self, workdir: &crate::workdir_fs::WorkdirRoot, observed_bytes: u64) {
         let breach = WorkdirBreach {
             max_bytes: self.max_bytes,
             observed_bytes,
@@ -878,7 +878,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("small"), vec![0u8; 64]).unwrap();
 
-        let guard = WorkdirGuard::spawn(temp.path(), DEFAULT_WORKDIR_MAX_BYTES);
+        let guard = WorkdirGuard::spawn(
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            DEFAULT_WORKDIR_MAX_BYTES,
+        );
         assert_eq!(guard.breach(), None);
     }
 

@@ -27,11 +27,12 @@
 //! with [`stdout_failure`], so the command can be reported as failed after it has finished.
 
 use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::agent::append_bootstrap_log;
+use crate::workdir_fs::WorkdirRoot;
 
 /// What became of one diagnostic line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +49,7 @@ pub enum Emitted {
 ///
 /// Process-wide rather than threaded through every caller: a diagnostic can be raised from a
 /// spawned tokio task or a detached drain thread that holds no handle on the session.
-static FALLBACK_WORKDIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+static FALLBACK_WORKDIR: Mutex<Option<WorkdirRoot>> = Mutex::new(None);
 
 /// Arm the fallback with this session's directory — the one that holds `logs/`, not the user
 /// project directory a capsule sees as `"."`.
@@ -57,15 +58,19 @@ static FALLBACK_WORKDIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// from `runtime::launch` before the session announces itself. Setting it again replaces the
 /// previous value: a process that runs several sessions in sequence sends each session's
 /// refused lines to the session that is currently launching.
-pub fn set_diagnostic_workdir(workdir: &Path) {
+pub fn set_diagnostic_workdir(workdir: &WorkdirRoot) {
     let mut slot = FALLBACK_WORKDIR
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *slot = Some(workdir.to_path_buf());
+    *slot = Some(workdir.clone());
 }
 
-/// The armed fallback directory, or `None` when no session workdir exists yet.
+/// The armed fallback directory's host path, or `None` when no session workdir exists yet.
 pub fn diagnostic_workdir() -> Option<PathBuf> {
+    fallback_root().map(|root| root.path().to_path_buf())
+}
+
+fn fallback_root() -> Option<WorkdirRoot> {
     FALLBACK_WORKDIR
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -74,8 +79,8 @@ pub fn diagnostic_workdir() -> Option<PathBuf> {
 
 /// Write `line` and a newline to standard output.
 pub fn to_stdout(line: &str) -> Emitted {
-    let fallback = diagnostic_workdir();
-    emit_to(&mut std::io::stdout().lock(), line, fallback.as_deref())
+    let fallback = fallback_root();
+    emit_to(&mut std::io::stdout().lock(), line, fallback.as_ref())
 }
 
 /// [`to_stdout`] for a line that carries a credential, such as a door token. A line the stream
@@ -87,8 +92,8 @@ pub fn credential_to_stdout(line: &str) -> Emitted {
 
 /// Write `line` and a newline to standard error.
 pub fn to_stderr(line: &str) -> Emitted {
-    let fallback = diagnostic_workdir();
-    emit_to(&mut std::io::stderr().lock(), line, fallback.as_deref())
+    let fallback = fallback_root();
+    emit_to(&mut std::io::stderr().lock(), line, fallback.as_ref())
 }
 
 /// Write `chunk` to standard output exactly as given, adding no newline.
@@ -96,12 +101,16 @@ pub fn to_stderr(line: &str) -> Emitted {
 /// For relaying bytes that already carry their own line endings — a delegated child capsule's
 /// stdout, a rendered report.
 pub fn raw_to_stdout(chunk: &str) -> Emitted {
-    let fallback = diagnostic_workdir();
-    emit_raw_to(&mut std::io::stdout().lock(), chunk, fallback.as_deref())
+    let fallback = fallback_root();
+    emit_raw_to(&mut std::io::stdout().lock(), chunk, fallback.as_ref())
 }
 
 /// [`to_stdout`]'s core, over any writer, so a test can hand it a stream that refuses writes.
-pub(crate) fn emit_to<W: Write>(out: &mut W, line: &str, fallback: Option<&Path>) -> Emitted {
+pub(crate) fn emit_to<W: Write>(
+    out: &mut W,
+    line: &str,
+    fallback: Option<&WorkdirRoot>,
+) -> Emitted {
     let written = out
         .write_all(line.as_bytes())
         .and_then(|()| out.write_all(b"\n"))
@@ -114,7 +123,11 @@ pub(crate) fn emit_to<W: Write>(out: &mut W, line: &str, fallback: Option<&Path>
 
 /// [`raw_to_stdout`]'s core. `chunk` is written verbatim; the fallback line is it without its
 /// trailing newlines, since `append_bootstrap_log` ends every record with one of its own.
-pub(crate) fn emit_raw_to<W: Write>(out: &mut W, chunk: &str, fallback: Option<&Path>) -> Emitted {
+pub(crate) fn emit_raw_to<W: Write>(
+    out: &mut W,
+    chunk: &str,
+    fallback: Option<&WorkdirRoot>,
+) -> Emitted {
     let written = out.write_all(chunk.as_bytes()).and_then(|()| out.flush());
     match written {
         Ok(()) => Emitted::Written,
@@ -122,7 +135,7 @@ pub(crate) fn emit_raw_to<W: Write>(out: &mut W, chunk: &str, fallback: Option<&
     }
 }
 
-fn fall_back(line: &str, fallback: Option<&Path>) -> Emitted {
+fn fall_back(line: &str, fallback: Option<&WorkdirRoot>) -> Emitted {
     match fallback {
         Some(workdir) => {
             append_bootstrap_log(workdir, line);
@@ -316,7 +329,7 @@ mod tests {
         let outcome = emit_to(
             &mut Refusing::new(ErrorKind::BrokenPipe),
             "{\"url\":\"http://127.0.0.1:1/\"}",
-            Some(workdir.path()),
+            Some(&WorkdirRoot::open(workdir.path()).unwrap()),
         );
         assert_eq!(outcome, Emitted::Logged);
         let log = workdir.path().join("logs").join("bootstrap.log");
@@ -356,7 +369,7 @@ mod tests {
         let outcome = emit_raw_to(
             &mut Refusing::new(ErrorKind::BrokenPipe),
             "child line\n",
-            Some(workdir.path()),
+            Some(&WorkdirRoot::open(workdir.path()).unwrap()),
         );
         assert_eq!(outcome, Emitted::Logged);
         let log = workdir.path().join("logs").join("bootstrap.log");

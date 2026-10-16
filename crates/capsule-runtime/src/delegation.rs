@@ -40,6 +40,7 @@ use crate::a2a::{send_message_params, user_message, A2A_PROTOCOL_VERSION, A2A_VE
 use crate::errors::RuntimeError;
 use crate::http_client::http_json;
 use crate::origin::{TaskOrigin, PEER_ORIGIN_HEADER};
+use crate::workdir_fs::{EntryKind, WorkdirRoot, DEFAULT_FILE_MODE};
 
 /// The variable the parent's launcher injects into a delegated child, carrying its
 /// [`SpawnerHandle`] as compact JSON.
@@ -409,11 +410,18 @@ pub fn child_result_candidates(
     ]
 }
 
-/// The first of [`child_result_candidates`] that exists, or `None` when the child wrote no result.
-pub fn child_result_path(child_workdir: &Path, session_id: &str, task_id: &str) -> Option<PathBuf> {
+/// The first of [`child_result_candidates`] that is a regular file beneath `root`, or `None` when
+/// the child wrote no result. `child_workdir` is relative to `root`; a link where a candidate
+/// belongs is skipped, never followed.
+pub fn child_result_path(
+    root: &WorkdirRoot,
+    child_workdir: &Path,
+    session_id: &str,
+    task_id: &str,
+) -> Option<PathBuf> {
     child_result_candidates(child_workdir, session_id, task_id)
         .into_iter()
-        .find(|path| path.is_file())
+        .find(|path| matches!(root.entry_kind(path), Ok(Some(EntryKind::File))))
 }
 
 /// Where a child's own record of its ending goes: `<child workdir>/completion.json`.
@@ -427,8 +435,11 @@ pub fn completion_path(workdir: &Path) -> PathBuf {
 ///
 /// This is what stops one delegation being reported twice: the launcher's watcher reads the file
 /// before reporting anything, and a child that already delivered is not reported again.
-pub fn read_completion(workdir: &Path) -> Option<DelegationOutcome> {
-    let raw = std::fs::read_to_string(completion_path(workdir)).ok()?;
+///
+/// `workdir` is the child's directory relative to `root`, the parent's accessible workdir. A link
+/// at the file or on the way to it is refused and latched on `root`, and reads as no completion.
+pub fn read_completion(root: &WorkdirRoot, workdir: &Path) -> Option<DelegationOutcome> {
+    let raw = root.read_to_string(completion_path(workdir)).ok()??;
     serde_json::from_str(&raw).ok()
 }
 
@@ -439,22 +450,23 @@ pub fn read_completion(workdir: &Path) -> Option<DelegationOutcome> {
 /// [`report_completion`] rewrites it immediately after posting that completion — so a plain
 /// truncating write leaves a window in which the parent reads an empty or half-written file and
 /// records the delegation's outcome as `unknown`. The rename makes every reader see either the
-/// whole previous content or the whole new content. The temporary name is unique because the
-/// child and the watcher behind it can both reach this function.
-pub fn write_completion(workdir: &Path, outcome: &DelegationOutcome) -> Result<(), String> {
+/// whole previous content or the whole new content; [`WorkdirRoot::write_file`]'s temporary name
+/// is unique, because the child and the watcher behind it can both reach this function.
+///
+/// `workdir` is the child's directory relative to `root`, the parent's accessible workdir.
+pub fn write_completion(
+    root: &WorkdirRoot,
+    workdir: &Path,
+    outcome: &DelegationOutcome,
+) -> Result<(), String> {
     let body = serde_json::to_string_pretty(outcome)
         .map_err(|error| format!("failed to serialize the completion: {error}"))?;
-    let target = completion_path(workdir);
-    let temp = workdir.join(format!(
-        ".{COMPLETION_FILE}.{}.tmp",
-        uuid::Uuid::now_v7().simple()
-    ));
-    std::fs::write(&temp, format!("{body}\n"))
-        .map_err(|error| format!("failed to write {COMPLETION_FILE}: {error}"))?;
-    std::fs::rename(&temp, &target).map_err(|error| {
-        let _ = std::fs::remove_file(&temp);
-        format!("failed to write {COMPLETION_FILE}: {error}")
-    })
+    root.write_file(
+        completion_path(workdir),
+        format!("{body}\n").as_bytes(),
+        DEFAULT_FILE_MODE,
+    )
+    .map_err(|error| format!("failed to write {COMPLETION_FILE}: {error}"))
 }
 
 /// Post one completion to the parent's A2A door.
@@ -518,12 +530,13 @@ pub fn report_completion(
     handle: &SpawnerHandle,
     address: &CompletionAddress,
     outcome: DelegationOutcome,
+    root: &WorkdirRoot,
     workdir: &Path,
 ) -> DelegationOutcome {
     let mut outcome = outcome.with_bounded_detail();
     outcome.delivered = false;
     outcome.delivery_error = None;
-    if let Err(reason) = write_completion(workdir, &outcome) {
+    if let Err(reason) = write_completion(root, workdir, &outcome) {
         crate::runtime_err!(
             "[capsule-runtime] delegation {}: {reason}",
             outcome.delegation_id
@@ -540,12 +553,12 @@ pub fn report_completion(
                 "[capsule-runtime] delegation {}: the completion could not be delivered to {}: {reason}; recorded in {}",
                 outcome.delegation_id,
                 address.url,
-                completion_path(workdir).display(),
+                root.host_path(completion_path(workdir)).display(),
             );
             outcome.delivery_error = Some(reason);
         }
     }
-    if let Err(reason) = write_completion(workdir, &outcome) {
+    if let Err(reason) = write_completion(root, workdir, &outcome) {
         crate::runtime_err!(
             "[capsule-runtime] delegation {}: {reason}",
             outcome.delegation_id
@@ -558,11 +571,17 @@ pub fn report_completion(
 ///
 /// The only party that would be told is the party that did it, so this writes the file and
 /// contacts nobody.
-pub fn record_terminated(workdir: &Path, outcome: DelegationOutcome) -> DelegationOutcome {
+///
+/// `workdir` is the child's directory relative to `root`, the parent's accessible workdir.
+pub fn record_terminated(
+    root: &WorkdirRoot,
+    workdir: &Path,
+    outcome: DelegationOutcome,
+) -> DelegationOutcome {
     let mut outcome = outcome.with_bounded_detail();
     outcome.delivered = false;
     outcome.delivery_error = None;
-    if let Err(reason) = write_completion(workdir, &outcome) {
+    if let Err(reason) = write_completion(root, workdir, &outcome) {
         crate::runtime_err!(
             "[capsule-runtime] delegation {}: {reason}",
             outcome.delegation_id
@@ -781,13 +800,19 @@ mod tests {
     #[test]
     fn a_completion_round_trips_through_the_file() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_completion(dir.path()).is_none());
+        assert!(read_completion(&WorkdirRoot::open(dir.path()).unwrap(), Path::new("")).is_none());
 
         let mut written = outcome();
         written.delivered = true;
-        write_completion(dir.path(), &written).unwrap();
+        write_completion(
+            &WorkdirRoot::open(dir.path()).unwrap(),
+            Path::new(""),
+            &written,
+        )
+        .unwrap();
 
-        let read = read_completion(dir.path()).expect("the written completion reads back");
+        let read = read_completion(&WorkdirRoot::open(dir.path()).unwrap(), Path::new(""))
+            .expect("the written completion reads back");
         assert_eq!(read.delegation_id, written.delegation_id);
         assert_eq!(read.status, DelegationStatus::Ok);
         assert!(read.delivered);
@@ -809,10 +834,15 @@ mod tests {
         ended.reported_by = Reporter::Launcher;
         ended.detail = Some(PARENT_ENDED_DETAIL.to_string());
 
-        let recorded = record_terminated(dir.path(), ended);
+        let recorded = record_terminated(
+            &WorkdirRoot::open(dir.path()).unwrap(),
+            Path::new(""),
+            ended,
+        );
         assert!(!recorded.delivered);
         assert!(recorded.delivery_error.is_none());
-        let read = read_completion(dir.path()).expect("the record exists");
+        let read = read_completion(&WorkdirRoot::open(dir.path()).unwrap(), Path::new(""))
+            .expect("the record exists");
         assert_eq!(read.status, DelegationStatus::Terminated);
         assert_eq!(read.reported_by, Reporter::Launcher);
     }
@@ -872,12 +902,19 @@ mod tests {
             url: "http://127.0.0.1:1".to_string(),
         };
 
-        let reported = report_completion(&handle(), &nowhere, outcome(), dir.path());
+        let reported = report_completion(
+            &handle(),
+            &nowhere,
+            outcome(),
+            &WorkdirRoot::open(dir.path()).unwrap(),
+            Path::new(""),
+        );
         assert!(!reported.delivered);
         let reason = reported.delivery_error.expect("the refusal is recorded");
         assert!(reason.contains("failed to connect"), "{reason}");
 
-        let read = read_completion(dir.path()).expect("the record exists");
+        let read = read_completion(&WorkdirRoot::open(dir.path()).unwrap(), Path::new(""))
+            .expect("the record exists");
         assert!(!read.delivered);
         assert!(read.delivery_error.is_some());
     }
@@ -891,7 +928,12 @@ mod tests {
     #[test]
     fn a_rewrite_is_never_visible_half_written() {
         let dir = tempfile::tempdir().unwrap();
-        write_completion(dir.path(), &outcome()).unwrap();
+        write_completion(
+            &WorkdirRoot::open(dir.path()).unwrap(),
+            Path::new(""),
+            &outcome(),
+        )
+        .unwrap();
 
         let path = dir.path().to_path_buf();
         let writer = std::thread::spawn(move || {
@@ -901,14 +943,15 @@ mod tests {
                 // A detail long enough that one write is several pages, so a truncating write
                 // leaves a wide window rather than a theoretical one.
                 record.detail = Some("x".repeat(64 * 1024));
-                write_completion(&path, &record).unwrap();
+                write_completion(&WorkdirRoot::open(&path).unwrap(), Path::new(""), &record)
+                    .unwrap();
             }
         });
 
         let mut reads = 0;
         while !writer.is_finished() {
             assert!(
-                read_completion(dir.path()).is_some(),
+                read_completion(&WorkdirRoot::open(dir.path()).unwrap(), Path::new("")).is_some(),
                 "a concurrent reader saw no readable completion after {reads} good reads"
             );
             reads += 1;

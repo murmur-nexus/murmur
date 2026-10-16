@@ -15,10 +15,7 @@
 //! runtime rather than from `mur run`, so a reconciler in the CLI would be on a path the
 //! delegation case could not use.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -48,7 +45,7 @@ struct PriorSessionScan {
 /// from the report rather than reported unmarked, since an unmarked work id would be reported
 /// again by every later resume of the same session.
 pub(crate) async fn reconcile_prior_session(
-    sessions_root: &Path,
+    sessions_root: &crate::workdir_fs::WorkdirRoot,
     from_session: &str,
     this_session_id: &str,
     context_id: &str,
@@ -60,14 +57,21 @@ pub(crate) async fn reconcile_prior_session(
         );
         return None;
     }
-    let trace_path = sessions_root.join(from_session).join("trace.jsonl");
-    let contents = match std::fs::read_to_string(&trace_path) {
-        Ok(contents) => contents,
+    let trace_path = format!("{from_session}/{}", crate::trace::TRACE_FILE_NAME);
+    let contents = match sessions_root.read_to_string(&trace_path) {
+        Ok(Some(contents)) => contents,
+        Ok(None) => {
+            crate::runtime_err!(
+                "[capsule-runtime] could not read {} (it does not exist); background work \
+                 session {from_session} left unaccounted is not reported",
+                sessions_root.display_path(&trace_path)
+            );
+            return None;
+        }
         Err(error) => {
             crate::runtime_err!(
-                "[capsule-runtime] could not read {} ({error}); background work session \
-                 {from_session} left unaccounted is not reported",
-                trace_path.display()
+                "[capsule-runtime] could not read {error}; background work session \
+                 {from_session} left unaccounted is not reported"
             );
             return None;
         }
@@ -82,6 +86,7 @@ pub(crate) async fn reconcile_prior_session(
     // exist before the first marker is written.
     let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
     let mut appender = match PriorSessionTraceAppender::open(
+        sessions_root,
         &trace_path,
         from_session.to_string(),
         scan.session_event_id,
@@ -93,7 +98,7 @@ pub(crate) async fn reconcile_prior_session(
             crate::runtime_err!(
                 "[capsule-runtime] could not append to {} ({error}); the {} background command(s) \
                  session {from_session} left unaccounted are not reported",
-                trace_path.display(),
+                sessions_root.display_path(&trace_path),
                 scan.unaccounted.len()
             );
             return None;
@@ -224,6 +229,7 @@ fn scan_prior_trace(contents: &str) -> PriorSessionScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     use std::path::PathBuf;
 
@@ -273,7 +279,7 @@ mod tests {
         let (_root, root) = sessions_root_with("ses_prior", &trace_with(""));
 
         let report = block_on(reconcile_prior_session(
-            &root,
+            &crate::workdir_fs::WorkdirRoot::open(&root).unwrap(),
             "ses_prior",
             "ses_resumed",
             "ctx_1",
@@ -330,7 +336,7 @@ mod tests {
         let (_root, root) = sessions_root_with("ses_prior", &trace_with(""));
 
         assert!(block_on(reconcile_prior_session(
-            &root,
+            &crate::workdir_fs::WorkdirRoot::open(&root).unwrap(),
             "ses_prior",
             "ses_resumed",
             "ctx_1"
@@ -338,7 +344,7 @@ mod tests {
         .is_some());
         assert!(
             block_on(reconcile_prior_session(
-                &root,
+                &crate::workdir_fs::WorkdirRoot::open(&root).unwrap(),
                 "ses_prior",
                 "ses_third",
                 "ctx_1"
@@ -364,7 +370,7 @@ mod tests {
                 sessions_root_with("ses_prior", &trace_with(&format!("{accounting}\n")));
             assert!(
                 block_on(reconcile_prior_session(
-                    &root,
+                    &crate::workdir_fs::WorkdirRoot::open(&root).unwrap(),
                     "ses_prior",
                     "ses_resumed",
                     "ctx_1"
@@ -384,7 +390,7 @@ mod tests {
             &trace_with("not json at all\n{\"event_type\":\"shell_comple"),
         );
         let report = block_on(reconcile_prior_session(
-            &root,
+            &crate::workdir_fs::WorkdirRoot::open(&root).unwrap(),
             "ses_prior",
             "ses_resumed",
             "ctx_1",
@@ -406,7 +412,13 @@ mod tests {
             "",
         ] {
             assert!(
-                block_on(reconcile_prior_session(&root, name, "ses_resumed", "ctx_1")).is_none(),
+                block_on(reconcile_prior_session(
+                    &crate::workdir_fs::WorkdirRoot::open(&root).unwrap(),
+                    name,
+                    "ses_resumed",
+                    "ctx_1"
+                ))
+                .is_none(),
                 "{name:?} must report nothing rather than fail"
             );
         }
@@ -425,7 +437,7 @@ mod tests {
 "#;
         let (_root, root) = sessions_root_with("ses_prior", &trace_with(untrusted));
         let report = block_on(reconcile_prior_session(
-            &root,
+            &crate::workdir_fs::WorkdirRoot::open(&root).unwrap(),
             "ses_prior",
             "ses_resumed",
             "ctx_1",
@@ -442,7 +454,7 @@ mod tests {
 "#;
         let (_root, root) = sessions_root_with("ses_prior", &trace_with(orphaned));
         let report = block_on(reconcile_prior_session(
-            &root,
+            &crate::workdir_fs::WorkdirRoot::open(&root).unwrap(),
             "ses_prior",
             "ses_resumed",
             "ctx_1",

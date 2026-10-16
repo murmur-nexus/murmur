@@ -1,9 +1,13 @@
-use std::{fs, path::Path, sync::LazyLock};
+use std::sync::LazyLock;
 
 use murmur_artifact::{ArtifactRuntime, ToolRefresh, PACKED_MANIFEST_ENTRY};
 use serde_json::{json, Value};
 
-use crate::{origin::TrustClass, types::InstalledArtifactSummary};
+use crate::{
+    origin::TrustClass,
+    types::InstalledArtifactSummary,
+    workdir_fs::{EntryKind, WorkdirRoot},
+};
 
 const DEFAULT_INPUT_SCHEMA: &str = r#"{"type":"object","properties":{}}"#;
 
@@ -50,42 +54,33 @@ pub(crate) fn staged_manifest_runtime(manifest: &serde_yaml::Value) -> ArtifactR
 /// other entry, and a name with no summary (a runtime-provided tool), is built exactly as it
 /// would be with `installed` empty.
 pub(crate) fn build_tool_inventory(
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     system_prompt_artifact: Option<&str>,
     installed: &[InstalledArtifactSummary],
 ) -> Vec<Value> {
-    let tools_dir = workdir.join("tools");
     let mut tools = Vec::new();
 
-    let entries = match fs::read_dir(&tools_dir) {
-        Ok(e) => e,
-        Err(_) => return tools,
+    // Sorted by `list_dir`, not in directory order, because of prompt caching: the serialized
+    // tool array is part of the prefix every provider matches its cache on, so a reordered array
+    // changes the prefix and invalidates the cache entry for the whole session. Directory order
+    // is filesystem-dependent and unstable across launches; the sort is what makes the same tool
+    // set render the same bytes twice.
+    let Ok(Some(entries)) = workdir.list_dir("tools") else {
+        return tools;
     };
 
-    let mut entries: Vec<_> = entries.flatten().collect();
-    // Sorted, not in `read_dir` order, because of prompt caching: the serialized tool array is
-    // part of the prefix every provider matches its cache on, so a reordered array changes the
-    // prefix and invalidates the cache entry for the whole session. Directory order is
-    // filesystem-dependent and unstable across launches; the sort is what makes the same tool
-    // set render the same bytes twice.
-    entries.sort_by_key(|e| e.file_name());
-
-    for entry in entries {
-        let path = entry.path();
-        if !path.is_dir() {
+    for (name, kind) in entries {
+        // A link under `tools/` is read through below, which refuses it and latches the refusal;
+        // anything else that is not a directory is not a tool.
+        if !matches!(kind, EntryKind::Directory | EntryKind::Symlink) {
             continue;
         }
 
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-
-        let manifest_path = path.join(PACKED_MANIFEST_ENTRY);
-        let manifest_content = match fs::read_to_string(&manifest_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        let manifest_content =
+            match workdir.read_to_string(format!("tools/{name}/{PACKED_MANIFEST_ENTRY}")) {
+                Ok(Some(c)) => c,
+                _ => continue,
+            };
 
         let value: serde_yaml::Value = match serde_yaml::from_str(&manifest_content) {
             Ok(v) => v,
@@ -116,8 +111,10 @@ pub(crate) fn build_tool_inventory(
 
             from_manifest.unwrap_or_else(|| {
                 if matches!(runtime, ArtifactRuntime::Skill) {
-                    let skill_path = path.join("skill.md");
-                    fs::read_to_string(&skill_path)
+                    workdir
+                        .read_to_string(format!("tools/{name}/skill.md"))
+                        .ok()
+                        .flatten()
                         .unwrap_or_default()
                         .lines()
                         .find(|l| !l.trim().is_empty())
@@ -195,7 +192,7 @@ pub(crate) struct InventoryRefresh {
 impl HeldInventory {
     /// The launch build: [`build_tool_inventory`] over `workdir`, held as of `generation`.
     pub(crate) fn build(
-        workdir: &Path,
+        workdir: &WorkdirRoot,
         system_prompt_artifact: Option<&str>,
         installed: &[InstalledArtifactSummary],
         generation: u64,
@@ -230,7 +227,7 @@ impl HeldInventory {
     /// a runtime-origin entry the rebuild offers is marked from it exactly as at launch.
     pub(crate) fn refresh_before_call(
         &mut self,
-        workdir: &Path,
+        workdir: &WorkdirRoot,
         system_prompt_artifact: Option<&str>,
         installed: &[InstalledArtifactSummary],
         trigger: ToolRefresh,
@@ -297,6 +294,7 @@ mod tests {
     use murmur_artifact::LockOrigin;
 
     use super::*;
+    use std::{fs, path::Path};
 
     fn write_tool(tools_dir: &Path, name: &str) {
         let dir = tools_dir.join(name);
@@ -318,10 +316,11 @@ mod tests {
             write_tool(&tools_dir, name);
         }
 
-        let names: Vec<String> = build_tool_inventory(workdir.path(), None, &[])
-            .iter()
-            .map(|t| t["name"].as_str().unwrap().to_string())
-            .collect();
+        let names: Vec<String> =
+            build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[])
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect();
 
         assert_eq!(names, vec!["alpha", "mid", "zeta"]);
     }
@@ -336,10 +335,18 @@ mod tests {
             write_tool(&tools_dir, name);
         }
 
-        let first =
-            serde_json::to_string(&build_tool_inventory(workdir.path(), None, &[])).unwrap();
-        let second =
-            serde_json::to_string(&build_tool_inventory(workdir.path(), None, &[])).unwrap();
+        let first = serde_json::to_string(&build_tool_inventory(
+            &WorkdirRoot::open(workdir.path()).unwrap(),
+            None,
+            &[],
+        ))
+        .unwrap();
+        let second = serde_json::to_string(&build_tool_inventory(
+            &WorkdirRoot::open(workdir.path()).unwrap(),
+            None,
+            &[],
+        ))
+        .unwrap();
 
         assert_eq!(first, second);
     }
@@ -399,7 +406,12 @@ mod tests {
     }
 
     fn render(workdir: &Path, installed: &[InstalledArtifactSummary]) -> String {
-        serde_json::to_string(&build_tool_inventory(workdir, None, installed)).unwrap()
+        serde_json::to_string(&build_tool_inventory(
+            &WorkdirRoot::open(workdir).unwrap(),
+            None,
+            installed,
+        ))
+        .unwrap()
     }
 
     /// Operator-declared summaries leave the array byte-identical to one built with none, so a
@@ -423,9 +435,9 @@ mod tests {
     #[test]
     fn runtime_origin_inventory_prefixes_only_the_runtime_entry() {
         let workdir = mixed_workdir();
-        let unmarked = build_tool_inventory(workdir.path(), None, &[]);
+        let unmarked = build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[]);
         let marked = build_tool_inventory(
-            workdir.path(),
+            &WorkdirRoot::open(workdir.path()).unwrap(),
             None,
             &[
                 summary("fetcher", ArtifactRuntime::Tool, pulled_by("ses_puller")),
@@ -460,16 +472,22 @@ mod tests {
             "bare-skill",
             "name: bare-skill\nversion: 1.0.0\nruntime: skill\n",
         );
-        assert!(build_tool_inventory(workdir.path(), None, &[])[0]
-            .get("description")
-            .is_none());
+        assert!(
+            build_tool_inventory(&WorkdirRoot::open(workdir.path()).unwrap(), None, &[])[0]
+                .get("description")
+                .is_none()
+        );
 
         let installed = [summary(
             "bare-skill",
             ArtifactRuntime::Skill,
             pulled_by("ses_puller"),
         )];
-        let marked = build_tool_inventory(workdir.path(), None, &installed);
+        let marked = build_tool_inventory(
+            &WorkdirRoot::open(workdir.path()).unwrap(),
+            None,
+            &installed,
+        );
         assert_eq!(marked[0]["description"], RUNTIME_ORIGIN_MARKER);
 
         let described = mixed_workdir();
@@ -478,7 +496,11 @@ mod tests {
             ArtifactRuntime::Skill,
             pulled_by(""),
         )];
-        let marked = build_tool_inventory(described.path(), None, &installed);
+        let marked = build_tool_inventory(
+            &WorkdirRoot::open(described.path()).unwrap(),
+            None,
+            &installed,
+        );
         let entry = marked
             .iter()
             .find(|tool| tool["name"] == "pulled-style")

@@ -14,7 +14,7 @@ use capsule_runtime::{
     launch_session_handling_sigterm, preopen_reports, probe_io_max, requires_process_bounding,
     stage_session, state_store_reports, AfterTask, ArtifactRequest, IoMaxReport, LaunchEnding,
     LifecycleOverride, LockExpectation, ResumeMode, ResumeRequest, RuntimeError, StageRequest,
-    TaskAcceptance,
+    TaskAcceptance, WorkdirError,
 };
 use murmur_artifact::warn_on_unknown_manifest_keys;
 use murmur_artifact::{
@@ -842,18 +842,27 @@ pub(crate) fn run_run(
         // the agent's tools are preopened at `staged.accessible_workdir` (see
         // capsule-runtime's build_wasi_ctx calls), so task.md must land there or the
         // agent's own `read_file("task.md")` 404s even though the task was delivered.
-        let dst = staged.accessible_workdir.join("task.md");
-        write_input_to_workdir(task_value, &dst).map_err(|source| {
-            fail(
-                &session_id,
-                &workdir,
+        let written = task_input_bytes(task_value)
+            .map_err(|source| {
                 CliError::new(
                     E_IO_003,
-                    format!("failed to write --task to workdir: {source}"),
-                ),
-                json,
-            )
-        })?;
+                    format!("failed to read --task {task_value}: {source}"),
+                )
+            })
+            .and_then(|bytes| {
+                staged
+                    .write_task_input(&bytes)
+                    .map_err(|error| match error {
+                        WorkdirError::Refused(refusal) => {
+                            CliError::from(RuntimeError::WorkdirPathRefused { refusal })
+                        }
+                        WorkdirError::Io { .. } => CliError::new(
+                            E_IO_003,
+                            format!("failed to write --task to workdir: {error}"),
+                        ),
+                    })
+            });
+        written.map_err(|error| fail(&session_id, &workdir, error, json))?;
     }
 
     if write_lock_after_stage {
@@ -1355,13 +1364,14 @@ fn discover_capsule_component(project_dir: &Path) -> Result<PathBuf, CliError> {
     }
 }
 
-/// Copy `value` as a file if it names an existing path, otherwise write it
-/// as UTF-8 text.  This is the implementation of `--input` auto-detection.
-fn write_input_to_workdir(value: &str, dst: &Path) -> std::io::Result<()> {
+/// The task input `--task` names: the contents of the file at `value` when it names an existing
+/// path, otherwise `value` itself as UTF-8 text. The write into the workdir is
+/// [`capsule_runtime::StagedSession::write_task_input`]'s.
+fn task_input_bytes(value: &str) -> std::io::Result<Vec<u8>> {
     if Path::new(value).exists() {
-        fs::copy(value, dst).map(|_| ())
+        fs::read(value)
     } else {
-        fs::write(dst, value)
+        Ok(value.as_bytes().to_vec())
     }
 }
 
@@ -1382,37 +1392,29 @@ mod tests {
     }
 
     #[test]
-    fn write_input_file_path_copies_contents() {
+    fn task_input_from_a_file_path_is_its_contents() {
         let src_dir = tempdir().unwrap();
-        let dst_dir = tempdir().unwrap();
 
         let src = src_dir.path().join("task.md");
         fs::write(&src, "hello from file").unwrap();
 
-        let dst = dst_dir.path().join("task.md");
-        write_input_to_workdir(src.to_str().unwrap(), &dst).unwrap();
-
-        assert_eq!(fs::read_to_string(&dst).unwrap(), "hello from file");
+        assert_eq!(
+            task_input_bytes(src.to_str().unwrap()).unwrap(),
+            b"hello from file"
+        );
     }
 
     #[test]
-    fn write_input_inline_text_written_verbatim() {
-        let dst_dir = tempdir().unwrap();
-        let dst = dst_dir.path().join("task.md");
-
-        write_input_to_workdir("Run: echo hello", &dst).unwrap();
-
-        assert_eq!(fs::read_to_string(&dst).unwrap(), "Run: echo hello");
+    fn task_input_inline_text_is_verbatim() {
+        assert_eq!(
+            task_input_bytes("Run: echo hello").unwrap(),
+            b"Run: echo hello"
+        );
     }
 
     #[test]
-    fn write_input_empty_string_creates_empty_file() {
-        let dst_dir = tempdir().unwrap();
-        let dst = dst_dir.path().join("task.md");
-
-        write_input_to_workdir("", &dst).unwrap();
-
-        assert_eq!(fs::read_to_string(&dst).unwrap(), "");
+    fn task_input_empty_string_is_empty() {
+        assert_eq!(task_input_bytes("").unwrap(), b"");
     }
 
     #[test]

@@ -507,9 +507,17 @@ pub struct StagedProcessDriver {
 
 pub struct StagedSession {
     pub session_id: String,
+    /// The session directory's host path, for display and subprocess arguments. The runtime reads
+    /// and writes beneath it only through [`Self::session_root`].
     pub workdir: PathBuf,
     /// User project directory (or session dir if no --workdir). WASM tools see this at ".".
+    /// The runtime reads and writes beneath it only through [`Self::accessible_root`].
     pub accessible_workdir: std::path::PathBuf,
+    /// [`Self::accessible_workdir`], held open.
+    pub accessible_root: crate::workdir_fs::WorkdirRoot,
+    /// [`Self::workdir`], held open, reached from [`Self::accessible_root`] with no link followed.
+    /// The same root as `accessible_root` without `--workdir`.
+    pub session_root: crate::workdir_fs::WorkdirRoot,
     pub(crate) manifest_dir: PathBuf,
     pub(crate) capsule_name: String,
     pub(crate) capsule_version: String,
@@ -678,6 +686,16 @@ pub struct StagedSession {
 }
 
 impl StagedSession {
+    /// Writes `bytes` as the task input, `task.md` in the accessible workdir, with no link
+    /// followed: a link at `task.md` is refused rather than written through.
+    pub fn write_task_input(&self, bytes: &[u8]) -> Result<(), crate::workdir_fs::WorkdirError> {
+        self.accessible_root.write_file(
+            crate::runtime::TASK_INPUT_FILE,
+            bytes,
+            crate::workdir_fs::DEFAULT_FILE_MODE,
+        )
+    }
+
     /// Hands this session the credential it will present to the spawning daemon.
     pub fn set_spawn_credential(&mut self, credential: SpawnCredential) {
         self.spawn_credential = Some(credential);

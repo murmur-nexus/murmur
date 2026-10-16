@@ -100,6 +100,7 @@ pub(crate) mod trace;
 pub(crate) mod trace_blobs;
 pub mod types;
 pub(crate) mod wit_versions;
+pub mod workdir_fs;
 pub mod workdir_writes;
 
 pub use artifact_config::{
@@ -253,6 +254,11 @@ pub use types::{
     capability_policy_from_runtime_manifest, ArtifactRequest, CapabilityPolicy,
     InstalledArtifactSummary, LaunchEnding, LaunchResult, LockExpectation, ResolvedLockArtifact,
     ResumeMode, ResumeRequest, StageRequest, StagedSession,
+};
+// The one way the runtime touches a path inside a capsule's workdir, and what it reports when a
+// link there is refused.
+pub use workdir_fs::{
+    EntryKind, RefusalReason, WorkdirError, WorkdirOperation, WorkdirRefusal, WorkdirRoot,
 };
 // The declaration `--explain-scope` prints and `trace.jsonl` carries as
 // `session_start.effective_grants.runtime_writes`. Flat, on the same terms as the other report

@@ -8,12 +8,13 @@
 //! See `wit/hook/deps/murmur-conversation/read.wit` for the contract and
 //! [`crate::conversation`] for the record itself.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use wasmtime::component::Linker;
 
 use crate::bindings::hook::murmur::conversation::read::MessagePage;
+use crate::workdir_fs::WorkdirRoot;
 
 /// The versioned instance name the host provides `read-messages` under. Hook components that do
 /// not import it ignore the registration.
@@ -30,7 +31,7 @@ pub(crate) struct ConversationState {
     /// resolved. A read then returns an empty page, never an error.
     root: Option<PathBuf>,
     /// Session directory a malformed record line is reported into, beside stderr.
-    workdir: PathBuf,
+    workdir: WorkdirRoot,
     /// Context id of the task in scope. `None` before the first task of a launch.
     context_id: Mutex<Option<String>>,
     /// The record parsed for the last read, held so a hook paging one record reads and parses it
@@ -40,10 +41,10 @@ pub(crate) struct ConversationState {
 }
 
 impl ConversationState {
-    pub(crate) fn new(root: Option<PathBuf>, workdir: &Path) -> Self {
+    pub(crate) fn new(root: Option<PathBuf>, workdir: &WorkdirRoot) -> Self {
         Self {
             root,
-            workdir: workdir.to_path_buf(),
+            workdir: workdir.clone(),
             context_id: Mutex::new(None),
             cache: Mutex::new(crate::conversation::RecordCache::default()),
         }
@@ -377,6 +378,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// The hand-authored guest double is laid out against the canonical ABI, so its layout is
     /// only checked when Wasmtime validates it. Building it here fails loudly on a slip rather
@@ -402,7 +404,10 @@ mod tests {
 
         for state in [
             None,
-            Some(Arc::new(ConversationState::new(None, workdir.path()))),
+            Some(Arc::new(ConversationState::new(
+                None,
+                &WorkdirRoot::open(workdir.path()).unwrap(),
+            ))),
         ] {
             let mut linker: Linker<()> = Linker::new(&engine);
             add_conversation_to_linker(&mut linker, state).unwrap();
@@ -420,9 +425,12 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
 
-        let no_record = ConversationState::new(None, workdir.path());
+        let no_record = ConversationState::new(None, &WorkdirRoot::open(workdir.path()).unwrap());
         no_record.set_context(Some("ctx_1".to_string()));
-        let no_context = ConversationState::new(Some(home.path().to_path_buf()), workdir.path());
+        let no_context = ConversationState::new(
+            Some(home.path().to_path_buf()),
+            &WorkdirRoot::open(workdir.path()).unwrap(),
+        );
 
         for state in [&no_record, &no_context] {
             let page = state.read_messages(None, 10).expect("an Ok empty page");
@@ -456,7 +464,7 @@ mod tests {
             std::fs::write(dir.join("conversation.jsonl"), raw).unwrap();
         }
 
-        let state = ConversationState::new(Some(root), workdir.path());
+        let state = ConversationState::new(Some(root), &WorkdirRoot::open(workdir.path()).unwrap());
         state.set_context(Some("ctx_a".to_string()));
         let first = state.read_messages(None, 10).unwrap();
         assert_eq!(first.total, 2);
@@ -481,8 +489,10 @@ mod tests {
     fn a_context_id_that_escapes_reads_as_no_record() {
         let workdir = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let state =
-            ConversationState::new(Some(home.path().join("conversations/c")), workdir.path());
+        let state = ConversationState::new(
+            Some(home.path().join("conversations/c")),
+            &WorkdirRoot::open(workdir.path()).unwrap(),
+        );
         state.set_context(Some("../../escape".to_string()));
 
         assert_eq!(state.read_messages(None, 10).unwrap().total, 0);
@@ -526,7 +536,10 @@ mod tests {
                 }),
             ],
         );
-        let state = Arc::new(ConversationState::new(Some(root), workdir.path()));
+        let state = Arc::new(ConversationState::new(
+            Some(root),
+            &WorkdirRoot::open(workdir.path()).unwrap(),
+        ));
         state.set_context(Some("ctx_marks".to_string()));
 
         let mut config = wasmtime::Config::new();
@@ -599,7 +612,7 @@ mod tests {
                 json!({"role": "user", "content": "m", "id": "msg_number", "inserted_by": 42}),
             ],
         );
-        let state = ConversationState::new(Some(root), workdir.path());
+        let state = ConversationState::new(Some(root), &WorkdirRoot::open(workdir.path()).unwrap());
         state.set_context(Some("ctx_odd".to_string()));
 
         let page = state.read_messages(None, 10).expect("the read succeeds");

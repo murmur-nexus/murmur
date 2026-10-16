@@ -388,6 +388,7 @@ dependencies = [
  "mur-roost",
  "murmur-artifact",
  "ring",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml",

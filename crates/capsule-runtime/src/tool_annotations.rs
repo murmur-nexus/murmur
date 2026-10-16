@@ -69,7 +69,6 @@
 //! model-chosen values inside the containment check.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use murmur_artifact::PACKED_MANIFEST_ENTRY;
 use serde_json::Value;
@@ -513,17 +512,20 @@ impl ToolAnnotationMap {
     /// Read from the staged manifests rather than from anything the session produces: the schema
     /// is fixed before the session starts, and the model chooses values at call time but never
     /// annotations. A directory that cannot be read contributes nothing.
-    pub(crate) fn from_workdir(workdir: &Path) -> Self {
+    pub(crate) fn from_workdir(workdir: &crate::workdir_fs::WorkdirRoot) -> Self {
         let mut tools = BTreeMap::new();
-        let Ok(entries) = std::fs::read_dir(workdir.join("tools")) else {
+        let Ok(Some(entries)) = workdir.list_dir("tools") else {
             return Self { tools };
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let Some(schema) = read_staged_schema(&path.join(PACKED_MANIFEST_ENTRY)) else {
+        for (name, _) in entries {
+            // A link at the tool's directory or manifest is refused and latched, never read
+            // through.
+            let Some(schema) = workdir
+                .read_to_string(format!("tools/{name}/{PACKED_MANIFEST_ENTRY}"))
+                .ok()
+                .flatten()
+                .and_then(|yaml| schema_from_manifest_yaml(&yaml))
+            else {
                 continue;
             };
             let annotations = ToolAnnotations::from_schema_json(&schema);
@@ -583,10 +585,6 @@ pub(crate) fn declared_input_schema(manifest: &serde_yaml::Value) -> Option<Valu
 pub(crate) fn schema_from_manifest_yaml(manifest_yaml: &str) -> Option<String> {
     let manifest: serde_yaml::Value = serde_yaml::from_str(manifest_yaml).ok()?;
     Some(declared_input_schema(&manifest)?.to_string())
-}
-
-fn read_staged_schema(manifest_path: &Path) -> Option<String> {
-    schema_from_manifest_yaml(&std::fs::read_to_string(manifest_path).ok()?)
 }
 
 /// The properties that leave a tool's calls judged by key name — the decision behind `W-SEC-018`.
@@ -1008,12 +1006,18 @@ mod tests {
         );
         write("bare", "name: bare\nversion: 0.1.0\n");
 
-        let map = ToolAnnotationMap::from_workdir(workdir.path());
+        let map = ToolAnnotationMap::from_workdir(
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+        );
         assert!(map.for_tool("noter").is_opaque(&[key("note")]));
         assert!(
             map.for_tool("writer").is_empty() && map.for_tool("bare").is_empty(),
             "a tool that annotated nothing keeps the key-name heuristic"
         );
-        assert!(ToolAnnotationMap::from_workdir(Path::new("/nowhere/at/all")).is_empty());
+        let empty = tempfile::tempdir().unwrap();
+        assert!(ToolAnnotationMap::from_workdir(
+            &crate::workdir_fs::WorkdirRoot::open(empty.path()).unwrap()
+        )
+        .is_empty());
     }
 }

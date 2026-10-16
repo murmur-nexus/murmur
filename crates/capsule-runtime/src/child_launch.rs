@@ -51,6 +51,7 @@ use crate::host_warnings::HOST_WARNINGS_REPORTED_ENV;
 use crate::lifeline::SPAWNER_LIFELINE_ENV;
 use crate::mac_token;
 use crate::spawn_credential::SpawnApproval;
+use crate::workdir_fs::{WorkdirRoot, DEFAULT_DIR_MODE};
 
 /// Environment variable naming the `mur` binary to launch children with.
 ///
@@ -121,9 +122,10 @@ const CHILD_END_POLL: Duration = Duration::from_millis(20);
 /// and again at the `POST /register` the child performs for itself.
 #[derive(Debug)]
 pub struct ChildLaunchRequest {
-    /// The parent's own accessible workdir. The child's directory is composed beneath it, which
-    /// is what keeps the child inside the single preopen the parent's WASI layer already has.
-    pub parent_accessible_workdir: PathBuf,
+    /// The parent's own accessible workdir. The child's directory is created beneath it, with no
+    /// link followed, which is what keeps the child inside the single preopen the parent's WASI
+    /// layer already has.
+    pub parent_accessible_root: WorkdirRoot,
     pub capsule_name: String,
     pub capsule_version: String,
     /// The approval `POST /spawn` returned, spent by the child's own registration.
@@ -335,6 +337,11 @@ pub struct LaunchedChild {
     /// The directory the parent created for this child, and passed as its `--workdir`. The
     /// child's own session artifacts land at `<workdir>/.murmur/<session_id>/`.
     pub workdir: PathBuf,
+    /// [`Self::workdir`] relative to [`Self::parent_root`], the form every runtime read and write
+    /// of the child's files goes through.
+    pub(crate) workdir_rel: PathBuf,
+    /// The parent's accessible root the child's directory was created beneath.
+    pub(crate) parent_root: WorkdirRoot,
     /// The session id the child's runtime minted for itself.
     pub session_id: String,
     /// The child's A2A endpoint, `http://host:port`. Empty for a script capsule, which binds no
@@ -492,6 +499,16 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// with it. `<name>` is the bare part of a full `capsule_name`, so the directory is one segment
 /// whatever the scope.
 pub fn child_workdir_for(parent_accessible_workdir: &Path, capsule_name: &str) -> PathBuf {
+    parent_accessible_workdir.join(child_workdir_rel(capsule_name))
+}
+
+/// Every child's directory sits directly beneath this one, relative to the parent's accessible
+/// workdir.
+pub(crate) const CHILDREN_DIR: &str = ".murmur/children";
+
+/// [`child_workdir_for`] relative to the parent's accessible workdir: `.murmur/children/<name>-<16
+/// hex>`.
+fn child_workdir_rel(capsule_name: &str) -> PathBuf {
     let suffix = mac_token::random_hex(8).unwrap_or_else(|_| {
         // The OS CSPRNG is not expected to fail; a nanosecond clock reading still distinguishes
         // two delegations rather than collapsing them onto one directory.
@@ -503,13 +520,10 @@ pub fn child_workdir_for(parent_accessible_workdir: &Path, capsule_name: &str) -
                 .unwrap_or(0)
         )
     });
-    parent_accessible_workdir
-        .join(".murmur")
-        .join("children")
-        .join(format!(
-            "{}-{suffix}",
-            murmur_artifact::tool_name_of(capsule_name)
-        ))
+    Path::new(CHILDREN_DIR).join(format!(
+        "{}-{suffix}",
+        murmur_artifact::tool_name_of(capsule_name)
+    ))
 }
 
 /// Create the child's directory, start `mur` on it, and wait for the child to report itself.
@@ -525,8 +539,9 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
             "the child capsule's spawner lifeline could not be created: {error}"
         ))
     })?;
-    let workdir = child_workdir_for(&request.parent_accessible_workdir, &request.capsule_name);
-    create_child_dir(&workdir)?;
+    let workdir_rel = child_workdir_rel(&request.capsule_name);
+    create_child_dir(&request.parent_accessible_root, &workdir_rel)?;
+    let workdir = request.parent_accessible_root.host_path(&workdir_rel);
 
     let binary = mur_binary()?;
     let argv: Vec<String> = vec![
@@ -595,6 +610,8 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         write_result.map_err(|error| format!("failed to hand the child its launch grant: {error}"));
     let mut launched = LaunchedChild {
         workdir,
+        workdir_rel,
+        parent_root: request.parent_accessible_root.clone(),
         session_id: String::new(),
         capsule_url: String::new(),
         argv,
@@ -721,6 +738,8 @@ fn watch_for_completion(
     let process = Arc::clone(&launched.process);
     let stderr_tail = Arc::clone(&launched.stderr_tail);
     let workdir = launched.workdir.clone();
+    let workdir_rel = launched.workdir_rel.clone();
+    let root = launched.parent_root.clone();
     let session_id = launched.session_id.clone();
     let capsule_name = capsule_name.to_string();
     let capsule_version = capsule_version.to_string();
@@ -749,14 +768,15 @@ fn watch_for_completion(
         // down from `SIGTERM`. That record is not the outcome: the delegation was ended, and the
         // launcher's record below is written over it.
         let recorded = match ending {
-            Ending::Exited(_) => delegation::read_completion(&workdir),
+            Ending::Exited(_) => delegation::read_completion(&root, &workdir_rel),
             Ending::Deliberate => None,
         };
         if let Some(recorded) = recorded {
             if recorded.delivered {
                 return;
             }
-            let retried = delegation::report_completion(&handle, &address, recorded, &workdir);
+            let retried =
+                delegation::report_completion(&handle, &address, recorded, &root, &workdir_rel);
             if !retried.delivered {
                 // One retry, then the file and the line above it are the record.
                 crate::runtime_err!(
@@ -800,12 +820,14 @@ fn watch_for_completion(
                              delegation deadline"
                         ),
                     ),
-                    &workdir,
+                    &root,
+                    &workdir_rel,
                 );
             }
             Ending::Deliberate => {
                 delegation::record_terminated(
-                    &workdir,
+                    &root,
+                    &workdir_rel,
                     outcome(
                         DelegationStatus::Terminated,
                         delegation::PARENT_ENDED_DETAIL.to_string(),
@@ -832,7 +854,8 @@ fn watch_for_completion(
                     &handle,
                     &address,
                     outcome(DelegationStatus::Crashed, detail),
-                    &workdir,
+                    &root,
+                    &workdir_rel,
                 );
             }
         }
@@ -926,20 +949,12 @@ pub(crate) fn mur_binary() -> Result<PathBuf, RuntimeError> {
     })
 }
 
-fn create_child_dir(workdir: &Path) -> Result<(), RuntimeError> {
-    std::fs::create_dir_all(workdir).map_err(|source| RuntimeError::CreateWorkdir {
-        path: workdir.display().to_string(),
-        source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(workdir, std::fs::Permissions::from_mode(CHILD_DIR_MODE))
-            .map_err(|source| RuntimeError::CreateWorkdir {
-                path: workdir.display().to_string(),
-                source,
-            })?;
-    }
+/// Creates `rel` beneath `root` with [`CHILD_DIR_MODE`], and `.murmur/children` above it with the
+/// default mode, no link followed. A link on the way is
+/// [`RuntimeError::WorkdirPathRefused`].
+fn create_child_dir(root: &WorkdirRoot, rel: &Path) -> Result<(), RuntimeError> {
+    root.create_dir_all(CHILDREN_DIR, DEFAULT_DIR_MODE)?;
+    root.create_dir_all(rel, CHILD_DIR_MODE)?;
     Ok(())
 }
 
@@ -1326,7 +1341,7 @@ mod tests {
 
     fn request(env_allow: &[&str], spawner: Option<Spawner>) -> ChildLaunchRequest {
         ChildLaunchRequest {
-            parent_accessible_workdir: PathBuf::from("/tmp/parent"),
+            parent_accessible_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
             capsule_name: "worker".to_string(),
             capsule_version: "0.1.0".to_string(),
             grant: SpawnApproval::new("msa1.token".to_string()),
@@ -1548,6 +1563,8 @@ mod tests {
     fn child_launch_debug_prints_no_door_token() {
         let child = LaunchedChild {
             workdir: PathBuf::from("/tmp/child"),
+            workdir_rel: PathBuf::new(),
+            parent_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
             session_id: "ses_child".to_string(),
             capsule_url: "http://localhost:1".to_string(),
             argv: Vec::new(),
@@ -1716,6 +1733,8 @@ mod tests {
                 process_with_lifeline("bash", &["-c", "trap '' TERM; while :; do sleep 0.1; done"]);
             LaunchedChild {
                 workdir: PathBuf::from("/tmp/child"),
+                workdir_rel: PathBuf::new(),
+                parent_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
                 session_id: "ses_child".to_string(),
                 capsule_url: String::new(),
                 argv: Vec::new(),
@@ -1777,6 +1796,8 @@ mod tests {
             let process = Arc::new(Mutex::new(process));
             let child = LaunchedChild {
                 workdir: PathBuf::from("/tmp/child"),
+                workdir_rel: PathBuf::new(),
+                parent_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
                 session_id: "ses_child".to_string(),
                 capsule_url: String::new(),
                 argv: Vec::new(),
@@ -1842,6 +1863,8 @@ mod tests {
         let (process, _) = process_with_lifeline("sleep", &["30"]);
         let mut child = LaunchedChild {
             workdir: dir.path().to_path_buf(),
+            workdir_rel: PathBuf::new(),
+            parent_root: WorkdirRoot::open(dir.path()).unwrap(),
             session_id: "ses_child".to_string(),
             capsule_url: String::new(),
             argv: Vec::new(),
@@ -1872,7 +1895,9 @@ mod tests {
         child.shutdown().unwrap();
         watcher.join().unwrap();
 
-        let recorded = delegation::read_completion(dir.path()).expect("the ending is recorded");
+        let recorded =
+            delegation::read_completion(&WorkdirRoot::open(dir.path()).unwrap(), Path::new(""))
+                .expect("the ending is recorded");
         assert_eq!(recorded.status, DelegationStatus::Terminated);
         assert_eq!(recorded.reported_by, Reporter::Launcher);
         assert!(!recorded.delivered);
@@ -1913,6 +1938,8 @@ mod tests {
         let (process, _) = process_with_lifeline("bash", &["-c", &script]);
         let mut child = LaunchedChild {
             workdir: dir.path().to_path_buf(),
+            workdir_rel: PathBuf::new(),
+            parent_root: WorkdirRoot::open(dir.path()).unwrap(),
             session_id: "ses_child".to_string(),
             capsule_url: String::new(),
             argv: Vec::new(),
@@ -1943,7 +1970,9 @@ mod tests {
 
         child.shutdown().unwrap();
         watcher.join().unwrap();
-        let recorded = delegation::read_completion(dir.path()).expect("the ending is recorded");
+        let recorded =
+            delegation::read_completion(&WorkdirRoot::open(dir.path()).unwrap(), Path::new(""))
+                .expect("the ending is recorded");
         assert_eq!(recorded.status, DelegationStatus::Terminated);
         assert_eq!(recorded.reported_by, Reporter::Launcher);
         assert!(!recorded.delivered);

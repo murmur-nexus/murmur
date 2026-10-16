@@ -75,6 +75,7 @@ use crate::{
 use super::process_a2a::A2aStream;
 use super::process_events::SinkOutcome;
 use super::{claude_bridge, inventory::build_tool_inventory, process_events::ProcessEventSink};
+use crate::workdir_fs::WorkdirRoot;
 
 /// Loopback address the tool bridge binds on. Always host-local, independent of the capsule
 /// server's bind address — the bridge is only ever reached by the harness subprocess.
@@ -531,62 +532,61 @@ fn untested_version_message(probe: &VersionProbe, tested_versions: &[String]) ->
 }
 
 /// The run's private directory for the files the driver asked for, removed when the run ends.
-struct FilesDir(PathBuf);
+struct FilesDir {
+    root: WorkdirRoot,
+    /// The run id naming this run's directory under [`FILES_DIR_NAME`].
+    run: String,
+}
 
 impl FilesDir {
     /// Create `<session workdir>/.process-driver/<run id>/`, readable only by this user.
-    fn create(workdir: &Path) -> Result<Self, String> {
-        let dir = workdir
-            .join(FILES_DIR_NAME)
-            .join(Uuid::new_v4().simple().to_string());
-        std::fs::create_dir_all(&dir)
+    fn create(workdir: &WorkdirRoot) -> Result<Self, String> {
+        let run = Uuid::new_v4().simple().to_string();
+        workdir
+            .create_dir_all(format!("{FILES_DIR_NAME}/{run}"), FILES_DIR_MODE)
             .map_err(|e| format!("failed to create the harness files directory: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("failed to restrict the harness files directory: {e}"))?;
-        }
-        Ok(Self(dir))
+        Ok(Self {
+            root: workdir.clone(),
+            run,
+        })
     }
 
-    fn path(&self) -> &Path {
-        &self.0
+    /// The host path the harness is handed. The runtime itself writes here only through
+    /// [`Self::root`].
+    fn path(&self) -> PathBuf {
+        self.root
+            .host_path(format!("{FILES_DIR_NAME}/{}", self.run))
     }
 }
 
 impl Drop for FilesDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = self
+            .root
+            .remove_dir_all(format!("{FILES_DIR_NAME}/{}", self.run));
     }
 }
 
+/// Mode of a run's files directory: owner-only, because a file the driver asks for can carry a
+/// credential the harness reads.
+const FILES_DIR_MODE: u32 = 0o700;
+/// Mode of each file in it, owner-only for the same reason.
+const DRIVER_FILE_MODE: u32 = 0o600;
+
 /// Write the plan's files into the run's private directory, each readable only by this user.
 fn write_driver_files(
-    dir: &Path,
+    dir: &FilesDir,
     files: &[crate::process_driver::DriverFile],
 ) -> Result<Vec<String>, String> {
     let mut names = Vec::with_capacity(files.len());
     for file in files {
         check_driver_file_name(&file.name)?;
-        let path = dir.join(&file.name);
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut handle = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)
-                .map_err(|e| format!("failed to write the harness file {:?}: {e}", file.name))?;
-            handle
-                .write_all(file.contents.as_bytes())
-                .map_err(|e| format!("failed to write the harness file {:?}: {e}", file.name))?;
-        }
-        #[cfg(not(unix))]
-        std::fs::write(&path, file.contents.as_bytes())
+        dir.root
+            .write_file(
+                format!("{FILES_DIR_NAME}/{}/{}", dir.run, file.name),
+                file.contents.as_bytes(),
+                DRIVER_FILE_MODE,
+            )
             .map_err(|e| format!("failed to write the harness file {:?}: {e}", file.name))?;
         names.push(file.name.clone());
     }
@@ -598,7 +598,7 @@ pub(crate) async fn run_process_inference_loop(
     // `store_state` (shared &) lets the tool bridge execute declared tool artifacts through the
     // same dispatch the HTTP path uses, and carries the process driver this session staged.
     store_state: &CapsuleStoreState,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     // `max_turns` here is this attempt's remaining budget; `task_max_turns` is the task-wide
     // ceiling a run that exceeds it names.
     inference: &InferenceConfig,
@@ -610,7 +610,7 @@ pub(crate) async fn run_process_inference_loop(
     task_id: Option<String>,
     sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
     context_id: Option<String>,
-    accessible_workdir: &Path,
+    accessible_workdir: &WorkdirRoot,
     _name: &str,
     _version: &str,
     session_policy: HarnessSessionPolicy,
@@ -669,14 +669,14 @@ struct TaskCancel {
 #[allow(clippy::too_many_arguments)]
 async fn run_attempt(
     store_state: &CapsuleStoreState,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     inference: &InferenceConfig,
     task_max_turns: u32,
     system_prompt: Option<String>,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
-    accessible_workdir: &Path,
+    accessible_workdir: &WorkdirRoot,
     session_policy: HarnessSessionPolicy,
     cancel: Option<&TaskCancel>,
     a2a: &mut A2aStream,
@@ -726,14 +726,14 @@ async fn run_attempt(
 async fn run_harness(
     store_state: &CapsuleStoreState,
     staged: &StagedProcessDriver,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     inference: &InferenceConfig,
     task_max_turns: u32,
     system_prompt: Option<&str>,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
-    accessible_workdir: &Path,
+    accessible_workdir: &WorkdirRoot,
     session_policy: HarnessSessionPolicy,
     cancel: Option<&TaskCancel>,
     a2a: &mut A2aStream,
@@ -766,7 +766,7 @@ async fn run_harness(
         &staged.binary,
         &description.version_args,
         &base_env,
-        accessible_workdir,
+        accessible_workdir.path(),
     )
     .await;
     let (harness_version, version_tested) = match &probe {
@@ -834,7 +834,7 @@ async fn run_harness(
 
     let files_dir = FilesDir::create(workdir).map_err(launch_error)?;
     let files_dir_path = files_dir.path().to_string_lossy().into_owned();
-    let files = write_driver_files(files_dir.path(), &plan.files).map_err(launch_error)?;
+    let files = write_driver_files(&files_dir, &plan.files).map_err(launch_error)?;
     let args: Vec<String> = plan
         .args
         .iter()
@@ -888,7 +888,7 @@ async fn run_harness(
         &args,
         &env,
         workdir,
-        accessible_workdir,
+        accessible_workdir.path(),
         &plan,
         start,
         &mut driver,
@@ -946,7 +946,7 @@ async fn drive_harness(
     bridge: Option<&claude_bridge::BridgeHandle>,
     args: &[String],
     env: &BTreeMap<String, String>,
-    workdir: &Path,
+    workdir: &WorkdirRoot,
     cwd: &Path,
     plan: &LaunchPlan,
     start: HarnessStart,
@@ -1767,7 +1767,10 @@ mod tests {
     /// A policy over a map that keeps nothing on disk, which is all `plan_session` reads.
     fn policy(context_id: Option<&str>, continue_conversation: bool) -> HarnessSessionPolicy {
         HarnessSessionPolicy {
-            map: Arc::new(HarnessSessionMap::new(None, Path::new("/tmp"))),
+            map: Arc::new(HarnessSessionMap::new(
+                None,
+                &crate::workdir_fs::WorkdirRoot::open(Path::new("/tmp")).unwrap(),
+            )),
             context_id: context_id.map(str::to_string),
             continue_conversation,
             forget: None,
@@ -2326,9 +2329,9 @@ mod tests {
     fn the_files_directory_is_private_and_removed_when_the_run_ends() {
         let dir = tempfile::tempdir().unwrap();
         let path = {
-            let files = FilesDir::create(dir.path()).unwrap();
+            let files = FilesDir::create(&WorkdirRoot::open(dir.path()).unwrap()).unwrap();
             let names = write_driver_files(
-                files.path(),
+                &files,
                 &[crate::process_driver::DriverFile {
                     name: "config.json".to_string(),
                     contents: "{}".to_string(),
@@ -2340,11 +2343,11 @@ mod tests {
             {
                 use std::os::unix::fs::PermissionsExt;
                 let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-                assert_eq!(mode(files.path()), 0o700);
+                assert_eq!(mode(&files.path()), 0o700);
                 assert_eq!(mode(&files.path().join("config.json")), 0o600);
             }
             assert!(files.path().starts_with(dir.path().join(FILES_DIR_NAME)));
-            files.path().to_path_buf()
+            files.path()
         };
         assert!(!path.exists(), "the run's files directory outlived the run");
     }
