@@ -119,8 +119,26 @@ pub enum RuntimeError {
         refusal: crate::workdir_fs::WorkdirRefusal,
     },
 
+    /// `~/.murmur/sessions/<session-id>/`, the session's runtime directory, could not be created
+    /// or locked. `mur` renders it as `E-IO-003`.
+    #[error("failed to create the runtime directory: {reason}")]
+    RuntimeDirUnavailable { reason: String },
+
+    /// A delegated child's `--workdir` is not the directory its parent created: its
+    /// `(st_dev, st_ino)` differs from `--workdir-identity`. Nothing was written. `mur` renders it
+    /// as `E-RUN-051`.
+    #[error(
+        "the workdir {workdir} is not the directory the delegating capsule created (expected \
+         {expected}, found {found})"
+    )]
+    WorkdirIdentityMismatch {
+        workdir: String,
+        expected: String,
+        found: String,
+    },
+
     /// A tool name that is not one normal path component, so its staged manifest would land
-    /// outside `workdir/tools/`.
+    /// outside the runtime directory's `tools/`.
     #[error(
         "tool name '{}' is not a bare name, so its manifest would be written outside the \
          workdir's tools/ directory",
@@ -308,7 +326,7 @@ pub enum RuntimeError {
     },
 
     /// Two declared artifacts share a tool name, the bare part a session offers the model and
-    /// stages under `workdir/tools/`.
+    /// stages under `<runtime dir>/tools/`.
     #[error(
         "artifacts '{first}' and '{second}' share the tool name '{tool}'; a capsule offers each \
          artifact to the model by its tool name, so no two may share one"

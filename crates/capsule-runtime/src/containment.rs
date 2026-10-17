@@ -32,6 +32,7 @@ use serde::Serialize;
 use crate::{
     cgroup::{IoMaxReport, IoMaxStatus},
     errors::RuntimeError,
+    runtime_dir::RuntimeDirPlacement,
     sandbox::{detect_enforcement_tier, EnforcementTier},
     sealed::{SealedBlocker, UsernsGrant},
     types::CapabilityPolicy,
@@ -64,11 +65,12 @@ pub(crate) fn achieved_class_for_tier(tier: EnforcementTier) -> ContainmentClass
 }
 
 /// The class a session actually achieves: the host's ceiling from [`achieved_class_for_tier`],
-/// capped by what the capsule's own `capabilities.filesystem.workdir_exec` leaves standing.
+/// capped by what the capsule's own `capabilities.filesystem.workdir_exec` leaves standing and by
+/// where its runtime directory lies.
 ///
-/// This is the one place a *manifest* property lowers an achieved class, and it does so by capping
-/// rather than by deciding: [`achieved_class_for_tier`] above stays pure and tier-only, so no
-/// declaration can talk a host up, and this wrapper can only ever talk a capsule *down*.
+/// These are the only inputs besides the tier that lower an achieved class, and they do so by
+/// capping rather than by deciding: [`achieved_class_for_tier`] above stays pure and tier-only,
+/// so no declaration can talk a host up, and this wrapper can only ever talk a capsule *down*.
 ///
 /// Why `workdir_exec` caps at [`ContainmentClass::Advisory`]: `scoped` (and `sealed` above it) both
 /// claim that what runs inside the capsule is bounded by what the operator declared. With the
@@ -76,12 +78,18 @@ pub(crate) fn achieved_class_for_tier(tier: EnforcementTier) -> ContainmentClass
 /// own workdir runs whatever `capabilities.shell.allow` says — the allowlist stops being an
 /// enforceable property. A host that could back `scoped` still cannot back a claim the capsule
 /// itself has given up, so the honest report is `advisory`, on every tier.
+///
+/// Why `runtime_dir_inside_workdir` caps at [`ContainmentClass::Advisory`] too: with
+/// `~/.murmur/sessions` inside the workdir the capsule's commands write, they can rewrite the
+/// task, `MURMUR.md`, a submitted plan or an installed tool's entrypoint, which every class above
+/// `advisory` claims they cannot.
 pub(crate) fn achieved_containment_class(
     tier: EnforcementTier,
     workdir_exec: bool,
+    runtime_dir_inside_workdir: bool,
 ) -> ContainmentClass {
     let host_ceiling = achieved_class_for_tier(tier);
-    if workdir_exec {
+    if workdir_exec || runtime_dir_inside_workdir {
         host_ceiling.min(ContainmentClass::Advisory)
     } else {
         host_ceiling
@@ -112,11 +120,16 @@ pub fn detect_achieved_containment() -> ContainmentClass {
 /// no kernel backs `scoped` for a capsule that has declared its workdir executable. Naming a
 /// missing Landlock ABI to someone whose real problem is a line in their own manifest sends them to
 /// the wrong machine.
+///
+/// `runtime_dir_inside` is the placement when the session's runtime directory lies inside the
+/// workdir, checked right after `workdir_exec` and for the same reason: the fix is a different
+/// `--workdir`, not a different host.
 pub fn containment_shortfall_reason(
     declared: ContainmentClass,
     achieved: ContainmentClass,
     sealed_blocker: Option<SealedBlocker>,
     workdir_exec: bool,
+    runtime_dir_inside: Option<&RuntimeDirPlacement>,
 ) -> Option<String> {
     if achieved >= declared {
         return None;
@@ -124,6 +137,10 @@ pub fn containment_shortfall_reason(
 
     if workdir_exec && declared > ContainmentClass::Advisory {
         return Some(WORKDIR_EXEC_SHORTFALL.to_string());
+    }
+
+    if let Some(placement) = runtime_dir_inside.filter(|_| declared > ContainmentClass::Advisory) {
+        return Some(runtime_dir_inside_shortfall(placement));
     }
 
     let reason = match declared {
@@ -165,6 +182,19 @@ const WORKDIR_EXEC_SHORTFALL: &str =
      then enforced by the kernel on the resolved path) or lower the declared containment floor to \
      advisory";
 
+/// The reason a capsule whose runtime directory lies inside its workdir falls short of any floor
+/// above `advisory`, naming both paths and the fix.
+fn runtime_dir_inside_shortfall(placement: &RuntimeDirPlacement) -> String {
+    format!(
+        "the runtime directory {} lies inside the workdir {}, so this capsule's commands can \
+         change the files the runtime owns — task.md, MURMUR.md, plans and installed tools — and \
+         no host can back a class above advisory for it; run with a --workdir that does not \
+         contain ~/.murmur",
+        placement.sessions_dir.display(),
+        placement.workdir.display()
+    )
+}
+
 /// The refusal gate: `Ok(())` when the host's `achieved` class meets or exceeds the `declared`
 /// floor, [`RuntimeError::ContainmentFloorUnmet`] otherwise.
 ///
@@ -175,8 +205,15 @@ pub fn check_containment_floor(
     achieved: ContainmentClass,
     sealed_blocker: Option<SealedBlocker>,
     workdir_exec: bool,
+    runtime_dir_inside: Option<&RuntimeDirPlacement>,
 ) -> Result<(), RuntimeError> {
-    match containment_shortfall_reason(declared, achieved, sealed_blocker, workdir_exec) {
+    match containment_shortfall_reason(
+        declared,
+        achieved,
+        sealed_blocker,
+        workdir_exec,
+        runtime_dir_inside,
+    ) {
         None => Ok(()),
         Some(reason) => Err(RuntimeError::ContainmentFloorUnmet {
             declared,
@@ -315,6 +352,10 @@ pub struct PreopenReport {
     /// What the guest is preopened into once the role's baseline and [`Self::scope`] are both
     /// applied.
     pub surface: PreopenSurface,
+    /// Whether the guest also holds the session's runtime directory, read-only, at
+    /// `murmur-runtime/`: a `runtime: tool` entry with no `capabilities.filesystem.scope`, and
+    /// nothing else. Always serialized.
+    pub runtime_dir_read_only: bool,
 }
 
 impl PreopenReport {
@@ -324,12 +365,22 @@ impl PreopenReport {
         let artifact = &self.artifact;
         let role = &self.role;
         let surface = self.surface.summary();
+        let runtime_dir = if self.runtime_dir_read_only {
+            format!(
+                "; runtime directory read-only at {}/",
+                crate::runtime_dir::RUNTIME_DIR_GUEST_PATH
+            )
+        } else {
+            String::new()
+        };
         match &self.scope {
-            Some(scope) => {
-                format!("{artifact} ({role}): {surface} — capabilities.filesystem.scope: {scope}")
-            }
+            Some(scope) => format!(
+                "{artifact} ({role}): {surface} — capabilities.filesystem.scope: \
+                 {scope}{runtime_dir}"
+            ),
             None => format!(
-                "{artifact} ({role}): {surface} — no capabilities.filesystem.scope declared"
+                "{artifact} ({role}): {surface} — no capabilities.filesystem.scope \
+                 declared{runtime_dir}"
             ),
         }
     }
@@ -359,16 +410,17 @@ pub enum FilesystemRestriction {
 /// The counterpart to every grant beside it in a [`ScopeReport`]: those say what the capsule may
 /// reach, and this says which of the restrictions an operator would read into them are not there.
 ///
-/// [`Self::not_protected`] is empty at [`FilesystemRestriction::Absent`] and non-empty below it. It
-/// is serialized either way — an absent key identifies a runtime that predates the field, never a
-/// capsule with nothing to disclaim.
+/// [`Self::not_protected`] is non-empty below [`FilesystemRestriction::Absent`], and empty at it
+/// unless the runtime directory lies inside the workdir. It is serialized either way — an absent
+/// key identifies a runtime that predates the field, never a capsule with nothing to disclaim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FilesystemBoundaryReport {
     /// What the session's filesystem mechanism restricts.
     pub restriction: FilesystemRestriction,
-    /// One statement per protection an operator would otherwise assume, empty at
-    /// [`FilesystemRestriction::Absent`]. Rendered verbatim under `Not protected here`, so the JSON
-    /// and the human report cannot word the same disclaimer differently.
+    /// One statement per protection an operator would otherwise assume, the runtime directory's
+    /// [`RuntimeDirReport::not_protected_because`] among them when it is set. Rendered verbatim
+    /// under `Not protected here`, so the JSON and the human report cannot word the same
+    /// disclaimer differently.
     pub not_protected: Vec<String>,
 }
 
@@ -447,6 +499,109 @@ pub(crate) fn filesystem_boundary(applied: EnforcementTier) -> FilesystemBoundar
         restriction,
         not_protected,
     }
+}
+
+/// What the session's runtime directory is to the capsule's commands — `--explain-scope`'s
+/// `Runtime directory` block, `session_start.effective_grants.runtime_dir` and `mur doctor`'s
+/// section, all from [`runtime_dir_report`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeDirReport {
+    /// `<home>/.murmur/sessions/<session-id>/runtime`, with the literal `<session-id>` segment
+    /// `runtime_writes` carries.
+    pub path: String,
+    /// Whether no capsule command can change a file in it.
+    pub read_only_to_commands: bool,
+    /// The mechanism that makes it read-only: `mountns+landlock` on the sealed tier, `landlock`
+    /// on the Landlock tier, `null` when nothing does.
+    pub enforced_by: Option<&'static str>,
+    /// Why a command can change it, in words an operator can act on; `null` when none can.
+    pub not_protected_because: Option<String>,
+}
+
+/// The runtime directory on the sealed tier: a read-only bind plus a Landlock rule.
+const RUNTIME_DIR_ENFORCED_SEALED: &str = "mountns+landlock";
+
+/// The runtime directory on the Landlock tier: a read-only Landlock rule.
+const RUNTIME_DIR_ENFORCED_LANDLOCK: &str = "landlock";
+
+/// The lowest Landlock ABI that mediates `truncate(2)`.
+const LANDLOCK_TRUNCATE_ABI: u8 = 3;
+
+/// What the session's runtime directory is to its commands, from the tier the session applies,
+/// the Landlock ABI its ruleset is built at and where the directory lies.
+///
+/// Pure and the one source of the claim: `--explain-scope`, `session_start.effective_grants` and
+/// `mur doctor` all print what this returns. It never claims protection on the seccomp-only tier,
+/// with no kernel containment, or when the directory lies inside the workdir, and on the Landlock
+/// tier below ABI 3 it says `truncate(2)` is not mediated.
+#[must_use]
+pub(crate) fn runtime_dir_report(
+    applied: EnforcementTier,
+    landlock_abi: Option<u8>,
+    placement: &RuntimeDirPlacement,
+) -> RuntimeDirReport {
+    let path = placement.report_path();
+    let not_protected = |reason: String| RuntimeDirReport {
+        path: path.clone(),
+        read_only_to_commands: false,
+        enforced_by: None,
+        not_protected_because: Some(reason),
+    };
+    match applied {
+        EnforcementTier::EnvironmentOnly => not_protected(
+            "this host has no kernel containment for capsule commands — macOS and every \
+             non-Linux host run them as the operator's own processes, so a command can change \
+             the runtime directory"
+                .to_string(),
+        ),
+        EnforcementTier::KernelSeccompOnly => not_protected(
+            "this host has no Landlock, so no kernel mechanism keeps a command from changing the \
+             runtime directory"
+                .to_string(),
+        ),
+        _ if placement.inside_workdir => not_protected(format!(
+            "the runtime directory {path} lies inside the workdir {}, so the capsule's commands \
+             can write it; run with a --workdir that does not contain ~/.murmur",
+            placement.workdir.display()
+        )),
+        EnforcementTier::KernelSealed => RuntimeDirReport {
+            path,
+            read_only_to_commands: true,
+            enforced_by: Some(RUNTIME_DIR_ENFORCED_SEALED),
+            not_protected_because: None,
+        },
+        EnforcementTier::KernelFull => {
+            let abi = landlock_abi.unwrap_or(1);
+            if abi < LANDLOCK_TRUNCATE_ABI {
+                not_protected(format!(
+                    "Landlock ABI {abi} does not mediate truncate(2), so a command can empty a \
+                     runtime file though not replace it; kernel 6.2 or later refuses it"
+                ))
+            } else {
+                RuntimeDirReport {
+                    path,
+                    read_only_to_commands: true,
+                    enforced_by: Some(RUNTIME_DIR_ENFORCED_LANDLOCK),
+                    not_protected_because: None,
+                }
+            }
+        }
+    }
+}
+
+/// The `Runtime directory` block of `--explain-scope` and `mur doctor`: its path, and whether
+/// the capsule's commands can change it. Ends with a newline.
+#[must_use]
+pub fn render_runtime_dir(report: &RuntimeDirReport) -> String {
+    let commands = match (&report.not_protected_because, report.enforced_by) {
+        (Some(reason), _) => format!("can change it — {reason}"),
+        (None, Some(mechanism)) => format!("read only ({mechanism})"),
+        (None, None) => "read only".to_string(),
+    };
+    format!(
+        "Runtime directory\n  path:      {}\n  commands:  {commands}\n",
+        report.path
+    )
 }
 
 /// Read-only answer to "what would this capsule actually be allowed to do on this host?".
@@ -688,6 +843,11 @@ pub struct ScopeReport {
     /// no root, so a boundary keyed on the class would report an absence the capsule does not have.
     /// It stands beside the grants rather than among them because it qualifies every one at once.
     pub filesystem_boundary: FilesystemBoundaryReport,
+    /// What the session's runtime directory is to its commands, from [`runtime_dir_report`] on
+    /// the applied tier, [`Self::landlock_abi`] and where the directory lies. Always serialized.
+    /// When it is not read-only, its reason is also a [`FilesystemBoundaryReport::not_protected`]
+    /// statement.
+    pub runtime_dir: RuntimeDirReport,
 }
 
 impl ScopeReport {
@@ -723,6 +883,9 @@ impl ScopeReport {
                 None => "n/a".to_string(),
             }
         ));
+
+        out.push('\n');
+        out.push_str(&render_runtime_dir(&self.runtime_dir));
 
         out.push_str(&render_not_protected(&self.filesystem_boundary));
 
@@ -960,6 +1123,11 @@ fn push_list(out: &mut String, label: &str, values: &[String]) {
 /// [`crate::network_policy::preopen_reports`]) rather than derived here, because all three are
 /// per-artifact and `policy` is capsule-wide. No resolution creates anything, so this stays a
 /// read-only diagnostic.
+///
+/// `workdir` is the accessible workdir the launch would use — `--workdir`, or
+/// `<manifest dir>/workdir` without one — which decides whether the runtime directory lies
+/// inside it. Nothing is created to answer that.
+#[allow(clippy::too_many_arguments)]
 pub fn explain_scope(
     policy: &CapabilityPolicy,
     declared: ContainmentClass,
@@ -968,6 +1136,7 @@ pub fn explain_scope(
     configured_artifacts: Vec<String>,
     preopens: Vec<PreopenReport>,
     io_max: IoMaxReport,
+    workdir: &std::path::Path,
 ) -> ScopeReport {
     let probe = crate::sandbox::HostProbe::probe();
     scope_report_for_tier(
@@ -981,8 +1150,27 @@ pub fn explain_scope(
         state_stores,
         configured_artifacts,
         preopens,
+        &crate::runtime_dir::runtime_dir_placement(workdir),
         io_max,
     )
+}
+
+/// `mur doctor`'s `Runtime directory` section for a capsule declaring `declared`, run from
+/// `workdir`: the same [`runtime_dir_report`] on this host's applied tier and ruleset ABI.
+#[must_use]
+pub fn doctor_runtime_dir(
+    declared: ContainmentClass,
+    workdir: &std::path::Path,
+) -> (RuntimeDirReport, RuntimeDirPlacement) {
+    let probe = crate::sandbox::HostProbe::probe();
+    let applied = crate::sandbox::applied_tier(probe.tier(), declared);
+    let placement = crate::runtime_dir::runtime_dir_placement(workdir);
+    let report = runtime_dir_report(
+        applied,
+        crate::sandbox::ruleset_landlock_abi(probe.landlock_kernel_abi(), applied),
+        &placement,
+    );
+    (report, placement)
 }
 
 /// [`explain_scope`] with the tier and the sealed blocker injected — the seam every test uses so
@@ -999,9 +1187,14 @@ pub(crate) fn scope_report_for_tier(
     state_stores: Vec<StateStoreReport>,
     configured_artifacts: Vec<String>,
     preopens: Vec<PreopenReport>,
+    runtime_dir_placement: &RuntimeDirPlacement,
     io_max: IoMaxReport,
 ) -> ScopeReport {
-    let achieved = achieved_containment_class(tier, policy.workdir_exec_allowed);
+    let achieved = achieved_containment_class(
+        tier,
+        policy.workdir_exec_allowed,
+        runtime_dir_placement.inside_workdir,
+    );
     // The tier this session would actually install: the host reading `enforcement_tier`
     // reports, capped by the declared floor, which is the same `sandbox::applied_tier`
     // `ShellEnforcement::resolve` runs. Three fields below are keyed on it rather than on
@@ -1012,7 +1205,14 @@ pub(crate) fn scope_report_for_tier(
         achieved,
         sealed_blocker,
         policy.workdir_exec_allowed,
+        runtime_dir_placement.inside(),
     );
+    let landlock_abi = crate::sandbox::ruleset_landlock_abi(landlock_kernel_abi, applied);
+    let runtime_dir = runtime_dir_report(applied, landlock_abi, runtime_dir_placement);
+    let mut filesystem_boundary = filesystem_boundary(applied);
+    if let Some(reason) = &runtime_dir.not_protected_because {
+        filesystem_boundary.not_protected.push(reason.clone());
+    }
 
     ScopeReport {
         declared_containment: declared,
@@ -1022,7 +1222,7 @@ pub(crate) fn scope_report_for_tier(
         enforcement_tier: enforcement_tier_name(tier),
         mechanism_covers: MECHANISM_COVERS.to_vec(),
         userns_grant,
-        landlock_abi: crate::sandbox::ruleset_landlock_abi(landlock_kernel_abi, applied),
+        landlock_abi,
         // Copied straight through and never consulted above: `achieved` is already computed, and
         // no export or peer grant may reach it.
         exports_files: exports
@@ -1094,7 +1294,8 @@ pub(crate) fn scope_report_for_tier(
         // Derived here, from the `applied` tier already resolved above, rather than filled by
         // either caller: `--explain-scope --json` and `session_start.effective_grants` are the
         // same object, and a field either of them worded for itself would make them differ.
-        filesystem_boundary: filesystem_boundary(applied),
+        filesystem_boundary,
+        runtime_dir,
     }
 }
 
@@ -1194,26 +1395,26 @@ mod tests {
     fn workdir_exec_caps_the_achieved_class_at_advisory_on_every_tier() {
         // Without the declaration: the host ceiling, unchanged.
         assert_eq!(
-            achieved_containment_class(EnforcementTier::KernelSealed, false),
+            achieved_containment_class(EnforcementTier::KernelSealed, false, false),
             ContainmentClass::Sealed
         );
         assert_eq!(
-            achieved_containment_class(EnforcementTier::KernelFull, false),
+            achieved_containment_class(EnforcementTier::KernelFull, false, false),
             ContainmentClass::Scoped
         );
         assert_eq!(
-            achieved_containment_class(EnforcementTier::KernelSeccompOnly, false),
+            achieved_containment_class(EnforcementTier::KernelSeccompOnly, false, false),
             ContainmentClass::Advisory
         );
         assert_eq!(
-            achieved_containment_class(EnforcementTier::EnvironmentOnly, false),
+            achieved_containment_class(EnforcementTier::EnvironmentOnly, false, false),
             ContainmentClass::Advisory
         );
 
         // With it: advisory, whatever the host could otherwise back.
         for tier in ALL_TIERS {
             assert_eq!(
-                achieved_containment_class(*tier, true),
+                achieved_containment_class(*tier, true, false),
                 ContainmentClass::Advisory,
                 "workdir_exec must cap tier {tier:?} at advisory"
             );
@@ -1227,7 +1428,7 @@ mod tests {
         for tier in ALL_TIERS {
             assert_eq!(
                 achieved_class_for_tier(*tier),
-                achieved_containment_class(*tier, false),
+                achieved_containment_class(*tier, false, false),
                 "the tier-only mapping and the uncapped wrapper must agree on tier {tier:?}"
             );
         }
@@ -1238,10 +1439,10 @@ mod tests {
     /// refuse, and the reason must send them to their manifest rather than to another machine.
     #[test]
     fn workdir_exec_refuses_a_scoped_floor_even_on_a_landlock_capable_host() {
-        let achieved = achieved_containment_class(EnforcementTier::KernelFull, true);
+        let achieved = achieved_containment_class(EnforcementTier::KernelFull, true, false);
         assert_eq!(achieved, ContainmentClass::Advisory);
 
-        let error = check_containment_floor(ContainmentClass::Scoped, achieved, None, true)
+        let error = check_containment_floor(ContainmentClass::Scoped, achieved, None, true, None)
             .expect_err("workdir_exec + scoped must refuse");
         match error {
             RuntimeError::ContainmentFloorUnmet {
@@ -1274,6 +1475,7 @@ mod tests {
             ContainmentClass::Advisory,
             Some(SealedBlocker::AppArmorProfileMissing),
             true,
+            None,
         )
         .expect("refusal");
         assert!(reason.contains("workdir_exec"));
@@ -1285,9 +1487,10 @@ mod tests {
     #[test]
     fn workdir_exec_alone_refuses_nothing() {
         for tier in ALL_TIERS {
-            let achieved = achieved_containment_class(*tier, true);
+            let achieved = achieved_containment_class(*tier, true, false);
             assert!(
-                check_containment_floor(ContainmentClass::Advisory, achieved, None, true).is_ok(),
+                check_containment_floor(ContainmentClass::Advisory, achieved, None, true, None)
+                    .is_ok(),
                 "workdir_exec at an advisory floor must launch on tier {tier:?}"
             );
         }
@@ -1297,9 +1500,14 @@ mod tests {
     fn advisory_floor_is_met_on_every_tier() {
         for tier in ALL_TIERS {
             let achieved = achieved_class_for_tier(*tier);
-            assert!(
-                check_containment_floor(ContainmentClass::Advisory, achieved, None, false).is_ok()
-            );
+            assert!(check_containment_floor(
+                ContainmentClass::Advisory,
+                achieved,
+                None,
+                false,
+                None
+            )
+            .is_ok());
         }
     }
 
@@ -1308,7 +1516,8 @@ mod tests {
         for tier in [EnforcementTier::KernelFull, EnforcementTier::KernelSealed] {
             let achieved = achieved_class_for_tier(tier);
             assert!(
-                check_containment_floor(ContainmentClass::Scoped, achieved, None, false).is_ok()
+                check_containment_floor(ContainmentClass::Scoped, achieved, None, false, None)
+                    .is_ok()
             );
         }
 
@@ -1317,8 +1526,9 @@ mod tests {
             EnforcementTier::EnvironmentOnly,
         ] {
             let achieved = achieved_class_for_tier(tier);
-            let error = check_containment_floor(ContainmentClass::Scoped, achieved, None, false)
-                .expect_err("scoped must refuse without Landlock");
+            let error =
+                check_containment_floor(ContainmentClass::Scoped, achieved, None, false, None)
+                    .expect_err("scoped must refuse without Landlock");
             match error {
                 RuntimeError::ContainmentFloorUnmet {
                     declared,
@@ -1346,10 +1556,15 @@ mod tests {
     fn a_weaker_declaration_is_satisfied_by_a_sealed_host_without_being_upgraded() {
         let achieved = achieved_class_for_tier(EnforcementTier::KernelSealed);
         assert_eq!(achieved, ContainmentClass::Sealed);
-        assert!(check_containment_floor(ContainmentClass::Advisory, achieved, None, false).is_ok());
-        assert!(check_containment_floor(ContainmentClass::Scoped, achieved, None, false).is_ok());
+        assert!(
+            check_containment_floor(ContainmentClass::Advisory, achieved, None, false, None)
+                .is_ok()
+        );
+        assert!(
+            check_containment_floor(ContainmentClass::Scoped, achieved, None, false, None).is_ok()
+        );
         assert_eq!(
-            containment_shortfall_reason(ContainmentClass::Scoped, achieved, None, false),
+            containment_shortfall_reason(ContainmentClass::Scoped, achieved, None, false, None),
             None
         );
     }
@@ -1360,7 +1575,8 @@ mod tests {
             ContainmentClass::Sealed,
             achieved_class_for_tier(EnforcementTier::KernelSealed),
             None,
-            false
+            false,
+            None
         )
         .is_ok());
 
@@ -1374,6 +1590,7 @@ mod tests {
                 achieved,
                 Some(SealedBlocker::NamespaceCreationDenied),
                 false,
+                None,
             )
             .expect_err("sealed must refuse on a host that cannot back it");
             match error {
@@ -1402,6 +1619,7 @@ mod tests {
             achieved,
             Some(SealedBlocker::AppArmorProfileMissing),
             false,
+            None,
         )
         .expect("refusal");
         assert!(apparmor.contains("mur-sealed"));
@@ -1413,6 +1631,7 @@ mod tests {
             achieved,
             Some(SealedBlocker::NamespaceCreationDenied),
             false,
+            None,
         )
         .expect("refusal");
         assert!(container.contains("--cap-add SYS_ADMIN"));
@@ -1426,6 +1645,7 @@ mod tests {
             ContainmentClass::Advisory,
             Some(SealedBlocker::PivotRootDenied),
             false,
+            None,
         )
         .expect("refusal");
         assert!(pivot.contains("pivot_root(2)"), "reason was: {pivot}");
@@ -1436,6 +1656,7 @@ mod tests {
                 ContainmentClass::Advisory,
                 Some(SealedBlocker::MountDenied),
                 false,
+                None,
             )
             .expect("refusal")
         );
@@ -1455,6 +1676,7 @@ mod tests {
                 achieved,
                 Some(blocker),
                 false,
+                None,
             )
             .expect("refusal");
             assert!(
@@ -1473,6 +1695,7 @@ mod tests {
             ContainmentClass::Advisory,
             None,
             false,
+            None,
         )
         .expect("refusal");
         assert!(reason.contains("pivot_root"));
@@ -1486,7 +1709,8 @@ mod tests {
                 ContainmentClass::Advisory,
                 ContainmentClass::Scoped,
                 None,
-                false
+                false,
+                None
             ),
             None
         );
@@ -1495,7 +1719,8 @@ mod tests {
                 ContainmentClass::Scoped,
                 ContainmentClass::Scoped,
                 None,
-                false
+                false,
+                None
             ),
             None
         );
@@ -1504,7 +1729,8 @@ mod tests {
                 ContainmentClass::Sealed,
                 ContainmentClass::Sealed,
                 Some(SealedBlocker::NamespaceCreationDenied),
-                false
+                false,
+                None
             ),
             None,
             "a met floor must ignore a stale blocker rather than manufacture a refusal"
@@ -1543,6 +1769,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         );
 
@@ -1586,6 +1813,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         );
 
@@ -1625,6 +1853,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         ))
         .unwrap();
@@ -1643,6 +1872,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport {
                 declared_bytes_per_sec: 52_428_800,
                 status: IoMaxStatus::Enforced,
@@ -1670,6 +1900,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport {
                 declared_bytes_per_sec: 52_428_800,
                 status: IoMaxStatus::Unavailable,
@@ -1703,6 +1934,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         ))
         .unwrap();
@@ -1736,6 +1968,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                 IoMaxReport::default(),
             );
             assert_eq!(
@@ -1768,6 +2001,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         );
         assert!(report.staged_runtime_grants.is_empty());
@@ -1790,6 +2024,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Scoped);
@@ -1809,6 +2044,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         );
 
@@ -1832,6 +2068,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Sealed);
@@ -1855,6 +2092,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         );
         let value: serde_json::Value = serde_json::to_value(&report).unwrap();
@@ -1883,6 +2121,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                 IoMaxReport::default(),
             )
         };
@@ -1936,6 +2175,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         );
 
@@ -1951,6 +2191,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                 IoMaxReport::default(),
             );
             assert_eq!(report.achieved_containment, baseline.achieved_containment);
@@ -1985,6 +2226,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         )
         .render();
@@ -2023,6 +2265,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                     IoMaxReport::default(),
                 );
                 let with = scope_report_for_tier(
@@ -2040,6 +2283,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                     IoMaxReport::default(),
                 );
                 assert_eq!(
@@ -2101,6 +2345,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                     IoMaxReport::default(),
                 );
                 let with = scope_report_for_tier(
@@ -2118,6 +2363,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                     IoMaxReport::default(),
                 );
                 assert_eq!(
@@ -2168,6 +2414,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         ))
         .unwrap();
@@ -2196,6 +2443,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         ))
         .unwrap();
@@ -2222,6 +2470,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         )
         .render();
@@ -2251,6 +2500,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         )
         .render();
@@ -2278,6 +2528,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         )
     }
@@ -2361,6 +2612,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         );
         let with = scope_report_for_tier(
@@ -2374,6 +2626,7 @@ mod tests {
             stores.clone(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         );
 
@@ -2425,18 +2678,21 @@ mod tests {
                 role: "tool".to_string(),
                 scope: None,
                 surface: PreopenSurface::WholeWorkdir,
+                runtime_dir_read_only: true,
             },
             PreopenReport {
                 artifact: "cache-tool".to_string(),
                 role: "tool".to_string(),
                 scope: Some("cache".to_string()),
                 surface: PreopenSurface::ScopedSubtree,
+                runtime_dir_read_only: false,
             },
             PreopenReport {
                 artifact: "telemetry-hook".to_string(),
                 role: "hook".to_string(),
                 scope: None,
                 surface: PreopenSurface::Nothing,
+                runtime_dir_read_only: false,
             },
         ];
 
@@ -2451,6 +2707,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         );
         let with = scope_report_for_tier(
@@ -2464,6 +2721,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             preopens.clone(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         );
 
@@ -2482,7 +2740,7 @@ mod tests {
         let rendered = with.render();
         assert!(rendered.contains(
             "- notes-tool (tool): the whole accessible workdir — no capabilities.filesystem.scope \
-             declared"
+             declared; runtime directory read-only at murmur-runtime/"
         ));
         assert!(rendered.contains(
             "- cache-tool (tool): one subtree of the accessible workdir — \
@@ -2506,18 +2764,21 @@ mod tests {
                     "role": "tool",
                     "scope": null,
                     "surface": "whole-workdir",
+                    "runtime_dir_read_only": true,
                 },
                 {
                     "artifact": "cache-tool",
                     "role": "tool",
                     "scope": "cache",
                     "surface": "scoped-subtree",
+                    "runtime_dir_read_only": false,
                 },
                 {
                     "artifact": "telemetry-hook",
                     "role": "hook",
                     "scope": null,
                     "surface": "nothing",
+                    "runtime_dir_read_only": false,
                 },
             ])
         );
@@ -2539,6 +2800,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         ))
         .unwrap();
@@ -2563,6 +2825,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         ))
         .unwrap();
@@ -2585,6 +2848,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         )
         .render();
@@ -2612,6 +2876,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         )
         .render();
@@ -2645,6 +2910,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         )
     }
@@ -2846,6 +3112,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         ))
         .unwrap();
@@ -2868,11 +3135,14 @@ mod tests {
             tier,
             None,
             None,
+            // A kernel that mediates `truncate(2)`, so a Landlock tier's runtime directory is
+            // read-only and adds no statement of its own.
+            Some(6),
             None,
-            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         )
     }
@@ -2919,7 +3189,12 @@ mod tests {
             report.filesystem_boundary.restriction,
             FilesystemRestriction::Advisory
         );
-        assert_eq!(report.filesystem_boundary.not_protected.len(), 2);
+        // The filesystem, path rewriting, and the runtime directory no command is kept from.
+        assert_eq!(report.filesystem_boundary.not_protected.len(), 3);
+        assert_eq!(
+            Some(&report.filesystem_boundary.not_protected[2]),
+            report.runtime_dir.not_protected_because.as_ref()
+        );
 
         let filesystem = &report.filesystem_boundary.not_protected[0];
         assert!(filesystem.contains("advisory"), "{filesystem}");
@@ -2947,6 +3222,172 @@ mod tests {
         for statement in &report.filesystem_boundary.not_protected {
             assert!(rendered.contains(statement.as_str()), "{rendered}");
         }
+    }
+
+    fn inside_placement() -> RuntimeDirPlacement {
+        RuntimeDirPlacement {
+            sessions_dir: std::path::PathBuf::from("/home/dev/.murmur/sessions"),
+            workdir: std::path::PathBuf::from("/home/dev"),
+            inside_workdir: true,
+        }
+    }
+
+    /// One claim per applied tier, from the tier, the ruleset ABI and the placement alone.
+    #[test]
+    fn runtime_dir_report_makes_one_claim_per_tier() {
+        let outside = RuntimeDirPlacement::outside_for_test();
+        for abi in [None, Some(1), Some(2), Some(3), Some(6)] {
+            let sealed = runtime_dir_report(EnforcementTier::KernelSealed, abi, &outside);
+            assert!(sealed.read_only_to_commands, "sealed at {abi:?}");
+            assert_eq!(sealed.enforced_by, Some("mountns+landlock"));
+            assert_eq!(sealed.not_protected_because, None);
+        }
+
+        let full = runtime_dir_report(EnforcementTier::KernelFull, Some(3), &outside);
+        assert!(full.read_only_to_commands);
+        assert_eq!(full.enforced_by, Some("landlock"));
+        assert_eq!(full.not_protected_because, None);
+
+        for abi in [Some(1), Some(2)] {
+            let old = runtime_dir_report(EnforcementTier::KernelFull, abi, &outside);
+            assert!(!old.read_only_to_commands);
+            assert_eq!(old.enforced_by, None);
+            let reason = old.not_protected_because.unwrap();
+            assert!(
+                reason.contains(&format!("Landlock ABI {}", abi.unwrap()))
+                    && reason.contains("truncate(2)")
+                    && reason.contains("6.2"),
+                "{reason}"
+            );
+        }
+
+        let seccomp = runtime_dir_report(EnforcementTier::KernelSeccompOnly, None, &outside);
+        assert!(!seccomp.read_only_to_commands);
+        assert!(seccomp
+            .not_protected_because
+            .unwrap()
+            .contains("no Landlock"));
+
+        let none = runtime_dir_report(EnforcementTier::EnvironmentOnly, None, &outside);
+        assert!(!none.read_only_to_commands);
+        let reason = none.not_protected_because.unwrap();
+        assert!(
+            reason.contains("no kernel containment") && reason.contains("macOS"),
+            "{reason}"
+        );
+
+        assert_eq!(
+            full.path, "/home/test/.murmur/sessions/<session-id>/runtime",
+            "the path carries the literal session-id segment"
+        );
+    }
+
+    /// Inside the workdir, nothing protects it on any tier, and the reason names both paths.
+    #[test]
+    fn runtime_dir_report_inside_the_workdir_is_never_protected() {
+        for tier in ALL_TIERS {
+            let report = runtime_dir_report(*tier, Some(6), &inside_placement());
+            assert!(!report.read_only_to_commands, "{tier:?}");
+            assert_eq!(report.enforced_by, None);
+        }
+        let reason =
+            runtime_dir_report(EnforcementTier::KernelSealed, Some(6), &inside_placement())
+                .not_protected_because
+                .unwrap();
+        assert!(
+            reason.contains("/home/dev/.murmur/sessions/<session-id>/runtime"),
+            "{reason}"
+        );
+        assert!(reason.contains("inside the workdir /home/dev"), "{reason}");
+    }
+
+    /// A runtime directory inside the workdir caps the class at `advisory`, refuses a `scoped` or
+    /// `sealed` floor naming both paths and the fix, and lets an `advisory` launch through.
+    #[test]
+    fn runtime_dir_inside_the_workdir_caps_the_class_and_refuses_a_kernel_floor() {
+        let inside = inside_placement();
+        assert_eq!(
+            achieved_containment_class(EnforcementTier::KernelSealed, false, true),
+            ContainmentClass::Advisory
+        );
+        assert_eq!(
+            achieved_containment_class(EnforcementTier::KernelSealed, false, false),
+            ContainmentClass::Sealed
+        );
+        for declared in [ContainmentClass::Scoped, ContainmentClass::Sealed] {
+            match check_containment_floor(
+                declared,
+                ContainmentClass::Advisory,
+                None,
+                false,
+                inside.inside(),
+            ) {
+                Err(RuntimeError::ContainmentFloorUnmet { reason, .. }) => {
+                    assert!(reason.contains("/home/dev/.murmur/sessions"), "{reason}");
+                    assert!(reason.contains("the workdir /home/dev"), "{reason}");
+                    assert!(
+                        reason.contains("run with a --workdir that does not contain ~/.murmur"),
+                        "{reason}"
+                    );
+                }
+                other => panic!("{declared:?}: {other:?}"),
+            }
+        }
+        assert!(check_containment_floor(
+            ContainmentClass::Advisory,
+            ContainmentClass::Advisory,
+            None,
+            false,
+            inside.inside()
+        )
+        .is_ok());
+
+        let report = scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Advisory,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            Some(6),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &inside,
+            IoMaxReport::default(),
+        );
+        assert_eq!(report.achieved_containment, ContainmentClass::Advisory);
+        let reason = report.runtime_dir.not_protected_because.clone().unwrap();
+        assert!(report.filesystem_boundary.not_protected.contains(&reason));
+        let rendered = report.render();
+        assert!(
+            rendered.contains(&format!("  commands:  can change it — {reason}\n")),
+            "{rendered}"
+        );
+    }
+
+    /// The block `--explain-scope` prints after `Containment`, and the JSON object it renders.
+    #[test]
+    fn runtime_dir_block_renders_after_containment_and_serializes_every_field() {
+        let report = boundary_report(ContainmentClass::Scoped, EnforcementTier::KernelFull);
+        let rendered = report.render();
+        let block =
+            "Runtime directory\n  path:      /home/test/.murmur/sessions/<session-id>/runtime\n  \
+                     commands:  read only (landlock)\n";
+        let at = rendered.find(block).expect(&rendered);
+        assert!(at > rendered.find("Containment\n").unwrap());
+        assert!(at < rendered.find("Effective grants").unwrap());
+
+        let sealed = boundary_report(ContainmentClass::Sealed, EnforcementTier::KernelSealed);
+        assert!(sealed
+            .render()
+            .contains("  commands:  read only (mountns+landlock)\n"));
+
+        let json = serde_json::to_string(&report.runtime_dir).unwrap();
+        assert_eq!(
+            json,
+            r#"{"path":"/home/test/.murmur/sessions/<session-id>/runtime","read_only_to_commands":true,"enforced_by":"landlock","not_protected_because":null}"#
+        );
     }
 
     /// A Landlock domain really does mediate the filesystem, so its statement says what Landlock
@@ -3066,11 +3507,12 @@ mod tests {
             EnforcementTier::KernelSealed,
             None,
             None,
+            Some(6),
             None,
-            None,
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             IoMaxReport::default(),
         );
 
@@ -3165,8 +3607,10 @@ mod tests {
                 ..CapabilityPolicy::default()
             };
             let probe = crate::sandbox::HostProbe::probe();
-            let enforcement =
-                crate::sandbox::ShellEnforcement::resolve(&policy, declared, probe).unwrap();
+            let runtime = tempfile::tempdir().unwrap();
+            let enforcement = crate::sandbox::ShellEnforcement::resolve(&policy, declared, probe)
+                .unwrap()
+                .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None);
             let report = scope_report_for_tier(
                 &policy,
                 declared,
@@ -3178,6 +3622,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                 IoMaxReport::default(),
             );
 

@@ -21,7 +21,7 @@ struct Capsule;
 impl exports::murmur::capsule::run::Guest for Capsule {
     fn run() {
         std::fs::create_dir_all("./out").expect("create output directory");
-        let task = std::fs::read_to_string("./task.md").unwrap_or_default();
+        let task = std::fs::read_to_string("murmur-runtime/task.md").unwrap_or_default();
         let input = murmur::tool::run::ToolInput {
             data: Some(task.trim().to_string()),
             log_path: None,

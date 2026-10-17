@@ -698,8 +698,8 @@ const SYNTHETIC_LOGIN_SHELL: &str = "/bin/sh";
 const SYNTHETIC_ACCOUNT_NAME: &str = "capsule";
 
 impl SyntheticEtcFile {
-    /// File name under [`SEALED_ETC_STAGING_DIR_NAME`]. The basename of the target path, so the
-    /// staging directory reads like the `/etc` it stands in for.
+    /// File name under the session's `sealed-etc/`. The basename of the target path, so that
+    /// directory reads like the `/etc` it stands in for.
     pub(crate) fn file_name(self) -> &'static str {
         match self {
             Self::Passwd => "passwd",
@@ -978,27 +978,30 @@ pub const SEALED_DEVICE_SYMLINKS: &[(&str, &str)] = &[
 /// [`crate::workdir_writes`]. The capsule never names this path: it sees `/tmp`.
 pub const SEALED_TMP_DIR_NAME: &str = ".mur-tmp";
 
-/// Directory created inside the session workdir holding the synthetic `/etc` files, each of which
-/// the composed root binds read-only over its [`SEALED_ETC_PATHS`] target.
-///
-/// Inside the session workdir for the same reason as [`SEALED_TMP_DIR_NAME`], and in the same
-/// place: it is the one host directory the parent already owns, already creates per session, and
-/// already discards with it, and under `--workdir` it is under `.murmur/<session id>/` rather than
-/// at the top level of what the capsule was asked to produce. The capsule can read — and, since
-/// the workdir is its one writable path, rewrite — its own copy here; that buys it nothing,
-/// because the file is never read by anything outside the capsule and names no account the capsule
-/// is not already running as. The capsule sees `/etc/passwd` and `/etc/group`, never this path.
-pub const SEALED_ETC_STAGING_DIR_NAME: &str = ".mur-etc";
-
-/// Host path of the staging file backing one synthetic `/etc` entry.
+/// Host path of the file backing one synthetic `/etc` entry, in the session's `sealed-etc/`
+/// directory beside its runtime directory, which no capsule command can write.
 ///
 /// The single place this path is composed. Three callers need to agree on it byte for byte — the
 /// planner that binds it, the parent that writes it, and the Landlock fd that grants it — and two
 /// of them run in different phases of the launch.
-pub(crate) fn synthetic_etc_source(session_workdir: &Path, file: SyntheticEtcFile) -> PathBuf {
-    session_workdir
-        .join(SEALED_ETC_STAGING_DIR_NAME)
-        .join(file.file_name())
+pub(crate) fn synthetic_etc_source(sealed_etc_dir: &Path, file: SyntheticEtcFile) -> PathBuf {
+    sealed_etc_dir.join(file.file_name())
+}
+
+/// The host-side sources a composed root binds that the runtime itself provides, each resolved
+/// by the parent before the fork.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SealedBindSources<'a> {
+    /// The session workdir's [`SEALED_TMP_DIR_NAME`], bound at `/tmp`, with the `(st_dev,
+    /// st_ino)` of the descriptor the parent took on it with no link followed — the identity the
+    /// bind verifies, so a link swapped in after that moves nothing ([`RootOp::BindVerified`]).
+    pub(crate) tmp_store: (&'a Path, (u64, u64)),
+    /// The session's `sealed-etc/` directory, holding the synthetic `/etc/passwd` and
+    /// `/etc/group`.
+    pub(crate) etc_dir: &'a Path,
+    /// The session's runtime directory and the identity of the runtime root's own descriptor,
+    /// bound read-only and required at its own absolute path.
+    pub(crate) runtime_dir: Option<(&'a Path, (u64, u64))>,
 }
 
 /// Directory the old root is parked in between `pivot_root(2)` and `umount2(MNT_DETACH)`.
@@ -1118,6 +1121,20 @@ pub(crate) enum RootOp {
         target: PathBuf,
         read_only: bool,
     },
+    /// [`Self::Bind`] of a directory the parent holds a descriptor on: the child opens `source`
+    /// after it has entered its own mount namespace, refuses unless the directory it reached has
+    /// `identity` — the `(st_dev, st_ino)` of the parent's descriptor — and binds through the
+    /// descriptor it opened. A link swapped onto `source` after the parent took its descriptor
+    /// fails the step rather than redirecting the bind.
+    ///
+    /// The parent's descriptor itself cannot be the source: a bind's source must be a mount in
+    /// the caller's own namespace, and one opened before `unshare(CLONE_NEWNS)` is not (`EINVAL`).
+    BindVerified {
+        source: PathBuf,
+        target: PathBuf,
+        read_only: bool,
+        identity: (u64, u64),
+    },
     /// A fresh `tmpfs`.
     Tmpfs {
         target: PathBuf,
@@ -1190,7 +1207,7 @@ pub(crate) fn choose_root_base(
 /// difference is the whole point of the capability. See [`PlanBuilder::require_bind`].
 pub(crate) fn plan_composed_root(
     accessible_workdir: &Path,
-    session_workdir: &Path,
+    sources: &SealedBindSources<'_>,
     base: &Path,
     extra_read_only: &[PathBuf],
     staged_runtime_read_only: &[PathBuf],
@@ -1227,7 +1244,7 @@ pub(crate) fn plan_composed_root(
     // 2. The narrow /etc allowlist, read-only. Everything else under /etc simply does not exist.
     //
     //    An entry marked synthetic is not mirrored from the host at all: its target is bound from
-    //    the staging file the parent wrote inside the workdir, exactly as /tmp is in step 5 below.
+    //    the file the parent wrote in the session's `sealed-etc/` directory.
     //    `required: true` there, unlike the host-mirrored entries' `required: false` — those are
     //    optional because a distribution may genuinely not have them, whereas the parent wrote
     //    these two itself, so a bind that fails is a broken runtime rather than a narrower one, and
@@ -1237,7 +1254,7 @@ pub(crate) fn plan_composed_root(
         match entry.synthetic {
             None => builder.mirror(path, host, /* required */ false),
             Some(file) => builder.bind_file(
-                synthetic_etc_source(session_workdir, file),
+                synthetic_etc_source(sources.etc_dir, file),
                 rebase(base, path),
                 /* required */ true,
             ),
@@ -1305,10 +1322,11 @@ pub(crate) fn plan_composed_root(
     let tmp = base.join("tmp");
     builder.push(RootOp::MkDir(tmp.clone()), true);
     builder.push(
-        RootOp::Bind {
-            source: session_workdir.join(SEALED_TMP_DIR_NAME),
+        RootOp::BindVerified {
+            source: sources.tmp_store.0.to_path_buf(),
             target: tmp,
             read_only: false,
+            identity: sources.tmp_store.1,
         },
         true,
     );
@@ -1326,6 +1344,26 @@ pub(crate) fn plan_composed_root(
         },
         true,
     );
+
+    // 7. The session's runtime directory, read-only and REQUIRED, at its own absolute path, so
+    //    `$MURMUR_RUNTIME_DIR` names the same directory inside the root as on the host. After the
+    //    workdir for the reason /tmp precedes it: a runtime directory under either is created
+    //    inside it, and the deeper mount is the one that survives. A runtime directory that
+    //    cannot be bound ends the session rather than leaving its commands without their task
+    //    and tools.
+    if let Some((path, identity)) = sources.runtime_dir {
+        let target = rebase(base, path);
+        builder.mkdir_p(&target);
+        builder.push(
+            RootOp::BindVerified {
+                source: path.to_path_buf(),
+                target,
+                read_only: true,
+                identity,
+            },
+            true,
+        );
+    }
 
     ComposedRootPlan {
         base: base.to_path_buf(),
@@ -1821,28 +1859,10 @@ mod linux {
 
         let mut buf = [0u8; 32];
         let mut len = 0usize;
-        let write_number = |buf: &mut [u8; 32], len: &mut usize, mut n: u32| {
-            let mut digits = [0u8; 10];
-            let mut count = 0;
-            loop {
-                digits[count] = b'0' + (n % 10) as u8;
-                count += 1;
-                n /= 10;
-                if n == 0 {
-                    break;
-                }
-            }
-            while count > 0 {
-                count -= 1;
-                buf[*len] = digits[count];
-                *len += 1;
-            }
-        };
-
-        write_number(&mut buf, &mut len, value);
+        push_decimal(&mut buf, &mut len, value);
         buf[len] = b' ';
         len += 1;
-        write_number(&mut buf, &mut len, value);
+        push_decimal(&mut buf, &mut len, value);
         buf[len] = b' ';
         len += 1;
         buf[len] = b'1';
@@ -1877,6 +1897,12 @@ mod linux {
             source: CString,
             target: CString,
             read_only: bool,
+        },
+        BindVerified {
+            source: CString,
+            target: CString,
+            read_only: bool,
+            identity: (u64, u64),
         },
         Tmpfs {
             target: CString,
@@ -1956,6 +1982,130 @@ mod linux {
         }
     }
 
+    /// Remounts the bind at `target` read-only and `nosuid`, keeping the flags its source mount
+    /// locks.
+    ///
+    /// # Safety
+    /// Post-`fork()`, pre-exec only, on [`execute_step`]'s terms.
+    unsafe fn remount_read_only(target: &CString) -> Result<(), ()> {
+        // Inside a user namespace the bind inherits the source mount's flags locked: a remount
+        // that does not repeat them is refused with `EPERM`. `statvfs` on the new bind reports
+        // them from the kernel's `statfs` `f_flags`, with no allocation.
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        let kept = if libc::statvfs(target.as_ptr(), &mut stat) == 0 {
+            remount_flags_kept(stat.f_flag)
+        } else {
+            0
+        };
+        if libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | libc::MS_NOSUID | kept,
+            std::ptr::null(),
+        ) != 0
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// `"/proc/self/fd/"` and the longest decimal `c_int` and a NUL.
+    const PROC_FD_PATH_LEN: usize = 32;
+
+    /// Writes `/proc/self/fd/<fd>` and a NUL into `out`, with no allocation.
+    pub(crate) fn proc_fd_path(
+        fd: libc::c_int,
+        out: &mut [u8; PROC_FD_PATH_LEN],
+    ) -> Result<(), ()> {
+        const PREFIX: &[u8] = b"/proc/self/fd/";
+        if fd < 0 {
+            return Err(());
+        }
+        out[..PREFIX.len()].copy_from_slice(PREFIX);
+        let mut len = PREFIX.len();
+        push_decimal(out, &mut len, fd as u32);
+        out[len] = 0;
+        Ok(())
+    }
+
+    /// Appends `n` in decimal to `buf` at `*len`, advancing `*len`. Allocation-free, for the
+    /// post-`fork()` window; `buf` must have room for ten more bytes.
+    fn push_decimal(buf: &mut [u8], len: &mut usize, mut n: u32) {
+        let mut digits = [0u8; 10];
+        let mut count = 0;
+        loop {
+            digits[count] = b'0' + (n % 10) as u8;
+            count += 1;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        while count > 0 {
+            count -= 1;
+            buf[*len] = digits[count];
+            *len += 1;
+        }
+    }
+
+    /// Opens the directory at `source` with `O_PATH`, and returns its descriptor only when its
+    /// `(st_dev, st_ino)` is `identity`. A mismatch closes it and fails with `ESTALE`.
+    ///
+    /// # Safety
+    /// Allocation-free; callable post-`fork()`, pre-exec.
+    pub(crate) unsafe fn open_verified_dir(
+        source: &CString,
+        identity: (u64, u64),
+    ) -> Result<libc::c_int, ()> {
+        let fd = libc::open(
+            source.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        );
+        if fd < 0 {
+            return Err(());
+        }
+        let mut stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut stat) != 0 {
+            let errno = *libc::__errno_location();
+            libc::close(fd);
+            *libc::__errno_location() = errno;
+            return Err(());
+        }
+        if (stat.st_dev as u64, stat.st_ino as u64) != identity {
+            libc::close(fd);
+            *libc::__errno_location() = libc::ESTALE;
+            return Err(());
+        }
+        Ok(fd)
+    }
+
+    /// The mount flags a read-only remount of a bind has to repeat from the mount it was bound
+    /// from, given that mount's `statvfs` `f_flag`: `nodev`, `noexec`, `nosuid` and the atime
+    /// mode. A user namespace locks each of them on a mount it did not create, and a remount that
+    /// drops one is refused with `EPERM`. No atime flag at all is `strictatime`, which is stated
+    /// explicitly because a remount naming none defaults to `relatime`.
+    pub(crate) fn remount_flags_kept(f_flags: libc::c_ulong) -> libc::c_ulong {
+        let has = |flag: libc::c_ulong| f_flags & flag != 0;
+        let mut kept: libc::c_ulong = 0;
+        for (st, ms) in [
+            (libc::ST_NODEV, libc::MS_NODEV),
+            (libc::ST_NOEXEC, libc::MS_NOEXEC),
+            (libc::ST_NOSUID, libc::MS_NOSUID),
+            (libc::ST_NOATIME, libc::MS_NOATIME),
+            (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
+            (libc::ST_RELATIME, libc::MS_RELATIME),
+        ] {
+            if has(st) {
+                kept |= ms;
+            }
+        }
+        if !has(libc::ST_NOATIME) && !has(libc::ST_RELATIME) {
+            kept |= libc::MS_STRICTATIME;
+        }
+        kept
+    }
+
     /// Lowers a [`ComposedRootPlan`] into the C-string form the child executes. Fails only on a
     /// path containing an interior NUL, which no real path does.
     pub(crate) fn build_sealed_root_spec(
@@ -1996,6 +2146,27 @@ mod linux {
                         "bind{} {} -> {}",
                         if *read_only { " (ro)" } else { "" },
                         source.display(),
+                        target.display()
+                    ),
+                ),
+                RootOp::BindVerified {
+                    source,
+                    target,
+                    read_only,
+                    identity,
+                } => (
+                    CStepKind::BindVerified {
+                        source: cstr(source)?,
+                        target: cstr(target)?,
+                        read_only: *read_only,
+                        identity: *identity,
+                    },
+                    format!(
+                        "bind{} {} (dev:ino {}:{}) -> {}",
+                        if *read_only { " (ro)" } else { "" },
+                        source.display(),
+                        identity.0,
+                        identity.1,
                         target.display()
                     ),
                 ),
@@ -2240,16 +2411,35 @@ mod linux {
                 {
                     return Err(());
                 }
-                if *read_only
+                if *read_only {
+                    remount_read_only(target)?;
+                }
+            }
+            CStepKind::BindVerified {
+                source,
+                target,
+                read_only,
+                identity,
+            } => {
+                let fd = open_verified_dir(source, *identity)?;
+                let mut path = [0u8; PROC_FD_PATH_LEN];
+                let bound = proc_fd_path(fd, &mut path).is_ok()
                     && libc::mount(
-                        std::ptr::null(),
+                        path.as_ptr() as *const libc::c_char,
                         target.as_ptr(),
                         std::ptr::null(),
-                        libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | libc::MS_NOSUID,
+                        libc::MS_BIND | libc::MS_REC,
                         std::ptr::null(),
-                    ) != 0
-                {
+                    ) == 0;
+                // `close` may overwrite `errno`; the mount's is the one the failure reports.
+                let errno = *libc::__errno_location();
+                libc::close(fd);
+                if !bound {
+                    *libc::__errno_location() = errno;
                     return Err(());
+                }
+                if *read_only {
+                    remount_read_only(target)?;
                 }
             }
             CStepKind::Tmpfs { target, options } => {
@@ -2438,21 +2628,31 @@ mod tests {
         }
     }
 
-    /// The session workdir a `--workdir` launch stages under `accessible`.
-    ///
-    /// Spelled out rather than reusing the accessible path, because that is the shape in which
-    /// the two are different directories — and the `/tmp` and `/etc` staging sources have to
-    /// resolve against this one, not against the directory the capsule was asked to produce.
-    fn session_of(accessible: impl AsRef<Path>) -> PathBuf {
-        accessible.as_ref().join(".murmur").join(TEST_SESSION_ID)
-    }
+    /// The session workdir's `.mur-tmp` under a `--workdir` of `/home/u/w`, and the identity of
+    /// the descriptor `prepare_enforcement` took on it.
+    const TEST_TMP_SOURCE: &str = "/home/u/w/.murmur/ses_plan_tests/.mur-tmp";
+    const TEST_TMP_IDENTITY: (u64, u64) = (64, 7);
 
-    const TEST_SESSION_ID: &str = "ses_plan_tests";
+    /// The session's `sealed-etc/`, beside its runtime directory.
+    const TEST_ETC_DIR: &str = "/home/u/.murmur/sessions/ses_plan_tests/sealed-etc";
+
+    /// The runtime directory and the identity of its root's descriptor.
+    const TEST_RUNTIME_DIR: &str = "/home/u/.murmur/sessions/ses_plan_tests/runtime";
+    const TEST_RUNTIME_IDENTITY: (u64, u64) = (64, 8);
+
+    /// The runtime-provided bind sources, with no runtime directory: the planner's steps 1–6.
+    fn test_sources() -> SealedBindSources<'static> {
+        SealedBindSources {
+            tmp_store: (Path::new(TEST_TMP_SOURCE), TEST_TMP_IDENTITY),
+            etc_dir: Path::new(TEST_ETC_DIR),
+            runtime_dir: None,
+        }
+    }
 
     fn plan_for(workdir: &str) -> ComposedRootPlan {
         plan_composed_root(
             Path::new(workdir),
-            &session_of(workdir),
+            &test_sources(),
             Path::new("/tmp"),
             &[],
             &[],
@@ -2565,11 +2765,10 @@ mod tests {
     }
 
     /// The host has both files (see `FakeHost::usrmerge`) and the plan mirrors neither: their
-    /// targets are bound from the workdir-backed staging files the parent writes instead.
+    /// targets are bound from the files the parent writes into `sealed-etc/` instead.
     #[test]
     fn passwd_and_group_are_bound_from_the_staging_files_never_from_the_host() {
         let plan = plan_for("/home/u/w");
-        let workdir = Path::new("/home/u/w");
 
         for host_path in ["/etc/passwd", "/etc/group"] {
             assert!(
@@ -2588,7 +2787,7 @@ mod tests {
         ] {
             let expected = RootStep {
                 op: RootOp::Bind {
-                    source: synthetic_etc_source(&session_of(workdir), file),
+                    source: synthetic_etc_source(Path::new(TEST_ETC_DIR), file),
                     target: PathBuf::from(target),
                     read_only: true,
                 },
@@ -2686,6 +2885,75 @@ mod tests {
         }
     }
 
+    /// Step 7: the runtime directory, read-only and required, at its own absolute path, from the
+    /// descriptor the parent took, after the workdir's own bind.
+    #[test]
+    fn the_runtime_directory_is_bound_read_only_and_required_after_the_workdir() {
+        let plan = plan_composed_root(
+            Path::new("/home/u/w"),
+            &SealedBindSources {
+                runtime_dir: Some((Path::new(TEST_RUNTIME_DIR), TEST_RUNTIME_IDENTITY)),
+                ..test_sources()
+            },
+            Path::new("/tmp"),
+            &[],
+            &[],
+            &FakeHost::usrmerge(),
+        );
+        let bind = RootOp::BindVerified {
+            source: PathBuf::from(TEST_RUNTIME_DIR),
+            target: PathBuf::from("/tmp").join(TEST_RUNTIME_DIR.trim_start_matches('/')),
+            read_only: true,
+            identity: TEST_RUNTIME_IDENTITY,
+        };
+        let at = plan
+            .steps
+            .iter()
+            .position(|step| step.op == bind)
+            .expect("the runtime directory is bound");
+        assert!(
+            plan.steps[at].required,
+            "a missing runtime directory ends the session"
+        );
+        let workdir = plan
+            .steps
+            .iter()
+            .position(|step| {
+                matches!(&step.op, RootOp::Bind { source, .. } if source == Path::new("/home/u/w"))
+            })
+            .unwrap();
+        assert!(
+            workdir < at,
+            "the runtime directory is planned after the workdir"
+        );
+        assert_eq!(at, plan.steps.len() - 1);
+        assert!(plan_for("/home/u/w").steps.iter().all(|step| !matches!(
+            &step.op,
+            RootOp::BindVerified { source, .. } if source == Path::new(TEST_RUNTIME_DIR)
+        )));
+    }
+
+    /// The remount keeps every flag a user namespace locks on the source mount.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_read_only_remount_keeps_the_source_mounts_locked_flags() {
+        let kept = linux::remount_flags_kept(
+            libc::ST_NODEV | libc::ST_NOEXEC | libc::ST_NOSUID | libc::ST_RELATIME,
+        );
+        for flag in [
+            libc::MS_NODEV,
+            libc::MS_NOEXEC,
+            libc::MS_NOSUID,
+            libc::MS_RELATIME,
+        ] {
+            assert_ne!(kept & flag, 0, "{flag:#x}");
+        }
+        assert_eq!(kept & libc::MS_STRICTATIME, 0);
+        let strict = linux::remount_flags_kept(0);
+        assert_ne!(strict & libc::MS_STRICTATIME, 0);
+        assert_eq!(strict & (libc::MS_NODEV | libc::MS_NOEXEC), 0);
+    }
+
     #[test]
     fn the_workdir_keeps_its_absolute_path_inside_the_root() {
         let plan = plan_for("/home/u/.murmur/sessions/abc");
@@ -2709,20 +2977,63 @@ mod tests {
     }
 
     #[test]
-    fn tmp_is_backed_by_a_directory_inside_the_session_workdir() {
+    fn tmp_is_bound_only_when_it_is_the_directory_the_parent_holds() {
         let plan = plan_for("/home/u/w");
-        assert!(ops(&plan).contains(&RootOp::Bind {
-            source: session_of("/home/u/w").join(SEALED_TMP_DIR_NAME),
+        assert!(ops(&plan).contains(&RootOp::BindVerified {
+            source: PathBuf::from(TEST_TMP_SOURCE),
             target: PathBuf::from("/tmp/tmp"),
             read_only: false,
+            identity: TEST_TMP_IDENTITY,
         }));
-        // The accessible workdir's own top level gains nothing: `/tmp`'s backing store is under
-        // `.murmur/<session id>/`, the one prefix a consumer diffing that directory excludes.
-        assert!(!ops(&plan).contains(&RootOp::Bind {
-            source: PathBuf::from("/home/u/w").join(SEALED_TMP_DIR_NAME),
-            target: PathBuf::from("/tmp/tmp"),
-            read_only: false,
-        }));
+        // Never an unverified bind of a path a capsule's command could have replaced with a link.
+        assert!(!ops(&plan).iter().any(|op| matches!(
+            op,
+            RootOp::Bind { source, .. } if source.ends_with(SEALED_TMP_DIR_NAME)
+        )));
+    }
+
+    /// The child's check: the directory reached is the one whose identity the parent recorded,
+    /// or nothing is bound. A link swapped in after the parent's descriptor was taken reaches
+    /// another directory, and is refused with `ESTALE`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    fn a_verified_bind_source_refuses_a_directory_swapped_in_after_the_descriptor() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join(".mur-tmp");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let meta = std::fs::metadata(&store).unwrap();
+        let identity = (meta.dev(), meta.ino());
+        let source = std::ffi::CString::new(store.to_str().unwrap()).unwrap();
+
+        // SAFETY: open, fstat and close on a path this test owns; nothing else holds the fd.
+        let fd = unsafe { linux::open_verified_dir(&source, identity) }.expect("same directory");
+        let mut path = [0u8; 32];
+        linux::proc_fd_path(fd, &mut path).unwrap();
+        let resolved = std::fs::canonicalize(
+            std::ffi::CStr::from_bytes_until_nul(&path)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved, store.canonicalize().unwrap());
+        // SAFETY: `fd` was returned open by `open_verified_dir` and is closed once.
+        unsafe { libc::close(fd) };
+
+        std::fs::rename(&store, dir.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, &store).unwrap();
+        // SAFETY: `source` is a NUL-terminated path this test owns; on the identity mismatch it
+        // reports, `open_verified_dir` has already closed the descriptor it opened.
+        assert!(unsafe { linux::open_verified_dir(&source, identity) }.is_err());
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESTALE)
+        );
     }
 
     /// The composed root's own `/tmp` must not land on top of the path leading to the workdir.
@@ -2747,7 +3058,7 @@ mod tests {
         let tmp_index = operations
             .iter()
             .position(
-                |op| matches!(op, RootOp::Bind { target, .. } if target == Path::new("/tmp/tmp")),
+                |op| matches!(op, RootOp::BindVerified { target, .. } if target == Path::new("/tmp/tmp")),
             )
             .expect("the composed /tmp is bound");
         let workdir_index = operations
@@ -2829,7 +3140,7 @@ mod tests {
             .insert(PathBuf::from("/opt/python3.12"), PathKind::Dir);
         let plan = plan_composed_root(
             Path::new("/home/u/w"),
-            &session_of("/home/u/w"),
+            &test_sources(),
             Path::new("/tmp"),
             &[PathBuf::from("/opt/python3.12"), PathBuf::from("/usr")],
             &[],
@@ -2862,7 +3173,7 @@ mod tests {
         // Neither path is in `FakeHost::usrmerge()` — the host has neither.
         let plan = plan_composed_root(
             Path::new("/home/u/w"),
-            &session_of("/home/u/w"),
+            &test_sources(),
             Path::new("/tmp"),
             &[PathBuf::from("/opt/optional-tree")],
             &[PathBuf::from("/opt/staged-tree")],
@@ -2917,7 +3228,7 @@ mod tests {
             .insert(PathBuf::from("/opt/staged-tree"), PathKind::Dir);
         let plan = plan_composed_root(
             Path::new("/home/u/w"),
-            &session_of("/home/u/w"),
+            &test_sources(),
             Path::new("/tmp"),
             &[],
             &[PathBuf::from("/opt/staged-tree")],
@@ -2945,7 +3256,7 @@ mod tests {
         );
         let proc = position(&|op| matches!(op, RootOp::Proc { .. }));
         let tmp = position(
-            &|op| matches!(op, RootOp::Bind { target, .. } if target == Path::new("/tmp/tmp")),
+            &|op| matches!(op, RootOp::BindVerified { target, .. } if target == Path::new("/tmp/tmp")),
         );
         let workdir = position(
             &|op| matches!(op, RootOp::Bind { source, .. } if source == Path::new("/home/u/w")),
@@ -2972,7 +3283,7 @@ mod tests {
         host.0.insert(PathBuf::from("/opt/shared"), PathKind::Dir);
         let plan = plan_composed_root(
             Path::new("/home/u/w"),
-            &session_of("/home/u/w"),
+            &test_sources(),
             Path::new("/tmp"),
             &[PathBuf::from("/opt/shared")],
             &[PathBuf::from("/opt/shared")],

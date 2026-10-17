@@ -165,6 +165,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -554,6 +555,7 @@ fn stage_streaming_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtim
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),

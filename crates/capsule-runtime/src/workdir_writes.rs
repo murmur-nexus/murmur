@@ -32,11 +32,21 @@
 //! turns on what the session does after it starts, which no report can know, so those rows are
 //! always declared and the condition says when the path appears.
 //!
+//! # What is not here
+//!
+//! Every file the runtime writes for its own use — `MURMUR.md`, `task.md`, the manifest copy,
+//! `tools/` and `plans/` — is written into the session's runtime directory,
+//! `~/.murmur/sessions/<session-id>/runtime`, never into the workdir, and the synthetic `/etc`
+//! files and a `transport: process` harness's files go beside it. None of them is a runtime write
+//! inside the workdir, so none is declared here; [`crate::runtime_dir`] describes them.
+//!
 //! # Adding an entry
 //!
 //! Add a row to [`DECLARED_WRITES`]. `every_workdir_write_is_declared_or_exempted` reads the
 //! runtime's own source text and fails until a new `workdir.join(...)` is either declared here or
-//! listed in that test's exempt tables with a written reason.
+//! listed in that test's exempt tables with a written reason. A file the runtime writes for its
+//! own use goes through the runtime directory's root instead and is declared in that test's
+//! `RUNTIME_DIR_WRITES`.
 
 use serde::Serialize;
 
@@ -105,8 +115,6 @@ impl RuntimeWriteScope {
 pub enum RuntimeWriteCondition {
     /// Written by every session, before the capsule runs.
     Always,
-    /// Written only when the launch was given `--workdir`.
-    WorkdirProvided,
     /// Written by the agent loop, so absent from a script capsule's session.
     AgentSession,
     /// Written by a script capsule, whose WASI preopen `.` is the accessible workdir itself.
@@ -129,7 +137,6 @@ impl RuntimeWriteCondition {
     pub fn wire_name(self) -> &'static str {
         match self {
             Self::Always => "always",
-            Self::WorkdirProvided => "workdir-provided",
             Self::AgentSession => "agent-session",
             Self::ScriptSession => "script-session",
             Self::Shell => "shell",
@@ -204,23 +211,6 @@ const DECLARED_WRITES: &[DeclaredWrite] = &[
         condition: RuntimeWriteCondition::Always,
     },
     DeclaredWrite {
-        // The task input the capsule reads by relative path, rewritten on every incoming A2A
-        // message and removed again under `lifecycle.task_acceptance: queue`.
-        entry: "task.md",
-        kind: RuntimeWriteKind::File,
-        scope: RuntimeWriteScope::Accessible,
-        condition: RuntimeWriteCondition::Always,
-    },
-    DeclaredWrite {
-        // Copied from the manifest directory so the agent can reference it from `.`; skipped when
-        // the destination already exists, which is why a `--workdir` holding its own manifest is
-        // never overwritten.
-        entry: "murmur.yaml",
-        kind: RuntimeWriteKind::File,
-        scope: RuntimeWriteScope::Accessible,
-        condition: RuntimeWriteCondition::WorkdirProvided,
-    },
-    DeclaredWrite {
         // `logs/shell-<ms>.log` for a foreground command whose output was truncated, and
         // `logs/<work-id>.log` for a demoted one. Stays at the top level because the shell tool
         // returns this path, workdir-relative, in the result the model reads.
@@ -262,12 +252,6 @@ const DECLARED_WRITES: &[DeclaredWrite] = &[
     },
     // ── The per-session directory ─────────────────────────────────────────────
     DeclaredWrite {
-        entry: "tools",
-        kind: RuntimeWriteKind::Directory,
-        scope: RuntimeWriteScope::Session,
-        condition: RuntimeWriteCondition::Always,
-    },
-    DeclaredWrite {
         entry: "trace.jsonl",
         kind: RuntimeWriteKind::File,
         scope: RuntimeWriteScope::Session,
@@ -295,28 +279,6 @@ const DECLARED_WRITES: &[DeclaredWrite] = &[
         condition: RuntimeWriteCondition::AgentSession,
     },
     DeclaredWrite {
-        // One `0700` directory per harness run, holding the files the process driver asked for.
-        // Removed when the run ends, so it is present only while a `transport: process` harness
-        // is alive.
-        entry: ".process-driver",
-        kind: RuntimeWriteKind::Directory,
-        scope: RuntimeWriteScope::Session,
-        condition: RuntimeWriteCondition::AgentSession,
-    },
-    DeclaredWrite {
-        entry: "MURMUR.md",
-        kind: RuntimeWriteKind::File,
-        scope: RuntimeWriteScope::Session,
-        condition: RuntimeWriteCondition::AgentSession,
-    },
-    DeclaredWrite {
-        // One `plan-<n>.json` per submitted plan.
-        entry: "plans",
-        kind: RuntimeWriteKind::Directory,
-        scope: RuntimeWriteScope::Session,
-        condition: RuntimeWriteCondition::AgentSession,
-    },
-    DeclaredWrite {
         // `$HOME` for every shell and native tool subprocess. Reached only through the variable;
         // nothing outside the runtime names the literal path.
         entry: ".capsule-home",
@@ -328,13 +290,6 @@ const DECLARED_WRITES: &[DeclaredWrite] = &[
         // The bind source the composed root mounts at `/tmp`. The capsule sees `/tmp` and never a
         // workdir path.
         entry: ".mur-tmp",
-        kind: RuntimeWriteKind::Directory,
-        scope: RuntimeWriteScope::Session,
-        condition: RuntimeWriteCondition::Sealed,
-    },
-    DeclaredWrite {
-        // The bind sources for the composed root's synthetic `/etc/passwd` and `/etc/group`.
-        entry: ".mur-etc",
         kind: RuntimeWriteKind::Directory,
         scope: RuntimeWriteScope::Session,
         condition: RuntimeWriteCondition::Sealed,
@@ -417,6 +372,11 @@ mod tests {
         ("recipes.rs", include_str!("recipes.rs")),
         ("resource_plane.rs", include_str!("resource_plane.rs")),
         ("runtime.rs", include_str!("runtime.rs")),
+        (
+            "runtime/artifact_change.rs",
+            include_str!("runtime/artifact_change.rs"),
+        ),
+        ("runtime_dir.rs", include_str!("runtime_dir.rs")),
         ("sandbox.rs", include_str!("sandbox.rs")),
         ("sealed.rs", include_str!("sealed.rs")),
         ("shell.rs", include_str!("shell.rs")),
@@ -437,15 +397,14 @@ mod tests {
         ("BLOB_DIR_NAME", crate::trace_blobs::BLOB_DIR_NAME),
         ("SEALED_TMP_DIR_NAME", crate::sealed::SEALED_TMP_DIR_NAME),
         (
-            "SEALED_ETC_STAGING_DIR_NAME",
-            crate::sealed::SEALED_ETC_STAGING_DIR_NAME,
-        ),
-        (
             "SYNTHETIC_HOME_DIR_NAME",
             crate::shell::SYNTHETIC_HOME_DIR_NAME,
         ),
-        ("FILES_DIR_NAME", crate::agent::process::FILES_DIR_NAME),
         ("TASK_INPUT_FILE", crate::runtime::TASK_INPUT_FILE),
+        (
+            "LEGACY_TASK_INPUT_FILE",
+            crate::runtime::LEGACY_TASK_INPUT_FILE,
+        ),
         ("TRACE_FILE_NAME", crate::trace::TRACE_FILE_NAME),
         ("CHILDREN_DIR", crate::child_launch::CHILDREN_DIR),
     ];
@@ -454,9 +413,10 @@ mod tests {
     const EXEMPT: &[(&str, &str)] = &[
         (
             "input.txt",
-            "Read, never written: the fallback name `read_task` tries after `task.md`. Source \
-             text cannot tell a read from a write, so a path the runtime only ever opens for \
-             reading is exempted here rather than declared as something the runtime produces.",
+            "Read, never written: the operator's task file `import_task_input` reads once when \
+             the workdir has no `task.md`. Source text cannot tell a read from a write, so a \
+             path the runtime only ever opens for reading is exempted here rather than declared \
+             as something the runtime produces.",
         ),
         (
             "package.json",
@@ -481,12 +441,6 @@ mod tests {
              refusal decision.",
         ),
         (
-            "recipes.rs",
-            "dir",
-            "A directory name from the recipe detector's own candidate list, opened to see \
-             whether the workdir has it.",
-        ),
-        (
             "resource_plane.rs",
             "declared_root",
             "The `exports.files` / `exports.peer_files` root a manifest declares. The plane \
@@ -508,8 +462,8 @@ mod tests {
         (
             "runtime.rs",
             "rel",
-            "`write_staged_file`'s path, `tools/<name>/<file>`, composed by each of its callers. \
-             Declared through the `tools` entry.",
+            "`write_staged_file`'s path, `tools/<name>/<file>` in the runtime directory, composed \
+             by each of its callers. Declared through RUNTIME_DIR_WRITES' `tools` entry.",
         ),
         (
             "types.rs",
@@ -634,8 +588,27 @@ mod tests {
     /// A `.create_dir_all(` straight after `fs` is `std::fs`'s, a raw call
     /// [`no_workdir_file_bypasses_the_no_follow_helper`] judges instead.
     fn helper_write_arguments(source: &str) -> Vec<String> {
+        helper_calls(source, HELPER_WRITES)
+            .into_iter()
+            .map(|(_, argument)| argument)
+            .collect()
+    }
+
+    /// Every call of one of `methods` in `source`, as `(receiver, first argument)` source text,
+    /// skipping `std::fs` functions of the same name. The receiver is the identifier the call
+    /// chain ends in — `runtime_root` for `self.runtime_root\n    .write_file(` — or `""` when
+    /// the text before the call does not end in one.
+    fn helper_calls(source: &str, methods: &[&str]) -> Vec<(String, String)> {
+        helper_calls_at(source, methods)
+            .into_iter()
+            .map(|(_, receiver, argument)| (receiver, argument))
+            .collect()
+    }
+
+    /// [`helper_calls`], with the byte offset of each call.
+    fn helper_calls_at(source: &str, methods: &[&str]) -> Vec<(usize, String, String)> {
         let mut found = Vec::new();
-        for method in HELPER_WRITES {
+        for method in methods {
             let mut cursor = 0;
             while let Some(offset) = source[cursor..].find(method) {
                 let start = cursor + offset;
@@ -643,11 +616,92 @@ mod tests {
                 if source[..start].ends_with("fs") {
                     continue;
                 }
-                found.push(one_line(first_argument(parenthesised(source, cursor))));
+                let receiver: String = source[..start]
+                    .trim_end()
+                    .chars()
+                    .rev()
+                    .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                found.push((
+                    start,
+                    receiver,
+                    one_line(first_argument(parenthesised(source, cursor))),
+                ));
             }
         }
         found
     }
+
+    /// The receivers that name the session's runtime directory, through which every file the
+    /// runtime owns is written and read.
+    const RUNTIME_DIR_ROOT: &str = "runtime_root";
+
+    /// The receivers that name a directory beside the runtime directory, outside every workdir:
+    /// `sealed-etc/`, `harness/` and the session directory holding them. No capsule command is
+    /// granted any of them, so what is written there is no runtime write inside a workdir.
+    const OUTSIDE_WORKDIR_ROOTS: &[&str] = &["sealed_etc_root", "harness_root", "session_dir_root"];
+
+    /// Every entry the runtime writes into the runtime directory, with what it is. The files a
+    /// capsule's commands read and cannot change.
+    const RUNTIME_DIR_WRITES: &[(&str, &str)] = &[
+        (
+            "tools",
+            "Every staged and pulled artifact's manifest, `skill.md` and native entrypoint, and \
+             every runtime-provided tool's manifest.",
+        ),
+        (
+            "MURMUR.md",
+            "The environment reference, written at staging and after port binding.",
+        ),
+        (
+            "task.md",
+            "The task: `mur run --task`, the import from the workdir, every A2A message and \
+             every reopen's rewrite.",
+        ),
+        (
+            "plans",
+            "One `plan-<n>.json` per submitted plan, read back when it runs.",
+        ),
+        (
+            "murmur.yaml",
+            "The project manifest, copied on every launch.",
+        ),
+    ];
+
+    /// Entry names of files the runtime owns: a write or read under one of them reaches a
+    /// runtime-directory root, never a workdir root.
+    const MOVED_OUT_OF_THE_WORKDIR: &[&str] = &[
+        "tools",
+        "MURMUR.md",
+        "task.md",
+        "plans",
+        "murmur.yaml",
+        ".mur-etc",
+        ".process-driver",
+    ];
+
+    /// Functions that read the workdir's own copy of one of those names, each with the reason.
+    const MOVED_NAME_WORKDIR_READS: &[(&str, &str, &str)] = &[(
+        "runtime.rs",
+        "import_task_input",
+        "The one read of the operator's `task.md` from the workdir, at session start, copied \
+         into the runtime directory and never read again.",
+    )];
+
+    /// [`crate::workdir_fs::WorkdirRoot`] methods that read, list, inspect or remove.
+    const HELPER_READS: &[&str] = &[
+        ".read_file(",
+        ".read_to_string(",
+        ".list_dir(",
+        ".file_len(",
+        ".entry_kind(",
+        ".remove_file(",
+        ".remove_dir_all(",
+        ".open_beneath(",
+    ];
 
     /// The entry name — the first path segment — a path argument stands for, or `None` when the
     /// source text cannot say: a variable, a field access, a format string that opens with a
@@ -721,9 +775,14 @@ mod tests {
             let text = production_text(source);
             let arguments = workdir_join_arguments(text)
                 .into_iter()
-                .chain(helper_write_arguments(text));
-            for argument in arguments {
+                .map(|argument| (String::new(), argument))
+                .chain(helper_calls(text, HELPER_WRITES));
+            for (receiver, argument) in arguments {
                 scanned += 1;
+                if OUTSIDE_WORKDIR_ROOTS.contains(&receiver.as_str()) {
+                    continue;
+                }
+                let runtime_dir = receiver == RUNTIME_DIR_ROOT;
                 let Some(entry) = resolve_entry_name(&argument) else {
                     let row =
                         DYNAMIC_EXEMPT
@@ -741,6 +800,20 @@ mod tests {
                     dynamic_rows_used[row.unwrap()] = true;
                     continue;
                 };
+                if runtime_dir {
+                    assert!(
+                        RUNTIME_DIR_WRITES.iter().any(|(name, _)| *name == entry),
+                        "{file} writes `{entry}` into the runtime directory, and \
+                         RUNTIME_DIR_WRITES does not declare it. Add (\"{entry}\", <what it is>)."
+                    );
+                    continue;
+                }
+                assert!(
+                    !MOVED_OUT_OF_THE_WORKDIR.contains(&entry.as_str()),
+                    "{file} writes `{entry}` through `{receiver}` ({argument}), a workdir root. \
+                     `{entry}` is a file the runtime owns: it goes through the runtime \
+                     directory's root (`runtime_root`), which no capsule command can write."
+                );
                 assert!(
                     declared.contains(&entry.as_str())
                         || EXEMPT.iter().any(|(name, _)| *name == entry),
@@ -773,6 +846,53 @@ mod tests {
             assert!(
                 !declared.contains(name),
                 "`{name}` is listed as exempt and is also declared — remove one"
+            );
+        }
+    }
+
+    /// No production read, listing, check or removal of a file the runtime owns goes through a
+    /// workdir root: every one reaches the runtime directory, whose files no capsule command can
+    /// change, apart from the rows of [`MOVED_NAME_WORKDIR_READS`].
+    #[test]
+    fn no_runtime_owned_file_is_reached_through_a_workdir_root() {
+        let mut checked = 0usize;
+        let mut rows_used = vec![false; MOVED_NAME_WORKDIR_READS.len()];
+        for (file, source) in SCANNED {
+            let text = production_text(source);
+            let methods: Vec<&str> = HELPER_READS.iter().chain(HELPER_WRITES).copied().collect();
+            for (start, receiver, argument) in helper_calls_at(text, &methods) {
+                let Some(entry) = resolve_entry_name(&argument) else {
+                    continue;
+                };
+                if !MOVED_OUT_OF_THE_WORKDIR.contains(&entry.as_str()) {
+                    continue;
+                }
+                checked += 1;
+                if receiver == RUNTIME_DIR_ROOT {
+                    continue;
+                }
+                let function = enclosing_fn(text, start);
+                let row = MOVED_NAME_WORKDIR_READS
+                    .iter()
+                    .position(|(row_file, row_fn, _)| row_file == file && *row_fn == function);
+                let Some(row) = row else {
+                    panic!(
+                        "{file}: `{function}` reaches `{entry}` through `{receiver}` ({argument}), \
+                         a workdir root. `{entry}` is a file the runtime owns, and lives in the \
+                         runtime directory: go through `runtime_root`."
+                    );
+                };
+                rows_used[row] = true;
+            }
+        }
+        assert!(
+            checked >= 20,
+            "found only {checked} reaches of a runtime-owned file — the scanner is broken"
+        );
+        for ((file, function, _), used) in MOVED_NAME_WORKDIR_READS.iter().zip(rows_used) {
+            assert!(
+                used,
+                "MOVED_NAME_WORKDIR_READS row ({file:?}, {function:?}) matches no read; remove it"
             );
         }
     }
@@ -840,37 +960,6 @@ mod tests {
     /// goes through [`crate::workdir_fs::WorkdirRoot`] instead, and has no row here.
     const RAW_FS_EXEMPT: &[(&str, &str, &str)] = &[
         (
-            "recipes.rs",
-            "read_file",
-            "Reads a capsule-authored recipe file to show what a build-tool call runs. The path \
-             is canonicalized and confined to the workdir by `confine` first, links inside the \
-             workdir are followed by design, and nothing is written or decided beyond the text \
-             shown.",
-        ),
-        (
-            "recipes.rs",
-            "read_makefile",
-            "Tests whether an `include`d recipe file exists before `read_file` confines and \
-             reads it.",
-        ),
-        (
-            "recipes.rs",
-            "read_justfile",
-            "Tests whether an `import`ed recipe file exists before `read_file` confines and \
-             reads it.",
-        ),
-        (
-            "recipes.rs",
-            "resolve_make",
-            "Picks which of make's default file names exists, beneath a directory `confine` \
-             already resolved inside the workdir.",
-        ),
-        (
-            "recipes.rs",
-            "resolve_just",
-            "Picks which of just's default file names exists, on `resolve_make`'s terms.",
-        ),
-        (
             "resource_plane.rs",
             "open_no_follow",
             "The resource plane's own reads of files the capsule exported, under its own \
@@ -890,9 +979,9 @@ mod tests {
         ),
         (
             "runtime.rs",
-            "copy_manifest_into_workdir",
+            "copy_manifest_into_runtime_dir",
             "Reads the project's `murmur.yaml` from the manifest directory; the copy into the \
-             workdir goes through `WorkdirRoot`.",
+             runtime directory goes through `WorkdirRoot`.",
         ),
         (
             "runtime.rs",
@@ -911,6 +1000,12 @@ mod tests {
             "The operator's `--workdir` itself, checked by path before it is opened as the \
              accessible root, and `<manifest dir>/workdir/<session id>`, created before any root \
              exists. Nothing beneath either is touched by path.",
+        ),
+        (
+            "sandbox.rs",
+            "test_runtime_dir",
+            "Test-only: creates a runtime directory's three subdirectories under a temporary \
+             directory the test owns.",
         ),
         (
             "sandbox.rs",
@@ -1108,7 +1203,7 @@ mod tests {
     /// Sealed is the one condition that changes the reported set, and it adds nothing a consumer
     /// diffing the accessible workdir's top level would see.
     #[test]
-    fn the_sealed_tier_adds_exactly_the_two_sealed_session_entries() {
+    fn the_sealed_tier_adds_exactly_the_tmp_store() {
         let scoped = runtime_writes(EnforcementTier::KernelFull);
         let sealed = runtime_writes(EnforcementTier::KernelSealed);
 
@@ -1125,15 +1220,33 @@ mod tests {
                 .iter()
                 .map(|write| write.path.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                ".murmur/<session-id>/.mur-tmp",
-                ".murmur/<session-id>/.mur-etc"
-            ]
+            vec![".murmur/<session-id>/.mur-tmp"]
         );
         for write in added {
             assert_eq!(write.condition, RuntimeWriteCondition::Sealed);
             assert_eq!(write.scope, RuntimeWriteScope::Session);
             assert_eq!(write.kind, RuntimeWriteKind::Directory);
+        }
+    }
+
+    /// The files the runtime owns are in the runtime directory, so the workdir declaration names
+    /// none of them, on any tier.
+    #[test]
+    fn runtime_writes_lists_none_of_the_runtime_directory_files() {
+        for tier in [
+            EnforcementTier::KernelSealed,
+            EnforcementTier::KernelFull,
+            EnforcementTier::KernelSeccompOnly,
+            EnforcementTier::EnvironmentOnly,
+        ] {
+            for write in runtime_writes(tier) {
+                let last = write.path.rsplit('/').next().unwrap_or_default();
+                assert!(
+                    !MOVED_OUT_OF_THE_WORKDIR.contains(&last),
+                    "{} is declared as a workdir write",
+                    write.path
+                );
+            }
         }
     }
 

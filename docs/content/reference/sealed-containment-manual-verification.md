@@ -1019,8 +1019,8 @@ trust store are unchanged.
 A Landlock rule names the **inode** an fd resolved to, not the path string it was opened by. The
 `SEALED_ETC_PATHS` grant for `/etc/passwd` is taken on the *host's* `/etc/passwd`, which the
 composed root no longer binds — so the synthetic file needs a rule of its own, taken on the file in
-`<workdir>/.mur-etc/`. A third binary, identical to `mur-after` except that
-`apply_landlock_scope` skips those two rules:
+the session's `sealed-etc/` directory, beside its runtime directory. A third binary, identical to
+`mur-after` except that `apply_landlock_scope` skips those two rules:
 
 ```text
 --1-GETPWUID-HOME--
@@ -1836,13 +1836,9 @@ file; each is a scoping decision this slice made explicitly.
   This is the one place the composed root's "outside does not exist" promise degrades to `scoped`'s
   "outside is denied". See the warning under step 3e for the kernel rule that forces it and for what
   it costs.
-- **`/etc/passwd` and `/etc/group` are synthetic, and a capsule can rewrite its own copy.** They are
-  no longer the host's (card `60e1c285`; the residual this bullet used to record is closed — see the
-  2026-08-09 entry). What remains: the two files are staged in `<workdir>/.mur-etc/`, and the
-  workdir is the capsule's one writable path, so a capsule that edits them there changes what its
-  own `getpwuid(3)` reports. It reaches nothing outside itself by doing so — nothing on the host
-  reads those files, and they name no id the capsule is not already running as. The bind itself
-  stays read-only, so `touch /etc/passwd` is still `EROFS`.
+- **`/etc/passwd` and `/etc/group` are synthetic.** They are written into the session's
+  `sealed-etc/` directory beside its [runtime directory](workdir.md#runtime-directory), which no
+  command can open, and bound read-only, so `touch /etc/passwd` is `EROFS`.
 - **Read-only binds are not recursively read-only.** A submount underneath a bound directory (a
   separate `/usr/local` partition, say) keeps its own mount flags. `MS_REMOUNT | MS_BIND | MS_RDONLY`
   applies to one mount; walking the subtree is a follow-up.

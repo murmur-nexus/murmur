@@ -170,6 +170,7 @@ fn stage_fixture_tool_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: project_dir.to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),

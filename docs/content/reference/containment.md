@@ -136,15 +136,16 @@ Its grants are the capsule's own: `capabilities.filesystem`, `capabilities.netwo
 `capabilities.network.unix_sockets` and `capabilities.shell.allow` apply to it exactly as they apply
 to a shell command. The runtime adds one thing, the files the kernel itself executes to start the
 tool, each with read and execute and nothing else. It works them out once, when it installs the
-tool, from the artifact's own image, so nothing written to the workdir afterwards changes them:
+tool, from the artifact's own image:
 
-1. The tool's entrypoint, `<session workdir>/tools/<name>/<name>`.
+1. The tool's entrypoint, `tools/<name>/<name>` in the session's
+   [runtime directory](workdir.md#runtime-directory).
 2. For a script, the absolute interpreter on its `#!` line. On Sealed, that interpreter's
    directory is bound into the composed root when no fixed runtime path already carries it.
 3. The ELF interpreter and shared-library closure of each, found at absolute paths and in the
    system library directories. A library the tool finds through `$ORIGIN`, or anywhere inside
-   the workdir, gets no grant; one shipped beside the tool is read through the workdir's own
-   access.
+   the workdir, gets no grant; one shipped beside the tool is read through the runtime
+   directory's read-only grant.
 
 Everything else the tool reads, writes, runs or connects to has to be granted by the capsule:
 
@@ -167,12 +168,11 @@ tool still needs a network namespace, and is refused with
 that cannot be built for a native tool ends the session with
 `E-RUN-014` (see [Containment class](#field-containment)), as it does for a shell command.
 
-!!! warning "The entrypoint is in the writable workdir"
-    The tool's entrypoint sits in the session workdir, which the capsule can write. A capsule that
-    overwrites `tools/<name>/<name>` in place and then calls the tool runs code it wrote, which
-    [`workdir_exec: false`](#field-workdir-exec) otherwise forbids. That code runs with the grants
-    of the tool as installed: a new `#!` line or library entry adds none. A symlink or another
-    existing file put in the entrypoint's place has no execute grant, and the call fails.
+The entrypoint sits in the runtime directory, which the capsule's commands can read and cannot
+change on the Full and Sealed tiers: a command that overwrites, replaces or renames over it is
+refused, so the tool that runs is the tool that was installed, a pulled one included. On the
+Seccomp-only and Environment-only tiers nothing protects it; see
+[What protects it](workdir.md#what-protects-it).
 
 ### Where the user namespace comes from { #userns-grant }
 
@@ -295,6 +295,13 @@ including a `sealed`-capable one. The host probe still reports what the machine 
 `scoped` makes: with an executable workdir, `shell.allow` is no longer something the kernel can hold
 the capsule to. Nothing in a manifest can ever *raise* an achieved class. See
 [Executable workdirs](#field-workdir-exec).
+
+**So does a runtime directory inside the workdir.** When `~/.murmur/sessions` lies inside the
+workdir the capsule's commands write, they can change the task, `MURMUR.md`, plans and installed
+tools in its [runtime directory](workdir.md#runtime-directory), and the achieved class is capped at
+`advisory` the same way. A `scoped` or `sealed` floor is refused with
+[`E-CAP-003`](diagnostics.md#e-cap-003); below it the launch prints
+[`W-SEC-033`](diagnostics.md#w-sec-033).
 
 **A weaker declaration is never silently upgraded.** On a `sealed`-capable host, a capsule
 declaring `scoped` still runs with `scoped`'s mechanism — Landlock and seccomp over the host

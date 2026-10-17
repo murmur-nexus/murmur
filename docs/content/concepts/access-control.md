@@ -10,7 +10,7 @@ capsule's manifest and starts empty.
 ## Per-tool narrowing
 
 By default every WASM tool, and the inference driver, runs on the
-capsule-wide `capabilities:` ceiling: the same allow-list and the same preopened workdir. A
+capsule-wide `capabilities:` ceiling: the same allow-list and the same view of the workdir. A
 `runtime: tool` or `runtime: driver` entry in the capsule's own `murmur.yaml` may optionally
 declare its own `capabilities:` block to run *below* that ceiling — a narrower host list, a
 subdirectory instead of the whole workdir:
@@ -131,10 +131,10 @@ other:
 | Threat | What it looks like | What stops it |
 |---|---|---|
 | A steered honest tool | The model sends a write into a protected subtree through a tool or shell command that behaves exactly as documented | `capabilities.filesystem.read_only` — the dispatch check reads the resolved call and refuses it |
-| A malicious artifact | The artifact receives innocuous input, passes every dispatch check, and writes wherever its preopen allows | `capabilities.filesystem.scope` on that artifact's entry in the operator's own manifest — a narrow preopen the artifact cannot widen (see [Per-tool narrowing](#per-tool-narrowing)) |
+| A malicious artifact | The artifact receives innocuous input, passes every dispatch check, and writes wherever its directory grant allows | `capabilities.filesystem.scope` on that artifact's entry in the operator's own manifest — a narrow directory grant the artifact cannot widen (see [Per-tool narrowing](#per-tool-narrowing)) |
 
 The dispatch check sees what a call *says*. It cannot see what a component *does* once it holds a
-directory handle, and a narrow preopen is the only thing that governs that.
+directory handle, and a narrow directory grant is the only thing that governs that.
 
 ### The interpreter gap
 
@@ -151,7 +151,7 @@ is and is not identified is in [Read-only paths](../reference/manifest.md#read-o
 
 ## Untrusted publisher text
 
-Tool and skill descriptions rendered into [`MURMUR.md`](session-loop.md#murmurmd) are
+Tool and skill descriptions rendered into [`MURMUR.md`](session-loop.md#murmur-md) are
 publisher-controlled, untrusted text: the runtime
 sanitizes them (collapsing newlines, stripping control characters, truncating length) before
 rendering, and `MURMUR.md` states explicitly that this file is machine-generated inventory

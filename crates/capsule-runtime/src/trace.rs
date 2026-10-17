@@ -1177,8 +1177,7 @@ struct TaskFailedEvent {
     parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
-    /// The task in progress. Absent for the run a launch makes from `input.txt` when no task
-    /// arrived, which has no `task_start`.
+    /// The task in progress. Absent for a failure recorded before any `task_start`.
     #[serde(skip_serializing_if = "Option::is_none")]
     task_id: Option<String>,
     /// The turn that failed, 0-based. Absent when the failure is the task's rather than one
@@ -4717,6 +4716,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             crate::cgroup::IoMaxReport::default(),
         )
     }
@@ -5219,6 +5219,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                 crate::cgroup::IoMaxReport::default(),
             );
             let dir = tempfile::tempdir().unwrap();
@@ -5275,6 +5276,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             crate::cgroup::IoMaxReport::default(),
         );
         assert!(
@@ -5331,7 +5333,9 @@ mod tests {
                 role: "tool".to_string(),
                 scope: None,
                 surface: crate::containment::PreopenSurface::WholeWorkdir,
+                runtime_dir_read_only: true,
             }],
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             crate::cgroup::IoMaxReport::default(),
         );
 
@@ -5393,6 +5397,7 @@ mod tests {
                 "role": "tool",
                 "scope": null,
                 "surface": "whole-workdir",
+                "runtime_dir_read_only": true,
             }])
         );
         assert_eq!(events[0]["containment_declared"], "scoped");

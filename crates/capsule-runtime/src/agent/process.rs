@@ -51,7 +51,10 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    agent::{AgentLoopExit, AttemptEnding, CallGate, PLAN_TOOL_NOTICE, UNTRUSTED_CONTENT_NOTICE},
+    agent::{
+        AgentLoopExit, AttemptEnding, CallGate, PLAN_TOOL_NOTICE, RUNTIME_DIR_NOTICE,
+        UNTRUSTED_CONTENT_NOTICE,
+    },
     bindings::host::murmur::tool::run::ToolInput,
     cancel::{CancelSignal, Residue, PHASE_HARNESS},
     errors::RuntimeError,
@@ -106,21 +109,19 @@ const PARSE_BATCH_MAX_LINES: usize = 256;
 /// what the driver classifies a run by when the output ended without a terminal event.
 const STDERR_TAIL_CAP: usize = 4096;
 
-/// Where a run's driver-written files go, under the internal session workdir.
-pub(crate) const FILES_DIR_NAME: &str = ".process-driver";
-
 /// The token the runtime replaces, in the plan's arguments and `env-set` values, with the
 /// absolute path of the run's private files directory.
 const FILES_DIR_TOKEN: &str = "{files_dir}";
 
-/// Builds the system prompt the driver is handed. Always carries `MURMUR_MD_TRUST_NOTICE` and
-/// `UNTRUSTED_CONTENT_NOTICE`, even when no `inference.system_prompt` is configured, so the
-/// harness never receives MURMUR.md-adjacent context or runs tools without the
-/// not-instructions / untrusted-content notices.
+/// Builds the system prompt the driver is handed. Always carries `RUNTIME_DIR_NOTICE`,
+/// `MURMUR_MD_TRUST_NOTICE` and `UNTRUSTED_CONTENT_NOTICE`, even when no `inference.system_prompt`
+/// is configured, so the harness is always told where the runtime's files are and never receives
+/// MURMUR.md-adjacent context or runs tools without the not-instructions / untrusted-content
+/// notices.
 ///
 /// It carries no `[Capsule]` block, unlike the http transport's
 /// `agent::build_augmented_system_prompt`: on this transport murmur does not render the prompt at
-/// all — it hands the driver one string and the harness frames everything around it, so the two
+/// all — it hands the driver one string and the harness frames everything around it, so the three
 /// unconditional notices, plus `PLAN_TOOL_NOTICE` where `plan_tool_present` says the capsule was
 /// granted the plan tool, are the only part that is murmur's to inject. The value must
 /// nonetheless stay launch-invariant, for the same prompt caching reason as the http path: it
@@ -138,7 +139,8 @@ pub(super) fn build_process_system_prompt(
     } else {
         String::new()
     };
-    let notices = format!("{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}{plan}");
+    let notices =
+        format!("{RUNTIME_DIR_NOTICE}\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}{plan}");
     match system_prompt.filter(|sp| !sp.is_empty()) {
         Some(sp) => format!("{notices}\n\n{sp}"),
         None => notices,
@@ -418,6 +420,7 @@ pub(super) fn build_harness_env(
     policy: &CapabilityPolicy,
     env_set: &[(String, String)],
     files_dir: &str,
+    runtime_dir: &Path,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut env = shell::build_declared_env(policy);
     for (name, value) in env_set {
@@ -428,6 +431,11 @@ pub(super) fn build_harness_env(
         }
         env.insert(name.clone(), substitute_files_dir(value, files_dir));
     }
+    // Last, so no `env-set` entry displaces it.
+    env.insert(
+        crate::runtime_dir::RUNTIME_DIR_ENV.to_string(),
+        runtime_dir.to_string_lossy().into_owned(),
+    );
     Ok(env)
 }
 
@@ -533,37 +541,36 @@ fn untested_version_message(probe: &VersionProbe, tested_versions: &[String]) ->
 
 /// The run's private directory for the files the driver asked for, removed when the run ends.
 struct FilesDir {
-    root: WorkdirRoot,
-    /// The run id naming this run's directory under [`FILES_DIR_NAME`].
+    /// The session's `harness/` directory, beside its runtime directory, which no capsule command
+    /// can open.
+    harness_root: WorkdirRoot,
+    /// The run id naming this run's directory under [`Self::harness_root`].
     run: String,
 }
 
 impl FilesDir {
-    /// Create `<session workdir>/.process-driver/<run id>/`, readable only by this user.
-    fn create(workdir: &WorkdirRoot) -> Result<Self, String> {
+    /// Create `harness/<run id>/`, readable only by this user.
+    fn create(harness_root: &WorkdirRoot) -> Result<Self, String> {
         let run = Uuid::new_v4().simple().to_string();
-        workdir
-            .create_dir_all(format!("{FILES_DIR_NAME}/{run}"), FILES_DIR_MODE)
+        harness_root
+            .create_dir_all(&run, FILES_DIR_MODE)
             .map_err(|e| format!("failed to create the harness files directory: {e}"))?;
         Ok(Self {
-            root: workdir.clone(),
+            harness_root: harness_root.clone(),
             run,
         })
     }
 
     /// The host path the harness is handed. The runtime itself writes here only through
-    /// [`Self::root`].
+    /// [`Self::harness_root`].
     fn path(&self) -> PathBuf {
-        self.root
-            .host_path(format!("{FILES_DIR_NAME}/{}", self.run))
+        self.harness_root.host_path(&self.run)
     }
 }
 
 impl Drop for FilesDir {
     fn drop(&mut self) {
-        let _ = self
-            .root
-            .remove_dir_all(format!("{FILES_DIR_NAME}/{}", self.run));
+        let _ = self.harness_root.remove_dir_all(&self.run);
     }
 }
 
@@ -581,9 +588,9 @@ fn write_driver_files(
     let mut names = Vec::with_capacity(files.len());
     for file in files {
         check_driver_file_name(&file.name)?;
-        dir.root
+        dir.harness_root
             .write_file(
-                format!("{FILES_DIR_NAME}/{}/{}", dir.run, file.name),
+                format!("{}/{}", dir.run, file.name),
                 file.contents.as_bytes(),
                 DRIVER_FILE_MODE,
             )
@@ -786,15 +793,14 @@ async fn run_harness(
     }
 
     let inventory = build_tool_inventory(
-        workdir,
+        &store_state.runtime_root,
         inference.system_prompt_artifact.as_deref(),
         &store_state.installed_artifacts,
     );
     let bridge = claude_bridge::bind_bridge(BRIDGE_BIND_ADDR, &inventory).await;
 
     // A continued attempt's prompt is its continuation alone: the resumed session already holds
-    // the task. Otherwise it is task.md, which lives in accessible_workdir (where the agent's own
-    // tools are preopened), not the internal session workdir. Either is fenced on the same
+    // the task. Otherwise it is the runtime directory's task.md. Either is fenced on the same
     // condition as the http path, from the same functions, so the transport a capsule runs on
     // does not decide whether an untrusted payload is marked. The fence source is discarded: this
     // transport keeps no conversation record.
@@ -803,7 +809,7 @@ async fn run_harness(
         Some(continuation) => continuation.into_payload(provenance),
         None => super::fence_task_payload(
             provenance,
-            super::fresh_task_text(inference, accessible_workdir),
+            super::fresh_task_text(&store_state.runtime_root),
         ),
     };
 
@@ -832,7 +838,7 @@ async fn run_harness(
     };
     let plan: LaunchPlan = driver.launch(request).await?.map_err(launch_error)?;
 
-    let files_dir = FilesDir::create(workdir).map_err(launch_error)?;
+    let files_dir = FilesDir::create(&store_state.runtime_dirs.harness).map_err(launch_error)?;
     let files_dir_path = files_dir.path().to_string_lossy().into_owned();
     let files = write_driver_files(&files_dir, &plan.files).map_err(launch_error)?;
     let args: Vec<String> = plan
@@ -844,6 +850,7 @@ async fn run_harness(
         &store_state.capability_policy,
         &plan.env_set,
         &files_dir_path,
+        store_state.runtime_root.path(),
     )
     .map_err(launch_error)?;
 
@@ -1717,7 +1724,7 @@ mod tests {
         let prompt = build_process_system_prompt(None, false);
         assert_eq!(
             prompt,
-            format!("{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}")
+            format!("{RUNTIME_DIR_NOTICE}\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}")
         );
     }
 
@@ -1739,7 +1746,7 @@ mod tests {
         let prompt = build_process_system_prompt(Some(""), false);
         assert_eq!(
             prompt,
-            format!("{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}")
+            format!("{RUNTIME_DIR_NOTICE}\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}")
         );
     }
 
@@ -2050,6 +2057,7 @@ mod tests {
             &policy_allowing(&["MURMUR_TEST_HARNESS_DECLARED"]),
             &[],
             "/files",
+            std::path::Path::new("/runtime"),
         )
         .unwrap();
         assert_eq!(
@@ -2073,6 +2081,7 @@ mod tests {
                 ("FILES".to_string(), "{files_dir}/config.json".to_string()),
             ],
             "/tmp/run",
+            std::path::Path::new("/runtime"),
         )
         .unwrap();
         assert_eq!(
@@ -2097,11 +2106,34 @@ mod tests {
             &policy_allowing(&["MURMUR_TEST_HARNESS_API_KEY"]),
             &[],
             "/files",
+            std::path::Path::new("/runtime"),
         )
         .unwrap();
         assert!(
-            env.is_empty(),
+            !env.contains_key("MURMUR_TEST_HARNESS_API_KEY"),
             "a credential-shaped host name reached the harness: {env:?}"
+        );
+    }
+
+    /// The runtime directory is the session's, set last: no declaration, host value or `env-set`
+    /// entry displaces it.
+    #[test]
+    fn harness_env_names_the_runtime_directory_whatever_else_says() {
+        std::env::set_var(crate::runtime_dir::RUNTIME_DIR_ENV, "/host/value");
+        let env = build_harness_env(
+            &policy_allowing(&[crate::runtime_dir::RUNTIME_DIR_ENV]),
+            &[(
+                crate::runtime_dir::RUNTIME_DIR_ENV.to_string(),
+                "/plan/value".to_string(),
+            )],
+            "/files",
+            std::path::Path::new("/runtime"),
+        )
+        .unwrap();
+        assert_eq!(
+            env.get(crate::runtime_dir::RUNTIME_DIR_ENV)
+                .map(String::as_str),
+            Some("/runtime")
         );
     }
 
@@ -2117,8 +2149,13 @@ mod tests {
         let channel = crate::formation_credentials::FORMATION_CHANNEL_ENV;
         std::env::set_var(peers, "decoy=http://localhost:1");
         std::env::set_var(channel, "9");
-        let declared_only =
-            build_harness_env(&policy_allowing(&[peers, channel]), &[], "/files").unwrap();
+        let declared_only = build_harness_env(
+            &policy_allowing(&[peers, channel]),
+            &[],
+            "/files",
+            std::path::Path::new("/runtime"),
+        )
+        .unwrap();
         std::env::remove_var(peers);
         std::env::remove_var(channel);
         assert!(
@@ -2261,6 +2298,7 @@ mod tests {
                 &CapabilityPolicy::default(),
                 &[(bad.to_string(), "v".to_string())],
                 "/files",
+                std::path::Path::new("/runtime"),
             )
             .unwrap_err();
             assert!(error.contains("env-set"), "{bad:?}: {error}");
@@ -2346,7 +2384,7 @@ mod tests {
                 assert_eq!(mode(&files.path()), 0o700);
                 assert_eq!(mode(&files.path().join("config.json")), 0o600);
             }
-            assert!(files.path().starts_with(dir.path().join(FILES_DIR_NAME)));
+            assert_eq!(files.path().parent(), Some(dir.path()));
             files.path()
         };
         assert!(!path.exists(), "the run's files directory outlived the run");

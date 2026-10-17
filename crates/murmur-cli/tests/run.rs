@@ -988,20 +988,17 @@ impl LinkedWorkdir {
     }
 }
 
-/// `--task` into a `task.md` that is a link: the launch exits with `E-RUN-050` naming it, and the
-/// file the link names keeps its bytes.
+/// A `task.md` in the workdir that is a link: `--task` goes to the runtime directory, so the link
+/// is never written through, never read, and the file it names keeps its bytes.
 #[test]
-fn workdir_path_refused_at_launch_for_a_task_md_link() {
+fn a_task_md_link_in_the_workdir_is_never_written_through() {
     let linked = LinkedWorkdir::new();
     linked.link(&linked.outside().join("sentinel.txt"), "task.md");
 
     linked
         .run("x")
-        .failure()
-        .stderr(predicate::str::contains("E-RUN-050"))
-        .stderr(predicate::str::contains(
-            "refused to write task.md: task.md is a symbolic link inside the workdir",
-        ));
+        .success()
+        .stdout(predicate::str::contains("status:  ok"));
 
     linked.assert_outside_unchanged();
 }
@@ -1024,25 +1021,20 @@ fn workdir_path_refused_at_launch_for_a_murmur_link() {
     linked.assert_outside_unchanged();
 }
 
-/// A `murmur.yaml` that is a dangling link into `outside/`: the manifest copy is refused rather
-/// than creating the file the link names.
+/// A `murmur.yaml` that is a dangling link into `outside/`: the manifest is copied into the
+/// runtime directory, never into the workdir, so the file the link names is never created.
 #[test]
-fn workdir_path_refused_at_launch_for_a_dangling_manifest_link() {
+fn a_dangling_manifest_link_in_the_workdir_is_never_written_through() {
     let linked = LinkedWorkdir::new();
     linked.link(&linked.outside().join("not-yet.yaml"), "murmur.yaml");
 
-    linked
-        .run("x")
-        .failure()
-        .stderr(predicate::str::contains("E-RUN-050"))
-        .stderr(predicate::str::contains(
-            "murmur.yaml is a symbolic link inside the workdir",
-        ));
+    linked.run("x").success();
 
     linked.assert_outside_unchanged();
 }
 
-/// With no link anywhere, the same `--workdir` launch runs to completion and writes its task.
+/// With no link anywhere, the same `--workdir` launch runs to completion and writes neither its
+/// task nor the manifest into the workdir.
 #[test]
 fn workdir_path_with_no_links_runs_to_completion() {
     let linked = LinkedWorkdir::new();
@@ -1052,10 +1044,7 @@ fn workdir_path_with_no_links_runs_to_completion() {
         .success()
         .stdout(predicate::str::contains("status:  ok"));
 
-    assert_eq!(
-        fs::read_to_string(linked.workdir().join("task.md")).unwrap(),
-        "the task"
-    );
-    assert!(linked.workdir().join("murmur.yaml").is_file());
+    assert!(!linked.workdir().join("task.md").exists());
+    assert!(!linked.workdir().join("murmur.yaml").exists());
     linked.assert_outside_unchanged();
 }

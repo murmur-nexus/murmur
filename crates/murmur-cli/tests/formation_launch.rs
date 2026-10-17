@@ -1044,17 +1044,32 @@ fn members_running_one_capsule_are_each_told_their_own_name() {
     assert_formation_line(&formation, "planner", &["w1", "w2"]);
     let (_, planner) = launcher.next_json();
     project.await_entry_mid_task();
+    // Read while every member runs: each MURMUR.md is in its session's runtime directory, which
+    // goes when the session ends.
+    let members = ["planner", "w1", "w2"];
+    let murmur_mds: Vec<String> = members
+        .iter()
+        .map(|member| {
+            let session = project.session_of_member(member);
+            let id = session.file_name().unwrap();
+            let path = project
+                .home
+                .path()
+                .join(".murmur/sessions")
+                .join(id)
+                .join("runtime/MURMUR.md");
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
+        })
+        .collect();
     project.release.send(()).unwrap();
     assert_eq!(launcher.wait().code(), Some(0), "{}", launcher.stderr());
 
     assert_eq!(project.sessions_of("worker").len(), 2);
     let id = formation["formation_id"].as_str().unwrap();
-    let members = ["planner", "w1", "w2"];
-    for member in members {
+    for (member, murmur_md) in members.into_iter().zip(murmur_mds) {
         let session = project.session_of_member(member);
         let start = &read_trace(&session.join("trace.jsonl"))[0];
         assert_eq!(start["formation_id"], id, "{start}");
-        let murmur_md = std::fs::read_to_string(session.join("MURMUR.md")).unwrap();
         assert!(
             murmur_md.contains(&format!(
                 "\n- Formation member: {member} (your name in this formation; other members may \

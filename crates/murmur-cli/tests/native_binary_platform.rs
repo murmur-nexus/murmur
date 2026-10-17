@@ -170,6 +170,7 @@ fn stage_request(project_dir: &Path, manifest: &RuntimeManifest) -> StageRequest
 
     StageRequest {
         source_supply: None,
+        expected_workdir_identity: None,
         credentials_file: None,
         manifest_dir: project_dir.to_path_buf(),
         capsule_name: manifest.name.clone(),
@@ -404,12 +405,12 @@ fn an_unrecognised_payload_stages_and_doctor_reports_it_unverified() {
         .expect("an unidentifiable payload must stage");
     assert!(
         staged
-            .workdir
+            .runtime_dir
             .join("tools")
             .join(TOOL_NAME)
             .join(TOOL_NAME)
             .is_file(),
-        "the binary must still be installed into the session workdir"
+        "the binary must still be installed into the runtime directory"
     );
 
     common::install_artifact_to_project(project.path(), &artifact).success();

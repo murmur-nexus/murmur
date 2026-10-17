@@ -66,6 +66,29 @@ pub const MUR_BINARY_ENV: &str = "MURMUR_MUR_BINARY";
 /// peer — because it is the one `mur run` output that carries a token.
 pub const READINESS_TOKENS_FLAG: &str = "--readiness-tokens";
 
+/// The hidden `mur run` flag carrying `<st_dev>:<st_ino>` of the directory a delegating parent
+/// created for its child, which the child's staging compares with the `--workdir` it opened
+/// before writing anything there (`E-RUN-051` on a mismatch).
+pub const WORKDIR_IDENTITY_FLAG: &str = "--workdir-identity";
+
+/// `(st_dev, st_ino)` in [`WORKDIR_IDENTITY_FLAG`]'s `<dev>:<ino>` form.
+#[must_use]
+pub fn format_workdir_identity(identity: (u64, u64)) -> String {
+    format!("{}:{}", identity.0, identity.1)
+}
+
+/// Parses [`WORKDIR_IDENTITY_FLAG`]'s `<dev>:<ino>` value.
+pub fn parse_workdir_identity(value: &str) -> Result<(u64, u64), String> {
+    let (dev, ino) = value
+        .split_once(':')
+        .ok_or_else(|| format!("{WORKDIR_IDENTITY_FLAG} takes <dev>:<ino>, not {value:?}"))?;
+    let number = |part: &str| {
+        part.parse::<u64>()
+            .map_err(|_| format!("{WORKDIR_IDENTITY_FLAG} takes <dev>:<ino>, not {value:?}"))
+    };
+    Ok((number(dev)?, number(ino)?))
+}
+
 /// How long the parent waits for a child to print its `--json` launch line.
 ///
 /// Generous, because it bounds more than a handshake: a script capsule prints the line when its
@@ -540,7 +563,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         ))
     })?;
     let workdir_rel = child_workdir_rel(&request.capsule_name);
-    create_child_dir(&request.parent_accessible_root, &workdir_rel)?;
+    let identity = create_child_dir(&request.parent_accessible_root, &workdir_rel)?;
     let workdir = request.parent_accessible_root.host_path(&workdir_rel);
 
     let binary = mur_binary()?;
@@ -553,6 +576,8 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         request.capsule_version.clone(),
         "--workdir".to_string(),
         workdir.display().to_string(),
+        WORKDIR_IDENTITY_FLAG.to_string(),
+        format_workdir_identity(identity),
         "--json".to_string(),
         READINESS_TOKENS_FLAG.to_string(),
         "--no-env-file".to_string(),
@@ -950,12 +975,19 @@ pub(crate) fn mur_binary() -> Result<PathBuf, RuntimeError> {
 }
 
 /// Creates `rel` beneath `root` with [`CHILD_DIR_MODE`], and `.murmur/children` above it with the
-/// default mode, no link followed. A link on the way is
+/// default mode, no link followed, and returns the `(st_dev, st_ino)` of the directory it
+/// created, from a descriptor reached the same way. A link on the way is
 /// [`RuntimeError::WorkdirPathRefused`].
-fn create_child_dir(root: &WorkdirRoot, rel: &Path) -> Result<(), RuntimeError> {
+fn create_child_dir(root: &WorkdirRoot, rel: &Path) -> Result<(u64, u64), RuntimeError> {
     root.create_dir_all(CHILDREN_DIR, DEFAULT_DIR_MODE)?;
     root.create_dir_all(rel, CHILD_DIR_MODE)?;
-    Ok(())
+    let created = root.open_beneath(&rel.to_string_lossy())?.ok_or_else(|| {
+        RuntimeError::Runtime(format!(
+            "the child capsule's directory {} vanished after its creation",
+            root.display_path(rel)
+        ))
+    })?;
+    Ok(created.identity()?)
 }
 
 /// The child's stderr as the parent keeps it: every line echoed to this process's stderr as it

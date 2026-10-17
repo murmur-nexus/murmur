@@ -324,6 +324,7 @@ enum Commands {
                 "bind",
                 "explain_scope",
                 "readiness_tokens",
+                "workdir_identity",
             ]
         )]
         roster: Option<PathBuf>,
@@ -416,6 +417,12 @@ enum Commands {
         /// holds. Anything a person reads gets `mur token` instead.
         #[arg(long, hide = true, requires = "json")]
         readiness_tokens: bool,
+
+        /// The <dev>:<ino> the --workdir directory must have. Set by a parent capsule's runtime
+        /// for the directory it created for a delegated child; a launch whose --workdir is any
+        /// other directory is refused with E-RUN-051 before anything is written there.
+        #[arg(long, hide = true, requires = "workdir", value_name = "DEV:INO")]
+        workdir_identity: Option<String>,
 
         /// Print extended startup info: workdir, manifest identity, driver, and installed skills.
         /// Session ID is always shown at startup regardless of this flag.
@@ -754,6 +761,7 @@ fn main() {
             workdir,
             json,
             readiness_tokens,
+            workdir_identity,
             verbose,
             bind,
             no_env_file,
@@ -777,6 +785,7 @@ fn main() {
             workdir,
             json,
             readiness_tokens,
+            workdir_identity.as_deref(),
             verbose,
             &bind,
             no_env_file,

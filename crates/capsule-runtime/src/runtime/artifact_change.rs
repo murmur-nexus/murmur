@@ -280,17 +280,17 @@ impl CapsuleStoreState {
         self.installed_generation += 1;
 
         // 3. The files: manifest, `skill.md`, native binary.
-        // Removed by descriptor beneath the session root: a link at `tools` or at the tool's
+        // Removed by descriptor beneath the runtime directory: a link at `tools` or at the tool's
         // directory is refused, never followed into what it names.
         let rel = format!("tools/{tool}");
-        match self.session_root.remove_dir_all(&rel) {
+        match self.runtime_root.remove_dir_all(&rel) {
             Ok(()) => Ok(true),
             Err(err) if err.is_not_found() => Ok(true),
             Err(WorkdirError::Refused(refusal)) => Err(refusal.to_string()),
             Err(WorkdirError::Io { source, .. }) => {
                 Err(crate::artifact_removal::undeletable_directory(
                     name,
-                    &self.session_root.host_path(&rel),
+                    &self.runtime_root.host_path(&rel),
                     &source,
                 ))
             }
@@ -828,10 +828,10 @@ impl CapsuleStoreState {
         }
 
         // Extract murmur.yaml, dispatch extraction by runtime type, and write files under
-        // <workdir>/tools/<name>/ — nothing is written before every check above has passed.
+        // <runtime dir>/tools/<name>/ — nothing is written before every check above has passed.
         let manifest_yaml = extract_manifest_yaml(&name, &version, &resolved.bytes)
             .map_err(|err| err.to_string())?;
-        write_tool_manifest(&self.session_root, &tool, &manifest_yaml)
+        write_tool_manifest(&self.runtime_root, &tool, &manifest_yaml)
             .map_err(|err| err.to_string())?;
 
         let (artifact_runtime, implementation, wasm_component) = match resolved.meta.runtime {
@@ -853,7 +853,7 @@ impl CapsuleStoreState {
                 let binary = extract_native_binary(&tool, &version, &resolved.bytes)
                     .map_err(|err| err.to_string())?;
                 let installed = install_native_binaries(
-                    &self.session_root,
+                    &self.runtime_root,
                     &self.accessible_workdir,
                     vec![(tool.clone(), binary)],
                     &HashMap::from([(tool.clone(), name.clone())]),
@@ -869,7 +869,7 @@ impl CapsuleStoreState {
             RuntimeType::Static => {
                 let skill_md = extract_skill_md(&name, &version, &resolved.bytes)
                     .map_err(|err| err.to_string())?;
-                install_skill_files(&self.session_root, vec![(tool.clone(), skill_md)])
+                install_skill_files(&self.runtime_root, vec![(tool.clone(), skill_md)])
                     .map_err(|err| err.to_string())?;
                 (ArtifactRuntime::Skill, None, None)
             }
@@ -1077,7 +1077,7 @@ fn fit_refusal(name: &ArtifactName, version: &str, fit: &VersionFit, hint: &str)
 /// Write both tools' manifests, exactly when the capsule holds an install grant and its agent
 /// loop is the http one: the grant is the files' existence.
 pub(super) fn write_artifact_change_tool_manifests(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
     policy: &CapabilityPolicy,
     http_agent_loop: bool,
 ) -> Result<(), RuntimeError> {
@@ -1085,7 +1085,7 @@ pub(super) fn write_artifact_change_tool_manifests(
         return Ok(());
     }
     write_runtime_provided_tool_manifest(
-        workdir,
+        runtime_root,
         PULL_ARTIFACT_TOOL,
         &native_tool_manifest_yaml(
             PULL_ARTIFACT_TOOL,
@@ -1094,7 +1094,7 @@ pub(super) fn write_artifact_change_tool_manifests(
         ),
     )?;
     write_runtime_provided_tool_manifest(
-        workdir,
+        runtime_root,
         REMOVE_ARTIFACT_TOOL,
         &native_tool_manifest_yaml(
             REMOVE_ARTIFACT_TOOL,

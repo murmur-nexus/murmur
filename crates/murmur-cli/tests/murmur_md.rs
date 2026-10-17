@@ -86,7 +86,8 @@ fn create_agent_manifest(
     project_dir.join("murmur.yaml")
 }
 
-/// Test 1: MURMUR.md is written to the workdir root after stage_session.
+/// Test 1: MURMUR.md is written to the runtime directory after stage_session, and nowhere in the
+/// workdir.
 #[test]
 fn murmur_md_written_after_staging() {
     let home = TempDir::new().unwrap();
@@ -111,11 +112,12 @@ fn murmur_md_written_after_staging() {
 
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
 
-    let murmur_md_path = staged.workdir.join("MURMUR.md");
+    let murmur_md_path = staged.runtime_dir.join("MURMUR.md");
     assert!(
         murmur_md_path.exists(),
-        "MURMUR.md should exist in workdir after staging"
+        "MURMUR.md should exist in the runtime directory after staging"
     );
+    assert!(!staged.workdir.join("MURMUR.md").exists());
 
     let content = fs::read_to_string(&murmur_md_path).unwrap();
     assert!(
@@ -167,7 +169,7 @@ fn murmur_md_reflects_capsule_config() {
     );
 
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    let content = fs::read_to_string(staged.workdir.join("MURMUR.md")).unwrap();
+    let content = fs::read_to_string(staged.runtime_dir.join("MURMUR.md")).unwrap();
 
     assert!(
         content.contains("Model: claude-test-model"),
@@ -218,7 +220,7 @@ fn murmur_md_shows_visible_tools_not_drivers() {
     );
 
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    let content = fs::read_to_string(staged.workdir.join("MURMUR.md")).unwrap();
+    let content = fs::read_to_string(staged.runtime_dir.join("MURMUR.md")).unwrap();
 
     assert!(
         !content.contains(&format!("**{DRIVER_ANTHROPIC_NAME}**")),
@@ -234,7 +236,7 @@ fn murmur_md_shows_visible_tools_not_drivers() {
     );
 }
 
-/// Test 4: native artifact binary is staged to workdir/tools/<name>/<name> and is executable.
+/// Test 4: native artifact binary is staged to <runtime dir>/tools/<name>/<name> and is executable.
 #[test]
 fn native_artifact_binary_staged_to_workdir() {
     let home = TempDir::new().unwrap();
@@ -271,13 +273,13 @@ fn native_artifact_binary_staged_to_workdir() {
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
 
     let binary_path = staged
-        .workdir
+        .runtime_dir
         .join("tools")
         .join("test-native")
         .join("test-native");
     assert!(
         binary_path.exists(),
-        "native binary should exist at workdir/tools/test-native/test-native"
+        "native binary should exist at <runtime dir>/tools/test-native/test-native"
     );
 
     #[cfg(unix)]
@@ -380,7 +382,7 @@ fn skill_artifact_installed_to_tools_dir() {
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
 
     let skill_path = staged
-        .workdir
+        .runtime_dir
         .join("tools")
         .join("my-test-skill")
         .join("skill.md");
@@ -428,7 +430,7 @@ fn murmur_md_includes_skills_section_when_skill_installed() {
     );
 
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    let content = fs::read_to_string(staged.workdir.join("MURMUR.md")).unwrap();
+    let content = fs::read_to_string(staged.runtime_dir.join("MURMUR.md")).unwrap();
 
     assert!(
         content.contains("## Installed Skills"),
@@ -438,9 +440,15 @@ fn murmur_md_includes_skills_section_when_skill_installed() {
         content.contains("my-guide-skill"),
         "MURMUR.md skills section should name the installed skill"
     );
+    let skill_path = staged
+        .runtime_dir
+        .join("tools/my-guide-skill/skill.md")
+        .display()
+        .to_string();
     assert!(
-        content.contains("*(call by name to load guidance)*"),
-        "MURMUR.md skills section should mark the skill as callable by name; content:\n{content}"
+        content.contains(&format!("*(call by name to load guidance; {skill_path})*")),
+        "MURMUR.md skills section should mark the skill as callable by name and name its path \
+         in the runtime directory; content:\n{content}"
     );
     assert!(
         content.contains("it is not pre-injected\ninto context"),

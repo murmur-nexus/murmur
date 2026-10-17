@@ -1051,6 +1051,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                     crate::cgroup::IoMaxReport::default(),
                 ),
                 murmur_artifact::TraceCapture::Meta,

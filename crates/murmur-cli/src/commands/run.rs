@@ -30,7 +30,7 @@ use crate::{
     config::load_effective_mur_config_if_any_exists,
     error::{
         CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_008, E_RUN_015, E_RUN_016, E_RUN_019,
-        E_RUN_047,
+        E_RUN_047, E_RUN_051,
     },
     stores::FallbackRegistry,
 };
@@ -162,6 +162,7 @@ pub(crate) fn run_run(
     workdir_arg: Option<PathBuf>,
     json: bool,
     readiness_tokens: bool,
+    workdir_identity_arg: Option<&str>,
     verbose: bool,
     bind_addr: &str,
     no_env_file: bool,
@@ -590,6 +591,10 @@ pub(crate) fn run_run(
             configured_artifacts,
             preopens,
             io_max,
+            &workdir_arg
+                .as_deref()
+                .map(absolutise)
+                .unwrap_or_else(|| workdir.clone()),
         );
         if json {
             let line = serde_json::to_string(&report).map_err(|source| {
@@ -761,6 +766,18 @@ pub(crate) fn run_run(
     let source_supply = crate::source::supply::CliSourceSupply::for_policy(&capability_policy)
         .map_err(|error| fail(&session_id, &workdir, error, json))?;
 
+    let workdir_identity = workdir_identity_arg
+        .map(capsule_runtime::parse_workdir_identity)
+        .transpose()
+        .map_err(|reason| {
+            fail(
+                &session_id,
+                &workdir,
+                CliError::new(E_RUN_051, reason),
+                json,
+            )
+        })?;
+
     let stage_request = StageRequest {
         credentials_file: crate::config::mur_config_path().ok(),
         manifest_dir: project_dir.clone(),
@@ -810,6 +827,7 @@ pub(crate) fn run_run(
         formation_id,
         formation_member,
         source_supply,
+        expected_workdir_identity: workdir_identity,
     };
 
     // Stage against project-then-global, the order `check_artifacts_installed` pre-flights in,
@@ -844,10 +862,8 @@ pub(crate) fn run_run(
     workdir = staged.workdir.clone();
 
     if let Some(task_value) = task_arg {
-        // `staged.workdir` is the internal `.murmur/<session_id>` bookkeeping directory —
-        // the agent's tools are preopened at `staged.accessible_workdir` (see
-        // capsule-runtime's build_wasi_ctx calls), so task.md must land there or the
-        // agent's own `read_file("task.md")` 404s even though the task was delivered.
+        // Into the session's runtime directory, where the agent reads it at
+        // `$MURMUR_RUNTIME_DIR/task.md` or `murmur-runtime/task.md`; the workdir is left alone.
         let written = task_input_bytes(task_value)
             .map_err(|source| {
                 CliError::new(
@@ -864,7 +880,7 @@ pub(crate) fn run_run(
                         }
                         WorkdirError::Io { .. } => CliError::new(
                             E_IO_003,
-                            format!("failed to write --task to workdir: {error}"),
+                            format!("failed to write --task to the runtime directory: {error}"),
                         ),
                     })
             });

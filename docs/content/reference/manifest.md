@@ -730,7 +730,8 @@ Rules:
   runtime finds `skill.md` case-insensitively (`SKILL.md`, `Skill.md`, … all match) and installs it
   as lowercase `skill.md`. A file path is read directly regardless of its name.
 - Everything downstream is identical to a registry skill: the file is installed to
-  `workdir/tools/<name>/skill.md` and listed under `## Installed Skills` in `MURMUR.md`.
+  `tools/<name>/skill.md` in the session's [runtime directory](workdir.md#runtime-directory) and
+  listed under `## Installed Skills` in `MURMUR.md`.
 - A non-skill artifact declaring `local_source: true` passes manifest validation, but only a
   skill-shaped local payload — a `skill.md` file, or a directory containing one — resolves at
   launch.
@@ -2068,7 +2069,8 @@ the same terms. Omit the key to deliver no variable.
   ```
 
 - A `capabilities.shell` block present with an empty `allow` list is rejected at parse time.
-- A synthetic tool manifest is written to `workdir/tools/<binary>/murmur.yaml` at session start for
+- A synthetic tool manifest is written to `tools/<binary>/murmur.yaml` in the session's
+  [runtime directory](workdir.md#runtime-directory) at session start for
   each listed binary; the agent discovers these alongside artifact-backed tools.
 - The tool's `command` argument carries the arguments alone — the runtime supplies the binary. A
   shell interpreter (`bash`, `sh`, `zsh`, `fish`, `dash`, `ksh`) is the exception: its `command` is
@@ -2411,7 +2413,7 @@ How long a capsule waits for the next A2A message depends on the lifecycle it de
 | Lifecycle | Behaviour when no message arrives |
 |---|---|
 | `task_acceptance: queue` with `after_task: sleep` | Waits indefinitely. Shutdown is the host's responsibility. |
-| Every other combination | Waits 30 seconds for a task. If none arrives, the capsule runs the task in `input.txt` when the accessible workdir holds one, and otherwise ends the session without calling the model. |
+| Every other combination | Waits 30 seconds for a task when the launch was given none — no `--task`, and no `task.md` or `input.txt` in the accessible workdir when it started. If none arrives, the session ends without calling the model. |
 
 Set the `MURMUR_A2A_TIMEOUT_SECS` environment variable to change the 30-second window.
 

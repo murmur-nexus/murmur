@@ -382,7 +382,10 @@ impl Delegation {
 
     /// The child's own `mur run`: the one process whose `--workdir` is its directory.
     fn processes(&self) -> Vec<(u32, String)> {
-        processes_mentioning(&format!("{} --json", self.child_dir().display()))
+        processes_mentioning(&format!(
+            "{} --workdir-identity",
+            self.child_dir().display()
+        ))
     }
 }
 

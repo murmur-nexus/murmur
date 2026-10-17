@@ -149,13 +149,14 @@ pub enum HomeEntryKind {
     CompiledForms,
     BinaryCache,
     Formations,
+    Sessions,
     /// A top-level name this build writes nothing under.
     Unrecognised(String),
 }
 
 impl HomeEntryKind {
     /// Every kind with a fixed name, in the order the audit reports them after the home itself.
-    const KNOWN: [HomeEntryKind; 12] = [
+    const KNOWN: [HomeEntryKind; 13] = [
         Self::Config,
         Self::DeployKeys,
         Self::DeployStaging,
@@ -168,6 +169,7 @@ impl HomeEntryKind {
         Self::CompiledForms,
         Self::BinaryCache,
         Self::Formations,
+        Self::Sessions,
     ];
 
     /// The entry's name under `~/.murmur`, or `None` for the home itself.
@@ -186,6 +188,7 @@ impl HomeEntryKind {
             Self::CompiledForms => "compiled",
             Self::BinaryCache => "bin",
             Self::Formations => crate::formation_launch::FORMATIONS_DIR,
+            Self::Sessions => crate::runtime_dir::SESSIONS_DIR_NAME,
             Self::Unrecognised(name) => name,
         })
     }
@@ -206,6 +209,7 @@ impl HomeEntryKind {
             Self::CompiledForms => "compiled WASM cache",
             Self::BinaryCache => "cached mur binaries",
             Self::Formations => "formation members' working directories",
+            Self::Sessions => "running sessions' runtime directories",
             Self::Unrecognised(_) => "something not recognised by this build",
         }
     }
@@ -217,6 +221,10 @@ impl HomeEntryKind {
             Self::Formations => Some(
                 "each kept until its formation has ended and the entry member's trace.retain \
                  expires it",
+            ),
+            Self::Sessions => Some(
+                "each removed when its session ends, and by the next launch when a session \
+                 ended without removing its own",
             ),
             _ => None,
         }
@@ -249,6 +257,9 @@ impl HomeEntryKind {
     pub fn private_depth(&self) -> Option<usize> {
         match self {
             Self::Formations => Some(2),
+            // `sessions/<id>/` and the three directories in it are created owner-only; below
+            // them are the runtime's own files, written at the umask's modes.
+            Self::Sessions => Some(2),
             _ => None,
         }
     }
@@ -638,19 +649,21 @@ mod tests {
 
         let reports = audit_murmur_home(&home);
 
-        assert_eq!(reports.len(), 13);
+        assert_eq!(reports.len(), 14);
         assert_eq!(reports[0].kind, HomeEntryKind::Home);
         assert_eq!(reports[1].kind, HomeEntryKind::Config);
         assert_eq!(reports[10].kind, HomeEntryKind::CompiledForms);
         assert_eq!(reports[11].kind, HomeEntryKind::BinaryCache);
         assert_eq!(reports[12].kind, HomeEntryKind::Formations);
+        assert_eq!(reports[13].kind, HomeEntryKind::Sessions);
         assert!(reports
             .iter()
             .all(|report| report.state == HomeEntryState::Absent));
     }
 
-    /// Only `formations/` says how long it is kept, and only `compiled/` is safe to delete: a
-    /// formation directory is removed by retention, and what it holds is never written again.
+    /// Only `formations/` and `sessions/` say how long they are kept, and only `compiled/` is
+    /// safe to delete: a formation directory is removed by retention, and what it holds is never
+    /// written again; a session's runtime directory is removed when it ends.
     #[test]
     fn murmur_home_kinds_say_how_formations_are_kept_and_only_compiled_is_safe_to_delete() {
         let every = HomeEntryKind::KNOWN
@@ -659,7 +672,7 @@ mod tests {
         for kind in every {
             assert_eq!(
                 kind.kept().is_some(),
-                kind == HomeEntryKind::Formations,
+                matches!(kind, HomeEntryKind::Formations | HomeEntryKind::Sessions),
                 "{kind:?}"
             );
             assert_eq!(

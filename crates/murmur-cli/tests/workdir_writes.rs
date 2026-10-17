@@ -163,6 +163,7 @@ fn the_trace_carries_the_same_declaration_explain_scope_prints() {
         Vec::new(),
         Vec::new(),
         capsule_runtime::IoMaxReport::default(),
+        &run.accessible,
     );
     assert_eq!(
         serde_json::to_value(&declared.runtime_writes).unwrap(),
@@ -204,7 +205,9 @@ fn run_session(responses: Vec<String>) -> Run {
     );
     let session_id = staged.session_id.clone();
     let session_dir = staged.workdir.clone();
-    fs::write(accessible.path().join("task.md"), "Say done.").unwrap();
+    // The way `mur run --task` delivers it: into the runtime directory, so the workdir holds
+    // nothing the operator put there.
+    staged.write_task_input(b"Say done.").unwrap();
 
     launch_session(staged, |_| {}).expect("the session must launch");
 

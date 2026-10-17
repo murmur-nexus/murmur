@@ -236,18 +236,21 @@ fn the_json_report_carries_a_stable_preopen_shape() {
                 "role": "tool",
                 "scope": null,
                 "surface": "whole-workdir",
+                "runtime_dir_read_only": true,
             },
             {
                 "artifact": "local/cache-tool",
                 "role": "driver",
                 "scope": "cache",
                 "surface": "scoped-subtree",
+                "runtime_dir_read_only": false,
             },
             {
                 "artifact": "local/telemetry-hook",
                 "role": "hook",
                 "scope": null,
                 "surface": "nothing",
+                "runtime_dir_read_only": false,
             },
         ])
     );
@@ -326,6 +329,7 @@ fn a_capsule_wide_scope_does_not_narrow_a_tools_preopen() {
                 "role": "tool",
                 "scope": null,
                 "surface": "whole-workdir",
+                "runtime_dir_read_only": true,
             },
         ])
     );

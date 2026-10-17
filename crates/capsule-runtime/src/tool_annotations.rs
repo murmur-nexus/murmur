@@ -507,20 +507,20 @@ pub(crate) struct ToolAnnotationMap {
 }
 
 impl ToolAnnotationMap {
-    /// Lower the `input_schema` of every `<workdir>/tools/<name>/murmur.yaml`.
+    /// Lower the `input_schema` of every `<runtime dir>/tools/<name>/murmur.yaml`.
     ///
     /// Read from the staged manifests rather than from anything the session produces: the schema
     /// is fixed before the session starts, and the model chooses values at call time but never
     /// annotations. A directory that cannot be read contributes nothing.
-    pub(crate) fn from_workdir(workdir: &crate::workdir_fs::WorkdirRoot) -> Self {
+    pub(crate) fn from_runtime_dir(runtime_root: &crate::workdir_fs::WorkdirRoot) -> Self {
         let mut tools = BTreeMap::new();
-        let Ok(Some(entries)) = workdir.list_dir("tools") else {
+        let Ok(Some(entries)) = runtime_root.list_dir("tools") else {
             return Self { tools };
         };
         for (name, _) in entries {
             // A link at the tool's directory or manifest is refused and latched, never read
             // through.
-            let Some(schema) = workdir
+            let Some(schema) = runtime_root
                 .read_to_string(format!("tools/{name}/{PACKED_MANIFEST_ENTRY}"))
                 .ok()
                 .flatten()
@@ -1006,7 +1006,7 @@ mod tests {
         );
         write("bare", "name: bare\nversion: 0.1.0\n");
 
-        let map = ToolAnnotationMap::from_workdir(
+        let map = ToolAnnotationMap::from_runtime_dir(
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
         );
         assert!(map.for_tool("noter").is_opaque(&[key("note")]));
@@ -1015,7 +1015,7 @@ mod tests {
             "a tool that annotated nothing keeps the key-name heuristic"
         );
         let empty = tempfile::tempdir().unwrap();
-        assert!(ToolAnnotationMap::from_workdir(
+        assert!(ToolAnnotationMap::from_runtime_dir(
             &crate::workdir_fs::WorkdirRoot::open(empty.path()).unwrap()
         )
         .is_empty());

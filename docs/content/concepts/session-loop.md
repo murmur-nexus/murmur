@@ -45,12 +45,34 @@ system prompt; the driver returns a response. If the model requests a tool call,
 executes it, appends the result, and starts the next turn. When the model returns `end_turn`
 (or `max_tokens`) the result is written to `workdir/out/result.txt` and the loop exits.
 
-## `MURMUR.md`
+## `MURMUR.md` { #murmur-md }
 
-For agent capsules, the runtime writes `MURMUR.md` to the capsule workdir root — an
-onboarding file covering the capsule's identity, model and context budget, directory layout,
-installed tools and skills, how to call a tool, available shell commands, and how to write
-checkpoints.
+For agent capsules, the runtime writes `MURMUR.md` into the session's
+[runtime directory](../reference/workdir.md#runtime-directory), beside the task, the manifest copy
+and the installed tools. It is an onboarding file covering:
+
+- the capsule's identity, model and context budget
+- the two directories it works with
+- installed tools and skills, and how to call a tool
+- available shell commands
+- how to write checkpoints
+
+The agent reaches that directory by two names:
+
+| From | Name |
+|---|---|
+| A shell command, a native tool, a `transport: process` harness | `$MURMUR_RUNTIME_DIR` |
+| A file tool with no `capabilities.filesystem.scope` | `murmur-runtime/` |
+
+Where the host can enforce it, the agent's commands can read the directory and cannot change it —
+see [What protects it](../reference/workdir.md#what-protects-it). The `[Capsule]` block at the head
+of every system prompt names both ways in with one fixed line, the same on every launch:
+
+```text
+Runtime files: MURMUR.md, task.md, murmur.yaml and the installed tools are in a directory you can read and cannot change — $MURMUR_RUNTIME_DIR in a shell command, murmur-runtime/ in a file tool.
+```
+
+`transport: process` hands the same line to the harness as part of its system prompt.
 
 ## Turn limit (`inference.max_turns`)
 

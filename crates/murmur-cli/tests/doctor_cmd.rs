@@ -573,9 +573,13 @@ fn doctor_says_nothing_about_the_lock_when_no_lockfile_exists() {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
 
     assert!(stdout.contains("All checks passed."), "got:\n{stdout}");
-    // `Landlock` is the name of the host block every project prints, not lockfile output.
+    // `Landlock` is the name of the host block every project prints, and `landlock` the
+    // mechanism the runtime directory's line names: neither is lockfile output.
     assert!(
-        !stdout.replace("Landlock", "").contains("lock"),
+        !stdout
+            .replace("Landlock", "")
+            .replace("landlock", "")
+            .contains("lock"),
         "no lockfile means no lock-related output, got:\n{stdout}"
     );
 }
