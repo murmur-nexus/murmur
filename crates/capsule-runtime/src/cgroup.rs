@@ -1739,8 +1739,8 @@ fn transient_scope_unit_name() -> String {
 /// actually moved us.
 #[cfg(target_os = "linux")]
 fn request_transient_scope(unit: &str) -> Result<(), String> {
-    // zbus's blocking API drives its own executor; run it off-thread so it never blocks a
-    // caller already inside another async runtime (e.g. tokio) on a nested reactor.
+    // `zbus::block_on` drives the connection on the calling thread and panics or deadlocks inside
+    // another runtime's task; run it on a thread of its own so a caller inside tokio is safe.
     let owned_unit = unit.to_string();
     std::thread::Builder::new()
         .name("murmur-cgroup-scope".to_string())
@@ -1769,35 +1769,38 @@ fn request_transient_scope(unit: &str) -> Result<(), String> {
 /// * `Description` (`s`) — what `systemctl --user list-units` shows beside the unit.
 #[cfg(target_os = "linux")]
 fn start_transient_scope(unit: &str) -> Result<(), String> {
-    use zbus::zvariant::Value;
+    use zbus::Variant;
 
-    let connection = zbus::blocking::Connection::session()
-        .map_err(|error| format!("no systemd session bus: {error}"))?;
-
-    let properties: Vec<(&str, Value<'_>)> = vec![
+    let properties: Vec<(&str, Variant<'_>)> = vec![
         (
             "Description",
-            Value::from("Murmur capsule subprocess scope"),
+            Variant::from("Murmur capsule subprocess scope"),
         ),
-        ("PIDs", Value::from(vec![std::process::id()])),
-        ("Delegate", Value::from(true)),
-        ("CollectMode", Value::from("inactive-or-failed")),
+        ("PIDs", Variant::from(vec![std::process::id()])),
+        ("Delegate", Variant::from(true)),
+        ("CollectMode", Variant::from("inactive-or-failed")),
     ];
     // No auxiliary units: a scope has none.
-    let aux: Vec<(&str, Vec<(&str, Value<'_>)>)> = Vec::new();
+    let aux: Vec<(&str, Vec<(&str, Variant<'_>)>)> = Vec::new();
 
-    connection
-        .call_method(
-            Some("org.freedesktop.systemd1"),
-            "/org/freedesktop/systemd1",
-            Some("org.freedesktop.systemd1.Manager"),
-            "StartTransientUnit",
-            // "fail" rather than "replace": a name collision means something is wrong with our
-            // assumption of uniqueness, and displacing an unrelated unit is never the fix.
-            &(unit, "fail", properties, aux),
-        )
-        .map(|_| ())
-        .map_err(|error| format!("systemd refused to start {unit}: {error}"))
+    zbus::block_on(async {
+        let connection = zbus::Connection::session()
+            .await
+            .map_err(|error| format!("no systemd session bus: {error}"))?;
+        connection
+            .call_method(
+                Some("org.freedesktop.systemd1"),
+                "/org/freedesktop/systemd1",
+                Some("org.freedesktop.systemd1.Manager"),
+                "StartTransientUnit",
+                // "fail" rather than "replace": a name collision means something is wrong with
+                // our assumption of uniqueness, and displacing an unrelated unit is never the fix.
+                &(unit, "fail", properties, aux),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("systemd refused to start {unit}: {error}"))
+    })
 }
 
 /// Wait until `/proc/self/cgroup` actually reports us inside `unit`'s cgroup.
