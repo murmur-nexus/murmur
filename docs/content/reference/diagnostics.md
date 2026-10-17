@@ -403,7 +403,7 @@ error[E-IO-004]: HOME is not set, so there is no ~/.murmur to hold this session'
 |---|---|
 | `mur run` | Before any artifact store, lockfile or registry is read; also under `--explain-scope` |
 | `mur eval run` | When a case is staged |
-| `mur trace show`, `steps`, `diff`, `report`, `mur eval show`, `diff`, `mur run --resume` | When the address needs a records group; the path form needs none |
+| `mur trace show`, `steps`, `diff`, `report`, `list`, `mur eval show`, `diff`, `mur run --resume` | When the address needs a records group, which `list` always does; the path form needs none |
 | `mur doctor` | In place of the runtime and records directory paths, counted as a failed check |
 
 ### E-RUN-006 — a harness binary was not found { #e-run-006 }
@@ -771,9 +771,10 @@ and is reported as the driver reports it.
 
 ### E-RUN-028 — the running-capsule records could not be read { #e-run-028 }
 
-[`mur ps`](cli.md#mur-ps), [`mur watch`](cli.md#mur-watch), [`mur cancel`](cli.md#mur-cancel) and
-[`mur stop`](cli.md#mur-stop) read the [running-capsule records](cli.md#running-capsule-records)
-under `~/.murmur/running/`, and that directory could not be created, held at `0700`, or listed.
+[`mur ps`](cli.md#mur-ps), [`mur watch`](cli.md#mur-watch), [`mur cancel`](cli.md#mur-cancel),
+[`mur stop`](cli.md#mur-stop) and [`mur trace list`](cli.md#mur-trace-list) read the
+[running-capsule records](cli.md#running-capsule-records) under `~/.murmur/running/`, and that
+directory could not be created, held at `0700`, or listed. `mur trace list` only lists it.
 Which capsules are running is unknown, so nothing is listed, nothing is removed and nothing is
 signalled.
 
@@ -786,7 +787,7 @@ The message ends with the path and the operating system's error.
 
 | Error | Means |
 |---|---|
-| `File exists` | A file is where the directory belongs |
+| `File exists`, `Not a directory` | A file is where the directory belongs |
 | `Permission denied` | The directory exists and this user may not list it |
 
 ### E-WIT-LEVEL-001 — an artifact does not fit the served WIT level { #e-wit-level-001 }

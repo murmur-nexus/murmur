@@ -877,7 +877,17 @@ fn a_run_with_no_home_at_all_is_refused_with_e_io_004() {
         );
         let left: Vec<_> = fs::read_dir(tmp.path()).unwrap().collect();
         assert!(left.is_empty(), "nothing is written under TMPDIR: {left:?}");
+        String::from_utf8_lossy(&failure.get_output().stdout).to_string()
     };
+    let listing_refused = |home: Option<&Path>, args: &[&str], cause: &str| {
+        let stdout = refused(home, args, cause);
+        assert!(
+            stdout.is_empty(),
+            "{args:?} prints nothing on stdout: {stdout}"
+        );
+    };
+    let list = ["trace", "list"];
+    let list_json = ["trace", "list", "--json"];
     let run = [
         "run",
         "--manifest",
@@ -899,12 +909,27 @@ fn a_run_with_no_home_at_all_is_refused_with_e_io_004() {
         &run,
         "HOME is 'relative', which is not an absolute path",
     );
+    for args in [&list[..], &list_json[..]] {
+        listing_refused(None, args, "HOME is not set");
+        listing_refused(
+            Some(Path::new("relative")),
+            args,
+            "HOME is 'relative', which is not an absolute path",
+        );
+    }
     if closed_counts {
         refused(
             Some(closed.path()),
             &run,
             "cannot hold this session's runtime and records directories",
         );
+        for args in [&list[..], &list_json[..]] {
+            listing_refused(
+                Some(closed.path()),
+                args,
+                "cannot hold this session's runtime and records directories",
+            );
+        }
     }
     fs::set_permissions(
         closed.path().join(".murmur"),
