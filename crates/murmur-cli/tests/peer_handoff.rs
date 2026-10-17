@@ -273,6 +273,7 @@ fn end_turn_response(text: &str) -> String {
 struct Capsule {
     project: PathBuf,
     session_dir: PathBuf,
+    records_dir: PathBuf,
     url: String,
     name: String,
     port: u16,
@@ -283,7 +284,7 @@ struct Capsule {
 
 impl Capsule {
     fn trace(&self) -> String {
-        fs::read_to_string(self.session_dir.join("trace.jsonl")).unwrap_or_default()
+        fs::read_to_string(self.records_dir.join("trace.jsonl")).unwrap_or_default()
     }
 
     fn events(&self, event_type: &str) -> Vec<Value> {
@@ -402,6 +403,7 @@ fn launch(spec: CapsuleSpec<'_>) -> Capsule {
     let manifest_path = project.join("murmur.yaml");
     fs::write(&manifest_path, manifest).unwrap();
     let runtime_manifest = load_runtime_manifest(&manifest_path).unwrap();
+    common::process_home();
     let staged = stage_session(
         Arc::new(LocalRegistry::new(
             home.path().join(".murmur").join("artifacts"),
@@ -411,6 +413,7 @@ fn launch(spec: CapsuleSpec<'_>) -> Capsule {
     .expect("staging should succeed");
 
     let session_dir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
     let (url_tx, url_rx) = mpsc::channel::<String>();
     let handle = thread::spawn(move || {
         launch_session(staged, move |url| {
@@ -425,6 +428,7 @@ fn launch(spec: CapsuleSpec<'_>) -> Capsule {
     Capsule {
         project,
         session_dir,
+        records_dir,
         url,
         name: spec.name.to_string(),
         port: spec.port,
@@ -442,6 +446,7 @@ fn stage_request(
     StageRequest {
         source_supply: None,
         expected_workdir_identity: None,
+        manifest_file: None,
         credentials_file: None,
         manifest_dir: project.to_path_buf(),
         capsule_name: runtime_manifest.name.clone(),
@@ -1354,6 +1359,7 @@ fn relaunch(project: &Path, manifest: &str, port: u16) -> Capsule {
     let manifest_path = project.join("murmur.yaml");
     fs::write(&manifest_path, manifest).unwrap();
     let runtime_manifest = load_runtime_manifest(&manifest_path).unwrap();
+    common::process_home();
     let staged = stage_session(
         Arc::new(LocalRegistry::new(
             home.path().join(".murmur").join("artifacts"),
@@ -1363,6 +1369,7 @@ fn relaunch(project: &Path, manifest: &str, port: u16) -> Capsule {
     .expect("the second session should stage");
 
     let session_dir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
     let (url_tx, url_rx) = mpsc::channel::<String>();
     let handle = thread::spawn(move || {
         launch_session(staged, move |url| {
@@ -1377,6 +1384,7 @@ fn relaunch(project: &Path, manifest: &str, port: u16) -> Capsule {
     Capsule {
         project: project.to_path_buf(),
         session_dir,
+        records_dir,
         url,
         name: runtime_manifest.name.clone(),
         port,

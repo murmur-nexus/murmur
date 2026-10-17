@@ -193,6 +193,12 @@ fn workdir_of(assert: Assert) -> PathBuf {
     common::parse_workdir_from_stdout(&stdout)
 }
 
+/// A launched run's records directory, read off the line `mur run --verbose` prints.
+fn records_of(assert: Assert) -> PathBuf {
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    common::parse_records_from_stdout(&stdout)
+}
+
 /// One project, its temp home and its scripted provider, wired together.
 struct Fixture {
     home: TempDir,
@@ -620,8 +626,8 @@ fn seen_with_text<'a>(seen: &'a [Seen], text: &str) -> Vec<&'a Seen> {
 }
 
 /// Every event of `event_type` in a session's trace.
-fn trace_events(workdir: &Path, event_type: &str) -> Vec<Value> {
-    fs::read_to_string(workdir.join("trace.jsonl"))
+fn trace_events(records_dir: &Path, event_type: &str) -> Vec<Value> {
+    fs::read_to_string(records_dir.join("trace.jsonl"))
         .unwrap()
         .lines()
         .filter(|line| !line.is_empty())
@@ -632,8 +638,8 @@ fn trace_events(workdir: &Path, event_type: &str) -> Vec<Value> {
 
 /// What the reading hook saw through `murmur:conversation/read`, taken off the `task_reopened`
 /// line its report became.
-fn read_through_conversation(workdir: &Path) -> Vec<Seen> {
-    let reopened = trace_events(workdir, "task_reopened");
+fn read_through_conversation(records_dir: &Path) -> Vec<Seen> {
+    let reopened = trace_events(records_dir, "task_reopened");
     assert_eq!(reopened.len(), 1, "the reader reopens once: {reopened:?}");
     mark_report(reopened[0]["reason"].as_str().unwrap())
 }
@@ -666,8 +672,9 @@ fn a_reader_tells_a_real_compaction_summary_from_a_persons_turn() {
         );
         grant_conversation_read(&f.manifest, "reader");
 
-        let workdir = workdir_of(run(&f.home, &f.manifest, &["--context", CONTEXT_ID]).success());
-        let seen = read_through_conversation(&workdir);
+        let records_dir =
+            records_of(run(&f.home, &f.manifest, &["--context", CONTEXT_ID]).success());
+        let seen = read_through_conversation(&records_dir);
 
         for person in seen_with_text(&seen, TASK_TEXT) {
             assert_eq!(
@@ -785,7 +792,7 @@ fn the_mark_survives_a_threaded_reload_and_a_resume() {
 
     // `@1` is the threaded run, the latest session under this project's session root.
     unlock();
-    let workdir = workdir_of(run(&f.home, &resumed, &["--resume", "@1"]).success());
+    let records_dir = records_of(run(&f.home, &resumed, &["--resume", "@1"]).success());
     let after = record_lines(&f.home, CAPSULE_NAME, CONTEXT_ID);
     assert_eq!(
         &after[..reloaded.len()],
@@ -794,7 +801,7 @@ fn the_mark_survives_a_threaded_reload_and_a_resume() {
     );
     assert_first_run_marks(&handed_in_run(reloaded.len()), "resume, compaction event");
     assert_first_run_marks(
-        &read_through_conversation(&workdir),
+        &read_through_conversation(&records_dir),
         "resume, conversation/read",
     );
 
@@ -811,9 +818,9 @@ fn the_mark_survives_a_threaded_reload_and_a_resume() {
 fn the_inference_trace_event_names_the_messages_it_sent() {
     let f = fixture(vec![tool_call(), end_turn("done")], "", &[]);
 
-    let workdir = workdir_of(run(&f.home, &f.manifest, &["--context", CONTEXT_ID]));
+    let records_dir = records_of(run(&f.home, &f.manifest, &["--context", CONTEXT_ID]));
 
-    let trace = fs::read_to_string(workdir.join("trace.jsonl")).unwrap();
+    let trace = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap();
     let inferences: Vec<Value> = trace
         .lines()
         .filter(|line| !line.is_empty())
@@ -1044,10 +1051,11 @@ fn a_rejected_answer_is_fixed_in_one_more_turn_without_rerunning_a_tool() {
             )],
         );
 
-        let workdir = workdir_of(run(&f.home, &f.manifest, &["--context", CONTEXT_ID]).success());
+        let records_dir =
+            records_of(run(&f.home, &f.manifest, &["--context", CONTEXT_ID]).success());
 
         assert_eq!(
-            trace_events(&workdir, "tool_call").len(),
+            trace_events(&records_dir, "tool_call").len(),
             1,
             "{mode}: the first attempt's tool call is not re-run"
         );
@@ -1091,11 +1099,11 @@ fn a_rejected_answer_is_fixed_in_one_more_turn_without_rerunning_a_tool() {
             "{mode}: the task is sent once"
         );
 
-        assert_eq!(trace_events(&workdir, "inference").len(), 3, "{mode}");
-        let reopened = trace_events(&workdir, "task_reopened");
+        assert_eq!(trace_events(&records_dir, "inference").len(), 3, "{mode}");
+        let reopened = trace_events(&records_dir, "task_reopened");
         assert_eq!(reopened.len(), 1, "{mode}: {reopened:#?}");
         assert_eq!(reopened[0]["attempt_context"], "continued");
-        let end = trace_events(&workdir, "task_end");
+        let end = trace_events(&records_dir, "task_end");
         assert_eq!(end[0]["exit_status"], "ok", "{mode}: {end:#?}");
         assert_eq!(end[0]["reopen_count"], 1);
         drop(f.project);

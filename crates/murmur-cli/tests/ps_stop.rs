@@ -110,7 +110,8 @@ struct Capsule {
     /// Held so the manifest outlives the process reading it, and shared by capsules launched from
     /// one project.
     _project: Arc<TempDir>,
-    /// The `mur run --json` startup line: `url`, `pid`, `session_id`, `name`, `version`, `workdir`.
+    /// The `mur run --json` startup line: `url`, `pid`, `session_id`, `name`, `version`,
+    /// `workdir`, `records_dir`.
     startup: Value,
 }
 
@@ -128,7 +129,7 @@ impl Capsule {
     }
 
     fn trace_path(&self) -> PathBuf {
-        PathBuf::from(self.startup["workdir"].as_str().unwrap()).join("trace.jsonl")
+        PathBuf::from(self.startup["records_dir"].as_str().unwrap()).join("trace.jsonl")
     }
 }
 
@@ -246,6 +247,7 @@ fn write_record(home: &Path, session_id: &str, url: &str, pid: u32, process_star
             "capsule_name": "fabricated",
             "capsule_version": "0.1.0",
             "workdir": "/tmp/fabricated",
+            "records_dir": "/tmp/fabricated/records",
             "outlives_launcher": true,
             "started_at": "2026-01-01T00:00:00Z",
         }))
@@ -255,7 +257,7 @@ fn write_record(home: &Path, session_id: &str, url: &str, pid: u32, process_star
 }
 
 /// A record of a member of `formation_id` that holds a formation lifeline and names `launcher` as
-/// the process that started it: the keys a formation member's runtime writes beside the nine.
+/// the process that started it: the keys a formation member's runtime writes beside the ten.
 fn write_launched_member_record(
     home: &Path,
     session_id: &str,
@@ -2028,12 +2030,10 @@ fn start_member(home: &Arc<TempDir>, project: &Arc<TempDir>, formation: &str) ->
     )
 }
 
-/// The session root a capsule's session directory sits in.
+/// The session root a capsule's session directory sits in: the workdir root whose records group
+/// holds its records directory.
 fn session_root(capsule: &Capsule) -> PathBuf {
-    capsule
-        .trace_path()
-        .parent()
-        .unwrap()
+    PathBuf::from(capsule.startup["workdir"].as_str().unwrap())
         .parent()
         .unwrap()
         .to_path_buf()
@@ -2071,7 +2071,8 @@ fn formation_cell(row: &str) -> &str {
     row.split_whitespace().rev().nth(1).unwrap()
 }
 
-/// A record the runtime would write for a member, naming a session directory under `root`.
+/// A record the runtime would write for a member, naming a session directory under `root` and a
+/// records directory in `root`'s records group.
 fn write_member_record(
     home: &Path,
     session_id: &str,
@@ -2090,6 +2091,7 @@ fn write_member_record(
         "capsule_name": "fabricated",
         "capsule_version": "0.1.0",
         "workdir": root.join(session_id),
+        "records_dir": common::session_records_dir(home, root, session_id),
         "outlives_launcher": true,
         "started_at": "2026-01-01T00:00:00Z",
     });
@@ -2346,7 +2348,10 @@ fn a_formation_is_accounted_for_after_its_members_end() {
         "{shown}"
     );
     assert!(
-        shown.contains(&format!("searched:   {}\n", root.display())),
+        shown.contains(&format!(
+            "searched:   {}\n",
+            common::records_group(home.path(), &root).display()
+        )),
         "{shown}"
     );
     let member_rows: Vec<&str> = shown.lines().filter(|l| l.starts_with("ses_")).collect();
@@ -2433,7 +2438,7 @@ fn trace_show_refuses_a_formation_it_cannot_find() {
     assert!(
         stderr.contains(&format!(
             "no session under {} belongs to formation {unused}",
-            root.path().display()
+            common::records_group(home.path(), root.path()).display()
         )),
         "{stderr}"
     );

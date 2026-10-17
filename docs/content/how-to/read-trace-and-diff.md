@@ -18,7 +18,7 @@ manifest: my-agent v0.1.0
 driver: murmur/driver-anthropic (claude-sonnet-4-6)
 ```
 
-The trace lives at `<workdir>/trace.jsonl`. It is always written — even if the session failed — and cannot be suppressed by the capsule.
+The trace lives at `trace.jsonl` in the session's [records directory](../reference/workdir.md#records-directory), `~/.murmur/records/<workdir root>/<session id>/`. It is always written — even if the session failed — and the capsule's own commands cannot change it.
 
 ---
 
@@ -246,13 +246,13 @@ The exit status distribution immediately shows how often the agent hit the turn 
 
 ```bash
 # All events in order
-cat workdir/ses_.../trace.jsonl | jq .
+cat ~/.murmur/records/<your project>/workdir/ses_.../trace.jsonl | jq .
 
 # Only shell events
-grep '"event_type":"shell"' workdir/ses_.../trace.jsonl | jq .
+grep '"event_type":"shell"' ~/.murmur/records/<your project>/workdir/ses_.../trace.jsonl | jq .
 
 # Session summary fields
-grep '"event_type":"session_end"' workdir/ses_.../trace.jsonl | jq '{turns: .total_turns, tokens: (.total_input_tokens + .total_output_tokens), status: .exit_status}'
+grep '"event_type":"session_end"' ~/.murmur/records/<your project>/workdir/ses_.../trace.jsonl | jq '{turns: .total_turns, tokens: (.total_input_tokens + .total_output_tokens), status: .exit_status}'
 ```
 
 For persistent capsules (queue mode), one `trace.jsonl` holds one `session_start` / `session_end` pair for the launch, with a `task_start` / `task_end` block per task inside it. `mur trace show` displays a per-task breakdown in the **Tasks** section.

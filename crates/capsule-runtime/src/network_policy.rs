@@ -268,6 +268,14 @@ fn declared_filesystem_scope(
     Ok(scope)
 }
 
+/// Whether the entry declares `capabilities.filesystem.records: true`.
+fn declares_records(capabilities: &murmur_artifact::Capabilities) -> bool {
+    capabilities
+        .filesystem
+        .as_ref()
+        .is_some_and(|filesystem| filesystem.records)
+}
+
 /// Resolve a validated filesystem `scope` to the directory a guest's preopen should target,
 /// creating it if it does not already exist.
 ///
@@ -303,6 +311,14 @@ pub(crate) struct HookCapabilityGrant {
     /// Relative path under the hook's working directory to preopen. `None` = preopen
     /// nothing, so the hook has no `wasi:filesystem` access whatsoever.
     pub(crate) filesystem_scope: Option<String>,
+    /// `capabilities.filesystem.records: true`: the hook's `"."` is the session's records
+    /// directory's `hooks/`, read-write, in place of a [`Self::filesystem_scope`] (the manifest
+    /// refuses both on one entry).
+    pub(crate) filesystem_records: bool,
+    /// Host path of the created `<records dir>/hooks/`, filled by the staging path once it has
+    /// made it through the records directory's root. Left `None` by [`Self::derive`], on
+    /// [`Self::state_dir`]'s terms.
+    pub(crate) records_hooks_dir: Option<PathBuf>,
     /// Whether this hook may read the in-scope task's input and result text through the
     /// `murmur:task-io/read` host import. `false` = the import still links and every one of
     /// its functions returns `not-granted`.
@@ -357,10 +373,13 @@ impl HookCapabilityGrant {
         };
 
         let filesystem_scope = declared_filesystem_scope(capabilities)?;
+        let filesystem_records = declares_records(capabilities);
 
         Ok(Self {
             network_allow_rules,
             filesystem_scope,
+            filesystem_records,
+            records_hooks_dir: None,
             task_io_read: capabilities
                 .task_io
                 .as_ref()
@@ -562,22 +581,30 @@ where
             .transpose()?
             .flatten();
 
+        let records = matches!(runtime, murmur_artifact::ArtifactRuntime::Hook)
+            && capabilities.is_some_and(declares_records);
         let surface = match (runtime, scope.is_some()) {
             // A declared scope resolves the same way for every role: `build_wasi_ctx` in both
             // `runtime.rs` and `hooks.rs` preopens `<workdir>/<scope>` as `"."`.
             (_, true) => PreopenSurface::ScopedSubtree,
+            (murmur_artifact::ArtifactRuntime::Hook, false) if records => {
+                PreopenSurface::RecordsHooks
+            }
             (murmur_artifact::ArtifactRuntime::Hook, false) => PreopenSurface::Nothing,
             (_, false) => PreopenSurface::WholeWorkdir,
         };
 
-        let runtime_dir_read_only =
-            crate::runtime_dir::gets_runtime_dir_preopen(runtime, scope.is_some());
+        // Unresolved until the caller knows whether the installed artifact is WASM or native:
+        // see `containment::resolve_runtime_dir_reaches`.
+        let runtime_dir_reach =
+            crate::runtime_dir::gets_runtime_dir_preopen(runtime, scope.is_some())
+                .then_some(crate::containment::RuntimeDirReach::Unresolved);
         reports.push(PreopenReport {
             artifact: name.to_string(),
             role: runtime.as_str().to_string(),
             scope,
             surface,
-            runtime_dir_read_only,
+            runtime_dir_reach,
         });
     }
 
@@ -620,6 +647,7 @@ mod tests {
                 scope: Some(scope.to_string()),
                 workdir_exec: false,
                 read_only: Vec::new(),
+                records: false,
             }),
             shell: None,
             spawn: None,
@@ -1126,21 +1154,21 @@ mod tests {
                     role: "tool".to_string(),
                     scope: None,
                     surface: PreopenSurface::WholeWorkdir,
-                    runtime_dir_read_only: true,
+                    runtime_dir_reach: Some(crate::containment::RuntimeDirReach::Unresolved),
                 },
                 PreopenReport {
                     artifact: "anthropic-driver".to_string(),
                     role: "driver".to_string(),
                     scope: None,
                     surface: PreopenSurface::WholeWorkdir,
-                    runtime_dir_read_only: false,
+                    runtime_dir_reach: None,
                 },
                 PreopenReport {
                     artifact: "telemetry-hook".to_string(),
                     role: "hook".to_string(),
                     scope: None,
                     surface: PreopenSurface::Nothing,
-                    runtime_dir_read_only: false,
+                    runtime_dir_reach: None,
                 },
             ]
         );
@@ -1169,14 +1197,14 @@ mod tests {
                     role: "tool".to_string(),
                     scope: Some("cache".to_string()),
                     surface: PreopenSurface::ScopedSubtree,
-                    runtime_dir_read_only: false,
+                    runtime_dir_reach: None,
                 },
                 PreopenReport {
                     artifact: "telemetry-hook".to_string(),
                     role: "hook".to_string(),
                     scope: Some("hook-state".to_string()),
                     surface: PreopenSurface::ScopedSubtree,
-                    runtime_dir_read_only: false,
+                    runtime_dir_reach: None,
                 },
             ]
         );

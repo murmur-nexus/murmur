@@ -202,9 +202,12 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     let task_prompt = build_task_prompt(task, index.tool_input(), &inf);
 
     // Create a temp dir for the generator session. The session workdir lives inside it
-    // (manifest_dir/workdir/<session_id>/), so cleanup on Drop removes everything.
+    // (manifest_dir/workdir/<session_id>/), so cleanup on Drop removes it; the session's records
+    // directory, kept under ~/.murmur/records, is removed below once the session has run.
     let temp_dir = TempDir::create()?;
     let manifest_dir = temp_dir.path().to_path_buf();
+    let generator_records = capsule_runtime::records_group(temp_dir.path()).ok();
+    let manifest_file = manifest_dir.join(MANIFEST_FILENAME);
 
     // stage_session expects manifest_dir/murmur.yaml for system_prompt_file resolution.
     fs::write(manifest_dir.join(MANIFEST_FILENAME), &meta_yaml)
@@ -262,6 +265,7 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
         formation_member: None,
         source_supply,
         expected_workdir_identity: None,
+        manifest_file: Some(manifest_file),
     };
 
     // Stage the session (creates workdir, installs artifacts including skill.md).
@@ -290,7 +294,12 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     // Run the generator synchronously. The capsule reads skill.md via murmur/tool-editor,
     // discovers artifacts via murmur/tool-registry-search, generates the manifest, and writes
     // it to out/murmur.yaml. The session exits via after_task: exit.
-    launch_session(staged, |_url| {}).map_err(CliError::from)?;
+    let launched = launch_session(staged, |_url| {});
+    // The generator's trace is no record anybody reads again: it goes with its temp directory.
+    if let Some(records) = &generator_records {
+        let _ = fs::remove_dir_all(records);
+    }
+    launched.map_err(CliError::from)?;
 
     // Read the manifest written by the agent via write_file("out/murmur.yaml").
     // Read through the session root, so a link the generator left there is refused rather than

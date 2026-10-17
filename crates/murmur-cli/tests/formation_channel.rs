@@ -306,21 +306,25 @@ fn a_valid_channel_launches_the_member() {
     }
     let _ = child.wait();
     drop(writer);
+    // The session's workdir under the project and its records directory under the scratch HOME.
     let sessions = member.sessions();
-    assert_eq!(sessions.len(), 1, "{sessions:?}");
-    let session = &sessions[0];
-    assert!(session.ends_with(ready["session_id"].as_str().unwrap()));
-    let start = first_trace_line(session);
+    assert_eq!(sessions.len(), 2, "{sessions:?}");
+    let session_id = ready["session_id"].as_str().unwrap();
+    assert!(
+        sessions.iter().all(|session| session.ends_with(session_id)),
+        "{sessions:?}"
+    );
+    let start = first_trace_line(Path::new(ready["records_dir"].as_str().unwrap()));
     assert_eq!(start["formation_member"], "coder", "{start}");
     assert_eq!(start["formation_callees"], serde_json::json!(["reviewer"]));
     assert!(common::door_capsule::files_containing(member.project.path(), "mft1.").is_empty());
     assert!(common::door_capsule::files_containing(member.home.path(), "mft1.").is_empty());
 }
 
-fn first_trace_line(session: &Path) -> Value {
+fn first_trace_line(records: &Path) -> Value {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Some(line) = std::fs::read_to_string(session.join("trace.jsonl"))
+        if let Some(line) = std::fs::read_to_string(records.join("trace.jsonl"))
             .ok()
             .and_then(|trace| trace.lines().next().map(str::to_string))
         {

@@ -7,6 +7,10 @@
 //! literal path through; every command reaches it through a [`SessionQuery`] carrying the three
 //! things the vocabulary itself cannot know.
 //!
+//! The candidates are the sessions of one **workdir root** — the directory a run was given as
+//! `--workdir`, or `<manifest-dir>/workdir` — whose records directories sit in that root's records
+//! group under `~/.murmur/records`, outside every workdir a capsule's commands can write.
+//!
 //! The commands that need a capsule running right now — `mur watch`, `mur cancel` — spell an
 //! address the same way but resolve it against a different candidate set, and go through
 //! [`crate::live_address`] instead. A literal path is a spelling only this module accepts: it
@@ -24,7 +28,8 @@ const LATEST: &str = "@1";
 
 /// What a command supplies that the address vocabulary cannot know.
 pub(crate) struct SessionQuery<'a> {
-    /// The per-session file an address resolves to, `trace.jsonl` or `eval.jsonl`.
+    /// The file an address resolves to beneath a session's records directory, `trace.jsonl` or
+    /// `hooks/eval.jsonl`.
     pub(crate) record_file: &'a str,
     /// The diagnostic code every addressing failure carries.
     pub(crate) code: &'static str,
@@ -42,25 +47,28 @@ impl SessionQuery<'_> {
     }
 }
 
-/// The names of every `ses_`-prefixed session directory in `workdir`, unsorted.
+/// The records group of `workdir`, the workdir root a reader was pointed at: where every session
+/// it ran keeps its records directory. `E-IO-004` when `HOME` cannot hold `~/.murmur`.
+pub(crate) fn records_group(workdir: &Path) -> Result<PathBuf, CliError> {
+    capsule_runtime::records_group(workdir).map_err(CliError::from)
+}
+
+/// The names of every `ses_`-prefixed session directory in `group`, a records group, unsorted.
 ///
-/// A workdir that does not exist yet holds no sessions rather than being an error, so the
+/// A group that does not exist yet holds no sessions rather than being an error, so the
 /// callers that go on to report "no sessions found" get to phrase that themselves.
-pub(crate) fn ses_entries(workdir: &Path) -> Result<Vec<String>, CliError> {
-    if !workdir.exists() || !workdir.is_dir() {
+pub(crate) fn ses_entries(group: &Path) -> Result<Vec<String>, CliError> {
+    if !group.exists() || !group.is_dir() {
         return Ok(Vec::new());
     }
     let mut entries = Vec::new();
-    for entry_res in fs::read_dir(workdir).map_err(|e| {
-        CliError::new(
-            E_IO_003,
-            format!("failed to read {}: {e}", workdir.display()),
-        )
-    })? {
+    for entry_res in fs::read_dir(group)
+        .map_err(|e| CliError::new(E_IO_003, format!("failed to read {}: {e}", group.display())))?
+    {
         let entry = entry_res.map_err(|e| {
             CliError::new(
                 E_IO_003,
-                format!("failed to read entry in {}: {e}", workdir.display()),
+                format!("failed to read entry in {}: {e}", group.display()),
             )
         })?;
         let name = entry.file_name().to_string_lossy().to_string();
@@ -71,10 +79,11 @@ pub(crate) fn ses_entries(workdir: &Path) -> Result<Vec<String>, CliError> {
     Ok(entries)
 }
 
-/// The record file a session address names, under `workdir`.
+/// The record file a session address names, among the sessions of the workdir root `workdir`.
 ///
 /// Four forms, and nothing else: an `@N` ordinal counting back from the most recent session, a
-/// literal path, a full `ses_` id, or a 4+-character case-insensitive suffix of one. An omitted
+/// literal path, a full `ses_` id, or a 4+-character case-insensitive suffix of one. A literal
+/// path is read as given and consults no records group; every other form reads `workdir`'s. An omitted
 /// address is [`LATEST`] and takes the ordinal arm, so `mur trace show` and `mur trace show @1`
 /// resolve through the same code rather than through two derivations of "latest" that a later
 /// edit could pull apart.
@@ -87,6 +96,14 @@ pub(crate) fn resolve(
     query: &SessionQuery<'_>,
 ) -> Result<PathBuf, CliError> {
     let address = address.unwrap_or(LATEST);
+
+    // A literal path is taken verbatim; the records group is not consulted.
+    if !address.starts_with('@') && (address.contains('/') || address.ends_with(".jsonl")) {
+        return Ok(PathBuf::from(address));
+    }
+    let root = workdir;
+    let workdir = records_group(root)?;
+    let workdir = workdir.as_path();
 
     if let Some(n_str) = address.strip_prefix('@') {
         let n: usize = n_str.parse().map_err(|_| {
@@ -102,7 +119,11 @@ pub(crate) fn resolve(
             // Unlabelled: an empty workdir is not a fault of the argument that named it.
             return Err(CliError::new(
                 query.code,
-                format!("no sessions found in workdir at {}", workdir.display()),
+                format!(
+                    "no sessions found in workdir at {} (records in {})",
+                    root.display(),
+                    workdir.display()
+                ),
             ));
         }
         entries.sort();
@@ -115,11 +136,6 @@ pub(crate) fn resolve(
             )));
         }
         return Ok(workdir.join(&entries[n - 1]).join(query.record_file));
-    }
-
-    // A literal path is taken verbatim; the workdir is not consulted.
-    if address.contains('/') || address.ends_with(".jsonl") {
-        return Ok(PathBuf::from(address));
     }
 
     // Full session ID: "ses_" prefix + 32-char hex = 36 chars total.

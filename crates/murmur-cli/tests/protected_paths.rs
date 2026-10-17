@@ -217,6 +217,7 @@ fn run_session(responses: Vec<String>, capsule: &Capsule<'_>, seed: impl FnOnce(
     let manifest_path = create_manifest(project.path(), &server.endpoint, capsule);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
     let workdir = staged.workdir.clone();
+    let trace_path = staged.records_dir.join("trace.jsonl");
 
     fs::create_dir_all(workdir.join("tests")).unwrap();
     fs::write(workdir.join(PROTECTED_FILE), PROTECTED_CONTENTS).unwrap();
@@ -226,7 +227,6 @@ fn run_session(responses: Vec<String>, capsule: &Capsule<'_>, seed: impl FnOnce(
 
     launch_session(staged, |_| {}).expect("the session must launch whatever the manifest decides");
 
-    let trace_path = workdir.join("trace.jsonl");
     let trace_raw = fs::read_to_string(&trace_path).unwrap_or_default();
     let trace: Vec<Value> = trace_raw
         .lines()
@@ -853,12 +853,12 @@ fn an_absolute_path_resolves_to_the_same_rule() {
         &manifest_path,
         &accessible,
     );
-    let session_dir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
     fs::write(staged.accessible_workdir.join("task.md"), "Do the thing.").unwrap();
 
     launch_session(staged, |_| {}).expect("the session must launch");
 
-    let trace_raw = fs::read_to_string(session_dir.join("trace.jsonl")).unwrap_or_default();
+    let trace_raw = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap_or_default();
     let refusals: Vec<Value> = trace_raw
         .lines()
         .filter(|l| !l.is_empty())

@@ -226,9 +226,13 @@ fn workdir_of(run: &Ran) -> PathBuf {
     common::parse_workdir_from_stdout(&run.stdout)
 }
 
-fn trace_events(workdir: &Path) -> Vec<Value> {
-    fs::read_to_string(workdir.join("trace.jsonl"))
-        .unwrap_or_else(|err| panic!("no trace in {}: {err}", workdir.display()))
+fn records_of(run: &Ran) -> PathBuf {
+    common::parse_records_from_stdout(&run.stdout)
+}
+
+fn trace_events(records_dir: &Path) -> Vec<Value> {
+    fs::read_to_string(records_dir.join("trace.jsonl"))
+        .unwrap_or_else(|err| panic!("no trace in {}: {err}", records_dir.display()))
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
@@ -362,8 +366,12 @@ impl Idle {
         PathBuf::from(self.startup["workdir"].as_str().unwrap())
     }
 
+    fn records_dir(&self) -> PathBuf {
+        PathBuf::from(self.startup["records_dir"].as_str().unwrap())
+    }
+
     fn events(&self) -> Vec<Value> {
-        trace_events(&self.workdir())
+        trace_events(&self.records_dir())
     }
 
     fn refusals(&self) -> Vec<Value> {
@@ -546,8 +554,8 @@ fn a_controller_changes_a_declared_setting_from_the_next_inference_call() {
         "setting:  inference.max_tokens\nprevious: 4096\nvalue:    1234\napplies:  next inference call\n"
     );
 
-    let workdir = workdir_of(&run);
-    let events = trace_events(&workdir);
+    let records_dir = records_of(&run);
+    let events = trace_events(&records_dir);
     let changes = of_type(&events, "control_change");
     assert_eq!(changes.len(), 1, "{changes:?}");
     let change = changes[0];
@@ -578,7 +586,7 @@ fn a_controller_changes_a_declared_setting_from_the_next_inference_call() {
     let show = Ran::of(
         mur(home.path())
             .args(["trace", "show"])
-            .arg(workdir.join("trace.jsonl"))
+            .arg(records_dir.join("trace.jsonl"))
             .current_dir(project.dir.path())
             .output()
             .unwrap(),
@@ -646,7 +654,7 @@ fn an_injected_secret_reaches_the_gateway_and_no_record() {
     );
 
     let workdir = workdir_of(&run);
-    let events = trace_events(&workdir);
+    let events = trace_events(&records_of(&run));
     let gateways = &of_type(&events, "session_start")[0]["gateways"];
     let tool_gateway = gateways
         .as_array()
@@ -736,7 +744,7 @@ fn a_request_before_injection_never_reaches_the_upstream() {
     assert!(first_result.contains(SECRET), "{first_result}");
     assert!(first_result.contains("not been injected"), "{first_result}");
 
-    let events = trace_events(&workdir_of(&run));
+    let events = trace_events(&records_of(&run));
     let credential_events = of_type(&events, "gateway_credential");
     assert_eq!(credential_events.len(), 1, "{credential_events:?}");
     let event = credential_events[0];
@@ -1157,7 +1165,7 @@ fn a_secret_can_be_replaced_and_forgotten() {
     );
 
     let workdir = workdir_of(&run);
-    let events = trace_events(&workdir);
+    let events = trace_events(&records_of(&run));
     let sequence: Vec<Value> = events
         .iter()
         .filter(|e| e["event_type"] == "control_change" || e["event_type"] == "gateway_credential")
@@ -1362,17 +1370,20 @@ fn the_control_token_is_unreachable_from_inside_the_capsule() {
         &extra,
     );
 
-    // The one path under ~/.murmur a capsule may name is its own read-only runtime directory,
-    // under `sessions/`; the control tokens sit under `running/`, outside it.
+    // The paths under ~/.murmur a capsule may name are its own read-only runtime directory,
+    // under `sessions/`, and its records directory, under `records/`; the control tokens sit under
+    // `running/`, outside both.
     let mut scope = common::explain_scope_json(&home.dir, &project.manifest_path());
     let murmur_home = home.path().join(".murmur");
-    let runtime_dir = scope["runtime_dir"]["path"].as_str().unwrap().to_string();
-    assert!(
-        Path::new(&runtime_dir).starts_with(murmur_home.join("sessions")),
-        "{runtime_dir}"
-    );
-    assert!(!home.running_dir().starts_with(Path::new(&runtime_dir)));
-    scope.as_object_mut().unwrap().remove("runtime_dir");
+    for (key, parent) in [("runtime_dir", "sessions"), ("records_dir", "records")] {
+        let dir = scope[key]["path"].as_str().unwrap().to_string();
+        assert!(
+            Path::new(&dir).starts_with(murmur_home.join(parent)),
+            "{dir}"
+        );
+        assert!(!home.running_dir().starts_with(Path::new(&dir)));
+        scope.as_object_mut().unwrap().remove(key);
+    }
     let scope = scope.to_string();
     assert!(
         !scope.contains(murmur_home.to_str().unwrap()),
@@ -1398,9 +1409,10 @@ fn the_control_token_is_unreachable_from_inside_the_capsule() {
     }
 
     let workdir = workdir_of(&run);
-    let trace = fs::read_to_string(workdir.join("trace.jsonl")).unwrap();
+    let records_dir = records_of(&run);
+    let trace = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap();
     assert!(!trace.contains(&token));
-    let events = trace_events(&workdir);
+    let events = trace_events(&records_dir);
     let change = of_type(&events, "control_change")[0];
     assert_eq!(
         change["token_id"],

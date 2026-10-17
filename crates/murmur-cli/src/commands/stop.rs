@@ -91,7 +91,7 @@ fn stop_session(record: &RunningRecord, grace: Duration) -> Result<StoppedSessio
     // The process is gone, so the trace is final: whatever ending is missing now stays missing.
     let unended: Vec<String> = match &door {
         Ok(result) => {
-            let trace_path = record.workdir.join("trace.jsonl");
+            let trace_path = record.records_dir.join("trace.jsonl");
             if trace_path.exists() {
                 let settled = endings_noted(&trace_path);
                 canceled_ids(result)
@@ -256,7 +256,7 @@ fn stop_formation(address: &str, grace: Duration) -> Result<(), CliError> {
         } else if still_running.contains(&member.session_id.as_str()) {
             STILL_RUNNING_ENDING.to_string()
         } else {
-            recorded_ending(&member.workdir.join("trace.jsonl"))
+            recorded_ending(&member.records_dir.join("trace.jsonl"))
         };
         capsule_runtime::report_println!(
             "member:   {}  {}@{}  {ending}",
@@ -549,7 +549,7 @@ fn wait_for_endings(record: &RunningRecord, result: &Value) {
         return;
     }
 
-    let trace_path = record.workdir.join("trace.jsonl");
+    let trace_path = record.records_dir.join("trace.jsonl");
     // A session tracing somewhere else, or not at all, has no record here to wait for and never
     // will. Waiting out the deadline on every such stop would be a delay that buys nothing.
     if !trace_path.exists() {
@@ -758,6 +758,7 @@ mod tests {
             capsule_name: "coder".to_string(),
             capsule_version: "1.2.0".to_string(),
             workdir: std::path::PathBuf::from("/tmp/coder"),
+            records_dir: std::path::PathBuf::from("/tmp/coder").join("records"),
             outlives_launcher: true,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,

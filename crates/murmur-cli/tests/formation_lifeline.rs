@@ -168,6 +168,10 @@ impl Member {
         PathBuf::from(self.startup["workdir"].as_str().unwrap())
     }
 
+    fn records_dir(&self) -> PathBuf {
+        PathBuf::from(self.startup["records_dir"].as_str().unwrap())
+    }
+
     fn stderr(&self) -> String {
         self.stderr.lock().unwrap().clone()
     }
@@ -206,7 +210,7 @@ impl Member {
     /// Every record of the member's `trace.jsonl`, each line of which parses and none of which is
     /// a torn tail.
     fn trace(&self) -> Vec<Value> {
-        read_trace(&self.session_dir().join("trace.jsonl"))
+        read_trace(&self.records_dir().join("trace.jsonl"))
     }
 
     /// Ask the door who it is, under the operator token.
@@ -594,7 +598,8 @@ fn an_unreadable_lifeline_refuses_before_any_session() {
         assert!(stderr.contains(FORMATION_LIFELINE_ENV), "{case}: {stderr}");
         assert!(stderr.contains(expected), "{case}: {stderr}");
         assert!(
-            sessions_under(project.path()).is_empty(),
+            sessions_under(project.path()).is_empty()
+                && sessions_under(&common::records_root(home.path())).is_empty(),
             "{case}: a refused launch left a session"
         );
     }

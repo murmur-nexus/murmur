@@ -517,7 +517,15 @@ pub(crate) struct WorkdirGuard {
 impl WorkdirGuard {
     /// Spawn the checker thread for `workdir`. The returned handle owns the latch; dropping the
     /// last clone stops the thread within one interval.
-    pub(crate) fn spawn(workdir: &crate::workdir_fs::WorkdirRoot, max_bytes: u64) -> Arc<Self> {
+    ///
+    /// `workdir` is the directory measured; `records_root` is the session's records directory,
+    /// where a breach is logged, or `None` outside a session, where it is reported on stderr
+    /// alone.
+    pub(crate) fn spawn(
+        workdir: &crate::workdir_fs::WorkdirRoot,
+        records_root: Option<&crate::workdir_fs::WorkdirRoot>,
+        max_bytes: u64,
+    ) -> Arc<Self> {
         let guard = Arc::new(Self {
             max_bytes,
             breach: Mutex::new(None),
@@ -529,6 +537,7 @@ impl WorkdirGuard {
         // as `limits::EpochTicker`.
         let weak = Arc::downgrade(&guard);
         let workdir = workdir.clone();
+        let records_root = records_root.cloned();
         thread::spawn(move || loop {
             thread::sleep(WORKDIR_CHECK_INTERVAL);
             let Some(guard) = weak.upgrade() else {
@@ -539,7 +548,7 @@ impl WorkdirGuard {
             }
             let observed = directory_size_bytes(workdir.path());
             if observed > guard.max_bytes {
-                guard.record_breach(&workdir, observed);
+                guard.record_breach(records_root.as_ref(), observed);
                 break;
             }
         });
@@ -552,7 +561,11 @@ impl WorkdirGuard {
         self.breach.lock().ok().and_then(|breach| *breach)
     }
 
-    fn record_breach(&self, workdir: &crate::workdir_fs::WorkdirRoot, observed_bytes: u64) {
+    fn record_breach(
+        &self,
+        records_root: Option<&crate::workdir_fs::WorkdirRoot>,
+        observed_bytes: u64,
+    ) {
         let breach = WorkdirBreach {
             max_bytes: self.max_bytes,
             observed_bytes,
@@ -564,7 +577,9 @@ impl WorkdirGuard {
         }
         let message = workdir_breach_message(breach);
         crate::runtime_err!("[capsule-runtime] {message}");
-        crate::agent::append_bootstrap_log(workdir, &format!("[resources] {message}"));
+        if let Some(records_root) = records_root {
+            crate::agent::append_bootstrap_log(records_root, &format!("[resources] {message}"));
+        }
     }
 }
 
@@ -880,6 +895,7 @@ mod tests {
 
         let guard = WorkdirGuard::spawn(
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
             DEFAULT_WORKDIR_MAX_BYTES,
         );
         assert_eq!(guard.breach(), None);

@@ -37,8 +37,13 @@
 //! Every file the runtime writes for its own use — `MURMUR.md`, `task.md`, the manifest copy,
 //! `tools/` and `plans/` — is written into the session's runtime directory,
 //! `~/.murmur/sessions/<session-id>/runtime`, never into the workdir, and the synthetic `/etc`
-//! files and a `transport: process` harness's files go beside it. None of them is a runtime write
-//! inside the workdir, so none is declared here; [`crate::runtime_dir`] describes them.
+//! files and a `transport: process` harness's files go beside it. Every record it writes about
+//! the session — `trace.jsonl`, `blobs/`, `logs/bootstrap.log`, `logs/otel.log`,
+//! `logs/hook-<name>.log`, a delegated child's `completion.json` and the `hooks/` a records-granted
+//! hook writes in — goes into the session's records directory,
+//! `~/.murmur/records/<workdir root>/<session-id>`. None of them is a runtime write inside the
+//! workdir, so none is declared here; [`crate::runtime_dir`] and [`crate::records_dir`] describe
+//! them.
 //!
 //! # Adding an entry
 //!
@@ -46,7 +51,8 @@
 //! runtime's own source text and fails until a new `workdir.join(...)` is either declared here or
 //! listed in that test's exempt tables with a written reason. A file the runtime writes for its
 //! own use goes through the runtime directory's root instead and is declared in that test's
-//! `RUNTIME_DIR_WRITES`.
+//! `RUNTIME_DIR_WRITES`; a record about the session goes through the records directory's root,
+//! `records_root`, and is declared in its `RECORDS_DIR_WRITES`.
 
 use serde::Serialize;
 
@@ -125,8 +131,6 @@ pub enum RuntimeWriteCondition {
     PeerFetch,
     /// Written when this capsule launches a sub-capsule, which needs `capabilities.spawn.allow`.
     Spawn,
-    /// Written by a capsule that was itself launched as a delegated child, into its own workdir.
-    Delegated,
     /// Written only where the enforcement tier composes a sealed root.
     Sealed,
 }
@@ -142,7 +146,6 @@ impl RuntimeWriteCondition {
             Self::Shell => "shell",
             Self::PeerFetch => "peer-fetch",
             Self::Spawn => "spawn",
-            Self::Delegated => "delegated",
             Self::Sealed => "sealed",
         }
     }
@@ -243,34 +246,7 @@ const DECLARED_WRITES: &[DeclaredWrite] = &[
         scope: RuntimeWriteScope::Accessible,
         condition: RuntimeWriteCondition::ScriptSession,
     },
-    DeclaredWrite {
-        // A delegated child's own record of how it ended, read by the launcher's watcher.
-        entry: "completion.json",
-        kind: RuntimeWriteKind::File,
-        scope: RuntimeWriteScope::Accessible,
-        condition: RuntimeWriteCondition::Delegated,
-    },
     // ── The per-session directory ─────────────────────────────────────────────
-    DeclaredWrite {
-        entry: "trace.jsonl",
-        kind: RuntimeWriteKind::File,
-        scope: RuntimeWriteScope::Session,
-        condition: RuntimeWriteCondition::Always,
-    },
-    DeclaredWrite {
-        // Trace bodies too large to inline, addressed by their own sha256.
-        entry: "blobs",
-        kind: RuntimeWriteKind::Directory,
-        scope: RuntimeWriteScope::Session,
-        condition: RuntimeWriteCondition::Always,
-    },
-    DeclaredWrite {
-        // `bootstrap.log`, `otel.log` and one `hook-<name>.log` per failing hook.
-        entry: "logs",
-        kind: RuntimeWriteKind::Directory,
-        scope: RuntimeWriteScope::Session,
-        condition: RuntimeWriteCondition::AgentSession,
-    },
     DeclaredWrite {
         // `result.txt`, `result_<task-id>.txt` and `compaction-summaries.jsonl`.
         entry: "out",
@@ -367,10 +343,13 @@ mod tests {
         ("hooks.rs", include_str!("hooks.rs")),
         ("murmur_md.rs", include_str!("murmur_md.rs")),
         ("otel.rs", include_str!("otel.rs")),
+        ("network_policy.rs", include_str!("network_policy.rs")),
         ("plan.rs", include_str!("plan.rs")),
         ("protected_paths.rs", include_str!("protected_paths.rs")),
         ("recipes.rs", include_str!("recipes.rs")),
+        ("records_dir.rs", include_str!("records_dir.rs")),
         ("resource_plane.rs", include_str!("resource_plane.rs")),
+        ("retention.rs", include_str!("retention.rs")),
         ("runtime.rs", include_str!("runtime.rs")),
         (
             "runtime/artifact_change.rs",
@@ -407,6 +386,7 @@ mod tests {
         ),
         ("TRACE_FILE_NAME", crate::trace::TRACE_FILE_NAME),
         ("CHILDREN_DIR", crate::child_launch::CHILDREN_DIR),
+        ("HOOKS_SUBDIR", crate::records_dir::HOOKS_SUBDIR),
     ];
 
     /// Entry names the scanner resolves that are deliberately not declared, each with the reason.
@@ -491,16 +471,23 @@ mod tests {
              Declared through the `.murmur/children` entry.",
         ),
         (
-            "delegation.rs",
-            "completion_path(workdir)",
-            "`completion.json` in a delegated child's own directory, which is the child's \
-             accessible workdir. Declared through the `completion.json` entry.",
-        ),
-        (
             "trace.rs",
             "trace",
-            "A resumed-from session's `trace.jsonl`, relative to the directory every session of \
-             this workdir sits in. Declared through the `.murmur/<session-id>` entry.",
+            "A resumed-from session's `trace.jsonl`, relative to the records group every session \
+             of this workdir root keeps its records directory in, outside every workdir.",
+        ),
+        (
+            "runtime.rs",
+            "&name",
+            "The launched manifest's own file name, copied into the runtime directory through \
+             `runtime_root`. Declared through RUNTIME_DIR_WRITES' `murmur.yaml` entry, the \
+             project manifest's name.",
+        ),
+        (
+            "records_dir.rs",
+            "&rel",
+            "`<workdir root mirrored>/<session-id>` beneath `~/.murmur/records`, created at staging \
+             outside every workdir.",
         ),
     ];
 
@@ -639,6 +626,60 @@ mod tests {
     /// runtime owns is written and read.
     const RUNTIME_DIR_ROOT: &str = "runtime_root";
 
+    /// The receivers that name the session's records directory, through which every record the
+    /// runtime writes about the session goes.
+    const RECORDS_DIR_ROOT: &str = "records_root";
+
+    /// Every entry the runtime writes into the records directory, with what it is.
+    const RECORDS_DIR_WRITES: &[(&str, &str)] = &[
+        (
+            "trace.jsonl",
+            "The session's trace: every appender, and a resumed session's `shell_lost` markers.",
+        ),
+        (
+            "blobs",
+            "Trace bodies too large to inline, by their sha256.",
+        ),
+        (
+            "logs",
+            "`bootstrap.log`, `otel.log` and one `hook-<name>.log` per failing hook.",
+        ),
+        (
+            "completion.json",
+            "A delegated child's record of how it ended, written by the child and by its \
+             parent's watcher.",
+        ),
+        (
+            "hooks",
+            "The `\".\"` of every hook declared `capabilities.filesystem.records: true`.",
+        ),
+    ];
+
+    /// The session's own log files, which share the `logs` name with the accessible workdir's
+    /// shell output logs and are told apart by the rest of their path.
+    const MOVED_LOG_PREFIXES: &[&str] = &["logs/bootstrap.log", "logs/otel.log", "logs/hook-"];
+
+    /// The literal text a path argument opens with — a string literal, or a `format!` string up
+    /// to its first `{` — or `None` when it opens with no literal.
+    fn literal_prefix(argument: &str) -> Option<&str> {
+        let argument = argument.trim_start_matches('&');
+        let argument = argument
+            .strip_prefix("format!(")
+            .map(str::trim_start)
+            .unwrap_or(argument);
+        let (literal, _) = argument.strip_prefix('"')?.split_once('"')?;
+        Some(literal.split('{').next().unwrap_or(literal))
+    }
+
+    /// Whether a write of `argument` names one of the session's own log files.
+    fn names_a_moved_log(argument: &str) -> bool {
+        literal_prefix(argument).is_some_and(|literal| {
+            MOVED_LOG_PREFIXES
+                .iter()
+                .any(|prefix| literal.starts_with(prefix))
+        })
+    }
+
     /// The receivers that name a directory beside the runtime directory, outside every workdir:
     /// `sealed-etc/`, `harness/` and the session directory holding them. No capsule command is
     /// granted any of them, so what is written there is no runtime write inside a workdir.
@@ -671,8 +712,8 @@ mod tests {
         ),
     ];
 
-    /// Entry names of files the runtime owns: a write or read under one of them reaches a
-    /// runtime-directory root, never a workdir root.
+    /// Entry names of files the runtime owns and of the records it keeps: a write or read under
+    /// one of them reaches a runtime-directory or records-directory root, never a workdir root.
     const MOVED_OUT_OF_THE_WORKDIR: &[&str] = &[
         "tools",
         "MURMUR.md",
@@ -681,7 +722,21 @@ mod tests {
         "murmur.yaml",
         ".mur-etc",
         ".process-driver",
+        "trace.jsonl",
+        "blobs",
+        "completion.json",
+        "eval.jsonl",
     ];
+
+    /// The root a moved name belongs to: `records_root` for a record, `runtime_root` for every
+    /// other.
+    fn root_of(entry: &str) -> &'static str {
+        if RECORDS_DIR_WRITES.iter().any(|(name, _)| *name == entry) || entry == "eval.jsonl" {
+            RECORDS_DIR_ROOT
+        } else {
+            RUNTIME_DIR_ROOT
+        }
+    }
 
     /// Functions that read the workdir's own copy of one of those names, each with the reason.
     const MOVED_NAME_WORKDIR_READS: &[(&str, &str, &str)] = &[(
@@ -783,6 +838,13 @@ mod tests {
                     continue;
                 }
                 let runtime_dir = receiver == RUNTIME_DIR_ROOT;
+                let records_dir = receiver == RECORDS_DIR_ROOT;
+                assert!(
+                    records_dir || !names_a_moved_log(&argument),
+                    "{file} writes ({argument}) through `{receiver}`, a workdir root. The \
+                     session's own logs are records: they go through the records directory's root \
+                     (`records_root`), which no capsule command can write."
+                );
                 let Some(entry) = resolve_entry_name(&argument) else {
                     let row =
                         DYNAMIC_EXEMPT
@@ -808,11 +870,20 @@ mod tests {
                     );
                     continue;
                 }
+                if records_dir {
+                    assert!(
+                        RECORDS_DIR_WRITES.iter().any(|(name, _)| *name == entry),
+                        "{file} writes `{entry}` into the records directory, and \
+                         RECORDS_DIR_WRITES does not declare it. Add (\"{entry}\", <what it is>)."
+                    );
+                    continue;
+                }
                 assert!(
                     !MOVED_OUT_OF_THE_WORKDIR.contains(&entry.as_str()),
                     "{file} writes `{entry}` through `{receiver}` ({argument}), a workdir root. \
-                     `{entry}` is a file the runtime owns: it goes through the runtime \
-                     directory's root (`runtime_root`), which no capsule command can write."
+                     `{entry}` is a file the runtime owns or a record it keeps: it goes through \
+                     `{}`, which no capsule command can write.",
+                    root_of(&entry)
                 );
                 assert!(
                     declared.contains(&entry.as_str())
@@ -868,7 +939,7 @@ mod tests {
                     continue;
                 }
                 checked += 1;
-                if receiver == RUNTIME_DIR_ROOT {
+                if receiver == root_of(&entry) {
                     continue;
                 }
                 let function = enclosing_fn(text, start);
@@ -878,8 +949,9 @@ mod tests {
                 let Some(row) = row else {
                     panic!(
                         "{file}: `{function}` reaches `{entry}` through `{receiver}` ({argument}), \
-                         a workdir root. `{entry}` is a file the runtime owns, and lives in the \
-                         runtime directory: go through `runtime_root`."
+                         a workdir root. `{entry}` is a file the runtime owns or a record it \
+                         keeps, and lives outside the workdir: go through `{}`.",
+                        root_of(&entry)
                     );
                 };
                 rows_used[row] = true;
@@ -960,6 +1032,14 @@ mod tests {
     /// goes through [`crate::workdir_fs::WorkdirRoot`] instead, and has no row here.
     const RAW_FS_EXEMPT: &[(&str, &str, &str)] = &[
         (
+            "network_policy.rs",
+            "resolve_scoped_dir",
+            "Creates a declared `capabilities.filesystem.scope` beneath the root a WASI guest is \
+             preopened at. The preopen itself is opened by path by `wasmtime-wasi`, so a root \
+             here would hold nothing the guest then gets; the scope was validated as relative and \
+             non-escaping at staging.",
+        ),
+        (
             "resource_plane.rs",
             "open_no_follow",
             "The resource plane's own reads of files the capsule exported, under its own \
@@ -970,6 +1050,61 @@ mod tests {
             "list_export_files",
             "The resource plane's listing of a declared export root, on `open_no_follow`'s \
              terms.",
+        ),
+        (
+            "retention.rs",
+            "prune_formations",
+            "A formation directory under `~/.murmur/formations` and its records subtree under `~/.murmur/records`, outside every workdir.",
+        ),
+        (
+            "retention.rs",
+            "prune_records",
+            "A conversation record directory under `~/.murmur/conversations`, outside every workdir.",
+        ),
+        (
+            "retention.rs",
+            "remove_record",
+            "A conversation record directory, on `prune_records`'s terms.",
+        ),
+        (
+            "retention.rs",
+            "list_records",
+            "The conversation record root, on `prune_records`'s terms.",
+        ),
+        (
+            "retention.rs",
+            "child_dirs",
+            "Directories beneath the conversation record root, on `prune_records`'s terms.",
+        ),
+        (
+            "retention.rs",
+            "locate_message",
+            "A conversation record file, on `prune_records`'s terms.",
+        ),
+        (
+            "retention.rs",
+            "count_messages",
+            "A conversation record file, on `prune_records`'s terms.",
+        ),
+        (
+            "retention.rs",
+            "stage_truncation",
+            "A conversation record file being truncated, on `prune_records`'s terms.",
+        ),
+        (
+            "retention.rs",
+            "stage_with_mode",
+            "`StagedRewrite`, the sibling-file rewrite of a file under `~/.murmur` — a conversation record or a private file — outside every workdir.",
+        ),
+        (
+            "retention.rs",
+            "commit",
+            "`StagedRewrite`'s rename into place, on `stage_with_mode`'s terms.",
+        ),
+        (
+            "retention.rs",
+            "drop",
+            "`StagedRewrite`'s removal of an uncommitted sibling file, on `stage_with_mode`'s terms.",
         ),
         (
             "runtime.rs",

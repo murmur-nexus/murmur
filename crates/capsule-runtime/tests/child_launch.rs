@@ -324,12 +324,9 @@ fn wait_for_new_dir(parent: &Path, before: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
+/// The child's `trace.jsonl`, in the records directory its readiness line reported.
 fn trace_of(child: &LaunchedChild) -> PathBuf {
-    child
-        .workdir
-        .join(".murmur")
-        .join(&child.session_id)
-        .join("trace.jsonl")
+    child.records_dir.join("trace.jsonl")
 }
 
 // ── 1. The happy path ─────────────────────────────────────────────────────────

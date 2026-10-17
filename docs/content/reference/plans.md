@@ -118,7 +118,7 @@ An ended sub-capsule is closed the way a cancelled task closes a
 
 1. It winds down from `SIGTERM` and, if it exits within the 5 seconds, writes `session_end` with
    `exit_status: canceled` to its own trace, which [`mur trace show`](cli.md#mur-trace-show) reads.
-2. Its directory gets a `completion.json` with `status: terminated`, `reported_by: launcher` and
+2. Its [records directory](workdir.md#records-directory) gets a `completion.json` with `status: terminated`, `reported_by: launcher` and
    the detail `the parent ended this delegation`, once it has exited.
 3. The parent's trace writes `task_canceled`, whose `delegation_ids` names the step's delegation.
 4. The parent's trace then writes the delegation's terminal `delegation` line, with `outcome:

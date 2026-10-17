@@ -322,10 +322,10 @@ impl RunningParent {
         }
     }
 
+    /// The parent's `trace.jsonl`, in its records directory.
     fn trace_path(&self) -> PathBuf {
-        self.workdir
-            .path()
-            .join(".murmur")
+        capsule_runtime::records_group(self.workdir.path())
+            .expect("the suite's HOME holds ~/.murmur")
             .join(&self.session_id)
             .join("trace.jsonl")
     }
@@ -425,12 +425,12 @@ fn launch_bounded(
 /// briefly readable in a state that says neither that the completion arrived nor why it did not.
 /// Waiting for the settled one is what stops a case reading that intermediate write.
 fn wait_for_completion(child: &LaunchedChild) -> Value {
-    wait_for_completion_at(&child.workdir)
+    wait_for_completion_at(&child.records_dir)
 }
 
-/// The same, named by directory.
-fn wait_for_completion_at(workdir: &Path) -> Value {
-    let path = workdir.join("completion.json");
+/// The same, named by the child's records directory.
+fn wait_for_completion_at(records_dir: &Path) -> Value {
+    let path = records_dir.join("completion.json");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if let Ok(raw) = std::fs::read_to_string(&path) {
@@ -444,7 +444,7 @@ fn wait_for_completion_at(workdir: &Path) -> Value {
             Instant::now() < deadline,
             "no settled {} appeared for the child at {}; what is there: {}",
             "completion.json",
-            workdir.display(),
+            records_dir.display(),
             std::fs::read_to_string(&path).unwrap_or_else(|_| "nothing".to_string())
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -456,8 +456,8 @@ fn wait_for_completion_at(workdir: &Path) -> Value {
 /// A `terminated` outcome the watcher posts is written once before the post and rewritten after
 /// it, and [`is_settled`] reads any `terminated` record as settled on sight, so this waits for the
 /// refusal itself.
-fn wait_for_refused_completion(workdir: &Path) -> Value {
-    let path = workdir.join("completion.json");
+fn wait_for_refused_completion(records_dir: &Path) -> Value {
+    let path = records_dir.join("completion.json");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if let Ok(raw) = std::fs::read_to_string(&path) {
@@ -473,7 +473,7 @@ fn wait_for_refused_completion(workdir: &Path) -> Value {
         assert!(
             Instant::now() < deadline,
             "no refused completion appeared at {}; what is there: {}",
-            workdir.display(),
+            records_dir.display(),
             std::fs::read_to_string(&path).unwrap_or_else(|_| "nothing".to_string())
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -1011,7 +1011,7 @@ fn a_delegation_the_parent_ends_is_recorded_and_not_announced() {
         )
     };
     let delegation_id = child.delegation_id.clone().expect("a delegated launch");
-    let workdir = child.workdir.clone();
+    let records_dir = child.records_dir.clone();
     child.shutdown().expect("the parent ends the delegation");
     wait_for(
         "the watcher to record the ending",
@@ -1019,7 +1019,7 @@ fn a_delegation_the_parent_ends_is_recorded_and_not_announced() {
         || child.watcher_finished(),
     );
 
-    let raw = std::fs::read_to_string(workdir.join("completion.json"))
+    let raw = std::fs::read_to_string(records_dir.join("completion.json"))
         .expect("the watcher recorded completion.json");
     let completion: Value = serde_json::from_str(&raw).expect("completion.json parses");
 
@@ -1076,7 +1076,7 @@ fn a_started_child_that_never_ends_is_stopped_at_its_deadline() {
         Duration::from_secs(90),
         || child.watcher_finished(),
     );
-    let completion = wait_for_refused_completion(&child.workdir);
+    let completion = wait_for_refused_completion(&child.records_dir);
     assert_eq!(completion["status"], DelegationStatus::Terminated.as_str());
     assert_eq!(completion["reported_by"], Reporter::Launcher.as_str());
     let detail = completion["detail"].as_str().unwrap_or_default();

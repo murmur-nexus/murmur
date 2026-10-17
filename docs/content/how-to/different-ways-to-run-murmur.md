@@ -242,12 +242,16 @@ Runtime directory
   path:      /home/dev/.murmur/sessions/<session-id>/runtime
   commands:  read only (landlock)
 
+Records directory
+  path:      /home/dev/.murmur/records/home/dev/proj/workdir/<session-id>
+  commands:  read only (landlock)
+
 Effective grants
   filesystem scope: <none>
   workdir exec:     false
   read_only: <none>
   preopens:
-    - murmur/tool-git (tool): the whole accessible workdir — no capabilities.filesystem.scope declared
+    - murmur/tool-git (tool): the whole accessible workdir — no capabilities.filesystem.scope declared; runtime directory read-only at $MURMUR_RUNTIME_DIR
     - murmur/driver-anthropic (driver): the whole accessible workdir — no capabilities.filesystem.scope declared
     - ana/hook-telemetry (hook): nothing preopened — no capabilities.filesystem.scope declared
   network allow: <none>

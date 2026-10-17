@@ -115,9 +115,10 @@ fn mur_run(home: &TempDir, manifest: &Path, task: &str) -> assert_cmd::assert::A
 
 /// The `session_start` event's `effective_grants`, read out of the trace the run wrote.
 #[cfg(target_os = "linux")]
-fn session_start_grants(project_dir: &Path) -> Value {
-    let trace_path =
-        common::find_file(project_dir, "trace.jsonl").expect("the session wrote a trace");
+fn session_start_grants(home: &TempDir, project_dir: &Path) -> Value {
+    let trace_path = common::newest_session_records(home.path(), &project_dir.join("workdir"))
+        .expect("the session wrote a records directory")
+        .join("trace.jsonl");
     let trace = fs::read_to_string(trace_path).unwrap();
     trace
         .lines()
@@ -214,7 +215,7 @@ fn run_and_observe(
     let assertion = mur_run(home, &manifest, "Say something.").success();
     IoMaxObservation {
         explained,
-        session_start: session_start_grants(project_dir)["io_max"].clone(),
+        session_start: session_start_grants(home, project_dir)["io_max"].clone(),
         stderr: String::from_utf8(assertion.get_output().stderr.clone()).unwrap(),
     }
 }

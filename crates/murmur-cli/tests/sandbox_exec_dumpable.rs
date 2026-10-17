@@ -218,11 +218,11 @@ fn tool_result_text(request: &Value, tool_use_id: &str) -> String {
     panic!("no tool_result block for {tool_use_id} in {request}");
 }
 
-/// Every event the session recorded, read from its own `trace.jsonl`
-/// (`<project>/workdir/<session_id>/trace.jsonl`, the CLI's default no-`--workdir` layout).
-fn trace_events(project: &Path) -> Vec<Value> {
-    let sessions = fs::read_dir(project.join("workdir"))
-        .expect("mur run must create a workdir")
+/// Every event the session recorded, read from its own `trace.jsonl` in its records directory
+/// (the records group of `<project>/workdir`, the CLI's default no-`--workdir` layout).
+fn trace_events(home: &Path, project: &Path) -> Vec<Value> {
+    let sessions = fs::read_dir(common::records_group(home, &project.join("workdir")))
+        .expect("mur run must create a records group")
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.join("trace.jsonl").is_file())
@@ -293,6 +293,7 @@ fn assert_allowlisted_exec_succeeds(test_name: &str, containment_yaml: &str) {
         && common::cgroup_delegation_available()
     {
         fs::remove_dir_all(project.path().join("workdir")).ok();
+        fs::remove_dir_all(common::records_root(home.path())).ok();
         output = mur_in_delegated_scope(&home, project.path())
             .args(run_args)
             .assert()
@@ -328,7 +329,7 @@ fn assert_allowlisted_exec_succeeds(test_name: &str, containment_yaml: &str) {
         "the tool result must carry the binary's real stdout: {result}"
     );
 
-    let events = trace_events(project.path());
+    let events = trace_events(home.path(), project.path());
 
     // The `tool_call` event is where the defect showed up as `status: "error"`.
     let tool_calls = events_of_type(&events, "tool_call");

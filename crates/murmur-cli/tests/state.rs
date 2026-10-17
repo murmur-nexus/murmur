@@ -425,47 +425,38 @@ fn the_grant_is_reported_and_reporting_it_changes_nothing_else() {
     }
 }
 
-/// A home directory that cannot be resolved refuses a launch only when something declared a
-/// store, so the refusal is attributable to the declaration rather than to the environment. Both
-/// halves are asserted together, because either alone would be consistent with the other cause.
-///
-/// A *relative* `HOME` is the reachable form of an unresolvable one: a durable store resolved
-/// against it would depend on the process's working directory, so it is refused, while the config
-/// and artifact-store paths `mur run` needs unconditionally still resolve.
+/// A relative `HOME` refuses every launch alike with `E-IO-004`, declared store or not: there is
+/// no `~/.murmur` for the session's runtime and records directories, whatever the capsule asks
+/// for, and nothing is created relative to the current directory.
 #[test]
-fn an_unresolvable_home_refuses_only_a_capsule_that_declared_a_store() {
+fn an_unresolvable_home_refuses_every_launch_with_e_io_004() {
     let cwd = tempfile::tempdir().unwrap();
     let fixture = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
-    let declared = state_project(project.path(), CAPSULE_NAME, Some(" {}"));
+    let declared = project.path().join("declared.yaml");
+    fs::copy(
+        state_project(project.path(), CAPSULE_NAME, Some(" {}")),
+        &declared,
+    )
+    .unwrap();
     install_state_tool(fixture.path(), project.path());
-
-    // Run from a scratch directory: whatever `mur` does resolve against a relative `HOME` lands
-    // there rather than wherever the test binary happens to be invoked from.
-    let mut refused = Command::cargo_bin("mur").unwrap();
-    refused
-        .current_dir(cwd.path())
-        .env("HOME", "relative-home")
-        .args(["run", "--manifest", declared.to_str().unwrap()])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("error[E-CAP-009]"))
-        .stderr(predicate::str::contains(CAPSULE_NAME))
-        .stderr(predicate::str::contains(
-            "the home directory could not be resolved",
-        ));
-
-    // Same host, same unresolvable home, no declaration: nothing looks a home directory up on
-    // behalf of a store that was never asked for.
     let undeclared = state_project(project.path(), CAPSULE_NAME, None);
-    let mut launched = Command::cargo_bin("mur").unwrap();
-    launched
-        .current_dir(cwd.path())
-        .env("HOME", "relative-home")
-        .args(["run", "--manifest", undeclared.to_str().unwrap()])
-        .assert()
-        .success();
+
+    for manifest in [&declared, &undeclared] {
+        Command::cargo_bin("mur")
+            .unwrap()
+            .current_dir(cwd.path())
+            .env("HOME", "relative-home")
+            .args(["run", "--manifest", manifest.to_str().unwrap()])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("error[E-IO-004]"))
+            .stderr(predicate::str::contains(
+                "HOME is 'relative-home', which is not an absolute path",
+            ));
+    }
+    assert!(!cwd.path().join("relative-home").exists());
 }
 
 /// A capsule-wide `capabilities.state` reaches nothing — the capsule's own guest is built with no

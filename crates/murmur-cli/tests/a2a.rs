@@ -82,11 +82,13 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
     }
 
     let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
+    common::process_home();
     stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -247,7 +249,7 @@ fn a2a_message_send_starts_agent_loop_and_returns_submitted() {
     // Server is shut down by now; can't query GetTask after completion.
     // Verify via trace.jsonl instead.
     let trace_content =
-        fs::read_to_string(launched.workdir.join("trace.jsonl")).unwrap_or_default();
+        fs::read_to_string(launched.records_dir.join("trace.jsonl")).unwrap_or_default();
     assert!(
         trace_content.contains("a2a_task_received"),
         "trace should contain a2a_task_received event; got:\n{trace_content}"
@@ -336,9 +338,10 @@ fn a2a_second_message_send_is_rejected() {
     handle.join().expect("launch thread should not panic");
 }
 
-/// The single `task_start` line a completed session wrote.
-fn task_start_line(workdir: &Path) -> Value {
-    let trace = fs::read_to_string(workdir.join("trace.jsonl")).expect("trace.jsonl should exist");
+/// The single `task_start` line a completed session wrote to the trace in `records_dir`.
+fn task_start_line(records_dir: &Path) -> Value {
+    let trace =
+        fs::read_to_string(records_dir.join("trace.jsonl")).expect("trace.jsonl should exist");
     trace
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -388,7 +391,7 @@ fn task_start_for_inbound_message(headers: &[(&str, &str)]) -> Value {
     );
 
     let launched = handle.join().expect("launch thread should not panic");
-    task_start_line(&launched.workdir)
+    task_start_line(&launched.records_dir)
 }
 
 /// A local `mur run` is a person handing the capsule an instruction, so `user` / `trusted` —
@@ -406,7 +409,7 @@ fn task_md_task_start_records_user_and_trusted() {
 
     let launched = launch_session(staged, |_| {}).expect("launch with task.md should succeed");
 
-    let event = task_start_line(&launched.workdir);
+    let event = task_start_line(&launched.records_dir);
     assert_eq!(event["origin"], "user", "got: {event}");
     assert_eq!(event["trust"], "trusted", "got: {event}");
     assert_eq!(event["source"], "task_md", "got: {event}");
@@ -682,7 +685,7 @@ fn an_event_origin_task_line_is_labelled_fenced() {
     );
 
     let launched = handle.join().expect("launch thread should not panic");
-    let task_start = task_start_line(&launched.workdir);
+    let task_start = task_start_line(&launched.records_dir);
     assert_eq!(task_start["origin"], "event", "got: {task_start}");
     assert_eq!(task_start["trust"], "untrusted", "got: {task_start}");
 
@@ -719,7 +722,7 @@ fn a_user_origin_task_line_carries_no_fence_key() {
     fs::write(staged.workdir.join("task.md"), "Run the fallback task").unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("launch with task.md should succeed");
-    let task_start = task_start_line(&launched.workdir);
+    let task_start = task_start_line(&launched.records_dir);
     assert_eq!(task_start["origin"], "user", "got: {task_start}");
     assert_eq!(task_start["trust"], "trusted", "got: {task_start}");
 
@@ -776,9 +779,9 @@ fn send_one_task(
     handle.join().expect("launch thread should not panic")
 }
 
-/// Every line of `workdir`'s `trace.jsonl`.
-fn trace_events(workdir: &Path) -> Vec<Value> {
-    fs::read_to_string(workdir.join("trace.jsonl"))
+/// Every line of the `trace.jsonl` in `records_dir`.
+fn trace_events(records_dir: &Path) -> Vec<Value> {
+    fs::read_to_string(records_dir.join("trace.jsonl"))
         .expect("trace.jsonl should exist")
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -796,13 +799,14 @@ fn workdir_path_happy_path_writes_task_md_and_completes() {
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path);
     let workdir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
 
     send_one_task(staged, "the task text").expect("the session runs");
 
     assert!(!workdir.join("task.md").exists());
     assert_eq!(server.requests().len(), 1);
     assert!(common::last_user_text(&server.requests()[0]).contains("the task text"));
-    let events = trace_events(&workdir);
+    let events = trace_events(&records_dir);
     assert!(events
         .iter()
         .all(|event| event["event_type"] != "workdir_path_refused"));
@@ -826,6 +830,7 @@ fn workdir_path_refused_for_an_a2a_task_md_link() {
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path);
     let workdir = staged.accessible_workdir.clone();
+    let records_dir = staged.records_dir.clone();
     let outside = tempfile::tempdir().unwrap();
     let sentinel = outside.path().join("sentinel.txt");
     fs::write(&sentinel, "operator data").unwrap();
@@ -837,7 +842,7 @@ fn workdir_path_refused_for_an_a2a_task_md_link() {
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
     assert!(server.requests().is_empty(), "the provider was asked");
 
-    let events = trace_events(&workdir);
+    let events = trace_events(&records_dir);
     let types: Vec<&str> = events
         .iter()
         .filter_map(|event| event["event_type"].as_str())

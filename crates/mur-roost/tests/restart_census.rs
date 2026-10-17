@@ -75,6 +75,7 @@ fn write_record(dir: &Path, session_id: &str, pid: u32, process_start: &str, url
         "capsule_name": "survivor",
         "capsule_version": "0.1.0",
         "workdir": "/tmp/survivor",
+        "records_dir": "/tmp/survivor-records",
         "outlives_launcher": true,
         "started_at": "2026-01-01T00:00:00Z",
     });

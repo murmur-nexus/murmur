@@ -79,6 +79,10 @@ const AUTH_WORKER: &str = "auth-worker";
 /// The sub-capsule that answers as [`WORKER`] does and then stays up for its next task, so a plan
 /// step polling it for its task's state still reaches it after the answer.
 const STAYING_WORKER: &str = "staying-worker";
+/// The parent whose envelope also grants `bash`, so the child it delegates to may run commands.
+const FORGING_PARENT: &str = "forging-delegator";
+/// The sub-capsule whose one command tries to forge its own outcome, and whose task then fails.
+const FORGER: &str = "forger";
 
 /// The host variable both the parent and [`WORKER`] declare, and the whole of what a delegated
 /// child is handed beyond the names the runtime owns.
@@ -534,6 +538,8 @@ struct Suite {
     /// The answering sub-capsule's own inference endpoint, held so a case can read what that
     /// child put on the wire.
     worker_inference: AlwaysReplying,
+    /// The forging sub-capsule's own inference endpoint, scripted by its one case.
+    forger_inference: QueuedServer,
     /// Kept for the life of the process: `HOME` points inside it.
     _home: TempDir,
 }
@@ -564,6 +570,7 @@ fn suite() -> &'static Suite {
             &[
                 common::local(PARENT).as_str(),
                 common::local(UNGRANTED_PARENT).as_str(),
+                common::local(FORGING_PARENT).as_str(),
             ],
         );
         std::env::set_var("MURMUR_ROOST_URL", &roost.url);
@@ -684,10 +691,41 @@ fn suite() -> &'static Suite {
             )),
         );
 
+        // The forging parent's envelope, and the child that runs a command under it: `scoped`, a
+        // `bash` grant, and two turns, so the task fails once its model asks for a third.
+        roost.publish(
+            FORGING_PARENT,
+            VERSION,
+            &format!(
+                "artifacts: []\ncapabilities:\n  \
+                 network:\n    allow: [127.0.0.1]\n  \
+                 env:\n    allow: [{PROVIDER_KEY_VAR}]\n  \
+                 shell:\n    allow: [bash]\n  \
+                 spawn:\n    allow: [{}]\n",
+                common::local(FORGER)
+            ),
+            Some(&common::fixture_path(
+                "run/components/capsule-env-echo.wasm",
+            )),
+        );
+        let forger_inference = QueuedServer::start();
+        roost.publish(
+            FORGER,
+            VERSION,
+            &agent_capsule_manifest(&forger_inference.endpoint)
+                .replace(
+                    "capabilities:\n",
+                    "capabilities:\n  containment: scoped\n  shell:\n    allow: [bash]\n",
+                )
+                .replace("model: test-model\n", "model: test-model\n  max_turns: 2\n"),
+            None,
+        );
+
         Suite {
             roost,
             registry,
             worker_inference,
+            forger_inference,
             _home: home,
         }
     })
@@ -769,6 +807,8 @@ impl ParentConfig {
 struct Parent {
     project: PathBuf,
     session_dir: PathBuf,
+    /// The session's records directory, where its trace is.
+    records_dir: PathBuf,
     /// The session's runtime directory, where its tools are installed. Read while the parent runs.
     runtime_dir: PathBuf,
     url: String,
@@ -843,6 +883,7 @@ impl Parent {
             StageRequest {
                 source_supply: None,
                 expected_workdir_identity: None,
+                manifest_file: None,
                 credentials_file: None,
                 // An empty context is a per-message fact, not a launch-scoped one: `--context`
                 // refuses one, while an A2A `contextId` of `""` is taken as the conversation. So
@@ -861,6 +902,7 @@ impl Parent {
         )
         .expect("staging should succeed");
         let session_dir = staged.workdir.clone();
+        let records_dir = staged.records_dir.clone();
         let runtime_dir = staged.runtime_dir.clone();
         if let Some(task) = &config.task_md {
             std::fs::write(staged.accessible_workdir.join("task.md"), task).unwrap();
@@ -880,6 +922,7 @@ impl Parent {
         Self {
             project,
             session_dir,
+            records_dir,
             runtime_dir,
             url,
             server,
@@ -898,7 +941,7 @@ impl Parent {
     }
 
     fn trace(&self) -> String {
-        std::fs::read_to_string(self.session_dir.join("trace.jsonl")).unwrap_or_default()
+        std::fs::read_to_string(self.records_dir.join("trace.jsonl")).unwrap_or_default()
     }
 
     /// Every line of the parent's trace, in file order, so a case can assert that one record
@@ -1105,6 +1148,7 @@ fn stage_request(
     StageRequest {
         source_supply: None,
         expected_workdir_identity: None,
+        manifest_file: None,
         credentials_file: None,
         manifest_dir: project.to_path_buf(),
         capsule_name: runtime_manifest.name.clone(),
@@ -1207,13 +1251,28 @@ fn parse_events(trace: &str) -> Vec<Value> {
         .collect()
 }
 
-/// The child's own `trace.jsonl`, found from the parent's side exactly as an operator would:
-/// the child directory the parent composed, then the session directory beneath it.
+/// The `HOME` every capsule here runs under, the suite's.
+fn home() -> PathBuf {
+    suite();
+    PathBuf::from(std::env::var_os("HOME").unwrap())
+}
+
+/// The child's records directory: the records group of the child directory the parent composed,
+/// which the child was given as `--workdir`, then its session.
+fn child_records(child_dir: &Path, child_session_id: &str) -> PathBuf {
+    common::session_records_dir(&home(), child_dir, child_session_id)
+}
+
+/// The child's own `trace.jsonl`, in its records directory.
 fn child_trace_path(child_dir: &Path, child_session_id: &str) -> PathBuf {
-    child_dir
-        .join(".murmur")
-        .join(child_session_id)
-        .join("trace.jsonl")
+    child_records(child_dir, child_session_id).join("trace.jsonl")
+}
+
+/// The `completion.json` of the one session the child directory ran, in its records directory.
+fn child_completion(child_dir: &Path) -> PathBuf {
+    common::newest_session_records(&home(), child_dir)
+        .unwrap_or_else(|| panic!("no records directory for {}", child_dir.display()))
+        .join("completion.json")
 }
 
 /// The events in the child's [`child_trace_path`], in file order.
@@ -1564,7 +1623,7 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
 
     // The child recorded the same outcome for itself, and the delivery landed.
     let completion: Value = serde_json::from_str(
-        &std::fs::read_to_string(child_dir.join("completion.json"))
+        &std::fs::read_to_string(child_completion(&child_dir))
             .expect("the child records its own outcome"),
     )
     .unwrap();
@@ -1589,18 +1648,19 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
         .iter()
         .map(|event| {
             (
-                child_dir
-                    .join(".murmur")
-                    .join(child_session_id)
-                    .join("trace.jsonl"),
+                child_trace_path(&child_dir, child_session_id),
                 event.clone(),
             )
         })
         .collect();
-    for path in files_under(&child_dir).into_iter().filter(|path| {
-        path.file_name()
-            .is_some_and(|name| name == "completion.json")
-    }) {
+    for path in files_under(&child_records(&child_dir, child_session_id))
+        .into_iter()
+        .chain(files_under(&child_dir))
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "completion.json")
+        })
+    {
         let raw = std::fs::read_to_string(&path).unwrap();
         objects.push((path, serde_json::from_str(&raw).unwrap()));
     }
@@ -1668,6 +1728,9 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
             panic!("'{needle}' reached {}", path.display());
         }
         if let Some(path) = find_in_files(&parent.session_dir, &needle) {
+            panic!("'{needle}' reached {}", path.display());
+        }
+        if let Some(path) = find_in_files(&parent.records_dir, &needle) {
             panic!("'{needle}' reached {}", path.display());
         }
         assert!(
@@ -1795,7 +1858,7 @@ fn authenticated_child_is_driven_with_its_operator_token() {
 
     let child_dir = parent.only_child_dir();
     let completion: Value = serde_json::from_str(
-        &std::fs::read_to_string(child_dir.join("completion.json"))
+        &std::fs::read_to_string(child_completion(&child_dir))
             .expect("the child records its own outcome"),
     )
     .unwrap();
@@ -1820,7 +1883,7 @@ fn authenticated_child_is_driven_with_its_operator_token() {
         !text.contains("mdt1."),
         "a door token reached the tool result"
     );
-    for root in [&parent.project, &parent.session_dir] {
+    for root in [&parent.project, &parent.session_dir, &parent.records_dir] {
         if let Some(path) = find_in_files(root, "mdt1.") {
             panic!("a door token reached {}", path.display());
         }
@@ -2077,7 +2140,7 @@ fn a_wedged_started_child_is_ended_at_the_deadline() {
     // The child's own directory records the same ending, delivered — the watcher wrote it, and
     // posted it, because this ending was the runtime's own doing rather than the task's.
     let completion: Value = serde_json::from_str(
-        &std::fs::read_to_string(child_dir.join("completion.json"))
+        &std::fs::read_to_string(child_completion(&child_dir))
             .expect("the ended child's outcome is recorded in its own directory"),
     )
     .unwrap();
@@ -2434,7 +2497,7 @@ fn a_cancel_mid_delegation_names_the_child_and_ends_it() {
     );
 
     let completion: Value = serde_json::from_str(
-        &std::fs::read_to_string(child_dir.join("completion.json"))
+        &std::fs::read_to_string(child_completion(&child_dir))
             .expect("the ended child's outcome is recorded"),
     )
     .unwrap();
@@ -2607,7 +2670,7 @@ fn a_cancel_mid_plan_ends_the_plan_steps_sub_capsule() {
     assert_eq!(parent.events("delegation").len(), 1);
 
     let completion: Value = serde_json::from_str(
-        &std::fs::read_to_string(child_dir.join("completion.json"))
+        &std::fs::read_to_string(child_completion(&child_dir))
             .expect("the ended child's outcome is recorded"),
     )
     .unwrap();
@@ -2733,7 +2796,7 @@ fn a_capsule_that_accepts_no_tasks_still_hears_from_its_sub_capsule() {
         "{handed}"
     );
     let completion: Value = serde_json::from_str(
-        &std::fs::read_to_string(parent.only_child_dir().join("completion.json"))
+        &std::fs::read_to_string(child_completion(&parent.only_child_dir()))
             .expect("the child records its own outcome"),
     )
     .unwrap();
@@ -2915,4 +2978,105 @@ fn a_delegation_with_no_conversation_is_refused_rather_than_started() {
     assert_eq!(ended.len(), 1, "{ended:?}");
     assert_eq!(ended[0]["outcome"], "failed", "{}", ended[0]);
     assert_eq!(ended[0]["delegation_id"], Value::Null, "{}", ended[0]);
+}
+
+/// A delegated child cannot forge how it ended: its command's writes into its own records
+/// directory fail, its parent records the outcome the child's runtime wrote there, and the
+/// parent finds that directory where the child reported it — never under its own workdir.
+#[test]
+#[allow(clippy::print_stdout)]
+fn a_child_cannot_forge_its_completion() {
+    if common::skip_without_host_support("a_child_cannot_forge_its_completion") {
+        return;
+    }
+    if capsule_runtime::detect_achieved_containment() < murmur_artifact::ContainmentClass::Scoped {
+        eprintln!("[SKIP-HOST] a_child_cannot_forge_its_completion: the child declares scoped");
+        return;
+    }
+    let suite = suite();
+    let forge = "cd \"$PWD\"; \
+                 out=$( { printf '{\"status\":\"ok\"}' > \"$MURMUR_RECORDS_DIR/completion.json\"; } 2>&1 ); \
+                 echo \"FORGE|records|$?|$out\"; \
+                 out=$( { printf '{\"status\":\"ok\"}' > ./completion.json; } 2>&1 ); \
+                 echo \"FORGE|workdir|$?|$out\"";
+    suite.forger_inference.push(tool_use_response(
+        "toolu_forge",
+        "bash",
+        json!({"command": forge}),
+    ));
+    // A second call: the turn after it is the third, which the child's `max_turns` refuses.
+    suite.forger_inference.push(tool_use_response(
+        "toolu_again",
+        "bash",
+        json!({"command": "true"}),
+    ));
+    suite.forger_inference.push(end_turn_response("unreached"));
+
+    let parent = Parent::launch(
+        FORGING_PARENT,
+        &format!("  spawn:\n    allow: [{}]\n", common::local(FORGER)),
+    );
+    let text = parent.delegate("toolu_forger", FORGER, VERSION, "forge your outcome");
+    println!("── delegate-task\n{text}");
+    let child_dir = parent.only_child_dir();
+
+    // The child's own command was refused in its records directory, and wrote its workdir.
+    let forged = tool_result_text(&suite.forger_inference.requests(), "toolu_forge")
+        .expect("the child's model saw its command's result");
+    println!("── the child's command\n{forged}");
+    let records_line = forged
+        .lines()
+        .find(|line| line.starts_with("FORGE|records|"))
+        .unwrap_or_else(|| panic!("{forged}"));
+    assert!(
+        !records_line.starts_with("FORGE|records|0|"),
+        "{records_line}"
+    );
+    assert!(records_line.contains("Permission denied"), "{records_line}");
+    assert!(forged.contains("FORGE|workdir|0|"), "{forged}");
+
+    // The launch notice names the child's records directory as the child reported it.
+    let start = &parent.events("delegation_start")[0];
+    let child_session_id = start["child_session_id"].as_str().unwrap().to_string();
+    let records = child_records(&child_dir, &child_session_id);
+    assert_eq!(
+        start["child_records_dir"],
+        json!(records.display().to_string()),
+        "{start}"
+    );
+
+    // The child's real outcome: its task failed, whatever the file in its workdir says.
+    let completion: Value =
+        serde_json::from_str(&std::fs::read_to_string(records.join("completion.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        completion["session_id"],
+        json!(child_session_id),
+        "{completion}"
+    );
+    assert_eq!(completion["status"], "error", "{completion}");
+    let ended = &parent.events("delegation")[0];
+    assert_eq!(ended["outcome"], "error", "{ended}");
+    assert_eq!(
+        std::fs::read_to_string(child_dir.join("completion.json")).unwrap(),
+        "{\"status\":\"ok\"}",
+        "the plant is the child's own file, read by nobody"
+    );
+
+    // `mur trace show` of the parent points at the child's trace there.
+    let shown = assert_cmd::Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home())
+        .args(["trace", "show"])
+        .arg(parent.records_dir.join("trace.jsonl"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let shown = String::from_utf8_lossy(&shown);
+    assert!(
+        shown.contains(&format!("child trace: {}/trace.jsonl", records.display())),
+        "{shown}"
+    );
 }

@@ -183,6 +183,7 @@ fn stage_agent(
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -241,7 +242,7 @@ struct Capsule {
 }
 
 fn launch(staged: capsule_runtime::StagedSession) -> Capsule {
-    let trace_path = staged.workdir.join("trace.jsonl");
+    let trace_path = staged.records_dir.join("trace.jsonl");
     let session_dir = staged.workdir.clone();
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -1414,7 +1415,7 @@ fn the_session_frame_is_in_the_trace_when_the_address_is_announced() {
     let (home, manifest_path) =
         setup_project(&server.endpoint, "announce-agent", &network(&server));
     let staged = stage_agent(&home, &manifest_path, queue_lifecycle());
-    let trace_path = staged.workdir.join("trace.jsonl");
+    let trace_path = staged.records_dir.join("trace.jsonl");
 
     let (seen_tx, seen_rx) = std::sync::mpsc::channel::<(String, Vec<Value>)>();
     std::thread::spawn(move || {

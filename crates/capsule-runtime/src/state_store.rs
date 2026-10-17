@@ -208,24 +208,21 @@ fn murmur_home(store: &str) -> Result<PathBuf, RuntimeError> {
 
 /// `~/.murmur`, or why it could not be resolved.
 ///
-/// The one home-directory lookup in the runtime, shared with [`crate::conversation`], so a host
-/// whose `HOME` is unusable says the same thing about a state store and about a conversation
-/// record. Each caller wraps the reason in its own error type.
+/// Shared with [`crate::conversation`], so a host whose `HOME` is unusable says the same thing
+/// about a state store and about a conversation record. Each caller wraps the reason in its own
+/// error type.
 pub(crate) fn murmur_home_dir() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| {
+    use crate::murmur_home::HomeUnusable;
+    let home = crate::murmur_home::home_path().map_err(|error| match error {
+        HomeUnusable::NotSet => {
             "the home directory could not be resolved: HOME is not set in the environment"
                 .to_string()
-        })?;
-
-    if !home.is_absolute() {
-        return Err(
-            "the home directory could not be resolved: HOME is not an absolute path".to_string(),
-        );
-    }
-
+        }
+        HomeUnusable::NotAbsolute(_) => {
+            "the home directory could not be resolved: HOME is not an absolute path".to_string()
+        }
+        other @ HomeUnusable::CannotHold { .. } => other.to_string(),
+    })?;
     Ok(home.join(".murmur"))
 }
 

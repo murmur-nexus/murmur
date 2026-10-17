@@ -64,18 +64,21 @@ Every command that names a session spells the address the same way.
 | Full ID | `ses_019f01a940ce7761854e768ecbe3d399` | The session with that ID: `ses_` followed by 32 hex characters |
 | Suffix | `d399` | The one session whose ID ends with those characters, matched case-insensitively. 4 characters or more. Two or more matches are refused, and the refusal lists them |
 | Ordinal | `@1`, `@2` | The most recent session, the second most recent, and so on. Session IDs sort in creation order, so `@N` counts back from the newest |
-| Path | `workdir/ses_019f…/trace.jsonl` | The record file at that literal path, taken verbatim. `mur run --resume` also accepts the session directory itself |
+| Path | `~/.murmur/records/…/ses_019f…/trace.jsonl` | The record file at that literal path, taken verbatim. `mur run --resume` also accepts the session's records directory itself |
 
 What an address is resolved against depends on what the command needs.
 
 | Command | Candidate set | `@1` means |
 |---|---|---|
-| [`mur run --resume`](#mur-run), [`mur trace show`](#mur-trace-show), [`mur trace steps`](#mur-trace-steps), [`mur trace diff`](#mur-trace-diff), [`mur trace report`](#mur-trace-report), [`mur eval show`](#mur-eval-show), [`mur eval diff`](#mur-eval-diff) | The `ses_*` session directories in one workdir, whether or not the session is still running | The most recent recorded session |
+| [`mur run --resume`](#mur-run), [`mur trace show`](#mur-trace-show), [`mur trace steps`](#mur-trace-steps), [`mur trace diff`](#mur-trace-diff), [`mur trace report`](#mur-trace-report), [`mur eval show`](#mur-eval-show), [`mur eval diff`](#mur-eval-diff) | The `ses_*` [records directories](workdir.md#records-directory) of one workdir root, whether or not the session is still running | The most recent recorded session |
 | [`mur watch`](#mur-watch), [`mur cancel`](#mur-cancel), [`mur stop`](#mur-stop), [`mur token`](#mur-token) | The [running-capsule records](#running-capsule-records) for this whole machine | The most recent running session |
 
-The recorded set is the `ses_*` directories in `./workdir` for the `mur trace` and `mur eval`
-commands, and for `mur run` either `<manifest-dir>/workdir` or `.murmur` inside the directory
-`--workdir` names. See [Session workdir](workdir.md).
+The recorded set is the records group of one workdir root: the directory a run was given as
+`--workdir`, or `<manifest-dir>/workdir`. The `mur trace` and `mur eval` commands take it as their
+own `--workdir`, `./workdir` by default; `mur run --resume` uses its launch's own. Each group is under
+`~/.murmur/records`, so these commands need a `HOME` that can hold `~/.murmur` and are refused with
+[`E-IO-004`](diagnostics.md#e-io-004) otherwise; the path form reads no group. See
+[Records directory](workdir.md#records-directory).
 
 `mur watch`, `mur cancel`, `mur stop` and `mur token` have to reach a process, so they take the three forms that
 name a session and refuse the path form: a path names a directory on disk, which says nothing
@@ -125,8 +128,10 @@ A session whose manifest declares `control:` also holds its control token beside
 [Control surface](control-surface.md#token).
 
 Each record carries the session id, the capsule address, the process id and its start time, the
-capsule name and version, the session workdir, whether the session outlives its launcher, and the
-time it started. It carries nothing from the environment: no API key, no granted variable.
+capsule name and version, the session workdir as `workdir`, the session's
+[records directory](workdir.md#records-directory) as `records_dir`, whether the session outlives
+its launcher, and the time it started. A record without `records_dir` is unreadable. It carries
+nothing from the environment: no API key, no granted variable.
 
 A session that is a [member of a formation](#mur-run-formation) also records its formation id, as
 `formation_id`. A session in no formation writes no such key. The id groups records; it grants
@@ -1262,15 +1267,15 @@ mur run --roster [<path>] [--task <path-or-text>] [--json]
 | `--resume` | `@1` when the flag is given with no value | Session whose conversation this run continues, as a [session address](#session-addresses). Resolves that session's context id and runs under it, so it is `--context` with the id looked up for you. Loads the [conversation record](workdir.md#the-conversation-record) — or, under [`transport: process`](manifest.md#transport-process), hands the harness the session id that context's [harness session map](workdir.md#harness-session-map) holds — even when the capsule declares `lifecycle.conversation: stateless`. A context with neither refuses the launch with [`E-RUN-017`](diagnostics.md#e-run-017). Passing it together with `--context` refuses the launch with [`E-RUN-015`](diagnostics.md#e-run-015). Reads the named session's `trace.jsonl` only as far as its first task, so a session whose process was killed — leaving the file ending mid-record — still resumes. [`mur trace show`](#mur-trace-show) over that same file skips the torn last line and says so |
 | `--resume-mode` | `full` | How `--resume` puts the loaded conversation in front of the model. `full` loads the record verbatim; `compact` runs the capsule's `on-compaction` hook over it first and continues from the summary, which is the answer when the conversation would not fit the context window at all. `full` is often the cheaper of the two: a verbatim reload can hit the provider's prompt cache, while compaction changes the prefix from the first altered token, guarantees a cache miss, and costs an extra inference call to produce the summary. `compact` with no hook bound to `on-compaction` refuses the launch with [`E-RUN-018`](diagnostics.md#e-run-018), and `compact` under [`transport: process`](manifest.md#transport-process) — where the harness holds the history and murmur has none to summarize — with [`E-RUN-037`](diagnostics.md#e-run-037) |
 | <span id="run-forget-session">`--forget-session`</span> | off | Drop the harness session `--context` names, then run this launch's first task as a new conversation under the same context id. The answer to [`E-RUN-036`](diagnostics.md#e-run-036), where the harness no longer holds the conversation a context names and every later task in it fails the same way. The entry is deleted from the [harness session map](workdir.md#harness-session-map) and the run's trace records a `harness_session_forgotten` event naming the context, the id that was dropped and `requested_by: "cli"`; asked for a context with no entry, it drops nothing and records nothing. Applies to the launch's first task and to no later one. Requires `--context`, and cannot be combined with `--resume`, which asks for the opposite. Only [`transport: process`](manifest.md#transport-process) has a harness session, so every other transport refuses the launch with [`E-RUN-039`](diagnostics.md#e-run-039) |
-| `--workdir` | `<manifest-dir>/workdir/<session-id>` | Directory mounted as the capsule's accessible workspace. When passed, session artifacts are created inside it under `.murmur/<session-id>`. See [Session workdir](workdir.md) |
+| `--workdir` | `<manifest-dir>/workdir/<session-id>` | Directory mounted as the capsule's accessible workspace. When passed, the session workdir is created inside it under `.murmur/<session-id>`, and the session's records are kept under `~/.murmur/records/<this directory>/`. See [Session workdir](workdir.md) |
 | `--bind` | `127.0.0.1` | Address the capsule's HTTP server binds. Use `0.0.0.0` to accept connections from other machines. An address off loopback on a capsule declaring no [`network.authentication`](manifest.md#field-network-authentication) prints [`W-SEC-032`](diagnostics.md#w-sec-032) on stderr |
 | `--json` | off | Emit launch info as a single JSON line instead of human-readable output. Takes precedence over `--verbose` |
-| `--verbose`, `-v` | off | Add `workdir:`, `manifest:`, `driver:` and `skills:` to the startup lines, and `formation:` for a [formation member](#mur-run-formation) |
+| `--verbose`, `-v` | off | Add `workdir:`, `records:`, `manifest:`, `driver:` and `skills:` to the startup lines, and `formation:` for a [formation member](#mur-run-formation) |
 | `--lifecycle-task-acceptance` | — | Override `lifecycle.task_acceptance` (`none`\|`single`\|`queue`) |
 | `--lifecycle-after-task` | — | Override `lifecycle.after_task` (`exit`\|`sleep`). The resolved value is the one [`W-SEC-024`](diagnostics.md#w-sec-024) reports, so `--explain-scope` previews the warning this override produces; a value outside the two is refused there as on a real run |
 | `--no-env-file` | off | Skip auto-loading the workspace-root `.env` file for this invocation. Recommended default for CI/CD pipelines |
 | `--containment` | — | Require at least this containment class (`advisory`\|`scoped`\|`sealed`). Combines with the manifest's `capabilities.containment` and the workspace `containment` config by taking the strongest of the three — this flag can only raise the effective floor, never lower one another source already set. See [Containment class](containment.md#field-containment) |
-| `--explain-scope` | off | Print the effective grant set and the declared/achieved containment classes, then exit `0` without staging or launching anything — no artifact pull, no component compile, no workdir. Reports even when the declared floor is not met. The `Resource plane` block, and `io_max` under `--json`, report whether the declared [`cgroup_io_bytes_per_sec`](resource-limits.md#io-max-report) ceiling applies on this host. Also lists every path the runtime writes into the workdir, as `runtime_writes` under `--json` — see [Session workdir](workdir.md). A `Runtime directory` block after `Containment` gives the session's [runtime directory](workdir.md#runtime-directory) and whether the capsule's commands can change it; `--json` carries it as `runtime_dir`. Unless the session composes a sealed root, a `Not protected here` block prints under `Containment`, naming what its filesystem mechanism leaves unrestricted and why a `~`-based probe is not evidence of containment — see [Testing containment honestly](containment.md#testing-containment); `--json` carries the same statements as `filesystem_boundary` |
+| `--explain-scope` | off | Print the effective grant set and the declared/achieved containment classes, then exit `0` without staging or launching anything — no artifact pull, no component compile, no workdir. Reports even when the declared floor is not met. The `Resource plane` block, and `io_max` under `--json`, report whether the declared [`cgroup_io_bytes_per_sec`](resource-limits.md#io-max-report) ceiling applies on this host. Also lists every path the runtime writes into the workdir, as `runtime_writes` under `--json` — see [Session workdir](workdir.md). A `Runtime directory` block after `Containment` gives the session's [runtime directory](workdir.md#runtime-directory) and whether the capsule's commands can change it, and a `Records directory` block after it does the same for the [records directory](workdir.md#records-directory); `--json` carries them as `runtime_dir` and `records_dir`. Refused with [`E-IO-004`](diagnostics.md#e-io-004) when `HOME` cannot hold `~/.murmur`, as the launch would be. Unless the session composes a sealed root, a `Not protected here` block prints under `Containment`, naming what its filesystem mechanism leaves unrestricted and why a `~`-based probe is not evidence of containment — see [Testing containment honestly](containment.md#testing-containment); `--json` carries the same statements as `filesystem_boundary` |
 | `--system-prompt` | — | Replace the manifest's system prompt for this invocation only. Overrides `inference.system_prompt`, `inference.system_prompt_file` and `inference.system_prompt_artifact` alike, whichever the manifest used — and applies just as well when it declared none. The value is trimmed; an empty or whitespace-only value clears the prompt rather than setting one. `murmur.yaml` is not modified. Requires an agent capsule: on a manifest with no `inference:` block the run fails with `error[E-IO-003]` before anything is staged. Inert under `--explain-scope`. See [Override the prompt for a single run](../how-to/capsule-system-prompt.md#step-8-override-the-prompt-for-a-single-run) |
 
 For the output modes, the read-only pre-flight checks and driving a capsule over HTTP, see
@@ -1278,6 +1283,21 @@ For the output modes, the read-only pre-flight checks and driving a capsule over
 
 - Auto-loads `.env` from nearest workspace containing `murmur.yaml`, unless `--no-env-file` is passed
 - Creates/uses `murmur.lock` in manifest directory, except under `--capsule`, which has no project directory to hold one
+- Refuses with [`E-IO-004`](diagnostics.md#e-io-004), before any artifact store, lockfile or registry is read, when `HOME` is unset, relative, or names a directory in which `~/.murmur` cannot be created
+
+<span id="mur-run-json"></span>**Readiness line.** Under `--json`, standard output carries one JSON
+object the moment the capsule is addressable:
+
+| Key | Present | Value |
+|---|---|---|
+| `url` | always | `host:port` of the door, empty for a script capsule |
+| `pid` | always | The `mur run` process id |
+| `session_id` | always | The session id |
+| `name`, `version` | always | The capsule's name and version |
+| `workdir` | always | The accessible workdir |
+| `records_dir` | always | The session's [records directory](workdir.md#records-directory), where its trace is |
+| `formation_id` | a [formation member](#mur-run-formation) | The formation id |
+| `auth` | an authenticated door | `"bearer"` |
 
 **Door tokens.** `mur run` prints no door token. A capsule declaring
 [`network.authentication`](manifest.md#field-network-authentication) says its door is authenticated
@@ -1311,7 +1331,7 @@ of these:
 | `--json` | The readiness line gains `"formation_id": "<formation-id>"` |
 
 ```json
-{"formation_id":"frm_019f01a93ff27c1e9a3b5d0c4e8f2a61","name":"researcher","pid":48213,"session_id":"ses_019f01a940ce7761854e768ecbe3d399","url":"localhost:41873","version":"0.1.0","workdir":"/home/me/project/workdir/ses_019f01a940ce7761854e768ecbe3d399"}
+{"formation_id":"frm_019f01a93ff27c1e9a3b5d0c4e8f2a61","name":"researcher","pid":48213,"session_id":"ses_019f01a940ce7761854e768ecbe3d399","records_dir":"/home/me/.murmur/records/home/me/project/workdir/ses_019f01a940ce7761854e768ecbe3d399","url":"localhost:41873","version":"0.1.0","workdir":"/home/me/project/workdir/ses_019f01a940ce7761854e768ecbe3d399"}
 ```
 
 The variable is read before the workspace `.env` is loaded, so a `.env` line naming it has no
@@ -1382,8 +1402,8 @@ diagnostics.
 
 | The line was headed for | Where it lands instead |
 |---|---|
-| Either stream, once the session directory exists | [`logs/bootstrap.log`](workdir.md#session-workdir-files) in the session directory |
-| Either stream, before the session directory exists | Nowhere: a warning raised while the manifest and its grants are still being read has no file to fall back to |
+| Either stream, once the records directory exists | [`logs/bootstrap.log`](workdir.md#records-directory) in the session's records directory |
+| Either stream, before the records directory exists | Nowhere: a warning raised while the manifest and its grants are still being read has no file to fall back to |
 
 The fallback writes to that file alone, so `--json` standard output holds the readiness line and
 nothing else.
@@ -1634,9 +1654,10 @@ formation <id>: <L> listed (<statuses>)[, <P> pruned now][; <not-listed>][; <U> 
 
 <span id="mur-ps-session-roots"></span>The session roots searched are:
 
-- each directory holding a listed or pruned member's session directory;
-- each peer's session root under `~/.murmur/formations/<formation-id>/`, whether or not a record
-  of that peer remains — see [Member directories](roster.md#member-directories).
+- each records group holding a listed or pruned member's `records_dir`;
+- each peer's records group, the one its directory under `~/.murmur/formations/<formation-id>/`
+  names, whether or not a record of that peer remains — see
+  [Member directories](roster.md#member-directories).
 
 A member that ran under another root and has no record is not counted.
 [`mur trace show <formation-id>`](#mur-trace-show-formation) lists the members by name.
@@ -2391,7 +2412,7 @@ mur trace show <formation-id> [--workdir <dir>]
 | Argument / Flag | Default | Description |
 |---|---|---|
 | `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses), or a formation id (`frm_…`), which prints only the [Formation section](#mur-trace-show-formation) |
-| `--workdir` | `./workdir` | Directory holding the `ses_*` session directories. With a formation id, the first root searched — see [Listing a formation](#mur-trace-show-formation) |
+| `--workdir` | `./workdir` | The workdir root whose sessions are read: the directory a run was given as `--workdir`, or `<manifest-dir>/workdir`. Its sessions' [records directories](workdir.md#records-directory) are read from `~/.murmur/records`. With a formation id, the first group searched — see [Listing a formation](#mur-trace-show-formation) |
 | `--body` | — | Print the body behind one hash and nothing else. Selectors below |
 | `--turn` | — | The turn whose hashes `--body system`, `tools`, `response` and `message:<i>` name, as the Wire section numbers it. Must name exactly one turn. Required with those four, invalid without `--body` |
 
@@ -2433,7 +2454,7 @@ Output sections, in the order they are printed:
 | Reopens | one or more `task_reopened` records | Per reopen: its ordinal, the hook that asked, whether the next attempt `continued` the task's conversation or `restarted` it, the turns it had left, and the hook's feedback — `reopen 1  by gatekeeper  continued, 7 turns left  “…”` |
 | Resource plane | one or more `resource_list`/`resource_read` records | Counts by outcome |
 | Peer files | one or more `peer_handle_mint`/`peer_handle_redeem`/`peer_file_fetch` records | Counts by outcome |
-| Delegations | one or more [`delegation_start`](observability-schemas.md#delegation-lineage)/`delegation` records | One row per delegation: its `dlg_` id, `capsule@version`, the child session, and the outcome — `in flight` for a delegation this trace never saw end. The reason follows on any outcome that recorded one, and the path to the child's own trace follows on any delegation that launched one |
+| Delegations | one or more [`delegation_start`](observability-schemas.md#delegation-lineage)/`delegation` records | One row per delegation: its `dlg_` id, `capsule@version`, the child session, and the outcome — `in flight` for a delegation this trace never saw end. The reason follows on any outcome that recorded one, and the path to the child's own trace, in the records directory the child reported, follows on any delegation that launched one |
 | Plan | one or more [`plan_start`](observability-schemas.md#plan-events)/`plan_step`/`plan_end` records | Per plan run: its id, outcome, duration and step totals by status, the step that ended it, and one row per step in the order the plan declared them — kind, status, duration, attempt count when it retried more than once, what it waited on, and its error. A step the run never reached reads `not run` |
 | A2A | one or more `a2a_task_received`/`a2a_send` records | Tasks received, messages sent, and the peer URLs they went to |
 | Tasks | more than one task in the session | Per-task breakdown |
@@ -2444,32 +2465,33 @@ Output sections, in the order they are printed:
 
 `mur trace show <formation-id>` lists every session whose trace names that formation, by session
 id, with its roster name and how it ended, then every [`call-member`](runtime-provided-tools.md#call-member)
-call between the members. It searches these session roots, in order:
+call between the members. It searches these [records groups](workdir.md#records-directory), in
+order:
 
-| `--workdir` | Roots searched |
+| `--workdir` | Groups searched |
 |---|---|
-| Not given | `./workdir`, then `./.murmur`, then each peer's session root under `~/.murmur/formations/<formation-id>/` |
-| Given | That directory, then each peer's session root under `~/.murmur/formations/<formation-id>/` |
+| Not given | The group of `./workdir`, then the group of `.`, then each peer's group |
+| Given | That directory's group, then each peer's group |
 
-The entry member records under the roster's directory, so run the command from that directory, or
-pass `--workdir <roster directory>/.murmur`. Each peer's session root is
-`~/.murmur/formations/<formation-id>/<member>/.murmur` — see
+The entry member's `--workdir` is the roster's directory, so run the command from that directory, or
+pass `--workdir <roster directory>`. Each peer's group is the records group of
+`~/.murmur/formations/<formation-id>/<member>` — see
 [Member directories](roster.md#member-directories). A member's own `mur trace show` prints the same
-section, searching the session root it is in and then each peer's session root.
+section, searching the group it is in and then each peer's group.
 
 Run from the roster's directory `/home/me/project`:
 
 ```text
 ── Formation ────────────────────────────────────
 formation:  frm_019f01a93ff27c1e9a3b5d0c4e8f2a61
-searched:   /home/me/project/workdir
-searched:   /home/me/project/.murmur
-searched:   /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/lead-a/.murmur
-searched:   /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/lead-b/.murmur
-searched:   /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/worker-a1/.murmur
-searched:   /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/worker-a2/.murmur
-searched:   /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/worker-b1/.murmur
-searched:   /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/worker-b2/.murmur
+searched:   /home/me/.murmur/records/home/me/project/workdir
+searched:   /home/me/.murmur/records/home/me/project
+searched:   /home/me/.murmur/records/home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/lead-a
+searched:   /home/me/.murmur/records/home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/lead-b
+searched:   /home/me/.murmur/records/home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/worker-a1
+searched:   /home/me/.murmur/records/home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/worker-a2
+searched:   /home/me/.murmur/records/home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/worker-b1
+searched:   /home/me/.murmur/records/home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/worker-b2
 ses_019f01a940ce7761854e768ecbe3d399  chief      chief@0.1.0      ok  may call lead-a, lead-b
 ses_019f01a944a17b2c9d0e1f2a3b4c5d6e  lead-a     team-lead@0.1.0  ok  may call worker-a1, worker-a2
 ses_019f01a945b27c3d0e1f2a3b4c5d6e7f  lead-b     team-lead@0.1.0  ok  may call worker-b1, worker-b2
@@ -2492,7 +2514,7 @@ mcl_019f01a9513d7e6f1a2b3c4d5e6f7081    chief → lead-b      completed  51.0s  
 | `formation:` | The formation id |
 | `searched:` | One line per session root searched, in the order searched, whether or not it exists. A root after the first that could not be listed ends `could not be read: <why>`, and fails nothing |
 | One per member | Session id, the roster name from [`session_start.formation_member`](observability-schemas.md#session-trace-tracejsonl) — `-` for a member's delegated child, which has none — `name@version`, and the `session_end` exit status — `no session_end` for a member that was killed or is still running. `spawned by <session>` follows for a member another member delegated to, and `may call <member>, …` for a member the roster lets call others, its callees in roster order |
-| `delegated children not under these roots` | Members' delegated children whose traces are in another session root. Only when there are any. The member's own `mur trace show` prints each `child trace:` path in its Delegations section |
+| `delegated children not under these roots` | Members' delegated children whose traces are in another records group. Only when there are any. The member's own `mur trace show` prints each `child trace:` path in its Delegations section |
 | `calls:` | How many calls follow. Only when the members' traces record at least one call |
 | One per call | `<call id>  <caller> → <callee>  <status>  <duration>  <delivery>`, then the note for a missing side when there is one, `busy ×<n>` when the callee turned `<n>` offers away busy, and `no answer below: <member> (<status>), …` when the call names members further down that gave no answer, joined by `; `. Columns are aligned |
 
@@ -2681,7 +2703,7 @@ mur trace steps [<session>] [--verbose] [--workdir <dir>]
 |---|---|---|
 | `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses). A formation id (`frm_…`) is refused with [`E-TRC-001`](diagnostics.md): use [`mur trace show <formation-id>`](#mur-trace-show-formation) for a formation's members and calls |
 | `--verbose` | off | Append a truncated summary of each tool call's input |
-| `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
+| `--workdir` | `./workdir` | The workdir root whose sessions are read: the directory a run was given as `--workdir`, or `<manifest-dir>/workdir`. Its sessions' [records directories](workdir.md#records-directory) are read from `~/.murmur/records` |
 
 A trace whose lines carry [`event_id`](observability-schemas.md#session-trace-tracejsonl) renders as
 the session → task → turn tree that its `parent_id` chain describes: each turn's tool, shell and
@@ -2818,7 +2840,7 @@ mur trace diff [<before> <after>] [--workdir <dir>]
 |---|---|---|
 | `<before>` | `@2` | The run in the Run A column, as a [session address](#session-addresses) |
 | `<after>` | `@1` | The run in the Run B column, as a [session address](#session-addresses) |
-| `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
+| `--workdir` | `./workdir` | The workdir root whose sessions are read: the directory a run was given as `--workdir`, or `<manifest-dir>/workdir`. Its sessions' [records directories](workdir.md#records-directory) are read from `~/.murmur/records` |
 
 Both addresses or neither: one argument is refused with
 [`E-TRC-002`](diagnostics.md).
@@ -2885,7 +2907,7 @@ mur trace report [<session>...] [--last <n>] [--since <duration>] [--workdir <di
 | `<session>...` | every session in the workdir | One or more [session addresses](#session-addresses). Cannot be combined with `--last` or `--since` |
 | `--last` | — | Limit to the `n` most recently created sessions. Must be at least 1 |
 | `--since` | — | Limit to sessions created within a duration, written `<n>m`, `<n>h` or `<n>d` |
-| `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
+| `--workdir` | `./workdir` | The workdir root whose sessions are read: the directory a run was given as `--workdir`, or `<manifest-dir>/workdir`. Its sessions' [records directories](workdir.md#records-directory) are read from `~/.murmur/records` |
 
 Output: a short block per session, then mean, population stddev, min, and max for each numeric metric, followed by exit status distribution. If any sessions contain more than one task, a **Per-task averages** section is appended showing per-task metrics across all multi-task sessions.
 
@@ -2954,8 +2976,8 @@ mur eval show [<session>] [--workdir <dir>] [--json]
 
 | Argument / Flag | Default | Description |
 |---|---|---|
-| `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses), resolved to that session's `eval.jsonl` |
-| `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
+| `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses), resolved to `hooks/eval.jsonl` in that session's [records directory](workdir.md#records-directory) |
+| `--workdir` | `./workdir` | The workdir root whose sessions are read: the directory a run was given as `--workdir`, or `<manifest-dir>/workdir`. Its sessions' [records directories](workdir.md#records-directory) are read from `~/.murmur/records` |
 | `--json` | off | Emit a single pretty-printed JSON object instead of human-readable text |
 
 Human output sections:
@@ -2993,7 +3015,7 @@ mur eval diff [<a> <b>] [--workdir <dir>]
 |---|---|---|
 | `<a>` | `@2` | The run in the Run A column, as a [session address](#session-addresses) |
 | `<b>` | `@1` | The run in the Run B column, as a [session address](#session-addresses) |
-| `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
+| `--workdir` | `./workdir` | The workdir root whose sessions are read: the directory a run was given as `--workdir`, or `<manifest-dir>/workdir`. Its sessions' [records directories](workdir.md#records-directory) are read from `~/.murmur/records` |
 
 Both addresses or neither: one argument is refused with
 [`E-EVAL-002`](diagnostics.md).
@@ -3040,7 +3062,7 @@ mur eval run <capsule-dir> --dataset <dataset.jsonl>
 1. Stages the capsule session with `case_id` and `dataset_id` injected into the hook environment.
 2. Copies `task_path` to `task.md` in the session's [runtime directory](workdir.md#runtime-directory). If the file does not exist, a warning is printed and the session runs without it.
 3. Launches the session.
-4. Reads `workdir/eval.jsonl` from the resulting session workdir.
+4. Reads `hooks/eval.jsonl` from the session's [records directory](workdir.md#records-directory), where a scoring hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities) writes it. A case with no such file reports `no_scores` and a warning naming that grant.
 5. Prints a result line: `result: pass|fail|no_scores  session: <id>`.
 
 After all cases, prints a summary table:

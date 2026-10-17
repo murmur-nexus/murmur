@@ -331,7 +331,7 @@ handed it over, and a call one side of which was not found carries a note saying
 [Listing a formation](../reference/cli.md#mur-trace-show-formation).
 
 The call row comes from three records. In `lead`'s trace,
-`.murmur/<lead session>/trace.jsonl`, the call and its outcome:
+`trace.jsonl` in its [records directory](../reference/workdir.md#records-directory), the call and its outcome:
 
 ```json
 {"event_type":"member_call_start","event_id":"evt_01a11002a5e27232b8c9a161b0aa15e5","parent_id":"evt_01a1100298c178d1a950c189b9b5a2c0","session_id":"ses_01a11002984c7bd0ad3a7b1927d94d5d","timestamp":1791269971426,"task_id":"tsk_01a1100298c57060b6d732feee045060","call_id":"mcl_01a11002a5d57021b9017e9e2e31a465","member":"worker","member_task_id":"tsk_01a11002a5db7fe0a98b4e4e743aa444"}

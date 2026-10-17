@@ -165,7 +165,13 @@ pub(crate) fn uuid_v7_timestamp_ms(id: &str, prefix: &str) -> Option<u64> {
     u64::from_str_radix(hex.get(..12)?, 16).ok()
 }
 
-/// Remove the session directories under `sessions_root` that `policy` does not keep.
+/// Remove the sessions of one records group that `policy` does not keep: each pruned session's
+/// records directory in `records_group` and, when `session_workdirs` is given, its session
+/// workdir directory of the same name there, so a session goes whole.
+///
+/// The decision is made on `records_group`'s `ses_*` listing alone: a session whose workdir half
+/// is already gone still goes, and a workdir directory with no records directory is never a
+/// candidate. Both removals go by descriptor through their roots, with no link followed.
 ///
 /// `current_session_id` is a hard floor: no directory whose name sorts at or after it is ever a
 /// candidate, whatever the policy says. That is what keeps the running session's own trace, and
@@ -177,10 +183,12 @@ pub(crate) fn uuid_v7_timestamp_ms(id: &str, prefix: &str) -> Option<u64> {
 /// directories and one of them is the running one. Reasons are attributed age-first, because
 /// "too old" is the more specific statement about a directory that fails both.
 ///
-/// A directory that cannot be removed is skipped and left out of the returned list: retention
-/// never fails a launch, and a trace event must name only what actually went.
+/// A records directory that cannot be removed is skipped and left out of the returned list, and
+/// its workdir half is kept with it: retention never fails a launch, and a trace event must name
+/// only what actually went.
 pub fn prune_sessions(
-    sessions_root: &Path,
+    records_group: &crate::workdir_fs::WorkdirRoot,
+    session_workdirs: Option<&crate::workdir_fs::WorkdirRoot>,
     current_session_id: &str,
     policy: &murmur_artifact::TraceRetainConfig,
     now_ms: u64,
@@ -189,14 +197,14 @@ pub fn prune_sessions(
         return Vec::new();
     }
 
-    let mut entries: Vec<String> = match std::fs::read_dir(sessions_root) {
-        Ok(dir) => dir
-            .filter_map(Result::ok)
-            .filter(|entry| entry.path().is_dir())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+    let mut entries: Vec<String> = match records_group.list_dir("") {
+        Ok(Some(listed)) => listed
+            .into_iter()
+            .filter(|(_, kind)| *kind == crate::workdir_fs::EntryKind::Directory)
+            .map(|(name, _)| name)
             .filter(|name| session_id_timestamp_ms(name).is_some())
             .collect(),
-        Err(_) => return Vec::new(),
+        Ok(None) | Err(_) => return Vec::new(),
     };
     // Newest first, which for uuid v7 names is both the lexical and the chronological order.
     entries.sort_unstable_by(|a, b| b.cmp(a));
@@ -224,7 +232,10 @@ pub fn prune_sessions(
         } else {
             crate::trace::RETENTION_REASON_MAX_SESSIONS
         };
-        if std::fs::remove_dir_all(sessions_root.join(name)).is_ok() {
+        if records_group.remove_dir_all(name).is_ok() {
+            if let Some(workdirs) = session_workdirs {
+                let _ = workdirs.remove_dir_all(name);
+            }
             pruned.push(PrunedSession {
                 name: name.clone(),
                 reason,
@@ -256,8 +267,9 @@ pub fn prune_sessions(
 /// directory `is_live` answers `true` for is skipped and keeps its rank, so a formation still
 /// running is never removed and still counts against `max_sessions`.
 ///
-/// A missing `formations_dir` removes nothing. A directory that cannot be removed is left out of
-/// the returned list, which is newest first.
+/// A removed formation's records subtree, the records group of its directory and every member's
+/// group beneath it, goes with it. A missing `formations_dir` removes nothing. A directory that
+/// cannot be removed is left out of the returned list, which is newest first.
 pub fn prune_formations(
     formations_dir: &Path,
     current: &FormationId,
@@ -312,7 +324,14 @@ pub fn prune_formations(
             crate::trace::RETENTION_REASON_MAX_SESSIONS
         };
         let path = formations_dir.join(id.as_str());
+        // Every member's records group mirrors a directory beneath this one, so the formation's
+        // records subtree goes with it. Resolved before the removal, while the path still
+        // canonicalizes to what the members were launched in.
+        let records = crate::records_dir::records_group(&path).ok();
         if std::fs::remove_dir_all(&path).is_ok() {
+            if let Some(records) = records {
+                let _ = std::fs::remove_dir_all(records);
+            }
             pruned.push(PrunedFormation {
                 formation_id: id.clone(),
                 path,
@@ -811,7 +830,8 @@ mod tests {
         make_sessions(root.path(), &all);
 
         let pruned = prune_sessions(
-            root.path(),
+            &crate::workdir_fs::WorkdirRoot::open(root.path()).unwrap(),
+            None,
             &all[5],
             &TraceRetainConfig {
                 max_sessions: Some(3),
@@ -859,7 +879,8 @@ mod tests {
         );
 
         let pruned = prune_sessions(
-            root.path(),
+            &crate::workdir_fs::WorkdirRoot::open(root.path()).unwrap(),
+            None,
             &current,
             &TraceRetainConfig {
                 max_sessions: None,
@@ -893,7 +914,8 @@ mod tests {
         make_sessions(root.path(), &all);
 
         let pruned = prune_sessions(
-            root.path(),
+            &crate::workdir_fs::WorkdirRoot::open(root.path()).unwrap(),
+            None,
             &current,
             &TraceRetainConfig {
                 max_sessions: Some(2),
@@ -929,7 +951,8 @@ mod tests {
         );
 
         let pruned = prune_sessions(
-            root.path(),
+            &crate::workdir_fs::WorkdirRoot::open(root.path()).unwrap(),
+            None,
             &current,
             &TraceRetainConfig {
                 max_sessions: Some(1),
@@ -944,6 +967,67 @@ mod tests {
         assert!(root.path().join(&current).join("trace.jsonl").exists());
     }
 
+    /// A pruned session goes whole: its records directory and its session workdir directory of
+    /// the same name both go, and a workdir directory with no records directory is never a
+    /// candidate, whatever its name says.
+    #[test]
+    fn a_pruned_session_takes_its_records_and_its_session_workdir() {
+        let records = tempfile::tempdir().unwrap();
+        let workdirs = tempfile::tempdir().unwrap();
+        let all: Vec<String> = (1..=3).map(|n| ses(NOW - (3 - n) * 1000, n)).collect();
+        make_sessions(records.path(), &all);
+        for name in &all {
+            std::fs::create_dir_all(workdirs.path().join(name).join("out")).unwrap();
+        }
+        let workdir_only = ses(NOW - 9_000, 9);
+        std::fs::create_dir_all(workdirs.path().join(&workdir_only)).unwrap();
+
+        let pruned = prune_sessions(
+            &crate::workdir_fs::WorkdirRoot::open(records.path()).unwrap(),
+            Some(&crate::workdir_fs::WorkdirRoot::open(workdirs.path()).unwrap()),
+            &all[2],
+            &TraceRetainConfig {
+                max_sessions: Some(2),
+                max_age_secs: None,
+            },
+            NOW,
+        );
+
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].name, all[0]);
+        assert_eq!(names(records.path()), vec![all[1].clone(), all[2].clone()]);
+        let mut kept = vec![all[1].clone(), all[2].clone(), workdir_only];
+        kept.sort();
+        assert_eq!(names(workdirs.path()), kept);
+    }
+
+    /// A link planted where a session workdir directory belongs is refused, not followed: the
+    /// directory it points at survives the pruning of the session it is named for.
+    #[test]
+    fn a_link_in_place_of_a_session_workdir_is_not_followed() {
+        let records = tempfile::tempdir().unwrap();
+        let workdirs = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("keep"), b"x").unwrap();
+        let all: Vec<String> = (1..=2).map(|n| ses(NOW - (2 - n) * 1000, n)).collect();
+        make_sessions(records.path(), &all);
+        std::os::unix::fs::symlink(elsewhere.path(), workdirs.path().join(&all[0])).unwrap();
+
+        let pruned = prune_sessions(
+            &crate::workdir_fs::WorkdirRoot::open(records.path()).unwrap(),
+            Some(&crate::workdir_fs::WorkdirRoot::open(workdirs.path()).unwrap()),
+            &all[1],
+            &TraceRetainConfig {
+                max_sessions: Some(1),
+                max_age_secs: None,
+            },
+            NOW,
+        );
+
+        assert_eq!(pruned.len(), 1);
+        assert!(elsewhere.path().join("keep").exists());
+    }
+
     /// A policy with neither key set — which the manifest parser refuses, but which the runtime
     /// must still treat as inert rather than as "prune everything".
     #[test]
@@ -952,7 +1036,8 @@ mod tests {
         let all = [ses(NOW - 9_000_000, 1), ses(NOW, 2)];
         make_sessions(root.path(), &all);
         assert!(prune_sessions(
-            root.path(),
+            &crate::workdir_fs::WorkdirRoot::open(root.path()).unwrap(),
+            None,
             &all[1],
             &TraceRetainConfig {
                 max_sessions: None,

@@ -3,8 +3,8 @@
 //! These tests drive a real capsule session through the host `run_agent_loop` against a
 //! purpose-built WASM driver fixture (`wire-digest-driver`) that hashes the request *as the guest
 //! received it* and reports the digests in its final text. A person can read `out/result.txt`
-//! beside `trace.jsonl` and confirm that the hashes the trace recorded name the bytes the driver
-//! was handed, without either side trusting the other's serializer.
+//! against the session's `trace.jsonl` and confirm that the hashes the trace recorded name the
+//! bytes the driver was handed, without either side trusting the other's serializer.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -68,10 +68,9 @@ struct Run {
     /// The driver's own digests of what it received.
     result: String,
     trace: String,
-    workdir: PathBuf,
-    /// Kept alive so the session directory — and the `blobs/` beside it — outlives the run.
-    /// `workdir` is minted under the project directory, so dropping it would delete the very
-    /// files these tests read.
+    /// The session's records directory: `trace.jsonl` and the `blobs/` beside it.
+    records_dir: PathBuf,
+    /// Kept alive so the session workdir, minted under the project directory, outlives the run.
     _project: tempfile::TempDir,
     _home: tempfile::TempDir,
 }
@@ -94,7 +93,7 @@ impl Run {
     }
 
     fn blob_dir(&self) -> PathBuf {
-        self.workdir.join("blobs")
+        self.records_dir.join("blobs")
     }
 
     /// Every filename under `blobs/`, or an empty set when the directory was never created.
@@ -139,8 +138,8 @@ fn run_session(trace_block: &str) -> Run {
 
     Run {
         result: fs::read_to_string(launched.workdir.join("out/result.txt")).unwrap_or_default(),
-        trace: fs::read_to_string(launched.workdir.join("trace.jsonl")).unwrap_or_default(),
-        workdir: launched.workdir.clone(),
+        trace: fs::read_to_string(launched.records_dir.join("trace.jsonl")).unwrap_or_default(),
+        records_dir: launched.records_dir.clone(),
         _project: project,
         _home: home,
     }
@@ -511,7 +510,7 @@ impl Run {
         assert_cmd::Command::cargo_bin("mur")
             .unwrap()
             .args(["trace", "show"])
-            .arg(self.workdir.join("trace.jsonl"))
+            .arg(self.records_dir.join("trace.jsonl"))
             .args(args)
             .assert()
     }

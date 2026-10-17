@@ -315,6 +315,10 @@ impl Run {
         common::parse_workdir_from_stdout(&self.stdout)
     }
 
+    fn records_dir(&self) -> PathBuf {
+        common::parse_records_from_stdout(&self.stdout)
+    }
+
     fn result(&self) -> String {
         fs::read_to_string(self.workdir().join("out/result.txt")).unwrap_or_else(|err| {
             panic!(
@@ -325,7 +329,7 @@ impl Run {
     }
 
     fn trace(&self) -> Vec<Value> {
-        fs::read_to_string(self.workdir().join("trace.jsonl"))
+        fs::read_to_string(self.records_dir().join("trace.jsonl"))
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())

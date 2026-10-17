@@ -82,6 +82,8 @@ fn stage_door_with(
     allow_tools: bool,
 ) -> capsule_runtime::StagedSession {
     let runtime_manifest = murmur_artifact::load_runtime_manifest(manifest).unwrap();
+    // The session's records are kept under `$HOME`, which must not be the developer's.
+    super::process_home();
     let allowlisted_tools = runtime_manifest
         .artifacts
         .iter()
@@ -111,6 +113,7 @@ fn stage_door_with(
         capsule_runtime::StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -170,9 +173,9 @@ pub fn launch_door(staged: capsule_runtime::StagedSession) -> String {
         .expect("timed out waiting for the door")
 }
 
-/// Every event in the session's `trace.jsonl` so far.
-pub fn trace_events(workdir: &Path) -> Vec<Value> {
-    fs::read_to_string(workdir.join("trace.jsonl"))
+/// Every event in the trace of the session whose records directory is `records_dir` so far.
+pub fn trace_events(records_dir: &Path) -> Vec<Value> {
+    fs::read_to_string(records_dir.join("trace.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())

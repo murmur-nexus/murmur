@@ -236,21 +236,21 @@ fn the_json_report_carries_a_stable_preopen_shape() {
                 "role": "tool",
                 "scope": null,
                 "surface": "whole-workdir",
-                "runtime_dir_read_only": true,
+                "runtime_dir_reach": "unresolved",
             },
             {
                 "artifact": "local/cache-tool",
                 "role": "driver",
                 "scope": "cache",
                 "surface": "scoped-subtree",
-                "runtime_dir_read_only": false,
+                "runtime_dir_reach": null,
             },
             {
                 "artifact": "local/telemetry-hook",
                 "role": "hook",
                 "scope": null,
                 "surface": "nothing",
-                "runtime_dir_read_only": false,
+                "runtime_dir_reach": null,
             },
         ])
     );
@@ -329,7 +329,7 @@ fn a_capsule_wide_scope_does_not_narrow_a_tools_preopen() {
                 "role": "tool",
                 "scope": null,
                 "surface": "whole-workdir",
-                "runtime_dir_read_only": true,
+                "runtime_dir_reach": "unresolved",
             },
         ])
     );
@@ -381,4 +381,98 @@ fn doctor_reports_the_same_preopens_without_changing_its_verdict() {
     // The verdict is the artifact checklist's alone: two present artifacts, no fix lines.
     assert!(stdout.contains("All checks passed."), "got:\n{stdout}");
     assert!(!stdout.contains("Fix:"), "got:\n{stdout}");
+}
+
+/// How a tool reaches the runtime directory is read off `murmur.lock`: a native payload pinned per
+/// platform reaches it through `$MURMUR_RUNTIME_DIR`, a WASM one at `murmur-runtime/`, and an
+/// unlocked one names both. Nothing claims `murmur-runtime/` for a native tool.
+#[test]
+fn explain_scope_names_what_a_native_tool_really_gets() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    project(
+        dir.path(),
+        "",
+        &[
+            artifact_entry("native-tool", "tool", None),
+            artifact_entry("wasm-tool", "tool", None),
+            artifact_entry("unlocked-tool", "tool", None),
+        ],
+    );
+    let entry =
+        |name: &str, sha256: murmur_artifact::LockedSha256| murmur_artifact::LockedArtifact {
+            name: format!("local/{name}"),
+            resolved_version: ARTIFACT_VERSION.to_string(),
+            sha256,
+            origin: murmur_artifact::LockOrigin::Operator,
+            owner_id: None,
+        };
+    murmur_artifact::write_lockfile_atomic(
+        &dir.path().join("murmur.lock"),
+        &murmur_artifact::MurmurLock {
+            lock_version: murmur_artifact::LOCK_VERSION,
+            artifacts: vec![
+                entry(
+                    "native-tool",
+                    murmur_artifact::LockedSha256::for_one_platform(
+                        murmur_artifact::current_platform(),
+                        "a".repeat(64),
+                    ),
+                ),
+                entry(
+                    "wasm-tool",
+                    murmur_artifact::LockedSha256::any("b".repeat(64)),
+                ),
+            ],
+        },
+    )
+    .unwrap();
+
+    let report = explain_scope_json(&home, dir.path());
+    let reach = |name: &str| {
+        report["preopens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|preopen| preopen["artifact"] == format!("local/{name}"))
+            .unwrap_or_else(|| panic!("{report}"))["runtime_dir_reach"]
+            .clone()
+    };
+    assert_eq!(reach("native-tool"), "environment");
+    assert_eq!(reach("wasm-tool"), "murmur-runtime");
+    assert_eq!(reach("unlocked-tool"), "unresolved");
+    assert!(!report.to_string().contains("runtime_dir_read_only"));
+
+    let rendered = explain_scope_stdout(&home, dir.path());
+    let line = |name: &str| {
+        rendered
+            .lines()
+            .find(|line| line.contains(&format!("local/{name} (tool)")))
+            .unwrap_or_else(|| panic!("{rendered}"))
+            .to_string()
+    };
+    let protected = report["runtime_dir"]["read_only_to_commands"] == true;
+    let native = line("native-tool");
+    if protected {
+        assert!(
+            native.ends_with("; runtime directory read-only at $MURMUR_RUNTIME_DIR"),
+            "{native}"
+        );
+    } else {
+        assert!(
+            native.ends_with("; runtime directory at $MURMUR_RUNTIME_DIR, which commands can change on this host"),
+            "{native}"
+        );
+    }
+    assert!(!native.contains("murmur-runtime/"), "{native}");
+    assert!(
+        line("wasm-tool").ends_with("; runtime directory read-only at murmur-runtime/"),
+        "{rendered}"
+    );
+    assert!(
+        line("unlocked-tool").contains(
+            "; runtime directory read-only at murmur-runtime/ if WASM, at $MURMUR_RUNTIME_DIR if native"
+        ),
+        "{rendered}"
+    );
 }

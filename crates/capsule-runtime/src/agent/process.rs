@@ -52,7 +52,7 @@ use uuid::Uuid;
 
 use crate::{
     agent::{
-        AgentLoopExit, AttemptEnding, CallGate, PLAN_TOOL_NOTICE, RUNTIME_DIR_NOTICE,
+        runtime_dir_notice, AgentLoopExit, AttemptEnding, CallGate, PLAN_TOOL_NOTICE,
         UNTRUSTED_CONTENT_NOTICE,
     },
     bindings::host::murmur::tool::run::ToolInput,
@@ -130,6 +130,7 @@ const FILES_DIR_TOKEN: &str = "{files_dir}";
 pub(super) fn build_process_system_prompt(
     system_prompt: Option<&str>,
     plan_tool_present: bool,
+    manifest_file: Option<&str>,
 ) -> String {
     // The separating newline belongs to the notice, not to the template below, so an ungranted
     // capsule's prompt carries no blank line where the guidance would go. A single stray byte here
@@ -139,8 +140,9 @@ pub(super) fn build_process_system_prompt(
     } else {
         String::new()
     };
+    let runtime_dir = runtime_dir_notice(manifest_file);
     let notices =
-        format!("{RUNTIME_DIR_NOTICE}\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}{plan}");
+        format!("{runtime_dir}\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}{plan}");
     match system_prompt.filter(|sp| !sp.is_empty()) {
         Some(sp) => format!("{notices}\n\n{sp}"),
         None => notices,
@@ -376,6 +378,7 @@ impl RunSession {
 /// `model` is `none` when the manifest set none, so a driver never has to decide what an empty
 /// model means. The bridge's tool names go across bare: naming them the way a harness needs is
 /// the driver's job, and stripping that naming again in `parse` is too.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_launch_request(
     inference: &InferenceConfig,
     system_prompt: Option<&str>,
@@ -384,10 +387,11 @@ pub(super) fn build_launch_request(
     session: Session,
     harness_version: Option<String>,
     task: String,
+    manifest_file: Option<&str>,
 ) -> LaunchRequest {
     LaunchRequest {
         model: Some(inference.model.trim().to_string()).filter(|m| !m.is_empty()),
-        system_prompt: build_process_system_prompt(system_prompt, plan_tool_present),
+        system_prompt: build_process_system_prompt(system_prompt, plan_tool_present, manifest_file),
         config: inference
             .driver
             .as_ref()
@@ -421,6 +425,7 @@ pub(super) fn build_harness_env(
     env_set: &[(String, String)],
     files_dir: &str,
     runtime_dir: &Path,
+    records_dir: Option<&Path>,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut env = shell::build_declared_env(policy);
     for (name, value) in env_set {
@@ -431,11 +436,18 @@ pub(super) fn build_harness_env(
         }
         env.insert(name.clone(), substitute_files_dir(value, files_dir));
     }
-    // Last, so no `env-set` entry displaces it.
+    // Last, so no `env-set` entry displaces either.
     env.insert(
         crate::runtime_dir::RUNTIME_DIR_ENV.to_string(),
         runtime_dir.to_string_lossy().into_owned(),
     );
+    env.remove(crate::records_dir::RECORDS_DIR_ENV);
+    if let Some(records_dir) = records_dir {
+        env.insert(
+            crate::records_dir::RECORDS_DIR_ENV.to_string(),
+            records_dir.to_string_lossy().into_owned(),
+        );
+    }
     Ok(env)
 }
 
@@ -829,6 +841,7 @@ async fn run_harness(
         session_plan.session.clone(),
         harness_version.clone(),
         task,
+        store_state.manifest_file_name.as_deref(),
     );
     let launch_error = |message: String| RuntimeError::ProcessDriverCallFailed {
         name: staged.name.clone(),
@@ -851,6 +864,7 @@ async fn run_harness(
         &plan.env_set,
         &files_dir_path,
         store_state.runtime_root.path(),
+        Some(store_state.records_root.path()),
     )
     .map_err(launch_error)?;
 
@@ -880,6 +894,7 @@ async fn run_harness(
 
     let mut sink = ProcessEventSink::new(
         workdir,
+        &store_state.records_root,
         inference.max_turns,
         task_max_turns,
         first_turn,
@@ -894,7 +909,6 @@ async fn run_harness(
         bridge.as_ref(),
         &args,
         &env,
-        workdir,
         accessible_workdir.path(),
         &plan,
         start,
@@ -953,7 +967,6 @@ async fn drive_harness(
     bridge: Option<&claude_bridge::BridgeHandle>,
     args: &[String],
     env: &BTreeMap<String, String>,
-    workdir: &WorkdirRoot,
     cwd: &Path,
     plan: &LaunchPlan,
     start: HarnessStart,
@@ -1111,7 +1124,12 @@ async fn drive_harness(
                 }
                 // Arguments that are not JSON have no keys, so they miss every required field.
                 let input = serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
-                let mut gate = CallGate::new(hooks, trace, workdir, sink.current_turn());
+                let mut gate = CallGate::new(
+                    hooks,
+                    trace,
+                    &store_state.records_root,
+                    sink.current_turn(),
+                );
                 // A refusal that could not be recorded refuses anyway: an unaudited call is the
                 // thing the decision point exists to prevent.
                 let verdict = match gate
@@ -1699,8 +1717,8 @@ mod tests {
     #[test]
     fn process_system_prompt_is_launch_invariant() {
         for arg in [None, Some("You are a helpful assistant.")] {
-            let first = build_process_system_prompt(arg, false);
-            let second = build_process_system_prompt(arg, false);
+            let first = build_process_system_prompt(arg, false, Some("murmur.yaml"));
+            let second = build_process_system_prompt(arg, false, Some("murmur.yaml"));
             assert_eq!(first, second, "same input must yield the same string");
             assert!(first.contains(MURMUR_MD_TRUST_NOTICE));
             assert!(first.contains(UNTRUSTED_CONTENT_NOTICE));
@@ -1721,16 +1739,23 @@ mod tests {
 
     #[test]
     fn process_system_prompt_carries_trust_notice_with_no_custom_prompt() {
-        let prompt = build_process_system_prompt(None, false);
+        let prompt = build_process_system_prompt(None, false, Some("murmur.yaml"));
         assert_eq!(
             prompt,
-            format!("{RUNTIME_DIR_NOTICE}\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}")
+            format!(
+                "{}\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}",
+                runtime_dir_notice(Some("murmur.yaml"))
+            )
         );
     }
 
     #[test]
     fn process_system_prompt_carries_trust_notice_alongside_custom_prompt() {
-        let prompt = build_process_system_prompt(Some("You are a helpful assistant."), false);
+        let prompt = build_process_system_prompt(
+            Some("You are a helpful assistant."),
+            false,
+            Some("murmur.yaml"),
+        );
         assert!(prompt.contains(MURMUR_MD_TRUST_NOTICE));
         assert!(prompt.contains(UNTRUSTED_CONTENT_NOTICE));
         assert!(prompt.contains("You are a helpful assistant."));
@@ -1743,10 +1768,13 @@ mod tests {
 
     #[test]
     fn process_system_prompt_treats_empty_string_as_absent() {
-        let prompt = build_process_system_prompt(Some(""), false);
+        let prompt = build_process_system_prompt(Some(""), false, Some("murmur.yaml"));
         assert_eq!(
             prompt,
-            format!("{RUNTIME_DIR_NOTICE}\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}")
+            format!(
+                "{}\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}",
+                runtime_dir_notice(Some("murmur.yaml"))
+            )
         );
     }
 
@@ -1983,11 +2011,12 @@ mod tests {
             new_session("sess-1"),
             Some("harness 1.0.0".to_string()),
             "do the thing".to_string(),
+            Some("murmur.yaml"),
         );
         assert_eq!(request.model.as_deref(), Some("a-model"));
         assert_eq!(
             request.system_prompt,
-            build_process_system_prompt(Some("be brief"), true),
+            build_process_system_prompt(Some("be brief"), true, Some("murmur.yaml")),
             "the driver must be handed exactly what build_process_system_prompt produced"
         );
         assert_eq!(request.config.as_deref(), Some(r#"{"profile":"work"}"#));
@@ -2009,6 +2038,7 @@ mod tests {
                 new_session("sess-1"),
                 None,
                 "t".to_string(),
+                Some("murmur.yaml"),
             );
             assert!(
                 request.model.is_none(),
@@ -2034,6 +2064,7 @@ mod tests {
             new_session("sess-1"),
             None,
             "t".to_string(),
+            Some("murmur.yaml"),
         );
         let bridge = request.bridge.expect("a bridge was bound");
         assert_eq!(bridge.tool_names, vec!["echo-tool".to_string()]);
@@ -2058,6 +2089,7 @@ mod tests {
             &[],
             "/files",
             std::path::Path::new("/runtime"),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2082,6 +2114,7 @@ mod tests {
             ],
             "/tmp/run",
             std::path::Path::new("/runtime"),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2107,6 +2140,7 @@ mod tests {
             &[],
             "/files",
             std::path::Path::new("/runtime"),
+            None,
         )
         .unwrap();
         assert!(
@@ -2120,20 +2154,36 @@ mod tests {
     #[test]
     fn harness_env_names_the_runtime_directory_whatever_else_says() {
         std::env::set_var(crate::runtime_dir::RUNTIME_DIR_ENV, "/host/value");
+        std::env::set_var(crate::records_dir::RECORDS_DIR_ENV, "/host/records");
         let env = build_harness_env(
-            &policy_allowing(&[crate::runtime_dir::RUNTIME_DIR_ENV]),
-            &[(
-                crate::runtime_dir::RUNTIME_DIR_ENV.to_string(),
-                "/plan/value".to_string(),
-            )],
+            &policy_allowing(&[
+                crate::runtime_dir::RUNTIME_DIR_ENV,
+                crate::records_dir::RECORDS_DIR_ENV,
+            ]),
+            &[
+                (
+                    crate::runtime_dir::RUNTIME_DIR_ENV.to_string(),
+                    "/plan/value".to_string(),
+                ),
+                (
+                    crate::records_dir::RECORDS_DIR_ENV.to_string(),
+                    "/plan/records".to_string(),
+                ),
+            ],
             "/files",
             std::path::Path::new("/runtime"),
+            Some(std::path::Path::new("/records")),
         )
         .unwrap();
         assert_eq!(
             env.get(crate::runtime_dir::RUNTIME_DIR_ENV)
                 .map(String::as_str),
             Some("/runtime")
+        );
+        assert_eq!(
+            env.get(crate::records_dir::RECORDS_DIR_ENV)
+                .map(String::as_str),
+            Some("/records")
         );
     }
 
@@ -2154,6 +2204,7 @@ mod tests {
             &[],
             "/files",
             std::path::Path::new("/runtime"),
+            None,
         )
         .unwrap();
         std::env::remove_var(peers);
@@ -2299,6 +2350,7 @@ mod tests {
                 &[(bad.to_string(), "v".to_string())],
                 "/files",
                 std::path::Path::new("/runtime"),
+                None,
             )
             .unwrap_err();
             assert!(error.contains("env-set"), "{bad:?}: {error}");

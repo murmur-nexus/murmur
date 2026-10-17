@@ -135,14 +135,15 @@ impl Capsule {
         self.startup["url"].as_str().unwrap().to_string()
     }
 
-    /// This session's `trace.jsonl`: under `<project>/workdir/<session_id>/`, where a launch with
-    /// no `--workdir` keeps its session.
+    /// This session's `trace.jsonl`: in its records directory, in the records group of
+    /// `<project>/workdir`, the workdir root of a launch with no `--workdir`.
     fn trace_path(&self) -> PathBuf {
-        self._project
-            .path()
-            .join("workdir")
-            .join(self.startup["session_id"].as_str().unwrap())
-            .join("trace.jsonl")
+        common::session_records_dir(
+            self._home.path(),
+            &self._project.path().join("workdir"),
+            self.startup["session_id"].as_str().unwrap(),
+        )
+        .join("trace.jsonl")
     }
 
     /// The session's trace once the task has written `task_end`, polled because the stream's final

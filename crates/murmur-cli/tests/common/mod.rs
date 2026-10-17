@@ -87,6 +87,50 @@ pub fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// `<home>/.murmur/records`, where every session's records directory is kept.
+pub fn records_root(home: &Path) -> PathBuf {
+    home.join(".murmur").join("records")
+}
+
+/// The records group of `workdir_root` under `home`: the directory a run was given as
+/// `--workdir`, or `<manifest-dir>/workdir`, mirrored under `<home>/.murmur/records` the way the
+/// runtime mirrors it, without reading this process's `HOME`.
+pub fn records_group(home: &Path, workdir_root: &Path) -> PathBuf {
+    capsule_runtime::records_group_under(&home.join(".murmur"), workdir_root)
+}
+
+/// `session_id`'s records directory among the sessions of `workdir_root`.
+pub fn session_records_dir(home: &Path, workdir_root: &Path, session_id: &str) -> PathBuf {
+    records_group(home, workdir_root).join(session_id)
+}
+
+/// The most recent session's records directory among the sessions of `workdir_root`, or `None`
+/// when it has none.
+pub fn newest_session_records(home: &Path, workdir_root: &Path) -> Option<PathBuf> {
+    let group = records_group(home, workdir_root);
+    let mut sessions: Vec<PathBuf> = fs::read_dir(&group)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("ses_"))
+        })
+        .collect();
+    sessions.sort();
+    sessions.pop()
+}
+
+/// The `HOME` this test process staged its in-process sessions under: the scratch home
+/// [`stage_agent_session`] and its siblings point `$HOME` at.
+pub fn process_home() -> PathBuf {
+    redirect_home_away_from_the_developers();
+    PathBuf::from(std::env::var_os("HOME").expect("a scratch HOME"))
+}
+
 /// Whether a process id is still alive, by `kill(pid, 0)`.
 #[cfg(unix)]
 pub fn pid_alive(pid: i32) -> bool {
@@ -396,6 +440,13 @@ pub fn create_native_tool_zip(
 fn redirect_home_away_from_the_developers() {
     static SCRATCH_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let home = SCRATCH_HOME.get_or_init(|| {
+        // A binary that pointed `$HOME` at a scratch directory of its own keeps it.
+        if let Some(existing) = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.starts_with(std::env::temp_dir()))
+        {
+            return existing;
+        }
         let dir = tempfile::tempdir().expect("a scratch home");
         let path = dir.path().to_path_buf();
         // Held for the process: `$HOME` must not dangle while a later test is still launching.
@@ -521,6 +572,7 @@ fn stage_agent_session_inner(
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: Some(manifest_path.to_path_buf()),
             credentials_file: None,
             manifest_dir: project_dir.to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -1128,7 +1180,16 @@ pub fn explain_scope_json(home: &TempDir, manifest: &Path) -> Value {
 
 /// The session workdir `mur run --verbose` reports in its startup block.
 pub fn parse_workdir_from_stdout(stdout: &str) -> PathBuf {
-    let marker = "workdir: ";
+    parse_startup_path(stdout, "workdir: ")
+}
+
+/// The session's records directory `mur run --verbose` reports in its startup block.
+pub fn parse_records_from_stdout(stdout: &str) -> PathBuf {
+    parse_startup_path(stdout, "records: ")
+}
+
+/// The path after `marker` on its line of `mur run --verbose`'s startup block.
+fn parse_startup_path(stdout: &str, marker: &str) -> PathBuf {
     let start = stdout
         .find(marker)
         .unwrap_or_else(|| panic!("missing '{marker}' in stdout:\n{stdout}"));

@@ -4,8 +4,9 @@
 //!
 //! Every test publishes the fixture process driver, puts the fixture fake harness on `PATH` as
 //! `fixture-cli` under a profile that keeps a conversation of its own, and reads back
-//! `out/result.txt`, `trace.jsonl` and `~/.murmur/conversations/`. The fake harness is a bash
-//! script, so these tests are Unix-only — which every platform murmur targets is.
+//! `out/result.txt`, the session's `trace.jsonl` under `~/.murmur/records/` and
+//! `~/.murmur/conversations/`. The fake harness is a bash script, so these tests are Unix-only —
+//! which every platform murmur targets is.
 
 #![cfg(unix)]
 
@@ -186,6 +187,8 @@ struct Run {
     output: Output,
     text: String,
     workdir: PathBuf,
+    /// The session's records directory, or the records root when the run never staged a session.
+    records_dir: PathBuf,
 }
 
 impl Capsule {
@@ -236,10 +239,16 @@ impl Capsule {
         } else {
             self.project.path().to_path_buf()
         };
+        let records_dir = if text.contains("records: ") {
+            common::parse_records_from_stdout(&text)
+        } else {
+            common::records_root(self.home.path())
+        };
         Run {
             output,
             text,
             workdir,
+            records_dir,
         }
     }
 
@@ -330,7 +339,7 @@ impl Run {
     }
 
     fn events(&self) -> Vec<Value> {
-        fs::read_to_string(self.workdir.join("trace.jsonl"))
+        fs::read_to_string(self.records_dir.join("trace.jsonl"))
             .unwrap_or_default()
             .lines()
             .filter(|line| !line.is_empty())
@@ -366,6 +375,7 @@ struct LiveCapsule {
     child: std::process::Child,
     url: String,
     workdir: PathBuf,
+    records_dir: PathBuf,
 }
 
 impl Drop for LiveCapsule {
@@ -428,6 +438,7 @@ impl LiveCapsule {
             child,
             url: startup["url"].as_str().unwrap().to_string(),
             workdir: PathBuf::from(startup["workdir"].as_str().unwrap()),
+            records_dir: PathBuf::from(startup["records_dir"].as_str().unwrap()),
         }
     }
 
@@ -582,7 +593,7 @@ impl LiveCapsule {
     }
 
     fn events(&self) -> Vec<Value> {
-        fs::read_to_string(self.workdir.join("trace.jsonl"))
+        fs::read_to_string(self.records_dir.join("trace.jsonl"))
             .unwrap_or_default()
             .lines()
             .filter(|line| !line.is_empty())
@@ -1432,7 +1443,7 @@ fn a_forget_asked_of_a_capsule_with_no_harness_session_is_refused() {
         );
     }
     assert!(
-        !refused.workdir.join("trace.jsonl").exists(),
+        common::find_file(&common::records_root(capsule.home.path()), "trace.jsonl").is_none(),
         "a refusal at staging leaves no session behind"
     );
 

@@ -302,6 +302,10 @@ impl Run {
         common::parse_workdir_from_stdout(&self.stdout)
     }
 
+    fn records_dir(&self) -> PathBuf {
+        common::parse_records_from_stdout(&self.stdout)
+    }
+
     fn result(&self) -> String {
         fs::read_to_string(self.workdir().join("out/result.txt")).unwrap_or_else(|err| {
             panic!(
@@ -502,8 +506,8 @@ fn provider_in_network_allow_warns() {
 }
 
 /// At every `trace.capture` setting the key is nowhere the session writes — its workdir with
-/// `trace.jsonl`, blobs, logs and `out/`, the conversation records under `HOME` — nor on stdout or
-/// stderr.
+/// `out/`, its records directory under `HOME` with `trace.jsonl`, blobs and logs, the conversation
+/// records under `HOME` — nor on stdout or stderr.
 #[test]
 fn key_never_recorded() {
     for capture in ["none", "meta", "content"] {
@@ -515,7 +519,7 @@ fn key_never_recorded() {
             "{capture}: {}",
             run.stderr
         );
-        assert!(run.workdir().join("trace.jsonl").is_file(), "{capture}");
+        assert!(run.records_dir().join("trace.jsonl").is_file(), "{capture}");
         assert_eq!(
             upstream.requests()[0].header_values("x-api-key"),
             vec![MARKER]

@@ -1,0 +1,5 @@
+name: records-hook
+version: 0.1.0
+runtime: hook
+binding: on-session-end
+execution_mode: blocking

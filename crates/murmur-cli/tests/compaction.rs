@@ -106,7 +106,8 @@ fn compact_not_declared_threshold_reached_warning_logged() {
     );
 
     // bootstrap.log must contain warning that no hook returned replace-context
-    let log = fs::read_to_string(launched.workdir.join("logs/bootstrap.log")).unwrap_or_default();
+    let log =
+        fs::read_to_string(launched.records_dir.join("logs/bootstrap.log")).unwrap_or_default();
     assert!(
         log.contains("no hook returned replace-context"),
         "bootstrap.log should contain compaction skip warning, got: {log}"
@@ -114,7 +115,7 @@ fn compact_not_declared_threshold_reached_warning_logged() {
 
     // The decline also reaches the trace: a session that silently continued over budget is
     // indistinguishable in trace.jsonl from one that never needed compacting.
-    let trace = fs::read_to_string(launched.workdir.join("trace.jsonl")).unwrap_or_default();
+    let trace = fs::read_to_string(launched.records_dir.join("trace.jsonl")).unwrap_or_default();
     let events: Vec<serde_json::Value> = trace
         .lines()
         .filter(|l| !l.is_empty())
@@ -166,7 +167,7 @@ fn compact_not_declared_threshold_reached_warning_logged() {
         .args([
             "trace",
             "show",
-            launched.workdir.join("trace.jsonl").to_str().unwrap(),
+            launched.records_dir.join("trace.jsonl").to_str().unwrap(),
         ])
         .assert()
         .success()

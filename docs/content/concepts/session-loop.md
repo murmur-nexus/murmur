@@ -66,11 +66,16 @@ The agent reaches that directory by two names:
 
 Where the host can enforce it, the agent's commands can read the directory and cannot change it —
 see [What protects it](../reference/workdir.md#what-protects-it). The `[Capsule]` block at the head
-of every system prompt names both ways in with one fixed line, the same on every launch:
+of every system prompt names both ways in with one line, the same on every launch of the same
+manifest:
 
 ```text
 Runtime files: MURMUR.md, task.md, murmur.yaml and the installed tools are in a directory you can read and cannot change — $MURMUR_RUNTIME_DIR in a shell command, murmur-runtime/ in a file tool.
 ```
+
+`murmur.yaml` is the file name of the manifest the launch read — `murmur-scoped.yaml` for
+`mur run --manifest murmur-scoped.yaml`. A capsule launched with `--capsule` reads no manifest file,
+and the line names none.
 
 `transport: process` hands the same line to the harness as part of its system prompt.
 
@@ -207,7 +212,7 @@ What the runtime does with a proposal, checked in this order:
 A seed that cannot be committed never fails the task: the task runs without it. Every outcome is
 written to `trace.jsonl` as a
 [`context_seed` event](../reference/observability-schemas.md#context-seed) and to
-`workdir/logs/bootstrap.log`.
+`logs/bootstrap.log` in the session's [records directory](../reference/workdir.md#records-directory).
 
 ```yaml
 name: hook-memory

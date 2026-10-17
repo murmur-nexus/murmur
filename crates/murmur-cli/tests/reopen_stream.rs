@@ -321,8 +321,8 @@ fn task_state(addr: &str, task_id: &str) -> String {
 }
 
 /// The task the session trace's first `task_start` names, once there is one.
-fn first_started_task_id(workdir: &Path) -> Option<String> {
-    fs::read_to_string(workdir.join("trace.jsonl"))
+fn first_started_task_id(records_dir: &Path) -> Option<String> {
+    fs::read_to_string(records_dir.join("trace.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -331,8 +331,8 @@ fn first_started_task_id(workdir: &Path) -> Option<String> {
 }
 
 /// The session trace's records of `event_type` for `task_id`.
-fn trace_records(workdir: &Path, task_id: &str, event_type: &str) -> Vec<Value> {
-    fs::read_to_string(workdir.join("trace.jsonl"))
+fn trace_records(records_dir: &Path, task_id: &str, event_type: &str) -> Vec<Value> {
+    fs::read_to_string(records_dir.join("trace.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -429,10 +429,10 @@ fn a_reopened_task_is_told_it_finished_once_with_the_accepted_answer() {
 
     assert_eq!(task_state(&capsule.url, &task_id), "TASK_STATE_COMPLETED");
     assert_eq!(
-        trace_records(&capsule.workdir, &task_id, "task_reopened").len(),
+        trace_records(&capsule.records_dir, &task_id, "task_reopened").len(),
         1
     );
-    let end = trace_records(&capsule.workdir, &task_id, "task_end");
+    let end = trace_records(&capsule.records_dir, &task_id, "task_end");
     assert_eq!(end.len(), 1);
     assert_eq!(end[0]["exit_status"], "ok");
     assert_eq!(end[0]["reopen_count"], 1);
@@ -465,7 +465,7 @@ fn a_task_refused_a_reopen_is_told_it_failed_once() {
     assert_first_boundary(&stream, &task_id, REOPEN_ALWAYS_HOOK);
 
     assert_eq!(task_state(&capsule.url, &task_id), "TASK_STATE_FAILED");
-    let end = trace_records(&capsule.workdir, &task_id, "task_end");
+    let end = trace_records(&capsule.records_dir, &task_id, "task_end");
     assert_eq!(end.len(), 1);
     assert_eq!(end[0]["exit_status"], "reopen_budget_exhausted");
 }
@@ -500,12 +500,12 @@ fn a_failed_attempt_that_is_reopened_is_not_reported_failed() {
 
     assert_eq!(task_state(&capsule.url, &task_id), "TASK_STATE_COMPLETED");
     assert_eq!(
-        trace_records(&capsule.workdir, &task_id, "task_failed").len(),
+        trace_records(&capsule.records_dir, &task_id, "task_failed").len(),
         1,
         "the first attempt's failure is recorded"
     );
     assert_eq!(
-        trace_records(&capsule.workdir, &task_id, "task_reopened").len(),
+        trace_records(&capsule.records_dir, &task_id, "task_reopened").len(),
         1
     );
 }
@@ -559,11 +559,11 @@ fn an_input_timeout_a_hook_reopens_is_not_reported_failed() {
     let stop = Arc::new(AtomicBool::new(false));
     let poller = {
         let (seen, stop) = (Arc::clone(&seen), Arc::clone(&stop));
-        let (url, workdir) = (capsule.url.clone(), capsule.workdir.clone());
+        let (url, records_dir) = (capsule.url.clone(), capsule.records_dir.clone());
         std::thread::spawn(move || {
             let mut task_id = None;
             while !stop.load(Ordering::Relaxed) {
-                task_id = task_id.or_else(|| first_started_task_id(&workdir));
+                task_id = task_id.or_else(|| first_started_task_id(&records_dir));
                 if let Some(task_id) = &task_id {
                     let state = task_state(&url, task_id);
                     if !state.is_empty() {
@@ -605,7 +605,7 @@ fn an_input_timeout_a_hook_reopens_is_not_reported_failed() {
     );
     assert_eq!(task_state(&capsule.url, &task_id), "TASK_STATE_COMPLETED");
     assert_eq!(
-        trace_records(&capsule.workdir, &task_id, "task_failed")[0]["cause"],
+        trace_records(&capsule.records_dir, &task_id, "task_failed")[0]["cause"],
         "input_timeout"
     );
 }
@@ -621,7 +621,7 @@ fn message_stream_closes_on_its_own_tasks_final_status() {
     let a = open_message_stream(&capsule.url, "reopen-stream-s6-a", "task A");
     // A is running, waiting on its 2 s provider reply, when B is submitted.
     let deadline = Instant::now() + Duration::from_secs(30);
-    while trace_count(&capsule.workdir, "task_start") < 1 {
+    while trace_count(&capsule.records_dir, "task_start") < 1 {
         assert!(Instant::now() < deadline, "task A never started");
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -651,8 +651,8 @@ fn message_stream_closes_on_its_own_tasks_final_status() {
 }
 
 /// How many records of `event_type` the session trace holds.
-fn trace_count(workdir: &Path, event_type: &str) -> usize {
-    fs::read_to_string(workdir.join("trace.jsonl"))
+fn trace_count(records_dir: &Path, event_type: &str) -> usize {
+    fs::read_to_string(records_dir.join("trace.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())

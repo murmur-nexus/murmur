@@ -113,8 +113,8 @@ fn wait_for_state(addr: &str, task_id: &str, expected: &str) {
 }
 
 /// The session trace's records of `event_type`.
-fn trace_records(workdir: &Path, event_type: &str) -> Vec<Value> {
-    fs::read_to_string(workdir.join("trace.jsonl"))
+fn trace_records(records_dir: &Path, event_type: &str) -> Vec<Value> {
+    fs::read_to_string(records_dir.join("trace.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -123,9 +123,9 @@ fn trace_records(workdir: &Path, event_type: &str) -> Vec<Value> {
 }
 
 /// Wait until the trace holds `task_id`'s `task_end`.
-fn wait_for_task_end(workdir: &Path, task_id: &str) {
+fn wait_for_task_end(records_dir: &Path, task_id: &str) {
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !trace_records(workdir, "task_end")
+    while !trace_records(records_dir, "task_end")
         .iter()
         .any(|record| record["task_id"] == task_id)
     {
@@ -144,9 +144,9 @@ fn wait_for_task_end(workdir: &Path, task_id: &str) {
 fn two_tasks_replayed() -> (IdleCapsule, Vec<Event>) {
     let capsule = launch_idle_capsule(end_turn_server(&["first reply", "second reply"]));
     submit_task(&capsule.url, "event-id-cursor-1", "first task");
-    wait_for_task_ends(&capsule.workdir, 1);
+    wait_for_task_ends(&capsule.records_dir, 1);
     submit_task(&capsule.url, "event-id-cursor-2", "second task");
-    wait_for_task_ends(&capsule.workdir, 2);
+    wait_for_task_ends(&capsule.records_dir, 2);
 
     let replay = watch_frames(&capsule.url, 0);
     (capsule, replay)
@@ -327,7 +327,7 @@ fn reconnect_mid_task_receives_every_later_frame_once() {
     );
 
     let second = submit_task(&capsule.url, "event-id-mid-2", "second task");
-    wait_for_task_end(&capsule.workdir, &first);
+    wait_for_task_end(&capsule.records_dir, &first);
     wait_for_state(&capsule.url, &second, "TASK_STATE_WORKING");
 
     let mut resumed_conn = Watch::open(&capsule.url, last_seen);
@@ -336,7 +336,7 @@ fn reconnect_mid_task_receives_every_later_frame_once() {
     });
     let resumed = resumed_conn.events;
     assert!(
-        trace_records(&capsule.workdir, "task_end").len() == 2,
+        trace_records(&capsule.records_dir, "task_end").len() == 2,
         "the second task should have finished while the client was reconnected"
     );
     let resumed: Vec<Event> = resumed
@@ -416,12 +416,12 @@ fn every_kind_of_frame_shares_one_sequence() {
         input["result"]["task"]["id"] == first.as_str(),
         "the reply should go to the waiting task; got {input}"
     );
-    wait_for_task_end(&capsule.workdir, &first);
+    wait_for_task_end(&capsule.records_dir, &first);
 
     let third = submit_task(&capsule.url, "event-id-all-3", "third task");
-    wait_for_task_end(&capsule.workdir, &third);
+    wait_for_task_end(&capsule.records_dir, &third);
 
-    let reopened = trace_records(&capsule.workdir, "task_reopened");
+    let reopened = trace_records(&capsule.records_dir, "task_reopened");
     assert_eq!(
         reopened.len(),
         2,

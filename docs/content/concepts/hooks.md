@@ -3,7 +3,8 @@
 A hook is an artifact that observes a lifecycle point, receives structured input from the
 runtime, and optionally returns output that the runtime commits. Hooks are not tools: the
 model cannot call them, they are omitted from the tool inventory, and hook errors are
-non-fatal — failures are logged to `workdir/logs/hook-<name>.log` and the session continues.
+non-fatal — failures are logged to `logs/hook-<name>.log` in the session's
+[records directory](../reference/workdir.md#records-directory) and the session continues.
 
 **Binding** — when the hook fires:
 

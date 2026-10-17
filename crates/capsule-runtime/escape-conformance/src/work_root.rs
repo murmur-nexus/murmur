@@ -63,6 +63,14 @@ pub fn prepare_work_root(path: &Path) -> Result<PathBuf, String> {
             continue;
         }
         let entry_path = entry.path();
+        // An earlier run's session records are kept under `~/.murmur/records`, mirroring the
+        // case directories; they go too, or a later run would read them as its own evidence.
+        if let Ok(records) = capsule_runtime::records_group(&entry_path) {
+            if records.is_dir() {
+                fs::remove_dir_all(&records)
+                    .map_err(|err| format!("could not clear {}: {err}", records.display()))?;
+            }
+        }
         // `file_type` does not follow symlinks, so a link to a directory outside the work root is
         // removed as a link and its target is never entered.
         let removed = match entry.file_type() {

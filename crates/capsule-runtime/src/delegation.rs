@@ -64,7 +64,7 @@ pub const COMPLETION_SESSION_HEADER: &str = "x-murmur-completion-session";
 /// `trace.jsonl` can tell at a glance which id space a value belongs to.
 pub const DELEGATION_ID_PREFIX: &str = "dlg_";
 
-/// The child's own record of how it ended, in the child's directory.
+/// The child's own record of how it ended, in the child's records directory.
 pub const COMPLETION_FILE: &str = "completion.json";
 
 /// The `detail` a launcher records in [`COMPLETION_FILE`] for a child its parent ended on
@@ -262,8 +262,8 @@ pub struct DelegationOutcome {
     /// text legitimately leaves no file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_path: Option<String>,
-    /// The child's directory, absolute — the root [`Self::result_path`] is relative to, and where
-    /// [`COMPLETION_FILE`] itself sits.
+    /// The child's directory, absolute — the root [`Self::result_path`] is relative to.
+    /// [`COMPLETION_FILE`] itself sits in the child's records directory.
     pub workdir: String,
     pub duration_ms: u64,
     /// Present only for a `crashed` or `terminated` outcome: the exit status, and for a crash the
@@ -424,26 +424,21 @@ pub fn child_result_path(
         .find(|path| matches!(root.entry_kind(path), Ok(Some(EntryKind::File))))
 }
 
-/// Where a child's own record of its ending goes: `<child workdir>/completion.json`.
-///
-/// One rule, used by the child that writes it and by the launcher's watcher that reads it.
-pub fn completion_path(workdir: &Path) -> PathBuf {
-    workdir.join(COMPLETION_FILE)
-}
-
 /// The completion the child recorded, or `None` when it recorded none.
 ///
 /// This is what stops one delegation being reported twice: the launcher's watcher reads the file
 /// before reporting anything, and a child that already delivered is not reported again.
 ///
-/// `workdir` is the child's directory relative to `root`, the parent's accessible workdir. A link
-/// at the file or on the way to it is refused and latched on `root`, and reads as no completion.
-pub fn read_completion(root: &WorkdirRoot, workdir: &Path) -> Option<DelegationOutcome> {
-    let raw = root.read_to_string(completion_path(workdir)).ok()??;
+/// `records_root` is the child's records directory, outside both sessions' workdirs and read-only
+/// to their commands wherever the kernel tiers hold. A link at the file is refused and latched on
+/// `records_root`, and reads as no completion.
+pub fn read_completion(records_root: &WorkdirRoot) -> Option<DelegationOutcome> {
+    let raw = records_root.read_to_string(COMPLETION_FILE).ok()??;
     serde_json::from_str(&raw).ok()
 }
 
-/// Write `outcome` to [`COMPLETION_FILE`], replacing whatever was there.
+/// Write `outcome` to [`COMPLETION_FILE`] in the child's records directory, replacing whatever
+/// was there.
 ///
 /// **Written to a sibling temporary file and renamed into place, never truncated in place.** The
 /// parent reads this file once the completion has reached the delegating task, and
@@ -452,21 +447,19 @@ pub fn read_completion(root: &WorkdirRoot, workdir: &Path) -> Option<DelegationO
 /// records the delegation's outcome as `unknown`. The rename makes every reader see either the
 /// whole previous content or the whole new content; [`WorkdirRoot::write_file`]'s temporary name
 /// is unique, because the child and the watcher behind it can both reach this function.
-///
-/// `workdir` is the child's directory relative to `root`, the parent's accessible workdir.
 pub fn write_completion(
-    root: &WorkdirRoot,
-    workdir: &Path,
+    records_root: &WorkdirRoot,
     outcome: &DelegationOutcome,
 ) -> Result<(), String> {
     let body = serde_json::to_string_pretty(outcome)
         .map_err(|error| format!("failed to serialize the completion: {error}"))?;
-    root.write_file(
-        completion_path(workdir),
-        format!("{body}\n").as_bytes(),
-        DEFAULT_FILE_MODE,
-    )
-    .map_err(|error| format!("failed to write {COMPLETION_FILE}: {error}"))
+    records_root
+        .write_file(
+            COMPLETION_FILE,
+            format!("{body}\n").as_bytes(),
+            DEFAULT_FILE_MODE,
+        )
+        .map_err(|error| format!("failed to write {COMPLETION_FILE}: {error}"))
 }
 
 /// Post one completion to the parent's A2A door.
@@ -518,7 +511,7 @@ pub fn deliver_completion(
     Ok(())
 }
 
-/// Record `outcome` in the child's directory, post it, and record what the posting did.
+/// Record `outcome` in the child's records directory, post it, and record what the posting did.
 ///
 /// The file is written before the post and rewritten after it, so a reporter that dies mid-post
 /// still leaves the outcome on disk. The returned outcome is the one that was written last.
@@ -530,13 +523,12 @@ pub fn report_completion(
     handle: &SpawnerHandle,
     address: &CompletionAddress,
     outcome: DelegationOutcome,
-    root: &WorkdirRoot,
-    workdir: &Path,
+    records_root: &WorkdirRoot,
 ) -> DelegationOutcome {
     let mut outcome = outcome.with_bounded_detail();
     outcome.delivered = false;
     outcome.delivery_error = None;
-    if let Err(reason) = write_completion(root, workdir, &outcome) {
+    if let Err(reason) = write_completion(records_root, &outcome) {
         crate::runtime_err!(
             "[capsule-runtime] delegation {}: {reason}",
             outcome.delegation_id
@@ -553,12 +545,12 @@ pub fn report_completion(
                 "[capsule-runtime] delegation {}: the completion could not be delivered to {}: {reason}; recorded in {}",
                 outcome.delegation_id,
                 address.url,
-                root.host_path(completion_path(workdir)).display(),
+                records_root.host_path(COMPLETION_FILE).display(),
             );
             outcome.delivery_error = Some(reason);
         }
     }
-    if let Err(reason) = write_completion(root, workdir, &outcome) {
+    if let Err(reason) = write_completion(records_root, &outcome) {
         crate::runtime_err!(
             "[capsule-runtime] delegation {}: {reason}",
             outcome.delegation_id
@@ -572,16 +564,15 @@ pub fn report_completion(
 /// The only party that would be told is the party that did it, so this writes the file and
 /// contacts nobody.
 ///
-/// `workdir` is the child's directory relative to `root`, the parent's accessible workdir.
+/// `records_root` is the child's records directory.
 pub fn record_terminated(
-    root: &WorkdirRoot,
-    workdir: &Path,
+    records_root: &WorkdirRoot,
     outcome: DelegationOutcome,
 ) -> DelegationOutcome {
     let mut outcome = outcome.with_bounded_detail();
     outcome.delivered = false;
     outcome.delivery_error = None;
-    if let Err(reason) = write_completion(root, workdir, &outcome) {
+    if let Err(reason) = write_completion(records_root, &outcome) {
         crate::runtime_err!(
             "[capsule-runtime] delegation {}: {reason}",
             outcome.delegation_id
@@ -800,18 +791,13 @@ mod tests {
     #[test]
     fn a_completion_round_trips_through_the_file() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_completion(&WorkdirRoot::open(dir.path()).unwrap(), Path::new("")).is_none());
+        assert!(read_completion(&WorkdirRoot::open(dir.path()).unwrap()).is_none());
 
         let mut written = outcome();
         written.delivered = true;
-        write_completion(
-            &WorkdirRoot::open(dir.path()).unwrap(),
-            Path::new(""),
-            &written,
-        )
-        .unwrap();
+        write_completion(&WorkdirRoot::open(dir.path()).unwrap(), &written).unwrap();
 
-        let read = read_completion(&WorkdirRoot::open(dir.path()).unwrap(), Path::new(""))
+        let read = read_completion(&WorkdirRoot::open(dir.path()).unwrap())
             .expect("the written completion reads back");
         assert_eq!(read.delegation_id, written.delegation_id);
         assert_eq!(read.status, DelegationStatus::Ok);
@@ -819,7 +805,7 @@ mod tests {
         assert_eq!(read.result_path.as_deref(), Some("out/result.txt"));
 
         // An absent field is omitted from the file rather than written as null.
-        let raw = std::fs::read_to_string(completion_path(dir.path())).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join(COMPLETION_FILE)).unwrap();
         assert!(!raw.contains("detail"), "{raw}");
         assert!(!raw.contains("delivery_error"), "{raw}");
     }
@@ -834,15 +820,11 @@ mod tests {
         ended.reported_by = Reporter::Launcher;
         ended.detail = Some(PARENT_ENDED_DETAIL.to_string());
 
-        let recorded = record_terminated(
-            &WorkdirRoot::open(dir.path()).unwrap(),
-            Path::new(""),
-            ended,
-        );
+        let recorded = record_terminated(&WorkdirRoot::open(dir.path()).unwrap(), ended);
         assert!(!recorded.delivered);
         assert!(recorded.delivery_error.is_none());
-        let read = read_completion(&WorkdirRoot::open(dir.path()).unwrap(), Path::new(""))
-            .expect("the record exists");
+        let read =
+            read_completion(&WorkdirRoot::open(dir.path()).unwrap()).expect("the record exists");
         assert_eq!(read.status, DelegationStatus::Terminated);
         assert_eq!(read.reported_by, Reporter::Launcher);
     }
@@ -907,14 +889,13 @@ mod tests {
             &nowhere,
             outcome(),
             &WorkdirRoot::open(dir.path()).unwrap(),
-            Path::new(""),
         );
         assert!(!reported.delivered);
         let reason = reported.delivery_error.expect("the refusal is recorded");
         assert!(reason.contains("failed to connect"), "{reason}");
 
-        let read = read_completion(&WorkdirRoot::open(dir.path()).unwrap(), Path::new(""))
-            .expect("the record exists");
+        let read =
+            read_completion(&WorkdirRoot::open(dir.path()).unwrap()).expect("the record exists");
         assert!(!read.delivered);
         assert!(read.delivery_error.is_some());
     }
@@ -928,12 +909,7 @@ mod tests {
     #[test]
     fn a_rewrite_is_never_visible_half_written() {
         let dir = tempfile::tempdir().unwrap();
-        write_completion(
-            &WorkdirRoot::open(dir.path()).unwrap(),
-            Path::new(""),
-            &outcome(),
-        )
-        .unwrap();
+        write_completion(&WorkdirRoot::open(dir.path()).unwrap(), &outcome()).unwrap();
 
         let path = dir.path().to_path_buf();
         let writer = std::thread::spawn(move || {
@@ -943,15 +919,14 @@ mod tests {
                 // A detail long enough that one write is several pages, so a truncating write
                 // leaves a wide window rather than a theoretical one.
                 record.detail = Some("x".repeat(64 * 1024));
-                write_completion(&WorkdirRoot::open(&path).unwrap(), Path::new(""), &record)
-                    .unwrap();
+                write_completion(&WorkdirRoot::open(&path).unwrap(), &record).unwrap();
             }
         });
 
         let mut reads = 0;
         while !writer.is_finished() {
             assert!(
-                read_completion(&WorkdirRoot::open(dir.path()).unwrap(), Path::new("")).is_some(),
+                read_completion(&WorkdirRoot::open(dir.path()).unwrap()).is_some(),
                 "a concurrent reader saw no readable completion after {reads} good reads"
             );
             reads += 1;

@@ -502,6 +502,10 @@ pub struct StageRequest {
     /// Set by a delegating parent through `mur run --workdir-identity`, for the child directory it
     /// created. `None` checks nothing.
     pub expected_workdir_identity: Option<(u64, u64)>,
+    /// The manifest file this launch read, copied into the runtime directory under its own file
+    /// name: `--manifest`, or the project's `murmur.yaml`. `None` for a launch that read none from
+    /// disk — an installed capsule run by name — which copies nothing.
+    pub manifest_file: Option<PathBuf>,
 }
 
 /// The `transport: process` driver this session runs its harness through, compiled and described
@@ -542,8 +546,19 @@ pub struct StagedSession {
     pub runtime_dir: PathBuf,
     /// [`Self::runtime_dir`], held open, sharing [`Self::accessible_root`]'s refusal latch.
     pub runtime_root: crate::workdir_fs::WorkdirRoot,
-    /// The three held directories beneath the session's runtime directory.
+    /// The three held directories beneath the session's runtime directory, with the records
+    /// directory beside them.
     pub(crate) runtime_dirs: crate::runtime_dir::RuntimeDirRoots,
+    /// The session's records directory, `~/.murmur/records/<workdir root>/<session-id>`: the
+    /// value of `$MURMUR_RECORDS_DIR`, holding `trace.jsonl`, `blobs/`, `logs/`,
+    /// `completion.json` and `hooks/`. Kept after the session ends; the runtime reads and writes
+    /// beneath it only through [`Self::records_root`].
+    pub records_dir: PathBuf,
+    /// [`Self::records_dir`], held open, sharing [`Self::accessible_root`]'s refusal latch.
+    pub records_root: crate::workdir_fs::WorkdirRoot,
+    /// The file name the launched manifest was copied into the runtime directory under, which
+    /// the `[Capsule]` notice and `MURMUR.md` name. `None` when the launch read no manifest file.
+    pub(crate) manifest_file_name: Option<String>,
     /// Owns the runtime directory: dropping it removes the directory, so it is held until the
     /// session ends — `launch` takes it and drops it on return, and a `StagedSession` dropped
     /// unlaunched drops it with itself.
@@ -795,6 +810,8 @@ impl StagedSession {
 pub struct LaunchResult {
     pub session_id: String,
     pub workdir: PathBuf,
+    /// The session's records directory, where its trace is, kept after the session.
+    pub records_dir: PathBuf,
     /// How a launch that reports no error ended.
     pub ending: LaunchEnding,
 }

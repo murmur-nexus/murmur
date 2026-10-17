@@ -70,6 +70,7 @@ mod tests {
             capsule_name: "c".to_string(),
             capsule_version: "0.1.0".to_string(),
             workdir: PathBuf::from("/tmp/c"),
+            records_dir: PathBuf::from("/tmp/c").join("records"),
             outlives_launcher: false,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: door_token.map(|token| DoorToken::new(token.to_string())),

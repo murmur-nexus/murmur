@@ -148,6 +148,7 @@ pub const E_BLD_004: &str = "E-BLD-004"; // artifact manifest declares a retired
 pub const E_IO_001: &str = "E-IO-001"; // file or directory not found
 pub const E_IO_002: &str = "E-IO-002"; // permission denied (host, not capsule)
 pub const E_IO_003: &str = "E-IO-003"; // general I/O error
+pub const E_IO_004: &str = "E-IO-004"; // HOME cannot hold ~/.murmur
 
 // Artifact index
 pub const E_IDX_001: &str = "E-IDX-001"; // a file in the directory given to mur index cannot be indexed, or the directory holds no .mur.zip
@@ -211,9 +212,51 @@ impl fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+/// `E-CAP-003`'s hint, chosen by why the floor is unmet: a capsule-side cause no host can fix
+/// names the change to the capsule's launch, and only a host shortfall names another host.
+fn containment_floor_hint(
+    cause: capsule_runtime::containment::ShortfallCause,
+    declared: murmur_artifact::ContainmentClass,
+    achieved: murmur_artifact::ContainmentClass,
+) -> String {
+    use capsule_runtime::containment::ShortfallCause;
+    const WHERE_THE_FLOOR_IS: &str = "(capabilities.containment in murmur.yaml, containment in \
+                                      .murmur/config.yaml, or --containment)";
+    match cause {
+        ShortfallCause::InsideWorkdir => format!(
+            "run with a --workdir that does not contain ~/.murmur, or lower the declared floor to \
+             'advisory' {WHERE_THE_FLOOR_IS}"
+        ),
+        ShortfallCause::WorkdirExec => format!(
+            "set capabilities.filesystem.workdir_exec to false, or lower the declared floor to \
+             'advisory' {WHERE_THE_FLOOR_IS}"
+        ),
+        ShortfallCause::Host => format!(
+            "lower the declared floor to '{achieved}' {WHERE_THE_FLOOR_IS}, or run on a host that \
+             provides '{declared}'"
+        ),
+    }
+}
+
+/// `E-IO-004` for a `HOME` that cannot hold `~/.murmur`: the cause, and what to set.
+pub(crate) fn home_unusable(error: &capsule_runtime::HomeUnusable) -> CliError {
+    CliError::with_hint(
+        E_IO_004,
+        error.to_string(),
+        capsule_runtime::HOME_UNUSABLE_HINT,
+    )
+}
+
+impl From<capsule_runtime::HomeUnusable> for CliError {
+    fn from(error: capsule_runtime::HomeUnusable) -> Self {
+        home_unusable(&error)
+    }
+}
+
 impl From<RuntimeError> for CliError {
     fn from(error: RuntimeError) -> Self {
         match error {
+            RuntimeError::HomeUnusable(error) => home_unusable(&error),
             RuntimeError::CapsuleTrap(message) => {
                 if message.contains("matching implementation was not found in the linker") {
                     linker_error_from_message(&message)
@@ -365,7 +408,8 @@ impl From<RuntimeError> for CliError {
                  directory's creation and this launch; nothing was written"
                     .to_string(),
             ),
-            error @ RuntimeError::RuntimeDirUnavailable { .. } => {
+            error @ (RuntimeError::RuntimeDirUnavailable { .. }
+            | RuntimeError::RecordsDirUnavailable { .. }) => {
                 CliError::new(E_IO_003, error.to_string())
             }
             RuntimeError::CreateWorkdir { path, source } => CliError::new(
@@ -548,9 +592,8 @@ impl From<RuntimeError> for CliError {
                 E_CAP_009,
                 error.to_string(),
                 concat!(
-                    "a capsule declaring capabilities.state needs a resolvable home directory: run \
-                     with HOME set to an absolute path, and make sure ~/.murmur/state/ can be \
-                     created as a 0700 directory — see ",
+                    "a capsule declaring capabilities.state keeps its store under ~/.murmur/state/: \
+                     make sure that directory can be created as a 0700 directory — see ",
                     murmur_artifact::docs_reference_url!("workdir/#state-store")
                 ),
             ),
@@ -558,13 +601,12 @@ impl From<RuntimeError> for CliError {
             // pair and the missing-mechanism reason cannot drift from capsule-runtime's
             // `containment` module, which is what actually decided the refusal.
             error @ RuntimeError::ContainmentFloorUnmet {
-                declared, achieved, ..
+                declared,
+                achieved,
+                cause,
+                ..
             } => {
-                let hint = format!(
-                    "lower the declared floor to '{achieved}' (capabilities.containment in \
-                     murmur.yaml, containment in .murmur/config.yaml, or --containment), or run \
-                     on a host that provides '{declared}'"
-                );
+                let hint = containment_floor_hint(cause, declared, achieved);
                 CliError::with_hint(E_CAP_003, error.to_string(), hint)
             }
             // An export is a disclosure, not a grant, so this is not a containment shortfall and
@@ -1451,6 +1493,48 @@ mod tests {
         assert!(!cli.message.contains("frm_ABC"), "{}", cli.message);
         let hint = cli.hint.as_deref().unwrap_or_default();
         assert!(hint.contains("unset it"), "{hint}");
+    }
+
+    /// `E-CAP-003`'s hint names the change that meets the floor for the cause that missed it: a
+    /// different host only when the host is what fell short.
+    #[test]
+    fn a_containment_shortfall_hint_is_chosen_by_its_cause() {
+        use capsule_runtime::containment::ShortfallCause;
+        use murmur_artifact::ContainmentClass;
+        let hint = |cause| {
+            let cli = CliError::from(RuntimeError::ContainmentFloorUnmet {
+                declared: ContainmentClass::Sealed,
+                achieved: ContainmentClass::Advisory,
+                reason: "a reason".to_string(),
+                cause,
+            });
+            assert_eq!(cli.code, E_CAP_003);
+            cli.hint.unwrap_or_default()
+        };
+        let floor =
+            "(capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, \
+                     or --containment)";
+        assert_eq!(
+            hint(ShortfallCause::InsideWorkdir),
+            format!(
+                "run with a --workdir that does not contain ~/.murmur, or lower the declared \
+                 floor to 'advisory' {floor}"
+            )
+        );
+        assert_eq!(
+            hint(ShortfallCause::WorkdirExec),
+            format!(
+                "set capabilities.filesystem.workdir_exec to false, or lower the declared floor \
+                 to 'advisory' {floor}"
+            )
+        );
+        assert_eq!(
+            hint(ShortfallCause::Host),
+            format!(
+                "lower the declared floor to 'advisory' {floor}, or run on a host that provides \
+                 'sealed'"
+            )
+        );
     }
 
     #[test]

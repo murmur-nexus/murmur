@@ -180,13 +180,14 @@ impl Project {
     }
 }
 
-fn workdir_of(assert: Assert) -> PathBuf {
+/// The records directory of the session `assert` ran.
+fn records_of(assert: Assert) -> PathBuf {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    common::parse_workdir_from_stdout(&stdout)
+    common::parse_records_from_stdout(&stdout)
 }
 
-fn trace_events(workdir: &Path) -> Vec<Value> {
-    fs::read_to_string(workdir.join("trace.jsonl"))
+fn trace_events(records_dir: &Path) -> Vec<Value> {
+    fs::read_to_string(records_dir.join("trace.jsonl"))
         .unwrap()
         .lines()
         .filter(|line| !line.is_empty())
@@ -267,9 +268,9 @@ fn a_runtime_pinned_skill_is_marked_and_a_declared_one_is_not() {
     ]);
     let p = project(&server.endpoint, "", "", &[]);
 
-    let first = workdir_of(p.run(&[]).success());
+    let first = records_of(p.run(&[]).success());
     p.mark_pulled_at_runtime(PULLED_SKILL_ARTIFACT);
-    let second = workdir_of(p.run(&[]).success());
+    let second = records_of(p.run(&[]).success());
 
     // The pin is written back as a v3 runtime entry under the full name, the operator's beside it.
     let raw = fs::read_to_string(p.project.path().join("murmur.lock")).unwrap();
@@ -446,7 +447,7 @@ fn the_disclosure_survives_a_compaction() {
 
     p.run(&[]).success();
     p.mark_pulled_at_runtime(PULLED_SKILL_ARTIFACT);
-    let workdir = workdir_of(p.run(&[]).success());
+    let records = records_of(p.run(&[]).success());
 
     let requests = server.requests();
     let after = &requests[1..];
@@ -457,7 +458,7 @@ fn the_disclosure_survives_a_compaction() {
         "the compaction hook replaced the context: {after:#?}"
     );
     assert!(
-        !events_of(&trace_events(&workdir), "compaction").is_empty(),
+        !events_of(&trace_events(&records), "compaction").is_empty(),
         "the trace records the compaction"
     );
 

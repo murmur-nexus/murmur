@@ -169,17 +169,18 @@ fn trace_two_turn_session_all_event_types() {
     let manifest_path = create_manifest(project.path(), &server.endpoint);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
     let workdir = staged.workdir.clone();
+    let records = staged.records_dir.clone();
     fs::write(workdir.join("task.md"), "Run echo and report.").unwrap();
 
     launch_session(staged, |_| {}).expect("agent launch should succeed");
 
     // trace.jsonl must exist
     assert!(
-        workdir.join("trace.jsonl").exists(),
+        records.join("trace.jsonl").exists(),
         "trace.jsonl must exist after session"
     );
 
-    let events = parse_events(&workdir);
+    let events = parse_events(&records);
     assert!(!events.is_empty(), "trace.jsonl must not be empty");
 
     // ── Outer frame is the launch: one session_start first, one session_end last,
@@ -468,16 +469,17 @@ fn trace_written_without_hook_artifacts() {
     let manifest_path = create_manifest(project.path(), &server.endpoint);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
     let workdir = staged.workdir.clone();
+    let records = staged.records_dir.clone();
     fs::write(workdir.join("task.md"), "Just say done.").unwrap();
 
     launch_session(staged, |_| {}).expect("should succeed");
 
     assert!(
-        workdir.join("trace.jsonl").exists(),
+        records.join("trace.jsonl").exists(),
         "trace.jsonl must exist even with no hook artifacts"
     );
 
-    let events = parse_events(&workdir);
+    let events = parse_events(&records);
     assert!(!events.is_empty(), "trace must not be empty");
     assert_eq!(events.first().unwrap()["event_type"], "session_start");
     assert_eq!(events.last().unwrap()["event_type"], "session_end");
@@ -513,6 +515,7 @@ fn trace_session_end_written_on_failed_exit() {
     let manifest_path = create_manifest(project.path(), &server.endpoint);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
     let workdir = staged.workdir.clone();
+    let records = staged.records_dir.clone();
     fs::write(workdir.join("task.md"), "Echo something.").unwrap();
 
     let launched = launch_session(staged, |_| {});
@@ -522,11 +525,11 @@ fn trace_session_end_written_on_failed_exit() {
     );
 
     assert!(
-        workdir.join("trace.jsonl").exists(),
+        records.join("trace.jsonl").exists(),
         "trace.jsonl must exist even after failed session"
     );
 
-    let events = parse_events(&workdir);
+    let events = parse_events(&records);
     assert_walkable_tree(&events);
 
     // One session frame per launch, closed on the failing exit path.
@@ -591,12 +594,13 @@ fn trace_session_id_matches_staged_session() {
     let manifest_path = create_manifest(project.path(), &server.endpoint);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
     let workdir = staged.workdir.clone();
+    let records = staged.records_dir.clone();
     let expected_session_id = staged.session_id.clone();
     fs::write(workdir.join("task.md"), "done").unwrap();
 
     launch_session(staged, |_| {}).expect("should succeed");
 
-    let events = parse_events(&workdir);
+    let events = parse_events(&records);
     for event in &events {
         assert_eq!(
             event["session_id"].as_str().unwrap(),
@@ -702,11 +706,12 @@ fn session_start_effective_grants_match_explain_scope_json() {
         serde_json::from_str(String::from_utf8(explain_stdout).unwrap().trim()).unwrap();
 
     let workdir = staged.workdir.clone();
+    let records = staged.records_dir.clone();
     fs::write(workdir.join("task.md"), "Report and stop.").unwrap();
 
     launch_session(staged, |_| {}).expect("agent launch should succeed");
 
-    let events = parse_events(&workdir);
+    let events = parse_events(&records);
     let session_start = events
         .iter()
         .find(|e| e["event_type"] == "session_start")
@@ -791,10 +796,11 @@ fn effective_grants_network_allow_tracks_the_manifest_across_two_runs() {
 
         let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
         let workdir = staged.workdir.clone();
+        let records = staged.records_dir.clone();
         fs::write(workdir.join("task.md"), "Report and stop.").unwrap();
         launch_session(staged, |_| {}).expect("agent launch should succeed");
 
-        parse_events(&workdir)
+        parse_events(&records)
             .into_iter()
             .find(|e| e["event_type"] == "session_start")
             .expect("session_start must be present")["effective_grants"]["network_allow"]

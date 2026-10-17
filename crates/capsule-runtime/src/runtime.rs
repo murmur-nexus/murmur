@@ -17,7 +17,7 @@ use murmur_artifact::{
     ApiKeyReference, ArtifactImplementation, ArtifactName, ArtifactRuntime, ContextConfig,
     ConversationMode, HookBinding, InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig,
     LockOrigin, LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry,
-    RegistryError, RuntimeArtifact, RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME,
+    RegistryError, RuntimeArtifact, RuntimeType, TaskAcceptance, LOCK_VERSION,
     PACKED_MANIFEST_ENTRY, W_RUN_003, W_RUN_008, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
     W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018,
     W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
@@ -167,19 +167,14 @@ fn pending_task_input(runtime_root: &WorkdirRoot) -> Option<u64> {
     runtime_root.file_len(TASK_INPUT_FILE).ok().flatten()
 }
 
-/// The directory this session's siblings sit in, held open: `.murmur` beneath the accessible
-/// workdir under `--workdir`, reached with no link followed, and the directory holding the
-/// accessible workdir without it, which is the operator's. Refusals beneath either land on the
-/// session's latch. `None` when it cannot be opened.
-fn sibling_sessions_root(
+/// The records group this session's records directory sits in, held open: every sibling
+/// session's records directory, outside every workdir. Refusals beneath it land on the session's
+/// latch and name their paths absolutely. `None` when it cannot be opened.
+fn records_group_root(
+    records_root: &WorkdirRoot,
     accessible_root: &WorkdirRoot,
-    session_root: &WorkdirRoot,
 ) -> Option<WorkdirRoot> {
-    if session_root.path() != accessible_root.path() {
-        accessible_root.open_beneath(".murmur").ok().flatten()
-    } else {
-        WorkdirRoot::open_sharing_latch(accessible_root.path().parent()?, accessible_root).ok()
-    }
+    WorkdirRoot::open_sharing_latch_absolute(records_root.path().parent()?, accessible_root).ok()
 }
 
 /// `peer_file_fetch.outcome` when the stored path, or a directory on the way to it, is a link
@@ -831,7 +826,7 @@ async fn end_task(
     let _ = trace.flush().await;
     let Some(task_id) = agent_task_id else {
         if ending.state == TaskState::Canceled {
-            write_canceled_result(workdir, mode, None);
+            write_canceled_result(workdir, mode, None, &state.records_root);
         }
         return;
     };
@@ -880,7 +875,7 @@ async fn end_task(
         }
     };
     if ending.state == TaskState::Canceled {
-        write_canceled_result(workdir, mode, Some(task_id));
+        write_canceled_result(workdir, mode, Some(task_id), &state.records_root);
     }
     let reported = reported.or_else(|| {
         let context_id = context_id?;
@@ -915,7 +910,14 @@ fn unregistered_ending(task_id: &str, context_id: &str, ending: &agent::AttemptE
 /// Through [`agent::write_result`] rather than the task-output funnel: the cancelled attempt's
 /// task-io output was cleared when the attempt began, and stays unset. A failed write is reported
 /// on stderr and in the bootstrap log, and changes nothing about the task's ending.
-fn write_canceled_result(workdir: &WorkdirRoot, mode: &ConversationMode, task_id: Option<&str>) {
+///
+/// `records_root` is the session's records directory, where that report is logged.
+fn write_canceled_result(
+    workdir: &WorkdirRoot,
+    mode: &ConversationMode,
+    task_id: Option<&str>,
+    records_root: &WorkdirRoot,
+) {
     let text = crate::cancel::CANCELED_RESULT_TEXT;
     let mut failures = Vec::new();
     if let Err(error) = agent::write_result(workdir, text) {
@@ -929,7 +931,7 @@ fn write_canceled_result(workdir: &WorkdirRoot, mode: &ConversationMode, task_id
     for error in failures {
         let message = format!("[capsule-runtime] cancelled task's result marker: {error}");
         crate::runtime_err!("{message}");
-        agent::append_bootstrap_log(workdir, &message);
+        agent::append_bootstrap_log(records_root, &message);
     }
 }
 
@@ -1245,12 +1247,17 @@ async fn deliver_delegation(
     mut delegation: crate::cancel::LiveDelegation,
 ) -> crate::delegation::OutcomeNotice {
     release_finished_child(delegation.child.take()).await;
-    // The child's directory as the parent's own tools address it, read beneath the parent's
-    // accessible root with no link followed.
-    match crate::delegation::read_completion(
+    // The child's records directory as the child reported it, never a path beneath the parent's
+    // workdir, which the parent's commands can write.
+    let child_records = WorkdirRoot::open_sharing_latch_absolute(
+        &delegation.child_records_dir,
         &state.accessible_root,
-        Path::new(&delegation.child_workdir),
-    ) {
+    )
+    .ok();
+    match child_records
+        .as_ref()
+        .and_then(crate::delegation::read_completion)
+    {
         Some(outcome) => {
             write_delegation_end(
                 state,
@@ -1272,7 +1279,7 @@ async fn deliver_delegation(
             let reason = format!(
                 "a completion arrived for this delegation, but no readable {} was left in {}",
                 crate::delegation::COMPLETION_FILE,
-                delegation.workdir.display()
+                delegation.child_records_dir.display()
             );
             write_delegation_end(
                 state,
@@ -1823,15 +1830,15 @@ pub fn stage_session(
     // Derived only so the refusal can name *which* part of the sealed mechanism is missing —
     // the AppArmor profile, `CAP_SYS_ADMIN` inside a container, or the kernel itself.
     let sealed_blocker = host_probe.sealed_blocker();
-    // The second input that caps the achieved class: a runtime directory inside the workdir the
-    // capsule's commands write is one they can change. Decided from the two paths alone, before
-    // anything is created.
+    // The second input that caps the achieved class: a runtime or records directory inside the
+    // workdir the capsule's commands write is one they can change. Decided from the paths alone,
+    // before anything is created, and refused here when `HOME` cannot hold `~/.murmur` at all.
     let runtime_dir_placement = crate::runtime_dir::runtime_dir_placement(
         &request
             .workdir
             .clone()
             .unwrap_or_else(|| request.manifest_dir.join("workdir")),
-    );
+    )?;
     let achieved_containment = achieved_containment_class(
         enforcement_tier,
         workdir_exec,
@@ -1929,7 +1936,7 @@ pub fn stage_session(
                 artifact.capabilities.as_ref(),
             )
         }))?;
-    let scope_report = crate::containment::scope_report_for_tier(
+    let mut scope_report = crate::containment::scope_report_for_tier(
         &request.capability_policy,
         request.declared_containment_floor,
         enforcement_tier,
@@ -2078,7 +2085,7 @@ pub fn stage_session(
     // Only tools/drivers that declare a `capabilities:` block get an entry; everything else
     // stays absent and therefore runs on the unclamped ceiling.
     let mut artifact_grants: HashMap<String, ToolCapabilityGrant> = HashMap::new();
-    let mut hook_components = Vec::new();
+    let mut hook_components: Vec<StagedHookArtifact> = Vec::new();
     // The ceiling every per-artifact network grant is clamped against. Re-parsed here rather
     // than at launch because narrowing is lowered at staging time; `validate_capability_policy`
     // above already proved these entries parse.
@@ -2606,8 +2613,49 @@ pub fn stage_session(
         &accessible_root,
     )
     .map_err(|reason| RuntimeError::RuntimeDirUnavailable { reason })?;
-    let runtime_dirs = runtime_dir_guard.roots().clone();
+    // Beside it and on the same terms, but kept after the session for `trace.retain` to prune.
+    let records_dir = crate::records_dir::RecordsDir::create(
+        &runtime_dir_placement.records_group,
+        &session_id,
+        &accessible_root,
+    )
+    .map_err(|reason| RuntimeError::RecordsDirUnavailable { reason })?;
+    let records_root = records_dir.root().clone();
+    let runtime_dirs = runtime_dir_guard
+        .roots()
+        .clone()
+        .with_records(records_root.clone());
     let runtime_root = runtime_dirs.runtime.clone();
+    let manifest_file_name = request
+        .manifest_file
+        .as_deref()
+        .and_then(manifest_file_name);
+    // A hook granted the records directory gets `hooks/` as its `"."`, created here through the
+    // records root and never by path.
+    if hook_components
+        .iter()
+        .any(|hook| hook.grant.filesystem_records)
+    {
+        records_root.create_dir_all(
+            crate::records_dir::HOOKS_SUBDIR,
+            crate::murmur_home::MURMUR_HOME_DIR_MODE,
+        )?;
+        let hooks_dir = records_root.host_path(crate::records_dir::HOOKS_SUBDIR);
+        for hook in hook_components
+            .iter_mut()
+            .filter(|hook| hook.grant.filesystem_records)
+        {
+            hook.grant.records_hooks_dir = Some(hooks_dir.clone());
+        }
+    }
+    // What each preopen's runtime-directory reach really is, now that every installed artifact's
+    // implementation is known: `session_start.effective_grants` records the exact answer.
+    crate::containment::resolve_runtime_dir_reaches(&mut scope_report.preopens, |name| {
+        installed_artifacts
+            .iter()
+            .find(|installed| installed.name == name)
+            .and_then(|installed| installed.implementation.clone())
+    });
     let session_root = if request.workdir.is_some() {
         accessible_root.session_beneath(&session_id)?
     } else {
@@ -2618,7 +2666,7 @@ pub fn stage_session(
     // Armed as soon as the directory exists rather than in `launch`, so the staging warnings
     // below this line have somewhere to land when stderr has already been closed. Everything
     // warned about above it fires before any session directory exists and reaches stderr alone.
-    diagnostic::set_diagnostic_workdir(&session_root);
+    diagnostic::set_diagnostic_workdir(&records_root);
 
     for (name, manifest_yaml) in &installed_manifests {
         write_tool_manifest(&runtime_root, name, manifest_yaml)?;
@@ -2655,7 +2703,7 @@ pub fn stage_session(
     write_member_call_tool_manifest(&runtime_root, request.formation_member.as_deref())?;
     write_end_without_answer_tool_manifest(&runtime_root, request.formation_member.as_deref())?;
     warn_on_member_calls_without_egress(
-        &session_root,
+        &records_root,
         request.formation_member.as_deref(),
         &request.capability_policy.network_allow,
     );
@@ -2706,6 +2754,7 @@ pub fn stage_session(
     dispatch_stage(
         &engine,
         &session_root,
+        &records_root,
         &runtime_root,
         &hook_components,
         request.capability_policy.shell_allow.clone(),
@@ -2732,12 +2781,13 @@ pub fn stage_session(
             &request.capability_policy,
             &partial_identity,
             request.formation_member.as_deref(),
+            manifest_file_name.as_deref(),
         );
     }
 
-    // The project manifest, beside `MURMUR.md`, for the agent to read; nothing is copied into
-    // the workdir.
-    copy_manifest_into_runtime_dir(&request.manifest_dir, &runtime_root)?;
+    // The manifest this launch read, beside `MURMUR.md`, for the agent to read; nothing is copied
+    // into the workdir.
+    copy_manifest_into_runtime_dir(request.manifest_file.as_deref(), &runtime_root)?;
 
     // Every refusal latched while staging — including one a best-effort writer above swallowed,
     // such as `MURMUR.md` or an `on-stage` hook's manifest — fails the launch. No trace exists
@@ -2759,6 +2809,9 @@ pub fn stage_session(
         runtime_root,
         runtime_dirs,
         runtime_dir_guard: Some(runtime_dir_guard),
+        records_dir: records_dir.path().to_path_buf(),
+        records_root,
+        manifest_file_name,
         manifest_dir: request.manifest_dir,
         capsule_artifact: request.capsule_artifact.unwrap_or_else(|| {
             format!("{}/{}", murmur_artifact::LOCAL_SCOPE, request.capsule_name)
@@ -2893,7 +2946,7 @@ fn launch(
     // closed. `stage_session` arms the same directory once it creates it; this also covers a
     // caller launching a session staged by some earlier process, and a process that stages
     // several sessions before launching one of them.
-    diagnostic::set_diagnostic_workdir(&staged.session_root);
+    diagnostic::set_diagnostic_workdir(&staged.records_root);
     // Removes the session's runtime directory on every return from this function. The forced
     // exits a second `SIGTERM` or the teardown deadline take remove it through the session's
     // `ShellEnforcement` first.
@@ -2997,10 +3050,11 @@ fn launch(
     staged.scope_report.io_max = prepared_scope.io_max.clone();
     // `io.max` is the one cgroup limit a host is not refused for, so a declared ceiling that did
     // not apply has to be *said* here or the manifest and the scope report both go on implying it.
-    cgroup::warn_for_unenforced_io_max(&staged.session_root, &prepared_scope.io_max);
+    cgroup::warn_for_unenforced_io_max(&staged.records_root, &prepared_scope.io_max);
     let cgroup_scope = prepared_scope.scope;
     let workdir_guard = Some(resources::WorkdirGuard::spawn(
         &staged.session_root,
+        Some(&staged.records_root),
         staged.capability_policy.resources.workdir_max_bytes,
     ));
 
@@ -3035,6 +3089,7 @@ fn launch(
         let session_root = staged.session_root.clone();
         let accessible_root = staged.accessible_root.clone();
         let runtime_root = staged.runtime_root.clone();
+        let records_root = staged.records_root.clone();
         // Before anything decides whether there is a task: the one read of the operator's task
         // from the workdir.
         import_task_input(&accessible_root, &runtime_root, inference);
@@ -3081,7 +3136,7 @@ fn launch(
                 staged.context.as_ref(),
                 &staged.capsule_name,
                 inference,
-                &session_root,
+                &records_root,
             ),
             // Ownership is claimed only by a capsule that declares a record policy: without one
             // there is nothing retention needs the header for, and an upgrading capsule's record
@@ -3100,9 +3155,9 @@ fn launch(
                         staged.context.as_ref(),
                         &staged.capsule_name,
                         inference,
-                        &session_root,
+                        &records_root,
                     ),
-                    &session_root,
+                    &records_root,
                 ))
             }),
             formation_member: staged
@@ -3247,20 +3302,21 @@ fn launch(
             &staged.capability_policy,
             &capsule_identity,
             staged.formation_member.as_deref(),
+            staged.manifest_file_name.as_deref(),
         );
 
         sandbox::warn_for_enforcement_tier(
             shell_enforcement.tier,
-            &session_root,
+            &records_root,
             &staged.capability_policy,
         );
         sandbox::warn_for_missing_aggregate_bounding(
-            &session_root,
+            &records_root,
             requires_process_bounding,
             shell_enforcement.cgroup_scope.is_some(),
         );
         warn_for_unreachable_shell_completions(
-            &session_root,
+            &records_root,
             !staged.capability_policy.shell_allow.is_empty(),
             &staged.lifecycle,
         );
@@ -3467,6 +3523,7 @@ fn launch(
         // Extra copies retained for the LaunchResult returned after block_on consumes the others.
         let session_id_ret = session_id.clone();
         let workdir_ret = workdir.clone();
+        let records_dir_ret = staged.records_dir.clone();
 
         // --- Agent loop inside a LocalSet ---
         // The session future is `!Send`: it captures `on_url`, which has no `Send` bound, and
@@ -3475,7 +3532,7 @@ fn launch(
         // hook workers therefore run on this thread; the A2A door does not.
         let loop_result: Result<LaunchEnding, RuntimeError> = rt.block_on(async move {
             let mut trace = TraceWriter::open(
-                &session_root,
+                &records_root,
                 session_id.clone(),
                 capsule_name.clone(),
                 capsule_version.clone(),
@@ -3541,6 +3598,7 @@ fn launch(
             // operator remembers to invoke a command does not run.
             apply_retention(
                 &mut trace,
+                &records_root,
                 &session_root,
                 &session_id,
                 trace_retain.as_ref(),
@@ -3556,7 +3614,7 @@ fn launch(
             // A trace that cannot be opened must not make the plane unserveable — the read is
             // still refused or served correctly, it is only unrecorded.
             let resource_trace = crate::trace::ResourceTraceAppender::open(
-                &session_root,
+                &records_root,
                 session_id.clone(),
                 trace.session_event_id().to_string(),
             )
@@ -3600,7 +3658,7 @@ fn launch(
             // on blocking threads, so they cannot be lent the agent loop's own writer. A trace
             // that cannot be opened leaves a plan unrecorded and still runs it.
             let plan_trace = crate::trace::PlanTraceAppender::open(
-                &session_root,
+                &records_root,
                 session_id.clone(),
                 trace.session_event_id().to_string(),
             )
@@ -3630,7 +3688,7 @@ fn launch(
 
             let mut otel = OtelEmitter::new(
                 otel_endpoint.clone(),
-                &session_root,
+                &records_root,
                 capsule_name.clone(),
                 capsule_version.clone(),
             );
@@ -3721,6 +3779,8 @@ fn launch(
                         accessible_root: accessible_root.clone(),
                         runtime_root: runtime_root.clone(),
                         runtime_dirs: staged.runtime_dirs.clone(),
+                        records_root: records_root.clone(),
+                        manifest_file_name: staged.manifest_file_name.clone(),
                         tool_components,
                         native_entrypoints,
                         process_driver: process_driver_for_state.clone(),
@@ -3823,7 +3883,7 @@ fn launch(
                     // Create hooks ONCE — session_start fires once per capsule lifetime
                     let mut hooks = HookRuntime::new(
                         &engine,
-                        &session_root,
+                        &records_root,
                         &accessible_workdir,
                         hook_components,
                         SessionContextData {
@@ -3850,7 +3910,7 @@ fn launch(
                     // on-session-start fires ONCE per launch, before the task loop —
                     // regardless of task_acceptance. For queue capsules this is the single
                     // session boundary that the per-task on-task-start events nest inside.
-                    hooks.emit(&session_root, HookEvent::SessionStart).await;
+                    hooks.emit(&records_root, HookEvent::SessionStart).await;
 
                     // The session is addressable from here, and this is where it says so. A
                     // caller that sees the URL reads the record and then probes the door, so the
@@ -3869,7 +3929,7 @@ fn launch(
                     // until the task loop has ended: a record that outlived its session would
                     // resolve an address onto a port nothing holds. Only the agent path reaches
                     // here; a script capsule binds nothing and is never addressable.
-                    let _running_record = write_running_record(&running_record, &session_root);
+                    let _running_record = write_running_record(&running_record, &records_root);
                     on_url(&capsule_url);
 
                     // Every run this loop makes on the launch's behalf is folded in; an
@@ -3899,13 +3959,13 @@ fn launch(
                     // on every clean exit. The one over-report is a graceful exit whose own
                     // `write_shell_abandoned` failed, which reads here as unplanned death; for
                     // accounting that is the right direction to be wrong in.
-                    if let (Some(from_session), Some(sessions_root)) = (
+                    if let (Some(from_session), Some(records_group)) = (
                         reconcile_from_session.as_deref(),
-                        sibling_sessions_root(&accessible_root, &session_root),
+                        records_group_root(&records_root, &accessible_root),
                     ) {
                         if let Some(report) =
                             crate::detached_reconcile::reconcile_prior_session(
-                                &sessions_root,
+                                &records_group,
                                 from_session,
                                 &session_id,
                                 &task_context_id(supplied_context_id.as_deref()),
@@ -4007,7 +4067,7 @@ fn launch(
                                                 u64::from(context_window),
                                                 agent::prior_history_tokens(
                                                     run_config.conversation_root.as_deref(),
-                                                    &session_root,
+                                                    &records_root,
                                                     &conversation_mode,
                                                     Some(&context_id),
                                                     run_config.resume.is_some(),
@@ -4093,7 +4153,7 @@ fn launch(
                                                 u64::from(context_window),
                                                 agent::prior_history_tokens(
                                                     run_config.conversation_root.as_deref(),
-                                                    &session_root,
+                                                    &records_root,
                                                     &conversation_mode,
                                                     Some(&context_id),
                                                     run_config.resume.is_some(),
@@ -4363,7 +4423,7 @@ fn launch(
                                 u64::from(context_window),
                                 agent::prior_history_tokens(
                                     run_config.conversation_root.as_deref(),
-                                    &session_root,
+                                    &records_root,
                                     &conversation_mode,
                                     Some(&incoming.context_id),
                                     run_config.resume.is_some(),
@@ -4493,7 +4553,7 @@ fn launch(
                     let session_total_turns = hooks.total_turns();
                     hooks
                         .emit(
-                            &session_root,
+                            &records_root,
                             HookEvent::SessionEnd {
                                 total_turns: session_total_turns,
                                 exit_status: session_exit_status.to_string(),
@@ -4576,7 +4636,7 @@ fn launch(
                     if !abandoned.is_empty() {
                         let report = detached::abandonment_report_text(&session_id, &abandoned);
                         crate::runtime_err!("{report}");
-                        agent::append_bootstrap_log(&session_root, &report);
+                        agent::append_bootstrap_log(&records_root, &report);
                         for work in &abandoned {
                             let _ = trace
                                 .write_shell_abandoned(
@@ -4616,6 +4676,7 @@ fn launch(
         return Ok(LaunchResult {
             session_id: session_id_ret,
             workdir: workdir_ret,
+            records_dir: records_dir_ret,
             ending,
         });
     }
@@ -4729,6 +4790,8 @@ fn launch(
         accessible_root: staged.accessible_root.clone(),
         runtime_root: staged.runtime_root.clone(),
         runtime_dirs: staged.runtime_dirs.clone(),
+        records_root: staged.records_root.clone(),
+        manifest_file_name: staged.manifest_file_name.clone(),
         tool_components: staged.tool_components,
         native_entrypoints: staged.native_entrypoints,
         // A script capsule runs no agent loop, so nothing here would ever drive a harness.
@@ -4829,7 +4892,7 @@ fn launch(
     let pending_pulls = std::mem::take(&mut store.data_mut().pending_artifact_pulls);
     let pending_sends = std::mem::take(&mut store.data_mut().pending_a2a_events);
     rt.block_on(drain_script_trace_buffers(
-        &staged.session_root,
+        &staged.records_root,
         &staged.session_id,
         &staged.capsule_name,
         &staged.capsule_version,
@@ -4846,6 +4909,7 @@ fn launch(
     Ok(LaunchResult {
         session_id: staged.session_id,
         workdir: staged.workdir,
+        records_dir: staged.records_dir,
         ending: LaunchEnding::Completed,
     })
 }
@@ -4943,6 +5007,7 @@ fn running_record_for(
         capsule_name: staged.capsule_name.clone(),
         capsule_version: staged.capsule_version.clone(),
         workdir: staged.workdir.clone(),
+        records_dir: staged.records_dir.clone(),
         outlives_launcher: !running::has_controlling_terminal(),
         started_at: chrono::Utc::now().to_rfc3339(),
         door_token: staged
@@ -5100,11 +5165,12 @@ struct DelegationReport {
     capsule_name: String,
     capsule_version: String,
     session_id: String,
-    /// The child's own directory — where `completion.json` goes, and the root the completion's
-    /// `result_path` is relative to.
+    /// The child's own directory — the root the completion's `result_path` is relative to.
     accessible_root: WorkdirRoot,
     /// This session's directory beneath it, the other place the runtime writes `out/result.txt`.
     session_root: WorkdirRoot,
+    /// This session's records directory, where `completion.json` goes.
+    records_root: WorkdirRoot,
     started: Instant,
     status: crate::delegation::DelegationStatus,
 }
@@ -5119,6 +5185,7 @@ impl DelegationReport {
             session_id: staged.session_id.clone(),
             accessible_root: staged.accessible_root.clone(),
             session_root: staged.session_root.clone(),
+            records_root: staged.records_root.clone(),
             started: Instant::now(),
             status: crate::delegation::DelegationStatus::Error,
         })
@@ -5146,7 +5213,7 @@ impl DelegationReport {
 }
 
 impl Drop for DelegationReport {
-    /// Writes `completion.json` into this capsule's own directory and posts the notification to
+    /// Writes `completion.json` into this capsule's records directory and posts the notification to
     /// the address its parent injected. A delivery that fails is recorded in that file and on
     /// stderr; it never fails this session, whose work was already done.
     ///
@@ -5181,13 +5248,7 @@ impl Drop for DelegationReport {
             delivered: false,
             delivery_error: None,
         };
-        crate::delegation::report_completion(
-            &handle,
-            &address,
-            outcome,
-            &self.accessible_root,
-            Path::new(""),
-        );
+        crate::delegation::report_completion(&handle, &address, outcome, &self.records_root);
     }
 }
 
@@ -6752,6 +6813,11 @@ pub(crate) struct CapsuleStoreState {
     /// [`StagedSession::runtime_dirs`]: the runtime directory with its `sealed-etc/` and
     /// `harness/` siblings.
     pub(crate) runtime_dirs: crate::runtime_dir::RuntimeDirRoots,
+    /// [`StagedSession::records_root`]: the records directory, through which every runtime write
+    /// of `trace.jsonl`, `blobs/`, `logs/` and `completion.json` goes.
+    pub(crate) records_root: WorkdirRoot,
+    /// [`StagedSession::manifest_file_name`], which the `[Capsule]` notice names.
+    pub(crate) manifest_file_name: Option<String>,
     /// [`StagedSession::accessible_root`]. Its refusal latch is the session's: the agent loop's
     /// checkpoints drain it through here.
     pub(crate) accessible_root: WorkdirRoot,
@@ -8531,6 +8597,7 @@ impl CapsuleStoreState {
                     &notice.version,
                     &notice.child_session_id,
                     &notice.child_workdir,
+                    &notice.child_records_dir,
                 )
                 .await;
         }
@@ -9986,34 +10053,55 @@ fn write_staged_file(
     })
 }
 
-/// Copies the project's `murmur.yaml` from `manifest_dir` into the runtime directory, with the
-/// source's mode as `fs::copy` would, for the agent to read beside `MURMUR.md`.
+/// Copies the manifest file this launch read into the runtime directory under its own file name,
+/// with the source's mode as `fs::copy` would, for the agent to read beside `MURMUR.md`. A launch
+/// that read no manifest file copies nothing.
 ///
-/// A refusal fails the launch; any other failure warns and the launch goes on.
+/// The file was read moments earlier to stage this launch, so failing to read it now fails the
+/// launch, as does a refusal; a failed write into the runtime directory warns and the launch goes
+/// on.
 fn copy_manifest_into_runtime_dir(
-    manifest_dir: &Path,
+    manifest_file: Option<&Path>,
     runtime_root: &WorkdirRoot,
 ) -> Result<(), RuntimeError> {
     use std::os::unix::fs::PermissionsExt;
 
-    let src = manifest_dir.join(MANIFEST_FILENAME);
-    let Ok(bytes) = fs::read(&src) else {
+    let Some(src) = manifest_file else {
         return Ok(());
     };
-    let mode = fs::metadata(&src)
+    let name = manifest_file_name(src).ok_or_else(|| {
+        RuntimeError::Runtime(format!(
+            "the manifest {} has no file name to copy it under",
+            src.display()
+        ))
+    })?;
+    let bytes = fs::read(src).map_err(|error| {
+        RuntimeError::Runtime(format!(
+            "failed to read the manifest {} to copy it into the runtime directory: {error}",
+            src.display()
+        ))
+    })?;
+    let mode = fs::metadata(src)
         .map(|metadata| metadata.permissions().mode() & 0o7777)
         .unwrap_or(DEFAULT_FILE_MODE);
-    match runtime_root.write_file_exact_mode(MANIFEST_FILENAME, &bytes, mode) {
+    match runtime_root.write_file_exact_mode(&name, &bytes, mode) {
         Ok(()) => Ok(()),
         Err(WorkdirError::Refused(refusal)) => Err(RuntimeError::WorkdirPathRefused { refusal }),
         Err(error) => {
             crate::runtime_err!(
-                "[capsule-runtime] warning: failed to copy {MANIFEST_FILENAME} to the runtime \
-                 directory: {error}"
+                "[capsule-runtime] warning: failed to copy {name} to the runtime directory: \
+                 {error}"
             );
             Ok(())
         }
     }
+}
+
+/// The file name a launched manifest is copied into the runtime directory under.
+fn manifest_file_name(manifest_file: &Path) -> Option<String> {
+    manifest_file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 /// Mode of an installed native binary: executable by everyone, writable by its owner.
@@ -10756,7 +10844,13 @@ fn dispatch_native_tool(
 
     enforcement.check_workdir_budget()?;
 
-    let env = build_shell_env(policy, &[], session_workdir, enforcement.runtime_dir_path())?;
+    let env = build_shell_env(
+        policy,
+        &[],
+        session_workdir,
+        enforcement.runtime_dir_path(),
+        enforcement.records_dir_path(),
+    )?;
 
     let mut command = Command::new(entrypoint.path());
     command
@@ -11202,15 +11296,18 @@ fn resolve_conversation_root(
 /// written are each survived, on the same terms as an unresolvable `HOME` in
 /// [`resolve_conversation_root`] — a capsule whose retention cannot run must still do its work.
 ///
-/// Session pruning is computed from `workdir.parent()`, the directory holding every sibling
-/// session, and never considers an id at or after this session's own. Record pruning needs the
-/// resolved conversation root, the capsule name — records this capsule does not own are never
-/// touched — and the launch's context id, which is never removed and is the one record
-/// `max_messages` truncates.
+/// Session pruning decides on `records_root.parent()`, the records group holding every sibling
+/// session's records directory, removes each pruned session's records directory and its session
+/// workdir directory beside `session_root`, and never considers an id at or after this session's
+/// own. Both are opened with latches of their own: a link refused while pruning fails nothing.
+/// Record pruning needs the resolved conversation root, the capsule name — records this capsule
+/// does not own are never touched — and the launch's context id, which is never removed and is
+/// the one record `max_messages` truncates.
 #[allow(clippy::too_many_arguments)]
 async fn apply_retention(
     trace: &mut TraceWriter,
-    workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
+    session_root: &WorkdirRoot,
     session_id: &str,
     trace_retain: Option<&murmur_artifact::TraceRetainConfig>,
     context_retain: Option<&murmur_artifact::ContextRetainConfig>,
@@ -11224,8 +11321,22 @@ async fn apply_retention(
 
     let now_ms = crate::retention::now_ms();
 
-    if let (Some(policy), Some(sessions_root)) = (trace_retain, workdir.path().parent()) {
-        let pruned = crate::retention::prune_sessions(sessions_root, session_id, policy, now_ms);
+    let records_group = records_root
+        .path()
+        .parent()
+        .and_then(|group| WorkdirRoot::open(group).ok());
+    if let (Some(policy), Some(records_group)) = (trace_retain, records_group) {
+        let session_workdirs = session_root
+            .path()
+            .parent()
+            .and_then(|workdirs| WorkdirRoot::open(workdirs).ok());
+        let pruned = crate::retention::prune_sessions(
+            &records_group,
+            session_workdirs.as_ref(),
+            session_id,
+            policy,
+            now_ms,
+        );
         for reason in [
             crate::trace::RETENTION_REASON_MAX_SESSIONS,
             crate::trace::RETENTION_REASON_MAX_AGE,
@@ -11297,7 +11408,7 @@ async fn apply_retention(
                 path.display()
             );
             crate::runtime_err!("[capsule-runtime] {message}");
-            agent::append_bootstrap_log(workdir, &message);
+            agent::append_bootstrap_log(records_root, &message);
         }
     }
 }
@@ -13538,6 +13649,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -13640,6 +13752,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -13731,6 +13844,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -13821,6 +13935,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -13972,6 +14087,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: project.path().to_path_buf(),
             capsule_name: "test".to_string(),
@@ -14080,6 +14196,7 @@ inference:
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: project.to_path_buf(),
             capsule_name: "test".to_string(),
@@ -14126,8 +14243,23 @@ inference:
         }
     }
 
+    /// Staging creates the session's runtime and records directories under `HOME`, so the body
+    /// runs in a process of its own with a scratch one.
     #[test]
     fn stage_session_installs_local_source_skill_without_registry() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(
+            "runtime::tests::stage_session_installs_local_source_skill_without_registry_inner",
+            home.path(),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by stage_session_installs_local_source_skill_without_registry under a scratch HOME"]
+    fn stage_session_installs_local_source_skill_without_registry_inner() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
         let project = tempfile::tempdir().unwrap();
         let request = local_source_skill_agent_request(project.path());
 
@@ -14160,8 +14292,23 @@ inference:
         );
     }
 
+    /// Staging creates the session's runtime and records directories under `HOME`, so the body
+    /// runs in a process of its own with a scratch one.
     #[test]
     fn staging_an_agent_session_builds_the_token_tables() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(
+            "runtime::tests::staging_an_agent_session_builds_the_token_tables_inner",
+            home.path(),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by staging_an_agent_session_builds_the_token_tables under a scratch HOME"]
+    fn staging_an_agent_session_builds_the_token_tables_inner() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
         let project = tempfile::tempdir().unwrap();
         let request = local_source_skill_agent_request(project.path());
 
@@ -14222,8 +14369,23 @@ inference:
         }
     }
 
+    /// Staging creates the session's runtime and records directories under `HOME`, so the body
+    /// runs in a process of its own with a scratch one.
     #[test]
     fn staging_carries_the_lock_origin_onto_each_staged_artifact() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(
+            "runtime::tests::staging_carries_the_lock_origin_onto_each_staged_artifact_inner",
+            home.path(),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by staging_carries_the_lock_origin_onto_each_staged_artifact under a scratch HOME"]
+    fn staging_carries_the_lock_origin_onto_each_staged_artifact_inner() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
         let registry = FakeSkillRegistry::new(zip_with_files(&[
             (
                 PACKED_MANIFEST_ENTRY,
@@ -14938,7 +15100,10 @@ inference:
                 root.clone(),
                 root.clone(),
                 root.clone(),
-            ),
+            )
+            .with_records(root.clone()),
+            records_root: root.clone(),
+            manifest_file_name: Some("murmur.yaml".to_string()),
             session_root: root.clone(),
             accessible_root: root,
             accessible_workdir: workdir,
@@ -15706,6 +15871,7 @@ inference:
                 &mut state,
                 3,
                 100,
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 &mut hooks,
                 &mut trace,
@@ -17029,6 +17195,7 @@ inference:
             &declaring,
             &native_env(&agent),
             &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            None,
             None,
         )
         .unwrap();
@@ -18400,6 +18567,7 @@ inference:
                 scope: Some(scope.to_string()),
                 workdir_exec: false,
                 read_only: Vec::new(),
+                records: false,
             }),
             shell: None,
             spawn: None,
@@ -19056,6 +19224,7 @@ inference:
                     scope: Some("../escape".to_string()),
                     workdir_exec: false,
                     read_only: Vec::new(),
+                    records: false,
                 }),
                 shell: None,
                 spawn: None,
@@ -19092,6 +19261,7 @@ inference:
                 scope: None,
                 workdir_exec: false,
                 read_only: Vec::new(),
+                records: false,
             }),
             shell: Some(murmur_artifact::ShellCapabilities {
                 allow: vec!["bash".to_string()],
@@ -19911,6 +20081,8 @@ inference:
             grant: crate::network_policy::HookCapabilityGrant {
                 network_allow_rules: Vec::new(),
                 filesystem_scope: None,
+                filesystem_records: false,
+                records_hooks_dir: None,
                 task_io_read,
                 conversation_read: false,
                 state_store: None,
@@ -20451,6 +20623,7 @@ inference:
             &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             &ConversationMode::Threaded,
             Some("tsk_a"),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
         );
         let read = |name: &str| std::fs::read_to_string(out.join(name)).unwrap();
         assert_eq!(read("result.txt"), crate::cancel::CANCELED_RESULT_TEXT);
@@ -20469,11 +20642,13 @@ inference:
             &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             &ConversationMode::Stateless,
             Some("tsk_b"),
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
         );
         write_canceled_result(
             &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             &ConversationMode::Threaded,
             None,
+            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
         );
         let out = dir.path().join("out");
         assert_eq!(
@@ -22291,6 +22466,9 @@ inference:
                     version: "0.1.0".to_string(),
                     child_session_id: "ses_child".to_string(),
                     child_workdir: ".murmur/children/worker-1".to_string(),
+                    child_records_dir: std::path::PathBuf::from(
+                        "/home/test/.murmur/records/work/ses_child"
+                    ),
                     started: std::time::Instant::now(),
                     child: None,
                     arrived: false,
@@ -22743,6 +22921,7 @@ inference:
                 capsule_url: String::new(),
             },
             None,
+            Some("murmur.yaml"),
         );
 
         let murmur_md = fs::read_to_string(planted.workdir.join("MURMUR.md")).unwrap();
@@ -23519,6 +23698,9 @@ mod member_call_tests {
             version: "0.1.0".to_string(),
             child_session_id: "ses_child".to_string(),
             child_workdir: ".murmur/children/child-1".to_string(),
+            child_records_dir: std::path::PathBuf::from(
+                "/home/test/.murmur/records/work/ses_child",
+            ),
             started: std::time::Instant::now() - ago,
             child: None,
             arrived: false,
@@ -24831,6 +25013,7 @@ mod submitting_task_tests {
             version: "0.1.0".to_string(),
             child_session_id: "ses_child".to_string(),
             child_workdir: ".murmur/children/worker-1".to_string(),
+            child_records_dir: "/home/test/.murmur/records/work/ses_child".to_string(),
         }
     }
 

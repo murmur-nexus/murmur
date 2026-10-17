@@ -136,6 +136,13 @@ impl Project {
         workdir_of(self.run_with(None).success())
     }
 
+    /// The records directory of the session `mur run` staged at `workdir`, a
+    /// `<project>/workdir/<session-id>` directory.
+    fn records(&self, workdir: &Path) -> PathBuf {
+        let session_id = workdir.file_name().unwrap().to_str().unwrap();
+        common::session_records_dir(self.home.path(), workdir.parent().unwrap(), session_id)
+    }
+
     /// Both stores' file listings.
     fn stores(&self) -> (Vec<String>, Vec<String>) {
         (
@@ -397,8 +404,8 @@ fn fenced_and_note(text: &str, tool: &str) -> (Value, Option<String>) {
     (serde_json::from_str(data).unwrap(), note)
 }
 
-fn trace(workdir: &Path) -> Vec<Value> {
-    common::read_whole_trace(&workdir.join("trace.jsonl"))
+fn trace(records_dir: &Path) -> Vec<Value> {
+    common::read_whole_trace(&records_dir.join("trace.jsonl"))
 }
 
 fn of_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> {
@@ -481,7 +488,7 @@ fn s1_a_pulled_tool_is_offered_and_called_from_the_next_turn() {
     assert!(!is_error, "{edited}");
     assert!(common::unfence(&edited).contains("from 0.2.0"), "{edited}");
 
-    let events = trace(&workdir);
+    let events = trace(&p.records(&workdir));
     let session_id = events[0]["session_id"].as_str().unwrap().to_string();
     let lock = read_lockfile(&p.lock_path()).unwrap();
     let entry = lock.artifact_for(EDITOR).expect("the pull is pinned");
@@ -548,7 +555,7 @@ fn s2_without_a_grant_neither_tool_exists() {
             "{names:?}"
         );
     }
-    let events = trace(&workdir);
+    let events = trace(&p.records(&workdir));
     let declared = &of_type(&events, "session_start")[0]["tools_declared"];
     assert!(
         !declared
@@ -702,7 +709,7 @@ fn s3_refused_pulls_write_nothing() {
         assert!(!workdir.join("tools").join(name).exists(), "{name}");
     }
     assert_eq!(p.stores(), stores_before);
-    let events = trace(&workdir);
+    let events = trace(&p.records(&workdir));
     assert!(of_type(&events, "artifact_pulled").is_empty());
     assert!(of_type(&events, "tools_refreshed").is_empty());
     assert_eq!(requests[2]["tools"], requests[1]["tools"]);
@@ -756,7 +763,7 @@ fn s4_with_only_a_non_fitting_version_a_versionless_pull_is_refused() {
         .unwrap()
         .artifact_for(EDITOR)
         .is_none());
-    assert!(of_type(&trace(&workdir), "artifact_pulled").is_empty());
+    assert!(of_type(&trace(&p.records(&workdir)), "artifact_pulled").is_empty());
 }
 
 // ── S5 ───────────────────────────────────────────────────────────────────────
@@ -842,7 +849,7 @@ fn s5_from_sources_fetches_from_the_scope_source() {
     ana_stores_hold_nothing(&p);
     let (edited, is_error) = result(&requests, "toolu_edit");
     assert!(!is_error && edited.contains("from ana"), "{edited}");
-    let events = trace(&workdir);
+    let events = trace(&p.records(&workdir));
     let pulled = of_type(&events, "artifact_pulled");
     assert_eq!(pulled[0]["fetched_from"], "github:ana/artifacts");
     assert_eq!(pulled[0]["owner_id"], ANA_OWNER_ID);
@@ -1068,7 +1075,7 @@ fn s6_a_removal_lets_earlier_calls_finish_and_refuses_later_ones() {
         "{declared}"
     );
 
-    let events = trace(&workdir);
+    let events = trace(&p.records(&workdir));
     let refreshed = of_type(&events, "tools_refreshed");
     assert_eq!(refreshed.len(), 2, "{refreshed:#?}");
     assert_eq!(refreshed[1]["trigger"], "agent");
@@ -1249,12 +1256,14 @@ fn s7_a_pull_writes_only_its_tool_directory_the_lock_and_a_compiled_form() {
             .any(|path| path.starts_with(".murmur/compiled/") && path.ends_with(".cwasm")),
         "{home_added:?}"
     );
-    // Every session keeps a conversation record and a running record under the home, and its
-    // runtime directory under `sessions/` while it runs; the pull adds only its compiled form.
+    // Every session keeps a conversation record, a running record and its records directory
+    // under the home, and its runtime directory under `sessions/` while it runs; the pull adds
+    // only its compiled form.
     for path in &home_added {
         assert!(
             path.starts_with(".murmur/compiled")
                 || path.starts_with(".murmur/conversations")
+                || path.starts_with(".murmur/records")
                 || path.starts_with(".murmur/running")
                 || path.starts_with(".murmur/sessions"),
             "a pull wrote {path} outside the workdir: {home_added:?}"
@@ -1297,6 +1306,7 @@ fn s7_a_link_planted_in_the_workdir_redirects_no_pull() {
     });
     let s = stage(&server, GRANT, workdir.path());
     let session = s.staged.workdir.clone();
+    let records = s.staged.records_dir.clone();
     *planted.lock().unwrap() = Some((
         outside.path().to_path_buf(),
         session.join("tools").join(EDITOR_TOOL),
@@ -1307,7 +1317,7 @@ fn s7_a_link_planted_in_the_workdir_redirects_no_pull() {
     let (text, is_error) = result(&server.requests(), "toolu_pull");
     assert!(!is_error, "{text}");
     assert!(files_under(outside.path()).is_empty());
-    let events = trace(&session);
+    let events = trace(&records);
     assert!(
         of_type(&events, "workdir_path_refused").is_empty(),
         "{events:#?}"
@@ -1379,7 +1389,7 @@ fn s8_a_pattern_lists_what_the_capsule_may_pull_and_pulls_nothing() {
 
     assert_eq!(p.lock_bytes(), lock_before);
     assert!(!workdir.join("tools").join(EDITOR_TOOL).exists());
-    let events = trace(&workdir);
+    let events = trace(&p.records(&workdir));
     assert!(of_type(&events, "artifact_pulled").is_empty());
     assert!(of_type(&events, "tools_refreshed").is_empty());
 }

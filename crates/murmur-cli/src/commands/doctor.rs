@@ -9,13 +9,14 @@ use capsule_runtime::{
     detect_egress_namespace_blocker, detect_landlock_abi, detect_userns_grant, doctor_runtime_dir,
     find_on_path, has_subprocess_route_at_staging, inspect_installed_profile,
     inspect_profile_attachment, install_from_places, landlock_doctor_lines, preopen_reports,
-    read_only_advisory_for, render_install, render_read_only, render_runtime_dir,
-    runtime_dir_inside_warning, served_wit_level, undeclarable_runtime_pin_role,
-    warn_on_gateway_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
-    warn_on_launch_only_gateway_credential, warn_on_secret_shaped_env_grants,
-    warn_on_unmetered_gateways, warn_on_unreachable_toolchain_helpers,
-    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, wit_levels,
-    ArtifactRequest, EgressNamespaceBlocker, InstalledProfileState, ProfileAttachment, UsernsGrant,
+    read_only_advisory_for, render_install, render_read_only, render_records_dir,
+    render_runtime_dir, runtime_dir_inside_warning, served_wit_level,
+    undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
+    warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
+    warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
+    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
+    warn_on_workdir_exec, wit_levels, ArtifactRequest, EgressNamespaceBlocker,
+    InstalledProfileState, ProfileAttachment, UsernsGrant, HOME_UNUSABLE_HINT,
     SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
@@ -524,6 +525,14 @@ fn report_murmur_home() {
     }
 }
 
+/// The `Runtime directory` and `Records directory` blocks for a `HOME` that cannot hold
+/// `~/.murmur`: the reason in place of both paths.
+fn report_home_unusable(error: &capsule_runtime::HomeUnusable) {
+    capsule_runtime::report_println!("Runtime directory\n  path:      unavailable — {error}");
+    capsule_runtime::report_println!();
+    capsule_runtime::report_println!("Records directory\n  path:      unavailable — {error}");
+}
+
 /// Prints the filesystem surface every guest-bearing artifact in `runtime_manifest` will be
 /// preopened into, one line per artifact, resolved through the same `preopen_reports` that
 /// `mur run --explain-scope` and `stage_session` use.
@@ -537,15 +546,33 @@ fn report_murmur_home() {
 /// A scope `mur run` would refuse is reported as a warning rather than a failure, on the
 /// `E-CAP-004` precedent above: doctor launches nothing, so it has nothing to refuse, and aborting
 /// the checklist over one manifest line would hide every artifact problem behind it.
-fn report_preopens(runtime_manifest: &murmur_artifact::RuntimeManifest) {
+///
+/// How each tool reaches the runtime directory is read off the project's `murmur.lock`, as
+/// `--explain-scope` reads it; an unlocked tool is reported unresolved.
+fn report_preopens(
+    runtime_manifest: &murmur_artifact::RuntimeManifest,
+    project_root: &Path,
+    declared_floor: murmur_artifact::ContainmentClass,
+) {
     capsule_runtime::report_println!("Filesystem preopens");
+    let lock = read_optional_lockfile(project_root).ok().flatten();
+    let runtime_dir_protected = doctor_runtime_dir(declared_floor, &project_root.join("workdir"))
+        .is_ok_and(|reports| reports.runtime_dir.read_only_to_commands);
     match preopen_reports(runtime_manifest.artifacts.iter().map(|artifact| {
         (
             artifact.name.as_str(),
             &artifact.runtime,
             artifact.capabilities.as_ref(),
         )
-    })) {
+    }))
+    .map(|mut preopens| {
+        capsule_runtime::resolve_runtime_dir_reaches(&mut preopens, |name| {
+            lock.as_ref()
+                .and_then(|lock| lock.artifact_for(name))
+                .map(|entry| crate::commands::run::locked_implementation(&entry.sha256))
+        });
+        preopens
+    }) {
         Ok(preopens) if preopens.is_empty() => {
             capsule_runtime::report_println!(
                 "  <none> (this capsule declares no tool, driver or hook artifact)"
@@ -553,7 +580,7 @@ fn report_preopens(runtime_manifest: &murmur_artifact::RuntimeManifest) {
         }
         Ok(preopens) => {
             for preopen in &preopens {
-                capsule_runtime::report_println!("  - {}", preopen.render());
+                capsule_runtime::report_println!("  - {}", preopen.render(runtime_dir_protected));
             }
         }
         Err(error) => {
@@ -1548,6 +1575,13 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
 
     report_door(&runtime_manifest, bind_addr);
 
+    // Everything below reads `~/.murmur`, and no launch here would start without it: the reason
+    // stands in for both directories, and the check fails.
+    if let Err(error) = capsule_runtime::usable_murmur_home() {
+        report_home_unusable(&error);
+        return Err(CliError::from(error));
+    }
+
     let effective_config = load_effective_mur_config_if_any_exists()?;
 
     // Same reasoning for `staged_runtime`, but it is a refusal rather than a posture warning: a
@@ -1662,7 +1696,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // the same reason the block above is: it is a property of the manifest, not of any one
     // artifact's presence in a store, and it is the question `capabilities.filesystem.scope` at
     // the capsule level does not answer.
-    report_preopens(&runtime_manifest);
+    report_preopens(&runtime_manifest, &project_root, declared_floor);
 
     // The `read_only` declaration and whether it is enforced or advisory, through the renderer
     // `--explain-scope` prints from, for the reason `report_preopens` shares `PreopenReport::render`.
@@ -1980,17 +2014,27 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         }
     }
 
-    // Where the session's runtime directory lies and what this host's mechanism makes of it, for
-    // the floor this capsule declares and the default workdir, `<manifest dir>/workdir`.
-    let (runtime_dir, placement) =
-        doctor_runtime_dir(declared_floor, &project_root.join("workdir"));
+    // Where the session's runtime and records directories lie and what this host's mechanism
+    // makes of them, for the floor this capsule declares and the default workdir,
+    // `<manifest dir>/workdir`. A `HOME` that cannot hold them is a failed check: no launch here
+    // would start.
     capsule_runtime::report_println!();
-    capsule_runtime::report_print!("{}", render_runtime_dir(&runtime_dir));
-    if placement.inside_workdir {
-        capsule_runtime::report_eprintln!(
-            "[mur doctor] {}",
-            runtime_dir_inside_warning(&placement)
-        );
+    match doctor_runtime_dir(declared_floor, &project_root.join("workdir")) {
+        Ok(reports) => {
+            capsule_runtime::report_print!("{}", render_runtime_dir(&reports.runtime_dir));
+            capsule_runtime::report_println!();
+            capsule_runtime::report_print!("{}", render_records_dir(&reports.records_dir));
+            if reports.placement.inside_workdir {
+                capsule_runtime::report_eprintln!(
+                    "[mur doctor] {}",
+                    runtime_dir_inside_warning(&reports.placement)
+                );
+            }
+        }
+        Err(error) => {
+            report_home_unusable(&error);
+            fixes.push(HOME_UNUSABLE_HINT.to_string());
+        }
     }
 
     capsule_runtime::report_println!();

@@ -2,8 +2,9 @@
 //! harness its driver names, drives it through the driver, and records what happened.
 //!
 //! Every test publishes the fixture process driver, points `inference.command` (or `PATH`) at the
-//! fixture fake harness, and reads back `out/result.txt` and `trace.jsonl`. The fake harness is a
-//! bash script, so these tests are Unix-only — which every platform murmur targets is.
+//! fixture fake harness, and reads back `out/result.txt` and the session's `trace.jsonl` under
+//! `~/.murmur/records/`. The fake harness is a bash script, so these tests are Unix-only — which
+//! every platform murmur targets is.
 
 #![cfg(unix)]
 
@@ -264,6 +265,8 @@ struct Run {
     output: Output,
     text: String,
     workdir: PathBuf,
+    /// The session's records directory, or the records root when the run never staged a session.
+    records_dir: PathBuf,
 }
 
 impl Capsule {
@@ -299,10 +302,16 @@ impl Capsule {
         } else {
             self.project.path().to_path_buf()
         };
+        let records_dir = if text.contains("records: ") {
+            common::parse_records_from_stdout(&text)
+        } else {
+            common::records_root(self.home.path())
+        };
         Run {
             output,
             text,
             workdir,
+            records_dir,
         }
     }
 
@@ -316,7 +325,7 @@ impl Capsule {
         )
     }
 
-    fn trace_show(&self, workdir: &Path) -> String {
+    fn trace_show(&self, records_dir: &Path) -> String {
         let output = Command::cargo_bin("mur")
             .unwrap()
             .env("HOME", self.home.path())
@@ -324,7 +333,7 @@ impl Capsule {
             .args([
                 "trace",
                 "show",
-                workdir.join("trace.jsonl").to_str().unwrap(),
+                records_dir.join("trace.jsonl").to_str().unwrap(),
             ])
             .output()
             .unwrap();
@@ -360,7 +369,7 @@ impl Run {
     }
 
     fn trace_raw(&self) -> String {
-        fs::read_to_string(self.workdir.join("trace.jsonl")).unwrap_or_default()
+        fs::read_to_string(self.records_dir.join("trace.jsonl")).unwrap_or_default()
     }
 
     fn events(&self) -> Vec<Value> {
@@ -501,7 +510,7 @@ fn s3_the_harness_calls_a_capsule_tool_through_the_bridge() {
     let start = run.one("harness_start");
     assert_eq!(start["bridge_tools"], serde_json::json!([TOOL]));
 
-    let shown = capsule.trace_show(&run.workdir);
+    let shown = capsule.trace_show(&run.records_dir);
     assert!(shown.contains(TOOL), "{shown}");
     assert!(shown.contains("ok"), "{shown}");
 }
@@ -584,7 +593,7 @@ fn s4_a_failed_turn_fails_the_run_and_names_its_kind() {
         assert_eq!(failed["kind"], kind);
         assert_eq!(failed["source"], "harness");
         if kind == "auth" {
-            let shown = capsule.trace_show(&run.workdir);
+            let shown = capsule.trace_show(&run.records_dir);
             assert!(
                 shown.contains("harness failed (auth): the harness says so"),
                 "{shown}"
@@ -710,7 +719,7 @@ fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
     assert_eq!(
         names.join(","),
         "FIXTURE_BRIDGE_TOKEN,FIXTURE_BRIDGE_TOOLS,FIXTURE_BRIDGE_URL,FIXTURE_FILES,\
-         FIXTURE_HARNESS_PROFILE,HOME,MURMUR_RUNTIME_DIR,PATH",
+         FIXTURE_HARNESS_PROFILE,HOME,MURMUR_RECORDS_DIR,MURMUR_RUNTIME_DIR,PATH",
         "{env_note}"
     );
     assert!(
@@ -747,6 +756,7 @@ fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
             "FIXTURE_FILES",
             "FIXTURE_HARNESS_PROFILE",
             "HOME",
+            "MURMUR_RECORDS_DIR",
             "MURMUR_RUNTIME_DIR",
             "PATH"
         ])
@@ -783,7 +793,7 @@ fn s8_an_untested_harness_version_warns_and_runs() {
     let warning = run.one("harness_warning");
     assert_eq!(warning["code"], "W-RUN-002");
 
-    let shown = capsule.trace_show(&run.workdir);
+    let shown = capsule.trace_show(&run.records_dir);
     assert!(shown.contains("warning W-RUN-002"), "{shown}");
 }
 
@@ -951,7 +961,7 @@ fn s13_a_reported_turn_carries_the_harness_counts_everywhere() {
 
     // The same numbers in the session summary, and a provider line naming only what the harness
     // reported: there is no `*_actual` pair on this transport to sum.
-    let shown = capsule.trace_show(&run.workdir);
+    let shown = capsule.trace_show(&run.records_dir);
     assert!(shown.contains("input:      120"), "{shown}");
     assert!(shown.contains("output:     30"), "{shown}");
     assert!(shown.contains("total:      150"), "{shown}");
@@ -1014,11 +1024,12 @@ fn s13_cumulative_reports_are_attributed_turn_by_turn() {
 /// trace holds absent, because `murmur:hook`'s `inference-event` has no optional count.
 ///
 /// The hook traps exactly when it is handed the numbers named here, and a trap writes
-/// `logs/hook-<name>.log`; that file's presence is the assertion, in both directions.
+/// `logs/hook-<name>.log` in the session's records directory; that file's presence is the
+/// assertion, in both directions.
 #[test]
 fn s13_a_hook_is_handed_the_numbers_the_trace_holds() {
     println!("S13: on-inference sees the trace's counts, and zero where the trace says nothing");
-    let armed = |run: &Run, hook: &str| run.workdir.join("logs").join(format!("hook-{hook}.log"));
+    let armed = |run: &Run, hook: &str| run.records_dir.join(format!("logs/hook-{hook}.log"));
 
     // Reported: the hook armed at the trace's own numbers fires, and one armed at zero does not.
     for (hook, tokens, expected) in [

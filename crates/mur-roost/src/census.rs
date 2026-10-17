@@ -177,6 +177,7 @@ mod tests {
             "capsule_name": "demo",
             "capsule_version": "0.1.0",
             "workdir": "/tmp/demo",
+            "records_dir": "/tmp/demo-records",
             "outlives_launcher": true,
             "started_at": "2026-01-01T00:00:00Z",
             "door_token": "operator-door-token",

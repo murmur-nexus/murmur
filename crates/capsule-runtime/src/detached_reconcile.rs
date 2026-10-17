@@ -45,7 +45,7 @@ struct PriorSessionScan {
 /// from the report rather than reported unmarked, since an unmarked work id would be reported
 /// again by every later resume of the same session.
 pub(crate) async fn reconcile_prior_session(
-    sessions_root: &crate::workdir_fs::WorkdirRoot,
+    records_group: &crate::workdir_fs::WorkdirRoot,
     from_session: &str,
     this_session_id: &str,
     context_id: &str,
@@ -58,13 +58,13 @@ pub(crate) async fn reconcile_prior_session(
         return None;
     }
     let trace_path = format!("{from_session}/{}", crate::trace::TRACE_FILE_NAME);
-    let contents = match sessions_root.read_to_string(&trace_path) {
+    let contents = match records_group.read_to_string(&trace_path) {
         Ok(Some(contents)) => contents,
         Ok(None) => {
             crate::runtime_err!(
                 "[capsule-runtime] could not read {} (it does not exist); background work \
                  session {from_session} left unaccounted is not reported",
-                sessions_root.display_path(&trace_path)
+                records_group.display_path(&trace_path)
             );
             return None;
         }
@@ -86,7 +86,7 @@ pub(crate) async fn reconcile_prior_session(
     // exist before the first marker is written.
     let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
     let mut appender = match PriorSessionTraceAppender::open(
-        sessions_root,
+        records_group,
         &trace_path,
         from_session.to_string(),
         scan.session_event_id,
@@ -98,7 +98,7 @@ pub(crate) async fn reconcile_prior_session(
             crate::runtime_err!(
                 "[capsule-runtime] could not append to {} ({error}); the {} background command(s) \
                  session {from_session} left unaccounted are not reported",
-                sessions_root.display_path(&trace_path),
+                records_group.display_path(&trace_path),
                 scan.unaccounted.len()
             );
             return None;

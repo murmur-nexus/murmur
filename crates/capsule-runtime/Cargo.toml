@@ -37,7 +37,7 @@ murmur-artifact.workspace = true
 # Ed25519 for formation tokens: the launcher signs, every member's door verifies.
 ring = { version = "0.17", default-features = false }
 # Safe `openat`/`mkdirat`/`renameat`/`unlinkat`/`fstatat` for `workdir_fs`'s no-follow walk.
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -66,7 +66,7 @@ libseccomp = "0.4"
 # session bus (see `cgroup::move_self_into_own_systemd_scope`). `blocking-api` is the sync
 # wrapper the cgroup module calls on its own thread; `async-io`, not `tokio`, so the call never
 # depends on running inside a tokio runtime.
-zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+zbus = { version = "6", default-features = false, features = ["default-rt"] }
 
 [features]
 # Exposes `alloc_bench`, the timing harness `mur-alloc-bench` runs to compare global

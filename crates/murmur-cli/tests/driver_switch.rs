@@ -243,9 +243,9 @@ fn run_task(home: &Home, project: &Project) -> Ran {
     )
 }
 
-fn trace_events(workdir: &Path) -> Vec<Value> {
-    fs::read_to_string(workdir.join("trace.jsonl"))
-        .unwrap_or_else(|err| panic!("no trace in {}: {err}", workdir.display()))
+fn trace_events(records_dir: &Path) -> Vec<Value> {
+    fs::read_to_string(records_dir.join("trace.jsonl"))
+        .unwrap_or_else(|err| panic!("no trace in {}: {err}", records_dir.display()))
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
@@ -266,11 +266,11 @@ fn turns(events: &[Value]) -> Vec<&Value> {
         .collect()
 }
 
-fn trace_show(home: &Home, workdir: &Path) -> Ran {
+fn trace_show(home: &Home, records_dir: &Path) -> Ran {
     Ran::of(
         mur(home.path())
             .args(["trace", "show"])
-            .arg(workdir.join("trace.jsonl"))
+            .arg(records_dir.join("trace.jsonl"))
             .output()
             .unwrap(),
     )
@@ -473,8 +473,12 @@ impl Idle {
         PathBuf::from(self.startup["workdir"].as_str().unwrap())
     }
 
+    fn records_dir(&self) -> PathBuf {
+        PathBuf::from(self.startup["records_dir"].as_str().unwrap())
+    }
+
     fn events(&self) -> Vec<Value> {
-        trace_events(&self.workdir())
+        trace_events(&self.records_dir())
     }
 
     /// Everything the capsule has printed to stderr by now, waiting up to five seconds for
@@ -527,7 +531,7 @@ impl Idle {
             response["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
             "{response}"
         );
-        wait_for_task_ends(&self.workdir(), n);
+        wait_for_task_ends(&self.records_dir(), n);
     }
 }
 
@@ -653,7 +657,7 @@ fn s1_a_controller_switches_primary_gpt_primary_across_threaded_tasks() {
     );
 
     capsule.stop();
-    let show = trace_show(&home, &capsule.workdir());
+    let show = trace_show(&home, &capsule.records_dir());
     assert!(show.ok, "{}", show.context());
     assert!(
         show.stdout.contains(
@@ -929,7 +933,7 @@ fn s4_without_the_agent_grant_switch_driver_does_not_exist() {
 
     let workdir = common::parse_workdir_from_stdout(&run.stdout);
     assert!(!workdir.join("tools").join("switch-driver").exists());
-    let events = trace_events(&workdir);
+    let events = trace_events(&common::parse_records_from_stdout(&run.stdout));
     let declared = &of_type(&events, "session_start")[0]["tools_declared"];
     assert!(!declared
         .as_array()
@@ -992,8 +996,8 @@ fn s5_the_agent_switches_itself_with_the_grant() {
     assert!(b_text.contains("switched from primary to gpt"), "{b_text}");
     assert!(!b_text.contains("produced_by"), "{b_text}");
 
-    let workdir = common::parse_workdir_from_stdout(&run.stdout);
-    let events = trace_events(&workdir);
+    let records_dir = common::parse_records_from_stdout(&run.stdout);
+    let events = trace_events(&records_dir);
     let changes = of_type(&events, "control_change");
     assert_eq!(changes.len(), 1, "{changes:?}");
     assert_eq!(changes[0]["principal"], "agent");
@@ -1010,7 +1014,7 @@ fn s5_the_agent_switches_itself_with_the_grant() {
         .collect();
     assert_eq!(served, vec!["primary", "gpt"]);
 
-    let show = trace_show(&home, &workdir);
+    let show = trace_show(&home, &records_dir);
     assert!(
         show.stdout.contains(
             "setting inference.driver  primary \u{2192} gpt  applied from turn 1  by agent"
@@ -1052,7 +1056,7 @@ fn s5_an_undeclared_name_from_the_agent_is_a_tool_error() {
     assert!(second.contains("toolu_nope"), "{second}");
     assert!(b.requests().is_empty());
 
-    let events = trace_events(&common::parse_workdir_from_stdout(&run.stdout));
+    let events = trace_events(&common::parse_records_from_stdout(&run.stdout));
     assert!(of_type(&events, "control_change").is_empty());
     let refusals = of_type(&events, "control_refused");
     assert_eq!(refusals.len(), 1);
@@ -1350,8 +1354,8 @@ fn s9_a_capsule_without_alternates_writes_nothing_new() {
     let run = run_task(&home, &project);
     assert!(run.stdout.contains("status:  ok"), "{}", run.context());
 
-    let workdir = common::parse_workdir_from_stdout(&run.stdout);
-    let trace = fs::read_to_string(workdir.join("trace.jsonl")).unwrap();
+    let records_dir = common::parse_records_from_stdout(&run.stdout);
+    let trace = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap();
     for absent in [
         "driver_choice",
         "inference_choices",
@@ -1372,7 +1376,7 @@ fn s9_a_capsule_without_alternates_writes_nothing_new() {
     for request in a.requests() {
         assert!(!request.body_text().contains("produced_by"));
     }
-    assert!(turns(&trace_events(&workdir))
+    assert!(turns(&trace_events(&records_dir))
         .iter()
         .all(|turn| turn.get("model").is_none()));
 }

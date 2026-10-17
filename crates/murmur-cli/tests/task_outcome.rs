@@ -160,8 +160,8 @@ impl Run {
         )
     }
 
-    fn workdir(&self) -> PathBuf {
-        common::parse_workdir_from_stdout(&self.stdout)
+    fn records_dir(&self) -> PathBuf {
+        common::parse_records_from_stdout(&self.stdout)
     }
 
     /// Every `status:` line `mur run` printed.
@@ -181,7 +181,7 @@ impl Run {
     }
 
     fn trace(&self) -> Vec<Value> {
-        read_trace(&self.workdir().join("trace.jsonl"))
+        read_trace(&self.records_dir().join("trace.jsonl"))
     }
 }
 
@@ -510,6 +510,7 @@ fn stage(
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: project,
             capsule_name: runtime_manifest.name.clone(),
@@ -569,7 +570,7 @@ struct Capsule {
 
 impl Capsule {
     fn launch(staged: capsule_runtime::StagedSession) -> Self {
-        let trace_path = staged.workdir.join("trace.jsonl");
+        let trace_path = staged.records_dir.join("trace.jsonl");
         let (url_tx, url_rx) = mpsc::channel::<String>();
         let (result_tx, launched) = mpsc::channel();
         std::thread::spawn(move || {
@@ -848,7 +849,7 @@ fn trace_show_and_steps_render_task_failed() {
     let server = common::ScriptedServer::start(vec![TRUNCATED_BODY.to_string()]);
     let project = project(&queue_manifest("outcome-render", &server.endpoint, ""));
     let run = run_queue_exit(&home, &project);
-    let trace_path = run.workdir().join("trace.jsonl");
+    let trace_path = run.records_dir().join("trace.jsonl");
     let trace = run.trace();
     let reason = TaskRecords::of_task_md(&trace).sole_failure("driver_error")["reason"]
         .as_str()

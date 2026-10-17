@@ -287,6 +287,7 @@ pub(crate) fn run_shell(
         env_overrides,
         session_workdir,
         enforcement.runtime_dir_path(),
+        enforcement.records_dir_path(),
     )?;
 
     // Resolve before spawning: this is the identity of the binary this call is about to
@@ -732,6 +733,7 @@ pub(crate) fn build_shell_env(
     env_overrides: &[(String, String)],
     session_workdir: &WorkdirRoot,
     runtime_dir: Option<&std::path::Path>,
+    records_dir: Option<&std::path::Path>,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut env = BTreeMap::new();
 
@@ -774,6 +776,14 @@ pub(crate) fn build_shell_env(
         env.insert(
             crate::runtime_dir::RUNTIME_DIR_ENV.to_string(),
             runtime_dir.to_string_lossy().into_owned(),
+        );
+    }
+    // And the session's records directory, on the same terms.
+    env.remove(crate::records_dir::RECORDS_DIR_ENV);
+    if let Some(records_dir) = records_dir {
+        env.insert(
+            crate::records_dir::RECORDS_DIR_ENV.to_string(),
+            records_dir.to_string_lossy().into_owned(),
         );
     }
 
@@ -864,6 +874,7 @@ pub(crate) fn build_declared_env(policy: &CapabilityPolicy) -> BTreeMap<String, 
             || crate::formation::is_member_grant_env(key)
             || key == crate::lifeline::SPAWNER_LIFELINE_ENV
             || key == crate::runtime_dir::RUNTIME_DIR_ENV
+            || key == crate::records_dir::RECORDS_DIR_ENV
         {
             continue;
         }
@@ -1249,6 +1260,7 @@ mod tests {
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             None,
+            None,
         )
         .unwrap();
 
@@ -1279,6 +1291,7 @@ mod tests {
             &policy,
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
             None,
         )
         .unwrap_err();
@@ -1357,6 +1370,7 @@ mod tests {
             &overrides,
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             None,
+            None,
         )
         .unwrap();
 
@@ -1398,6 +1412,7 @@ mod tests {
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             None,
+            None,
         )
         .unwrap();
         std::env::remove_var(FORMATION_LIFELINE_ENV);
@@ -1427,6 +1442,7 @@ mod tests {
             &policy,
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
             None,
         )
         .unwrap();
@@ -1517,6 +1533,7 @@ mod tests {
             &overrides,
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             None,
+            None,
         )
         .unwrap();
 
@@ -1538,6 +1555,7 @@ mod tests {
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             None,
+            None,
         )
         .unwrap();
         std::env::remove_var("CARGO_HOME");
@@ -1558,6 +1576,7 @@ mod tests {
             &policy,
             &overrides,
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
             None,
         )
         .unwrap();
@@ -1809,6 +1828,7 @@ mod tests {
             &overrides,
             &root,
             Some(std::path::Path::new("/runtime/dir")),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1817,8 +1837,45 @@ mod tests {
             Some("/runtime/dir")
         );
 
-        let without = build_shell_env(&policy, &overrides, &root, None).unwrap();
+        let without = build_shell_env(&policy, &overrides, &root, None, None).unwrap();
         assert!(!without.contains_key(crate::runtime_dir::RUNTIME_DIR_ENV));
         assert!(!build_declared_env(&policy).contains_key(crate::runtime_dir::RUNTIME_DIR_ENV));
+    }
+
+    /// `MURMUR_RECORDS_DIR` is runtime-owned on `MURMUR_RUNTIME_DIR`'s terms: an override, a
+    /// baseline entry, `env.allow` and a host value all lose to the session's own records
+    /// directory, and with none there is no such variable.
+    #[test]
+    fn build_shell_env_sets_the_records_dir_last_whatever_else_says() {
+        let workdir = tempfile::tempdir().unwrap();
+        let root = WorkdirRoot::open(workdir.path()).unwrap();
+        std::env::set_var(crate::records_dir::RECORDS_DIR_ENV, "/host/records");
+        let policy = CapabilityPolicy {
+            shell_baseline_env: vec![crate::records_dir::RECORDS_DIR_ENV.to_string()],
+            env_allow: vec![crate::records_dir::RECORDS_DIR_ENV.to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let overrides = [(
+            crate::records_dir::RECORDS_DIR_ENV.to_string(),
+            "/override".to_string(),
+        )];
+
+        let env = build_shell_env(
+            &policy,
+            &overrides,
+            &root,
+            None,
+            Some(std::path::Path::new("/records/dir")),
+        )
+        .unwrap();
+        assert_eq!(
+            env.get(crate::records_dir::RECORDS_DIR_ENV)
+                .map(String::as_str),
+            Some("/records/dir")
+        );
+
+        let without = build_shell_env(&policy, &overrides, &root, None, None).unwrap();
+        assert!(!without.contains_key(crate::records_dir::RECORDS_DIR_ENV));
+        assert!(!build_declared_env(&policy).contains_key(crate::records_dir::RECORDS_DIR_ENV));
     }
 }

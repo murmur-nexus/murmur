@@ -330,6 +330,7 @@ fn write_record(home: &Path, session_id: &str, url: &str, pid: u32, process_star
             "capsule_name": "fabricated",
             "capsule_version": "0.1.0",
             "workdir": "/tmp/fabricated",
+            "records_dir": "/tmp/fabricated-records",
             "outlives_launcher": true,
             "started_at": "2026-01-01T00:00:00Z",
         }))
@@ -552,6 +553,7 @@ fn the_record_names_the_process_and_holds_nothing_from_the_environment() {
             "outlives_launcher",
             "pid",
             "process_start",
+            "records_dir",
             "session_id",
             "started_at",
             "url",
@@ -769,23 +771,6 @@ fn a_terminal_backed_launch_and_a_detached_one_are_both_recorded() {
 
 // ── 9. An unwritable home warns and the run proceeds ──────────────────────────
 
-/// A directory held at `0500` for as long as this value lives, restored afterwards so the scratch
-/// home can be removed.
-struct ClosedDir(PathBuf);
-
-impl ClosedDir {
-    fn at(path: PathBuf) -> Self {
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for ClosedDir {
-    fn drop(&mut self) {
-        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
-    }
-}
-
 /// Root is excluded: a `0500` directory is still writable to it, so there would be nothing to warn
 /// about.
 fn running_as_root() -> bool {
@@ -800,25 +785,30 @@ fn running_as_root() -> bool {
 
 #[test]
 fn a_home_that_cannot_be_written_warns_and_the_capsule_still_serves() {
-    if running_as_root() {
-        eprintln!("[SKIP-HOST] running_address: a 0500 directory is writable to this user");
-        return;
-    }
     let server = common::ScriptedServer::start(vec![end_turn_response("msg_1", "unused")]);
     let home = driver_home();
     let project = agent_project(&server.endpoint, "address-readonly-home", &[]);
 
-    // Held closed until the warning has been seen: restoring the mode the moment the door opened
-    // would race the record write this case is about.
-    let closed = ClosedDir::at(home.path().join(".murmur"));
+    // A regular file where `running/` belongs: the record cannot be written beneath it, by root
+    // or anyone. A `~/.murmur` that cannot be written as a whole refuses the launch with E-IO-004
+    // before anything runs, and a `0500` `running/` is re-moded back to `0700` by its owner.
+    fs::create_dir_all(home.path().join(".murmur")).unwrap();
+    fs::write(home.path().join(".murmur/running"), b"").unwrap();
     let Some(capsule) = start_capsule(&home, project, Attachment::Inherited) else {
         return;
     };
-    let stderr = wait_until(Duration::from_secs(60), "the W-SEC-023 warning", || {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let stderr = loop {
         let stderr = capsule.stderr();
-        stderr.contains("W-SEC-023").then_some(stderr)
-    });
-    drop(closed);
+        if stderr.contains("W-SEC-023") {
+            break stderr;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the W-SEC-023 warning: {stderr}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
 
     // The door is open and answering, which is the whole of "the run proceeds".
     let card = http_get(&capsule.url(), "/.well-known/agent-card.json");
@@ -834,11 +824,11 @@ fn a_home_that_cannot_be_written_warns_and_the_capsule_still_serves() {
     assert!(records(home.path()).is_empty());
 }
 
-/// With no home to resolve at all, `mur run` refuses before a session exists, so there is no door
-/// to record and nothing to warn about. The artifact store lives under the same home the record
-/// does, and a run cannot reach a capsule without it.
+/// A launch, a scope report and a reader with `HOME` unset, relative, or naming a home whose
+/// `~/.murmur` cannot be written are each refused with `E-IO-004`, naming `HOME`, its cause and
+/// what to set — and write nothing, the temp directory included.
 #[test]
-fn a_run_with_no_home_at_all_refuses_before_a_session_exists() {
+fn a_run_with_no_home_at_all_is_refused_with_e_io_004() {
     let project = tempfile::tempdir().unwrap();
     fs::write(
         project.path().join("murmur.yaml"),
@@ -851,21 +841,92 @@ fn a_run_with_no_home_at_all_refuses_before_a_session_exists() {
         project.path().join("capsule.wasm"),
     )
     .unwrap();
+    let manifest = project.path().join("murmur.yaml");
+    let closed = tempfile::tempdir().unwrap();
+    fs::create_dir(closed.path().join(".murmur")).unwrap();
+    fs::set_permissions(
+        closed.path().join(".murmur"),
+        fs::Permissions::from_mode(0o500),
+    )
+    .unwrap();
+    let closed_counts = fs::write(closed.path().join(".murmur/probe"), b"x").is_err();
 
-    let mut command = Command::cargo_bin("mur").unwrap();
-    let failure = command
+    let refused = |home: Option<&Path>, args: &[&str], cause: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut command = Command::cargo_bin("mur").unwrap();
+        match home {
+            Some(home) => command.env("HOME", home),
+            None => command.env_remove("HOME"),
+        };
+        let failure = command
+            .env("TMPDIR", tmp.path())
+            .current_dir(project.path())
+            .args(args)
+            .assert()
+            .failure();
+        let stderr = String::from_utf8_lossy(&failure.get_output().stderr).to_string();
+        println!("{args:?} under {home:?}: {stderr}");
+        assert!(stderr.contains("error[E-IO-004]"), "{stderr}");
+        assert!(stderr.contains(cause), "{stderr}");
+        assert!(
+            stderr.contains(
+                "hint: set HOME to the absolute path of a directory you own, in which ~/.murmur \
+                 exists or can be created as a 0700 directory"
+            ),
+            "{stderr}"
+        );
+        let left: Vec<_> = fs::read_dir(tmp.path()).unwrap().collect();
+        assert!(left.is_empty(), "nothing is written under TMPDIR: {left:?}");
+    };
+    let run = [
+        "run",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--task",
+        "do nothing",
+    ];
+    let explain = [
+        "run",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--explain-scope",
+    ];
+    refused(None, &run, "HOME is not set");
+    refused(None, &explain, "HOME is not set");
+    refused(None, &["trace", "show"], "HOME is not set");
+    refused(
+        Some(Path::new("relative")),
+        &run,
+        "HOME is 'relative', which is not an absolute path",
+    );
+    if closed_counts {
+        refused(
+            Some(closed.path()),
+            &run,
+            "cannot hold this session's runtime and records directories",
+        );
+    }
+    fs::set_permissions(
+        closed.path().join(".murmur"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert!(!project.path().join("workdir").exists());
+
+    // `mur doctor` reports the reason in place of both directories and counts it as a failure.
+    let doctor = Command::cargo_bin("mur")
+        .unwrap()
         .env_remove("HOME")
         .current_dir(project.path())
-        .args(["run", "--manifest"])
-        .arg(project.path().join("murmur.yaml"))
-        .args(["--task", "do nothing"])
-        .assert()
-        .failure();
-    let stderr = String::from_utf8_lossy(&failure.get_output().stderr).to_string();
+        .arg("doctor")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&doctor.stdout);
     assert!(
-        stderr.contains("home directory"),
-        "the refusal must name the home directory it could not resolve: {stderr}"
+        stdout.contains("Records directory\n  path:      unavailable — HOME is not set"),
+        "{stdout}"
     );
+    assert!(!doctor.status.success(), "{stdout}");
 }
 
 // ── 10. A script capsule writes no record ─────────────────────────────────────
@@ -927,7 +988,7 @@ fn recorded_session_addressing_is_untouched() {
     let workdir = tempfile::tempdir().unwrap();
     for (index, suffix) in ["aa11", "bb22"].iter().enumerate() {
         let session_id = format!("ses_0199c4e2f1b7712a9d3e4f50617283{suffix}");
-        let dir = workdir.path().join(&session_id);
+        let dir = common::session_records_dir(home.path(), workdir.path(), &session_id);
         fs::create_dir_all(&dir).unwrap();
         let start = 1000 + index as u64 * 1000;
         fs::write(
@@ -1106,6 +1167,7 @@ fn stage_in_process(
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -1189,7 +1251,7 @@ fn a_session_that_ends_leaves_no_record_whether_it_succeeded_or_failed() {
         "a session that exited left its record behind"
     );
 
-    // A launch that fails between binding its door and starting its loop. The session directory
+    // A launch that fails between binding its door and starting its loop. The records directory
     // is closed to writing after staging, so `trace.jsonl` cannot be opened and `launch_session`
     // returns through a `?` rather than through either of its success returns.
     if running_as_root() {
@@ -1209,10 +1271,10 @@ fn a_session_that_ends_leaves_no_record_whether_it_succeeded_or_failed() {
         },
     );
     let failing_session_id = staged.session_id.clone();
-    let session_workdir = staged.workdir.clone();
-    fs::set_permissions(&session_workdir, fs::Permissions::from_mode(0o500)).unwrap();
+    let records_dir = staged.records_dir.clone();
+    fs::set_permissions(&records_dir, fs::Permissions::from_mode(0o500)).unwrap();
     let result = launch_session(staged, |_| {});
-    fs::set_permissions(&session_workdir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&records_dir, fs::Permissions::from_mode(0o700)).unwrap();
 
     let failure = result.expect_err("the launch was expected to fail after binding its door");
     assert!(
@@ -1293,7 +1355,7 @@ fn door_auth_session_address_resolves_an_authenticated_capsule() {
         record["credentials"]["reader"],
         run.token("reader").as_str()
     );
-    assert_eq!(record.as_object().unwrap().len(), 11, "{record}");
+    assert_eq!(record.as_object().unwrap().len(), 12, "{record}");
 
     let canceled = mur(home.path(), &[])
         .args(["cancel", suffix, &task_id])

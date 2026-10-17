@@ -582,7 +582,8 @@ parent that wants it reads the file deliberately through an ordinary tool call.
 | `duration_ms` | How long the child ran |
 | `detail` | The exit status and the child's last stderr lines, on a `crashed` or `terminated` outcome |
 
-The same fields are written to `completion.json` in the child's own directory, with three more that
+The same fields are written to `completion.json` in the child's own
+[records directory](workdir.md#records-directory), with three more that
 describe the delivery rather than the outcome.
 
 | Field of `completion.json` only | Meaning |

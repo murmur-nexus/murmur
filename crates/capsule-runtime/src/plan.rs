@@ -384,6 +384,7 @@ fn execute_inner(
     };
     let workdir_guard = Some(crate::resources::WorkdirGuard::spawn(
         &ctx.accessible_workdir,
+        ctx.runtime_dir.records.as_ref(),
         ctx.capability_policy.resources.workdir_max_bytes,
     ));
 
@@ -1278,6 +1279,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
                     &notice.version,
                     &notice.child_session_id,
                     &notice.child_workdir,
+                    &notice.child_records_dir,
                 );
             }
             if let Some(plan_task) = plan_task {

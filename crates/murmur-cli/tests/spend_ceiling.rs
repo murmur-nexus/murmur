@@ -160,7 +160,7 @@ impl Run {
     }
 
     fn trace(&self) -> Vec<Value> {
-        read_trace(&self.workdir().join("trace.jsonl"))
+        read_trace(&common::parse_records_from_stdout(&self.stdout).join("trace.jsonl"))
     }
 
     fn warning_lines(&self, code: &str) -> Vec<&str> {
@@ -469,6 +469,7 @@ fn stage_queue_capsule(home: &TempDir, manifest_path: &Path) -> capsule_runtime:
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -515,7 +516,7 @@ fn stage_queue_capsule(home: &TempDir, manifest_path: &Path) -> capsule_runtime:
 
 /// Launch on a background thread; returns the door address and the trace path.
 fn launch(staged: capsule_runtime::StagedSession) -> (String, PathBuf) {
-    let trace_path = staged.workdir.join("trace.jsonl");
+    let trace_path = staged.records_dir.join("trace.jsonl");
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         let _ = launch_session(staged, move |url| {

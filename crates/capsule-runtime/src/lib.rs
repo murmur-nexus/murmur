@@ -71,6 +71,7 @@ pub mod process_driver;
 pub(crate) mod protected_paths;
 pub(crate) mod reachability;
 pub(crate) mod recipes;
+pub mod records_dir;
 pub mod registration;
 pub(crate) mod required_fields;
 pub mod resource_plane;
@@ -114,13 +115,20 @@ pub use containment::{
     applied_mechanism, check_containment_floor, containment_shortfall_reason,
     detect_achieved_containment, detect_sealed_blocker, detect_userns_grant, doctor_runtime_dir,
     explain_scope, install_from_places, read_only_advisory_for, render_install, render_read_only,
-    render_runtime_dir, ExportsFilesReport, FilesystemBoundaryReport, FilesystemRestriction,
-    PreopenReport, PreopenSurface, RuntimeDirReport, ScopeReport, StateStoreReport,
+    render_records_dir, render_runtime_dir, resolve_runtime_dir_reach, resolve_runtime_dir_reaches,
+    DoctorDirReports, ExportsFilesReport, FilesystemBoundaryReport, FilesystemRestriction,
+    PreopenReport, PreopenSurface, RuntimeDirReach, RuntimeDirReport, ScopeReport, ShortfallCause,
+    StateStoreReport,
 };
 pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
+pub use murmur_home::{usable_murmur_home, HomeUnusable, HOME_UNUSABLE_HINT};
 pub use network_namespace::{
     check_egress_namespace, detect_egress_namespace_blocker, skip_without_egress_namespace,
     EgressNamespaceBlocker,
+};
+pub use records_dir::{
+    records_dir_root, records_group, records_group_under, RecordsDir, HOOKS_SUBDIR,
+    RECORDS_DIR_ENV, RECORDS_DIR_NAME,
 };
 pub use runtime_dir::{
     runtime_dir_inside_warning, runtime_dir_placement, RuntimeDirPlacement, RUNTIME_DIR_ENV,

@@ -60,6 +60,7 @@ fn stage(home: &TempDir, manifest: &Path) -> StagedSession {
             capabilities: artifact.capabilities.clone(),
         })
         .collect();
+    common::process_home();
     stage_session(
         std::sync::Arc::new(LocalRegistry::new(
             home.path().join(".murmur").join("artifacts"),
@@ -67,6 +68,7 @@ fn stage(home: &TempDir, manifest: &Path) -> StagedSession {
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -109,12 +111,12 @@ fn stage(home: &TempDir, manifest: &Path) -> StagedSession {
     .unwrap()
 }
 
-/// A launched queue+sleep capsule: its door, its session, its workdir, its tokens, and the
-/// scripted provider and store it runs against.
+/// A launched queue+sleep capsule: its door, its session, its records directory, its tokens,
+/// and the scripted provider and store it runs against.
 struct Capsule {
     addr: String,
     session_id: String,
-    workdir: PathBuf,
+    records_dir: PathBuf,
     operator: Option<String>,
     _server: common::ScriptedServer,
     _home: TempDir,
@@ -137,7 +139,7 @@ impl Capsule {
         );
         let staged = stage(&home, &project.path().join("murmur.yaml"));
         let session_id = staged.session_id.clone();
-        let workdir = staged.workdir.clone();
+        let records_dir = staged.records_dir.clone();
         let operator = staged
             .door_tokens()
             .into_iter()
@@ -157,7 +159,7 @@ impl Capsule {
         Capsule {
             addr,
             session_id,
-            workdir,
+            records_dir,
             operator,
             _server: server,
             _home: home,
@@ -166,7 +168,7 @@ impl Capsule {
     }
 
     fn events(&self, event_type: &str) -> Vec<Value> {
-        fs::read_to_string(self.workdir.join("trace.jsonl"))
+        fs::read_to_string(self.records_dir.join("trace.jsonl"))
             .unwrap_or_default()
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -188,7 +190,7 @@ impl Capsule {
             assert!(
                 Instant::now() < deadline,
                 "no task_start for {task_id}; trace:\n{}",
-                fs::read_to_string(self.workdir.join("trace.jsonl")).unwrap_or_default()
+                fs::read_to_string(self.records_dir.join("trace.jsonl")).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -205,7 +207,7 @@ impl Capsule {
             assert!(
                 Instant::now() < deadline,
                 "no task_end for {task_id}; trace:\n{}",
-                fs::read_to_string(self.workdir.join("trace.jsonl")).unwrap_or_default()
+                fs::read_to_string(self.records_dir.join("trace.jsonl")).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -340,7 +342,7 @@ fn a_capsule_that_does_not_consent_refuses_a_peer_task() {
         std::thread::sleep(Duration::from_millis(300));
         assert!(capsule.events("task_start").is_empty(), "{name}");
         assert!(capsule.events("a2a_task_received").is_empty(), "{name}");
-        let trace = fs::read_to_string(capsule.workdir.join("trace.jsonl")).unwrap_or_default();
+        let trace = fs::read_to_string(capsule.records_dir.join("trace.jsonl")).unwrap_or_default();
         assert!(!trace.contains("peer_not_accepted"), "{name}: {trace}");
     }
 }

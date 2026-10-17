@@ -35,7 +35,8 @@ pub(crate) enum EvalCommand {
         /// Session ID (full or last 4+ chars as suffix), or omit for the most recent session.
         /// A literal path is also accepted for backward compatibility.
         session: Option<String>,
-        /// Directory containing session subdirectories (default: ./workdir)
+        /// The directory a run was given as --workdir, or <manifest-dir>/workdir, whose sessions'
+        /// records are read from ~/.murmur/records (default: ./workdir)
         #[arg(long)]
         workdir: Option<PathBuf>,
         /// Output as JSON instead of human-readable text
@@ -53,7 +54,8 @@ pub(crate) enum EvalCommand {
         a: Option<String>,
         /// Session B: full ID, suffix (4+ chars), @N ordinal, or literal path.
         b: Option<String>,
-        /// Directory containing session subdirectories (default: ./workdir)
+        /// The directory a run was given as --workdir, or <manifest-dir>/workdir, whose sessions'
+        /// records are read from ~/.murmur/records (default: ./workdir)
         #[arg(long)]
         workdir: Option<PathBuf>,
     },
@@ -137,14 +139,28 @@ impl EvalMetrics {
     }
 }
 
+/// The records directory an `eval.jsonl` path names, for a message.
+fn staged_records_display(eval_path: &Path) -> String {
+    eval_path
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(eval_path)
+        .display()
+        .to_string()
+}
+
 // ── Session resolution ────────────────────────────────────────────────────────
 
-/// `eval.jsonl` addressing: the vocabulary every session-naming command shares, under this
+/// Where a session's scoring hook's `eval.jsonl` is, beneath its records directory: the `hooks/`
+/// a hook declared `capabilities.filesystem.records: true` is preopened at.
+const EVAL_RECORD_FILE: &str = "hooks/eval.jsonl";
+
+/// `hooks/eval.jsonl` addressing: the vocabulary every session-naming command shares, under this
 /// command's own diagnostic code. Neither `mur eval show` nor either side of `mur eval diff`
 /// labels its failures — the command line already shows which address was written.
 fn eval_query() -> SessionQuery<'static> {
     SessionQuery {
-        record_file: "eval.jsonl",
+        record_file: EVAL_RECORD_FILE,
         code: E_EVAL_002,
         label: None,
     }
@@ -692,6 +708,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             formation_member: None,
             source_supply: source_supply.clone(),
             expected_workdir_identity: None,
+            manifest_file: Some(manifest_path.clone()),
         };
 
         let staged = match stage_session(Arc::clone(&local_registry), stage_request) {
@@ -755,6 +772,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
         }
 
         let case_workdir = staged.workdir.clone();
+        let case_eval = staged.records_dir.join(EVAL_RECORD_FILE);
         let case_session_id = staged.session_id.clone();
 
         match launch_session(staged, |_| {}) {
@@ -767,8 +785,9 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             }
         }
 
-        // Read eval.jsonl from this session's workdir
-        let eval_path = case_workdir.join("eval.jsonl");
+        // The scoring hook's `eval.jsonl`, from this session's records directory, never from the
+        // case's workdir, which its commands write.
+        let eval_path = case_eval;
         let run_record = if eval_path.exists() {
             match parse_eval_file(&eval_path) {
                 Ok(metrics) => metrics.dataset_run,
@@ -780,6 +799,11 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
                 }
             }
         } else {
+            capsule_runtime::report_eprintln!(
+                "    warning: no {EVAL_RECORD_FILE} in {} — the scoring hook writes it there only \
+                 when its entry declares capabilities.filesystem.records: true",
+                staged_records_display(&eval_path)
+            );
             None
         };
 

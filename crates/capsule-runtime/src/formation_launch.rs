@@ -891,8 +891,8 @@ fn formations_dir() -> Result<PathBuf, String> {
     Ok(crate::state_store::murmur_home_dir()?.join(FORMATIONS_DIR))
 }
 
-/// Every session root a formation's peers record under: `<dir>/.murmur` for each directory under
-/// `<murmur home>/formations/<frm_id>/`, sorted.
+/// Every records group a formation's peers record under: the records group of each directory
+/// under `<murmur home>/formations/<frm_id>/`, sorted, for each one that exists.
 ///
 /// Reads the directory and creates nothing. A formation with no directory, or a `HOME` that does
 /// not resolve, has no roots. A formation directory that exists and cannot be listed is returned
@@ -904,7 +904,8 @@ pub fn formation_member_roots(formation_id: &FormationId) -> Vec<PathBuf> {
     }
 }
 
-/// [`formation_member_roots`] under `formations_dir` in place of `<murmur home>/formations`.
+/// [`formation_member_roots`] under `formations_dir` in place of `<murmur home>/formations`. Each
+/// member's records group is still resolved under this host's `~/.murmur/records`.
 pub fn formation_member_roots_in(
     formations_dir: &Path,
     formation_id: &FormationId,
@@ -918,7 +919,7 @@ pub fn formation_member_roots_in(
     let mut roots: Vec<PathBuf> = entries
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .map(|entry| entry.path().join(".murmur"))
+        .filter_map(|entry| crate::records_dir::records_group(&entry.path()).ok())
         .filter(|root| root.exists())
         .collect();
     roots.sort();
@@ -2572,31 +2573,45 @@ mod tests {
     }
 
     /// A member's directory is `formations/<frm_id>/<member>`, and the roots `mur trace show
-    /// frm_<id>` searches are one `.murmur` per member directory that has one, sorted, and none for
-    /// a formation with no directory.
+    /// frm_<id>` searches are the records group of each member directory that has one, sorted,
+    /// and none for a formation with no directory.
     #[test]
-    fn member_roots_are_the_member_directories_that_hold_sessions() {
+    fn member_roots_are_the_records_groups_of_member_directories() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(
+            "formation_launch::tests::member_roots_inner",
+            home.path(),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by member_roots_are_the_records_groups_of_member_directories"]
+    fn member_roots_inner() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
         assert!(formation_member_roots(&FormationId::mint()).is_empty());
 
         let id = FormationId::mint();
-        let home = tempfile::tempdir().unwrap();
-        let formations = home.path().join(FORMATIONS_DIR);
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let formations = home.join(".murmur").join(FORMATIONS_DIR);
         for member in ["worker", "reviewer", "idle"] {
             assert_eq!(
                 make_member_workdir(&formations, &id, member).unwrap(),
                 formations.join(id.as_str()).join(member)
             );
         }
+        let group = |member: &str| {
+            crate::records_dir::records_group(&formations.join(id.as_str()).join(member)).unwrap()
+        };
         for member in ["worker", "reviewer"] {
-            std::fs::create_dir(formations.join(id.as_str()).join(member).join(".murmur")).unwrap();
+            std::fs::create_dir_all(group(member)).unwrap();
         }
         assert_eq!(
             formation_member_roots_in(&formations, &id),
-            [
-                formations.join(id.as_str()).join("reviewer/.murmur"),
-                formations.join(id.as_str()).join("worker/.murmur"),
-            ]
+            [group("reviewer"), group("worker")]
         );
+        assert!(group("worker").starts_with(home.join(".murmur/records")));
     }
 
     /// The marker is three keys, written and read back unchanged.
@@ -2715,6 +2730,7 @@ mod tests {
             capsule_name: "worker".to_string(),
             capsule_version: "0.1.0".to_string(),
             workdir: PathBuf::from("/tmp/worker"),
+            records_dir: PathBuf::from("/tmp/worker").join("records"),
             outlives_launcher: false,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,

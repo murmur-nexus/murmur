@@ -65,9 +65,9 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Every field but `door_token`, `credentials`, `formation_id`, `formation_lifeline`,
 /// `formation_launcher` and `spawned_by` is required, and each of those six is omitted when it does
-/// not apply, so a standalone session's record carries the nine required keys alone. There is no version field: a
-/// record that does not deserialize names no process that could be checked, and is pruned, which
-/// is what "the record is a hint" already means.
+/// not apply, so a standalone session's record carries the ten required keys alone. There is no
+/// version field: a record that does not deserialize names no process that could be checked, and
+/// is pruned, which is what "the record is a hint" already means.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningRecord {
     /// The session this door answers for, compared against the agent card by layer 3.
@@ -80,8 +80,13 @@ pub struct RunningRecord {
     pub process_start: String,
     pub capsule_name: String,
     pub capsule_version: String,
-    /// The session directory, so a reader can find the trace of what it is watching.
+    /// The session directory. Kept for the readers that name it; the trace is in
+    /// [`Self::records_dir`].
     pub workdir: PathBuf,
+    /// The session's records directory, `~/.murmur/records/<workdir root>/<session-id>`, where a
+    /// reader finds the trace of what it is watching, outside the workdir the capsule's commands
+    /// write. Required: a record without it is unreadable.
+    pub records_dir: PathBuf,
     /// Whether the capsule survives the window that launched it — `true` when the launching
     /// process had no controlling terminal.
     pub outlives_launcher: bool,
@@ -833,6 +838,7 @@ mod tests {
             capsule_name: "c".to_string(),
             capsule_version: "0.1.0".to_string(),
             workdir: PathBuf::from("/tmp"),
+            records_dir: PathBuf::from("/tmp").join("records"),
             outlives_launcher: false,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,
@@ -877,6 +883,7 @@ mod tests {
             capsule_name: "demo".to_string(),
             capsule_version: "0.1.0".to_string(),
             workdir: PathBuf::from("/tmp/demo"),
+            records_dir: PathBuf::from("/tmp/demo").join("records"),
             outlives_launcher: true,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,
@@ -891,7 +898,7 @@ mod tests {
     /// The serialized shape is the whole contract with the CLI and with an operator reading the
     /// file, so the key set is asserted rather than assumed.
     #[test]
-    fn a_record_serializes_exactly_the_nine_fields() {
+    fn a_record_serializes_exactly_the_ten_fields() {
         let value = serde_json::to_value(record(1, "42")).unwrap();
         let mut keys: Vec<&str> = value
             .as_object()
@@ -908,6 +915,7 @@ mod tests {
                 "outlives_launcher",
                 "pid",
                 "process_start",
+                "records_dir",
                 "session_id",
                 "started_at",
                 "url",
@@ -917,14 +925,14 @@ mod tests {
     }
 
     #[test]
-    fn a_record_with_a_door_token_serializes_it_beside_the_nine_fields() {
+    fn a_record_with_a_door_token_serializes_it_beside_the_ten_fields() {
         let mut with_token = record(1, "42");
         with_token.door_token = Some(crate::door_auth::DoorToken::new(
             "mdt1.payload.mac".to_string(),
         ));
         let value = serde_json::to_value(&with_token).unwrap();
         let object = value.as_object().unwrap();
-        assert_eq!(object.len(), 10);
+        assert_eq!(object.len(), 11);
         assert_eq!(object["door_token"], "mdt1.payload.mac");
         let back: RunningRecord = serde_json::from_value(value).unwrap();
         assert_eq!(back, with_token);
@@ -960,7 +968,7 @@ mod tests {
         let authenticated = with_credentials();
         let value = serde_json::to_value(&authenticated).unwrap();
         let object = value.as_object().unwrap();
-        assert_eq!(object.len(), 11);
+        assert_eq!(object.len(), 12);
         assert_eq!(
             object["credentials"],
             serde_json::json!({
@@ -1014,13 +1022,13 @@ mod tests {
     }
 
     #[test]
-    fn a_member_record_serializes_its_formation_beside_the_nine_fields() {
+    fn a_member_record_serializes_its_formation_beside_the_ten_fields() {
         let formation = crate::formation::FormationId::mint();
         let mut member = record(1, "42");
         member.formation_id = Some(formation.clone());
         let value = serde_json::to_value(&member).unwrap();
         let object = value.as_object().unwrap();
-        assert_eq!(object.len(), 10);
+        assert_eq!(object.len(), 11);
         assert_eq!(object["formation_id"], formation.as_str());
         let back: RunningRecord = serde_json::from_value(value).unwrap();
         assert_eq!(back, member);
@@ -1519,6 +1527,7 @@ mod home_tests {
             capsule_name: "demo".to_string(),
             capsule_version: "0.1.0".to_string(),
             workdir: PathBuf::from("/tmp/demo"),
+            records_dir: PathBuf::from("/tmp/demo").join("records"),
             outlives_launcher: true,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,

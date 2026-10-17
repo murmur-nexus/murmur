@@ -10,13 +10,13 @@ use tokio::net::TcpStream;
 /// Emits OpenTelemetry spans to an OTLP/HTTP endpoint (`/v1/traces`).
 ///
 /// All emit calls are fire-and-forget — failures are logged to
-/// `workdir/logs/otel.log` and never propagate errors to the caller.
+/// `<records dir>/logs/otel.log` and never propagate errors to the caller.
 ///
 /// When `endpoint` is `None` every method is a no-op.
 pub(crate) struct OtelEmitter {
     endpoint: Option<String>,
-    /// The session root `logs/otel.log` is appended to.
-    workdir: WorkdirRoot,
+    /// The session's records directory, which `logs/otel.log` is appended to.
+    records_root: WorkdirRoot,
     capsule_name: String,
     capsule_version: String,
     // ── Per-session state; reset by begin_session() ──
@@ -34,13 +34,13 @@ impl OtelEmitter {
     /// Create an emitter. `begin_session` must be called before any emit.
     pub(crate) fn new(
         endpoint: Option<String>,
-        workdir: &WorkdirRoot,
+        records_root: &WorkdirRoot,
         capsule_name: String,
         capsule_version: String,
     ) -> Self {
         Self {
             endpoint,
-            workdir: workdir.clone(),
+            records_root: records_root.clone(),
             capsule_name,
             capsule_version,
             trace_id: new_trace_id(),
@@ -356,7 +356,7 @@ impl OtelEmitter {
 
     fn log_err(&self, msg: &str) {
         if let Ok(mut f) = self
-            .workdir
+            .records_root
             .open_append("logs/otel.log", crate::workdir_fs::DEFAULT_FILE_MODE)
         {
             let ts = SystemTime::now()

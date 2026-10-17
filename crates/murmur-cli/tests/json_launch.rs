@@ -93,11 +93,13 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
     }
 
     let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
+    common::process_home();
     stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -179,6 +181,7 @@ fn build_json_line(
     name: &str,
     version: &str,
     workdir: &Path,
+    records_dir: &Path,
 ) -> String {
     serde_json::json!({
         "url": url,
@@ -187,6 +190,7 @@ fn build_json_line(
         "name": name,
         "version": version,
         "workdir": workdir.to_string_lossy(),
+        "records_dir": records_dir.to_string_lossy(),
     })
     .to_string()
 }
@@ -203,6 +207,7 @@ fn json_launch_emits_parseable_json() {
     let expected_session_id = staged.session_id.clone();
     let expected_pid = std::process::id();
     let expected_workdir = staged.workdir.clone();
+    let expected_records_dir = staged.records_dir.clone();
 
     let (json_tx, json_rx) = std::sync::mpsc::channel::<String>();
 
@@ -215,6 +220,7 @@ fn json_launch_emits_parseable_json() {
                 CAPSULE_NAME,
                 CAPSULE_VERSION,
                 &expected_workdir,
+                &expected_records_dir,
             );
             let _ = json_tx.send(line);
         })
@@ -273,6 +279,12 @@ fn json_launch_emits_parseable_json() {
         std::path::Path::new(wd).is_absolute(),
         "workdir should be an absolute path; got: '{wd}'"
     );
+
+    let records_dir = parsed["records_dir"].as_str().unwrap_or("");
+    assert!(
+        std::path::Path::new(records_dir).is_absolute(),
+        "records_dir should be an absolute path; got: {parsed}"
+    );
 }
 
 /// Test 2: The URL in the JSON line is live and serves the A2A agent card.
@@ -287,6 +299,7 @@ fn json_launch_url_is_reachable() {
     let expected_session_id = staged.session_id.clone();
     let expected_pid = std::process::id();
     let expected_workdir = staged.workdir.clone();
+    let expected_records_dir = staged.records_dir.clone();
 
     let (json_tx, json_rx) = std::sync::mpsc::channel::<String>();
 
@@ -299,6 +312,7 @@ fn json_launch_url_is_reachable() {
                 CAPSULE_NAME,
                 CAPSULE_VERSION,
                 &expected_workdir,
+                &expected_records_dir,
             );
             let _ = json_tx.send(line);
         })
@@ -345,8 +359,9 @@ fn json_launch_session_id_matches_trace() {
 
     let expected_session_id = staged.session_id.clone();
     let expected_pid = std::process::id();
-    let workdir = staged.workdir.clone();
-    let expected_workdir = workdir.clone();
+    let expected_workdir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
+    let expected_records_dir = records_dir.clone();
 
     let (json_tx, json_rx) = std::sync::mpsc::channel::<String>();
 
@@ -359,6 +374,7 @@ fn json_launch_session_id_matches_trace() {
                 CAPSULE_NAME,
                 CAPSULE_VERSION,
                 &expected_workdir,
+                &expected_records_dir,
             );
             let _ = json_tx.send(line);
         })
@@ -378,7 +394,7 @@ fn json_launch_session_id_matches_trace() {
         .expect("session_id should be a string")
         .to_string();
 
-    let trace_path = workdir.join("trace.jsonl");
+    let trace_path = records_dir.join("trace.jsonl");
     assert!(
         trace_path.exists(),
         "trace.jsonl should exist at {}",
@@ -521,6 +537,17 @@ fn json_launch_workdir_flag_is_reflected() {
     assert!(
         std::path::Path::new(wd).is_absolute(),
         "workdir should be an absolute path; got: '{wd}'"
+    );
+
+    let session_id = parsed["session_id"].as_str().unwrap();
+    assert_eq!(
+        parsed["records_dir"].as_str().map(std::path::PathBuf::from),
+        Some(common::session_records_dir(
+            home.path(),
+            user_workdir.path(),
+            session_id
+        )),
+        "records_dir in JSON should be the session's records directory under --workdir's group"
     );
 
     // .murmur/ directory should have been created inside the workdir
@@ -669,11 +696,8 @@ fn json_launch_survives_a_reader_that_never_reads() {
     let stderr = stderr.join().expect("stderr drain should not panic");
     assert_capsule_survived(status, &stderr);
 
-    let session_dir = fs::read_dir(user_workdir.path().join(".murmur"))
-        .expect("--workdir should hold a .murmur directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.join("trace.jsonl").is_file())
+    let session_dir = common::newest_session_records(home.path(), user_workdir.path())
+        .filter(|dir| dir.join("trace.jsonl").is_file())
         .expect("the session should have written a trace");
 
     let trace = fs::read_to_string(session_dir.join("trace.jsonl")).expect("should read trace");
@@ -793,11 +817,8 @@ fn json_launch_answers_its_door_after_the_supervisor_stops_reading() {
     let stderr = stderr.join().expect("stderr drain should not panic");
     assert_capsule_survived(status, &stderr);
 
-    let session_dir = fs::read_dir(user_workdir.path().join(".murmur"))
-        .expect("--workdir should hold a .murmur directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.join("trace.jsonl").is_file())
+    let session_dir = common::newest_session_records(home.path(), user_workdir.path())
+        .filter(|dir| dir.join("trace.jsonl").is_file())
         .expect("the session should have written a trace");
     let trace = fs::read_to_string(session_dir.join("trace.jsonl")).expect("should read trace");
     assert!(
@@ -811,7 +832,8 @@ fn json_launch_answers_its_door_after_the_supervisor_stops_reading() {
 
 /// The human-readable launch, with no `--json`: a supervisor reads up to the `murmur: url` line
 /// and closes the pipe. The session serves a task at its door, ends on its own terms, and the
-/// `status:` line its reader can no longer take lands in the session's `logs/bootstrap.log`.
+/// `status:` line its reader can no longer take lands in `logs/bootstrap.log` in the session's
+/// records directory.
 #[test]
 fn human_launch_runs_to_its_end_after_the_supervisor_stops_reading() {
     let server = end_turn_server("human launch door");
@@ -871,11 +893,8 @@ fn human_launch_runs_to_its_end_after_the_supervisor_stops_reading() {
     let stderr = stderr.join().expect("stderr drain should not panic");
     assert_capsule_survived(status, &stderr);
 
-    let session_dir = fs::read_dir(user_workdir.path().join(".murmur"))
-        .expect("--workdir should hold a .murmur directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.join("trace.jsonl").is_file())
+    let session_dir = common::newest_session_records(home.path(), user_workdir.path())
+        .filter(|dir| dir.join("trace.jsonl").is_file())
         .expect("the session should have written a trace");
     let trace = fs::read_to_string(session_dir.join("trace.jsonl")).expect("should read trace");
     let event_types: Vec<String> = trace
@@ -942,6 +961,7 @@ fn an_authenticated_capsule_readiness_line_says_auth_and_carries_no_token() {
             "auth",
             "name",
             "pid",
+            "records_dir",
             "session_id",
             "url",
             "version",
@@ -1013,7 +1033,7 @@ fn readiness_tokens_puts_every_token_on_the_readiness_line() {
     }
 }
 
-/// A capsule declaring nothing keeps the six keys it always had.
+/// A capsule declaring nothing carries neither `auth` nor `tokens` on its readiness line.
 #[test]
 fn door_tokens_are_absent_from_a_public_capsule_readiness_line() {
     use common::door_capsule::{agent_project, driver_home, MurRun, QUEUE_SLEEP_YAML};
@@ -1037,7 +1057,15 @@ fn door_tokens_are_absent_from_a_public_capsule_readiness_line() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["name", "pid", "session_id", "url", "version", "workdir"]
+        [
+            "name",
+            "pid",
+            "records_dir",
+            "session_id",
+            "url",
+            "version",
+            "workdir"
+        ]
     );
 }
 

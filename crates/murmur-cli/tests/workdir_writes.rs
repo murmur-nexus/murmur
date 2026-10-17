@@ -164,7 +164,8 @@ fn the_trace_carries_the_same_declaration_explain_scope_prints() {
         Vec::new(),
         capsule_runtime::IoMaxReport::default(),
         &run.accessible,
-    );
+    )
+    .expect("the scratch home can hold ~/.murmur");
     assert_eq!(
         serde_json::to_value(&declared.runtime_writes).unwrap(),
         Value::Array(run.runtime_writes.clone()),
@@ -204,14 +205,14 @@ fn run_session(responses: Vec<String>) -> Run {
         accessible.path(),
     );
     let session_id = staged.session_id.clone();
-    let session_dir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
     // The way `mur run --task` delivers it: into the runtime directory, so the workdir holds
     // nothing the operator put there.
     staged.write_task_input(b"Say done.").unwrap();
 
     launch_session(staged, |_| {}).expect("the session must launch");
 
-    let trace = fs::read_to_string(session_dir.join("trace.jsonl")).unwrap();
+    let trace = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap();
     let start: Value = trace
         .lines()
         .filter(|line| !line.is_empty())

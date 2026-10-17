@@ -328,7 +328,7 @@ Declared shell binaries: bash
 Call them via the shell-execution interface or directly from bash if `bash` is in the allowlist.
 ```
 
-Each shell invocation the agent makes appears in `workdir/<session_id>/trace.jsonl` as a `shell` event:
+Each shell invocation the agent makes appears in the session's [`trace.jsonl`](../reference/workdir.md#records-directory) as a `shell` event:
 
 ```json
 {"event_type":"shell","turn":0,"command":"git status","exit_code":0,"stdout_bytes":124,"stderr_bytes":0,"duration_ms":12}

@@ -216,7 +216,7 @@ cat workdir/<session_id>/out/result.txt
 
 Replace `<session_id>` with the value printed by `mur run`. For the data analyst persona above, you would expect exactly one summary sentence and a bullet list — no preamble, no closing remarks.
 
-The session trace records which prompt was in effect. Every `session_start` line in `workdir/<session_id>/trace.jsonl` carries `system_prompt_source` (`"manifest"`, `"cli"` or `"none"`) and `system_prompt_sha256`, the hash of the prompt as resolved:
+The session trace records which prompt was in effect. Every `session_start` line in the session's `trace.jsonl`, kept in its [records directory](../reference/workdir.md#records-directory), carries `system_prompt_source` (`"manifest"`, `"cli"` or `"none"`) and `system_prompt_sha256`, the hash of the prompt as resolved:
 
 ```bash
 mur trace show
@@ -227,7 +227,7 @@ mur trace show
 --8<-- "includes/mur-trace-explore.md"
 
 !!! note "The prompt text is recorded only when you ask for it"
-    `system_prompt_source` and `system_prompt_sha256` are always written, and the hash alone tells you whether two sessions ran with the same prompt. To read the prompt itself, set `trace.capture: content` in the manifest and `cat <session_id>/blobs/<system_prompt_sha256>`. See [Session trace schema](../reference/observability-schemas.md#trace-blobs).
+    `system_prompt_source` and `system_prompt_sha256` are always written, and the hash alone tells you whether two sessions ran with the same prompt. To read the prompt itself, set `trace.capture: content` in the manifest and `cat <records directory>/blobs/<system_prompt_sha256>`, where `<records directory>` is the path `mur run --verbose` prints on its `records:` line. See [Session trace schema](../reference/observability-schemas.md#trace-blobs).
 
 If the agent is ignoring your constraints, add a more explicit rule to the system prompt and re-run.
 
