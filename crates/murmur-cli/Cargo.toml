@@ -56,7 +56,7 @@ tikv-jemallocator = { version = "0.7", default-features = false, optional = true
 # whatever the crate defaults to.
 mimalloc = { version = "0.1", default-features = false, optional = true }
 uuid = { version = "1", features = ["v4"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [features]
 default = []
@@ -90,4 +90,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"]
 # Pinned in lockstep with capsule-runtime's: the hook components the seed-context tests
 # build are hand-authored WAT compiled in-test, so no artifact checkout is needed.
 wat = "=1.251.0"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }

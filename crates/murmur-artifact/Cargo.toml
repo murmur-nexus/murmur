@@ -18,7 +18,7 @@ serde_yaml = "0.9"
 thiserror = "2"
 url = "2"
 wasmparser = { version = "0.251", default-features = false, features = ["std", "component-model"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 proc-macro2 = "1"

@@ -18,7 +18,7 @@ fn zip_entries(path: &Path) -> Vec<String> {
     let file = fs::File::open(path).unwrap();
     let mut archive = ZipArchive::new(file).unwrap();
     let mut names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
         .collect();
     names.sort();
     names

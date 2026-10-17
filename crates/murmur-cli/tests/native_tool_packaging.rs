@@ -60,7 +60,7 @@ fn native_tool_zip_layout() {
 
     // Collect all entry names.
     let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
         .collect();
 
     // Must have exactly two entries.
