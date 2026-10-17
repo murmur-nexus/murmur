@@ -526,6 +526,12 @@ fn an_unlistable_running_directory_is_e_run_028_with_nothing_on_stdout() {
     fs::create_dir(home.path().join(".murmur")).unwrap();
     fs::write(running_dir(home.path()), b"not a directory").unwrap();
     let w = home.path().join("W");
+    let session = "ses_019f0193c7d871a5b2e30ff41a7c0ce1";
+    write_session(
+        &common::records_group(home.path(), &w),
+        session,
+        Some(&format!("{}\n", session_start_line(session))),
+    );
 
     for json in [true, false] {
         let mut args = vec!["trace", "list", "--workdir", w.to_str().unwrap()];
