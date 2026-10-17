@@ -1,10 +1,8 @@
-//! WIT levels: numbered, exact sets of `murmur:*` package versions, and whether an artifact's
-//! interfaces fit one.
+//! WIT levels: numbered, exact sets of `murmur:*` package versions.
 //!
 //! A level names every `murmur:*` package at one version. An artifact fits a level when every
 //! `murmur:*` interface it names, exports and imports alike, is at exactly the version that level
-//! lists for its package. [`level_fit`] is the one place that is decided; load, install, search,
-//! `mur index` and `mur doctor` all reach it.
+//! lists for its package. [`crate::version_fit`] is the one place that is decided.
 //!
 //! The levels themselves live in `crates/capsule-runtime/wit/levels.txt`, read by
 //! [`parse_wit_levels`]. The file is append-only: a committed level is never edited, renumbered
@@ -12,7 +10,7 @@
 
 use thiserror::Error;
 
-use crate::{UnservedInterface, WitContracts};
+use crate::UnservedInterface;
 
 /// One WIT level: its number and the exact version of every `murmur:*` package it serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +31,7 @@ impl WitLevel {
             .map(|(_, version)| version.as_str())
     }
 
-    /// The level as the `(package, version)` table [`WitContracts::unserved_against`] reads.
+    /// The level as the `(package, version)` table [`crate::WitContracts::unserved_against`] reads.
     #[must_use]
     pub fn served(&self) -> Vec<(&str, &str)> {
         self.packages
@@ -41,53 +39,6 @@ impl WitLevel {
             .map(|(package, version)| (package.as_str(), version.as_str()))
             .collect()
     }
-}
-
-/// Whether an artifact's `murmur:*` interfaces fit one WIT level.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LevelFit {
-    Fits,
-    /// Every interface whose version is not the one the level lists for its package, exports
-    /// then imports, in recorded order. Never empty.
-    Mismatched(Vec<UnservedInterface>),
-}
-
-impl LevelFit {
-    #[must_use]
-    pub fn fits(&self) -> bool {
-        matches!(self, LevelFit::Fits)
-    }
-}
-
-/// Whether `contracts` fits `level`: every `murmur:*` name in either direction must be at
-/// exactly the version the level lists for its package. A name with no `@version`, or of a
-/// package the level does not list, does not fit. Names outside `murmur:` are not read, so an
-/// artifact naming no `murmur:*` interface fits every level.
-#[must_use]
-pub fn level_fit(contracts: &WitContracts, level: &WitLevel) -> LevelFit {
-    let mismatched = contracts.unserved_against(&level.served());
-    if mismatched.is_empty() {
-        LevelFit::Fits
-    } else {
-        LevelFit::Mismatched(mismatched)
-    }
-}
-
-/// The numbers of every level in `levels` that `contracts` fits, in `levels`' order.
-#[must_use]
-pub fn fitting_levels(contracts: &WitContracts, levels: &[WitLevel]) -> Vec<u64> {
-    levels
-        .iter()
-        .filter(|level| level_fit(contracts, level).fits())
-        .map(|level| level.level)
-        .collect()
-}
-
-/// The newest level in `levels` that `contracts` fits; `None` when it fits none. This is an
-/// artifact's built-at level.
-#[must_use]
-pub fn newest_fitting_level(contracts: &WitContracts, levels: &[WitLevel]) -> Option<u64> {
-    fitting_levels(contracts, levels).into_iter().max()
 }
 
 /// Why `levels.txt` text could not be read. Every variant naming a line counts lines from 1.
@@ -300,7 +251,6 @@ pub fn level_has_phrase(level: u64, mismatch: &UnservedInterface) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ContractDirection;
 
     const LEVEL_1: &str = "\
 1 murmur:artifact-manager@0.1.0
@@ -331,13 +281,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         parse_wit_levels(&format!("{LEVEL_1}{level_2}\n")).unwrap()
-    }
-
-    fn contracts(exports: &[&str], imports: &[&str]) -> WitContracts {
-        WitContracts {
-            exports: exports.iter().map(|s| s.to_string()).collect(),
-            imports: imports.iter().map(|s| s.to_string()).collect(),
-        }
     }
 
     fn refusal(text: &str) -> WitLevelsError {
@@ -459,61 +402,6 @@ mod tests {
         assert_eq!(
             refusal("1 murmur:a@0.1.0\n1 murmur:b@x\n").to_string(),
             "line 2: version 'x' of murmur:b is not <digits>.<digits>.<digits>"
-        );
-    }
-
-    #[test]
-    fn wit_level_a_tool_naming_no_driver_interface_fits_both_levels() {
-        let levels = two_levels();
-        let tool = contracts(&["murmur:tool/run@0.1.0"], &[]);
-        assert!(level_fit(&tool, &levels[0]).fits());
-        assert!(level_fit(&tool, &levels[1]).fits());
-        assert_eq!(fitting_levels(&tool, &levels), vec![1, 2]);
-        assert_eq!(newest_fitting_level(&tool, &levels), Some(2));
-    }
-
-    #[test]
-    fn wit_level_a_process_driver_fits_only_the_level_it_was_built_against() {
-        let levels = two_levels();
-        let driver = contracts(&["murmur:driver/process@0.3.0"], &[]);
-        assert!(level_fit(&driver, &levels[0]).fits());
-        let LevelFit::Mismatched(mismatched) = level_fit(&driver, &levels[1]) else {
-            panic!("a 0.3.0 driver fits a level serving murmur:driver@0.4.0");
-        };
-        assert_eq!(mismatched.len(), 1);
-        assert_eq!(mismatched[0].direction, ContractDirection::Export);
-        assert_eq!(mismatched[0].package, "murmur:driver");
-        assert_eq!(mismatched[0].served_version.as_deref(), Some("0.4.0"));
-        assert_eq!(
-            level_has_phrase(2, &mismatched[0]),
-            "level 2 has murmur:driver@0.4.0"
-        );
-        assert_eq!(fitting_levels(&driver, &levels), vec![1]);
-        assert_eq!(newest_fitting_level(&driver, &levels), Some(1));
-    }
-
-    #[test]
-    fn wit_level_a_skill_fits_every_level() {
-        let levels = two_levels();
-        let skill = WitContracts::default();
-        assert_eq!(fitting_levels(&skill, &levels), vec![1, 2]);
-        let wasi_only = contracts(&[], &["wasi:cli/stdout@0.2.0"]);
-        assert_eq!(newest_fitting_level(&wasi_only, &levels), Some(2));
-    }
-
-    #[test]
-    fn wit_level_a_hook_at_an_older_version_fits_no_level() {
-        let levels = two_levels();
-        let hook = contracts(&["murmur:hook/lifecycle@0.8.0"], &[]);
-        assert_eq!(fitting_levels(&hook, &levels), Vec::<u64>::new());
-        assert_eq!(newest_fitting_level(&hook, &levels), None);
-        let text = contracts(&[], &["murmur:text/stream@0.1.0"]);
-        let LevelFit::Mismatched(mismatched) = level_fit(&text, &levels[0]) else {
-            panic!("murmur:text fits level 1");
-        };
-        assert_eq!(
-            level_has_phrase(1, &mismatched[0]),
-            "level 1 has no version of murmur:text"
         );
     }
 }

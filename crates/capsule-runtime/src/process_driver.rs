@@ -5,7 +5,9 @@
 //! it on an empty WASI context with no Murmur host import, so a driver that reaches for anything
 //! else fails to load rather than running with less than it expected.
 
-use murmur_artifact::{level_fit, LevelFit, WitContracts, WitLevel};
+use murmur_artifact::{
+    current_platform, version_fit, FitSubject, VersionFit, WitContracts, WitLevel,
+};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -194,14 +196,16 @@ fn level_mismatch(
     exports: Vec<String>,
     imports: Vec<String>,
 ) -> Option<RuntimeError> {
-    match level_fit(&WitContracts { exports, imports }, level) {
-        LevelFit::Fits => None,
-        LevelFit::Mismatched(mismatched) => Some(RuntimeError::WitLevelMismatch {
+    let subject = FitSubject::component(WitContracts { exports, imports });
+    // One untagged payload: the platform never decides a component's fit.
+    match version_fit(&subject, level, current_platform()) {
+        VersionFit::Unserved(mismatched) => Some(RuntimeError::WitLevelMismatch {
             name: name.to_string(),
             version: version.to_string(),
             level: level.level,
             mismatched,
         }),
+        VersionFit::Fits | VersionFit::NoPayloadFor(_) => None,
     }
 }
 

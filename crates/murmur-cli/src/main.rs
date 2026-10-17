@@ -130,10 +130,11 @@ enum Commands {
         /// Plain-language task description for the capsule to generate (beta: mur-new)
         task: Option<String>,
 
-        /// Artifact index to search: "local" lists the global store ~/.murmur/artifacts/; an
-        /// http:// or https:// URL is fetched; anything else is a file path. Defaults to
-        /// registry.index_url in ~/.murmur/config.yaml, else the public index URL.
-        #[arg(long, value_name = "PATH|URL|local")]
+        /// Artifact index the generator searches: an http:// or https:// URL is fetched by its
+        /// search tool; any other value is an index file, which the generator reads from a copy
+        /// in its work folder. "local" is refused. Omitted, the generator searches the index on
+        /// the latest default-artifacts release
+        #[arg(long, value_name = "PATH|URL")]
         index: Option<String>,
     },
     /// Search the public artifact index for artifacts matching a keyword
@@ -143,7 +144,8 @@ enum Commands {
 
         /// Artifact index to search: "local" lists the global store ~/.murmur/artifacts/; an
         /// http:// or https:// URL is fetched; anything else is a file path. Defaults to
-        /// registry.index_url in ~/.murmur/config.yaml, else the public index URL.
+        /// registry.index_url in ~/.murmur/config.yaml, else the index on the latest
+        /// default-artifacts release.
         #[arg(long, value_name = "PATH|URL|local")]
         index: Option<String>,
 
@@ -985,7 +987,7 @@ fn registry_flag_hint(subcommand: &str) -> Option<&'static str> {
         "publish" => Some("`mur publish` writes into the global store ~/.murmur/artifacts/"),
         "search" => Some("to choose the artifact index, pass --index <PATH|URL|local>"),
         #[cfg(feature = "beta-mur-new")]
-        "new" => Some("to choose the artifact index, pass --index <PATH|URL|local>"),
+        "new" => Some("to choose the artifact index, pass --index <PATH|URL>"),
         _ => None,
     }
 }

@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use capsule_runtime::served_wit_level;
 use murmur_artifact::{
-    compare_versions, current_platform, murmur_interfaces, version_fit, ArtifactIndex,
-    ArtifactIndexError, ArtifactMeta, LocalRegistry, Registry, VersionFit,
+    compare_versions, current_platform, version_fit, ArtifactIndex, ArtifactIndexError,
+    ArtifactMeta, FitSubject, LocalRegistry, Registry, VersionFit,
 };
 
 use crate::{
@@ -13,10 +13,10 @@ use crate::{
     stores::installed_contracts,
 };
 
-// The default public artifact index URL. Overridable via ~/.murmur/config.yaml key
-// registry.index_url, or per-command with --index <PATH|URL|local>.
+/// The index published on the latest default-artifacts release. `registry.index_url` in
+/// `~/.murmur/config.yaml` replaces it, and `--index` replaces both for one command.
 pub const DEFAULT_INDEX_URL: &str =
-    "https://raw.githubusercontent.com/murmur-nexus/default-artifacts/refs/heads/main/artifacts-index.json";
+    "https://github.com/murmur-nexus/default-artifacts/releases/latest/download/artifacts-index.json";
 
 /// One artifact as `mur search` lists it, from an index or from the global store.
 struct SearchEntry {
@@ -61,7 +61,7 @@ impl SearchEntry {
 
 /// Where `--index` reads the artifact index from.
 #[derive(Debug, PartialEq, Eq)]
-enum IndexSource<'a> {
+pub(crate) enum IndexSource<'a> {
     /// `local`: the global store's own listing.
     GlobalStore,
     /// A value starting `http://` or `https://`.
@@ -71,7 +71,7 @@ enum IndexSource<'a> {
 }
 
 impl<'a> IndexSource<'a> {
-    fn parse(value: &'a str) -> Self {
+    pub(crate) fn parse(value: &'a str) -> Self {
         if value == "local" {
             Self::GlobalStore
         } else if value.starts_with("http://") || value.starts_with("https://") {
@@ -132,13 +132,19 @@ pub(crate) fn index_error(source: &str, error: ArtifactIndexError) -> CliError {
 /// Read a schema 2 index from a file: `E-IO-003` when it cannot be read, `E-IDX-002` when it is
 /// not an index this `mur` reads.
 pub(crate) fn read_index_file(path: &str) -> Result<ArtifactIndex, CliError> {
+    read_index_file_verbatim(path).map(|(index, _)| index)
+}
+
+/// [`read_index_file`], also returning the file's text exactly as read.
+pub(crate) fn read_index_file_verbatim(path: &str) -> Result<(ArtifactIndex, String), CliError> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
         CliError::new(
             E_IO_003,
             format!("failed to read artifact index from {path}: {e}"),
         )
     })?;
-    ArtifactIndex::from_json(&raw).map_err(|error| index_error(path, error))
+    let index = ArtifactIndex::from_json(&raw).map_err(|error| index_error(path, error))?;
+    Ok((index, raw))
 }
 
 fn fetch_remote(url: &str) -> Result<ArtifactIndex, CliError> {
@@ -179,7 +185,10 @@ fn index_entries(index: ArtifactIndex, platform: &str) -> Vec<SearchEntry> {
             versions: artifact
                 .versions
                 .iter()
-                .map(|v| (v.version.clone(), v.fit(served_wit_level(), platform)))
+                .map(|v| {
+                    let fit = version_fit(&FitSubject::indexed(v), served_wit_level(), platform);
+                    (v.version.clone(), fit)
+                })
                 .collect(),
             runtime: artifact.runtime,
             description: artifact.description,
@@ -205,24 +214,11 @@ fn scan_local(platform: &str) -> Result<Vec<SearchEntry>, CliError> {
             let versions = metas
                 .iter()
                 .map(|meta| {
-                    let interfaces = installed_contracts(&registry, meta)
-                        .map(|contracts| murmur_interfaces(&contracts))
-                        .unwrap_or_default();
-                    let tags: Vec<String> = meta
-                        .platforms
-                        .iter()
-                        .map(|(os, arch)| format!("{os}-{arch}"))
-                        .collect();
-                    let fit = if tags.is_empty() {
-                        version_fit(&interfaces, [None], served_wit_level(), platform)
-                    } else {
-                        version_fit(
-                            &interfaces,
-                            tags.iter().map(|tag| Some(tag.as_str())),
-                            served_wit_level(),
-                            platform,
-                        )
+                    let subject = FitSubject {
+                        contracts: installed_contracts(&registry, meta).unwrap_or_default(),
+                        ..FitSubject::stored(meta, None)
                     };
+                    let fit = version_fit(&subject, served_wit_level(), platform);
                     (meta.version.clone(), fit)
                 })
                 .collect();
@@ -285,7 +281,21 @@ fn print_results(entries: &[&SearchEntry]) {
 
 #[cfg(test)]
 mod tests {
-    use super::IndexSource;
+    use murmur_artifact::ARTIFACT_INDEX_FILE_NAME;
+
+    use super::{IndexSource, DEFAULT_INDEX_URL};
+    use crate::source::DEFAULT_ARTIFACTS_REPO;
+
+    #[test]
+    fn the_default_index_is_the_latest_default_artifacts_release_asset() {
+        assert_eq!(
+            DEFAULT_INDEX_URL,
+            format!(
+                "https://github.com/{DEFAULT_ARTIFACTS_REPO}/releases/latest/download/\
+                 {ARTIFACT_INDEX_FILE_NAME}"
+            )
+        );
+    }
 
     #[test]
     fn local_names_the_global_store() {

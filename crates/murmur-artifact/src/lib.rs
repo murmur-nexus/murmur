@@ -11,6 +11,7 @@ pub mod build_info;
 pub mod build_lints;
 pub mod docs_url;
 pub mod dotenv;
+pub mod fit;
 pub mod install_pattern;
 pub mod lockfile;
 pub mod manifest;
@@ -46,10 +47,9 @@ pub use artifact::{
 pub use artifact_index::{
     asset_file_name, compare_versions, derived_built_at_level, derived_tags, description_summary,
     index_directory, index_scope_error, merge_indexes, metadata_file_name, murmur_interfaces,
-    release_tag_error, sha256_file_name, version_fit, ArtifactIndex, ArtifactIndexError,
-    IndexBuildError, IndexedArtifact, IndexedAsset, IndexedVersion, MergeReport, VersionFit,
-    ARTIFACT_FILE_SUFFIX, ARTIFACT_INDEX_FILE_NAME, ARTIFACT_INDEX_SCHEMA_VERSION,
-    MURMUR_INTERFACE_PREFIX,
+    release_tag_error, sha256_file_name, ArtifactIndex, ArtifactIndexError, IndexBuildError,
+    IndexedArtifact, IndexedAsset, IndexedVersion, MergeReport, ARTIFACT_FILE_SUFFIX,
+    ARTIFACT_INDEX_FILE_NAME, ARTIFACT_INDEX_SCHEMA_VERSION, MURMUR_INTERFACE_PREFIX,
 };
 pub use artifact_name::{
     prefix_part_error, unscoped_name_hint, ArtifactName, ArtifactNameError, LOCAL_SCOPE,
@@ -67,6 +67,7 @@ pub use build_lints::{
 };
 pub use docs_url::{diagnostic_link, DOCS_REFERENCE_URL};
 pub use dotenv::{dotenv_variable_names, load_dotenv_non_override, DotenvError};
+pub use fit::{newest_fitting_level, version_fit, FitSubject, VersionFit};
 pub use lockfile::{
     read_lockfile, write_lockfile_atomic, LockOrigin, LockedArtifact, LockedSha256, LockfileError,
     MurmurLock, LOCK_VERSION,
@@ -145,10 +146,7 @@ pub use wit_contract::{
     wit_contracts_from_artifact_reader, wit_package_declarations, ComponentReadError,
     ContractDirection, UnservedInterface, WitContractError, WitContracts,
 };
-pub use wit_level::{
-    fitting_levels, level_fit, level_has_phrase, newest_fitting_level, parse_wit_levels, LevelFit,
-    WitLevel, WitLevelsError,
-};
+pub use wit_level::{level_has_phrase, parse_wit_levels, WitLevel, WitLevelsError};
 pub use zip_guard::{
     max_artifact_decompressed_bytes, read_zip_entry_capped, read_zip_entry_to_string_capped,
     resolve_within, sanitize_entry_path, ZipGuardError, DEFAULT_MAX_ARTIFACT_DECOMPRESSED_BYTES,

@@ -38,8 +38,8 @@
 use std::collections::BTreeMap;
 
 use murmur_artifact::{
-    compare_versions, install_pattern, level_fit, wit_contracts_from_artifact_bytes, ArtifactIndex,
-    ArtifactMeta, IndexedArtifact, LevelFit, ResolvedArtifact, VersionFit, WitContracts, WitLevel,
+    compare_versions, install_pattern, version_fit, ArtifactIndex, FitSubject, IndexedArtifact,
+    ResolvedArtifact, VersionFit,
 };
 use serde::Serialize;
 
@@ -173,27 +173,6 @@ fn store_label(registry: &dyn Registry, name: &ArtifactName, version: &str) -> S
     registry
         .held_in(name, version)
         .unwrap_or_else(|| "store".to_string())
-}
-
-/// Whether a stored version fits `level` on `platform`, read from its sidecar: its recorded
-/// contracts, which the store derives from the payload on every write, and its platforms.
-fn stored_fit(meta: &ArtifactMeta, level: &WitLevel, platform: &str) -> VersionFit {
-    if let Some(contracts) = &meta.wit_contracts {
-        if let LevelFit::Mismatched(unserved) = level_fit(contracts, level) {
-            return VersionFit::Unserved(unserved);
-        }
-    }
-    let runs_here = meta.runtime != RuntimeType::Native
-        || meta.platforms.is_empty()
-        || meta
-            .platforms
-            .iter()
-            .any(|(os, arch)| format!("{os}-{arch}") == platform);
-    if runs_here {
-        VersionFit::Fits
-    } else {
-        VersionFit::NoPayloadFor(platform.to_string())
-    }
 }
 
 /// The candidate a pull without a version takes among `candidates`: the newest by semver
@@ -398,7 +377,7 @@ impl CapsuleStoreState {
                     entry.0.native |= meta.runtime == RuntimeType::Native;
                     entry.1.push(Candidate {
                         version: meta.version.clone(),
-                        fit: stored_fit(&meta, level, platform),
+                        fit: version_fit(&FitSubject::stored(&meta, None), level, platform),
                         place,
                     });
                 }
@@ -443,7 +422,7 @@ impl CapsuleStoreState {
                 for version in &artifact.versions {
                     entry.1.push(Candidate {
                         version: version.version.clone(),
-                        fit: version.fit(level, platform),
+                        fit: version_fit(&FitSubject::indexed(version), level, platform),
                         place: Place::Source(label.clone()),
                     });
                 }
@@ -613,7 +592,7 @@ impl CapsuleStoreState {
             .filter(|meta| meta.name == *name)
             .map(|meta| Candidate {
                 place: Place::Store(store_label(self.registry.as_ref(), name, &meta.version)),
-                fit: stored_fit(&meta, level, platform),
+                fit: version_fit(&FitSubject::stored(&meta, None), level, platform),
                 version: meta.version,
             })
             .collect();
@@ -623,7 +602,7 @@ impl CapsuleStoreState {
                 if let Some(artifact) = indexed(&index, name) {
                     candidates.extend(artifact.versions.iter().map(|version| Candidate {
                         version: version.version.clone(),
-                        fit: version.fit(level, platform),
+                        fit: version_fit(&FitSubject::indexed(version), level, platform),
                         place: Place::Source(label.clone()),
                     }));
                 }
@@ -750,7 +729,11 @@ impl CapsuleStoreState {
                 listed.join(", ")
             ));
         };
-        let fit = indexed_version.fit(crate::served_wit_level(), current_platform());
+        let fit = version_fit(
+            &FitSubject::indexed(indexed_version),
+            crate::served_wit_level(),
+            current_platform(),
+        );
         if fit != VersionFit::Fits {
             return Err(fit_refusal(name, version, &fit, &self.fit_hint(name)));
         }
@@ -790,21 +773,13 @@ impl CapsuleStoreState {
         {
             return Err(refusal);
         }
-        let contracts: Option<WitContracts> = resolved
-            .meta
-            .wit_contracts
-            .clone()
-            .or_else(|| wit_contracts_from_artifact_bytes(&resolved.bytes));
-        if let Some(contracts) = contracts {
-            if let LevelFit::Mismatched(unserved) = level_fit(&contracts, crate::served_wit_level())
-            {
-                return Err(fit_refusal(
-                    name,
-                    version,
-                    &VersionFit::Unserved(unserved),
-                    &self.fit_hint(name),
-                ));
-            }
+        let fit = version_fit(
+            &FitSubject::stored(&resolved.meta, Some(&resolved.bytes)),
+            crate::served_wit_level(),
+            current_platform(),
+        );
+        if fit != VersionFit::Fits {
+            return Err(fit_refusal(name, version, &fit, &self.fit_hint(name)));
         }
         if let Some(owner_id) = payload.owner_id {
             if let Some(entry) = lock.owner_conflict(name.scope(), owner_id) {

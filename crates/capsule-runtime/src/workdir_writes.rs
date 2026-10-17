@@ -466,6 +466,13 @@ mod tests {
              by each of its callers. Declared through RUNTIME_DIR_WRITES' `tools` entry.",
         ),
         (
+            "types.rs",
+            "rel",
+            "`StagedSession::write_workdir_file`'s path, named by the embedding caller for an \
+             input it stages for the capsule before launch. A launch writes nothing there of its \
+             own.",
+        ),
+        (
             "shell.rs",
             "&relative_path",
             "A command's full-output log, `logs/<stem>.log`, composed on the line above. Declared \

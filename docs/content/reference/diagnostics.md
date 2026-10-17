@@ -57,6 +57,7 @@ section that explains it.
 | `E-NEW-002` | The name given to `mur new --roster`, or a capsule name derived from it, is not an artifact name | [`mur new --roster`](cli.md#mur-new-roster) |
 | `E-NEW-003` | The directory `mur new --roster` would write already exists | [`mur new --roster`](cli.md#mur-new-roster-writing) |
 | `E-NEW-004` | `inference.provider` in `~/.murmur/config.yaml` names a provider `mur new --roster` has no driver for | [`mur new --roster`](cli.md#mur-new-roster-provider) |
+| `E-NEW-005` | `mur new <task>` was given `--index local`, the global store the generator capsule cannot read | [`mur new`](cli.md#mur-new-task) |
 | `E-REG-001` | The scope's index lists no such name, no such version, or no payload of it for the host platform, or no version that fits this `mur`; or a `local/` artifact is not in the store, and no source serves the `local` scope | [E-REG-001](#e-reg-001) |
 | `E-REG-002` | Artifact bytes do not match the sha256 recorded for them or listed in the source's index, or an artifact's packed `name:` or `version:` is not the one it is installed as | [E-REG-002](#e-reg-002) |
 | `E-REG-003` | An artifact of that name and version is already published | [`mur publish`](cli.md#mur-publish) |
@@ -2000,12 +2001,12 @@ error[E-IDX-001]: release holds no .mur.zip file to index
 
 ### E-IDX-002 — not a schema 2 artifact index { #e-idx-002 }
 
-`mur search`, and `mur index --merge`, read only a schema 2 [artifact index](artifact-index.md).
+`mur search`, `mur new --index` and `mur index --merge` read only a schema 2 [artifact index](artifact-index.md).
 A schema 1 index, whose `schema_version` is `1` as a string or a number, is refused with a hint
 for its publisher:
 
 ```text
-error[E-IDX-002]: artifact index https://raw.githubusercontent.com/ana/my-artifacts/main/artifacts-index.json is a schema 1 index
+error[E-IDX-002]: artifact index https://github.com/ana/my-artifacts/releases/latest/download/artifacts-index.json is a schema 1 index
   hint: this is a schema 1 artifact index, which this mur does not read; its publisher regenerates it with `mur index <dir> --repo <owner>/<repo> --release <tag>`
 ```
 

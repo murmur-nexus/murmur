@@ -8,12 +8,12 @@ use capsule_runtime::served_wit_level;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use murmur_artifact::{
-    current_platform, is_reserved_version, level_fit, load_manifest_from_artifact_bytes,
+    current_platform, is_reserved_version, load_manifest_from_artifact_bytes,
     load_runtime_manifest, read_lockfile, registry_warning_link, resolve_manifest_path, sha256_hex,
-    split_platform_suffix, split_platform_tag, verify_sha256, wit_contracts_from_artifact_bytes,
-    write_lockfile_atomic, ArtifactMeta, ArtifactName, ArtifactRef, ArtifactRefError, LevelFit,
-    LocalRegistry, LockOrigin, LockedSha256, LockfileError, Manifest, MurmurLock, Platform,
-    Registry, RegistryError, ResolvedArtifact, RuntimeType, VersionFit, LOCAL_SCOPE, LOCK_VERSION,
+    split_platform_suffix, split_platform_tag, verify_sha256, version_fit, write_lockfile_atomic,
+    ArtifactMeta, ArtifactName, ArtifactRef, ArtifactRefError, FitSubject, LocalRegistry,
+    LockOrigin, LockedSha256, LockfileError, Manifest, MurmurLock, Platform, Registry,
+    RegistryError, ResolvedArtifact, RuntimeType, VersionFit, LOCAL_SCOPE, LOCK_VERSION,
     MANIFEST_FILENAME, SUPPORTED_PLATFORMS, W_REG_001,
 };
 use rayon::prelude::*;
@@ -537,18 +537,31 @@ fn install_single(
     if let Some(version) = version {
         let global_store = LocalRegistry::from_default_home().map_err(CliError::from)?;
         match global_store.resolve_with_platform(&name, version, Some(current_platform())) {
-            Ok(resolved) => {
-                check_stored_fit(&name, version, &resolved)?;
-                return install_from_global_store(
-                    &name,
-                    version,
-                    resolved,
-                    store,
-                    lock_path.as_deref(),
-                    lock.as_ref(),
-                    build_precompiler(no_precompile, project_root).as_ref(),
-                );
-            }
+            Ok(resolved) => match version_fit(
+                &FitSubject::stored(&resolved.meta, Some(&resolved.bytes)),
+                served_wit_level(),
+                current_platform(),
+            ) {
+                VersionFit::Fits => {
+                    return install_from_global_store(
+                        &name,
+                        version,
+                        resolved,
+                        store,
+                        lock_path.as_deref(),
+                        lock.as_ref(),
+                        build_precompiler(no_precompile, project_root).as_ref(),
+                    );
+                }
+                VersionFit::Unserved(mismatched) => {
+                    return Err(level_mismatch(name.as_str(), version, mismatched));
+                }
+                // No payload for this platform is the store's miss for it.
+                VersionFit::NoPayloadFor(_) if name.is_local() => {
+                    return Err(local_store_miss(&name, Some(version)));
+                }
+                VersionFit::NoPayloadFor(_) => {}
+            },
             Err(RegistryError::NotFound { .. }) if name.is_local() => {
                 return Err(local_store_miss(&name, Some(version)));
             }
@@ -576,28 +589,6 @@ fn install_single(
         lock_path.as_deref(),
         precompiler.as_ref(),
     )
-}
-
-/// `E-WIT-LEVEL-001` when the payload a store holds as `name@version` does not fit the WIT level
-/// this mur serves, read from the contracts its sidecar records, else from its component. A
-/// payload with no component (a native tool, a skill) fits.
-fn check_stored_fit(
-    name: &ArtifactName,
-    version: &str,
-    held: &ResolvedArtifact,
-) -> Result<(), CliError> {
-    let contracts = held
-        .meta
-        .wit_contracts
-        .clone()
-        .or_else(|| wit_contracts_from_artifact_bytes(&held.bytes));
-    let Some(contracts) = contracts else {
-        return Ok(());
-    };
-    match level_fit(&contracts, served_wit_level()) {
-        LevelFit::Fits => Ok(()),
-        LevelFit::Mismatched(mismatched) => Err(level_mismatch(name.as_str(), version, mismatched)),
-    }
 }
 
 /// Copy `name@version`, which the global store holds as `resolved`, into `store` and pin it. No
@@ -1076,7 +1067,13 @@ fn check_fits(
     for ((name, artifact), held) in names.iter().zip(artifacts).zip(held) {
         match held {
             Ok(Held::Project(held) | Held::Global(held)) => {
-                check_stored_fit(name, &artifact.version, held)?;
+                let subject = FitSubject::stored(&held.meta, Some(&held.bytes));
+                // `held_payload` resolved this platform's payload, so only interfaces refuse.
+                if let VersionFit::Unserved(mismatched) =
+                    version_fit(&subject, served_wit_level(), current_platform())
+                {
+                    return Err(level_mismatch(name.as_str(), &artifact.version, mismatched));
+                }
             }
             Ok(Held::Source) => {
                 let Some(source) = sources.for_scope(name.scope()) else {
@@ -1096,9 +1093,11 @@ fn check_fits(
                 let Some(version) = select_version(listed, &artifact.version) else {
                     continue;
                 };
-                if let VersionFit::Unserved(mismatched) =
-                    version.fit(served_wit_level(), current_platform())
-                {
+                if let VersionFit::Unserved(mismatched) = version_fit(
+                    &FitSubject::indexed(version),
+                    served_wit_level(),
+                    current_platform(),
+                ) {
                     return Err(index_level_mismatch(
                         name.as_str(),
                         &artifact.version,

@@ -19,14 +19,14 @@ use capsule_runtime::{
     SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
-    current_platform, effective_containment_floor, level_fit, native_binary_verdict,
-    newest_fitting_level, parse_tool_implementation_from_yaml, read_runtime_manifest_text,
-    registry_warning_link, resolve_manifest_path, resolve_roster_path, sha256_hex,
+    current_platform, effective_containment_floor, native_binary_verdict, newest_fitting_level,
+    parse_tool_implementation_from_yaml, read_runtime_manifest_text, registry_warning_link,
+    resolve_manifest_path, resolve_roster_path, sha256_hex, version_fit,
     warn_on_unknown_manifest_keys, wit_contracts_from_artifact_bytes, ArtifactImplementation,
-    ArtifactRuntime, ContractDirection, LevelFit, LocalRegistry, LockOrigin, MurmurLock,
+    ArtifactRuntime, ContractDirection, FitSubject, LocalRegistry, LockOrigin, MurmurLock,
     NativeBinaryVerdict, PlatformMatch, Registry, ResolvedArtifact, RosterReachability,
-    RuntimeManifest, UnservedInterface, WitContracts, MANIFEST_FILENAME, ROSTER_FILENAME,
-    W_REG_001, W_REG_002, W_REG_003,
+    RuntimeManifest, UnservedInterface, VersionFit, WitContracts, MANIFEST_FILENAME,
+    ROSTER_FILENAME, W_REG_001, W_REG_002, W_REG_003,
 };
 
 use crate::commands::install::find_project_root;
@@ -908,9 +908,10 @@ fn report_interface_versions(project: &LocalRegistry, global: &LocalRegistry) ->
             }
             // A payload with no readable component names no `murmur:*` interface.
             let contracts = installed_contracts(registry, &meta).unwrap_or_default();
-            let mismatched = match level_fit(&contracts, served) {
-                LevelFit::Fits => Vec::new(),
-                LevelFit::Mismatched(mismatched) => mismatched,
+            let subject = FitSubject::component(contracts.clone());
+            let mismatched = match version_fit(&subject, served, current_platform()) {
+                VersionFit::Unserved(mismatched) => mismatched,
+                VersionFit::Fits | VersionFit::NoPayloadFor(_) => Vec::new(),
             };
             rows.push(InstalledRow {
                 reference,
@@ -1015,9 +1016,13 @@ fn resolved_unserved(resolved: &ResolvedArtifact) -> Vec<UnservedInterface> {
         .clone()
         .or_else(|| wit_contracts_from_artifact_bytes(&resolved.bytes))
         .unwrap_or_default();
-    match level_fit(&contracts, served_wit_level()) {
-        LevelFit::Fits => Vec::new(),
-        LevelFit::Mismatched(mismatched) => mismatched,
+    match version_fit(
+        &FitSubject::component(contracts),
+        served_wit_level(),
+        current_platform(),
+    ) {
+        VersionFit::Unserved(mismatched) => mismatched,
+        VersionFit::Fits | VersionFit::NoPayloadFor(_) => Vec::new(),
     }
 }
 

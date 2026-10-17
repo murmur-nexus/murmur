@@ -13,10 +13,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use capsule_runtime::served_wit_level;
 use murmur_artifact::{
-    artifact_name_format_error, load_manifest_from_artifact_bytes, sha256_hex, ArtifactIndex,
-    ArtifactIndexError, ArtifactName, IndexedArtifact, IndexedAsset, IndexedVersion, Manifest,
-    MurmurLock, RegistryError, UnservedInterface, VersionFit, ARTIFACT_INDEX_FILE_NAME,
-    MURMUR_SCOPE, RESERVED_SCOPES,
+    artifact_name_format_error, load_manifest_from_artifact_bytes, sha256_hex, version_fit,
+    ArtifactIndex, ArtifactIndexError, ArtifactName, FitSubject, IndexedArtifact, IndexedAsset,
+    IndexedVersion, Manifest, MurmurLock, RegistryError, UnservedInterface, VersionFit,
+    ARTIFACT_INDEX_FILE_NAME, MURMUR_SCOPE, RESERVED_SCOPES,
 };
 
 use crate::config::{
@@ -730,13 +730,15 @@ pub(crate) fn resolve(
                 source: label.clone(),
                 name: name.clone(),
                 newest: newest.version.clone(),
-                fit: newest.fit(served_wit_level(), platform),
+                fit: version_fit(&FitSubject::indexed(newest), served_wit_level(), platform),
             })
         })?,
     };
 
     if version.is_some() && explicit == ExplicitVersion::FitChecked {
-        if let VersionFit::Unserved(mismatched) = chosen.fit(served_wit_level(), platform) {
+        if let VersionFit::Unserved(mismatched) =
+            version_fit(&FitSubject::indexed(chosen), served_wit_level(), platform)
+        {
             return Err(Box::new(ResolveError::DoesNotFit {
                 source: label,
                 name: name.clone(),

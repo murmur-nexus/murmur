@@ -12,13 +12,14 @@ use capsule_runtime::{
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
 use murmur_artifact::{
     current_platform, resolve_manifest_path, ArtifactRuntime, LocalRegistry, Registry,
-    RegistryError, RuntimeManifest, MANIFEST_FILENAME,
+    RegistryError, RuntimeManifest, ARTIFACT_INDEX_FILE_NAME, MANIFEST_FILENAME,
 };
 
 use super::new_roster::{Provider, ANTHROPIC, OPENAI};
+use super::search::{read_index_file_verbatim, IndexSource, DEFAULT_INDEX_URL};
 use crate::{
     config::{load_mur_config, save_mur_config, InferenceConfig},
-    error::{CliError, E_CFG_001, E_IO_003, E_MAN_002, E_RUN_008},
+    error::{CliError, E_CFG_001, E_IO_003, E_MAN_002, E_NEW_005, E_RUN_008},
 };
 
 // Temporary directory that cleans itself up on drop.
@@ -77,7 +78,90 @@ fn inject_driver_key(runtime_manifest: &mut RuntimeManifest, key: &str) {
     }
 }
 
+/// The origins `murmur/tool-registry-search` reads the index on the latest default-artifacts
+/// release from: the release download URL, and the asset host it redirects to. A native tool
+/// runs under the capsule-wide grants, so the generator capsule lists both itself.
+pub(crate) const REGISTRY_SEARCH_ORIGINS: [&str; 2] = [
+    "https://github.com",
+    "https://release-assets.githubusercontent.com",
+];
+
+/// The index `--index` names, as the generator capsule's search tool reads it.
+#[derive(Debug, PartialEq, Eq)]
+enum GeneratorIndex {
+    /// No `--index`: the index on the latest default-artifacts release, the tool's own default.
+    Default,
+    /// An `http(s)` URL the tool fetches, and its `<scheme>://<host>[:<port>]` origin.
+    Url { url: String, origin: String },
+    /// An index file checked on the host, as read. The tool reads a copy of it in its work
+    /// folder, [`ARTIFACT_INDEX_FILE_NAME`]: a host path outside that folder is unreadable to it.
+    File { text: String },
+}
+
+impl GeneratorIndex {
+    /// Errors before anything is staged: `E-NEW-005` for `local`, the global store the capsule
+    /// cannot read; `E-IO-003` for an unparseable URL or an unreadable file; `E-IDX-002` for a
+    /// file that is not a schema 2 index.
+    fn resolve(index: Option<&str>) -> Result<Self, CliError> {
+        let Some(index) = index else {
+            return Ok(Self::Default);
+        };
+        match IndexSource::parse(index) {
+            IndexSource::GlobalStore => Err(CliError::with_hint(
+                E_NEW_005,
+                "--index local names the global artifact store on this host, which the \
+                 generator capsule cannot read",
+                "run `mur search <query> --index local` to list it, or pass an index file or an \
+                 http(s) URL",
+            )),
+            IndexSource::Url(url) => {
+                let origin = url::Url::parse(url)
+                    .map(|parsed| parsed.origin())
+                    .ok()
+                    .filter(url::Origin::is_tuple)
+                    .ok_or_else(|| {
+                        CliError::new(
+                            E_IO_003,
+                            format!("artifact index URL {url} has no scheme, host and port"),
+                        )
+                    })?;
+                Ok(Self::Url {
+                    url: url.to_string(),
+                    origin: origin.ascii_serialization(),
+                })
+            }
+            IndexSource::File(path) => {
+                let (_, text) = read_index_file_verbatim(path)?;
+                Ok(Self::File { text })
+            }
+        }
+    }
+
+    /// The search tool's `index` input. The default index is named rather than left out: a
+    /// model given a strict function schema, as OpenAI's Responses API makes every tool's, fills
+    /// every property, and the tool reads an empty `index` as a file path.
+    fn tool_input(&self) -> &str {
+        match self {
+            Self::Default => DEFAULT_INDEX_URL,
+            Self::Url { url, .. } => url,
+            Self::File { .. } => ARTIFACT_INDEX_FILE_NAME,
+        }
+    }
+
+    /// The origin the generator's network allow list needs beyond [`REGISTRY_SEARCH_ORIGINS`].
+    fn extra_network_allow(&self) -> Vec<String> {
+        match self {
+            Self::Url { origin, .. } if !REGISTRY_SEARCH_ORIGINS.contains(&origin.as_str()) => {
+                vec![origin.clone()]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
 pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
+    let index = GeneratorIndex::resolve(index)?;
+
     // Resolve inference config: config file → env var → interactive wizard.
     let inf = resolve_inference_config()?;
 
@@ -87,7 +171,7 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     // touches the environment — then inject the real key directly into the parsed struct.
     // This keeps the resolved key a Rust `String` in memory only; it is never round-tripped
     // through this process's own environment (which a /proc/<pid>/environ read could expose).
-    let meta_yaml = build_meta_manifest(&inf);
+    let meta_yaml = build_meta_manifest(&inf, &index.extra_network_allow());
     let mut runtime_manifest = RuntimeManifest::from_yaml_str(&meta_yaml).map_err(|e| {
         CliError::new(
             E_MAN_002,
@@ -115,7 +199,7 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     check_artifacts_installed(&local_registry, &generator_artifacts)?;
 
     // Build the task prompt with a compact inline schema.
-    let task_prompt = build_task_prompt(task, index, &inf);
+    let task_prompt = build_task_prompt(task, index.tool_input(), &inf);
 
     // Create a temp dir for the generator session. The session workdir lives inside it
     // (manifest_dir/workdir/<session_id>/), so cleanup on Drop removes everything.
@@ -190,6 +274,16 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     staged
         .write_task_input(task_prompt.as_bytes())
         .map_err(|e| CliError::new(E_IO_003, format!("failed to write task prompt: {e}")))?;
+    if let GeneratorIndex::File { text } = &index {
+        staged
+            .write_workdir_file(ARTIFACT_INDEX_FILE_NAME, text.as_bytes())
+            .map_err(|e| {
+                CliError::new(
+                    E_IO_003,
+                    format!("failed to copy the artifact index into the generator's workdir: {e}"),
+                )
+            })?;
+    }
 
     capsule_runtime::report_eprintln!("mur new: generating manifest...");
 
@@ -390,7 +484,7 @@ pub(crate) struct GeneratorArtifact {
 pub(crate) const GENERATOR_ARTIFACTS: [GeneratorArtifact; 3] = [
     GeneratorArtifact {
         name: "murmur/tool-registry-search",
-        version: "0.1.0",
+        version: "0.2.0",
         runtime: "tool",
     },
     GeneratorArtifact {
@@ -405,7 +499,12 @@ pub(crate) const GENERATOR_ARTIFACTS: [GeneratorArtifact; 3] = [
     },
 ];
 
-pub(crate) fn build_meta_manifest(config: &InferenceConfig) -> String {
+/// The generator capsule's manifest. Its `capabilities.network.allow` lists
+/// [`REGISTRY_SEARCH_ORIGINS`], then `extra_network_allow`.
+pub(crate) fn build_meta_manifest(
+    config: &InferenceConfig,
+    extra_network_allow: &[String],
+) -> String {
     let provider: &Provider = match config.provider.as_str() {
         "openai" => &OPENAI,
         _ => &ANTHROPIC,
@@ -424,6 +523,12 @@ pub(crate) fn build_meta_manifest(config: &InferenceConfig) -> String {
             )
         })
         .collect();
+    let network_allow: String = REGISTRY_SEARCH_ORIGINS
+        .iter()
+        .copied()
+        .chain(extra_network_allow.iter().map(String::as_str))
+        .map(|origin| format!("      - \"{origin}\"\n"))
+        .collect();
 
     format!(
         r#"name: murmur-manifest-generator
@@ -435,7 +540,10 @@ artifacts:
     gateway:
       endpoint: {endpoint}
       api_key: {META_MANIFEST_KEY_PLACEHOLDER}
-{others}lifecycle:
+{others}capabilities:
+  network:
+    allow:
+{network_allow}lifecycle:
   task_acceptance: single
   after_task: exit
 inference:
@@ -449,6 +557,8 @@ inference:
     )
 }
 
+/// `E-RUN-008` for the first generator artifact the global store does not hold. The generator
+/// stages from the global store, so the hint installs there: a project install never reaches it.
 fn check_artifacts_installed(
     local_registry: &LocalRegistry,
     artifacts: &[ArtifactRequest],
@@ -467,7 +577,7 @@ fn check_artifacts_installed(
                     E_RUN_008,
                     format!("generator artifact '{}' is not installed", artifact.name),
                     format!(
-                        "run `mur install {}@{}` to install it",
+                        "run `mur install -g {}@{}` to install it",
                         artifact.name, artifact.version
                     ),
                 ));
@@ -478,14 +588,9 @@ fn check_artifacts_installed(
     Ok(())
 }
 
-/// The prompt for the generator capsule. `index` reaches the registry-search tool under that
-/// tool's own input key, `registry`.
-fn build_task_prompt(task: &str, index: Option<&str>, _inf: &InferenceConfig) -> String {
-    let registry_arg = match index {
-        Some(index) => format!(", \"registry\":\"{index}\""),
-        None => String::new(),
-    };
-
+/// The prompt for the generator capsule. `index` is the registry-search tool's `index` input,
+/// shown in the example call.
+fn build_task_prompt(task: &str, index: &str, _inf: &InferenceConfig) -> String {
     format!(
         r#"Step 1 — Read your manifest generation guide:
 Call read_file with path "murmur-runtime/tools/skill-create-manifest/skill.md".
@@ -493,15 +598,17 @@ Read the full contents before proceeding.
 
 Step 2 — Search for available artifacts:
 Call the registry search tool with a query relevant to the task.
-Example: {{"query": "git editor shell"{registry_arg}}}
-Use the exact artifact names and versions from the results.
+Example: {{"query": "git editor shell", "index": {index}}}
+Pass this index on every search call.
+Each result names an artifact by its full <scope>/<name> and lists its versions newest first.
+Use each artifact's full <scope>/<name>, at the newest version the results list for it.
 
 Step 3 — Generate the manifest:
 Task: {task}
 
 Follow all guidance from the skill file. The manifest must pass `mur build` validation.
 Prefer murmur/tool-git and murmur/tool-editor over granting bash shell access.
-Use the exact artifact versions returned by the registry search.
+Name every artifact by its full <scope>/<name>, at the newest version the registry search lists.
 Include runtime: tool at the top level.
 
 Step 4 — Write the manifest:
@@ -510,7 +617,7 @@ Do not include markdown fences in the file content — write raw YAML only.
 Output only the word DONE when finished.
 "#,
         task = task,
-        registry_arg = registry_arg,
+        index = serde_json::Value::from(index),
     )
 }
 
@@ -532,7 +639,7 @@ mod tests {
             api_key: fake_key(&["sk-", "ant-", "test"]),
             endpoint: String::new(),
         };
-        let yaml = build_meta_manifest(&config);
+        let yaml = build_meta_manifest(&config, &[]);
         assert!(
             yaml.contains("name: murmur/driver-anthropic"),
             "should use anthropic driver"
@@ -559,7 +666,7 @@ mod tests {
             api_key: fake_key(&["sk-", "test"]),
             endpoint: String::new(),
         };
-        let yaml = build_meta_manifest(&config);
+        let yaml = build_meta_manifest(&config, &[]);
         assert!(
             yaml.contains("name: murmur/driver-openai"),
             "should use openai driver"
@@ -583,7 +690,7 @@ mod tests {
             api_key: fake_key(&["sk-", "ant-", "test"]),
             endpoint: "https://custom.proxy.example.com".to_string(),
         };
-        let yaml = build_meta_manifest(&config);
+        let yaml = build_meta_manifest(&config, &[]);
         assert!(
             yaml.contains("custom.proxy.example.com"),
             "should use custom endpoint"
@@ -602,7 +709,7 @@ mod tests {
             api_key: fake_key(&["sk-", "ant-", "test"]),
             endpoint: String::new(),
         };
-        let yaml = build_meta_manifest(&config);
+        let yaml = build_meta_manifest(&config, &[]);
         assert!(
             yaml.contains(&format!("api_key: {META_MANIFEST_KEY_PLACEHOLDER}")),
             "the driver entry must carry the placeholder key reference"
@@ -642,7 +749,7 @@ mod tests {
             api_key: fake_key(&["sk-", "ant-", "test"]),
             endpoint: String::new(),
         };
-        let yaml = build_meta_manifest(&config);
+        let yaml = build_meta_manifest(&config, &[]);
         let runtime_manifest = RuntimeManifest::from_yaml_str(&yaml)
             .expect("build_meta_manifest should produce a valid runtime manifest without any env var present");
         let driver = runtime_manifest
@@ -696,7 +803,7 @@ mod tests {
         // parse → inject the real key into the parsed struct in memory.
         let result = (|| -> Result<RuntimeManifest, CliError> {
             let inf = resolve_inference_config()?;
-            let meta_yaml = build_meta_manifest(&inf);
+            let meta_yaml = build_meta_manifest(&inf, &[]);
             let mut runtime_manifest = RuntimeManifest::from_yaml_str(&meta_yaml).map_err(|e| {
                 CliError::new(
                     E_MAN_002,
@@ -907,21 +1014,166 @@ mod tests {
     }
 
     #[test]
-    fn index_flag_appears_in_task_prompt_as_the_tools_registry_input() {
-        let prompt = build_task_prompt("summarise a document", Some("local"), &anthropic_inf());
-        assert!(
-            prompt.contains("\"registry\":\"local\""),
-            "task prompt should embed the --index value under the `registry` input key of murmur/tool-registry-search"
-        );
+    fn a_url_index_reaches_the_tool_as_its_index_input() {
+        let url = "http://127.0.0.1:8080/x/artifacts-index.json";
+        let index = GeneratorIndex::resolve(Some(url)).unwrap();
+        for config in [anthropic_inf(), openai_inf()] {
+            let prompt = build_task_prompt("summarise a document", index.tool_input(), &config);
+            assert!(
+                prompt.contains(&format!("\"index\": \"{url}\"")),
+                "the example call passes the URL as `index`: {prompt}"
+            );
+            assert!(!prompt.contains("\"registry\""), "{prompt}");
+        }
     }
 
     #[test]
-    fn no_index_flag_omits_registry_from_prompt() {
-        let prompt = build_task_prompt("summarise a document", None, &anthropic_inf());
-        assert!(
-            !prompt.contains("\"registry\""),
-            "task prompt should not include the registry input when --index is absent"
+    fn a_file_index_reaches_the_tool_as_its_work_folder_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("my-index.json");
+        let text = "{\"schema_version\":2,\"scope\":\"ana\",\"artifacts\":[]}\n";
+        std::fs::write(&path, text).unwrap();
+        let index = GeneratorIndex::resolve(Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(
+            index,
+            GeneratorIndex::File {
+                text: text.to_string()
+            }
         );
+        assert!(index.extra_network_allow().is_empty());
+        for config in [anthropic_inf(), openai_inf()] {
+            let prompt = build_task_prompt("summarise a document", index.tool_input(), &config);
+            assert!(
+                prompt.contains("\"index\": \"artifacts-index.json\""),
+                "{prompt}"
+            );
+            assert!(!prompt.contains("\"registry\""), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn no_index_names_the_latest_default_artifacts_release() {
+        let index = GeneratorIndex::resolve(None).unwrap();
+        assert_eq!(index, GeneratorIndex::Default);
+        assert!(index.extra_network_allow().is_empty());
+        for config in [anthropic_inf(), openai_inf()] {
+            let prompt = build_task_prompt("summarise a document", index.tool_input(), &config);
+            assert!(
+                prompt.contains(&format!("\"index\": \"{DEFAULT_INDEX_URL}\"")),
+                "{prompt}"
+            );
+            assert!(!prompt.contains("\"registry\""), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn a_local_index_is_refused_naming_mur_search() {
+        let error = GeneratorIndex::resolve(Some("local")).unwrap_err();
+        assert_eq!(error.code, E_NEW_005);
+        assert!(
+            error
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("mur search <query> --index local")),
+            "{error:?}"
+        );
+    }
+
+    /// GitHub's raw-content host, which the generator manifest never names. Split so a search
+    /// of the source for references to it finds none.
+    const RETIRED_INDEX_HOST: &str = concat!("raw.", "githubusercontent.com");
+
+    /// The parsed generator manifest's top-level `capabilities.network.allow`.
+    fn network_allow(yaml: &str) -> Vec<String> {
+        RuntimeManifest::from_yaml_str(yaml)
+            .expect("the generator manifest parses")
+            .capabilities
+            .and_then(|capabilities| capabilities.network)
+            .map(|network| network.allow)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn build_meta_manifest_grants_the_registry_search_hosts() {
+        for config in [anthropic_inf(), openai_inf()] {
+            let yaml = build_meta_manifest(&config, &[]);
+            assert_eq!(
+                declared_version(&yaml, "murmur/tool-registry-search").as_deref(),
+                Some("0.2.0")
+            );
+            assert_eq!(
+                network_allow(&yaml),
+                [
+                    "https://github.com",
+                    "https://release-assets.githubusercontent.com"
+                ],
+                "{} provider",
+                config.provider
+            );
+            assert!(!yaml.contains(RETIRED_INDEX_HOST), "{yaml}");
+        }
+    }
+
+    #[test]
+    fn build_meta_manifest_appends_a_url_indexs_origin_once() {
+        let index =
+            GeneratorIndex::resolve(Some("http://127.0.0.1:8080/x/artifacts-index.json")).unwrap();
+        let extra = index.extra_network_allow();
+        assert_eq!(extra, ["http://127.0.0.1:8080"]);
+        for config in [anthropic_inf(), openai_inf()] {
+            let yaml = build_meta_manifest(&config, &extra);
+            assert_eq!(
+                network_allow(&yaml),
+                [
+                    "https://github.com",
+                    "https://release-assets.githubusercontent.com",
+                    "http://127.0.0.1:8080"
+                ],
+                "{} provider",
+                config.provider
+            );
+            assert!(!yaml.contains(RETIRED_INDEX_HOST), "{yaml}");
+            let mut manifest = RuntimeManifest::from_yaml_str(&yaml).unwrap();
+            inject_driver_key(&mut manifest, "test-key");
+            let driver = config_driver(&config);
+            assert_eq!(
+                manifest
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.name == driver)
+                    .and_then(|artifact| artifact.gateway.as_ref())
+                    .and_then(|gateway| gateway.api_key.clone()),
+                Some(murmur_artifact::ApiKeyReference::Literal(
+                    "test-key".to_string()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn build_meta_manifest_adds_nothing_for_a_url_on_github() {
+        let index = GeneratorIndex::resolve(Some(
+            "https://github.com/ana/my-artifacts/releases/latest/download/artifacts-index.json",
+        ))
+        .unwrap();
+        assert!(index.extra_network_allow().is_empty());
+        for config in [anthropic_inf(), openai_inf()] {
+            let yaml = build_meta_manifest(&config, &index.extra_network_allow());
+            assert_eq!(
+                network_allow(&yaml),
+                [
+                    "https://github.com",
+                    "https://release-assets.githubusercontent.com"
+                ]
+            );
+        }
+    }
+
+    fn config_driver(config: &InferenceConfig) -> &'static str {
+        match config.provider.as_str() {
+            "openai" => OPENAI.driver,
+            _ => ANTHROPIC.driver,
+        }
     }
 
     /// The `version:` of the artifact entry named `name` in a generator manifest.
@@ -937,7 +1189,7 @@ mod tests {
     #[test]
     fn build_meta_manifest_pins_the_providers_driver_version() {
         for (config, provider) in [(anthropic_inf(), &ANTHROPIC), (openai_inf(), &OPENAI)] {
-            let yaml = build_meta_manifest(&config);
+            let yaml = build_meta_manifest(&config, &[]);
             assert_eq!(
                 declared_version(&yaml, provider.driver).as_deref(),
                 Some(provider.driver_version),
@@ -956,7 +1208,7 @@ mod tests {
     #[test]
     fn build_meta_manifest_includes_tool_editor() {
         for config in [anthropic_inf(), openai_inf()] {
-            let yaml = build_meta_manifest(&config);
+            let yaml = build_meta_manifest(&config, &[]);
             assert_eq!(
                 declared_version(&yaml, "murmur/tool-editor").as_deref(),
                 Some(GENERATOR_ARTIFACTS[1].version),
@@ -969,7 +1221,7 @@ mod tests {
     #[test]
     fn build_meta_manifest_includes_tool_registry_search() {
         for config in [anthropic_inf(), openai_inf()] {
-            let yaml = build_meta_manifest(&config);
+            let yaml = build_meta_manifest(&config, &[]);
             assert_eq!(
                 declared_version(&yaml, "murmur/tool-registry-search").as_deref(),
                 Some(GENERATOR_ARTIFACTS[0].version),
@@ -982,7 +1234,7 @@ mod tests {
     #[test]
     fn build_meta_manifest_includes_skill_create_manifest() {
         for config in [anthropic_inf(), openai_inf()] {
-            let yaml = build_meta_manifest(&config);
+            let yaml = build_meta_manifest(&config, &[]);
             let manifest = RuntimeManifest::from_yaml_str(&yaml).expect("parses");
             let skill = manifest
                 .artifacts
@@ -1020,7 +1272,7 @@ mod tests {
     #[test]
     fn build_task_prompt_does_not_contain_inline_schema() {
         for config in [anthropic_inf(), openai_inf()] {
-            let prompt = build_task_prompt("summarise a document", None, &config);
+            let prompt = build_task_prompt("summarise a document", DEFAULT_INDEX_URL, &config);
             assert!(
                 !prompt.contains("api_key:"),
                 "prompt must not embed api_key inline schema field ({} provider)",
@@ -1041,7 +1293,7 @@ mod tests {
 
     #[test]
     fn build_task_prompt_instructs_read_file() {
-        let prompt = build_task_prompt("summarise a document", None, &anthropic_inf());
+        let prompt = build_task_prompt("summarise a document", DEFAULT_INDEX_URL, &anthropic_inf());
         assert!(
             prompt.contains("read_file"),
             "prompt must instruct agent to call read_file"
@@ -1054,7 +1306,7 @@ mod tests {
 
     #[test]
     fn build_task_prompt_instructs_write_file() {
-        let prompt = build_task_prompt("summarise a document", None, &anthropic_inf());
+        let prompt = build_task_prompt("summarise a document", DEFAULT_INDEX_URL, &anthropic_inf());
         assert!(
             prompt.contains("write_file"),
             "prompt must instruct agent to call write_file"

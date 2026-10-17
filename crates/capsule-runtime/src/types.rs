@@ -731,6 +731,18 @@ impl StagedSession {
         )
     }
 
+    /// Writes `bytes` as `rel` in the accessible workdir before launch, the folder the capsule's
+    /// tools see as their working directory. A link at `rel` is refused rather than written
+    /// through, and missing parent directories are created.
+    pub fn write_workdir_file(
+        &self,
+        rel: &str,
+        bytes: &[u8],
+    ) -> Result<(), crate::workdir_fs::WorkdirError> {
+        self.accessible_root
+            .write_file(rel, bytes, crate::workdir_fs::DEFAULT_FILE_MODE)
+    }
+
     /// Hands this session the credential it will present to the spawning daemon.
     pub fn set_spawn_credential(&mut self, credential: SpawnCredential) {
         self.spawn_credential = Some(credential);

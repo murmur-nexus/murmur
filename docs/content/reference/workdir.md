@@ -450,7 +450,7 @@ conversation. The runtime keeps no message list for that capsule and records one
 [`context.record_store`](manifest.md#field-context) points both transports at the same place.
 
 ```json
-{"type":"murmur.harness-session","session_id":"0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55","harness":"claude-code","driver":"driver-claude-code","created_ms":1758326400000,"updated_ms":1758326461000}
+{"type":"murmur.harness-session","session_id":"0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55","harness":"claude-code","driver":"murmur/driver-claude-code","created_ms":1758326400000,"updated_ms":1758326461000}
 ```
 
 | Key | Value |
@@ -458,7 +458,7 @@ conversation. The runtime keeps no message list for that capsule and records one
 | `type` | Always `murmur.harness-session`. A file carrying anything else is read as no entry |
 | `session_id` | What the harness calls this conversation. Opaque: the runtime only ever hands it back |
 | `harness` | The harness its process driver named, for a person reading the directory |
-| `driver` | The bare name of the process driver artifact that drove it, for a person reading the directory |
+| `driver` | The full `<scope>/<name>` of the process driver artifact that drove it, for a person reading the directory |
 | `created_ms` | When this context first got a session |
 | `updated_ms` | When the entry was last written |
 
