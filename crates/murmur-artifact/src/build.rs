@@ -498,7 +498,7 @@ mod tests {
         let file = std::fs::File::open(&out).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
             .collect();
 
         assert!(names.contains(&"murmur.yaml".to_string()));
@@ -567,7 +567,7 @@ mod tests {
         let file = File::open(archive_path).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
         (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
             .collect()
     }
 
@@ -722,7 +722,7 @@ mod tests {
         let mut archive = ZipArchive::new(file).unwrap();
 
         let mut names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
             .collect();
         names.sort();
 
@@ -776,7 +776,7 @@ mod tests {
         let file = File::open(&out).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
             .collect();
 
         assert_eq!(

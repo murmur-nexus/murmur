@@ -275,6 +275,11 @@ fn cli_system_prompt_overrides_a_prompt_file_that_does_not_exist() {
 /// run, in the runtime directory, which is removed when the session ends.
 #[test]
 fn cli_system_prompt_restores_an_overridden_prompt_artifact_to_the_inventory() {
+    if common::skip_without_host_support(
+        "cli_system_prompt_restores_an_overridden_prompt_artifact_to_the_inventory",
+    ) {
+        return;
+    }
     // Baseline: the manifest declaration alone binds the skill and hides it from the inventory.
     let baseline = CliFixture::new(read_murmur_md_responses());
     let manifest_path = baseline.write_manifest_with_skill_and_bash(&format!(

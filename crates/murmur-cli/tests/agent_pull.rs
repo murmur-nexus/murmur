@@ -413,6 +413,11 @@ fn of_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> {
 /// Pulled in turn 1, offered and called in turn 2, under the default `inference.tool_refresh`.
 #[test]
 fn s1_a_pulled_tool_is_offered_and_called_from_the_next_turn() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s1_a_pulled_tool_is_offered_and_called_from_the_next_turn",
+    ) {
+        return;
+    }
     let server = common::ScriptedServer::start(vec![
         tool_use(
             1,
@@ -616,6 +621,9 @@ fn s2_a_grant_under_transport_process_is_refused_at_load() {
 /// token, and nothing written.
 #[test]
 fn s3_refused_pulls_write_nothing() {
+    if capsule_runtime::skip_without_egress_namespace("s3_refused_pulls_write_nothing") {
+        return;
+    }
     let calls = [
         ("toolu_other", "murmur/other"),
         ("toolu_hook", "murmur/tool-hookish"),
@@ -704,6 +712,11 @@ fn s3_refused_pulls_write_nothing() {
 
 #[test]
 fn s4_with_only_a_non_fitting_version_a_versionless_pull_is_refused() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s4_with_only_a_non_fitting_version_a_versionless_pull_is_refused",
+    ) {
+        return;
+    }
     let server = common::ScriptedServer::start(vec![
         tool_use(
             1,
@@ -788,6 +801,11 @@ fn ana_stores_hold_nothing(p: &Project) {
 
 #[test]
 fn s5_from_sources_fetches_from_the_scope_source() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s5_from_sources_fetches_from_the_scope_source",
+    ) {
+        return;
+    }
     let stub = MockGitHub::start();
     let _source = ana_source(&stub, "tool");
     let server = common::ScriptedServer::start(vec![
@@ -836,6 +854,9 @@ fn s5_from_sources_fetches_from_the_scope_source() {
 
 #[test]
 fn s5_the_default_from_reads_no_source() {
+    if capsule_runtime::skip_without_egress_namespace("s5_the_default_from_reads_no_source") {
+        return;
+    }
     let stub = MockGitHub::start();
     let _source = ana_source(&stub, "tool");
     let server = common::ScriptedServer::start(vec![
@@ -870,6 +891,11 @@ fn s5_the_default_from_reads_no_source() {
 
 #[test]
 fn s5_a_lock_recording_another_owner_refuses_before_any_asset() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s5_a_lock_recording_another_owner_refuses_before_any_asset",
+    ) {
+        return;
+    }
     let stub = MockGitHub::start();
     let _source = ana_source(&stub, "tool");
     let server = common::ScriptedServer::start(vec![
@@ -916,6 +942,11 @@ fn s5_a_lock_recording_another_owner_refuses_before_any_asset() {
 
 #[test]
 fn s5_a_hook_in_the_index_is_refused_before_any_asset() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s5_a_hook_in_the_index_is_refused_before_any_asset",
+    ) {
+        return;
+    }
     let stub = MockGitHub::start();
     let _source = ana_source(&stub, "hook");
     let server = common::ScriptedServer::start(vec![
@@ -949,6 +980,11 @@ fn s5_a_hook_in_the_index_is_refused_before_any_asset() {
 /// refused, and the next request no longer offers it.
 #[test]
 fn s6_a_removal_lets_earlier_calls_finish_and_refuses_later_ones() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s6_a_removal_lets_earlier_calls_finish_and_refuses_later_ones",
+    ) {
+        return;
+    }
     let server = common::ScriptedServer::start(vec![
         tool_use(
             1,
@@ -1135,6 +1171,11 @@ fn tools_at_second_request(
 
 #[test]
 fn s7_a_pull_writes_only_its_tool_directory_the_lock_and_a_compiled_form() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s7_a_pull_writes_only_its_tool_directory_the_lock_and_a_compiled_form",
+    ) {
+        return;
+    }
     let runtime_dir: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>> = Default::default();
     let seen: std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>> = Default::default();
     let server = common::ScriptedServer::start_answering(
@@ -1227,6 +1268,11 @@ fn s7_a_pull_writes_only_its_tool_directory_the_lock_and_a_compiled_form() {
 /// gains nothing.
 #[test]
 fn s7_a_link_planted_in_the_workdir_redirects_no_pull() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s7_a_link_planted_in_the_workdir_redirects_no_pull",
+    ) {
+        return;
+    }
     let workdir = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let planted: std::sync::Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>> =
@@ -1273,6 +1319,11 @@ fn s7_a_link_planted_in_the_workdir_redirects_no_pull() {
 
 #[test]
 fn s8_a_pattern_lists_what_the_capsule_may_pull_and_pulls_nothing() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s8_a_pattern_lists_what_the_capsule_may_pull_and_pulls_nothing",
+    ) {
+        return;
+    }
     let server = common::ScriptedServer::start(vec![
         end_turn("pinned"),
         tool_uses(

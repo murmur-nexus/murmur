@@ -816,6 +816,11 @@ fn wasm_probe_run(
 #[test]
 #[allow(clippy::print_stdout)]
 fn runtime_dir_wasm_tool_reads_murmur_runtime_and_cannot_write_it() {
+    if common::skip_without_host_support(
+        "runtime_dir_wasm_tool_reads_murmur_runtime_and_cannot_write_it",
+    ) {
+        return;
+    }
     let (server, preopens) = wasm_probe_run(None);
     let report = preopens
         .iter()
@@ -845,6 +850,9 @@ fn runtime_dir_wasm_tool_reads_murmur_runtime_and_cannot_write_it() {
 #[test]
 #[allow(clippy::print_stdout)]
 fn runtime_dir_scoped_wasm_tool_has_no_murmur_runtime() {
+    if common::skip_without_host_support("runtime_dir_scoped_wasm_tool_has_no_murmur_runtime") {
+        return;
+    }
     let (server, preopens) = wasm_probe_run(Some("work"));
     let report = preopens
         .iter()
@@ -1358,6 +1366,11 @@ fn runtime_dir_is_private_locked_while_held_and_removed_when_the_session_ends() 
 
 #[test]
 fn runtime_dir_staging_sweeps_unlocked_stale_directories_only() {
+    if common::skip_without_host_support(
+        "runtime_dir_staging_sweeps_unlocked_stale_directories_only",
+    ) {
+        return;
+    }
     let server = common::ScriptedServer::start(vec![end_turn("done")]);
     let p = project(&server.endpoint, &Spec::default()).unwrap();
     // Staged once to learn the home this process stages under.
@@ -1689,6 +1702,11 @@ fn run_with_identity(p: &Project, workdir: &Path, identity: &str) -> String {
 #[test]
 #[allow(clippy::print_stdout)]
 fn runtime_dir_workdir_identity_mismatch_refuses_before_writing() {
+    if common::skip_without_host_support(
+        "runtime_dir_workdir_identity_mismatch_refuses_before_writing",
+    ) {
+        return;
+    }
     let server = common::ScriptedServer::start(vec![end_turn("never sent")]);
     let p = project(&server.endpoint, &Spec::default()).unwrap();
     let workdir = TempDir::new().unwrap();
@@ -1716,6 +1734,11 @@ fn runtime_dir_workdir_identity_mismatch_refuses_before_writing() {
 #[test]
 #[allow(clippy::print_stdout)]
 fn runtime_dir_workdir_identity_refuses_a_link_swapped_onto_the_created_directory() {
+    if common::skip_without_host_support(
+        "runtime_dir_workdir_identity_refuses_a_link_swapped_onto_the_created_directory",
+    ) {
+        return;
+    }
     let server = common::ScriptedServer::start(vec![end_turn("never sent")]);
     let p = project(&server.endpoint, &Spec::default()).unwrap();
     let parent = TempDir::new().unwrap();
