@@ -130,8 +130,16 @@ A session whose manifest declares `control:` also holds its control token beside
 Each record carries the session id, the capsule address, the process id and its start time, the
 capsule name and version, the session workdir as `workdir`, the session's
 [records directory](workdir.md#records-directory) as `records_dir`, whether the session outlives
-its launcher, and the time it started. A record without `records_dir` is unreadable. It carries
-nothing from the environment: no API key, no granted variable.
+its launcher, and the time it started. It carries nothing from the environment: no API key, no
+granted variable.
+
+A record that is a JSON object with a string `session_id` and no `records_dir` key was written by
+an older `mur`. Its capsule may still be running, and only the `mur` that started it can stop it.
+
+| Command | What it does with an older `mur`'s record |
+|---|---|
+| [`mur ps`](#mur-ps) | Names it on stderr, as a `skipped:` line, and lists no row for it |
+| Every command, `mur ps` included | Leaves it in place: none reads, verifies, signals or removes it, so `mur stop`, `mur watch`, `mur cancel` and `mur token` answer as if it were absent |
 
 A session that is a [member of a formation](#mur-run-formation) also records its formation id, as
 `formation_id`. A session in no formation writes no such key. The id groups records; it grants
@@ -1558,8 +1566,16 @@ directory this user may not list — is neither: `mur ps` prints nothing on stdo
 [`E-RUN-028`](diagnostics.md#e-run-028).
 
 Listing also prunes the directory: `mur ps` removes the record of every capsule whose process is
-gone, and every file in the directory that is not a readable record. What it removed is printed on
-stderr, before the table. A read that removes nothing prints nothing on stderr.
+gone, and every file in the directory that is neither a readable record nor
+[a record an older `mur` wrote](#running-capsule-records). What it removed is printed on stderr,
+before the table. A read that removes nothing prints nothing on stderr.
+
+A record an older `mur` wrote is left in place, counted in no summary, and named on stderr ahead of
+any `pruned` line, with or without `--verbose`. Stop that capsule with the `mur` that started it:
+
+```text
+skipped: /home/me/.murmur/running/ses_019f0193c7d871a5b2e30ff41a7c0ce1.json — a record an older mur wrote, which this mur cannot read; it is left in place, so stop that capsule with the mur that started it
+```
 
 | Mode | Stderr |
 |---|---|

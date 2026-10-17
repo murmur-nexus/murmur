@@ -24,6 +24,26 @@ const TOOL_NAME: &str = "echo-tool";
 const TOOL_ARTIFACT: &str = "local/echo-tool";
 const TOOL_VERSION: &str = "0.1.0";
 
+/// `--task` names where the task lands: the session's runtime directory, which the capsule
+/// cannot change, and not the workdir.
+#[test]
+fn run_help_says_the_task_is_written_to_the_runtime_directory() {
+    let assert = Command::cargo_bin("mur")
+        .unwrap()
+        .args(["run", "--help"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let help = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    let start = help.find("--task <TASK>").expect("a --task entry");
+    let rest = &help[start + "--task <TASK>".len()..];
+    let entry = &rest[..rest.find(" --").unwrap_or(rest.len())];
+    assert!(entry.contains("runtime directory"), "{entry}");
+    assert!(entry.contains("$MURMUR_RUNTIME_DIR/task.md"), "{entry}");
+    assert!(entry.contains("the workdir is left alone"), "{entry}");
+    assert!(!entry.contains("capsule workdir"), "{entry}");
+}
+
 #[test]
 fn run_round_trip_writes_lock_and_uses_existing_lock_on_second_run() {
     let home = tempfile::tempdir().unwrap();

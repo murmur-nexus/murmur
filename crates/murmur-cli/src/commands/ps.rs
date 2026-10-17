@@ -26,6 +26,10 @@ const UPTIME_WIDTH: usize = 9;
 /// A full `frm_` id, or `-` for a session in no formation.
 const FORMATION_WIDTH: usize = 36;
 
+/// What follows `skipped: <path>` for a record an older `mur` wrote.
+const OLDER_MUR_SKIPPED: &str = "a record an older mur wrote, which this mur cannot read; it is \
+     left in place, so stop that capsule with the mur that started it";
+
 /// What a row says about the capsule it names, once the record has been verified.
 const STATUS_RUNNING: &str = "running";
 const STATUS_UNREACHABLE: &str = "unreachable";
@@ -40,6 +44,11 @@ const STATUS_UNREACHABLE: &str = "unreachable";
 /// or whose start time could not be read, is kept and reported as `unreachable` — neither is
 /// evidence of a dead capsule, and unlinking it would throw away the only handle to something
 /// still running.
+///
+/// A record an older `mur` wrote is neither listed nor removed: its capsule may still be running,
+/// and only the `mur` that started it can reach it. Each one is named on stderr first, in both
+/// modes, as `skipped: <path> — ` followed by [`OLDER_MUR_SKIPPED`], and none is counted as
+/// pruned.
 ///
 /// What was unlinked is stated on stderr, before the table. By default that is one line counting
 /// every removal, [`pruned_summary`], and nothing when there was none. With `verbose` it is one
@@ -56,6 +65,9 @@ const STATUS_UNREACHABLE: &str = "unreachable";
 /// Nothing a formation summary reads can fail the command.
 pub(crate) fn run_ps(verbose: bool) -> Result<(), CliError> {
     let listing = running::list_reporting().map_err(|reason| records_unreadable(&reason))?;
+    for path in &listing.older_mur {
+        capsule_runtime::report_eprintln!("skipped: {} — {OLDER_MUR_SKIPPED}", path.display());
+    }
     let mut rows = Vec::new();
     let mut pruned = Vec::new();
     for record in listing.records {

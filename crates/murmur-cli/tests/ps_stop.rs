@@ -691,6 +691,79 @@ fn ps_prunes_the_dead_and_keeps_the_unreachable() {
     assert!(stray.is_alive(), "`mur ps` must signal nothing");
 }
 
+/// The line `mur ps` prints for a record an older `mur` wrote.
+fn skipped_line(path: &Path) -> String {
+    format!(
+        "skipped: {} — a record an older mur wrote, which this mur cannot read; it is left in \
+         place, so stop that capsule with the mur that started it",
+        path.display()
+    )
+}
+
+/// A record v0.6.0 wrote has no `records_dir`. `mur ps` names it in both modes and leaves it byte
+/// for byte, while a file that is no record is still pruned and counted; `mur stop @1` neither
+/// reaches nor removes it. The record names a formation, which keys no `FORMATION` column.
+#[test]
+fn ps_names_a_record_an_older_mur_wrote_and_leaves_it() {
+    let home = tempfile::tempdir().unwrap();
+    let older_id = fabricated_id("060");
+    let older = record_for(home.path(), &older_id);
+    fs::create_dir_all(running_dir(home.path())).unwrap();
+    let older_body = serde_json::to_vec_pretty(&json!({
+        "session_id": older_id,
+        "url": "127.0.0.1:1",
+        "pid": DEAD_PID,
+        "process_start": "1",
+        "capsule_name": "fabricated",
+        "capsule_version": "0.1.0",
+        "workdir": "/tmp/fabricated",
+        "outlives_launcher": true,
+        "started_at": "2026-01-01T00:00:00Z",
+        "formation_id": capsule_runtime::FormationId::mint().to_string(),
+    }))
+    .unwrap();
+    fs::write(&older, &older_body).unwrap();
+    let broken = running_dir(home.path()).join("ses_broken.json");
+    fs::write(&broken, "{").unwrap();
+
+    let (stdout, stderr) = ps_output(home.path());
+    println!("mur ps stderr:\n{stderr}");
+    assert!(stderr.contains(&skipped_line(&older)), "{stderr}");
+    assert_eq!(pruned_summaries(&stderr), [pruned_summary(1)], "{stderr}");
+    assert!(
+        ps_rows(&stdout).iter().all(|row| !row.contains(&older_id)),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("FORMATION"), "{stdout}");
+    assert_eq!(fs::read(&older).unwrap(), older_body);
+    assert!(!broken.exists(), "the unreadable file");
+
+    fs::write(&broken, "{").unwrap();
+    let (_, stderr) = ps_output_verbose(home.path());
+    println!("mur ps --verbose stderr:\n{stderr}");
+    assert!(stderr.contains(&skipped_line(&older)), "{stderr}");
+    let pruned = pruned_lines(&stderr);
+    assert!(
+        pruned.contains(&format!("pruned: {} — not a readable record", broken.display()).as_str()),
+        "{stderr}"
+    );
+    assert!(
+        pruned.iter().all(|line| !line.contains(&older_id)),
+        "{stderr}"
+    );
+    assert_eq!(fs::read(&older).unwrap(), older_body);
+
+    let output = mur(home.path())
+        .args(["stop", "@1"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(stderr.contains("E-RUN-022"), "{stderr}");
+    assert_eq!(fs::read(&older).unwrap(), older_body);
+}
+
 /// A live pid whose start time differs from the recorded one belongs to another process now. The
 /// record is unlinked and named on stderr, and the process holding the pid is left alone.
 #[test]
