@@ -181,7 +181,7 @@ fn published_pins_beta_generator() {
                 "mur new <task>'s generator manifest ({} provider)",
                 provider.name
             ),
-            &build_meta_manifest(&config),
+            &build_meta_manifest(&config, &[]),
         );
     }
 }

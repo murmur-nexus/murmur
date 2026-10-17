@@ -18,7 +18,7 @@ use std::{
 };
 
 use capsule_runtime::launch_session;
-use murmur_artifact::ContainmentClass;
+use murmur_artifact::{current_platform, ContainmentClass, ARTIFACT_INDEX_FILE_NAME};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -685,17 +685,26 @@ fn write_git_repo(root: &Path) {
     }
 }
 
-/// The installed name of the zip in `zips` whose file name starts with `artifact-`.
+/// The zip in `zips` whose file name starts with `artifact-`: the one ending
+/// `-<current platform>.mur.zip` when `zips` holds one, so a directory holding several platforms'
+/// payloads works.
 fn zip_for(zips: &Path, artifact: &str) -> PathBuf {
-    fs::read_dir(zips)
+    let candidates: Vec<PathBuf> = fs::read_dir(zips)
         .unwrap()
         .flatten()
         .map(|entry| entry.path())
-        .find(|path| {
+        .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(&format!("{artifact}-")))
         })
+        .collect();
+    let this_platform = format!("-{}.mur.zip", current_platform());
+    candidates
+        .iter()
+        .find(|path| path.to_string_lossy().ends_with(&this_platform))
+        .or_else(|| candidates.first())
+        .cloned()
         .unwrap_or_else(|| panic!("no {artifact} zip in {}", zips.display()))
 }
 
@@ -713,7 +722,7 @@ fn zip_version(zip: &Path) -> String {
         .to_string()
 }
 
-/// S12: the five default-artifacts native tools, each driven through one scripted session under
+/// The five default-artifacts native tools, each driven through one scripted session under
 /// `scoped` and under `sealed`, with the grants the coding capsules declare for them. Prints each
 /// call's result; asserts the outcomes `docs/content/reference/default-artifacts.md` records.
 #[test]
@@ -755,7 +764,7 @@ fn default_artifacts_native_tools_run_confined() {
                 .expect("the fixture tool builds");
             for (id, tool, _) in &calls {
                 let text = ran.text(id);
-                let expected = expect(floor, id);
+                let expected = expect(id);
                 println!("[{floor}] {tool} {id}: expected one of {expected:?}");
                 assert!(
                     expected.iter().any(|expect| expect.matches(text)),
@@ -771,23 +780,15 @@ fn default_artifacts_native_tools_run_confined() {
 enum Expect {
     /// Succeeds, and its result contains this text.
     Ok(&'static str),
-    /// Fails with this text, on a need no manifest field can express at this floor or on a defect
-    /// in the tool itself.
-    Unmet(&'static str),
 }
 
 impl Expect {
     fn matches(self, text: &str) -> bool {
         match self {
             Self::Ok(marker) => text.contains(marker) && !text.contains("\"ok\":false"),
-            Self::Unmet(error) => text.contains(error),
         }
     }
 }
-
-/// registry-search 0.1.0 enables ureq's `native-tls` feature without handing ureq a connector,
-/// so every HTTPS fetch fails before a connection is attempted, sandboxed or not.
-const REGISTRY_SEARCH_NO_TLS: Expect = Expect::Unmet("no TLS backend is configured");
 
 /// The tools one session installs, with the grants the coding capsules give them.
 struct DefaultArtifactCase {
@@ -799,25 +800,28 @@ struct DefaultArtifactCase {
 impl DefaultArtifactCase {
     const ALL: [DefaultArtifactCase; 4] = [
         DefaultArtifactCase {
-            artifacts: &["murmur-tool-git"],
+            artifacts: &["tool-git"],
             shell_allow: &["git"],
             network_allow: &[],
         },
         // One session: code-coverage localizes against the index code-graph builds.
         DefaultArtifactCase {
-            artifacts: &["murmur-tool-code-graph", "murmur-tool-code-coverage"],
+            artifacts: &["tool-code-graph", "tool-code-coverage"],
             shell_allow: &[],
             network_allow: &[],
         },
         DefaultArtifactCase {
-            artifacts: &["murmur-tool-test-report"],
+            artifacts: &["tool-test-report"],
             shell_allow: &[],
             network_allow: &[],
         },
         DefaultArtifactCase {
-            artifacts: &["murmur-tool-registry-search"],
+            artifacts: &["tool-registry-search"],
             shell_allow: &[],
-            network_allow: &["https://raw.githubusercontent.com"],
+            network_allow: &[
+                "https://github.com",
+                "https://release-assets.githubusercontent.com",
+            ],
         },
     ];
 
@@ -826,7 +830,7 @@ impl DefaultArtifactCase {
         let crate_root = root.join("sample");
         let crate_path = crate_root.to_str().unwrap().to_string();
         match self.artifacts[0] {
-            "murmur-tool-git" => {
+            "tool-git" => {
                 let repo = root.join("repo");
                 write_git_repo(&repo);
                 fs::write(repo.join("untracked.txt"), "new\n").unwrap();
@@ -834,69 +838,73 @@ impl DefaultArtifactCase {
                 vec![
                     (
                         "toolu_git_status",
-                        "murmur-tool-git",
+                        "tool-git",
                         json!({"operation": "status", "repo": repo}),
                     ),
                     (
                         "toolu_git_log",
-                        "murmur-tool-git",
+                        "tool-git",
                         json!({"operation": "log", "repo": repo, "n": 1}),
                     ),
                 ]
             }
-            "murmur-tool-code-graph" => {
+            "tool-code-graph" => {
                 write_rust_crate(&crate_root);
                 write_lcov(&root.join("coverage"), &crate_root);
                 vec![
                     (
                         "toolu_graph_index",
-                        "murmur-tool-code-graph",
+                        "tool-code-graph",
                         json!({"operation": "index_repository", "repo_path": crate_path}),
                     ),
                     (
                         "toolu_graph_find",
-                        "murmur-tool-code-graph",
+                        "tool-code-graph",
                         json!({"operation": "find_symbol", "repo_path": crate_path,
                                "query": "double"}),
                     ),
                     (
                         "toolu_coverage_localize",
-                        "murmur-tool-code-coverage",
+                        "tool-code-coverage",
                         json!({"operation": "localize", "repo_path": crate_path,
                                "coverage_dir": root.join("coverage").to_str().unwrap(),
                                "failing_tests": ["doubles"]}),
                     ),
                 ]
             }
-            "murmur-tool-test-report" => {
+            "tool-test-report" => {
                 let output = root.join("cargo-test.txt");
                 fs::write(&output, CARGO_TEST_OUTPUT).unwrap();
                 vec![(
                     "toolu_report_parse",
-                    "murmur-tool-test-report",
+                    "tool-test-report",
                     json!({"operation": "parse", "input_path": output.to_str().unwrap()}),
                 )]
             }
-            "murmur-tool-registry-search" => vec![
-                (
-                    "toolu_search_public",
-                    "murmur-tool-registry-search",
-                    json!({"query": "git", "limit": 3}),
-                ),
-                (
-                    "toolu_search_local",
-                    "murmur-tool-registry-search",
-                    json!({"query": "registry", "registry": "local"}),
-                ),
-            ],
+            "tool-registry-search" => {
+                let index = root.join(ARTIFACT_INDEX_FILE_NAME);
+                fs::copy(published_index_fixture(), &index).unwrap();
+                vec![
+                    (
+                        "toolu_search_public",
+                        "tool-registry-search",
+                        json!({"query": "git", "limit": 3}),
+                    ),
+                    (
+                        "toolu_search_local",
+                        "tool-registry-search",
+                        json!({"query": "registry-search", "index": index.to_str().unwrap()}),
+                    ),
+                ]
+            }
             other => unreachable!("no case for {other}"),
         }
     }
 }
 
-/// The outcomes `docs/content/reference/default-artifacts.md` records for each call at `floor`;
-/// a call passes when it matches any of them.
-fn expect(floor: ContainmentClass, id: &str) -> Vec<Expect> {
+/// The outcomes `docs/content/reference/default-artifacts.md` records for each call, the same at
+/// `scoped` and `sealed`; a call passes when it matches any of them.
+fn expect(id: &str) -> Vec<Expect> {
     match id {
         "toolu_git_status" => vec![Expect::Ok("untracked.txt")],
         "toolu_git_log" => vec![Expect::Ok("first commit")],
@@ -904,14 +912,15 @@ fn expect(floor: ContainmentClass, id: &str) -> Vec<Expect> {
         "toolu_graph_find" => vec![Expect::Ok("double")],
         "toolu_coverage_localize" => vec![Expect::Ok("top_suspects")],
         "toolu_report_parse" => vec![Expect::Ok("tests::doubles")],
-        // With a TLS backend, `scoped` still refuses OpenSSL the system trust store under /etc/ssl,
-        // which no manifest field grants a native tool. `sealed` binds and grants it.
-        "toolu_search_public" if floor == ContainmentClass::Scoped => vec![
-            REGISTRY_SEARCH_NO_TLS,
-            Expect::Unmet("X509_load_cert_file_ex"),
-        ],
-        "toolu_search_public" => vec![REGISTRY_SEARCH_NO_TLS, Expect::Ok("murmur-tool-git")],
-        "toolu_search_local" => vec![Expect::Ok("results")],
+        "toolu_search_public" => vec![Expect::Ok("murmur/tool-git")],
+        "toolu_search_local" => vec![Expect::Ok("murmur/tool-registry-search")],
         other => unreachable!("no expectation for {other}"),
     }
+}
+
+/// The verbatim copy of the index a default-artifacts release publishes.
+fn published_index_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/published-index")
+        .join(ARTIFACT_INDEX_FILE_NAME)
 }

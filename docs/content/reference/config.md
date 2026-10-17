@@ -352,10 +352,10 @@ affect them. `mur deploy` builds each scope's source from that file's `registry.
 ## Artifact index and custom registry URL
 
 `mur search` fetches a static JSON catalog, the [artifact index](artifact-index.md)
-`artifacts-index.json`. The default is the copy in the Murmur default-artifacts repository:
+`artifacts-index.json`. The default is the index on the latest default-artifacts release:
 
 ```text
-https://raw.githubusercontent.com/murmur-nexus/default-artifacts/refs/heads/main/artifacts-index.json
+https://github.com/murmur-nexus/default-artifacts/releases/latest/download/artifacts-index.json
 ```
 
 To point `mur search` at a different catalog — a private org index, say — set

@@ -12,12 +12,13 @@ use zip::{
 };
 
 use crate::build_info::{BuildInfo, BUILD_INFO_FILE};
+use crate::fit::newest_fitting_level;
 use crate::manifest::{load_manifest, refuse_retired_auth_block, Manifest, ManifestError};
 use crate::manifest_path::{resolve_manifest_path, MANIFEST_FILENAME};
 use crate::payload_shape::{select_root_wasm_from_entries, PayloadShapeError};
 use crate::registry::RuntimeType;
 use crate::wit_contract::extract_wit_contracts;
-use crate::wit_level::{newest_fitting_level, WitLevel};
+use crate::wit_level::WitLevel;
 use crate::zip_guard::{sanitize_entry_path, ZipGuardError};
 
 /// The name the project manifest is stored under *inside* a `.mur.zip`.

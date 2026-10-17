@@ -512,6 +512,13 @@ mod tests {
              Declared through the `tools` entry.",
         ),
         (
+            "types.rs",
+            "rel",
+            "`StagedSession::write_workdir_file`'s path, named by the embedding caller: an input \
+             it stages for the capsule before launch, such as the `artifacts-index.json` copy \
+             `mur new <task> --index <file>` writes. A launch writes nothing there of its own.",
+        ),
+        (
             "shell.rs",
             "&relative_path",
             "A command's full-output log, `logs/<stem>.log`, composed on the line above. Declared \

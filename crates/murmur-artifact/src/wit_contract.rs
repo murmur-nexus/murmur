@@ -68,7 +68,7 @@ impl WitContracts {
     /// package: exports in recorded order, then imports in recorded order.
     ///
     /// `served` is a `(package, version)` table such as [`crate::WitLevel::served`]; fit against
-    /// a level is [`crate::level_fit`], which calls this.
+    /// a level is [`crate::version_fit`], which calls this.
     /// Versions compare as exact strings, matching a host that resolves one instance name per
     /// interface. A name is reported when its package is absent from `served`, when it carries
     /// no `@version`, or when its version differs. Names outside the `murmur:` namespace are

@@ -1073,11 +1073,87 @@ fn the_task_form_refuses_registry_and_names_index() {
     assert!(
         refused
             .stderr
-            .contains("hint: to choose the artifact index, pass --index <PATH|URL|local>"),
+            .contains("hint: to choose the artifact index, pass --index <PATH|URL>"),
         "{}",
         refused.stderr
     );
     assert!(scratch.tree().is_empty(), "{:?}", scratch.tree());
+}
+
+/// A scratch with `mur-new` enabled and nothing else: no `inference:`, no store, no provider
+/// key, and no terminal on stdin.
+#[cfg(feature = "beta-mur-new")]
+fn beta_task_scratch() -> Scratch {
+    let scratch = Scratch::new();
+    scratch.run(&["beta", "enable", "mur-new"]).assert_code(0);
+    scratch
+}
+
+#[cfg(feature = "beta-mur-new")]
+#[test]
+fn the_task_form_refuses_a_local_index_before_reading_any_configuration() {
+    let scratch = beta_task_scratch();
+    let refused = scratch.run(&["new", "a capsule that greps logs", "--index", "local"]);
+    refused.assert_code(1);
+    assert!(
+        refused.stderr.contains("error[E-NEW-005]"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        refused.stderr.contains("hint:")
+            && refused.stderr.contains("mur search <query> --index local"),
+        "{}",
+        refused.stderr
+    );
+    assert!(!refused.stderr.contains("E-CFG-001"), "{}", refused.stderr);
+    assert!(scratch.tree().is_empty(), "{:?}", scratch.tree());
+    assert!(
+        !scratch
+            .home
+            .path()
+            .join(".murmur")
+            .join("artifacts")
+            .exists(),
+        "nothing is staged"
+    );
+}
+
+#[cfg(feature = "beta-mur-new")]
+#[test]
+fn the_task_form_checks_an_index_file_on_the_host_first() {
+    let scratch = beta_task_scratch();
+
+    let missing = scratch.run(&[
+        "new",
+        "a capsule that greps logs",
+        "--index",
+        "./missing.json",
+    ]);
+    missing.assert_code(1);
+    assert!(
+        missing.stderr.contains("E-IO-003") && missing.stderr.contains("./missing.json"),
+        "{}",
+        missing.stderr
+    );
+    assert!(!missing.stderr.contains("E-CFG-001"), "{}", missing.stderr);
+
+    std::fs::write(
+        scratch.path().join("old.json"),
+        r#"{"schema_version":"1","artifacts":[]}"#,
+    )
+    .unwrap();
+    let old = scratch.run(&["new", "a capsule that greps logs", "--index", "./old.json"]);
+    old.assert_code(1);
+    assert!(old.stderr.contains("E-IDX-002"), "{}", old.stderr);
+    assert!(
+        old.stderr
+            .contains("hint: this is a schema 1 artifact index, which this mur does not read"),
+        "{}",
+        old.stderr
+    );
+    assert!(!old.stderr.contains("E-CFG-001"), "{}", old.stderr);
+    assert!(!scratch.path().join("murmur.yaml").exists());
 }
 
 #[cfg(feature = "beta-mur-new")]

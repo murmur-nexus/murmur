@@ -363,16 +363,16 @@ None of the steps changes a generated file.
     `mur beta enable mur-new`. Without the flag, `mur new "<task description>"` exits 1 and names
     the command that enables it.
 
-Generate a ready-to-refine `murmur.yaml` in the current directory from a plain-language task description. `mur new` cold-boots a short-lived generator capsule backed by Claude, which searches an artifact index and produces a manifest tailored to the task.
+Generate a ready-to-refine `murmur.yaml` in the current directory from a plain-language task description. `mur new` cold-boots a short-lived generator capsule backed by the configured inference provider, which searches an artifact index and produces a manifest tailored to the task.
 
 ```bash
-mur new "<task description>" [--index <PATH|URL|local>]
+mur new "<task description>" [--index <PATH|URL>]
 ```
 
 | Argument / Flag | Required | Description |
 |---|---|---|
 | `<task description>` | yes | Plain-language description of what the capsule should do |
-| `--index` | no | Artifact index the generator searches, passed unchanged to `murmur/tool-registry-search` as its `registry` input — `local` lists the global store `~/.murmur/artifacts/`; a URL fetches that index. Omit for the public index. `--registry` is refused with exit status 2 and a hint naming `--index` |
+| `--index` | no | Artifact index the generator searches; see [The `--index` value](#mur-new-task-index). Omit for the index on the latest default-artifacts release. `--registry` is refused with exit status 2 and a hint naming `--index` |
 
 **Prerequisites:**
 
@@ -394,6 +394,17 @@ mur new "<task description>" [--index <PATH|URL|local>]
 Install missing artifacts with `mur install <name>@<version>`. `mur new` exits with a clear
 error and install hint naming the first artifact it cannot resolve.
 
+#### The `--index` value { #mur-new-task-index }
+
+`mur new` reads `--index` before anything else, so a refused value needs no inference provider:
+
+| Value | What the generator's `murmur/tool-registry-search` reads |
+|---|---|
+| Omitted | The index on the latest default-artifacts release, `https://github.com/murmur-nexus/default-artifacts/releases/latest/download/artifacts-index.json`, passed as the tool's `index` input |
+| A value starting `http://` or `https://` | That URL, passed as the tool's `index` input. Its origin, `<scheme>://<host>[:<port>]`, is added to the generator's `capabilities.network.allow` unless it is `https://github.com` or `https://release-assets.githubusercontent.com`, which the generator always lists |
+| `local` | Refused with `E-NEW-005`: the generator capsule cannot read the global store. `mur search <query> --index local` lists it |
+| Any other value | A file path, relative to the working directory or absolute. `mur` reads it and checks it is a schema 2 [artifact index](artifact-index.md), then copies it unchanged into the generator's work folder as `artifacts-index.json` and passes `artifacts-index.json` as the tool's `index` input |
+
 **Output:**
 
 - `murmur.yaml` written to the current working directory
@@ -405,8 +416,11 @@ error and install hint naming the first artifact it cannot resolve.
 # Generate a manifest for a PR security review capsule
 mur new "review this PR for security issues"
 
-# Use locally installed artifacts (ensures generated versions are available)
-mur new "summarise a document" --index local
+# Search another source's index
+mur new "summarise a document" --index https://github.com/ana/my-artifacts/releases/latest/download/artifacts-index.json
+
+# Search an index file in the working directory
+mur new "summarise a document" --index ./artifacts-index.json
 
 # Research/report task — generator adds a spawn capability
 mur new "research climate change trends and produce a report"
@@ -438,6 +452,9 @@ mur run --manifest murmur.yaml  # run it locally
 
 | Code | Meaning |
 |---|---|
+| `E-NEW-005` | `--index local` was given |
+| `E-IO-003` | The `--index` file could not be read |
+| `E-IDX-002` | The `--index` file is not a schema 2 artifact index |
 | `E-CFG-001` | No inference provider configured and wizard cannot run in non-interactive mode |
 | `E-RUN-008` | A required generator artifact is not installed |
 | `E-MAN-002` | Generated YAML failed structural validation |
@@ -3100,11 +3117,13 @@ mur search <query> [--index <PATH|URL|local>] [--limit <n>]
 | Argument / Flag | Default | Description |
 |---|---|---|
 | `<query>` | required | Case-insensitive keyword matched against the artifact's full name `<scope>/<name>`, its description, and its tags. `""` matches every artifact |
-| `--index` | `registry.index_url`, else the public index URL | `local` lists the global store `~/.murmur/artifacts/`; a value starting `http://` or `https://` is fetched; any other value is a file path, relative to the working directory or absolute. `--registry` is refused with exit status 2 and a hint naming `--index` |
+| `--index` | `registry.index_url`, else the index on the latest default-artifacts release | `local` lists the global store `~/.murmur/artifacts/`; a value starting `http://` or `https://` is fetched; any other value is a file path, relative to the working directory or absolute. `--registry` is refused with exit status 2 and a hint naming `--index` |
 | `--limit` | `10` | Maximum number of rows to show |
 
-**Default behaviour (no `--index`):** fetches the artifact index from the configured URL (default:
-the Murmur default-artifacts repository). Override the URL with `registry.index_url` in the
+**Default behaviour (no `--index`):** fetches the artifact index from `registry.index_url`, else
+from the latest default-artifacts release,
+`https://github.com/murmur-nexus/default-artifacts/releases/latest/download/artifacts-index.json`.
+Override the URL with `registry.index_url` in the
 effective (global + project-level, merged) config — see
 [Artifact index and custom registry URL](config.md#artifact-index-and-custom-registry-url) and
 [Configuration files](config.md#configuration-files). The index must be schema 2; a schema 1 index
@@ -3148,7 +3167,7 @@ When no artifacts match, prints `No results found.` and exits `0`.
 **Examples:**
 
 ```bash
-# Search the public index for git-related artifacts
+# Search the latest default-artifacts release for git-related artifacts
 mur search "git"
 
 # Search only locally installed artifacts

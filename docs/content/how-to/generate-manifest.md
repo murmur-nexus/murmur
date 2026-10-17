@@ -87,22 +87,6 @@ priority order:
    The wizard requires an interactive terminal. In non-interactive contexts (CI, piped stdin), it
    exits with error `E-CFG-001` and a message describing how to configure inference.
 
-**Registry token** — by default `mur new` queries the remote artifact index hosted on GitHub.
-Set `MURMUR_REGISTRY_TOKEN` to a GitHub personal access token with repository read scope so
-the request is authenticated:
-
-```bash
-export MURMUR_REGISTRY_TOKEN=ghp_...
-```
-
-The token is injected automatically when the index URL hostname is `raw.githubusercontent.com`
-or `api.github.com`. For public repos it is optional — unauthenticated requests are served
-without a token. For private repos it is required.
-
-If you point `mur new` at a custom index URL on a private GitHub repo (see Step 2), the
-same `MURMUR_REGISTRY_TOKEN` value is reused. Indexes on other hostnames are never given the
-token automatically.
-
 ---
 
 ## Step 2 — run mur new
@@ -123,25 +107,28 @@ murmur.yaml written to /path/to/current-dir/murmur.yaml
 The generator queries the artifact index, reasons about the task, and writes `murmur.yaml`
 to the current directory.
 
-To restrict artifact discovery to versions already installed in `~/.murmur/artifacts/` — which
-guarantees the generated manifest references versions you can run immediately — pass
-`--index local`:
-
-```bash
-mur new "review this PR for security issues" --index local
-```
-
-To point the generator at a custom artifact index — for example, a private GitHub-hosted
-`artifacts-index.json` — pass its raw URL:
+By default the generator searches the index on the latest default-artifacts release. To point it
+at another source's index, pass the index's URL:
 
 ```bash
 mur new "review this PR for security issues" \
-  --index https://raw.githubusercontent.com/your-org/your-artifacts/main/artifacts-index.json
+  --index https://github.com/your-org/your-artifacts/releases/latest/download/artifacts-index.json
 ```
 
-When the URL hostname is `raw.githubusercontent.com` or `api.github.com`, `mur new`
-automatically attaches `MURMUR_REGISTRY_TOKEN` as a bearer token. Set the variable before
-running if the repo is private (see Step 1).
+The generator capsule fetches that URL itself, and `mur new` adds its host to the generator's
+network allow list. To search an index file on disk, pass its path instead; `mur new` checks it
+and copies it into the generator's work folder:
+
+```bash
+mur new "review this PR for security issues" --index ./artifacts-index.json
+```
+
+The generator cannot see the artifacts installed on this machine, so `--index local` is refused
+with `E-NEW-005`. To list what is installed, run:
+
+```bash
+mur search "" --index local
+```
 
 ---
 
@@ -339,8 +326,8 @@ The generator picks one of two shapes based on the task description.
 
 !!! note "Generated manifests are a starting point"
     Artifact versions in the generated manifest reflect what the generator found in the artifact index at
-    run time. Re-run with `--index local` to ensure versions match what is installed, or run
-    `mur list` to compare.
+    run time. `mur install` refuses a version that does not fit this `mur` and names the one
+    that does; run `mur list` to compare with what is installed.
 
 ---
 
@@ -412,9 +399,10 @@ mur run --manifest murmur.yaml --task task.md
 | Feature / setting | How it works |
 |---|---|
 | `mur new "<description>"` | Boots a generator capsule; writes `murmur.yaml` to CWD |
-| `--index local` | Restricts artifact discovery to `~/.murmur/artifacts/`; ensures generated versions are installed |
-| `--index <url>` | Queries a custom artifact index; GitHub URLs receive the bearer token automatically |
-| `MURMUR_REGISTRY_TOKEN` | GitHub PAT injected as `Authorization: Bearer` on `raw.githubusercontent.com` and `api.github.com` requests; required for private repos, optional for public |
+| No `--index` | Searches the index on the latest default-artifacts release |
+| `--index <url>` | Searches that index; its host is added to the generator's network allow list |
+| `--index <path>` | Checks the index file on the host, then searches a copy in the generator's work folder |
+| `--index local` | Refused with `E-NEW-005`; `mur search <query> --index local` lists the installed artifacts |
 | Single capsule | Generated for focused, bounded tasks — no `spawn` block |
 | Orchestrator | Generated for research and pipeline tasks — adds a `capabilities.spawn.allow` list |
 | Validation | Generated YAML is validated before writing; nothing written if validation fails |

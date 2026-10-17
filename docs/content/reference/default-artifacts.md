@@ -159,20 +159,33 @@ is skipped rather than failing the call: the response carries `skipped_lines` an
 
 ### `murmur/tool-registry-search` { #murmur-tool-registry-search }
 
-Returns ranked matches with name, version, runtime, description and publication date, so a capsule
-can discover artifacts mid-session. It takes three inputs:
+Searches an [artifact index](artifact-index.md) by keyword, so a capsule can discover artifacts
+mid-session. It is a native tool with payloads for `linux-x86_64` and `darwin-aarch64`. It takes
+three inputs:
 
 | Input | Required | Notes |
 |---|---:|---|
-| `query` | yes | Matched case-insensitively against artifact name, description and tags |
-| `registry` | no | Omit for the public index; `local` for the local artifact store; a URL or absolute path for a custom registry |
+| `query` | yes | Matched case-insensitively against the full name `<scope>/<name>`, the bare name, the description and the tags |
+| `index` | no | An `http://` or `https://` URL, or a path to an `artifacts-index.json` inside the capsule's workdir, relative to it or absolute. Omit for the index on the latest default-artifacts release. `local` is refused: the capsule cannot see the global artifact store |
 | `limit` | no | Maximum results to return. Default: 10 |
 
-The tool reads the public `artifacts-index.json` in the schema 1 format. [`mur search`](cli.md#mur-search)
-reads only the schema 2 [artifact index](artifact-index.md), so it refuses a schema 1 index with
-[`E-IDX-002`](diagnostics.md#e-idx-002).
-[`mur new`](cli.md#mur-new) declares this tool in the generator capsule it cold-boots, and fails
-with `E-RUN-008` if it is not installed first.
+It returns:
+
+| Field | Value |
+|---|---|
+| `index` | The URL or path it read |
+| `scope` | The index's `scope` |
+| `count` | The number of results |
+| `results` | One entry per matching artifact: `name` (`<scope>/<name>`), `runtime`, `description`, `tags`, and `versions` |
+| `results[].versions` | Every version the index lists, newest first, each with `version`, `release`, `built_at_level` and `platforms` (`any` for a platform-independent payload) |
+
+`mur` decides whether a version fits when it installs it; the tool lists every published version.
+
+As a native tool it runs under the capsule-wide grants, so the capsule lists
+`https://github.com` and `https://release-assets.githubusercontent.com` in its top-level
+`capabilities.network.allow`, plus the host of any other `index` URL.
+[`mur new`](cli.md#mur-new-task) declares this tool in the generator capsule it cold-boots, and
+fails with `E-RUN-008` if it is not installed first.
 
 ### What each native tool needs { #native-tool-needs }
 
@@ -186,18 +199,10 @@ declared in the capsule's top-level `capabilities:` block, never on its own arti
 | `murmur/tool-code-graph` | `repo_path` inside the workdir. It writes `<repo_path>/.murmur/code-graph.db` | Works | Works |
 | `murmur/tool-code-coverage` | `repo_path` and `coverage_dir` inside the workdir, and the index `murmur/tool-code-graph` built there | Works | Works |
 | `murmur/tool-test-report` | `input_path` (and `repo_path`, when given) inside the workdir | Works | Works |
-| `murmur/tool-registry-search` | `https://raw.githubusercontent.com` in `capabilities.network.allow` for the public index | Public index fails: see below | Public index fails: see below |
+| `murmur/tool-registry-search` | `https://github.com` and `https://release-assets.githubusercontent.com` in `capabilities.network.allow`, plus the host of any other `index` URL; a path `index` inside the workdir | Works | Works |
 
 Without `git` in `capabilities.shell.allow`, every `murmur/tool-git` operation fails with
 `failed to execute git: Permission denied (os error 13)`.
-
-`murmur/tool-registry-search` cannot reach the public index at any floor, or outside a sandbox:
-its build has no TLS backend, so every HTTPS fetch fails with
-`cannot make HTTPS request because no TLS backend is configured`. A build with one still needs the
-system trust store under `/etc/ssl`, which `sealed` provides and `scoped` refuses; no
-`capabilities:` field grants read-only access outside the workdir. `registry: local`
-searches the store under the session's synthetic `HOME`, which is empty, never the operator's
-`~/.murmur/artifacts`.
 
 ---
 

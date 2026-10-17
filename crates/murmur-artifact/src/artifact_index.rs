@@ -20,9 +20,10 @@ use thiserror::Error;
 
 use crate::{
     artifact::ArtifactError, artifact_name_format_error, build_info_from_artifact_bytes,
-    is_reserved_version, level_fit, load_manifest_from_artifact_bytes, newest_fitting_level,
-    read_component_contracts, sha256_hex, split_platform_suffix, LevelFit, RuntimeType,
-    UnservedInterface, WitContracts, WitLevel, BUILD_INFO_FILE, LOCAL_SCOPE, SUPPORTED_PLATFORMS,
+    is_reserved_version, load_manifest_from_artifact_bytes, newest_fitting_level,
+    read_component_contracts, sha256_hex, split_platform_suffix, version_fit, FitSubject,
+    RuntimeType, VersionFit, WitContracts, WitLevel, BUILD_INFO_FILE, LOCAL_SCOPE,
+    SUPPORTED_PLATFORMS,
 };
 
 /// The `schema_version` [`ArtifactIndex::from_json`] reads and [`ArtifactIndex::to_json`] writes.
@@ -66,8 +67,9 @@ pub struct IndexedVersion {
     pub version: String,
     /// The release tag whose assets hold [`Self::assets`].
     pub release: String,
-    /// The WIT level the version was built at. `mur index` never derives it; `--merge` carries
-    /// it over from the earlier index.
+    /// The WIT level the version was built at: the label its files pack in `murmur-build.json`,
+    /// else the newest level its `interfaces` fit. `mur index --merge` keeps the earlier index's
+    /// value for unchanged assets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub built_at_level: Option<u64>,
     /// Every `murmur:` interface the version's component exports or imports, sorted and
@@ -135,17 +137,6 @@ pub struct MergeReport {
     pub replaced: usize,
 }
 
-/// Whether one version can run on a host serving a given WIT level and platform.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VersionFit {
-    Fits,
-    /// Its interfaces whose version is not the one the level lists for their package, in
-    /// recorded order. Never empty.
-    Unserved(Vec<UnservedInterface>),
-    /// Every payload is tagged for a platform other than this one.
-    NoPayloadFor(String),
-}
-
 impl ArtifactIndex {
     /// Read an index, checking `schema_version` before anything else, then every constraint of
     /// the schema 2 format: part-rule names and scope, unique sorted artifacts, versions that
@@ -187,55 +178,12 @@ impl ArtifactIndex {
 }
 
 impl IndexedArtifact {
-    /// The newest version [`IndexedVersion::fit`] accepts for `level` and `platform`.
+    /// The newest version [`version_fit`] accepts for `level` and `platform`.
     #[must_use]
     pub fn newest_fitting(&self, level: &WitLevel, platform: &str) -> Option<&IndexedVersion> {
-        self.versions
-            .iter()
-            .find(|version| version.fit(level, platform) == VersionFit::Fits)
-    }
-}
-
-impl IndexedVersion {
-    #[must_use]
-    pub fn fit(&self, level: &WitLevel, platform: &str) -> VersionFit {
-        version_fit(
-            &self.interfaces,
-            self.assets.iter().map(|asset| asset.platform.as_deref()),
-            level,
-            platform,
-        )
-    }
-}
-
-/// A version fits when its `interfaces` fit `level` ([`level_fit`]) and one of its payloads is
-/// untagged (`None`) or tagged `platform`. The interface check comes first, so a version failing
-/// both reports [`VersionFit::Unserved`].
-pub fn version_fit<'a>(
-    interfaces: &[String],
-    payload_platforms: impl IntoIterator<Item = Option<&'a str>>,
-    level: &WitLevel,
-    platform: &str,
-) -> VersionFit {
-    if let LevelFit::Mismatched(unserved) = level_fit(&interfaces_as_contracts(interfaces), level) {
-        return VersionFit::Unserved(unserved);
-    }
-    let runs_here = payload_platforms
-        .into_iter()
-        .any(|tag| tag.is_none() || tag == Some(platform));
-    if runs_here {
-        VersionFit::Fits
-    } else {
-        VersionFit::NoPayloadFor(platform.to_string())
-    }
-}
-
-/// An index version's `interfaces`, which merge both directions, as contracts [`level_fit`]
-/// reads. Fit treats exports and imports alike, so which list they go in does not change it.
-fn interfaces_as_contracts(interfaces: &[String]) -> WitContracts {
-    WitContracts {
-        exports: Vec::new(),
-        imports: interfaces.to_vec(),
+        self.versions.iter().find(|version| {
+            version_fit(&FitSubject::indexed(version), level, platform) == VersionFit::Fits
+        })
     }
 }
 
@@ -243,7 +191,11 @@ fn interfaces_as_contracts(interfaces: &[String]) -> WitContracts {
 /// `interfaces` fit, `None` when they fit none.
 #[must_use]
 pub fn derived_built_at_level(interfaces: &[String], levels: &[WitLevel]) -> Option<u64> {
-    newest_fitting_level(&interfaces_as_contracts(interfaces), levels)
+    let contracts = WitContracts {
+        exports: Vec::new(),
+        imports: interfaces.to_vec(),
+    };
+    newest_fitting_level(&contracts, levels)
 }
 
 /// The `murmur:` names among `contracts`' exports and imports, sorted and deduplicated.
@@ -1295,19 +1247,25 @@ mod tests {
             &[("tool-x-1.0.0-darwin-aarch64.mur.zip", 'a')],
         );
         assert_eq!(
-            v.fit(&served(), "linux-x86_64"),
+            version_fit(&FitSubject::indexed(&v), &served(), "linux-x86_64"),
             VersionFit::NoPayloadFor("linux-x86_64".to_string())
         );
-        assert_eq!(v.fit(&served(), "darwin-aarch64"), VersionFit::Fits);
+        assert_eq!(
+            version_fit(&FitSubject::indexed(&v), &served(), "darwin-aarch64"),
+            VersionFit::Fits
+        );
         v.interfaces = vec!["murmur:tool/run@9.9.9".to_string()];
-        match v.fit(&served(), "linux-x86_64") {
+        match version_fit(&FitSubject::indexed(&v), &served(), "linux-x86_64") {
             VersionFit::Unserved(unserved) => {
                 assert_eq!(unserved[0].served_version.as_deref(), Some("0.1.0"))
             }
             other => panic!("{other:?}"),
         }
         let untagged = version("1.0.0", "v1", &[("tool-x-1.0.0.mur.zip", 'a')]);
-        assert_eq!(untagged.fit(&served(), "linux-aarch64"), VersionFit::Fits);
+        assert_eq!(
+            version_fit(&FitSubject::indexed(&untagged), &served(), "linux-aarch64"),
+            VersionFit::Fits
+        );
     }
 
     #[test]
