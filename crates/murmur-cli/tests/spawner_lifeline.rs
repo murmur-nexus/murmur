@@ -185,8 +185,8 @@ impl Session {
         self.startup["session_id"].as_str().unwrap().to_string()
     }
 
-    fn session_dir(&self) -> PathBuf {
-        PathBuf::from(self.startup["workdir"].as_str().unwrap())
+    fn records_dir(&self) -> PathBuf {
+        PathBuf::from(self.startup["records_dir"].as_str().unwrap())
     }
 
     fn stderr(&self) -> String {
@@ -233,7 +233,7 @@ impl Session {
     }
 
     fn trace(&self) -> Vec<Value> {
-        read_trace(&self.session_dir().join("trace.jsonl"))
+        read_trace(&self.records_dir().join("trace.jsonl"))
     }
 
     /// `SendMessage` under the operator token; the task id.
@@ -763,7 +763,8 @@ fn an_unreadable_spawner_lifeline_refuses_before_any_session() {
             "{case}: {stderr}"
         );
         assert!(
-            sessions_under(project.path()).is_empty(),
+            sessions_under(project.path()).is_empty()
+                && sessions_under(&common::records_root(home.path())).is_empty(),
             "{case}: a refused launch left a session"
         );
     }
@@ -872,8 +873,10 @@ fn a_script_capsule_child_ends_its_run_when_its_spawner_lifeline_closes() {
     assert!(common::find_file(project.path(), "done.txt").is_none());
     let sessions = sessions_under(project.path());
     assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let records = sessions_under(&common::records_root(home.path()));
+    assert_eq!(records.len(), 1, "{records:?}");
     let log =
-        std::fs::read_to_string(sessions[0].join("logs").join("bootstrap.log")).unwrap_or_default();
+        std::fs::read_to_string(records[0].join("logs").join("bootstrap.log")).unwrap_or_default();
     assert!(log.contains(SPAWNER_CLOSED), "{log}");
     assert!(log.contains("ending the run"), "{log}");
 

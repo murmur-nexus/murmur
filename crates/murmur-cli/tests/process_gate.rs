@@ -343,6 +343,7 @@ fn run_session(capsule: &Capsule<'_>) -> Session {
     let manifest_path = create_manifest(project.path(), capsule, &harness);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
     let workdir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
 
     fs::create_dir_all(workdir.join(PROTECTED_RULE)).unwrap();
     fs::write(workdir.join(PROTECTED_FILE), PROTECTED_CONTENTS).unwrap();
@@ -350,7 +351,7 @@ fn run_session(capsule: &Capsule<'_>) -> Session {
 
     launch_session(staged, |_| {}).expect("the session must launch whatever the manifest decides");
 
-    let trace_raw = fs::read_to_string(workdir.join("trace.jsonl")).unwrap_or_default();
+    let trace_raw = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap_or_default();
     let trace: Vec<Value> = trace_raw
         .lines()
         .filter(|l| !l.is_empty())

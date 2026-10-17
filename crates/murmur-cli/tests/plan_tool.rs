@@ -202,8 +202,12 @@ fn workdir_from(assert: &assert_cmd::assert::Assert) -> PathBuf {
     common::parse_workdir_from_stdout(&String::from_utf8_lossy(&assert.get_output().stdout))
 }
 
-fn trace_events(workdir: &Path, event_type: &str) -> Vec<Value> {
-    fs::read_to_string(workdir.join("trace.jsonl"))
+fn records_from(assert: &assert_cmd::assert::Assert) -> PathBuf {
+    common::parse_records_from_stdout(&String::from_utf8_lossy(&assert.get_output().stdout))
+}
+
+fn trace_events(records_dir: &Path, event_type: &str) -> Vec<Value> {
+    fs::read_to_string(records_dir.join("trace.jsonl"))
         .expect("a launched session writes trace.jsonl")
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -255,6 +259,7 @@ fn a_submitted_plan_runs_its_steps_in_dependency_order_and_reports_both() {
 
     let assert = run(&home, &manifest, "run the plan").success();
     let workdir = workdir_from(&assert);
+    let records = records_from(&assert);
     let requests = server.requests();
 
     // The tool exists because the grant does, and the model was offered it.
@@ -290,7 +295,7 @@ fn a_submitted_plan_runs_its_steps_in_dependency_order_and_reports_both() {
 
     // The interpolation, as the scheduler recorded it: `b` was dispatched with `a`'s real output
     // in place of the reference.
-    let steps = trace_events(&workdir, "plan_step");
+    let steps = trace_events(&records, "plan_step");
     let b = steps
         .iter()
         .find(|event| event["step_id"] == "b")
@@ -301,9 +306,9 @@ fn a_submitted_plan_runs_its_steps_in_dependency_order_and_reports_both() {
             .is_some_and(|seen| seen.contains("NOTES-BODY-7F3Q-PLAN")),
         "$a.output must have been substituted before dispatch: {b}"
     );
-    assert_eq!(trace_events(&workdir, "plan_start").len(), 1);
+    assert_eq!(trace_events(&records, "plan_start").len(), 1);
     assert_eq!(
-        trace_events(&workdir, "plan_end")[0]["outcome"],
+        trace_events(&records, "plan_end")[0]["outcome"],
         "completed"
     );
 }
@@ -359,7 +364,7 @@ fn independent_shell_steps_run_together_and_a_later_step_reads_both() {
     let manifest = write_project(project.path(), &server.endpoint, true, &["bash"]);
 
     let assert = run(&home, &manifest, "run the tail").success();
-    let workdir = workdir_from(&assert);
+    let records = records_from(&assert);
     let report = plan_report(&server.requests(), "toolu_tail");
 
     assert_eq!(report["completed"], true, "{report}");
@@ -387,7 +392,7 @@ fn independent_shell_steps_run_together_and_a_later_step_reads_both() {
 
     // Both outputs reached the joining step, which is only possible if both had settled — and
     // neither is `alone`, which is only possible if both were running at the same time.
-    let join = trace_events(&workdir, "plan_step")
+    let join = trace_events(&records, "plan_step")
         .into_iter()
         .find(|event| event["step_id"] == "join")
         .expect("a plan_step for join");
@@ -491,6 +496,7 @@ fn a_plan_step_is_refused_by_the_read_only_declaration() {
 
     let assert = run(&home, &manifest, "write the file").success();
     let workdir = workdir_from(&assert);
+    let records = records_from(&assert);
     let report = plan_report(&server.requests(), "toolu_write");
 
     assert_eq!(report["completed"], false, "{report}");
@@ -508,7 +514,7 @@ fn a_plan_step_is_refused_by_the_read_only_declaration() {
     );
 
     // Recorded where a direct call's refusal is recorded, so an audit reads one kind of line.
-    let denials = trace_events(&workdir, "protected_path_denied");
+    let denials = trace_events(&records, "protected_path_denied");
     assert_eq!(denials.len(), 1, "{denials:#?}");
     assert_eq!(denials[0]["call"], "shell", "{}", denials[0]);
     assert_eq!(denials[0]["rule"], PROTECTED, "{}", denials[0]);
@@ -538,6 +544,7 @@ fn an_ungranted_capsule_is_offered_no_plan_tool_and_is_refused_if_it_names_one()
 
     let assert = run(&home, &manifest, "try to plan").success();
     let workdir = workdir_from(&assert);
+    let records = records_from(&assert);
     let requests = server.requests();
 
     assert!(
@@ -549,7 +556,7 @@ fn an_ungranted_capsule_is_offered_no_plan_tool_and_is_refused_if_it_names_one()
         "the tool must be absent from the inventory: {:?}",
         offered_tools(&requests)
     );
-    let declared = trace_events(&workdir, "session_start")[0]["tools_declared"].clone();
+    let declared = trace_events(&records, "session_start")[0]["tools_declared"].clone();
     assert!(
         !declared
             .as_array()
@@ -592,7 +599,7 @@ fn a_plan_step_naming_the_plan_tool_is_refused_before_anything_runs() {
     let manifest = write_project(project.path(), &server.endpoint, true, &[]);
 
     let assert = run(&home, &manifest, "try to nest").success();
-    let workdir = workdir_from(&assert);
+    let records = records_from(&assert);
     let report = plan_report(&server.requests(), "toolu_nested");
 
     assert_eq!(report["completed"], false, "{report}");
@@ -603,7 +610,7 @@ fn a_plan_step_naming_the_plan_tool_is_refused_before_anything_runs() {
         "the refusal states the rule: {report}"
     );
     // Refused ahead of dispatch, so no step ever started.
-    assert!(trace_events(&workdir, "plan_step_start").is_empty());
+    assert!(trace_events(&records, "plan_step_start").is_empty());
 }
 
 /// A failing first step stops the plan under the default `on_error: fail`: the dependent step is
@@ -648,8 +655,8 @@ fn a_failed_step_stops_the_plan_and_is_reported_as_a_failure() {
     // The result carries `Status::Failed`, so the call is recorded as an error rather than as a
     // passing call whose body happens to say otherwise. (The fixture driver does not put the
     // runtime's `is_error` flag onto the wire, so the trace is where it is observable.)
-    let workdir = workdir_from(&assert);
-    let call = trace_events(&workdir, "tool_call")
+    let records = records_from(&assert);
+    let call = trace_events(&records, "tool_call")
         .into_iter()
         .find(|event| event["tool_name"] == "submit-plan")
         .expect("a tool_call for the plan tool");
@@ -676,6 +683,7 @@ fn malformed_input_is_refused_before_a_plan_file_exists() {
 
     let assert = run(&home, &manifest, "submit nonsense").success();
     let workdir = workdir_from(&assert);
+    let records = records_from(&assert);
     let requests = server.requests();
 
     let missing = tool_result_text(&requests, "toolu_empty");
@@ -686,10 +694,10 @@ fn malformed_input_is_refused_before_a_plan_file_exists() {
     let string = tool_result_text(&requests, "toolu_string");
     assert!(string.contains("submit-plan"), "{string}");
     assert!(string.contains("'plan'"), "{string}");
-    assert_eq!(trace_events(&workdir, "tool_input_refused").len(), 1);
+    assert_eq!(trace_events(&records, "tool_input_refused").len(), 1);
     assert!(
         !workdir.join("plans").exists(),
         "a refused call writes no plan file"
     );
-    assert!(trace_events(&workdir, "plan_start").is_empty());
+    assert!(trace_events(&records, "plan_start").is_empty());
 }

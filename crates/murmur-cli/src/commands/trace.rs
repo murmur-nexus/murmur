@@ -39,7 +39,8 @@ pub(crate) enum TraceCommand {
         /// Session ID (full or last 4+ chars as suffix), or omit for the most recent session.
         /// A literal path is also accepted for backward compatibility.
         session: Option<String>,
-        /// Directory containing session subdirectories (default: ./workdir)
+        /// The directory a run was given as --workdir, or <manifest-dir>/workdir, whose sessions'
+        /// records are read from ~/.murmur/records (default: ./workdir)
         #[arg(long)]
         workdir: Option<PathBuf>,
         /// Print the recorded body behind one hash and nothing else: `system`, `tools`,
@@ -63,7 +64,8 @@ pub(crate) enum TraceCommand {
         before: Option<String>,
         /// After session: full ID, suffix (4+ chars), @N ordinal, or literal path.
         after: Option<String>,
-        /// Directory containing session subdirectories (default: ./workdir)
+        /// The directory a run was given as --workdir, or <manifest-dir>/workdir, whose sessions'
+        /// records are read from ~/.murmur/records (default: ./workdir)
         #[arg(long)]
         workdir: Option<PathBuf>,
     },
@@ -75,7 +77,8 @@ pub(crate) enum TraceCommand {
         /// Include a truncated summary of each tool's input
         #[arg(long)]
         verbose: bool,
-        /// Directory containing session subdirectories (default: ./workdir)
+        /// The directory a run was given as --workdir, or <manifest-dir>/workdir, whose sessions'
+        /// records are read from ~/.murmur/records (default: ./workdir)
         #[arg(long)]
         workdir: Option<PathBuf>,
     },
@@ -94,7 +97,8 @@ pub(crate) enum TraceCommand {
         /// Limit to sessions created within a duration, e.g. 2h, 30m, 1d.
         #[arg(long)]
         since: Option<String>,
-        /// Directory containing session subdirectories (default: ./workdir)
+        /// The directory a run was given as --workdir, or <manifest-dir>/workdir, whose sessions'
+        /// records are read from ~/.murmur/records (default: ./workdir)
         #[arg(long)]
         workdir: Option<PathBuf>,
     },
@@ -732,6 +736,10 @@ struct DelegationStartEvent {
     version: String,
     child_session_id: String,
     child_workdir: String,
+    /// Absent from a session recorded with its trace inside the workdir; the summary then names
+    /// the child's trace from `child_workdir`.
+    #[serde(default)]
+    child_records_dir: Option<String>,
 }
 
 /// One `delegation` record: how a delegation ended. A refusal carries no ids, because it made no
@@ -1335,9 +1343,12 @@ struct DelegationRecord {
     capsule: String,
     version: String,
     child_session_id: Option<String>,
-    /// Where the child's own trace is, relative to this capsule's accessible workdir. `None` for
-    /// a delegation with no `delegation_start`.
+    /// The child's directory, relative to this capsule's accessible workdir. `None` for a
+    /// delegation with no `delegation_start`.
     child_workdir: Option<String>,
+    /// The child's records directory, where its own trace is, as the child reported it. `None`
+    /// for a delegation with no `delegation_start`, or one that carries no `child_records_dir`.
+    child_records_dir: Option<String>,
     /// `None` while a delegation is still in flight — the shape a parent that died mid-delegation
     /// leaves behind.
     outcome: Option<String>,
@@ -2144,6 +2155,7 @@ fn compute_metrics(
                 version: e.version,
                 child_session_id: Some(e.child_session_id),
                 child_workdir: Some(e.child_workdir),
+                child_records_dir: e.child_records_dir,
                 outcome: None,
                 reason: None,
             }),
@@ -2166,6 +2178,7 @@ fn compute_metrics(
                         version: e.version,
                         child_session_id: e.child_session_id,
                         child_workdir: None,
+                        child_records_dir: None,
                         outcome: Some(e.outcome),
                         reason: e.reason,
                     }),
@@ -3180,12 +3193,19 @@ fn print_show(m: &TraceMetrics) {
             if let Some(reason) = &d.reason {
                 capsule_runtime::report_println!("  {reason}");
             }
-            // The one join a reader would otherwise have to compose by hand, and the only thing
-            // in this file that points outside it. Relative to this capsule's accessible workdir.
-            if let (Some(workdir), Some(child)) = (&d.child_workdir, &d.child_session_id) {
-                capsule_runtime::report_println!(
-                    "  child trace: {workdir}/.murmur/{child}/trace.jsonl"
-                );
+            // The one thing in this file that points outside it: the child's records directory,
+            // as the child reported it. A trace without one kept the child's trace in its
+            // directory, relative to this capsule's accessible workdir, under its session id.
+            match (&d.child_records_dir, &d.child_workdir, &d.child_session_id) {
+                (Some(records), _, _) => {
+                    capsule_runtime::report_println!("  child trace: {records}/trace.jsonl");
+                }
+                (None, Some(workdir), Some(child)) => {
+                    capsule_runtime::report_println!(
+                        "  child trace: {workdir}/.murmur/{child}/trace.jsonl"
+                    );
+                }
+                _ => {}
             }
         }
     }
@@ -3644,9 +3664,18 @@ pub(crate) fn run_trace_show(
             ));
         }
         // With no `--workdir`, the directory a roster runs from is searched too: its entry
-        // member's `--workdir` is the roster's directory, so it records under `./.murmur`.
-        let entry_root = (!given_workdir).then(|| current_dir.join(".murmur"));
-        return run_formation_show(formation, &workdir, entry_root);
+        // member's `--workdir` is the roster's directory, so it records under that directory's
+        // records group.
+        let entry_root = if given_workdir {
+            None
+        } else {
+            Some(session_address::records_group(&current_dir)?)
+        };
+        return run_formation_show(
+            formation,
+            &session_address::records_group(&workdir)?,
+            entry_root,
+        );
     }
     if body.is_none() && turn.is_some() {
         return Err(CliError::new(
@@ -5121,11 +5150,16 @@ pub(crate) fn run_trace_report(
                 format!("workdir not found: {}", workdir.display()),
             ));
         }
-        let mut entries = ses_entries(&workdir)?;
+        let group = session_address::records_group(&workdir)?;
+        let mut entries = ses_entries(&group)?;
         if entries.is_empty() {
             return Err(CliError::new(
                 E_TRC_002,
-                format!("no sessions found in workdir at {}", workdir.display()),
+                format!(
+                    "no sessions found in workdir at {} (records in {})",
+                    workdir.display(),
+                    group.display()
+                ),
             ));
         }
         entries.sort();
@@ -5161,7 +5195,7 @@ pub(crate) fn run_trace_report(
 
         entries
             .into_iter()
-            .map(|e| workdir.join(e).join("trace.jsonl"))
+            .map(|e| group.join(e).join("trace.jsonl"))
             .collect()
     } else {
         sessions

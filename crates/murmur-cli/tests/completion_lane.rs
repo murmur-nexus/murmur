@@ -89,7 +89,7 @@ struct Running {
 
 fn launch(staged: StagedSession) -> Running {
     let session_id = staged.session_id.clone();
-    let trace_path = staged.workdir.join("trace.jsonl");
+    let trace_path = staged.records_dir.join("trace.jsonl");
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         let _ = launch_session(staged, move |url| {
@@ -440,12 +440,12 @@ fn a_capsule_that_never_delegates_is_unaffected() {
         "a capsule that declares no spawn capability opens no connection to the daemon"
     );
     assert!(
-        common::find_file(project.path(), "completion.json").is_none(),
+        common::find_file(&common::records_root(home.path()), "completion.json").is_none(),
         "a capsule nobody delegated writes no completion"
     );
 
-    let trace_path =
-        common::find_file(project.path(), "trace.jsonl").expect("the session wrote a trace");
+    let trace_path = common::find_file(&common::records_root(home.path()), "trace.jsonl")
+        .expect("the session wrote a trace");
     let trace = fs::read_to_string(&trace_path).unwrap();
     let starts: Vec<Value> = trace
         .lines()
@@ -501,10 +501,15 @@ fn a_malformed_spawner_handle_refuses_the_launch() {
     );
 
     // Nothing was staged and nothing was written: no session directory, no trace.
-    assert!(
-        common::find_file(project.path(), "trace.jsonl").is_none(),
-        "a refused launch writes no trace"
-    );
+    for root in [
+        project.path().to_path_buf(),
+        common::records_root(home.path()),
+    ] {
+        assert!(
+            common::find_file(&root, "trace.jsonl").is_none(),
+            "a refused launch writes no trace"
+        );
+    }
     assert!(
         !project.path().join("workdir").exists(),
         "a refused launch stages no session"

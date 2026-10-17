@@ -168,6 +168,8 @@ struct OpenTurn {
 pub(super) struct ProcessEventSink<'a> {
     /// The internal session workdir, where `out/result.txt` goes.
     workdir: WorkdirRoot,
+    /// The session's records directory, where every hook fault this run raises is logged.
+    records_root: WorkdirRoot,
     /// This attempt's remaining turn budget, already net of the turns earlier attempts spent.
     max_turns: u32,
     /// The task-wide ceiling, `inference.max_turns` as declared, which a run that opens one turn
@@ -231,6 +233,7 @@ impl<'a> ProcessEventSink<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         workdir: &WorkdirRoot,
+        records_root: &WorkdirRoot,
         max_turns: u32,
         task_max_turns: u32,
         first_turn: u32,
@@ -241,6 +244,7 @@ impl<'a> ProcessEventSink<'a> {
     ) -> Self {
         Self {
             workdir: workdir.clone(),
+            records_root: records_root.clone(),
             max_turns,
             task_max_turns,
             turns: 0,
@@ -476,7 +480,7 @@ impl<'a> ProcessEventSink<'a> {
                     .await;
                 hooks
                     .emit(
-                        &self.workdir,
+                        &self.records_root,
                         HookEvent::ToolCall {
                             turn: call.turn,
                             tool_name: call.name.clone(),
@@ -799,7 +803,7 @@ impl<'a> ProcessEventSink<'a> {
         // the call through must flush at both, ahead of the turn's own record, as http does.
         let hook_artifacts = hooks
             .emit(
-                &self.workdir,
+                &self.records_root,
                 HookEvent::Inference {
                     turn: open.index,
                     input_tokens: spent.input.unwrap_or(0),
@@ -1116,6 +1120,7 @@ mod tests {
             let session = RunSession::new(&self.plan, &self.policy, HARNESS, "fixture-driver");
             let mut sink = ProcessEventSink::new(
                 &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
+                &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
                 self.max_turns,
                 self.task_max_turns,
                 self.first_turn,
@@ -1138,6 +1143,7 @@ mod tests {
         async fn feed_then_go_quiet(&mut self, events: Vec<Event>) {
             let session = RunSession::new(&self.plan, &self.policy, HARNESS, "fixture-driver");
             let mut sink = ProcessEventSink::new(
+                &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
                 &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
                 self.max_turns,
                 self.task_max_turns,

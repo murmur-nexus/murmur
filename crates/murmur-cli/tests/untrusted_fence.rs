@@ -205,8 +205,8 @@ fn first_user_text(requests: &[Value]) -> String {
         .to_string()
 }
 
-fn trace_events(workdir: &Path) -> Vec<Value> {
-    fs::read_to_string(workdir.join("trace.jsonl"))
+fn trace_events(records_dir: &Path) -> Vec<Value> {
+    fs::read_to_string(records_dir.join("trace.jsonl"))
         .expect("trace.jsonl should exist")
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -458,7 +458,7 @@ fn skill_result_reaches_the_model_unfenced() {
         "a declared skill must reach the model verbatim, with no marker of any kind"
     );
 
-    let events = trace_events(&launched.workdir);
+    let events = trace_events(&launched.records_dir);
     assert!(
         events
             .iter()
@@ -536,7 +536,7 @@ fn event_origin_task_payload_is_fenced() {
         "an event-origin payload reaches the model fenced and named by its origin"
     );
 
-    let task_start = trace_events(&launched.workdir)
+    let task_start = trace_events(&launched.records_dir)
         .into_iter()
         .find(|event| event["event_type"] == "task_start")
         .expect("task_start event");

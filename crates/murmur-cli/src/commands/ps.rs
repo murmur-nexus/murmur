@@ -231,13 +231,14 @@ fn summary_line(
         line.push_str(&format!(", {} pruned now", pruned_here.len()));
     }
 
-    // A record's `workdir` is its session directory, so its parent is the root its siblings are in.
+    // A record's `records_dir` is its session's records directory, so its parent is the records
+    // group its siblings are in.
     let roots: BTreeSet<PathBuf> = rows
         .iter()
         .map(|(record, _)| record)
         .filter(in_formation)
         .chain(pruned_here.iter().copied())
-        .filter_map(|record| record.workdir.parent().map(PathBuf::from))
+        .filter_map(|record| record.records_dir.parent().map(PathBuf::from))
         // Each peer records under its own directory in the murmur home, whether or not a record
         // of it is left to point there.
         .chain(capsule_runtime::formation_launch::formation_member_roots(
@@ -365,6 +366,7 @@ mod tests {
             capsule_name: "c".to_string(),
             capsule_version: "0.1.0".to_string(),
             workdir: PathBuf::from("/nonexistent/root").join(session_id),
+            records_dir: PathBuf::from("/nonexistent/records/root").join(session_id),
             outlives_launcher: false,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,
@@ -434,9 +436,14 @@ mod tests {
         let formation = FormationId::mint();
         let mut entry = row("ses_3", Some(&formation));
         entry.0.workdir = PathBuf::from("/nonexistent/project/.murmur/ses_3");
+        entry.0.records_dir =
+            PathBuf::from("/nonexistent/home/.murmur/records/nonexistent/project/ses_3");
         let mut worker = row("ses_2", Some(&formation));
         worker.0.workdir = PathBuf::from(format!(
             "/nonexistent/home/.murmur/formations/{formation}/worker/.murmur/ses_2"
+        ));
+        worker.0.records_dir = PathBuf::from(format!(
+            "/nonexistent/home/.murmur/records/nonexistent/home/.murmur/formations/{formation}/worker/ses_2"
         ));
         let rows = vec![entry, row("ses_1", None), worker];
         let order: Vec<String> = grouped(rows.clone())

@@ -53,7 +53,8 @@ struct Fixture {
     _artifacts: TempDir,
     _server: common::ScriptedServer,
     manifest: PathBuf,
-    /// `--workdir` for every run, so sessions land under `<workdir>/.murmur/`.
+    /// `--workdir` for every run: session workdirs land under `<workdir>/.murmur/`, records in
+    /// its records group.
     workdir: TempDir,
 }
 
@@ -88,9 +89,22 @@ impl Fixture {
         }
     }
 
-    /// The directory holding every `ses_*` of this fixture's runs.
+    /// The records group holding every `ses_*` records directory of this fixture's runs.
     fn sessions_root(&self) -> PathBuf {
+        common::records_group(self.home.path(), self.workdir.path())
+    }
+
+    /// The directory holding every `ses_*` session workdir of this fixture's runs.
+    fn session_workdirs(&self) -> PathBuf {
         self.workdir.path().join(".murmur")
+    }
+
+    /// A session whose uuid-v7 timestamp is `ms`, both halves: its records directory and its
+    /// session workdir.
+    fn plant(&self, ms: u64, tail: u64) -> String {
+        let name = plant_session(&self.sessions_root(), ms, tail);
+        fs::create_dir_all(self.session_workdirs().join(&name).join("out")).unwrap();
+        name
     }
 
     fn run(&self, extra: &[&str]) -> Assert {
@@ -295,6 +309,10 @@ fn max_sessions_leaves_exactly_the_newest_three_and_says_so_in_the_trace() {
     for gone in &newest_three[..3] {
         let dir = f.sessions_root().join(gone);
         assert!(!dir.exists(), "{gone} must go whole");
+        assert!(
+            !f.session_workdirs().join(gone).exists(),
+            "{gone}'s session workdir goes with its records"
+        );
         assert!(!dir.join("trace.jsonl").exists());
         assert!(!dir.join("blobs").exists());
     }
@@ -328,7 +346,7 @@ fn max_sessions_leaves_exactly_the_newest_three_and_says_so_in_the_trace() {
                 "show",
                 survivors.last().unwrap(),
                 "--workdir",
-                f.sessions_root().to_str().unwrap(),
+                f.workdir.path().to_str().unwrap(),
             ])
             .assert()
             .success(),
@@ -355,9 +373,9 @@ fn max_age_prunes_by_the_session_id_and_never_by_the_mtime() {
     );
     fs::create_dir_all(f.sessions_root()).unwrap();
     let now = now_ms();
-    let recent = plant_session(&f.sessions_root(), now - 60_000, 3);
-    let old_a = plant_session(&f.sessions_root(), now - 7_200_000, 1);
-    let old_b = plant_session(&f.sessions_root(), now - 7_100_000, 2);
+    let recent = f.plant(now - 60_000, 3);
+    let old_a = f.plant(now - 7_200_000, 1);
+    let old_b = f.plant(now - 7_100_000, 2);
 
     f.run(&[]).success();
 
@@ -391,14 +409,11 @@ fn both_trace_keys_keep_only_sessions_inside_both() {
     );
     fs::create_dir_all(f.sessions_root()).unwrap();
     let now = now_ms();
-    let old = [
-        plant_session(&f.sessions_root(), now - 7_200_000, 1),
-        plant_session(&f.sessions_root(), now - 7_100_000, 2),
-    ];
+    let old = [f.plant(now - 7_200_000, 1), f.plant(now - 7_100_000, 2)];
     let recent = [
-        plant_session(&f.sessions_root(), now - 300_000, 3),
-        plant_session(&f.sessions_root(), now - 200_000, 4),
-        plant_session(&f.sessions_root(), now - 100_000, 5),
+        f.plant(now - 300_000, 3),
+        f.plant(now - 200_000, 4),
+        f.plant(now - 100_000, 5),
     ];
 
     f.run(&[]).success();
@@ -446,7 +461,7 @@ fn the_running_session_survives_a_policy_that_would_otherwise_delete_it() {
         Duration::from_millis(1500),
     );
     fs::create_dir_all(f.sessions_root()).unwrap();
-    let older = plant_session(&f.sessions_root(), now_ms() - 5_000, 1);
+    let older = f.plant(now_ms() - 5_000, 1);
 
     let started = std::time::Instant::now();
     f.run(&[]).success();

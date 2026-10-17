@@ -14,7 +14,7 @@ pub(crate) const BLOB_DIR_NAME: &str = "blobs";
 /// system prompt, tool inventory and every message, unredacted.
 const BLOB_DIR_MODE: u32 = 0o700;
 
-/// Write-once, content-addressed store at `<session workdir>/blobs/<sha256>`.
+/// Write-once, content-addressed store at `<records dir>/blobs/<sha256>`.
 ///
 /// One file per distinct body, named by its own lowercase-hex SHA-256 with no prefix and no
 /// extension — the same bare-sha convention the rest of the trace uses for content, as against
@@ -24,22 +24,22 @@ const BLOB_DIR_MODE: u32 = 0o700;
 /// Session-scoped and never pruned: a blob is readable exactly as long as its session directory
 /// is.
 pub(crate) struct BlobStore {
-    /// The session root `blobs/` is created beneath.
-    root: WorkdirRoot,
+    /// The session's records directory, `blobs/` is created beneath.
+    records_root: WorkdirRoot,
 }
 
 impl BlobStore {
-    /// A store rooted at `<session_workdir>/blobs`. Creates nothing; see [`Self::put`].
-    pub(crate) fn new(session_workdir: &WorkdirRoot) -> Self {
+    /// A store rooted at `<records dir>/blobs`. Creates nothing; see [`Self::put`].
+    pub(crate) fn new(records_root: &WorkdirRoot) -> Self {
         Self {
-            root: session_workdir.clone(),
+            records_root: records_root.clone(),
         }
     }
 
     /// The directory this store writes into, whether or not it exists yet.
     #[cfg(test)]
     pub(crate) fn dir(&self) -> std::path::PathBuf {
-        self.root.host_path(BLOB_DIR_NAME)
+        self.records_root.host_path(BLOB_DIR_NAME)
     }
 
     /// Store `bytes` as `<blobs>/<sha256>`, where `sha256` is the caller's already-computed
@@ -50,11 +50,16 @@ impl BlobStore {
     ///
     /// A link at `blobs/` or at the blob's name is refused, never taken as "already stored".
     pub(crate) async fn put(&self, sha256: &str, bytes: &[u8]) -> std::io::Result<()> {
-        if self.root.entry_kind(format!("{BLOB_DIR_NAME}/{sha256}"))? == Some(EntryKind::File) {
+        if self
+            .records_root
+            .entry_kind(format!("{BLOB_DIR_NAME}/{sha256}"))?
+            == Some(EntryKind::File)
+        {
             return Ok(());
         }
-        self.root.create_dir_all(BLOB_DIR_NAME, BLOB_DIR_MODE)?;
-        self.root.write_file(
+        self.records_root
+            .create_dir_all(BLOB_DIR_NAME, BLOB_DIR_MODE)?;
+        self.records_root.write_file(
             format!("{BLOB_DIR_NAME}/{sha256}"),
             bytes,
             DEFAULT_FILE_MODE,

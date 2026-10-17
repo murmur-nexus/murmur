@@ -90,7 +90,7 @@ observability:
 ```
 
 Without `observability.otel_endpoint` the hook logs a warning to
-`workdir/logs/hook-hook-grafana.log` and exports nothing for that session. The session runs
+`logs/hook-hook-grafana.log` in its current directory and exports nothing for that session. The session runs
 as normal.
 
 ### `murmur/hook-eval` { #murmur-hook-eval }
@@ -100,6 +100,9 @@ artifacts:
   - name: murmur/hook-eval
     version: "{{ v.murmur_hook_eval }}"
     runtime: hook
+    capabilities:
+      filesystem:
+        records: true
 
 observability:
   eval:
@@ -112,8 +115,14 @@ observability:
         max: 5
 ```
 
+`records: true` mounts the session [records directory](workdir.md#records-directory)'s `hooks/` as
+the hook's current directory, so `eval.jsonl` lands beside the session's `trace.jsonl`, where the
+capsule's commands cannot change it and where [`mur eval`](cli.md#mur-eval) reads it.
+
 Without an `observability.eval` block the hook logs a warning to
-`workdir/logs/hook-hook-eval.log` and scores nothing. The session runs as normal.
+`logs/hook-hook-eval.log` in its current directory — the records directory's `hooks/` when its
+entry declares [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities) — and scores
+nothing. The session runs as normal.
 
 See [Scorer types](observability-schemas.md#structured-evaluation-evaljsonl) for what each scorer
 measures and the shape of the file it writes, [`observability.eval`](manifest.md#field-observability)

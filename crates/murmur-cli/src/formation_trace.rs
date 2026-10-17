@@ -7,8 +7,9 @@
 //! known to be a member. A session whose first line is anything else — a script capsule's
 //! drain-only trace, a torn file — is no member.
 //!
-//! A formation's members record under more than one root: the entry member under the roster's
-//! project, each peer under its own directory in `~/.murmur/formations/<frm_id>/`.
+//! A formation's members record under more than one records group: the entry member under the
+//! roster's project's, each peer under the group of its own directory in
+//! `~/.murmur/formations/<frm_id>/`.
 //! [`search_formation`] reads a given root and then those, and merges what they record. Nothing
 //! here follows a delegation edge into another session root: a member's delegated child that was
 //! not found under a searched root is counted, not chased.
@@ -800,6 +801,7 @@ mod tests {
     fn a_formation_is_found_across_the_project_root_and_its_peers_roots() {
         let formation = FormationId::mint();
         let home = tempfile::tempdir().unwrap();
+        let _home = crate::config::test_env::EnvGuard::set_up(home.path(), home.path());
         let project = tempfile::tempdir().unwrap();
         let root = project.path().join(".murmur");
         let entry = session_after(&formation, 30, "1");
@@ -809,10 +811,10 @@ mod tests {
             &[start(&entry, Some(formation.as_str()), None), end("ok")],
         );
         let formations = home.path().join("formations");
-        let worker_root = formations
-            .join(formation.as_str())
-            .join("worker")
-            .join(".murmur");
+        std::fs::create_dir_all(formations.join(formation.as_str()).join("worker")).unwrap();
+        let worker_root =
+            capsule_runtime::records_group(&formations.join(formation.as_str()).join("worker"))
+                .unwrap();
         let worker = session_after(&formation, 10, "2");
         write_trace(
             &worker_root,

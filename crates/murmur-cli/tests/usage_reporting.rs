@@ -111,8 +111,8 @@ fn run_session(config_mode: Option<&str>) -> Run {
 
     Run {
         result: fs::read_to_string(launched.workdir.join("out/result.txt")).unwrap_or_default(),
-        trace: fs::read_to_string(launched.workdir.join("trace.jsonl")).unwrap_or_default(),
-        bootstrap_log: fs::read_to_string(launched.workdir.join("logs/bootstrap.log"))
+        trace: fs::read_to_string(launched.records_dir.join("trace.jsonl")).unwrap_or_default(),
+        bootstrap_log: fs::read_to_string(launched.records_dir.join("logs/bootstrap.log"))
             .unwrap_or_default(),
     }
 }

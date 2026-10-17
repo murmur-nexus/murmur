@@ -325,6 +325,10 @@ impl Parent {
         self.startup["session_id"].as_str().unwrap().to_string()
     }
 
+    fn records_dir(&self) -> PathBuf {
+        PathBuf::from(self.startup["records_dir"].as_str().unwrap())
+    }
+
     fn submit(&self) {
         let sent = rpc(
             &self.url(),
@@ -355,10 +359,27 @@ fn find_dir(root: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// The records directory under `home` of the session whose session workdir is `session`: a run
+/// given `--workdir D` keeps its session workdir at `D/.murmur/<id>` and its records in `D`'s
+/// group, one given none at `<manifest-dir>/workdir/<id>`, in that directory's group.
+fn records_of(home: &Path, session: &Path) -> PathBuf {
+    let id = session.file_name().unwrap().to_str().unwrap();
+    let parent = session.parent().unwrap();
+    let root = if parent.ends_with(".murmur") {
+        parent.parent().unwrap()
+    } else {
+        parent
+    };
+    common::session_records_dir(home, root, id)
+}
+
 /// One delegation as the delegating session recorded it, and where its child lives.
 struct Delegation {
     delegation_id: String,
+    /// The child's session workdir.
     child_session: PathBuf,
+    /// The child's records directory: its trace, its bootstrap log and its `completion.json`.
+    child_records: PathBuf,
 }
 
 impl Delegation {
@@ -372,11 +393,11 @@ impl Delegation {
     }
 
     fn trace(&self) -> Vec<Value> {
-        read_trace(&self.child_session.join("trace.jsonl"))
+        read_trace(&self.child_records.join("trace.jsonl"))
     }
 
     fn bootstrap_log(&self) -> String {
-        std::fs::read_to_string(self.child_session.join("logs").join("bootstrap.log"))
+        std::fs::read_to_string(self.child_records.join("logs").join("bootstrap.log"))
             .unwrap_or_default()
     }
 
@@ -389,13 +410,16 @@ impl Delegation {
     }
 }
 
-/// Wait for the session `session_id`, somewhere under `root`, to record a `delegation_start`
-/// whose child has written its own `session_start`.
-fn await_delegation(root: &Path, session_id: &str) -> Delegation {
+/// Wait for the session `session_id`, its session workdir somewhere under `root` and its records
+/// under `world`'s `HOME`, to record a `delegation_start` whose child has written its own
+/// `session_start`.
+fn await_delegation(world: &World, root: &Path, session_id: &str) -> Delegation {
+    let home = world.home.path();
     let deadline = Instant::now() + START_LIMIT;
     loop {
         if let Some(session) = find_dir(root, session_id) {
-            let trace = std::fs::read_to_string(session.join("trace.jsonl")).unwrap_or_default();
+            let trace = std::fs::read_to_string(records_of(home, &session).join("trace.jsonl"))
+                .unwrap_or_default();
             let events: Vec<Value> = trace
                 .lines()
                 .filter_map(|line| serde_json::from_str(line).ok())
@@ -413,10 +437,12 @@ fn await_delegation(root: &Path, session_id: &str) -> Delegation {
             {
                 let child = start["child_session_id"].as_str().unwrap();
                 if let Some(child_session) = find_dir(root, child) {
-                    if child_session.join("trace.jsonl").exists() {
+                    let child_records = records_of(home, &child_session);
+                    if child_records.join("trace.jsonl").exists() {
                         return Delegation {
                             delegation_id: start["delegation_id"].as_str().unwrap().to_string(),
                             child_session,
+                            child_records,
                         };
                     }
                 }
@@ -434,7 +460,7 @@ fn await_delegation(root: &Path, session_id: &str) -> Delegation {
 fn trace_show(delegation: &Delegation) -> String {
     let output = Command::new(assert_cmd::cargo::cargo_bin("mur"))
         .args(["trace", "show"])
-        .arg(delegation.child_session.join("trace.jsonl"))
+        .arg(delegation.child_records.join("trace.jsonl"))
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -541,7 +567,7 @@ fn a_parent_killed_outright_takes_its_child_with_it() {
     let body = agent_body(&model.endpoint, &spawn_allow(&[MUTE]), QUEUE_SLEEP, "");
     let mut parent = Parent::start(&world, "lone-parent", &body, model, |_| {});
     parent.submit();
-    let delegation = await_delegation(parent.project.path(), &parent.session_id());
+    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
     assert!(
         !delegation.processes().is_empty(),
         "the child is not running"
@@ -591,14 +617,14 @@ fn a_grandchild_winds_down_once_its_parent_has() {
     );
     let mut parent = Parent::start(&world, "root-parent", &body, model, |_| {});
     parent.submit();
-    let relay = await_delegation(parent.project.path(), &parent.session_id());
+    let relay = await_delegation(&world, parent.project.path(), &parent.session_id());
     let relay_session = relay
         .child_session
         .file_name()
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    let grandchild = await_delegation(&relay.child_dir(), &relay_session);
+    let grandchild = await_delegation(&world, &relay.child_dir(), &relay_session);
     assert!(!relay.processes().is_empty() && !grandchild.processes().is_empty());
 
     let killed = Instant::now();
@@ -643,7 +669,7 @@ fn assert_ended_by_its_parents_task(child: &Delegation, parent: &Delegation) {
         events[ended]
     );
     let completion: Value = serde_json::from_str(
-        &std::fs::read_to_string(child.child_dir().join("completion.json"))
+        &std::fs::read_to_string(child.child_records.join("completion.json"))
             .expect("the ended child's outcome is recorded"),
     )
     .unwrap();
@@ -654,16 +680,14 @@ fn assert_ended_by_its_parents_task(child: &Delegation, parent: &Delegation) {
         !child_kinds.iter().any(|kind| kind == "spawner_ended"),
         "{child_kinds:?}"
     );
-    common::assert_trace_ends_canceled(&child.child_session.join("trace.jsonl"));
+    common::assert_trace_ends_canceled(&child.child_records.join("trace.jsonl"));
 }
 
 // ── A parent that exits on its own ────────────────────────────────────────────
 
 /// The delegating session's own trace, in file order.
 fn parent_trace(parent: &Parent) -> Vec<Value> {
-    let session = find_dir(parent.project.path(), &parent.session_id())
-        .expect("the parent's session directory");
-    read_trace(&session.join("trace.jsonl"))
+    read_trace(&parent.records_dir().join("trace.jsonl"))
 }
 
 /// The last user message's text in one provider request.
@@ -744,7 +768,7 @@ fn a_parent_that_exits_after_its_task_has_its_childs_answer_first() {
 
     let (status, exited) = await_exit(&mut parent.proc, START_LIMIT);
     assert!(status.success(), "{status}: {}", parent.proc.stderr());
-    let delegation = await_delegation(parent.project.path(), &parent.session_id());
+    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
     let running = delegation.processes();
     eprintln!(
         "[measure] processes naming the child dir {} ms after the parent exited: {}",
@@ -826,7 +850,7 @@ fn a_parent_that_exits_after_its_task_has_its_childs_answer_first() {
 
     // The child finished on its own, reported, and was not wound down by its spawner.
     let completion: Value = serde_json::from_str(
-        &std::fs::read_to_string(delegation.child_dir().join("completion.json"))
+        &std::fs::read_to_string(delegation.child_records.join("completion.json"))
             .expect("the child recorded its outcome"),
     )
     .unwrap();
@@ -875,7 +899,7 @@ fn a_parent_stopped_while_it_waits_ends_its_child_first() {
     let body = agent_body(&model.endpoint, &spawn_allow(&[MUTE]), "", "");
     let mut parent = Parent::start(&world, "stopped-parent", &body, model, |_| {});
     parent.submit();
-    let delegation = await_delegation(parent.project.path(), &parent.session_id());
+    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
     let deadline = Instant::now() + START_LIMIT;
     while parent._model.requests().len() < 2 {
         assert!(Instant::now() < deadline, "the turn never ended");
@@ -934,13 +958,13 @@ fn a_parent_stopped_while_it_waits_ends_its_child_first() {
          {child_kinds:?}"
     );
     let completion: Value = serde_json::from_str(
-        &std::fs::read_to_string(delegation.child_dir().join("completion.json"))
+        &std::fs::read_to_string(delegation.child_records.join("completion.json"))
             .expect("the ended child's outcome is recorded"),
     )
     .unwrap();
     assert_eq!(completion["status"], "terminated", "{completion}");
     assert_eq!(completion["reported_by"], "launcher", "{completion}");
-    common::assert_trace_ends_canceled(&delegation.child_session.join("trace.jsonl"));
+    common::assert_trace_ends_canceled(&delegation.child_records.join("trace.jsonl"));
 }
 
 // ── A parent running a plan ───────────────────────────────────────────────────
@@ -984,7 +1008,7 @@ fn a_parent_stopped_mid_plan_ends_the_plan_steps_child_first() {
     let body = agent_body(&model.endpoint, &plan_capabilities(&[MUTE]), "", "");
     let mut parent = Parent::start(&world, "stopped-planner", &body, model, |_| {});
     parent.submit();
-    let delegation = await_delegation(parent.project.path(), &parent.session_id());
+    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
     // The plan's step named the bare `mute-worker`; what was asked of the daemon, and recorded,
     // is the full name it stands for.
     let started = parent_trace(&parent)
@@ -1055,13 +1079,13 @@ fn a_parent_stopped_mid_plan_ends_the_plan_steps_child_first() {
          {child_kinds:?}"
     );
     let completion: Value = serde_json::from_str(
-        &std::fs::read_to_string(delegation.child_dir().join("completion.json"))
+        &std::fs::read_to_string(delegation.child_records.join("completion.json"))
             .expect("the ended child's outcome is recorded"),
     )
     .unwrap();
     assert_eq!(completion["status"], "terminated", "{completion}");
     assert_eq!(completion["reported_by"], "launcher", "{completion}");
-    common::assert_trace_ends_canceled(&delegation.child_session.join("trace.jsonl"));
+    common::assert_trace_ends_canceled(&delegation.child_records.join("trace.jsonl"));
 }
 
 /// `SIGKILL` of a capsule whose plan is waiting on a `capsule` step's sub-capsule. Nothing in the
@@ -1084,7 +1108,7 @@ fn a_parent_killed_mid_plan_takes_the_plan_steps_child_with_it() {
     );
     let mut parent = Parent::start(&world, "killed-planner", &body, model, |_| {});
     parent.submit();
-    let delegation = await_delegation(parent.project.path(), &parent.session_id());
+    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
     assert!(
         !delegation.processes().is_empty(),
         "the child is not running"
@@ -1100,7 +1124,7 @@ fn a_parent_killed_mid_plan_takes_the_plan_steps_child_with_it() {
     assert_wound_down_by_spawner(&delegation, &parent.session_id());
     assert_trace_show_names_the_ending(&delegation, true);
     assert!(
-        !delegation.child_dir().join("completion.json").exists(),
+        !delegation.child_records.join("completion.json").exists(),
         "a launcher killed outright recorded nothing, and the child reports to nobody"
     );
 }
@@ -1184,7 +1208,7 @@ fn a_formation_member_killed_outright_takes_its_child_with_it() {
     let formation_id = formation["formation_id"].as_str().unwrap().to_string();
     let entry_session = entry["session_id"].as_str().unwrap().to_string();
     let entry_pid = entry["pid"].as_u64().unwrap() as u32;
-    let delegation = await_delegation(project.path(), &entry_session);
+    let delegation = await_delegation(&world, project.path(), &entry_session);
     assert!(
         !delegation.processes().is_empty(),
         "the child is not running"
@@ -1315,7 +1339,7 @@ fn without_close_range_a_child_is_launched_and_still_ends_with_its_parent() {
         under_filter(command, filter)
     });
     parent.submit();
-    let delegation = await_delegation(parent.project.path(), &parent.session_id());
+    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
     let (child_pid, _) = delegation.processes()[0].clone();
     let status = std::fs::read_to_string(format!("/proc/{child_pid}/status")).unwrap();
     assert!(

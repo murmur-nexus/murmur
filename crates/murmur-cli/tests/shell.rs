@@ -353,8 +353,8 @@ fn end_turn(id: &str, text: &str) -> String {
     .to_string()
 }
 
-fn trace_events(workdir: &Path) -> Vec<Value> {
-    fs::read_to_string(workdir.join("trace.jsonl"))
+fn trace_events(records_dir: &Path) -> Vec<Value> {
+    fs::read_to_string(records_dir.join("trace.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter(|line| !line.is_empty())
@@ -438,7 +438,7 @@ fn shell_detaches_a_slow_command_and_the_turn_continues() {
         "the result says the command is still running:\n{demotion}"
     );
 
-    let events = trace_events(&launched.workdir);
+    let events = trace_events(&launched.records_dir);
     let detached = events_of_type(&events, "shell_detached");
     assert_eq!(detached.len(), 1, "exactly one command was demoted");
     let work_id = detached[0]["work_id"].as_str().unwrap();
@@ -531,13 +531,13 @@ fn shell_records_work_abandoned_when_the_session_ends() {
     );
 
     let stdout = fs::read_to_string(&stdout_path).unwrap();
-    let workdir = stdout
+    let records_dir = stdout
         .lines()
         .find_map(|line| serde_json::from_str::<Value>(line).ok())
-        .and_then(|line| line["workdir"].as_str().map(std::path::PathBuf::from))
+        .and_then(|line| line["records_dir"].as_str().map(std::path::PathBuf::from))
         .unwrap_or_else(|| panic!("no JSON launch line on stdout:\n{stdout}"));
 
-    let events = trace_events(&workdir);
+    let events = trace_events(&records_dir);
     let detached = events_of_type(&events, "shell_detached");
     assert_eq!(detached.len(), 1, "exactly one command was demoted");
     let work_id = detached[0]["work_id"].as_str().unwrap();
@@ -571,10 +571,13 @@ fn shell_records_work_abandoned_when_the_session_ends() {
     );
 }
 
-/// Sessions of `project_dir`, newest last. The launch writes one directory per run under
-/// `<manifest dir>/workdir`, which is where `--resume` looks for the one it names.
-fn session_dirs(project_dir: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = fs::read_dir(project_dir.join("workdir"))
+/// The records directories of `project_dir`'s sessions under `home`, newest last. The launch
+/// writes one session workdir per run under `<manifest dir>/workdir`, which is where `--resume`
+/// looks for the one it names, and one records directory per run in that directory's records
+/// group, named for the same session.
+fn session_records(home: &Path, project_dir: &Path) -> Vec<PathBuf> {
+    let group = common::records_group(home, &project_dir.join("workdir"));
+    let mut dirs: Vec<PathBuf> = fs::read_dir(group)
         .map(|entries| {
             entries
                 .filter_map(Result::ok)
@@ -617,11 +620,17 @@ fn spawn_mur_run(
     command.spawn().expect("mur run should execute")
 }
 
-/// Block until `predicate` holds over the newest session's trace, or fail.
-fn await_trace<F: Fn(&[Value]) -> bool>(project_dir: &Path, what: &str, predicate: F) -> PathBuf {
+/// Block until `predicate` holds over the newest session's trace, or fail; returns that session's
+/// records directory.
+fn await_trace<F: Fn(&[Value]) -> bool>(
+    home: &Path,
+    project_dir: &Path,
+    what: &str,
+    predicate: F,
+) -> PathBuf {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
     loop {
-        if let Some(dir) = session_dirs(project_dir).last() {
+        if let Some(dir) = session_records(home, project_dir).last() {
             if predicate(&trace_events(dir)) {
                 return dir.clone();
             }
@@ -683,6 +692,7 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
     // Both, not just the demotion: the task has to be over for the run to have reached the wait
     // the kill interrupts.
     let killed_dir = await_trace(
+        home.path(),
         project.path(),
         "the first run to demote and finish its task",
         |events| {
@@ -735,11 +745,13 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
     let resume_stderr = fs::read_to_string(project.path().join("resume-1-stderr.txt")).unwrap();
     assert!(status.success(), "the resume failed:\n{resume_stderr}");
 
-    let resumed_dir = session_dirs(project.path())
+    let resumed_dir = session_records(home.path(), project.path())
         .into_iter()
         .find(|dir| dir != &killed_dir)
         .expect("the resume opened its own session");
     let resumed_events = trace_events(&resumed_dir);
+    let resumed_session = session_name(&resumed_dir);
+    let resumed_workdir = project.path().join("workdir").join(&resumed_session);
     let reports: Vec<&Value> = events_of_type(&resumed_events, "task_start")
         .into_iter()
         .filter(|event| event["source"] == "detached_lost")
@@ -756,7 +768,7 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
         .map(common::last_user_text)
         .find(|text| text.contains(work_id.as_str()))
         .expect("a request carries the loss report");
-    assert!(!resumed_dir.join("task.md").exists());
+    assert!(!resumed_workdir.join("task.md").exists());
     for named in [
         work_id.as_str(),
         binary.as_str(),
@@ -777,7 +789,6 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
         "no log file exists, so the report names none:\n{message}"
     );
 
-    let resumed_session = session_name(&resumed_dir);
     let killed_events = trace_events(&killed_dir);
     let lost = events_of_type(&killed_events, "shell_lost");
     assert_eq!(lost.len(), 1, "one marker accounts for the demotion");
@@ -803,7 +814,7 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
         }
     }
     assert!(
-        !resumed_dir.join(format!("logs/{work_id}.log")).exists(),
+        !resumed_workdir.join(format!("logs/{work_id}.log")).exists(),
         "a killed runtime writes no output log"
     );
 
@@ -829,7 +840,7 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
         "the second resume failed:\n{second_stderr}"
     );
 
-    let second_dir = session_dirs(project.path())
+    let second_dir = session_records(home.path(), project.path())
         .into_iter()
         .find(|dir| dir != &killed_dir && dir != &resumed_dir)
         .expect("the second resume opened its own session");
@@ -884,7 +895,7 @@ fn a_resume_over_an_unreadable_prior_trace_still_runs_its_task() {
     fs::write(staged.workdir.join("task.md"), "Say something.").unwrap();
     let first = launch_session(staged, |_| {}).expect("the first launch should succeed");
     let first_session = session_name(&first.workdir);
-    let context_id = trace_events(&first.workdir)
+    let context_id = trace_events(&first.records_dir)
         .iter()
         .find(|event| event["event_type"] == "task_start")
         .and_then(|event| event["context_id"].as_str().map(str::to_string))
@@ -892,7 +903,7 @@ fn a_resume_over_an_unreadable_prior_trace_still_runs_its_task() {
 
     // A trace whose writer was killed mid-record: a complete `shell_detached` line followed by a
     // partial one.
-    let trace_path = first.workdir.join("trace.jsonl");
+    let trace_path = first.records_dir.join("trace.jsonl");
     let mut torn = fs::read_to_string(&trace_path).unwrap();
     torn.push_str(
         "{\"event_type\":\"shell_detached\",\"event_id\":\"evt_torn\",\"session_id\":\"s\",\"timestamp\":1750,\"turn\":1,\"task_id\":\"tsk_x\",\"work_id\":\"wrk_torn\",\"binary\":\"/usr/bin/bash\",\"command\":\"sleep 60\",\"grace_ms\":1000}\n{\"event_type\":\"shell_com",
@@ -927,7 +938,7 @@ fn a_resume_over_an_unreadable_prior_trace_still_runs_its_task() {
     // This manifest declares no `lifecycle:` block, so the resume runs on the defaults. The
     // report still reaches the agent: a marker is only written for a loss that gets reported.
     assert_eq!(
-        events_of_type(&trace_events(&resumed.workdir), "task_start")
+        events_of_type(&trace_events(&resumed.records_dir), "task_start")
             .iter()
             .filter(|event| event["source"] == "detached_lost")
             .count(),

@@ -470,10 +470,14 @@ fn read_probe_file(workdir: &Path) -> Option<(Verdict, String)> {
     verdict.map(|v| (v, detail))
 }
 
-/// Every `trace.jsonl` under the capsule workdir's `.murmur/` session directories.
+/// Every `trace.jsonl` of a session the capsule ran with `--workdir <workdir>`: each in its
+/// session's records directory, in `workdir`'s records group under `~/.murmur/records`.
 fn trace_files(workdir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    let Ok(sessions) = fs::read_dir(workdir.join(".murmur")) else {
+    let Ok(group) = capsule_runtime::records_group(workdir) else {
+        return found;
+    };
+    let Ok(sessions) = fs::read_dir(group) else {
         return found;
     };
     for session in sessions.flatten() {
@@ -981,7 +985,15 @@ mod tests {
         // The files a first run leaves at the paths `stage`, the probe and the driver use.
         let case_dir = work_root.join(cases::PREFLIGHT.id);
         let workdir = case_dir.join("wd");
-        let session = workdir.join(".murmur").join("sess-earlier");
+        // The earlier run's records directory, under a scratch home: nextest runs this test in a
+        // process of its own, so no other test reads `HOME` while it is set.
+        let home = crate::work_root::tests::scratch_path("rerun-home");
+        fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+        fs::create_dir_all(&workdir).unwrap();
+        let session = capsule_runtime::records_group(&workdir)
+            .unwrap()
+            .join("sess-earlier");
         fs::create_dir_all(&session).unwrap();
         fs::write(
             workdir.join(probe::PROBE_FILE),
@@ -1012,6 +1024,7 @@ mod tests {
         assert!(trace_resource_limit(&workdir).is_none());
         assert!(work_root.join(crate::work_root::WORK_ROOT_MARKER).is_file());
         fs::remove_dir_all(&work_root).unwrap();
+        let _ = fs::remove_dir_all(&home);
     }
 
     fn preflight_outcome(detail: &str, reach: RunReach) -> CaseOutcome {

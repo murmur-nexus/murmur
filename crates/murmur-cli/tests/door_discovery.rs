@@ -278,11 +278,13 @@ fn launch(task_acceptance: TaskAcceptance, exports: Option<&str>) -> Capsule {
         .collect();
 
     let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
+    common::process_home();
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: project.clone(),
             capsule_name: runtime_manifest.name.clone(),

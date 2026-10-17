@@ -99,9 +99,9 @@ struct Session {
     requests: Vec<Value>,
     trace: Vec<Value>,
     trace_raw: String,
-    /// The session directory, and the project tempdir it lives under — kept alive so a test
-    /// can run `mur trace show` against the trace this session actually wrote.
-    workdir: PathBuf,
+    /// The session's records directory, so a test can run `mur trace show` against the trace
+    /// this session actually wrote.
+    records_dir: PathBuf,
     _project: tempfile::TempDir,
 }
 
@@ -181,12 +181,12 @@ fn run_session(seed_budget: &str, hooks: &[(&str, &str, &str, Vec<u8>)]) -> Sess
 
     let manifest_path = create_manifest(project.path(), &server.endpoint, seed_budget, &hook_names);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    let workdir = staged.workdir.clone();
-    fs::write(workdir.join("task.md"), TASK_TEXT).unwrap();
+    let records_dir = staged.records_dir.clone();
+    fs::write(staged.workdir.join("task.md"), TASK_TEXT).unwrap();
 
     launch_session(staged, |_| {}).expect("the session must launch whatever the seed does");
 
-    let trace_raw = fs::read_to_string(workdir.join("trace.jsonl")).unwrap_or_default();
+    let trace_raw = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap_or_default();
     let trace: Vec<Value> = trace_raw
         .lines()
         .filter(|l| !l.is_empty())
@@ -201,7 +201,7 @@ fn run_session(seed_budget: &str, hooks: &[(&str, &str, &str, Vec<u8>)]) -> Sess
             .collect(),
         trace,
         trace_raw,
-        workdir,
+        records_dir,
         _project: project,
     }
 }
@@ -654,7 +654,7 @@ fn trace_show_renders_the_context_section_for_a_seeded_session() {
     let assert = assert_cmd::Command::cargo_bin("mur")
         .unwrap()
         .args(["trace", "show"])
-        .arg(session.workdir.join("trace.jsonl"))
+        .arg(session.records_dir.join("trace.jsonl"))
         .assert()
         .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();

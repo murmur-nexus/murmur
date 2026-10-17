@@ -78,15 +78,13 @@ fn fail(session_id: &str, workdir: &std::path::Path, error: CliError, json: bool
     }
 }
 
-/// Where this launch's sessions live, and therefore where `--resume` looks for the one it names.
-///
-/// The two layouts are not interchangeable, and `--resume` has to match whichever this launch
-/// will use: `--workdir <dir>` puts sessions at `<dir>/.murmur/<ses_id>`, and without it they go
-/// to `<manifest_dir>/workdir/<ses_id>`. Never `$CWD/workdir` — a `--manifest` pointing
-/// elsewhere would then resolve `@1` against a directory this capsule never wrote to.
-fn session_root(project_dir: &Path, workdir_arg: Option<&Path>) -> PathBuf {
+/// This launch's workdir root, which names the records group its sessions keep their records
+/// in, and therefore where `--resume` looks for the one it names: `--workdir <dir>` itself, and
+/// without it `<manifest_dir>/workdir`. Never `$CWD/workdir` — a `--manifest` pointing elsewhere
+/// would then resolve `@1` against a group this capsule never wrote to.
+fn workdir_root(project_dir: &Path, workdir_arg: Option<&Path>) -> PathBuf {
     match workdir_arg {
-        Some(dir) => absolutise(dir).join(".murmur"),
+        Some(dir) => absolutise(dir),
         None => project_dir.join("workdir"),
     }
 }
@@ -113,7 +111,7 @@ fn resolve_resume(
     project_dir: &Path,
     workdir_arg: Option<&Path>,
 ) -> Result<(ResumeRequest, String), CliError> {
-    let root = session_root(project_dir, workdir_arg);
+    let root = workdir_root(project_dir, workdir_arg);
     let session_dir = resolve_session_dir(resume_arg, &root, "--resume")?;
     let session = session_dir
         .file_name()
@@ -246,6 +244,16 @@ pub(crate) fn run_run(
     } else {
         None
     };
+
+    // Before any artifact store, lockfile or registry read, and before `--explain-scope`: a launch
+    // needs `~/.murmur` to hold its runtime and records directories, and a `HOME` that cannot hold
+    // it is refused with what to set rather than surfacing later as an artifact-store error.
+    // Creates nothing.
+    if let Err(error) =
+        capsule_runtime::runtime_dir_placement(&workdir_root(&project_dir, workdir_arg.as_deref()))
+    {
+        return Err(fail(&session_id, &workdir, CliError::from(error), json));
+    }
 
     // Read here, ahead of staging, for the same reason the grant is: a child that cannot read
     // the handle its parent injected cannot report its outcome to anybody, and running it would
@@ -549,7 +557,7 @@ pub(crate) fn run_run(
         // Same inputs and the same resolver again, so the preopen this reports is the preopen a
         // launch opens, and an escaping `capabilities.filesystem.scope` refuses here exactly as it
         // refuses a real run. Resolving creates no directory — that is the staging path's job.
-        let preopens = preopen_reports(runtime_manifest.artifacts.iter().map(|artifact| {
+        let mut preopens = preopen_reports(runtime_manifest.artifacts.iter().map(|artifact| {
             (
                 artifact.name.as_str(),
                 &artifact.runtime,
@@ -557,6 +565,20 @@ pub(crate) fn run_run(
             )
         }))
         .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+        // Whether a tool reaches the runtime directory through its preopen or its environment is
+        // a property of the installed artifact, which this block reads no store to learn. The
+        // project's `murmur.lock` says it for every locked entry: only a native payload is pinned
+        // per platform. An unlocked entry, an installed capsule's and a lock that cannot be read
+        // stay unresolved.
+        let lock = installed_capsule
+            .is_none()
+            .then(|| read_lockfile(&project_dir.join("murmur.lock")).ok())
+            .flatten();
+        capsule_runtime::resolve_runtime_dir_reaches(&mut preopens, |name| {
+            lock.as_ref()
+                .and_then(|lock| lock.artifact_for(name))
+                .map(|entry| locked_implementation(&entry.sha256))
+        });
         // Answered by performing the write, not by inferring it from a delegated controller list:
         // `probe_io_max` creates a throwaway cgroup, writes the same `io.max` line a launch
         // writes, and removes the directory again. The would-be workdir does not exist yet — this
@@ -591,11 +613,9 @@ pub(crate) fn run_run(
             configured_artifacts,
             preopens,
             io_max,
-            &workdir_arg
-                .as_deref()
-                .map(absolutise)
-                .unwrap_or_else(|| workdir.clone()),
-        );
+            &workdir_root(&project_dir, workdir_arg.as_deref()),
+        )
+        .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
         if json {
             let line = serde_json::to_string(&report).map_err(|source| {
                 CliError::new(
@@ -828,6 +848,8 @@ pub(crate) fn run_run(
         formation_member,
         source_supply,
         expected_workdir_identity: workdir_identity,
+        // An installed capsule's manifest came out of the artifact, not off disk.
+        manifest_file: installed_capsule.is_none().then(|| manifest_path.clone()),
     };
 
     // Stage against project-then-global, the order `check_artifacts_installed` pre-flights in,
@@ -930,6 +952,7 @@ pub(crate) fn run_run(
             Some(wd) => absolutise(wd),
             None => staged.workdir.clone(),
         };
+        let records_dir_for_json = staged.records_dir.clone();
         launch_session_handling_sigterm(staged, move |url| {
             let mut ready = serde_json::json!({
                 "url": url,
@@ -938,6 +961,7 @@ pub(crate) fn run_run(
                 "name": capsule_name,
                 "version": capsule_version,
                 "workdir": accessible_workdir_for_json.to_string_lossy(),
+                "records_dir": records_dir_for_json.to_string_lossy(),
             });
             // Present only for a formation member: a session in no formation has no id to name.
             if let Some(id) = &formation_id {
@@ -967,6 +991,7 @@ pub(crate) fn run_run(
         // Capture fields for the startup closure before `staged` is consumed by launch_session.
         let session_id_for_startup = session_id.clone();
         let workdir_for_startup = workdir.clone();
+        let records_dir_for_startup = staged.records_dir.clone();
         let skill_count = runtime_manifest
             .artifacts
             .iter()
@@ -999,6 +1024,7 @@ pub(crate) fn run_run(
             capsule_runtime::runtime_out!("session: {session_id_for_startup}");
             if verbose {
                 capsule_runtime::runtime_out!("workdir: {}", workdir_for_startup.display());
+                capsule_runtime::runtime_out!("records: {}", records_dir_for_startup.display());
                 capsule_runtime::runtime_out!("manifest: {manifest_name} v{manifest_version}");
                 if let Some(ref d) = driver_line {
                     capsule_runtime::runtime_out!("driver: {d}");
@@ -1024,6 +1050,18 @@ pub(crate) fn run_run(
                 Err(CliError::from(error))
             }
         }
+    }
+}
+
+/// The implementation a `murmur.lock` pin says its payload is: every writer pins a native binary
+/// per platform and anything else under `any`.
+pub(crate) fn locked_implementation(
+    sha256: &murmur_artifact::LockedSha256,
+) -> murmur_artifact::ArtifactImplementation {
+    if sha256.platforms.is_empty() {
+        murmur_artifact::ArtifactImplementation::Wasm
+    } else {
+        murmur_artifact::ArtifactImplementation::Native
     }
 }
 

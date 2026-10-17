@@ -50,6 +50,7 @@ section that explains it.
 | `E-IO-001` | File or directory not found | — |
 | `E-IO-002` | Permission denied on a host path (the host's own permissions, not a capsule capability) | — |
 | `E-IO-003` | General I/O error (read/write failure), including a write to standard output that failed for a reason other than its reader going away | [Piped output](cli.md#piped-output) |
+| `E-IO-004` | `HOME` is unset, relative, or names a directory in which `~/.murmur` cannot be created, so there is nowhere to keep a session's runtime and records directories | [E-IO-004](#e-io-004) |
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
 | `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication), a credential scope that names a retired door method, a `network.authentication` declared beside a non-empty `capabilities.spawn.allow`, a `lifecycle.queue_depth: 0` under `task_acceptance: queue`, a top-level `mur_version`, which is pinned as [`deploy.mur_version`](manifest.md#field-deploy), a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds, an artifact name that is not `<scope>/<name>` where a full name is required, a scope on a `source:` entry, two `capabilities.spawn.allow` entries with one bare part, or a top-level `registry:` key | [E-MAN-003](#e-man-003) |
@@ -177,7 +178,7 @@ section that explains it.
 | `W-SEC-030` | An artifact reaches its upstream through an unmetered credential gateway, which the spend ceilings do not cover | [W-SEC-030](#w-sec-030) |
 | `W-SEC-031` | A `transport: process` harness session reports it is authenticating as something other than a subscription | [W-SEC-031](#w-sec-031) |
 | `W-SEC-032` | The A2A door is exposed off loopback and `network.authentication` is not declared | [W-SEC-032](#w-sec-032) |
-| `W-SEC-033` | The session's runtime directory lies inside the workdir, so the capsule's commands can change the files the runtime owns | [W-SEC-033](#w-sec-033) |
+| `W-SEC-033` | The session's runtime or records directory lies inside the workdir, so the capsule's commands can change the files the runtime owns or the records it keeps | [W-SEC-033](#w-sec-033) |
 
 ---
 
@@ -318,9 +319,13 @@ The same two rules apply wherever a scope is declared: the capsule-wide
 
 If the achieved class is weaker than the effective declared floor, `mur run` refuses to launch
 before any registry pull, artifact compile, or workdir creation. The message names both classes
-and the reason; the hint is always the same pair of remedies — lower the declared floor
-(`capabilities.containment` in `murmur.yaml`, `containment` in `.murmur/config.yaml`, or
-`--containment`), or run on a host that provides the declared class.
+and the reason. The hint is chosen by the cause:
+
+| Cause | Hint |
+|---|---|
+| The host lacks the mechanism | `lower the declared floor to '<achieved>' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment), or run on a host that provides '<declared>'` |
+| [`capabilities.filesystem.workdir_exec: true`](containment.md#field-workdir-exec) | `set capabilities.filesystem.workdir_exec to false, or lower the declared floor to 'advisory' (…the same three places)` |
+| The runtime or records directory lies inside the workdir | `run with a --workdir that does not contain ~/.murmur, or lower the declared floor to 'advisory' (…the same three places)` |
 
 ```text
 error[E-CAP-003]: declared containment class 'scoped' is not achievable on this host (achieved: 'advisory'): scoped requires Landlock filesystem mediation (Linux 5.13+ with a usable Landlock ABI); this host provides no kernel filesystem mediation, so paths outside the workdir are constrained by convention only
@@ -350,13 +355,15 @@ enforceable property of the capsule, and the achieved class is capped at `adviso
 Remove `workdir_exec`, or lower the declared floor to `advisory`.
 
 **A second case names the workdir:** `~/.murmur/sessions`, where the session's
-[runtime directory](workdir.md#runtime-directory) is created, lying inside the workdir the capsule's
-commands write — `HOME` and `--workdir` the same directory, for one. The commands could then change
-the task, `MURMUR.md`, a submitted plan or an installed tool, and the achieved class is capped at
-`advisory`. The reason names both paths:
+[runtime directory](workdir.md#runtime-directory) is created, or the session's
+[records directory](workdir.md#records-directory), lying inside the workdir the capsule's commands
+write — `HOME` and `--workdir` the same directory, for one. The commands could then change the
+task, `MURMUR.md`, a submitted plan, an installed tool or the session's trace, and the achieved
+class is capped at `advisory`. The reason names the directory and the workdir:
 
 ```text
-error[E-CAP-003]: declared containment class 'scoped' is not achievable on this host (achieved: 'advisory'): the runtime directory /home/dev/.murmur/sessions lies inside the workdir /home/dev, so this capsule's commands can change the files the runtime owns — task.md, MURMUR.md, plans and installed tools — and no host can back a class above advisory for it; run with a --workdir that does not contain ~/.murmur
+error[E-CAP-003]: declared containment class 'scoped' is not achievable on this host (achieved: 'advisory'): the runtime directory /home/dev/.murmur/sessions and the records directory /home/dev/.murmur/records/home/dev/<session-id> lie inside the workdir /home/dev, so this capsule's commands can change the files the runtime owns — task.md, MURMUR.md, plans and installed tools — and the records it keeps about the session — its trace, logs, eval scores and delegation outcome, and no host can back a class above advisory for it; run with a --workdir that does not contain ~/.murmur
+  hint: run with a --workdir that does not contain ~/.murmur, or lower the declared floor to 'advisory' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment)
 ```
 
 Run with a `--workdir` that does not contain `~/.murmur`. Below a `scoped` floor the launch runs
@@ -374,6 +381,30 @@ and the message names the failing step and its errno:
   policy changed. Re-probe with `mur run --explain-scope`.
 
 Neither means the declared floor was wrong; `E-CAP-003` covers that.
+
+### E-IO-004 — `HOME` cannot hold `~/.murmur` { #e-io-004 }
+
+Every launch keeps its [runtime directory](workdir.md#runtime-directory) and its
+[records directory](workdir.md#records-directory) under `~/.murmur`. A `HOME` that cannot hold it is
+refused, and nothing is written anywhere:
+
+| Cause | Message |
+|---|---|
+| `HOME` is unset | `HOME is not set, so there is no ~/.murmur to hold this session's runtime and records directories` |
+| `HOME` is a relative path | `HOME is '<value>', which is not an absolute path, so there is no ~/.murmur to hold this session's runtime and records directories` |
+| `~/.murmur`, `~/.murmur/sessions` or `~/.murmur/records` is not a directory this user can write, or `~/.murmur` is absent and `HOME` cannot be written | `~/.murmur (<path>) cannot hold this session's runtime and records directories: <reason>` |
+
+```text
+error[E-IO-004]: HOME is not set, so there is no ~/.murmur to hold this session's runtime and records directories
+  hint: set HOME to the absolute path of a directory you own, in which ~/.murmur exists or can be created as a 0700 directory
+```
+
+| Raised by | When |
+|---|---|
+| `mur run` | Before any artifact store, lockfile or registry is read; also under `--explain-scope` |
+| `mur eval run` | When a case is staged |
+| `mur trace show`, `steps`, `diff`, `report`, `mur eval show`, `diff`, `mur run --resume` | When the address needs a records group; the path form needs none |
+| `mur doctor` | In place of the runtime and records directory paths, counted as a failed check |
 
 ### E-RUN-006 — a harness binary was not found { #e-run-006 }
 
@@ -1260,7 +1291,7 @@ code in two cases:
 | When | Typical paths |
 |---|---|
 | Staging the session, before the capsule starts | The `.murmur/<session-id>` directory |
-| During the task `mur run` ran, after the capsule created a link | The operator's `task.md` read when the session starts, `out/result.txt`, `logs/bootstrap.log`, `peer-in/` |
+| During the task `mur run` ran, after the capsule created a link | The operator's `task.md` read when the session starts, `out/result.txt`, `peer-in/` |
 
 The message names the path and the part of it that is the link:
 
@@ -2601,7 +2632,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 
 | Warning | Written to |
 |---|---|
-| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-021`, `W-SEC-022`, `W-SEC-023` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
+| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-021`, `W-SEC-022`, `W-SEC-023` — decided at launch | stderr and the session's [`logs/bootstrap.log`](workdir.md#records-directory) |
 | `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-027`, `W-SEC-028`, `W-SEC-029`, `W-SEC-030` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 | `W-SEC-031` — decided mid-session, when the harness reports its session | stderr |
@@ -3626,10 +3657,11 @@ loopback.
 callers the tokens [`mur run`](cli.md#mur-run) prints, and put a TLS terminator in front of the
 door, which speaks plain HTTP. Or bind to loopback.
 
-### W-SEC-033 — the runtime directory lies inside the workdir { #w-sec-033 }
+### W-SEC-033 — the runtime or records directory lies inside the workdir { #w-sec-033 }
 
 **Fires when:** `~/.murmur/sessions`, where every session's
-[runtime directory](workdir.md#runtime-directory) is created, lies inside the accessible workdir:
+[runtime directory](workdir.md#runtime-directory) is created, or the session's
+[records directory](workdir.md#records-directory), lies inside the accessible workdir:
 
 | From | When |
 |---|---|
@@ -3637,14 +3669,15 @@ door, which speaks plain HTTP. Or bind to loopback.
 | `mur doctor` | For `<manifest-dir>/workdir`, whatever the declared containment |
 
 ```text
-[capsule-runtime] warning[W-SEC-033]: the runtime directory /home/dev/.murmur/sessions lies inside the workdir /home/dev, so this capsule's commands can change the files the runtime owns — task.md, MURMUR.md, plans and installed tools; run with a --workdir that does not contain ~/.murmur (https://docs.murmur.nexus/reference/diagnostics/#w-sec-033)
+[capsule-runtime] warning[W-SEC-033]: the runtime directory /home/dev/.murmur/sessions and the records directory /home/dev/.murmur/records/home/dev/<session-id> lie inside the workdir /home/dev, so this capsule's commands can change the files the runtime owns — task.md, MURMUR.md, plans and installed tools — and the records it keeps about the session — its trace, logs, eval scores and delegation outcome; run with a --workdir that does not contain ~/.murmur (https://docs.murmur.nexus/reference/diagnostics/#w-sec-033)
 ```
 
 **Why it matters:** the capsule's commands can rewrite the task, `MURMUR.md`, a submitted plan
-before it runs, or an installed native tool before its next call.
+before it runs, an installed native tool before its next call, or the trace and eval scores every
+later reader trusts.
 
 **What the runtime does about it:** the launch runs, records `achieved_containment: advisory`, and
-reports `runtime_dir.read_only_to_commands: false`. A `scoped` or `sealed` floor is refused with
+reports `read_only_to_commands: false` for the directory that lies inside. A `scoped` or `sealed` floor is refused with
 [`E-CAP-003`](#e-cap-003) instead.
 
 **What to do:** run with a `--workdir` that does not contain `~/.murmur`.

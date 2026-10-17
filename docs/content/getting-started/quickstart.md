@@ -124,7 +124,7 @@ session: ses_019ed2af53da75c2aefee84ee10c34af
 status:  ok
 ```
 
-The `session:` value identifies this run. Everything the run produces lands under `workdir/<session_id>/`: the model's final text (`out/result.txt`), the structured trace (`trace.jsonl`), and runtime logs (`logs/`). The session workdir is the single place to look — read the result directly with:
+The `session:` value identifies this run. The model's final text lands under `workdir/<session_id>/` as `out/result.txt`; the structured trace (`trace.jsonl`) and runtime logs (`logs/`) are kept in the session's [records directory](../reference/workdir.md#records-directory) under `~/.murmur/records`, where `mur trace show` reads them. Read the result directly with:
 
 ```bash
 cat workdir/*/out/result.txt

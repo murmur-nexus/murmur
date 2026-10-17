@@ -681,6 +681,9 @@ pub(crate) async fn run_agent_loop(
     // What this attempt continues the task's conversation with, or `None` for an attempt that
     // builds a fresh context.
     let continuation = continuation.filter(|_| thread.can_continue(&inference.transport));
+    // Every log line and hook fault this attempt records goes into the session's records
+    // directory; `workdir` keeps the session's `out/`.
+    let records_root = store_state.records_root.clone();
 
     // A fresh attempt with nothing to say fails before either transport starts: the http path
     // would otherwise load history, which may compact through the driver, and then send an empty
@@ -718,7 +721,7 @@ pub(crate) async fn run_agent_loop(
             record_seed_rejection(
                 hooks,
                 trace,
-                workdir,
+                &records_root,
                 &seed.hook_name,
                 proposed_tokens,
                 seed_budget_tokens(run_config.context_window, run_config.seed_budget),
@@ -732,7 +735,8 @@ pub(crate) async fn run_agent_loop(
         let session_policy = process::HarnessSessionPolicy {
             map: run_config.harness_sessions.clone().unwrap_or_else(|| {
                 Arc::new(crate::harness_session::HarnessSessionMap::new(
-                    None, workdir,
+                    None,
+                    &records_root,
                 ))
             }),
             context_id: context_id.clone(),
@@ -820,7 +824,7 @@ pub(crate) async fn run_agent_loop(
         store_state.installed_generation,
     );
     log_tool_inventory(
-        workdir,
+        &records_root,
         "Installed tools",
         inventory.tools(),
         &mut store_state.logged_tool_inventory,
@@ -832,6 +836,7 @@ pub(crate) async fn run_agent_loop(
         run_config.formation_member.as_deref(),
         system_prompt.as_deref(),
         store_state.capability_policy.plan_submit,
+        store_state.manifest_file_name.as_deref(),
     );
     // Constant for the whole session: a routing hint that keeps every request sharing this
     // prompt prefix on one machine, so the provider's cache entry is the one it lands on.
@@ -851,7 +856,7 @@ pub(crate) async fn run_agent_loop(
         (Some(root), Some(context_id)) => crate::conversation::ConversationRecord::open(
             root,
             context_id,
-            workdir,
+            &records_root,
             run_config.record_owner.as_deref(),
         ),
         _ => None,
@@ -935,6 +940,7 @@ pub(crate) async fn run_agent_loop(
                     first_turn as usize,
                     run_config.context_window,
                     workdir,
+                    &records_root,
                     hooks,
                     trace,
                     otel,
@@ -984,7 +990,7 @@ pub(crate) async fn run_agent_loop(
                     &mut session_tokens,
                     &occupancy,
                     store_state,
-                    workdir,
+                    &records_root,
                     hooks,
                     trace,
                     otel,
@@ -1138,7 +1144,7 @@ pub(crate) async fn run_agent_loop(
                 .await
                 .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
             log_tool_inventory(
-                workdir,
+                &records_root,
                 "Refreshed tools",
                 inventory.tools(),
                 &mut store_state.logged_tool_inventory,
@@ -1455,7 +1461,7 @@ pub(crate) async fn run_agent_loop(
         let inference_tools = payload.get("tools").map(|t| t.to_string());
         let hook_artifact = hooks
             .emit(
-                workdir,
+                &records_root,
                 HookEvent::Inference {
                     turn: turn_u32,
                     input_tokens: u64::from(input_tokens),
@@ -1580,6 +1586,7 @@ pub(crate) async fn run_agent_loop(
                     turn,
                     run_config.context_window,
                     workdir,
+                    &records_root,
                     hooks,
                     trace,
                     otel,
@@ -1696,7 +1703,7 @@ pub(crate) async fn run_agent_loop(
                     // The required-field check comes first. Its refusal takes the failed-dispatch
                     // arm below, so the call is observed and traced as a failed `tool_call` like
                     // any other dispatch failure, beside its own `tool_input_refused` record.
-                    let mut gate = CallGate::new(hooks, trace, workdir, turn_u32);
+                    let mut gate = CallGate::new(hooks, trace, &records_root, turn_u32);
                     let refused = gate
                         .check_required_fields(store_state, &tool_name, Some(&tool_call_id), &input)
                         .await?;
@@ -1776,7 +1783,7 @@ pub(crate) async fn run_agent_loop(
                             let output_bytes = text.len() as u64;
                             hooks
                                 .emit(
-                                    workdir,
+                                    &records_root,
                                     HookEvent::ToolCall {
                                         turn: turn_u32,
                                         tool_name: tool_name.clone(),
@@ -1840,7 +1847,7 @@ pub(crate) async fn run_agent_loop(
                             if let Some(shell) = outcome.shell {
                                 hooks
                                     .emit(
-                                        workdir,
+                                        &records_root,
                                         HookEvent::Shell {
                                             turn: turn_u32,
                                             binary: shell.binary.clone(),
@@ -1920,7 +1927,7 @@ pub(crate) async fn run_agent_loop(
                             let output_bytes = error.len() as u64;
                             hooks
                                 .emit(
-                                    workdir,
+                                    &records_root,
                                     HookEvent::ToolCall {
                                         turn: turn_u32,
                                         tool_name: tool_name.clone(),
@@ -3140,7 +3147,7 @@ fn has_unresolved_tool_call(messages: &[Value]) -> bool {
 /// record the decline is not a reason to end a session that is otherwise still running.
 async fn record_compaction_declined(
     trace: &mut TraceWriter,
-    workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     turn: u32,
     tokens: u32,
     reason: &str,
@@ -3150,7 +3157,7 @@ async fn record_compaction_declined(
         .await
     {
         append_bootstrap_log(
-            workdir,
+            records_root,
             &format!("[compaction] trace write failed: {e}; continuing"),
         );
     }
@@ -3165,6 +3172,7 @@ pub(crate) async fn try_compact_via_hooks(
     turn: usize,
     context_window: u32,
     workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &OtelEmitter,
@@ -3208,12 +3216,12 @@ pub(crate) async fn try_compact_via_hooks(
 
     let Some(new_wit_messages) = replacement else {
         append_bootstrap_log(
-            workdir,
+            records_root,
             "[compaction] threshold reached but no hook returned replace-context; continuing without compaction",
         );
         record_compaction_declined(
             trace,
-            workdir,
+            records_root,
             turn_u32,
             tokens_before,
             crate::trace::COMPACTION_DECLINED_NO_HOOK_REPLACEMENT,
@@ -3227,12 +3235,12 @@ pub(crate) async fn try_compact_via_hooks(
 
     if has_unresolved_tool_call(&candidate_messages) {
         append_bootstrap_log(
-            workdir,
+            records_root,
             "[compaction] compacted result has an unresolved tool_call; continuing without compaction",
         );
         record_compaction_declined(
             trace,
-            workdir,
+            records_root,
             turn_u32,
             tokens_before,
             crate::trace::COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL,
@@ -3269,7 +3277,7 @@ pub(crate) async fn try_compact_via_hooks(
         .await
     {
         append_bootstrap_log(
-            workdir,
+            records_root,
             &format!("[compaction] trace write failed: {e}; continuing"),
         );
     }
@@ -3289,12 +3297,12 @@ pub(crate) async fn try_compact_via_hooks(
         messages,
     ) {
         append_bootstrap_log(
-            workdir,
+            records_root,
             &format!("[compaction] summary dump write failed: {e}; continuing"),
         );
     }
     append_bootstrap_log(
-        workdir,
+        records_root,
         &format!(
             "[compaction] hook compaction at turn {turn}; new session_tokens: {session_tokens}"
         ),
@@ -3509,7 +3517,7 @@ fn append_to_record(
 /// of a conversation it cannot see and duplicates it.
 pub(crate) fn prior_history_tokens(
     conversation_root: Option<&Path>,
-    workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     mode: &ConversationMode,
     context_id: Option<&str>,
     resume: bool,
@@ -3518,7 +3526,7 @@ pub(crate) fn prior_history_tokens(
     // must not gain a header line from being measured.
     let mut record = match (conversation_root, context_id) {
         (Some(root), Some(context_id)) if matches!(mode, ConversationMode::Threaded) || resume => {
-            crate::conversation::ConversationRecord::open(root, context_id, workdir, None)
+            crate::conversation::ConversationRecord::open(root, context_id, records_root, None)
         }
         _ => None,
     };
@@ -3540,14 +3548,14 @@ pub(crate) fn prior_history_tokens(
 async fn record_seed_rejection(
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
-    workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     hook_name: &str,
     proposed_tokens: u64,
     budget_tokens: u64,
     reason: &str,
 ) {
     append_bootstrap_log(
-        workdir,
+        records_root,
         &format!(
             "[seed] hook '{hook_name}' proposed {proposed_tokens} tokens against a budget of \
              {budget_tokens}; rejected ({reason}); the task runs without a seed"
@@ -3566,7 +3574,7 @@ async fn record_seed_rejection(
         .await
     {
         append_bootstrap_log(
-            workdir,
+            records_root,
             &format!("[seed] trace write failed: {e}; continuing"),
         );
     }
@@ -3596,7 +3604,7 @@ pub(crate) async fn apply_seed_context(
     session_tokens: &mut u32,
     occupancy: &ContextOccupancy<'_>,
     store_state: &mut CapsuleStoreState,
-    workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &OtelEmitter,
@@ -3622,7 +3630,7 @@ pub(crate) async fn apply_seed_context(
         record_seed_rejection(
             hooks,
             trace,
-            workdir,
+            records_root,
             &hook_name,
             proposed_tokens,
             budget,
@@ -3644,7 +3652,7 @@ pub(crate) async fn apply_seed_context(
         record_seed_rejection(
             hooks,
             trace,
-            workdir,
+            records_root,
             &hook_name,
             proposed_tokens,
             budget,
@@ -3666,7 +3674,7 @@ pub(crate) async fn apply_seed_context(
         match summarize_seed_overflow(
             &plan.dropped,
             front_tokens,
-            workdir,
+            records_root,
             hooks,
             trace,
             otel,
@@ -3683,7 +3691,7 @@ pub(crate) async fn apply_seed_context(
                     record_seed_rejection(
                         hooks,
                         trace,
-                        workdir,
+                        records_root,
                         &hook_name,
                         proposed_tokens,
                         budget,
@@ -3734,7 +3742,7 @@ pub(crate) async fn apply_seed_context(
     );
 
     append_bootstrap_log(
-        workdir,
+        records_root,
         &format!(
             "[seed] hook '{hook_name}' seeded {committed_tokens} of {proposed_tokens} proposed \
              tokens against a budget of {budget} ({outcome})"
@@ -3753,7 +3761,7 @@ pub(crate) async fn apply_seed_context(
         .await
     {
         append_bootstrap_log(
-            workdir,
+            records_root,
             &format!("[seed] trace write failed: {e}; continuing"),
         );
     }
@@ -3773,7 +3781,7 @@ pub(crate) async fn apply_seed_context(
 async fn summarize_seed_overflow(
     front: &[Value],
     front_tokens: u64,
-    workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &OtelEmitter,
@@ -3798,7 +3806,7 @@ async fn summarize_seed_overflow(
                 reconstruct_hook_messages(wit_messages, ContextInsertion::ReplaceContext, front);
             if summary.is_empty() {
                 append_bootstrap_log(
-                    workdir,
+                    records_root,
                     "[seed] the compaction hook's replacement reconstructed to nothing; \
                      trimming the overflowing front instead",
                 );
@@ -3808,7 +3816,7 @@ async fn summarize_seed_overflow(
         }
         Ok(None) => {
             append_bootstrap_log(
-                workdir,
+                records_root,
                 "[seed] no compaction hook returned replace-context for the overflowing front; \
                  trimming it instead",
             );
@@ -3816,7 +3824,7 @@ async fn summarize_seed_overflow(
         }
         Err(error) => {
             append_bootstrap_log(
-                workdir,
+                records_root,
                 &format!(
                     "[seed] compaction hook failed while summarizing the overflowing front \
                      ({error}); trimming it instead"
@@ -4224,8 +4232,19 @@ perfectly and do the wrong work. Read first, decide, and submit a plan only for 
 follow from what you found.";
 
 /// Where the agent finds the files the runtime owns, in the `[Capsule]` block and the
-/// `transport: process` system prompt. A constant, so neither prefix carries a per-launch path.
-pub(crate) const RUNTIME_DIR_NOTICE: &str = "Runtime files: MURMUR.md, task.md, murmur.yaml and the installed tools are in a directory you can read and cannot change — $MURMUR_RUNTIME_DIR in a shell command, murmur-runtime/ in a file tool.";
+/// `transport: process` system prompt, naming the manifest file the launch copied there, or none
+/// for a launch that read none. It carries no per-launch path, so a prefix holding it stays the
+/// same for every launch of one manifest.
+pub(crate) fn runtime_dir_notice(manifest_file: Option<&str>) -> String {
+    let files = match manifest_file {
+        Some(name) => format!("MURMUR.md, task.md, {name} and the installed tools are"),
+        None => "MURMUR.md, task.md and the installed tools are".to_string(),
+    };
+    format!(
+        "Runtime files: {files} in a directory you can read and cannot change — \
+         $MURMUR_RUNTIME_DIR in a shell command, murmur-runtime/ in a file tool."
+    )
+}
 
 /// Builds the always-present `[Capsule]` context block prepended to `system_prompt`
 /// (which may be absent) for the http-driver transport. Runs unconditionally for every
@@ -4251,8 +4270,10 @@ fn build_augmented_system_prompt(
     member: Option<&str>,
     system_prompt: Option<&str>,
     plan_tool_present: bool,
+    manifest_file: Option<&str>,
 ) -> String {
     let base = system_prompt.unwrap_or("");
+    let runtime_dir = runtime_dir_notice(manifest_file);
     // Like the plan notice's, this newline belongs to the member line, so a non-member's block
     // carries no stray byte.
     let member = member
@@ -4267,7 +4288,7 @@ fn build_augmented_system_prompt(
         String::new()
     };
     let context = format!(
-        "[Capsule]\nName: {name}\nVersion: {version}\n{member}{RUNTIME_DIR_NOTICE}\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}{plan}\n\n"
+        "[Capsule]\nName: {name}\nVersion: {version}\n{member}{runtime_dir}\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}{plan}\n\n"
     );
     format!("{context}{base}")
 }
@@ -4277,7 +4298,7 @@ fn build_augmented_system_prompt(
 /// becomes the new `last_logged`. The log is the only thing this decides: every request carries
 /// its full array regardless.
 pub(crate) fn log_tool_inventory(
-    workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     heading: &str,
     tools: &[Value],
     last_logged: &mut Option<String>,
@@ -4288,15 +4309,16 @@ pub(crate) fn log_tool_inventory(
     if last_logged.as_deref() == Some(tools_json.as_str()) {
         return Ok(());
     }
-    append_bootstrap_log(workdir, &format!("{heading} (JSON):\n{tools_json}"));
+    append_bootstrap_log(records_root, &format!("{heading} (JSON):\n{tools_json}"));
     *last_logged = Some(tools_json);
     Ok(())
 }
 
-/// Appends `message` and a newline to `logs/bootstrap.log`. Never fails: a refused append is on
-/// `workdir`'s refusal latch, which fails the task at its next checkpoint.
-pub(crate) fn append_bootstrap_log(workdir: &WorkdirRoot, message: &str) {
-    if let Ok(mut file) = workdir.open_append("logs/bootstrap.log", DEFAULT_FILE_MODE) {
+/// Appends `message` and a newline to `logs/bootstrap.log` in the session's records directory.
+/// Never fails: a refused append is on `records_root`'s refusal latch, which fails the task at its
+/// next checkpoint.
+pub(crate) fn append_bootstrap_log(records_root: &WorkdirRoot, message: &str) {
+    if let Ok(mut file) = records_root.open_append("logs/bootstrap.log", DEFAULT_FILE_MODE) {
         let _ = file.write_all(message.as_bytes());
         let _ = file.write_all(b"\n");
     }
@@ -4449,6 +4471,24 @@ fn extract_text_content(content: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`runtime_dir_notice`] for a launch that read `murmur.yaml`.
+    const RUNTIME_DIR_NOTICE: &str = "Runtime files: MURMUR.md, task.md, murmur.yaml and the \
+        installed tools are in a directory you can read and cannot change — $MURMUR_RUNTIME_DIR \
+        in a shell command, murmur-runtime/ in a file tool.";
+
+    /// The notice names the manifest file the launch copied, by its own name, and no manifest
+    /// for a launch that read none.
+    #[test]
+    fn the_runtime_dir_notice_names_the_launched_manifest() {
+        assert_eq!(runtime_dir_notice(Some("murmur.yaml")), RUNTIME_DIR_NOTICE);
+        assert!(runtime_dir_notice(Some("murmur-scoped.yaml")).starts_with(
+            "Runtime files: MURMUR.md, task.md, murmur-scoped.yaml and the installed"
+        ));
+        let none = runtime_dir_notice(None);
+        assert!(none.starts_with("Runtime files: MURMUR.md, task.md and the installed tools are"));
+        assert!(!none.contains(".yaml"));
+    }
     use crate::spend::SpendLimit;
     use std::fs;
 
@@ -4521,7 +4561,14 @@ mod tests {
 
     #[test]
     fn augmented_system_prompt_carries_trust_notice_with_no_custom_prompt() {
-        let prompt = build_augmented_system_prompt("my-capsule", "1.0.0", None, None, false);
+        let prompt = build_augmented_system_prompt(
+            "my-capsule",
+            "1.0.0",
+            None,
+            None,
+            false,
+            Some("murmur.yaml"),
+        );
         assert!(
             prompt.contains(MURMUR_MD_TRUST_NOTICE),
             "notice missing from: {prompt}"
@@ -4542,6 +4589,7 @@ mod tests {
             None,
             Some("You are a helpful assistant."),
             false,
+            Some("murmur.yaml"),
         );
         assert!(prompt.contains(MURMUR_MD_TRUST_NOTICE));
         assert!(prompt.contains(UNTRUSTED_CONTENT_NOTICE));
@@ -4559,12 +4607,25 @@ mod tests {
     fn augmented_system_prompt_names_no_host_path() {
         // The block is the first text of every prompt, so every element of it has to be
         // launch-invariant for a provider to match the prefix against its cache.
-        let prompt =
-            build_augmented_system_prompt("my-capsule", "1.0.0", None, Some("custom"), false);
+        let prompt = build_augmented_system_prompt(
+            "my-capsule",
+            "1.0.0",
+            None,
+            Some("custom"),
+            false,
+            Some("murmur.yaml"),
+        );
         assert!(!prompt.contains("Workdir:"), "got:\n{prompt}");
         assert_eq!(
             prompt,
-            build_augmented_system_prompt("my-capsule", "1.0.0", None, Some("custom"), false),
+            build_augmented_system_prompt(
+                "my-capsule",
+                "1.0.0",
+                None,
+                Some("custom"),
+                false,
+                Some("murmur.yaml")
+            ),
             "the block must be a pure function of capsule identity and manifest prompt"
         );
         assert!(prompt.starts_with(&format!(
@@ -4579,8 +4640,14 @@ mod tests {
     /// the name, so the block stays launch-invariant; the per-launch formation id stays out of it.
     #[test]
     fn augmented_system_prompt_names_a_formation_member() {
-        let prompt =
-            build_augmented_system_prompt("s4-worker", "0.1.0", Some("a1"), Some("custom"), false);
+        let prompt = build_augmented_system_prompt(
+            "s4-worker",
+            "0.1.0",
+            Some("a1"),
+            Some("custom"),
+            false,
+            Some("murmur.yaml"),
+        );
         assert_eq!(
             prompt,
             format!(
@@ -4591,13 +4658,27 @@ mod tests {
         );
         assert_eq!(
             prompt,
-            build_augmented_system_prompt("s4-worker", "0.1.0", Some("a1"), Some("custom"), false),
+            build_augmented_system_prompt(
+                "s4-worker",
+                "0.1.0",
+                Some("a1"),
+                Some("custom"),
+                false,
+                Some("murmur.yaml")
+            ),
         );
         assert!(!prompt.contains("frm_"), "got:\n{prompt}");
         assert!(!prompt.contains("ses_"), "got:\n{prompt}");
         assert_ne!(
             prompt,
-            build_augmented_system_prompt("s4-worker", "0.1.0", Some("a2"), Some("custom"), false),
+            build_augmented_system_prompt(
+                "s4-worker",
+                "0.1.0",
+                Some("a2"),
+                Some("custom"),
+                false,
+                Some("murmur.yaml")
+            ),
             "two members of one capsule must be told apart"
         );
     }
@@ -4608,8 +4689,15 @@ mod tests {
     #[test]
     fn untrusted_content_notice_states_the_fence_rule() {
         for prompt in [
-            build_augmented_system_prompt("my-capsule", "1.0.0", None, None, false),
-            process::build_process_system_prompt(None, false),
+            build_augmented_system_prompt(
+                "my-capsule",
+                "1.0.0",
+                None,
+                None,
+                false,
+                Some("murmur.yaml"),
+            ),
+            process::build_process_system_prompt(None, false, Some("murmur.yaml")),
         ] {
             assert!(
                 prompt.contains("<untrusted-content source=NAME>"),
@@ -4641,8 +4729,15 @@ forgery: {prompt}"
     #[test]
     fn plan_guidance_is_present_exactly_when_the_grant_is() {
         for granted in [
-            build_augmented_system_prompt("my-capsule", "1.0.0", None, None, true),
-            process::build_process_system_prompt(None, true),
+            build_augmented_system_prompt(
+                "my-capsule",
+                "1.0.0",
+                None,
+                None,
+                true,
+                Some("murmur.yaml"),
+            ),
+            process::build_process_system_prompt(None, true, Some("murmur.yaml")),
         ] {
             assert!(
                 granted.contains(PLAN_TOOL_NOTICE),
@@ -4650,8 +4745,15 @@ forgery: {prompt}"
             );
         }
         for ungranted in [
-            build_augmented_system_prompt("my-capsule", "1.0.0", None, None, false),
-            process::build_process_system_prompt(None, false),
+            build_augmented_system_prompt(
+                "my-capsule",
+                "1.0.0",
+                None,
+                None,
+                false,
+                Some("murmur.yaml"),
+            ),
+            process::build_process_system_prompt(None, false, Some("murmur.yaml")),
         ] {
             assert!(
                 !ungranted.contains("submit-plan"),
@@ -4667,14 +4769,21 @@ forgery: {prompt}"
     #[test]
     fn the_ungranted_prompt_is_unchanged_on_both_transports() {
         assert_eq!(
-            build_augmented_system_prompt("my-capsule", "1.0.0", None, Some("custom"), false),
+            build_augmented_system_prompt(
+                "my-capsule",
+                "1.0.0",
+                None,
+                Some("custom"),
+                false,
+                Some("murmur.yaml")
+            ),
             format!(
                 "[Capsule]\nName: my-capsule\nVersion: 1.0.0\n{RUNTIME_DIR_NOTICE}\n\
                  {MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}\n\ncustom"
             )
         );
         assert_eq!(
-            process::build_process_system_prompt(None, false),
+            process::build_process_system_prompt(None, false, Some("murmur.yaml")),
             format!("{RUNTIME_DIR_NOTICE}\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}")
         );
     }
@@ -4686,7 +4795,10 @@ forgery: {prompt}"
         assert!(RUNTIME_DIR_NOTICE.contains("murmur-runtime/"));
         assert!(!RUNTIME_DIR_NOTICE.contains("/home"));
         assert!(!RUNTIME_DIR_NOTICE.contains(".murmur"));
-        assert!(process::build_process_system_prompt(Some("x"), true).contains(RUNTIME_DIR_NOTICE));
+        assert!(
+            process::build_process_system_prompt(Some("x"), true, Some("murmur.yaml"))
+                .contains(RUNTIME_DIR_NOTICE)
+        );
     }
 
     /// The load-bearing half of the guidance is the refusal, so it is pinned: a model told only
@@ -6763,6 +6875,7 @@ forgery: {prompt}"
             None,
             var("SYSTEM_PROMPT").as_deref(),
             false,
+            Some("murmur.yaml"),
         );
         let cache_key = build_prompt_cache_key(&name, &version, var("CONTEXT_ID").as_deref());
         let occupancy = ContextOccupancy {

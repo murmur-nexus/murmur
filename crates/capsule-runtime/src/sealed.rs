@@ -1002,6 +1002,9 @@ pub(crate) struct SealedBindSources<'a> {
     /// The session's runtime directory and the identity of the runtime root's own descriptor,
     /// bound read-only and required at its own absolute path.
     pub(crate) runtime_dir: Option<(&'a Path, (u64, u64))>,
+    /// The session's records directory and the identity of the records root's own descriptor,
+    /// bound read-only and required at its own absolute path, on [`Self::runtime_dir`]'s terms.
+    pub(crate) records_dir: Option<(&'a Path, (u64, u64))>,
 }
 
 /// Directory the old root is parked in between `pivot_root(2)` and `umount2(MNT_DETACH)`.
@@ -1352,6 +1355,25 @@ pub(crate) fn plan_composed_root(
     //    cannot be bound ends the session rather than leaving its commands without their task
     //    and tools.
     if let Some((path, identity)) = sources.runtime_dir {
+        let target = rebase(base, path);
+        builder.mkdir_p(&target);
+        builder.push(
+            RootOp::BindVerified {
+                source: path.to_path_buf(),
+                target,
+                read_only: true,
+                identity,
+            },
+            true,
+        );
+    }
+
+    // 8. The session's records directory, read-only and REQUIRED, at its own absolute path, so
+    //    `$MURMUR_RECORDS_DIR` names it inside the root: a command reads the trace and logs and
+    //    changes none of them. Bound after the runtime directory, so the deeper bind wins when one
+    //    lies beneath the other. A records directory that cannot be bound ends the session rather than leaving
+    //    it writable, or absent from a root whose commands are told where it is.
+    if let Some((path, identity)) = sources.records_dir {
         let target = rebase(base, path);
         builder.mkdir_p(&target);
         builder.push(
@@ -2646,6 +2668,7 @@ mod tests {
             tmp_store: (Path::new(TEST_TMP_SOURCE), TEST_TMP_IDENTITY),
             etc_dir: Path::new(TEST_ETC_DIR),
             runtime_dir: None,
+            records_dir: None,
         }
     }
 
@@ -2931,6 +2954,49 @@ mod tests {
             &step.op,
             RootOp::BindVerified { source, .. } if source == Path::new(TEST_RUNTIME_DIR)
         )));
+    }
+
+    /// The records directory is bound read-only and required at its own path, after the runtime
+    /// directory, so the deeper bind survives a records directory beneath either.
+    #[test]
+    fn the_records_directory_is_bound_read_only_and_required_after_the_runtime_directory() {
+        const TEST_RECORDS_DIR: &str = "/home/u/.murmur/records/home/u/w/ses_x";
+        const TEST_RECORDS_IDENTITY: (u64, u64) = (7, 77);
+        let plan = plan_composed_root(
+            Path::new("/home/u/w"),
+            &SealedBindSources {
+                runtime_dir: Some((Path::new(TEST_RUNTIME_DIR), TEST_RUNTIME_IDENTITY)),
+                records_dir: Some((Path::new(TEST_RECORDS_DIR), TEST_RECORDS_IDENTITY)),
+                ..test_sources()
+            },
+            Path::new("/tmp"),
+            &[],
+            &[],
+            &FakeHost::usrmerge(),
+        );
+        let position = |source: &str| {
+            plan.steps
+                .iter()
+                .position(|step| {
+                    matches!(&step.op, RootOp::BindVerified { source: s, read_only: true, .. } if s == Path::new(source))
+                })
+                .unwrap_or_else(|| panic!("{source} is bound read-only"))
+        };
+        let records = position(TEST_RECORDS_DIR);
+        assert!(
+            plan.steps[records].required,
+            "a missing records directory ends the session"
+        );
+        assert!(position(TEST_RUNTIME_DIR) < records);
+        assert_eq!(
+            plan.steps[records].op,
+            RootOp::BindVerified {
+                source: PathBuf::from(TEST_RECORDS_DIR),
+                target: PathBuf::from("/tmp").join(TEST_RECORDS_DIR.trim_start_matches('/')),
+                read_only: true,
+                identity: TEST_RECORDS_IDENTITY,
+            }
+        );
     }
 
     /// The remount keeps every flag a user namespace locks on the source mount.

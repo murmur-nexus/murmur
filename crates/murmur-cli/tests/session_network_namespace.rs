@@ -125,7 +125,7 @@ fn a_server_from_one_shell_call_answers_the_next() {
 
     let manifest_path = create_manifest(project.path(), &server.endpoint);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    let workdir = staged.workdir.clone();
+    let records = staged.records_dir.clone();
     let accessible = staged.accessible_workdir.clone();
     fs::write(accessible.join("task.md"), "Start a server, then reach it.").unwrap();
 
@@ -134,7 +134,7 @@ fn a_server_from_one_shell_call_answers_the_next() {
     let requests = server.requests();
     let reply = common::tool_result_text(&requests, "toolu_client")
         .expect("the second bash call returned a tool_result");
-    let trace_raw = fs::read_to_string(workdir.join("trace.jsonl")).unwrap();
+    let trace_raw = fs::read_to_string(records.join("trace.jsonl")).unwrap();
     let shells: Vec<Value> = trace_raw
         .lines()
         .filter(|line| !line.is_empty())

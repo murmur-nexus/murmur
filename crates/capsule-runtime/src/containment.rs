@@ -131,16 +131,50 @@ pub fn containment_shortfall_reason(
     workdir_exec: bool,
     runtime_dir_inside: Option<&RuntimeDirPlacement>,
 ) -> Option<String> {
+    containment_shortfall(
+        declared,
+        achieved,
+        sealed_blocker,
+        workdir_exec,
+        runtime_dir_inside,
+    )
+    .map(|(reason, _)| reason)
+}
+
+/// Why a containment floor is unmet, which decides what an operator is told to change: a host
+/// that cannot back the class, or one of the two capsule-side causes no host can fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortfallCause {
+    /// This host lacks the mechanism the declared class needs.
+    Host,
+    /// `capabilities.filesystem.workdir_exec: true` caps the class at `advisory`.
+    WorkdirExec,
+    /// The runtime or records directory lies inside the workdir, which caps the class at
+    /// `advisory`.
+    InsideWorkdir,
+}
+
+/// [`containment_shortfall_reason`], with the [`ShortfallCause`] it was decided by.
+fn containment_shortfall(
+    declared: ContainmentClass,
+    achieved: ContainmentClass,
+    sealed_blocker: Option<SealedBlocker>,
+    workdir_exec: bool,
+    runtime_dir_inside: Option<&RuntimeDirPlacement>,
+) -> Option<(String, ShortfallCause)> {
     if achieved >= declared {
         return None;
     }
 
     if workdir_exec && declared > ContainmentClass::Advisory {
-        return Some(WORKDIR_EXEC_SHORTFALL.to_string());
+        return Some((
+            WORKDIR_EXEC_SHORTFALL.to_string(),
+            ShortfallCause::WorkdirExec,
+        ));
     }
 
     if let Some(placement) = runtime_dir_inside.filter(|_| declared > ContainmentClass::Advisory) {
-        return Some(runtime_dir_inside_shortfall(placement));
+        return Some((placement.inside_shortfall(), ShortfallCause::InsideWorkdir));
     }
 
     let reason = match declared {
@@ -167,7 +201,7 @@ pub fn containment_shortfall_reason(
         },
     };
 
-    Some(reason)
+    Some((reason, ShortfallCause::Host))
 }
 
 /// The reason a capsule that declared `capabilities.filesystem.workdir_exec: true` falls short of
@@ -182,19 +216,6 @@ const WORKDIR_EXEC_SHORTFALL: &str =
      then enforced by the kernel on the resolved path) or lower the declared containment floor to \
      advisory";
 
-/// The reason a capsule whose runtime directory lies inside its workdir falls short of any floor
-/// above `advisory`, naming both paths and the fix.
-fn runtime_dir_inside_shortfall(placement: &RuntimeDirPlacement) -> String {
-    format!(
-        "the runtime directory {} lies inside the workdir {}, so this capsule's commands can \
-         change the files the runtime owns — task.md, MURMUR.md, plans and installed tools — and \
-         no host can back a class above advisory for it; run with a --workdir that does not \
-         contain ~/.murmur",
-        placement.sessions_dir.display(),
-        placement.workdir.display()
-    )
-}
-
 /// The refusal gate: `Ok(())` when the host's `achieved` class meets or exceeds the `declared`
 /// floor, [`RuntimeError::ContainmentFloorUnmet`] otherwise.
 ///
@@ -207,7 +228,7 @@ pub fn check_containment_floor(
     workdir_exec: bool,
     runtime_dir_inside: Option<&RuntimeDirPlacement>,
 ) -> Result<(), RuntimeError> {
-    match containment_shortfall_reason(
+    match containment_shortfall(
         declared,
         achieved,
         sealed_blocker,
@@ -215,10 +236,11 @@ pub fn check_containment_floor(
         runtime_dir_inside,
     ) {
         None => Ok(()),
-        Some(reason) => Err(RuntimeError::ContainmentFloorUnmet {
+        Some((reason, cause)) => Err(RuntimeError::ContainmentFloorUnmet {
             declared,
             achieved,
             reason,
+            cause,
         }),
     }
 }
@@ -316,6 +338,10 @@ pub enum PreopenSurface {
     /// default-deny baseline a `runtime: hook` entry with no `capabilities.filesystem.scope`
     /// resolves to — see [`crate::network_policy::HookCapabilityGrant`].
     Nothing,
+    /// The session's records directory's `hooks/` and nothing else, preopened as `"."`
+    /// read-write: what a `runtime: hook` entry declaring `capabilities.filesystem.records: true`
+    /// resolves to, in place of a workdir scope.
+    RecordsHooks,
 }
 
 impl PreopenSurface {
@@ -327,6 +353,7 @@ impl PreopenSurface {
             PreopenSurface::WholeWorkdir => "the whole accessible workdir",
             PreopenSurface::ScopedSubtree => "one subtree of the accessible workdir",
             PreopenSurface::Nothing => "nothing preopened",
+            PreopenSurface::RecordsHooks => "the records directory's hooks/",
         }
     }
 }
@@ -352,26 +379,88 @@ pub struct PreopenReport {
     /// What the guest is preopened into once the role's baseline and [`Self::scope`] are both
     /// applied.
     pub surface: PreopenSurface,
-    /// Whether the guest also holds the session's runtime directory, read-only, at
-    /// `murmur-runtime/`: a `runtime: tool` entry with no `capabilities.filesystem.scope`, and
-    /// nothing else. Always serialized.
-    pub runtime_dir_read_only: bool,
+    /// How the artifact reaches the session's runtime directory, read-only: at `murmur-runtime/`
+    /// for a WASM `runtime: tool` with no `capabilities.filesystem.scope`, through
+    /// `$MURMUR_RUNTIME_DIR` for a native one, `unresolved` where the report could not tell which
+    /// the installed artifact is. `None` — serialized `null` — for every other entry, which has
+    /// no reach.
+    pub runtime_dir_reach: Option<RuntimeDirReach>,
+}
+
+/// How one artifact reaches the runtime directory, as [`PreopenReport::runtime_dir_reach`]
+/// carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeDirReach {
+    /// A WASM tool's read-only preopen at `murmur-runtime/`.
+    MurmurRuntime,
+    /// A native tool's `$MURMUR_RUNTIME_DIR`, read-only by Landlock where the host enforces it.
+    Environment,
+    /// A tool whose implementation the report could not resolve: no lock entry pins it.
+    Unresolved,
+}
+
+/// `reach` once the artifact's implementation is known: native reaches the runtime directory
+/// through its environment, WASM through its preopen, and an unknown implementation stays
+/// unresolved. No reach stays none.
+#[must_use]
+pub fn resolve_runtime_dir_reach(
+    reach: Option<RuntimeDirReach>,
+    implementation: Option<murmur_artifact::ArtifactImplementation>,
+) -> Option<RuntimeDirReach> {
+    reach?;
+    Some(match implementation {
+        Some(murmur_artifact::ArtifactImplementation::Native) => RuntimeDirReach::Environment,
+        Some(murmur_artifact::ArtifactImplementation::Wasm) => RuntimeDirReach::MurmurRuntime,
+        None => RuntimeDirReach::Unresolved,
+    })
+}
+
+/// Every report's [`PreopenReport::runtime_dir_reach`] resolved through `implementation_of`, the
+/// implementation of the artifact a report names, or `None` where it is not known.
+pub fn resolve_runtime_dir_reaches(
+    reports: &mut [PreopenReport],
+    implementation_of: impl Fn(&str) -> Option<murmur_artifact::ArtifactImplementation>,
+) {
+    for report in reports {
+        report.runtime_dir_reach = resolve_runtime_dir_reach(
+            report.runtime_dir_reach,
+            implementation_of(&report.artifact),
+        );
+    }
 }
 
 impl PreopenReport {
     /// The single line this preopen renders as, shared by [`ScopeReport::render`] and by
     /// `mur doctor` so the two cannot word the same grant differently.
-    pub fn render(&self) -> String {
+    ///
+    /// `runtime_dir_protected` is [`RuntimeDirReport::read_only_to_commands`] for the session:
+    /// whether a native tool's `$MURMUR_RUNTIME_DIR` is read-only on this host. A WASM tool's
+    /// preopen is read-only on every host.
+    pub fn render(&self, runtime_dir_protected: bool) -> String {
         let artifact = &self.artifact;
         let role = &self.role;
         let surface = self.surface.summary();
-        let runtime_dir = if self.runtime_dir_read_only {
-            format!(
-                "; runtime directory read-only at {}/",
-                crate::runtime_dir::RUNTIME_DIR_GUEST_PATH
-            )
-        } else {
-            String::new()
+        let guest = crate::runtime_dir::RUNTIME_DIR_GUEST_PATH;
+        let env = crate::runtime_dir::RUNTIME_DIR_ENV;
+        let runtime_dir = match (self.runtime_dir_reach, runtime_dir_protected) {
+            (None, _) => String::new(),
+            (Some(RuntimeDirReach::MurmurRuntime), _) => {
+                format!("; runtime directory read-only at {guest}/")
+            }
+            (Some(RuntimeDirReach::Environment), true) => {
+                format!("; runtime directory read-only at ${env}")
+            }
+            (Some(RuntimeDirReach::Environment), false) => {
+                format!("; runtime directory at ${env}, which commands can change on this host")
+            }
+            (Some(RuntimeDirReach::Unresolved), true) => {
+                format!("; runtime directory read-only at {guest}/ if WASM, at ${env} if native")
+            }
+            (Some(RuntimeDirReach::Unresolved), false) => format!(
+                "; runtime directory read-only at {guest}/ if WASM, at ${env} if native, which \
+                 commands can change on this host"
+            ),
         };
         match &self.scope {
             Some(scope) => format!(
@@ -501,13 +590,15 @@ pub(crate) fn filesystem_boundary(applied: EnforcementTier) -> FilesystemBoundar
     }
 }
 
-/// What the session's runtime directory is to the capsule's commands — `--explain-scope`'s
-/// `Runtime directory` block, `session_start.effective_grants.runtime_dir` and `mur doctor`'s
-/// section, all from [`runtime_dir_report`].
+/// What the session's runtime directory, or its records directory, is to the capsule's commands —
+/// `--explain-scope`'s `Runtime directory` and `Records directory` blocks,
+/// `session_start.effective_grants.runtime_dir` and `.records_dir` and `mur doctor`'s sections,
+/// all from [`runtime_dir_report`] and [`records_dir_report`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeDirReport {
-    /// `<home>/.murmur/sessions/<session-id>/runtime`, with the literal `<session-id>` segment
-    /// `runtime_writes` carries.
+    /// `<home>/.murmur/sessions/<session-id>/runtime`, or
+    /// `<home>/.murmur/records/<workdir root>/<session-id>`, with the literal `<session-id>`
+    /// segment `runtime_writes` carries.
     pub path: String,
     /// Whether no capsule command can change a file in it.
     pub read_only_to_commands: bool,
@@ -527,6 +618,38 @@ const RUNTIME_DIR_ENFORCED_LANDLOCK: &str = "landlock";
 /// The lowest Landlock ABI that mediates `truncate(2)`.
 const LANDLOCK_TRUNCATE_ABI: u8 = 3;
 
+/// One of the two directories outside the workdir the runtime keeps out of the commands' reach,
+/// as [`protected_dir_report`] words its claims about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtectedDir {
+    Runtime,
+    Records,
+}
+
+impl ProtectedDir {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime directory",
+            Self::Records => "records directory",
+        }
+    }
+
+    /// What a command could empty there on a Landlock ABI that does not mediate `truncate(2)`.
+    fn file(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime file",
+            Self::Records => "record",
+        }
+    }
+
+    fn heading(self) -> &'static str {
+        match self {
+            Self::Runtime => "Runtime directory",
+            Self::Records => "Records directory",
+        }
+    }
+}
+
 /// What the session's runtime directory is to its commands, from the tier the session applies,
 /// the Landlock ABI its ruleset is built at and where the directory lies.
 ///
@@ -540,7 +663,43 @@ pub(crate) fn runtime_dir_report(
     landlock_abi: Option<u8>,
     placement: &RuntimeDirPlacement,
 ) -> RuntimeDirReport {
-    let path = placement.report_path();
+    protected_dir_report(
+        ProtectedDir::Runtime,
+        applied,
+        landlock_abi,
+        placement.report_path(),
+        placement.sessions_inside_workdir,
+        &placement.workdir,
+    )
+}
+
+/// [`runtime_dir_report`] for the session's records directory, which the same rule and bind
+/// protect on the same tiers.
+#[must_use]
+pub(crate) fn records_dir_report(
+    applied: EnforcementTier,
+    landlock_abi: Option<u8>,
+    placement: &RuntimeDirPlacement,
+) -> RuntimeDirReport {
+    protected_dir_report(
+        ProtectedDir::Records,
+        applied,
+        landlock_abi,
+        placement.records_report_path(),
+        placement.records_inside_workdir,
+        &placement.workdir,
+    )
+}
+
+fn protected_dir_report(
+    dir: ProtectedDir,
+    applied: EnforcementTier,
+    landlock_abi: Option<u8>,
+    path: String,
+    inside_workdir: bool,
+    workdir: &std::path::Path,
+) -> RuntimeDirReport {
+    let noun = dir.noun();
     let not_protected = |reason: String| RuntimeDirReport {
         path: path.clone(),
         read_only_to_commands: false,
@@ -548,21 +707,19 @@ pub(crate) fn runtime_dir_report(
         not_protected_because: Some(reason),
     };
     match applied {
-        EnforcementTier::EnvironmentOnly => not_protected(
+        EnforcementTier::EnvironmentOnly => not_protected(format!(
             "this host has no kernel containment for capsule commands — macOS and every \
              non-Linux host run them as the operator's own processes, so a command can change \
-             the runtime directory"
-                .to_string(),
-        ),
-        EnforcementTier::KernelSeccompOnly => not_protected(
+             the {noun}"
+        )),
+        EnforcementTier::KernelSeccompOnly => not_protected(format!(
             "this host has no Landlock, so no kernel mechanism keeps a command from changing the \
-             runtime directory"
-                .to_string(),
-        ),
-        _ if placement.inside_workdir => not_protected(format!(
-            "the runtime directory {path} lies inside the workdir {}, so the capsule's commands \
-             can write it; run with a --workdir that does not contain ~/.murmur",
-            placement.workdir.display()
+             {noun}"
+        )),
+        _ if inside_workdir => not_protected(format!(
+            "the {noun} {path} lies inside the workdir {}, so the capsule's commands can write \
+             it; run with a --workdir that does not contain ~/.murmur",
+            workdir.display()
         )),
         EnforcementTier::KernelSealed => RuntimeDirReport {
             path,
@@ -575,7 +732,8 @@ pub(crate) fn runtime_dir_report(
             if abi < LANDLOCK_TRUNCATE_ABI {
                 not_protected(format!(
                     "Landlock ABI {abi} does not mediate truncate(2), so a command can empty a \
-                     runtime file though not replace it; kernel 6.2 or later refuses it"
+                     {} though not replace it; kernel 6.2 or later refuses it",
+                    dir.file()
                 ))
             } else {
                 RuntimeDirReport {
@@ -593,13 +751,25 @@ pub(crate) fn runtime_dir_report(
 /// the capsule's commands can change it. Ends with a newline.
 #[must_use]
 pub fn render_runtime_dir(report: &RuntimeDirReport) -> String {
+    render_protected_dir(ProtectedDir::Runtime, report)
+}
+
+/// The `Records directory` block of `--explain-scope` and `mur doctor`, on
+/// [`render_runtime_dir`]'s terms. Ends with a newline.
+#[must_use]
+pub fn render_records_dir(report: &RuntimeDirReport) -> String {
+    render_protected_dir(ProtectedDir::Records, report)
+}
+
+fn render_protected_dir(dir: ProtectedDir, report: &RuntimeDirReport) -> String {
     let commands = match (&report.not_protected_because, report.enforced_by) {
         (Some(reason), _) => format!("can change it — {reason}"),
         (None, Some(mechanism)) => format!("read only ({mechanism})"),
         (None, None) => "read only".to_string(),
     };
     format!(
-        "Runtime directory\n  path:      {}\n  commands:  {commands}\n",
+        "{}\n  path:      {}\n  commands:  {commands}\n",
+        dir.heading(),
         report.path
     )
 }
@@ -848,6 +1018,10 @@ pub struct ScopeReport {
     /// When it is not read-only, its reason is also a [`FilesystemBoundaryReport::not_protected`]
     /// statement.
     pub runtime_dir: RuntimeDirReport,
+    /// What the session's records directory is to its commands, from [`records_dir_report`] on
+    /// the same inputs. Always serialized; its reason, when set, is also a
+    /// [`FilesystemBoundaryReport::not_protected`] statement.
+    pub records_dir: RuntimeDirReport,
 }
 
 impl ScopeReport {
@@ -886,6 +1060,8 @@ impl ScopeReport {
 
         out.push('\n');
         out.push_str(&render_runtime_dir(&self.runtime_dir));
+        out.push('\n');
+        out.push_str(&render_records_dir(&self.records_dir));
 
         out.push_str(&render_not_protected(&self.filesystem_boundary));
 
@@ -905,7 +1081,7 @@ impl ScopeReport {
             &self
                 .preopens
                 .iter()
-                .map(PreopenReport::render)
+                .map(|preopen| preopen.render(self.runtime_dir.read_only_to_commands))
                 .collect::<Vec<_>>(),
         );
         push_list(&mut out, "network allow", &self.network_allow);
@@ -1124,9 +1300,10 @@ fn push_list(out: &mut String, label: &str, values: &[String]) {
 /// per-artifact and `policy` is capsule-wide. No resolution creates anything, so this stays a
 /// read-only diagnostic.
 ///
-/// `workdir` is the accessible workdir the launch would use — `--workdir`, or
-/// `<manifest dir>/workdir` without one — which decides whether the runtime directory lies
-/// inside it. Nothing is created to answer that.
+/// `workdir` is the workdir root the launch would use — `--workdir`, or `<manifest dir>/workdir`
+/// without one — which names the records group and decides whether the runtime or records
+/// directory lies inside it. Nothing is created to answer that; a `HOME` that cannot hold either
+/// is refused, as the launch would be.
 #[allow(clippy::too_many_arguments)]
 pub fn explain_scope(
     policy: &CapabilityPolicy,
@@ -1137,9 +1314,10 @@ pub fn explain_scope(
     preopens: Vec<PreopenReport>,
     io_max: IoMaxReport,
     workdir: &std::path::Path,
-) -> ScopeReport {
+) -> Result<ScopeReport, crate::murmur_home::HomeUnusable> {
+    let placement = crate::runtime_dir::runtime_dir_placement(workdir)?;
     let probe = crate::sandbox::HostProbe::probe();
-    scope_report_for_tier(
+    Ok(scope_report_for_tier(
         policy,
         declared,
         probe.tier(),
@@ -1150,27 +1328,35 @@ pub fn explain_scope(
         state_stores,
         configured_artifacts,
         preopens,
-        &crate::runtime_dir::runtime_dir_placement(workdir),
+        &placement,
         io_max,
-    )
+    ))
 }
 
-/// `mur doctor`'s `Runtime directory` section for a capsule declaring `declared`, run from
-/// `workdir`: the same [`runtime_dir_report`] on this host's applied tier and ruleset ABI.
-#[must_use]
+/// `mur doctor`'s `Runtime directory` and `Records directory` sections for a capsule declaring
+/// `declared`, run from `workdir`: the same [`runtime_dir_report`] and [`records_dir_report`] on
+/// this host's applied tier and ruleset ABI, or why `HOME` cannot hold either.
 pub fn doctor_runtime_dir(
     declared: ContainmentClass,
     workdir: &std::path::Path,
-) -> (RuntimeDirReport, RuntimeDirPlacement) {
+) -> Result<DoctorDirReports, crate::murmur_home::HomeUnusable> {
+    let placement = crate::runtime_dir::runtime_dir_placement(workdir)?;
     let probe = crate::sandbox::HostProbe::probe();
     let applied = crate::sandbox::applied_tier(probe.tier(), declared);
-    let placement = crate::runtime_dir::runtime_dir_placement(workdir);
-    let report = runtime_dir_report(
-        applied,
-        crate::sandbox::ruleset_landlock_abi(probe.landlock_kernel_abi(), applied),
-        &placement,
-    );
-    (report, placement)
+    let abi = crate::sandbox::ruleset_landlock_abi(probe.landlock_kernel_abi(), applied);
+    Ok(DoctorDirReports {
+        runtime_dir: runtime_dir_report(applied, abi, &placement),
+        records_dir: records_dir_report(applied, abi, &placement),
+        placement,
+    })
+}
+
+/// What [`doctor_runtime_dir`] reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorDirReports {
+    pub runtime_dir: RuntimeDirReport,
+    pub records_dir: RuntimeDirReport,
+    pub placement: RuntimeDirPlacement,
 }
 
 /// [`explain_scope`] with the tier and the sealed blocker injected — the seam every test uses so
@@ -1209,9 +1395,12 @@ pub(crate) fn scope_report_for_tier(
     );
     let landlock_abi = crate::sandbox::ruleset_landlock_abi(landlock_kernel_abi, applied);
     let runtime_dir = runtime_dir_report(applied, landlock_abi, runtime_dir_placement);
+    let records_dir = records_dir_report(applied, landlock_abi, runtime_dir_placement);
     let mut filesystem_boundary = filesystem_boundary(applied);
-    if let Some(reason) = &runtime_dir.not_protected_because {
-        filesystem_boundary.not_protected.push(reason.clone());
+    for report in [&runtime_dir, &records_dir] {
+        if let Some(reason) = &report.not_protected_because {
+            filesystem_boundary.not_protected.push(reason.clone());
+        }
     }
 
     ScopeReport {
@@ -1296,6 +1485,7 @@ pub(crate) fn scope_report_for_tier(
         // same object, and a field either of them worded for itself would make them differ.
         filesystem_boundary,
         runtime_dir,
+        records_dir,
     }
 }
 
@@ -1449,6 +1639,7 @@ mod tests {
                 declared,
                 achieved,
                 reason,
+                ..
             } => {
                 assert_eq!(declared, ContainmentClass::Scoped);
                 assert_eq!(achieved, ContainmentClass::Advisory);
@@ -1534,6 +1725,7 @@ mod tests {
                     declared,
                     achieved,
                     reason,
+                    ..
                 } => {
                     assert_eq!(declared, ContainmentClass::Scoped);
                     assert_eq!(achieved, ContainmentClass::Advisory);
@@ -2678,21 +2870,21 @@ mod tests {
                 role: "tool".to_string(),
                 scope: None,
                 surface: PreopenSurface::WholeWorkdir,
-                runtime_dir_read_only: true,
+                runtime_dir_reach: Some(RuntimeDirReach::MurmurRuntime),
             },
             PreopenReport {
                 artifact: "cache-tool".to_string(),
                 role: "tool".to_string(),
                 scope: Some("cache".to_string()),
                 surface: PreopenSurface::ScopedSubtree,
-                runtime_dir_read_only: false,
+                runtime_dir_reach: None,
             },
             PreopenReport {
                 artifact: "telemetry-hook".to_string(),
                 role: "hook".to_string(),
                 scope: None,
                 surface: PreopenSurface::Nothing,
-                runtime_dir_read_only: false,
+                runtime_dir_reach: None,
             },
         ];
 
@@ -2764,21 +2956,21 @@ mod tests {
                     "role": "tool",
                     "scope": null,
                     "surface": "whole-workdir",
-                    "runtime_dir_read_only": true,
+                    "runtime_dir_reach": "murmur-runtime",
                 },
                 {
                     "artifact": "cache-tool",
                     "role": "tool",
                     "scope": "cache",
                     "surface": "scoped-subtree",
-                    "runtime_dir_read_only": false,
+                    "runtime_dir_reach": null,
                 },
                 {
                     "artifact": "telemetry-hook",
                     "role": "hook",
                     "scope": null,
                     "surface": "nothing",
-                    "runtime_dir_read_only": false,
+                    "runtime_dir_reach": null,
                 },
             ])
         );
@@ -3189,12 +3381,18 @@ mod tests {
             report.filesystem_boundary.restriction,
             FilesystemRestriction::Advisory
         );
-        // The filesystem, path rewriting, and the runtime directory no command is kept from.
-        assert_eq!(report.filesystem_boundary.not_protected.len(), 3);
+        // The filesystem, path rewriting, and the runtime and records directories no command is
+        // kept from.
+        assert_eq!(report.filesystem_boundary.not_protected.len(), 4);
         assert_eq!(
             Some(&report.filesystem_boundary.not_protected[2]),
             report.runtime_dir.not_protected_because.as_ref()
         );
+        assert_eq!(
+            Some(&report.filesystem_boundary.not_protected[3]),
+            report.records_dir.not_protected_because.as_ref()
+        );
+        assert!(report.filesystem_boundary.not_protected[3].contains("the records directory"));
 
         let filesystem = &report.filesystem_boundary.not_protected[0];
         assert!(filesystem.contains("advisory"), "{filesystem}");
@@ -3227,7 +3425,10 @@ mod tests {
     fn inside_placement() -> RuntimeDirPlacement {
         RuntimeDirPlacement {
             sessions_dir: std::path::PathBuf::from("/home/dev/.murmur/sessions"),
+            records_group: std::path::PathBuf::from("/home/dev/.murmur/records/home/dev"),
             workdir: std::path::PathBuf::from("/home/dev"),
+            sessions_inside_workdir: true,
+            records_inside_workdir: true,
             inside_workdir: true,
         }
     }

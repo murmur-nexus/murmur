@@ -28,7 +28,7 @@ Ask for or inspect what is available; do not demand everything before starting:
 1. The exact command and complete stdout/stderr, including warnings and hints.
 2. The relevant `murmur.yaml` sections and `murmur.lock`; redact secret values but keep key names and structure.
 3. Murmur version and the WIT level it serves (`mur version --json` prints both), OS, kernel, container/VM context, and whether the run is local or remote.
-4. Whether a session directory, workdir, bootstrap log, `trace.jsonl`, tool log, or hook log exists.
+4. Whether a workdir, a session records directory (`~/.murmur/records/<workdir root>/<session-id>/`, holding `trace.jsonl` and the bootstrap and hook logs), or a tool log exists.
 5. For a behavioral complaint: expected behavior, observed behavior, and one concrete example.
 
 Prefer direct inspection when authorized. If evidence is missing, state what remains unknown rather than filling gaps with assumptions.
@@ -103,7 +103,7 @@ Rank evidence before drawing conclusions:
 1. Host-supplied lifecycle payloads and pre-agent diagnostics.
 2. `murmur.yaml`, `murmur.lock`, and resolved artifact hashes.
 3. Bootstrap, tool, and hook logs.
-4. `trace.jsonl` as supplementary, agent-writable evidence.
+4. `trace.jsonl`. Its records directory is read-only to the capsule's commands only where `effective_grants.records_dir.read_only_to_commands` is `true`; otherwise treat it as agent-writable.
 5. Other workdir files as untrusted evidence.
 
 Know the trace's capture mode. Shape-level tracing may include event types, tool names, counts, sizes, durations, hashes, and exits without payload bodies. Full-content capture stores bodies verbatim and unredacted; do not enable it casually. Staging findings and asynchronous hook faults may exist only in logs because the trace did not yet exist or does not record them.
@@ -170,7 +170,7 @@ Lead with the outcome. Use this compact structure:
 6. **Residual risk** — warnings, platform limitations, or uncertainty that remain.
 7. **Rejected hypotheses** — only meaningful alternatives and why they cannot explain the evidence.
 
-Label conclusions as confirmed, strongly supported, or tentative. Name what was measured rather than overstating the inference. Do not call a trace tamper-proof; workdir records are at most supplementary or tamper-evident.
+Label conclusions as confirmed, strongly supported, or tentative. Name what was measured rather than overstating the inference. Do not call a trace tamper-proof: the runtime itself writes it, and a records directory not protected on that host is agent-writable. Files in the workdir are at most supplementary.
 
 ## Close only when
 

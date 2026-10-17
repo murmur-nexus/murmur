@@ -271,13 +271,14 @@ fn run_session(responses: Vec<String>, capsule: &Capsule<'_>) -> Session {
     let manifest_path = create_manifest(project.path(), &server.endpoint, capsule);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
     let workdir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
     fs::write(workdir.join("task.md"), "Edit the notes.").unwrap();
 
     let launch_error = launch_session(staged, |_| {})
         .err()
         .map(|e| format!("{e:?}"));
 
-    let trace_raw = fs::read_to_string(workdir.join("trace.jsonl")).unwrap_or_default();
+    let trace_raw = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap_or_default();
     let trace: Vec<Value> = trace_raw
         .lines()
         .filter(|l| !l.is_empty())

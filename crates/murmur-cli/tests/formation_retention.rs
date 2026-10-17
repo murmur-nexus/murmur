@@ -1,6 +1,7 @@
-//! Formation directories under `~/.murmur/formations/` are removed by the entry member's
-//! `trace.retain`, at the end of a later `mur run --roster` from the same project, and never while
-//! any part of the formation runs, never another project's, and never one with no marker.
+//! Formation directories under `~/.murmur/formations/`, each with its records subtree, are
+//! removed by the entry member's `trace.retain`, at the end of a later `mur run --roster` from the
+//! same project, and never while any part of the formation runs, never another project's, and
+//! never one with no marker.
 //!
 //! Every case runs a real two-member roster — entry `lead`, peer `worker` — under a scratch
 //! `HOME`, against one scripted model on loopback that answers every request with an ended turn.
@@ -169,6 +170,18 @@ impl Project {
         self.formations().join(id)
     }
 
+    /// The records subtree of formation `id`: the records group of its directory, which holds
+    /// that of each peer.
+    fn formation_records(&self, id: &str) -> PathBuf {
+        common::records_group(self.home.path(), &self.formation_dir(id))
+    }
+
+    /// Fail unless formation `id`'s directory and its records subtree are both gone.
+    fn assert_formation_gone(&self, id: &str) {
+        assert!(!self.formation_dir(id).exists(), "{id}");
+        assert!(!self.formation_records(id).exists(), "{id}'s records");
+    }
+
     /// `mur <args>` in the project directory, under the scratch `HOME`, with no formation, door
     /// token or provider key inherited from this process.
     fn command(&self, args: &[&str]) -> Command {
@@ -199,18 +212,19 @@ impl Project {
         launched.finished(&launcher)
     }
 
-    /// An owned-looking formation directory minted two days ago, holding one peer session, with
-    /// `marker` as its `formation.json` when given.
+    /// An owned-looking formation directory minted two days ago, holding one peer session — its
+    /// session workdir and its records directory — with `marker` as its `formation.json` when
+    /// given.
     fn fabricate(&self, tail: u64, marker: Option<&str>) -> String {
         let minted = now_ms() - 2 * DAY_MS;
         let id = format!("frm_{minted:012x}{tail:020x}");
         let dir = self.formation_dir(&id);
-        let session = dir
-            .join("worker")
-            .join(".murmur")
-            .join(format!("ses_{minted:012x}{tail:020x}"));
-        std::fs::create_dir_all(&session).unwrap();
-        std::fs::write(session.join("trace.jsonl"), "{}\n").unwrap();
+        let session_id = format!("ses_{minted:012x}{tail:020x}");
+        let worker = dir.join("worker");
+        std::fs::create_dir_all(worker.join(".murmur").join(&session_id)).unwrap();
+        let records = common::session_records_dir(self.home.path(), &worker, &session_id);
+        std::fs::create_dir_all(&records).unwrap();
+        std::fs::write(records.join("trace.jsonl"), "{}\n").unwrap();
         if let Some(marker) = marker {
             std::fs::write(dir.join(FORMATION_MARKER_FILE), marker).unwrap();
         }
@@ -351,14 +365,15 @@ fn max_sessions_keeps_the_newest_formations_and_trace_show_still_reads_them() {
         "{}",
         third.stderr
     );
-    assert!(!project.formation_dir(&first.formation_id).exists());
-    assert!(project.formation_dir(&second.formation_id).is_dir());
-    assert!(project.formation_dir(&third.formation_id).is_dir());
+    project.assert_formation_gone(&first.formation_id);
+    for kept in [&second.formation_id, &third.formation_id] {
+        assert!(project.formation_dir(kept).is_dir(), "{kept}");
+        assert!(project.formation_records(kept).is_dir(), "{kept}'s records");
+    }
 
-    let workdir = project.path().join(".murmur");
     let shown = project
         .command(&["trace", "show", &second.formation_id, "--workdir"])
-        .arg(&workdir)
+        .arg(project.path())
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&shown.stdout);
@@ -367,10 +382,10 @@ fn max_sessions_keeps_the_newest_formations_and_trace_show_still_reads_them() {
         "{stdout}\n{}",
         String::from_utf8_lossy(&shown.stderr)
     );
-    let worker_root = project
-        .formation_dir(&second.formation_id)
-        .join("worker")
-        .join(".murmur");
+    let worker_root = common::records_group(
+        project.home.path(),
+        &project.formation_dir(&second.formation_id).join("worker"),
+    );
     assert!(
         stdout
             .lines()
@@ -424,6 +439,11 @@ fn max_age_removes_an_ended_formation_and_keeps_a_live_one() {
         capsule_name: "worker".to_string(),
         capsule_version: "0.1.0".to_string(),
         workdir: project.formation_dir(&old_record).join("worker"),
+        records_dir: common::session_records_dir(
+            project.home.path(),
+            &project.formation_dir(&old_record).join("worker"),
+            &session_id,
+        ),
         outlives_launcher: false,
         started_at: "2026-01-01T00:00:00Z".to_string(),
         door_token: None,
@@ -446,9 +466,10 @@ fn max_age_removes_an_ended_formation_and_keeps_a_live_one() {
         "{}",
         launched.stderr
     );
-    assert!(!project.formation_dir(&old_dead).exists());
+    project.assert_formation_gone(&old_dead);
     for id in [&old_record, &old_launcher, &launched.formation_id] {
         assert!(project.formation_dir(id).is_dir(), "{id}");
+        assert!(project.formation_records(id).is_dir(), "{id}'s records");
     }
     assert_eq!(std::fs::read_to_string(&record_path).unwrap(), record_json);
 }
@@ -498,9 +519,10 @@ fn a_live_formation_outlives_a_later_launch() {
         "{}",
         c.stderr
     );
-    assert!(!project.formation_dir(&a.formation_id).exists());
-    assert!(!project.formation_dir(&b.formation_id).exists());
+    project.assert_formation_gone(&a.formation_id);
+    project.assert_formation_gone(&b.formation_id);
     assert!(project.formation_dir(&c.formation_id).is_dir());
+    assert!(project.formation_records(&c.formation_id).is_dir());
     assert!(project.model.arrived.load(Ordering::SeqCst) >= 3);
 }
 
@@ -520,6 +542,7 @@ fn no_policy_removes_nothing() {
     }
     for id in &ids {
         assert!(project.formation_dir(id).is_dir(), "{id}");
+        assert!(project.formation_records(id).is_dir(), "{id}'s records");
     }
 }
 
@@ -547,5 +570,6 @@ fn another_projects_and_unmarked_formations_are_never_removed() {
     assert!(launched.retention_lines().is_empty(), "{}", launched.stderr);
     for id in [&foreign, &unmarked, &garbled, &launched.formation_id] {
         assert!(project.formation_dir(id).is_dir(), "{id}");
+        assert!(project.formation_records(id).is_dir(), "{id}'s records");
     }
 }

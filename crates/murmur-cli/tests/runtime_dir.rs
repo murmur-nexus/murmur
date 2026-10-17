@@ -509,11 +509,12 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
         fs::read_to_string(workdir.path().join("task.md")).unwrap(),
         TASK
     );
-    let traces: Vec<PathBuf> = common::sessions_under(&workdir.path().join(".murmur"))
-        .into_iter()
-        .map(|session| session.join("trace.jsonl"))
-        .filter(|trace| trace.is_file())
-        .collect();
+    let traces: Vec<PathBuf> =
+        common::newest_session_records(&common::process_home(), workdir.path())
+            .into_iter()
+            .map(|records| records.join("trace.jsonl"))
+            .filter(|trace| trace.is_file())
+            .collect();
     assert!(!traces.is_empty(), "the session left its trace");
     for trace in traces {
         let trace = fs::read_to_string(trace).unwrap();
@@ -826,9 +827,13 @@ fn runtime_dir_wasm_tool_reads_murmur_runtime_and_cannot_write_it() {
         .iter()
         .find(|report| report.artifact == PROBE_TOOL || report.artifact == PROBE_ARTIFACT)
         .unwrap_or_else(|| panic!("{preopens:?}"));
-    assert!(report.runtime_dir_read_only, "{report:?}");
+    assert_eq!(
+        report.runtime_dir_reach,
+        Some(capsule_runtime::RuntimeDirReach::MurmurRuntime),
+        "{report:?}"
+    );
     assert!(report
-        .render()
+        .render(true)
         .contains("runtime directory read-only at murmur-runtime/"));
 
     let read = result_text(&server, "toolu_read");
@@ -858,8 +863,8 @@ fn runtime_dir_scoped_wasm_tool_has_no_murmur_runtime() {
         .iter()
         .find(|report| report.artifact == PROBE_TOOL || report.artifact == PROBE_ARTIFACT)
         .unwrap_or_else(|| panic!("{preopens:?}"));
-    assert!(!report.runtime_dir_read_only, "{report:?}");
-    assert!(!report.render().contains("murmur-runtime"));
+    assert_eq!(report.runtime_dir_reach, None, "{report:?}");
+    assert!(!report.render(true).contains("murmur-runtime"));
     for id in ["toolu_read", "toolu_write", "toolu_list"] {
         let text = result_text(&server, id);
         assert!(text.contains("err:"), "{id}: {text}");
@@ -1267,7 +1272,7 @@ fn runtime_dir_a_task_md_link_in_the_workdir_fails_the_first_task() {
         ContainmentClass::Advisory,
         Some(workdir.path()),
     );
-    let session = staged.workdir.clone();
+    let session = staged.records_dir.clone();
     let _ = send_one_message(staged, "anything").join();
 
     assert!(server.requests().is_empty(), "the provider was asked");

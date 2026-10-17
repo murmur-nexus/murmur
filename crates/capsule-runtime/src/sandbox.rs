@@ -2235,6 +2235,15 @@ impl ShellEnforcement {
         self.runtime_dir.as_ref().map(|roots| roots.runtime.path())
     }
 
+    /// The records directory's absolute path, the value of `$MURMUR_RECORDS_DIR`. `None` for an
+    /// enforcement held outside a session.
+    pub(crate) fn records_dir_path(&self) -> Option<&Path> {
+        self.runtime_dir
+            .as_ref()
+            .and_then(|roots| roots.records.as_ref())
+            .map(crate::workdir_fs::WorkdirRoot::path)
+    }
+
     /// Removes the session's runtime directory now, ahead of a process exit that runs no
     /// destructor. Does nothing on an enforcement that does not own one.
     pub(crate) fn remove_runtime_dir(&self) {
@@ -2726,8 +2735,8 @@ pub(crate) fn sealed_test_enforcement() -> ShellEnforcement {
     .with_runtime_dir(test_runtime_dir(&base), None)
 }
 
-/// `runtime/`, `sealed-etc/` and `harness/` created under `base`, held as a session's runtime
-/// directory roots.
+/// `runtime/`, `sealed-etc/`, `harness/` and a records directory created under `base`, held as
+/// a session's runtime directory roots.
 #[cfg(test)]
 pub(crate) fn test_runtime_dir(base: &Path) -> crate::runtime_dir::RuntimeDirRoots {
     let open = |sub: &str| {
@@ -2740,6 +2749,7 @@ pub(crate) fn test_runtime_dir(base: &Path) -> crate::runtime_dir::RuntimeDirRoo
         open(crate::runtime_dir::SEALED_ETC_SUBDIR),
         open(crate::runtime_dir::HARNESS_SUBDIR),
     )
+    .with_records(open(crate::records_dir::RECORDS_DIR_NAME))
 }
 
 /// Attach the OS-level *process* bounds — hard rlimits, and cgroup membership where a scope
@@ -2875,6 +2885,23 @@ pub(crate) fn prepare_enforcement(
             })?,
         None => None,
     };
+    // The records directory takes the runtime directory's rule on both Landlock tiers, from the
+    // same descriptor its sealed bind verifies.
+    let records_dir_fd = match &sealed_sources {
+        Some(sources) => sources.records_dir.as_ref().map(|(fd, _)| Arc::clone(fd)),
+        None if enforcement.tier == EnforcementTier::KernelFull => enforcement
+            .runtime_dir
+            .as_ref()
+            .and_then(|roots| roots.records.as_ref())
+            .map(|records| records.path_fd().map(Arc::new))
+            .transpose()
+            .map_err(|error| {
+                format!(
+                    "sandbox: failed to open the records directory for Landlock scoping: {error}"
+                )
+            })?,
+        None => None,
+    };
 
     // Resolve/open every Landlock path in the PARENT, before fork(). Failing to open the workdir
     // is a normal synchronous error here — it names the path and returns before any subprocess is
@@ -2894,6 +2921,7 @@ pub(crate) fn prepare_enforcement(
             enforcement.landlock_abi,
             sealed_sources.as_ref(),
             runtime_dir_fd,
+            records_dir_fd,
         )?)
     } else {
         None
@@ -3145,6 +3173,10 @@ pub(crate) struct SealedSourceFds {
     /// The runtime directory's absolute path, which the bind reproduces inside the root and the
     /// child verifies against [`Self::runtime_dir`].
     runtime_dir_path: PathBuf,
+    /// The records directory, reopened from its root's held descriptor, and its absolute path:
+    /// its rule's fd and its read-only bind, on the runtime directory's terms. `None` for an
+    /// enforcement held outside a session.
+    records_dir: Option<(Arc<std::os::fd::OwnedFd>, PathBuf)>,
     /// `sealed-etc/`'s host path.
     etc_dir: PathBuf,
     /// The synthetic `/etc` files, in [`crate::sealed::SEALED_ETC_PATHS`] order.
@@ -3169,11 +3201,26 @@ impl SealedSourceFds {
         let runtime_dir = Arc::new(roots.runtime.path_fd().map_err(|error| {
             format!("sealed: failed to open the runtime directory for its bind: {error}")
         })?);
+        let records_dir = roots
+            .records
+            .as_ref()
+            .map(|records| {
+                records
+                    .path_fd()
+                    .map(|fd| (Arc::new(fd), records.path().to_path_buf()))
+                    .map_err(|error| {
+                        format!(
+                            "sealed: failed to open the records directory for its bind: {error}"
+                        )
+                    })
+            })
+            .transpose()?;
         Ok(Self {
             tmp_store,
             tmp_store_path: session_workdir.host_path(crate::sealed::SEALED_TMP_DIR_NAME),
             runtime_dir,
             runtime_dir_path: roots.runtime.path().to_path_buf(),
+            records_dir,
             etc_dir: roots.sealed_etc.path().to_path_buf(),
             identity_files,
         })
@@ -3246,6 +3293,13 @@ fn build_sealed_root(
                 &sources.runtime_dir_path,
                 SealedSourceFds::identity_of(&sources.runtime_dir)?,
             )),
+            records_dir: sources
+                .records_dir
+                .as_ref()
+                .map(|(fd, path)| {
+                    SealedSourceFds::identity_of(fd).map(|identity| (path.as_path(), identity))
+                })
+                .transpose()?,
         },
         &base,
         extra_read_only,
@@ -3344,6 +3398,11 @@ mod linux_enforce {
         /// and installed tools and changes none of them. `None` outside a session. On
         /// `KernelSealed` the same descriptor is the read-only bind's source.
         runtime_dir_fd: Option<std::sync::Arc<OwnedFd>>,
+        /// The session's records directory, reopened from its root's held descriptor, granted on
+        /// [`Self::runtime_dir_fd`]'s terms: every command reads the trace and logs and changes
+        /// none of them. `None` outside a session. On `KernelSealed` the same descriptor is the
+        /// read-only bind's source.
+        records_dir_fd: Option<std::sync::Arc<OwnedFd>>,
         grants: Vec<OpenLandlockGrant>,
         devices: Vec<OpenDeviceGrant>,
     }
@@ -3360,6 +3419,12 @@ mod linux_enforce {
         #[cfg(test)]
         pub(super) fn runtime_dir_fd(&self) -> Option<&OwnedFd> {
             self.runtime_dir_fd.as_deref()
+        }
+
+        /// The records directory's fd, for the tier-gate test, on the same terms.
+        #[cfg(test)]
+        pub(super) fn records_dir_fd(&self) -> Option<&OwnedFd> {
+            self.records_dir_fd.as_deref()
         }
 
         /// How many synthetic-`/etc` fds were opened, for the tier-gate test. A count, not the fds:
@@ -4340,6 +4405,19 @@ mod linux_enforce {
                 })?;
         }
 
+        // The records directory, on the same terms: the runtime appends to the trace from
+        // outside the domain, and no command inside it can.
+        if let Some(records_dir_fd) = &fds.records_dir_fd {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(
+                    records_dir_fd.as_fd(),
+                    read_list & handled,
+                ))
+                .map_err(|error| {
+                    format!("landlock: add_rule for the records directory failed: {error}")
+                })?;
+        }
+
         // `KernelSealed` only — empty on every other tier. `ReadFile` alone: these are the two
         // synthetic account databases the root binds read-only at `/etc/passwd`/`/etc/group`, and
         // the grant loop's rules for those two paths are taken on the host's files, not on these.
@@ -4408,10 +4486,11 @@ mod linux_enforce {
     ///
     /// `sealed` carries what only `KernelSealed` opens: the workdir-backed `/tmp` store
     /// ([`crate::sealed::SEALED_TMP_DIR_NAME`]), whose descriptor `prepare_enforcement` already
-    /// took and shares with the bind, and the synthetic `/etc` files. `runtime_dir_fd` is the
-    /// runtime directory's descriptor on both Landlock tiers. Each is fail-closed — an `Err`
-    /// naming the path, exactly like the workdir's own open above, never the grant loops'
-    /// shrink-not-fail `continue`.
+    /// took and shares with the bind, and the synthetic `/etc` files. `runtime_dir_fd` and
+    /// `records_dir_fd` are the runtime and records directories' descriptors on both Landlock
+    /// tiers. Each is fail-closed — an `Err` naming the path, exactly like the workdir's own open
+    /// above, never the grant loops' shrink-not-fail `continue`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn open_landlock_fds(
         accessible_workdir: &Path,
         landlock_grants: &[LandlockGrant],
@@ -4420,6 +4499,7 @@ mod linux_enforce {
         abi: Option<u8>,
         sealed: Option<&super::SealedSourceFds>,
         runtime_dir_fd: Option<std::sync::Arc<OwnedFd>>,
+        records_dir_fd: Option<std::sync::Arc<OwnedFd>>,
     ) -> Result<LandlockChildFds, String> {
         let workdir_fd = open_o_path(accessible_workdir)
             .map(OwnedFd::from)
@@ -4500,6 +4580,7 @@ mod linux_enforce {
             sealed_tmp_fd,
             sealed_identity_fds,
             runtime_dir_fd,
+            records_dir_fd,
             grants,
             devices,
         })
@@ -6865,6 +6946,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
             .grant_count()
@@ -7650,6 +7732,7 @@ mod linux_integration_tests {
             None,
             Some(&sources),
             Some(Arc::clone(&sources.runtime_dir)),
+            sources.records_dir.as_ref().map(|(fd, _)| Arc::clone(fd)),
         )
         .expect("a real, writable workdir must yield sealed Landlock fds");
 
@@ -7660,6 +7743,10 @@ mod linux_integration_tests {
             crate::sealed::SEALED_TMP_DIR_NAME,
         );
         assert!(fds.runtime_dir_fd().is_some());
+        assert!(
+            fds.records_dir_fd().is_some(),
+            "the records directory takes the runtime directory's read-only rule"
+        );
         assert!(
             session.join(crate::sealed::SEALED_TMP_DIR_NAME).is_dir(),
             "the /tmp store must be created before build_sealed_root binds it",
@@ -7685,6 +7772,7 @@ mod linux_integration_tests {
                 &[],
                 &[],
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -7766,6 +7854,7 @@ mod linux_integration_tests {
             None,
             Some(&sources),
             None,
+            None,
         )
         .expect("a real, writable workdir must yield sealed Landlock fds");
 
@@ -7795,9 +7884,17 @@ mod linux_integration_tests {
             );
         }
 
-        let fds =
-            linux_enforce::open_landlock_fds(accessible.path(), &[], &[], false, None, None, None)
-                .unwrap();
+        let fds = linux_enforce::open_landlock_fds(
+            accessible.path(),
+            &[],
+            &[],
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(fds.sealed_identity_fd_count(), 0);
     }
 
@@ -7844,6 +7941,7 @@ mod linux_integration_tests {
             &crate::types::CapabilityPolicy::default(),
             &[],
             &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
+            None,
             None,
         )
         .unwrap();

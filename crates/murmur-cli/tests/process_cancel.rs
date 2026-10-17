@@ -119,6 +119,7 @@ struct Built {
 struct Capsule {
     url: String,
     workdir: PathBuf,
+    records_dir: PathBuf,
     _home: TempDir,
     _project: TempDir,
     /// The file the harness wrapper reads its profile from, rewritten between two tasks of the
@@ -219,6 +220,7 @@ impl Built {
 
         let staged = stage(&home, &manifest, self.sleeps);
         let workdir = staged.workdir.clone();
+        let records_dir = staged.records_dir.clone();
         let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
             let _ = launch_session(staged, move |url| {
@@ -231,6 +233,7 @@ impl Built {
         Capsule {
             url,
             workdir,
+            records_dir,
             _home: home,
             _project: project,
             profile_file,
@@ -285,6 +288,7 @@ fn stage(home: &TempDir, manifest_path: &Path, sleeps: bool) -> capsule_runtime:
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -510,7 +514,7 @@ impl Capsule {
     }
 
     fn events(&self) -> Vec<Value> {
-        fs::read_to_string(self.workdir.join("trace.jsonl"))
+        fs::read_to_string(self.records_dir.join("trace.jsonl"))
             .unwrap_or_default()
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -596,7 +600,7 @@ impl Capsule {
             .args([
                 "trace",
                 "show",
-                self.workdir.join("trace.jsonl").to_str().unwrap(),
+                self.records_dir.join("trace.jsonl").to_str().unwrap(),
             ])
             .output()
             .unwrap();

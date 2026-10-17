@@ -116,7 +116,7 @@ impl Capsule {
     }
 
     fn trace_path(&self) -> PathBuf {
-        PathBuf::from(self.startup["workdir"].as_str().unwrap()).join("trace.jsonl")
+        PathBuf::from(self.startup["records_dir"].as_str().unwrap()).join("trace.jsonl")
     }
 
     fn record_path(&self) -> PathBuf {

@@ -80,11 +80,13 @@ fn local_source_file_path_installs_skill_md() {
     let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
 
+    common::process_home();
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -153,11 +155,13 @@ fn local_source_directory_path_finds_skill_md_case_insensitively() {
     let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
 
+    common::process_home();
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -241,11 +245,13 @@ fn local_source_coexists_with_registry_skill() {
     let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
 
+    common::process_home();
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),

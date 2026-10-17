@@ -257,9 +257,11 @@ pub struct DelegationLaunch {
     pub version: String,
     /// The session id the child's runtime minted for itself and reported on its launch line.
     pub child_session_id: String,
-    /// The child's directory, relative to the parent's accessible workdir — the path a reader of
-    /// the parent's trace joins to find the child's own `trace.jsonl`.
+    /// The child's directory, relative to the parent's accessible workdir.
     pub child_workdir: String,
+    /// The child's records directory, absolute, as the child reported it: where its own
+    /// `trace.jsonl` and `completion.json` are.
+    pub child_records_dir: String,
 }
 
 /// The parent's side of one delegation, beyond the three strings its agent supplied.
@@ -562,6 +564,7 @@ impl DelegationPlane {
                 version: request.version.clone(),
                 child_session_id: child.session_id.clone(),
                 child_workdir: self.workdir_relative(&child.workdir),
+                child_records_dir: child.records_dir.display().to_string(),
             });
         }
     }
@@ -1064,9 +1067,11 @@ fn end_for_canceled_task(
     if let Err(error) = child.shutdown() {
         crate::runtime_err!("[capsule-runtime] delegation {delegation_id}: {error}");
     }
+    let Some(records_root) = child.records_root.as_ref() else {
+        return;
+    };
     crate::delegation::record_terminated(
-        &child.parent_root,
-        &child.workdir_rel,
+        records_root,
         crate::delegation::DelegationOutcome {
             delegation_id: delegation_id.to_string(),
             capsule_name: request.capsule.clone(),

@@ -415,6 +415,7 @@ artifacts:
 Hook-specific grants may also include:
 
 - `state` for durable state;
+- `filesystem.records: true`, in place of a `filesystem.scope`, for a hook that writes records — a scorer such as `murmur/hook-eval` writing `eval.jsonl`. Its current directory becomes the session records directory's `hooks/`, outside the workdir, where `mur eval` reads `hooks/eval.jsonl`. Declaring it beside `scope`, on a non-hook entry or at capsule scope fails with `E-MAN-003`;
 - `task_io.read: true` to read task input/result through the host interface;
 - `conversation.read: true` to read the capsule conversation record through the host interface.
 
@@ -527,7 +528,7 @@ observability:
 
 `trace.capture: content` stores unredacted inference bodies and tool outputs in blobs. Treat that as sensitive data collection, not a harmless debugging switch. Prefer the default metadata-only capture unless full content is required.
 
-Evaluation scorer configuration is meaningful only when the corresponding evaluation hook/artifact is actually present and supports the intended scorer behavior.
+Evaluation scorer configuration is meaningful only when the corresponding evaluation hook/artifact is actually present and supports the intended scorer behavior. A scoring hook must declare `capabilities.filesystem.records: true`; with `scope: .` it writes `eval.jsonl` into the workdir, where `mur eval` does not read it.
 
 ### 10. Add exports only when another actor must read files
 

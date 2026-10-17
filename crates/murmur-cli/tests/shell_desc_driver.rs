@@ -16,11 +16,13 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
     let project = tempfile::tempdir().unwrap();
     let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
 
+    common::process_home();
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: project.path().to_path_buf(),
             capsule_name: "test-no-driver".to_string(),

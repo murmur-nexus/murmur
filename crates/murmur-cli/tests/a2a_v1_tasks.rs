@@ -30,7 +30,7 @@ use tempfile::TempDir;
 struct Door {
     addr: String,
     operator: String,
-    workdir: PathBuf,
+    records_dir: PathBuf,
     provider: common::ScriptedServer,
     _home: TempDir,
     _project: TempDir,
@@ -101,11 +101,11 @@ impl Door {
             .find(|(name, _)| name == "operator")
             .map(|(_, token)| token.expose().to_string())
             .expect("an authenticated door mints an operator token");
-        let workdir = staged.workdir.clone();
+        let records_dir = staged.records_dir.clone();
         Door {
             addr: launch_door(staged),
             operator,
-            workdir,
+            records_dir,
             provider,
             _home: home,
             _project: project,
@@ -151,7 +151,7 @@ impl Door {
 
     /// Every record of type `event_type` in the session's trace.
     fn trace(&self, event_type: &str) -> Vec<Value> {
-        trace_events(&self.workdir)
+        trace_events(&self.records_dir)
             .into_iter()
             .filter(|event| event["event_type"] == event_type)
             .collect()

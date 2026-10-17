@@ -1,6 +1,6 @@
 # How to score your agent's behavior with eval
 
-Murmur's eval system lets you run your capsule against a dataset of test cases and automatically score each session. Scores are written to `eval.jsonl` alongside `trace.jsonl` in each session workdir and can be compared across runs with `mur eval diff`. This guide shows how to wire up `murmur/hook-eval`, write a dataset, run it, and interpret the results.
+Murmur's eval system lets you run your capsule against a dataset of test cases and automatically score each session. Scores are written to `hooks/eval.jsonl` beside `trace.jsonl` in each session's [records directory](../reference/workdir.md#records-directory), where the capsule's own commands cannot change them, and can be compared across runs with `mur eval diff`. This guide shows how to wire up `murmur/hook-eval`, write a dataset, run it, and interpret the results.
 
 The relevant manifest options are:
 
@@ -33,7 +33,7 @@ The relevant manifest options are:
         runtime: hook
         capabilities:
           filesystem:
-            scope: .          # the hook writes the session's eval.jsonl scores here; hooks get no filesystem by default
+            records: true     # the hook writes the session's eval.jsonl beside its trace; hooks get no filesystem by default
       - name: murmur/tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
@@ -84,7 +84,7 @@ The relevant manifest options are:
         runtime: hook
         capabilities:
           filesystem:
-            scope: .          # the hook writes the session's eval.jsonl scores here; hooks get no filesystem by default
+            records: true     # the hook writes the session's eval.jsonl beside its trace; hooks get no filesystem by default
       - name: murmur/tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
@@ -135,7 +135,7 @@ The relevant manifest options are:
         runtime: hook
         capabilities:
           filesystem:
-            scope: .          # the hook writes the session's eval.jsonl scores here; hooks get no filesystem by default
+            records: true     # the hook writes the session's eval.jsonl beside its trace; hooks get no filesystem by default
       - name: murmur/tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
@@ -239,10 +239,10 @@ mur eval run ./other-capsule --dataset ./other.jsonl        # both explicit
 
 `mur eval run` runs one capsule session per case, sequentially. For each case it:
 
-1. Stages the session — allocates a per-session workdir (`workdir/ses_xxx/`) and loads artifacts
+1. Stages the session — allocates a per-session workdir (`workdir/ses_xxx/`) and records directory, and loads artifacts
 2. Copies `task_path` to `task.md` in the session's [runtime directory](../reference/workdir.md#runtime-directory)
 3. Launches the session
-4. Reads `eval.jsonl` from the session workdir (written by the hook at session end)
+4. Reads `hooks/eval.jsonl` from the session's records directory (written by the hook at session end). A case whose hook wrote none — one declared `scope: .` instead of `records: true` — reports `no_scores` and a warning naming the grant
 5. Prints a result line
 
 Output as cases complete:
@@ -277,7 +277,7 @@ All four cases pass every scorer. Reading MURMUR.md takes one inference turn (th
 
 ## Step 5 — read the eval output
 
-Each case produces its own `eval.jsonl` in the session workdir. Inspect the most recent session, or any session by suffix:
+Each case produces its own `hooks/eval.jsonl` in the session's records directory. Inspect the most recent session, or any session by suffix:
 
 ```bash
 mur eval show               # most recent session
@@ -287,7 +287,7 @@ mur eval show 6801          # session whose ID ends in "6801"
 Output:
 
 ```text
-── Eval: workdir/ses_6801.../eval.jsonl ─────────────────────────────────────
+── Eval: /home/me/.murmur/records/home/me/eval-capsule/workdir/ses_6801.../hooks/eval.jsonl ──────
 
 ── Scorers ──────────────────────────────────────
   response_size            1/1 pass  (100.0%)
@@ -385,7 +385,7 @@ mur trace show
 | Step | What you do |
 |---|---|
 | Declare `murmur/hook-eval` with `runtime: hook` | Activates the eval hook for this capsule |
-| Grant it `capabilities.filesystem.scope` on its own entry | Lets it write `eval.jsonl`; hooks have no filesystem access by default (see [Hook capabilities](../reference/manifest.md#hook-capabilities)) |
+| Grant it `capabilities.filesystem.records: true` on its own entry | Lets it write `eval.jsonl` into the records directory beside the trace; hooks have no filesystem access by default (see [Hook capabilities](../reference/manifest.md#hook-capabilities)) |
 | Declare `murmur/tool-editor` with `runtime: tool` | Gives the agent file-read capability; required for `tool_sequence` cases |
 | Configure `observability.eval.scorers` | Defines the scoring criteria — all scorers run for every case |
 | Write `eval.jsonl` | One case per line, each with a `case_id` and `task_path` |

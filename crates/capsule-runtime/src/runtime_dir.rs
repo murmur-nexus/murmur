@@ -73,32 +73,44 @@ pub const STALE_AFTER: Duration = Duration::from_secs(60);
 /// The mode every directory beneath `~/.murmur/sessions` is created at.
 const PRIVATE_DIR_MODE: u32 = crate::murmur_home::MURMUR_HOME_DIR_MODE;
 
-/// Where the runtime directory lies relative to a workdir, decided without creating anything.
+/// Where the runtime directory and the records directory lie relative to a workdir, decided
+/// without creating anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeDirPlacement {
     /// `~/.murmur/sessions`, as `HOME` names it.
     pub sessions_dir: PathBuf,
-    /// The accessible workdir it was compared with.
+    /// The records group of [`Self::workdir`], [`crate::records_dir::records_group`]'s answer:
+    /// every session of this workdir root keeps its records directory in it.
+    pub records_group: PathBuf,
+    /// The workdir root it was compared with: `--workdir`, else `<manifest-dir>/workdir`.
     pub workdir: PathBuf,
     /// Whether `sessions_dir` lies inside `workdir`, both resolved through their nearest
     /// existing ancestor. When it does, the capsule's commands can change the runtime directory.
+    pub sessions_inside_workdir: bool,
+    /// Whether this session's records directory lies inside `workdir`, resolved the same way.
+    pub records_inside_workdir: bool,
+    /// Either of the two: the capsule's commands can change a directory the runtime keeps out of
+    /// their reach.
     pub inside_workdir: bool,
 }
 
 impl RuntimeDirPlacement {
-    /// `Some(self)` when the runtime directory lies inside the workdir.
+    /// `Some(self)` when the runtime directory or the records directory lies inside the workdir.
     #[must_use]
     pub fn inside(&self) -> Option<&Self> {
         self.inside_workdir.then_some(self)
     }
 
-    /// A runtime directory under `/home/test` and a workdir under `/work`, apart, for a test
-    /// that is not about where the directory lies.
+    /// A runtime directory and a records group under `/home/test` and a workdir under `/work`,
+    /// apart, for a test that is not about where the directories lie.
     #[cfg(test)]
     pub(crate) fn outside_for_test() -> Self {
         Self {
             sessions_dir: PathBuf::from("/home/test/.murmur/sessions"),
+            records_group: PathBuf::from("/home/test/.murmur/records/work"),
             workdir: PathBuf::from("/work"),
+            sessions_inside_workdir: false,
+            records_inside_workdir: false,
             inside_workdir: false,
         }
     }
@@ -113,105 +125,106 @@ impl RuntimeDirPlacement {
             .display()
             .to_string()
     }
+
+    /// The records directory's path with the literal `<session-id>` segment, on
+    /// [`Self::report_path`]'s terms.
+    #[must_use]
+    pub fn records_report_path(&self) -> String {
+        self.records_group
+            .join(crate::workdir_writes::SESSION_ID_PLACEHOLDER)
+            .display()
+            .to_string()
+    }
+
+    /// The directory, or both, that lies inside the workdir, and what the capsule's commands can
+    /// therefore change, as `(subject with its verb, what can be changed)`.
+    fn inside_subject(&self) -> (String, &'static str) {
+        let runtime = format!("the runtime directory {}", self.sessions_dir.display());
+        let records = format!("the records directory {}", self.records_report_path());
+        match (self.sessions_inside_workdir, self.records_inside_workdir) {
+            (true, true) => (
+                format!("{runtime} and {records} lie"),
+                "the files the runtime owns — task.md, MURMUR.md, plans and installed tools — \
+                 and the records it keeps about the session — its trace, logs, eval scores and \
+                 delegation outcome",
+            ),
+            (true, false) => (
+                format!("{runtime} lies"),
+                "the files the runtime owns — task.md, MURMUR.md, plans and installed tools",
+            ),
+            (false, true) => (
+                format!("{records} lies"),
+                "the records the runtime keeps about the session — its trace, logs, eval scores \
+                 and delegation outcome",
+            ),
+            (false, false) => (String::new(), ""),
+        }
+    }
+
+    /// `E-CAP-003`'s reason for a placement inside the workdir.
+    #[must_use]
+    pub(crate) fn inside_shortfall(&self) -> String {
+        let (subject, changes) = self.inside_subject();
+        format!(
+            "{subject} inside the workdir {}, so this capsule's commands can change {changes}, \
+             and no host can back a class above advisory for it; run with a --workdir that does \
+             not contain ~/.murmur",
+            self.workdir.display()
+        )
+    }
 }
 
-/// The `W-SEC-033` line for a runtime directory inside the workdir, without a prefix: shared by
-/// `stage_session` and `mur doctor` so the two cannot word it differently.
+/// The `W-SEC-033` line for a runtime or records directory inside the workdir, without a prefix:
+/// shared by `stage_session` and `mur doctor` so the two cannot word it differently.
 #[must_use]
 pub fn runtime_dir_inside_warning(placement: &RuntimeDirPlacement) -> String {
     use murmur_artifact::{security_warning_link, W_SEC_033};
+    let (subject, changes) = placement.inside_subject();
     format!(
-        "warning[{W_SEC_033}]: the runtime directory {} lies inside the workdir {}, so this \
-         capsule's commands can change the files the runtime owns — task.md, MURMUR.md, plans \
-         and installed tools; run with a --workdir that does not contain ~/.murmur ({})",
-        placement.sessions_dir.display(),
+        "warning[{W_SEC_033}]: {subject} inside the workdir {}, so this capsule's commands can \
+         change {changes}; run with a --workdir that does not contain ~/.murmur ({})",
         placement.workdir.display(),
         security_warning_link(W_SEC_033)
     )
 }
 
-/// The `sessions/` directory every runtime directory on this host is created in, decided without
-/// creating anything: `~/.murmur/sessions` when `HOME` resolves to an absolute path and
-/// `~/.murmur` can be written, and `<temp dir>/murmur-<uid>/sessions` otherwise, so a home closed
-/// to writes or a relative `HOME` costs a session nothing but the location.
-#[must_use]
-pub fn sessions_dir() -> PathBuf {
-    match crate::state_store::murmur_home_dir() {
-        Ok(home) if home_is_writable(&home) => home.join(SESSIONS_DIR_NAME),
-        _ => fallback_parent().join(SESSIONS_DIR_NAME),
-    }
+/// The `sessions/` directory every runtime directory on this host is created in,
+/// `~/.murmur/sessions`, decided without creating anything. A `HOME` that cannot hold it is
+/// refused, never replaced by another location.
+pub fn sessions_dir() -> Result<PathBuf, crate::murmur_home::HomeUnusable> {
+    Ok(crate::murmur_home::usable_murmur_home()?.join(SESSIONS_DIR_NAME))
 }
 
-/// Whether the deepest existing one of `~/.murmur/sessions`, `~/.murmur` and `$HOME` is a
-/// directory this process may create entries in.
-fn home_is_writable(murmur_home: &Path) -> bool {
-    let candidates = [
-        murmur_home.join(SESSIONS_DIR_NAME),
-        murmur_home.to_path_buf(),
-        murmur_home
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default(),
-    ];
-    let Some(existing) = candidates
-        .iter()
-        .find(|path| std::fs::symlink_metadata(path).is_ok())
-    else {
-        return false;
-    };
-    std::fs::metadata(existing).is_ok_and(|metadata| metadata.is_dir())
-        && rustix::fs::access(
-            existing,
-            rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
-        )
-        .is_ok()
-}
-
-/// `<temp dir>/murmur-<uid>`, the per-user parent of `sessions/` when the home cannot hold it.
-fn fallback_parent() -> PathBuf {
-    std::env::temp_dir().join(format!("murmur-{}", rustix::process::getuid().as_raw()))
-}
-
-/// Creates `parent` at `0700` if absent, and holds it there only when it is a real directory this
-/// user owns: a shared temp directory may hold a name another user created first.
-fn hold_owned_private_dir(parent: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-
-    let located = |reason: &str| format!("{}: {reason}", parent.display());
-    if std::fs::symlink_metadata(parent).is_err() {
-        crate::murmur_home::hold_private_dir(parent).map_err(|reason| located(&reason))?;
-    }
-    let metadata =
-        std::fs::symlink_metadata(parent).map_err(|error| located(&error.to_string()))?;
-    if !metadata.file_type().is_dir() {
-        return Err(located("not a directory"));
-    }
-    if metadata.uid() != rustix::process::getuid().as_raw() {
-        return Err(located("owned by another user"));
-    }
-    crate::murmur_home::hold_private_dir(parent).map_err(|reason| located(&reason))
-}
-
-/// Where the runtime directory would lie relative to `workdir`. Creates nothing.
+/// Where the runtime directory and the records directory would lie relative to `workdir`, the
+/// session's workdir root. Creates nothing.
 ///
 /// Each path is resolved by canonicalizing its nearest existing ancestor and appending the rest,
 /// so a workdir that does not exist yet, or a home with no `.murmur` in it yet, is judged by
 /// where it would be created.
-#[must_use]
-pub fn runtime_dir_placement(workdir: &Path) -> RuntimeDirPlacement {
+pub fn runtime_dir_placement(
+    workdir: &Path,
+) -> Result<RuntimeDirPlacement, crate::murmur_home::HomeUnusable> {
     let workdir = std::path::absolute(workdir).unwrap_or_else(|_| workdir.to_path_buf());
-    let sessions_dir = sessions_dir();
-    let inside_workdir = canonicalize_existing_prefix(&sessions_dir)
-        .starts_with(canonicalize_existing_prefix(&workdir));
-    RuntimeDirPlacement {
+    let sessions_dir = sessions_dir()?;
+    let records_group = crate::records_dir::records_group(&workdir)?;
+    let canonical_workdir = canonicalize_existing_prefix(&workdir);
+    let sessions_inside_workdir =
+        canonicalize_existing_prefix(&sessions_dir).starts_with(&canonical_workdir);
+    let records_inside_workdir =
+        canonicalize_existing_prefix(&records_group).starts_with(&canonical_workdir);
+    Ok(RuntimeDirPlacement {
         sessions_dir,
+        records_group,
         workdir,
-        inside_workdir,
-    }
+        sessions_inside_workdir,
+        records_inside_workdir,
+        inside_workdir: sessions_inside_workdir || records_inside_workdir,
+    })
 }
 
-/// The three held directories beneath one session's `<session-id>/`, each sharing the session's
-/// refusal latch. Cheap to clone.
+/// The three held directories beneath one session's `<session-id>/`, and the session's records
+/// directory beside them, each sharing the session's refusal latch: every directory outside the
+/// workdir a command is told of or a sealed root is composed from. Cheap to clone.
 #[derive(Clone, Debug)]
 pub struct RuntimeDirRoots {
     /// `runtime/`, which `$MURMUR_RUNTIME_DIR` names.
@@ -220,18 +233,30 @@ pub struct RuntimeDirRoots {
     pub sealed_etc: WorkdirRoot,
     /// `harness/`.
     pub harness: WorkdirRoot,
+    /// The session's records directory, which `$MURMUR_RECORDS_DIR` names, given the same
+    /// read-only rule and bind as `runtime/`. `None` for roots held outside a session, where no
+    /// records directory exists.
+    pub records: Option<WorkdirRoot>,
 }
 
 impl RuntimeDirRoots {
     /// The three roots of a session's runtime directory, for a caller that holds them itself —
-    /// a test, or a plan run outside a session.
+    /// a test, or a plan run outside a session. No records directory.
     #[must_use]
     pub fn new(runtime: WorkdirRoot, sealed_etc: WorkdirRoot, harness: WorkdirRoot) -> Self {
         Self {
             runtime,
             sealed_etc,
             harness,
+            records: None,
         }
+    }
+
+    /// These roots with `records` as the session's records directory.
+    #[must_use]
+    pub fn with_records(mut self, records: WorkdirRoot) -> Self {
+        self.records = Some(records);
+        self
     }
 }
 
@@ -259,22 +284,20 @@ impl RuntimeDir {
     /// `runtime/`, `sealed-etc/` and `harness/` beneath it at `0700`. Every refusal beneath the
     /// three lands on `latch_of`'s latch and names its path absolutely.
     ///
-    /// `sessions_path` is [`sessions_dir`]'s answer, the one the launch was judged against. Under
-    /// the murmur home, the home is held through [`crate::murmur_home::ensure_murmur_home`] first.
+    /// `sessions_path` is [`sessions_dir`]'s answer, the one the launch was judged against. The
+    /// murmur home is held through [`crate::murmur_home::ensure_murmur_home`] first.
     pub fn create(
         sessions_path: &Path,
         session_id: &str,
         latch_of: &WorkdirRoot,
     ) -> Result<Self, String> {
         let located = |path: &Path, reason: String| format!("{}: {reason}", path.display());
-        let parent = sessions_path
-            .parent()
-            .ok_or_else(|| located(sessions_path, "has no parent directory".to_string()))?;
-        let home = crate::state_store::murmur_home_dir().ok();
-        if home.as_deref() == Some(parent) {
-            crate::murmur_home::ensure_murmur_home()?;
-        } else {
-            hold_owned_private_dir(parent)?;
+        let home = crate::murmur_home::ensure_murmur_home()?;
+        if sessions_path.parent() != Some(home.as_path()) {
+            return Err(located(
+                sessions_path,
+                format!("is not beneath {}", home.display()),
+            ));
         }
         let sessions_path = sessions_path.to_path_buf();
         crate::murmur_home::hold_private_dir(&sessions_path)
@@ -307,6 +330,7 @@ impl RuntimeDir {
                 runtime: open(RUNTIME_SUBDIR)?,
                 sealed_etc: open(SEALED_ETC_SUBDIR)?,
                 harness: open(HARNESS_SUBDIR)?,
+                records: None,
             },
         })
     }
@@ -521,6 +545,52 @@ mod tests {
             .starts_with(canonicalize_existing_prefix(&real)));
     }
 
+    /// A workdir root that holds the murmur home holds both directories; one that holds
+    /// `~/.murmur/records` alone holds the records directory alone; one elsewhere holds neither.
+    #[test]
+    fn runtime_dir_placement_judges_the_records_directory_too() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(
+            "runtime_dir::tests::runtime_dir_placement_records_inner",
+            home.path(),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by runtime_dir_placement_judges_the_records_directory_too"]
+    fn runtime_dir_placement_records_inner() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let both = runtime_dir_placement(&home).unwrap();
+        assert!(both.sessions_inside_workdir && both.records_inside_workdir);
+        assert!(both.inside_workdir);
+        assert!(runtime_dir_inside_warning(&both).contains("the records directory"));
+
+        let records = home
+            .join(".murmur")
+            .join(crate::records_dir::RECORDS_DIR_NAME);
+        let records_only = runtime_dir_placement(&records).unwrap();
+        assert!(!records_only.sessions_inside_workdir);
+        assert!(records_only.records_inside_workdir && records_only.inside_workdir);
+        let reason = records_only.inside_shortfall();
+        assert!(reason.starts_with("the records directory "), "{reason}");
+        assert!(reason.contains("run with a --workdir that does not contain ~/.murmur"));
+
+        let elsewhere = runtime_dir_placement(&home.join("project/workdir")).unwrap();
+        assert!(!elsewhere.inside_workdir);
+        assert_eq!(
+            elsewhere.records_report_path(),
+            crate::records_dir::records_group(&home.join("project/workdir"))
+                .unwrap()
+                .join("<session-id>")
+                .display()
+                .to_string()
+        );
+        assert!(!home.join(".murmur").exists(), "judging creates nothing");
+    }
+
     #[test]
     fn runtime_dir_lock_is_exclusive_across_open_file_descriptions() {
         let temp = tempfile::tempdir().unwrap();
@@ -540,48 +610,5 @@ mod tests {
         );
         drop(held);
         assert!(take_lock(&root, &session).is_ok());
-    }
-
-    /// A home that resolves and can be written holds `sessions/`; a relative `HOME` and a
-    /// `~/.murmur` closed to writes fall back to the per-user temp directory.
-    #[test]
-    fn runtime_dir_sessions_fall_back_when_the_home_cannot_hold_them() {
-        let home = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", home.path());
-        assert_eq!(
-            sessions_dir(),
-            home.path().join(".murmur").join(SESSIONS_DIR_NAME)
-        );
-
-        let murmur = home.path().join(".murmur");
-        std::fs::create_dir(&murmur).unwrap();
-        std::fs::set_permissions(&murmur, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let closed = std::fs::write(murmur.join("probe"), b"x").is_err();
-        if closed {
-            assert_eq!(sessions_dir(), fallback_parent().join(SESSIONS_DIR_NAME));
-        }
-        std::fs::set_permissions(&murmur, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-        std::env::set_var("HOME", "relative-home");
-        assert_eq!(sessions_dir(), fallback_parent().join(SESSIONS_DIR_NAME));
-        assert!(fallback_parent().starts_with(std::env::temp_dir()));
-    }
-
-    /// The fallback parent is held only when it is a real directory this user owns.
-    #[test]
-    fn runtime_dir_fallback_parent_refuses_a_link() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("elsewhere");
-        std::fs::create_dir(&target).unwrap();
-        let link = temp.path().join("murmur-link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(hold_owned_private_dir(&link)
-            .unwrap_err()
-            .contains("not a directory"));
-
-        let fresh = temp.path().join("murmur-fresh");
-        hold_owned_private_dir(&fresh).unwrap();
-        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
     }
 }

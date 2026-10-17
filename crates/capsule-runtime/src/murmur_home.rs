@@ -61,6 +61,90 @@ pub fn hold_private_dir(path: &Path) -> Result<(), String> {
     crate::state_store::ensure_private_dir(path, MURMUR_HOME_DIR_MODE)
 }
 
+/// Why `HOME` cannot hold `~/.murmur`, and with it a session's runtime and records directories.
+///
+/// The one answer every launch and every reader of a records group gives: `mur` renders it as
+/// `E-IO-004`, and nothing is written anywhere when it is returned.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HomeUnusable {
+    #[error(
+        "HOME is not set, so there is no ~/.murmur to hold this session's runtime and records \
+         directories"
+    )]
+    NotSet,
+    #[error(
+        "HOME is '{0}', which is not an absolute path, so there is no ~/.murmur to hold this \
+         session's runtime and records directories"
+    )]
+    NotAbsolute(String),
+    #[error("~/.murmur ({}) cannot hold this session's runtime and records directories: {reason}", path.display())]
+    CannotHold { path: PathBuf, reason: String },
+}
+
+/// What an operator sets to clear any [`HomeUnusable`].
+pub const HOME_UNUSABLE_HINT: &str = "set HOME to the absolute path of a directory you own, in \
+                                      which ~/.murmur exists or can be created as a 0700 directory";
+
+/// `~/.murmur`, when `HOME` names an absolute path in which it exists as a directory this process
+/// can create entries in, or can be created. Creates nothing.
+///
+/// Also refuses a `~/.murmur/sessions` or `~/.murmur/records` that exists and is not such a
+/// directory, the two places every launch creates something beneath.
+pub fn usable_murmur_home() -> Result<PathBuf, HomeUnusable> {
+    let home = home_path()?;
+    let murmur_home = home.join(".murmur");
+    let cannot_hold = |reason: String| HomeUnusable::CannotHold {
+        path: murmur_home.clone(),
+        reason,
+    };
+    for sub in [
+        crate::runtime_dir::SESSIONS_DIR_NAME,
+        crate::records_dir::RECORDS_DIR_NAME,
+    ] {
+        let path = murmur_home.join(sub);
+        if std::fs::symlink_metadata(&path).is_ok() {
+            writable_dir(&path)
+                .map_err(|reason| cannot_hold(format!("{}: {reason}", path.display())))?;
+        }
+    }
+    if std::fs::symlink_metadata(&murmur_home).is_ok() {
+        writable_dir(&murmur_home).map_err(cannot_hold)?;
+    } else {
+        writable_dir(&home)
+            .map_err(|reason| cannot_hold(format!("HOME {}: {reason}", home.display())))?;
+    }
+    Ok(murmur_home)
+}
+
+/// `HOME`, when it is set, non-empty and absolute. Checks and creates nothing.
+///
+/// The one place the runtime reads `HOME`; every caller either checks `~/.murmur` further
+/// ([`usable_murmur_home`]) or wraps the reason in its own error.
+pub(crate) fn home_path() -> Result<PathBuf, HomeUnusable> {
+    let home = match std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+        None => return Err(HomeUnusable::NotSet),
+        Some(home) => PathBuf::from(home),
+    };
+    if !home.is_absolute() {
+        return Err(HomeUnusable::NotAbsolute(home.display().to_string()));
+    }
+    Ok(home)
+}
+
+/// `Ok` when `path` is a directory this process may create entries in.
+fn writable_dir(path: &Path) -> Result<(), String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err("not a directory".to_string()),
+        Err(error) => return Err(error.to_string()),
+    }
+    rustix::fs::access(
+        path,
+        rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
+    )
+    .map_err(|errno| format!("cannot be written ({})", std::io::Error::from(errno)))
+}
+
 /// Replace `target` with `contents` at [`PRIVATE_FILE_MODE`].
 ///
 /// Staged beside `target` and renamed over it, so a reader sees the old file or the new one, and
@@ -150,13 +234,14 @@ pub enum HomeEntryKind {
     BinaryCache,
     Formations,
     Sessions,
+    Records,
     /// A top-level name this build writes nothing under.
     Unrecognised(String),
 }
 
 impl HomeEntryKind {
     /// Every kind with a fixed name, in the order the audit reports them after the home itself.
-    const KNOWN: [HomeEntryKind; 13] = [
+    const KNOWN: [HomeEntryKind; 14] = [
         Self::Config,
         Self::DeployKeys,
         Self::DeployStaging,
@@ -170,6 +255,7 @@ impl HomeEntryKind {
         Self::BinaryCache,
         Self::Formations,
         Self::Sessions,
+        Self::Records,
     ];
 
     /// The entry's name under `~/.murmur`, or `None` for the home itself.
@@ -189,6 +275,7 @@ impl HomeEntryKind {
             Self::BinaryCache => "bin",
             Self::Formations => crate::formation_launch::FORMATIONS_DIR,
             Self::Sessions => crate::runtime_dir::SESSIONS_DIR_NAME,
+            Self::Records => crate::records_dir::RECORDS_DIR_NAME,
             Self::Unrecognised(name) => name,
         })
     }
@@ -210,6 +297,7 @@ impl HomeEntryKind {
             Self::BinaryCache => "cached mur binaries",
             Self::Formations => "formation members' working directories",
             Self::Sessions => "running sessions' runtime directories",
+            Self::Records => "every session's trace, logs, eval scores and delegation outcome",
             Self::Unrecognised(_) => "something not recognised by this build",
         }
     }
@@ -225,6 +313,9 @@ impl HomeEntryKind {
             Self::Sessions => Some(
                 "each removed when its session ends, and by the next launch when a session \
                  ended without removing its own",
+            ),
+            Self::Records => Some(
+                "each kept after its session ends, until its capsule's trace.retain expires it",
             ),
             _ => None,
         }
@@ -260,6 +351,11 @@ impl HomeEntryKind {
             // `sessions/<id>/` and the three directories in it are created owner-only; below
             // them are the runtime's own files, written at the umask's modes.
             Self::Sessions => Some(2),
+            // `records/<first component of a workdir root>/` is held owner-only; the rest of the
+            // mirrored path and each `<session-id>/` are created owner-only too, at a depth that
+            // varies with the workdir, and below them are the runtime's own files at the umask's
+            // modes. The owner-only `records/` is what keeps them from other accounts.
+            Self::Records => Some(1),
             _ => None,
         }
     }
@@ -642,6 +738,99 @@ mod tests {
         assert_ne!(std::fs::metadata(&path).unwrap().ino(), before);
     }
 
+    /// Re-runs `test` with `HOME` removed from its environment, on [`run_with_home`]'s terms.
+    fn run_without_home(test: &str) {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([
+                test,
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env_remove("HOME")
+            .env(INNER_HOME_ENV, "1")
+            .output()
+            .expect("re-exec the test binary with no HOME");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{test} failed\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Each way `HOME` cannot hold `~/.murmur` names `HOME` and its cause, and creates nothing.
+    #[test]
+    fn an_unusable_home_names_home_and_its_cause() {
+        run_without_home("murmur_home::tests::an_unset_home_inner");
+        let relative = std::path::Path::new("relative-home");
+        run_with_home("murmur_home::tests::a_relative_home_inner", relative);
+        let closed = tempfile::tempdir().unwrap();
+        run_with_home("murmur_home::tests::a_closed_home_inner", closed.path());
+    }
+
+    #[test]
+    #[ignore = "run by an_unusable_home_names_home_and_its_cause"]
+    fn an_unset_home_inner() {
+        if !in_scratch_home() {
+            return;
+        }
+        let error = usable_murmur_home().unwrap_err();
+        assert_eq!(error, HomeUnusable::NotSet);
+        assert_eq!(
+            error.to_string(),
+            "HOME is not set, so there is no ~/.murmur to hold this session's runtime and \
+             records directories"
+        );
+        assert!(crate::runtime_dir::sessions_dir().is_err());
+        assert!(crate::records_dir::records_group(Path::new("/w")).is_err());
+    }
+
+    #[test]
+    #[ignore = "run by an_unusable_home_names_home_and_its_cause"]
+    fn a_relative_home_inner() {
+        if !in_scratch_home() {
+            return;
+        }
+        let error = usable_murmur_home().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "HOME is 'relative-home', which is not an absolute path, so there is no ~/.murmur to \
+             hold this session's runtime and records directories"
+        );
+        assert!(!Path::new("relative-home").exists());
+    }
+
+    #[test]
+    #[ignore = "run by an_unusable_home_names_home_and_its_cause"]
+    fn a_closed_home_inner() {
+        use std::os::unix::fs::PermissionsExt;
+        if !in_scratch_home() {
+            return;
+        }
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let murmur = home.join(".murmur");
+        std::fs::create_dir(&murmur).unwrap();
+        std::fs::set_permissions(&murmur, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Root writes through any mode, and then there is nothing to refuse.
+        if std::fs::write(murmur.join("probe"), b"x").is_err() {
+            let error = usable_murmur_home().unwrap_err();
+            let text = error.to_string();
+            assert!(
+                text.starts_with(&format!(
+                    "~/.murmur ({}) cannot hold this session's runtime and records directories: ",
+                    murmur.display()
+                )),
+                "{text}"
+            );
+            assert!(text.contains("cannot be written"), "{text}");
+        }
+        std::fs::set_permissions(&murmur, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(usable_murmur_home().unwrap(), murmur);
+    }
+
     #[test]
     fn murmur_home_audit_reports_absent_entries_in_kind_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -649,21 +838,23 @@ mod tests {
 
         let reports = audit_murmur_home(&home);
 
-        assert_eq!(reports.len(), 14);
+        assert_eq!(reports.len(), 15);
         assert_eq!(reports[0].kind, HomeEntryKind::Home);
         assert_eq!(reports[1].kind, HomeEntryKind::Config);
         assert_eq!(reports[10].kind, HomeEntryKind::CompiledForms);
         assert_eq!(reports[11].kind, HomeEntryKind::BinaryCache);
         assert_eq!(reports[12].kind, HomeEntryKind::Formations);
         assert_eq!(reports[13].kind, HomeEntryKind::Sessions);
+        assert_eq!(reports[14].kind, HomeEntryKind::Records);
         assert!(reports
             .iter()
             .all(|report| report.state == HomeEntryState::Absent));
     }
 
-    /// Only `formations/` and `sessions/` say how long they are kept, and only `compiled/` is
-    /// safe to delete: a formation directory is removed by retention, and what it holds is never
-    /// written again; a session's runtime directory is removed when it ends.
+    /// Only `formations/`, `sessions/` and `records/` say how long they are kept, and only
+    /// `compiled/` is safe to delete: a formation directory and a session's records are removed by
+    /// retention, and what they hold is never written again; a session's runtime directory is
+    /// removed when it ends.
     #[test]
     fn murmur_home_kinds_say_how_formations_are_kept_and_only_compiled_is_safe_to_delete() {
         let every = HomeEntryKind::KNOWN
@@ -672,7 +863,10 @@ mod tests {
         for kind in every {
             assert_eq!(
                 kind.kept().is_some(),
-                matches!(kind, HomeEntryKind::Formations | HomeEntryKind::Sessions),
+                matches!(
+                    kind,
+                    HomeEntryKind::Formations | HomeEntryKind::Sessions | HomeEntryKind::Records
+                ),
                 "{kind:?}"
             );
             assert_eq!(

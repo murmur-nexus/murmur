@@ -247,11 +247,13 @@ impl Project {
     }
 
     /// No file the session or a refusal could have written holds `key`: the project directory
-    /// (which holds every script-capsule workdir), `workdir` when the session had one, and
-    /// `$HOME/.murmur/running`. `run`'s own output holds it nowhere either.
+    /// (which holds every script-capsule workdir), `workdir` when the session had one,
+    /// `$HOME/.murmur/records` and `$HOME/.murmur/running`. `run`'s own output holds it nowhere
+    /// either.
     fn assert_key_recorded_nowhere(&self, run: &Run, key: &str) {
         let mut roots = vec![
             self.project.path().to_path_buf(),
+            common::records_root(self.home.path()),
             self.home.path().join(".murmur").join("running"),
         ];
         if let Some(workdir) = run.workdir() {
@@ -347,10 +349,9 @@ impl Run {
     }
 
     fn trace(&self) -> Vec<Value> {
-        let workdir = self
-            .workdir()
-            .unwrap_or_else(|| panic!("{}", self.context()));
-        fs::read_to_string(workdir.join("trace.jsonl"))
+        assert!(self.stdout.contains("records: "), "{}", self.context());
+        let records_dir = common::parse_records_from_stdout(&self.stdout);
+        fs::read_to_string(records_dir.join("trace.jsonl"))
             .unwrap_or_else(|err| panic!("no trace.jsonl ({err}); {}", self.context()))
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())

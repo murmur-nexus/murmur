@@ -1,11 +1,23 @@
+#[path = "common/mod.rs"]
+mod common;
+
 use std::{fs, path::Path};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+/// The `HOME` every `mur` here runs under: one scratch directory for the process, so a session
+/// written into a workdir root's records group is the one `--workdir` finds.
+fn scratch_home() -> &'static Path {
+    static HOME: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| TempDir::new().unwrap()).path()
+}
+
 fn mur() -> Command {
-    Command::cargo_bin("mur").unwrap()
+    let mut command = Command::cargo_bin("mur").unwrap();
+    command.env("HOME", scratch_home());
+    command
 }
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -416,8 +428,10 @@ fn write_fixture(dir: &Path, name: &str, content: &str) -> std::path::PathBuf {
 
 // ── session resolution helpers ────────────────────────────────────────────────
 
+/// A recorded session of the workdir root `workdir`: its records directory, under
+/// [`scratch_home`].
 fn write_session(workdir: &Path, session_id: &str, content: &str) {
-    let ses_dir = workdir.join(session_id);
+    let ses_dir = common::session_records_dir(scratch_home(), workdir, session_id);
     fs::create_dir_all(&ses_dir).unwrap();
     fs::write(ses_dir.join("trace.jsonl"), content).unwrap();
 }
@@ -3131,7 +3145,7 @@ fn write_wire_session(
     write_session(workdir, session_id, &trace);
 
     if store_bodies {
-        let blobs = workdir.join(session_id).join("blobs");
+        let blobs = common::session_records_dir(scratch_home(), workdir, session_id).join("blobs");
         fs::create_dir_all(&blobs).unwrap();
         for body in [system, TOOLS_BODY, RESPONSE_BODY, PROMPT_BODY]
             .into_iter()
@@ -3180,7 +3194,8 @@ fn body_selectors_print_the_stored_blob_verbatim() {
     let tmp = TempDir::new().unwrap();
     let system = system_body();
     write_wire_session(tmp.path(), SESSION_ID_WIRE, &system, &MESSAGE_BODIES, true);
-    let blobs = tmp.path().join(SESSION_ID_WIRE).join("blobs");
+    let blobs =
+        common::session_records_dir(scratch_home(), tmp.path(), SESSION_ID_WIRE).join("blobs");
 
     for (selector, body) in [
         ("system", system.as_str()),
@@ -3347,7 +3362,7 @@ fn write_numbered_turns_session(workdir: &Path, session_id: &str, turns: &[(&str
     ));
     write_session(workdir, session_id, &(lines.join("\n") + "\n"));
 
-    let blobs = workdir.join(session_id).join("blobs");
+    let blobs = common::session_records_dir(scratch_home(), workdir, session_id).join("blobs");
     fs::create_dir_all(&blobs).unwrap();
     for body in [PROMPT_BODY, TOOLS_BODY]
         .into_iter()
@@ -3417,8 +3432,7 @@ fn a_turn_number_two_turns_share_is_refused_with_each_ones_hashes() {
     assert_eq!(
         out.get_output().stdout,
         fs::read(
-            tmp.path()
-                .join(SESSION_ID_RENUMBERED)
+            common::session_records_dir(scratch_home(), tmp.path(), SESSION_ID_RENUMBERED)
                 .join("blobs")
                 .join(sha(responses[2]))
         )

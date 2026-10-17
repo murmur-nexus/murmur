@@ -346,16 +346,22 @@ impl Project {
         Launcher::spawn(command)
     }
 
-    /// Every `ses_*` session directory members created: the entry member's under the project,
-    /// each peer's under its own directory in the scratch `HOME`.
+    /// The records directory of every session members created: the entry member's in the records
+    /// group of the project, each peer's in the records group of its own directory in the scratch
+    /// `HOME`.
     fn sessions(&self) -> Vec<PathBuf> {
-        std::iter::once(self.path().join(".murmur"))
-            .chain(common::formation::peer_session_roots(self.home.path()))
-            .flat_map(|root| common::formation::session_dirs(&root))
+        let peer_dirs = common::formation::peer_session_roots(self.home.path())
+            .into_iter()
+            .filter_map(|root| root.parent().map(Path::to_path_buf));
+        std::iter::once(self.path().to_path_buf())
+            .chain(peer_dirs)
+            .flat_map(|dir| {
+                common::formation::session_dirs(&common::records_group(self.home.path(), &dir))
+            })
             .collect()
     }
 
-    /// The session directory whose trace names `capsule` as the capsule it ran.
+    /// The records directory whose trace names `capsule` as the capsule it ran.
     fn sessions_of(&self, capsule: &str) -> Vec<PathBuf> {
         self.sessions()
             .into_iter()
@@ -369,14 +375,15 @@ impl Project {
             .collect()
     }
 
-    /// The one session `capsule` ran in this project.
+    /// The records directory of the one session `capsule` ran in this project.
     fn session_of(&self, capsule: &str) -> PathBuf {
         let sessions = self.sessions_of(capsule);
         assert_eq!(sessions.len(), 1, "{capsule}: {sessions:?}");
         sessions.into_iter().next().unwrap()
     }
 
-    /// The one session the roster member `member` ran, found by its `session_start`.
+    /// The records directory of the one session the roster member `member` ran, found by its
+    /// `session_start`.
     fn session_of_member(&self, member: &str) -> PathBuf {
         let sessions: Vec<PathBuf> = self
             .sessions()
@@ -746,8 +753,8 @@ fn a_formation_reaches_exactly_what_its_roster_lets_it() {
 }
 
 /// `mft1.` appears nowhere the run produced — the launcher's two streams, any file under the
-/// project or the scratch `HOME` (every session directory and running record among them), or any
-/// request any member's model was sent.
+/// project or the scratch `HOME` (every session directory, records directory and running record
+/// among them), or any request any member's model was sent.
 fn assert_no_formation_token(project: &Project, stdout: &[String], stderr: &str) {
     assert!(
         !stdout.iter().any(|line| line.contains("mft1.")),

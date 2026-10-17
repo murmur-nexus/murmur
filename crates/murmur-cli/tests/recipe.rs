@@ -182,12 +182,13 @@ fn run_session(command: &str, shell_binary: &str, setup: impl FnOnce(&Path)) -> 
     let manifest_path = create_manifest(project.path(), &server.endpoint, shell_binary);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
     let workdir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
     fs::write(workdir.join("task.md"), "Do the thing.").unwrap();
     setup(&workdir);
 
     launch_session(staged, |_| {}).expect("the session must launch whatever the policy decides");
 
-    let trace_raw = fs::read_to_string(workdir.join("trace.jsonl")).unwrap_or_default();
+    let trace_raw = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap_or_default();
     let trace: Vec<Value> = trace_raw
         .lines()
         .filter(|l| !l.is_empty())

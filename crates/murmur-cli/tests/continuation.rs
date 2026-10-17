@@ -93,7 +93,7 @@ fn run_session(config_mode: Option<&str>) -> (String, String) {
     let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
 
     let result = fs::read_to_string(launched.workdir.join("out/result.txt")).unwrap_or_default();
-    let trace = fs::read_to_string(launched.workdir.join("trace.jsonl")).unwrap_or_default();
+    let trace = fs::read_to_string(launched.records_dir.join("trace.jsonl")).unwrap_or_default();
     (result, trace)
 }
 

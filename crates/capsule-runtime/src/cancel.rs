@@ -161,7 +161,7 @@ impl Default for CancelSignal {
 pub(crate) struct LiveDelegation {
     /// The task that started it, and the only task its outcome is delivered into.
     pub(crate) task_id: String,
-    /// The child's directory, absolute — where its `completion.json` is read from.
+    /// The child's directory, absolute.
     pub(crate) workdir: PathBuf,
     pub(crate) capsule: String,
     pub(crate) version: String,
@@ -170,6 +170,9 @@ pub(crate) struct LiveDelegation {
     /// The child's directory as the parent's own tools address it: relative to the parent's
     /// accessible workdir.
     pub(crate) child_workdir: String,
+    /// The child's records directory, absolute, as the child reported it on its readiness line:
+    /// where its `completion.json` is read from. Never derived from [`Self::child_workdir`].
+    pub(crate) child_records_dir: PathBuf,
     /// When the launch was recorded: the start of the backstop's bound, and the duration of a
     /// row closed without the child's own record.
     pub(crate) started: Instant,
@@ -198,6 +201,7 @@ impl LiveDelegation {
             version: notice.version.clone(),
             child_session_id: notice.child_session_id.clone(),
             child_workdir: notice.child_workdir.clone(),
+            child_records_dir: PathBuf::from(&notice.child_records_dir),
             started: Instant::now(),
             child: None,
             arrived: false,
@@ -640,6 +644,9 @@ mod tests {
             version: "0.1.0".to_string(),
             child_session_id: "ses_child".to_string(),
             child_workdir: ".murmur/children/child-1".to_string(),
+            child_records_dir: std::path::PathBuf::from(
+                "/home/test/.murmur/records/work/ses_child",
+            ),
             started: Instant::now(),
             child: None,
             arrived: false,

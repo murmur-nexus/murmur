@@ -37,7 +37,7 @@ murmur-artifact.workspace = true
 # Ed25519 for formation tokens: the launcher signs, every member's door verifies.
 ring = { version = "0.17", default-features = false }
 # Safe `openat`/`mkdirat`/`renameat`/`unlinkat`/`fstatat` for `workdir_fs`'s no-follow walk.
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

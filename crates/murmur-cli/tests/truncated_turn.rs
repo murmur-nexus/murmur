@@ -71,6 +71,7 @@ struct Run {
     _project: TempDir,
     output: std::process::Output,
     workdir: PathBuf,
+    records_dir: PathBuf,
 }
 
 impl Run {
@@ -93,7 +94,7 @@ impl Run {
     }
 
     fn trace(&self) -> String {
-        fs::read_to_string(self.workdir.join("trace.jsonl")).expect("a trace was written")
+        fs::read_to_string(self.records_dir.join("trace.jsonl")).expect("a trace was written")
     }
 
     fn inference_events(&self) -> Vec<Value> {
@@ -148,7 +149,7 @@ impl Run {
             .args([
                 "trace",
                 "steps",
-                self.workdir.join("trace.jsonl").to_str().unwrap(),
+                self.records_dir.join("trace.jsonl").to_str().unwrap(),
             ])
             .assert()
             .success();
@@ -185,15 +186,20 @@ fn run(config_mode: Option<&str>) -> Run {
         ])
         .assert();
 
-    let trace =
-        common::find_file(project.path(), "trace.jsonl").expect("the session wrote a trace");
-    let workdir = trace.parent().unwrap().to_path_buf();
+    let trace = common::find_file(&common::records_root(home.path()), "trace.jsonl")
+        .expect("the session wrote a trace");
+    let records_dir = trace.parent().unwrap().to_path_buf();
+    let workdir = project
+        .path()
+        .join("workdir")
+        .join(records_dir.file_name().unwrap());
 
     Run {
         home,
         _project: project,
         output: assertion.get_output().clone(),
         workdir,
+        records_dir,
     }
 }
 
@@ -247,7 +253,7 @@ fn a_capped_turn_is_marked_on_every_surface() {
     // A capped turn is a result, not a failure.
     assert_eq!(run.exit_status(), "ok", "trace: {}", run.trace());
     assert!(
-        !common::find_file(run.workdir.as_path(), "bootstrap.log")
+        !common::find_file(run.records_dir.as_path(), "bootstrap.log")
             .map(|p| fs::read_to_string(p).unwrap_or_default())
             .unwrap_or_default()
             .contains("W-RUN-001"),

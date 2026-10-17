@@ -124,6 +124,8 @@ fn compare(
         .iter()
         .map(|(package, version)| (package.as_str(), version.as_str()))
         .collect();
+    // Staleness of a committed binary against the WIT subtree it is built from, imports and exports
+    // alike — not whether an artifact fits a `mur`'s served level, which is `level_fit`'s question.
     Ok(Some(contracts.unserved_against(&table)))
 }
 

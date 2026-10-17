@@ -4,8 +4,8 @@
 //! Every test here stages with `StageRequest::workdir` pointed at the project directory, so the
 //! session's *accessible* workdir — the one `exports.files.root` resolves against and the one the
 //! agent sees at `.` — is the directory the test itself wrote files into. `trace.jsonl` lives in
-//! the internal `.murmur/<session_id>` directory beside it, which no export rooted in the project
-//! can reach.
+//! the session's records directory under `~/.murmur/records`, outside the project, where no
+//! export rooted in the project can reach.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -151,8 +151,8 @@ fn message_send_body(id: &str, text: &str) -> String {
 /// resource plane can be exercised while the session is idle *and* mid-task.
 struct Capsule {
     project: PathBuf,
-    /// Internal session directory — where `trace.jsonl` is.
-    session_dir: PathBuf,
+    /// The session's records directory — where `trace.jsonl` is.
+    records_dir: PathBuf,
     url: String,
     handle: Option<thread::JoinHandle<capsule_runtime::LaunchResult>>,
     _home: tempfile::TempDir,
@@ -161,7 +161,7 @@ struct Capsule {
 
 impl Capsule {
     fn trace(&self) -> String {
-        fs::read_to_string(self.session_dir.join("trace.jsonl")).unwrap_or_default()
+        fs::read_to_string(self.records_dir.join("trace.jsonl")).unwrap_or_default()
     }
 
     fn trace_events(&self, event_type: &str) -> Vec<Value> {
@@ -275,11 +275,13 @@ fn launch(exports: Option<&str>, responses: usize) -> Capsule {
         .collect();
 
     let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
+    common::process_home();
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: project.clone(),
             capsule_name: runtime_manifest.name.clone(),
@@ -326,7 +328,7 @@ fn launch(exports: Option<&str>, responses: usize) -> Capsule {
     )
     .expect("staging should succeed");
 
-    let session_dir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
     let (url_tx, url_rx) = mpsc::channel::<String>();
     let handle = thread::spawn(move || {
         launch_session(staged, move |url| {
@@ -340,7 +342,7 @@ fn launch(exports: Option<&str>, responses: usize) -> Capsule {
 
     Capsule {
         project,
-        session_dir,
+        records_dir,
         url,
         handle: Some(handle),
         _home: home,
@@ -371,6 +373,7 @@ fn achieved_class_here() -> ContainmentClass {
         capsule_runtime::IoMaxReport::default(),
         &std::env::temp_dir().join("murmur-resource-plane-workdir"),
     )
+    .expect("HOME can hold ~/.murmur")
     .achieved_containment
 }
 

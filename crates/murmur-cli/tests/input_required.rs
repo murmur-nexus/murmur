@@ -172,11 +172,13 @@ fn stage_agent(
     }
 
     let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
+    common::process_home();
     stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -828,7 +830,7 @@ fn input_required_timeout_transitions_to_failed() {
         ..Default::default()
     };
     let staged = stage_agent(&home, &manifest_path, Some(lifecycle));
-    let trace_path = staged.workdir.join("trace.jsonl");
+    let trace_path = staged.records_dir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -961,7 +963,7 @@ fn input_timeout_fails_the_launch() {
         ..Default::default()
     };
     let staged = stage_agent(&home, &manifest_path, Some(lifecycle));
-    let trace_path = staged.workdir.join("trace.jsonl");
+    let trace_path = staged.records_dir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let handle = std::thread::spawn(move || {

@@ -203,7 +203,7 @@ fn cli_system_prompt_overrides_inline_manifest_prompt() {
     let fixture = CliFixture::new(vec![one_turn_response()]);
     let manifest_path = fixture.write_manifest("  system_prompt: \"Manifest prompt\"\n");
 
-    let workdir = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
+    let records = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
 
     let system_field = fixture.only_system_field();
     assert!(
@@ -219,7 +219,7 @@ fn cli_system_prompt_overrides_inline_manifest_prompt() {
         "system field must not carry the overridden manifest prompt; got:\n{system_field}"
     );
 
-    let start = session_start(&workdir);
+    let start = session_start(&records);
     assert_eq!(start["system_prompt_source"], "cli");
     assert_eq!(start["system_prompt_sha256"], sha256_hex_of("CLI prompt"));
 }
@@ -231,10 +231,10 @@ fn without_the_flag_the_trace_attributes_the_prompt_to_the_manifest() {
     let fixture = CliFixture::new(vec![one_turn_response()]);
     let manifest_path = fixture.write_manifest("  system_prompt: \"Manifest prompt\"\n");
 
-    let workdir = fixture.run_ok(&manifest_path, &[]);
+    let records = fixture.run_ok(&manifest_path, &[]);
 
     assert!(fixture.only_system_field().contains("Manifest prompt"));
-    let start = session_start(&workdir);
+    let start = session_start(&records);
     assert_eq!(start["system_prompt_source"], "manifest");
     assert_eq!(
         start["system_prompt_sha256"],
@@ -249,9 +249,9 @@ fn without_a_prompt_the_trace_records_none() {
     let fixture = CliFixture::new(vec![one_turn_response()]);
     let manifest_path = fixture.write_manifest("");
 
-    let workdir = fixture.run_ok(&manifest_path, &[]);
+    let records = fixture.run_ok(&manifest_path, &[]);
 
-    let start = session_start(&workdir);
+    let start = session_start(&records);
     assert_eq!(start["system_prompt_source"], "none");
     assert!(start["system_prompt_sha256"].is_null());
 }
@@ -264,10 +264,10 @@ fn cli_system_prompt_overrides_a_prompt_file_that_does_not_exist() {
     let fixture = CliFixture::new(vec![one_turn_response()]);
     let manifest_path = fixture.write_manifest("  system_prompt_file: missing-conventions.md\n");
 
-    let workdir = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
+    let records = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
 
     assert!(fixture.only_system_field().contains("CLI prompt"));
-    assert_eq!(session_start(&workdir)["system_prompt_source"], "cli");
+    assert_eq!(session_start(&records)["system_prompt_source"], "cli");
 }
 
 /// Overriding a `system_prompt_artifact` clears the field CLI-side, so the skill is callable in
@@ -307,7 +307,7 @@ fn cli_system_prompt_restores_an_overridden_prompt_artifact_to_the_inventory() {
     let manifest_path = fixture.write_manifest_with_skill_and_bash(&format!(
         "  system_prompt_artifact: local/{SKILL_NAME}\n"
     ));
-    let workdir = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
+    let records = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
 
     let system_field = fixture.first_system_field();
     assert!(system_field.contains("CLI prompt"));
@@ -325,7 +325,7 @@ fn cli_system_prompt_restores_an_overridden_prompt_artifact_to_the_inventory() {
         !murmur_md.contains("bound as system prompt"),
         "MURMUR.md must not still call the skill bound; got:\n{murmur_md}"
     );
-    assert_eq!(session_start(&workdir)["system_prompt_source"], "cli");
+    assert_eq!(session_start(&records)["system_prompt_source"], "cli");
 }
 
 /// A turn that prints the runtime directory's MURMUR.md, then one that ends.
@@ -359,10 +359,10 @@ fn cli_system_prompt_applies_when_the_manifest_declares_no_prompt() {
     let fixture = CliFixture::new(vec![one_turn_response()]);
     let manifest_path = fixture.write_manifest("");
 
-    let workdir = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
+    let records = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
 
     assert!(fixture.only_system_field().contains("CLI prompt"));
-    let start = session_start(&workdir);
+    let start = session_start(&records);
     assert_eq!(start["system_prompt_source"], "cli");
     assert_eq!(start["system_prompt_sha256"], sha256_hex_of("CLI prompt"));
 }
@@ -375,7 +375,7 @@ fn cli_empty_system_prompt_clears_the_manifest_prompt() {
     let fixture = CliFixture::new(vec![one_turn_response()]);
     let manifest_path = fixture.write_manifest("  system_prompt: \"Manifest prompt\"\n");
 
-    let workdir = fixture.run_ok(&manifest_path, &["--system-prompt", "   "]);
+    let records = fixture.run_ok(&manifest_path, &["--system-prompt", "   "]);
 
     let system_field = fixture.only_system_field();
     assert!(system_field.starts_with("[Capsule]\nName:"));
@@ -384,7 +384,7 @@ fn cli_empty_system_prompt_clears_the_manifest_prompt() {
         "an empty override still clears the manifest prompt; got:\n{system_field}"
     );
 
-    let start = session_start(&workdir);
+    let start = session_start(&records);
     assert_eq!(start["system_prompt_source"], "cli");
     assert!(start["system_prompt_sha256"].is_null());
 }
@@ -396,13 +396,13 @@ fn cli_system_prompt_is_trimmed_before_use() {
     let fixture = CliFixture::new(vec![one_turn_response()]);
     let manifest_path = fixture.write_manifest("");
 
-    let workdir = fixture.run_ok(
+    let records = fixture.run_ok(
         &manifest_path,
         &["--system-prompt", "  \n CLI prompt \n\n "],
     );
 
     assert_eq!(
-        session_start(&workdir)["system_prompt_sha256"],
+        session_start(&records)["system_prompt_sha256"],
         sha256_hex_of("CLI prompt")
     );
 }
@@ -414,15 +414,15 @@ fn cli_system_prompt_is_trimmed_before_use() {
 fn trace_records_the_prompt_by_hash_and_stores_it_only_under_content_capture() {
     let fixture = CliFixture::new(vec![one_turn_response()]);
     let manifest_path = fixture.write_manifest("  system_prompt: \"Manifest prompt\"\n");
-    let workdir = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
-    let start = session_start(&workdir);
+    let records = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
+    let start = session_start(&records);
     assert!(
         start.get("system_prompt").is_none(),
         "the verbatim prompt is not a session_start field; got: {start}"
     );
     assert_eq!(start["system_prompt_sha256"], sha256_hex_of("CLI prompt"));
     assert!(
-        !workdir.join("blobs").exists(),
+        !records.join("blobs").exists(),
         "the default capture mode stores no bodies"
     );
 
@@ -431,13 +431,13 @@ fn trace_records_the_prompt_by_hash_and_stores_it_only_under_content_capture() {
         "  system_prompt: \"Manifest prompt\"\n",
         "trace:\n  capture: content\n",
     );
-    let workdir = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
-    let start = session_start(&workdir);
+    let records = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
+    let start = session_start(&records);
     assert!(start.get("system_prompt").is_none());
     let sha = start["system_prompt_sha256"].as_str().unwrap();
     assert_eq!(sha, sha256_hex_of("CLI prompt"));
     assert_eq!(
-        fs::read_to_string(workdir.join("blobs").join(sha)).unwrap(),
+        fs::read_to_string(records.join("blobs").join(sha)).unwrap(),
         "CLI prompt",
         "the resolved prompt is the blob its own hash names"
     );
@@ -630,13 +630,13 @@ impl CliFixture {
         common::install_artifact_to_project(self.project.path(), artifact_path).success();
     }
 
-    /// Runs `mur run --json --task ...` to completion and returns the session workdir.
+    /// Runs `mur run --json --task ...` to completion and returns the session's records directory.
     fn run_ok(&self, manifest_path: &Path, extra_args: &[&str]) -> PathBuf {
         let mut args = vec!["--task", "Say hello.", "--json"];
         args.extend_from_slice(extra_args);
         let assert = mur_run(&self.home, manifest_path, &args).success();
         let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-        parse_workdir_from_json(&stdout)
+        parse_records_from_json(&stdout)
     }
 
     fn requests(&self) -> Vec<Value> {
@@ -663,17 +663,21 @@ fn mur_run(
 }
 
 /// The `--json` launch line is the first parseable JSON object on stdout.
-fn parse_workdir_from_json(stdout: &str) -> PathBuf {
+fn parse_records_from_json(stdout: &str) -> PathBuf {
     let line = stdout
         .lines()
         .find_map(|line| serde_json::from_str::<Value>(line).ok())
         .unwrap_or_else(|| panic!("no JSON launch line in stdout:\n{stdout}"));
-    PathBuf::from(line["workdir"].as_str().expect("workdir in launch JSON"))
+    PathBuf::from(
+        line["records_dir"]
+            .as_str()
+            .expect("records_dir in launch JSON"),
+    )
 }
 
 /// The single `session_start` record of a one-task session.
-fn session_start(workdir: &Path) -> Value {
-    let content = fs::read_to_string(workdir.join("trace.jsonl")).unwrap();
+fn session_start(records_dir: &Path) -> Value {
+    let content = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap();
     let starts: Vec<Value> = content
         .lines()
         .filter(|line| !line.is_empty())

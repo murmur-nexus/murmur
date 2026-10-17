@@ -74,7 +74,7 @@ fn watch_heartbeat_does_not_perturb_event_ids() {
 
     // Put real events in the replay buffer before observing.
     submit_task(&capsule.url, "heartbeat-ids-1", "produce some events");
-    wait_for_task_ends(&capsule.workdir, 1);
+    wait_for_task_ends(&capsule.records_dir, 1);
 
     // Before: too short a connection to have seen a heartbeat.
     let before_conn = open_watch(&capsule.url, 0);

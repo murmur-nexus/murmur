@@ -445,7 +445,8 @@ instance a component imports is `murmur:stream/events@0.1.0`, and Rust bindings 
 ## `murmur:hook/lifecycle`
 
 Hook artifacts (`runtime: hook`) export this interface. The runtime calls each handler
-synchronously. Returning an error logs it to `logs/hook-<name>.log` in the workdir and the
+synchronously. Returning an error logs it to `logs/hook-<name>.log` in the session's
+[records directory](workdir.md#records-directory) and the
 session continues — except at `on-compaction`, where the error ends the session, because the
 runtime has no other way back under the token budget:
 

@@ -367,6 +367,14 @@ pub struct LaunchedChild {
     pub(crate) parent_root: WorkdirRoot,
     /// The session id the child's runtime minted for itself.
     pub session_id: String,
+    /// The child's records directory, as the child reported it on its readiness line: where its
+    /// trace and its `completion.json` are. Never derived from a path inside the parent's
+    /// workdir, whose `.murmur/children/` the parent's commands can replace with a link.
+    pub records_dir: PathBuf,
+    /// [`Self::records_dir`], held, sharing [`Self::parent_root`]'s refusal latch: every read and
+    /// write of the child's `completion.json` goes through it. `None` until the readiness line
+    /// has been read.
+    pub(crate) records_root: Option<WorkdirRoot>,
     /// The child's A2A endpoint, `http://host:port`. Empty for a script capsule, which binds no
     /// port and has already finished by the time it reports.
     pub capsule_url: String,
@@ -404,6 +412,7 @@ impl std::fmt::Debug for LaunchedChild {
         f.debug_struct("LaunchedChild")
             .field("workdir", &self.workdir)
             .field("session_id", &self.session_id)
+            .field("records_dir", &self.records_dir)
             .field("capsule_url", &self.capsule_url)
             .field("delegation_id", &self.delegation_id)
             .field("formation_id", &self.formation_id)
@@ -638,6 +647,8 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         workdir_rel,
         parent_root: request.parent_accessible_root.clone(),
         session_id: String::new(),
+        records_dir: PathBuf::new(),
+        records_root: None,
         capsule_url: String::new(),
         argv,
         env,
@@ -680,6 +691,15 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         .unwrap_or_default();
 
     launched.session_id = session_id.to_string();
+    launched.records_dir = readiness_records_dir(&report, session_id)?;
+    launched.records_root = Some(
+        WorkdirRoot::open_sharing_latch_absolute(&launched.records_dir, &launched.parent_root)
+            .map_err(|error| {
+                RuntimeError::Runtime(format!(
+                    "the child capsule's records directory could not be opened: {error}"
+                ))
+            })?,
+    );
     launched.door_token = readiness_door_token(&report);
     launched.formation_id = report
         .get("formation_id")
@@ -709,6 +729,42 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         }
     }
     Ok(launched)
+}
+
+/// The records directory a child's `--json` readiness line carries under `records_dir`: an
+/// absolute path in this host's `~/.murmur/records`, ending in the child's own session id.
+/// Anything else refuses the delegation rather than reading the child's outcome from somewhere
+/// the line named.
+pub(crate) fn readiness_records_dir(
+    report: &serde_json::Value,
+    session_id: &str,
+) -> Result<PathBuf, RuntimeError> {
+    let refused = |why: String| {
+        RuntimeError::Runtime(format!(
+            "the child capsule's --json line {why}, so its outcome has nowhere to be read from"
+        ))
+    };
+    let reported = report
+        .get("records_dir")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| refused("carried no records_dir".to_string()))?;
+    let records_root = crate::records_dir::records_dir_root()
+        .map_err(|error| refused(format!("named a records directory and this host's {error}")))?;
+    let well_formed = reported.is_absolute()
+        && reported.starts_with(&records_root)
+        && reported.file_name().and_then(|name| name.to_str()) == Some(session_id)
+        && !reported
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir));
+    if !well_formed {
+        return Err(refused(format!(
+            "named {} as its records directory, which is not {}/<workdir root>/{session_id}",
+            reported.display(),
+            records_root.display()
+        )));
+    }
+    Ok(reported)
 }
 
 /// The operator token a child's `--json` readiness line carries under `tokens.operator`, present
@@ -763,8 +819,14 @@ fn watch_for_completion(
     let process = Arc::clone(&launched.process);
     let stderr_tail = Arc::clone(&launched.stderr_tail);
     let workdir = launched.workdir.clone();
-    let workdir_rel = launched.workdir_rel.clone();
-    let root = launched.parent_root.clone();
+    let Some(records_root) = launched.records_root.clone() else {
+        crate::runtime_err!(
+            "[capsule-runtime] delegation {}: the child reported no records directory, so its \
+             completion cannot be watched",
+            handle.delegation_id
+        );
+        return None;
+    };
     let session_id = launched.session_id.clone();
     let capsule_name = capsule_name.to_string();
     let capsule_version = capsule_version.to_string();
@@ -793,7 +855,7 @@ fn watch_for_completion(
         // down from `SIGTERM`. That record is not the outcome: the delegation was ended, and the
         // launcher's record below is written over it.
         let recorded = match ending {
-            Ending::Exited(_) => delegation::read_completion(&root, &workdir_rel),
+            Ending::Exited(_) => delegation::read_completion(&records_root),
             Ending::Deliberate => None,
         };
         if let Some(recorded) = recorded {
@@ -801,7 +863,7 @@ fn watch_for_completion(
                 return;
             }
             let retried =
-                delegation::report_completion(&handle, &address, recorded, &root, &workdir_rel);
+                delegation::report_completion(&handle, &address, recorded, &records_root);
             if !retried.delivered {
                 // One retry, then the file and the line above it are the record.
                 crate::runtime_err!(
@@ -845,14 +907,12 @@ fn watch_for_completion(
                              delegation deadline"
                         ),
                     ),
-                    &root,
-                    &workdir_rel,
+                    &records_root,
                 );
             }
             Ending::Deliberate => {
                 delegation::record_terminated(
-                    &root,
-                    &workdir_rel,
+                    &records_root,
                     outcome(
                         DelegationStatus::Terminated,
                         delegation::PARENT_ENDED_DETAIL.to_string(),
@@ -879,8 +939,7 @@ fn watch_for_completion(
                     &handle,
                     &address,
                     outcome(DelegationStatus::Crashed, detail),
-                    &root,
-                    &workdir_rel,
+                    &records_root,
                 );
             }
         }
@@ -1598,6 +1657,8 @@ mod tests {
             workdir_rel: PathBuf::new(),
             parent_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
             session_id: "ses_child".to_string(),
+            records_dir: PathBuf::new(),
+            records_root: None,
             capsule_url: "http://localhost:1".to_string(),
             argv: Vec::new(),
             env: Vec::new(),
@@ -1768,6 +1829,8 @@ mod tests {
                 workdir_rel: PathBuf::new(),
                 parent_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
                 session_id: "ses_child".to_string(),
+                records_dir: PathBuf::new(),
+                records_root: None,
                 capsule_url: String::new(),
                 argv: Vec::new(),
                 env: Vec::new(),
@@ -1831,6 +1894,8 @@ mod tests {
                 workdir_rel: PathBuf::new(),
                 parent_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
                 session_id: "ses_child".to_string(),
+                records_dir: PathBuf::new(),
+                records_root: None,
                 capsule_url: String::new(),
                 argv: Vec::new(),
                 env: Vec::new(),
@@ -1898,6 +1963,8 @@ mod tests {
             workdir_rel: PathBuf::new(),
             parent_root: WorkdirRoot::open(dir.path()).unwrap(),
             session_id: "ses_child".to_string(),
+            records_dir: dir.path().to_path_buf(),
+            records_root: Some(WorkdirRoot::open(dir.path()).unwrap()),
             capsule_url: String::new(),
             argv: Vec::new(),
             env: Vec::new(),
@@ -1927,9 +1994,8 @@ mod tests {
         child.shutdown().unwrap();
         watcher.join().unwrap();
 
-        let recorded =
-            delegation::read_completion(&WorkdirRoot::open(dir.path()).unwrap(), Path::new(""))
-                .expect("the ending is recorded");
+        let recorded = delegation::read_completion(&WorkdirRoot::open(dir.path()).unwrap())
+            .expect("the ending is recorded");
         assert_eq!(recorded.status, DelegationStatus::Terminated);
         assert_eq!(recorded.reported_by, Reporter::Launcher);
         assert!(!recorded.delivered);
@@ -1973,6 +2039,8 @@ mod tests {
             workdir_rel: PathBuf::new(),
             parent_root: WorkdirRoot::open(dir.path()).unwrap(),
             session_id: "ses_child".to_string(),
+            records_dir: dir.path().to_path_buf(),
+            records_root: Some(WorkdirRoot::open(dir.path()).unwrap()),
             capsule_url: String::new(),
             argv: Vec::new(),
             env: Vec::new(),
@@ -2002,9 +2070,8 @@ mod tests {
 
         child.shutdown().unwrap();
         watcher.join().unwrap();
-        let recorded =
-            delegation::read_completion(&WorkdirRoot::open(dir.path()).unwrap(), Path::new(""))
-                .expect("the ending is recorded");
+        let recorded = delegation::read_completion(&WorkdirRoot::open(dir.path()).unwrap())
+            .expect("the ending is recorded");
         assert_eq!(recorded.status, DelegationStatus::Terminated);
         assert_eq!(recorded.reported_by, Reporter::Launcher);
         assert!(!recorded.delivered);

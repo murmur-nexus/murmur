@@ -251,14 +251,20 @@ impl Project {
             .join(member)
     }
 
+    /// The records group `member` of `formation` keeps its sessions' records in: that of the
+    /// project for the entry member, that of [`Self::member_dir`] for a peer.
+    fn member_records(&self, formation: &str, member: &str) -> PathBuf {
+        let dir = if self.members.iter().any(|m| m.name == member && m.entry) {
+            self.path().to_path_buf()
+        } else {
+            self.member_dir(formation, member)
+        };
+        common::records_group(self.home.path(), &dir)
+    }
+
     /// Every record of the one session `member` of `formation` ran.
     fn trace_of(&self, formation: &str, member: &str) -> Vec<Value> {
-        let root = if self.members.iter().any(|m| m.name == member && m.entry) {
-            self.path().join(".murmur")
-        } else {
-            self.member_dir(formation, member).join(".murmur")
-        };
-        let sessions = session_dirs(&root);
+        let sessions = session_dirs(&self.member_records(formation, member));
         assert_eq!(sessions.len(), 1, "{member}: {sessions:?}");
         read_whole_trace(&sessions[0].join("trace.jsonl"))
     }
@@ -284,7 +290,7 @@ fn records<'a>(trace: &'a [Value], kind: &str) -> Vec<&'a Value> {
         .collect()
 }
 
-/// Block until `member`'s trace under `root` holds a `task_start`.
+/// Block until `member`'s trace in the records group `root` holds a `task_start`.
 fn await_task_start(root: &Path, member: &str) {
     let deadline = Instant::now() + LAUNCH_LIMIT;
     loop {
@@ -357,8 +363,11 @@ fn two_callees_work_at_once_each_in_its_own_directory() {
     // Both callees hold their task before either is answered.
     let worker_dir = project.member_dir(&formation_id, "worker");
     let reviewer_dir = project.member_dir(&formation_id, "reviewer");
-    await_task_start(&worker_dir.join(".murmur"), "worker");
-    await_task_start(&reviewer_dir.join(".murmur"), "reviewer");
+    await_task_start(&project.member_records(&formation_id, "worker"), "worker");
+    await_task_start(
+        &project.member_records(&formation_id, "reviewer"),
+        "reviewer",
+    );
     project.await_requests("worker", 1);
     project.await_requests("reviewer", 1);
     // Each callee was handed its own task, in its own session's runtime directory: nothing is
@@ -480,8 +489,8 @@ fn a_caller_without_egress_is_warned_and_refused() {
         "{result}"
     );
 
-    let lead_session = &session_dirs(&project.path().join(".murmur"))[0];
-    let bootstrap = std::fs::read_to_string(lead_session.join("logs/bootstrap.log")).unwrap();
+    let lead_records = &session_dirs(&project.member_records(&formation_id, "lead"))[0];
+    let bootstrap = std::fs::read_to_string(lead_records.join("logs/bootstrap.log")).unwrap();
     assert_eq!(
         bootstrap.matches("warning[W-RUN-008]").count(),
         1,
@@ -578,8 +587,7 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
         );
         assert!(!continued.contains("the answers are above"), "{continued}");
         let worker_trace = read_whole_trace(
-            &session_dirs(&project.member_dir(&formation_id, "worker").join(".murmur"))[0]
-                .join("trace.jsonl"),
+            &session_dirs(&project.member_records(&formation_id, "worker"))[0].join("trace.jsonl"),
         );
         let task_id = records(&worker_trace, "a2a_task_received")[0]["task_id"]
             .as_str()
@@ -1419,14 +1427,13 @@ fn a_continued_lead_numbers_its_turns_straight_through() {
     assert_eq!(calls[0]["turn"], 0);
     assert_eq!(records(&lead_trace, "task_end")[0]["turns"], 3);
 
-    let workdir = project.path().join(".murmur");
-    let lead_session = &session_dirs(&workdir)[0];
-    let session_id = lead_session.file_name().unwrap().to_str().unwrap();
+    let lead_records = &session_dirs(&project.member_records(&formation_id, "lead"))[0];
+    let session_id = lead_records.file_name().unwrap().to_str().unwrap();
     let mur = |args: &[&str]| {
         let output = Command::new(assert_cmd::cargo::cargo_bin("mur"))
             .arg("trace")
             .args(args)
-            .args([session_id, "--workdir", workdir.to_str().unwrap()])
+            .args([session_id, "--workdir", project.path().to_str().unwrap()])
             .env("HOME", project.home.path())
             .output()
             .unwrap();
@@ -1784,7 +1791,7 @@ fn busy_callee_is_offered_the_task_again_and_both_callers_get_answers() {
     // c's model holds its first task until some caller has been turned away busy.
     let deadline = Instant::now() + LAUNCH_LIMIT;
     while !CALLERS.iter().any(|caller| {
-        session_dirs(&project.member_dir(&formation_id, caller).join(".murmur"))
+        session_dirs(&project.member_records(&formation_id, caller))
             .iter()
             .any(|session| {
                 std::fs::read_to_string(session.join("trace.jsonl"))
@@ -1869,7 +1876,8 @@ fn busy_callee_is_offered_the_task_again_and_both_callers_get_answers() {
 
 // ── Who called whom ───────────────────────────────────────────────────────────
 
-/// Block until some session under `root` has a trace line containing every one of `needles`.
+/// Block until some session in the records group `root` has a trace line containing every one
+/// of `needles`.
 fn await_trace_line(root: &Path, needles: &[&str]) {
     let deadline = Instant::now() + LAUNCH_LIMIT;
     loop {
@@ -2004,9 +2012,8 @@ fn two_tier_formation_trace_names_every_call() {
     }
 
     open_gate.send(()).unwrap();
-    let lead_b_root = project.member_dir(&formation_id, "lead-b").join(".murmur");
     await_trace_line(
-        &lead_b_root,
+        &project.member_records(&formation_id, "lead-b"),
         &[
             "\"event_type\":\"member_call_busy\"",
             "\"member\":\"worker-b4\"",
@@ -2031,14 +2038,11 @@ fn two_tier_formation_trace_names_every_call() {
     println!("lead-b's member_call for worker-b4:\n{}", busy_call[0]);
 
     let mut trace_bytes = 0;
-    let mut roots = vec![project.path().join(".murmur")];
-    for member in project.members.iter().filter(|member| !member.entry) {
-        roots.push(
-            project
-                .member_dir(&formation_id, member.name)
-                .join(".murmur"),
-        );
-    }
+    let roots: Vec<PathBuf> = project
+        .members
+        .iter()
+        .map(|member| project.member_records(&formation_id, member.name))
+        .collect();
     for root in &roots {
         for session in session_dirs(root) {
             trace_bytes += std::fs::metadata(session.join("trace.jsonl"))

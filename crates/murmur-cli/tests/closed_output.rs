@@ -233,9 +233,18 @@ fn head_takes_one_line_from_a_long_report() {
 fn a_closed_stdout_leaves_the_exit_status_alone() {
     let scratch = Scratch::new();
     let sessions = scratch.cwd.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    // `mur trace report --workdir <sessions>` reads the records group `<sessions>` mirrors under
+    // `$HOME/.murmur/records`.
+    let group = scratch
+        .home
+        .path()
+        .join(".murmur")
+        .join("records")
+        .join(sessions.canonicalize().unwrap().strip_prefix("/").unwrap());
     for (id, trace) in [(SESSION_A, FIXTURE_A), (SESSION_B, FIXTURE_B)] {
-        fs::create_dir_all(sessions.join(id)).unwrap();
-        fs::write(sessions.join(id).join("trace.jsonl"), trace).unwrap();
+        fs::create_dir_all(group.join(id)).unwrap();
+        fs::write(group.join(id).join("trace.jsonl"), trace).unwrap();
     }
     let a = scratch.file("trace-a.jsonl", FIXTURE_A);
     let b = scratch.file("trace-b.jsonl", FIXTURE_B);
@@ -289,6 +298,7 @@ fn ps_finishes_pruning_with_both_streams_closed() {
             "capsule_name": "fabricated",
             "capsule_version": "0.1.0",
             "workdir": "/tmp/fabricated",
+            "records_dir": "/tmp/fabricated-records",
             "outlives_launcher": true,
             "started_at": "2026-01-01T00:00:00Z",
         }))

@@ -171,6 +171,7 @@ fn stage_request(project_dir: &Path, manifest: &RuntimeManifest) -> StageRequest
     StageRequest {
         source_supply: None,
         expected_workdir_identity: None,
+        manifest_file: None,
         credentials_file: None,
         manifest_dir: project_dir.to_path_buf(),
         capsule_name: manifest.name.clone(),
@@ -276,6 +277,7 @@ fn staging_refuses_a_native_binary_built_for_another_platform() {
     let registry = Arc::new(LocalRegistry::new(
         home.path().join(".murmur").join("artifacts"),
     ));
+    common::process_home();
     let Err(error) = stage_session(registry, stage_request(project.path(), &manifest)) else {
         panic!("staging a foreign-platform native tool must fail");
     };
@@ -362,6 +364,7 @@ fn staging_and_doctor_name_the_same_platform_for_the_same_bytes() {
     let registry = Arc::new(LocalRegistry::new(
         home.path().join(".murmur").join("artifacts"),
     ));
+    common::process_home();
     let Err(error) = stage_session(registry, stage_request(project.path(), &manifest)) else {
         panic!("staging a foreign-platform native tool must fail");
     };
@@ -401,6 +404,7 @@ fn an_unrecognised_payload_stages_and_doctor_reports_it_unverified() {
     let registry = Arc::new(LocalRegistry::new(
         home.path().join(".murmur").join("artifacts"),
     ));
+    common::process_home();
     let staged = stage_session(registry, stage_request(project.path(), &manifest))
         .expect("an unidentifiable payload must stage");
     assert!(

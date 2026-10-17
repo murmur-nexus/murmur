@@ -518,8 +518,10 @@ impl Drop for MockEndpoint {
 struct E2eCapsule {
     /// `host:port` of the capsule's A2A door.
     url: String,
-    /// The internal session workdir — where `trace.jsonl` and `out/` are written.
+    /// The internal session workdir — where `out/` is written.
     workdir: PathBuf,
+    /// The session's records directory — where `trace.jsonl` is written.
+    records_dir: PathBuf,
     /// The git repository the capsule edits, mounted as its accessible workdir.
     repo: PathBuf,
     /// The context every task in this capsule is sent under, so they share one harness session.
@@ -554,6 +556,7 @@ impl E2eCapsule {
 
         let staged = stage(&home, &manifest_path, &repo);
         let workdir = staged.workdir.clone();
+        let records_dir = staged.records_dir.clone();
         let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
             let _ = launch_session(staged, move |url| {
@@ -567,6 +570,7 @@ impl E2eCapsule {
         Self {
             url,
             workdir,
+            records_dir,
             repo,
             context_id: format!("ctx-{name}"),
             _home: home,
@@ -642,7 +646,7 @@ impl E2eCapsule {
     }
 
     fn trace_records(&self, event_type: &str) -> Vec<Value> {
-        let trace = fs::read_to_string(self.workdir.join("trace.jsonl")).unwrap_or_default();
+        let trace = fs::read_to_string(self.records_dir.join("trace.jsonl")).unwrap_or_default();
         trace
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -661,9 +665,9 @@ impl E2eCapsule {
     ///
     /// `.git` and `.murmur` are skipped. Neither is content a coding task edits: the first is the
     /// repository's own store, and the second is the session workdir the runtime creates under
-    /// the capsule's accessible directory, holding `trace.jsonl` and `out/`. Counting either
-    /// would make "the run wrote only what the tool call asked for" a statement about murmur's
-    /// bookkeeping rather than about the repository.
+    /// the capsule's accessible directory, holding `out/`. Counting either would make "the run
+    /// wrote only what the tool call asked for" a statement about murmur's bookkeeping rather than
+    /// about the repository.
     fn repo_tree(&self) -> Vec<String> {
         let mut found = Vec::new();
         let mut stack = vec![self.repo.clone()];
@@ -789,6 +793,7 @@ fn stage(home: &TempDir, manifest_path: &Path, repo: &Path) -> capsule_runtime::
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),

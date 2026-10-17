@@ -887,10 +887,17 @@ const TEST_APPROVAL: &str = "msa1.APPROVALmustNEVERleakYY88.testsignature";
 /// its working directory beside itself — outside the plan's workdir, so a test that scans the
 /// workdir for token material is scanning what a capsule could actually reach — and prints the
 /// `--json` launch line the parent parses, naming the fake daemon's `/capsule` path as its own
-/// address.
+/// address and a records directory it creates under a scratch `HOME` this stub installs for the
+/// test process, so the parent's check that the directory is under `~/.murmur/records` passes
+/// without touching the developer's own home.
 struct StubMur {
     dir: tempfile::TempDir,
+    records_dir: PathBuf,
+    home_before: Option<std::ffi::OsString>,
 }
+
+/// The session id the stub reports, and the last segment of its records directory.
+const STUB_SESSION: &str = "ses_stub00000000000000000000000";
 
 impl StubMur {
     /// Installs the stub and points [`MUR_BINARY_ENV`] at it. Every caller already holds
@@ -908,6 +915,15 @@ impl StubMur {
     fn install_with(capsule_authority: &str, after_launch_line: &str) -> Self {
         let dir = tempdir().unwrap();
         let record = dir.path().display().to_string();
+        let home = dir.path().join("home");
+        let records_dir = home
+            .join(".murmur")
+            .join("records")
+            .join("stub")
+            .join(STUB_SESSION);
+        let records = records_dir.display().to_string();
+        let home_before = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
         let binary = dir.path().join("mur");
         fs::write(
             &binary,
@@ -919,7 +935,8 @@ impl StubMur {
                  printf '%s' \"$*\" > '{record}/argv.txt'\n\
                  env > '{record}/env.txt'\n\
                  pwd > '{record}/cwd.txt'\n\
-                 printf '{{\"url\":\"{capsule_authority}/capsule\",\"session_id\":\"ses_stub00000000000000000000000\"}}\\n'\n\
+                 mkdir -p '{records}'\n\
+                 printf '{{\"url\":\"{capsule_authority}/capsule\",\"session_id\":\"{STUB_SESSION}\",\"records_dir\":\"{records}\"}}\\n'\n\
                  {after_launch_line}"
             ),
         )
@@ -930,7 +947,11 @@ impl StubMur {
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         }
         std::env::set_var(capsule_runtime::MUR_BINARY_ENV, &binary);
-        Self { dir }
+        Self {
+            dir,
+            records_dir,
+            home_before,
+        }
     }
 
     fn recorded(&self, name: &str) -> String {
@@ -942,6 +963,10 @@ impl StubMur {
 impl Drop for StubMur {
     fn drop(&mut self) {
         std::env::remove_var(capsule_runtime::MUR_BINARY_ENV);
+        match self.home_before.take() {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }
 
@@ -2323,7 +2348,7 @@ fn test_a_cancelled_task_ends_its_capsule_steps_sub_capsule() {
         .collect();
     assert_eq!(children.len(), 1, "{children:?}");
     let completion: Value = serde_json::from_str(
-        &fs::read_to_string(children[0].join("completion.json"))
+        &fs::read_to_string(stub.records_dir.join("completion.json"))
             .expect("the ended child's outcome is recorded"),
     )
     .unwrap();

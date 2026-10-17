@@ -62,6 +62,8 @@ pub fn end_turn_server(texts: &[&str]) -> ScriptedServer {
 pub struct IdleCapsule {
     pub url: String,
     pub workdir: PathBuf,
+    /// The session's records directory, where its trace is.
+    pub records_dir: PathBuf,
     _home: TempDir,
     _server: ScriptedServer,
 }
@@ -112,6 +114,7 @@ pub fn launch_idle_capsule_with_input_timeout(
 
     let staged = stage_agent(&home, &manifest_path, input_timeout_secs);
     let workdir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     // The capsule never exits in queue+sleep, so the join handle is deliberately dropped.
@@ -128,6 +131,7 @@ pub fn launch_idle_capsule_with_input_timeout(
     IdleCapsule {
         url,
         workdir,
+        records_dir,
         _home: home,
         _server: server,
     }
@@ -139,6 +143,8 @@ fn stage_agent(
     input_timeout_secs: Option<u64>,
 ) -> capsule_runtime::StagedSession {
     let runtime_manifest = load_runtime_manifest(manifest_path).unwrap();
+    // The session's records are kept under `$HOME`, which must not be the developer's.
+    super::process_home();
     let mut allowlisted_tools = HashSet::new();
     let mut requested_artifacts = Vec::new();
 
@@ -164,6 +170,7 @@ fn stage_agent(
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -384,11 +391,11 @@ pub fn submit_task(addr: &str, message_id: &str, text: &str) -> String {
         .to_string()
 }
 
-/// Wait until the session trace holds `expected` `task_end` records.
-pub fn wait_for_task_ends(workdir: &Path, expected: usize) {
+/// Wait until the trace in the session's records directory holds `expected` `task_end` records.
+pub fn wait_for_task_ends(records_dir: &Path, expected: usize) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let trace = fs::read_to_string(workdir.join("trace.jsonl")).unwrap_or_default();
+        let trace = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap_or_default();
         if trace.lines().filter(|l| l.contains("\"task_end\"")).count() >= expected {
             return;
         }

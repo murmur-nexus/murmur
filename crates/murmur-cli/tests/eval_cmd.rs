@@ -1,11 +1,23 @@
-use std::fs;
+#[path = "common/mod.rs"]
+mod common;
+
+use std::{fs, path::Path};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+/// The `HOME` every `mur` here runs under: one scratch directory for the process, so a session
+/// written into a workdir root's records group is the one `--workdir` finds.
+fn scratch_home() -> &'static Path {
+    static HOME: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| TempDir::new().unwrap()).path()
+}
+
 fn mur() -> Command {
-    Command::cargo_bin("mur").unwrap()
+    let mut command = Command::cargo_bin("mur").unwrap();
+    command.env("HOME", scratch_home());
+    command
 }
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -408,11 +420,12 @@ fn run_both_explicit_uses_given_paths() {
 //
 // `mur eval` names a session exactly the way `mur trace` does, down to the omission rule.
 
-/// A session directory holding one `eval.jsonl`.
-fn write_session(workdir: &std::path::Path, session_id: &str, content: &str) {
-    let ses_dir = workdir.join(session_id);
-    fs::create_dir_all(&ses_dir).unwrap();
-    fs::write(ses_dir.join("eval.jsonl"), content).unwrap();
+/// A recorded session of the workdir root `workdir` holding one `hooks/eval.jsonl`, the file a
+/// records-granted scoring hook writes.
+fn write_session(workdir: &Path, session_id: &str, content: &str) {
+    let hooks = common::session_records_dir(scratch_home(), workdir, session_id).join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::write(hooks.join("eval.jsonl"), content).unwrap();
 }
 
 /// A workdir holding A (older) and B (newer), so `@2` is A and `@1` is B.

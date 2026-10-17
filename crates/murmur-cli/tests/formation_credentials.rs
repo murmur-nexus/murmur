@@ -24,10 +24,12 @@ const AUTHENTICATED: &str = "network:\n  authentication:\n    scheme: bearer\n";
 const CONSENTS: &str =
     "exports:\n  peer_tasks:\n    accept: true\n  files:\n    root: out\n    mode: read-only\n";
 
-/// One running member: its door, its session directory and its operator token.
+/// One running member: its door, its session directory, its records directory and its operator
+/// token.
 struct Door {
     addr: String,
     workdir: std::path::PathBuf,
+    records_dir: std::path::PathBuf,
     operator: String,
     _project: TempDir,
 }
@@ -50,10 +52,12 @@ fn door(
     );
     let staged = stage_door(home, &project.path().join("murmur.yaml"), member);
     let workdir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
     let operator = staged.door_tokens()[0].1.expose().to_string();
     Door {
         addr: launch_door(staged),
         workdir,
+        records_dir,
         operator,
         _project: project,
     }
@@ -341,7 +345,7 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
     // member's.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let received = loop {
-        let received: Vec<Value> = trace_events(&coder.workdir)
+        let received: Vec<Value> = trace_events(&coder.records_dir)
             .into_iter()
             .filter(|event| event["event_type"] == "a2a_task_received")
             .collect();
@@ -359,15 +363,17 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
         [Some("planner"), None, Some("planner")],
         "{received:?}"
     );
-    let start = &trace_events(&coder.workdir)[0];
+    let start = &trace_events(&coder.records_dir)[0];
     assert_eq!(start["formation_member"], "coder");
     assert_eq!(start["formation_callees"], json!(["reviewer"]));
-    for workdir in [&coder.workdir, &reviewer.workdir, &auditor.workdir] {
-        assert!(
-            common::door_capsule::files_containing(workdir, "mft1.").is_empty(),
-            "{}",
-            workdir.display()
-        );
+    for door in [&coder, &reviewer, &auditor] {
+        for dir in [&door.workdir, &door.records_dir] {
+            assert!(
+                common::door_capsule::files_containing(dir, "mft1.").is_empty(),
+                "{}",
+                dir.display()
+            );
+        }
     }
 }
 

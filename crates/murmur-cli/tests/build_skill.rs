@@ -362,11 +362,13 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
 
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
 
+    common::process_home();
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),

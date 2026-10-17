@@ -263,11 +263,12 @@ fn run_session_with(
     );
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
     let workdir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
     fs::write(workdir.join("task.md"), "Do the thing.").unwrap();
 
     launch_session(staged, |_| {}).expect("the session must launch whatever the policy decides");
 
-    let trace_raw = fs::read_to_string(workdir.join("trace.jsonl")).unwrap_or_default();
+    let trace_raw = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap_or_default();
     let trace: Vec<Value> = trace_raw
         .lines()
         .filter(|l| !l.is_empty())

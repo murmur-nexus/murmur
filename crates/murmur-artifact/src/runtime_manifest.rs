@@ -1438,6 +1438,11 @@ pub struct FilesystemCapabilities {
     /// Entries are trimmed and empty ones dropped at parse; path *shape* is judged by the
     /// runtime (`capsule_runtime::protected_paths`), exactly as `scope`'s shape is.
     pub read_only: Vec<String>,
+    /// Whether a `runtime: hook` entry's `"."` is the session's records directory's `hooks/`,
+    /// read-write, in place of a workdir [`Self::scope`], so what the hook writes is outside the
+    /// workdir the capsule's commands write. `false` when the key is absent. Refused at parse on any other role, in the capsule-wide
+    /// block, and beside a `scope` on the same entry.
+    pub records: bool,
 }
 
 /// The `capabilities.task_io` block on a `runtime: hook` artifact entry — the operator's
@@ -2435,6 +2440,9 @@ struct RawFilesystemCapabilities {
     /// same declaration — nothing is protected.
     #[serde(default)]
     read_only: Vec<String>,
+    /// Same defaulting convention as `workdir_exec`.
+    #[serde(default)]
+    records: bool,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -3019,7 +3027,7 @@ impl RawBlock for RawPeerFetchCapabilities {
 }
 
 impl RawBlock for RawFilesystemCapabilities {
-    const KNOWN_KEYS: &'static [&'static str] = &["scope", "workdir_exec", "read_only"];
+    const KNOWN_KEYS: &'static [&'static str] = &["scope", "workdir_exec", "read_only", "records"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
@@ -3500,6 +3508,44 @@ impl RuntimeManifest {
                                 ),
                             });
                         }
+                        // `filesystem.records` replaces a hook's workdir scope with the records
+                        // directory's `hooks/`. Only a hook is preopened that way, and a hook has
+                        // one `"."`, so the two declarations cannot both hold.
+                        if let Some(filesystem) = raw_caps
+                            .filesystem
+                            .as_ref()
+                            .filter(|filesystem| filesystem.records)
+                        {
+                            if runtime != ArtifactRuntime::Hook {
+                                return Err(RuntimeManifestError::InvalidArtifact {
+                                    index,
+                                    message: format!(
+                                        "artifact '{name}' declares \
+                                         'capabilities.filesystem.records: true' but has \
+                                         'runtime: {}'; the key gives a hook the records \
+                                         directory's hooks/ and is only recognized on \
+                                         'runtime: hook' entries",
+                                        runtime.as_str()
+                                    ),
+                                });
+                            }
+                            if filesystem
+                                .scope
+                                .as_deref()
+                                .is_some_and(|scope| !scope.trim().is_empty())
+                            {
+                                return Err(RuntimeManifestError::InvalidArtifact {
+                                    index,
+                                    message: format!(
+                                        "artifact '{name}' declares both \
+                                         'capabilities.filesystem.records: true' and \
+                                         'capabilities.filesystem.scope'; a hook's \".\" is \
+                                         either the records directory's hooks/ or a workdir \
+                                         scope — declare one"
+                                    ),
+                                });
+                            }
+                        }
                         // `conversation` grants the `murmur:conversation/read` host import, on the
                         // same terms as `task_io` above: only a hook component's world can import
                         // it, so on any other role the grant would be silently inert.
@@ -3615,6 +3661,21 @@ impl RuntimeManifest {
         {
             return Err(RuntimeManifestError::InvalidCapabilities {
                 field: "capabilities.task_io".to_string(),
+                message: "is recognized only on 'runtime: hook' artifact entries, not in the \
+                          capsule-wide capabilities block — the grant is per-hook"
+                    .to_string(),
+            });
+        }
+        // `filesystem.records` names a hook's preopen, and the capsule-wide block preopens nothing
+        // for any hook. Refused rather than ignored, on the `task_io` block's terms.
+        if raw
+            .capabilities
+            .as_ref()
+            .and_then(|caps| caps.filesystem.as_ref())
+            .is_some_and(|filesystem| filesystem.records)
+        {
+            return Err(RuntimeManifestError::InvalidCapabilities {
+                field: "capabilities.filesystem.records".to_string(),
                 message: "is recognized only on 'runtime: hook' artifact entries, not in the \
                           capsule-wide capabilities block — the grant is per-hook"
                     .to_string(),
@@ -4466,6 +4527,8 @@ fn parse_capabilities(
                     (!trimmed.is_empty()).then(|| trimmed.to_string())
                 })
                 .collect(),
+            // Where it is recognized is decided by the caller, which knows the entry's role.
+            records: raw_filesystem.records,
         });
 
     let shell = raw_caps
@@ -7870,6 +7933,87 @@ capabilities:
                 "{runtime} entry: error was: {msg}"
             );
         }
+    }
+
+    // ── capabilities.filesystem.records (per-hook, honored only on runtime: hook) ──
+
+    /// A capsule manifest with one artifact entry carrying `capabilities: filesystem: <block>`.
+    fn manifest_with_filesystem(runtime: &str, block: &str) -> String {
+        format!(
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/thing\n    version: 0.1.0\n    \
+             runtime: {runtime}\n    capabilities:\n      filesystem:\n{block}"
+        )
+    }
+
+    /// `records: true` on a hook entry grants it; absent, it is `false`.
+    #[test]
+    fn filesystem_records_on_a_hook_entry_parses() {
+        let manifest = RuntimeManifest::from_yaml_str(&manifest_with_filesystem(
+            "hook",
+            "        records: true\n",
+        ))
+        .expect("records on a hook entry parses");
+        let filesystem = manifest.artifacts[0]
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .filesystem
+            .as_ref()
+            .unwrap();
+        assert!(filesystem.records);
+        assert_eq!(filesystem.scope, None);
+
+        let scoped =
+            RuntimeManifest::from_yaml_str(&manifest_with_filesystem("hook", "        scope: .\n"))
+                .unwrap();
+        let filesystem = scoped.artifacts[0]
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .filesystem
+            .as_ref()
+            .unwrap();
+        assert!(!filesystem.records);
+        assert!(scoped.unknown_keys.is_empty(), "{:?}", scoped.unknown_keys);
+    }
+
+    /// Beside a `scope`, on any other role and in the capsule-wide block, `records: true` is
+    /// refused, naming the field.
+    #[test]
+    fn filesystem_records_is_refused_beside_a_scope_off_a_hook_and_capsule_wide() {
+        let beside = RuntimeManifest::from_yaml_str(&manifest_with_filesystem(
+            "hook",
+            "        records: true\n        scope: .\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            beside.contains("capabilities.filesystem.records"),
+            "{beside}"
+        );
+        assert!(beside.contains("capabilities.filesystem.scope"), "{beside}");
+        for runtime in ["tool", "driver"] {
+            let off_hook = RuntimeManifest::from_yaml_str(&manifest_with_filesystem(
+                runtime,
+                "        records: true\n",
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                off_hook.contains("capabilities.filesystem.records"),
+                "{off_hook}"
+            );
+            assert!(off_hook.contains("runtime: hook"), "{off_hook}");
+        }
+        let capsule_wide = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\ncapabilities:\n  filesystem:\n    records: true\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            capsule_wide.contains("capabilities.filesystem.records"),
+            "{capsule_wide}"
+        );
     }
 
     /// The capsule-wide block reaches capsule, tool and driver components, none of which can

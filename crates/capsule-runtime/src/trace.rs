@@ -1695,14 +1695,17 @@ struct DelegationStartEvent {
     version: String,
     /// The session id the child's runtime minted for itself.
     child_session_id: String,
-    /// The child's directory, relative to this capsule's accessible workdir — join the two to
-    /// reach the child's own `trace.jsonl`.
+    /// The child's directory, relative to this capsule's accessible workdir.
     child_workdir: String,
+    /// The child's records directory, absolute, as the child reported it: its own `trace.jsonl`
+    /// and `completion.json` are there.
+    child_records_dir: String,
 }
 
 impl DelegationStartEvent {
     /// The one place this record is built, so the two appenders that write it cannot drift into
     /// two shapes. Which surface launched the child is not an argument, because it is not a field.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         session_id: &str,
         session_event_id: &str,
@@ -1711,6 +1714,7 @@ impl DelegationStartEvent {
         version: &str,
         child_session_id: &str,
         child_workdir: &str,
+        child_records_dir: &str,
     ) -> Self {
         Self {
             event_type: "delegation_start",
@@ -1723,6 +1727,7 @@ impl DelegationStartEvent {
             version: version.to_string(),
             child_session_id: child_session_id.to_string(),
             child_workdir: child_workdir.to_string(),
+            child_records_dir: child_records_dir.to_string(),
         }
     }
 }
@@ -1896,7 +1901,7 @@ impl DelegationEvent {
 impl TraceWriter {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open(
-        workdir: &WorkdirRoot,
+        records_root: &WorkdirRoot,
         session_id: String,
         capsule_name: String,
         capsule_version: String,
@@ -1911,7 +1916,7 @@ impl TraceWriter {
         spawned_by: Option<String>,
         spawn_delegation_id: Option<String>,
     ) -> std::io::Result<Self> {
-        let file = File::from_std(workdir.open_append(TRACE_FILE_NAME, DEFAULT_FILE_MODE)?);
+        let file = File::from_std(records_root.open_append(TRACE_FILE_NAME, DEFAULT_FILE_MODE)?);
         // `"cli"` wins over `"none"` when the override cleared the prompt: the operator passed
         // `--system-prompt ""`, which is a decision worth recording, not an absence.
         let system_prompt_source = match (system_prompt_overridden, system_prompt.is_some()) {
@@ -1922,7 +1927,7 @@ impl TraceWriter {
         let system_prompt_sha256 = system_prompt
             .as_ref()
             .map(|prompt| murmur_artifact::sha256_hex(prompt.as_bytes()));
-        let blobs = BlobStore::new(workdir);
+        let blobs = BlobStore::new(records_root);
         // The prompt the operator wrote, kept under the hash `session_start` already carried.
         // Written here rather than at `session_start` because a session writes that frame once
         // per task and the blob is the same one every time.
@@ -3766,11 +3771,11 @@ pub struct ResourceTraceAppender {
 
 impl ResourceTraceAppender {
     pub async fn open(
-        workdir: &WorkdirRoot,
+        records_root: &WorkdirRoot,
         session_id: String,
         session_event_id: String,
     ) -> std::io::Result<Self> {
-        let file = File::from_std(workdir.open_append(TRACE_FILE_NAME, DEFAULT_FILE_MODE)?);
+        let file = File::from_std(records_root.open_append(TRACE_FILE_NAME, DEFAULT_FILE_MODE)?);
         Ok(Self {
             file: tokio::sync::Mutex::new(file),
             session_id,
@@ -3973,6 +3978,7 @@ impl ResourceTraceAppender {
         version: &str,
         child_session_id: &str,
         child_workdir: &str,
+        child_records_dir: &str,
     ) {
         let event = DelegationStartEvent::new(
             &self.session_id,
@@ -3982,6 +3988,7 @@ impl ResourceTraceAppender {
             version,
             child_session_id,
             child_workdir,
+            child_records_dir,
         );
         self.append(&event).await;
     }
@@ -4272,21 +4279,22 @@ pub(crate) struct PriorSessionTraceAppender {
 }
 
 impl PriorSessionTraceAppender {
-    /// `trace` is the prior session's `trace.jsonl`, relative to `sessions_root`. Errors when it
-    /// cannot be read or opened for appending, which the caller reports rather than reporting work
-    /// it could not mark.
+    /// `trace` is the prior session's `trace.jsonl`, relative to `records_group`, the records
+    /// group both sessions keep their records directories in. Errors when it cannot be read or
+    /// opened for appending, which the caller reports rather than reporting work it could not
+    /// mark.
     pub(crate) async fn open(
-        sessions_root: &WorkdirRoot,
+        records_group: &WorkdirRoot,
         trace: &str,
         session_id: String,
         session_event_id: Option<String>,
     ) -> std::io::Result<Self> {
-        let contents = sessions_root
+        let contents = records_group
             .read_file(trace, u64::MAX)?
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
         // An empty file counts as terminated: there is no record for an appended line to run into.
         let terminate_torn_tail = contents.last().is_some_and(|last| *last != b'\n');
-        let file = File::from_std(sessions_root.open_append(trace, DEFAULT_FILE_MODE)?);
+        let file = File::from_std(records_group.open_append(trace, DEFAULT_FILE_MODE)?);
         Ok(Self {
             file,
             session_id,
@@ -4494,11 +4502,11 @@ pub struct PlanTraceAppender {
 
 impl PlanTraceAppender {
     pub fn open(
-        workdir: &WorkdirRoot,
+        records_root: &WorkdirRoot,
         session_id: String,
         session_event_id: String,
     ) -> std::io::Result<Self> {
-        let file = workdir.open_append(TRACE_FILE_NAME, DEFAULT_FILE_MODE)?;
+        let file = records_root.open_append(TRACE_FILE_NAME, DEFAULT_FILE_MODE)?;
         Ok(Self {
             file: std::sync::Mutex::new(file),
             session_id,
@@ -4610,6 +4618,7 @@ impl PlanTraceAppender {
         version: &str,
         child_session_id: &str,
         child_workdir: &str,
+        child_records_dir: &str,
     ) {
         let event = DelegationStartEvent::new(
             &self.session_id,
@@ -4619,6 +4628,7 @@ impl PlanTraceAppender {
             version,
             child_session_id,
             child_workdir,
+            child_records_dir,
         );
         self.append(&event);
     }
@@ -5333,7 +5343,7 @@ mod tests {
                 role: "tool".to_string(),
                 scope: None,
                 surface: crate::containment::PreopenSurface::WholeWorkdir,
-                runtime_dir_read_only: true,
+                runtime_dir_reach: Some(crate::containment::RuntimeDirReach::MurmurRuntime),
             }],
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
             crate::cgroup::IoMaxReport::default(),
@@ -5397,7 +5407,7 @@ mod tests {
                 "role": "tool",
                 "scope": null,
                 "surface": "whole-workdir",
-                "runtime_dir_read_only": true,
+                "runtime_dir_reach": "murmur-runtime",
             }])
         );
         assert_eq!(events[0]["containment_declared"], "scoped");
@@ -7589,9 +7599,23 @@ mod tests {
         .await
         .unwrap();
 
-        plan.write_delegation_start("dlg_abc123", "worker", "0.1.0", "ses_child", ".murmur/c");
-        tool.write_delegation_start("dlg_abc123", "worker", "0.1.0", "ses_child", ".murmur/c")
-            .await;
+        plan.write_delegation_start(
+            "dlg_abc123",
+            "worker",
+            "0.1.0",
+            "ses_child",
+            ".murmur/c",
+            "/r/ses_child",
+        );
+        tool.write_delegation_start(
+            "dlg_abc123",
+            "worker",
+            "0.1.0",
+            "ses_child",
+            ".murmur/c",
+            "/r/ses_child",
+        )
+        .await;
         plan.write_delegation(
             "worker",
             "0.1.0",

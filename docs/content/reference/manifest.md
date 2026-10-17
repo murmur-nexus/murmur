@@ -365,6 +365,14 @@ artifacts:
     runtime: hook
     capabilities:
       state: {}
+
+  # writes its records beside the session's trace, outside the workdir
+  - name: murmur/hook-eval
+    version: 1.0.0
+    runtime: hook
+    capabilities:
+      filesystem:
+        records: true
 ```
 
 | Key | Type | Required | Description |
@@ -372,6 +380,8 @@ artifacts:
 | `task_io.read` | bool | yes | Whether this hook may read the task's input text and the agent's result text through [`murmur:task-io/read`](wit-interfaces.md#murmurtask-ioread). Never inferred: a `task_io:` block that omits it fails with `E-MAN-003`. |
 | `conversation.read` | bool | yes | Whether this hook may read the capsule's [conversation record](workdir.md#the-conversation-record) through [`murmur:conversation/read`](wit-interfaces.md#murmurconversationread). Never inferred: a `conversation:` block that omits it fails with `E-MAN-003`. |
 | `state.store` | string | no | Directory name under `~/.murmur/state/`. Omitted, the capsule name is used. See [Durable state](workdir.md#state-store). |
+| `filesystem.scope` | string | no | A directory of the workdir mounted as the hook's current directory. See the rules below. |
+| `filesystem.records` | bool | no | Mount the session [records directory](workdir.md#records-directory)'s `hooks/` as the hook's current directory, read-write, in place of a `scope`. Default: `false`. Recognized only on a `runtime: hook` entry; declared `true` together with `filesystem.scope`, on any other role, or in the capsule-wide [`capabilities`](#field-capabilities) block, it fails with `E-MAN-003`. |
 
 Rules:
 
@@ -386,6 +396,12 @@ Rules:
   is mounted as the hook's current directory, and is created if missing. Paths outside that subtree
   are unreachable. An absolute scope, or one that escapes the workdir via `..`, fails at launch with
   [`E-CAP-002`](diagnostics.md#e-cap-002) before any hook component is instantiated.
+- **`filesystem.records` keeps what a hook writes out of the commands' reach.** A hook that
+  writes records — `murmur/hook-eval`'s `eval.jsonl` and its own log — declared
+  `records: true` writes them into `hooks/` beside the session's `trace.jsonl`, where the capsule's
+  commands can read them and cannot change them, and where [`mur eval`](cli.md#mur-eval) reads
+  `hooks/eval.jsonl`. The same hook declared `scope: .` writes them into the workdir. It works on
+  every hook binding, on-stage included.
 - **`state` is a second, independent directory grant.** A hook holding one reaches
   `~/.murmur/state/<store>/` as `state/`, alongside — or instead of — the
   `filesystem.scope` directory mounted as `.`. The two do not imply each other in either
@@ -1187,9 +1203,9 @@ these fields are accepted and inert:
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `trace.capture` | `none \| meta \| content` | no | Default: `meta`. How much of each turn's driver request `trace.jsonl` keeps — see the table below. |
-| `trace.retain` { #trace-retain } | block | no | What bounds the [session directories](workdir.md) beside the running one. On a roster's entry member, it also bounds the roster's [formation directories](roster.md#formation-retention). Omitted, nothing is ever deleted. See [Retention](#retention). |
-| `trace.retain.max_sessions` | integer ≥ 1 | no | Session directories to keep, counting the running session itself. The rest are removed whole, taking their `trace.jsonl` and `blobs/` with them. On an entry member, also the project's formation directories to keep, counting the current formation's. |
-| `trace.retain.max_age` | duration | no | Age beyond which a session directory is removed, measured from the millisecond timestamp inside its own uuid-v7 `ses_` id. No file metadata is read. On an entry member, also the age beyond which an ended formation directory is removed, measured from its `frm_` id. |
+| `trace.retain` { #trace-retain } | block | no | What bounds the sessions beside the running one: each session's [records directory](workdir.md#records-directory) and its session workdir, removed together. On a roster's entry member, it also bounds the roster's [formation directories](roster.md#formation-retention). Omitted, nothing is ever deleted. See [Retention](#retention). |
+| `trace.retain.max_sessions` | integer ≥ 1 | no | Sessions to keep in the running session's records group, counting the running session itself. The rest are removed whole: records directory, with its `trace.jsonl` and `blobs/`, and session workdir. On an entry member, also the project's formation directories to keep, counting the current formation's. |
+| `trace.retain.max_age` | duration | no | Age beyond which a session is removed, measured from the millisecond timestamp inside its own uuid-v7 `ses_` id. No file metadata is read. On an entry member, also the age beyond which an ended formation directory is removed, measured from its `frm_` id. |
 
 | `trace.capture` | `inference` content hashes | `blobs/` | `tool_call.output` |
 |---|---|---|---|
@@ -1753,7 +1769,7 @@ observability:
 |---|---|
 | Model visibility | Hook artifacts are not included in the tool inventory or the `MURMUR.md` installed-tool list. |
 | Invocation order | Multiple hooks are invoked in manifest declaration order for each event. |
-| Failure handling | A hook that returns an error does not abort the agent loop. The error is appended to `workdir/logs/hook-<name>.log`. For an `execution_mode: async` hook it is also recorded as a `hook_dispatch_error` event in `trace.jsonl`, since the log is otherwise the only place it appears. A blocking hook's error is additionally surfaced to the agent loop, which is fatal only for compaction. |
+| Failure handling | A hook that returns an error does not abort the agent loop. The error is appended to `logs/hook-<name>.log` in the session's [records directory](workdir.md#records-directory). For an `execution_mode: async` hook it is also recorded as a `hook_dispatch_error` event in `trace.jsonl`, since the log is otherwise the only place it appears. A blocking hook's error is additionally surfaced to the agent loop, which is fatal only for compaction. |
 | Workdir access | A hook sees one directory, and only where its entry in the capsule manifest grants a `filesystem.scope` — see [Hook capabilities](#hook-capabilities). |
 | Reference hook | `murmur/hook-debug` writes one JSON object per event to `workdir/hook-debug.jsonl`. |
 | Call deadline | Each hook lifecycle call gets its own wall-clock budget: `capabilities.limits.deadline_seconds` when the manifest sets it, otherwise 30 seconds — well below the capsule-wide 600-second default, so one wedged hook cannot stall a session for most of ten minutes per event. |
@@ -2126,9 +2142,9 @@ Three stores grow as capsules run:
 
 | Store | Bounded by | Enforced | Each deletion is reported as |
 |---|---|---|---|
-| [Session directories](workdir.md) under the workdir | `trace.retain` | At launch, by the runtime | A [`retention` event](observability-schemas.md#retention) in the running session's trace |
+| Sessions: each [records directory](workdir.md#records-directory) under `~/.murmur/records/` and its session workdir | `trace.retain` | At launch, by the runtime | A [`retention` event](observability-schemas.md#retention) in the running session's trace |
 | [Conversation records](workdir.md#the-conversation-record) under `~/.murmur/conversations/` | `context.retain` | At launch, by the runtime | A `retention` event in the running session's trace |
-| [Formation directories](roster.md#formation-retention) under `~/.murmur/formations/` | The roster entry member's `trace.retain` | At the end of every `mur run --roster`, by the launcher | A `[mur run] retention:` line on the launcher's stderr |
+| [Formation directories](roster.md#formation-retention) under `~/.murmur/formations/`, each with its records subtree under `~/.murmur/records/` | The roster entry member's `trace.retain` | At the end of every `mur run --roster`, by the launcher | A `[mur run] retention:` line on the launcher's stderr |
 
 **There are no defaults. A capsule with no `retain:` block deletes nothing, ever.**
 
@@ -2146,15 +2162,16 @@ seconds.
 
 | Key | Age is measured from | Unit removed |
 |---|---|---|
-| `trace.retain.max_sessions` | — | One session directory, whole |
-| `trace.retain.max_age` | The uuid-v7 timestamp inside the `ses_` id | One session directory, whole |
-| `trace.retain.max_sessions`, on an entry member | — | One formation directory, whole |
-| `trace.retain.max_age`, on an entry member | The uuid-v7 timestamp inside the `frm_` id | One formation directory, whole |
+| `trace.retain.max_sessions` | — | One session, whole: its records directory and its session workdir |
+| `trace.retain.max_age` | The uuid-v7 timestamp inside the `ses_` id | One session, whole |
+| `trace.retain.max_sessions`, on an entry member | — | One formation directory and its records subtree, whole |
+| `trace.retain.max_age`, on an entry member | The uuid-v7 timestamp inside the `frm_` id | One formation directory and its records subtree, whole |
 | `context.retain.max_messages` | — | The oldest messages of one record |
 | `context.retain.max_age` | The last write to `conversation.jsonl` | One context directory, whole |
 
-A session directory is an independent unit — nothing references it and nothing spans two of them
-— so it is removed whole, taking its `trace.jsonl` and its `blobs/` with it. A record is one unit
+A session is an independent unit — nothing references it and nothing spans two of them — so it is
+removed whole: its records directory, with `trace.jsonl` and `blobs/`, and its session workdir. The
+decision is made on the records group's `ses_*` names. A record is one unit
 that grows, so it is trimmed from the front: the newest `max_messages` stay, each keeping the `id`
 it has always carried, and the [header line](workdir.md#record-header) records what went.
 

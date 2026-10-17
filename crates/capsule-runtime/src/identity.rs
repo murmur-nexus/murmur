@@ -6364,6 +6364,9 @@ mod tests {
             version: "0.1.0".to_string(),
             child_session_id: "ses_child".to_string(),
             child_workdir: ".murmur/children/worker-1".to_string(),
+            child_records_dir: std::path::PathBuf::from(
+                "/home/test/.murmur/records/work/ses_child",
+            ),
             started: std::time::Instant::now(),
             child: None,
             arrived: false,

@@ -161,11 +161,13 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
     }
 
     let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
+    common::process_home();
     stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -551,11 +553,13 @@ fn stage_streaming_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtim
         });
     }
     let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
+    common::process_home();
     stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -962,7 +966,7 @@ fn stage_skill_and_tool_agent(endpoint: &str) -> capsule_runtime::StagedSession 
 }
 
 fn trace_events(launched: &capsule_runtime::LaunchResult) -> Vec<Value> {
-    fs::read_to_string(launched.workdir.join("trace.jsonl"))
+    fs::read_to_string(launched.records_dir.join("trace.jsonl"))
         .expect("trace.jsonl should exist")
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())

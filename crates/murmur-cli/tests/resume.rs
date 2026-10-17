@@ -127,12 +127,24 @@ impl Fixture {
     fn session_root(&self) -> PathBuf {
         self.project.path().join("workdir")
     }
+
+    /// The records group of [`Fixture::session_root`], where each session's `trace.jsonl` lands
+    /// and where `--resume` resolves the session it names.
+    fn records_group(&self) -> PathBuf {
+        common::records_group(self.home.path(), &self.session_root())
+    }
 }
 
 /// A launched run's session workdir, read off the line `mur run --verbose` prints.
 fn workdir_of(assert: Assert) -> PathBuf {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     common::parse_workdir_from_stdout(&stdout)
+}
+
+/// A launched run's records directory, read off the line `mur run --verbose` prints.
+fn records_of(assert: Assert) -> PathBuf {
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    common::parse_records_from_stdout(&stdout)
 }
 
 /// The session id a launched run reported, taken off its session directory.
@@ -149,9 +161,9 @@ fn request_text(request: &Value) -> String {
     request["messages"].to_string()
 }
 
-/// The `session_start` line of a session directory's trace.
-fn session_start(session_dir: &Path) -> Value {
-    let content = fs::read_to_string(session_dir.join("trace.jsonl")).unwrap();
+/// The `session_start` line of the trace in a session's records directory.
+fn session_start(records_dir: &Path) -> Value {
+    let content = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap();
     content
         .lines()
         .filter(|line| !line.is_empty())
@@ -176,10 +188,10 @@ fn record_lines(home: &TempDir, context_id: &str) -> Vec<String> {
         .collect()
 }
 
-/// A hand-written session directory holding exactly `lines`, for the cases that need a trace no
-/// real launch produces.
-fn write_session(root: &Path, session_id: &str, lines: &[Value]) {
-    let dir = root.join(session_id);
+/// A hand-written session records directory under the records group `group`, holding a trace of
+/// exactly `lines`, for the cases that need a trace no real launch produces.
+fn write_session(group: &Path, session_id: &str, lines: &[Value]) {
+    let dir = group.join(session_id);
     fs::create_dir_all(&dir).unwrap();
     let body: String = lines
         .iter()
@@ -319,7 +331,8 @@ fn every_address_form_resolves_without_workdir() {
 }
 
 /// The same three address forms under the other layout: `--workdir <dir>` puts sessions at
-/// `<dir>/.murmur/<ses_id>`, and `--resume` has to look there instead.
+/// `<dir>/.murmur/<ses_id>` and their records in `<dir>`'s records group, and `--resume` has to
+/// look in that group instead.
 #[test]
 fn every_address_form_resolves_with_workdir() {
     let f = fixture(
@@ -384,7 +397,7 @@ fn resume_with_context_is_an_error() {
 fn a_session_with_no_task_start_is_an_error() {
     let f = fixture(vec![end_turn("unused")], "", &[]);
     let session = "ses_00000000000000000000000000000001";
-    write_session(&f.session_root(), session, &[session_start_line(session)]);
+    write_session(&f.records_group(), session, &[session_start_line(session)]);
 
     let assert = f.run("second task", &["--resume", session]).failure();
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
@@ -400,7 +413,7 @@ fn a_resolved_context_with_no_record_is_an_error() {
     let f = fixture(vec![end_turn("unused")], "", &[]);
     let session = "ses_00000000000000000000000000000002";
     write_session(
-        &f.session_root(),
+        &f.records_group(),
         session,
         &[
             session_start_line(session),
@@ -498,13 +511,13 @@ fn resume_mode_compact_without_a_hook_is_an_error() {
 fn session_start_carries_resumed_from_and_context_id() {
     let f = fixture(vec![end_turn("first"), end_turn("second")], "", &[]);
 
-    let first_dir = workdir_of(f.run("first task", &[]));
+    let first_dir = records_of(f.run("first task", &[]));
     let first_id = first_dir
         .file_name()
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    let second_dir = workdir_of(f.run("second task", &["--resume", "@1"]));
+    let second_dir = records_of(f.run("second task", &["--resume", "@1"]));
 
     let plain = session_start(&first_dir);
     assert_eq!(plain["resumed_from"], Value::Null);
@@ -603,8 +616,8 @@ fn an_unresolvable_address_reuses_the_existing_trace_errors() {
     // Two sessions sharing a suffix, so the ambiguity is the resolver's to report.
     let one = "ses_0000000000000000000000000000cafe";
     let two = "ses_1111111111111111111111111111cafe";
-    write_session(&f.session_root(), one, &[session_start_line(one)]);
-    write_session(&f.session_root(), two, &[session_start_line(two)]);
+    write_session(&f.records_group(), one, &[session_start_line(one)]);
+    write_session(&f.records_group(), two, &[session_start_line(two)]);
 
     let ambiguous = f.run("second task", &["--resume", "cafe"]).failure();
     let stderr = String::from_utf8(ambiguous.get_output().stderr.clone()).unwrap();
@@ -624,13 +637,13 @@ fn bare_resume_means_at_1_without_workdir() {
         &[],
     );
 
-    let first_dir = workdir_of(f.run("first task", &[]));
+    let first_dir = records_of(f.run("first task", &[]));
     let first_id = first_dir
         .file_name()
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    let second_dir = workdir_of(f.run("second task", &["--resume"]));
+    let second_dir = records_of(f.run("second task", &["--resume"]));
 
     let second = request_text(&f.server.requests()[1]);
     assert!(
@@ -641,9 +654,10 @@ fn bare_resume_means_at_1_without_workdir() {
     drop(f.project);
 }
 
-/// The other workdir layout: `--workdir <dir>` puts sessions at `<dir>/.murmur/<ses_id>`, and a
-/// valueless `--resume` has to find `@1` there. `--workdir` following it also shows that clap
-/// never takes a `--`-prefixed token as the optional value.
+/// The other workdir layout: `--workdir <dir>` puts sessions at `<dir>/.murmur/<ses_id>` and their
+/// records in `<dir>`'s records group, and a valueless `--resume` has to find `@1` there.
+/// `--workdir` following it also shows that clap never takes a `--`-prefixed token as the
+/// optional value.
 #[test]
 fn bare_resume_means_at_1_with_workdir() {
     let f = fixture(
@@ -655,7 +669,7 @@ fn bare_resume_means_at_1_with_workdir() {
     let mount_arg = mount.path().to_str().unwrap();
 
     let first = session_id_of(f.run("first task", &["--workdir", mount_arg]));
-    let second_dir = workdir_of(f.run("second task", &["--resume", "--workdir", mount_arg]));
+    let second_dir = records_of(f.run("second task", &["--resume", "--workdir", mount_arg]));
 
     let second = request_text(&f.server.requests()[1]);
     assert!(second.contains("first task"), "{second}");
@@ -744,7 +758,7 @@ fn a_torn_final_trace_line_still_resumes() {
         &[],
     );
 
-    let first_dir = workdir_of(f.run("first task", &[]));
+    let first_dir = records_of(f.run("first task", &[]));
     let trace = first_dir.join("trace.jsonl");
     let mut content = fs::read_to_string(&trace).unwrap();
     content.push_str(r#"{"event_type":"task_end","session_"#);
@@ -805,7 +819,7 @@ fn a_torn_final_trace_line_still_resumes() {
 fn a_malformed_line_before_the_answer_is_an_error() {
     let f = fixture(vec![end_turn("unused")], "", &[]);
     let session = "ses_00000000000000000000000000000003";
-    let dir = f.session_root().join(session);
+    let dir = f.records_group().join(session);
     fs::create_dir_all(&dir).unwrap();
     let trace = dir.join("trace.jsonl");
     fs::write(
@@ -839,14 +853,14 @@ fn an_unreadable_trace_is_an_io_error() {
     let f = fixture(vec![end_turn("unused")], "", &[]);
     let session = "ses_00000000000000000000000000000004";
     write_session(
-        &f.session_root(),
+        &f.records_group(),
         session,
         &[
             session_start_line(session),
             task_start_line(session, "ctx_unreadable"),
         ],
     );
-    let trace = f.session_root().join(session).join("trace.jsonl");
+    let trace = f.records_group().join(session).join("trace.jsonl");
     fs::set_permissions(&trace, fs::Permissions::from_mode(0o000)).unwrap();
     if fs::read_to_string(&trace).is_ok() {
         // uid 0, or an account holding CAP_DAC_OVERRIDE: the mode bits deny nobody and the

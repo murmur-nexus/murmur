@@ -7,10 +7,10 @@
 //! here panics on a write error.
 //!
 //! A line the stream refused is not discarded where it can be kept: it goes to
-//! `<session workdir>/logs/bootstrap.log` through [`crate::agent::append_bootstrap_log`], the
-//! same file the rest of the runtime's bootstrap diagnostics land in. Before a session workdir
-//! exists there is nowhere else to put it and the line is dropped — the warnings that fire during
-//! staging say so in their own doc comments.
+//! `<records dir>/logs/bootstrap.log` through [`crate::agent::append_bootstrap_log`], the same
+//! file the rest of the runtime's bootstrap diagnostics land in. Before a session's records
+//! directory exists there is nowhere else to put it and the line is dropped — the warnings that
+//! fire during staging say so in their own doc comments.
 //!
 //! Nothing here touches the broken-pipe signal. Rust's default is to ignore it, and that default
 //! is what turns a write to a closed pipe into an `EPIPE` this module can handle rather than an
@@ -41,31 +41,31 @@ pub enum Emitted {
     Written,
     /// The stream refused it and it was appended to `logs/bootstrap.log` instead.
     Logged,
-    /// The stream refused it and no session workdir was armed, so it went nowhere.
+    /// The stream refused it and no records directory was armed, so it went nowhere.
     Dropped,
 }
 
-/// Where a refused line goes. `None` until [`set_diagnostic_workdir`] names a session directory.
+/// Where a refused line goes. `None` until [`set_diagnostic_workdir`] names a records directory.
 ///
 /// Process-wide rather than threaded through every caller: a diagnostic can be raised from a
 /// spawned tokio task or a detached drain thread that holds no handle on the session.
 static FALLBACK_WORKDIR: Mutex<Option<WorkdirRoot>> = Mutex::new(None);
 
-/// Arm the fallback with this session's directory — the one that holds `logs/`, not the user
-/// project directory a capsule sees as `"."`.
+/// Arm the fallback with this session's records directory — the one that holds `logs/`, outside
+/// the workdir a capsule sees as `"."`.
 ///
-/// Called from `runtime::stage_session` as soon as it creates the session directory, and again
+/// Called from `runtime::stage_session` as soon as it creates the records directory, and again
 /// from `runtime::launch` before the session announces itself. Setting it again replaces the
 /// previous value: a process that runs several sessions in sequence sends each session's
 /// refused lines to the session that is currently launching.
-pub fn set_diagnostic_workdir(workdir: &WorkdirRoot) {
+pub fn set_diagnostic_workdir(records_root: &WorkdirRoot) {
     let mut slot = FALLBACK_WORKDIR
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *slot = Some(workdir.clone());
+    *slot = Some(records_root.clone());
 }
 
-/// The armed fallback directory's host path, or `None` when no session workdir exists yet.
+/// The armed fallback directory's host path, or `None` when no records directory exists yet.
 pub fn diagnostic_workdir() -> Option<PathBuf> {
     fallback_root().map(|root| root.path().to_path_buf())
 }

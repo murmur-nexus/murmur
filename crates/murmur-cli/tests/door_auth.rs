@@ -24,8 +24,8 @@ const EXPORTS_YAML: &str = "exports:\n  files:\n    root: out\n    mode: read-on
 
 // ── In-process launch ─────────────────────────────────────────────────────────
 
-fn event_count(workdir: &Path, event: &str) -> usize {
-    trace_events(workdir)
+fn event_count(records_dir: &Path, event: &str) -> usize {
+    trace_events(records_dir)
         .iter()
         .filter(|e| e["event_type"] == event)
         .count()
@@ -76,6 +76,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
     let staged = stage_door(&home, &manifest, None);
     let session_id = staged.session_id.clone();
     let workdir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
     fs::create_dir_all(workdir.join("out")).unwrap();
     fs::write(workdir.join("out").join("report.txt"), "exported").unwrap();
 
@@ -133,7 +134,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
     let refused = rpc(&addr, None, "SendMessage", message("m-none", "hello"));
     assert_refused(&refused, 401, "unauthenticated", &realm);
     std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(event_count(&workdir, "task_start"), 0);
+    assert_eq!(event_count(&records_dir, "task_start"), 0);
 
     // A token this session did not mint, garbage, and two headers: 401 invalid_token.
     for presented in [
@@ -191,7 +192,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
         text.contains("watcher") && text.contains("SendMessage"),
         "{text}"
     );
-    assert_eq!(event_count(&workdir, "task_start"), 0);
+    assert_eq!(event_count(&records_dir, "task_start"), 0);
 
     // In scope, every real error is unchanged.
     let missing = rpc(&addr, Some(&watcher), "GetTask", json!({"id": "tsk_nope"}));
@@ -327,7 +328,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
     assert_ne!(peer.json()["error"], "unauthenticated", "{peer:?}");
 
     // Refusals at the gate write nothing: the one task_start is the operator's task.
-    assert_eq!(event_count(&workdir, "task_start"), 1);
+    assert_eq!(event_count(&records_dir, "task_start"), 1);
 }
 
 #[test]
@@ -491,6 +492,7 @@ fn tokens_stay_out_of_the_session() {
     let run = MurRun::start(home.path(), &manifest, true, &[], &[]);
     let addr = run.url();
     let workdir = std::path::PathBuf::from(run.startup["workdir"].as_str().unwrap());
+    let records_dir = std::path::PathBuf::from(run.startup["records_dir"].as_str().unwrap());
     let tokens: Vec<String> = ["operator", "watcher", "reader"]
         .into_iter()
         .map(|name| run.token(name))
@@ -551,13 +553,18 @@ fn tokens_stay_out_of_the_session() {
         );
     }
 
-    assert!(workdir.join("trace.jsonl").exists());
+    assert!(records_dir.join("trace.jsonl").exists());
     let stderr = run.stderr();
     for token in &tokens {
         assert_eq!(
             common::door_capsule::files_containing(&workdir, token),
             Vec::<std::path::PathBuf>::new(),
             "a session file carries a token"
+        );
+        assert_eq!(
+            common::door_capsule::files_containing(&records_dir, token),
+            Vec::<std::path::PathBuf>::new(),
+            "a session record carries a token"
         );
         assert_eq!(
             common::door_capsule::files_containing(project.path(), token),

@@ -173,10 +173,13 @@ call a member than it holds tasks at once, [`W-ROS-001`](diagnostics.md#w-ros-00
 
 ### Member directories { #member-directories }
 
-| Member | Accessible directory | Sessions |
-|---|---|---|
-| Entry member | The roster's project directory | `<project>/.murmur/<ses_id>/` |
-| Each peer | `~/.murmur/formations/<frm_id>/<member>/` | `~/.murmur/formations/<frm_id>/<member>/.murmur/<ses_id>/` |
+| Member | Accessible directory | Session workdirs | Records directories |
+|---|---|---|---|
+| Entry member | The roster's project directory | `<project>/.murmur/<ses_id>/` | `~/.murmur/records/<project>/<ses_id>/` |
+| Each peer | `~/.murmur/formations/<frm_id>/<member>/` | `~/.murmur/formations/<frm_id>/<member>/.murmur/<ses_id>/` | `~/.murmur/records/<home>/.murmur/formations/<frm_id>/<member>/<ses_id>/` |
+
+`<project>` and `<home>` are those absolute paths without their leading `/` — see
+[Records directory](workdir.md#records-directory).
 
 `~/.murmur/formations/<frm_id>/` also holds `formation.json`, the formation's ownership marker.
 The launcher writes it at mode `0600` before the first peer's directory is made. A roster with no
@@ -212,7 +215,8 @@ ever removed.
 | `max_sessions` | Keep this many of the project's formation directories, newest first, the current formation's included |
 | `max_age` | Remove a formation directory older than this, measured from the time in its `frm_` id |
 
-Both keys apply together: a directory over either limit is removed, whole. The pass runs at the end
+Both keys apply together: a directory over either limit is removed, whole, with its members'
+records under `~/.murmur/records/`. The pass runs at the end
 of every `mur run --roster`, after every member of that launch has stopped, whether the entry
 member ended, the launcher was signalled, or the launch was refused after it started. Each removal
 is one line on stderr, newest first:

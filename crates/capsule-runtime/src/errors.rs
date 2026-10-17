@@ -124,6 +124,16 @@ pub enum RuntimeError {
     #[error("failed to create the runtime directory: {reason}")]
     RuntimeDirUnavailable { reason: String },
 
+    /// `~/.murmur/records/<workdir root>/<session-id>/`, the session's records directory, could not
+    /// be created. `mur` renders it as `E-IO-003`.
+    #[error("failed to create the records directory: {reason}")]
+    RecordsDirUnavailable { reason: String },
+
+    /// `HOME` cannot hold `~/.murmur`, so there is nowhere to put a session's runtime and records
+    /// directories. Checked before anything is created; `mur` renders it as `E-IO-004`.
+    #[error(transparent)]
+    HomeUnusable(#[from] crate::murmur_home::HomeUnusable),
+
     /// A delegated child's `--workdir` is not the directory its parent created: its
     /// `(st_dev, st_ino)` differs from `--workdir-identity`. Nothing was written. `mur` renders it
     /// as `E-RUN-051`.
@@ -284,6 +294,8 @@ pub enum RuntimeError {
         declared: murmur_artifact::ContainmentClass,
         achieved: murmur_artifact::ContainmentClass,
         reason: String,
+        /// Why the floor is unmet, which decides what the operator is told to change.
+        cause: crate::containment::ShortfallCause,
     },
     /// A capsule declares an `exports.files.root` that, once resolved against the session's
     /// accessible workdir, lands somewhere else — the root already exists as a symlink pointing

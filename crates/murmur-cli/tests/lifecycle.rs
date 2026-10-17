@@ -104,11 +104,13 @@ fn stage_agent(
     }
 
     let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
+    common::process_home();
     stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -272,7 +274,7 @@ fn lifecycle_queue_sleep_processes_two_tasks() {
         }),
         None,
     );
-    let workdir_for_thread = staged.workdir.clone();
+    let trace_path = staged.records_dir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let handle = std::thread::spawn(move || {
@@ -310,7 +312,7 @@ fn lifecycle_queue_sleep_processes_two_tasks() {
     // Do NOT rely on idle timeout — queue+sleep capsules wait indefinitely.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let trace = fs::read_to_string(workdir_for_thread.join("trace.jsonl")).unwrap_or_default();
+        let trace = fs::read_to_string(&trace_path).unwrap_or_default();
         let task_end_count = trace.lines().filter(|l| l.contains("\"task_end\"")).count();
         if task_end_count >= 2 {
             let received_count = trace
@@ -327,7 +329,7 @@ fn lifecycle_queue_sleep_processes_two_tasks() {
         assert!(
             std::time::Instant::now() < deadline,
             "timed out waiting for both tasks to complete; trace:\n{}",
-            fs::read_to_string(workdir_for_thread.join("trace.jsonl")).unwrap_or_default()
+            fs::read_to_string(&trace_path).unwrap_or_default()
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -434,8 +436,7 @@ fn lifecycle_queue_runs_the_peer_lane_before_the_background_lane() {
         }),
         None,
     );
-    let workdir_for_thread = staged.workdir.clone();
-    let trace_path = workdir_for_thread.join("trace.jsonl");
+    let trace_path = staged.records_dir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let handle = std::thread::spawn(move || {
@@ -797,7 +798,7 @@ fn lifecycle_a_detached_command_completes_as_a_background_task() {
         }),
         None,
     );
-    let trace_path = staged.workdir.join("trace.jsonl");
+    let trace_path = staged.records_dir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -890,7 +891,7 @@ fn lifecycle_a_completion_waits_behind_a_peer_request() {
         }),
         None,
     );
-    let trace_path = staged.workdir.join("trace.jsonl");
+    let trace_path = staged.records_dir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -940,27 +941,28 @@ fn lifecycle_a_completion_waits_behind_a_peer_request() {
     assert_eq!(starts[2]["lane"], "bg");
 }
 
-/// The abandonment report block in `logs/bootstrap.log`, or `None` if the sweep wrote none.
+/// The abandonment report block in the session's `logs/bootstrap.log` under `records_dir`, or
+/// `None` if the sweep wrote none.
 ///
 /// Read from `bootstrap.log` rather than `trace.jsonl` on purpose: under `after_task: exit` there
 /// is no turn left to tell the agent in, so the operator's surfaces are the whole delivery.
-fn abandonment_report(workdir: &Path) -> Option<String> {
-    let log = fs::read_to_string(workdir.join("logs").join("bootstrap.log")).ok()?;
+fn abandonment_report(records_dir: &Path) -> Option<String> {
+    let log = fs::read_to_string(records_dir.join("logs").join("bootstrap.log")).ok()?;
     let start = log.find("background shell command")?;
     Some(log[start..].to_string())
 }
 
 /// Block until `logs/bootstrap.log` holds an abandonment report, or fail naming what it does hold.
-fn wait_for_abandonment_report(workdir: &Path, seconds: u64) -> String {
+fn wait_for_abandonment_report(records_dir: &Path, seconds: u64) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
     loop {
-        if let Some(report) = abandonment_report(workdir) {
+        if let Some(report) = abandonment_report(records_dir) {
             return report;
         }
         assert!(
             std::time::Instant::now() < deadline,
             "timed out waiting for an abandonment report; logs/bootstrap.log holds: {}",
-            fs::read_to_string(workdir.join("logs").join("bootstrap.log")).unwrap_or_default()
+            fs::read_to_string(records_dir.join("logs").join("bootstrap.log")).unwrap_or_default()
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -994,8 +996,8 @@ fn lifecycle_a_command_still_running_at_exit_is_reported_to_the_operator() {
         }),
         None,
     );
-    let workdir = staged.workdir.clone();
-    let trace_path = workdir.join("trace.jsonl");
+    let records_dir = staged.records_dir.clone();
+    let trace_path = records_dir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -1021,7 +1023,7 @@ fn lifecycle_a_command_still_running_at_exit_is_reported_to_the_operator() {
         .expect("a demoted command carries its work id")
         .to_string();
 
-    let report = wait_for_abandonment_report(&workdir, 120);
+    let report = wait_for_abandonment_report(&records_dir, 120);
     assert!(report.contains(&work_id), "report was: {report}");
     assert!(report.contains("bash"), "report was: {report}");
     assert!(
@@ -1067,8 +1069,8 @@ fn lifecycle_a_command_inside_the_grace_period_is_reported_nowhere() {
         }),
         None,
     );
-    let workdir = staged.workdir.clone();
-    let trace_path = workdir.join("trace.jsonl");
+    let records_dir = staged.records_dir.clone();
+    let trace_path = records_dir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -1098,7 +1100,7 @@ fn lifecycle_a_command_inside_the_grace_period_is_reported_nowhere() {
     assert!(events_named(&events, "shell_detached").is_empty());
     assert!(events_named(&events, "shell_abandoned").is_empty());
     assert_eq!(
-        abandonment_report(&workdir),
+        abandonment_report(&records_dir),
         None,
         "nothing was discarded, so nothing is reported"
     );
@@ -1141,7 +1143,8 @@ fn lifecycle_a_command_that_finished_during_teardown_is_reported_with_its_result
         None,
     );
     let workdir = staged.workdir.clone();
-    let trace_path = workdir.join("trace.jsonl");
+    let records_dir = staged.records_dir.clone();
+    let trace_path = records_dir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -1159,7 +1162,7 @@ fn lifecycle_a_command_that_finished_during_teardown_is_reported_with_its_result
         &message_send_body("task-build", "run the build"),
     );
 
-    let report = wait_for_abandonment_report(&workdir, 180);
+    let report = wait_for_abandonment_report(&records_dir, 180);
     assert!(
         report.contains("state: finished during teardown after"),
         "report was: {report}"
@@ -1267,8 +1270,8 @@ fn lifecycle_queue_exit_ends_as_soon_as_its_task_md_task_does() {
         "mur run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
-    let workdir = common::parse_workdir_from_stdout(&stdout);
-    let events = read_trace(&workdir.join("trace.jsonl"));
+    let records_dir = common::parse_records_from_stdout(&stdout);
+    let events = read_trace(&records_dir.join("trace.jsonl"));
     let held = millis_from_task_end_to_session_end(&events);
     assert!(
         held < 5_000,
@@ -1329,8 +1332,8 @@ fn lifecycle_queue_exit_task_md_still_reports_discarded_shell_work() {
         None,
     );
     fs::write(staged.accessible_workdir.join("task.md"), "Run the build.").unwrap();
-    let workdir = staged.workdir.clone();
-    let trace_path = workdir.join("trace.jsonl");
+    let records_dir = staged.records_dir.clone();
+    let trace_path = records_dir.join("trace.jsonl");
 
     std::thread::spawn(move || {
         let _ = launch_session(staged, |_| {});
@@ -1344,7 +1347,7 @@ fn lifecycle_queue_exit_task_md_still_reports_discarded_shell_work() {
         .expect("a demoted command carries its work id")
         .to_string();
 
-    let report = wait_for_abandonment_report(&workdir, 60);
+    let report = wait_for_abandonment_report(&records_dir, 60);
     assert!(report.contains(&work_id), "report was: {report}");
     assert!(report.contains("bash"), "report was: {report}");
     assert!(
@@ -1413,8 +1416,8 @@ fn lifecycle_a_launch_that_receives_no_task_ends_without_calling_the_model() {
             "{lifecycle_args:?}: nothing was sent to the model"
         );
 
-        let workdir = common::parse_workdir_from_stdout(&stdout);
-        let events = read_trace(&workdir.join("trace.jsonl"));
+        let records_dir = common::parse_records_from_stdout(&stdout);
+        let events = read_trace(&records_dir.join("trace.jsonl"));
         assert!(events_named(&events, "inference").is_empty());
         assert!(events_named(&events, "task_start").is_empty());
         let session_end = events_named(&events, "session_end");
@@ -1443,8 +1446,8 @@ fn lifecycle_a_blank_task_is_never_sent_to_the_model() {
     );
     assert_eq!(server.requests().len(), 0, "nothing was sent to the model");
 
-    let workdir = common::parse_workdir_from_stdout(&stdout);
-    let events = read_trace(&workdir.join("trace.jsonl"));
+    let records_dir = common::parse_records_from_stdout(&stdout);
+    let events = read_trace(&records_dir.join("trace.jsonl"));
     assert_eq!(events_named(&events, "task_start").len(), 1);
     let task_ends = events_named(&events, "task_end");
     assert_eq!(task_ends.len(), 1);
@@ -1463,7 +1466,7 @@ fn lifecycle_a_blank_untrusted_message_is_never_sent_to_the_model() {
     common::consent_to_peer_tasks(&manifest_path);
 
     let staged = stage_agent(&home, &manifest_path, None, None);
-    let trace_path = staged.workdir.join("trace.jsonl");
+    let trace_path = staged.records_dir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let handle = std::thread::spawn(move || {
@@ -1670,9 +1673,11 @@ fn assert_sole_rejection<'a>(events: &'a [Value], task_id: &str, cause: &str) ->
 fn lifecycle_a_task_queued_behind_an_exit_task_is_rejected_when_the_session_closes() {
     let (server, arrived, release) = held_provider(end_turn_response("msg_1", "done"));
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
+    // Before staging, so the session's records land under the home `mur trace show` reads below.
+    let process_home = common::process_home();
     let staged = stage_agent(&home, &manifest_path, Some(queue_exit_lifecycle()), None);
     fs::write(staged.accessible_workdir.join("task.md"), "Say done.").unwrap();
-    let trace_path = staged.workdir.join("trace.jsonl");
+    let trace_path = staged.records_dir.join("trace.jsonl");
     let session_id = staged.session_id.clone();
     let sessions_root = staged.workdir.parent().unwrap().to_path_buf();
 
@@ -1726,7 +1731,7 @@ fn lifecycle_a_task_queued_behind_an_exit_task_is_rejected_when_the_session_clos
 
     let shown = assert_cmd::Command::cargo_bin("mur")
         .unwrap()
-        .env("HOME", home.path())
+        .env("HOME", &process_home)
         .args(["trace", "show", &session_id, "--workdir"])
         .arg(&sessions_root)
         .output()
@@ -1771,7 +1776,7 @@ fn lifecycle_a_rejected_task_reads_rejected_over_tasks_get() {
 
     let staged = stage_agent(&home, &manifest_path, Some(queue_exit_lifecycle()), None);
     fs::write(staged.accessible_workdir.join("task.md"), "Say done.").unwrap();
-    let trace_path = staged.workdir.join("trace.jsonl");
+    let trace_path = staged.records_dir.join("trace.jsonl");
 
     let (handle, capsule_url) = launch_in_background(staged);
     arrived
@@ -1854,7 +1859,7 @@ fn lifecycle_single_exit_rejects_the_task_it_accepted_during_its_task_md_task() 
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path, None, None);
     fs::write(staged.accessible_workdir.join("task.md"), "Say done.").unwrap();
-    let trace_path = staged.workdir.join("trace.jsonl");
+    let trace_path = staged.records_dir.join("trace.jsonl");
 
     let (handle, capsule_url) = launch_in_background(staged);
     arrived
@@ -1891,7 +1896,7 @@ fn lifecycle_a_failed_exit_task_still_rejects_what_queued_behind_it() {
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path, Some(queue_exit_lifecycle()), None);
     fs::write(staged.accessible_workdir.join("task.md"), "Say done.").unwrap();
-    let trace_path = staged.workdir.join("trace.jsonl");
+    let trace_path = staged.records_dir.join("trace.jsonl");
 
     let (handle, capsule_url) = launch_in_background(staged);
     arrived
@@ -2027,8 +2032,8 @@ fn lifecycle_queue_depth_zero_under_single_still_runs() {
         output.status.success(),
         "mur run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let workdir = common::parse_workdir_from_stdout(&stdout);
-    let events = read_trace(&workdir.join("trace.jsonl"));
+    let records_dir = common::parse_records_from_stdout(&stdout);
+    let events = read_trace(&records_dir.join("trace.jsonl"));
     assert_eq!(events_named(&events, "task_end").len(), 1);
     assert_eq!(events_named(&events, "session_end")[0]["exit_status"], "ok");
     assert_eq!(server.requests().len(), 1);

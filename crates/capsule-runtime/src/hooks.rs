@@ -102,8 +102,9 @@ const FAULT_ARM_TIMEOUT: &str = "timeout";
 pub(crate) const FAULT_ARM_SEED_REJECTED: &str = "seed-rejected";
 
 pub(crate) struct HookRuntime {
-    /// Session directory — used for error log paths and mounted as "." in hook WASI contexts.
-    workdir: WorkdirRoot,
+    /// The session's records directory, which every hook fault and `logs/hook-<name>.log` line
+    /// is written through.
+    records_root: WorkdirRoot,
     blocking_hooks: Vec<HookInstance>,
     /// One entry per `execution_mode: async` hook: its queue and the worker draining it. The
     /// instance itself lives inside that worker, instantiated once at [`Self::new`] exactly
@@ -682,9 +683,11 @@ pub(crate) struct HookEnvVars<'a> {
 ///
 /// Called from `stage_session` which may be in a sync context; this function is sync
 /// and uses a temporary current-thread runtime internally.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_stage(
     engine: &wasmtime::Engine,
     workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     runtime_root: &WorkdirRoot,
     staged_hooks: &[StagedHookArtifact],
     shell_allow: Vec<String>,
@@ -711,7 +714,17 @@ pub(crate) fn dispatch_stage(
     rt.block_on(async {
         let evt = StageEvent { shell_allow };
         for staged in &matching {
-            match call_stage_once(engine, workdir, staged, &evt, env_vars, limits).await {
+            match call_stage_once(
+                engine,
+                workdir,
+                records_root,
+                staged,
+                &evt,
+                env_vars,
+                limits,
+            )
+            .await
+            {
                 // `on-stage` runs during staging, before `trace.jsonl` exists, so an
                 // unsupported-arm fault here is logged but never traced — unlike the
                 // shared `dispatch` path. The honored arm is decided by the same
@@ -729,7 +742,7 @@ pub(crate) fn dispatch_stage(
                                     DEFAULT_FILE_MODE,
                                 ) {
                                     log_hook_error(
-                                        workdir,
+                                        records_root,
                                         &staged.name,
                                         &format!(
                                             "failed to write manifest for {}: {e}",
@@ -743,7 +756,7 @@ pub(crate) fn dispatch_stage(
                     }
                     OutputDisposition::Fault(arm) => {
                         log_hook_error(
-                            workdir,
+                            records_root,
                             &staged.name,
                             &format_dispatch_fault(&staged.name, "on-stage", arm),
                         )
@@ -751,7 +764,7 @@ pub(crate) fn dispatch_stage(
                     }
                     OutputDisposition::Ignore => {}
                 },
-                Err(err) => log_hook_error(workdir, &staged.name, &err).await,
+                Err(err) => log_hook_error(records_root, &staged.name, &err).await,
             }
         }
         Ok(())
@@ -761,6 +774,7 @@ pub(crate) fn dispatch_stage(
 async fn call_stage_once(
     engine: &wasmtime::Engine,
     workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     staged: &StagedHookArtifact,
     evt: &StageEvent,
     env_vars: &HookEnvVars<'_>,
@@ -794,7 +808,7 @@ async fn call_stage_once(
         staged
             .grant
             .conversation_read
-            .then(|| Arc::new(ConversationState::new(None, workdir))),
+            .then(|| Arc::new(ConversationState::new(None, records_root))),
     )?;
     // Counting text reaches nothing, so the counter is defined on every linker
     // with no grant to consult.
@@ -894,7 +908,7 @@ impl HookRuntime {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         engine: &wasmtime::Engine,
-        workdir: &WorkdirRoot,
+        records_root: &WorkdirRoot,
         accessible_workdir: &Path,
         staged_hooks: Vec<StagedHookArtifact>,
         context: SessionContextData,
@@ -908,7 +922,7 @@ impl HookRuntime {
         let (fault_tx, fault_rx) = mpsc::unbounded_channel();
         let host_state = HookHostState {
             task_io: Arc::new(TaskIoState::new()),
-            conversation: Arc::new(ConversationState::new(conversation_root, workdir)),
+            conversation: Arc::new(ConversationState::new(conversation_root, records_root)),
         };
 
         for staged in staged_hooks {
@@ -931,7 +945,7 @@ impl HookRuntime {
                         instance,
                         rx,
                         context.clone(),
-                        workdir.clone(),
+                        records_root.clone(),
                         fault_tx.clone(),
                     ));
                     async_hooks.push(AsyncHookQueue {
@@ -955,7 +969,7 @@ impl HookRuntime {
         });
 
         Ok(Self {
-            workdir: workdir.clone(),
+            records_root: records_root.clone(),
             blocking_hooks,
             async_hooks,
             fault_tx,
@@ -1084,7 +1098,7 @@ impl HookRuntime {
                      ({ASYNC_HOOK_QUEUE_DEPTH} deep) was full and the capsule manifest declares \
                      'on_overflow: drop' for this hook"
                 );
-                log_hook_error(&self.workdir, &name, &summary).await;
+                log_hook_error(&self.records_root, &name, &summary).await;
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1093,7 +1107,7 @@ impl HookRuntime {
                 Ok(Ok(())) => {}
                 Ok(Err(join_error)) => {
                     let message = format!("hook '{name}' worker task failed: {join_error}");
-                    log_hook_error(&self.workdir, &name, &message).await;
+                    log_hook_error(&self.records_root, &name, &message).await;
                 }
                 Err(_) => {
                     worker.abort();
@@ -1102,7 +1116,7 @@ impl HookRuntime {
                          {}ms session-end drain budget; the remaining calls were abandoned",
                         budget.as_millis()
                     );
-                    log_hook_error(&self.workdir, &name, &message).await;
+                    log_hook_error(&self.records_root, &name, &message).await;
                     self.dispatch_faults.push(DispatchFault {
                         hook_name: name,
                         event: FAULT_EVENT_DRAIN.to_string(),
@@ -1459,7 +1473,7 @@ impl HookRuntime {
         model: Option<String>,
         system_prompt: Option<String>,
     ) -> Result<Option<Vec<Message>>, String> {
-        let workdir = self.workdir.clone();
+        let workdir = self.records_root.clone();
         let event = HookEvent::Compaction {
             messages,
             session_tokens,
@@ -1493,7 +1507,7 @@ impl HookRuntime {
         context_window: u64,
         prior_tokens: u64,
     ) -> Option<HookSeed> {
-        let workdir = self.workdir.clone();
+        let workdir = self.records_root.clone();
         // The task's conversation becomes the one `murmur:conversation/read` answers about, from
         // this dispatch onward: a memory hook bound to `on-task-start` reads the record it is
         // about to seed from.
@@ -1523,7 +1537,7 @@ impl HookRuntime {
         task_id: String,
         exit_status: String,
     ) -> Option<TaskReopen> {
-        let workdir = self.workdir.clone();
+        let workdir = self.records_root.clone();
         let event = HookEvent::TaskEnd {
             task_id,
             exit_status,
@@ -2057,7 +2071,9 @@ async fn run_async_hook_worker(
 ///   guest can only name paths under a preopen. The scope was already validated (relative,
 ///   non-escaping) by `HookCapabilityGrant::derive` at staging time; it is created here if it
 ///   does not exist, and a creation failure fails the instantiation rather than silently
-///   downgrading to no access.
+///   downgrading to no access. A grant declaring `capabilities.filesystem.records: true` instead
+///   preopens the session's records directory's `hooks/` as `"."`, the directory staging created
+///   and named in `grant.records_hooks_dir`; one with no such directory fails the instantiation.
 /// - **Configuration.** One environment variable, [`ARTIFACT_CONFIG_ENV`], added only when
 ///   `grant.config_json` carries one — the `config:` block this hook's own manifest entry
 ///   declared, lowered to compact JSON at staging. It rides the grant rather than
@@ -2120,6 +2136,20 @@ fn build_wasi_ctx(
         builder
             .preopened_dir(&scoped_dir, ".", FsPerms::ReadWrite)
             .map_err(|err| RuntimeError::wasi(scoped_dir, err.to_string()))?;
+    } else if grant.filesystem_records {
+        // Fail closed: a records grant with no staged directory fails the instantiation rather
+        // than preopening anything else as ".".
+        let hooks_dir = grant.records_hooks_dir.as_deref().ok_or_else(|| {
+            RuntimeError::wasi(
+                root_dir.to_path_buf(),
+                "capabilities.filesystem.records is declared, but this session holds no \
+                 records directory to preopen"
+                    .to_string(),
+            )
+        })?;
+        builder
+            .preopened_dir(hooks_dir, ".", FsPerms::ReadWrite)
+            .map_err(|err| RuntimeError::wasi(hooks_dir.to_path_buf(), err.to_string()))?;
     }
 
     if let Some(state_dir) = grant.state_dir.as_deref() {
@@ -2131,19 +2161,19 @@ fn build_wasi_ctx(
     Ok(builder.build())
 }
 
-/// Appends `error` to `logs/hook-<hook_name>.log`. A refused append is on `workdir`'s refusal
-/// latch; nothing else is reported.
+/// Appends `error` to `logs/hook-<hook_name>.log` in the session's records directory. A refused
+/// append is on `records_root`'s refusal latch; nothing else is reported.
 ///
 /// Runs on the blocking pool so the `.await` yields: a checkpoint draining the latch can run
 /// between an async hook worker's calls.
-async fn log_hook_error(workdir: &WorkdirRoot, hook_name: &str, error: &str) {
+async fn log_hook_error(records_root: &WorkdirRoot, hook_name: &str, error: &str) {
     use std::io::Write;
-    let root = workdir.clone();
+    let records_root = records_root.clone();
     let hook_name = hook_name.to_string();
     let line = format!("{error}\n");
     let _ = tokio::task::spawn_blocking(move || {
         if let Ok(mut file) =
-            root.open_append(format!("logs/hook-{hook_name}.log"), DEFAULT_FILE_MODE)
+            records_root.open_append(format!("logs/hook-{hook_name}.log"), DEFAULT_FILE_MODE)
         {
             let _ = file.write_all(line.as_bytes());
         }
@@ -4078,6 +4108,7 @@ mod tests {
             &engine,
             &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
             std::slice::from_ref(&staged),
             Vec::new(),
             &HookEnvVars::default(),
@@ -4114,6 +4145,8 @@ mod tests {
             grant: HookCapabilityGrant {
                 network_allow_rules: Vec::new(),
                 filesystem_scope: None,
+                filesystem_records: false,
+                records_hooks_dir: None,
                 task_io_read,
                 conversation_read: false,
                 state_store: None,
@@ -4152,6 +4185,7 @@ mod tests {
         on_stage.config.binding = HookBinding::OnStage;
         dispatch_stage(
             &engine,
+            &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
             std::slice::from_ref(&on_stage),
@@ -4551,6 +4585,7 @@ mod tests {
                 scope: Some(scope.to_string()),
                 workdir_exec: false,
                 read_only: Vec::new(),
+                records: false,
             }),
             shell: None,
             spawn: None,
@@ -4986,6 +5021,7 @@ mod tests {
         rt.block_on(async {
             let _ = call_stage_once(
                 &engine,
+                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 &staged,
                 &StageEvent {
@@ -5955,6 +5991,7 @@ artifacts:
             &engine,
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             std::slice::from_ref(&staged),
             Vec::new(),
             &HookEnvVars::default(),
@@ -5993,6 +6030,7 @@ artifacts:
 
         dispatch_stage(
             &engine,
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             std::slice::from_ref(&staged),

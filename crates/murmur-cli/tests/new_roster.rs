@@ -438,10 +438,12 @@ fn crew_model(nonce: &str) -> ScriptedServer {
     })
 }
 
-/// Every record of the one session under `root`.
-fn only_trace(root: &Path) -> Vec<Value> {
-    let sessions = common::formation::session_dirs(root);
-    assert_eq!(sessions.len(), 1, "{}: {sessions:?}", root.display());
+/// Every record of the one session whose records are in the records group of `workdir_root`
+/// under `home`.
+fn only_trace(home: &Path, workdir_root: &Path) -> Vec<Value> {
+    let group = common::records_group(home, workdir_root);
+    let sessions = common::formation::session_dirs(&group);
+    assert_eq!(sessions.len(), 1, "{}: {sessions:?}", group.display());
     common::read_whole_trace(&sessions[0].join("trace.jsonl"))
 }
 
@@ -513,7 +515,7 @@ fn the_scaffolded_lead_hands_the_worker_a_task() {
     let readiness: Value = serde_json::from_str(stdout.lines().nth(1).unwrap()).unwrap();
 
     // Lead, under the roster's project.
-    let lead = only_trace(&scratch.path().join("crew/.murmur"));
+    let lead = only_trace(scratch.home.path(), &scratch.path().join("crew"));
     let start = &records(&lead, "session_start")[0];
     assert!(
         start["tools_declared"]
@@ -556,7 +558,7 @@ fn the_scaffolded_lead_hands_the_worker_a_task() {
     assert_eq!(records(&lead, "task_reopened").len(), 0);
 
     // Worker, under its own directory.
-    let worker = only_trace(&worker_dir.join(".murmur"));
+    let worker = only_trace(scratch.home.path(), &worker_dir);
     assert!(!records(&worker, "session_start")[0]["tools_declared"]
         .as_array()
         .unwrap()
@@ -717,8 +719,9 @@ fn a_hand_resume_of_a_members_session_joins_no_formation() {
     let formation: Value = serde_json::from_str(launch.stdout.lines().next().unwrap()).unwrap();
     let formation_id = formation["formation_id"].as_str().unwrap();
 
-    let lead_root = scratch.path().join("crew/.murmur");
-    let lead = only_trace(&lead_root);
+    let crew = scratch.path().join("crew");
+    let lead_records = common::records_group(scratch.home.path(), &crew);
+    let lead = only_trace(scratch.home.path(), &crew);
     let lead_start = records(&lead, "session_start")[0];
     assert_eq!(lead_start["formation_id"], formation_id, "{lead_start}");
     assert!(
@@ -734,7 +737,6 @@ fn a_hand_resume_of_a_members_session_joins_no_formation() {
         .unwrap()
         .to_string();
 
-    let crew = scratch.path().join("crew");
     let mut resume = scratch.command(&[
         "run",
         "--capsule",
@@ -770,7 +772,7 @@ fn a_hand_resume_of_a_members_session_joins_no_formation() {
     assert!(readiness.get("formation_id").is_none(), "{readiness}");
     let session = readiness["session_id"].as_str().unwrap();
     assert_ne!(session, lead_session);
-    let trace = common::read_whole_trace(&lead_root.join(session).join("trace.jsonl"));
+    let trace = common::read_whole_trace(&lead_records.join(session).join("trace.jsonl"));
     let start = records(&trace, "session_start")[0];
     assert_eq!(start["resumed_from"], lead_session.as_str(), "{start}");
     assert_eq!(start["context_id"], lead_context.as_str(), "{start}");
