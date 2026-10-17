@@ -56,7 +56,7 @@ the bare name:
 |---|---|
 | An artifact's own `name:`, the one `mur build` packs | `name: tool-git` |
 | A `source:` entry in `artifacts:` | `- name: style` with `source: ./skills/style` |
-| Inside a session: the tool name the model calls, `workdir/tools/<name>/`, skill names in `MURMUR.md` | `tool-git` |
+| Inside a session: the tool name the model calls, `tools/<name>/` in the [runtime directory](../reference/workdir.md#runtime-directory), skill names in `MURMUR.md` | `tool-git` |
 
 Because a session names each artifact by its bare name, two artifacts a capsule declares cannot
 share one: `murmur/tool-editor` and `ana/tool-editor` together are refused with

@@ -769,6 +769,8 @@ impl ParentConfig {
 struct Parent {
     project: PathBuf,
     session_dir: PathBuf,
+    /// The session's runtime directory, where its tools are installed. Read while the parent runs.
+    runtime_dir: PathBuf,
     url: String,
     server: QueuedServer,
     /// The conversation every task this parent is given runs under, when the case fixed one.
@@ -840,6 +842,7 @@ impl Parent {
             Arc::new(LocalRegistry::new(&suite.registry)),
             StageRequest {
                 source_supply: None,
+                expected_workdir_identity: None,
                 credentials_file: None,
                 // An empty context is a per-message fact, not a launch-scoped one: `--context`
                 // refuses one, while an A2A `contextId` of `""` is taken as the conversation. So
@@ -858,6 +861,7 @@ impl Parent {
         )
         .expect("staging should succeed");
         let session_dir = staged.workdir.clone();
+        let runtime_dir = staged.runtime_dir.clone();
         if let Some(task) = &config.task_md {
             std::fs::write(staged.accessible_workdir.join("task.md"), task).unwrap();
         }
@@ -876,6 +880,7 @@ impl Parent {
         Self {
             project,
             session_dir,
+            runtime_dir,
             url,
             server,
             context_id: fixed_context,
@@ -1099,6 +1104,7 @@ fn stage_request(
 ) -> StageRequest {
     StageRequest {
         source_supply: None,
+        expected_workdir_identity: None,
         credentials_file: None,
         manifest_dir: project.to_path_buf(),
         capsule_name: runtime_manifest.name.clone(),
@@ -1370,11 +1376,11 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     let suite = suite();
     let parent = Parent::launch(PARENT, SPAWN_YAML);
 
-    // The tool the grant put in the workdir, and the enum that is the whole of what stops the
+    // The tool the grant put in the runtime directory, and the enum that is the whole of what stops the
     // model naming a capsule the operator never granted.
     let manifest = std::fs::read_to_string(
         parent
-            .session_dir
+            .runtime_dir
             .join("tools")
             .join("delegate-task")
             .join("murmur.yaml"),
@@ -1702,7 +1708,7 @@ fn delegate_task_offers_the_bare_name_and_spawns_the_full_one() {
 
     let manifest = std::fs::read_to_string(
         parent
-            .session_dir
+            .runtime_dir
             .join("tools")
             .join("delegate-task")
             .join("murmur.yaml"),
@@ -1833,7 +1839,7 @@ fn a_capsule_without_the_grant_is_never_offered_the_tool() {
     // Not in the workdir.
     assert!(
         !parent
-            .session_dir
+            .runtime_dir
             .join("tools")
             .join("delegate-task")
             .exists(),

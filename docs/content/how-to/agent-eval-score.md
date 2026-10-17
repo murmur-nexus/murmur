@@ -199,10 +199,10 @@ Create one task file in the project root:
 
 `task.md`:
 ```text
-Read MURMUR.md, then draft a one-sentence summary of the Murmur project. Reply with only the final sentence.
+Read murmur-runtime/MURMUR.md, then draft a one-sentence summary of the Murmur project. Reply with only the final sentence.
 ```
 
-The task starts with a tool call — the agent reads `MURMUR.md` (the capsule environment reference injected into every workdir) before answering. This is important: `tool_sequence` applies to every case in the dataset, so every case must call the tool. Grounding the task in a file read makes that natural.
+The task starts with a tool call — the agent reads `MURMUR.md` (the capsule environment reference the runtime writes for every agent session, which `tool-editor` reads at `murmur-runtime/MURMUR.md`) before answering. This is important: `tool_sequence` applies to every case in the dataset, so every case must call the tool. Grounding the task in a file read makes that natural.
 
 The same task runs for all four cases — what differs is the `case_id`, which names the scorer each case is primarily meant to verify.
 
@@ -215,7 +215,7 @@ Then create `eval.jsonl`:
 { "case_id": "tool-check",  "task_path": "task.md" }
 ```
 
-Each `task_path` points to a file that is copied into the capsule workdir as `task.md` before the session starts. `exit-check` verifies `success_check` (clean exit); `turns-check` verifies `turn_limit` (read + answer takes two inference turns, well within five); `size-check` verifies `response_size` (MURMUR.md content adds roughly 1200 tokens to the second turn, bringing the total to ~2450, within the 3000-token budget); `tool-check` verifies `tool_order` (the editor was called before the answer).
+Each `task_path` points to a file that is copied to the session's `task.md` before the session starts. `exit-check` verifies `success_check` (clean exit); `turns-check` verifies `turn_limit` (read + answer takes two inference turns, well within five); `size-check` verifies `response_size` (MURMUR.md content adds roughly 1200 tokens to the second turn, bringing the total to ~2450, within the 3000-token budget); `tool-check` verifies `tool_order` (the editor was called before the answer).
 
 The `case_id` is injected into the hook environment as `MURMUR_CASE_ID` and appears in every `dataset_run` record — it's how you identify each case in the output.
 
@@ -240,7 +240,7 @@ mur eval run ./other-capsule --dataset ./other.jsonl        # both explicit
 `mur eval run` runs one capsule session per case, sequentially. For each case it:
 
 1. Stages the session — allocates a per-session workdir (`workdir/ses_xxx/`) and loads artifacts
-2. Copies `task_path` into the session workdir as `task.md`
+2. Copies `task_path` to `task.md` in the session's [runtime directory](../reference/workdir.md#runtime-directory)
 3. Launches the session
 4. Reads `eval.jsonl` from the session workdir (written by the hook at session end)
 5. Prints a result line

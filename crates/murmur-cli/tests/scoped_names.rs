@@ -972,10 +972,11 @@ fn the_model_is_offered_the_bare_tool_name_and_never_a_scope() {
         assert!(!name.contains('/'), "a tool name carries no scope: {name}");
         assert!(!description.contains("murmur/"), "{description}");
     }
-    assert!(workdir
+    // Staged under the bare name in the session's runtime directory, never in the workdir.
+    assert!(!workdir
         .join(".murmur")
         .join(&session)
-        .join("tools/tool-editor/murmur.yaml")
+        .join("tools")
         .exists());
 }
 

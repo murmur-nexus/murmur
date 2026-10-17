@@ -496,6 +496,12 @@ pub struct StageRequest {
     /// `capabilities.install.from: [stores, sources]`. `None` fetches from no source: every pull
     /// is answered by the stores alone.
     pub source_supply: Option<Arc<dyn crate::artifact_supply::SourceSupply>>,
+    /// The `(st_dev, st_ino)` the accessible workdir must have, compared with `fstat` of the
+    /// directory `stage_session` opens at [`Self::workdir`] before anything is written beneath
+    /// it; a mismatch refuses the launch with [`crate::RuntimeError::WorkdirIdentityMismatch`].
+    /// Set by a delegating parent through `mur run --workdir-identity`, for the child directory it
+    /// created. `None` checks nothing.
+    pub expected_workdir_identity: Option<(u64, u64)>,
 }
 
 /// The `transport: process` driver this session runs its harness through, compiled and described
@@ -529,6 +535,19 @@ pub struct StagedSession {
     /// [`Self::workdir`], held open, reached from [`Self::accessible_root`] with no link followed.
     /// The same root as `accessible_root` without `--workdir`.
     pub session_root: crate::workdir_fs::WorkdirRoot,
+    /// The session's runtime directory, `~/.murmur/sessions/<session-id>/runtime`: the value of
+    /// `$MURMUR_RUNTIME_DIR`, holding `MURMUR.md`, `task.md`, `murmur.yaml`, `tools/` and
+    /// `plans/`. Removed when the session ends; the runtime reads and writes beneath it only
+    /// through [`Self::runtime_root`].
+    pub runtime_dir: PathBuf,
+    /// [`Self::runtime_dir`], held open, sharing [`Self::accessible_root`]'s refusal latch.
+    pub runtime_root: crate::workdir_fs::WorkdirRoot,
+    /// The three held directories beneath the session's runtime directory.
+    pub(crate) runtime_dirs: crate::runtime_dir::RuntimeDirRoots,
+    /// Owns the runtime directory: dropping it removes the directory, so it is held until the
+    /// session ends — `launch` takes it and drops it on return, and a `StagedSession` dropped
+    /// unlaunched drops it with itself.
+    pub(crate) runtime_dir_guard: Option<crate::runtime_dir::RuntimeDir>,
     pub(crate) manifest_dir: PathBuf,
     pub(crate) capsule_name: String,
     pub(crate) capsule_version: String,
@@ -636,7 +655,7 @@ pub struct StagedSession {
     /// capsule that declared no `capabilities.filesystem.read_only`.
     pub(crate) protected_paths: crate::protected_paths::ProtectedPaths,
     /// What each staged tool's own `input_schema` declared about where its inputs go, lowered by
-    /// `stage_session` from the manifests it wrote into `<workdir>/tools/`. Empty for a capsule
+    /// `stage_session` from the manifests it wrote into `<runtime dir>/tools/`. Empty for a capsule
     /// that declared no `read_only`, which reads no schema at all, and for one whose tools
     /// annotated nothing.
     pub(crate) tool_annotations: crate::tool_annotations::ToolAnnotationMap,
@@ -701,10 +720,11 @@ pub struct StagedSession {
 }
 
 impl StagedSession {
-    /// Writes `bytes` as the task input, `task.md` in the accessible workdir, with no link
-    /// followed: a link at `task.md` is refused rather than written through.
+    /// Writes `bytes` as the task input, `task.md` in the runtime directory, which the capsule's
+    /// commands can read and not change. A launch with one finds nothing to import from the
+    /// workdir.
     pub fn write_task_input(&self, bytes: &[u8]) -> Result<(), crate::workdir_fs::WorkdirError> {
-        self.accessible_root.write_file(
+        self.runtime_root.write_file(
             crate::runtime::TASK_INPUT_FILE,
             bytes,
             crate::workdir_fs::DEFAULT_FILE_MODE,

@@ -748,9 +748,15 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
     assert_eq!(reports[0]["origin"], "completion");
     assert_eq!(reports[0]["lane"], "bg");
 
-    // The lanes path writes the task's own message to task.md before running it, so this is the
-    // text the agent was handed.
-    let message = fs::read_to_string(resumed_dir.join("task.md")).unwrap();
+    // The text the agent was handed for the report: the user message of the request that
+    // carries it.
+    let message = server
+        .requests()
+        .iter()
+        .map(common::last_user_text)
+        .find(|text| text.contains(work_id.as_str()))
+        .expect("a request carries the loss report");
+    assert!(!resumed_dir.join("task.md").exists());
     for named in [
         work_id.as_str(),
         binary.as_str(),

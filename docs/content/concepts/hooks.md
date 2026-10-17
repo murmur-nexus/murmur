@@ -9,7 +9,7 @@ non-fatal — failures are logged to `workdir/logs/hook-<name>.log` and the sess
 
 | Value | When |
 |---|---|
-| `on-stage` | During `stage_session`, before the agent loop begins. Once per launch. |
+| `on-stage` | During staging, before the agent loop begins. Once per launch. |
 | `on-session-start` | After staging, before the first task's work begins. Once per capsule launch. |
 | `on-task-start` | Before that task's first inference turn. Once per task. |
 | `on-inference` | After each inference response is received. |
@@ -34,7 +34,7 @@ ends. See [Async hook execution](../reference/manifest.md#hook-overflow) for ove
 |---|---|---|
 | `none` | Discards the output | Observability hooks |
 | `replace-context` | Replaces the conversation history | Compaction |
-| `write-manifests` | Writes tool manifest records to `workdir/tools/<binary>/murmur.yaml`, overwriting any existing file | Shell tool enrichment during staging |
+| `write-manifests` | Writes tool manifest records to `tools/<binary>/murmur.yaml` in the session's [runtime directory](../reference/workdir.md#runtime-directory), overwriting any existing file | Shell tool enrichment during staging |
 | `reopen-task` | Continues the task's conversation with the hook's feedback as one new message instead of finalizing it, within the task's turn budget — see [Task reopening](session-loop.md#task-reopening-commit_policy-reopen-task) | Review and retry hooks |
 | `seed-context` | Places the hook's messages at the head of the task's first message list, under the [`context.seed_budget`](../reference/manifest.md#field-context) ceiling — see [Context seeding](session-loop.md#context-seeding-commit_policy-seed-context) | Memory |
 | `deny` | Refuses the shell command or tool call the hook was asked about, before it runs — see [Policy hooks](#policy-hooks) | Guardrails |

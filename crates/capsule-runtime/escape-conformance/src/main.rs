@@ -306,7 +306,7 @@ fn gate(options: &Options, facts: &host::HostFacts, class: ContainmentClass) -> 
     // machine back the class under test? The suite's own probe capsules never declare it, and one
     // that did would be asserting a boundary it had opted out of.
     if let Some(reason) =
-        capsule_runtime::containment_shortfall_reason(class, achieved, sealed_blocker, false)
+        capsule_runtime::containment_shortfall_reason(class, achieved, sealed_blocker, false, None)
     {
         return Err(format!(
             "REFUSED — this host cannot back the class under test.\n\

@@ -279,7 +279,10 @@ fn read_skill_from_zip(zip_path: &Path) -> Result<SkillContents, CliError> {
             .map_err(|e| CliError::new(E_IO_003, format!("zip read error: {e}")))?;
 
         // Root-level entries only: skip anything with a directory separator
-        let entry_name = entry.name().to_string();
+        let entry_name = entry
+            .name()
+            .map_err(|e| CliError::new(E_IO_003, format!("zip read error: {e}")))?
+            .into_owned();
         if entry_name.contains('/') || entry_name.contains('\\') || entry.is_dir() {
             continue;
         }
@@ -512,7 +515,7 @@ mod tests {
         let file = fs::File::open(path).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
         (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
             .collect()
     }
 

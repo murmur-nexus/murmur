@@ -3,7 +3,7 @@
 A skill artifact packages a `skill.md` file — a Markdown document encoding domain knowledge, conventions, or structured guidance — into a `.mur.zip` the runtime installs alongside a capsule. Skills are **callable**: the agent invokes a skill by name (no arguments) and receives its full `skill.md` content as the tool result. No file-read capability is required. This lets you ship guidance independently of any particular capsule and install it into any capsule that benefits from it.
 
 ??? definition "What is a skill artifact?"
-    A **skill artifact** is a `.mur.zip` whose required payload is a single `skill.md` file. Unlike tool artifacts (WASM or native binaries), a skill artifact installs a static guidance file. The runtime writes it to `workdir/tools/<name>/skill.md`, lists it in `MURMUR.md`, and exposes it in the tool inventory as a zero-argument callable. When the agent calls the skill, the runtime reads `skill.md` and returns its content as the tool result — no file-read capability, no subprocess, no WASM. Content is loaded just-in-time, so it only consumes context tokens when the agent chooses to call it.
+    A **skill artifact** is a `.mur.zip` whose required payload is a single `skill.md` file. Unlike tool artifacts (WASM or native binaries), a skill artifact installs a static guidance file. The runtime writes it to `tools/<name>/skill.md` in the session's [runtime directory](../reference/workdir.md#runtime-directory), lists it in `MURMUR.md`, and exposes it in the tool inventory as a zero-argument callable. When the agent calls the skill, the runtime reads `skill.md` and returns its content as the tool result — no file-read capability, no subprocess, no WASM. Content is loaded just-in-time, so it only consumes context tokens when the agent chooses to call it.
 
 The relevant manifest options are:
 
@@ -45,7 +45,7 @@ Key points:
 - **No `version:` needed.** A local file has no registry version — the runtime labels it `local`. If you do set `version:`, it is ignored with a warning.
 - **Relative paths resolve against the manifest's directory**, not your shell's working directory. Absolute paths work too.
 - **`source:` is skill-only.** Putting it on a `tool`, `driver`, or `hook` artifact is a manifest error (`E-MAN-003`) caught before launch.
-- **Everything downstream is unchanged.** The skill installs to `workdir/tools/<name>/skill.md` and appears in the tool inventory and `MURMUR.md` exactly as a registry skill would be — the agent calls it by name the same way (see [Step 4](#step-4-declare-the-skill-in-a-capsule-manifest)).
+- **Everything downstream is unchanged.** The skill installs to `tools/<name>/skill.md` in the session's [runtime directory](../reference/workdir.md#runtime-directory) and appears in the tool inventory and `MURMUR.md` exactly as a registry skill would be — the agent calls it by name the same way (see [Step 4](#step-4-declare-the-skill-in-a-capsule-manifest)).
 
 Run `mur install` to fetch the driver and any other registry artifacts in your manifest:
 
@@ -317,16 +317,17 @@ session: ses_019ed2af53da75c2aefee84ee10c34af
 ^C
 ```
 
-At startup, the runtime installs the skill to:
+At startup, the runtime installs the skill in the session's runtime directory, which exists while
+the session runs:
 
 ```
-workdir/
+~/.murmur/sessions/<session_id>/runtime/
 └── tools/
     └── code-review-conventions/
         └── skill.md
 ```
 
-`MURMUR.md` at the workdir root lists all installed skills and tells the agent they are callable:
+`MURMUR.md`, which the agent reads in its runtime directory, lists all installed skills and tells the agent they are callable:
 
 ```markdown
 ## Installed Skills

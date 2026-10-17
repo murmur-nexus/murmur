@@ -307,7 +307,13 @@ fn explain_scope_declares_what_the_runtime_writes_and_creates_nothing() {
         .map(|write| write["path"].as_str().unwrap())
         .collect();
     assert!(declared.contains(&".murmur/<session-id>"), "{declared:?}");
-    assert!(declared.contains(&"task.md"), "{declared:?}");
+    // The files the runtime owns are in the runtime directory, so none is a workdir write.
+    for moved in ["task.md", "murmur.yaml", "MURMUR.md", "tools", "plans"] {
+        assert!(
+            !declared.iter().any(|path| path.ends_with(moved)),
+            "{moved}: {declared:?}"
+        );
+    }
 
     assert!(
         !project.path().join(".murmur").exists(),
@@ -353,11 +359,7 @@ fn asking_for_sealed_adds_only_paths_under_the_session_directory() {
         .collect();
     if sealed["achieved_containment"] == "sealed" {
         assert_eq!(sealed["floor_met"], true);
-        assert_eq!(
-            added.len(),
-            2,
-            "sealed adds /tmp and /etc staging: {added:?}"
-        );
+        assert_eq!(added.len(), 1, "sealed adds the /tmp store: {added:?}");
     } else {
         assert!(
             added.is_empty(),

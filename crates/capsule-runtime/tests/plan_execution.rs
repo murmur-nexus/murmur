@@ -55,6 +55,11 @@ fn ctx_gated<'a>(
     SchedulerContext {
         accessible_workdir: WorkdirRoot::open(&workdir).unwrap(),
         session_workdir: WorkdirRoot::open(&workdir).unwrap(),
+        runtime_dir: capsule_runtime::runtime_dir::RuntimeDirRoots::new(
+            WorkdirRoot::open(&workdir).unwrap(),
+            WorkdirRoot::open(&workdir).unwrap(),
+            WorkdirRoot::open(&workdir).unwrap(),
+        ),
         capability_policy: CapabilityPolicy {
             shell_allow: vec!["bash".to_string(), "printf".to_string()],
             spawn_allow: vec!["local/worker".to_string()],
@@ -717,16 +722,26 @@ fn test_capsule_step_asks_permission_then_launches_the_child_itself() {
         argv.ends_with(" --json --readiness-tokens --no-env-file --spawn-grant-stdin"),
         "{argv}"
     );
-    assert_eq!(_stub.recorded("cwd.txt").trim(), {
-        let cwd = _stub.recorded("argv.txt");
-        cwd.split(" --workdir ")
-            .nth(1)
-            .unwrap()
-            .split(" --json")
-            .next()
-            .unwrap()
-            .to_string()
-    });
+    let child_workdir = argv
+        .split(" --workdir ")
+        .nth(1)
+        .unwrap()
+        .split(" --workdir-identity ")
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(_stub.recorded("cwd.txt").trim(), child_workdir);
+    // The child is told the identity of the directory its parent created, which its staging
+    // compares with the `--workdir` it opens.
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(&child_workdir).unwrap();
+        format!("{}:{}", meta.dev(), meta.ino())
+    };
+    assert!(
+        argv.contains(&format!(" --workdir-identity {identity} --json")),
+        "{argv}"
+    );
 
     // The grant travelled on standard input, and on nothing else.
     assert_eq!(_stub.recorded("grant.txt"), TEST_APPROVAL);

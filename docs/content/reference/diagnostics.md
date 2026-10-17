@@ -124,6 +124,7 @@ section that explains it.
 | `E-RUN-048` | `mur token` named a session whose door is public, which minted no token | [E-RUN-048](#e-run-048) |
 | `E-RUN-049` | `mur token --credential` named a credential the session did not mint | [E-RUN-049](#e-run-049) |
 | `E-RUN-050` | The runtime met a symbolic link, or the wrong kind of file, inside the workdir — while staging the session, or during the task `mur run` ran | [E-RUN-050](#e-run-050) |
+| `E-RUN-051` | A delegated child's `--workdir` is not the directory its parent created; nothing was written | [E-RUN-051](#e-run-051) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -175,6 +176,7 @@ section that explains it.
 | `W-SEC-030` | An artifact reaches its upstream through an unmetered credential gateway, which the spend ceilings do not cover | [W-SEC-030](#w-sec-030) |
 | `W-SEC-031` | A `transport: process` harness session reports it is authenticating as something other than a subscription | [W-SEC-031](#w-sec-031) |
 | `W-SEC-032` | The A2A door is exposed off loopback and `network.authentication` is not declared | [W-SEC-032](#w-sec-032) |
+| `W-SEC-033` | The session's runtime directory lies inside the workdir, so the capsule's commands can change the files the runtime owns | [W-SEC-033](#w-sec-033) |
 
 ---
 
@@ -345,6 +347,19 @@ Landlock `Execute` right on the session workdir, so a binary the capsule compile
 renames inside it runs regardless of `capabilities.shell.allow` — the allowlist stops being an
 enforceable property of the capsule, and the achieved class is capped at `advisory` on every host.
 Remove `workdir_exec`, or lower the declared floor to `advisory`.
+
+**A second case names the workdir:** `~/.murmur/sessions`, where the session's
+[runtime directory](workdir.md#runtime-directory) is created, lying inside the workdir the capsule's
+commands write — `HOME` and `--workdir` the same directory, for one. The commands could then change
+the task, `MURMUR.md`, a submitted plan or an installed tool, and the achieved class is capped at
+`advisory`. The reason names both paths:
+
+```text
+error[E-CAP-003]: declared containment class 'scoped' is not achievable on this host (achieved: 'advisory'): the runtime directory /home/dev/.murmur/sessions lies inside the workdir /home/dev, so this capsule's commands can change the files the runtime owns — task.md, MURMUR.md, plans and installed tools — and no host can back a class above advisory for it; run with a --workdir that does not contain ~/.murmur
+```
+
+Run with a `--workdir` that does not contain `~/.murmur`. Below a `scoped` floor the launch runs
+and prints [`W-SEC-033`](#w-sec-033) instead.
 
 A `sealed` host that clears the probe at launch and *then* fails to build the composed root for a
 particular subprocess is a different event and gets its own code, `E-RUN-014`. Two causes reach it,
@@ -1243,20 +1258,35 @@ code in two cases:
 
 | When | Typical paths |
 |---|---|
-| Staging the session, before the capsule starts | `task.md` written by `--task`, the `murmur.yaml` copy, the `.murmur/<session-id>` directory |
-| During the task `mur run` ran, after the capsule created a link | `out/result.txt`, `logs/bootstrap.log`, `plans/`, `peer-in/`, anything under `tools/` |
+| Staging the session, before the capsule starts | The `.murmur/<session-id>` directory |
+| During the task `mur run` ran, after the capsule created a link | The operator's `task.md` read when the session starts, `out/result.txt`, `logs/bootstrap.log`, `peer-in/` |
 
 The message names the path and the part of it that is the link:
 
 ```text
-error[E-RUN-050]: refused to write task.md: task.md is a symbolic link inside the workdir
-  hint: the runtime never follows a link inside the workdir; replace task.md with a regular file or directory, or remove it, and run again
+error[E-RUN-050]: refused to create directory .murmur/ses_01a0…: .murmur is a symbolic link inside the workdir
+  hint: the runtime never follows a link inside the workdir; replace .murmur with a regular file or directory, or remove it, and run again
 ```
 
 Remove the link, or replace it with the regular file or directory it stands in for. A refusal during
 a task also writes a [`workdir_path_refused`](observability-schemas.md#workdir-path-refused) trace
 line naming the path, and an A2A task that meets one ends `failed` with the refusal as its status
 message; see [Links inside the workdir](workdir.md#links-inside-the-workdir).
+
+### E-RUN-051 — a delegated child's workdir is not the one its parent created { #e-run-051 }
+
+A capsule that delegates creates the child's directory under `.murmur/children/` and launches the
+child with that directory's identity. The child compares it with the `--workdir` it opens, before
+writing anything there, and refuses when they differ: something replaced the directory under
+`.murmur/children/`, with a link or another directory, between its creation and the launch:
+
+```text
+error[E-RUN-051]: the workdir /home/dev/project/.murmur/children/worker-3f9c2a1b7e4d5c60 is not the directory the delegating capsule created (expected 2049:1311021, found 2049:1311042)
+  hint: the delegating capsule's workdir changed under .murmur/children between the directory's creation and this launch; nothing was written
+```
+
+The delegation fails at the child's start, as any child that cannot launch does. Nothing was
+written under either directory.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
@@ -1302,12 +1332,13 @@ This applies to **every** Linux capsule that can spawn a subprocess, including o
 `capabilities.network.allow` is empty: with the namespace missing, an empty allowlist would mean
 unrestricted egress rather than none. There is no path that continues at reduced enforcement.
 
-A capsule spawns a subprocess through any of three routes, and `mur run` checks each at a
+A capsule can spawn a subprocess through any of the routes below, and `mur run` checks each at a
 different point:
 
 | Route | Checked |
 |---|---|
 | `capabilities.shell.allow` or `capabilities.spawn.allow` is non-empty | At staging, before any artifact is pulled |
+| `capabilities.install.tool` is non-empty: a pattern can match a native tool a pull installs | At staging, before any artifact is pulled |
 | A declared `runtime: tool` artifact ships a native implementation | At launch, once the artifacts are staged and before any component is instantiated |
 | A native tool pulled into the session by `manage.pull` or `pull-artifact` | At that tool's first call, which fails with the same reason |
 
@@ -1659,7 +1690,8 @@ error[E-CAP-019]: process driver 'my-process-driver@1.0.0' requires MY_PROFILE i
 ### E-CAP-020 — two artifacts share a tool name { #e-cap-020 }
 
 A session offers each declared artifact to the model by its tool name, the part of its full name
-after the `/`, and stages it under `workdir/tools/<tool name>/`. Two declared artifacts with one
+after the `/`, and stages it under `tools/<tool name>/` in the session's
+[runtime directory](workdir.md#runtime-directory). Two declared artifacts with one
 tool name are refused, whatever their scopes:
 
 ```text
@@ -2573,6 +2605,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | `W-SEC-004` — from `mur build` | stderr |
 | `W-SEC-031` — decided mid-session, when the harness reports its session | stderr |
 | `W-SEC-032` — decided at staging by `mur run`, by `mur doctor`, and by `mur deploy run` once the port is published | stderr from `mur run` and `mur deploy run`; stdout from `mur doctor` |
+| `W-SEC-033` — decided at staging by `mur run`, and by `mur doctor` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
 
@@ -3591,3 +3624,26 @@ loopback.
 **What to do:** declare [`network.authentication`](manifest.md#field-network-authentication), hand
 callers the tokens [`mur run`](cli.md#mur-run) prints, and put a TLS terminator in front of the
 door, which speaks plain HTTP. Or bind to loopback.
+
+### W-SEC-033 — the runtime directory lies inside the workdir { #w-sec-033 }
+
+**Fires when:** `~/.murmur/sessions`, where every session's
+[runtime directory](workdir.md#runtime-directory) is created, lies inside the accessible workdir:
+
+| From | When |
+|---|---|
+| `mur run` | Once per launch, when the declared containment is `advisory` |
+| `mur doctor` | For `<manifest-dir>/workdir`, whatever the declared containment |
+
+```text
+[capsule-runtime] warning[W-SEC-033]: the runtime directory /home/dev/.murmur/sessions lies inside the workdir /home/dev, so this capsule's commands can change the files the runtime owns — task.md, MURMUR.md, plans and installed tools; run with a --workdir that does not contain ~/.murmur (https://docs.murmur.nexus/reference/diagnostics/#w-sec-033)
+```
+
+**Why it matters:** the capsule's commands can rewrite the task, `MURMUR.md`, a submitted plan
+before it runs, or an installed native tool before its next call.
+
+**What the runtime does about it:** the launch runs, records `achieved_containment: advisory`, and
+reports `runtime_dir.read_only_to_commands: false`. A `scoped` or `sealed` floor is refused with
+[`E-CAP-003`](#e-cap-003) instead.
+
+**What to do:** run with a `--workdir` that does not contain `~/.murmur`.

@@ -38,6 +38,49 @@ fn end_turn_server(text: &str) -> common::ScriptedServer {
     .to_string()])
 }
 
+/// The `MURMUR.md` a session's runtime directory held when the model's first request arrived:
+/// rewritten with the door's URL by then, and removed with the directory when the session ends.
+#[derive(Clone, Default)]
+struct MurmurMdSnapshot {
+    runtime_dir: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
+    content: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl MurmurMdSnapshot {
+    /// An `end_turn` server that takes the snapshot as it answers.
+    fn server(&self, text: &str) -> common::ScriptedServer {
+        let snapshot = self.clone();
+        let reply = serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "test-model",
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })
+        .to_string();
+        common::ScriptedServer::start_answering(1, move |_| {
+            if let Some(dir) = snapshot.runtime_dir.lock().unwrap().as_ref() {
+                *snapshot.content.lock().unwrap() = fs::read_to_string(dir.join("MURMUR.md")).ok();
+            }
+            reply.clone()
+        })
+    }
+
+    fn watch(&self, staged: &capsule_runtime::StagedSession) {
+        *self.runtime_dir.lock().unwrap() = Some(staged.runtime_dir.clone());
+    }
+
+    fn content(&self) -> String {
+        self.content
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("MURMUR.md was read while the session ran")
+    }
+}
+
 fn setup_agent_project(endpoint: &str) -> (TempDir, PathBuf) {
     let home = tempfile::tempdir().unwrap();
     let artifacts = tempfile::tempdir().unwrap();
@@ -97,6 +140,7 @@ fn stage_agent_with_port(
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -141,15 +185,17 @@ fn murmur_md_has_identity_section_with_correct_values() {
     if common::skip_without_host_support("murmur_md_has_identity_section_with_correct_values") {
         return;
     }
-    let server = end_turn_server("done");
+    let snapshot = MurmurMdSnapshot::default();
+    let server = snapshot.server("done");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path);
+    snapshot.watch(&staged);
     let session_id = staged.session_id.clone();
     fs::write(staged.workdir.join("task.md"), "Identity test").unwrap();
 
-    let launched = launch_session(staged, |_| {}).expect("launch should succeed");
+    let _launched = launch_session(staged, |_| {}).expect("launch should succeed");
 
-    let content = fs::read_to_string(launched.workdir.join("MURMUR.md")).unwrap();
+    let content = snapshot.content();
 
     assert!(
         content.contains("## Identity"),
@@ -328,14 +374,17 @@ fn two_concurrent_sessions_have_distinct_capsule_urls_and_session_ids() {
     ) {
         return;
     }
-    let server1 = end_turn_server("session 1");
-    let server2 = end_turn_server("session 2");
+    let (snapshot1, snapshot2) = (MurmurMdSnapshot::default(), MurmurMdSnapshot::default());
+    let server1 = snapshot1.server("session 1");
+    let server2 = snapshot2.server("session 2");
 
     let (home1, manifest_path1) = setup_agent_project(&server1.endpoint);
     let (home2, manifest_path2) = setup_agent_project(&server2.endpoint);
 
     let staged1 = stage_agent(&home1, &manifest_path1);
     let staged2 = stage_agent(&home2, &manifest_path2);
+    snapshot1.watch(&staged1);
+    snapshot2.watch(&staged2);
 
     assert_ne!(
         staged1.session_id, staged2.session_id,
@@ -355,12 +404,13 @@ fn two_concurrent_sessions_have_distinct_capsule_urls_and_session_ids() {
         launch_session(staged2, |_| {}).expect("session 2 should launch")
     });
 
-    let r1 = h1.join().expect("session 1 thread should not panic");
-    let r2 = h2.join().expect("session 2 thread should not panic");
+    h1.join().expect("session 1 thread should not panic");
+    h2.join().expect("session 2 thread should not panic");
 
-    // Extract capsule URLs from the final MURMUR.md (overwritten by launch_session with full identity)
-    let content1 = fs::read_to_string(r1.workdir.join("MURMUR.md")).unwrap();
-    let content2 = fs::read_to_string(r2.workdir.join("MURMUR.md")).unwrap();
+    // Extract capsule URLs from MURMUR.md as each session ran (rewritten by launch_session with
+    // the full identity once the port is bound).
+    let content1 = snapshot1.content();
+    let content2 = snapshot2.content();
 
     let url1 = extract_capsule_url(&content1).expect("MURMUR.md 1 should contain a capsule_url");
     let url2 = extract_capsule_url(&content2).expect("MURMUR.md 2 should contain a capsule_url");
@@ -378,20 +428,22 @@ fn http_server_not_reachable_after_session_ends() {
     if common::skip_without_host_support("http_server_not_reachable_after_session_ends") {
         return;
     }
-    let server = end_turn_server("done");
+    let snapshot = MurmurMdSnapshot::default();
+    let server = snapshot.server("done");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     // The capsule is staged on a port pinned from a process-wide claimed range below the Linux
     // ephemeral range, so nothing in this process — no `:0` bind, no other test — can be handed
     // that number once the session releases it. A connect that succeeds is therefore the capsule's
     // own listener and nothing else.
     let staged = stage_agent_with_port(&home, &manifest_path, Some(common::free_port()));
+    snapshot.watch(&staged);
     let workdir_for_thread = staged.workdir.clone();
     fs::write(workdir_for_thread.join("task.md"), "shutdown test").unwrap();
 
     let staged_workdir = staged.workdir.clone();
-    let launched = launch_session(staged, |_| {}).expect("launch should succeed");
+    let _launched = launch_session(staged, |_| {}).expect("launch should succeed");
 
-    let content = fs::read_to_string(launched.workdir.join("MURMUR.md")).unwrap();
+    let content = snapshot.content();
     let capsule_url =
         extract_capsule_url(&content).expect("MURMUR.md should contain a capsule_url after launch");
 

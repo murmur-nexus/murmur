@@ -177,6 +177,7 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
         formation_id: None,
         formation_member: None,
         source_supply,
+        expected_workdir_identity: None,
     };
 
     // Stage the session (creates workdir, installs artifacts including skill.md).
@@ -487,7 +488,7 @@ fn build_task_prompt(task: &str, index: Option<&str>, _inf: &InferenceConfig) ->
 
     format!(
         r#"Step 1 — Read your manifest generation guide:
-Call read_file with path "tools/skill-create-manifest/skill.md".
+Call read_file with path "murmur-runtime/tools/skill-create-manifest/skill.md".
 Read the full contents before proceeding.
 
 Step 2 — Search for available artifacts:
@@ -1046,7 +1047,7 @@ mod tests {
             "prompt must instruct agent to call read_file"
         );
         assert!(
-            prompt.contains("tools/skill-create-manifest/skill.md"),
+            prompt.contains("murmur-runtime/tools/skill-create-manifest/skill.md"),
             "prompt must reference skill.md path"
         );
     }

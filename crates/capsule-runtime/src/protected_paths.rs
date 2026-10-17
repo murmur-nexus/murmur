@@ -609,7 +609,7 @@ fn normalize_absolute(path: &Path) -> PathBuf {
 }
 
 /// Canonicalize the longest existing prefix of `path` and re-append the components below it.
-fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+pub(crate) fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
     if let Ok(real) = path.canonicalize() {
         return real;
     }

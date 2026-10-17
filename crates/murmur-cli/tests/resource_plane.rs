@@ -279,6 +279,7 @@ fn launch(exports: Option<&str>, responses: usize) -> Capsule {
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: project.clone(),
             capsule_name: runtime_manifest.name.clone(),
@@ -368,6 +369,7 @@ fn achieved_class_here() -> ContainmentClass {
         // Only `achieved_containment` is read here, and `io.max` reaches no class. `NotProbed` is
         // the honest value for a report nobody asked the question of.
         capsule_runtime::IoMaxReport::default(),
+        &std::env::temp_dir().join("murmur-resource-plane-workdir"),
     )
     .achieved_containment
 }

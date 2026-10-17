@@ -413,6 +413,11 @@ fn of_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> {
 /// Pulled in turn 1, offered and called in turn 2, under the default `inference.tool_refresh`.
 #[test]
 fn s1_a_pulled_tool_is_offered_and_called_from_the_next_turn() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s1_a_pulled_tool_is_offered_and_called_from_the_next_turn",
+    ) {
+        return;
+    }
     let server = common::ScriptedServer::start(vec![
         tool_use(
             1,
@@ -616,6 +621,9 @@ fn s2_a_grant_under_transport_process_is_refused_at_load() {
 /// token, and nothing written.
 #[test]
 fn s3_refused_pulls_write_nothing() {
+    if capsule_runtime::skip_without_egress_namespace("s3_refused_pulls_write_nothing") {
+        return;
+    }
     let calls = [
         ("toolu_other", "murmur/other"),
         ("toolu_hook", "murmur/tool-hookish"),
@@ -704,6 +712,11 @@ fn s3_refused_pulls_write_nothing() {
 
 #[test]
 fn s4_with_only_a_non_fitting_version_a_versionless_pull_is_refused() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s4_with_only_a_non_fitting_version_a_versionless_pull_is_refused",
+    ) {
+        return;
+    }
     let server = common::ScriptedServer::start(vec![
         tool_use(
             1,
@@ -788,6 +801,11 @@ fn ana_stores_hold_nothing(p: &Project) {
 
 #[test]
 fn s5_from_sources_fetches_from_the_scope_source() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s5_from_sources_fetches_from_the_scope_source",
+    ) {
+        return;
+    }
     let stub = MockGitHub::start();
     let _source = ana_source(&stub, "tool");
     let server = common::ScriptedServer::start(vec![
@@ -836,6 +854,9 @@ fn s5_from_sources_fetches_from_the_scope_source() {
 
 #[test]
 fn s5_the_default_from_reads_no_source() {
+    if capsule_runtime::skip_without_egress_namespace("s5_the_default_from_reads_no_source") {
+        return;
+    }
     let stub = MockGitHub::start();
     let _source = ana_source(&stub, "tool");
     let server = common::ScriptedServer::start(vec![
@@ -870,6 +891,11 @@ fn s5_the_default_from_reads_no_source() {
 
 #[test]
 fn s5_a_lock_recording_another_owner_refuses_before_any_asset() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s5_a_lock_recording_another_owner_refuses_before_any_asset",
+    ) {
+        return;
+    }
     let stub = MockGitHub::start();
     let _source = ana_source(&stub, "tool");
     let server = common::ScriptedServer::start(vec![
@@ -916,6 +942,11 @@ fn s5_a_lock_recording_another_owner_refuses_before_any_asset() {
 
 #[test]
 fn s5_a_hook_in_the_index_is_refused_before_any_asset() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s5_a_hook_in_the_index_is_refused_before_any_asset",
+    ) {
+        return;
+    }
     let stub = MockGitHub::start();
     let _source = ana_source(&stub, "hook");
     let server = common::ScriptedServer::start(vec![
@@ -949,6 +980,11 @@ fn s5_a_hook_in_the_index_is_refused_before_any_asset() {
 /// refused, and the next request no longer offers it.
 #[test]
 fn s6_a_removal_lets_earlier_calls_finish_and_refuses_later_ones() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s6_a_removal_lets_earlier_calls_finish_and_refuses_later_ones",
+    ) {
+        return;
+    }
     let server = common::ScriptedServer::start(vec![
         tool_use(
             1,
@@ -1113,25 +1149,53 @@ fn process_home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap())
 }
 
+/// The runtime directory's `tools/` as it stood when the model's second request arrived: after
+/// the pull's result was posted, before the session ended and removed the directory.
+fn tools_at_second_request(
+    runtime_dir: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
+    seen: std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>>,
+    first: String,
+) -> impl FnMut(&Value) -> String + Send + 'static {
+    let mut answered = 0;
+    move |_| {
+        answered += 1;
+        if answered == 1 {
+            return first.clone();
+        }
+        if let Some(dir) = runtime_dir.lock().unwrap().as_ref() {
+            *seen.lock().unwrap() = Some(files_under(&dir.join("tools")));
+        }
+        end_turn("done")
+    }
+}
+
 #[test]
 fn s7_a_pull_writes_only_its_tool_directory_the_lock_and_a_compiled_form() {
-    let server = common::ScriptedServer::start(vec![
-        tool_use(
-            1,
-            "toolu_pull",
-            "pull-artifact",
-            json!({"artifact": EDITOR}),
+    if capsule_runtime::skip_without_egress_namespace(
+        "s7_a_pull_writes_only_its_tool_directory_the_lock_and_a_compiled_form",
+    ) {
+        return;
+    }
+    let runtime_dir: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>> = Default::default();
+    let seen: std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>> = Default::default();
+    let server = common::ScriptedServer::start_answering(
+        2,
+        tools_at_second_request(
+            std::sync::Arc::clone(&runtime_dir),
+            std::sync::Arc::clone(&seen),
+            tool_use(
+                1,
+                "toolu_pull",
+                "pull-artifact",
+                json!({"artifact": EDITOR}),
+            ),
         ),
-        end_turn("done"),
-    ]);
+    );
     let workdir = tempfile::tempdir().unwrap();
     let s = stage(&server, GRANT, workdir.path());
     let session = s.staged.workdir.clone();
-    let session_rel = session
-        .strip_prefix(workdir.path())
-        .unwrap()
-        .display()
-        .to_string();
+    let tools_before = files_under(&s.staged.runtime_dir.join("tools"));
+    *runtime_dir.lock().unwrap() = Some(s.staged.runtime_dir.clone());
     let outside_session = |paths: Vec<String>| -> Vec<String> {
         paths
             .into_iter()
@@ -1139,7 +1203,6 @@ fn s7_a_pull_writes_only_its_tool_directory_the_lock_and_a_compiled_form() {
             .collect()
     };
     let workdir_before = outside_session(files_under(workdir.path()));
-    let tools_before = files_under(&session.join("tools"));
     let project_before = files_under(s.project.path());
     let store_before = files_under(&s.home.path().join(".murmur").join("artifacts"));
     let home_before = files_under(&process_home());
@@ -1148,7 +1211,11 @@ fn s7_a_pull_writes_only_its_tool_directory_the_lock_and_a_compiled_form() {
 
     let (text, is_error) = result(&server.requests(), "toolu_pull");
     assert!(!is_error, "{text}");
-    let tools_after = files_under(&session.join("tools"));
+    let tools_after = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the second request arrived");
     let added: Vec<&String> = tools_after
         .iter()
         .filter(|path| !tools_before.contains(path))
@@ -1156,7 +1223,11 @@ fn s7_a_pull_writes_only_its_tool_directory_the_lock_and_a_compiled_form() {
     assert_eq!(
         added,
         ["tool-editor", "tool-editor/murmur.yaml"],
-        "under {session_rel}/tools"
+        "under the runtime directory's tools/"
+    );
+    assert!(
+        !session.join("tools").exists(),
+        "the session workdir has no tools/"
     );
     assert_eq!(outside_session(files_under(workdir.path())), workdir_before);
     let project_added: Vec<String> = files_under(s.project.path())
@@ -1178,23 +1249,30 @@ fn s7_a_pull_writes_only_its_tool_directory_the_lock_and_a_compiled_form() {
             .any(|path| path.starts_with(".murmur/compiled/") && path.ends_with(".cwasm")),
         "{home_added:?}"
     );
-    // Every session keeps a conversation record and a running record under the home; the pull
-    // adds only its compiled form.
+    // Every session keeps a conversation record and a running record under the home, and its
+    // runtime directory under `sessions/` while it runs; the pull adds only its compiled form.
     for path in &home_added {
         assert!(
             path.starts_with(".murmur/compiled")
                 || path.starts_with(".murmur/conversations")
-                || path.starts_with(".murmur/running"),
+                || path.starts_with(".murmur/running")
+                || path.starts_with(".murmur/sessions"),
             "a pull wrote {path} outside the workdir: {home_added:?}"
         );
     }
 }
 
-/// The capsule replaces `tools/tool-editor` with a link to a directory outside the workdir after
-/// the session has started, the moment its first inference request is answered: the pull's write
-/// is refused at the link, nothing reaches the outside directory, and the task fails.
+/// The capsule replaces the workdir's `tools/tool-editor` with a link to a directory outside it
+/// the moment its first inference request is answered: the pull installs into the runtime
+/// directory, which no command can write, so the link redirects nothing and the outside directory
+/// gains nothing.
 #[test]
-fn s7_a_link_planted_at_the_tool_directory_refuses_the_pull() {
+fn s7_a_link_planted_in_the_workdir_redirects_no_pull() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s7_a_link_planted_in_the_workdir_redirects_no_pull",
+    ) {
+        return;
+    }
     let workdir = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let planted: std::sync::Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>> =
@@ -1207,6 +1285,7 @@ fn s7_a_link_planted_at_the_tool_directory_refuses_the_pull() {
             return end_turn("done");
         }
         if let Some((target, link)) = plant.lock().unwrap().as_ref() {
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
             std::os::unix::fs::symlink(target, link).unwrap();
         }
         tool_use(
@@ -1222,49 +1301,29 @@ fn s7_a_link_planted_at_the_tool_directory_refuses_the_pull() {
         outside.path().to_path_buf(),
         session.join("tools").join(EDITOR_TOOL),
     ));
-    let lock_before = fs::read(s.project.path().join("murmur.lock")).ok();
 
-    let _ = capsule_runtime::launch_session(s.staged, |_| {});
+    capsule_runtime::launch_session(s.staged, |_| {}).expect("the session runs");
 
-    // The refusal ends the task at the checkpoint after the call, so no later request carries
-    // the call's result: the trace records it.
-    assert_eq!(server.requests().len(), 1);
-    let events = trace(&session);
-    let call = of_type(&events, "tool_call")
-        .into_iter()
-        .find(|event| event["tool_call_id"] == "toolu_pull")
-        .unwrap_or_else(|| panic!("the pull is traced: {events:#?}"));
-    assert_eq!(call["status"], "error", "{call}");
-    let failed = of_type(&events, "task_failed");
-    assert_eq!(failed[0]["cause"], "workdir_path_refused", "{events:#?}");
-    let reason = failed[0]["reason"].as_str().unwrap();
-    println!("S7 planted link: {reason}");
-    assert!(
-        reason.contains("tools/tool-editor") && reason.contains("symbolic link"),
-        "{reason}"
-    );
+    let (text, is_error) = result(&server.requests(), "toolu_pull");
+    assert!(!is_error, "{text}");
     assert!(files_under(outside.path()).is_empty());
-    assert_eq!(
-        fs::read(s.project.path().join("murmur.lock")).ok(),
-        lock_before
-    );
-    let refused = of_type(&events, "workdir_path_refused");
-    assert!(!refused.is_empty(), "{events:#?}");
+    let events = trace(&session);
     assert!(
-        refused[0]["path"]
-            .as_str()
-            .unwrap()
-            .contains("tools/tool-editor"),
-        "{}",
-        refused[0]
+        of_type(&events, "workdir_path_refused").is_empty(),
+        "{events:#?}"
     );
-    assert!(of_type(&events, "artifact_pulled").is_empty());
+    assert_eq!(of_type(&events, "artifact_pulled").len(), 1, "{events:#?}");
 }
 
 // ── S8 ───────────────────────────────────────────────────────────────────────
 
 #[test]
 fn s8_a_pattern_lists_what_the_capsule_may_pull_and_pulls_nothing() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "s8_a_pattern_lists_what_the_capsule_may_pull_and_pulls_nothing",
+    ) {
+        return;
+    }
     let server = common::ScriptedServer::start(vec![
         end_turn("pinned"),
         tool_uses(

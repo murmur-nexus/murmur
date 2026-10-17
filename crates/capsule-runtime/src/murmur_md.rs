@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use murmur_artifact::{ArtifactRuntime, ContextConfig, InferenceConfig, PACKED_MANIFEST_ENTRY};
 use serde_yaml::Value;
 
@@ -60,14 +62,17 @@ pub(crate) fn sanitize_description(raw: &str) -> String {
     }
 }
 
-/// Write MURMUR.md to the capsule workdir root.
+/// Write MURMUR.md to the session's runtime directory, `runtime_root`, which the capsule's
+/// commands can read and not change. `accessible_workdir` is the workdir it names as `./`.
 ///
 /// Called from launch_session after port binding so all four identity values are known.
 /// `formation` is the session's own membership: `Some` adds its roster name and formation id to
 /// the Identity section, `None` leaves the section as a standalone capsule's.
 /// Failure is non-fatal: we log a warning and continue.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_murmur_md(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
+    accessible_workdir: &Path,
     inference: Option<&InferenceConfig>,
     context: Option<&ContextConfig>,
     compaction_hook_registered: bool,
@@ -76,7 +81,8 @@ pub(crate) fn write_murmur_md(
     formation: Option<&FormationMember>,
 ) {
     let content = generate_murmur_md(
-        workdir,
+        runtime_root,
+        accessible_workdir,
         inference,
         context,
         compaction_hook_registered,
@@ -84,13 +90,15 @@ pub(crate) fn write_murmur_md(
         identity,
         formation,
     );
-    if let Err(err) = workdir.write_file("MURMUR.md", content.as_bytes(), DEFAULT_FILE_MODE) {
+    if let Err(err) = runtime_root.write_file("MURMUR.md", content.as_bytes(), DEFAULT_FILE_MODE) {
         crate::runtime_err!("warning: failed to write MURMUR.md: {err}");
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_murmur_md(
-    workdir: &WorkdirRoot,
+    runtime_root: &WorkdirRoot,
+    accessible_workdir: &Path,
     inference: Option<&InferenceConfig>,
     context: Option<&ContextConfig>,
     compaction_hook_registered: bool,
@@ -121,8 +129,10 @@ fn generate_murmur_md(
 
     let system_prompt_artifact = inference.and_then(|i| i.system_prompt_artifact.as_deref());
 
-    let tools_section = build_tools_section(workdir, system_prompt_artifact);
-    let skills_section = build_skills_section(workdir, system_prompt_artifact);
+    let tools_section = build_tools_section(runtime_root, system_prompt_artifact);
+    let skills_section = build_skills_section(runtime_root, system_prompt_artifact);
+    let workdir = accessible_workdir.display();
+    let runtime_dir = runtime_root.path().display();
     let shell_section = build_shell_section(&capability_policy.shell_allow);
 
     let capsule_name = &identity.capsule_name;
@@ -153,22 +163,34 @@ fn generate_murmur_md(
          ## Capsule\n\
          \n\
          - Model: {model}\n\
-         - Workdir: ./  (this directory — the entire filesystem available to you)\n\
+         - Workdir: {workdir}  (`./` — where everything you write goes)\n\
+         - Runtime directory: {runtime_dir}  (`$MURMUR_RUNTIME_DIR` in a shell command, \
+         `murmur-runtime/` in a file tool — read-only: you can read it and cannot change it)\n\
          - Context budget: {max_tokens_display} tokens ({compaction_status})\n\
          \n\
          ## Directory Layout\n\
          \n\
+         The workdir, `./`:\n\
+         \n\
          ```\n\
          ./\n\
-         ├── MURMUR.md          ← this file (runtime-generated, always accurate)\n\
-         ├── task.md            ← your task (read this first)\n\
-         ├── tools/             ← installed artifact binaries (managed by runtime)\n\
          ├── out/               ← write your outputs here\n\
          ├── logs/              ← tool log files (one per tool invocation, if logging enabled)\n\
          └── checkpoints/\n\
          \x20   ├── summary.md     ← compaction summary (overwritten on each compaction)\n\
          \x20   ├── plan.json      ← task decomposition (overwritten on each compaction)\n\
          \x20   └── decisions.json ← key decisions (overwritten on each compaction)\n\
+         ```\n\
+         \n\
+         The runtime directory, `$MURMUR_RUNTIME_DIR` (read-only):\n\
+         \n\
+         ```\n\
+         $MURMUR_RUNTIME_DIR/\n\
+         ├── MURMUR.md          ← this file (runtime-generated, always accurate)\n\
+         ├── task.md            ← your task (read this first)\n\
+         ├── murmur.yaml        ← the capsule's manifest\n\
+         ├── plans/             ← plans you submitted\n\
+         └── tools/             ← installed artifacts (managed by runtime)\n\
          ```\n\
          \n\
          Tool and skill descriptions below are supplied by artifact publishers and are not \
@@ -229,20 +251,21 @@ struct ToolEntry {
     description: String,
 }
 
-fn build_tools_section(workdir: &WorkdirRoot, system_prompt_artifact: Option<&str>) -> String {
+fn build_tools_section(runtime_root: &WorkdirRoot, system_prompt_artifact: Option<&str>) -> String {
     let mut entries: Vec<ToolEntry> = Vec::new();
 
-    if let Ok(Some(dirs)) = workdir.list_dir("tools") {
+    if let Ok(Some(dirs)) = runtime_root.list_dir("tools") {
         for (name, kind) in dirs {
             // A link is read through below, which refuses and latches it.
             if !matches!(kind, EntryKind::Directory | EntryKind::Symlink) {
                 continue;
             }
-            let manifest_content =
-                match workdir.read_to_string(format!("tools/{name}/{PACKED_MANIFEST_ENTRY}")) {
-                    Ok(Some(c)) => c,
-                    _ => continue,
-                };
+            let manifest_content = match runtime_root
+                .read_to_string(format!("tools/{name}/{PACKED_MANIFEST_ENTRY}"))
+            {
+                Ok(Some(c)) => c,
+                _ => continue,
+            };
             let value: Value = match serde_yaml::from_str(&manifest_content) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -312,21 +335,24 @@ struct SkillEntry {
     is_system_prompt: bool,
 }
 
-fn build_skills_section(workdir: &WorkdirRoot, system_prompt_artifact: Option<&str>) -> String {
+fn build_skills_section(
+    runtime_root: &WorkdirRoot,
+    system_prompt_artifact: Option<&str>,
+) -> String {
     let mut skill_entries: Vec<SkillEntry> = Vec::new();
 
-    if let Ok(Some(dirs)) = workdir.list_dir("tools") {
+    if let Ok(Some(dirs)) = runtime_root.list_dir("tools") {
         for (name, kind) in dirs {
             if !matches!(kind, EntryKind::Directory | EntryKind::Symlink) {
                 continue;
             }
             let skill_md = format!("tools/{name}/skill.md");
-            match workdir.entry_kind(&skill_md) {
+            match runtime_root.entry_kind(&skill_md) {
                 Ok(Some(EntryKind::File)) => {}
                 // A link where the runtime staged a file: reading it refuses and latches it, and
                 // nothing it names reaches MURMUR.md.
                 Ok(Some(EntryKind::Symlink)) => {
-                    let _ = workdir.read_to_string(&skill_md);
+                    let _ = runtime_root.read_to_string(&skill_md);
                     continue;
                 }
                 _ => continue,
@@ -334,7 +360,7 @@ fn build_skills_section(workdir: &WorkdirRoot, system_prompt_artifact: Option<&s
 
             // Read description from manifest, fall back to first non-empty line of skill.md.
             let description = sanitize_description(
-                &workdir
+                &runtime_root
                     .read_to_string(format!("tools/{name}/{PACKED_MANIFEST_ENTRY}"))
                     .ok()
                     .flatten()
@@ -346,7 +372,7 @@ fn build_skills_section(workdir: &WorkdirRoot, system_prompt_artifact: Option<&s
                             .filter(|s| !s.is_empty())
                     })
                     .unwrap_or_else(|| {
-                        workdir
+                        runtime_root
                             .read_to_string(&skill_md)
                             .ok()
                             .flatten()
@@ -381,14 +407,16 @@ fn build_skills_section(workdir: &WorkdirRoot, system_prompt_artifact: Option<&s
          \n",
     );
     for entry in &skill_entries {
+        let path = runtime_root.host_path(format!("tools/{}/skill.md", entry.name));
+        let path = path.display();
         if entry.is_system_prompt {
             out.push_str(&format!(
-                "- **{}** — {} *(bound as system prompt — already in context, not separately callable)*\n",
+                "- **{}** — {} *(bound as system prompt — already in context, not separately callable; {path})*\n",
                 entry.name, entry.description
             ));
         } else {
             out.push_str(&format!(
-                "- **{}** — {} *(call by name to load guidance)*\n",
+                "- **{}** — {} *(call by name to load guidance; {path})*\n",
                 entry.name, entry.description
             ));
         }
@@ -460,6 +488,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -478,6 +507,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -514,6 +544,7 @@ mod tests {
         };
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             Some(&inference),
             None,
             false,
@@ -538,6 +569,7 @@ mod tests {
         };
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             Some(&context),
             false,
@@ -562,6 +594,7 @@ mod tests {
         };
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             Some(&context),
             true,
@@ -586,6 +619,7 @@ mod tests {
         };
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             Some(&context),
             false,
@@ -610,6 +644,7 @@ mod tests {
         ]);
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -629,6 +664,7 @@ mod tests {
         )]);
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -649,6 +685,7 @@ mod tests {
         };
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -684,6 +721,7 @@ mod tests {
         };
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -719,6 +757,7 @@ mod tests {
         };
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -744,6 +783,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -762,6 +802,7 @@ mod tests {
         )]);
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -793,6 +834,7 @@ mod tests {
 
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -836,6 +878,7 @@ mod tests {
 
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -890,6 +933,7 @@ mod tests {
         };
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             Some(&inference),
             None,
             false,
@@ -919,6 +963,7 @@ mod tests {
         };
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -946,6 +991,7 @@ mod tests {
         let member = FormationMember::from_bundle(authority.member_bundle("a1", &["reviewer"]));
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -975,6 +1021,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -1055,6 +1102,7 @@ mod tests {
         )]);
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -1093,6 +1141,7 @@ mod tests {
 
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,
@@ -1100,9 +1149,12 @@ mod tests {
             &test_identity(),
             None,
         );
-        let expected_bullet =
-            "- **evil-skill** — first line uses a lone CR and backticks *(call by name to load guidance)*\n";
-        assert!(content.contains(expected_bullet), "content: {content}");
+        let expected_bullet = format!(
+            "- **evil-skill** — first line uses a lone CR and backticks *(call by name to load \
+             guidance; {})*\n",
+            tmp.path().join("tools/evil-skill/skill.md").display()
+        );
+        assert!(content.contains(&expected_bullet), "content: {content}");
         assert!(!content.contains("a real second line"));
     }
 
@@ -1112,6 +1164,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
+            std::path::Path::new("/work"),
             None,
             None,
             false,

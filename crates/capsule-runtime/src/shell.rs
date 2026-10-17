@@ -282,7 +282,12 @@ pub(crate) fn run_shell(
     // to stop it growing further is to not start the next process that would write to it.
     enforcement.check_workdir_budget()?;
 
-    let env = build_shell_env(policy, env_overrides, session_workdir)?;
+    let env = build_shell_env(
+        policy,
+        env_overrides,
+        session_workdir,
+        enforcement.runtime_dir_path(),
+    )?;
 
     // Resolve before spawning: this is the identity of the binary this call is about to
     // run, and it is the only point where the invoked name is still in hand.
@@ -726,6 +731,7 @@ pub(crate) fn build_shell_env(
     policy: &CapabilityPolicy,
     env_overrides: &[(String, String)],
     session_workdir: &WorkdirRoot,
+    runtime_dir: Option<&std::path::Path>,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut env = BTreeMap::new();
 
@@ -761,6 +767,15 @@ pub(crate) fn build_shell_env(
     let synthetic_home = synthetic_home.to_string_lossy().into_owned();
     env.insert("HOME".to_string(), synthetic_home.clone());
     env.insert("USERPROFILE".to_string(), synthetic_home);
+    // Runtime-owned on the same terms: whatever an override, a baseline entry or the host said,
+    // a command reads the session's own runtime directory here, or no such variable at all.
+    env.remove(crate::runtime_dir::RUNTIME_DIR_ENV);
+    if let Some(runtime_dir) = runtime_dir {
+        env.insert(
+            crate::runtime_dir::RUNTIME_DIR_ENV.to_string(),
+            runtime_dir.to_string_lossy().into_owned(),
+        );
+    }
 
     Ok(env)
 }
@@ -848,6 +863,7 @@ pub(crate) fn build_declared_env(policy: &CapabilityPolicy) -> BTreeMap<String, 
         if key == ARTIFACT_CONFIG_ENV
             || crate::formation::is_member_grant_env(key)
             || key == crate::lifeline::SPAWNER_LIFELINE_ENV
+            || key == crate::runtime_dir::RUNTIME_DIR_ENV
         {
             continue;
         }
@@ -1232,6 +1248,7 @@ mod tests {
             &policy,
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
         )
         .unwrap();
 
@@ -1262,6 +1279,7 @@ mod tests {
             &policy,
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
         )
         .unwrap_err();
 
@@ -1338,6 +1356,7 @@ mod tests {
             &policy,
             &overrides,
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
         )
         .unwrap();
 
@@ -1378,6 +1397,7 @@ mod tests {
             &policy,
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
         )
         .unwrap();
         std::env::remove_var(FORMATION_LIFELINE_ENV);
@@ -1407,6 +1427,7 @@ mod tests {
             &policy,
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
         )
         .unwrap();
         std::env::remove_var(SPAWNER_LIFELINE_ENV);
@@ -1495,6 +1516,7 @@ mod tests {
             &policy,
             &overrides,
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
         )
         .unwrap();
 
@@ -1515,6 +1537,7 @@ mod tests {
             &policy,
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
         )
         .unwrap();
         std::env::remove_var("CARGO_HOME");
@@ -1535,6 +1558,7 @@ mod tests {
             &policy,
             &overrides,
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
         )
         .unwrap();
 
@@ -1760,5 +1784,41 @@ mod tests {
             "the signal is per-process evidence and needs no exclusive window"
         );
         assert_eq!(attribute_resource_limit(None, None, true), None);
+    }
+
+    /// `MURMUR_RUNTIME_DIR` is runtime-owned like `HOME`: an override, a declared baseline name
+    /// and a host value all lose to the session's own runtime directory, and with none there is
+    /// no such variable.
+    #[test]
+    fn build_shell_env_sets_the_runtime_dir_last_whatever_else_says() {
+        let workdir = tempfile::tempdir().unwrap();
+        let root = WorkdirRoot::open(workdir.path()).unwrap();
+        std::env::set_var(crate::runtime_dir::RUNTIME_DIR_ENV, "/host/value");
+        let policy = CapabilityPolicy {
+            shell_baseline_env: vec![crate::runtime_dir::RUNTIME_DIR_ENV.to_string()],
+            env_allow: vec![crate::runtime_dir::RUNTIME_DIR_ENV.to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let overrides = [(
+            crate::runtime_dir::RUNTIME_DIR_ENV.to_string(),
+            "/override".to_string(),
+        )];
+
+        let env = build_shell_env(
+            &policy,
+            &overrides,
+            &root,
+            Some(std::path::Path::new("/runtime/dir")),
+        )
+        .unwrap();
+        assert_eq!(
+            env.get(crate::runtime_dir::RUNTIME_DIR_ENV)
+                .map(String::as_str),
+            Some("/runtime/dir")
+        );
+
+        let without = build_shell_env(&policy, &overrides, &root, None).unwrap();
+        assert!(!without.contains_key(crate::runtime_dir::RUNTIME_DIR_ENV));
+        assert!(!build_declared_env(&policy).contains_key(crate::runtime_dir::RUNTIME_DIR_ENV));
     }
 }

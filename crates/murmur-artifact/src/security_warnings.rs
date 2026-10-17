@@ -312,6 +312,13 @@ pub const W_SEC_031: &str = "W-SEC-031";
 /// `mur doctor --bind`, and from `mur deploy`.
 pub const W_SEC_032: &str = "W-SEC-032";
 
+/// `~/.murmur/sessions`, where every session's runtime directory is created, lies inside the
+/// workdir the capsule's commands write, so they can change `task.md`, `MURMUR.md`, plans and
+/// installed tools. Fires once per launch below a `scoped` floor, which records
+/// `achieved_containment: advisory`; a `scoped` or `sealed` floor refuses the launch with
+/// `E-CAP-003` instead. `mur doctor` prints it for `<manifest-dir>/workdir`.
+pub const W_SEC_033: &str = "W-SEC-033";
+
 /// Builds the doc link for a `W-SEC-*` code, e.g. `.../diagnostics/#w-sec-001`.
 pub fn security_warning_link(code: &str) -> String {
     crate::diagnostic_link(code)
@@ -329,7 +336,7 @@ mod tests {
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
             W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_021, W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025,
-            W_SEC_027, W_SEC_028, W_SEC_029, W_SEC_030, W_SEC_031, W_SEC_032,
+            W_SEC_027, W_SEC_028, W_SEC_029, W_SEC_030, W_SEC_031, W_SEC_032, W_SEC_033,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

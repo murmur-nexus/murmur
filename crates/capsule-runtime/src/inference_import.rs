@@ -272,6 +272,8 @@ impl HookInferenceCtx {
             ToolInvokeEnv {
                 engine: &self.engine,
                 accessible_workdir: &self.accessible_workdir,
+                // A driver is handed no runtime directory.
+                runtime_dir: None,
                 inference_env: &self.inference_env,
                 capability_policy: &self.capability_policy,
                 network_allow_rules: &self.network_allow_rules,

@@ -37,7 +37,7 @@ fn build_valid_fixture_creates_mur_zip_with_expected_layout() {
     let mut names = Vec::new();
     for i in 0..archive.len() {
         let file = archive.by_index(i).unwrap();
-        names.push(file.name().to_string());
+        names.push(file.name().unwrap().into_owned());
     }
     names.sort();
 
@@ -150,7 +150,7 @@ fn skill_artifact_build_succeeds_with_skill_md() {
     let mut archive = ZipArchive::new(file).unwrap();
 
     let mut names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
         .collect();
     names.sort();
 

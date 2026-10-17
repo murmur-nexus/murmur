@@ -86,6 +86,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -784,7 +785,8 @@ fn trace_events(workdir: &Path) -> Vec<Value> {
         .collect()
 }
 
-/// With no link in the workdir, an A2A task writes its `task.md` and completes.
+/// With no link in the workdir, an A2A task is written to the runtime directory, not the
+/// workdir, and completes.
 #[test]
 fn workdir_path_happy_path_writes_task_md_and_completes() {
     if common::skip_without_host_support("workdir_path_happy_path_writes_task_md_and_completes") {
@@ -797,11 +799,9 @@ fn workdir_path_happy_path_writes_task_md_and_completes() {
 
     send_one_task(staged, "the task text").expect("the session runs");
 
-    assert_eq!(
-        fs::read_to_string(workdir.join("task.md")).unwrap(),
-        "the task text"
-    );
+    assert!(!workdir.join("task.md").exists());
     assert_eq!(server.requests().len(), 1);
+    assert!(common::last_user_text(&server.requests()[0]).contains("the task text"));
     let events = trace_events(&workdir);
     assert!(events
         .iter()
@@ -813,9 +813,10 @@ fn workdir_path_happy_path_writes_task_md_and_completes() {
     assert_eq!(end["exit_status"], "ok", "{end}");
 }
 
-/// `task.md` replaced by a link to an outside sentinel after staging: the A2A task's write is
-/// refused, the sentinel keeps its bytes, the trace records the refusal and then the failure,
-/// and the provider is never asked anything for the task.
+/// `task.md` replaced by a link to an outside sentinel after staging: the one read of the
+/// operator's task at session start is refused, the A2A task goes to the runtime directory, the
+/// sentinel keeps its bytes, the trace records the refusal and then the failure, and the provider
+/// is never asked anything for the task.
 #[test]
 fn workdir_path_refused_for_an_a2a_task_md_link() {
     if common::skip_without_host_support("workdir_path_refused_for_an_a2a_task_md_link") {
@@ -851,14 +852,14 @@ fn workdir_path_refused_for_an_a2a_task_md_link() {
         at("workdir_path_refused") < at("task_failed") && at("task_failed") < at("task_end"),
         "{types:?}"
     );
-    // A link at `task.md` when the session starts is refused as a pending task too, so the
-    // write's line is the one asserted on.
+    // Nothing writes the workdir's `task.md`: the refusal is the import's read.
     let refusal = events
         .iter()
-        .find(|event| {
-            event["event_type"] == "workdir_path_refused" && event["operation"] == "write"
-        })
-        .unwrap_or_else(|| panic!("no refused write in {types:?}"));
+        .find(|event| event["event_type"] == "workdir_path_refused" && event["operation"] == "read")
+        .unwrap_or_else(|| panic!("no refused read in {types:?}"));
+    assert!(!events.iter().any(|event| {
+        event["event_type"] == "workdir_path_refused" && event["operation"] == "write"
+    }));
     assert_eq!(refusal["path"], "task.md", "{refusal}");
     assert_eq!(refusal["refused_at"], "task.md", "{refusal}");
     assert_eq!(refusal["reason"], "symlink", "{refusal}");

@@ -1362,8 +1362,18 @@ fn the_control_token_is_unreachable_from_inside_the_capsule() {
         &extra,
     );
 
-    let scope = common::explain_scope_json(&home.dir, &project.manifest_path()).to_string();
+    // The one path under ~/.murmur a capsule may name is its own read-only runtime directory,
+    // under `sessions/`; the control tokens sit under `running/`, outside it.
+    let mut scope = common::explain_scope_json(&home.dir, &project.manifest_path());
     let murmur_home = home.path().join(".murmur");
+    let runtime_dir = scope["runtime_dir"]["path"].as_str().unwrap().to_string();
+    assert!(
+        Path::new(&runtime_dir).starts_with(murmur_home.join("sessions")),
+        "{runtime_dir}"
+    );
+    assert!(!home.running_dir().starts_with(Path::new(&runtime_dir)));
+    scope.as_object_mut().unwrap().remove("runtime_dir");
+    let scope = scope.to_string();
     assert!(
         !scope.contains(murmur_home.to_str().unwrap()),
         "the scope names a path under ~/.murmur: {scope}"

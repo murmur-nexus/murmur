@@ -115,7 +115,7 @@ Explain what makes an infrastructure deployment reproducible, in three bullet po
 
 ## Step 4 — run the capsule
 
-Pass the task file with `--task`. `mur run` stages the declared artifacts, copies `task.md` into the capsule's working directory, starts the capsule's local HTTP server, and drives the agent loop to completion:
+Pass the task file with `--task`. `mur run` stages the declared artifacts, hands the agent the task, starts the capsule's local HTTP server, and drives the agent loop to completion:
 
 ```text
 mur run --task task.md
@@ -124,7 +124,7 @@ session: ses_019ed2af53da75c2aefee84ee10c34af
 status:  ok
 ```
 
-The `session:` value identifies this run. Everything the run produces lands under `workdir/<session_id>/`: the task input (`task.md`), the model's final text (`out/result.txt`), the structured trace (`trace.jsonl`), and runtime logs (`logs/`). The session workdir is the single place to look — read the result directly with:
+The `session:` value identifies this run. Everything the run produces lands under `workdir/<session_id>/`: the model's final text (`out/result.txt`), the structured trace (`trace.jsonl`), and runtime logs (`logs/`). The session workdir is the single place to look — read the result directly with:
 
 ```bash
 cat workdir/*/out/result.txt

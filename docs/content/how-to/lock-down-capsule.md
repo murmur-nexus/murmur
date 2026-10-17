@@ -319,7 +319,7 @@ session: ses_019ed2af53da75c2aefee84ee10c34af
 status:  ok
 ```
 
-Check `workdir/<session_id>/MURMUR.md`. The **Running Shell Commands** section lists the binaries the agent has access to:
+The capsule's `MURMUR.md`, which the agent reads at `$MURMUR_RUNTIME_DIR/MURMUR.md`, lists the binaries it has access to under **Running Shell Commands**:
 
 ```text
 ## Running Shell Commands

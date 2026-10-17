@@ -18,7 +18,7 @@ fn zip_entries(path: &Path) -> Vec<String> {
     let file = fs::File::open(path).unwrap();
     let mut archive = ZipArchive::new(file).unwrap();
     let mut names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
         .collect();
     names.sort();
     names
@@ -366,6 +366,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
@@ -404,10 +405,10 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
     )
     .unwrap();
 
-    // 6. Verify tools/rt-skill/skill.md is present in the workdir: the model-facing directory
+    // 6. Verify tools/rt-skill/skill.md is present in the runtime directory: the model-facing directory
     // carries the bare name
     let skill_path = staged
-        .workdir
+        .runtime_dir
         .join("tools")
         .join("rt-skill")
         .join("skill.md");

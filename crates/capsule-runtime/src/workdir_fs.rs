@@ -378,6 +378,80 @@ impl WorkdirRoot {
         })
     }
 
+    /// [`Self::open_sharing_latch`], with every refusal and error naming its path as
+    /// `<path>/<rel>`: for a directory outside the workdir that an operator reads about by its
+    /// absolute path, such as the session's runtime directory.
+    pub fn open_sharing_latch_absolute(
+        path: &Path,
+        latch_of: &WorkdirRoot,
+    ) -> Result<Self, WorkdirError> {
+        let opened = Self::open(path)?;
+        Ok(Self {
+            anchor: Arc::new(Anchor {
+                fd: Mutex::new(opened.anchor_fd(false)?),
+                path: path.to_path_buf(),
+                prefix: path.display().to_string(),
+                origin: Origin::Path,
+            }),
+            latch: Arc::clone(&latch_of.latch),
+        })
+    }
+
+    /// `(st_dev, st_ino)` of this root's directory, from `fstat` on the held descriptor.
+    pub fn identity(&self) -> Result<(u64, u64), WorkdirError> {
+        fd_identity(&*self.anchor_fd(false)?).map_err(|errno| self.io("", errno.into()))
+    }
+
+    /// A fresh read-only directory descriptor for this root's own directory, reopened from the
+    /// held descriptor with no path lookup, for `*at` calls the root has no method for.
+    pub fn dir_fd(&self) -> Result<OwnedFd, WorkdirError> {
+        let anchor = self.anchor_fd(false)?;
+        rustix::fs::openat(&*anchor, ".", DIR_FLAGS, Mode::empty())
+            .map_err(|errno| self.io("", errno.into()))
+    }
+
+    /// An `O_PATH | O_DIRECTORY` descriptor for this root's own directory, reopened from the held
+    /// descriptor with no path lookup: a Landlock rule's fd, or a bind source through
+    /// `/proc/self/fd/<n>`.
+    #[cfg(target_os = "linux")]
+    pub fn path_fd(&self) -> Result<OwnedFd, WorkdirError> {
+        let anchor = self.anchor_fd(false)?;
+        rustix::fs::openat(
+            &*anchor,
+            ".",
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|errno| self.io("", errno.into()))
+    }
+
+    /// An `O_PATH | O_DIRECTORY | O_NOFOLLOW` descriptor for the existing directory `rel`,
+    /// reached by the same no-follow walk every other call takes. A link at any segment is
+    /// refused and latched; a missing directory is a `NotFound` I/O error.
+    #[cfg(target_os = "linux")]
+    pub fn path_fd_beneath(&self, rel: impl AsRef<Path>) -> Result<OwnedFd, WorkdirError> {
+        let rel = rel.as_ref().to_string_lossy();
+        let op = WorkdirOperation::Read;
+        let (parent, name) = self.parent_of(&rel, op, false)?;
+        let Some(parent) = parent else {
+            return Err(self.io(&rel, std::io::ErrorKind::NotFound.into()));
+        };
+        let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let refused_or = |errno: Errno| match self.leaf_type(&parent, name, &rel) {
+            Ok(Some(FileType::Symlink)) => self.refuse(&rel, &rel, op, RefusalReason::Symlink),
+            Ok(_) => self.io(&rel, errno.into()),
+            Err(error) => error,
+        };
+        let fd = rustix::fs::openat(&parent, name, flags, Mode::empty()).map_err(refused_or)?;
+        // `O_PATH | O_NOFOLLOW` opens a link itself rather than failing on it, so the kind is
+        // checked on the descriptor that was opened.
+        let stat = rustix::fs::fstat(&fd).map_err(|errno| self.io(&rel, errno.into()))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(refused_or(Errno::NOTDIR));
+        }
+        Ok(fd)
+    }
+
     /// This root's host path, for display, a subprocess argument, a Landlock rule or a bind
     /// source. The runtime never opens it through `std`.
     pub fn path(&self) -> &Path {
@@ -982,6 +1056,12 @@ impl WorkdirRoot {
             source,
         }
     }
+}
+
+/// `(st_dev, st_ino)` of the file `fd` names, from `fstat`.
+pub(crate) fn fd_identity(fd: impl AsFd) -> rustix::io::Result<(u64, u64)> {
+    let stat = rustix::fs::fstat(fd)?;
+    Ok((stat.st_dev as u64, stat.st_ino as u64))
 }
 
 #[cfg(test)]

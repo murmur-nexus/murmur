@@ -308,7 +308,8 @@ pub enum HookCommitPolicy {
     None,
     /// `"replace-context"` — runtime replaces conversation history. Valid only with on-compaction.
     ReplaceContext,
-    /// `"write-manifests"` — runtime writes tool manifests to workdir/tools/. Valid only with on-stage.
+    /// `"write-manifests"` — runtime writes tool manifests to the runtime directory's tools/. Valid
+    /// only with on-stage.
     WriteManifests,
     /// `"reopen-task"` — runtime re-runs the task's agent loop with the hook's feedback.
     /// Valid only with on-task-end.
@@ -1113,7 +1114,7 @@ pub struct RuntimeArtifact {
 impl RuntimeArtifact {
     /// The name a staged session knows this artifact by: the bare part of its full name, or a
     /// `source:` entry's own name. It is the model-facing tool name and the directory under
-    /// `workdir/tools/`.
+    /// `<runtime dir>/tools/`.
     #[must_use]
     pub fn tool_name(&self) -> &str {
         tool_name_of(&self.name)

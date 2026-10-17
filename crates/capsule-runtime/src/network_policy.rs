@@ -570,11 +570,14 @@ where
             (_, false) => PreopenSurface::WholeWorkdir,
         };
 
+        let runtime_dir_read_only =
+            crate::runtime_dir::gets_runtime_dir_preopen(runtime, scope.is_some());
         reports.push(PreopenReport {
             artifact: name.to_string(),
             role: runtime.as_str().to_string(),
             scope,
             surface,
+            runtime_dir_read_only,
         });
     }
 
@@ -1123,18 +1126,21 @@ mod tests {
                     role: "tool".to_string(),
                     scope: None,
                     surface: PreopenSurface::WholeWorkdir,
+                    runtime_dir_read_only: true,
                 },
                 PreopenReport {
                     artifact: "anthropic-driver".to_string(),
                     role: "driver".to_string(),
                     scope: None,
                     surface: PreopenSurface::WholeWorkdir,
+                    runtime_dir_read_only: false,
                 },
                 PreopenReport {
                     artifact: "telemetry-hook".to_string(),
                     role: "hook".to_string(),
                     scope: None,
                     surface: PreopenSurface::Nothing,
+                    runtime_dir_read_only: false,
                 },
             ]
         );
@@ -1163,12 +1169,14 @@ mod tests {
                     role: "tool".to_string(),
                     scope: Some("cache".to_string()),
                     surface: PreopenSurface::ScopedSubtree,
+                    runtime_dir_read_only: false,
                 },
                 PreopenReport {
                     artifact: "telemetry-hook".to_string(),
                     role: "hook".to_string(),
                     scope: Some("hook-state".to_string()),
                     surface: PreopenSurface::ScopedSubtree,
+                    runtime_dir_read_only: false,
                 },
             ]
         );

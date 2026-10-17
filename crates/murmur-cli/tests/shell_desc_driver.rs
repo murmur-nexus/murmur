@@ -20,6 +20,7 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
         std::sync::Arc::new(local_registry),
         StageRequest {
             source_supply: None,
+            expected_workdir_identity: None,
             credentials_file: None,
             manifest_dir: project.path().to_path_buf(),
             capsule_name: "test-no-driver".to_string(),
@@ -80,7 +81,7 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
 
     let bash_manifest = fs::read_to_string(
         staged
-            .workdir
+            .runtime_dir
             .join("tools")
             .join("bash")
             .join("murmur.yaml"),

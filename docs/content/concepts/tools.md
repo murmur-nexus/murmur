@@ -18,7 +18,7 @@ Each tool call is resolved in a fixed precedence order:
 
 1. A native binary staged for that artifact
 2. The shell allowlist
-3. A skill artifact (`workdir/tools/<name>/skill.md`, returned directly)
+3. A skill artifact (`tools/<name>/skill.md` in the [runtime directory](../reference/workdir.md#runtime-directory), returned directly)
 4. A WASM-artifact tool
 5. Otherwise, an error
 

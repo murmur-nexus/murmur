@@ -141,7 +141,10 @@ pub fn select_root_wasm_in_archive<R: Read + Seek>(
         let Ok(file) = archive.by_index(idx) else {
             continue;
         };
-        entry_names.push(file.name().to_string());
+        let Ok(name) = file.name() else {
+            continue;
+        };
+        entry_names.push(name.into_owned());
     }
 
     select_root_wasm_from_entries(entry_names)
