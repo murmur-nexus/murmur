@@ -117,7 +117,7 @@ The first two lines are printed the moment the capsule's HTTP port is bound, bef
 | `session:` | The session ID — names the workdir subdirectory and appears in `trace.jsonl` |
 | `status:` | `ok`, `failed`, or `trapped` |
 
-`--task` also accepts inline text. If the value is the path to an existing file its contents are copied to `task.md`; anything else is written to `task.md` verbatim:
+`--task` also accepts inline text. Either way the task lands in `task.md` in the session's [runtime directory](../reference/workdir.md#runtime-directory), and your workdir is left alone. If the value is the path to an existing file its contents are copied; anything else is written verbatim:
 
 ```bash
 mur run --task "Summarise what this repository does in three sentences."

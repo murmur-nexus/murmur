@@ -82,7 +82,8 @@ pub struct InheritReport {
     pub counted: u32,
     /// Records whose process is gone. Left on disk for `mur ps` to prune.
     pub stale: u32,
-    /// `.json` files that did not parse. Left on disk.
+    /// `.json` files that did not parse, and records an older `mur` wrote, which this daemon cannot
+    /// count as live. Left on disk.
     pub unreadable: u32,
     /// How long the read and the classification took.
     pub elapsed: Duration,
@@ -120,7 +121,8 @@ pub fn inherit_with(
 ) -> Result<(Inherited, InheritReport), String> {
     let started = Instant::now();
     let scan = running::scan(dir)?;
-    let records_read = scan.records.len() + scan.unreadable.len();
+    let not_counted = scan.older_mur.len() + scan.unreadable.len();
+    let records_read = scan.records.len() + not_counted;
 
     let mut kept = Vec::with_capacity(scan.records.len());
     let mut stale = 0u32;
@@ -139,7 +141,7 @@ pub fn inherit_with(
         records_read,
         counted: kept.len() as u32,
         stale,
-        unreadable: scan.unreadable.len() as u32,
+        unreadable: not_counted as u32,
         elapsed: started.elapsed(),
     };
     Ok((Inherited { records: kept }, report))
@@ -207,16 +209,31 @@ mod tests {
         write_record(dir.path(), "ses_c", GONE);
         let broken = dir.path().join("ses_d.json");
         std::fs::write(&broken, "{").unwrap();
+        let older_mur = dir.path().join("ses_e.json");
+        let older_body = serde_json::json!({
+            "session_id": "ses_e",
+            "url": "127.0.0.1:1",
+            "pid": ALIVE,
+            "process_start": "42",
+            "capsule_name": "demo",
+            "capsule_version": "0.1.0",
+            "workdir": "/tmp/demo",
+            "outlives_launcher": true,
+            "started_at": "2026-01-01T00:00:00Z",
+        })
+        .to_string();
+        std::fs::write(&older_mur, &older_body).unwrap();
 
         let (mut inherited, report) = inherit_with(dir.path(), by_pid).unwrap();
 
-        assert_eq!(report.records_read, 4);
+        assert_eq!(report.records_read, 5);
         assert_eq!(report.counted, 2);
         assert_eq!(report.stale, 1);
-        assert_eq!(report.unreadable, 1);
+        assert_eq!(report.unreadable, 2);
         assert_eq!(inherited.len(), 2);
         assert_eq!(inherited.live_with(&HashMap::new(), by_pid), 2);
         assert_eq!(std::fs::read_to_string(&broken).unwrap(), "{");
+        assert_eq!(std::fs::read_to_string(&older_mur).unwrap(), older_body);
         assert!(dir.path().join("ses_c.json").exists());
     }
 

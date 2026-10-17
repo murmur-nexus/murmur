@@ -337,9 +337,10 @@ enum Commands {
         #[arg(long)]
         spawn_grant_stdin: bool,
 
-        /// File path or inline text to write as task.md in the capsule workdir.
-        /// If the value is the path to an existing file its contents are copied;
-        /// otherwise the value itself is written as UTF-8 text.
+        /// This launch's task, written as task.md in the session's runtime directory before
+        /// launch. The capsule reads it at $MURMUR_RUNTIME_DIR/task.md and cannot change it;
+        /// the workdir is left alone. If the value is the path to an existing file its
+        /// contents are copied; otherwise the value itself is written as UTF-8 text.
         #[arg(long)]
         task: Option<String>,
 

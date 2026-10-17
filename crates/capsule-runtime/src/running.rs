@@ -67,7 +67,8 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// `formation_launcher` and `spawned_by` is required, and each of those six is omitted when it does
 /// not apply, so a standalone session's record carries the ten required keys alone. There is no
 /// version field: a record that does not deserialize names no process that could be checked, and
-/// is pruned, which is what "the record is a hint" already means.
+/// is pruned, which is what "the record is a hint" already means — except one an older `mur`
+/// wrote, which [`scan`] recognises by its missing `records_dir` and no reader removes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningRecord {
     /// The session this door answers for, compared against the agent card by layer 3.
@@ -85,7 +86,9 @@ pub struct RunningRecord {
     pub workdir: PathBuf,
     /// The session's records directory, `~/.murmur/records/<workdir root>/<session-id>`, where a
     /// reader finds the trace of what it is watching, outside the workdir the capsule's commands
-    /// write. Required: a record without it is unreadable.
+    /// write. Required. A JSON object with a string `session_id` and no `records_dir` key is a
+    /// record an older `mur` wrote: [`scan`] lists it in [`RecordScan::older_mur`], and nothing
+    /// reads its other fields or removes it.
     pub records_dir: PathBuf,
     /// Whether the capsule survives the window that launched it — `true` when the launching
     /// process had no controlling terminal.
@@ -235,15 +238,29 @@ pub fn running_dir_location() -> Result<PathBuf, String> {
 pub struct RecordScan {
     /// Every record that parses, most recent session first.
     pub records: Vec<RunningRecord>,
-    /// Every `.json` file that could not be read or did not parse, left where it is.
+    /// Every `.json` file an older `mur` wrote — a JSON object with a string `session_id` and no
+    /// `records_dir` key — most recent session first. Its capsule may still be running, so no
+    /// reader removes it, and none reads it past those two keys.
+    pub older_mur: Vec<PathBuf>,
+    /// Every other `.json` file that could not be read or did not parse, left where it is.
     pub unreadable: Vec<PathBuf>,
+}
+
+/// What [`read_record`] made of one `.json` file.
+#[derive(Debug)]
+enum RecordRead {
+    Record(Box<RunningRecord>),
+    /// A JSON object with a string `session_id` and no `records_dir` key.
+    OlderMur,
+    Unreadable,
 }
 
 /// Every `.json` entry of `dir`, read and parsed, with nothing created, re-moded or removed.
 ///
 /// Session ids are time-ordered, so a lexical sort descending is chronological. Only the `json`
 /// extension is read: the staging file [`RunningGuard::write`] renames into place ends in `.tmp`,
-/// so a record mid-write is neither a record nor unreadable.
+/// so a record mid-write is neither a record nor unreadable. A file is sorted into
+/// [`RecordScan::older_mur`] by its `session_id` and `records_dir` keys alone.
 ///
 /// A `dir` that does not exist is an empty machine. The `Err` is any other failure to list it —
 /// a path that is a regular file, or one this user may not read — and names the path and the OS
@@ -262,12 +279,14 @@ pub fn scan(dir: &Path) -> Result<RecordScan, String> {
             continue;
         }
         match read_record(&path) {
-            Some(record) => scan.records.push(record),
-            None => scan.unreadable.push(path),
+            RecordRead::Record(record) => scan.records.push(*record),
+            RecordRead::OlderMur => scan.older_mur.push(path),
+            RecordRead::Unreadable => scan.unreadable.push(path),
         }
     }
     scan.records
         .sort_by(|left, right| right.session_id.cmp(&left.session_id));
+    scan.older_mur.sort_by(|left, right| right.cmp(left));
     Ok(scan)
 }
 
@@ -275,7 +294,8 @@ pub fn scan(dir: &Path) -> Result<RecordScan, String> {
 ///
 /// A file that does not parse is unlinked on the way past: nothing can verify it, and leaving it
 /// would mean carrying a permanent unreadable entry in a directory whose whole purpose is to be
-/// read.
+/// read. A record an older `mur` wrote is left in place and not listed: its capsule may still be
+/// running, and this file is the only handle the `mur` that started it has.
 ///
 /// The `Err` is the directory being unusable — `~/.murmur/running` cannot be created, held at
 /// `0700`, or listed — and names the path and the OS error. An empty machine is `Ok` with no
@@ -289,17 +309,25 @@ pub fn list() -> Result<Vec<RunningRecord>, String> {
 pub struct RecordListing {
     /// Every record that parses, most recent session first.
     pub records: Vec<RunningRecord>,
-    /// Every `.json` file that could not be read or did not parse and that this read unlinked. A
-    /// file the unlink failed on is not here.
+    /// Every `.json` file an older `mur` wrote, as [`RecordScan::older_mur`] names it, left in
+    /// place.
+    pub older_mur: Vec<PathBuf>,
+    /// Every other `.json` file that could not be read or did not parse and that this read
+    /// unlinked. A file the unlink failed on is not here.
     pub removed_unreadable: Vec<PathBuf>,
 }
 
-/// [`list`], also naming the unreadable files it removed, for a reader that reports its pruning.
+/// [`list`], also naming the unreadable files it removed and the older-`mur` records it left, for
+/// a reader that reports its pruning.
 ///
 /// The `Err` is [`list`]'s.
 pub fn list_reporting() -> Result<RecordListing, String> {
-    let dir = running_dir()?;
-    let scan = scan(&dir)?;
+    list_pruning(&running_dir()?)
+}
+
+/// [`scan`] of `dir`, unlinking every unreadable file and no other.
+fn list_pruning(dir: &Path) -> Result<RecordListing, String> {
+    let scan = scan(dir)?;
     let removed_unreadable = scan
         .unreadable
         .into_iter()
@@ -307,6 +335,7 @@ pub fn list_reporting() -> Result<RecordListing, String> {
         .collect();
     Ok(RecordListing {
         records: scan.records,
+        older_mur: scan.older_mur,
         removed_unreadable,
     })
 }
@@ -603,9 +632,24 @@ fn token_path(dir: &Path, session_id: &str) -> PathBuf {
     dir.join(format!("{session_id}.{CONTROL_TOKEN_EXTENSION}"))
 }
 
-fn read_record(path: &Path) -> Option<RunningRecord> {
-    let body = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&body).ok()
+fn read_record(path: &Path) -> RecordRead {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return RecordRead::Unreadable;
+    };
+    if let Ok(record) = serde_json::from_str(&body) {
+        return RecordRead::Record(record);
+    }
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(serde_json::Value::Object(object))
+            if object
+                .get("session_id")
+                .is_some_and(serde_json::Value::is_string)
+                && !object.contains_key("records_dir") =>
+        {
+            RecordRead::OlderMur
+        }
+        _ => RecordRead::Unreadable,
+    }
 }
 
 /// Layer 1. `EPERM` counts as alive: the pid is held, by a process this user may not signal.
@@ -1565,6 +1609,93 @@ mod home_tests {
         assert_eq!(std::fs::read_to_string(&broken).unwrap(), "{");
         assert!(staging.exists());
         assert!(control.exists());
+    }
+
+    /// A directory holding a current record, a record v0.6.0 wrote, a truncated file and a record
+    /// with `records_dir` and a `pid` that is no integer.
+    fn mixed_running_dir() -> (tempfile::TempDir, RunningRecord, PathBuf, [PathBuf; 2]) {
+        let dir = tempfile::tempdir().unwrap();
+        let current = record("ses_0199c4e2f1b7712a9d3e4f5061728391");
+        std::fs::write(
+            record_path(dir.path(), &current.session_id),
+            serde_json::to_vec(&current).unwrap(),
+        )
+        .unwrap();
+        let older_mur = record_path(dir.path(), "ses_0199c4e2f1b7712a9d3e4f5061728390");
+        std::fs::write(
+            &older_mur,
+            serde_json::json!({
+                "session_id": "ses_0199c4e2f1b7712a9d3e4f5061728390",
+                "url": "127.0.0.1:1",
+                "pid": 1,
+                "process_start": "42",
+                "capsule_name": "demo",
+                "capsule_version": "0.1.0",
+                "workdir": "/tmp/demo",
+                "outlives_launcher": true,
+                "started_at": "2026-01-01T00:00:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let truncated = dir.path().join("ses_broken.json");
+        std::fs::write(&truncated, "{").unwrap();
+        let mut bad_pid = serde_json::to_value(record("ses_bad_pid")).unwrap();
+        bad_pid["pid"] = serde_json::json!("one");
+        let bad_pid_path = dir.path().join("ses_bad_pid.json");
+        std::fs::write(&bad_pid_path, bad_pid.to_string()).unwrap();
+        (dir, current, older_mur, [truncated, bad_pid_path])
+    }
+
+    #[test]
+    fn scan_names_a_record_an_older_mur_wrote_apart_from_unreadable_files() {
+        let (dir, current, older_mur, unreadable) = mixed_running_dir();
+        let before = std::fs::read(&older_mur).unwrap();
+
+        let mut scan = scan(dir.path()).unwrap();
+
+        scan.unreadable.sort();
+        let mut expected_unreadable = unreadable.to_vec();
+        expected_unreadable.sort();
+        assert_eq!(scan.records, vec![current]);
+        assert_eq!(scan.older_mur, vec![older_mur.clone()]);
+        assert_eq!(scan.unreadable, expected_unreadable);
+        assert_eq!(std::fs::read(&older_mur).unwrap(), before);
+        assert!(unreadable.iter().all(|path| path.exists()));
+    }
+
+    #[test]
+    fn listing_unlinks_only_the_unreadable_files() {
+        let (dir, current, older_mur, unreadable) = mixed_running_dir();
+        let before = std::fs::read(&older_mur).unwrap();
+
+        let mut listing = list_pruning(dir.path()).unwrap();
+
+        listing.removed_unreadable.sort();
+        let mut expected_removed = unreadable.to_vec();
+        expected_removed.sort();
+        assert_eq!(listing.records, vec![current]);
+        assert_eq!(listing.older_mur, vec![older_mur.clone()]);
+        assert_eq!(listing.removed_unreadable, expected_removed);
+        assert_eq!(std::fs::read(&older_mur).unwrap(), before);
+        assert!(unreadable.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn an_object_without_a_string_session_id_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("ses_array.json", "[]"),
+            ("ses_no_id.json", r#"{"pid": 1}"#),
+            ("ses_number_id.json", r#"{"session_id": 7}"#),
+        ] {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+
+        let scan = scan(dir.path()).unwrap();
+
+        assert!(scan.older_mur.is_empty());
+        assert_eq!(scan.unreadable.len(), 3);
     }
 
     #[test]

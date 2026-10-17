@@ -913,7 +913,7 @@ is never counted again. A session that also registers with the daemon is counted
 | A record whose process is running and whose door does not answer | Yes — the process still holds memory, and the daemon never contacts a door |
 | A root started by hand before the restart that never registered | Yes — the daemon cannot tell which capsules its predecessor admitted, so it counts every one. The count falls as they exit |
 | A record whose process id nothing holds, or is held by a process that started at another time | No — stale |
-| A `.json` file that does not parse | No — unreadable, and under-counted if its capsule is running |
+| A `.json` file that does not parse, or a [record an older `mur` wrote](cli.md#running-capsule-records) | No — unreadable, and under-counted if its capsule is running |
 | A session that runs on with no record after [`W-SEC-023`](diagnostics.md#w-sec-023) | No — under-counted |
 | A script capsule | No — under-counted: it opens no door and writes no record |
 | A capsule running under another user's `HOME` | No — under-counted: the daemon reads its own `HOME` only |
@@ -926,7 +926,7 @@ The startup line reports the count, and every record read that it left out:
 | `counted from <dir>` | The running directory that was read |
 | `N records read in T ms` | Every `.json` file read, parseable or not, and how long the count took |
 | `N stale` | Records whose capsule is gone |
-| `N unreadable` | Files that did not parse |
+| `N unreadable` | Files that did not parse, and records an older `mur` wrote |
 
 The daemon writes nothing in `~/.murmur/running`: it creates no directory, changes no mode, and
 leaves every record where it found it, stale and unreadable ones included. `mur ps` prunes those.

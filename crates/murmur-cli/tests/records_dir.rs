@@ -1007,3 +1007,84 @@ fn the_runtime_dir_copies_the_launched_manifest() {
         );
     }
 }
+
+/// A capsule launched by name read no manifest, so its runtime directory holds none and neither
+/// the `[Capsule]` notice nor `MURMUR.md` names one.
+#[test]
+#[allow(clippy::print_stdout)]
+fn an_installed_capsule_s_runtime_dir_holds_and_names_no_manifest() {
+    if common::skip_without_host_support(
+        "an_installed_capsule_s_runtime_dir_holds_and_names_no_manifest",
+    ) {
+        return;
+    }
+    let server = common::ScriptedServer::start(vec![
+        tool_call(
+            1,
+            "toolu_ls",
+            "bash",
+            bash("ls -A \"$MURMUR_RUNTIME_DIR\"; echo ===; cat \"$MURMUR_RUNTIME_DIR/MURMUR.md\""),
+        ),
+        end_turn("done"),
+    ]);
+    let p = project(&server.endpoint, None, false);
+    let manifest = fs::read_to_string(&p.manifest).unwrap();
+    let body = manifest
+        .strip_prefix("name: records-capsule\nversion: 0.1.0\n")
+        .expect("the project manifest opens with its name and version");
+    common::publish_to_store(
+        &p.home.path().join(".murmur").join("artifacts"),
+        "local/records-capsule",
+        "0.1.0",
+        "capsule",
+        body,
+        None,
+    );
+    let workdir = TempDir::new().unwrap();
+
+    mur(p.home.path())
+        .args([
+            "run",
+            "--capsule",
+            "local/records-capsule",
+            "--capsule-version",
+            "0.1.0",
+            "--workdir",
+            workdir.path().to_str().unwrap(),
+            "--task",
+            TASK,
+            "--no-env-file",
+        ])
+        .assert()
+        .success();
+
+    let listed = result_text(&server, "toolu_ls");
+    let system = common::system_text(&server.requests()[0]["system"]).unwrap();
+    let notice = system
+        .lines()
+        .find(|line| line.starts_with("Runtime files:"))
+        .unwrap_or_default();
+    println!("── [Capsule] notice\n{notice}");
+    assert!(
+        system.contains(
+            "Runtime files: MURMUR.md, task.md and the installed tools are in a directory you can \
+             read and cannot change"
+        ),
+        "{system}"
+    );
+    let (listing, murmur_md) = listed
+        .split_once("\n===\n")
+        .unwrap_or_else(|| panic!("no listing separator: {listed}"));
+    let entries: Vec<&str> = listing.lines().map(str::trim).collect();
+    assert!(entries.contains(&"MURMUR.md"), "{listing}");
+    assert!(entries.contains(&"task.md"), "{listing}");
+    assert!(
+        !entries.iter().any(|entry| entry.ends_with(".yaml")),
+        "an installed capsule's runtime directory holds no manifest: {listing}"
+    );
+    assert!(
+        !murmur_md.contains("← the capsule's manifest"),
+        "{murmur_md}"
+    );
+    assert!(!workdir.path().join("murmur.yaml").exists());
+}
