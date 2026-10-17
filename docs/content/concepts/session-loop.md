@@ -49,19 +49,24 @@ executes it, appends the result, and starts the next turn. When the model return
 
 For agent capsules, the runtime writes `MURMUR.md` into the session's
 [runtime directory](../reference/workdir.md#runtime-directory), beside the task, the manifest copy
-and the installed tools — an onboarding file covering the capsule's identity, model and context
-budget, the two directories it works with, installed tools and skills, how to call a tool,
-available shell commands, and how to write checkpoints.
+and the installed tools. It is an onboarding file covering:
 
-The agent reaches that directory, and cannot change anything in it, by two names:
+- the capsule's identity, model and context budget
+- the two directories it works with
+- installed tools and skills, and how to call a tool
+- available shell commands
+- how to write checkpoints
+
+The agent reaches that directory by two names:
 
 | From | Name |
 |---|---|
 | A shell command, a native tool, a `transport: process` harness | `$MURMUR_RUNTIME_DIR` |
 | A file tool with no `capabilities.filesystem.scope` | `murmur-runtime/` |
 
-The `[Capsule]` block at the head of every system prompt says so in one fixed line, the same on
-every launch:
+Where the host can enforce it, the agent's commands can read the directory and cannot change it —
+see [What protects it](../reference/workdir.md#what-protects-it). The `[Capsule]` block at the head
+of every system prompt names both ways in with one fixed line, the same on every launch:
 
 ```text
 Runtime files: MURMUR.md, task.md, murmur.yaml and the installed tools are in a directory you can read and cannot change — $MURMUR_RUNTIME_DIR in a shell command, murmur-runtime/ in a file tool.

@@ -21,12 +21,13 @@
 //! there exactly as it is in the workdir.
 
 use std::os::fd::OwnedFd;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags};
 
+use crate::protected_paths::canonicalize_existing_prefix;
 use crate::workdir_fs::WorkdirRoot;
 
 /// The variable naming the runtime directory in every shell command's, plan shell step's, native
@@ -37,6 +38,17 @@ pub const RUNTIME_DIR_ENV: &str = "MURMUR_RUNTIME_DIR";
 /// The guest path a `runtime: tool` with no `capabilities.filesystem.scope` finds the runtime
 /// directory at, preopened read-only beside its `"."`.
 pub const RUNTIME_DIR_GUEST_PATH: &str = "murmur-runtime";
+
+/// Whether an artifact's guest gets the read-only [`RUNTIME_DIR_GUEST_PATH`] preopen: a
+/// `runtime: tool` with no `capabilities.filesystem.scope`, which also holds the whole workdir
+/// at `"."`. A driver, a hook and a tool confined to a subtree get none.
+#[must_use]
+pub(crate) fn gets_runtime_dir_preopen(
+    runtime: &murmur_artifact::ArtifactRuntime,
+    declares_filesystem_scope: bool,
+) -> bool {
+    *runtime == murmur_artifact::ArtifactRuntime::Tool && !declares_filesystem_scope
+}
 
 /// `~/.murmur/sessions`, relative to the murmur home.
 pub const SESSIONS_DIR_NAME: &str = "sessions";
@@ -187,48 +199,14 @@ fn hold_owned_private_dir(parent: &Path) -> Result<(), String> {
 /// where it would be created.
 #[must_use]
 pub fn runtime_dir_placement(workdir: &Path) -> RuntimeDirPlacement {
-    let workdir = absolute(workdir);
+    let workdir = std::path::absolute(workdir).unwrap_or_else(|_| workdir.to_path_buf());
     let sessions_dir = sessions_dir();
-    let inside_workdir =
-        resolve_existing_prefix(&sessions_dir).starts_with(resolve_existing_prefix(&workdir));
+    let inside_workdir = canonicalize_existing_prefix(&sessions_dir)
+        .starts_with(canonicalize_existing_prefix(&workdir));
     RuntimeDirPlacement {
         sessions_dir,
         workdir,
         inside_workdir,
-    }
-}
-
-fn absolute(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    }
-}
-
-/// `path` with its nearest existing ancestor canonicalized and the components below it appended
-/// lexically.
-fn resolve_existing_prefix(path: &Path) -> PathBuf {
-    let path = absolute(path);
-    let mut rest = Vec::new();
-    let mut current = path.as_path();
-    loop {
-        if let Ok(resolved) = current.canonicalize() {
-            let mut joined = resolved;
-            for component in rest.iter().rev() {
-                joined.push(component);
-            }
-            return joined;
-        }
-        match (current.parent(), current.components().next_back()) {
-            (Some(parent), Some(Component::Normal(name))) => {
-                rest.push(name.to_os_string());
-                current = parent;
-            }
-            _ => return path,
-        }
     }
 }
 
@@ -534,13 +512,13 @@ mod tests {
         let link = temp.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let resolved = resolve_existing_prefix(&link.join("not-yet").join("deeper"));
+        let resolved = canonicalize_existing_prefix(&link.join("not-yet").join("deeper"));
         assert_eq!(
             resolved,
             real.canonicalize().unwrap().join("not-yet").join("deeper")
         );
-        assert!(resolve_existing_prefix(&link.join(".murmur/sessions"))
-            .starts_with(resolve_existing_prefix(&real)));
+        assert!(canonicalize_existing_prefix(&link.join(".murmur/sessions"))
+            .starts_with(canonicalize_existing_prefix(&real)));
     }
 
     #[test]

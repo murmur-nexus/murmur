@@ -26,7 +26,7 @@ there. `mur run --explain-scope` enumerates those paths, as `runtime_writes` und
 - Excluding the single prefix `.murmur/` covers every runtime-written path outside the accessible
   workdir's own top level.
 
-Two more directories sit outside both and outlive every session: a
+Two more directories sit outside the workdirs and outlive every session: a
 [durable state store](#state-store), for artifacts that ask for one by name, and the
 [conversation record](#the-conversation-record), which every `http` capsule keeps by default.
 
@@ -49,7 +49,8 @@ plus every reopen's feedback so far. When a task continues with
 than continuing its conversation, the rewrite also holds every batch of answers so far.
 
 The capsule reads it at `$MURMUR_RUNTIME_DIR/task.md` in a shell command and at
-`murmur-runtime/task.md` in a file tool, and cannot change it. A `task.md` the capsule writes in its
+`murmur-runtime/task.md` in a file tool, and cannot change it where the host can enforce that — see
+[What protects it](#what-protects-it). A `task.md` the capsule writes in its
 own workdir is its own file.
 
 A task whose text is empty or only whitespace fails without a request to the model, with a message
@@ -77,8 +78,7 @@ Under `lifecycle.task_acceptance: queue` with `lifecycle.after_task: sleep` the 
 | `.capsule-home` | `$HOME` for every shell command and native tool. Created on the first such call. Reached only through the variable |
 | `.mur-tmp` | Backs `/tmp` inside a `sealed` capsule's composed root. The capsule sees `/tmp`. Counted against `capabilities.resources.workdir_max_bytes` like everything else in the workdir |
 
-These are the session's records, and the capsule's own commands can write them like any other file
-in the workdir: nothing here is protected against the capsule that produced it.
+The capsule's commands can write these like any other file in the workdir.
 
 ---
 
@@ -203,7 +203,8 @@ Runtime directory
 ```
 
 On a host or workdir that cannot protect it, `commands:` reads `can change it — <reason>`, and the
-same reason appears under `Not protected here`. `--json` carries the object as `runtime_dir`, and
+same reason appears under `Not protected here`. The `landlock+seccomp` tier at Landlock ABI 1 or 2
+reports this too, naming `truncate(2)`. `--json` carries the object as `runtime_dir`, and
 `trace.jsonl`'s `session_start` carries it verbatim as `effective_grants.runtime_dir`. `mur doctor`
 prints the same block for the project's declared containment.
 

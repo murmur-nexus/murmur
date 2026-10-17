@@ -698,8 +698,8 @@ const SYNTHETIC_LOGIN_SHELL: &str = "/bin/sh";
 const SYNTHETIC_ACCOUNT_NAME: &str = "capsule";
 
 impl SyntheticEtcFile {
-    /// File name under [`SEALED_ETC_STAGING_DIR_NAME`]. The basename of the target path, so the
-    /// staging directory reads like the `/etc` it stands in for.
+    /// File name under the session's `sealed-etc/`. The basename of the target path, so that
+    /// directory reads like the `/etc` it stands in for.
     pub(crate) fn file_name(self) -> &'static str {
         match self {
             Self::Passwd => "passwd",
@@ -1859,28 +1859,10 @@ mod linux {
 
         let mut buf = [0u8; 32];
         let mut len = 0usize;
-        let write_number = |buf: &mut [u8; 32], len: &mut usize, mut n: u32| {
-            let mut digits = [0u8; 10];
-            let mut count = 0;
-            loop {
-                digits[count] = b'0' + (n % 10) as u8;
-                count += 1;
-                n /= 10;
-                if n == 0 {
-                    break;
-                }
-            }
-            while count > 0 {
-                count -= 1;
-                buf[*len] = digits[count];
-                *len += 1;
-            }
-        };
-
-        write_number(&mut buf, &mut len, value);
+        push_decimal(&mut buf, &mut len, value);
         buf[len] = b' ';
         len += 1;
-        write_number(&mut buf, &mut len, value);
+        push_decimal(&mut buf, &mut len, value);
         buf[len] = b' ';
         len += 1;
         buf[len] = b'1';
@@ -2041,22 +2023,30 @@ mod linux {
             return Err(());
         }
         out[..PREFIX.len()].copy_from_slice(PREFIX);
-        let mut digits = [0u8; 12];
+        let mut len = PREFIX.len();
+        push_decimal(out, &mut len, fd as u32);
+        out[len] = 0;
+        Ok(())
+    }
+
+    /// Appends `n` in decimal to `buf` at `*len`, advancing `*len`. Allocation-free, for the
+    /// post-`fork()` window; `buf` must have room for ten more bytes.
+    fn push_decimal(buf: &mut [u8], len: &mut usize, mut n: u32) {
+        let mut digits = [0u8; 10];
         let mut count = 0;
-        let mut rest = fd as u32;
         loop {
-            digits[count] = b'0' + (rest % 10) as u8;
+            digits[count] = b'0' + (n % 10) as u8;
             count += 1;
-            rest /= 10;
-            if rest == 0 {
+            n /= 10;
+            if n == 0 {
                 break;
             }
         }
-        for (offset, digit) in digits[..count].iter().rev().enumerate() {
-            out[PREFIX.len() + offset] = *digit;
+        while count > 0 {
+            count -= 1;
+            buf[*len] = digits[count];
+            *len += 1;
         }
-        out[PREFIX.len() + count] = 0;
-        Ok(())
     }
 
     /// Opens the directory at `source` with `O_PATH`, and returns its descriptor only when its
@@ -3037,7 +3027,8 @@ mod tests {
 
         std::fs::rename(&store, dir.path().join("moved")).unwrap();
         std::os::unix::fs::symlink(&outside, &store).unwrap();
-        // SAFETY: as above.
+        // SAFETY: `source` is a NUL-terminated path this test owns; on the identity mismatch it
+        // reports, `open_verified_dir` has already closed the descriptor it opened.
         assert!(unsafe { linux::open_verified_dir(&source, identity) }.is_err());
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),

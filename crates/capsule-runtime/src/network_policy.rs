@@ -570,10 +570,8 @@ where
             (_, false) => PreopenSurface::WholeWorkdir,
         };
 
-        // Exactly the condition `runtime::runtime_dir_preopen` gives a tool the read-only
-        // `murmur-runtime/` preopen on.
         let runtime_dir_read_only =
-            matches!(runtime, murmur_artifact::ArtifactRuntime::Tool) && scope.is_none();
+            crate::runtime_dir::gets_runtime_dir_preopen(runtime, scope.is_some());
         reports.push(PreopenReport {
             artifact: name.to_string(),
             role: runtime.as_str().to_string(),

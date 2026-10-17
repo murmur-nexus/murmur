@@ -270,10 +270,9 @@ fn cli_system_prompt_overrides_a_prompt_file_that_does_not_exist() {
     assert_eq!(session_start(&workdir)["system_prompt_source"], "cli");
 }
 
-/// Overriding a `system_prompt_artifact` has to reach the two readers that never went through
-/// prompt resolution: the callable tool inventory, which excluded the skill, and MURMUR.md,
-/// which labelled it as bound. Both follow from clearing the field CLI-side. MURMUR.md is read
-/// from inside the run, where it lives: in the runtime directory, removed when the session ends.
+/// Overriding a `system_prompt_artifact` clears the field CLI-side, so the skill is callable in
+/// the tool inventory and MURMUR.md does not list it as bound. MURMUR.md is read from inside the
+/// run, in the runtime directory, which is removed when the session ends.
 #[test]
 fn cli_system_prompt_restores_an_overridden_prompt_artifact_to_the_inventory() {
     // Baseline: the manifest declaration alone binds the skill and hides it from the inventory.

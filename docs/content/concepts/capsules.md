@@ -99,6 +99,6 @@ component. The deadline bounds runaway compute, not slow I/O.
 
 Every running agent capsule gets a capsule name and version (from `murmur.yaml`), a
 runtime-generated session id, and a capsule URL (an OS-assigned local listener port). The same
-identity is exposed in [`MURMUR.md`](session-loop.md#murmur-md), in the WASI env for the driver
-and WASM tools, and in the shell tool subprocess env — so the agent, its tools, and its hooks
+identity is exposed in [`MURMUR.md`](session-loop.md#murmur-md), in the environment the driver
+and WASM tools see, and in every shell command's environment — so the agent, its tools, and its hooks
 all see one consistent identity for the session.

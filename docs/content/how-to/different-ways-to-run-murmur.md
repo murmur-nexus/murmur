@@ -238,6 +238,10 @@ Containment
   userns grant: profile_confining
   landlock ABI: 3
 
+Runtime directory
+  path:      /home/dev/.murmur/sessions/<session-id>/runtime
+  commands:  read only (landlock)
+
 Effective grants
   filesystem scope: <none>
   workdir exec:     false

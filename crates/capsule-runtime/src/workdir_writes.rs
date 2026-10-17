@@ -664,8 +664,8 @@ mod tests {
         ),
     ];
 
-    /// Entry names a file the runtime owns used to be written under inside a workdir, each of
-    /// which must now reach a runtime-directory root or nothing.
+    /// Entry names of files the runtime owns: a write or read under one of them reaches a
+    /// runtime-directory root, never a workdir root.
     const MOVED_OUT_OF_THE_WORKDIR: &[&str] = &[
         "tools",
         "MURMUR.md",
@@ -676,7 +676,7 @@ mod tests {
         ".process-driver",
     ];
 
-    /// Functions that read the workdir's own copy of a moved name, each with the reason.
+    /// Functions that read the workdir's own copy of one of those names, each with the reason.
     const MOVED_NAME_WORKDIR_READS: &[(&str, &str, &str)] = &[(
         "runtime.rs",
         "import_task_input",

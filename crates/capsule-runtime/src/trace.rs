@@ -1177,8 +1177,7 @@ struct TaskFailedEvent {
     parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
-    /// The task in progress. Absent for the run a launch makes from `input.txt` when no task
-    /// arrived, which has no `task_start`.
+    /// The task in progress. Absent for a failure recorded before any `task_start`.
     #[serde(skip_serializing_if = "Option::is_none")]
     task_id: Option<String>,
     /// The turn that failed, 0-based. Absent when the failure is the task's rather than one

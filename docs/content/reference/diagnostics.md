@@ -1277,8 +1277,8 @@ message; see [Links inside the workdir](workdir.md#links-inside-the-workdir).
 
 A capsule that delegates creates the child's directory under `.murmur/children/` and launches the
 child with that directory's identity. The child compares it with the `--workdir` it opens, before
-writing anything there, and refuses when they differ — the parent's workdir was changed under
-`.murmur/children/` between the directory's creation and the launch, a link swapped in for one:
+writing anything there, and refuses when they differ: something replaced the directory under
+`.murmur/children/`, with a link or another directory, between its creation and the launch:
 
 ```text
 error[E-RUN-051]: the workdir /home/dev/project/.murmur/children/worker-3f9c2a1b7e4d5c60 is not the directory the delegating capsule created (expected 2049:1311021, found 2049:1311042)
@@ -1332,7 +1332,7 @@ This applies to **every** Linux capsule that can spawn a subprocess, including o
 `capabilities.network.allow` is empty: with the namespace missing, an empty allowlist would mean
 unrestricted egress rather than none. There is no path that continues at reduced enforcement.
 
-A capsule spawns a subprocess through any of three routes, and `mur run` checks each at a
+A capsule can spawn a subprocess through any of the routes below, and `mur run` checks each at a
 different point:
 
 | Route | Checked |
@@ -1690,7 +1690,8 @@ error[E-CAP-019]: process driver 'my-process-driver@1.0.0' requires MY_PROFILE i
 ### E-CAP-020 — two artifacts share a tool name { #e-cap-020 }
 
 A session offers each declared artifact to the model by its tool name, the part of its full name
-after the `/`, and stages it under `workdir/tools/<tool name>/`. Two declared artifacts with one
+after the `/`, and stages it under `tools/<tool name>/` in the session's
+[runtime directory](workdir.md#runtime-directory). Two declared artifacts with one
 tool name are refused, whatever their scopes:
 
 ```text
@@ -3627,12 +3628,15 @@ door, which speaks plain HTTP. Or bind to loopback.
 ### W-SEC-033 — the runtime directory lies inside the workdir { #w-sec-033 }
 
 **Fires when:** `~/.murmur/sessions`, where every session's
-[runtime directory](workdir.md#runtime-directory) is created, lies inside the accessible workdir,
-and the declared containment is `advisory`. Once per launch from `mur run`, and from `mur doctor`
-for `<manifest-dir>/workdir`.
+[runtime directory](workdir.md#runtime-directory) is created, lies inside the accessible workdir:
+
+| From | When |
+|---|---|
+| `mur run` | Once per launch, when the declared containment is `advisory` |
+| `mur doctor` | For `<manifest-dir>/workdir`, whatever the declared containment |
 
 ```text
-warning[W-SEC-033]: the runtime directory /home/dev/.murmur/sessions lies inside the workdir /home/dev, so this capsule's commands can change the files the runtime owns — task.md, MURMUR.md, plans and installed tools; run with a --workdir that does not contain ~/.murmur (https://docs.murmur.nexus/reference/diagnostics/#w-sec-033)
+[capsule-runtime] warning[W-SEC-033]: the runtime directory /home/dev/.murmur/sessions lies inside the workdir /home/dev, so this capsule's commands can change the files the runtime owns — task.md, MURMUR.md, plans and installed tools; run with a --workdir that does not contain ~/.murmur (https://docs.murmur.nexus/reference/diagnostics/#w-sec-033)
 ```
 
 **Why it matters:** the capsule's commands can rewrite the task, `MURMUR.md`, a submitted plan

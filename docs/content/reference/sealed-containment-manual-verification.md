@@ -1019,8 +1019,8 @@ trust store are unchanged.
 A Landlock rule names the **inode** an fd resolved to, not the path string it was opened by. The
 `SEALED_ETC_PATHS` grant for `/etc/passwd` is taken on the *host's* `/etc/passwd`, which the
 composed root no longer binds — so the synthetic file needs a rule of its own, taken on the file in
-the session's `sealed-etc/` directory, beside its runtime directory. A third binary, identical to `mur-after` except that
-`apply_landlock_scope` skips those two rules:
+the session's `sealed-etc/` directory, beside its runtime directory. A third binary, identical to
+`mur-after` except that `apply_landlock_scope` skips those two rules:
 
 ```text
 --1-GETPWUID-HOME--

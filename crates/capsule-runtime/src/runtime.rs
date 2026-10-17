@@ -217,12 +217,7 @@ fn import_task_input(
     runtime_root: &WorkdirRoot,
     inference: &InferenceConfig,
 ) {
-    if runtime_root
-        .file_len(TASK_INPUT_FILE)
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    if pending_task_input(runtime_root).is_some() {
         return;
     }
     let task = match accessible_root.read_file(TASK_INPUT_FILE, MAX_IMPORTED_TASK_BYTES) {
@@ -258,8 +253,8 @@ fn check_workdir_identity(
     }
     Err(RuntimeError::WorkdirIdentityMismatch {
         workdir: accessible_root.path().display().to_string(),
-        expected: format!("{}:{}", expected.0, expected.1),
-        found: format!("{}:{}", found.0, found.1),
+        expected: crate::child_launch::format_workdir_identity(expected),
+        found: crate::child_launch::format_workdir_identity(found),
     })
 }
 
@@ -369,11 +364,7 @@ async fn run_task_with_reopens(
     // reopens re-inject a fresh copy of every feedback item rather than compounding. A refused
     // read is latched and fails the first attempt at its own checkpoint.
     let runtime_root = state.runtime_root.clone();
-    let original_task = runtime_root
-        .read_to_string(TASK_INPUT_FILE)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    let original_task = agent::fresh_task_text(&runtime_root);
     // Every reopen's (hook_name, reason) so far — all re-injected on each reopen.
     let mut feedback: Vec<(String, String)> = Vec::new();
     let mut reopens_used: u32 = 0;
@@ -4276,76 +4267,13 @@ fn launch(
                                                 Ok(Woke::Terminating) => break 'task_loop,
                                                 Ok(Woke::Task(Some(task))) => task,
                                                 Ok(Woke::Task(None)) => break 'task_loop,
-                                                // A `task.md` in the runtime directory would have
-                                                // run above, imported from the workdir's
-                                                // `task.md` or `input.txt` included. Without one
-                                                // there is nothing to send, so the model is never
-                                                // called.
-                                                Err(_elapsed)
-                                                    if agent::fresh_task_text(&runtime_root)
-                                                    .trim()
-                                                    .is_empty() =>
-                                                {
+                                                // A launch's own task — `--task`, or a workdir
+                                                // `task.md` or `input.txt` imported at session
+                                                // start — ran before this wait, so a timeout has
+                                                // nothing to send and the model is never called.
+                                                Err(_elapsed) => {
                                                     crate::runtime_err!(
                                                         "[capsule-runtime] no A2A message received within {idle_timeout_secs}s and there is no task to run; ending the session without calling the model"
-                                                    );
-                                                    break 'task_loop;
-                                                }
-                                                Err(_elapsed) => {
-                                                    crate::runtime_err!("[capsule-runtime] no A2A message received within {idle_timeout_secs}s; running the task in task.md");
-                                                    otel.begin_session(None);
-                                                    state.current_traceparent = otel.outgoing_traceparent();
-                                                    let failures_before =
-                                                        trace.task_failures_written();
-                                                    let result = agent::run_agent_loop(
-                                                        &mut state,
-                                                        &session_root,
-                                                        inference,
-                                                        inference.max_turns,
-                                                        system_prompt,
-                                                        run_config,
-                                                        &mut hooks,
-                                                        &mut trace,
-                                                        &mut otel,
-                                                        None,
-                                                        None,
-                                                        &accessible_root,
-                                                        &capsule_name,
-                                                        &capsule_version,
-                                                        conversation_mode.clone(),
-                                                        None,
-                                                        // No task was ever put in scope on this
-                                                        // path, so `on-task-start` never fired and
-                                                        // there is no seed to apply.
-                                                        None,
-                                                        // Nor is there a task to cancel; only
-                                                        // `SIGTERM` ends this attempt early.
-                                                        Some(terminating.clone()),
-                                                        // Nor a task to reopen.
-                                                        &mut agent::TaskThread::default(),
-                                                        None,
-                                                    )
-                                                    .await;
-                                                    // No `run_task_with_reopens` wraps this run,
-                                                    // so its `runtime_error` is written here.
-                                                    if let Err(error) = &result {
-                                                        if trace.task_failures_written()
-                                                            == failures_before
-                                                        {
-                                                            let _ = trace
-                                                                .write_task_failed(
-                                                                    None,
-                                                                    crate::trace::TASK_FAILED_RUNTIME_ERROR,
-                                                                    &error.to_string(),
-                                                                )
-                                                                .await;
-                                                        }
-                                                    }
-                                                    outcome.record_terminated(
-                                                        result,
-                                                        ended_by_formation.load(Ordering::Acquire),
-                                                        &trace,
-                                                        failures_before,
                                                     );
                                                     break 'task_loop;
                                                 }
@@ -5555,8 +5483,9 @@ fn warn_on_runtime_dir_inside_workdir(placement: &crate::runtime_dir::RuntimeDir
 
 /// Whether `stage_session` can already tell the capsule may start a native subprocess: a
 /// `shell.allow`, a `spawn.allow` or an `install.tool` grant, whose pattern can match a native
-/// tool a pull installs.
-fn has_subprocess_route_at_staging(policy: &CapabilityPolicy) -> bool {
+/// tool a pull installs. `mur doctor` asks the same question before its checklist.
+#[must_use]
+pub fn has_subprocess_route_at_staging(policy: &CapabilityPolicy) -> bool {
     !policy.shell_allow.is_empty()
         || !policy.spawn_allow.is_empty()
         || !policy.install_tool.is_empty()
@@ -6849,7 +6778,7 @@ pub(crate) struct CapsuleStoreState {
     /// already out of the session. The agent
     /// loop compares it with the generation its held tool array was built at
     /// (`agent::inventory::HeldInventory`), so any path that adds or removes an artifact under
-    /// `workdir/tools/` must move it too, or the model is never offered the change.
+    /// `<runtime dir>/tools/` must move it too, or the model is never offered the change.
     pub(crate) installed_generation: u64,
     /// The names `murmur.yaml` declares under `artifacts:`, taken from
     /// [`StagedSession::installed_artifacts`] at construction and never changed. A removal
@@ -7989,7 +7918,7 @@ impl CapsuleStoreState {
     ///
     /// The lookup the tool-array marker, the skill fence and `skill_call`'s `origin` / `trust`
     /// fields all read, through [`artifact_origin_in`]. A name this session holds no summary for is
-    /// [`LockOrigin::Operator`]: the only entries under `workdir/tools/` without one are the
+    /// [`LockOrigin::Operator`]: the only entries under `<runtime dir>/tools/` without one are the
     /// runtime-provided tools (`share-file`, `fetch-peer-file`, `delegate-task`,
     /// `submit-plan`), which are the runtime's own and never came from a registry.
     pub(crate) fn artifact_origin(&self, name: &str) -> LockOrigin {
@@ -8049,19 +7978,18 @@ impl CapsuleStoreState {
             .await
     }
 
-    /// The runtime directory `name`'s guest is preopened into read-only, at `murmur-runtime/`:
-    /// for a `runtime: tool` whose entry declares no `capabilities.filesystem.scope`, which also
-    /// holds the whole workdir at `"."`. A driver, and a tool confined to a subtree, gets none.
+    /// The runtime directory, when `name`'s guest is preopened into it read-only at
+    /// `murmur-runtime/` ([`crate::runtime_dir::gets_runtime_dir_preopen`]).
     fn runtime_dir_preopen(&self, name: &str) -> Option<&Path> {
-        let is_tool = self.installed_artifacts.iter().any(|artifact| {
-            murmur_artifact::tool_name_of(&artifact.name) == name
-                && artifact.runtime == ArtifactRuntime::Tool
-        });
         let scoped = self
             .artifact_grants
             .get(name)
             .is_some_and(|grant| grant.filesystem_scope.is_some());
-        (is_tool && !scoped).then(|| self.runtime_root.path())
+        let gets = self.installed_artifacts.iter().any(|artifact| {
+            murmur_artifact::tool_name_of(&artifact.name) == name
+                && crate::runtime_dir::gets_runtime_dir_preopen(&artifact.runtime, scoped)
+        });
+        gets.then(|| self.runtime_root.path())
     }
 
     async fn dispatch_component_with_env(
@@ -8187,7 +8115,7 @@ impl CapsuleStoreState {
     }
 
     /// Whether `input` carries every name the called tool's `input_schema` lists in its
-    /// top-level `required`, read from `<workdir>/tools/<name>/murmur.yaml` at call time.
+    /// top-level `required`, read from `<runtime dir>/tools/<name>/murmur.yaml` at call time.
     ///
     /// `Some` is a refusal: the call must not be dispatched, and the refusal's `text` is what the
     /// model — or a plan step's `error` — is handed instead. `None` means the call proceeds to the
@@ -8326,8 +8254,8 @@ impl CapsuleStoreState {
     ) -> Result<DispatchOutcome, String> {
         // The two runtime-provided peer-handoff tools, intercepted ahead of every other path.
         // They have no artifact, no binary and no component: the manifests under
-        // `workdir/tools/` exist so `build_tool_inventory` shows them to the model, and this is
-        // where the call actually lands.
+        // `<runtime dir>/tools/` exist so `build_tool_inventory` shows them to the model, and this
+        // is where the call actually lands.
         if name == SHARE_FILE_TOOL {
             return self
                 .dispatch_share_file(input)
@@ -8381,8 +8309,8 @@ impl CapsuleStoreState {
             return Err(exclusive_only(name));
         }
 
-        // Native artifact: a binary this session installed at workdir/tools/<name>/<name>. A file
-        // the capsule wrote there itself has no entry and is not dispatched as a native tool.
+        // Native artifact: a binary this session installed at <runtime dir>/tools/<name>/<name>. A
+        // file the capsule wrote there itself has no entry and is not dispatched as a native tool.
         let native_entrypoint = self.native_entrypoints.get(name).cloned();
         if let Some(native_entrypoint) = native_entrypoint.filter(|_| {
             !self.tool_components.contains_key(name) && !self.removed_artifacts.contains(name)
@@ -9969,7 +9897,7 @@ pub(crate) fn describe_stripped_env_allow_entries(entries: &[StrippedEnvAllowEnt
         .join(", ")
 }
 
-/// Write a single artifact's `murmur.yaml` under `<workdir>/tools/<name>/`.
+/// Write a single artifact's `murmur.yaml` under `<runtime dir>/tools/<name>/`.
 ///
 /// Used both by `stage_session` (for every artifact declared in the manifest) and by
 /// `manage.pull()` (for the single artifact it just fetched at runtime). It is the only function
@@ -11874,7 +11802,7 @@ pub(crate) use tests::{
 mod tests {
     use murmur_artifact::LockedArtifact;
 
-    // ── shell tool manifests stay inside workdir/tools/ ──────────────────────
+    // ── shell tool manifests stay inside the runtime directory's tools/ ──────────────────────
 
     /// Every path under `root`, relative and sorted.
     fn tree_of(root: &std::path::Path) -> Vec<String> {
@@ -15003,8 +14931,8 @@ inference:
             spend: Arc::new(SpendMeter::unlimited()),
             compiled_forms: CompiledForms::new(&engine, &workdir),
             engine,
-            // The runtime directory is the same directory too, so a test reads what staging wrote
-            // where it always did.
+            // The runtime directory is the workdir root too, so a test reads staged files at the
+            // workdir path.
             runtime_root: root.clone(),
             runtime_dirs: crate::runtime_dir::RuntimeDirRoots::new(
                 root.clone(),

@@ -172,7 +172,7 @@ The entrypoint sits in the runtime directory, which the capsule's commands can r
 change on the Full and Sealed tiers: a command that overwrites, replaces or renames over it is
 refused, so the tool that runs is the tool that was installed, a pulled one included. On the
 Seccomp-only and Environment-only tiers nothing protects it; see
-[What protects it](workdir.md#runtime-directory).
+[What protects it](workdir.md#what-protects-it).
 
 ### Where the user namespace comes from { #userns-grant }
 

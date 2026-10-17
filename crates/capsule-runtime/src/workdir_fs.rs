@@ -399,9 +399,7 @@ impl WorkdirRoot {
 
     /// `(st_dev, st_ino)` of this root's directory, from `fstat` on the held descriptor.
     pub fn identity(&self) -> Result<(u64, u64), WorkdirError> {
-        let stat = rustix::fs::fstat(&*self.anchor_fd(false)?)
-            .map_err(|errno| self.io("", errno.into()))?;
-        Ok((stat.st_dev as u64, stat.st_ino as u64))
+        fd_identity(&*self.anchor_fd(false)?).map_err(|errno| self.io("", errno.into()))
     }
 
     /// A fresh read-only directory descriptor for this root's own directory, reopened from the
@@ -1058,6 +1056,12 @@ impl WorkdirRoot {
             source,
         }
     }
+}
+
+/// `(st_dev, st_ino)` of the file `fd` names, from `fstat`.
+pub(crate) fn fd_identity(fd: impl AsFd) -> rustix::io::Result<(u64, u64)> {
+    let stat = rustix::fs::fstat(fd)?;
+    Ok((stat.st_dev as u64, stat.st_ino as u64))
 }
 
 #[cfg(test)]

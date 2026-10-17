@@ -128,8 +128,8 @@ rejects a body carrying any field it does not define.
 
 The `[Capsule]` block the runtime prepends to every system prompt is a pure function of the
 capsule's name and version and, for a formation member, its roster name, plus one fixed line
-saying where the runtime directory is found. It names no host-specific path and no formation id, so it is byte-identical across every launch of the same
-capsule and version, and of the same roster member. Prefix caching depends on that stability: a
+saying where the runtime directory is found. It names no host-specific path and no formation id,
+so it is byte-identical across every launch of the same capsule and version, and of the same roster member. Prefix caching depends on that stability: a
 provider matches its cache against the bytes it has seen before, and the first block of every
 prompt would otherwise never repeat.
 
@@ -216,8 +216,8 @@ then the global store; under [`capabilities.install.from: [stores, sources]`](ma
 a version neither store holds is fetched from the scope's GitHub source, with the checks
 `mur install` makes, and written to no store. It verifies the bytes against the reported hash,
 checks that the payload fits the [WIT level](wit-levels.md#fit) this `mur` serves, checks the
-scope's owner id against `murmur.lock`, then installs it under `<workdir>/tools/<name>/`, `<name>`
-being the bare part of its full name, and updates `murmur.lock`. A new entry is pinned as
+scope's owner id against `murmur.lock`, then installs it under `tools/<name>/` in the session's
+[runtime directory](workdir.md#runtime-directory), `<name>` being the bare part of its full name, and updates `murmur.lock`. A new entry is pinned as
 [`origin: runtime`](workdir.md#lock-origin) with the id of the pulling session, which the runtime
 supplies itself, and with the scope's `owner_id` when the source or the stored payload records
 one; an entry that already exists keeps its origin. A pulled artifact is immediately visible to
@@ -298,7 +298,7 @@ A removal deletes the artifact from every place `pull` put it:
 
 | Place | After `remove` |
 |---|---|
-| `<workdir>/tools/<name>/`, `<name>` being the bare part | Deleted: the manifest, `skill.md` and the native binary |
+| `tools/<name>/` in the [runtime directory](workdir.md#runtime-directory), `<name>` being the bare part | Deleted: the manifest, `skill.md` and the native binary |
 | `list()` and `describe()` | The name is gone. `describe()` returns `artifact '<name>' is not installed` |
 | `murmur.lock` | The entry is deleted. Every other entry is rewritten unchanged |
 | `invoke()` | The name leaves the dispatch allowlist. A call to it returns `tool '<name>' was removed from this session; it can no longer be called` |

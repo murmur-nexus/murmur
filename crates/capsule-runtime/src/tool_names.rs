@@ -1,10 +1,10 @@
 //! The tool name of an artifact inside one staged session.
 //!
 //! A capsule declares artifacts by full name, `<scope>/<name>`, and a model is offered each by its
-//! tool name, the bare part: the tool it calls, its `workdir/tools/<name>/` directory and every
-//! key the session dispatches on. Staging refuses two artifacts that would share a tool name, then
-//! renames the request once ([`localize_artifact_names`]) so the rest of the session works in tool
-//! names alone. What leaves the session — the store, the lock, trace identity, `manage.*` and
+//! tool name, the bare part: the tool it calls, its `<runtime dir>/tools/<name>/` directory and
+//! every key the session dispatches on. Staging refuses two artifacts that would share a tool name,
+//! then renames the request once ([`localize_artifact_names`]) so the rest of the session works in
+//! tool names alone. What leaves the session — the store, the lock, trace identity, `manage.*` and
 //! roost requests — goes back to the full name through the map that rename returns.
 
 use std::collections::HashMap;

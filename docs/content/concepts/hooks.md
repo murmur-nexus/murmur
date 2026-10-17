@@ -9,7 +9,7 @@ non-fatal — failures are logged to `workdir/logs/hook-<name>.log` and the sess
 
 | Value | When |
 |---|---|
-| `on-stage` | During `stage_session`, before the agent loop begins. Once per launch. |
+| `on-stage` | During staging, before the agent loop begins. Once per launch. |
 | `on-session-start` | After staging, before the first task's work begins. Once per capsule launch. |
 | `on-task-start` | Before that task's first inference turn. Once per task. |
 | `on-inference` | After each inference response is received. |

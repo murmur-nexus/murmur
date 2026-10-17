@@ -32,6 +32,9 @@ const SKILL: &str = "rd-skill";
 const SKILL_BODY: &str = "# rd skill\n\nThe original guidance of the runtime-directory skill.\n";
 const TASK: &str = "Probe the runtime directory and report.";
 const PROBE_TOOL: &str = "runtime-dir-probe";
+/// The native fixture published under a second name, only to the test store, for a pull.
+const PULLED_ARTIFACT: &str = "local/tool-pulled";
+const PULLED_TOOL: &str = "tool-pulled";
 const PROBE_ARTIFACT: &str = "local/runtime-dir-probe";
 const NOTICE: &str = "Runtime files: MURMUR.md, task.md, murmur.yaml and the installed tools are \
                       in a directory you can read and cannot change — $MURMUR_RUNTIME_DIR in a \
@@ -209,7 +212,7 @@ fn probe_data(server: &common::ScriptedServer, id: &str) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|_| panic!("{id} returned no probe: {text}"))
 }
 
-// ── S1–S3: commands and native tools cannot change the runtime files ─────────
+// ── commands and native tools cannot change the runtime files ────────────────
 
 /// One `RD|<label>|<status>|<stderr>` line per attempt, each made against `target`.
 fn attack_lines(label: &str, target: &str) -> String {
@@ -232,8 +235,8 @@ fn attack_lines(label: &str, target: &str) -> String {
         .collect()
 }
 
-/// The shell script S1/S2 run: every attempt on every runtime file, a create in the runtime
-/// directory, then the read-backs.
+/// The shell script the scoped and sealed cases run: every attempt on every runtime file, a
+/// create in the runtime directory, then the read-backs.
 fn attack_script() -> String {
     let mut script = String::from("cd \"$PWD\"\n");
     for (label, rel) in runtime_files() {
@@ -264,8 +267,8 @@ fn runtime_files() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The plan S1/S2 submit: the first step tries to overwrite its own plan file, the second reads
-/// it back.
+/// The plan the scoped and sealed cases submit: the first step tries to overwrite its own plan
+/// file, the second reads it back.
 fn self_rewriting_plan() -> Value {
     json!({
         "id": "rd-plan",
@@ -276,14 +279,14 @@ fn self_rewriting_plan() -> Value {
             },
             {
                 "id": "readback",
-                "shell": "bash -c 'cat \"$MURMUR_RUNTIME_DIR/plans/plan-1.json\"'",
+                "shell": "bash -c 'echo readback-ran; cat \"$MURMUR_RUNTIME_DIR/plans/plan-1.json\"'",
                 "depends_on": ["rewrite"]
             }
         ]
     })
 }
 
-/// Runs S1 (`scoped`) or S2 (`sealed`) with S3's native-tool probes, and asserts every attempt to
+/// Runs a session at `floor` with the native tool's probes, and asserts every attempt to
 /// change a runtime file failed and every read-back returned the original.
 fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass) {
     if skip_host(test, floor) {
@@ -327,7 +330,7 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
     let runtime_dir = staged.runtime_dir.clone();
     fs::write(workdir.path().join("task.md"), TASK).unwrap();
 
-    // S3: the native tool's own write probe on every runtime file, its own entrypoint included,
+    // The native tool's own write probe on every runtime file, its own entrypoint included,
     // then its read probe.
     for (label, rel) in runtime_files() {
         calls.push((
@@ -352,6 +355,17 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
         "submit-plan".to_string(),
         json!({"plan": self_rewriting_plan()}),
     ));
+    let plan_file = runtime_dir.join("plans/plan-1.json");
+    calls.push((
+        "toolu_write_plan".to_string(),
+        FIXTURE_TOOL.to_string(),
+        probe("write", &plan_file),
+    ));
+    calls.push((
+        "toolu_read_plan".to_string(),
+        FIXTURE_TOOL.to_string(),
+        probe("read", &plan_file),
+    ));
     calls.push((
         "toolu_root".to_string(),
         "bash".to_string(),
@@ -366,7 +380,7 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
     assert!(runtime_dir.is_dir());
     launch_session(staged, |_| {}).expect("the session launches");
 
-    // S1/S2: every attempt failed.
+    // Every shell and plan attempt failed.
     let attack = result_text(&server, "toolu_attack");
     let truncate_mediated = floor == ContainmentClass::Sealed || landlock_abi() >= 3;
     let mut attempts = 0;
@@ -407,7 +421,7 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
                 .to_string()
         };
         assert_eq!(line("RD-TASK|"), TASK);
-        assert!(SKILL_BODY.starts_with(&line("RD-SKILL|")));
+        assert_eq!(line("RD-SKILL|"), SKILL_BODY.lines().next().unwrap());
         assert!(line("RD-MURMUR|").starts_with("# MURMUR.md"));
         let entry_len = fs::metadata(common::fixture_native_tool_binary().unwrap())
             .unwrap()
@@ -416,11 +430,29 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
         assert_eq!(line("RD-DIR|"), runtime_dir.display().to_string());
     }
 
-    // S3: the native tool's writes fail, its own entrypoint included; its reads return the
+    // The native tool's writes fail, its own entrypoint included; its reads return the
     // originals.
-    for (label, _) in runtime_files() {
+    let native_refusal = if floor == ContainmentClass::Sealed {
+        "Read-only file system"
+    } else {
+        "Permission denied"
+    };
+    for label in runtime_files()
+        .into_iter()
+        .map(|(label, _)| label)
+        .chain(["plan"])
+    {
         let data = probe_data(&server, &format!("toolu_write_{label}"));
         assert_eq!(data["ok"], false, "{label}: {data}");
+        let error = data["error"].as_str().unwrap_or_default();
+        // A running binary opened for writing is refused with ETXTBSY before Landlock is asked,
+        // so on `scoped` the fixture's write to its own entrypoint proves nothing about the rule;
+        // the shell's attempts on the same file above are what show Landlock refusing it.
+        let own_image = label == "entrypoint" && error.contains("Text file busy");
+        assert!(
+            error.contains(native_refusal) || own_image,
+            "{label} must fail with '{native_refusal}': {data}"
+        );
     }
     if truncate_mediated {
         let read = |label: &str| probe_data(&server, &format!("toolu_read_{label}"));
@@ -440,11 +472,11 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
     // original plan back.
     let plan = result_text(&server, "toolu_plan");
     assert!(plan.contains("rewrite-status=1"), "{plan}");
-    assert!(
-        plan.contains("\\\"id\\\":\\\"rd-plan\\\"") || plan.contains("rd-plan"),
-        "{plan}"
-    );
-    assert!(!plan.contains("pwned\\n\""), "{plan}");
+    assert!(plan.contains("readback-ran"), "{plan}");
+    let plan_read = probe_data(&server, "toolu_read_plan");
+    let stored: Value = serde_json::from_str(plan_read["contents"].as_str().unwrap_or_default())
+        .unwrap_or_else(|_| panic!("the plan file is still the submitted plan: {plan_read}"));
+    assert_eq!(stored["id"], "rd-plan", "{plan_read}");
 
     // Inside the root the runtime directory has the host's path, and the account database is the
     // synthetic one, written beside the runtime directory.
@@ -477,6 +509,19 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
         fs::read_to_string(workdir.path().join("task.md")).unwrap(),
         TASK
     );
+    let traces: Vec<PathBuf> = common::sessions_under(&workdir.path().join(".murmur"))
+        .into_iter()
+        .map(|session| session.join("trace.jsonl"))
+        .filter(|trace| trace.is_file())
+        .collect();
+    assert!(!traces.is_empty(), "the session left its trace");
+    for trace in traces {
+        let trace = fs::read_to_string(trace).unwrap();
+        assert!(
+            !trace.contains("\"workdir_path_refused\""),
+            "no runtime read or write was refused: {trace}"
+        );
+    }
     assert!(
         !runtime_dir.exists(),
         "the runtime directory outlived its session"
@@ -501,7 +546,7 @@ fn runtime_dir_sealed_commands_cannot_change_the_runtime_files() {
     );
 }
 
-// ── S4: a pulled native tool cannot be rewritten and then run ─────────────────
+// ── a pulled native tool cannot be rewritten and then run ────────────────────
 
 fn pulled_tool_cannot_be_rewritten(test: &str, floor: ContainmentClass) {
     use murmur_artifact::{
@@ -514,46 +559,51 @@ fn pulled_tool_cannot_be_rewritten(test: &str, floor: ContainmentClass) {
     let binary = common::fixture_native_tool_binary()
         .expect("the native fixture tool builds on a host that passes the host check");
     let rewrite = format!(
-        "E=\"$MURMUR_RUNTIME_DIR/tools/{FIXTURE_TOOL}/{FIXTURE_TOOL}\"\n\
+        "E=\"$MURMUR_RUNTIME_DIR/tools/{PULLED_TOOL}/{PULLED_TOOL}\"\n\
          printf '#!/bin/sh\\necho pwned\\n' > ./evil\n\
          out=$( {{ cp /bin/sh \"$E\"; }} 2>&1 ); echo \"RD|$?|$out\"\n\
          out=$( {{ cp ./evil \"$E\"; }} 2>&1 ); echo \"RD|$?|$out\"\n\
          out=$( {{ printf '#!/bin/sh\\necho pwned\\n' > \"$E\"; }} 2>&1 ); echo \"RD|$?|$out\"\n\
-         out=$( {{ mv -f ./evil \"$E\"; }} 2>&1 ); echo \"RD|$?|$out\"\n"
+         out=$( {{ mv -f ./evil \"$E\"; }} 2>&1 ); echo \"RD|$?|$out\"\n\
+         [ -x \"$E\" ] && echo \"RD-PULLED|$E\"\n"
     );
-    let server = common::ScriptedServer::start(vec![
-        tool_call(
-            1,
-            "toolu_pull",
-            "pull-artifact",
-            json!({"artifact": FIXTURE_ARTIFACT}),
-        ),
-        tool_call(2, "toolu_rewrite", "bash", bash(&rewrite)),
-        tool_call(
-            3,
-            "toolu_after",
-            FIXTURE_TOOL,
-            json!({"operation": "read", "path": "inside.txt"}),
-        ),
-        end_turn("done"),
-    ]);
+    let server_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let server = {
+        let replies = std::sync::Arc::clone(&server_calls);
+        common::ScriptedServer::start_answering(16, move |_| {
+            let mut replies = replies.lock().unwrap();
+            if replies.is_empty() {
+                end_turn("done")
+            } else {
+                replies.remove(0)
+            }
+        })
+    };
+    // The declared fixture is the native tool that attacks the pulled one.
     let p = project(
         &server.endpoint,
         &Spec {
+            native_fixture: true,
             extra_capabilities: "  install:\n    tool: [\"local/tool-*\"]\n",
             ..Spec::default()
         },
     )
     .unwrap();
-    let manifest_bytes = fs::read(common::fixture_native_tool_manifest()).unwrap();
+    let manifest_bytes = fs::read_to_string(common::fixture_native_tool_manifest())
+        .unwrap()
+        .replacen(
+            &format!("name: {FIXTURE_TOOL}\n"),
+            &format!("name: {PULLED_TOOL}\n"),
+            1,
+        );
     let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
     {
         let mut zip = zip::ZipWriter::new(&mut cursor);
         zip.start_file("murmur.yaml", zip::write::SimpleFileOptions::default())
             .unwrap();
-        zip.write_all(&manifest_bytes).unwrap();
+        zip.write_all(manifest_bytes.as_bytes()).unwrap();
         zip.start_file(
-            format!("bin/{FIXTURE_TOOL}"),
+            format!("bin/{PULLED_TOOL}"),
             zip::write::SimpleFileOptions::default().unix_permissions(0o755),
         )
         .unwrap();
@@ -564,7 +614,7 @@ fn pulled_tool_cannot_be_rewritten(test: &str, floor: ContainmentClass) {
     LocalRegistry::new(p.home.path().join(".murmur").join("artifacts"))
         .publish(
             ArtifactMeta {
-                name: ArtifactName::parse(FIXTURE_ARTIFACT).unwrap(),
+                name: ArtifactName::parse(PULLED_ARTIFACT).unwrap(),
                 version: FIXTURE_VERSION.to_string(),
                 runtime: RuntimeType::Native,
                 artifact_runtime: "tool".to_string(),
@@ -588,7 +638,30 @@ fn pulled_tool_cannot_be_rewritten(test: &str, floor: ContainmentClass) {
         Some(workdir.path()),
     );
     let session = staged.workdir.clone();
+    let staged_runtime_dir = staged.runtime_dir.clone();
     fs::write(workdir.path().join("task.md"), "Pull the fixture.").unwrap();
+    let pulled_entrypoint = staged_runtime_dir.join(format!("tools/{PULLED_TOOL}/{PULLED_TOOL}"));
+    *server_calls.lock().unwrap() = vec![
+        tool_call(
+            1,
+            "toolu_pull",
+            "pull-artifact",
+            json!({"artifact": PULLED_ARTIFACT}),
+        ),
+        tool_call(2, "toolu_rewrite", "bash", bash(&rewrite)),
+        tool_call(
+            3,
+            "toolu_native_write",
+            FIXTURE_TOOL,
+            probe("write", &pulled_entrypoint),
+        ),
+        tool_call(
+            4,
+            "toolu_after",
+            PULLED_TOOL,
+            json!({"operation": "read", "path": "inside.txt"}),
+        ),
+    ];
 
     launch_session(staged, |_| {}).expect("the session runs");
 
@@ -597,15 +670,47 @@ fn pulled_tool_cannot_be_rewritten(test: &str, floor: ContainmentClass) {
         .expect("a pull result");
     println!("── toolu_pull\n{pulled}");
     assert!(
-        pulled.contains("\"tool_name\":\"tool-fixture\""),
+        pulled.contains(&format!("\"tool_name\":\"{PULLED_TOOL}\"")),
         "{pulled}"
     );
     let rewrite = result_text(&server, "toolu_rewrite");
     let lines: Vec<&str> = rewrite.lines().filter(|l| l.starts_with("RD|")).collect();
     assert_eq!(lines.len(), 4, "{rewrite}");
-    for line in lines {
+    let entrypoint = format!("tools/{PULLED_TOOL}/{PULLED_TOOL}");
+    assert!(
+        rewrite.contains(&format!(
+            "RD-PULLED|{}",
+            staged_runtime_dir.join(&entrypoint).display()
+        )),
+        "the pull lands in the runtime directory: {rewrite}"
+    );
+    for (index, line) in lines.iter().enumerate() {
         assert!(!line.starts_with("RD|0|"), "the rewrite must fail: {line}");
+        // The first attempt may already fail reading `/bin/sh`; the others can only fail on the
+        // entrypoint itself.
+        if index > 0 {
+            assert!(
+                line.contains(&entrypoint)
+                    && (line.contains("Permission denied")
+                        || line.contains("Read-only file system")),
+                "the rewrite must be refused on the entrypoint: {line}"
+            );
+        }
     }
+    // A native tool cannot change another tool's pulled entrypoint either.
+    let native = probe_data(&server, "toolu_native_write");
+    let native_refusal = if floor == ContainmentClass::Sealed {
+        "Read-only file system"
+    } else {
+        "Permission denied"
+    };
+    assert_eq!(native["ok"], false, "{native}");
+    assert!(
+        native["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(native_refusal)),
+        "the native write must fail with '{native_refusal}': {native}"
+    );
     let after = result_text(&server, "toolu_after");
     assert!(!after.contains("pwned"), "{after}");
     let probe: Value = serde_json::from_str(&after).unwrap_or_else(|_| panic!("{after}"));
@@ -636,7 +741,7 @@ fn runtime_dir_sealed_a_pulled_tool_cannot_be_rewritten_and_run() {
     );
 }
 
-// ── S5: a WASM file tool reads the runtime directory at murmur-runtime/ ──────
+// ── a WASM file tool reads the runtime directory at murmur-runtime/ ──────────
 
 fn wasm_probe_run(
     scope: Option<&str>,
@@ -653,6 +758,10 @@ fn wasm_probe_run(
         (
             "toolu_create",
             json!({"op": "write", "path": "murmur-runtime/created"}),
+        ),
+        (
+            "toolu_reread",
+            json!({"op": "read", "path": "murmur-runtime/task.md"}),
         ),
         (
             "toolu_list",
@@ -723,6 +832,12 @@ fn runtime_dir_wasm_tool_reads_murmur_runtime_and_cannot_write_it() {
         let text = result_text(&server, id);
         assert!(text.contains("err:"), "{id}: {text}");
     }
+    let reread = result_text(&server, "toolu_reread");
+    assert!(
+        reread.contains(TASK),
+        "the refused write left the task as it was: {reread}"
+    );
+    assert!(!reread.contains("written by the probe"), "{reread}");
     let list = result_text(&server, "toolu_list");
     assert!(list.contains(SKILL), "{list}");
 }
@@ -744,7 +859,7 @@ fn runtime_dir_scoped_wasm_tool_has_no_murmur_runtime() {
     }
 }
 
-// ── S6: what the agent is told ───────────────────────────────────────────────
+// ── what the agent is told ───────────────────────────────────────────────────
 
 /// The `[Capsule]` block: everything before the first blank line of the system prompt.
 fn capsule_block(server: &common::ScriptedServer) -> String {
@@ -831,7 +946,7 @@ fn runtime_dir_murmur_md_and_the_capsule_block_name_the_runtime_dir() {
     );
 }
 
-// ── S7: the task's way in ────────────────────────────────────────────────────
+// ── the task's way in ────────────────────────────────────────────────────────
 
 /// One session whose single call cats the runtime directory's task, with `prepare` run on the
 /// workdir before launch.
@@ -1163,18 +1278,10 @@ fn runtime_dir_a_task_md_link_in_the_workdir_fails_the_first_task() {
     assert_eq!(refused["operation"], "read", "{refused}");
 }
 
-// ── S8: lifecycle ────────────────────────────────────────────────────────────
+// ── lifecycle ────────────────────────────────────────────────────────────────
 
 fn lock_is_free(lock: &Path) -> bool {
-    let file = fs::File::open(lock).unwrap();
-    // SAFETY: `flock` on a descriptor this function owns; it is released when `file` drops.
-    let rc = unsafe {
-        libc::flock(
-            std::os::fd::AsRawFd::as_raw_fd(&file),
-            libc::LOCK_EX | libc::LOCK_NB,
-        )
-    };
-    rc == 0
+    fs::File::open(lock).unwrap().try_lock().is_ok()
 }
 
 #[test]
@@ -1286,17 +1393,9 @@ fn runtime_dir_staging_sweeps_unlocked_stale_directories_only() {
     let stale = make("ses_rd_stale", 61);
     let locked = make("ses_rd_locked", 61);
     let recent = make("ses_rd_recent", 10);
+    // Held until `held` drops at the end of the test.
     let held = fs::File::open(locked.join(".lock")).unwrap();
-    // SAFETY: as in `lock_is_free`; held until `held` drops at the end of the test.
-    assert_eq!(
-        unsafe {
-            libc::flock(
-                std::os::fd::AsRawFd::as_raw_fd(&held),
-                libc::LOCK_EX | libc::LOCK_NB,
-            )
-        },
-        0
-    );
+    held.try_lock().unwrap();
 
     let second = common::stage_agent_session_at_floor(
         &p.home,
@@ -1318,7 +1417,7 @@ fn runtime_dir_staging_sweeps_unlocked_stale_directories_only() {
     let _ = fs::remove_dir_all(&recent);
 }
 
-// ── S9: a runtime directory inside the workdir ───────────────────────────────
+// ── a runtime directory inside the workdir ───────────────────────────────────
 
 /// A project published under `home`, whose `HOME` is also the `--workdir`.
 fn home_is_workdir(endpoint: &str) -> Project {
@@ -1436,7 +1535,10 @@ fn runtime_dir_inside_the_workdir_below_the_floor_warns_and_reports_advisory() {
         .lines()
         .find_map(|line| line.strip_prefix("  commands:  can change it — "))
         .unwrap_or_else(|| panic!("{explained}"));
-    assert!(commands.contains("inside the workdir"), "{commands}");
+    assert!(
+        commands.contains(&format!("inside the workdir {}", home.display())),
+        "{commands}"
+    );
     let not_protected = explained
         .split("\nNot protected here\n")
         .nth(1)
@@ -1445,9 +1547,30 @@ fn runtime_dir_inside_the_workdir_below_the_floor_warns_and_reports_advisory() {
         not_protected.contains(&format!("  - {commands}")),
         "{explained}"
     );
+
+    let json = mur(home)
+        .args([
+            "run",
+            "--manifest",
+            p.manifest.to_str().unwrap(),
+            "--workdir",
+            home.to_str().unwrap(),
+            "--explain-scope",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(
+        json["runtime_dir"]["read_only_to_commands"], false,
+        "{json}"
+    );
 }
 
-// ── S10: what --explain-scope and doctor say here ────────────────────────────
+// ── what --explain-scope and doctor say here ─────────────────────────────────
 
 #[test]
 #[allow(clippy::print_stdout)]
@@ -1535,7 +1658,7 @@ fn runtime_dir_explain_scope_and_doctor_name_the_runtime_directory() {
     assert!(doctor.contains("  commands:  "), "{doctor}");
 }
 
-// ── S12: a delegated child's --workdir is the directory its parent created ──
+// ── a delegated child's --workdir is the directory its parent created ────────
 
 fn identity_of(path: &Path) -> String {
     use std::os::unix::fs::MetadataExt;

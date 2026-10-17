@@ -30,8 +30,8 @@
 //! After [`refuse_before_lock`] and [`refuse_against_lock`] pass, `remove_artifact` writes
 //! `murmur.lock` without the entry, then updates the session (`tool_components`,
 //! `native_entrypoints`, `allowlisted_tools`, `installed_artifacts`, `removed_artifacts`,
-//! `installed_generation`), then deletes `workdir/tools/<name>/`. A lock write that fails leaves
-//! everything unchanged. A directory that cannot be deleted is reported with
+//! `installed_generation`), then deletes `<runtime dir>/tools/<name>/`. A lock write that fails
+//! leaves everything unchanged. A directory that cannot be deleted is reported with
 //! [`undeletable_directory`], and the name is already out of the session and the lock, so
 //! dispatch refuses it. The compiled form under
 //! `~/.murmur/compiled` is shared across sessions and kept, so pulling the same version again is
@@ -66,7 +66,7 @@
 //! history, the conversation record and the trace, records what happened, and rewriting them
 //! would break the durable record and the prompt-cache prefix. A held tool array is not shrunk by
 //! the removal itself: removal moves `installed_generation`, and the array drops the name at the
-//! next rebuild, because the rebuild reads `workdir/tools/`. After the model's own
+//! next rebuild, because the rebuild reads `<runtime dir>/tools/`. After the model's own
 //! `remove-artifact` that is its next call; after `manage.remove` it is the boundary
 //! `inference.tool_refresh` releases.
 //!

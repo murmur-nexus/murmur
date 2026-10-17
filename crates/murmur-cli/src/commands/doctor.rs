@@ -7,16 +7,16 @@ use capsule_runtime::{
     capability_policy_from_runtime_manifest, check_egress_namespace,
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
     detect_egress_namespace_blocker, detect_landlock_abi, detect_userns_grant, doctor_runtime_dir,
-    find_on_path, inspect_installed_profile, inspect_profile_attachment, install_from_places,
-    landlock_doctor_lines, preopen_reports, read_only_advisory_for, render_install,
-    render_read_only, render_runtime_dir, runtime_dir_inside_warning, served_wit_level,
-    undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
-    warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
-    warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
-    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
-    warn_on_workdir_exec, wit_levels, ArtifactRequest, EgressNamespaceBlocker,
-    InstalledProfileState, ProfileAttachment, UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS,
-    SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
+    find_on_path, has_subprocess_route_at_staging, inspect_installed_profile,
+    inspect_profile_attachment, install_from_places, landlock_doctor_lines, preopen_reports,
+    read_only_advisory_for, render_install, render_read_only, render_runtime_dir,
+    runtime_dir_inside_warning, served_wit_level, undeclarable_runtime_pin_role,
+    warn_on_gateway_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
+    warn_on_launch_only_gateway_credential, warn_on_secret_shaped_env_grants,
+    warn_on_unmetered_gateways, warn_on_unreachable_toolchain_helpers,
+    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, wit_levels,
+    ArtifactRequest, EgressNamespaceBlocker, InstalledProfileState, ProfileAttachment, UsernsGrant,
+    SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, level_fit, native_binary_verdict,
@@ -128,26 +128,6 @@ fn render_native_tools(native_tools: &[String], mechanism: &str) -> String {
         }
     }
     out
-}
-
-/// Whether `capabilities` grants a route to a native subprocess `mur run` can see before staging:
-/// `shell.allow`, `spawn.allow`, or `install.tool`, whose pattern can match a native tool a pull
-/// installs. The same three `stage_session` counts.
-fn declares_subprocess_route(capabilities: Option<&murmur_artifact::Capabilities>) -> bool {
-    let Some(caps) = capabilities else {
-        return false;
-    };
-    caps.shell
-        .as_ref()
-        .is_some_and(|shell| !shell.allow.is_empty())
-        || caps
-            .spawn
-            .as_ref()
-            .is_some_and(|spawn| !spawn.allow.is_empty())
-        || caps
-            .install
-            .as_ref()
-            .is_some_and(|install| !install.tool.is_empty())
 }
 
 /// The `E-CAP-005` warning for a capsule that can spawn a native subprocess on a host that cannot
@@ -1642,7 +1622,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let spawn_allows = capabilities
         .and_then(|caps| caps.spawn.as_ref())
         .is_some_and(|spawn| !spawn.allow.is_empty());
-    let can_spawn_subprocess = declares_subprocess_route(capabilities);
+    let can_spawn_subprocess = has_subprocess_route_at_staging(&capability_policy);
     if let Some(warning) =
         egress_namespace_warning(can_spawn_subprocess, detect_egress_namespace_blocker())
     {
@@ -2076,27 +2056,23 @@ mod tests {
     /// `mur run`; an `install.skill` grant installs nothing that runs.
     #[test]
     fn egress_namespace_warning_counts_an_install_tool_grant() {
-        let manifest = |install: &str| {
-            murmur_artifact::RuntimeManifest::from_yaml_str(&format!(
-                "name: c\nversion: 0.1.0\nartifacts: []\ncapabilities:\n  install:\n{install}"
-            ))
-            .unwrap()
+        let policy = |install: &str| {
+            capability_policy_from_runtime_manifest(
+                &murmur_artifact::RuntimeManifest::from_yaml_str(&format!(
+                    "name: c\nversion: 0.1.0\nartifacts: []\ncapabilities:\n  install:\n{install}"
+                ))
+                .unwrap(),
+            )
         };
-        let tool = manifest("    tool: [\"local/tool-*\"]\n");
-        let skill = manifest("    skill: [\"local/skill-*\"]\n");
-        assert!(declares_subprocess_route(tool.capabilities.as_ref()));
-        assert!(!declares_subprocess_route(skill.capabilities.as_ref()));
+        let tool = policy("    tool: [\"local/tool-*\"]\n");
+        let skill = policy("    skill: [\"local/skill-*\"]\n");
         let blocker = Some(EgressNamespaceBlocker::KernelSupportMissing);
-        assert!(egress_namespace_warning(
-            declares_subprocess_route(tool.capabilities.as_ref()),
-            blocker
-        )
-        .is_some());
-        assert!(egress_namespace_warning(
-            declares_subprocess_route(skill.capabilities.as_ref()),
-            blocker
-        )
-        .is_none());
+        assert!(
+            egress_namespace_warning(has_subprocess_route_at_staging(&tool), blocker).is_some()
+        );
+        assert!(
+            egress_namespace_warning(has_subprocess_route_at_staging(&skill), blocker).is_none()
+        );
     }
 
     #[test]

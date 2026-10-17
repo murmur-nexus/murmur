@@ -326,7 +326,7 @@ pub enum RuntimeError {
     },
 
     /// Two declared artifacts share a tool name, the bare part a session offers the model and
-    /// stages under `workdir/tools/`.
+    /// stages under `<runtime dir>/tools/`.
     #[error(
         "artifacts '{first}' and '{second}' share the tool name '{tool}'; a capsule offers each \
          artifact to the model by its tool name, so no two may share one"

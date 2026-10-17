@@ -655,7 +655,7 @@ pub struct StagedSession {
     /// capsule that declared no `capabilities.filesystem.read_only`.
     pub(crate) protected_paths: crate::protected_paths::ProtectedPaths,
     /// What each staged tool's own `input_schema` declared about where its inputs go, lowered by
-    /// `stage_session` from the manifests it wrote into `<workdir>/tools/`. Empty for a capsule
+    /// `stage_session` from the manifests it wrote into `<runtime dir>/tools/`. Empty for a capsule
     /// that declared no `read_only`, which reads no schema at all, and for one whose tools
     /// annotated nothing.
     pub(crate) tool_annotations: crate::tool_annotations::ToolAnnotationMap,

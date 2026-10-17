@@ -673,7 +673,7 @@ pub(crate) async fn run_agent_loop(
     context_id: Option<String>,
     seed: Option<HookSeed>,
     // This task's cancel flag, or `None` where no task can be cancelled: the `task.md` paths,
-    // which run no A2A task, and the idle-timeout path that runs an `input.txt` task.
+    // which run no A2A task.
     cancel: Option<CancelSignal>,
     thread: &mut TaskThread,
     continuation: Option<Continuation>,

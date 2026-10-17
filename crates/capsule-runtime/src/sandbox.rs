@@ -3041,19 +3041,34 @@ fn landlock_device_grants(tier: EnforcementTier) -> Vec<CapsuleDeviceGrant> {
 /// Creates (idempotently) the directory inside the session workdir that backs `/tmp` in the
 /// composed root, and returns an `O_PATH` descriptor for it taken with no link followed.
 ///
-/// The one descriptor is both the `/tmp` bind's source (`/proc/self/fd/<n>`) and its Landlock
-/// rule's fd, so a link swapped onto `.mur-tmp` after it is taken redirects neither, and a link
-/// already there is refused. See [`crate::sealed::SEALED_TMP_DIR_NAME`] for why `/tmp` is
+/// The descriptor is the `/tmp` Landlock rule's fd, and its `(st_dev, st_ino)` is the identity
+/// the child verifies its bind source against, so a link swapped onto `.mur-tmp` after it is
+/// taken redirects neither, and a link already there is refused. See [`crate::sealed::SEALED_TMP_DIR_NAME`] for why `/tmp` is
 /// workdir-backed rather than a second tmpfs.
 #[cfg(target_os = "linux")]
 fn open_sealed_tmp_store(
     session_workdir: &crate::workdir_fs::WorkdirRoot,
 ) -> Result<std::os::fd::OwnedFd, String> {
     use crate::sealed::SEALED_TMP_DIR_NAME;
+    let failed = |error| format!("sealed: failed to open the workdir-backed /tmp store: {error}");
     session_workdir
         .create_dir_all(SEALED_TMP_DIR_NAME, crate::workdir_fs::DEFAULT_DIR_MODE)
-        .and_then(|()| session_workdir.path_fd_beneath(SEALED_TMP_DIR_NAME))
-        .map_err(|error| format!("sealed: failed to open the workdir-backed /tmp store: {error}"))
+        .map_err(failed)?;
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_TMP_STORE_FD.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+    session_workdir
+        .path_fd_beneath(SEALED_TMP_DIR_NAME)
+        .map_err(failed)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    /// Runs between the `/tmp` store's creation and its descriptor, so a test can plant a link in
+    /// the window a racing command would use.
+    static BEFORE_TMP_STORE_FD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Writes (idempotently) the synthetic `/etc/passwd`/`/etc/group` the composed root binds in place
@@ -3166,9 +3181,8 @@ impl SealedSourceFds {
 
     /// `(st_dev, st_ino)` of `fd`, which a bind's source must still have in the child.
     fn identity_of(fd: &std::os::fd::OwnedFd) -> Result<(u64, u64), String> {
-        let stat = rustix::fs::fstat(fd)
-            .map_err(|errno| format!("sealed: fstat of a bind source failed: {errno}"))?;
-        Ok((stat.st_dev as u64, stat.st_ino as u64))
+        crate::workdir_fs::fd_identity(fd)
+            .map_err(|errno| format!("sealed: fstat of a bind source failed: {errno}"))
     }
 }
 
@@ -7701,10 +7715,13 @@ mod linux_integration_tests {
         // Planted between creation and the descriptor: refused, nothing written outside.
         let (_dir, session, outside, root) = sealed_planted();
         let tmp = session.join(crate::sealed::SEALED_TMP_DIR_NAME);
-        root.create_dir_all(crate::sealed::SEALED_TMP_DIR_NAME, 0o777)
-            .unwrap();
-        std::fs::remove_dir(&tmp).unwrap();
-        std::os::unix::fs::symlink(&outside, &tmp).unwrap();
+        let link_target = outside.clone();
+        BEFORE_TMP_STORE_FD.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_dir(&tmp).unwrap();
+                std::os::unix::fs::symlink(&link_target, &tmp).unwrap();
+            }));
+        });
         let error = open_sealed_tmp_store(&root).unwrap_err();
         assert!(
             error.contains(crate::sealed::SEALED_TMP_DIR_NAME),

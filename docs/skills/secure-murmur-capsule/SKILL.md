@@ -186,7 +186,7 @@ Verify each limit on the production platform. A declared memory or process limit
 Do not stop after editing YAML.
 
 1. Run the capsule on the target host type and capture stderr from staging onward.
-2. Inspect `workdir/<session_id>/MURMUR.md` for the inventory of model-visible shell commands and effective session context.
+2. Inspect `MURMUR.md` for the inventory of model-visible shell commands and effective session context. It lives in the session's runtime directory (`$MURMUR_RUNTIME_DIR` in a shell command), which is removed when the session ends, so read it during the run; `mur run --explain-scope` prints a `Runtime directory` block saying whether the capsule's commands can change it on this host.
 3. Inspect behavior with `mur trace show` and `mur trace steps --verbose`; use `mur trace diff` when comparing pre- and post-hardening runs.
 4. Verify the achieved containment class and the mechanism actually installed, not only the class the host could support.
 5. Exercise safe negative tests against each intended boundary: an unallowed host, a path outside scope, an unlisted binary, a stripped environment variable, and controlled resource-limit cases. A positive task succeeding proves functionality, not containment.
@@ -200,6 +200,7 @@ Treat these diagnostics as security-significant:
 - `W-SEC-007`: an artifact network entry was outside the ceiling and was dropped;
 - `W-SEC-008`: an artifact-local capability key is inert or the artifact cannot be narrowed that way;
 - `E-CAP-002`: an artifact filesystem scope used an absolute path or escaped its allowed root.
+- `W-SEC-033`: the runtime directory (`~/.murmur/sessions`) lies inside the workdir, so the capsule's commands can change its task, `MURMUR.md`, plans and installed tools; run with a `--workdir` that does not contain `~/.murmur`.
 
 Warnings are the difference between intended and effective policy. Capture them in automation; do not suppress, ignore, or “fix” them by renaming an equally powerful primitive.
 
