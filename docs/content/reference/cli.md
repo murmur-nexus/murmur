@@ -391,8 +391,9 @@ mur new "<task description>" [--index <PATH|URL>]
     - `murmur/tool-editor@{{ v.murmur_tool_editor }}`
     - `murmur/skill-create-manifest@{{ v.murmur_skill_create_manifest }}`
 
-Install missing artifacts with `mur install <name>@<version>`. `mur new` exits with a clear
-error and install hint naming the first artifact it cannot resolve.
+The generator reads them from the global store, so install them with
+`mur install -g <name>@<version>`. `mur new` exits with `E-RUN-008` naming the first one the
+global store does not hold, and the `mur install -g` command that installs it.
 
 #### The `--index` value { #mur-new-task-index }
 

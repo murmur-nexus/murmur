@@ -514,9 +514,9 @@ mod tests {
         (
             "types.rs",
             "rel",
-            "`StagedSession::write_workdir_file`'s path, named by the embedding caller: an input \
-             it stages for the capsule before launch, such as the `artifacts-index.json` copy \
-             `mur new <task> --index <file>` writes. A launch writes nothing there of its own.",
+            "`StagedSession::write_workdir_file`'s path, named by the embedding caller for an \
+             input it stages for the capsule before launch. A launch writes nothing there of its \
+             own.",
         ),
         (
             "shell.rs",

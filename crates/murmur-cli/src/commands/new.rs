@@ -556,6 +556,8 @@ inference:
     )
 }
 
+/// `E-RUN-008` for the first generator artifact the global store does not hold. The generator
+/// stages from the global store, so the hint installs there: a project install never reaches it.
 fn check_artifacts_installed(
     local_registry: &LocalRegistry,
     artifacts: &[ArtifactRequest],
@@ -574,7 +576,7 @@ fn check_artifacts_installed(
                     E_RUN_008,
                     format!("generator artifact '{}' is not installed", artifact.name),
                     format!(
-                        "run `mur install {}@{}` to install it",
+                        "run `mur install -g {}@{}` to install it",
                         artifact.name, artifact.version
                     ),
                 ));

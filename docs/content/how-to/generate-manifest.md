@@ -8,9 +8,9 @@
     [`mur new --roster`](../reference/cli.md#mur-new-roster), which is in every build.
 
 `mur new` takes a plain-language task description and writes a ready-to-refine `murmur.yaml`
-to the current directory. It cold-boots a short-lived generator capsule backed by Claude Haiku,
-which queries the artifact index to discover relevant tools and produces a manifest tailored
-to the task — no schema knowledge required.
+to the current directory. It cold-boots a short-lived generator capsule backed by your inference
+provider, which queries the artifact index to discover relevant tools and produces a manifest
+tailored to the task — no schema knowledge required.
 
 The relevant manifest options are:
 
@@ -18,51 +18,38 @@ The relevant manifest options are:
 |---|---|
 | [lifecycle.task_acceptance](../reference/manifest.md#lifecycle-task-acceptance) | How the capsule accepts tasks; always `single` in generated manifests |
 | [lifecycle.after_task](../reference/manifest.md#lifecycle-after-task) | What happens after the task completes; always `exit` in generated manifests |
-| [inference.model](../reference/manifest.md#field-inference) | The model the generated capsule will use; defaults to Claude Haiku |
+| [inference.model](../reference/manifest.md#field-inference) | The model the generated capsule will use; the generator chooses it, so check it |
 
 ---
 
 ## Step 1 — install the generator artifacts
 
-`mur new` uses two artifacts to run its internal generator capsule. Both must be present in
-`~/.murmur/artifacts/` before the first run.
-
-Install the inference driver for your provider:
+`mur new` runs its generator capsule from four artifacts, which must be in the global store
+`~/.murmur/artifacts/` before the first run. Install them with `mur install -g`; a project
+install does not reach the generator.
 
 === "Anthropic"
 
     ```bash
-    mur install murmur/driver-anthropic@{{ v.murmur_driver_anthropic }}
+    mur install -g murmur/driver-anthropic@{{ v.murmur_driver_anthropic }}
+    mur install -g murmur/tool-registry-search@{{ v.murmur_tool_registry_search }}
+    mur install -g murmur/tool-editor@{{ v.murmur_tool_editor }}
+    mur install -g murmur/skill-create-manifest@{{ v.murmur_skill_create_manifest }}
     ```
-
-    --8<-- "includes/mur-pull-info.md"
 
 === "OpenAI"
 
     ```bash
-    mur install murmur/driver-openai@{{ v.murmur_driver_openai }}
+    mur install -g murmur/driver-openai@{{ v.murmur_driver_openai }}
+    mur install -g murmur/tool-registry-search@{{ v.murmur_tool_registry_search }}
+    mur install -g murmur/tool-editor@{{ v.murmur_tool_editor }}
+    mur install -g murmur/skill-create-manifest@{{ v.murmur_skill_create_manifest }}
     ```
-
-    --8<-- "includes/mur-pull-info.md"
-
-=== "DeepSeek"
-
-    ```bash
-    mur install murmur/driver-deepseek@{{ v.murmur_driver_deepseek }}
-    ```
-
-    --8<-- "includes/mur-pull-info.md"
-
-Install `murmur/tool-registry-search`:
-
-```bash
-mur install murmur/tool-registry-search@{{ v.murmur_tool_registry_search }}
-```
 
 --8<-- "includes/mur-pull-info.md"
 
-`mur new` checks for both artifacts before starting any capsule and exits with a clear error and
-an `mur install` hint if either is missing.
+`mur new` checks for these artifacts before starting any capsule. If one is missing it exits with
+`E-RUN-008` and the `mur install -g` command that installs it.
 
 Configure your inference provider — `mur new` detects it automatically using the following
 priority order:
@@ -77,8 +64,9 @@ priority order:
       endpoint: ""                 # leave empty to use the provider default
     ```
 
-2. **Environment variable** — `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`. When detected, `mur new`
-   prints a one-line hint suggesting you add `inference:` to `~/.murmur/config.yaml` instead.
+2. **Environment variable** — `ANTHROPIC_API_KEY` (model `claude-haiku-4-5-20251001`) or
+   `OPENAI_API_KEY` (model `gpt-5.6-luna`). When detected, `mur new` prints a one-line hint
+   suggesting you add `inference:` to `~/.murmur/config.yaml` instead.
 
 3. **First-run wizard** — if neither the config file nor an env var is present, `mur new` launches
    an interactive wizard that prompts for provider, model, and API key, then offers to save the
@@ -335,8 +323,8 @@ The generator picks one of two shapes based on the task description.
 
 Open `murmur.yaml` and check these fields before running:
 
-**Model** — the generator always uses Claude Haiku. Change `inference.model` if the task needs
-a more capable model:
+**Model** — the generator chooses `inference.model`. Change it if the task needs a different
+model:
 
 === "Anthropic"
 
@@ -407,9 +395,9 @@ mur run --manifest murmur.yaml --task task.md
 | Orchestrator | Generated for research and pipeline tasks — adds a `capabilities.spawn.allow` list |
 | Validation | Generated YAML is validated before writing; nothing written if validation fails |
 | Inference config | Config file (`inference:` in `~/.murmur/config.yaml`) → env var (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) → interactive first-run wizard |
-| Generator artifacts | `murmur/driver-anthropic` (or `murmur/driver-openai`), `murmur/tool-registry-search`, `murmur/tool-editor` and `murmur/skill-create-manifest` must all be installed |
+| Generator artifacts | `murmur/driver-anthropic` (or `murmur/driver-openai`), `murmur/tool-registry-search`, `murmur/tool-editor` and `murmur/skill-create-manifest` must all be in the global store; install them with `mur install -g` |
 | Artifact discovery | `murmur/tool-registry-search` is a native tool and runs in the generator capsule's sandbox; [What each native tool needs](../reference/default-artifacts.md#native-tool-needs) lists what it can reach |
-| `inference.model` | Defaults to `claude-haiku-4-5-20251001`; change it in the generated manifest if needed |
+| `inference.model` | Chosen by the generator; change it in the generated manifest if needed |
 
 ---
 

@@ -1158,6 +1158,25 @@ fn the_task_form_checks_an_index_file_on_the_host_first() {
 
 #[cfg(feature = "beta-mur-new")]
 #[test]
+fn the_task_form_names_a_global_install_for_a_missing_generator_artifact() {
+    let scratch = beta_task_scratch();
+    let output = scratch
+        .command(&["new", "a capsule that greps logs"])
+        .env("OPENAI_API_KEY", ["sk-", "test"].concat())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("error[E-RUN-008]"), "{stderr}");
+    assert!(
+        stderr.contains("hint: run `mur install -g murmur/driver-openai@"),
+        "{stderr}"
+    );
+    assert!(scratch.tree().is_empty(), "{:?}", scratch.tree());
+}
+
+#[cfg(feature = "beta-mur-new")]
+#[test]
 fn with_the_beta_flag_off_the_task_form_names_the_flag_and_the_roster_form_works() {
     let scratch = Scratch::new();
     let task = scratch.run(&["new", "summarise a doc"]);
