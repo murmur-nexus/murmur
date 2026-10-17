@@ -57,7 +57,10 @@ use commands::{
     search::run_search,
     stop::run_stop,
     token::run_token,
-    trace::{run_trace_diff, run_trace_report, run_trace_show, run_trace_steps, TraceCommand},
+    trace::{
+        run_trace_diff, run_trace_list, run_trace_report, run_trace_show, run_trace_steps,
+        TraceCommand,
+    },
     version::run_version,
     watch::run_watch,
 };
@@ -831,6 +834,7 @@ fn main() {
                 since,
                 workdir,
             } => run_trace_report(sessions, last, since, workdir),
+            TraceCommand::List { workdir, json } => run_trace_list(workdir, json),
         },
         Commands::Eval { command } => match command {
             EvalCommand::Show {

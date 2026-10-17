@@ -5,7 +5,8 @@
 //! the same way when an address names nothing. That holds because [`resolve`] is the only body
 //! any of them reaches to parse an ordinal, match a suffix, recognise a full `ses_` id or pass a
 //! literal path through; every command reaches it through a [`SessionQuery`] carrying the three
-//! things the vocabulary itself cannot know.
+//! things the vocabulary itself cannot know. `mur trace list` prints the candidates in the order
+//! ordinals count them, through [`sessions_newest_first`].
 //!
 //! The candidates are the sessions of one **workdir root** — the directory a run was given as
 //! `--workdir`, or `<manifest-dir>/workdir` — whose records directories sit in that root's records
@@ -79,6 +80,16 @@ pub(crate) fn ses_entries(group: &Path) -> Result<Vec<String>, CliError> {
     Ok(entries)
 }
 
+/// The session directory names in `group`, most recent first: the order `@N` ordinals count in,
+/// so entry `i` is the session `@(i+1)` names. Session ids are uuid v7 and sort chronologically,
+/// which makes the order a plain sort of the names.
+pub(crate) fn sessions_newest_first(group: &Path) -> Result<Vec<String>, CliError> {
+    let mut entries = ses_entries(group)?;
+    entries.sort();
+    entries.reverse();
+    Ok(entries)
+}
+
 /// The record file a session address names, among the sessions of the workdir root `workdir`.
 ///
 /// Four forms, and nothing else: an `@N` ordinal counting back from the most recent session, a
@@ -86,10 +97,7 @@ pub(crate) fn ses_entries(group: &Path) -> Result<Vec<String>, CliError> {
 /// path is read as given and consults no records group; every other form reads `workdir`'s. An omitted
 /// address is [`LATEST`] and takes the ordinal arm, so `mur trace show` and `mur trace show @1`
 /// resolve through the same code rather than through two derivations of "latest" that a later
-/// edit could pull apart.
-///
-/// Session ids sort chronologically, which is what makes ordinals a plain sort of the directory
-/// names.
+/// edit could pull apart. Ordinals count [`sessions_newest_first`].
 pub(crate) fn resolve(
     address: Option<&str>,
     workdir: &Path,
@@ -114,7 +122,7 @@ pub(crate) fn resolve(
         if n == 0 {
             return Err(query.err("ordinal must be @1 or higher"));
         }
-        let mut entries = ses_entries(workdir)?;
+        let entries = sessions_newest_first(workdir)?;
         if entries.is_empty() {
             // Unlabelled: an empty workdir is not a fault of the argument that named it.
             return Err(CliError::new(
@@ -126,8 +134,6 @@ pub(crate) fn resolve(
                 ),
             ));
         }
-        entries.sort();
-        entries.reverse(); // descending: most recent first
         if n > entries.len() {
             return Err(query.err(format!(
                 "@{n} is out of range — workdir has {} session{}",

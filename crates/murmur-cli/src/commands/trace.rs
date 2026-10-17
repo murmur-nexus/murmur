@@ -10,6 +10,7 @@ use clap::Subcommand;
 use serde::Deserialize;
 
 use capsule_runtime::formation_launch::formation_member_roots;
+use capsule_runtime::running::{self, ProcessState};
 use capsule_runtime::{formation::FORMATION_ID_PREFIX, FormationId};
 
 use crate::error::{CliError, E_IO_001, E_IO_003};
@@ -18,6 +19,7 @@ use crate::formation_trace::{
     no_answer_below_note, search_formation, CallEnding, FormationCall, FormationSearch,
     MemberCallBusyLine, MemberCallLine, MemberCallRecord, MemberCallStartLine, RecordedMember,
 };
+use crate::live_address::records_unreadable;
 use crate::session_address::{self, ses_entries, SessionQuery};
 
 const E_TRC_001: &str = "E-TRC-001";
@@ -101,6 +103,16 @@ pub(crate) enum TraceCommand {
         /// records are read from ~/.murmur/records (default: ./workdir)
         #[arg(long)]
         workdir: Option<PathBuf>,
+    },
+    /// List the sessions of a workdir root, newest first
+    List {
+        /// The directory a run was given as --workdir, or <manifest-dir>/workdir, whose sessions'
+        /// records are read from ~/.murmur/records (default: ./workdir)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        /// Print one JSON object, the stable interface documented under mur trace list
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1618,6 +1630,51 @@ struct TaskMetrics {
 
 // ── Parsing ───────────────────────────────────────────────────────────────────
 
+/// What a session's `trace.jsonl` says about the context its first task ran under, read no
+/// further than the answer.
+enum FirstTaskContext {
+    /// The `context_id` of the first `task_start` carrying a non-empty one.
+    Found(String),
+    /// The trace ends with no `task_start` carrying a context id.
+    NoTask,
+    /// Line `line`, 1-based, is not valid JSON, and no line before it answered.
+    Torn {
+        line: usize,
+        error: serde_json::Error,
+    },
+}
+
+/// Scan the trace at `path` for the context its first task ran under. The `Err` is the trace
+/// that could not be opened or read, absent included.
+///
+/// `mur run --resume` ([`first_task_context_id`]) and `mur trace list` both read the context
+/// through this one body.
+fn scan_first_task_context(path: &Path) -> std::io::Result<FirstTaskContext> {
+    let file = fs::File::open(path)?;
+
+    // Read no further than the answer. The runtime appends one whole record per `write_all`
+    // under `O_APPEND`, so a writer killed mid-write leaves a truncated *tail* and nothing
+    // else — and a scan that has already found its `task_start` never reaches it. That
+    // narrower appetite is this scan's alone: [`parse_trace_records`] takes the whole file as
+    // its subject and a torn line there stays `E-TRC-001`.
+    for (i, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<TraceEvent>(line) {
+            Ok(TraceEvent::TaskStart(task)) if !task.context_id.is_empty() => {
+                return Ok(FirstTaskContext::Found(task.context_id));
+            }
+            Ok(_) => {}
+            Err(error) => return Ok(FirstTaskContext::Torn { line: i + 1, error }),
+        }
+    }
+
+    Ok(FirstTaskContext::NoTask)
+}
+
 /// The context id the first task of `session_dir` ran under, read off its `trace.jsonl`.
 ///
 /// `mur run --resume` turns a session address into the `--context` value it would otherwise have
@@ -1625,38 +1682,19 @@ struct TaskMetrics {
 /// the context, so the resolution needs no new trace field and no index. `None` means the trace
 /// holds no `task_start` carrying one — a session that never ran a task, or one written by a
 /// runtime that predates the key, which reaches `task_start.context_id` as the empty string.
+///
+/// A line that does not parse before the answer is `E-TRC-001`: there is nothing to weigh it
+/// against, and no killed writer produces one there.
 pub(crate) fn first_task_context_id(session_dir: &Path) -> Result<Option<String>, CliError> {
     let path = session_dir.join("trace.jsonl");
-    let file = fs::File::open(&path).map_err(|e| trace_read_error(&path, &e))?;
-
-    // Read no further than the answer. The runtime appends one whole record per `write_all`
-    // under `O_APPEND`, so a writer killed mid-write leaves a truncated *tail* and nothing
-    // else — and a resolver that has already found its `task_start` never reaches it. That
-    // narrower appetite is this caller's alone: [`parse_trace_records`] takes the whole file as
-    // its subject and a torn line there stays `E-TRC-001`.
-    for (i, line) in BufReader::new(file).lines().enumerate() {
-        let line = line.map_err(|e| trace_read_error(&path, &e))?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<TraceEvent>(line) {
-            Ok(TraceEvent::TaskStart(task)) if !task.context_id.is_empty() => {
-                return Ok(Some(task.context_id));
-            }
-            Ok(_) => {}
-            // Before the answer there is nothing to weigh an unreadable line against, and no
-            // killed writer produces one there anyway.
-            Err(err) => {
-                return Err(CliError::new(
-                    E_TRC_001,
-                    format!("{}:{}: {err}", path.display(), i + 1),
-                ));
-            }
-        }
+    match scan_first_task_context(&path).map_err(|e| trace_read_error(&path, &e))? {
+        FirstTaskContext::Found(context_id) => Ok(Some(context_id)),
+        FirstTaskContext::NoTask => Ok(None),
+        FirstTaskContext::Torn { line, error } => Err(CliError::new(
+            E_TRC_001,
+            format!("{}:{line}: {error}", path.display()),
+        )),
     }
-
-    Ok(None)
 }
 
 /// The diagnostic for a trace file that could not be opened or read.
@@ -5301,6 +5339,139 @@ pub(crate) fn run_trace_report(
     }
 
     Ok(())
+}
+
+// ── List ──────────────────────────────────────────────────────────────────────
+
+/// A full `ses_` id, never abbreviated, so it can be copied into the next command.
+const LIST_SESSION_WIDTH: usize = 36;
+/// RFC 3339 UTC to the millisecond, `2026-10-17T09:12:44.123Z`.
+const LIST_STARTED_WIDTH: usize = 24;
+/// `running` or `ended`.
+const LIST_STATUS_WIDTH: usize = 7;
+
+/// `mur trace list --json`: a stable interface. Keys keep their names, types and meanings and
+/// serialize in declaration order; a key may be added, never removed or renamed.
+#[derive(Debug, serde::Serialize)]
+struct SessionListing {
+    /// The workdir root that was read, absolute.
+    workdir_root: String,
+    /// [`session_address::records_group`] of `workdir_root`, which may not exist.
+    records_group: String,
+    /// Most recent first: entry `i` is the session `@(i+1)` names.
+    sessions: Vec<ListedSession>,
+}
+
+/// One session directory in [`SessionListing::records_group`].
+#[derive(Debug, serde::Serialize)]
+struct ListedSession {
+    session_id: String,
+    /// `<records_group>/<session_id>`, the form `mur run --resume` takes.
+    records_dir: String,
+    /// The mint time the session id carries, RFC 3339 UTC to the millisecond.
+    started_at: Option<String>,
+    /// [`scan_first_task_context`]'s answer; `None` for no task, no trace, or a torn line before
+    /// the first task.
+    context_id: Option<String>,
+    /// A record in `~/.murmur/running` names this session and its process is alive, or alive
+    /// with an unreadable start time.
+    running: bool,
+}
+
+/// List the sessions of the workdir root `workdir` (default `./workdir`), most recent first, as
+/// a table or, with `json`, as one [`SessionListing`].
+///
+/// A root that no longer exists is read like any other: its records outlive it. The checks run
+/// in a fixed order, and a failure prints nothing on stdout: `HOME` unusable is `E-IO-004`, a
+/// records group or trace that cannot be read is `E-IO-003`, and a `~/.murmur/running` that
+/// cannot be listed is `E-RUN-028`, so a machine is never reported as running nothing when that
+/// could not be told.
+///
+/// Writes, creates, prunes and signals nothing: the running records are read with
+/// [`running::scan`] and judged by [`running::process_state`] alone, with no door probe.
+pub(crate) fn run_trace_list(workdir: Option<PathBuf>, json: bool) -> Result<(), CliError> {
+    let root = workdir.unwrap_or_else(|| PathBuf::from("workdir"));
+    let group = session_address::records_group(&root)?;
+    let root = std::path::absolute(&root).map_err(|e| {
+        CliError::new(
+            E_IO_003,
+            format!("cannot make {} absolute: {e}", root.display()),
+        )
+    })?;
+    let names = session_address::sessions_newest_first(&group)?;
+    let scan = running::running_dir_location()
+        .and_then(|dir| running::scan(&dir))
+        .map_err(|reason| records_unreadable(&reason))?;
+
+    let mut sessions = Vec::with_capacity(names.len());
+    for session_id in names {
+        let records_dir = group.join(&session_id);
+        let context_id = match scan_first_task_context(&records_dir.join("trace.jsonl")) {
+            Ok(FirstTaskContext::Found(context_id)) => Some(context_id),
+            Ok(FirstTaskContext::NoTask | FirstTaskContext::Torn { .. }) => None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(trace_read_error(&records_dir.join("trace.jsonl"), &e)),
+        };
+        let running = scan.records.iter().any(|record| {
+            record.session_id == session_id
+                && matches!(
+                    running::process_state(record),
+                    ProcessState::Alive | ProcessState::Unverified(_)
+                )
+        });
+        sessions.push(ListedSession {
+            started_at: capsule_runtime::retention::session_id_timestamp_ms(&session_id)
+                .map(fmt_timestamp_ms),
+            records_dir: records_dir.display().to_string(),
+            session_id,
+            context_id,
+            running,
+        });
+    }
+    let listing = SessionListing {
+        workdir_root: root.display().to_string(),
+        records_group: group.display().to_string(),
+        sessions,
+    };
+
+    if json {
+        capsule_runtime::report_println!(
+            "{}",
+            serde_json::to_string_pretty(&listing)
+                .expect("a listing of strings and booleans always serializes")
+        );
+    } else {
+        print_session_listing(&listing);
+    }
+    Ok(())
+}
+
+/// The table form of `mur trace list`, or the one line an empty group gets.
+fn print_session_listing(listing: &SessionListing) {
+    if listing.sessions.is_empty() {
+        capsule_runtime::report_println!(
+            "no sessions in workdir at {} (records in {})",
+            listing.workdir_root,
+            listing.records_group
+        );
+        return;
+    }
+    capsule_runtime::report_println!(
+        "{:<LIST_SESSION_WIDTH$}  {:<LIST_STARTED_WIDTH$}  {:<LIST_STATUS_WIDTH$}  CONTEXT",
+        "SESSION",
+        "STARTED",
+        "STATUS"
+    );
+    for session in &listing.sessions {
+        capsule_runtime::report_println!(
+            "{:<LIST_SESSION_WIDTH$}  {:<LIST_STARTED_WIDTH$}  {:<LIST_STATUS_WIDTH$}  {}",
+            session.session_id,
+            session.started_at.as_deref().unwrap_or("-"),
+            if session.running { "running" } else { "ended" },
+            session.context_id.as_deref().unwrap_or("-")
+        );
+    }
+    capsule_runtime::report_println!("records: {}", listing.records_group);
 }
 
 #[cfg(test)]

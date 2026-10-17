@@ -28,7 +28,8 @@ const FORMATION_WIDTH: usize = 36;
 
 /// What follows `skipped: <path>` for a record an older `mur` wrote.
 const OLDER_MUR_SKIPPED: &str = "a record an older mur wrote, which this mur cannot read; it is \
-     left in place, so stop that capsule with the mur that started it";
+     left in place, so stop that capsule with the mur that started it, then delete this file once \
+     that capsule is gone";
 
 /// What a row says about the capsule it names, once the record has been verified.
 const STATUS_RUNNING: &str = "running";

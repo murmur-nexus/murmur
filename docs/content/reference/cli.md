@@ -74,7 +74,8 @@ What an address is resolved against depends on what the command needs.
 | [`mur watch`](#mur-watch), [`mur cancel`](#mur-cancel), [`mur stop`](#mur-stop), [`mur token`](#mur-token) | The [running-capsule records](#running-capsule-records) for this whole machine | The most recent running session |
 
 The recorded set is the records group of one workdir root: the directory a run was given as
-`--workdir`, or `<manifest-dir>/workdir`. The `mur trace` and `mur eval` commands take it as their
+`--workdir`, or `<manifest-dir>/workdir`. [`mur trace list`](#mur-trace-list) prints it in `@N`
+order. The `mur trace` and `mur eval` commands take it as their
 own `--workdir`, `./workdir` by default; `mur run --resume` uses its launch's own. Each group is under
 `~/.murmur/records`, so these commands need a `HOME` that can hold `~/.murmur` and are refused with
 [`E-IO-004`](diagnostics.md#e-io-004) otherwise; the path form reads no group. See
@@ -1571,10 +1572,11 @@ gone, and every file in the directory that is neither a readable record nor
 before the table. A read that removes nothing prints nothing on stderr.
 
 A record an older `mur` wrote is left in place, counted in no summary, and named on stderr ahead of
-any `pruned` line, with or without `--verbose`. Stop that capsule with the `mur` that started it:
+any `pruned` line, with or without `--verbose`. Stop that capsule with the `mur` that started it,
+then delete the file once that capsule is gone; `mur ps` never deletes it:
 
 ```text
-skipped: /home/me/.murmur/running/ses_019f0193c7d871a5b2e30ff41a7c0ce1.json — a record an older mur wrote, which this mur cannot read; it is left in place, so stop that capsule with the mur that started it
+skipped: /home/me/.murmur/running/ses_019f0193c7d871a5b2e30ff41a7c0ce1.json — a record an older mur wrote, which this mur cannot read; it is left in place, so stop that capsule with the mur that started it, then delete this file once that capsule is gone
 ```
 
 | Mode | Stderr |
@@ -2973,6 +2975,81 @@ Notes:
 - A single session produces stddev = 0.
 - The Per-task averages section appears when at least one session ran more than one task. Traces carrying no task events are excluded from per-task aggregation.
 - Exits non-zero if the workdir does not exist or holds no sessions.
+
+### `mur trace list` { #mur-trace-list }
+
+List the sessions of one workdir root, most recent first, with each one's records directory.
+
+```bash
+mur trace list [--workdir <dir>] [--json]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--workdir` | `./workdir` | The workdir root whose sessions are listed: the directory a run was given as `--workdir`, or `<manifest-dir>/workdir`. Its sessions' [records directories](workdir.md#records-directory) are read from `~/.murmur/records` |
+| `--json` | off | Print one JSON object, the stable interface below, instead of the table |
+
+A workdir root that no longer exists still lists its sessions: their records outlive it.
+
+The listing changes nothing. It creates no directory, and it removes and signals no
+[running-capsule record](#running-capsule-records).
+
+With `--json`, it prints one pretty-printed JSON object:
+
+```json
+{
+  "workdir_root": "/home/me/proj/workdir",
+  "records_group": "/home/me/.murmur/records/home/me/proj/workdir",
+  "sessions": [
+    {
+      "session_id": "ses_019f0193c7d871a5b2e30ff41a7c0ce1",
+      "records_dir": "/home/me/.murmur/records/home/me/proj/workdir/ses_019f0193c7d871a5b2e30ff41a7c0ce1",
+      "started_at": "2026-10-17T09:12:44.123Z",
+      "context_id": "ctx_019f0193c7e07c3a9d5e1b2f4a6c8e01",
+      "running": false
+    }
+  ]
+}
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `workdir_root` | string | The workdir root that was read: `--workdir` made absolute against the current directory, or `./workdir` |
+| `records_group` | string | `~/.murmur/records/<workdir root>`, the group `mur run` keeps that root's sessions in. It may not exist |
+| `sessions` | array | One entry per session directory in the group, most recent first: entry `i` is the session [`@(i+1)`](#session-addresses) names. Empty when the group holds none or does not exist |
+| `sessions[].session_id` | string | The session id, `ses_` followed by 32 hex characters |
+| `sessions[].records_dir` | string | The session's records directory, `<records_group>/<session_id>`, absolute. [`mur run --resume`](#mur-run) takes it as an address |
+| `sessions[].started_at` | string or `null` | When the session was staged, read from its session id: RFC 3339 UTC to the millisecond. `null` only for a `ses_` directory whose name carries no time, which `mur` never creates |
+| `sessions[].context_id` | string or `null` | The conversation the session's first task ran under: the `context_id` of the first `task_start` in its `trace.jsonl`, as `mur run --resume` reads it. `null` when the session ran no task, has no `trace.jsonl`, or its trace has a line that is not valid JSON before the first task |
+| `sessions[].running` | boolean | `true` when a [running-capsule record](#running-capsule-records) names this session and the process it names is alive, or alive with a start time that could not be read. The capsule's A2A door is not asked |
+
+These keys are a stable interface. Each keeps its name, type and meaning. New keys may be added, and
+a consumer ignores keys it does not know.
+
+Without `--json`, it prints a table and the group it read:
+
+```text
+SESSION                               STARTED                   STATUS   CONTEXT
+ses_019f0193c9a871a5b2e30ff41a7c0ce2  2026-10-17T09:14:02.210Z  running  ctx_019f0193c9b27a4e8c1d3f5b7a9e0c12
+ses_019f0193c7d871a5b2e30ff41a7c0ce1  2026-10-17T09:12:44.123Z  ended    ctx_019f0193c7e07c3a9d5e1b2f4a6c8e01
+records: /home/me/.murmur/records/home/me/proj/workdir
+```
+
+`STATUS` is `running` or `ended`, and `-` stands for a `null` start time or context. A group that
+holds no session prints one line:
+
+```text
+no sessions in workdir at /home/me/proj/workdir (records in /home/me/.murmur/records/home/me/proj/workdir)
+```
+
+| Exit | When |
+|---|---|
+| `0` | The group was read, including when it holds no session or does not exist |
+| `1` | [`E-IO-004`](diagnostics.md#e-io-004): `HOME` cannot hold `~/.murmur` |
+| `1` | `E-IO-003`: the group, or a session's `trace.jsonl`, exists and cannot be read |
+| `1` | [`E-RUN-028`](diagnostics.md#e-run-028): `~/.murmur/running/` exists and cannot be listed |
+
+A failure prints nothing on stdout, with or without `--json`.
 
 ---
 

@@ -695,7 +695,8 @@ fn ps_prunes_the_dead_and_keeps_the_unreachable() {
 fn skipped_line(path: &Path) -> String {
     format!(
         "skipped: {} — a record an older mur wrote, which this mur cannot read; it is left in \
-         place, so stop that capsule with the mur that started it",
+         place, so stop that capsule with the mur that started it, then delete this file once that \
+         capsule is gone",
         path.display()
     )
 }

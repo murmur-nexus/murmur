@@ -238,7 +238,9 @@ Its instance name is now `murmur:driver/process@0.2.0`.
 The bump was paid for by rebuilding: every driver built against `@0.1.0`,
 including this repository's own `tests/fixtures/process-driver` components,
 stopped loading and was rebuilt against `@0.2.0`. The host keeps no fallback, so
-a `@0.1.0` driver is refused at staging with `E-RUN-029`, naming both versions.
+a `@0.1.0` driver is refused at staging with `E-WIT-LEVEL-001`: it does not fit
+WIT level 1, it exports `murmur:driver/process@0.1.0`, and level 1 has
+`murmur:driver@0.3.0`, with a hint to rebuild it against level 1's packages.
 One `@0.1.0` component stays committed under
 `crates/murmur-cli/tests/fixtures/process-driver-v1/`, together with a frozen
 copy of the `@0.1.0` `.wit` it is built from, so that refusal stays testable
@@ -275,7 +277,10 @@ Carrying only a count across the interface means the runtime never holds a
 call's input before the gate does.
 
 The cost was paid knowingly. Every installed `@0.2.0` driver is refused at
-launch with `E-RUN-029` the moment `mur` upgrades — including one pinned in a
+launch with `E-WIT-LEVEL-001` the moment `mur` upgrades: it does not fit WIT
+level 1, it exports `murmur:driver/process@0.2.0`, and level 1 has
+`murmur:driver@0.3.0`, with a hint to pin a version that fits and run
+`mur install`. That includes one pinned in a
 `murmur.lock` that launched the day before, and every third-party process
 driver. A pinned lock stops reproducing a launch it reproduced yesterday; that
 was spent for a one-time correction while the ecosystem is small enough to
@@ -314,9 +319,10 @@ have cost the same rebuild — every driver importing `murmur:text/chunks@0.1.0`
 stops linking either way — and kept a name that misdescribes what it holds.
 
 The cost was paid knowingly. Every installed http driver importing any
-`murmur:text` interface is refused at staging with `E-RUN-029`, naming the
-imports the host does not serve and `murmur:stream/events@0.1.0`, with a hint to
-pin a release built against it and run `mur install`. The check covers every
+`murmur:text` interface is refused at staging with `E-WIT-LEVEL-001`: it does
+not fit WIT level 1, it imports `murmur:text/chunks@0.1.0`, and level 1 has no
+version of `murmur:text`, with a hint to pin a version that fits and run
+`mur install`. The check covers every
 `runtime: driver` artifact a capsule declares, not only its inference driver,
 because a `switch_driver` target is dispatched through the same linker. This
 repository's own driver fixtures were rebuilt against `murmur:stream`. One
