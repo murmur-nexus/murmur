@@ -4989,7 +4989,10 @@ async fn drain_script_trace_buffers(
 /// `holds_formation_lifeline` is whether this session holds a formation lifeline, which its
 /// launcher ends it by closing. Only such a member records the launcher its channel named, which
 /// is how `mur stop <formation id>` finds a launcher that writes no record of its own.
-/// `spawned_by` is the delegating session's id, for a delegated child that ends with its spawner.
+/// `formation_member` is the roster name `mur run --roster` handed a member, from the same
+/// `staged.formation_member` the trace's `session_start.formation_member` comes from, so the two
+/// always agree. `spawned_by` is the delegating session's id, for a delegated child that ends with
+/// its spawner.
 fn running_record_for(
     staged: &StagedSession,
     session_id: &str,
@@ -5021,6 +5024,10 @@ fn running_record_for(
             .map(|auth| auth.tokens().iter().skip(1).cloned().collect())
             .unwrap_or_default(),
         formation_id: staged.formation_id.clone(),
+        formation_member: staged
+            .formation_member
+            .as_ref()
+            .map(|member| member.name().to_string()),
         formation_lifeline: holds_formation_lifeline,
         formation_launcher: staged
             .formation_member

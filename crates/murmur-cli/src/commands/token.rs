@@ -79,6 +79,7 @@ mod tests {
                 .map(|(name, token)| (name.to_string(), DoorToken::new(token.to_string())))
                 .collect::<BTreeMap<_, _>>(),
             formation_id: None,
+            formation_member: None,
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,

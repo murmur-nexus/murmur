@@ -456,6 +456,31 @@ fn await_delegation(world: &World, root: &Path, session_id: &str) -> Delegation 
     }
 }
 
+/// The running record of `session_id` under `world`'s `HOME`, once it is there: a session writes
+/// it after its `session_start`.
+fn await_running_record(world: &World, session_id: &str) -> Value {
+    let path = world
+        .home
+        .path()
+        .join(".murmur")
+        .join("running")
+        .join(format!("{session_id}.json"));
+    let deadline = Instant::now() + START_LIMIT;
+    loop {
+        if let Some(record) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|body| serde_json::from_str(&body).ok())
+        {
+            return record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{session_id} never wrote {path:?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// `mur trace show` on the child's own trace: it opens, exits 0, and returns what it printed.
 fn trace_show(delegation: &Delegation) -> String {
     let output = Command::new(assert_cmd::cargo::cargo_bin("mur"))
@@ -1212,6 +1237,33 @@ fn a_formation_member_killed_outright_takes_its_child_with_it() {
     assert!(
         !delegation.processes().is_empty(),
         "the child is not running"
+    );
+    // The child is joined to the formation and has no roster name; the member that delegated has.
+    let child_session = delegation
+        .child_session
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let child_record = await_running_record(&world, child_session);
+    assert_eq!(
+        child_record["formation_id"],
+        formation_id.as_str(),
+        "{child_record}"
+    );
+    assert_eq!(
+        child_record["spawned_by"],
+        entry_session.as_str(),
+        "{child_record}"
+    );
+    assert!(
+        child_record.get("formation_member").is_none(),
+        "{child_record}"
+    );
+    let entry_record = await_running_record(&world, &entry_session);
+    assert_eq!(
+        entry_record["formation_member"], "planner",
+        "{entry_record}"
     );
 
     let killed = Instant::now();

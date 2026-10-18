@@ -63,12 +63,13 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where one running session's door is, and which process holds it.
 ///
-/// Every field but `door_token`, `credentials`, `formation_id`, `formation_lifeline`,
-/// `formation_launcher` and `spawned_by` is required, and each of those six is omitted when it does
-/// not apply, so a standalone session's record carries the ten required keys alone. There is no
-/// version field: a record that does not deserialize names no process that could be checked, and
-/// is pruned, which is what "the record is a hint" already means — except one an older `mur`
-/// wrote, which [`scan`] recognises by its missing `records_dir` and no reader removes.
+/// Every field but `door_token`, `credentials`, `formation_id`, `formation_member`,
+/// `formation_lifeline`, `formation_launcher` and `spawned_by` is required, and each of those seven
+/// is omitted when it does not apply, so a standalone session's record carries the ten required
+/// keys alone. There is no version field: a record that does not deserialize names no process that
+/// could be checked, and is pruned, which is what "the record is a hint" already means — except one
+/// an older `mur` wrote, which [`scan`] recognises by its missing `records_dir` and no reader
+/// removes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningRecord {
     /// The session this door answers for, compared against the agent card by layer 3.
@@ -121,6 +122,18 @@ pub struct RunningRecord {
     /// id makes the whole record unreadable, which [`list`] prunes like any other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formation_id: Option<crate::formation::FormationId>,
+    /// The member's roster name, so a reader can tell apart members running the same capsule.
+    /// Present only for a session `mur run --roster` launched as a member, and then the same name
+    /// as the trace's `session_start.formation_member`. Absent for a session in no formation, for
+    /// a member's delegated child, for a session joined to a formation through
+    /// `MURMUR_FORMATION_ID` alone, and in a record an older runtime wrote. It labels the record
+    /// and grants nothing. A value that is not a member name makes the whole record unreadable.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "member_name_field::deserialize"
+    )]
+    pub formation_member: Option<String>,
     /// The session holds a formation lifeline: its launcher ends it by closing that lifeline, and
     /// nothing else needs to. Absent when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -207,6 +220,26 @@ mod door_credentials_field {
             .into_iter()
             .map(|(name, token)| (name, DoorToken::new(token)))
             .collect())
+    }
+}
+
+/// How the running record reads its member name: a string that is a roster member name, as
+/// [`murmur_artifact::member_name_format_error`] judges it, or `null`.
+mod member_name_field {
+    use serde::{de::Error, Deserialize, Deserializer};
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        let Some(name) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        match murmur_artifact::member_name_format_error(&name) {
+            Some(reason) => Err(D::Error::custom(format!(
+                "formation_member {name:?} is not a member name: it {reason}"
+            ))),
+            None => Ok(Some(name)),
+        }
     }
 }
 
@@ -888,6 +921,7 @@ mod tests {
             door_token: None,
             credentials: BTreeMap::new(),
             formation_id: None,
+            formation_member: None,
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,
@@ -933,6 +967,7 @@ mod tests {
             door_token: None,
             credentials: BTreeMap::new(),
             formation_id: None,
+            formation_member: None,
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,
@@ -1118,6 +1153,80 @@ mod tests {
         let mut malformed = serde_json::to_value(record(2, "42")).unwrap();
         malformed["session_id"] = "ses_0199c4e2f1b7712a9d3e4f5061728395".into();
         malformed["formation_id"] = "frm_ABC".into();
+        let member_path = record_path(&dir, &member.session_id);
+        let malformed_path = dir.join("ses_0199c4e2f1b7712a9d3e4f5061728395.json");
+        std::fs::write(&member_path, serde_json::to_vec_pretty(&member).unwrap()).unwrap();
+        std::fs::write(
+            &malformed_path,
+            serde_json::to_vec_pretty(&malformed).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(list().unwrap(), vec![member]);
+        assert!(member_path.exists());
+        assert!(!malformed_path.exists());
+    }
+
+    #[test]
+    fn a_member_record_serializes_its_roster_name_beside_its_formation() {
+        let mut member = record(1, "42");
+        member.formation_id = Some(crate::formation::FormationId::mint());
+        member.formation_member = Some("w1".to_string());
+        let value = serde_json::to_value(&member).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 12);
+        assert_eq!(object["formation_member"], "w1");
+        let back: RunningRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(back, member);
+    }
+
+    #[test]
+    fn a_record_without_a_formation_member_or_with_a_null_one_parses_to_none() {
+        let mut value = serde_json::to_value(record(1, "42")).unwrap();
+        assert!(value.get("formation_member").is_none());
+        let parsed: RunningRecord = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.formation_member, None);
+        value["formation_member"] = serde_json::Value::Null;
+        let parsed: RunningRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.formation_member, None);
+    }
+
+    #[test]
+    fn a_record_whose_formation_member_is_not_a_member_name_does_not_parse() {
+        let too_long = format!("w{}", "1".repeat(32));
+        let malformed: [serde_json::Value; 4] = [7.into(), "".into(), "W1".into(), too_long.into()];
+        for bad in malformed {
+            let mut value = serde_json::to_value(record(1, "42")).unwrap();
+            value["formation_member"] = bad.clone();
+            assert!(
+                serde_json::from_value::<RunningRecord>(value).is_err(),
+                "formation_member {bad} parsed"
+            );
+        }
+    }
+
+    #[test]
+    fn list_prunes_a_record_with_a_malformed_formation_member() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(
+            "running::tests::inner_list_prunes_a_record_with_a_malformed_formation_member",
+            home.path(),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by list_prunes_a_record_with_a_malformed_formation_member"]
+    fn inner_list_prunes_a_record_with_a_malformed_formation_member() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let dir = running_dir().unwrap();
+        let mut member = record(1, "42");
+        member.formation_id = Some(crate::formation::FormationId::mint());
+        member.formation_member = Some("w1".to_string());
+        let mut malformed = serde_json::to_value(&member).unwrap();
+        malformed["session_id"] = "ses_0199c4e2f1b7712a9d3e4f5061728395".into();
+        malformed["formation_member"] = 7.into();
         let member_path = record_path(&dir, &member.session_id);
         let malformed_path = dir.join("ses_0199c4e2f1b7712a9d3e4f5061728395.json");
         std::fs::write(&member_path, serde_json::to_vec_pretty(&member).unwrap()).unwrap();
@@ -1577,6 +1686,7 @@ mod home_tests {
             door_token: None,
             credentials: BTreeMap::new(),
             formation_id: None,
+            formation_member: None,
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,

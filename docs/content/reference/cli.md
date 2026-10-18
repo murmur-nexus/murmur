@@ -142,10 +142,18 @@ an older `mur`. Its capsule may still be running, and only the `mur` that starte
 | [`mur ps`](#mur-ps) | Names it on stderr, as a `skipped:` line, and lists no row for it |
 | Every command, `mur ps` included | Leaves it in place: none reads, verifies, signals or removes it, so `mur stop`, `mur watch`, `mur cancel` and `mur token` answer as if it were absent |
 
-A session that is a [member of a formation](#mur-run-formation) also records its formation id, as
-`formation_id`. A session in no formation writes no such key. The id groups records; it grants
-nothing. A record whose `formation_id` is not a formation id is unreadable, and is removed on the
-next read like any other unreadable record.
+A session that is a [member of a formation](#mur-run-formation) also records its formation, and a
+member [`mur run --roster`](#mur-run-roster) launched records its roster name. A session in no
+formation writes neither key. Both group and label records; neither grants anything.
+
+| Key | Written when | Value |
+|---|---|---|
+| `formation_id` | The session is a member of a formation, a member's delegated sub-capsule and a session started by hand with `MURMUR_FORMATION_ID` included | The formation id |
+| `formation_member` | `mur run --roster` launched the session as a member. A member's delegated sub-capsule and a session started by hand with `MURMUR_FORMATION_ID` write no such key | The member's roster name, the `session_start.formation_member` of its [trace](observability-schemas.md#session-trace-tracejsonl). Members running the same capsule share a `capsule_name`; this name tells them apart |
+
+A record whose `formation_id` is not a formation id, or whose `formation_member` is not a
+[member name](roster.md#fields), is unreadable, and is removed on the next read like any other
+unreadable record.
 
 Three more keys say what ends the session other than `mur stop`. Each is written only when it
 applies, so a standalone session's record carries none of them.
