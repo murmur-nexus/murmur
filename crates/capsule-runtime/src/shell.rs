@@ -30,8 +30,8 @@ const DEFAULT_ENV_BASELINE: &[&str] = &[
 ];
 
 /// The two variables that name the account a process runs as, sorted. Neither is a credential:
-/// each is a login name, which is what a harness such as Claude Code keys its stored login by
-/// (the macOS login keychain item is looked up by user name).
+/// each is a login name. A harness may look up its stored login by it (the macOS login keychain
+/// is keyed by user name), so a harness started without them can fail to find a login it has.
 pub(crate) const ACCOUNT_ENV: [&str; 2] = ["LOGNAME", "USER"];
 
 /// Serializes the unit tests that set or remove an [`ACCOUNT_ENV`] name in this test binary's

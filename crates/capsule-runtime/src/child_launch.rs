@@ -961,7 +961,7 @@ fn watch_for_completion(
 ///
 /// `capabilities.env.allow` is the child's own, not the parent's: a sibling's declaration reaches
 /// nothing here, and a variable the parent holds but the child did not declare is simply absent.
-/// The runtime-owned names — `PATH`, `HOME`, `USER` and `LOGNAME` ([`crate::shell::ACCOUNT_ENV`]),
+/// The runtime-owned names — `PATH`, `HOME`, `LOGNAME` and `USER` ([`crate::shell::ACCOUNT_ENV`]),
 /// `MURMUR_ROOST_URL`, [`HOST_WARNINGS_REPORTED_ENV`], [`SPAWNER_ENV`] on a delegated launch and
 /// [`FORMATION_ID_ENV`] for a parent in a formation, in that order — are applied last, so a child
 /// cannot displace the daemon URL it is required to register with, the handle it reports its

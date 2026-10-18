@@ -343,6 +343,7 @@ the child holds:
 | `USER` | When the parent's own process holds it, from the parent's value |
 | `LOGNAME` | When the parent's own process holds it, from the parent's value |
 | `MURMUR_ROOST_URL` | Always, so the child registers at the same daemon its parent asked |
+| `MURMUR_HOST_WARNINGS_REPORTED` | Always `1`, so the child does not repeat the host warnings its parent already printed, such as [`W-SEC-013`](diagnostics.md#w-sec-013) |
 | `MURMUR_SPAWNER_LIFELINE` | Always: the descriptor of the child's own [spawner lifeline](#spawner-lifeline) |
 | `MURMUR_SPAWNER` | The child was given a spawner handle — see [The completion path](#the-completion-path) |
 | `MURMUR_FORMATION_ID` | The parent session belongs to a formation. The child joins it, whether or not it was given a spawner handle |
@@ -355,7 +356,7 @@ parent's own `MURMUR_SPAWNER_LIFELINE`: a child that declares any of them receiv
 the parent's environment, and holds no formation token. A
 name a child declares that its parent does not is refused at `POST /spawn` on the
 [`capabilities.env.allow` axis](#spawn-envelope).
-The eight names above are the runtime's, and a child that lists one of them under
+The nine names above are the runtime's, and a child that lists one of them under
 `capabilities.env.allow` does not displace the runtime's value.
 
 The value copied is the value the parent's process holds at launch. A variable the parent itself
