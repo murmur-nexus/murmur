@@ -331,7 +331,7 @@ parent's own accessible workdir, so a parent can place inputs in it before launc
 to it while the child runs, without any grant saying so. The spawn envelope does not cover this
 channel. A child cannot reach out of its own directory, so nothing flows the other way.
 
-### The child's environment
+### The child's environment { #the-childs-environment }
 
 A delegated child starts from a cleared environment. Its parent's runtime builds the whole of what
 the child holds:
@@ -340,6 +340,8 @@ the child holds:
 |---|---|
 | `PATH` | Always, from the parent's own value |
 | `HOME` | Always, from the parent's own value |
+| `USER` | When the parent's own process holds it, from the parent's value |
+| `LOGNAME` | When the parent's own process holds it, from the parent's value |
 | `MURMUR_ROOST_URL` | Always, so the child registers at the same daemon its parent asked |
 | `MURMUR_SPAWNER_LIFELINE` | Always: the descriptor of the child's own [spawner lifeline](#spawner-lifeline) |
 | `MURMUR_SPAWNER` | The child was given a spawner handle — see [The completion path](#the-completion-path) |
@@ -353,7 +355,7 @@ parent's own `MURMUR_SPAWNER_LIFELINE`: a child that declares any of them receiv
 the parent's environment, and holds no formation token. A
 name a child declares that its parent does not is refused at `POST /spawn` on the
 [`capabilities.env.allow` axis](#spawn-envelope).
-The six names above are the runtime's, and a child that lists one of them under
+The eight names above are the runtime's, and a child that lists one of them under
 `capabilities.env.allow` does not displace the runtime's value.
 
 The value copied is the value the parent's process holds at launch. A variable the parent itself

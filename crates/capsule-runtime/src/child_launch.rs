@@ -961,13 +961,16 @@ fn watch_for_completion(
 ///
 /// `capabilities.env.allow` is the child's own, not the parent's: a sibling's declaration reaches
 /// nothing here, and a variable the parent holds but the child did not declare is simply absent.
-/// The runtime-owned names — `PATH`, `HOME`, `MURMUR_ROOST_URL`,
-/// [`HOST_WARNINGS_REPORTED_ENV`], [`SPAWNER_ENV`] on a delegated launch and [`FORMATION_ID_ENV`]
-/// for a parent in a formation, in that order — are applied last, so a child cannot displace the
-/// daemon URL it is required to register with, the handle it reports its outcome to, or the
-/// formation it joins, by allowlisting the name. [`HOST_WARNINGS_REPORTED_ENV`] is always `1`:
-/// the host-level warnings were printed by the process the operator started, so a child does not
-/// repeat them, and its manifest cannot choose otherwise.
+/// The runtime-owned names — `PATH`, `HOME`, `USER` and `LOGNAME` ([`crate::shell::ACCOUNT_ENV`]),
+/// `MURMUR_ROOST_URL`, [`HOST_WARNINGS_REPORTED_ENV`], [`SPAWNER_ENV`] on a delegated launch and
+/// [`FORMATION_ID_ENV`] for a parent in a formation, in that order — are applied last, so a child
+/// cannot displace the daemon URL it is required to register with, the handle it reports its
+/// outcome to, or the formation it joins, by allowlisting the name. `PATH`, `HOME` and the account
+/// names carry this process's values when it holds them and are absent when it does not, so a
+/// child's harness and commands run as the account this process runs as.
+/// [`HOST_WARNINGS_REPORTED_ENV`] is always `1`: the host-level warnings were printed by the
+/// process the operator started, so a child does not repeat them, and its manifest cannot choose
+/// otherwise.
 ///
 /// Two kinds of name are never copied from this process's environment, whatever the child
 /// allowlists:
@@ -990,6 +993,7 @@ pub(crate) fn child_environment(
     }
     env.retain(|(key, _)| {
         !matches!(key.as_str(), "PATH" | "HOME" | "MURMUR_ROOST_URL")
+            && !crate::shell::ACCOUNT_ENV.contains(&key.as_str())
             && key != SPAWNER_ENV
             && key != FORMATION_ID_ENV
             && key != SPAWNER_LIFELINE_ENV
@@ -1003,6 +1007,12 @@ pub(crate) fn child_environment(
     if let Ok(home) = std::env::var("HOME") {
         env.push(("HOME".to_string(), home));
     }
+    env.extend(
+        crate::shell::HostAccountEnv::from_host()
+            .set()
+            .iter()
+            .cloned(),
+    );
     env.push(("MURMUR_ROOST_URL".to_string(), request.roost_url.clone()));
     env.push(crate::host_warnings::reported_env_pair());
     // Last, with the other runtime-owned names, and only for a launch that has a spawner: a child
@@ -1589,6 +1599,60 @@ mod tests {
             }
         }
         std::env::remove_var(HOST_WARNINGS_REPORTED_ENV);
+    }
+
+    fn values_of<'a>(env: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+        env.iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
+
+    /// A child runs as the account its parent runs as: one `USER` and one `LOGNAME`, the parent's,
+    /// whether or not the child allowlists either name.
+    #[test]
+    fn a_child_carries_the_parents_account_names() {
+        let _guard = crate::shell::ACCOUNT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var("USER", "murmur-parent-user");
+        std::env::set_var("LOGNAME", "murmur-parent-login");
+        for allow in [&[][..], &["USER"][..], &["USER", "LOGNAME"][..]] {
+            let env = child_environment(&request(allow, None), None);
+            assert_eq!(
+                values_of(&env, "USER"),
+                vec!["murmur-parent-user"],
+                "{env:?}"
+            );
+            assert_eq!(
+                values_of(&env, "LOGNAME"),
+                vec!["murmur-parent-login"],
+                "{env:?}"
+            );
+        }
+    }
+
+    /// A parent that holds neither account name hands neither on, and none is made up.
+    #[test]
+    fn a_child_of_a_parent_without_account_names_has_none() {
+        let _guard = crate::shell::ACCOUNT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved: Vec<_> = crate::shell::ACCOUNT_ENV
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        for name in crate::shell::ACCOUNT_ENV {
+            std::env::remove_var(name);
+        }
+        let env = child_environment(&request(&["USER", "LOGNAME"], None), None);
+        for (name, value) in saved {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            }
+        }
+        assert!(values_of(&env, "USER").is_empty(), "{env:?}");
+        assert!(values_of(&env, "LOGNAME").is_empty(), "{env:?}");
     }
 
     /// A child's exit closes its stdout and its stderr together, so the reader that reports the

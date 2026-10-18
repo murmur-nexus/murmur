@@ -17,7 +17,8 @@
 //! 5. **Launch** — [`plan_session`] decides whether this turn starts a conversation or continues
 //!    one, then [`build_launch_request`], then the driver's `launch`, which returns the plan.
 //! 6. **Spawn** — an environment that starts empty and holds only what `capabilities.env.allow`
-//!    delivers plus the plan's `env-set`, in the accessible workdir the capsule's tools see.
+//!    delivers, the plan's `env-set` and the host's `USER` and `LOGNAME`, in the accessible
+//!    workdir the capsule's tools see.
 //! 7. **Read** — complete stdout lines, batched into `parse`, fed to [`ProcessEventSink`], whose
 //!    A2A half writes the task's frames through [`A2aStream`].
 //! 8. **End** — the harness is dead whenever this returns, on every path, and the attempt's
@@ -67,7 +68,7 @@ use crate::{
         Session, SessionMode,
     },
     runtime::CapsuleStoreState,
-    shell,
+    shell::{self, HostAccountEnv},
     spend::SpendRefusal,
     streaming::{SseBroadcast, SseEventBuffer},
     trace::{HarnessExit, HarnessStart, TraceWriter, INFERENCE_ERROR_HARNESS_INACTIVE},
@@ -413,21 +414,41 @@ fn substitute_files_dir(value: &str, files_dir: &str) -> String {
     value.replace(FILES_DIR_TOKEN, files_dir)
 }
 
-/// The environment the harness starts with: nothing, then the host values of the names
-/// `capabilities.env.allow` declares, then the plan's `env-set`, which wins.
+/// The environment the version probe runs with, and the one the harness's own is built on: the
+/// host values of the names `capabilities.env.allow` declares, then the host's `USER` and
+/// `LOGNAME` as `account` holds them.
+pub(super) fn harness_base_env(
+    policy: &CapabilityPolicy,
+    account: &HostAccountEnv,
+) -> BTreeMap<String, String> {
+    let mut env = shell::build_declared_env(policy);
+    account.apply(&mut env);
+    env
+}
+
+/// The environment the harness starts with, in the order each source is applied, a later one
+/// winning over an earlier one:
 ///
-/// The same mechanism every WASM guest gets, credential backstop included — a credential-shaped
+/// 1. nothing;
+/// 2. the host values of the names `capabilities.env.allow` declares;
+/// 3. the plan's `env-set`;
+/// 4. the host's `USER` and `LOGNAME`, each only where the host sets it, so no plan or allowlist
+///    entry names a different account;
+/// 5. `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR`, the session's own.
+///
+/// The allowlist goes through the credential backstop every WASM guest gets — a credential-shaped
 /// name in `env.allow` is refused at staging, so the harness cannot be handed a key that way
-/// either. Native shell subprocesses use a different, baseline-derived environment and are
-/// deliberately not the model here: a harness is a guest, not a shell command.
+/// either. Native shell subprocesses use a different, baseline-derived environment
+/// ([`shell::build_shell_env`]): a harness is a guest, not a shell command.
 pub(super) fn build_harness_env(
     policy: &CapabilityPolicy,
+    account: &HostAccountEnv,
     env_set: &[(String, String)],
     files_dir: &str,
     runtime_dir: &Path,
     records_dir: Option<&Path>,
 ) -> Result<BTreeMap<String, String>, String> {
-    let mut env = shell::build_declared_env(policy);
+    let mut env = harness_base_env(policy, account);
     for (name, value) in env_set {
         if !crate::process_driver::is_usable_env_name(name) {
             return Err(format!(
@@ -436,6 +457,7 @@ pub(super) fn build_harness_env(
         }
         env.insert(name.clone(), substitute_files_dir(value, files_dir));
     }
+    account.apply(&mut env);
     // Last, so no `env-set` entry displaces either.
     env.insert(
         crate::runtime_dir::RUNTIME_DIR_ENV.to_string(),
@@ -780,7 +802,8 @@ async fn run_harness(
     .await?;
 
     let description = &staged.description;
-    let base_env = shell::build_declared_env(&store_state.capability_policy);
+    let account = HostAccountEnv::from_host();
+    let base_env = harness_base_env(&store_state.capability_policy, &account);
     let probe = probe_harness_version(
         &staged.binary,
         &description.version_args,
@@ -861,6 +884,7 @@ async fn run_harness(
         .collect();
     let env = build_harness_env(
         &store_state.capability_policy,
+        &account,
         &plan.env_set,
         &files_dir_path,
         store_state.runtime_root.path(),
@@ -883,6 +907,7 @@ async fn run_harness(
         session_mode: session_mode_name(session.mode()).to_string(),
         args_count: args.len(),
         env_names: env.keys().cloned().collect(),
+        account_env_unset: account.unset().to_vec(),
         files,
         bridge_tools: bridge
             .as_ref()
@@ -989,7 +1014,8 @@ async fn drive_harness(
     let mut child = Command::new(&staged.binary)
         .args(args)
         // The environment is exactly what was built: no host variable reaches the harness unless
-        // `capabilities.env.allow` declared it or the driver's plan set it.
+        // `capabilities.env.allow` declared it, the driver's plan set it, or it is the host's
+        // `USER` or `LOGNAME`.
         .env_clear()
         .envs(env)
         .current_dir(cwd)
@@ -2080,12 +2106,101 @@ mod tests {
         }
     }
 
+    /// An account the host holds neither name of.
+    fn no_account() -> HostAccountEnv {
+        HostAccountEnv::from_lookup(|_| None)
+    }
+
+    /// The probe runs as the host's account, beside only the declared names the host set.
+    #[test]
+    fn harness_base_env_carries_the_hosts_account_and_the_declared_names() {
+        std::env::set_var("MURMUR_TEST_HARNESS_BASE_DECLARED", "yes");
+        std::env::remove_var("MURMUR_TEST_HARNESS_BASE_ABSENT");
+        let policy = policy_allowing(&[
+            "MURMUR_TEST_HARNESS_BASE_DECLARED",
+            "MURMUR_TEST_HARNESS_BASE_ABSENT",
+        ]);
+
+        let env = harness_base_env(
+            &policy,
+            &HostAccountEnv::from_pairs(&[("USER", "alice"), ("LOGNAME", "alice-login")]),
+        );
+        assert_eq!(
+            env,
+            BTreeMap::from([
+                ("LOGNAME".to_string(), "alice-login".to_string()),
+                (
+                    "MURMUR_TEST_HARNESS_BASE_DECLARED".to_string(),
+                    "yes".to_string()
+                ),
+                ("USER".to_string(), "alice".to_string()),
+            ])
+        );
+
+        let without = harness_base_env(&policy, &no_account());
+        assert!(
+            !without.contains_key("USER") && !without.contains_key("LOGNAME"),
+            "{without:?}"
+        );
+    }
+
+    /// No `env-set` entry names a different account than the host's.
+    #[test]
+    fn harness_env_keeps_the_hosts_user_over_the_plans() {
+        let env = build_harness_env(
+            &CapabilityPolicy::default(),
+            &HostAccountEnv::from_pairs(&[("USER", "alice")]),
+            &[("USER".to_string(), "someone-else".to_string())],
+            "/files",
+            std::path::Path::new("/runtime"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(env.get("USER").map(String::as_str), Some("alice"));
+    }
+
+    /// A name the host does not set stays unset, whatever the plan says.
+    #[test]
+    fn harness_env_delivers_no_logname_the_host_did_not_set() {
+        let env = build_harness_env(
+            &CapabilityPolicy::default(),
+            &HostAccountEnv::from_pairs(&[("USER", "alice")]),
+            &[("LOGNAME".to_string(), "someone-else".to_string())],
+            "/files",
+            std::path::Path::new("/runtime"),
+            None,
+        )
+        .unwrap();
+        assert!(!env.contains_key("LOGNAME"), "{env:?}");
+    }
+
+    /// The account names are the host's as the run read them once: an allowlist entry resolves
+    /// neither from anywhere else.
+    #[test]
+    fn harness_env_allowlisting_user_supplies_nothing_the_account_lacks() {
+        let _guard = shell::ACCOUNT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var("USER", "murmur-test-user");
+        let env = build_harness_env(
+            &policy_allowing(&["USER"]),
+            &no_account(),
+            &[],
+            "/files",
+            std::path::Path::new("/runtime"),
+            None,
+        )
+        .unwrap();
+        assert!(!env.contains_key("USER"), "{env:?}");
+    }
+
     #[test]
     fn harness_env_starts_empty_and_holds_only_declared_names() {
         std::env::set_var("MURMUR_TEST_HARNESS_DECLARED", "yes");
         std::env::set_var("MURMUR_TEST_HARNESS_UNDECLARED", "no");
         let env = build_harness_env(
             &policy_allowing(&["MURMUR_TEST_HARNESS_DECLARED"]),
+            &no_account(),
             &[],
             "/files",
             std::path::Path::new("/runtime"),
@@ -2105,6 +2220,7 @@ mod tests {
         std::env::set_var("MURMUR_TEST_HARNESS_OVERRIDE", "host");
         let env = build_harness_env(
             &policy_allowing(&["MURMUR_TEST_HARNESS_OVERRIDE"]),
+            &no_account(),
             &[
                 (
                     "MURMUR_TEST_HARNESS_OVERRIDE".to_string(),
@@ -2137,6 +2253,7 @@ mod tests {
         std::env::set_var("MURMUR_TEST_HARNESS_API_KEY", "leaked");
         let env = build_harness_env(
             &policy_allowing(&["MURMUR_TEST_HARNESS_API_KEY"]),
+            &no_account(),
             &[],
             "/files",
             std::path::Path::new("/runtime"),
@@ -2160,6 +2277,7 @@ mod tests {
                 crate::runtime_dir::RUNTIME_DIR_ENV,
                 crate::records_dir::RECORDS_DIR_ENV,
             ]),
+            &no_account(),
             &[
                 (
                     crate::runtime_dir::RUNTIME_DIR_ENV.to_string(),
@@ -2201,6 +2319,7 @@ mod tests {
         std::env::set_var(channel, "9");
         let declared_only = build_harness_env(
             &policy_allowing(&[peers, channel]),
+            &no_account(),
             &[],
             "/files",
             std::path::Path::new("/runtime"),
@@ -2347,6 +2466,7 @@ mod tests {
         for bad in ["", "A=B", "A\0B"] {
             let error = build_harness_env(
                 &CapabilityPolicy::default(),
+                &no_account(),
                 &[(bad.to_string(), "v".to_string())],
                 "/files",
                 std::path::Path::new("/runtime"),

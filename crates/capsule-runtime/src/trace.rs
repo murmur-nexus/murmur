@@ -1293,6 +1293,9 @@ pub(crate) struct HarnessStart {
     pub args_count: usize,
     /// The names of the variables actually delivered, sorted. Never their values.
     pub env_names: Vec<String>,
+    /// Which of `USER` and `LOGNAME` the host did not set, sorted; empty when it set both. Never
+    /// their values.
+    pub account_env_unset: Vec<String>,
     /// The names of the files written into the run's private directory. Never their contents.
     pub files: Vec<String>,
     /// The capsule tool names the bridge offered, bare. Empty when no bridge was bound.

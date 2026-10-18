@@ -862,6 +862,39 @@ before an absent variable shows itself. [`mur doctor`](cli.md#mur-doctor) report
 `spawn.allow` closure's requirement ahead of a run, marking every declared name set or unset — by
 name only, never by value.
 
+#### Process environment { #process-environment }
+
+A process the runtime starts on the host — a `transport: process` harness, a shell command or a
+native tool — begins with an empty environment and receives the variables below, in order. A later
+row wins over an earlier one for the same name. A WASM component receives only what
+`capabilities.env.allow` declares, as described above.
+
+A [`transport: process`](#transport-process) harness:
+
+| Order | Source | Variables |
+|---|---|---|
+| 1 | `capabilities.env.allow` | The host's value of each declared name the host sets, after the credential backstop |
+| 2 | The driver's launch plan | Each name its `env-set` lists |
+| 3 | The host account | `USER` and `LOGNAME`, each with the host's value when the host sets it and absent when it does not. No `env.allow` entry or launch plan names a different account. [`harness_start`](observability-schemas.md#harness-records)'s `account_env_unset` lists the names the host did not set |
+| 4 | The session | `MURMUR_RUNTIME_DIR`, the session's [runtime directory](workdir.md#runtime-directory), and `MURMUR_RECORDS_DIR`, its [records directory](workdir.md#records-directory) |
+
+The harness's version check runs with rows 1 and 3 only.
+
+A shell tool call, a plan's `shell` step, or a native tool:
+
+| Order | Source | Variables |
+|---|---|---|
+| 1 | Baseline | The host's value of each of `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TMPDIR`, `TEMP`, `TMP`, `CARGO_HOME`, `RUSTUP_HOME` and `TERM` the host sets |
+| 2 | The session's identity | A shell tool call in a session with `inference:` only: `MURMUR_CAPSULE_NAME`, `MURMUR_CAPSULE_VERSION`, `MURMUR_SESSION_ID`, `MURMUR_CAPSULE_URL` and the [`MURMUR_INFERENCE_*` variables](default-artifacts.md#driver-environment) |
+| 3 | `capabilities.shell.baseline_env` | The host's value of each listed name the host sets |
+| 4 | Credential backstop and `capabilities.shell.strip_env` | Removes every name that matches a [credential pattern](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) or a `strip_env` pattern, baseline names such as `USER` and `LOGNAME` included |
+| 5 | Synthetic home | `HOME` and `USERPROFILE`, both the session-scoped `.capsule-home` directory, never the host's home |
+| 6 | The session | `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR`, as for the harness |
+
+A delegated child `mur` starts from an empty environment and receives the parent's `USER` and
+`LOGNAME` beside its `PATH` and `HOME`, each only when the parent holds it.
+[The child's environment](roost-api.md#the-childs-environment) lists every variable it receives.
+
 #### `capabilities.plan` { #field-plan }
 
 Grants the capsule's agent one [runtime-provided tool](runtime-provided-tools.md), `submit-plan`,
@@ -1665,7 +1698,7 @@ inference:
 | Binary | `inference.command` when set, otherwise the executable the driver's `describe()` names, looked up on `PATH`. A binary that cannot be resolved refuses the launch with [`E-RUN-006`](diagnostics.md#e-run-006). |
 | Version check | The binary is run with the driver's version arguments. A version the driver was not tested against, or one that cannot be read, is [`W-RUN-002`](diagnostics.md#w-run-002) and the run proceeds. |
 | Tool dispatch | When the capsule declares tool artifacts, murmur stands up a loopback tool server and hands the driver its URL, its token and the capsule's tool names; the driver points its harness at them, the model calls those tools, and murmur executes them. With no tools declared, the harness runs with no tools. |
-| Environment | The harness starts with an empty environment, receives the host values of the names [`capabilities.env.allow`](#field-capabilities) declares, and then whatever the driver's launch plan sets. |
+| Environment | The harness starts with an empty environment, then receives the host values of the names [`capabilities.env.allow`](#field-capabilities) declares, whatever the driver's launch plan sets, the host's `USER` and `LOGNAME`, and the session's runtime and records directories. See [Process environment](#process-environment). |
 | Turn limit | One model action — a message or a tool call — is one turn, bounded by `inference.max_turns`. A turn past the limit ends the run with [`E-RUN-033`](diagnostics.md#e-run-033). |
 | Inactivity limit | A run with neither a line of harness output nor a tool call for 600 seconds is killed with [`E-RUN-035`](diagnostics.md#e-run-035). A harness that is working is never interrupted for taking a long time. |
 | Interrupt grace | A harness sent a graceful interrupt has 10 seconds to end on its own before it is killed. Both this and the inactivity limit are fixed, not manifest settings. |

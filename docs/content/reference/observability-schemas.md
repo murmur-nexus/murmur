@@ -954,6 +954,7 @@ process exists
 | `session_mode` | string | `"new"` or `"resume"` — whether this run started the harness on a fresh session or continued the one its context already had |
 | `args_count` | u32 | How many arguments the driver asked for. Never the arguments |
 | `env_names` | array of string | Names of the environment variables the harness was given, sorted. Never their values |
+| `account_env_unset` | array of string | Which of `USER` and `LOGNAME` the host did not set, and so the harness did not receive, sorted. `[]` when the host set both. Always present. Never their values — see [Process environment](manifest.md#process-environment) |
 | `files` | array of string | Names of the files the driver asked to be written into the run's private directory. Never their contents |
 | `bridge_tools` | array of string | The capsule's tool names offered over the loopback tool server. `[]` when the capsule declares no tools |
 | `stdin_bytes` | u64 | Bytes written to the harness's stdin |
