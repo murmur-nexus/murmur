@@ -164,7 +164,7 @@ The agent can now run `git`, `python3`, and `jq` but has no general shell. Any b
 
 ## Step 2 — manage the subprocess environment
 
-The subprocess does not inherit your full host environment. It starts with a minimal baseline: `PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TMPDIR`, `TEMP`, `TMP`, `CARGO_HOME`, `RUSTUP_HOME`, and `TERM`. Known credential-shaped variables are always stripped before the subprocess spawns, regardless of any other configuration — this includes exact names (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `HUGGING_FACE_HUB_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, `KUBECONFIG`, `NPM_TOKEN`, `PYPI_TOKEN`, `CARGO_REGISTRY_TOKEN`) and glob patterns (`AWS_*`, `DOCKER_*`, `*_API_KEY`). A `capabilities.env.allow` entry matching one of these, or a `strip_env` pattern, is refused with [E-CAP-016](../reference/diagnostics.md#e-cap-016).
+The subprocess does not inherit your full host environment. It starts with a minimal baseline: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TMPDIR`, `TEMP`, `TMP`, `CARGO_HOME`, `RUSTUP_HOME`, and `TERM`. Known credential-shaped variables are always stripped before the subprocess spawns, regardless of any other configuration — this includes exact names (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `HUGGING_FACE_HUB_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, `KUBECONFIG`, `NPM_TOKEN`, `PYPI_TOKEN`, `CARGO_REGISTRY_TOKEN`) and glob patterns (`AWS_*`, `DOCKER_*`, `*_API_KEY`). A `capabilities.env.allow` entry matching one of these, or a `strip_env` pattern, is refused with [E-CAP-016](../reference/diagnostics.md#e-cap-016). [Process environment](../reference/manifest.md#process-environment) lists every variable a command starts with, in the order the runtime applies them.
 
 !!! info "HOME is always synthetic"
     `HOME` (and, on Windows, `USERPROFILE`) is never the real host home directory. The runtime always replaces it with a session-scoped directory (`<workdir>/.capsule-home`, created on demand) before the subprocess spawns. Neither `baseline_env` nor any environment override the agent supplies can restore the real host value — the synthetic path always wins. This is also why `cat ~/.ssh/id_rsa` inside a capsule answers *no such file* on every tier, including a host that denies nothing: test containment with an absolute path instead, per [Testing containment honestly](../reference/containment.md#testing-containment).
@@ -206,6 +206,7 @@ The default baseline only includes variables the runtime considers universally s
     | `PATH` | Locates executables on the host |
     | `HOME` | Session-scoped synthetic directory, not the real host home (see above) |
     | `USER` | Current username |
+    | `LOGNAME` | Login name of the current user |
     | `LANG` | System locale |
     | `LC_ALL` | Locale override for all categories |
     | `TMPDIR` | Preferred temporary directory (macOS/BSD) |

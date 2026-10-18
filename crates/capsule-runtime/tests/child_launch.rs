@@ -461,18 +461,23 @@ fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
     let keys = |child: &LaunchedChild| -> Vec<String> {
         child.env.iter().map(|(key, _)| key.clone()).collect()
     };
+    // The account names follow `HOME`, each present only when this process holds it.
+    let runtime_owned = |tail: &[&str]| -> Vec<String> {
+        ["PATH", "HOME"]
+            .into_iter()
+            .chain(
+                ["LOGNAME", "USER"]
+                    .into_iter()
+                    .filter(|name| std::env::var(name).is_ok()),
+            )
+            .chain(["MURMUR_ROOST_URL", HOST_WARNINGS_REPORTED_ENV])
+            .chain(tail.iter().copied())
+            .map(str::to_string)
+            .collect()
+    };
 
     let plain = parent.launch("local/child-a", &[]);
-    assert_eq!(
-        keys(&plain),
-        [
-            "PATH",
-            "HOME",
-            "MURMUR_ROOST_URL",
-            HOST_WARNINGS_REPORTED_ENV,
-            SPAWNER_LIFELINE_ENV
-        ]
-    );
+    assert_eq!(keys(&plain), runtime_owned(&[SPAWNER_LIFELINE_ENV]));
 
     // The same launch with lineage. It reports to nobody, so the handle is the whole of what the
     // spawner adds and no watcher runs.
@@ -495,14 +500,7 @@ fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
     .expect("a child that declares no variables launches");
     assert_eq!(
         keys(&delegated),
-        [
-            "PATH",
-            "HOME",
-            "MURMUR_ROOST_URL",
-            HOST_WARNINGS_REPORTED_ENV,
-            SPAWNER_LIFELINE_ENV,
-            SPAWNER_ENV
-        ]
+        runtime_owned(&[SPAWNER_LIFELINE_ENV, SPAWNER_ENV])
     );
 }
 

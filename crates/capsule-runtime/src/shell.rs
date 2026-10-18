@@ -18,6 +18,7 @@ const DEFAULT_ENV_BASELINE: &[&str] = &[
     "PATH",
     "HOME",
     "USER",
+    "LOGNAME",
     "LANG",
     "LC_ALL",
     "TMPDIR",
@@ -27,6 +28,78 @@ const DEFAULT_ENV_BASELINE: &[&str] = &[
     "RUSTUP_HOME",
     "TERM",
 ];
+
+/// The two variables that name the account a process runs as, sorted. Neither is a credential:
+/// each is a login name. A harness may look up its stored login by it (the macOS login keychain
+/// is keyed by user name), so a harness started without them can fail to find a login it has.
+pub(crate) const ACCOUNT_ENV: [&str; 2] = ["LOGNAME", "USER"];
+
+/// Serializes the unit tests that set or remove an [`ACCOUNT_ENV`] name in this test binary's
+/// process environment, which every test thread shares.
+#[cfg(test)]
+pub(crate) static ACCOUNT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The host's values of [`ACCOUNT_ENV`], read once.
+///
+/// Each name carries the host's value or is absent: the runtime never makes one up, never copies
+/// one from the other, and [`HostAccountEnv::apply`] lets nothing an allowlist or a launch plan
+/// put in an environment stand in for the host's. A value that is not valid UTF-8 counts as
+/// unset, since no environment the runtime builds can carry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostAccountEnv {
+    set: Vec<(String, String)>,
+    unset: Vec<String>,
+}
+
+impl HostAccountEnv {
+    /// The account names this process holds.
+    pub(crate) fn from_host() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// The account names as `lookup` answers them, for a caller that is not reading this process.
+    pub(crate) fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let mut set = Vec::new();
+        let mut unset = Vec::new();
+        for name in ACCOUNT_ENV {
+            match lookup(name) {
+                Some(value) => set.push((name.to_string(), value)),
+                None => unset.push(name.to_string()),
+            }
+        }
+        Self { set, unset }
+    }
+
+    /// An account holding exactly `pairs`, for a test standing in for the host.
+    #[cfg(test)]
+    pub(crate) fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+        Self::from_lookup(|name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    /// The names the host did not set, sorted. Empty when it set both.
+    pub(crate) fn unset(&self) -> &[String] {
+        &self.unset
+    }
+
+    /// The names the host set, with its values, sorted by name.
+    pub(crate) fn set(&self) -> &[(String, String)] {
+        &self.set
+    }
+
+    /// Make `env`'s account names the host's: both are removed, then each the host set is
+    /// inserted with its value. Whatever `env` held under either name is gone afterwards.
+    pub(crate) fn apply(&self, env: &mut BTreeMap<String, String>) {
+        for name in ACCOUNT_ENV {
+            env.remove(name);
+        }
+        env.extend(self.set.iter().cloned());
+    }
+}
 
 /// Directory name for the per-session synthetic home, created under the capsule's
 /// session workdir — `<accessible workdir>/.murmur/<session id>/` under `--workdir`, so it is
@@ -855,10 +928,10 @@ pub fn credential_backstop_drops(name: &str, extra_patterns: &[String]) -> bool 
 /// the host actually has set, minus anything credential-shaped. A declared name absent from the
 /// host is simply omitted, not an error.
 ///
-/// This is what every WASM guest observes, and what a `transport: process` harness starts from
-/// before its driver's `env-set` is applied. Native shell subprocesses are the exception: they
-/// run on [`DEFAULT_ENV_BASELINE`] plus `capabilities.shell.baseline_env`, built by
-/// [`build_shell_env`].
+/// This is what every WASM guest observes. A `transport: process` harness starts from it plus the
+/// host's [`HostAccountEnv`], before its driver's `env-set` is applied. Native shell subprocesses
+/// are the exception: they run on [`DEFAULT_ENV_BASELINE`] plus `capabilities.shell.baseline_env`,
+/// built by [`build_shell_env`].
 ///
 /// [`ARTIFACT_CONFIG_ENV`], a formation member's names
 /// ([`crate::formation::is_member_grant_env`]) and [`crate::lifeline::SPAWNER_LIFELINE_ENV`] are
@@ -1561,6 +1634,102 @@ mod tests {
         std::env::remove_var("CARGO_HOME");
 
         assert_eq!(env.get("CARGO_HOME"), Some(&"/fake/cargo/home".to_string()));
+    }
+
+    /// A command names the account it runs as with the host's own pair, beside a synthetic
+    /// `HOME`, and `strip_env` governs the account names like any other baseline entry.
+    #[test]
+    fn build_shell_env_carries_the_hosts_account_names() {
+        let temp = tempdir().unwrap();
+        let root = crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap();
+        let _guard = ACCOUNT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var("USER", "murmur-test-user");
+        std::env::set_var("LOGNAME", "murmur-test-login");
+
+        let env = build_shell_env(&CapabilityPolicy::default(), &[], &root, None, None).unwrap();
+        let stripped = build_shell_env(
+            &CapabilityPolicy {
+                shell_strip_env: vec!["LOGNAME".to_string()],
+                ..CapabilityPolicy::default()
+            },
+            &[],
+            &root,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            env.get("USER").map(String::as_str),
+            Some("murmur-test-user")
+        );
+        assert_eq!(
+            env.get("LOGNAME").map(String::as_str),
+            Some("murmur-test-login")
+        );
+        let expected_home = temp.path().join(SYNTHETIC_HOME_DIR_NAME);
+        assert_eq!(
+            env.get("HOME"),
+            Some(&expected_home.to_string_lossy().into_owned())
+        );
+        assert!(!stripped.contains_key("LOGNAME"), "{stripped:?}");
+        assert_eq!(
+            stripped.get("USER").map(String::as_str),
+            Some("murmur-test-user")
+        );
+        let guest = build_declared_env(&CapabilityPolicy::default());
+        assert!(
+            !guest.contains_key("USER") && !guest.contains_key("LOGNAME"),
+            "a WASM guest is handed only what env.allow declares: {guest:?}"
+        );
+    }
+
+    #[test]
+    fn host_account_with_both_names_set_reports_none_unset() {
+        let account = HostAccountEnv::from_pairs(&[("USER", "alice"), ("LOGNAME", "alice-login")]);
+        assert!(account.unset().is_empty());
+        let mut env = BTreeMap::new();
+        account.apply(&mut env);
+        assert_eq!(env.get("USER").map(String::as_str), Some("alice"));
+        assert_eq!(env.get("LOGNAME").map(String::as_str), Some("alice-login"));
+    }
+
+    /// One name set never supplies the other.
+    #[test]
+    fn host_account_with_one_name_set_never_copies_it_to_the_other() {
+        let account = HostAccountEnv::from_pairs(&[("USER", "alice")]);
+        assert_eq!(account.unset(), ["LOGNAME".to_string()]);
+        let mut env = BTreeMap::new();
+        account.apply(&mut env);
+        assert_eq!(env.get("USER").map(String::as_str), Some("alice"));
+        assert!(!env.contains_key("LOGNAME"), "{env:?}");
+    }
+
+    #[test]
+    fn host_account_with_neither_name_set_reports_both_sorted() {
+        let account = HostAccountEnv::from_pairs(&[]);
+        assert_eq!(account.unset(), ["LOGNAME".to_string(), "USER".to_string()]);
+        let mut env = BTreeMap::new();
+        account.apply(&mut env);
+        assert!(env.is_empty(), "{env:?}");
+    }
+
+    /// Whatever an environment held under an account name is replaced by the host's value, or
+    /// removed when the host has none.
+    #[test]
+    fn host_account_apply_replaces_a_stale_value() {
+        let account = HostAccountEnv::from_pairs(&[("USER", "alice")]);
+        let mut env = BTreeMap::from([
+            ("USER".to_string(), "someone-else".to_string()),
+            ("LOGNAME".to_string(), "someone-else".to_string()),
+            ("PATH".to_string(), "/bin".to_string()),
+        ]);
+        account.apply(&mut env);
+        assert_eq!(env.get("USER").map(String::as_str), Some("alice"));
+        assert!(!env.contains_key("LOGNAME"), "{env:?}");
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
     }
 
     #[test]

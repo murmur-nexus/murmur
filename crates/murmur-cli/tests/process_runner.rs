@@ -762,6 +762,10 @@ fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
         ])
     );
     assert_eq!(start["files"], serde_json::json!(["config.json"]));
+    assert_eq!(
+        start["account_env_unset"],
+        serde_json::json!(["LOGNAME", "USER"])
+    );
 
     // The bridge's bearer token reaches the harness through an environment value, and no
     // environment value is ever recorded.
@@ -1065,4 +1069,117 @@ fn s13_a_hook_is_handed_the_numbers_the_trace_holds() {
     let run = capsule.run("usage", &[]).succeeded();
     assert!(run.one("inference").get("input_tokens").is_none());
     assert!(armed(&run, "zeros").exists(), "{}", run.text);
+}
+
+// ── S15: the harness runs as the host's account ───────────────────────────────
+
+/// One `account` profile run of `capsule`: its `account` note, the names its `env` note lists,
+/// and the run, whose records live as long as `capsule` does.
+fn account_run(capsule: &Capsule, extra_env: &[(&str, &str)]) -> (String, Vec<String>, Run) {
+    let run = capsule.run("account", extra_env).succeeded();
+    assert_eq!(run.result(), "ACCOUNT-RESULT");
+    let notes: Vec<String> = run
+        .of_type("harness_note")
+        .into_iter()
+        .map(|note| note["text"].as_str().unwrap().to_string())
+        .collect();
+    let account = notes
+        .iter()
+        .find(|note| note.starts_with("account "))
+        .unwrap_or_else(|| panic!("no account note in {notes:#?}"))
+        .clone();
+    let env_names = notes
+        .iter()
+        .find(|note| note.starts_with("env "))
+        .unwrap_or_else(|| panic!("no env note in {notes:#?}"))["env ".len()..]
+        .split(',')
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    (account, env_names, run)
+}
+
+fn names(value: &Value) -> Vec<&str> {
+    value
+        .as_array()
+        .unwrap_or_else(|| panic!("not an array: {value}"))
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn s15_the_harness_runs_as_the_hosts_account() {
+    println!("S15: the harness gets the host's USER and LOGNAME and no credential");
+    let capsule = Built::new().build();
+    let (account, env_names, run) = account_run(
+        &capsule,
+        &[
+            ("USER", "murmur-fixture-user"),
+            ("LOGNAME", "murmur-fixture-login"),
+            ("ANTHROPIC_API_KEY", "sentinel-anthropic"),
+            ("OPENAI_API_KEY", "sentinel-openai"),
+            ("GITHUB_TOKEN", "sentinel-github"),
+        ],
+    );
+
+    assert_eq!(
+        account,
+        "account USER=murmur-fixture-user LOGNAME=murmur-fixture-login"
+    );
+    for name in ["LOGNAME", "USER"] {
+        assert!(env_names.iter().any(|n| n == name), "{env_names:?}");
+    }
+    for name in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN"] {
+        assert!(!env_names.iter().any(|n| n == name), "{env_names:?}");
+    }
+
+    let start = run.one("harness_start");
+    let delivered = names(&start["env_names"]);
+    assert!(
+        delivered.contains(&"LOGNAME") && delivered.contains(&"USER"),
+        "{delivered:?}"
+    );
+    assert_eq!(start["account_env_unset"], serde_json::json!([]));
+
+    let trace = run.trace_raw();
+    for sentinel in ["sentinel-anthropic", "sentinel-openai", "sentinel-github"] {
+        assert!(!trace.contains(sentinel), "{sentinel} reached the trace");
+    }
+}
+
+#[test]
+fn s15_a_host_without_account_names_hands_the_harness_none() {
+    println!("S15: a host that sets neither name leaves both unset and the record says so");
+    let capsule = Built::new().build();
+    let (account, env_names, run) = account_run(&capsule, &[]);
+
+    assert_eq!(account, "account USER=unset LOGNAME=unset");
+    assert!(
+        !env_names.iter().any(|n| n == "USER" || n == "LOGNAME"),
+        "{env_names:?}"
+    );
+    let start = run.one("harness_start");
+    let delivered = names(&start["env_names"]);
+    assert!(
+        !delivered.contains(&"USER") && !delivered.contains(&"LOGNAME"),
+        "{delivered:?}"
+    );
+    assert_eq!(
+        start["account_env_unset"],
+        serde_json::json!(["LOGNAME", "USER"])
+    );
+}
+
+#[test]
+fn s15_one_account_name_never_supplies_the_other() {
+    println!("S15: a host that sets only USER delivers USER and no LOGNAME");
+    let capsule = Built::new().build();
+    let (account, env_names, run) = account_run(&capsule, &[("USER", "murmur-fixture-user")]);
+
+    assert_eq!(account, "account USER=murmur-fixture-user LOGNAME=unset");
+    assert!(env_names.iter().any(|n| n == "USER"), "{env_names:?}");
+    assert!(!env_names.iter().any(|n| n == "LOGNAME"), "{env_names:?}");
+    let start = run.one("harness_start");
+    assert_eq!(start["account_env_unset"], serde_json::json!(["LOGNAME"]));
 }
