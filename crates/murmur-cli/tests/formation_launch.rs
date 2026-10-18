@@ -1051,32 +1051,45 @@ fn members_running_one_capsule_are_each_told_their_own_name() {
     assert_formation_line(&formation, "planner", &["w1", "w2"]);
     let (_, planner) = launcher.next_json();
     project.await_entry_mid_task();
-    // Read while every member runs: each MURMUR.md is in its session's runtime directory, which
-    // goes when the session ends.
+    // Read while every member runs: each MURMUR.md is in its session's runtime directory, and
+    // each running record in `~/.murmur/running`, and both go when the session ends.
     let members = ["planner", "w1", "w2"];
-    let murmur_mds: Vec<String> = members
+    let id = formation["formation_id"].as_str().unwrap();
+    let (murmur_mds, records): (Vec<String>, Vec<Value>) = members
         .iter()
         .map(|member| {
             let session = project.session_of_member(member);
-            let id = session.file_name().unwrap();
+            let session_id = session.file_name().unwrap();
             let path = project
                 .home
                 .path()
                 .join(".murmur/sessions")
-                .join(id)
+                .join(session_id)
                 .join("runtime/MURMUR.md");
-            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
+            let murmur_md =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+            let record = project.running_record(session_id.to_str().unwrap());
+            assert_eq!(record["formation_member"], *member, "{record}");
+            assert_eq!(record["formation_id"], id, "{record}");
+            (murmur_md, record)
         })
-        .collect();
+        .unzip();
+    let (w1, w2) = (&records[1], &records[2]);
+    assert_eq!(w1["capsule_name"], "worker", "{w1}");
+    assert_eq!(w2["capsule_name"], "worker", "{w2}");
+    assert_ne!(w1["formation_member"], w2["formation_member"]);
     project.release.send(()).unwrap();
     assert_eq!(launcher.wait().code(), Some(0), "{}", launcher.stderr());
 
     assert_eq!(project.sessions_of("worker").len(), 2);
-    let id = formation["formation_id"].as_str().unwrap();
-    for (member, murmur_md) in members.into_iter().zip(murmur_mds) {
+    for ((member, murmur_md), record) in members.into_iter().zip(murmur_mds).zip(&records) {
         let session = project.session_of_member(member);
         let start = &read_trace(&session.join("trace.jsonl"))[0];
         assert_eq!(start["formation_id"], id, "{start}");
+        assert_eq!(
+            record["formation_member"], start["formation_member"],
+            "{start}"
+        );
         assert!(
             murmur_md.contains(&format!(
                 "\n- Formation member: {member} (your name in this formation; other members may \
@@ -2291,9 +2304,12 @@ fn mur_stop_ends_a_formation_through_its_launcher() {
     let members = launched_members(&formation, &planner);
 
     let launcher_start = capsule_runtime::running::process_start_token(launcher_pid).unwrap();
-    for (session_id, _) in &members {
+    for (session_id, capsule) in &members {
         let record = project.running_record(session_id);
         assert_eq!(record["formation_id"], id, "{record}");
+        // Each member of this roster runs the capsule of its own name.
+        let (member, _) = capsule.split_once('@').unwrap();
+        assert_eq!(record["formation_member"], member, "{record}");
         assert_eq!(record["formation_lifeline"], true, "{record}");
         assert_eq!(
             record["formation_launcher"]["pid"], launcher_pid,
@@ -2313,6 +2329,7 @@ fn mur_stop_ends_a_formation_through_its_launcher() {
             "formation_launcher",
             "spawned_by",
             "formation_id",
+            "formation_member",
         ] {
             assert!(record.get(key).is_none(), "{key}: {record}");
         }
@@ -2454,7 +2471,12 @@ fn mur_stop_stops_a_hand_started_member_left_behind_as_one_session() {
     let by_hand_session = by_hand.session_id();
     let record = project.running_record(&by_hand_session);
     assert_eq!(record["formation_id"], id, "{record}");
-    for key in ["formation_lifeline", "formation_launcher", "spawned_by"] {
+    for key in [
+        "formation_lifeline",
+        "formation_launcher",
+        "spawned_by",
+        "formation_member",
+    ] {
         assert!(record.get(key).is_none(), "{key}: {record}");
     }
     assert!(

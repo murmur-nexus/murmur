@@ -385,6 +385,7 @@ mod tests {
             door_token: None,
             credentials: Default::default(),
             formation_id: formation.cloned(),
+            formation_member: None,
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,
