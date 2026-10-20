@@ -170,7 +170,7 @@ Six manifest fields work together to make the recursive pattern possible. Create
 
 **Task creation.** `capabilities.shell.allow: curl` exposes `curl` as a named tool so the router can POST new tasks to the A2A endpoint. Those tasks land in the capsule's own queue, which is enabled by `lifecycle.task_acceptance: queue`. `lifecycle.after_task: sleep` keeps the capsule alive to drain it rather than exiting after the first task. `lifecycle.queue_depth: 20` gives the router room to dispatch all sub-tasks in parallel without any being rejected.
 
-**Iteration headroom.** `inference.max_turns: 100` raises the per-task turn limit from the default of 10. The iteration sub-task may rewrite the poem and both reviews several times before both scores reach 10/10; without extra headroom it would be cut off mid-iteration.
+**Iteration bound.** `inference.max_turns: 100` caps each task at 100 turns. The iteration sub-task may rewrite the poem and both reviews several times before both scores reach 10/10, so the cap leaves room for that while still ending a task that never converges.
 
 **The key ingredient.** `inference.system_prompt_file: instructions.md` is what makes the capsule recursive. It points to the file that tells the model to decompose incoming tasks into `[EXECUTE]:`-prefixed sub-tasks rather than executing everything in one context. Without it the capsule is just a standard single-task agent. As a best practice, the prompt also instructs the model to issue all curl dispatches as parallel tool calls in a single turn, avoiding unnecessary round trips.
 

@@ -50,13 +50,11 @@ use crate::{
 };
 use murmur_artifact::PACKED_MANIFEST_ENTRY;
 
-/// Output cap sent to the driver when `inference.max_tokens` is absent from the manifest.
-/// Applied exactly once, at the `AgentRunConfig` population site in runtime.rs.
-pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
-
 #[derive(Clone)]
 pub(crate) struct AgentRunConfig {
-    /// Resolved token budget for this session. 0 means compaction is disabled.
+    /// The primary driver choice's context window, which `on-task-start` and the seed budget
+    /// measure against. 0 means the primary has none, and compaction is disabled on it. An
+    /// agent-loop call measures against its own choice's window.
     pub context_window: u32,
     /// Fraction of context_window at which compaction fires (0.0–1.0).
     pub compaction_threshold: f32,
@@ -68,11 +66,14 @@ pub(crate) struct AgentRunConfig {
     /// `out/compaction-summaries.jsonl`. Resolved from `inference.compaction.dump_summaries`,
     /// absent = false.
     pub compaction_dump_summaries: bool,
-    /// Per-turn output cap sent to the driver as `max_tokens`. Resolved from
-    /// `inference.max_tokens`, falling back to [`DEFAULT_MAX_OUTPUT_TOKENS`]. When `control`
-    /// declares the setting, it is only the launch value: each call reads the live one through
+    /// The primary driver choice's resolved per-turn output cap; 0 under `transport: process`,
+    /// which sends none. Each agent-loop call reads its own through
     /// [`AgentRunConfig::output_cap_for_call`].
     pub max_output_tokens: u32,
+    /// The session's driver choices as staging resolved them, each with its own limits. A choice
+    /// with none recorded measures against [`Self::max_output_tokens`] and
+    /// [`Self::context_window`].
+    pub choices: DriverChoices,
     /// What a controller has changed on this session, or `None` for a capsule with no
     /// `control:` block.
     pub control: Option<Arc<crate::control_plane::ControlState>>,
@@ -115,21 +116,33 @@ pub(crate) struct AgentRunConfig {
 }
 
 impl AgentRunConfig {
-    /// The output cap one agent-loop inference call sends, read once so the call's payload, its
-    /// occupancy count, its spend admission and its truncation warning all use the same number.
-    /// The `String` is the `control_change` this call is the first to apply, if any.
+    /// The output cap one agent-loop inference call under `choice` sends, read once so the
+    /// call's payload, its occupancy count, its spend admission and its truncation warning all
+    /// use the same number: a controller's `inference.max_tokens` once one is set, else the
+    /// choice's own. The `String` is the `control_change` this call is the first to apply, if any.
     ///
     /// Compaction calls and a hook's `run-inference` do not read this.
-    fn output_cap_for_call(&self) -> (u32, Option<String>) {
+    fn output_cap_for_call(&self, choice: &DriverChoice) -> (u32, Option<String>) {
+        let own = choice
+            .limits
+            .map_or(self.max_output_tokens, |limits| limits.max_output_tokens);
         match self.control.as_ref().and_then(|control| {
             control.for_call(murmur_artifact::ControllableSetting::InferenceMaxTokens)
         }) {
-            Some(reading) => (
-                reading.value.tokens().unwrap_or(self.max_output_tokens),
+            Some(reading) if reading.set_by_change => (
+                reading.value.tokens().unwrap_or(own),
                 reading.applies_change,
             ),
-            None => (self.max_output_tokens, None),
+            _ => (own, None),
         }
+    }
+
+    /// The context window an agent-loop call under `choice` measures compaction against; 0 when
+    /// the choice has none.
+    fn context_window_for(&self, choice: &DriverChoice) -> u32 {
+        choice.limits.map_or(self.context_window, |limits| {
+            limits.context_window.unwrap_or(0)
+        })
     }
 
     /// The driver choice one agent-loop inference call is served by, read once so the call's
@@ -139,17 +152,9 @@ impl AgentRunConfig {
     ///
     /// Compaction, a hook's `run-inference` and seed summarization do not read this: they stay on
     /// the primary.
-    fn driver_choice_for_call(
-        &self,
-        inference: &InferenceConfig,
-    ) -> (DriverChoice, Option<String>) {
+    fn driver_choice_for_call(&self) -> (DriverChoice, Option<String>) {
         let Some(control) = self.control.as_ref() else {
-            return (
-                DriverChoices::declared(inference, &std::collections::HashMap::new())
-                    .primary()
-                    .clone(),
-                None,
-            );
+            return (self.choices.primary().clone(), None);
         };
         let reading = control.for_call(murmur_artifact::ControllableSetting::InferenceDriver);
         let choice = reading
@@ -163,11 +168,9 @@ impl AgentRunConfig {
 
     /// The driver choice selected now, without marking it read: what a cancelled turn that never
     /// reached its call records as its producer.
-    fn selected_driver_choice(&self, inference: &InferenceConfig) -> DriverChoice {
+    fn selected_driver_choice(&self) -> DriverChoice {
         let Some(control) = self.control.as_ref() else {
-            return DriverChoices::declared(inference, &std::collections::HashMap::new())
-                .primary()
-                .clone();
+            return self.choices.primary().clone();
         };
         control
             .selected(murmur_artifact::ControllableSetting::InferenceDriver)
@@ -654,11 +657,12 @@ fn user_message((text, fence_source): (String, Option<String>)) -> Value {
 pub(crate) async fn run_agent_loop(
     store_state: &mut CapsuleStoreState,
     workdir: &WorkdirRoot,
-    // `max_turns` here is what this attempt has left of the task's budget, and bounds its loop.
+    // `max_turns` here is what this attempt has left of the task's budget, and bounds its loop;
+    // `None` leaves it unbounded.
     inference: &InferenceConfig,
     // The task-wide ceiling, `inference.max_turns` as declared: what a message about running out
     // of turns names.
-    task_max_turns: u32,
+    task_max_turns: Option<u32>,
     system_prompt: Option<String>,
     run_config: AgentRunConfig,
     hooks: &mut HookRuntime,
@@ -1006,13 +1010,16 @@ pub(crate) async fn run_agent_loop(
     // The task this attempt's events belong to, when it serves an A2A task.
     let stream_task = StreamTask::of(task_id.as_deref(), context_id.as_deref());
 
-    let max_turns = inference.max_turns;
     // The trace's `session_start`/`session_end` frame and the `on-session-start`/
     // `on-session-end` hook dispatch both fire once per launch, from runtime.rs around the
     // task loop. This function runs one attempt of one task and writes neither.
     // `max_turns` is this attempt's remaining budget, so it bounds the loop; `turn` is the
-    // task-wide number every line the turn writes carries.
-    for attempt_turn in 0..max_turns as usize {
+    // task-wide number every line the turn writes carries. With no cap the loop runs until the
+    // model ends the task, a spend ceiling refuses a call, or the task is canceled.
+    let turn_bound = inference
+        .max_turns
+        .map_or(usize::MAX, |max_turns| max_turns as usize);
+    for attempt_turn in 0..turn_bound {
         let turn = first_turn as usize + attempt_turn;
         let turn_u32 = u32::try_from(turn).unwrap_or(u32::MAX);
 
@@ -1020,8 +1027,7 @@ pub(crate) async fn run_agent_loop(
         // honoured here rather than by another request to the provider: an ordinary tool call
         // runs to its own bound, and this is the first place after it that can stop.
         if let Some(signal) = cancel.as_ref().filter(|signal| signal.is_canceled()) {
-            let producer =
-                has_alternates.then(|| run_config.selected_driver_choice(inference).producer());
+            let producer = has_alternates.then(|| run_config.selected_driver_choice().producer());
             return Ok(finish_canceled_turn(
                 store_state,
                 trace,
@@ -1085,9 +1091,12 @@ pub(crate) async fn run_agent_loop(
             });
         }
 
+        // Read once for this call: the payload's model, the wire view, the count, the dispatch,
+        // the credential, the cap and the trace all name one choice.
+        let (choice, choice_change) = run_config.driver_choice_for_call();
         // Read once for this call, so its payload, occupancy count, spend admission and
         // truncation warning never mix a cap a controller changed partway through.
-        let (max_output_tokens, applies_change) = run_config.output_cap_for_call();
+        let (max_output_tokens, applies_change) = run_config.output_cap_for_call(&choice);
         if let Some(change_id) = applies_change {
             trace
                 .write_control_applied(
@@ -1099,9 +1108,6 @@ pub(crate) async fn run_agent_loop(
                 .await
                 .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
         }
-        // Read once for this call, beside the cap and on the same terms: the payload's model, the
-        // wire view, the count, the dispatch, the credential and the trace all name one choice.
-        let (choice, choice_change) = run_config.driver_choice_for_call(inference);
         if let Some(change_id) = choice_change {
             trace
                 .write_control_applied(
@@ -1574,9 +1580,11 @@ pub(crate) async fn run_agent_loop(
             None => store_state.clear_continuation(),
         }
 
-        // Check compaction after receiving response, before processing the turn.
-        if run_config.context_window > 0 {
-            let ratio = session_tokens as f32 / run_config.context_window as f32;
+        // Check compaction after receiving response, before processing the turn, against the
+        // window of the choice that served it.
+        let context_window = run_config.context_window_for(&choice);
+        if context_window > 0 {
+            let ratio = session_tokens as f32 / context_window as f32;
             if ratio >= run_config.compaction_threshold {
                 let compacted = try_compact_via_hooks(
                     messages,
@@ -1584,7 +1592,7 @@ pub(crate) async fn run_agent_loop(
                     &occupancy,
                     store_state,
                     turn,
-                    run_config.context_window,
+                    context_window,
                     workdir,
                     &records_root,
                     hooks,
@@ -2108,8 +2116,9 @@ pub(crate) async fn run_agent_loop(
         return finish_no_answer_turn(hooks, trace, otel, workdir, ending, &reason).await;
     }
 
+    // Only a set cap ends the loop here: an uncapped one never spends `usize::MAX` turns.
     let exceeded = max_turns_exceeded_message(
-        task_max_turns,
+        task_max_turns.unwrap_or(u32::MAX),
         trace.task_agent_turns(),
         trace.task_hook_inferences(),
     );
@@ -4472,6 +4481,9 @@ fn extract_text_content(content: &[Value]) -> String {
 mod tests {
     use super::*;
 
+    /// The output cap the payload and occupancy tests build with.
+    const OUTPUT_CAP: u32 = 8192;
+
     /// [`runtime_dir_notice`] for a launch that read `murmur.yaml`.
     const RUNTIME_DIR_NOTICE: &str = "Runtime files: MURMUR.md, task.md, murmur.yaml and the \
         installed tools are in a directory you can read and cannot change — $MURMUR_RUNTIME_DIR \
@@ -5362,7 +5374,7 @@ forgery: {prompt}"
     fn occupancy_fixture<'a>(tools: &'a [Value], system: &'a str) -> ContextOccupancy<'a> {
         ContextOccupancy {
             model: "test-model",
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            max_output_tokens: OUTPUT_CAP,
             tools,
             system,
             prompt_cache_key: Some("cap:1.0.0:ctx-1"),
@@ -5388,7 +5400,7 @@ forgery: {prompt}"
 
         let payload = build_driver_payload(
             "test-model",
-            DEFAULT_MAX_OUTPUT_TOKENS,
+            OUTPUT_CAP,
             &messages,
             &tools,
             system,
@@ -5437,7 +5449,7 @@ forgery: {prompt}"
 
         let wire_with_continuation = build_driver_payload(
             "test-model",
-            DEFAULT_MAX_OUTPUT_TOKENS,
+            OUTPUT_CAP,
             &messages,
             &tools,
             system,
@@ -5529,15 +5541,7 @@ forgery: {prompt}"
         // byte-for-byte the pre-continuation payload shape.
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
-        let payload = build_driver_payload(
-            "m",
-            DEFAULT_MAX_OUTPUT_TOKENS,
-            &msgs,
-            &tools,
-            "sys",
-            None,
-            None,
-        );
+        let payload = build_driver_payload("m", OUTPUT_CAP, &msgs, &tools, "sys", None, None);
 
         assert_eq!(payload["messages"].as_array().unwrap().len(), 3);
         assert_eq!(payload["messages"], json!(msgs));
@@ -5560,26 +5564,19 @@ forgery: {prompt}"
 
     #[test]
     fn build_driver_payload_uses_configured_max_output_tokens() {
-        // A manifest-supplied inference.max_tokens reaches the wire verbatim, and nothing
-        // else about the payload changes versus the default-valued one.
+        // The resolved output cap reaches the wire verbatim, and nothing else about the payload
+        // changes versus one built with another cap.
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
         let payload = build_driver_payload("m", 4096, &msgs, &tools, "sys", None, None);
 
         assert_eq!(payload["max_tokens"], json!(4096));
 
-        let mut default_payload = build_driver_payload(
-            "m",
-            DEFAULT_MAX_OUTPUT_TOKENS,
-            &msgs,
-            &tools,
-            "sys",
-            None,
-            None,
-        );
-        assert_eq!(default_payload["max_tokens"], json!(8192));
-        default_payload["max_tokens"] = json!(4096);
-        assert_eq!(payload, default_payload, "only max_tokens differs");
+        let mut other_payload =
+            build_driver_payload("m", OUTPUT_CAP, &msgs, &tools, "sys", None, None);
+        assert_eq!(other_payload["max_tokens"], json!(8192));
+        other_payload["max_tokens"] = json!(4096);
+        assert_eq!(payload, other_payload, "only max_tokens differs");
     }
 
     #[test]
@@ -6570,8 +6567,9 @@ forgery: {prompt}"
         );
     }
 
-    /// Compaction is disabled when no context window is resolved (`context.max_tokens`
-    /// absent -> `resolve_context_window` yields 0), regardless of token counts.
+    /// Compaction is disabled when the choice has no context window (neither
+    /// `context.max_tokens` nor its driver's `models:` entry gives one), regardless of token
+    /// counts.
     #[test]
     fn zero_context_window_never_triggers_compaction() {
         let turns: Vec<(u32, u32)> = (0..20).map(|_| (900_000, 90_000)).collect();
@@ -6861,9 +6859,9 @@ forgery: {prompt}"
         let name = var("NAME").unwrap_or_default();
         let version = var("VERSION").unwrap_or_default();
         let model = var("MODEL").unwrap_or_default();
-        let max_output_tokens = var("MAX_TOKENS")
+        let max_output_tokens: u32 = var("MAX_TOKENS")
             .and_then(|n| n.parse().ok())
-            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+            .expect("MURMUR_OCCUPANCY_MAX_TOKENS: the session's resolved output cap");
         let tools = inventory::build_tool_inventory(
             &crate::workdir_fs::WorkdirRoot::open(std::path::Path::new(&workdir)).unwrap(),
             None,

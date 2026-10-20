@@ -193,7 +193,7 @@ Two manifest keys govern how much a seed may occupy:
 
 | Key | Controls |
 |---|---|
-| [`context.seed_budget`](../reference/manifest.md#field-context) | Fraction of `context.max_tokens` the seed may occupy. The product, rounded down, is the seed's ceiling and is sent to the hook as `task-start-event.budget-tokens` |
+| [`context.seed_budget`](../reference/manifest.md#field-context) | Fraction of the [context window](../reference/manifest.md#field-context) the seed may occupy. The product, rounded down, is the seed's ceiling and is sent to the hook as `task-start-event.budget-tokens` |
 | [`context.seed_overflow_margin`](../reference/manifest.md#field-context) | How far over that ceiling a seed may go before the runtime spends an inference call summarizing it instead of simply dropping its oldest messages |
 
 What the runtime does with a proposal, checked in this order:
@@ -201,7 +201,7 @@ What the runtime does with a proposal, checked in this order:
 | Condition | Result |
 |---|---|
 | The session runs `inference.transport: process` | Nothing is seeded — that transport's CLI owns its own conversation |
-| The capsule declares no `context.max_tokens` | Nothing is seeded — there is no ceiling to enforce |
+| The primary driver choice has no context window — neither `context.max_tokens` nor its driver's `models:` entry gives one | Nothing is seeded — there is no ceiling to enforce |
 | One message alone is wider than the whole ceiling | Nothing is seeded — no trim can fit it |
 | The proposal is more than three times the ceiling over it | Nothing is seeded — a seed that far over is a broken hook, not a full memory |
 | The proposal fits the ceiling | All of it is seeded |

@@ -45,7 +45,7 @@ status:     ok
 duration:   3.2s
 
 ── Turns ────────────────────────────────────────
-count:      4  (max: 10)
+count:      4  (max: no cap)
 
 ── Tokens ───────────────────────────────────────
 input:      5,840  (avg 1460/turn)
@@ -87,7 +87,7 @@ Two more sections appear only when they have something to report, both placed so
 
 ## Step 2 — spot problems in the output
 
-**Too many turns** — if count is close to the maximum (set in `murmur.yaml`, default 10 turns), the agent hit the turn cap. Use `mur trace steps --verbose` to see what it called each turn and what each tool received:
+**Too many turns** — if count reached the maximum `inference.max_turns` sets (`no cap` when the manifest sets none), the agent hit the turn cap. Use `mur trace steps --verbose` to see what it called each turn and what each tool received:
 
 ```bash
 mur trace steps --verbose

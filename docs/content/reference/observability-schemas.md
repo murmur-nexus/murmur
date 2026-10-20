@@ -62,7 +62,8 @@ before the first task begins
 | `capsule_name` | string | Manifest `name` |
 | `capsule_version` | string | Manifest `version` |
 | `model` | string | `inference.model` |
-| `max_turns` | u32 | `inference.max_turns` — the turn ceiling each task of this launch runs under |
+| `max_turns` | u32 \| null | [`inference.max_turns`](manifest.md#inference-max-turns) — the turn ceiling each task of this launch runs under. Always present; `null` when no cap applies |
+| `model_limits` | object \| null | The primary driver choice's [output cap and context window](manifest.md#inference-max-tokens): `max_output_tokens` (u32), `max_output_tokens_source` (`"manifest"` \| `"driver"`), `context_window` (u32 \| null; `null` when the choice has none) and `context_window_source` (`"manifest"` \| `"driver"` \| `"none"`). `"manifest"` is `inference.max_tokens` or `context.max_tokens`; `"driver"` is the driver's [`models:`](manifest.md#driver-models) entry. Always present; `null` under `transport: process` |
 | `max_session_tokens` | u64 \| null | [`inference.max_session_tokens`](manifest.md#inference-max-session-tokens). Always present; `null` when no session ceiling applies |
 | `machine_tokens_per_day` | u64 \| null | [`spend.machine_tokens_per_day`](config.md#spend) when this session is counted against it. Always present; `null` when no machine ceiling was in effect, and under `transport: process` |
 | `capabilities` | string[] | The capability categories the manifest granted anything under: `"network"`, `"filesystem"`, `"shell"` |
@@ -76,7 +77,7 @@ before the first task begins
 | `resumed_from` | string \| null | The session [`mur run --resume`](cli.md#mur-run) continued, verbatim as the address resolved it. `null` on an ordinary launch. Always written, so its absence identifies a trace from a runtime predating the field |
 | `context_id` | string \| null | The context id every task of this launch runs under: the `mur run --context` value, or the id `--resume` resolved to. `null` when each task mints its own — `task_start.context_id` carries the id a task actually ran under either way. Always written, on the same terms as `resumed_from` |
 | `control` | object | What may be changed on this session: `settings` (the names `control.settings` lists), `secrets` (the names `control.secrets` lists) and `agent_settings` (the names `control.agent_settings` lists; absent when it lists none). Written only when the manifest declares [`control:`](manifest.md#field-control); absent otherwise. Never a value — see [Control surface](control-surface.md) |
-| `inference_choices` | array of object | Every [driver choice](manifest.md#inference-alternates), `primary` first, one object each: `name`, `driver` (the driver artifact's full name), `model`, `credential_source` (as on `gateways`, or `"none"` for a credential found nowhere at launch) and `available` (whether that credential resolved at launch; an injected one is `true` here and checked again at each switch). Written only when `inference.alternates` is declared; absent otherwise |
+| `inference_choices` | array of object | Every [driver choice](manifest.md#inference-alternates), `primary` first, one object each: `name`, `driver` (the driver artifact's full name), `model`, `credential_source` (as on `gateways`, or `"none"` for a credential found nowhere at launch), `available` (whether that credential resolved at launch; an injected one is `true` here and checked again at each switch) and `model_limits` (the choice's own, shaped as the top-level `model_limits`). Written only when `inference.alternates` is declared; absent otherwise |
 | `spawned_by` | string | `ses_…` — the session that spawned this one, for a capsule another capsule launched with [`delegate-task`](runtime-provided-tools.md) or with a plan's [`capsule` step](plans.md). Written only then; the field is absent from every other line rather than written as `null`, so a capsule nobody delegated produces a byte-identical record |
 | `delegation_id` | string | `dlg_…` — the delegation that created this session, character-identical to the id on the spawning session's own `delegation_start`. Present exactly when `spawned_by` is |
 | `formation_id` | string | `frm_…` — the [formation](cli.md#mur-run-formation) this session is a member of. Written only for a member; absent rather than `null` otherwise, so a session in no formation produces a byte-identical record. `session_start` is always the trace's first line, so this is too. See [Reading a formation](#formation) |
@@ -495,7 +496,7 @@ one turn does not stop a later turn from compacting successfully.
 | `hook_name` | string | Manifest name of the hook that returned the `seed-context` |
 | `tokens` | u64 | Tokens actually committed to the head of the context. `0` on a rejection |
 | `proposed_tokens` | u64 | Tokens the hook returned, before any trim or summarization |
-| `budget_tokens` | u64 | The ceiling in force: `context.max_tokens` × `context.seed_budget`, rounded down. `0` when the capsule declares no `context.max_tokens` |
+| `budget_tokens` | u64 | The ceiling in force: the primary choice's [context window](manifest.md#field-context) × `context.seed_budget`, rounded down. `0` when it has no window |
 | `outcome` | string | What the runtime did — see below |
 | `reason` | string | Why nothing was committed. Present on `"rejected"` only; absent otherwise |
 | `message_ids` | list of string | The `msg_`-prefixed id of every committed message, in the order they were placed. Empty on a rejection. The same ids appear on the `inference` line of each request that carried these messages, and on their lines in the [conversation record](workdir.md#the-conversation-record); none of them ever reaches the driver |
@@ -511,7 +512,7 @@ one turn does not stop a later turn from compacting successfully.
 |---|---|
 | `"message_over_budget"` | One message alone was wider than the whole budget, so no trim could fit it |
 | `"overflow_over_limit"` | The proposal overflowed the budget by more than three times the budget |
-| `"no_budget"` | The capsule declares no `context.max_tokens`, so there is no ceiling to enforce |
+| `"no_budget"` | The primary choice has no [context window](manifest.md#field-context) — neither `context.max_tokens` nor its driver's `models:` entry gives one — so there is no ceiling to enforce |
 | `"unsupported_transport"` | The session runs `inference.transport: process`, which owns its own context |
 
 A rejection never fails the task: the seed is dropped, the task runs without it, and a
@@ -813,7 +814,7 @@ the reopen is granted
 | `reason` | string | Feedback text the hook returned; the next attempt receives it as one new user message |
 | `reopen_number` | u32 | 1-based ordinal of this reopen within the task (first reopen = `1`) |
 | `attempt_context` | string | `continued` — the next attempt continues the task's conversation with the feedback appended; `restarted` — the previous attempt left nothing to continue, so the next one starts from the rewritten `task.md` |
-| `turns_remaining` | u32 | Turns the next attempt is handed: `inference.max_turns` less every turn the task's attempts have spent |
+| `turns_remaining` | u32 \| null | Turns the next attempt is handed: `inference.max_turns` less every turn the task's attempts have spent. `null` when `inference.max_turns` sets no cap |
 
 Appears zero or more times per task, always before the task's terminal `task_end`. See [Task
 reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task) for the full
@@ -832,7 +833,7 @@ attempt receives every answer and outcome in one message
 | `member_calls` | string[] | The `mcl_` id of every call whose outcome this continuation delivers, in arrival order. `[]` when it delivers none |
 | `delegations` | string[] | The `dlg_` id of every delegation whose outcome this continuation delivers — arrived, or ended by the backstop — in id order. `[]` when it delivers none |
 | `waited_ms` | u64 | How long the task waited, from its attempt's end until nothing was outstanding |
-| `turns_remaining` | u32 | Turns the continued attempt is handed: `inference.max_turns` less every turn the task's attempts have spent |
+| `turns_remaining` | u32 \| null | Turns the continued attempt is handed: `inference.max_turns` less every turn the task's attempts have spent. `null` when `inference.max_turns` sets no cap |
 
 ```json
 {"event_type":"task_continued","event_id":"evt_0193…","parent_id":"evt_0192…","session_id":"ses_0192…","timestamp":1791273600000,"task_id":"tsk_0192…","continuation_number":1,"member_calls":["mcl_01a1…","mcl_01a2…","mcl_01a3…"],"delegations":[],"waited_ms":12210,"turns_remaining":8}

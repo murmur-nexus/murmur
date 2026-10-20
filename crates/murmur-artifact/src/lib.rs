@@ -73,9 +73,10 @@ pub use lockfile::{
     MurmurLock, LOCK_VERSION,
 };
 pub use manifest::{
-    describe_yaml_shape, load_manifest, parse_upstream_auth, refuse_retired_auth_block, Manifest,
-    ManifestError, UpstreamAuth, REGISTRY_BLOCK_HINT, REGISTRY_BLOCK_KEY, REGISTRY_BLOCK_MESSAGE,
-    RETIRED_AUTH_BLOCK, UPSTREAM_AUTH_KEY_PLACEHOLDER,
+    describe_yaml_shape, load_manifest, parse_model_limits, parse_upstream_auth,
+    refuse_retired_auth_block, Manifest, ManifestError, ModelLimits, UpstreamAuth,
+    REGISTRY_BLOCK_HINT, REGISTRY_BLOCK_KEY, REGISTRY_BLOCK_MESSAGE, RETIRED_AUTH_BLOCK,
+    UPSTREAM_AUTH_KEY_PLACEHOLDER,
 };
 pub use manifest_path::{resolve_manifest_path, MANIFEST_FILENAME};
 pub use payload_shape::{
@@ -123,6 +124,7 @@ pub use runtime_manifest::{
 };
 pub use runtime_warnings::{
     runtime_warning_link, W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_007, W_RUN_008,
+    W_RUN_009,
 };
 pub use secrets::{
     is_credential_shaped_env_name, is_secret_shaped_name, scan_yaml_secrets, SecretWarning,

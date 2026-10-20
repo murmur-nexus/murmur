@@ -509,7 +509,8 @@ pub(crate) const GENERATOR_ARTIFACTS: [GeneratorArtifact; 3] = [
 ];
 
 /// The generator capsule's manifest. Its `capabilities.network.allow` lists
-/// [`REGISTRY_SEARCH_ORIGINS`], then `extra_network_allow`.
+/// [`REGISTRY_SEARCH_ORIGINS`], then `extra_network_allow`. It sets `inference.max_tokens`, so it
+/// launches whether or not the pinned driver's `models:` table lists the model.
 pub(crate) fn build_meta_manifest(
     config: &InferenceConfig,
     extra_network_allow: &[String],
@@ -557,6 +558,7 @@ artifacts:
   after_task: exit
 inference:
   model: {model}
+  max_tokens: 8192
   driver:
     artifact: {driver_name}
 "#,
@@ -761,6 +763,15 @@ mod tests {
         let yaml = build_meta_manifest(&config, &[]);
         let runtime_manifest = RuntimeManifest::from_yaml_str(&yaml)
             .expect("build_meta_manifest should produce a valid runtime manifest without any env var present");
+        // The generator sets its own output cap, so it launches whether or not the pinned
+        // driver's `models:` table lists the model.
+        assert_eq!(
+            runtime_manifest
+                .inference
+                .as_ref()
+                .and_then(|inference| inference.max_tokens),
+            Some(8192)
+        );
         let driver = runtime_manifest
             .artifacts
             .iter()

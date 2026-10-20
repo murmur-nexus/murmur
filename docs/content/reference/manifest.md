@@ -21,6 +21,7 @@ The manifest that ships inside a `.mur.zip`, read by `mur build` and `mur publis
 | `requires_files` | list<string> | no | Companion files that must sit beside `murmur.yaml` — and the complete list of what `mur build` packages besides the manifest itself. Paths are relative to the source directory and may be nested (`assets/logo.png`). Default: `["skill.md"]` for `runtime: skill`, empty for every other role; an explicit value, including `[]`, always overrides that default. A missing file fails the build with `E-IO-003`, naming the first missing entry. Entries must be plain relative paths to real files: absolute paths, `..` components and symlinks are rejected with [`E-BLD-002`](diagnostics.md#e-bld-002). An artifact with a compiled payload must declare it here, or the built `.mur.zip` contains nothing but `murmur.yaml` — for a wasm artifact that is [`E-BLD-003`](diagnostics.md#e-bld-003). |
 | `input_schema` | string (JSON) or map | no | A `runtime: tool` artifact's parameters, as a JSON Schema object. Offered to the model as the tool's input; every name in its top-level `required` must be present in a call's input or the call is refused before the tool runs. Default: an object with no properties, and no field required. `input` is an accepted older spelling. See [`input_schema`](#input-schema). |
 | `upstream_auth` | map | no | How the artifact's upstream takes its key: `header` and a `value` template with `{key}` exactly once. Read only when the capsule's entry for this artifact declares [`gateway:`](#artifact-gateway); absent or malformed then refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025). See [`upstream_auth:` block](#upstream-auth). |
+| `models` | map | no | `runtime: driver` only. Each model id the driver serves, with its `max_output_tokens` and `context_window`. Default: empty. A capsule on the driver takes its output cap and context window from here. See [`models:` block](#driver-models). |
 
 A hook artifact's own manifest carries three more fields — see
 [Hook contract fields](#hook-contract-fields).
@@ -67,6 +68,37 @@ When the block is read and refused:
 | Capsule entry declares no `gateway:` | The block is never read |
 | Capsule entry declares `gateway:`, block absent or malformed | `mur run` refuses with [`E-RUN-025`](diagnostics.md#e-run-025) |
 | Artifact manifest declares `inference_auth:`, the block's former name, with or without `upstream_auth:` | `mur build` refuses with [`E-BLD-004`](diagnostics.md#e-bld-004); an artifact already packed refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025) when its entry declares `gateway:` |
+
+### `models:` block { #driver-models }
+
+The limits of each model a driver serves, declared in the driver's own `murmur.yaml` beside
+`upstream_auth:`. A `transport: http` capsule on the driver takes each driver choice's
+[output cap](#inference-max-tokens) and context window from the entry for its model, unless the
+capsule's manifest sets them.
+
+```yaml
+name: driver-glm
+version: "0.1.0"
+runtime: driver
+requires_files:
+  - driver.wasm
+models:
+  glm-5.3:
+    max_output_tokens: 131072
+    context_window: 200000
+```
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `models.<id>` | map | — | One entry per model id. The id is matched by exact string equality with `inference.model` or an alternate's `model`: no prefix, alias or case folding, so a driver that accepts a dated id and an alias lists both. Must not be empty. No key besides the two below |
+| `models.<id>.max_output_tokens` | integer | yes | The most output tokens the model produces in one completion. `1` to `4294967295` |
+| `models.<id>.context_window` | integer | yes | The model's context window in tokens. `1` to `4294967295` |
+
+| Case | Result |
+|---|---|
+| `models:` malformed, or declared on an artifact whose `runtime` is not `driver` | `mur build` refuses with [`E-BLD-005`](diagnostics.md#e-bld-005), naming the field |
+| An installed driver whose `models:` is malformed | `mur run` refuses with [`E-RUN-052`](diagnostics.md#e-run-052), naming the driver and the field |
+| The table lists no entry for a choice's model | The capsule's own `inference.max_tokens` and `context.max_tokens` apply; see [Output cap](#inference-max-tokens) |
 
 ### `input_schema` { #input-schema }
 
@@ -253,14 +285,14 @@ inference:
   system_prompt: |              # optional; injected as `system` on every API call
     Always begin responses with CONFIRMED:
   # system_prompt_file: conventions.md  # alternative: load from file
-  # max_turns: 10               # optional; default 10
+  # max_turns: 50               # optional; default: no cap
 
 # Alternative: run a harness CLI as a subprocess (no ANTHROPIC_API_KEY required)
 # inference:
 #   transport: process
 #   driver:
 #     artifact: local/my-process-driver  # the process driver that knows this harness
-#   max_turns: 10
+#   max_turns: 50
 
 lifecycle:
   task_acceptance: queue  # none | single (default) | queue
@@ -1067,7 +1099,7 @@ model. These fields are read under both transports:
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `inference.transport` | `http \| process` | no | Default: `http`. `http` routes every call through a WASM driver artifact; `process` runs a harness CLI as a subprocess. See [Inference configuration](#inference-config). |
-| `inference.max_turns` | integer | no | Maximum LLM inference calls per task. Default: `10`. Must be > 0. A hook's counted `run-inference` call is one of them: it is in `task_end.turns`, and an attempt [reopened](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task) after it is handed only the turns the task has left. |
+| `inference.max_turns` | integer | no | Maximum LLM inference calls per task. Default: no cap. Must be > 0. A hook's counted `run-inference` call is one of them: it is in `task_end.turns`, and an attempt [reopened](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task) after it is handed only the turns the task has left. See [Turn cap](#inference-max-turns). |
 | `inference.system_prompt` | string | no | Text injected verbatim as the `system` parameter on every inference call. At most one of `system_prompt`, `system_prompt_file` and `system_prompt_artifact` may be set. |
 | `inference.system_prompt_file` | string | no | Path to a file whose content is injected as the system prompt, relative to the manifest directory. |
 | `inference.system_prompt_artifact` | string | no | The `name`, as written, of an artifact declared in `artifacts:` whose payload is bound as the system prompt — see [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
@@ -1078,7 +1110,7 @@ These fields are read under `transport: http`. Setting any of them except `infer
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `inference.model` | string | yes | Model identifier passed to the driver. |
-| `inference.max_tokens` | integer | no | Maximum output tokens the model may generate **per turn**. Default: `8192`. Must be > 0; not clamped at the top end. Distinct from [`context.max_tokens`](#field-context) — see [Output cap](#inference-max-tokens). |
+| `inference.max_tokens` | integer | no | Maximum output tokens the model may generate **per turn**, for every driver choice. Default: the `max_output_tokens` the driver's [`models:`](#driver-models) table declares for the choice's model; a choice with neither refuses the launch with [`E-RUN-052`](diagnostics.md#e-run-052). Must be > 0; not clamped at the top end. Distinct from [`context.max_tokens`](#field-context) — see [Output cap](#inference-max-tokens). |
 | `inference.tool_refresh` | `compaction \| immediate` | no | When an artifact installed mid-session, other than by the model's own `pull-artifact`, reaches the tool list the model is offered. Default: `compaction`. See [Tool refresh](#inference-tool-refresh). |
 | `inference.alternates` | list | no | Default: empty. Other driver choices the agent loop may be switched to while the capsule runs. Requires `inference.driver` in `control.settings` or `control.agent_settings`. See [Driver alternates](#inference-alternates). |
 
@@ -1179,9 +1211,10 @@ What follows a switch:
 | `MURMUR_INFERENCE_*` as tools and hooks see it | The primary, for the whole session |
 
 A driver-choice call sets `MURMUR_INFERENCE_ENDPOINT`, `MURMUR_INFERENCE_MODEL` and
-`MURMUR_INFERENCE_DRIVER` in that driver's environment to the choice's own values.
-`inference.max_tokens` and `context.max_tokens` are one number each for the session and must suit
-every declared model. Every choice's gateway is metered like the primary's. An alternate whose
+`MURMUR_INFERENCE_DRIVER` in that driver's environment to the choice's own values. Each choice has
+its own [output cap and context window](#inference-max-tokens), resolved at launch, and an
+agent-loop call uses the cap and window of the choice it is served by. A controller's change to
+`inference.max_tokens` applies to every later call whatever the choice. Every choice's gateway is metered like the primary's. An alternate whose
 credential is found nowhere at launch does not refuse the launch: it is staged unavailable and
 warns [`W-RUN-003`](diagnostics.md#w-run-003). Nothing a controller or the agent selects survives a
 restart. What the conversation carries across a switch is in
@@ -1200,7 +1233,7 @@ these fields are accepted and inert:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `inference.compaction.threshold` | float (0.0–1.0] | no | Fraction of `context.max_tokens` at which compaction fires. Default: `0.98`. |
+| `inference.compaction.threshold` | float (0.0–1.0] | no | Fraction of the context window at which compaction fires. Default: `0.98`. |
 | `inference.compaction.model` | string | no | Model override for compaction calls. Defaults to the primary inference model. |
 | `inference.compaction.system_prompt` | string | no | System prompt override for compaction calls, passed verbatim to the compaction hook. No trimming, length limit or format check. Omitted, the compaction hook picks its own default prompt. Mutually exclusive with `inference.compaction.system_prompt_file`. |
 | `inference.compaction.system_prompt_file` | string | no | Path to a file whose content is passed verbatim as the compaction system prompt. Relative to the manifest directory; read when the session launches. Mutually exclusive with `inference.compaction.system_prompt`. |
@@ -1210,9 +1243,9 @@ these fields are accepted and inert:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `context.max_tokens` | integer | no | Token budget for the session. Required to enable compaction; omit to disable it. Must be > 0. Read only under `transport: http`, like the [`inference.compaction`](#field-inference) block it drives. Distinct from [`inference.max_tokens`](#field-inference), the per-turn output cap. |
-| `context.seed_budget` | float (0.0–1.0) | no | Default: `0.10`. Fraction of `context.max_tokens` an `on-task-start` hook's `seed-context` may occupy. The product, rounded down, is sent to the hook as `task-start-event.budget-tokens`. Requires `context.max_tokens`: without it there is no ceiling, and a returned seed is refused with `reason: "no_budget"`. Inert under `transport: process`, where a seed is refused with `reason: "unsupported_transport"`. |
-| `context.seed_overflow_margin` | float (0.0–1.0) | no | Default: `0.10`. Slack above `context.seed_budget`, as a fraction of it, within which an over-budget seed has its oldest messages dropped rather than being handed to the compaction hook. Requires `context.max_tokens` and is inert under `transport: process`, exactly like `context.seed_budget`. |
+| `context.max_tokens` | integer | no | The context window compaction and the seed budget measure against, for every driver choice. Default: the `context_window` the driver's [`models:`](#driver-models) table declares for the choice's model; with neither, the choice has no window, and compaction does not run on it. Must be > 0. Read only under `transport: http`, like the [`inference.compaction`](#field-inference) block it drives. Distinct from [`inference.max_tokens`](#field-inference), the per-turn output cap. |
+| `context.seed_budget` | float (0.0–1.0) | no | Default: `0.10`. Fraction of the primary choice's context window an `on-task-start` hook's `seed-context` may occupy. The product, rounded down, is sent to the hook as `task-start-event.budget-tokens`. Requires a window: with none there is no ceiling, and a returned seed is refused with `reason: "no_budget"`. Inert under `transport: process`, where a seed is refused with `reason: "unsupported_transport"`. |
+| `context.seed_overflow_margin` | float (0.0–1.0) | no | Default: `0.10`. Slack above `context.seed_budget`, as a fraction of it, within which an over-budget seed has its oldest messages dropped rather than being handed to the compaction hook. Requires a window and is inert under `transport: process`, exactly like `context.seed_budget`. |
 | `context.record` { #context-record } | `on \| off` | no | Default: `on`. Whether the runtime keeps a [durable conversation record](workdir.md#the-conversation-record) for this capsule. `off` turns the mechanism off: nothing is created under `~/.murmur/conversations/`, and a hook granted `capabilities.conversation.read` reads an empty page. Under `transport: process` no record is written either way, and `off` additionally turns off the [harness session map](workdir.md#harness-session-map). |
 | `context.record_store` | string | no | Default: the capsule name. Directory under `~/.murmur/conversations/` this capsule's records live in. One path segment: no `/`, no `.` or `..`, not absolute, not starting with a dot — anything else refuses the launch with [`E-CAP-011`](diagnostics.md#e-cap-011). Accepted and inert alongside `record: off`. |
 | `context.retain` { #context-retain } | block | no | What bounds this capsule's [conversation records](workdir.md#the-conversation-record). Omitted, nothing is ever deleted. See [Retention](#retention). |
@@ -1504,34 +1537,62 @@ artifacts:
 inference:
   transport: http
   model: claude-opus-4-5
-  max_tokens: 4096        # optional per-turn output cap; default 8192
+  max_tokens: 4096        # optional per-turn output cap; default: the driver's models: entry
   max_session_tokens: 2000000   # optional session spend ceiling; default none
   driver:
     artifact: murmur/driver-anthropic
 ```
 
+#### Turn cap: `inference.max_turns` { #inference-max-turns }
+
+`inference.max_turns` caps the inference turns one task may take, across its reopens and
+continuations. A task that spends them ends `max_turns_reached`. Omitted, a task runs until the
+model ends it. What bounds a task with no turn cap:
+
+| Bound | Ends |
+|---|---|
+| [`inference.max_session_tokens`](#inference-max-session-tokens) | The session's inference, once its tokens are spent |
+| [`spend.machine_tokens_per_day`](config.md#spend) | Every run on the machine, once the day's tokens are spent |
+| [`mur stop`](cli.md#mur-stop), or [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) | The session, or the one task |
+| A deadline the launcher imposes, such as a CI job's timeout | Whatever the launcher kills |
+
+mur sets no wall-clock limit on a session.
+
 #### Output cap: `inference.max_tokens` { #inference-max-tokens }
 
 `inference.max_tokens` is the per-turn **output** cap — the `max_tokens` field of the payload the
-runtime hands the driver, which every driver forwards verbatim to its provider API. Omit it and the
-runtime sends `8192`. It is provider-agnostic and reaches every driver through the same wire field,
-so no `driver.config` entry is needed for it.
+runtime hands the driver, which every driver forwards verbatim to its provider API. It is
+provider-agnostic and reaches every driver through the same wire field, so no `driver.config` entry
+is needed for it.
 
-[`context.max_tokens`](#field-context) is the session-wide token budget that decides when
-compaction fires, counted across the whole conversation; `inference.max_tokens` bounds a single
-response. They are parsed and validated independently and never share a default.
+[`context.max_tokens`](#field-context) is the context window compaction and the seed budget measure
+against; `inference.max_tokens` bounds a single response.
+
+At launch, each driver choice — the primary and every [alternate](#inference-alternates) — resolves
+both numbers once, from the manifest or else from the [`models:`](#driver-models) entry its driver
+declares for its model:
+
+| Limit | Manifest sets it | Else the driver's table lists the model | Else |
+|---|---|---|---|
+| Output cap | `inference.max_tokens`, for every choice | `max_output_tokens` | The launch is refused with [`E-RUN-052`](diagnostics.md#e-run-052), naming the choice, the model, the driver and `inference.max_tokens` |
+| Context window | `context.max_tokens`, for every choice | `context_window` | No window: compaction does not run for that choice, and no seed budget applies |
+
+A choice whose model the table does not list draws [`W-RUN-009`](diagnostics.md#w-run-009) once at
+launch, unless the manifest sets both keys. `session_start` records each choice's numbers and where
+each came from in [`model_limits`](observability-schemas.md#session-trace-tracejsonl), and
+[`mur doctor`](cli.md#mur-doctor) prints them.
 
 Validation is one-sided: `0` is rejected at parse time, but a value larger than a given model's
 documented maximum is neither rejected nor clamped — an over-large cap surfaces as the provider's
 own error at request time.
 
-Two interactions worth knowing:
+| Call | Output cap sent |
+|---|---|
+| An agent-loop turn | The cap of the choice serving it. A controller's change to `inference.max_tokens` through the [control surface](control-surface.md) is the cap of every later turn, whatever the choice; until one is made, `GET /control` shows the cap the next turn uses |
+| A hook's `run-inference`: compaction, seed summarization | The `max_output_tokens` the primary driver's table declares for the model the hook calls — its own model, `inference.compaction.model`, or `inference.model`. When the table lists none, the primary choice's cap |
 
-- The anthropic driver caps extended thinking's `budget_tokens` to `max_tokens - 1`, so lowering
-  this value also squeezes a configured thinking budget.
-- Hook-initiated completions, such as the compaction hook's own summarization call, always use the
-  built-in `8192` default. This field caps the agent's own responses, not the runtime's internal
-  calls.
+The anthropic driver caps extended thinking's `budget_tokens` to `max_tokens - 1`, so lowering
+this value also squeezes a configured thinking budget.
 
 ##### When a turn hits the cap { #inference-max-tokens-reached }
 
@@ -1566,7 +1627,11 @@ fit under the ceiling together:
 |---|---|
 | Used | Every earlier call's `input_tokens + output_tokens`, plus what calls still in flight reserved |
 | The call's input | `input_tokens` of the request about to be sent |
-| The call's most output | `inference.max_tokens` (default `8192`) for an agent turn; the built-in `8192` for a hook's completion |
+| The call's most output | The [output cap](#inference-max-tokens) the call sends |
+
+A session with `inference.max_session_tokens` set therefore reserves the whole output cap for every
+call: with the cap taken from the driver's table, that is the model's full output ceiling. Set
+`inference.max_tokens` to reserve less.
 
 A call that does not fit is never sent. The refusal appears as:
 
@@ -1600,7 +1665,7 @@ can be larger than the cap the provider applied.
 |---|---|
 | `inference.max_session_tokens` | Tokens across the whole session, input and output |
 | [`inference.max_tokens`](#inference-max-tokens) | One response's output |
-| [`context.max_tokens`](#field-context) | The conversation's size, which drives compaction |
+| [`context.max_tokens`](#field-context) | The conversation's size against the context window, which drives compaction |
 | [`spend.machine_tokens_per_day`](config.md#spend) | Tokens across every run on the machine per UTC day |
 
 Under `transport: process` there is nothing to admit: the harness reaches its provider itself, and
@@ -1636,7 +1701,7 @@ is added at the boundary `inference.tool_refresh` names:
 The tool list sits at the head of the prompt the provider caches, so any change to it is a cache
 miss for everything after it — see [Measured cost](#inference-tool-refresh-cost).
 
-Compaction runs only when the conversation reaches [`context.max_tokens`](#field-context), which
+Compaction runs only when the conversation reaches the [context window](#field-context), which
 may be many turns away or never within a task.
 
 A session that installs nothing sends the same tool list on every call under either value.

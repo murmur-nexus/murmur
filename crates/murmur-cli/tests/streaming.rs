@@ -505,6 +505,8 @@ fn create_streaming_driver_artifact(dir: &Path) -> PathBuf {
     writeln!(zip, "upstream_auth:").unwrap();
     writeln!(zip, "  header: x-api-key").unwrap();
     writeln!(zip, "  value: \"{{key}}\"").unwrap();
+    zip.write_all(common::FIXTURE_DRIVER_MODELS.as_bytes())
+        .unwrap();
 
     zip.start_file("tool.wasm", opts).unwrap();
     zip.write_all(&fs::read(streaming_driver_wasm_path()).unwrap())

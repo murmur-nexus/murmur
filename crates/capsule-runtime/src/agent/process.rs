@@ -641,9 +641,9 @@ pub(crate) async fn run_process_inference_loop(
     store_state: &CapsuleStoreState,
     workdir: &WorkdirRoot,
     // `max_turns` here is this attempt's remaining budget; `task_max_turns` is the task-wide
-    // ceiling a run that exceeds it names.
+    // ceiling a run that exceeds it names. `None` is no cap.
     inference: &InferenceConfig,
-    task_max_turns: u32,
+    task_max_turns: Option<u32>,
     system_prompt: Option<String>,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
@@ -712,7 +712,7 @@ async fn run_attempt(
     store_state: &CapsuleStoreState,
     workdir: &WorkdirRoot,
     inference: &InferenceConfig,
-    task_max_turns: u32,
+    task_max_turns: Option<u32>,
     system_prompt: Option<String>,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
@@ -769,7 +769,7 @@ async fn run_harness(
     staged: &StagedProcessDriver,
     workdir: &WorkdirRoot,
     inference: &InferenceConfig,
-    task_max_turns: u32,
+    task_max_turns: Option<u32>,
     system_prompt: Option<&str>,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
@@ -1817,7 +1817,7 @@ mod tests {
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
-            max_turns: 10,
+            max_turns: Some(10),
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,

@@ -168,7 +168,8 @@ struct SessionStartEvent {
     capsule_name: String,
     capsule_version: String,
     model: String,
-    max_turns: u32,
+    /// `inference.max_turns`, `None` for no cap.
+    max_turns: Option<u32>,
     /// Capability categories the manifest granted anything under.
     #[serde(default)]
     capabilities: Vec<String>,
@@ -1200,7 +1201,7 @@ struct TraceMetrics {
     capsule_name: String,
     capsule_version: String,
     model: String,
-    max_turns: u32,
+    max_turns: Option<u32>,
     capabilities: Vec<String>,
     tools_declared: Vec<String>,
     containment_declared: Option<String>,
@@ -2833,7 +2834,12 @@ fn print_show(m: &TraceMetrics) {
     }
 
     capsule_runtime::report_println!("── Turns ────────────────────────────────────────");
-    capsule_runtime::report_println!("count:      {}  (max: {})", m.total_turns, m.max_turns);
+    capsule_runtime::report_println!(
+        "count:      {}  (max: {})",
+        m.total_turns,
+        m.max_turns
+            .map_or_else(|| "no cap".to_string(), |max| max.to_string())
+    );
     if let Some(line) = continued_line(&m.continuations) {
         capsule_runtime::report_println!("{line}");
     }

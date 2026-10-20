@@ -185,7 +185,7 @@ impl Capsule {
             DRIVER,
             VERSION,
             &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-            AUTH,
+            &format!("{AUTH}{}", common::FIXTURE_DRIVER_MODELS),
         );
         common::publish_local(&home, &driver).success();
         let skill = common::create_skill_artifact(

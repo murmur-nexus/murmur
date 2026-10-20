@@ -531,7 +531,7 @@ reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task)
 `seed-context` is honored at `on-task-start` alone: the first bound blocking hook to return it
 wins, and its messages are placed at the head of the task's context, ahead of any loaded history
 and ahead of the task message. The list is chronological, oldest first. The host measures it
-against `task-start-event.budget-tokens` — `context.max_tokens` × `context.seed_budget` — and
+against `task-start-event.budget-tokens` — the context window × `context.seed_budget` — and
 commits it whole, drops its oldest messages, summarizes the overflowing front through the
 compaction hook, or refuses it; every outcome is recorded as a
 [`context_seed`](observability-schemas.md#context-seed) event, and a refusal never fails the task.
@@ -580,13 +580,14 @@ fail-closed rule that governs a policy hook's failures.
   `id` names a message in the context the hook was handed and its `role` and `content` are
   unchanged. Any other returned message is marked with the output it came in through, so reusing
   a held `id` on new content cannot pass a summary off as a person's turn.
-- `task-start-event.context-window` is the capsule's
-  [`context.max_tokens`](manifest.md#field-context), or `0` when the manifest declares no `context:`
-  block. It is precomputed so a hook sizing its work against the window never has to know which
+- `task-start-event.context-window` is the primary driver choice's context window:
+  [`context.max_tokens`](manifest.md#field-context), else the `context_window` its driver's
+  [`models:`](manifest.md#driver-models) table declares for the model, or `0` when neither gives
+  one. It is precomputed so a hook sizing its work against the window never has to know which
   model the session runs.
 - `task-start-event.budget-tokens` is the ceiling a `seed-context` returned from this event is
-  enforced against: [`context.max_tokens`](manifest.md#field-context) ×
-  [`context.seed_budget`](manifest.md#field-context), rounded down.
+  enforced against: that context window × [`context.seed_budget`](manifest.md#field-context),
+  rounded down.
   `task-start-event.prior-tokens` is the token count of the conversation history the task will
   load under [`lifecycle.conversation: threaded`](manifest.md#lifecycle-conversation), and `0`
   under every other conversation mode. Read `0` as "the runtime has not computed this" and

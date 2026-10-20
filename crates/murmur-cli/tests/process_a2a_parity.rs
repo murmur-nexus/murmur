@@ -73,6 +73,24 @@ fn create_fixture_driver_artifact(dir: &Path, name: &str, wasm: &str) -> PathBuf
     writeln!(zip, "upstream_auth:").unwrap();
     writeln!(zip, "  header: x-api-key").unwrap();
     writeln!(zip, "  value: \"{{key}}\"").unwrap();
+    // The tool-progress driver reads its model as the way to report the call, so each mode is a
+    // model it serves.
+    zip.write_all(common::FIXTURE_DRIVER_MODELS.as_bytes())
+        .unwrap();
+    for mode in [
+        "tool-progress",
+        "tool-progress-streaming",
+        "tool-progress-large",
+        "tool-progress-unruly",
+    ] {
+        writeln!(
+            zip,
+            "  {mode}:\n    max_output_tokens: {}\n    context_window: {}",
+            common::FIXTURE_MAX_OUTPUT_TOKENS,
+            common::FIXTURE_CONTEXT_WINDOW
+        )
+        .unwrap();
+    }
     zip.start_file("tool.wasm", options).unwrap();
     zip.write_all(&fs::read(common::fixture_path(wasm)).unwrap())
         .unwrap();

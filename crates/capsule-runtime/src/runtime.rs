@@ -414,8 +414,8 @@ async fn run_task_with_reopens(
         // Reopening never grants turns past `max_turns`: hand this attempt only the turns
         // still unspent by prior attempts of the same task. On the first attempt
         // `task_turns()` is 0 (reset by the preceding `write_task_start`), so it gets the
-        // full ceiling.
-        let remaining_turns = inference.max_turns.saturating_sub(trace.task_turns());
+        // full ceiling. With no cap, every attempt is uncapped.
+        let remaining_turns = turns_left(inference.max_turns, trace.task_turns());
         let mut attempt_inference = inference.clone();
         attempt_inference.max_turns = remaining_turns;
         let failures_before = trace.task_failures_written();
@@ -499,7 +499,9 @@ async fn run_task_with_reopens(
             calls.as_ref().map_or((0, 0), |calls| calls.counts());
         let (delegations_outstanding, delegations_arrived) = delegations.counts();
         if calls_outstanding + calls_arrived + delegations_outstanding + delegations_arrived > 0 {
-            if matches!(result, Ok(AgentLoopExit::Ok)) && trace.task_turns() < inference.max_turns {
+            if matches!(result, Ok(AgentLoopExit::Ok))
+                && turns_left(inference.max_turns, trace.task_turns()) != Some(0)
+            {
                 // The task's own bound on a delegation whose outcome was lost on the way: the
                 // watcher's deadline, plus the grace for its post to land.
                 let backstop = state
@@ -573,7 +575,7 @@ async fn run_task_with_reopens(
                                 &call_ids,
                                 &delegation_ids,
                                 u64::try_from(round.waited.as_millis()).unwrap_or(u64::MAX),
-                                inference.max_turns.saturating_sub(trace.task_turns()),
+                                turns_left(inference.max_turns, trace.task_turns()),
                             )
                             .await;
                         emit_task_working(
@@ -684,7 +686,7 @@ async fn run_task_with_reopens(
                 // turns remain under the ceiling; otherwise the request is exhausted and
                 // ends the task non-silently.
                 let budget_ok = reopens_used < max_task_reopens;
-                let turns_ok = trace.task_turns() < inference.max_turns;
+                let turns_ok = turns_left(inference.max_turns, trace.task_turns()) != Some(0);
                 if budget_ok && turns_ok {
                     reopens_used += 1;
                     // The reopened attempt may answer after all.
@@ -704,7 +706,7 @@ async fn run_task_with_reopens(
                             &reason,
                             reopens_used,
                             attempt_context,
-                            inference.max_turns.saturating_sub(trace.task_turns()),
+                            turns_left(inference.max_turns, trace.task_turns()),
                         )
                         .await;
                     // The attempt boundary, so a client watching the task does not read the
@@ -742,8 +744,7 @@ async fn run_task_with_reopens(
                     &hook_name,
                     reopens_used,
                     max_task_reopens,
-                    inference.max_turns,
-                    budget_ok,
+                    inference.max_turns.filter(|_| budget_ok),
                 );
                 let _ = trace
                     .write_task_failed(
@@ -935,18 +936,23 @@ fn write_canceled_result(
     }
 }
 
+/// The turns `inference.max_turns` leaves a task that has spent `spent`: `None` with no cap.
+fn turns_left(max_turns: Option<u32>, spent: u32) -> Option<u32> {
+    max_turns.map(|max_turns| max_turns.saturating_sub(spent))
+}
+
 /// Why a reopen a hook asked for was refused, naming the limit that refused it. The two limits
 /// share one `task_end` exit status, so this message is the only place an operator learns
 /// whether to raise `lifecycle.max_task_reopens` or `inference.max_turns`; when both are spent,
-/// the reopen limit is named.
+/// the reopen limit is named. `spent_turn_cap` is `inference.max_turns` when reopens were left,
+/// so the turn cap is what refused.
 fn reopen_refusal_message(
     hook_name: &str,
     reopens_used: u32,
     max_task_reopens: u32,
-    max_turns: u32,
-    reopens_left: bool,
+    spent_turn_cap: Option<u32>,
 ) -> String {
-    if reopens_left {
+    if let Some(max_turns) = spent_turn_cap {
         format!(
             "task turn budget exhausted after {reopens_used} reopen(s): hook '{hook_name}' \
              still requested another reopen, but the task's attempts have spent all \
@@ -2497,20 +2503,35 @@ pub fn stage_session(
         &spend,
         injected_secrets.as_ref(),
     )?;
-    let driver_choices = request.inference.as_ref().map(|inference| {
+    let mut driver_choices = request.inference.as_ref().map(|inference| {
         stage_driver_choices(inference, &full_names, &gateways, &unresolved_credentials)
     });
+    // Resolved before the session directory exists, so a choice with no output cap leaves nothing
+    // behind and no request leaves. The warnings wait for the bootstrap log.
+    let (model_limit_warnings, hook_output_caps) =
+        match (request.inference.as_ref(), driver_choices.as_mut()) {
+            (Some(inference), Some(choices)) => stage_model_limits(
+                inference,
+                request.context.as_ref(),
+                choices,
+                &installed_manifests,
+                &installed_artifacts,
+                &request.artifacts,
+                &full_names,
+            )?,
+            _ => Default::default(),
+        };
     // Built after the gateways, because whether a driver choice can be selected depends on the
-    // credential staging left it.
+    // credential staging left it, and after the limits, because the output cap a controller
+    // starts from is the primary's.
     let control = request
         .control
         .as_ref()
-        .zip(request.inference.as_ref())
         .zip(driver_choices.clone())
         .zip(injected_secrets)
-        .map(|(((control, inference), choices), secrets)| {
+        .map(|((control, choices), secrets)| {
             Arc::new(crate::control_plane::ControlState::new(
-                control, inference, choices, secrets,
+                control, choices, secrets,
             ))
         });
     for hook in &mut hook_components {
@@ -2707,6 +2728,7 @@ pub fn stage_session(
         request.formation_member.as_deref(),
         &request.capability_policy.network_allow,
     );
+    warn_on_unknown_model_limits(&records_root, &model_limit_warnings);
 
     // And the plan tool, on the same terms once more. Its schema is fixed rather than built: a
     // plan reaches this session's own tools, so there is no granted list to fold into it.
@@ -2776,7 +2798,7 @@ pub fn stage_session(
             &runtime_root,
             &accessible_workdir,
             Some(inference),
-            request.context.as_ref(),
+            primary_context_window(driver_choices.as_ref(), request.context.as_ref()),
             has_compaction_hook(&hook_components),
             &request.capability_policy,
             &partial_identity,
@@ -2826,6 +2848,8 @@ pub fn stage_session(
         gateways,
         spend,
         control,
+        driver_choices,
+        hook_output_caps,
         door_authentication: request.door_authentication,
         door_auth,
         system_prompt_overridden: request.system_prompt_overridden,
@@ -3098,14 +3122,20 @@ fn launch(
             resolve_compaction_system_prompt(&staged.manifest_dir, inference.compaction.as_ref())?;
         let session_id = staged.session_id.clone();
         let accessible_workdir = staged.accessible_workdir.clone();
-        let context_window = resolve_context_window(staged.context.as_ref());
+        let primary_limits = staged
+            .driver_choices
+            .as_ref()
+            .and_then(|choices| choices.primary().limits);
+        let context_window =
+            primary_context_window(staged.driver_choices.as_ref(), staged.context.as_ref())
+                .unwrap_or(0);
         let seed_budget = staged
             .context
             .as_ref()
             .map(|c| c.seed_budget)
             .unwrap_or(murmur_artifact::DEFAULT_SEED_BUDGET);
-        // Computed once for the whole launch: the ceiling depends only on the manifest, and
-        // every `on-task-start` in the session is measured against the same number.
+        // Computed once for the whole launch: the ceiling depends only on the primary's window,
+        // and every `on-task-start` in the session is measured against the same number.
         let seed_budget_tokens = agent::seed_budget_tokens(context_window, seed_budget);
 
         let run_config = agent::AgentRunConfig {
@@ -3122,9 +3152,10 @@ fn launch(
                 .as_ref()
                 .and_then(|c| c.dump_summaries)
                 .unwrap_or(false),
-            max_output_tokens: inference
-                .max_tokens
-                .unwrap_or(agent::DEFAULT_MAX_OUTPUT_TOKENS),
+            max_output_tokens: primary_limits.map_or(0, |limits| limits.max_output_tokens),
+            choices: staged.driver_choices.clone().unwrap_or_else(|| {
+                crate::driver_choice::DriverChoices::declared(inference, &HashMap::new())
+            }),
             control: staged.control.clone(),
             seed_budget,
             seed_overflow_margin: staged
@@ -3191,9 +3222,9 @@ fn launch(
         // lives for the rest of the launch, so the file goes when the session does.
         let session_control = staged.control.as_ref().map(|state| state.session_control());
         let session_inference_choices = staged
-            .control
+            .driver_choices
             .as_ref()
-            .map(|state| session_inference_choices(state.choices()))
+            .map(session_inference_choices)
             .unwrap_or_default();
         let (control_plane, _control_token) = match staged
             .control
@@ -3297,7 +3328,7 @@ fn launch(
             &runtime_root,
             &staged.accessible_workdir,
             Some(inference),
-            staged.context.as_ref(),
+            primary_context_window(staged.driver_choices.as_ref(), staged.context.as_ref()),
             has_compaction_hook(&staged.hook_components),
             &staged.capability_policy,
             &capsule_identity,
@@ -3495,6 +3526,7 @@ fn launch(
         let formation_member = staged.formation_member.clone();
         let capsule_version = staged.capsule_version.clone();
         let inference_model = inference.model.clone();
+        let hook_output_caps = staged.hook_output_caps.clone();
         // The driver artifact the manifest names, under either transport. Only a
         // `transport: http` driver can back a hook's `run-inference`: a process
         // driver never enters `tool_components` (see `hook_inference`).
@@ -3589,7 +3621,7 @@ fn launch(
             trace.set_formation_id(formation_id.as_ref());
             trace.set_formation_member(formation_member.as_deref());
             trace
-                .write_session_start(inference.max_turns, tools_declared)
+                .write_session_start(inference.max_turns, primary_limits, tools_declared)
                 .await
                 .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
 
@@ -3863,6 +3895,7 @@ fn launch(
                                     driver_name,
                                     driver_component,
                                     model: inference_model.clone(),
+                                    output_caps: hook_output_caps.clone(),
                                     engine: state.engine.clone(),
                                     accessible_workdir: state.accessible_workdir.clone(),
                                     workdir: state.session_root.clone(),
@@ -7529,6 +7562,92 @@ fn stage_driver_choices(
     choices
 }
 
+/// Resolves every driver choice's output cap and context window from the `models:` table of the
+/// driver just staged for it, and records them on `choices`. Returns the `W-RUN-009` texts to
+/// print once the bootstrap log exists, and the caps a hook's `run-inference` sends.
+///
+/// Refused with [`RuntimeError::ModelLimits`] for a choice with no output cap, or a driver whose
+/// table is malformed. Under `transport: process` nothing is resolved.
+fn stage_model_limits(
+    inference: &InferenceConfig,
+    context: Option<&ContextConfig>,
+    choices: &mut crate::driver_choice::DriverChoices,
+    installed_manifests: &[(String, String)],
+    installed_artifacts: &[InstalledArtifactSummary],
+    declared_artifacts: &[ArtifactRequest],
+    full_names: &HashMap<String, String>,
+) -> Result<(Vec<String>, crate::model_limits::HookOutputCaps), RuntimeError> {
+    let drivers: Vec<(&str, String, &str)> = choices
+        .iter()
+        .map(|choice| {
+            let version = installed_artifacts
+                .iter()
+                .find(|installed| installed.name == choice.artifact)
+                .map(|installed| installed.version.as_str())
+                .or_else(|| {
+                    declared_artifacts
+                        .iter()
+                        .find(|artifact| artifact.name == choice.driver)
+                        .map(|artifact| artifact.version.as_str())
+                })
+                .unwrap_or_default();
+            let manifest_yaml = installed_manifests
+                .iter()
+                .find(|(name, _)| *name == choice.driver)
+                .map_or("", |(_, yaml)| yaml.as_str());
+            let full_name = crate::tool_names::full_name_of(full_names, &choice.driver);
+            let label = if version.is_empty() {
+                full_name.to_string()
+            } else {
+                format!("{full_name}@{version}")
+            };
+            (choice.driver.as_str(), label, manifest_yaml)
+        })
+        .collect();
+    // Every driver the resolver asks for is a choice's, so each is in `drivers`.
+    let lookup = |driver: &str| {
+        drivers.iter().find(|(name, _, _)| *name == driver).map_or(
+            crate::model_limits::DriverManifest {
+                label: "",
+                manifest_yaml: "",
+            },
+            |(_, label, yaml)| crate::model_limits::DriverManifest {
+                label,
+                manifest_yaml: yaml,
+            },
+        )
+    };
+    let resolved = crate::model_limits::resolve_model_limits(inference, context, lookup)?;
+    let hook_output_caps = resolved
+        .first()
+        .map(|primary| {
+            crate::model_limits::HookOutputCaps::new(
+                murmur_artifact::parse_model_limits(
+                    lookup(&choices.primary().driver).manifest_yaml,
+                )
+                .unwrap_or_default(),
+                primary.limits.max_output_tokens,
+            )
+        })
+        .unwrap_or_default();
+    let warnings = resolved
+        .iter()
+        .filter_map(|choice| choice.warning.clone())
+        .collect();
+    choices.record_limits(&resolved);
+    Ok((warnings, hook_output_caps))
+}
+
+/// `W-RUN-009` once per driver choice whose driver declares no limits for its model, to stderr
+/// and `logs/bootstrap.log`. The launch goes ahead on the operator's output cap.
+fn warn_on_unknown_model_limits(workdir: &WorkdirRoot, warnings: &[String]) {
+    for message in warnings {
+        let line = crate::model_limits::model_limits_warning_line(message);
+        crate::runtime_err!("[capsule-runtime] {line}");
+        agent::append_bootstrap_log(workdir, &format!("[inference] {line}"));
+    }
+}
+
 /// `session_start.inference_choices`: every driver choice, the primary first, each driver by its
 /// full name, or nothing for a capsule with no alternates. Never a key.
 fn session_inference_choices(
@@ -7545,6 +7664,7 @@ fn session_inference_choices(
             model: choice.model.clone(),
             credential_source: choice.credential_source,
             available: choice.staged(),
+            model_limits: choice.limits,
         })
         .collect()
 }
@@ -11420,8 +11540,17 @@ async fn apply_retention(
     }
 }
 
-fn resolve_context_window(context: Option<&ContextConfig>) -> u32 {
-    context.and_then(|c| c.max_tokens).unwrap_or(0)
+/// The primary driver choice's context window, which `on-task-start`, the seed budget and
+/// `MURMUR.md` read; `None` when it has none. Under `transport: process`, which resolves no model
+/// limits, it is `context.max_tokens`.
+fn primary_context_window(
+    choices: Option<&crate::driver_choice::DriverChoices>,
+    context: Option<&ContextConfig>,
+) -> Option<u32> {
+    match choices.and_then(|choices| choices.primary().limits) {
+        Some(limits) => limits.context_window,
+        None => context.and_then(|context| context.max_tokens),
+    }
 }
 
 fn validate_capability_policy(policy: &CapabilityPolicy) -> Result<(), RuntimeError> {
@@ -12319,7 +12448,7 @@ mod tests {
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
-            max_turns: 10,
+            max_turns: Some(10),
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
@@ -12730,12 +12859,43 @@ inference:
 "#;
 
     /// The `context-window` the three `HookEvent::TaskStart` sites in `launch_session`
-    /// send, computed the way they compute it: from the parsed manifest's `context:`
-    /// block, through [`resolve_context_window`], widened to the WIT `u64`.
-    fn dispatched_context_window(manifest_yaml: &str) -> u64 {
+    /// send, computed the way they compute it: the primary choice's window as `limits` resolve
+    /// it, else the parsed manifest's `context:` block, through [`primary_context_window`],
+    /// widened to the WIT `u64`.
+    fn dispatched_context_window(
+        manifest_yaml: &str,
+        limits: Option<crate::model_limits::ResolvedModelLimits>,
+    ) -> u64 {
         let manifest = murmur_artifact::RuntimeManifest::from_yaml_str(manifest_yaml)
             .expect("the manifest under test parses");
-        u64::from(resolve_context_window(manifest.context.as_ref()))
+        let inference = manifest.inference.as_ref().unwrap();
+        let mut choices = crate::driver_choice::DriverChoices::declared(inference, &HashMap::new());
+        if let Some(limits) = limits {
+            choices.record_limits(&[crate::model_limits::ChoiceModelLimits {
+                choice: murmur_artifact::PRIMARY_DRIVER_CHOICE.to_string(),
+                model: inference.model.clone(),
+                driver: String::new(),
+                limits,
+                warning: None,
+            }]);
+        }
+        u64::from(primary_context_window(Some(&choices), manifest.context.as_ref()).unwrap_or(0))
+    }
+
+    /// A window the driver's `models:` table declares reaches `on-task-start` when the manifest
+    /// sets none.
+    #[test]
+    fn a_driver_declared_context_window_reaches_on_task_start() {
+        let limits = crate::model_limits::ResolvedModelLimits {
+            max_output_tokens: 4096,
+            max_output_tokens_source: crate::model_limits::LimitSource::Manifest,
+            context_window: Some(400_000),
+            context_window_source: crate::model_limits::LimitSource::Driver,
+        };
+        assert_eq!(
+            dispatched_context_window(CONTEXT_WINDOW_MANIFEST, Some(limits)),
+            400_000
+        );
     }
 
     /// A capsule declaring `context.max_tokens` puts that number on every
@@ -12743,14 +12903,14 @@ inference:
     #[test]
     fn a_declared_context_window_reaches_on_task_start() {
         let yaml = format!("{CONTEXT_WINDOW_MANIFEST}context:\n  max_tokens: 200000\n");
-        assert_eq!(dispatched_context_window(&yaml), 200_000);
+        assert_eq!(dispatched_context_window(&yaml, None), 200_000);
     }
 
     /// A capsule with no `context:` block sends `0` — the WIT contract's "the host has
     /// not computed this", never a guessed default window.
     #[test]
     fn no_context_block_sends_a_zero_context_window() {
-        assert_eq!(dispatched_context_window(CONTEXT_WINDOW_MANIFEST), 0);
+        assert_eq!(dispatched_context_window(CONTEXT_WINDOW_MANIFEST, None), 0);
     }
 
     // ── The persistent-capsule handle-TTL rule ───────────────────────────────
@@ -13191,7 +13351,7 @@ inference:
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
-            max_turns: 10,
+            max_turns: Some(10),
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
@@ -14193,8 +14353,9 @@ inference:
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
-            max_turns: 10,
-            max_tokens: None,
+            max_turns: Some(10),
+            // The driver is never staged, so no `models:` table is read: the cap is the manifest's.
+            max_tokens: Some(4096),
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
             alternates: Vec::new(),
@@ -15945,13 +16106,16 @@ inference:
                     artifact: "mock-driver".to_string(),
                     config: None,
                 }),
-                max_turns: 3,
+                max_turns: Some(3),
                 tool_refresh: trigger,
                 ..task_io_inference_config()
             };
             let mut trace = tool_refresh_trace(workdir).await;
             trace.set_tool_refresh(Some(trigger.wire_name()));
-            trace.write_session_start(3, Vec::new()).await.unwrap();
+            trace
+                .write_session_start(Some(3), None, Vec::new())
+                .await
+                .unwrap();
             let otel = OtelEmitter::new(
                 None,
                 &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
@@ -15977,6 +16141,10 @@ inference:
                 compaction_system_prompt: None,
                 compaction_dump_summaries: false,
                 max_output_tokens: 1024,
+                choices: crate::driver_choice::DriverChoices::declared(
+                    &self.inference,
+                    &HashMap::new(),
+                ),
                 control: None,
                 seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
                 seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
@@ -18720,7 +18888,7 @@ inference:
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
-            max_turns: 10,
+            max_turns: Some(10),
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
@@ -19674,6 +19842,7 @@ inference:
     }
 
     fn reopen_scenario_run_config(
+        inference: &InferenceConfig,
         context_window: u32,
         conversation_root: Option<PathBuf>,
         harness_sessions: Option<Arc<crate::harness_session::HarnessSessionMap>>,
@@ -19685,6 +19854,7 @@ inference:
             compaction_system_prompt: None,
             compaction_dump_summaries: false,
             max_output_tokens: 1024,
+            choices: crate::driver_choice::DriverChoices::declared(inference, &HashMap::new()),
             control: None,
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
@@ -19812,7 +19982,7 @@ inference:
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
-            max_turns: scenario.max_turns,
+            max_turns: Some(scenario.max_turns),
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
@@ -19828,7 +19998,7 @@ inference:
         state.current_forget_harness_session = scenario.forget;
 
         let mut hooks = reopen_scenario_hooks(&state, &workdir, scenario.reopen_limit).await;
-        let run_config = reopen_scenario_run_config(0, None, scenario.harness_sessions);
+        let run_config = reopen_scenario_run_config(&inference, 0, None, scenario.harness_sessions);
         drive_reopen_scenario(
             &mut state,
             &workdir,
@@ -19921,13 +20091,17 @@ inference:
                 artifact: "mock-driver".to_string(),
                 config: None,
             }),
-            max_turns: scenario.max_turns,
+            max_turns: Some(scenario.max_turns),
             ..task_io_inference_config()
         };
 
         let mut hooks = reopen_scenario_hooks(&state, &workdir, scenario.reopen_limit).await;
-        let run_config =
-            reopen_scenario_run_config(scenario.context_window, Some(conversation_root), None);
+        let run_config = reopen_scenario_run_config(
+            &inference,
+            scenario.context_window,
+            Some(conversation_root),
+            None,
+        );
         drive_reopen_scenario(
             &mut state,
             &workdir,
@@ -20127,6 +20301,7 @@ inference:
             compaction_system_prompt: None,
             compaction_dump_summaries: false,
             max_output_tokens: 1024,
+            choices: crate::driver_choice::DriverChoices::declared(&inference, &HashMap::new()),
             control: None,
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
@@ -20194,7 +20369,7 @@ inference:
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
-            max_turns: 10,
+            max_turns: Some(10),
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
@@ -20732,6 +20907,7 @@ inference:
             driver_name: "mock-driver".to_string(),
             driver_component: driver,
             model: "test-model".to_string(),
+            output_caps: crate::model_limits::HookOutputCaps::new(Default::default(), 1024),
             engine: state.engine.clone(),
             accessible_workdir: workdir.clone(),
             workdir: crate::workdir_fs::WorkdirRoot::open(&workdir.clone()).unwrap(),
@@ -20753,7 +20929,7 @@ inference:
                 artifact: "mock-driver".to_string(),
                 config: None,
             }),
-            max_turns: 2,
+            max_turns: Some(2),
             ..task_io_inference_config()
         };
         let run = drive_reopen_scenario(
@@ -20761,7 +20937,7 @@ inference:
             &workdir,
             &inference,
             0,
-            reopen_scenario_run_config(0, None, None),
+            reopen_scenario_run_config(&inference, 0, None, None),
             &mut hooks,
             ConversationMode::Stateless,
             None,
@@ -22366,7 +22542,7 @@ inference:
         state.process_driver = Some(staged_fixture_driver(&state.engine, harness));
         setup(&mut state);
         let mut hooks = reopen_scenario_hooks(&state, &planted.workdir, reopen_limit).await;
-        let run_config = reopen_scenario_run_config(0, None, None);
+        let run_config = reopen_scenario_run_config(&inference, 0, None, None);
         drive_reopen_scenario(
             &mut state,
             &planted.workdir,
@@ -22402,12 +22578,16 @@ inference:
                 artifact: "mock-driver".to_string(),
                 config: None,
             }),
-            max_turns: 5,
+            max_turns: Some(5),
             ..task_io_inference_config()
         };
         let mut hooks = reopen_scenario_hooks(&state, &planted.workdir, 0).await;
-        let run_config =
-            reopen_scenario_run_config(0, Some(planted.dir.path().join("conversations")), None);
+        let run_config = reopen_scenario_run_config(
+            &inference,
+            0,
+            Some(planted.dir.path().join("conversations")),
+            None,
+        );
         drive_reopen_scenario(
             &mut state,
             &planted.workdir,

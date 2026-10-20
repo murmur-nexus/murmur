@@ -171,10 +171,11 @@ pub(super) struct ProcessEventSink<'a> {
     /// The session's records directory, where every hook fault this run raises is logged.
     records_root: WorkdirRoot,
     /// This attempt's remaining turn budget, already net of the turns earlier attempts spent.
-    max_turns: u32,
+    /// `None` refuses no turn.
+    max_turns: Option<u32>,
     /// The task-wide ceiling, `inference.max_turns` as declared, which a run that opens one turn
     /// too many names.
-    task_max_turns: u32,
+    task_max_turns: Option<u32>,
     /// How many turns have opened in this run.
     turns: u32,
     /// The task-wide number this run's first turn takes: the agent-loop turns earlier attempts of
@@ -234,8 +235,8 @@ impl<'a> ProcessEventSink<'a> {
     pub(super) fn new(
         workdir: &WorkdirRoot,
         records_root: &WorkdirRoot,
-        max_turns: u32,
-        task_max_turns: u32,
+        max_turns: Option<u32>,
+        task_max_turns: Option<u32>,
         first_turn: u32,
         session: RunSession,
         spend: Arc<SpendMeter>,
@@ -634,11 +635,12 @@ impl<'a> ProcessEventSink<'a> {
             return None;
         }
         self.turns += 1;
-        if self.turns > self.max_turns {
+        if let Some(max_turns) = self.max_turns.filter(|max_turns| self.turns > *max_turns) {
+            let ceiling = self.task_max_turns.unwrap_or(max_turns);
             let message = turn_budget_exceeded_message(
                 self.first_turn + self.turns - 1,
-                self.task_max_turns,
-                self.task_max_turns.saturating_sub(self.max_turns),
+                ceiling,
+                ceiling.saturating_sub(max_turns),
             );
             let _ = trace
                 .write_harness_failed("max-turns", &message, "runtime")
@@ -950,10 +952,10 @@ mod tests {
     struct Harness {
         _dir: tempfile::TempDir,
         workdir: PathBuf,
-        max_turns: u32,
+        max_turns: Option<u32>,
         /// The task-wide ceiling the sink names; [`Self::max_turns`] unless a test continues a
         /// task.
-        task_max_turns: u32,
+        task_max_turns: Option<u32>,
         /// The task-wide number the sink's first turn takes; 0 unless a test continues a task.
         first_turn: u32,
         /// The session policy and plan this harness runs under. Held rather than the `RunSession`
@@ -1001,7 +1003,14 @@ mod tests {
 
         /// The same harness, under a task-wide `inference.max_turns` of `ceiling`.
         fn under_ceiling(mut self, ceiling: u32) -> Self {
-            self.task_max_turns = ceiling;
+            self.task_max_turns = Some(ceiling);
+            self
+        }
+
+        /// The same harness, with no `inference.max_turns`.
+        fn uncapped(mut self) -> Self {
+            self.max_turns = None;
+            self.task_max_turns = None;
             self
         }
 
@@ -1091,8 +1100,8 @@ mod tests {
             Self {
                 _dir: dir,
                 workdir: workdir.clone(),
-                max_turns,
-                task_max_turns: max_turns,
+                max_turns: Some(max_turns),
+                task_max_turns: Some(max_turns),
                 first_turn: 0,
                 policy,
                 plan,
@@ -1588,6 +1597,28 @@ mod tests {
         let failed = h.of_type("harness_failed").await;
         assert_eq!(failed[0]["kind"], "max-turns");
         assert_eq!(failed[0]["source"], "runtime");
+    }
+
+    /// With no `inference.max_turns`, the sink opens every turn the harness reports.
+    #[tokio::test]
+    async fn no_turn_cap_refuses_no_turn() {
+        let mut h = Harness::new(1).await.uncapped();
+        let mut events = Vec::new();
+        for call in 0..12 {
+            let id = format!("c{call}");
+            events.push(tool_call(&id, "t"));
+            events.push(tool_result(&id, false));
+        }
+        events.push(text("the last turn"));
+        let outcome = h.feed(events).await;
+        assert!(
+            !matches!(outcome, SinkOutcome::TurnBudgetExceeded(_)),
+            "an uncapped run refuses no turn"
+        );
+        // Each turn is written when the next one opens; the thirteenth is still open.
+        assert_eq!(h.of_type("inference").await.len(), 12);
+        assert_eq!(h.turn, 12);
+        assert!(h.of_type("harness_failed").await.is_empty());
     }
 
     /// A continued attempt that opens a turn past its budget names that turn as `mur trace show`

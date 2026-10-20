@@ -127,7 +127,8 @@ pub fn publish_driver(registry_root: &Path, name: &str, version: &str, wasm_path
         zip.write_all(
             format!(
                 "name: {}\nversion: {version}\nruntime: driver\n\
-                 upstream_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n",
+                 upstream_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n\
+                 models:\n  test-model:\n    max_output_tokens: 8192\n    context_window: 1000000\n",
                 murmur_artifact::tool_name_of(name)
             )
             .as_bytes(),

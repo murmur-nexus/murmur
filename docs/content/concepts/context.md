@@ -5,8 +5,10 @@ automatically condenses the message history so the session can continue without 
 hard limit:
 
 1. The runtime tracks `session_tokens` on every turn.
-2. After each driver response, it checks whether `session_tokens / context.max_tokens` has
-   crossed `inference.compaction.threshold`.
+2. After each driver response, it checks whether `session_tokens` over the context window of the
+   driver choice that served the call has crossed `inference.compaction.threshold`. The window is
+   [`context.max_tokens`](../reference/manifest.md#field-context), or the `context_window` the
+   driver's [`models:`](../reference/manifest.md#driver-models) table declares for the model.
 3. Once crossed, the runtime fires the `on-compaction` lifecycle event with the full message
    history. The runtime picks the compaction hook by binding, so you configure no artifact name
    anywhere — any hook bound to `on-compaction` receives the event. `murmur/hook-compact` is the
@@ -29,7 +31,7 @@ failed:
 A hook error is fatal because there is no fallback compactor behind a declared compaction hook, and
 another turn would run on a context already known to be over budget. No further turns run.
 
-Compaction requires both `context.max_tokens` to be set and a hook bound to `on-compaction` to be
+Compaction requires both a context window and a hook bound to `on-compaction` to be
 staged — see [Enable context compaction](../how-to/context-compaction.md) for the full
 configuration and protocol.
 
@@ -66,10 +68,10 @@ reasoning on that turn is its driver's to accommodate.
 
 **Token counts are an estimate, and a switch makes them a worse one.** Context occupancy, the
 compaction trigger and the spend admission all count the request with one tokenizer (`cl100k`),
-whatever the provider. After a switch they count against a model whose tokenizer and context
-window may differ more from that estimate. There is no per-model window: `context.max_tokens` and
-`inference.max_tokens` are one number each for the session, and must suit every declared model.
-Each turn's `inference` line in `trace.jsonl` names the choice that served it, beside the
+whatever the provider. After a switch they count against a model whose tokenizer may differ more
+from that estimate. Each choice has its own [output cap and context window](../reference/manifest.md#inference-max-tokens),
+resolved at launch, and the compaction trigger measures against the window of the choice that
+served the turn. Each turn's `inference` line in `trace.jsonl` names the choice that served it, beside the
 provider's own counts in `input_tokens_actual` and `output_tokens_actual`, so the gap between the
 estimate and each model's own count is visible per model.
 

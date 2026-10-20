@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use murmur_artifact::{ArtifactRuntime, ContextConfig, InferenceConfig, PACKED_MANIFEST_ENTRY};
+use murmur_artifact::{ArtifactRuntime, InferenceConfig, PACKED_MANIFEST_ENTRY};
 use serde_yaml::Value;
 
 use crate::{
@@ -67,14 +67,15 @@ pub(crate) fn sanitize_description(raw: &str) -> String {
 ///
 /// Called from launch_session after port binding so all four identity values are known.
 /// `formation` is the session's own membership: `Some` adds its roster name and formation id to
-/// the Identity section, `None` leaves the section as a standalone capsule's.
+/// the Identity section, `None` leaves the section as a standalone capsule's. `context_window` is
+/// the primary driver choice's, `None` when it has none.
 /// Failure is non-fatal: we log a warning and continue.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_murmur_md(
     runtime_root: &WorkdirRoot,
     accessible_workdir: &Path,
     inference: Option<&InferenceConfig>,
-    context: Option<&ContextConfig>,
+    context_window: Option<u32>,
     compaction_hook_registered: bool,
     capability_policy: &CapabilityPolicy,
     identity: &CapsuleIdentity,
@@ -85,7 +86,7 @@ pub(crate) fn write_murmur_md(
         runtime_root,
         accessible_workdir,
         inference,
-        context,
+        context_window,
         compaction_hook_registered,
         capability_policy,
         identity,
@@ -102,7 +103,7 @@ fn generate_murmur_md(
     runtime_root: &WorkdirRoot,
     accessible_workdir: &Path,
     inference: Option<&InferenceConfig>,
-    context: Option<&ContextConfig>,
+    context_window: Option<u32>,
     compaction_hook_registered: bool,
     capability_policy: &CapabilityPolicy,
     identity: &CapsuleIdentity,
@@ -115,20 +116,19 @@ fn generate_murmur_md(
         .map(|i| i.model.as_str())
         .unwrap_or("not configured");
 
-    let max_tokens_display = context
-        .and_then(|c| c.max_tokens)
+    let max_tokens_display = context_window
         .map(|n| n.to_string())
         .unwrap_or_else(|| "not set".to_string());
 
-    // Compaction is dispatched by lifecycle binding, not by artifact name: it fires when
-    // `context.max_tokens` is set AND at least one hook is bound to `on-compaction`. Report the
-    // same two conditions the runtime actually gates on rather than probing for a tool directory.
-    let compaction_status =
-        if context.and_then(|c| c.max_tokens).is_some() && compaction_hook_registered {
-            "compaction configured"
-        } else {
-            "compaction not configured"
-        };
+    // Compaction is dispatched by lifecycle binding, not by artifact name: it fires when the
+    // primary choice has a context window AND at least one hook is bound to `on-compaction`.
+    // Report the same two conditions the runtime actually gates on rather than probing for a tool
+    // directory.
+    let compaction_status = if context_window.is_some() && compaction_hook_registered {
+        "compaction configured"
+    } else {
+        "compaction not configured"
+    };
 
     let system_prompt_artifact = inference.and_then(|i| i.system_prompt_artifact.as_deref());
 
@@ -546,7 +546,7 @@ mod tests {
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
-            max_turns: 10,
+            max_turns: Some(10),
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
@@ -570,19 +570,12 @@ mod tests {
     fn shows_context_budget_when_set() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
-        let context = ContextConfig {
-            max_tokens: Some(200_000),
-            record: true,
-            record_store: None,
-            seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
-            seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
-            retain: None,
-        };
+        let context_window = Some(200_000);
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
             std::path::Path::new("/work"),
             None,
-            Some(&context),
+            context_window,
             false,
             &CapabilityPolicy::default(),
             &test_identity(),
@@ -596,19 +589,12 @@ mod tests {
     fn compaction_configured_when_hook_registered_and_max_tokens_set() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
-        let context = ContextConfig {
-            max_tokens: Some(100_000),
-            record: true,
-            record_store: None,
-            seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
-            seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
-            retain: None,
-        };
+        let context_window = Some(100_000);
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
             std::path::Path::new("/work"),
             None,
-            Some(&context),
+            context_window,
             true,
             &CapabilityPolicy::default(),
             &test_identity(),
@@ -622,19 +608,12 @@ mod tests {
     fn compaction_not_configured_when_max_tokens_set_but_no_hook() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
-        let context = ContextConfig {
-            max_tokens: Some(100_000),
-            record: true,
-            record_store: None,
-            seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
-            seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
-            retain: None,
-        };
+        let context_window = Some(100_000);
         let content = generate_murmur_md(
             &WorkdirRoot::open(tmp.path()).unwrap(),
             std::path::Path::new("/work"),
             None,
-            Some(&context),
+            context_window,
             false,
             &CapabilityPolicy::default(),
             &test_identity(),
@@ -948,7 +927,7 @@ mod tests {
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: Some("sys-skill".to_string()),
-            max_turns: 10,
+            max_turns: Some(10),
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,

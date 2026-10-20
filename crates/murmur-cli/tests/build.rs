@@ -245,6 +245,102 @@ fn a_retired_auth_block_fails_the_build_with_no_artifact_written() {
     assert!(artifact.exists());
 }
 
+/// Builds the source in `dir` to `dir/out.mur.zip`.
+fn build_in(dir: &Path) -> assert_cmd::assert::Assert {
+    Command::cargo_bin("mur")
+        .unwrap()
+        .args([
+            "build",
+            dir.to_str().unwrap(),
+            "--output",
+            dir.join("out.mur.zip").to_str().unwrap(),
+        ])
+        .assert()
+}
+
+/// A driver manifest with `models` as written, packing one `driver.wasm`.
+fn models_driver_manifest(runtime: &str, models: &str) -> String {
+    format!(
+        "name: model-driver\nversion: 0.1.0\nruntime: {runtime}\nrequires_files:\n  - driver.wasm\n\
+         {models}"
+    )
+}
+
+/// Every malformed `models:` table, and one on an artifact that is not a driver, is refused before
+/// anything is written, naming the field.
+#[test]
+fn models_malformed_tables_fail_the_build_naming_the_field() {
+    let entry = |body: &str| format!("models:\n  glm-5.3:\n{body}");
+    for (runtime, models, field) in [
+        ("driver", "models: [glm-5.3]\n".to_string(), "'models'"),
+        (
+            "driver",
+            entry("    max_output_tokens: 131072\n"),
+            "'models.glm-5.3.context_window'",
+        ),
+        (
+            "driver",
+            entry("    max_output_tokens: 0\n    context_window: 200000\n"),
+            "'models.glm-5.3.max_output_tokens'",
+        ),
+        (
+            "driver",
+            entry("    max_output_tokens: 1\n    context_window: 2\n    tokenizer: x\n"),
+            "'models.glm-5.3.tokenizer'",
+        ),
+        (
+            "driver",
+            "models:\n  \"\":\n    max_output_tokens: 1\n    context_window: 2\n".to_string(),
+            "'models' has an empty model id",
+        ),
+        (
+            "tool",
+            entry("    max_output_tokens: 1\n    context_window: 2\n"),
+            "'models' is only valid on an artifact whose runtime is driver",
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("murmur.yaml"),
+            models_driver_manifest(runtime, &models),
+        )
+        .unwrap();
+        fs::write(dir.path().join("driver.wasm"), b"\0asm").unwrap();
+        build_in(dir.path()).failure().stderr(
+            predicate::str::contains("error[E-BLD-005]:")
+                .and(predicate::str::contains(field))
+                .and(predicate::str::contains(
+                    "hint: models: is a driver's table",
+                )),
+        );
+        assert!(!dir.path().join("out.mur.zip").exists(), "{models}");
+    }
+}
+
+/// A well-formed `models:` table builds, and the manifest is packed byte for byte.
+#[test]
+fn models_a_good_table_builds_and_is_packed_byte_for_byte() {
+    let dir = tempdir().unwrap();
+    let manifest = models_driver_manifest(
+        "driver",
+        "# limits for each model this driver serves\nmodels:\n  glm-5.3:\n    \
+         max_output_tokens: 131072\n    context_window: 200000\n",
+    );
+    fs::write(dir.path().join("murmur.yaml"), &manifest).unwrap();
+    fs::write(dir.path().join("driver.wasm"), b"\0asm").unwrap();
+    build_in(dir.path()).success();
+
+    let mut archive =
+        ZipArchive::new(fs::File::open(dir.path().join("out.mur.zip")).unwrap()).unwrap();
+    let mut packed = String::new();
+    archive
+        .by_name("murmur.yaml")
+        .unwrap()
+        .read_to_string(&mut packed)
+        .unwrap();
+    assert_eq!(packed, manifest);
+}
+
 #[test]
 fn an_invalid_artifact_name_fails_the_build() {
     let dir = tempdir().unwrap();

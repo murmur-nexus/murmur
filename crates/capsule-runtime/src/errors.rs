@@ -578,6 +578,11 @@ pub enum RuntimeError {
         reason: Option<String>,
     },
 
+    /// A driver choice under `transport: http` has no output cap, or its driver ships a malformed
+    /// `models:` table. Refused at staging, before any request leaves.
+    #[error(transparent)]
+    ModelLimits(#[from] crate::model_limits::ModelLimitsError),
+
     /// A `gateway:` block is declared on a `runtime: tool` entry whose artifact ships a native
     /// implementation. A native tool's requests leave through the egress proxy and never pass the
     /// credential gateway, so the key could never be attached. Refused at staging.

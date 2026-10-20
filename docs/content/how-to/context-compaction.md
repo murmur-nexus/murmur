@@ -6,8 +6,8 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [context.max_tokens](../reference/manifest.md#field-context) | Token budget for the session; required to enable compaction |
-| [inference.compaction.threshold](../reference/manifest.md#field-inference) | Fraction of `context.max_tokens` that triggers compaction |
+| [context.max_tokens](../reference/manifest.md#field-context) | The context window compaction measures against; default: the window the driver's `models:` table declares for the model |
+| [inference.compaction.threshold](../reference/manifest.md#field-inference) | Fraction of the context window that triggers compaction |
 | [inference.compaction.model](../reference/manifest.md#field-inference) | Model used for the compaction call (optional override) |
 | [inference.compaction.system_prompt](../reference/manifest.md#field-inference) | System prompt override for the compaction call (optional; hook picks its own default when unset) |
 | [inference.compaction.system_prompt_file](../reference/manifest.md#field-inference) | Same override, loaded from a file next to the manifest (optional; mutually exclusive with `system_prompt`) |
@@ -17,7 +17,7 @@ The relevant manifest options are:
 
 ## Step 1 — create murmur.yaml with context.max_tokens and the compaction artifact
 
-Compaction requires two things: `context.max_tokens` set to match your model's actual context window, and `murmur/hook-compact` declared as a hook artifact. Create a `murmur.yaml` file:
+Compaction requires two things: a context window, and `murmur/hook-compact` declared as a hook artifact. The window is the one the driver's [`models:`](../reference/manifest.md#driver-models) table declares for the model; setting `context.max_tokens` overrides it, and gives a window to a model the table does not list. Create a `murmur.yaml` file:
 
 === "Anthropic"
 
@@ -100,7 +100,7 @@ Compaction requires two things: `context.max_tokens` set to match your model's a
         artifact: murmur/driver-deepseek
     ```
 
-`context.max_tokens` is a manifest value — the runtime does not query the API to discover the context window. Use the number from your model's documentation; most current frontier models support between 400,000 and 1,000,000 tokens.
+Set `context.max_tokens` from your model's documentation when the driver does not list the model; most current frontier models support between 400,000 and 1,000,000 tokens. [`mur doctor`](../reference/cli.md#mur-doctor) prints the window each driver choice resolves to and where it came from.
 
 Using `runtime: hook` ensures the model never sees `murmur/hook-compact` as a callable tool — the runtime invokes it directly at fixed lifecycle points.
 
@@ -108,7 +108,7 @@ Using `runtime: hook` ensures the model never sees `murmur/hook-compact` as a ca
 
 ## Step 2 — install dependencies
 
-Both `context.max_tokens` and the compaction hook must be present for compaction to activate. Either one alone is not enough.
+Both a context window and the compaction hook must be present for compaction to activate. Either one alone is not enough.
 
 ```bash
 mur install
@@ -128,7 +128,7 @@ Compaction is not built into the Murmur runtime — it is externalized as an art
 
 ## Step 3 — set the compaction threshold
 
-The threshold controls when compaction fires. It is a fraction of `context.max_tokens`. The default is `0.98` — compaction fires when the session has consumed 98% of the token budget.
+The threshold controls when compaction fires. It is a fraction of the context window. The default is `0.98` — compaction fires when the session has consumed 98% of the token budget.
 
 For long-running tasks where you want compaction to kick in earlier and leave headroom for recovery, add `compaction.threshold` under `inference`:
 
@@ -168,7 +168,7 @@ For long-running tasks where you want compaction to kick in earlier and leave he
         threshold: 0.85
     ```
 
-With `threshold: 0.85`, compaction fires when the session has consumed 85% of `context.max_tokens`.
+With `threshold: 0.85`, compaction fires when the session has consumed 85% of the context window.
 
 To use a smaller, faster model for compaction calls (saving cost while keeping your primary model for inference):
 
@@ -237,13 +237,13 @@ At startup the runtime writes a generated `MURMUR.md` into the session's [runtim
 grep "Context budget" ~/.murmur/sessions/<session_id>/runtime/MURMUR.md
 ```
 
-When both `context.max_tokens` and a hook bound to `on-compaction` are staged, the status reads `compaction configured`:
+When the primary choice has a context window and a hook bound to `on-compaction` is staged, the status reads `compaction configured`:
 
 ```text
 - Context budget: 1000000 tokens (compaction configured)
 ```
 
-If either is missing — `context.max_tokens` is unset, or no `on-compaction` hook is staged — it reads `compaction not configured`:
+If either is missing — no window, or no `on-compaction` hook staged — it reads `compaction not configured`:
 
 ```text
 - Context budget: 1000000 tokens (compaction not configured)
@@ -358,7 +358,7 @@ compaction.
 
 | Manifest setting | Effect |
 |---|---|
-| `context.max_tokens: N` | Sets the token budget; required to enable compaction |
+| `context.max_tokens: N` | Sets the context window, over the driver's `models:` entry |
 | `murmur/hook-compact` with `runtime: hook` (or any hook bound to `on-compaction`) | Provides the compaction hook; required to enable compaction |
 | `inference.compaction.threshold: 0.85` | Compaction fires when session tokens reach 85% of the budget |
 | `inference.compaction.model: claude-haiku-4-5` | Uses a different (typically cheaper) model for compaction calls |

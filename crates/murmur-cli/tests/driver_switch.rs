@@ -66,6 +66,11 @@ struct Home {
 
 impl Home {
     fn new() -> Arc<Self> {
+        Self::with_openai_models(common::FIXTURE_DRIVER_MODELS)
+    }
+
+    /// Both drivers, the openai one declaring `models` as its `models:` table.
+    fn with_openai_models(models: &str) -> Arc<Self> {
         let dir = TempDir::new().unwrap();
         let artifacts = TempDir::new().unwrap();
         let anthropic = common::create_driver_artifact(
@@ -80,7 +85,7 @@ impl Home {
             OPENAI,
             VERSION,
             &common::fixture_path("drivers/openai/driver/murmur-driver-openai.wasm"),
-            BEARER_AUTH,
+            &format!("{BEARER_AUTH}{models}"),
         );
         common::publish_local(&dir, &openai).success();
         Arc::new(Self {
@@ -193,6 +198,8 @@ struct Spec<'a> {
     top: &'a str,
     /// Extra `artifacts:` entries.
     artifacts: &'a str,
+    /// Leave `inference.max_tokens` out, so each choice's cap is its driver's.
+    uncapped: bool,
 }
 
 fn project(anthropic: &str, spec: Spec<'_>) -> Project {
@@ -221,9 +228,16 @@ fn project(anthropic: &str, spec: Spec<'_>) -> Project {
         format!(
             "name: {CAPSULE}\nversion: 0.1.0\nartifacts:\n  - name: {ANTHROPIC}\n    version: \
              {VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {anthropic}\n      \
-             api_key: {A_KEY}\n{openai}{}inference:\n  transport: http\n  model: {SONNET}\n  \
-             max_tokens: 4096\n  driver:\n    artifact: {ANTHROPIC}\n{}{alternates}{}",
-            spec.artifacts, spec.inference_extra, spec.top
+             api_key: {A_KEY}\n{openai}{}inference:\n  transport: http\n  model: {SONNET}\n\
+             {}  driver:\n    artifact: {ANTHROPIC}\n{}{alternates}{}",
+            spec.artifacts,
+            if spec.uncapped {
+                ""
+            } else {
+                "  max_tokens: 4096\n"
+            },
+            spec.inference_extra,
+            spec.top
         ),
     )
     .unwrap();
@@ -869,8 +883,8 @@ fn s3_an_alternate_whose_credential_is_missing_at_launch_is_staged_unavailable()
     assert_eq!(
         of_type(&events, "session_start")[0]["inference_choices"],
         json!([
-            {"name": "primary", "driver": ANTHROPIC, "model": SONNET, "credential_source": "manifest", "available": true},
-            {"name": "gpt", "driver": OPENAI, "model": GPT, "credential_source": "none", "available": false},
+            {"name": "primary", "driver": ANTHROPIC, "model": SONNET, "credential_source": "manifest", "available": true, "model_limits": {"max_output_tokens": 4096, "max_output_tokens_source": "manifest", "context_window": 1_000_000, "context_window_source": "driver"}},
+            {"name": "gpt", "driver": OPENAI, "model": GPT, "credential_source": "none", "available": false, "model_limits": {"max_output_tokens": 4096, "max_output_tokens_source": "manifest", "context_window": 1_000_000, "context_window_source": "driver"}},
         ])
     );
     let show = mur_control(home.path(), &["show"], None);
@@ -1022,6 +1036,99 @@ fn s5_the_agent_switches_itself_with_the_grant() {
         "{}",
         show.context()
     );
+}
+
+/// With no `inference.max_tokens`, each choice runs on its own driver's ceiling for its model:
+/// `session_start` lists each choice's limits, and the call after the switch carries the
+/// alternate's cap. An alternate whose driver lists no limits for its model refuses the launch.
+#[test]
+fn limits_follow_the_choice() {
+    const GPT_CAP: u32 = 32_000;
+    let home = Home::with_openai_models(&format!(
+        "models:\n  {GPT}:\n    max_output_tokens: {GPT_CAP}\n    context_window: 400000\n"
+    ));
+    let a = RecordingUpstream::with_handler(|_, _| {
+        anthropic_tool("toolu_s7", "switch-driver", json!({"driver": "gpt"}))
+    });
+    let b = RecordingUpstream::with_handler(|_, _| openai_text("answered-by-gpt"));
+    let spec = |a: &str, b: &str| {
+        project(
+            a,
+            Spec {
+                openai: Some(b),
+                alternates: GPT_ALTERNATE,
+                top: AGENT,
+                uncapped: true,
+                ..Spec::default()
+            },
+        )
+    };
+    let run = run_task(&home, &spec(&a.endpoint, &b.endpoint));
+    assert!(run.stdout.contains("status:  ok"), "{}", run.context());
+    assert!(!run.holds("W-RUN-009"), "{}", run.context());
+
+    let a_requests = a.requests();
+    assert_eq!(a_requests.len(), 1);
+    assert_eq!(
+        body(&a_requests[0])["max_tokens"],
+        common::FIXTURE_MAX_OUTPUT_TOKENS
+    );
+    let b_requests = b.requests();
+    assert_eq!(b_requests.len(), 1);
+    assert_eq!(body(&b_requests[0])["max_output_tokens"], GPT_CAP);
+
+    let events = trace_events(&common::parse_records_from_stdout(&run.stdout));
+    let start = of_type(&events, "session_start")[0];
+    let limits = |cap: u32, window: u32| {
+        json!({
+            "max_output_tokens": cap,
+            "max_output_tokens_source": "driver",
+            "context_window": window,
+            "context_window_source": "driver",
+        })
+    };
+    assert_eq!(
+        start["model_limits"],
+        limits(
+            common::FIXTURE_MAX_OUTPUT_TOKENS,
+            common::FIXTURE_CONTEXT_WINDOW
+        )
+    );
+    let choices: Vec<(&str, &Value)> = start["inference_choices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|choice| (choice["name"].as_str().unwrap(), &choice["model_limits"]))
+        .collect();
+    assert_eq!(
+        choices,
+        vec![
+            (
+                "primary",
+                &limits(
+                    common::FIXTURE_MAX_OUTPUT_TOKENS,
+                    common::FIXTURE_CONTEXT_WINDOW
+                )
+            ),
+            ("gpt", &limits(GPT_CAP, 400_000)),
+        ]
+    );
+
+    let unlisted = Home::with_openai_models("");
+    let a = RecordingUpstream::with_handler(|_, _| anthropic_text("never sent"));
+    let b = RecordingUpstream::with_handler(|_, _| openai_text("never sent"));
+    let refused = run_task(&unlisted, &spec(&a.endpoint, &b.endpoint));
+    assert!(!refused.ok, "{}", refused.context());
+    assert!(
+        refused.stderr.contains(
+            "error[E-RUN-052]: driver choice 'gpt' has no output cap: driver \
+             local/murmur-driver-openai@0.1.0 declares no limits for model 'gpt-5' and the \
+             manifest sets no inference.max_tokens"
+        ),
+        "{}",
+        refused.context()
+    );
+    assert!(a.requests().is_empty() && b.requests().is_empty());
 }
 
 /// The agent asking for a name that is not declared gets a tool error, the trace records the
@@ -1321,8 +1428,8 @@ fn s8_an_alternates_gateway_is_metered_and_admitted_against_the_ceiling() {
     assert_eq!(
         start["inference_choices"],
         json!([
-            {"name": "primary", "driver": ANTHROPIC, "model": SONNET, "credential_source": "manifest", "available": true},
-            {"name": "gpt", "driver": OPENAI, "model": GPT, "credential_source": "manifest", "available": true},
+            {"name": "primary", "driver": ANTHROPIC, "model": SONNET, "credential_source": "manifest", "available": true, "model_limits": {"max_output_tokens": 4096, "max_output_tokens_source": "manifest", "context_window": 1_000_000, "context_window_source": "driver"}},
+            {"name": "gpt", "driver": OPENAI, "model": GPT, "credential_source": "manifest", "available": true, "model_limits": {"max_output_tokens": 4096, "max_output_tokens_source": "manifest", "context_window": 1_000_000, "context_window_source": "driver"}},
         ])
     );
     assert_eq!(of_type(&events, "spend_ceiling_reached").len(), 1);

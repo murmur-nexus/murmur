@@ -43,14 +43,20 @@
 //! `MURMUR_INFERENCE_*` as tools and hooks see it names the primary for the whole session. A
 //! driver-choice dispatch sets `MURMUR_INFERENCE_ENDPOINT`, `MURMUR_INFERENCE_MODEL` and
 //! `MURMUR_INFERENCE_DRIVER` in that driver's store to the choice's own values.
-//! `inference.driver.config` applies to every declared driver. `inference.max_tokens` and
-//! `context.max_tokens` are one number each for the session and must suit every declared model.
+//! `inference.driver.config` applies to every declared driver.
+//!
+//! **Each choice's limits.** Every choice carries the output cap and context window
+//! [`crate::model_limits`] resolved for its model at launch, and an agent-loop call uses the
+//! selected choice's: its `max_tokens`, and the window its compaction trigger measures against.
+//! `inference.max_tokens` and `context.max_tokens`, when set, are that cap and window for every
+//! choice. A controller's change to `inference.max_tokens` is the cap of every later call,
+//! whatever the choice.
 //!
 //! **Token accounting is an estimate.** Occupancy, the compaction trigger and spend admission count
 //! cl100k over the serialized payload for every provider, and after a switch they count it against
-//! a model whose tokenizer and window may differ more. No per-model window exists. The provider's
-//! own counts arrive in `input_tokens_actual` and `output_tokens_actual`, and each agent-loop
-//! `inference` event names its choice, so the divergence is visible per model.
+//! a model whose tokenizer may differ more. The provider's own counts arrive in
+//! `input_tokens_actual` and `output_tokens_actual`, and each agent-loop `inference` event names
+//! its choice, so the divergence is visible per model.
 //!
 //! **The agent's grant.** `control.agent_settings: [inference.driver]` writes the runtime-provided
 //! `switch-driver` tool, and the grant is the tool's existence. The runtime answers the call
@@ -68,6 +74,8 @@ use std::collections::HashMap;
 
 use murmur_artifact::{InferenceConfig, PRIMARY_DRIVER_CHOICE};
 use serde_json::{json, Value};
+
+use crate::model_limits::{ChoiceModelLimits, ResolvedModelLimits};
 
 /// One named pair of a driver artifact and a model, and whether its credential could be staged.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +98,9 @@ pub(crate) struct DriverChoice {
     pub(crate) injected_secret: Option<String>,
     /// The credential name that could not be resolved at launch, for a choice staged unavailable.
     pub(crate) unresolved_credential: Option<String>,
+    /// The output cap and context window in force for this choice. `None` under
+    /// `transport: process`, which resolves none.
+    pub(crate) limits: Option<ResolvedModelLimits>,
 }
 
 impl DriverChoice {
@@ -133,6 +144,7 @@ impl DriverChoices {
             credential_source: "none",
             injected_secret: None,
             unresolved_credential: None,
+            limits: None,
         };
         let alternates = inference.alternates.iter().map(|alternate| DriverChoice {
             name: alternate.name.clone(),
@@ -142,6 +154,7 @@ impl DriverChoices {
             credential_source: "none",
             injected_secret: None,
             unresolved_credential: None,
+            limits: None,
         });
         Self {
             choices: std::iter::once(primary).chain(alternates).collect(),
@@ -165,6 +178,17 @@ impl DriverChoices {
             choice.credential_source = credential_source;
             choice.injected_secret = injected_secret.map(str::to_string);
             choice.unresolved_credential = unresolved_credential.map(str::to_string);
+        }
+    }
+
+    /// Records each choice's limits as [`crate::model_limits::resolve_model_limits`] resolved
+    /// them, matched by choice name.
+    pub(crate) fn record_limits(&mut self, resolved: &[ChoiceModelLimits]) {
+        for choice in &mut self.choices {
+            choice.limits = resolved
+                .iter()
+                .find(|entry| entry.choice == choice.name)
+                .map(|entry| entry.limits);
         }
     }
 
@@ -238,7 +262,7 @@ mod tests {
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
-            max_turns: 10,
+            max_turns: Some(10),
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: ToolRefresh::Compaction,

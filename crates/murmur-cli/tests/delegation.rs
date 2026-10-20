@@ -354,8 +354,9 @@ fn publish_driver(registry_root: &Path) {
         zip.write_all(
             format!(
                 "name: {}\nversion: {DRIVER_VERSION}\nruntime: driver\n\
-                 upstream_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n",
-                murmur_artifact::tool_name_of(DRIVER)
+                 upstream_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n{}",
+                murmur_artifact::tool_name_of(DRIVER),
+                common::FIXTURE_DRIVER_MODELS
             )
             .as_bytes(),
         )

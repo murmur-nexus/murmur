@@ -275,7 +275,7 @@ status:     ok
 duration:   198.5s
 
 ── Turns ────────────────────────────────────────
-count:      2  (max: 10)
+count:      2  (max: no cap)
 
 ── Tokens ───────────────────────────────────────
 input:      403  (avg 202/turn)
