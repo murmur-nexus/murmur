@@ -121,7 +121,7 @@ created is refused with [`E-IO-004`](diagnostics.md#e-io-004) before anything is
 
 | Path | Holds |
 |---|---|
-| `runtime/MURMUR.md` | The capsule's generated inventory: identity (for a formation member, also its roster name and formation id), both directories, the network allowlist, the limits, the runtime directory's entries, installed tools and skills, shell access. See [`MURMUR.md`](../concepts/session-loop.md#murmur-md). Agent sessions only. Written at staging, rewritten once the capsule's port is bound, and rewritten after every `pull-artifact` or `remove-artifact` call |
+| `runtime/MURMUR.md` | The capsule's generated inventory: identity (for a formation member, also its roster name and formation id), both directories, the network allowlist, the limits, the runtime directory's entries, installed tools and skills, shell access. See [`MURMUR.md`](../concepts/session-loop.md#murmur-md). Agent sessions only. Written at staging, rewritten once the capsule's port is bound, and rewritten after every pull or removal that commits |
 | `runtime/task.md` | The task. See [Task input](#task-input) |
 | `runtime/<manifest file>` | A copy of the manifest file the launch read — `--manifest`, or the project's `murmur.yaml` — under its own name. A capsule launched by name with `--capsule` read none and has none |
 | `runtime/tools/<name>/murmur.yaml` | A staged or pulled artifact's manifest. `<name>` is the artifact's bare name, the part of its full name after the `/`, which is also its tool name |

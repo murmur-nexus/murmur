@@ -195,7 +195,7 @@ mod tests {
         assert!(facts.read_only_paths.is_empty());
     }
 
-    /// S3: every value is the one the runtime enforces, read from the staged policy, inference
+    /// Every value is the one the runtime enforces, read from the staged policy, inference
     /// block and lifecycle.
     #[test]
     fn capsule_facts_equal_the_enforced_values() {

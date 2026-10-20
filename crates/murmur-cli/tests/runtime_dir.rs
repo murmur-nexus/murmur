@@ -871,7 +871,7 @@ fn block_of(request: &Value) -> String {
     system.split("\n\n").next().expect("a block").to_string()
 }
 
-/// S1: one manifest's block is byte-identical whichever way the task arrives — `mur run --task`,
+/// One manifest's block is byte-identical whichever way the task arrives — `mur run --task`,
 /// a `task.md` in the workdir, an A2A message — and in each the task is the first user message.
 /// The block names no `task.md`, no checkpoint and, with the plan tool granted, no plan tool.
 #[test]
@@ -1062,7 +1062,7 @@ fn md_entries(section: &str) -> Vec<(String, &str)> {
         .collect()
 }
 
-/// S7: every tool MURMUR.md names is in the session's tool list, the skill bound as system prompt
+/// Every tool MURMUR.md names is in the session's tool list, the skill bound as system prompt
 /// is named as bound and is not, and every path the document names exists.
 #[test]
 #[allow(clippy::print_stdout)]

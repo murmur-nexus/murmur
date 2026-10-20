@@ -60,8 +60,9 @@ and the installed tools. It is an inventory of the session:
 | Installed Tools, Installed Skills | Every tool in the model's tool list, under its tool name, and every skill |
 | Running Shell Commands | The binaries `capabilities.shell.allow` declares |
 
-The runtime rewrites it at launch and after every `pull-artifact` or `remove-artifact` call, so
-every tool it lists is in the model's tool list.
+The runtime rewrites it at launch and after every pull or removal that commits —
+[`pull-artifact`, `remove-artifact`](../reference/runtime-provided-tools.md#pull-artifact),
+`manage.pull` or `manage.remove` — so every tool it lists is in the model's tool list.
 
 The agent reaches the runtime directory by two names:
 

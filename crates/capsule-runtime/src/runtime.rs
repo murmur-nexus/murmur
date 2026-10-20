@@ -10763,8 +10763,6 @@ fn switch_driver_tool_manifest(choices: &crate::driver_choice::DriverChoices) ->
     native_tool_manifest_yaml(SWITCH_DRIVER_TOOL, description, schema.to_string())
 }
 
-/// A runtime-provided tool's `murmur.yaml`, built from YAML values rather than text so a
-/// description carrying a quote, a colon or a backtick cannot break it.
 /// The `murmur.yaml` staged for a skill declared with `source:`, which has no package to carry
 /// one. With no `description`, its tool description is the first line of its `skill.md`.
 fn local_skill_manifest_yaml(name: &str, version: &str) -> String {
@@ -10778,6 +10776,8 @@ fn local_skill_manifest_yaml(name: &str, version: &str) -> String {
     serde_yaml::to_string(&manifest).unwrap_or_default()
 }
 
+/// A runtime-provided tool's `murmur.yaml`, built from YAML values rather than text so a
+/// description carrying a quote, a colon or a backtick cannot break it.
 fn native_tool_manifest_yaml(name: &str, description: String, input_schema: String) -> String {
     let mut manifest = serde_yaml::Mapping::new();
     for (key, value) in [
@@ -25403,7 +25403,7 @@ mod murmur_md_tests {
         &rest[..rest.find("\n## ").unwrap()]
     }
 
-    /// S5: no install grant. The tools are the staged ones, and the tree lists what exists.
+    /// No install grant. The tools are the staged ones, and the tree lists what exists.
     #[test]
     fn murmur_md_without_an_install_grant_lists_the_staged_tools_only() {
         let content = staged_murmur_md(&bash_policy(), true);
@@ -25429,7 +25429,7 @@ mod murmur_md_tests {
         assert!(content.contains("\n## Running Shell Commands\n"));
     }
 
-    /// S6: an install grant puts both tools under `## Installed Tools` on http, with their own
+    /// An install grant puts both tools under `## Installed Tools` on http, with their own
     /// descriptions, and nothing at all on process, where the tools are not staged.
     #[test]
     fn murmur_md_with_an_install_grant_lists_the_install_tools_on_http_only() {
