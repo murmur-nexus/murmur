@@ -663,6 +663,26 @@ pub const FIXTURE_DRIVER_MODELS: &str = "models:
     context_window: 1000000
 ";
 
+/// The tool-progress fixture driver's `models:` table: it reads its model as the way to report a
+/// tool call, so each mode is a model it serves, beside every model in [`FIXTURE_DRIVER_MODELS`].
+pub fn tool_progress_driver_models() -> String {
+    let modes: String = [
+        "tool-progress",
+        "tool-progress-streaming",
+        "tool-progress-large",
+        "tool-progress-unruly",
+    ]
+    .iter()
+    .map(|mode| {
+        format!(
+            "  {mode}:\n    max_output_tokens: {FIXTURE_MAX_OUTPUT_TOKENS}\n    context_window: \
+             {FIXTURE_CONTEXT_WINDOW}\n"
+        )
+    })
+    .collect();
+    format!("{FIXTURE_DRIVER_MODELS}{modes}")
+}
+
 /// The `upstream_auth:` block [`create_driver_artifact`] packs: the provider takes the key as
 /// `x-api-key`.
 pub const FIXTURE_DRIVER_AUTH: &str = "upstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n";

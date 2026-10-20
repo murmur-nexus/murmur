@@ -565,6 +565,7 @@ fn session_start_carries_resumed_from_and_context_id() {
             "max_session_tokens",
             "max_turns",
             "model",
+            "model_limits",
             "parent_id",
             "resumed_from",
             "runtime_artifacts",
