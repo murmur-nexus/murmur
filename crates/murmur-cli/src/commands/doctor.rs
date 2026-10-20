@@ -10,7 +10,7 @@ use capsule_runtime::{
     find_on_path, has_subprocess_route_at_staging, inspect_installed_profile,
     inspect_profile_attachment, install_from_places, landlock_doctor_lines, preopen_reports,
     read_only_advisory_for, render_install, render_read_only, render_records_dir,
-    render_runtime_dir, runtime_dir_inside_warning, served_wit_level,
+    render_runtime_dir, render_temp_dir, runtime_dir_inside_warning, served_wit_level,
     undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
     warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
     warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
@@ -2130,8 +2130,8 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         }
     }
 
-    // Where the session's runtime and records directories lie and what this host's mechanism
-    // makes of them, for the floor this capsule declares and the default workdir,
+    // Where the session's runtime and records directories and its temporary folder lie and what
+    // this host's mechanism makes of them, for the floor this capsule declares and the default workdir,
     // `<manifest dir>/workdir`. A `HOME` that cannot hold them is a failed check: no launch here
     // would start.
     capsule_runtime::report_println!();
@@ -2140,6 +2140,8 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
             capsule_runtime::report_print!("{}", render_runtime_dir(&reports.runtime_dir));
             capsule_runtime::report_println!();
             capsule_runtime::report_print!("{}", render_records_dir(&reports.records_dir));
+            capsule_runtime::report_println!();
+            capsule_runtime::report_print!("{}", render_temp_dir(&reports.temp_dir));
             if reports.placement.inside_workdir {
                 capsule_runtime::report_eprintln!(
                     "[mur doctor] {}",

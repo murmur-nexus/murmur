@@ -8,7 +8,7 @@ holding the files the runtime writes for its own use.
 |---|---|---|---|
 | Accessible workdir | The directory passed to `mur run --workdir`, otherwise `<manifest-dir>/workdir/<session-id>` | The capsule's current directory — everything it writes | Read and write |
 | Session workdir | `<accessible-workdir>/.murmur/<session-id>` when `--workdir` is passed, otherwise the accessible workdir itself | The agent's results, and the `$HOME` its shell commands run under | Read and write |
-| [Records directory](#records-directory) | `~/.murmur/records/<workdir root>/<session-id>` | `trace.jsonl`, `blobs/`, `logs/`, a delegated child's `completion.json` and a scoring hook's `eval.jsonl` | Read only, where the host can enforce it. Kept after the session |
+| [Records directory](#records-directory) | `~/.murmur/records/<workdir root>/<session-id>` | `trace.jsonl`, `blobs/`, `logs/`, a delegated child's `completion.json`, a scoring hook's `eval.jsonl` and the session's temporary folder `tmp/` | Read only, where the host can enforce it, apart from `tmp/`, which they read and write. Kept after the session |
 | [Runtime directory](#runtime-directory) | `~/.murmur/sessions/<session-id>/runtime` | `MURMUR.md`, `task.md`, the manifest copy, installed tools and submitted plans | Read only, where the host can enforce it |
 
 Without `--workdir` the first two are one directory.
@@ -72,7 +72,6 @@ Under `lifecycle.task_acceptance: queue` with `lifecycle.after_task: sleep` the 
 | `out/result_<task-id>.txt` | Per-task copy of the final output, so one task does not overwrite another's: a completed task's answer, or the `canceled:` line above for a canceled one. Only under `lifecycle.conversation: threaded` |
 | `out/compaction-summaries.jsonl` | The text each committed compaction replaced the context with. See [below](#compaction-summaries) |
 | `.capsule-home` | `$HOME` for every shell command and native tool. Created on the first such call. Reached only through the variable |
-| `.mur-tmp` | Backs `/tmp` inside a `sealed` capsule's composed root. The capsule sees `/tmp`. Counted against `capabilities.resources.workdir_max_bytes` like everything else in the workdir |
 
 The capsule's commands can write these like any other file in the workdir.
 
@@ -93,8 +92,9 @@ The capsule's commands can write these like any other file in the workdir.
 
 Everything else in this directory belongs to the capsule.
 
-A `sealed` capsule adds nothing to this list: its `/tmp` store is in the session workdir and its
-synthetic `/etc` files are beside the runtime directory.
+A `sealed` capsule adds nothing to this list: its `/tmp` is the
+[session's temporary folder](containment.md#temp-folder) in the records directory, and its synthetic `/etc`
+files are beside the runtime directory.
 
 ---
 
@@ -217,7 +217,8 @@ workdir, kept after the session ends:
         ├── blobs/<sha256>
         ├── logs/bootstrap.log | otel.log | hook-<hook-name>.log
         ├── completion.json
-        └── hooks/
+        ├── hooks/
+        └── tmp/                                  0700, created at staging
 ```
 
 The **workdir root** names the group a session's directory sits in:
@@ -241,12 +242,14 @@ stays under the old path.
 | `logs/hook-<hook-name>.log` | Errors from one hook, one per line. `<hook-name>` is the bare name: `hook-grafana` for `murmur/hook-grafana` |
 | `completion.json` | How a delegated child ended: written by the child at the end of its session and by the launcher that started it, read by that launcher |
 | `hooks/` | The current directory of every hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities), read-write. `murmur/hook-eval` writes `hooks/eval.jsonl` and `hooks/logs/hook-hook-eval.log` here. Created only when such a hook is declared |
+| `tmp/` | The [session's temporary folder](containment.md#temp-folder): `/tmp` and `$TMPDIR` to the session's shell commands, plan shell steps and native tools, which read and write it. The runtime writes nothing in it. Counted with the session workdir against `capabilities.resources.workdir_max_bytes` |
 
 ### How the capsule reaches it
 
 | Reader | Where |
 |---|---|
 | A shell command, a plan's `shell` step, a native tool, a `transport: process` harness | `$MURMUR_RECORDS_DIR`, the absolute path of the session's records directory. Set by the runtime last, on `$MURMUR_RUNTIME_DIR`'s terms |
+| A shell command, a plan's `shell` step, a native tool | `tmp/`, read-write, as `$TMPDIR`, `$TMP` and `$TEMP`, and as `/tmp` where the session maps it. See [The session's temporary folder](containment.md#temp-folder) |
 | A hook declared `capabilities.filesystem.records: true` | `hooks/`, as its current directory, read-write |
 | A WASM tool, a driver, any other hook | Nothing |
 
@@ -256,7 +259,8 @@ The runtime directory's mechanisms, applied to the records directory — see
 [What protects it](#what-protects-it). A command that tries to overwrite, append to, truncate,
 remove, rename over or create a file there gets `Permission denied` under Landlock and
 `Read-only file system` inside a composed root; a hard link from it into the workdir gets
-`Invalid cross-device link`. The runtime's own writes go on for the whole session. On a host with no
+`Invalid cross-device link`. `tmp/` is the one writable path: no record can be appended to, replaced,
+moved or hard-linked into it, and `tmp/` itself cannot be renamed. The runtime's own writes go on for the whole session. On a host with no
 kernel containment, macOS included, a command can change it.
 
 A records directory inside the workdir is judged as a runtime directory inside it is — see
@@ -268,7 +272,7 @@ A records directory inside the workdir is judged as a runtime directory inside i
 |---|---|
 | Staging, after every refusal that stops a launch | The directory is created |
 | The session ends | Nothing: the directory is kept |
-| A later launch of a capsule declaring [`trace.retain`](manifest.md#trace-retain) | Each session that policy does not keep loses its records directory and its session workdir together |
+| A later launch of a capsule declaring [`trace.retain`](manifest.md#trace-retain) | Each session that policy does not keep loses its records directory, `tmp/` included, and its session workdir together. A read-only directory a command left in `tmp/` does not stop the removal |
 | An ended formation pruned by its entry member's `trace.retain` | The formation's whole records subtree goes with its formation directory |
 
 ### Reading it
@@ -291,7 +295,8 @@ Records directory
 
 Its four keys, its per-tier `commands:` reasons and its `Not protected here` statement are the
 runtime directory's. `--json` carries the object as `records_dir`, `trace.jsonl`'s `session_start`
-carries it as `effective_grants.records_dir`, and `mur doctor` prints the same block.
+carries it as `effective_grants.records_dir`, and `mur doctor` prints the same block. A
+`Temporary folder` block follows it in both; see [Reporting](containment.md#temp-folder-reporting).
 
 ---
 

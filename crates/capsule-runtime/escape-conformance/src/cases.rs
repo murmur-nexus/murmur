@@ -26,7 +26,7 @@
 //! * **`sealed`** is asserted. Its column was validated against a real composed root on
 //!   2026-08-09 — an uncontainerised `KernelSealed` host, kernel `7.0.0-28-generic`, uid 1000 —
 //!   and every value in it is now [`Expectation::Must`] of the verdict that run actually
-//!   produced, with two exceptions named below. Nothing in the column is
+//!   produced, with three exceptions named below. Nothing in the column is
 //!   [`Expectation::Documented`] any more: that variant survives for the *next* containment class
 //!   that exists but has not been measured, not for this one. The run, the four
 //!   documented-versus-actual mismatches it resolved and the two probe fixes it needed are
@@ -40,6 +40,11 @@
 //!   of independent bind mounts, so `link(2)`/`rename(2)` hit `EXDEV` at the mount boundary before
 //!   Landlock is ever consulted, for every destination reachable from the workdir. See each case's
 //!   `attribution`.
+//!
+//!   The third is `write-outside-workdir`, which targets `/var/tmp` because `/tmp` is the
+//!   session's temporary folder wherever it is mapped. That target has not been measured against
+//!   a composed root, so its `sealed` expectation is [`Expectation::NotAsserted`] until a real run
+//!   records one.
 //!
 //! # Adding a fourth containment class
 //!
@@ -225,26 +230,25 @@ def main():
     Case {
         id: "write-outside-workdir",
         category: Category::Boundary,
-        summary: "creates a file in /tmp, outside the capsule workdir",
-        attribution: "Unambiguous. /tmp is world-writable, so ordinary file permissions permit \
+        summary: "creates a file in /var/tmp, outside the capsule workdir",
+        attribution: "Unambiguous. /var/tmp is world-writable, so ordinary file permissions permit \
                       this for any uid; only kernel filesystem mediation can refuse it. Under \
                       `scoped`, a REFUSED verdict here is attributable to Landlock and nothing \
-                      else. Under `sealed`, ALLOWED is the correct, intended verdict: /tmp is a \
-                      bind mount of a directory inside the session workdir \
-                      (`sealed::SEALED_TMP_DIR_NAME`), carrying the workdir's own Landlock \
-                      rights (see 646b64ee) — the write lands at the path named in DETAIL, under \
-                      the workdir, not actually outside it. Measured ALLOWED against a real \
-                      composed root, which is why it is asserted that way here rather than \
-                      merely predicted.",
+                      else. /var/tmp rather than /tmp: on every tier that maps /tmp, a literal \
+                      /tmp path is the session's temporary folder in its records directory, \
+                      carrying the workdir's own Landlock rights, so a write there probes no \
+                      boundary at all. NOT ASSERTED AT `sealed`: the composed root reproduces \
+                      no /var/tmp, and this target has not been measured against a real \
+                      composed root, so no verdict is claimed for it there.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Must(Allowed),
+        sealed: NotAsserted,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
         body: r#"
 def main():
-    target = "/tmp/murmur-escape-conformance-%d" % os.getpid()
+    target = "/var/tmp/murmur-escape-conformance-%d" % os.getpid()
     try:
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.write(fd, b"escaped\n")
@@ -401,29 +405,25 @@ def main():
     Case {
         id: "rename-across-boundary",
         category: Category::Boundary,
-        summary: "renames a workdir file to a path in /tmp, outside the workdir",
+        summary: "renames a workdir file to a path in /var/tmp, outside the workdir",
         attribution: "EXDEV means the two paths are on different filesystems and rename(2) could \
                       never have worked here regardless of containment — recorded as \
                       INCONCLUSIVE rather than credited as a refusal. Anything else is \
                       attributable: rename is a create-class action on the destination, which \
-                      Landlock does mediate.\
+                      Landlock does mediate. /var/tmp rather than /tmp: on every tier that maps \
+                      /tmp, /tmp is the session's temporary folder, a separate mount from the \
+                      workdir, so a rename there answers EXDEV from the mount layout and probes \
+                      no boundary.\
                       NOT ASSERTED AT `sealed`, and for a different reason than `advisory`'s. \
                       `advisory` asserts nothing because the *class* has no mechanism; this case \
                       asserts nothing at `sealed` because the *case's own shape* cannot reach its \
-                      premise there. /tmp in the composed root is a bind whose source is \
-                      `workdir.join(SEALED_TMP_DIR_NAME)` — a subdirectory of this very workdir on \
-                      the host — yet the workdir bind and the /tmp bind are two different mounts \
-                      in the namespace, so rename(2) returns EXDEV even though both sides share \
-                      one host filesystem. The real run measured exactly that, and the probe \
-                      correctly reports INCONCLUSIVE. Landlock is never reached, and no other \
-                      destination changes that: /etc/*, /dev and the base root are each their own \
-                      mount too, and a path with no bind at all answers ENOENT rather than \
-                      exercising a rename boundary. A control run rules out the obvious \
-                      alternative reading — that the harness's work root merely sat on a different \
-                      block device: re-run with the work root on the *same* device as /tmp, this \
-                      case refuses for real at `scoped` (EACCES) and still reports EXDEV at \
-                      `sealed`. Encoding a `Must` here would grade the mount layout instead of \
-                      containment.",
+                      premise there. The composed root is built out of independent bind mounts — \
+                      the workdir, /tmp, /etc/*, /dev and the base root are each their own mount \
+                      — so a rename out of the workdir to any destination the root reproduces \
+                      returns EXDEV before Landlock is consulted, and a path the root does not \
+                      reproduce, /var/tmp among them, answers ENOENT rather than exercising a \
+                      rename boundary. Encoding a `Must` here would grade the mount layout instead \
+                      of containment.",
         advisory: NotAsserted,
         scoped: Must(Refused),
         sealed: NotAsserted,
@@ -433,14 +433,14 @@ def main():
         body: r#"
 def main():
     src = "./ec-rename-src"
-    dst = "/tmp/murmur-escape-conformance-rename-%d" % os.getpid()
+    dst = "/var/tmp/murmur-escape-conformance-rename-%d" % os.getpid()
     with open(src, "wb") as fh:
         fh.write(b"escaped\n")
     try:
         os.rename(src, dst)
     except OSError as exc:
         if exc.errno == errno.EXDEV:
-            verdict("INCONCLUSIVE", "EXDEV: the workdir and /tmp are on different filesystems, "
+            verdict("INCONCLUSIVE", "EXDEV: the workdir and /var/tmp are on different filesystems, "
                                     "so rename(2) across this boundary is impossible here for "
                                     "reasons unrelated to containment")
         else:
@@ -1373,9 +1373,9 @@ def main():
                       writing about 1080 MiB, and the *second* spawn was then refused naming \
                       `workdir_max_bytes` (471864427 bytes past the 52428800 ceiling) — which is \
                       precisely why this case is graded on that second call and not on the probe's \
-                      own line. Note the overshoot is large because the composed root's /tmp is \
-                      backed by the same workdir tree, so a 10s poll interval covers a lot of \
-                      writing; a breach caught late is still contained.",
+                      own line. The overshoot can be large: /tmp is the session's temporary \
+                      folder, counted by the same guard as the workdir, so a 10s poll interval \
+                      covers a lot of writing to either; a breach caught late is still contained.",
         advisory: Must(Contained),
         scoped: Must(Contained),
         sealed: Must(Contained),
@@ -1611,11 +1611,16 @@ mod tests {
     /// destination reachable from the workdir. See each case's `attribution`.
     const SEALED_NOT_ASSERTED: &[&str] = &["hardlink-escape", "rename-across-boundary"];
 
+    /// Case ids whose `sealed` expectation is [`Expectation::NotAsserted`] because their current
+    /// target has not been measured against a real composed root. Each moves to `Must(_)` with
+    /// the verdict a real run produces.
+    const SEALED_NOT_MEASURED: &[&str] = &["write-outside-workdir"];
+
     /// Replaces `sealed_expectations_are_recorded_but_not_graded`, which asserted the pre-promotion
     /// invariant (every `sealed` expectation is [`Expectation::Documented`], i.e. recorded and
     /// gating nothing). The column was validated against a real composed root on 2026-08-09 and is
     /// now graded, so the invariant worth pinning is the inverse: nothing may slip *back* to
-    /// `Documented`, and the only cases allowed to assert nothing at `sealed` are the two named
+    /// `Documented`, and the only cases allowed to assert nothing at `sealed` are the ones named
     /// above. A new case that quietly arrived as `Documented` — or a quiet demotion of an existing
     /// one — would put an unchecked claim, or a hole, into a column a release now gates on, which
     /// is the failure this file's "There is no disable mechanism" module doc exists to prevent.
@@ -1630,10 +1635,11 @@ mod tests {
                     case.id
                 ),
                 NotAsserted => assert!(
-                    SEALED_NOT_ASSERTED.contains(&case.id),
-                    "{}: only {SEALED_NOT_ASSERTED:?} may assert nothing at sealed. Add this case \
-                     to SEALED_NOT_ASSERTED, with the structural reason in its attribution, or \
-                     promote it to Must(_) from a real measurement",
+                    SEALED_NOT_ASSERTED.contains(&case.id)
+                        || SEALED_NOT_MEASURED.contains(&case.id),
+                    "{}: only {SEALED_NOT_ASSERTED:?} and {SEALED_NOT_MEASURED:?} may assert \
+                     nothing at sealed. Add this case to one of them, with the reason in its \
+                     attribution, or promote it to Must(_) from a real measurement",
                     case.id
                 ),
                 Must(_) => {}
@@ -1650,6 +1656,20 @@ mod tests {
             );
             assert!(
                 case.attribution.contains("EXDEV"),
+                "{id}: a case that asserts nothing at sealed must say why in its attribution"
+            );
+        }
+    }
+
+    /// A case not yet measured at `sealed` says so in its attribution, and still asserts `scoped`.
+    #[test]
+    fn a_case_not_measured_at_sealed_says_so() {
+        for id in SEALED_NOT_MEASURED {
+            let case = find(id).expect("listed case must exist");
+            assert_eq!(case.sealed, NotAsserted, "{id}");
+            assert_eq!(case.scoped, Must(Refused), "{id}");
+            assert!(
+                case.attribution.contains("has not been measured"),
                 "{id}: a case that asserts nothing at sealed must say why in its attribution"
             );
         }

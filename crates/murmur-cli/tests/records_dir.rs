@@ -367,19 +367,17 @@ fn commands_cannot_change_the_records(test: &str, floor: ContainmentClass) {
             continue;
         }
         assert_ne!(status, "0", "the attempt must fail: {line}");
-        let expected = if label.ends_with(":link-out") {
-            "Invalid cross-device link"
-        } else if floor == ContainmentClass::Sealed {
-            "Read-only file system"
+        let expected: &[&str] = if label.ends_with(":link-out") {
+            &["Invalid cross-device link"]
         } else {
-            "Permission denied"
+            write_refusals(floor, &records)
         };
         assert!(
-            error.contains(expected)
+            expected.iter().any(|text| error.contains(text))
                 || (label.ends_with(":rename-over")
                     && (error.contains("Permission denied")
                         || error.contains("Read-only file system"))),
-            "{label} must fail with '{expected}': {line}"
+            "{label} must fail with {expected:?}: {line}"
         );
     }
     assert_eq!(attempts, 10, "{attack}");
@@ -399,15 +397,16 @@ fn commands_cannot_change_the_records(test: &str, floor: ContainmentClass) {
     assert_eq!(line("RD-DIR|"), records.display().to_string());
 
     // The native tool's writes fail with the text the kernel gave; its read returns the trace.
-    let native_refusal = if floor == ContainmentClass::Sealed {
-        "Read-only file system (os error 30)"
-    } else {
-        "Permission denied (os error 13)"
-    };
+    let native_refusals = write_refusals(floor, &records);
     for label in ["trace", "eval", "completion"] {
         let data = probe_data(&server, &format!("toolu_write_{label}"));
         assert_eq!(data["ok"], false, "{label}: {data}");
-        assert_eq!(data["error"], native_refusal, "{label}: {data}");
+        assert!(
+            native_refusals
+                .iter()
+                .any(|text| data["error"] == format!("{text} (os error {})", errno_of(text))),
+            "{label}: {data}"
+        );
     }
     if truncate_mediated {
         let read = probe_data(&server, "toolu_read_trace");
@@ -1087,4 +1086,28 @@ fn an_installed_capsule_s_runtime_dir_holds_and_names_no_manifest() {
         "{murmur_md}"
     );
     assert!(!workdir.path().join("murmur.yaml").exists());
+}
+
+/// The refusal texts a write into `dir` may fail with at `floor`: a sealed root's read-only bind,
+/// Landlock's, or, with `dir` under a `/tmp` the session maps onto its temporary folder, the
+/// read-only bind that re-exposes it.
+fn write_refusals(floor: ContainmentClass, dir: &Path) -> &'static [&'static str] {
+    let tmp = fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let under_tmp = dir.starts_with(&tmp) || dir.starts_with("/tmp");
+    if floor == ContainmentClass::Sealed {
+        &["Read-only file system"]
+    } else if under_tmp {
+        &["Permission denied", "Read-only file system"]
+    } else {
+        &["Permission denied"]
+    }
+}
+
+/// The `errno` the kernel's message `text` is the `strerror` of.
+fn errno_of(text: &str) -> i32 {
+    match text {
+        "Read-only file system" => 30,
+        _ => 13,
+    }
 }

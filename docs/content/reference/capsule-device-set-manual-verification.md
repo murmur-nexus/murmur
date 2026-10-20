@@ -186,9 +186,9 @@ with open(\"/dev/urandom\", \"rb\") as f:
 
 ### Scenario 3 — `/dev/zero` and `/dev/urandom` are **not** writable
 
-The read-only grants must be exactly that. This is what keeps `/dev/null` the *sole* writable path
-outside the workdir (on `sealed`, `/tmp` is writable too — but it *is* the workdir, bound there from
-`<workdir>/.mur-tmp`; see [the note above](containment.md#capsule-device-set)).
+The read-only grants must be exactly that. This is what keeps `/dev/null` the *sole* writable device
+(the [session's temporary folder](containment.md#temp-folder) is also writable outside the workdir,
+with exactly the workdir's rights; see [the fixed capsule device set](containment.md#capsule-device-set)).
 
 ```bash
 SCRATCH_SCRIPT='

@@ -964,20 +964,6 @@ pub const SEALED_DEVICE_SYMLINKS: &[(&str, &str)] = &[
     ("ptmx", "pts/ptmx"),
 ];
 
-/// Directory created inside the session workdir and bind-mounted at `/tmp` in the composed root.
-///
-/// `/tmp` has to exist — bash heredocs, `mktemp`, compilers and package managers all fail without
-/// it in ways that read as runtime bugs rather than as policy. Backing it with a directory *inside
-/// the workdir* is what keeps "the capsule's workdir is the only writable path" literally true:
-/// the bytes written to `/tmp` land in the workdir, are counted by the existing workdir-size guard
-/// (`capabilities.resources.workdir_max_bytes`), and are discarded with the session.
-///
-/// Under `--workdir` the session workdir is `<accessible workdir>/.murmur/<session id>/`, so this
-/// directory sits under the one prefix a consumer diffing the accessible workdir excludes, and
-/// inside the subtree `WorkdirGuard` measures. Declared as a runtime write by
-/// [`crate::workdir_writes`]. The capsule never names this path: it sees `/tmp`.
-pub const SEALED_TMP_DIR_NAME: &str = ".mur-tmp";
-
 /// Host path of the file backing one synthetic `/etc` entry, in the session's `sealed-etc/`
 /// directory beside its runtime directory, which no capsule command can write.
 ///
@@ -992,9 +978,9 @@ pub(crate) fn synthetic_etc_source(sealed_etc_dir: &Path, file: SyntheticEtcFile
 /// by the parent before the fork.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SealedBindSources<'a> {
-    /// The session workdir's [`SEALED_TMP_DIR_NAME`], bound at `/tmp`, with the `(st_dev,
-    /// st_ino)` of the descriptor the parent took on it with no link followed — the identity the
-    /// bind verifies, so a link swapped in after that moves nothing ([`RootOp::BindVerified`]).
+    /// The session's temporary folder ([`crate::temp_dir`]), bound at `/tmp`, with the
+    /// `(st_dev, st_ino)` of the descriptor the session's records root holds on it — the identity
+    /// the bind verifies, so a link swapped onto its path moves nothing ([`RootOp::BindVerified`]).
     pub(crate) tmp_store: (&'a Path, (u64, u64)),
     /// The session's `sealed-etc/` directory, holding the synthetic `/etc/passwd` and
     /// `/etc/group`.
@@ -1312,8 +1298,8 @@ pub(crate) fn plan_composed_root(
     builder.push(RootOp::MkDir(proc.clone()), true);
     builder.push(RootOp::Proc { target: proc }, true);
 
-    // 5. /tmp, backed by a directory inside the session workdir so it stays inside the one
-    //    writable path and inside the workdir size budget.
+    // 5. /tmp, the session's temporary folder in its records directory, counted by the same
+    //    size guard as the workdir.
     //
     //    Before the workdir, not after, and the ordering is load-bearing rather than tidy. A
     //    session workdir under `/tmp` is not an edge case — it is `mur run`'s default, since
@@ -1335,8 +1321,8 @@ pub(crate) fn plan_composed_root(
     );
 
     // 6. The capsule's workdir — the accessible one, which is also the subprocess cwd — at its
-    //    own absolute path, read-write. The only writable path in the composed root, and the
-    //    subtree holding the session directory that backs /tmp above.
+    //    own absolute path, read-write. With /tmp above, the only writable paths in the composed
+    //    root.
     let workdir_target = rebase(base, accessible_workdir);
     builder.mkdir_p(&workdir_target);
     builder.push(
@@ -1574,7 +1560,8 @@ pub(crate) use linux::{
 /// things.
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
-    make_dumpable_for_map_writes, restore_dumpable, userns_grant, write_decimal_map,
+    make_dumpable_for_map_writes, open_verified_dir, proc_fd_path, remount_flags_kept,
+    restore_dumpable, userns_grant, write_decimal_map, PROC_FD_PATH_LEN,
 };
 
 #[cfg(target_os = "linux")]
@@ -2033,7 +2020,7 @@ mod linux {
     }
 
     /// `"/proc/self/fd/"` and the longest decimal `c_int` and a NUL.
-    const PROC_FD_PATH_LEN: usize = 32;
+    pub(crate) const PROC_FD_PATH_LEN: usize = 32;
 
     /// Writes `/proc/self/fd/<fd>` and a NUL into `out`, with no allocation.
     pub(crate) fn proc_fd_path(
@@ -2650,9 +2637,9 @@ mod tests {
         }
     }
 
-    /// The session workdir's `.mur-tmp` under a `--workdir` of `/home/u/w`, and the identity of
-    /// the descriptor `prepare_enforcement` took on it.
-    const TEST_TMP_SOURCE: &str = "/home/u/w/.murmur/ses_plan_tests/.mur-tmp";
+    /// The session's temporary folder in its records directory, and the identity of the
+    /// descriptor its records root holds on it.
+    const TEST_TMP_SOURCE: &str = "/home/u/.murmur/records/home/u/w/ses_plan_tests/tmp";
     const TEST_TMP_IDENTITY: (u64, u64) = (64, 7);
 
     /// The session's `sealed-etc/`, beside its runtime directory.
@@ -2756,8 +2743,8 @@ mod tests {
             })
             .collect();
 
-        // The workdir, /tmp's workdir-backed store, and the /dev nodes (whose write side is the
-        // device driver's, not the filesystem's) — and nothing else.
+        // The workdir and the /dev nodes (whose write side is the device driver's, not the
+        // filesystem's) — and nothing else. /tmp is a verified bind, not among these.
         for source in &writable {
             assert!(
                 source.starts_with("/home/u/w") || source.starts_with("/dev/"),
@@ -3054,7 +3041,7 @@ mod tests {
         // Never an unverified bind of a path a capsule's command could have replaced with a link.
         assert!(!ops(&plan).iter().any(|op| matches!(
             op,
-            RootOp::Bind { source, .. } if source.ends_with(SEALED_TMP_DIR_NAME)
+            RootOp::Bind { source, .. } if source == Path::new(TEST_TMP_SOURCE)
         )));
     }
 
@@ -3068,7 +3055,7 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let store = dir.path().join(".mur-tmp");
+        let store = dir.path().join("tmp");
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&store).unwrap();
         std::fs::create_dir_all(&outside).unwrap();

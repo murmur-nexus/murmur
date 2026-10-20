@@ -384,20 +384,31 @@ fn execute_inner(
     };
     let workdir_guard = Some(crate::resources::WorkdirGuard::spawn(
         &ctx.accessible_workdir,
+        ctx.runtime_dir.temp.as_ref(),
         ctx.runtime_dir.records.as_ref(),
         ctx.capability_policy.resources.workdir_max_bytes,
     ));
 
     // Host-probed kernel enforcement tier + resolved network allowlist for this plan's shell
-    // steps — resolved once, up front, same cadence as `runtime::launch_session`.
+    // steps — resolved once, up front, same cadence as `runtime::launch_session`. The `/tmp`
+    // mapping is decided from the same reading, for the tier this enforcement applies.
+    let probe = sandbox::HostProbe::probe();
     let shell_enforcement = match sandbox::ShellEnforcement::resolve(
         &ctx.capability_policy,
         ctx.capability_policy.containment_floor,
-        sandbox::HostProbe::probe(),
+        probe,
     ) {
-        Ok(enforcement) => enforcement
-            .with_host_bounding(cgroup_scope, workdir_guard)
-            .with_runtime_dir(ctx.runtime_dir.clone(), None),
+        Ok(enforcement) => {
+            let temp_mapping = crate::temp_dir::temp_mapping(
+                enforcement.tier,
+                probe.mount_namespace_usable(),
+                ctx.accessible_workdir.path(),
+            );
+            enforcement
+                .with_host_bounding(cgroup_scope, workdir_guard)
+                .with_runtime_dir(ctx.runtime_dir.clone(), None)
+                .with_temp_mapping(temp_mapping)
+        }
         Err(error) => {
             let error = format!("failed to resolve shell subprocess sandbox enforcement: {error}");
             return Ok(refused_before_any_step(

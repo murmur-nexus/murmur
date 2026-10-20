@@ -59,8 +59,9 @@ subprocess routes that mechanism confines, and `--explain-scope --json` carries 
 **and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
 interpreter (dynamic loader), and the transitive closure of their shared libraries — so an
 allowlisted program can exec and dynamic-link `/usr/bin/bash` and its libraries while no directory
-is granted wholesale and the only writable path outside the workdir is `/dev/null` (see
-[the fixed capsule device set](#capsule-device-set)). A capsule may *additionally* name specific
+is granted wholesale and the only writable paths outside the workdir are `/dev/null` (see
+[the fixed capsule device set](#capsule-device-set)) and the
+[session's temporary folder](#temp-folder). A capsule may *additionally* name specific
 host directories a path-based interpreter needs (its stdlib) via
 `capabilities.shell.interpreter_runtime`, which grants exactly the directories named, each with an
 explicit per-directory `list_dir` flag (see [`W-SEC-009`](diagnostics.md#w-sec-009)). The workdir
@@ -153,7 +154,7 @@ Everything else the tool reads, writes, runs or connects to has to be granted by
 |---|---|
 | Runs another program, such as `git` | That program in `capabilities.shell.allow` |
 | Is a `#!/usr/bin/env python3` script | `python3` in `capabilities.shell.allow`: the `#!` grant covers `env` only |
-| Reads or writes a path outside the workdir | On Full and Sealed, keep its inputs and outputs in the workdir. Nothing grants a write outside it; the only read grant outside it is a [`capabilities.shell.interpreter_runtime`](manifest.md#field-capabilities) directory, which names a `shell.allow` binary and grants execute as well |
+| Reads or writes a path outside the workdir | On Full and Sealed, keep its inputs and outputs in the workdir or the [session's temporary folder](#temp-folder). Nothing grants a write anywhere else; the only read grant outside it is a [`capabilities.shell.interpreter_runtime`](manifest.md#field-capabilities) directory, which names a `shell.allow` binary and grants execute as well |
 | Reaches a host | That host in `capabilities.network.allow`; the connection leaves through the egress proxy |
 | Reaches a server an earlier shell call started on `127.0.0.1` | Nothing: the tool shares the session's loopback |
 | Opens an `AF_UNIX` socket | `capabilities.network.unix_sockets: true` |
@@ -399,7 +400,7 @@ every response reports in `x-murmur-containment`:
 | Achieved class | Rule | Why |
 |---|---|---|
 | `scoped` | Refuse any symlink on the resolved path with `symlink_refused`, and omit symlinked entries from a listing | Host-path grants are possible and the filesystem's shape stays visible, so a symlink under the export root could target a granted host path |
-| `sealed` | Follow, and serve only when the fully-resolved target is still beneath the export root | The workdir is the only writable path and there is no outside to name, so everything under the root is capsule-authored |
+| `sealed` | Follow, and serve only when the fully-resolved target is still beneath the export root | The workdir and the session's temporary folder are the only writable paths and there is no outside to name, so everything under the root is capsule-authored |
 | `advisory` | Same rule as `sealed` | A convention on top of a convention; every response carries `advisory` so a reader knows what it is trusting |
 
 A symlink whose target leaves the root is refused at every class: `symlink_refused` under `scoped`,
@@ -414,16 +415,13 @@ manifest key** that adds a device or removes one:
 
 | Device | Access | Why |
 |---|---|---|
-| `/dev/null` | read **and** write | The one deliberate exception to "nothing outside the workdir is writable". Ordinary tooling opens it for both reading and writing — a shell `2>/dev/null` redirect, a language runtime's null-device constant — and a read-only grant fails those, as an unexplained crash rather than as a policy denial. |
+| `/dev/null` | read **and** write | The one deliberate exception to "nothing outside the workdir and the session's temporary folder is writable". Ordinary tooling opens it for both reading and writing — a shell `2>/dev/null` redirect, a language runtime's null-device constant — and a read-only grant fails those, as an unexplained crash rather than as a policy denial. |
 | `/dev/zero` | read only | Zero-fill reads and older allocators' mapping fallbacks. Nothing needs to write it. |
 | `/dev/urandom` | read only | Not for `getrandom(2)` — that is a syscall and needs no filesystem grant — but because OpenSSL and older glibc paths still `open()` the device outright. |
 
-**`/tmp` under `sealed` is not a second exception.** Inside a composed root `/tmp` is writable, but
-it is the workdir under another name: the runtime binds a directory inside the session workdir
-there, counted by the same `capabilities.resources.workdir_max_bytes` guard and discarded with the
-session. It carries exactly the workdir's rights, so a binary written to `/tmp` is no more runnable
-than one written to the workdir. `scoped` composes no root and binds nothing at `/tmp`, where it
-stays denied.
+**`/tmp` is not a second exception.** Where a command's `/tmp` is writable, it is the
+[session's temporary folder](#temp-folder), which carries exactly the workdir's rights, so a binary
+written to `/tmp` is no more runnable than one written to the workdir.
 
 **Every other device path is denied.** The capsule's Landlock domain declares every right of the
 [ABI it is built at](#landlock-abi), so a path with no matching rule is refused rather than merely
@@ -436,7 +434,7 @@ denied, and a fourth device can appear only by editing the fixed set.
 set, so the kernel-visible device namespace is the boundary rather than a per-path grant. It holds
 six nodes — `null`, `zero`, `full` and `tty` readable and writable, `random` and `urandom` read-only
 — plus the OCI symlinks `fd`, `stdin`, `stdout`, `stderr` and `ptmx`. `/dev/shm` is deliberately
-absent: it is writable, and the session workdir is the only writable path in a composed root.
+absent: it is writable, and the workdir and `/tmp` are the only writable paths in a composed root.
 Landlock keeps running *inside* the composed root, so the sealed `/dev` carries Landlock rules of
 its own — without them its device nodes would be present and unopenable. The two device sets are
 independent: a `scoped` declaration on a `sealed`-capable host keeps the three-rule list above.
@@ -514,8 +512,8 @@ onto. It holds exactly what the sections above put there, and every other path i
 | The sixteen [`/etc` allowlist](#sealed-etc-grant) entries | Bind-mounted read-only, the account databases synthetic | lists, on the six directory entries |
 | `/dev` | A private tmpfs carrying the [OCI device set](#capsule-device-set) | `Permission denied` |
 | `/proc` | Masked with `hidepid` where the kernel allows it, bound from the host where it does not | `Permission denied` |
-| `/tmp` | A directory inside the session workdir, bound here so it stays inside the workdir's size budget | lists |
-| The workdir, at its own absolute host path | The capsule's accessible workdir, read-write, and the only writable path in the root | lists |
+| `/tmp` | The [session's temporary folder](#temp-folder), `tmp/` in the records directory, bound read-write | lists |
+| The workdir, at its own absolute host path | The capsule's accessible workdir, read-write. It and `/tmp` are the only writable paths in the root | lists |
 | `/`, `/etc` as a directory, and each path component above the workdir | Scaffolding the runtime created so the mounts below have somewhere to land | `Permission denied` |
 
 **`cd` and `stat` succeed where `ls` fails, and that is the design.** With a workdir at
@@ -540,6 +538,106 @@ the capsule can open inside directories it cannot enumerate.
 
 Enumerating the root is refused; opening a path inside it is not. Read a file under `/usr` or
 `/etc` directly rather than listing the directory that holds it.
+
+## The session's temporary folder { #temp-folder }
+
+Every session has a private temporary folder: `tmp/` in its
+[records directory](workdir.md#records-directory),
+`~/.murmur/records/<workdir root>/<session-id>/tmp`.
+
+| Property | Value |
+|---|---|
+| Created | At staging, mode `0700` |
+| Written by | The session's shell commands, plan shell steps and native tools. The runtime writes nothing in it |
+| Shared with | No other session. It is never inside the workdir |
+| Landlock rights | Exactly the workdir's, so with `capabilities.filesystem.workdir_exec: false` nothing written to it can run |
+| Size | Counted together with the session workdir against [`capabilities.resources.workdir_max_bytes`](resource-limits.md#host-resource-limits); a breach ends the session with `E-RUN-013` |
+| Removed | With the session's records directory, by [`trace.retain`](manifest.md#trace-retain), including any read-only directory a command left in it |
+
+The rest of the records directory stays read-only to commands: no record can be appended to,
+replaced, moved or hard-linked into the folder, and the folder itself cannot be renamed.
+
+### How a command reaches it { #temp-folder-env }
+
+`TMPDIR`, `TMP` and `TEMP` are runtime-owned in every shell command, plan shell step and native
+tool: no manifest key, `capabilities.shell.baseline_env` entry or host value changes them. All
+three hold `/tmp` where a literal `/tmp` is mapped onto the folder, and the folder's absolute path
+where it is not:
+
+| Applied tier (classes) | Mount namespace usable | Literal `/tmp` | `TMPDIR`, `TMP`, `TEMP` | `temp_dir.mapped_by` |
+|---|---|---|---|---|
+| `mountns+pivot_root+landlock+seccomp` (`sealed`) | required by the tier | The composed root binds the folder at `/tmp` | `/tmp` | `composed-root` |
+| `landlock+seccomp` (`scoped`, and `advisory` on Linux 5.13+) | yes | A private mount namespace per command binds the folder over `/tmp` | `/tmp` | `mount-namespace` |
+| `landlock+seccomp` | no | Not mapped; Landlock refuses it | The folder's absolute path | `null` |
+| `seccomp-only` | yes | A private mount namespace per command binds the folder over `/tmp` | `/tmp` | `mount-namespace` |
+| `seccomp-only` | no | Not mapped; the host's own `/tmp`, with no filesystem containment on this tier | The folder's absolute path | `null` |
+| `none` (macOS, any non-Linux host) | — | Not mapped; the host's own `/tmp` | The folder's absolute path | `null` |
+| Any tier but `mountns+pivot_root+landlock+seccomp`, with the workdir **being** `/tmp` | — | Not mapped, since binding `/tmp` would hide the workdir | The folder's absolute path | `null` |
+
+**Mount namespace usable** is the host reading that also decides `sealed`: unprivileged user
+namespaces are permitted and a real namespace probe succeeded. On a sealed-capable host, a capsule
+declaring `advisory` or `scoped` runs on `landlock+seccomp` and maps `/tmp` through a mount
+namespace.
+
+On a `mount-namespace` tier each command enters a private mount namespace inside the session's
+user namespace:
+
+1. The folder is bound over `/tmp`.
+2. Every path the command needs that lies under the host's `/tmp` is bound back at its own path,
+   and nothing else of the host's `/tmp` is visible:
+
+    | Path | Bound |
+    |---|---|
+    | The workdir and the session workdir | Read-write |
+    | The runtime directory, the records directory and every Landlock grant path | Read-only |
+
+    A workdir or `HOME` under `/tmp` keeps working, and the empty directories leading to each
+    bound path appear in the folder.
+3. A mapping that cannot be built fails that command's spawn, and nothing runs:
+
+    ```text
+    sandbox: could not map /tmp onto this session's temporary folder: <step> failed: <errno text>
+    ```
+
+    The command fails as an ordinary tool call; the session goes on. A link swapped onto the
+    folder's path fails the step with `ESTALE` rather than redirecting the bind.
+
+WASM artifacts and a `transport: process` harness are not capsule commands: their environment and
+mounts do not change.
+
+### Reporting { #temp-folder-reporting }
+
+`mur run --explain-scope` prints a `Temporary folder` block after the `Records directory` block, and
+`mur doctor` prints the same block after its own `Records directory` block:
+
+```text
+Temporary folder
+  path:      /home/dev/.murmur/records/home/dev/proj/workdir/<session-id>/tmp
+  TMPDIR:    /tmp
+  /tmp:      mapped (mount-namespace)
+```
+
+Where `/tmp` is not mapped, the last line reads `/tmp:      not mapped — <reason>`:
+
+| Case | Reason |
+|---|---|
+| No kernel containment | `this host has no kernel containment for capsule commands, so a literal /tmp path is the host's own /tmp; TMPDIR names the session's temporary folder` |
+| `seccomp-only` without a mount namespace | `this host can give capsule commands neither a private mount namespace nor Landlock, so a literal /tmp path is the host's own /tmp; TMPDIR names the session's temporary folder` |
+| `landlock+seccomp` without a mount namespace | `this host cannot give capsule commands a private mount namespace, so a literal /tmp path is refused; TMPDIR names the session's temporary folder` |
+| The workdir is `/tmp` | `the workdir is /tmp itself, which mapping /tmp would hide; TMPDIR names the session's temporary folder` |
+
+`--explain-scope --json` and `trace.jsonl`'s `session_start.effective_grants` carry the block as
+[`temp_dir`](observability-schemas.md#session-trace-tracejsonl).
+
+### Known properties { #temp-folder-properties }
+
+| Property | Where | What it means |
+|---|---|---|
+| `/tmp` and the workdir are different mounts | A mapped tier | `rename(2)` between them fails with `EXDEV`, as on any host whose `/tmp` is a tmpfs |
+| The host's own `/tmp` is hidden | A mapped tier | A Unix socket a host daemon keeps under `/tmp` is unreachable, which matters only with `capabilities.network.unix_sockets: true` |
+| `TMPDIR` is the folder's full path | An unmapped tier | A program that creates a Unix socket beneath it can exceed the socket name limit: 104 bytes on macOS, 108 on Linux |
+| The folder lives under `HOME` | Every tier | Its bytes land on `HOME`'s filesystem |
+| A path the command needs lies under the host's `/tmp` | A mapped tier | It is a read-only bind unless it is the workdir, so a write there fails with `Read-only file system` rather than `Permission denied`, and it carries the folder's read and execute rights |
 
 ## Default-deny syscall allowlist { #default-deny-syscall-allowlist }
 

@@ -410,7 +410,7 @@ mur run --manifest murmur.yaml --task 'run this shell command:
 - the session terminates with `E-RUN-013` naming both numbers:
 
 ```
-error[E-RUN-013]: session workdir grew to 57671680 bytes, past the 52428800 byte ceiling
+error[E-RUN-013]: session workdir and temporary folder grew to 57671680 bytes, past the 52428800 byte ceiling (capabilities.resources.workdir_max_bytes)
 ```
 
 - `workdir/<session_id>/logs/bootstrap.log` carries the same wording from the watcher thread.
@@ -421,8 +421,9 @@ process against host paths, before any `pivot_root`, so the
 [sealed](sealed-containment-manual-verification.md) composed root does not affect it. Expect the
 one-interval detection lag described above.
 
-A `sealed` capsule's `/tmp` is backed by `<workdir>/.mur-tmp`, so its temporary files count against
-`workdir_max_bytes`.
+The check measures the session workdir and the
+[session's temporary folder](containment.md#temp-folder) together, so files a command writes to
+`/tmp` or `$TMPDIR` count against `workdir_max_bytes` on every tier.
 
 ---
 

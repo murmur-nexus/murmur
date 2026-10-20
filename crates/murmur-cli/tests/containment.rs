@@ -322,16 +322,13 @@ fn explain_scope_declares_what_the_runtime_writes_and_creates_nothing() {
     assert!(!project.path().join("workdir").exists());
 }
 
-/// Enabling `sealed` changes the set of paths the runtime writes, and the change is visible in
-/// the declaration rather than only on disk.
+/// Asking for `sealed` changes nothing the runtime writes in the workdir: the declaration is the
+/// same set on every tier, since `/tmp` is the session's temporary folder in its records
+/// directory, and no row names a temp store.
 ///
-/// Host-independent in the same way the rest of this file is: on a host that can back `sealed`
-/// the two reports differ by exactly the sealed rows, and on a host that cannot they are equal,
-/// because the declaration is keyed on the tier that will actually be used rather than on the
-/// class the manifest asked for. Either way, no added row is a new top-level entry in the
-/// accessible workdir — which is the property a consumer diffing that directory depends on.
+/// Host-independent: the declaration does not depend on whether this host can back `sealed`.
 #[test]
-fn asking_for_sealed_adds_only_paths_under_the_session_directory() {
+fn asking_for_sealed_adds_nothing_to_the_workdir_declaration() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     write_project(
@@ -342,41 +339,11 @@ fn asking_for_sealed_adds_only_paths_under_the_session_directory() {
     let scoped = explain_scope_report(&home, project.path(), &[]);
     let sealed = explain_scope_report(&home, project.path(), &["--containment", "sealed"]);
 
-    let rows = |report: &serde_json::Value| -> Vec<serde_json::Value> {
-        report["runtime_writes"].as_array().unwrap().clone()
-    };
-    let (scoped_rows, sealed_rows) = (rows(&scoped), rows(&sealed));
-    for row in &scoped_rows {
-        assert!(
-            sealed_rows.contains(row),
-            "the sealed declaration must keep every scoped row: {row}"
-        );
-    }
-
-    let added: Vec<&serde_json::Value> = sealed_rows
-        .iter()
-        .filter(|row| !scoped_rows.contains(row))
-        .collect();
-    if sealed["achieved_containment"] == "sealed" {
-        assert_eq!(sealed["floor_met"], true);
-        assert_eq!(added.len(), 1, "sealed adds the /tmp store: {added:?}");
-    } else {
-        assert!(
-            added.is_empty(),
-            "a host that cannot seal runs the non-sealed set, whatever the manifest declared: \
-             {added:?}"
-        );
-    }
-    for row in added {
-        assert_eq!(row["condition"], "sealed");
-        assert_eq!(row["scope"], "session");
-        assert!(
-            row["path"]
-                .as_str()
-                .unwrap()
-                .starts_with(".murmur/<session-id>/"),
-            "enabling sealed must add nothing to the top level of the accessible workdir: {row}"
-        );
+    assert_eq!(scoped["runtime_writes"], sealed["runtime_writes"]);
+    for row in scoped["runtime_writes"].as_array().unwrap() {
+        assert_ne!(row["condition"], "sealed", "{row}");
+        let last = row["path"].as_str().unwrap().rsplit('/').next().unwrap();
+        assert!(!last.contains("tmp"), "no temp store in the workdir: {row}");
     }
 }
 

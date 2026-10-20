@@ -844,7 +844,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.resources.cgroup_pids_max` | integer | no | cgroup v2 `pids.max` — aggregate task count across the whole subprocess tree. Default: 256. Must be > 0. Linux only. |
 | `capabilities.resources.cgroup_cpu_percent` | integer | no | cgroup v2 `cpu.max` quota as a percentage of one core (200 = two cores' worth). Default: 200. Must be > 0. Linux only. |
 | `capabilities.resources.cgroup_io_bytes_per_sec` | integer | no | cgroup v2 `io.max` read+write throughput on the workdir's backing device, in bytes/sec. Default: 104857600 (100 MiB/s). Must be > 0. Linux only, best-effort — a workdir whose backing device cannot be resolved (overlayfs, tmpfs, device-mapper) reports [`io_max.status: unavailable`](resource-limits.md#io-max-report) with [`W-SEC-021`](diagnostics.md#w-sec-021) and keeps the other three controllers. |
-| `capabilities.resources.workdir_max_bytes` | integer | no | Ceiling on total session-workdir size, in bytes, enforced by a periodic check. Default: 10737418240 (10 GiB). Must be > 0. Every platform. Under the `sealed` containment class this also bounds `/tmp`, which is backed by a directory inside the session workdir — see [the fixed capsule device set](containment.md#capsule-device-set). |
+| `capabilities.resources.workdir_max_bytes` | integer | no | Ceiling on the session workdir and the [session's temporary folder](containment.md#temp-folder) together, in bytes, enforced by a periodic check. Default: 10737418240 (10 GiB). Must be > 0. Every platform. |
 | `capabilities.containment` | `advisory \| scoped \| sealed` | no | Minimum containment class this capsule requires, in ascending strength. Omitted, the capsule states no requirement — see [Containment class](containment.md#field-containment). Capsule-wide only; declaring it on a per-artifact entry has no effect and warns at staging — [What bounds a WASM artifact](containment.md#artifact-boundary) names the grant that scopes one artifact. |
 | `capabilities.conversation.read` | bool | no | Grant of the `murmur:conversation/read` import, applied **per hook only**. Declaring it in this capsule-wide block reaches nothing — no artifact can read the conversation record — and prints [`W-SEC-016`](diagnostics.md#w-sec-016) at staging. Put it on the hook entry that needs it: [Hook capabilities](#hook-capabilities). |
 | `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` directory is mounted — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
@@ -916,12 +916,13 @@ A shell tool call, a plan's `shell` step, or a native tool:
 
 | Order | Source | Variables |
 |---|---|---|
-| 1 | Baseline | The host's value of each of `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TMPDIR`, `TEMP`, `TMP`, `CARGO_HOME`, `RUSTUP_HOME` and `TERM` the host sets |
+| 1 | Baseline | The host's value of each of `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `CARGO_HOME`, `RUSTUP_HOME` and `TERM` the host sets |
 | 2 | The session's identity | A shell tool call in a session with `inference:` only: `MURMUR_CAPSULE_NAME`, `MURMUR_CAPSULE_VERSION`, `MURMUR_SESSION_ID`, `MURMUR_CAPSULE_URL` and the [`MURMUR_INFERENCE_*` variables](default-artifacts.md#driver-environment) |
 | 3 | `capabilities.shell.baseline_env` | The host's value of each listed name the host sets |
 | 4 | Credential backstop and `capabilities.shell.strip_env` | Removes every name that matches a [credential pattern](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) or a `strip_env` pattern, baseline names such as `USER` and `LOGNAME` included |
 | 5 | Synthetic home | `HOME` and `USERPROFILE`, both the session-scoped `.capsule-home` directory, never the host's home |
 | 6 | The session | `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR`, as for the harness |
+| 7 | The session's temporary folder | `TMPDIR`, `TMP` and `TEMP`: `/tmp` where the session maps `/tmp` onto its [temporary folder](containment.md#temp-folder), and the folder's absolute path where it does not. No earlier row sets them, `capabilities.shell.baseline_env` included |
 
 A delegated child `mur` starts from an empty environment and receives the parent's `USER` and
 `LOGNAME` beside its `PATH` and `HOME`, each only when the parent holds it.

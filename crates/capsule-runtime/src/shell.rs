@@ -21,9 +21,6 @@ const DEFAULT_ENV_BASELINE: &[&str] = &[
     "LOGNAME",
     "LANG",
     "LC_ALL",
-    "TMPDIR",
-    "TEMP",
-    "TMP",
     "CARGO_HOME",
     "RUSTUP_HOME",
     "TERM",
@@ -361,6 +358,7 @@ pub(crate) fn run_shell(
         session_workdir,
         enforcement.runtime_dir_path(),
         enforcement.records_dir_path(),
+        enforcement.tmpdir_value().as_deref(),
     )?;
 
     // Resolve before spawning: this is the identity of the binary this call is about to
@@ -801,12 +799,18 @@ pub(crate) fn attribute_resource_limit(
         .map(str::to_string)
 }
 
+/// The environment of one shell command, plan shell step or native tool: [`DEFAULT_ENV_BASELINE`]
+/// from the host, `env_overrides`, `capabilities.shell.baseline_env`, the credential backstop,
+/// and then the runtime-owned names no entry before them can set — the synthetic `HOME`,
+/// `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR` from `runtime_dir` and `records_dir`, and
+/// `TMPDIR`, `TMP` and `TEMP`, all three `tmpdir` or all three absent.
 pub(crate) fn build_shell_env(
     policy: &CapabilityPolicy,
     env_overrides: &[(String, String)],
     session_workdir: &WorkdirRoot,
     runtime_dir: Option<&std::path::Path>,
     records_dir: Option<&std::path::Path>,
+    tmpdir: Option<&str>,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut env = BTreeMap::new();
 
@@ -858,6 +862,13 @@ pub(crate) fn build_shell_env(
             crate::records_dir::RECORDS_DIR_ENV.to_string(),
             records_dir.to_string_lossy().into_owned(),
         );
+    }
+    // And the session's temporary folder, under all three names programs look for it by.
+    for name in crate::temp_dir::TEMP_DIR_ENV {
+        env.remove(name);
+        if let Some(tmpdir) = tmpdir {
+            env.insert(name.to_string(), tmpdir.to_string());
+        }
     }
 
     Ok(env)
@@ -1334,6 +1345,7 @@ mod tests {
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1364,6 +1376,7 @@ mod tests {
             &policy,
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
             None,
             None,
         )
@@ -1444,6 +1457,7 @@ mod tests {
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1486,6 +1500,7 @@ mod tests {
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             None,
             None,
+            None,
         )
         .unwrap();
         std::env::remove_var(FORMATION_LIFELINE_ENV);
@@ -1515,6 +1530,7 @@ mod tests {
             &policy,
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
             None,
             None,
         )
@@ -1607,6 +1623,7 @@ mod tests {
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1629,6 +1646,7 @@ mod tests {
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             None,
             None,
+            None,
         )
         .unwrap();
         std::env::remove_var("CARGO_HOME");
@@ -1648,7 +1666,8 @@ mod tests {
         std::env::set_var("USER", "murmur-test-user");
         std::env::set_var("LOGNAME", "murmur-test-login");
 
-        let env = build_shell_env(&CapabilityPolicy::default(), &[], &root, None, None).unwrap();
+        let env =
+            build_shell_env(&CapabilityPolicy::default(), &[], &root, None, None, None).unwrap();
         let stripped = build_shell_env(
             &CapabilityPolicy {
                 shell_strip_env: vec!["LOGNAME".to_string()],
@@ -1656,6 +1675,7 @@ mod tests {
             },
             &[],
             &root,
+            None,
             None,
             None,
         )
@@ -1745,6 +1765,7 @@ mod tests {
             &policy,
             &overrides,
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            None,
             None,
             None,
         )
@@ -1998,6 +2019,7 @@ mod tests {
             &root,
             Some(std::path::Path::new("/runtime/dir")),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2006,7 +2028,7 @@ mod tests {
             Some("/runtime/dir")
         );
 
-        let without = build_shell_env(&policy, &overrides, &root, None, None).unwrap();
+        let without = build_shell_env(&policy, &overrides, &root, None, None, None).unwrap();
         assert!(!without.contains_key(crate::runtime_dir::RUNTIME_DIR_ENV));
         assert!(!build_declared_env(&policy).contains_key(crate::runtime_dir::RUNTIME_DIR_ENV));
     }
@@ -2035,6 +2057,7 @@ mod tests {
             &root,
             None,
             Some(std::path::Path::new("/records/dir")),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2043,8 +2066,121 @@ mod tests {
             Some("/records/dir")
         );
 
-        let without = build_shell_env(&policy, &overrides, &root, None, None).unwrap();
+        let without = build_shell_env(&policy, &overrides, &root, None, None, None).unwrap();
         assert!(!without.contains_key(crate::records_dir::RECORDS_DIR_ENV));
         assert!(!build_declared_env(&policy).contains_key(crate::records_dir::RECORDS_DIR_ENV));
+    }
+
+    /// `TMPDIR`, `TMP` and `TEMP` are runtime-owned: `/tmp` when the session maps it, the
+    /// folder's absolute path when not, and absent when the enforcement holds no folder — whatever
+    /// the host, an override or `shell.baseline_env` said.
+    #[test]
+    fn build_shell_env_owns_tmpdir_tmp_and_temp() {
+        use crate::temp_dir::{NotMappedReason, TempMapping, TEMP_DIR_ENV};
+
+        let workdir = tempfile::tempdir().unwrap();
+        let root = WorkdirRoot::open(workdir.path()).unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let roots = crate::sandbox::test_runtime_dir(base.path());
+        let folder = roots.temp.as_ref().unwrap().path().to_path_buf();
+        for name in TEMP_DIR_ENV {
+            std::env::set_var(name, "/host/tmp");
+        }
+        let policy = CapabilityPolicy {
+            shell_baseline_env: TEMP_DIR_ENV.iter().map(|name| name.to_string()).collect(),
+            ..CapabilityPolicy::default()
+        };
+        let overrides: Vec<(String, String)> = TEMP_DIR_ENV
+            .iter()
+            .map(|name| (name.to_string(), "/override".to_string()))
+            .collect();
+
+        let held = |tier, mapping| {
+            crate::sandbox::ShellEnforcement {
+                tier,
+                ..crate::sandbox::ShellEnforcement::environment_only()
+            }
+            .with_runtime_dir(roots.clone(), None)
+            .with_temp_mapping(mapping)
+        };
+        let folder_text = folder.to_string_lossy().into_owned();
+        let cases = [
+            (
+                held(
+                    crate::sandbox::EnforcementTier::KernelFull,
+                    TempMapping::MountNamespace,
+                ),
+                Some("/tmp".to_string()),
+            ),
+            (
+                held(
+                    crate::sandbox::EnforcementTier::KernelSealed,
+                    TempMapping::ComposedRoot,
+                ),
+                Some("/tmp".to_string()),
+            ),
+            (
+                held(
+                    crate::sandbox::EnforcementTier::KernelFull,
+                    TempMapping::NotMapped(NotMappedReason::NoMountNamespace),
+                ),
+                Some(folder_text.clone()),
+            ),
+            (
+                held(
+                    crate::sandbox::EnforcementTier::KernelSeccompOnly,
+                    TempMapping::NotMapped(NotMappedReason::NoMountNamespaceNoLandlock),
+                ),
+                Some(folder_text.clone()),
+            ),
+            (
+                held(
+                    crate::sandbox::EnforcementTier::KernelFull,
+                    TempMapping::NotMapped(NotMappedReason::WorkdirIsTmp),
+                ),
+                Some(folder_text.clone()),
+            ),
+            (
+                held(
+                    crate::sandbox::EnforcementTier::EnvironmentOnly,
+                    TempMapping::NotMapped(NotMappedReason::NoKernelContainment),
+                ),
+                Some(folder_text.clone()),
+            ),
+            (crate::sandbox::ShellEnforcement::environment_only(), None),
+        ];
+        for (enforcement, expected) in cases {
+            assert_eq!(
+                enforcement.tmpdir_value(),
+                expected,
+                "{:?}",
+                enforcement.tier
+            );
+            let env = build_shell_env(
+                &policy,
+                &overrides,
+                &root,
+                None,
+                None,
+                enforcement.tmpdir_value().as_deref(),
+            )
+            .unwrap();
+            for name in TEMP_DIR_ENV {
+                assert_eq!(
+                    env.get(name),
+                    expected.as_ref(),
+                    "{name} on {:?}",
+                    enforcement.tier
+                );
+            }
+        }
+    }
+
+    /// The baseline passes no temporary-folder name through from the host.
+    #[test]
+    fn the_env_baseline_names_no_temp_variable() {
+        for name in crate::temp_dir::TEMP_DIR_ENV {
+            assert!(!DEFAULT_ENV_BASELINE.contains(&name), "{name}");
+        }
     }
 }

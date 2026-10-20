@@ -518,11 +518,13 @@ impl WorkdirGuard {
     /// Spawn the checker thread for `workdir`. The returned handle owns the latch; dropping the
     /// last clone stops the thread within one interval.
     ///
-    /// `workdir` is the directory measured; `records_root` is the session's records directory,
+    /// `workdir` and `temp_dir`, the session's temporary folder, are the directories measured,
+    /// against one ceiling for their sum; `records_root` is the session's records directory,
     /// where a breach is logged, or `None` outside a session, where it is reported on stderr
     /// alone.
     pub(crate) fn spawn(
         workdir: &crate::workdir_fs::WorkdirRoot,
+        temp_dir: Option<&crate::workdir_fs::WorkdirRoot>,
         records_root: Option<&crate::workdir_fs::WorkdirRoot>,
         max_bytes: u64,
     ) -> Arc<Self> {
@@ -537,6 +539,7 @@ impl WorkdirGuard {
         // as `limits::EpochTicker`.
         let weak = Arc::downgrade(&guard);
         let workdir = workdir.clone();
+        let temp_dir = temp_dir.cloned();
         let records_root = records_root.cloned();
         thread::spawn(move || loop {
             thread::sleep(WORKDIR_CHECK_INTERVAL);
@@ -546,14 +549,29 @@ impl WorkdirGuard {
             if guard.stop.load(Ordering::Relaxed) || guard.breach().is_some() {
                 break;
             }
-            let observed = directory_size_bytes(workdir.path());
-            if observed > guard.max_bytes {
-                guard.record_breach(records_root.as_ref(), observed);
+            if guard.check(&workdir, temp_dir.as_ref(), records_root.as_ref()) {
                 break;
             }
         });
 
         guard
+    }
+
+    /// One measurement of `workdir` and `temp_dir` together, latching a breach when their sum is
+    /// past the ceiling. `true` when it was.
+    fn check(
+        &self,
+        workdir: &crate::workdir_fs::WorkdirRoot,
+        temp_dir: Option<&crate::workdir_fs::WorkdirRoot>,
+        records_root: Option<&crate::workdir_fs::WorkdirRoot>,
+    ) -> bool {
+        let observed = directory_size_bytes(workdir.path())
+            .saturating_add(temp_dir.map_or(0, |temp_dir| directory_size_bytes(temp_dir.path())));
+        if observed > self.max_bytes {
+            self.record_breach(records_root, observed);
+            return true;
+        }
+        false
     }
 
     /// The latched breach, if the workdir has crossed its ceiling.
@@ -593,7 +611,7 @@ impl Drop for WorkdirGuard {
 /// subprocess spawn paths return, so the two cannot drift.
 pub(crate) fn workdir_breach_message(breach: WorkdirBreach) -> String {
     format!(
-        "workdir grew to {} bytes, past the {} byte ceiling \
+        "workdir and temporary folder grew to {} bytes, past the {} byte ceiling \
          (capabilities.resources.workdir_max_bytes)",
         breach.observed_bytes, breach.max_bytes
     )
@@ -896,9 +914,45 @@ mod tests {
         let guard = WorkdirGuard::spawn(
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             None,
+            None,
             DEFAULT_WORKDIR_MAX_BYTES,
         );
         assert_eq!(guard.breach(), None);
+    }
+
+    /// The session's temporary folder counts against the workdir's ceiling: 2 MiB in the folder
+    /// alone breaches 1 MiB, and the breach observes the sum of both.
+    #[test]
+    fn the_workdir_guard_counts_the_temp_folder() {
+        const MIB: u64 = 1024 * 1024;
+        let workdir = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(workdir.path().join("small"), vec![0u8; 100]).unwrap();
+        std::fs::write(folder.path().join("big"), vec![0u8; 2 * MIB as usize]).unwrap();
+        let workdir = crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap();
+        let folder = crate::workdir_fs::WorkdirRoot::open(folder.path()).unwrap();
+
+        let guard = WorkdirGuard::spawn(&workdir, Some(&folder), None, MIB);
+        assert!(
+            !guard.check(&workdir, None, None),
+            "the workdir alone is under 1 MiB"
+        );
+        assert_eq!(guard.breach(), None);
+        assert!(guard.check(&workdir, Some(&folder), None));
+        let breach = guard
+            .breach()
+            .expect("the folder's bytes breach the ceiling");
+        assert_eq!(breach.max_bytes, MIB);
+        assert_eq!(breach.observed_bytes, 2 * MIB + 100);
+
+        let message = workdir_breach_message(breach);
+        assert!(message.contains("temporary folder"), "{message}");
+        let error = crate::errors::RuntimeError::WorkdirSizeExceeded {
+            max_bytes: breach.max_bytes,
+            observed_bytes: breach.observed_bytes,
+        }
+        .to_string();
+        assert!(error.contains("workdir and temporary folder"), "{error}");
     }
 
     /// The baseline must be a real, plausible count — a `0` here would silently turn

@@ -1942,6 +1942,13 @@ pub fn stage_session(
                 artifact.capabilities.as_ref(),
             )
         }))?;
+    // Whether a literal `/tmp` reaches the session's temporary folder, decided once: the report
+    // below says it and `launch_session` hands it to the enforcement that installs it.
+    let temp_mapping = crate::temp_dir::temp_mapping(
+        sandbox::applied_tier(enforcement_tier, request.declared_containment_floor),
+        host_probe.mount_namespace_usable(),
+        &runtime_dir_placement.workdir,
+    );
     let mut scope_report = crate::containment::scope_report_for_tier(
         &request.capability_policy,
         request.declared_containment_floor,
@@ -1954,6 +1961,7 @@ pub fn stage_session(
         configured_artifacts,
         preopens,
         &runtime_dir_placement,
+        temp_mapping,
         // Not established at stage time: whether the declared `io.max` ceiling applies is known
         // only once the cgroup scope has been created, which `launch_session` does. Left at
         // `NotProbed` here so the staged report claims nothing, and overwritten from
@@ -2642,10 +2650,27 @@ pub fn stage_session(
     )
     .map_err(|reason| RuntimeError::RecordsDirUnavailable { reason })?;
     let records_root = records_dir.root().clone();
+    // The session's temporary folder, created through the records root and held by descriptor
+    // from here on.
+    records_root.create_dir_all(
+        crate::temp_dir::SESSION_TEMP_DIR_NAME,
+        crate::murmur_home::MURMUR_HOME_DIR_MODE,
+    )?;
+    let temp_root = records_root
+        .open_beneath(crate::temp_dir::SESSION_TEMP_DIR_NAME)?
+        .ok_or_else(|| RuntimeError::RecordsDirUnavailable {
+            reason: format!(
+                "the temporary folder {} vanished as it was created",
+                records_root
+                    .host_path(crate::temp_dir::SESSION_TEMP_DIR_NAME)
+                    .display()
+            ),
+        })?;
     let runtime_dirs = runtime_dir_guard
         .roots()
         .clone()
-        .with_records(records_root.clone());
+        .with_records(records_root.clone())
+        .with_temp(temp_root);
     let runtime_root = runtime_dirs.runtime.clone();
     let manifest_file_name = request
         .manifest_file
@@ -2886,6 +2911,7 @@ pub fn stage_session(
             .unwrap_or_default(),
         trace_retain: request.trace.as_ref().and_then(|t| t.retain),
         host_probe,
+        temp_mapping,
         protected_paths,
         tool_annotations,
         bind_addr: request.bind_addr,
@@ -3078,6 +3104,7 @@ fn launch(
     let cgroup_scope = prepared_scope.scope;
     let workdir_guard = Some(resources::WorkdirGuard::spawn(
         &staged.session_root,
+        staged.runtime_dirs.temp.as_ref(),
         Some(&staged.records_root),
         staged.capability_policy.resources.workdir_max_bytes,
     ));
@@ -3089,7 +3116,8 @@ fn launch(
     )
     .map_err(RuntimeError::Runtime)?
     .with_host_bounding(cgroup_scope, workdir_guard)
-    .with_runtime_dir(staged.runtime_dirs.clone(), Some(runtime_dir_owner.clone()));
+    .with_runtime_dir(staged.runtime_dirs.clone(), Some(runtime_dir_owner.clone()))
+    .with_temp_mapping(staged.temp_mapping);
     // Ends the session on every path out of this function, an error return included: every path
     // that ends normally ends it explicitly first, and a second end is a no-op.
     let _session_end = sandbox::EndSessionOnDrop::new(shell_enforcement.clone());
@@ -10977,6 +11005,7 @@ fn dispatch_native_tool(
         session_workdir,
         enforcement.runtime_dir_path(),
         enforcement.records_dir_path(),
+        enforcement.tmpdir_value().as_deref(),
     )?;
 
     let mut command = Command::new(entrypoint.path());
@@ -14937,6 +14966,10 @@ inference:
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                sandbox::EnforcementTier::EnvironmentOnly,
+                murmur_artifact::ContainmentClass::Advisory,
+            )),
             crate::cgroup::IoMaxReport::default(),
         );
 
@@ -15950,6 +15983,10 @@ inference:
                 Vec::new(),
                 Vec::new(),
                 &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                    sandbox::EnforcementTier::EnvironmentOnly,
+                    murmur_artifact::ContainmentClass::Advisory,
+                )),
                 crate::cgroup::IoMaxReport::default(),
             ),
             murmur_artifact::TraceCapture::Meta,
@@ -17372,6 +17409,7 @@ inference:
             &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
             None,
             None,
+            None,
         )
         .unwrap();
         let binary = write_env_echo_native_tool(tmp.path(), "echo-peers", &[name]);
@@ -18430,6 +18468,10 @@ inference:
                     Vec::new(),
                     Vec::new(),
                     &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                    crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                        sandbox::EnforcementTier::EnvironmentOnly,
+                        murmur_artifact::ContainmentClass::Advisory,
+                    )),
                     crate::cgroup::IoMaxReport::default(),
                 ),
                 murmur_artifact::TraceCapture::Meta,
@@ -19786,6 +19828,10 @@ inference:
                 Vec::new(),
                 Vec::new(),
                 &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                    sandbox::EnforcementTier::EnvironmentOnly,
+                    murmur_artifact::ContainmentClass::Advisory,
+                )),
                 crate::cgroup::IoMaxReport::default(),
             ),
             murmur_artifact::TraceCapture::Meta,
@@ -20231,6 +20277,10 @@ inference:
                 Vec::new(),
                 Vec::new(),
                 &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                    sandbox::EnforcementTier::EnvironmentOnly,
+                    murmur_artifact::ContainmentClass::Advisory,
+                )),
                 crate::cgroup::IoMaxReport::default(),
             ),
             murmur_artifact::TraceCapture::Meta,

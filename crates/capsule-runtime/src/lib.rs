@@ -96,6 +96,7 @@ pub mod state_store;
 pub(crate) mod stream_events;
 pub(crate) mod streaming;
 pub(crate) mod task_io_import;
+pub mod temp_dir;
 pub(crate) mod tokens_import;
 pub(crate) mod tool_annotations;
 pub(crate) mod tool_call_progress;
@@ -116,10 +117,10 @@ pub use containment::{
     applied_mechanism, check_containment_floor, containment_shortfall_reason,
     detect_achieved_containment, detect_sealed_blocker, detect_userns_grant, doctor_runtime_dir,
     explain_scope, install_from_places, read_only_advisory_for, render_install, render_read_only,
-    render_records_dir, render_runtime_dir, resolve_runtime_dir_reach, resolve_runtime_dir_reaches,
-    DoctorDirReports, ExportsFilesReport, FilesystemBoundaryReport, FilesystemRestriction,
-    PreopenReport, PreopenSurface, RuntimeDirReach, RuntimeDirReport, ScopeReport, ShortfallCause,
-    StateStoreReport,
+    render_records_dir, render_runtime_dir, render_temp_dir, resolve_runtime_dir_reach,
+    resolve_runtime_dir_reaches, DoctorDirReports, ExportsFilesReport, FilesystemBoundaryReport,
+    FilesystemRestriction, PreopenReport, PreopenSurface, RuntimeDirReach, RuntimeDirReport,
+    ScopeReport, ShortfallCause, StateStoreReport, TempDirReport,
 };
 pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
 pub use murmur_home::{usable_murmur_home, HomeUnusable, HOME_UNUSABLE_HINT};

@@ -3033,7 +3033,13 @@ fn a_child_cannot_forge_its_completion() {
         !records_line.starts_with("FORGE|records|0|"),
         "{records_line}"
     );
-    assert!(records_line.contains("Permission denied"), "{records_line}");
+    // Landlock refuses it, or, with the records directory under a mapped `/tmp`, its read-only
+    // bind does.
+    assert!(
+        records_line.contains("Permission denied")
+            || records_line.contains("Read-only file system"),
+        "{records_line}"
+    );
     assert!(forged.contains("FORGE|workdir|0|"), "{forged}");
 
     // The launch notice names the child's records directory as the child reported it.

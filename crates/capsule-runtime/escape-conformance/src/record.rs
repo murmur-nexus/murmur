@@ -278,7 +278,9 @@ impl Record<'_> {
              claim (every kernel-mediated case at `advisory`), or the case's own shape cannot reach \
              its premise at this class (`hardlink-escape` and `rename-across-boundary` at `sealed`, \
              where independent bind mounts make link(2)/rename(2) fail with EXDEV before Landlock \
-             is consulted). The per-case `attribution` below says which applies.\n"
+             is consulted). `write-outside-workdir` at `sealed` is the one case whose target has \
+             not been measured against a composed root. The per-case `attribution` below says \
+             which applies.\n"
         );
         self.render_table(&mut out, Category::Boundary);
 
@@ -333,7 +335,8 @@ impl Record<'_> {
              The `sealed` column is graded rather than merely recorded: every entry is the verdict \
              a real composed root produced on 2026-08-09, except `hardlink-escape` and \
              `rename-across-boundary`, which assert nothing there because `sealed`'s independent \
-             bind mounts make link(2)/rename(2) fail with EXDEV before Landlock is consulted. \
+             bind mounts make link(2)/rename(2) fail with EXDEV before Landlock is consulted, and \
+             `write-outside-workdir`, whose `/var/tmp` target has not been measured there. \
              `not-asserted` in the `advisory` column means something different — a class with no \
              mechanism — and the two must not be read as one.\n"
         );
