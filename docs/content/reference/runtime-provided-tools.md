@@ -104,7 +104,7 @@ Seconds are whole, rounded down.
 |---|---|---|
 | `time.elapsed_secs` | Seconds since the session started | — |
 | `time.task_elapsed_secs` | Seconds since the running task's `task_start` | `"unknown"` outside a task |
-| `time.deadline.at` | When the runtime ends the session, RFC 3339 UTC: [`mur run --deadline`](cli.md#mur-run) seconds after `mur run` started | `time.deadline` is `"none"` with no `--deadline` |
+| `time.deadline.at` | When the runtime ends the session, RFC 3339 UTC: [`mur run --deadline`](cli.md#mur-run-deadline) seconds after `mur run` started | `time.deadline` is `"none"` with no `--deadline` |
 | `time.deadline.left_secs` | Seconds until `at`; `0` once it has passed | — |
 | `turns.used` | Inference calls the running task has made, across its reopens and continuations, a hook's `run-inference` included: the count [`inference.max_turns`](manifest.md#field-inference) is checked against | — |
 | `turns.cap` | `inference.max_turns` | `"none"` with no cap |
@@ -127,13 +127,12 @@ The two transports differ in where the numbers come from:
 | `context` | An object | `"unknown"`: the harness keeps its own context |
 | `tokens` | The provider's `usage` on each call | The harness's own counts for each closed turn |
 
-The tool's description names these fields and is fixed per transport, so the tool array is the same
-bytes on every request. Each call writes one [`session_status`](observability-schemas.md#session-status)
-record carrying the object returned.
+Each call writes one [`session_status`](observability-schemas.md#session-status) record carrying
+the object returned.
 
 ### The deadline notice { #deadline-notice }
 
-With [`mur run --deadline`](cli.md#mur-run) set, the agent is told once that the session is about
+With [`mur run --deadline`](cli.md#mur-run-deadline) set, the agent is told once that the session is about
 to end. The first tool result the runtime hands the model once no more than
 [`lifecycle.deadline_notice_secs`](manifest.md#field-lifecycle) are left carries one line after
 its fence:
@@ -145,16 +144,13 @@ Session deadline: the runtime ends this session at 2026-10-20T14:00:00Z, in 297 
 | Aspect | Behaviour |
 |---|---|
 | Margin | `lifecycle.deadline_notice_secs`; default five minutes, or a tenth of the deadline when that is shorter, and at least one second. `0` sends none |
-| Carried by | The first tool result dispatched inside the margin, on either transport — under `transport: process`, the bridged tool result. A refused or failed call does not carry it |
+| Carried by | The first tool result dispatched inside the margin, on either transport — under `transport: process`, the bridged tool result. A tool that ran and reported failure carries it; a refused call, or one the runtime could not run, does not |
 | How often | Once per session |
 | A turn with no tool call | Gets no notice; the deadline still ends the session |
 | Trace | One [`deadline_notice`](observability-schemas.md#deadline-notice) record |
 
-Nothing else the runtime adds to the conversation changes.
-
-When the deadline is reached the session ends as a first `SIGTERM` ends it: the running task is
-cancelled, the trace records [`deadline_reached`](observability-schemas.md#deadline-reached), and
-`mur run` exits with [`E-RUN-053`](diagnostics.md#e-run-053).
+Nothing else the runtime adds to the conversation changes. What happens when the deadline is
+reached is described under [The deadline](cli.md#mur-run-deadline).
 
 ## `switch-driver` { #switch-driver }
 

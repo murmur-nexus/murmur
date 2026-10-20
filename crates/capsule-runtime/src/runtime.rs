@@ -91,11 +91,11 @@ use crate::{
     registration::SessionOutcome,
     resources, running, sandbox,
     sealed::UsernsGrant,
+    session_status::SESSION_STATUS_TOOL,
     shell::{
         build_declared_env, build_shell_env, is_shell_interpreter, run_shell,
         shell_tool_manifest_yaml, split_shell_words, ShellExecError, ShellOutcome, ShellResult,
     },
-    session_status::SESSION_STATUS_TOOL,
     spawn_credential::SpawnCredential,
     spend::{MachineLedger, SpendMeter},
     state_store::STATE_PREOPEN_NAME,
@@ -9414,14 +9414,6 @@ impl CapsuleStoreState {
         Ok((result, note))
     }
 
-    /// `switch-driver`: the agent selects the driver choice its next inference call is served by.
-    ///
-    /// Answered here, in-process, because only the runtime knows the caller is the agent. It
-    /// presents no credential, never reaches the control surface, and never reads the controller
-    /// token or its file. The call has already passed the policy decision point by the time it
-    /// lands here, like every tool call, and a plan step cannot name it. The checks and refusals
-    /// are the controller's own, made through [`crate::control_plane::ControlState::request_change`],
-    /// and a refusal comes back to the model as a tool error.
     /// `session-status`: where this session stands, measured now, recorded as `session_status`.
     async fn dispatch_session_status(&self) -> Result<murmur::tool::run::ToolResult, String> {
         let Some(status) = &self.session_status else {
@@ -9433,8 +9425,10 @@ impl CapsuleStoreState {
         if let Some(trace) = &self.peer_trace {
             trace.write_session_status(status.task_id(), &report).await;
         }
-        // Serialized from the report itself rather than through a `Value`, so the model reads the
-        // fields in the order the description names them.
+        // Serialized from the report itself rather than through a `Value`, so the top-level fields
+        // and the `time`, `turns`, `tokens` and `spend` members keep the order the description
+        // names them in. The nested `deadline`, `context` and `machine` objects are `Value`s and
+        // serialize with their keys sorted.
         let data = serde_json::to_string(&report).map_err(|error| error.to_string())?;
         Ok(murmur::tool::run::ToolResult {
             status: murmur::tool::run::Status::Passed,
@@ -9446,6 +9440,14 @@ impl CapsuleStoreState {
         })
     }
 
+    /// `switch-driver`: the agent selects the driver choice its next inference call is served by.
+    ///
+    /// Answered here, in-process, because only the runtime knows the caller is the agent. It
+    /// presents no credential, never reaches the control surface, and never reads the controller
+    /// token or its file. The call has already passed the policy decision point by the time it
+    /// lands here, like every tool call, and a plan step cannot name it. The checks and refusals
+    /// are the controller's own, made through [`crate::control_plane::ControlState::request_change`],
+    /// and a refusal comes back to the model as a tool error.
     async fn dispatch_switch_driver(
         &self,
         input: murmur::tool::run::ToolInput,
@@ -12117,7 +12119,10 @@ async fn start_termination(
             if let Some(trace) = &ends.spawner {
                 trace
                     .appender
-                    .write_spawner_ended(trace.spawned_by.as_deref(), trace.delegation_id.as_deref())
+                    .write_spawner_ended(
+                        trace.spawned_by.as_deref(),
+                        trace.delegation_id.as_deref(),
+                    )
                     .await;
             }
         }
@@ -13022,7 +13027,11 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(!script.path().join("tools").join(SESSION_STATUS_TOOL).exists());
+        assert!(!script
+            .path()
+            .join("tools")
+            .join(SESSION_STATUS_TOOL)
+            .exists());
 
         for (transport, description) in [
             ("http", crate::session_status::description_http()),
@@ -13050,6 +13059,9 @@ mod tests {
             )
             .unwrap();
             assert_eq!(manifest["name"].as_str(), Some(SESSION_STATUS_TOOL));
+            assert_eq!(manifest["version"].as_str(), Some("0.0.0"));
+            assert_eq!(manifest["runtime"].as_str(), Some("tool"));
+            assert_eq!(manifest["implementation"].as_str(), Some("native"));
             assert_eq!(manifest["description"].as_str(), Some(description.as_str()));
             assert_eq!(
                 manifest["input_schema"].as_str(),
@@ -21309,7 +21321,11 @@ inference:
             outcome
         };
 
-        let ended = terminated(None, AgentLoopExit::Canceled, Some(LaunchEnding::FormationEnded));
+        let ended = terminated(
+            None,
+            AgentLoopExit::Canceled,
+            Some(LaunchEnding::FormationEnded),
+        );
         assert_eq!(ended.exit_status(), "formation_ended");
         assert_eq!(
             ended.into_launch_result().unwrap(),
@@ -21345,7 +21361,10 @@ inference:
             AgentLoopExit::MaxTurnsReached,
             AgentLoopExit::SpendCeilingReached,
         ] {
-            assert_eq!(terminated(None, exit, Some(LaunchEnding::FormationEnded)).exit_status(), exit.as_str());
+            assert_eq!(
+                terminated(None, exit, Some(LaunchEnding::FormationEnded)).exit_status(),
+                exit.as_str()
+            );
         }
         let completed = terminated(None, AgentLoopExit::Ok, Some(LaunchEnding::FormationEnded));
         assert_eq!(completed.exit_status(), "ok");
@@ -21355,7 +21374,11 @@ inference:
         );
 
         // An earlier run that did not complete still decides the launch.
-        let failed = terminated(Some(AgentLoopExit::Failed), AgentLoopExit::Canceled, Some(LaunchEnding::FormationEnded));
+        let failed = terminated(
+            Some(AgentLoopExit::Failed),
+            AgentLoopExit::Canceled,
+            Some(LaunchEnding::FormationEnded),
+        );
         assert_eq!(failed.exit_status(), "failed");
         assert!(matches!(
             failed.into_launch_result(),

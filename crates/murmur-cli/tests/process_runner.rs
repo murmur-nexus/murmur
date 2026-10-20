@@ -510,7 +510,10 @@ fn s3_the_harness_calls_a_capsule_tool_through_the_bridge() {
     assert_eq!(inferences[1]["decision"], "end_turn");
 
     let start = run.one("harness_start");
-    assert_eq!(start["bridge_tools"], serde_json::json!([TOOL, "session-status"]));
+    assert_eq!(
+        start["bridge_tools"],
+        serde_json::json!([TOOL, "session-status"])
+    );
 
     let shown = capsule.trace_show(&run.records_dir);
     assert!(shown.contains(TOOL), "{shown}");

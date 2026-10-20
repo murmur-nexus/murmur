@@ -31,6 +31,10 @@ const UNKNOWN: &str = "unknown";
 /// The longest default notice margin: five minutes.
 const DEFAULT_NOTICE_CEILING_SECS: u64 = 300;
 
+/// The longest deadline `mur run --deadline` takes: ten years. A larger one overflows the clocks
+/// the deadline is read against.
+pub const MAX_DEADLINE_SECS: u64 = 315_360_000;
+
 /// The hard limit `mur run --deadline` set: `secs` after the moment `mur run` started.
 ///
 /// Both clocks are read once, at that moment. The monotonic one is what the runtime enforces and
@@ -44,8 +48,10 @@ pub struct SessionDeadline {
 }
 
 impl SessionDeadline {
-    /// The deadline `secs` after a start read as `started` and `started_wall`.
+    /// The deadline `secs` after a start read as `started` and `started_wall`. A `secs` above
+    /// [`MAX_DEADLINE_SECS`] is taken as that bound.
     pub fn after(started: Instant, started_wall: SystemTime, secs: u64) -> Self {
+        let secs = secs.min(MAX_DEADLINE_SECS);
         let length = Duration::from_secs(secs);
         Self {
             at: started + length,
@@ -299,10 +305,10 @@ impl SessionStatus {
         let whole_secs = |since: Instant| now.saturating_duration_since(since).as_secs();
         let time = TimeReport {
             elapsed_secs: whole_secs(self.started),
-            task_elapsed_secs: fed
-                .task
-                .as_ref()
-                .map_or_else(|| Value::from(UNKNOWN), |(_, at)| Value::from(whole_secs(*at))),
+            task_elapsed_secs: fed.task.as_ref().map_or_else(
+                || Value::from(UNKNOWN),
+                |(_, at)| Value::from(whole_secs(*at)),
+            ),
             deadline: self.deadline.map_or_else(
                 || Value::from(NONE),
                 |deadline| {
@@ -449,7 +455,7 @@ pub fn description_http() -> String {
 pub fn description_process() -> String {
     format!(
         "Report where this session stands, measured at the moment of the call. Takes no input and \
-         returns one JSON object. {FIELDS} Turns are counted when they close. `context` reads \
+         returns one JSON object. {FIELDS} Turns are counted as they close. `context` reads \
          \"unknown\": the harness keeps its own context. `tokens`: the `input`, `output`, \
          `cached` and `cache_write` tokens the harness reported for this session's closed turns, \
          and `unreported_calls`, the turns it reported none for. {SPEND_AND_VALUES}"
@@ -533,10 +539,16 @@ mod tests {
         );
         // The wire text keeps the documented field order.
         let text = serde_json::to_string(&status.snapshot_at(now, spend)).unwrap();
-        let order: Vec<usize> = ["\"time\"", "\"turns\"", "\"context\"", "\"tokens\"", "\"spend\""]
-            .iter()
-            .map(|key| text.find(key).unwrap())
-            .collect();
+        let order: Vec<usize> = [
+            "\"time\"",
+            "\"turns\"",
+            "\"context\"",
+            "\"tokens\"",
+            "\"spend\"",
+        ]
+        .iter()
+        .map(|key| text.find(key).unwrap())
+        .collect();
         assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
     }
 
@@ -560,7 +572,12 @@ mod tests {
         // A record with no usage is an unreported call; one with only some members leaves the
         // others unknown.
         status.record_inference(1, Some(900), Some(40), None);
-        status.record_inference(2, Some(900), Some(40), Some(&usage(Some(7), None, None, None)));
+        status.record_inference(
+            2,
+            Some(900),
+            Some(40),
+            Some(&usage(Some(7), None, None, None)),
+        );
         status.set_context(940, None, MEASURED_BY_ESTIMATE);
         let value = report(&status, started + Duration::from_secs(3), no_spend());
         assert_eq!(
@@ -634,7 +651,10 @@ mod tests {
         let started = Instant::now();
         let deadline = SessionDeadline::after(started, SystemTime::now(), 30);
         let status = SessionStatus::new(started, false, None, Some(deadline), 20);
-        assert_eq!(status.take_due_notice(started + Duration::from_secs(9)), None);
+        assert_eq!(
+            status.take_due_notice(started + Duration::from_secs(9)),
+            None
+        );
         let notice = status
             .take_due_notice(started + Duration::from_secs(10))
             .expect("due once 20 seconds are left");
@@ -647,8 +667,14 @@ mod tests {
                 deadline.at_rfc3339()
             )
         );
-        assert_eq!(status.take_due_notice(started + Duration::from_secs(11)), None);
-        assert_eq!(status.take_due_notice(started + Duration::from_secs(40)), None);
+        assert_eq!(
+            status.take_due_notice(started + Duration::from_secs(11)),
+            None
+        );
+        assert_eq!(
+            status.take_due_notice(started + Duration::from_secs(40)),
+            None
+        );
     }
 
     #[test]
@@ -656,12 +682,17 @@ mod tests {
         let started = Instant::now();
         let deadline = SessionDeadline::after(started, SystemTime::now(), 30);
         let silent = SessionStatus::new(started, false, None, Some(deadline), 0);
-        assert_eq!(silent.take_due_notice(started + Duration::from_secs(29)), None);
+        assert_eq!(
+            silent.take_due_notice(started + Duration::from_secs(29)),
+            None
+        );
         let unbounded = SessionStatus::new(started, false, None, None, 300);
         assert_eq!(unbounded.take_due_notice(started), None);
         // A deadline already past still gives its one notice, saying no time is left.
         let past = SessionStatus::new(started, false, None, Some(deadline), 5);
-        let notice = past.take_due_notice(started + Duration::from_secs(31)).unwrap();
+        let notice = past
+            .take_due_notice(started + Duration::from_secs(31))
+            .unwrap();
         assert_eq!(notice.left_secs, 0);
     }
 
@@ -672,7 +703,22 @@ mod tests {
         let deadline = SessionDeadline::after(started, wall, 600);
         assert_eq!(deadline.at_rfc3339(), "2026-10-20T12:10:00Z");
         assert_eq!(deadline.secs(), 600);
-        assert_eq!(deadline.left(started + Duration::from_secs(700)), Duration::ZERO);
+        assert_eq!(
+            deadline.left(started + Duration::from_secs(700)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn session_status_deadline_beyond_the_bound_is_taken_as_the_bound() {
+        let started = Instant::now();
+        let deadline = SessionDeadline::after(started, SystemTime::now(), u64::MAX);
+        assert_eq!(deadline.secs(), MAX_DEADLINE_SECS);
+        assert_eq!(
+            deadline.left(started),
+            Duration::from_secs(MAX_DEADLINE_SECS)
+        );
+        assert!(deadline.at_rfc3339().ends_with('Z'));
     }
 
     #[test]
@@ -698,10 +744,14 @@ mod tests {
                 "\"none\"",
                 "\"unknown\"",
             ] {
-                assert!(description.contains(field), "{field} missing: {description}");
+                assert!(
+                    description.contains(field),
+                    "{field} missing: {description}"
+                );
             }
-            for advice in ["when to call", "Call this", "before ending", "periodically"] {
-                assert!(!description.contains(advice), "{advice}: {description}");
+            let lower = description.to_lowercase();
+            for advice in ["when", "should", "call this", "periodically"] {
+                assert!(!lower.contains(advice), "{advice}: {description}");
             }
         }
         assert!(description_http().contains("measured_by"));

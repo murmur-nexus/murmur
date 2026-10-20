@@ -361,11 +361,12 @@ enum Commands {
         /// does, records deadline_reached, and exits non-zero with E-RUN-053. The agent is told
         /// once, on a tool result, when lifecycle.deadline_notice_secs are left, and its
         /// session-status tool reports the time left. Requires an agent capsule (a manifest with
-        /// an inference: block).
+        /// an inference: block). At most 315360000 (ten years).
         #[arg(
             long,
             value_name = "SECONDS",
-            value_parser = clap::value_parser!(u64).range(1..)
+            value_parser = clap::value_parser!(u64)
+                .range(1..=capsule_runtime::session_status::MAX_DEADLINE_SECS)
         )]
         deadline: Option<u64>,
 

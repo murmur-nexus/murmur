@@ -272,7 +272,7 @@ fn split_notice(text: &str) -> (String, Option<String>) {
     }
 }
 
-// ── 1. In the tool list ──────────────────────────────────────────────────────
+// ── In the tool list ──────────────────────────────────────────────────────
 
 /// Every http agent capsule is offered `session-status`, with the fixed description and an
 /// empty-object schema, granted nothing; `session_start` lists it.
@@ -316,7 +316,7 @@ fn session_status_is_in_every_agent_capsules_tool_list() {
     assert!(events(&trace, "session_status").is_empty());
 }
 
-// ── 2. The fields match the trace ────────────────────────────────────────────
+// ── The fields match the trace ────────────────────────────────────────────
 
 /// Turn 1 runs a granted tool, turn 2 calls `session-status`, turn 3 ends. Every field the model
 /// was handed agrees with the trace written before the call, and the `session_status` record
@@ -352,7 +352,10 @@ fn session_status_fields_match_the_trace() {
         &common::tool_result_text(&server.requests(), "toolu_2").expect("the turn-3 request"),
     )
     .unwrap();
-    assert_eq!(&handed, status, "the record is the object the model was handed");
+    assert_eq!(
+        &handed, status,
+        "the record is the object the model was handed"
+    );
 
     let task_id = first(&trace, "task_start")["task_id"].clone();
     let before: Vec<&Value> = trace[..at]
@@ -422,7 +425,7 @@ fn session_status_fields_match_the_trace() {
     assert!(events(&trace, "deadline_notice").is_empty(), "{trace:#?}");
 }
 
-// ── 3. Unset limits and unreported counts ────────────────────────────────────
+// ── Unset limits and unreported counts ────────────────────────────────────
 
 /// No deadline, no turn cap, no ceiling, no window and a provider that reports no usage: every
 /// limit reads `"none"` and every count the runtime lacks `"unknown"`.
@@ -462,7 +465,7 @@ fn unset_limits_say_none_and_unreported_counts_say_unknown() {
     assert_eq!(status["spend"]["machine"], "none");
 }
 
-// ── 4. Process transport ─────────────────────────────────────────────────────
+// ── Process transport ─────────────────────────────────────────────────────
 
 /// A process capsule whose fake harness runs `profile`, with `wait` seconds before its third
 /// call.
@@ -573,19 +576,28 @@ fn session_status_through_the_process_bridge() {
     assert_eq!(second["tokens"]["input"], 40);
     assert_eq!(second["tokens"]["cached"], 100);
 
-    assert_eq!(carriers.len(), 1, "exactly one bridged result carries the notice");
+    assert_eq!(
+        carriers.len(),
+        1,
+        "exactly one bridged result carries the notice"
+    );
     let (carrier, left) = carriers[0];
     assert!(left <= 91, "the notice is due within the margin: {left}");
     for (_, earlier) in &statuses[..carrier] {
         assert!(
-            earlier["status"]["time"]["deadline"]["left_secs"].as_u64().unwrap() >= 89,
+            earlier["status"]["time"]["deadline"]["left_secs"]
+                .as_u64()
+                .unwrap()
+                >= 89,
             "an earlier result inside the margin would have carried it: {earlier}"
         );
     }
-    assert_eq!(events(&trace, "deadline_notice").len(), 1, "{trace:#?}");
+    let notices = events(&trace, "deadline_notice");
+    assert_eq!(notices.len(), 1, "{trace:#?}");
+    assert_eq!(notices[0]["tool_name"], "session-status", "{trace:#?}");
 }
 
-// ── 5. One notice ────────────────────────────────────────────────────────────
+// ── One notice ────────────────────────────────────────────────────────────
 
 /// The scripted conversation of the notice case: `sleep 1`, `sleep 40`, `session-status`,
 /// `sleep 1`, then the end.
@@ -640,20 +652,23 @@ fn the_deadline_notice_is_sent_once() {
     if common::skip_without_host_support("the_deadline_notice_is_sent_once") {
         return;
     }
-    let with = std::thread::spawn(|| {
-        notice_run("  deadline_notice_secs: 40\n", &["--deadline", "75"])
-    });
+    let with =
+        std::thread::spawn(|| notice_run("  deadline_notice_secs: 40\n", &["--deadline", "75"]));
     let without = std::thread::spawn(|| notice_run("  deadline_notice_secs: 40\n", &[]));
-    let silent = std::thread::spawn(|| {
-        notice_run("  deadline_notice_secs: 0\n", &["--deadline", "75"])
-    });
+    let silent =
+        std::thread::spawn(|| notice_run("  deadline_notice_secs: 0\n", &["--deadline", "75"]));
     let (with, without, silent) = (
         with.join().unwrap(),
         without.join().unwrap(),
         silent.join().unwrap(),
     );
     for each in [&with, &without, &silent] {
-        assert_eq!(each.run.output.status.code(), Some(0), "{}", each.run.context());
+        assert_eq!(
+            each.run.output.status.code(),
+            Some(0),
+            "{}",
+            each.run.context()
+        );
     }
 
     let trace = with.run.trace();
@@ -681,7 +696,11 @@ fn the_deadline_notice_is_sent_once() {
     }
     let carrier = carrier.expect("one tool result carries the notice");
     let left_at = |n: usize| deadline_ms - ms(tool_calls[n]);
-    assert!(left_at(carrier) <= 41_000, "carried {}ms out", left_at(carrier));
+    assert!(
+        left_at(carrier) <= 41_000,
+        "carried {}ms out",
+        left_at(carrier)
+    );
     for earlier in 0..carrier {
         assert!(
             left_at(earlier) > 39_000,
@@ -714,7 +733,10 @@ fn the_deadline_notice_is_sent_once() {
 
     let silent_trace = silent.run.trace();
     assert!(events(&silent_trace, "deadline_notice").is_empty());
-    assert_eq!(first(&silent_trace, "session_start")["deadline"]["notice_secs"], 0);
+    assert_eq!(
+        first(&silent_trace, "session_start")["deadline"]["notice_secs"],
+        0
+    );
     for id in NOTICE_TOOL_IDS {
         assert!(
             !raw_tool_result(&silent.requests, id).contains(NOTICE_PREFIX),
@@ -722,7 +744,7 @@ fn the_deadline_notice_is_sent_once() {
         );
     }
 
-    // 9. `mur trace show` renders the deadline and each new record on one line.
+    // `mur trace show` renders the deadline and each new record on one line.
     let show = Command::cargo_bin("mur")
         .unwrap()
         .args(["trace", "show"])
@@ -737,7 +759,9 @@ fn the_deadline_notice_is_sent_once() {
         "{show}"
     );
     assert_eq!(
-        show.lines().filter(|line| line.starts_with("session_status  ")).count(),
+        show.lines()
+            .filter(|line| line.starts_with("session_status  "))
+            .count(),
         1,
         "{show}"
     );
@@ -750,7 +774,7 @@ fn the_deadline_notice_is_sent_once() {
     );
 }
 
-// ── 6. The deadline ends the session ─────────────────────────────────────────
+// ── The deadline ends the session ─────────────────────────────────────────
 
 /// The deadline the ending cases run under: long enough that staging is over well before it, so
 /// the session is in its first turn when it falls.
@@ -801,7 +825,11 @@ fn the_deadline_ends_an_http_session_in_flight() {
     let project = project(&http_manifest(&endpoint, &Http::default()));
     let begun = Instant::now();
     let run = run(&home, &project, &["--deadline", &DEADLINE_SECS.to_string()]);
-    assert!(begun.elapsed() < Duration::from_secs(60), "{}", run.context());
+    assert!(
+        begun.elapsed() < Duration::from_secs(60),
+        "{}",
+        run.context()
+    );
     assert_ended_by_the_deadline(&run);
 }
 
@@ -825,7 +853,7 @@ fn the_deadline_ends_a_process_session_and_its_harness() {
     common::assert_dead_within(pid, Duration::from_secs(5));
 }
 
-// ── 7. Validation ────────────────────────────────────────────────────────────
+// ── Validation ────────────────────────────────────────────────────────────
 
 fn refused(home: &TempDir, args: &[&str]) -> String {
     let output = Command::cargo_bin("mur")
@@ -838,14 +866,21 @@ fn refused(home: &TempDir, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// `--deadline` takes a whole number of seconds from 1, needs an agent capsule, and is not a
-/// `--roster` flag.
+/// `--deadline` takes a whole number of seconds from 1 to ten years, needs an agent capsule, and is
+/// not a `--roster` flag.
 #[test]
 fn deadline_arguments_are_validated() {
     let home = home_with_driver(common::FIXTURE_DRIVER_MODELS);
     let agent = project(&http_manifest("http://127.0.0.1:9", &Http::default()));
     let manifest = agent.manifest.to_str().unwrap();
-    for bad in ["0", "1.5", "soon", "-3"] {
+    for bad in [
+        "0",
+        "1.5",
+        "soon",
+        "-3",
+        "315360001",
+        "18446744073709551615",
+    ] {
         let stderr = refused(
             &home,
             &[

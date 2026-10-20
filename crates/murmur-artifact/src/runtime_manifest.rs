@@ -11151,7 +11151,10 @@ context:
     fn lifecycle_deadline_notice_secs_defaults_to_none() {
         let without_block =
             RuntimeManifest::from_yaml_str("name: cap\nversion: 0.0.1\nartifacts: []\n").unwrap();
-        assert_eq!(without_block.effective_lifecycle().deadline_notice_secs, None);
+        assert_eq!(
+            without_block.effective_lifecycle().deadline_notice_secs,
+            None
+        );
         let without_key = RuntimeManifest::from_yaml_str(
             "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  queue_depth: 3\n",
         )
@@ -11177,12 +11180,14 @@ context:
     }
 
     #[test]
-    fn lifecycle_deadline_notice_secs_refuses_a_negative_value() {
-        let refused = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  \
-             deadline_notice_secs: -5\n",
-        );
-        assert!(refused.is_err(), "a negative margin is refused: {refused:?}");
+    fn lifecycle_deadline_notice_secs_refuses_a_negative_or_non_integer_value() {
+        for declared in ["-5", "1.5", "soon"] {
+            let refused = RuntimeManifest::from_yaml_str(&format!(
+                "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  \
+                 deadline_notice_secs: {declared}\n"
+            ));
+            assert!(refused.is_err(), "{declared} is refused: {refused:?}");
+        }
     }
 
     #[test]
