@@ -140,12 +140,9 @@ created is refused with [`E-IO-004`](diagnostics.md#e-io-004) before anything is
 | A script capsule's own component, a WASM `runtime: tool` artifact with no `capabilities.filesystem.scope` | `murmur-runtime/`, beside the workdir it sees as its current directory, read-only. A script capsule reads its task at `murmur-runtime/task.md` |
 | A tool with a `scope`, a driver, a hook | Nothing |
 
-The model is told the names that work for the tools it has:
-
-| Text | Names |
-|---|---|
-| The [`[Capsule]` block](../concepts/session-loop.md#capsule-block), and the `transport: process` system prompt | `$MURMUR_RUNTIME_DIR` when `capabilities.shell.allow` names a shell interpreter; `murmur-runtime/` with the declared tools preopened there. Neither, and the `Runtime files:` line is left out |
-| [`MURMUR.md`](../concepts/session-loop.md#murmur-md) | The absolute path, then the name for a shell command, the tools installed now that use `murmur-runtime/`, and the absolute path for any other tool given a path |
+The model is told only the names its own tools can use: by the `Runtime files:` line of the
+[`[Capsule]` block](../concepts/session-loop.md#capsule-block), and by the runtime-directory entry
+of [`MURMUR.md`](../concepts/session-loop.md#murmur-md), which also gives the absolute path.
 
 `sealed-etc/` and `harness/` are reached by no command.
 
