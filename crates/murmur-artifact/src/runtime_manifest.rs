@@ -78,6 +78,11 @@ pub struct LifecycleConfig {
     /// `MURMUR_DELEGATION_TIMEOUT_SECS` overrides this value when it names a positive number of
     /// seconds.
     pub delegation_deadline_secs: u64,
+    /// How long before a `mur run --deadline` the runtime tells the agent, once, that its session
+    /// is about to end. `None` takes the default the runtime derives from the deadline: five
+    /// minutes, or a tenth of the deadline when that is shorter, and at least one second. `0`
+    /// sends no notice. Inert for a session launched with no deadline.
+    pub deadline_notice_secs: Option<u64>,
 }
 
 impl LifecycleConfig {
@@ -131,6 +136,7 @@ impl Default for LifecycleConfig {
             max_task_reopens: 1,
             shell_grace_secs: 10,
             delegation_deadline_secs: 600,
+            deadline_notice_secs: None,
         }
     }
 }
@@ -2110,6 +2116,8 @@ struct RawLifecycleConfig {
     shell_grace_secs: Option<u64>,
     #[serde(default)]
     delegation_deadline_secs: Option<u64>,
+    #[serde(default)]
+    deadline_notice_secs: Option<u64>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2740,6 +2748,7 @@ impl RawBlock for RawLifecycleConfig {
         "max_task_reopens",
         "shell_grace_secs",
         "delegation_deadline_secs",
+        "deadline_notice_secs",
     ];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
@@ -3766,6 +3775,7 @@ impl RuntimeManifest {
                     delegation_deadline_secs: raw_lc
                         .delegation_deadline_secs
                         .unwrap_or(defaults.delegation_deadline_secs),
+                    deadline_notice_secs: raw_lc.deadline_notice_secs,
                 };
                 if lifecycle.queue_has_room() {
                     Ok(lifecycle)
@@ -11134,6 +11144,50 @@ context:
             30,
             "the misspelt neighbour does not disturb the declared value"
         );
+    }
+
+    /// The deadline notice's margin is optional: absent leaves the runtime's default in force.
+    #[test]
+    fn lifecycle_deadline_notice_secs_defaults_to_none() {
+        let without_block =
+            RuntimeManifest::from_yaml_str("name: cap\nversion: 0.0.1\nartifacts: []\n").unwrap();
+        assert_eq!(without_block.effective_lifecycle().deadline_notice_secs, None);
+        let without_key = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  queue_depth: 3\n",
+        )
+        .unwrap();
+        assert_eq!(without_key.lifecycle.unwrap().deadline_notice_secs, None);
+    }
+
+    /// `0` and a positive value are both taken as declared: `0` is "send no notice", not absent.
+    #[test]
+    fn lifecycle_deadline_notice_secs_takes_zero_and_positive_values() {
+        for (declared, expected) in [("0", 0), ("90", 90)] {
+            let manifest = RuntimeManifest::from_yaml_str(&format!(
+                "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  \
+                 deadline_notice_secs: {declared}\n"
+            ))
+            .unwrap();
+            assert!(manifest.unknown_keys.is_empty());
+            assert_eq!(
+                manifest.lifecycle.unwrap().deadline_notice_secs,
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_deadline_notice_secs_refuses_a_negative_value() {
+        let refused = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  \
+             deadline_notice_secs: -5\n",
+        );
+        assert!(refused.is_err(), "a negative margin is refused: {refused:?}");
+    }
+
+    #[test]
+    fn lifecycle_deadline_notice_secs_is_a_known_key() {
+        assert!(RawLifecycleConfig::KNOWN_KEYS.contains(&"deadline_notice_secs"));
     }
 
     /// `0` is a valid explicit value, not an absent one: it demotes at the first poll after the

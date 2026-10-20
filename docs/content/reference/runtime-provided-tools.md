@@ -9,7 +9,7 @@ The model sees no difference. A runtime-provided tool has the same manifest shap
 same inventory, and is called the same way as a tool artifact. What differs is where it comes from
 and what decides whether it may run.
 
-## The ten
+## The eleven
 
 Each one appears only when the declaration in the second column is present.
 
@@ -25,6 +25,7 @@ Each one appears only when the declaration in the second column is present.
 | `end-without-answer` | The same rule as `call-member` | Ends a task another formation member sent without an answer, and the runtime tells that member none came — see [`end-without-answer`](#end-without-answer) |
 | `pull-artifact` | [`capabilities.install`](manifest.md#field-install), under `transport: http` | Installs a skill or tool into the running session, usable from the next turn, or lists what the capsule may pull — see [`pull-artifact`](#pull-artifact) |
 | `remove-artifact` | The same grant as `pull-artifact` | Takes out an artifact the session pulled — see [`remove-artifact`](#remove-artifact) |
+| `session-status` | An [`inference:`](manifest.md#field-inference) block: every agent capsule, on both transports | Reports the time the session has run and has left, its turns, context, tokens and spend — see [`session-status`](#session-status) |
 
 Every one of their manifests carries `version: 0.0.0`, `runtime: tool` and
 `implementation: native`. Nothing was fetched, so nothing is version-pinned, nothing is
@@ -33,8 +34,12 @@ hash-verified, and no entry appears for them in `murmur.lock` or in `mur list`.
 ## The grant is the tool's existence
 
 `share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member`,
-`end-without-answer`, `pull-artifact` and `remove-artifact` are answered before the tool allowlist
-is consulted. The allowlist governs which tool *artifacts* may run; it has no say over these nine.
+`end-without-answer`, `pull-artifact`, `remove-artifact` and `session-status` are answered before
+the tool allowlist is consulted. The allowlist governs which tool *artifacts* may run; it has no say
+over these ten.
+
+`session-status` needs no grant: staging writes its manifest for every agent capsule and for no
+script capsule.
 
 **The gate is whether the manifest file was written at all.** With the grant absent, staging writes
 nothing under `tools/<name>/`, so:
@@ -57,7 +62,7 @@ are additionally checked against that list again at dispatch.
 ## Reserved names
 
 `share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member`,
-`end-without-answer`, `pull-artifact` and `remove-artifact` are reserved.
+`end-without-answer`, `pull-artifact`, `remove-artifact` and `session-status` are reserved.
 The check is made on an artifact's tool name, the part of its full name after the `/`, so a
 capsule declaring `murmur/delegate-task` or `ana/pull-artifact` is refused at staging, before any
 artifact is pulled, with [`E-CAP-013`](diagnostics.md#e-cap-013). The same refusal covers an
@@ -74,6 +79,82 @@ first and the shell manifest yields to it, so the inventory describes the artifa
 Dispatch resolves such a pair by [precedence](../concepts/tools.md#tool-dispatch): a native
 artifact answers ahead of the shell binary, and the shell binary answers ahead of a WASM artifact
 of the same name.
+
+## `session-status` { #session-status }
+
+`session-status` takes no input (`{"type":"object","properties":{}}`) and returns one JSON object,
+measured at the moment of the call:
+
+```json
+{
+  "time":    {"elapsed_secs": 1834, "task_elapsed_secs": 1790,
+              "deadline": {"at": "2026-10-20T14:00:00Z", "left_secs": 5366}},
+  "turns":   {"used": 42, "cap": "none"},
+  "context": {"used_tokens": 61234, "window_tokens": 200000, "measured_by": "estimate"},
+  "tokens":  {"input": 812345, "output": 23456, "cached": 600000, "cache_write": 10000,
+              "unreported_calls": 0},
+  "spend":   {"tokens": 835801, "ceiling": "none", "machine": "none"}
+}
+```
+
+A limit that is not set reads `"none"`. A count the runtime does not have reads `"unknown"`.
+Seconds are whole, rounded down.
+
+| Field | Value | `"none"` / `"unknown"` |
+|---|---|---|
+| `time.elapsed_secs` | Seconds since the session started | — |
+| `time.task_elapsed_secs` | Seconds since the running task's `task_start` | `"unknown"` outside a task |
+| `time.deadline.at` | When the runtime ends the session, RFC 3339 UTC: [`mur run --deadline`](cli.md#mur-run) seconds after `mur run` started | `time.deadline` is `"none"` with no `--deadline` |
+| `time.deadline.left_secs` | Seconds until `at`; `0` once it has passed | — |
+| `turns.used` | Inference calls the running task has made, across its reopens and continuations, a hook's `run-inference` included: the count [`inference.max_turns`](manifest.md#field-inference) is checked against | — |
+| `turns.cap` | `inference.max_turns` | `"none"` with no cap |
+| `context.used_tokens` | The conversation's size as the compaction check last counted it | `context` is `"unknown"` before the first turn, and always under `transport: process` |
+| `context.window_tokens` | The context window that check compared it with, the serving driver choice's | `"none"` when the choice has none |
+| `context.measured_by` | `"estimate"`: the runtime's own count | — |
+| `tokens.input`, `tokens.output`, `tokens.cached`, `tokens.cache_write` | Sums of what the provider reported over the session's `inference` records so far | `"unknown"` for a member no record carried |
+| `tokens.unreported_calls` | `inference` records that carried no count | — |
+| `spend.tokens` | Tokens the spend ceilings count for this session | — |
+| `spend.ceiling` | [`inference.max_session_tokens`](manifest.md#field-inference) | `"none"` with no ceiling |
+| `spend.machine` | `{"tokens_today": …, "ceiling": …}`: this machine's day total against [`spend.machine_tokens_per_day`](config.md#spend) | `"none"` when the machine ceiling does not cover the session |
+
+No money amount is kept on either transport: spend is counted in tokens.
+
+The two transports differ in where the numbers come from:
+
+| Field | `transport: http` | `transport: process` |
+|---|---|---|
+| `turns.used` | Every inference call | Turns the harness has closed |
+| `context` | An object | `"unknown"`: the harness keeps its own context |
+| `tokens` | The provider's `usage` on each call | The harness's own counts for each closed turn |
+
+The tool's description names these fields and is fixed per transport, so the tool array is the same
+bytes on every request. Each call writes one [`session_status`](observability-schemas.md#session-status)
+record carrying the object returned.
+
+### The deadline notice { #deadline-notice }
+
+With [`mur run --deadline`](cli.md#mur-run) set, the agent is told once that the session is about
+to end. The first tool result the runtime hands the model once no more than
+[`lifecycle.deadline_notice_secs`](manifest.md#field-lifecycle) are left carries one line after
+its fence:
+
+```text
+Session deadline: the runtime ends this session at 2026-10-20T14:00:00Z, in 297 seconds.
+```
+
+| Aspect | Behaviour |
+|---|---|
+| Margin | `lifecycle.deadline_notice_secs`; default five minutes, or a tenth of the deadline when that is shorter, and at least one second. `0` sends none |
+| Carried by | The first tool result dispatched inside the margin, on either transport — under `transport: process`, the bridged tool result. A refused or failed call does not carry it |
+| How often | Once per session |
+| A turn with no tool call | Gets no notice; the deadline still ends the session |
+| Trace | One [`deadline_notice`](observability-schemas.md#deadline-notice) record |
+
+Nothing else the runtime adds to the conversation changes.
+
+When the deadline is reached the session ends as a first `SIGTERM` ends it: the running task is
+cancelled, the trace records [`deadline_reached`](observability-schemas.md#deadline-reached), and
+`mur run` exits with [`E-RUN-053`](diagnostics.md#e-run-053).
 
 ## `switch-driver` { #switch-driver }
 

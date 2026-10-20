@@ -91,6 +91,7 @@ pub(crate) mod shell;
 mod source_scan;
 pub mod spawn_credential;
 pub mod spawn_envelope;
+pub mod session_status;
 pub(crate) mod spend;
 pub mod staged_runtime;
 pub mod state_store;

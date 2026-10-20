@@ -1693,6 +1693,15 @@ pub(crate) async fn run_agent_loop(
                 .await;
             }
         }
+        // What `session-status` reports as `context`: the count this check compared, after any
+        // replacement it committed, against the window it compared it with.
+        if let Some(status) = &store_state.session_status {
+            status.set_context(
+                session_tokens,
+                (context_window > 0).then_some(context_window),
+                crate::session_status::MEASURED_BY_ESTIMATE,
+            );
+        }
 
         let content = response
             .get("content")

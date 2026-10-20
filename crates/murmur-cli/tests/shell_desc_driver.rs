@@ -22,6 +22,7 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            session_deadline: None,
             manifest_file: None,
             credentials_file: None,
             manifest_dir: project.path().to_path_buf(),

@@ -30,7 +30,7 @@ use crate::{
     config::load_effective_mur_config_if_any_exists,
     error::{
         CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_008, E_RUN_015, E_RUN_016, E_RUN_019,
-        E_RUN_047, E_RUN_051,
+        E_RUN_047, E_RUN_051, E_RUN_053,
     },
     stores::FallbackRegistry,
 };
@@ -151,6 +151,7 @@ pub(crate) fn run_run(
     spawn_grant_stdin: bool,
     task_arg: Option<&str>,
     system_prompt_arg: Option<&str>,
+    deadline_arg: Option<u64>,
     context_id_arg: Option<&str>,
     resume_arg: Option<&str>,
     resume_mode: capsule_runtime::ResumeMode,
@@ -167,6 +168,15 @@ pub(crate) fn run_run(
     containment_arg: Option<&str>,
     explain_scope_only: bool,
 ) -> Result<(), CliError> {
+    // Read first, so the runtime's deadline is never later than a launcher's own timeout started
+    // at the same moment.
+    let session_deadline = deadline_arg.map(|secs| {
+        capsule_runtime::session_status::SessionDeadline::after(
+            std::time::Instant::now(),
+            std::time::SystemTime::now(),
+            secs,
+        )
+    });
     let mut session_id = "n/a".to_string();
     let mut workdir = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("/"))
@@ -643,6 +653,18 @@ pub(crate) fn run_run(
         &workdir,
         json,
     )?;
+    if session_deadline.is_some() && staged_inference.is_none() {
+        return Err(fail(
+            &session_id,
+            &workdir,
+            CliError::with_hint(
+                E_IO_003,
+                "--deadline requires an agent capsule: this manifest has no inference: block",
+                "add an inference: block to murmur.yaml, or drop --deadline",
+            ),
+            json,
+        ));
+    }
 
     let mut allowlisted_tools = HashSet::new();
     let mut requested_artifacts = Vec::with_capacity(runtime_manifest.artifacts.len());
@@ -848,6 +870,7 @@ pub(crate) fn run_run(
         formation_member,
         source_supply,
         expected_workdir_identity: workdir_identity,
+        session_deadline,
         // An installed capsule's manifest came out of the artifact, not off disk.
         manifest_file: installed_capsule.is_none().then(|| manifest_path.clone()),
     };
@@ -985,8 +1008,8 @@ pub(crate) fn run_run(
                 capsule_runtime::diagnostic::credential_to_stdout(&ready.to_string());
             }
         })
-        .map(|_| ())
         .map_err(CliError::from)
+        .and_then(|launched| deadline_outcome(launched.ending, deadline_arg))
     } else {
         // Capture fields for the startup closure before `staged` is consumed by launch_session.
         let session_id_for_startup = session_id.clone();
@@ -1043,7 +1066,7 @@ pub(crate) fn run_run(
                     &launched.workdir,
                     run_status_for_ending(launched.ending),
                 );
-                Ok(())
+                deadline_outcome(launched.ending, deadline_arg)
             }
             Err(error) => {
                 print_run_output(&session_id, &workdir, run_status_for(&error));
@@ -1081,7 +1104,26 @@ fn run_status_for_ending(ending: LaunchEnding) -> RunStatus {
     match ending {
         LaunchEnding::Completed => RunStatus::Success,
         LaunchEnding::FormationEnded => RunStatus::FormationEnded,
+        LaunchEnding::DeadlineReached => RunStatus::DeadlineReached,
     }
+}
+
+/// What `mur run` returns for a launch that ended `ending`: `E-RUN-053` for one its
+/// `--deadline` ended, success for every other.
+fn deadline_outcome(ending: LaunchEnding, deadline_secs: Option<u64>) -> Result<(), CliError> {
+    if ending != LaunchEnding::DeadlineReached {
+        return Ok(());
+    }
+    let limit = deadline_secs.map_or_else(String::new, |secs| format!(" of {secs} seconds"));
+    Err(CliError::with_hint(
+        E_RUN_053,
+        format!(
+            "the session reached its --deadline{limit}; the runtime cancelled the running task \
+             and ended the session"
+        ),
+        "raise --deadline, or set lifecycle.deadline_notice_secs so the agent is told sooner; \
+         `mur trace show <session>` shows where the task was when the deadline fell",
+    ))
 }
 
 /// The `status:` line `mur run` prints for a launch that returned `error`.

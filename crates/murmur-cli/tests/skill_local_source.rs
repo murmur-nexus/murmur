@@ -87,6 +87,7 @@ fn local_source_file_path_installs_skill_md() {
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            session_deadline: None,
             manifest_file: None,
             credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),
@@ -162,6 +163,7 @@ fn local_source_directory_path_finds_skill_md_case_insensitively() {
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            session_deadline: None,
             manifest_file: None,
             credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),
@@ -252,6 +254,7 @@ fn local_source_coexists_with_registry_skill() {
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            session_deadline: None,
             manifest_file: None,
             credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),

@@ -884,6 +884,7 @@ impl Parent {
             StageRequest {
                 source_supply: None,
                 expected_workdir_identity: None,
+                session_deadline: None,
                 manifest_file: None,
                 credentials_file: None,
                 // An empty context is a per-message fact, not a launch-scoped one: `--context`
@@ -1149,6 +1150,7 @@ fn stage_request(
     StageRequest {
         source_supply: None,
         expected_workdir_identity: None,
+        session_deadline: None,
         manifest_file: None,
         credentials_file: None,
         manifest_dir: project.to_path_buf(),

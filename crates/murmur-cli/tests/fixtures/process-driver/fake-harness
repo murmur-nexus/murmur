@@ -217,6 +217,35 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "text $answer"
     echo "end $answer"
     ;;
+  session-status)
+    # Three turns, each calling `session-status` through the bridge and keeping what it was
+    # handed in status-<n>.answer. Turn 1 reports usage before its call, so the second call sees
+    # one closed turn; the third waits FIXTURE_STATUS_WAIT seconds first.
+    echo "started fixture-session-1"
+    QUALIFIED=""
+    for candidate in $(printf '%s' "$FIXTURE_BRIDGE_TOOLS" | tr ',' ' '); do
+      case "$candidate" in
+        *__session-status) QUALIFIED="$candidate" ;;
+      esac
+    done
+    echo "usage in=40 out=20 cache-read=100 cache-creation=10"
+    for i in 1 2 3; do
+      if [ "$i" -eq 3 ]; then
+        sleep "${FIXTURE_STATUS_WAIT:-0}"
+      fi
+      echo "tool c$i $QUALIFIED {}"
+      answer="$(call_bridge session-status '{}')"
+      printf '%s\n' "$answer" > "status-$i.answer"
+      echo "result c$i ok status $i"
+      # The runtime closes the turn on the result line; give it the moment it takes to read it.
+      sleep 1
+      if [ "$i" -eq 1 ]; then
+        echo "usage in=100 out=50"
+      fi
+    done
+    echo "text STATUS-RESULT"
+    echo "end STATUS-RESULT"
+    ;;
   bridge-bench)
     # FIXTURE_BRIDGE_CALLS bridged calls back to back and one turn around all of them, so a test
     # can time the same run with and without a decision point in the way.

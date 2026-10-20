@@ -39,7 +39,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
 | `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
-| `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended` | The session node |
+| `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended`, `session_status`, `deadline_notice`, `deadline_reached` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `control_change`, `control_refused` | The session node — written as the control surface answers, outside any turn |
 | `control_applied`, `tools_refreshed` | The task node, or the session node between tasks. Written just before the turn's own `inference` line |
@@ -66,6 +66,7 @@ before the first task begins
 | `model_limits` | object \| null | The primary driver choice's [output cap and context window](manifest.md#inference-max-tokens): `max_output_tokens` (u32), `max_output_tokens_source` (`"manifest"` \| `"driver"`), `context_window` (u32 \| null; `null` when the choice has none) and `context_window_source` (`"manifest"` \| `"driver"` \| `"none"`). `"manifest"` is `inference.max_tokens` or `context.max_tokens`; `"driver"` is the driver's [`models:`](manifest.md#driver-models) entry. Always present; `null` under `transport: process` |
 | `max_session_tokens` | u64 \| null | [`inference.max_session_tokens`](manifest.md#inference-max-session-tokens). Always present; `null` when no session ceiling applies |
 | `machine_tokens_per_day` | u64 \| null | [`spend.machine_tokens_per_day`](config.md#spend) when this session is counted against it. Always present; `null` when no machine ceiling was in effect, and under `transport: process` |
+| `deadline` | object \| null | The [`mur run --deadline`](cli.md#mur-run-deadline) this session runs under: `at` (string, RFC 3339 UTC, when the runtime ends the session), `secs` (u64, the `--deadline` value) and `notice_secs` (u64, the [notice](runtime-provided-tools.md#deadline-notice) margin in force; `0` sends none). Always present; `null` with no `--deadline` |
 | `capabilities` | string[] | The capability categories the manifest granted anything under: `"network"`, `"filesystem"`, `"shell"` |
 | `tools_declared` | string[] | Names of the tools offered to the model: each artifact's bare name, the part of its full name after the `/` |
 | `tool_refresh` | string \| null | [`inference.tool_refresh`](manifest.md#inference-tool-refresh): `"compaction"` \| `"immediate"` under `transport: http`, `null` under `transport: process`. Always written |
@@ -534,7 +535,7 @@ loop has exited, on every exit path
 | `total_tool_calls` | u32 | Equals the count of `tool_call` lines |
 | `total_shell_calls` | u32 | Equals the count of `shell` plus `shell_detached` lines |
 | `duration_ms` | u64 | Wall-clock time from session start |
-| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"spend_ceiling_reached"` \| `"canceled"` \| `"formation_ended"` — the launch's outcome, which is the status [`mur run`](cli.md#mur-run-status) prints. The first [task that decides the launch](cli.md#mur-run-status) and ended anything but `"ok"` sets it, and no later run replaces it. `"formation_ended"`: a formation member was running a task when its [formation ended](roster.md#launch-stop), and the wind-down canceled that task |
+| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"spend_ceiling_reached"` \| `"canceled"` \| `"formation_ended"` \| `"deadline_reached"` — the launch's outcome, which is the status [`mur run`](cli.md#mur-run-status) prints. The first [task that decides the launch](cli.md#mur-run-status) and ended anything but `"ok"` sets it, and no later run replaces it. `"formation_ended"`: a formation member was running a task when its [formation ended](roster.md#launch-stop), and the wind-down canceled that task. `"deadline_reached"`: the session reached its [`--deadline`](cli.md#mur-run-deadline), whether or not a task was running |
 
 **`a2a_task_received`** — written when an incoming message reserves the task slot
 
@@ -685,6 +686,41 @@ because of `SIGTERM` or [`mur stop`](cli.md#mur-stop) writes none.
 ```json
 {"event_type":"spawner_ended","event_id":"evt_01a1058d3a9070319d2783f65aa594f3","parent_id":"evt_01a1058d39ef70d18c55d007dae98732","session_id":"ses_01a1058d39de73f18822af4c5494398f","timestamp":1791094504080,"spawned_by":"ses_01a1058d39217722b5e52c896926dbf4","delegation_id":"dlg_01a1058d39a07992a594e3ff0888c45a"}
 ```
+
+**`deadline_reached`**{ #deadline-reached } — written once when the session reaches its
+[`mur run --deadline`](cli.md#mur-run-deadline), and is winding down because of it
+
+| Field | Type | Notes |
+|---|---|---|
+| `deadline_at` | string | When the deadline fell, RFC 3339 UTC, as `session_start.deadline.at` names it |
+| `deadline_secs` | u64 | The `--deadline` value |
+
+Written before every `task_canceled`, `task_end`, `task_rejected`, `shell_abandoned` and
+`session_end` the wind-down writes. A session already ending because of `SIGTERM`, `mur stop` or a
+lifeline writes none.
+
+```json
+{"event_type":"deadline_reached","event_id":"evt_01a159926fbf70138104548d543e102b","parent_id":"evt_01a159926fa973e0999c70200a61aec4","session_id":"ses_01a159926f337512afbba4069bfd85ce","timestamp":1792504131519,"deadline_at":"2026-10-20T13:48:18Z","deadline_secs":25}
+```
+
+**`session_status`**{ #session-status } — written once per
+[`session-status`](runtime-provided-tools.md#session-status) call, at the call, on both transports
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The task that made the call. Absent outside a task |
+| `status` | object | The object the call returned, field for field — see [`session-status`](runtime-provided-tools.md#session-status) |
+
+**`deadline_notice`**{ #deadline-notice } — written once, when a tool result carries the
+[deadline notice](runtime-provided-tools.md#deadline-notice)
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The task whose tool result carried it. Absent outside a task |
+| `tool_name` | string | The tool whose result carried it |
+| `deadline_at` | string | When the runtime ends the session, RFC 3339 UTC |
+| `left_secs` | u64 | Whole seconds left when the result was handed back: the number the notice line states |
+| `notice_secs` | u64 | The margin it was due under |
 
 **`member_call_busy`**{ #member-call-busy } — written once per offer of a
 [`call-member`](runtime-provided-tools.md#call-member) call's task that the member's door turned

@@ -424,7 +424,9 @@ fn s1_a_process_capsule_runs_its_harness_and_records_one_turn() {
     assert_eq!(start["version_tested"], true);
     assert_eq!(start["session_mode"], "new");
     assert_eq!(start["binary_source"], "inference.command");
-    assert!(start["bridge_tools"].as_array().unwrap().is_empty());
+    // A capsule that declares no tool still has the runtime's own `session-status`, so every
+    // process capsule gets a bridge.
+    assert_eq!(start["bridge_tools"], serde_json::json!(["session-status"]));
 
     let session = run.one("harness_session");
     assert_eq!(session["harness_session_id"], "fixture-session-1");
@@ -508,7 +510,7 @@ fn s3_the_harness_calls_a_capsule_tool_through_the_bridge() {
     assert_eq!(inferences[1]["decision"], "end_turn");
 
     let start = run.one("harness_start");
-    assert_eq!(start["bridge_tools"], serde_json::json!([TOOL]));
+    assert_eq!(start["bridge_tools"], serde_json::json!([TOOL, "session-status"]));
 
     let shown = capsule.trace_show(&run.records_dir);
     assert!(shown.contains(TOOL), "{shown}");

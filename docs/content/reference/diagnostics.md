@@ -129,6 +129,7 @@ section that explains it.
 | `E-RUN-050` | The runtime met a symbolic link, or the wrong kind of file, inside the workdir — while staging the session, or during the task `mur run` ran | [E-RUN-050](#e-run-050) |
 | `E-RUN-051` | A delegated child's `--workdir` is not the directory its parent created; nothing was written | [E-RUN-051](#e-run-051) |
 | `E-RUN-052` | A driver choice has no output cap — its driver lists no limits for its model and the manifest sets no `inference.max_tokens` — or its driver ships a malformed `models:` table | [E-RUN-052](#e-run-052) |
+| `E-RUN-053` | The session reached its `mur run --deadline` and was ended, or a launch was handed a deadline it cannot enforce | [E-RUN-053](#e-run-053) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -1348,6 +1349,23 @@ driver and the field:
 error[E-RUN-052]: driver local/driver-glm@0.1.0 ships a malformed models: table: murmur.yaml: field 'models.glm-5.3.max_output_tokens' must be an integer from 1 to 4294967295
   hint: the driver's own murmur.yaml is at fault; use a release of the driver whose models: table is well formed
 ```
+
+### E-RUN-053 — the session reached its deadline { #e-run-053 }
+
+[`mur run --deadline <SECONDS>`](cli.md#mur-run-deadline) ends the session that many seconds after
+`mur run` started. Reached, the running task is cancelled, the session's teardown runs, and the run
+exits `1`:
+
+```text
+status:  deadline_reached
+error[E-RUN-053]: the session reached its --deadline of 600 seconds; the runtime cancelled the running task and ended the session
+  hint: raise --deadline, or set lifecycle.deadline_notice_secs so the agent is told sooner; `mur trace show <session>` shows where the task was when the deadline fell
+```
+
+The trace records `deadline_reached` and ends with `session_end.exit_status: "deadline_reached"`.
+
+The same code refuses a session staged with a deadline that its launch cannot enforce: one launched
+by a program embedding the runtime rather than by `mur run`, or a script capsule.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
