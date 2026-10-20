@@ -1,10 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-<<<<<<< HEAD
-use murmur_artifact::{ArtifactRuntime, InferenceConfig, PACKED_MANIFEST_ENTRY};
-=======
 use murmur_artifact::{ArtifactRuntime, PACKED_MANIFEST_ENTRY};
->>>>>>> 831222af (The system text and MURMUR.md state facts and name only what exists)
 use serde_yaml::Value;
 
 use crate::{
@@ -68,36 +64,6 @@ pub(crate) fn sanitize_description(raw: &str) -> String {
 
 /// Everything MURMUR.md is rendered from besides the runtime directory's own contents.
 ///
-<<<<<<< HEAD
-/// Called from launch_session after port binding so all four identity values are known.
-/// `formation` is the session's own membership: `Some` adds its roster name and formation id to
-/// the Identity section, `None` leaves the section as a standalone capsule's. `context_window` is
-/// the primary driver choice's, `None` when it has none.
-/// Failure is non-fatal: we log a warning and continue.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn write_murmur_md(
-    runtime_root: &WorkdirRoot,
-    accessible_workdir: &Path,
-    inference: Option<&InferenceConfig>,
-    context_window: Option<u32>,
-    compaction_hook_registered: bool,
-    capability_policy: &CapabilityPolicy,
-    identity: &CapsuleIdentity,
-    formation: Option<&FormationMember>,
-    manifest_file: Option<&str>,
-) {
-    let content = generate_murmur_md(
-        runtime_root,
-        accessible_workdir,
-        inference,
-        context_window,
-        compaction_hook_registered,
-        capability_policy,
-        identity,
-        formation,
-        manifest_file,
-    );
-=======
 /// Built once at staging for an agent session, completed at launch with the capsule URL, and held
 /// on the session so a committed pull or removal rewrites the file from the same values.
 #[derive(Debug, Clone)]
@@ -114,10 +80,10 @@ pub(crate) struct MurmurMdInputs {
     pub(crate) system_prompt_artifact: Option<String>,
     /// The accessible workdir's host path, the agent's `./`.
     pub(crate) accessible_workdir: PathBuf,
-    /// `context.max_tokens`.
-    pub(crate) context_max_tokens: Option<u32>,
-    /// Whether a hook is bound to `on-compaction`: with `context.max_tokens` set, the two
-    /// conditions compaction runs on.
+    /// The primary driver choice's context window, else `context.max_tokens`.
+    pub(crate) context_window: Option<u32>,
+    /// Whether a hook is bound to `on-compaction`: with a context window, the two conditions
+    /// compaction runs on.
     pub(crate) compaction_hook_registered: bool,
     /// `capabilities.shell.allow`.
     pub(crate) shell_allow: Vec<String>,
@@ -134,26 +100,11 @@ pub(crate) struct MurmurMdInputs {
 /// warning and continue.
 pub(crate) fn write_murmur_md(runtime_root: &WorkdirRoot, inputs: &MurmurMdInputs) {
     let content = generate_murmur_md(runtime_root, inputs);
->>>>>>> 831222af (The system text and MURMUR.md state facts and name only what exists)
     if let Err(err) = runtime_root.write_file("MURMUR.md", content.as_bytes(), DEFAULT_FILE_MODE) {
         crate::runtime_err!("warning: failed to write MURMUR.md: {err}");
     }
 }
 
-<<<<<<< HEAD
-#[allow(clippy::too_many_arguments)]
-fn generate_murmur_md(
-    runtime_root: &WorkdirRoot,
-    accessible_workdir: &Path,
-    inference: Option<&InferenceConfig>,
-    context_window: Option<u32>,
-    compaction_hook_registered: bool,
-    capability_policy: &CapabilityPolicy,
-    identity: &CapsuleIdentity,
-    formation: Option<&FormationMember>,
-    manifest_file: Option<&str>,
-) -> String {
-=======
 /// The candidates the `## Runtime Directory` tree lists, each kept only when it exists:
 /// `MURMUR.md`, the manifest file, `plans/` and `tools/`. `task.md` is never listed: the task
 /// reaches the model as its first message, and the file is replaced between tasks.
@@ -183,17 +134,12 @@ fn runtime_dir_tree(runtime_root: &WorkdirRoot, manifest_file: Option<&str>) -> 
 }
 
 fn generate_murmur_md(runtime_root: &WorkdirRoot, inputs: &MurmurMdInputs) -> String {
->>>>>>> 831222af (The system text and MURMUR.md state facts and name only what exists)
     let timestamp = chrono::Utc::now().to_rfc3339();
     let model = &inputs.model;
     let facts = &inputs.facts;
 
-<<<<<<< HEAD
-    let model = inference
-        .map(|i| i.model.as_str())
-        .unwrap_or("not configured");
-
-    let max_tokens_display = context_window
+    let max_tokens_display = inputs
+        .context_window
         .map(|n| n.to_string())
         .unwrap_or_else(|| "not set".to_string());
 
@@ -201,27 +147,12 @@ fn generate_murmur_md(runtime_root: &WorkdirRoot, inputs: &MurmurMdInputs) -> St
     // primary choice has a context window AND at least one hook is bound to `on-compaction`.
     // Report the same two conditions the runtime actually gates on rather than probing for a tool
     // directory.
-    let compaction_status = if context_window.is_some() && compaction_hook_registered {
+    let compaction_status = if inputs.context_window.is_some() && inputs.compaction_hook_registered
+    {
         "compaction configured"
     } else {
         "compaction not configured"
     };
-=======
-    let max_tokens_display = inputs
-        .context_max_tokens
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "not set".to_string());
-
-    // Compaction is dispatched by lifecycle binding, not by artifact name: it fires when
-    // `context.max_tokens` is set AND at least one hook is bound to `on-compaction`. Report the
-    // same two conditions the runtime actually gates on rather than probing for a tool directory.
-    let compaction_status =
-        if inputs.context_max_tokens.is_some() && inputs.compaction_hook_registered {
-            "compaction configured"
-        } else {
-            "compaction not configured"
-        };
->>>>>>> 831222af (The system text and MURMUR.md state facts and name only what exists)
 
     let system_prompt_artifact = inputs.system_prompt_artifact.as_deref();
     let tools_section = build_tools_section(runtime_root, system_prompt_artifact);
@@ -530,7 +461,7 @@ pub(crate) fn test_inputs() -> MurmurMdInputs {
         model: "test-model".to_string(),
         system_prompt_artifact: None,
         accessible_workdir: PathBuf::from("/work"),
-        context_max_tokens: None,
+        context_window: None,
         compaction_hook_registered: false,
         shell_allow: Vec::new(),
         manifest_file: Some("murmur.yaml".to_string()),
@@ -542,7 +473,6 @@ pub(crate) fn test_inputs() -> MurmurMdInputs {
 mod tests {
     use super::*;
     use crate::types::CapabilityPolicy;
-    use murmur_artifact::ContextConfig;
     use std::fs;
     use tempfile::TempDir;
 
@@ -586,7 +516,7 @@ mod tests {
         );
         let content = render(&tmp, |inputs| {
             inputs.model = inference.model.clone();
-            inputs.context_max_tokens = Some(200_000);
+            inputs.context_window = Some(200_000);
             inputs.facts = facts.clone();
         });
         let runtime_dir = tmp.path().display();
@@ -736,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn context_budget_not_set_without_context_max_tokens() {
+    fn context_budget_not_set_without_context_window() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
         let content = render(&tmp, |_| {});
@@ -777,32 +707,9 @@ mod tests {
     fn shows_context_budget_when_set() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
-<<<<<<< HEAD
-        let context_window = Some(200_000);
-        let content = generate_murmur_md(
-            &WorkdirRoot::open(tmp.path()).unwrap(),
-            std::path::Path::new("/work"),
-            None,
-            context_window,
-            false,
-            &CapabilityPolicy::default(),
-            &test_identity(),
-            None,
-            Some("murmur.yaml"),
-        );
-=======
-        let context = ContextConfig {
-            max_tokens: Some(200_000),
-            record: true,
-            record_store: None,
-            seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
-            seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
-            retain: None,
-        };
         let content = render(&tmp, |inputs| {
-            inputs.context_max_tokens = context.max_tokens;
+            inputs.context_window = Some(200_000);
         });
->>>>>>> 831222af (The system text and MURMUR.md state facts and name only what exists)
         assert!(content.contains("200000 tokens"));
     }
 
@@ -810,33 +717,10 @@ mod tests {
     fn compaction_configured_when_hook_registered_and_max_tokens_set() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
-<<<<<<< HEAD
-        let context_window = Some(100_000);
-        let content = generate_murmur_md(
-            &WorkdirRoot::open(tmp.path()).unwrap(),
-            std::path::Path::new("/work"),
-            None,
-            context_window,
-            true,
-            &CapabilityPolicy::default(),
-            &test_identity(),
-            None,
-            Some("murmur.yaml"),
-        );
-=======
-        let context = ContextConfig {
-            max_tokens: Some(100_000),
-            record: true,
-            record_store: None,
-            seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
-            seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
-            retain: None,
-        };
         let content = render(&tmp, |inputs| {
-            inputs.context_max_tokens = context.max_tokens;
+            inputs.context_window = Some(100_000);
             inputs.compaction_hook_registered = true;
         });
->>>>>>> 831222af (The system text and MURMUR.md state facts and name only what exists)
         assert!(content.contains("compaction configured"));
     }
 
@@ -844,32 +728,9 @@ mod tests {
     fn compaction_not_configured_when_max_tokens_set_but_no_hook() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
-<<<<<<< HEAD
-        let context_window = Some(100_000);
-        let content = generate_murmur_md(
-            &WorkdirRoot::open(tmp.path()).unwrap(),
-            std::path::Path::new("/work"),
-            None,
-            context_window,
-            false,
-            &CapabilityPolicy::default(),
-            &test_identity(),
-            None,
-            Some("murmur.yaml"),
-        );
-=======
-        let context = ContextConfig {
-            max_tokens: Some(100_000),
-            record: true,
-            record_store: None,
-            seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
-            seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
-            retain: None,
-        };
         let content = render(&tmp, |inputs| {
-            inputs.context_max_tokens = context.max_tokens;
+            inputs.context_window = Some(100_000);
         });
->>>>>>> 831222af (The system text and MURMUR.md state facts and name only what exists)
         assert!(content.contains("compaction not configured"));
     }
 

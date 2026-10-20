@@ -2815,32 +2815,6 @@ pub fn stage_session(
         request.capability_policy.hook_limits(),
     )?;
 
-<<<<<<< HEAD
-    // Write MURMUR.md now for agent sessions so that tooling that inspects the workdir after
-    // staging (e.g. tests, debuggers) can read it. launch_session overwrites this file after
-    // port binding with the complete identity including capsule_url.
-    if let Some(ref inference) = request.inference {
-        let partial_identity = CapsuleIdentity {
-            capsule_name: request.capsule_name.clone(),
-            capsule_version: request.capsule_version.clone(),
-            session_id: session_id.clone(),
-            capsule_url: String::new(),
-        };
-        murmur_md::write_murmur_md(
-            &runtime_root,
-            &accessible_workdir,
-            Some(inference),
-            primary_context_window(driver_choices.as_ref(), request.context.as_ref()),
-            has_compaction_hook(&hook_components),
-            &request.capability_policy,
-            &partial_identity,
-            request.formation_member.as_deref(),
-            manifest_file_name.as_deref(),
-        );
-    }
-
-=======
->>>>>>> 831222af (The system text and MURMUR.md state facts and name only what exists)
     // The manifest this launch read, beside `MURMUR.md`, for the agent to read; nothing is copied
     // into the workdir.
     copy_manifest_into_runtime_dir(request.manifest_file.as_deref(), &runtime_root)?;
@@ -2863,10 +2837,10 @@ pub fn stage_session(
             model: inference.model.clone(),
             system_prompt_artifact: inference.system_prompt_artifact.clone(),
             accessible_workdir: accessible_workdir.clone(),
-            context_max_tokens: request
-                .context
-                .as_ref()
-                .and_then(|context| context.max_tokens),
+            context_window: primary_context_window(
+                driver_choices.as_ref(),
+                request.context.as_ref(),
+            ),
             compaction_hook_registered: has_compaction_hook(&hook_components),
             shell_allow: request.capability_policy.shell_allow.clone(),
             manifest_file: manifest_file_name.clone(),
@@ -3394,19 +3368,6 @@ fn launch(
         all_env.push(("MURMUR_SESSION_ID".to_string(), session_id.clone()));
         all_env.push(("MURMUR_CAPSULE_URL".to_string(), capsule_url.clone()));
 
-<<<<<<< HEAD
-        murmur_md::write_murmur_md(
-            &runtime_root,
-            &staged.accessible_workdir,
-            Some(inference),
-            primary_context_window(staged.driver_choices.as_ref(), staged.context.as_ref()),
-            has_compaction_hook(&staged.hook_components),
-            &staged.capability_policy,
-            &capsule_identity,
-            staged.formation_member.as_deref(),
-            staged.manifest_file_name.as_deref(),
-        );
-=======
         // Rewritten now that the capsule URL is known, and held on the session for the rewrite a
         // committed pull or removal makes.
         let murmur_md_inputs = staged.murmur_md.take().map(|mut inputs| {
@@ -3414,7 +3375,6 @@ fn launch(
             murmur_md::write_murmur_md(&runtime_root, &inputs);
             inputs
         });
->>>>>>> 831222af (The system text and MURMUR.md state facts and name only what exists)
 
         sandbox::warn_for_enforcement_tier(
             shell_enforcement.tier,

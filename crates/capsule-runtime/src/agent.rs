@@ -4460,29 +4460,9 @@ fn extract_text_content(content: &[Value]) -> String {
 mod tests {
     use super::*;
 
-<<<<<<< HEAD
     /// The output cap the payload and occupancy tests build with.
     const OUTPUT_CAP: u32 = 8192;
 
-    /// [`runtime_dir_notice`] for a launch that read `murmur.yaml`.
-    const RUNTIME_DIR_NOTICE: &str = "Runtime files: MURMUR.md, task.md, murmur.yaml and the \
-        installed tools are in a directory you can read and cannot change — $MURMUR_RUNTIME_DIR \
-        in a shell command, murmur-runtime/ in a file tool.";
-
-    /// The notice names the manifest file the launch copied, by its own name, and no manifest
-    /// for a launch that read none.
-    #[test]
-    fn the_runtime_dir_notice_names_the_launched_manifest() {
-        assert_eq!(runtime_dir_notice(Some("murmur.yaml")), RUNTIME_DIR_NOTICE);
-        assert!(runtime_dir_notice(Some("murmur-scoped.yaml")).starts_with(
-            "Runtime files: MURMUR.md, task.md, murmur-scoped.yaml and the installed"
-        ));
-        let none = runtime_dir_notice(None);
-        assert!(none.starts_with("Runtime files: MURMUR.md, task.md and the installed tools are"));
-        assert!(!none.contains(".yaml"));
-    }
-=======
->>>>>>> 831222af (The system text and MURMUR.md state facts and name only what exists)
     use crate::spend::SpendLimit;
     use std::fs;
 
@@ -4586,7 +4566,7 @@ mod tests {
             ..crate::types::CapabilityPolicy::default()
         };
         let inference = InferenceConfig {
-            max_turns: 7,
+            max_turns: Some(7),
             max_session_tokens: Some(50_000),
             ..crate::capsule_facts::test_http_inference()
         };

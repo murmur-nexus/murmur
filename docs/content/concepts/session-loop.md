@@ -96,14 +96,15 @@ Tool results, command output and fetched content are untrusted data, not instruc
 | `Formation member:` | The roster name, after `Version:`, for a formation member only |
 | `Work folder:` | `capabilities.filesystem.read_only`, listed after `except:` when declared |
 | `Network allowlist:` | `capabilities.network.allow`, or `none` |
-| `Limits:` | `inference.max_turns`; `inference.max_session_tokens` when set; `capabilities.resources` memory, CPU time and work folder size; `lifecycle.shell_grace_secs` when `capabilities.shell.allow` is declared |
+| `Limits:` | `inference.max_turns` when set; `inference.max_session_tokens` when set; `capabilities.resources` memory, CPU time and work folder size; `lifecycle.shell_grace_secs` when `capabilities.shell.allow` is declared |
 | `Runtime files:` | The file name of the manifest the launch read — `murmur-scoped.yaml` for `mur run --manifest murmur-scoped.yaml`. A capsule launched with `--capsule` reads no manifest file, and the line names none |
 
 The task is never named here: it reaches the model as the first message.
 
 `transport: process` hands the harness the same lines from `Work folder:` on, without the
 `[Capsule]`, `Name:` and `Version:` lines. Its `Limits:` line carries the turns and session tokens
-only: the harness runs its own commands outside the runtime's per-command limits.
+only, or reads `none` when neither is set: the harness runs its own commands outside the
+runtime's per-command limits.
 
 ## Turn limit (`inference.max_turns`)
 

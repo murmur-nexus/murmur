@@ -21,8 +21,8 @@ pub(crate) struct CapsuleFacts {
     pub(crate) read_only_paths: Vec<String>,
     /// `capabilities.network.allow`, verbatim and in declaration order.
     pub(crate) network_allow: Vec<String>,
-    /// `inference.max_turns`.
-    pub(crate) max_turns: u32,
+    /// `inference.max_turns`; `None` sets no turn limit.
+    pub(crate) max_turns: Option<u32>,
     /// `inference.max_session_tokens`.
     pub(crate) max_session_tokens: Option<u64>,
     /// The limits on what the runtime itself spawns. `None` on `transport: process`: the harness
@@ -74,7 +74,11 @@ impl CapsuleFacts {
     /// `[Capsule]` block and the process prompt join them into one sentence; MURMUR.md lists
     /// them.
     pub(crate) fn limit_parts(&self) -> Vec<String> {
-        let mut parts = vec![format!("{} turns per task", self.max_turns)];
+        let mut parts: Vec<String> = self
+            .max_turns
+            .map(|turns| format!("{turns} turns per task"))
+            .into_iter()
+            .collect();
         if let Some(tokens) = self.max_session_tokens {
             parts.push(format!("{tokens} tokens per session"));
         }
@@ -98,9 +102,15 @@ impl CapsuleFacts {
         parts
     }
 
-    /// [`Self::limit_parts`] as one sentence.
+    /// [`Self::limit_parts`] as one sentence, or `none` when the session declares no limit the
+    /// text can state (a `transport: process` capsule with neither turn nor token limit).
     pub(crate) fn limits_sentence(&self) -> String {
-        format!("{}.", self.limit_parts().join("; "))
+        let parts = self.limit_parts();
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            format!("{}.", parts.join("; "))
+        }
     }
 
     /// `capabilities.network.allow` as a list, or `none`.
@@ -141,7 +151,7 @@ pub(crate) fn test_http_inference() -> InferenceConfig {
         system_prompt: None,
         system_prompt_file: None,
         system_prompt_artifact: None,
-        max_turns: 10,
+        max_turns: Some(10),
         max_tokens: None,
         max_session_tokens: None,
         tool_refresh: murmur_artifact::ToolRefresh::Compaction,
@@ -201,7 +211,7 @@ mod tests {
             ..CapabilityPolicy::default()
         };
         let inference = InferenceConfig {
-            max_turns: 7,
+            max_turns: Some(7),
             max_session_tokens: Some(50_000),
             ..test_http_inference()
         };
@@ -248,6 +258,32 @@ mod tests {
             facts.limits_sentence(),
             "10 turns per task; 9000 tokens per session."
         );
+    }
+
+    /// An absent `inference.max_turns` sets no turn limit, so none is stated; a process capsule
+    /// with no turn or token limit states `none` rather than an empty sentence.
+    #[test]
+    fn capsule_facts_state_no_turn_limit_when_none_is_set() {
+        let http = InferenceConfig {
+            max_turns: None,
+            ..test_http_inference()
+        };
+        let facts = CapsuleFacts::resolve(
+            &CapabilityPolicy::default(),
+            &http,
+            &LifecycleConfig::default(),
+        );
+        assert!(!facts.limits_sentence().contains("turns"));
+        let process = InferenceConfig {
+            transport: "process".into(),
+            ..http
+        };
+        let facts = CapsuleFacts::resolve(
+            &CapabilityPolicy::default(),
+            &process,
+            &LifecycleConfig::default(),
+        );
+        assert_eq!(facts.limits_sentence(), "none");
     }
 
     #[test]
