@@ -563,7 +563,7 @@ const PATH_REWRITING_NOT_PROTECTED: &str =
 pub(crate) fn filesystem_boundary(applied: EnforcementTier) -> FilesystemBoundaryReport {
     // The path-rewriting statement rides along with the mechanism-specific one rather than standing
     // on its own, so a composed root — where the paths outside it are absent, and the `~` rewrite
-    // lands inside the only writable path in that root — discloses nothing at all.
+    // lands inside the workdir — discloses nothing at all.
     let (restriction, filesystem) = match applied {
         EnforcementTier::KernelSealed => (FilesystemRestriction::Absent, None),
         EnforcementTier::KernelFull => (

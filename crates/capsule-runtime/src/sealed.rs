@@ -903,7 +903,7 @@ pub struct SealedDevice {
 /// `/dev/console` is omitted (the OCI spec creates it only for a terminal-attached container, and
 /// a capsule subprocess has pipes, not a controlling terminal). `/dev/ptmx` and `/dev/pts` come
 /// from a `devpts` mount rather than from this list, and `/dev/shm` is omitted deliberately: it is
-/// writable, and the session workdir is the only writable path in a composed root.
+/// writable, and the session workdir and `/tmp` are the only writable paths in a composed root.
 pub const SEALED_DEVICE_NODES: &[SealedDevice] = &[
     SealedDevice {
         name: "null",
@@ -1560,7 +1560,7 @@ pub(crate) use linux::{
 /// things.
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
-    make_dumpable_for_map_writes, open_verified_dir, proc_fd_path, remount_flags_kept,
+    make_dumpable_for_map_writes, open_verified_dir, proc_fd_path, remount_read_only,
     restore_dumpable, userns_grant, write_decimal_map, PROC_FD_PATH_LEN,
 };
 
@@ -1992,11 +1992,11 @@ mod linux {
     }
 
     /// Remounts the bind at `target` read-only and `nosuid`, keeping the flags its source mount
-    /// locks.
+    /// locks. `target` may be a `/proc/self/fd/<n>` path from [`proc_fd_path`].
     ///
     /// # Safety
-    /// Post-`fork()`, pre-exec only, on [`execute_step`]'s terms.
-    unsafe fn remount_read_only(target: &CString) -> Result<(), ()> {
+    /// Allocation-free; callable post-`fork()`, pre-exec, with the capabilities to remount.
+    pub(crate) unsafe fn remount_read_only(target: &std::ffi::CStr) -> Result<(), ()> {
         // Inside a user namespace the bind inherits the source mount's flags locked: a remount
         // that does not repeat them is refused with `EPERM`. `statvfs` on the new bind reports
         // them from the kernel's `statfs` `f_flags`, with no allocation.

@@ -41,8 +41,9 @@
 //!     `linux_enforce::WORKDIR_ACCESS_RIGHTS_NO_EXEC` and `linux_enforce::workdir_access_rights`.
 //!     Outside the workdir, alongside the derived
 //!     read+execute grants, a fixed three-device set is granted unconditionally — see
-//!     `CAPSULE_DEVICE_GRANTS`: `/dev/null` read+write (the only writable path outside the
-//!     workdir), `/dev/zero` and `/dev/urandom` read-only, and no other device at all.
+//!     `CAPSULE_DEVICE_GRANTS`: `/dev/null` read+write (with the session's temporary folder, the
+//!     only writable paths outside the workdir), `/dev/zero` and `/dev/urandom` read-only, and no
+//!     other device at all.
 //!
 //! Both Linux tiers additionally strip the forked child's **Linux capabilities** (bounding set,
 //! then permitted/effective/inheritable, then `no_new_privs`) before `execve()` — see
@@ -1384,8 +1385,8 @@ pub(crate) fn resolve_sealed_etc_landlock_grants(tier: EnforcementTier) -> Vec<L
 /// `writable` is the whole reason this type exists as more than a path list:
 ///
 ///   - `false` → `ReadFile` only. The device is readable and nothing more.
-///   - `true` → `ReadFile | WriteFile`. Granted to exactly one path, `/dev/null`, and it is the
-///     only writable path outside the workdir in the entire sandbox.
+///   - `true` → `ReadFile | WriteFile`. Granted to exactly one path, `/dev/null`, which with the
+///     session's temporary folder is one of the two writable paths outside the workdir.
 ///
 /// Only `mod linux_enforce` consumes this outside of tests, so on a non-Linux build the type and
 /// the constant below are dead — the same deliberate cross-platform exception the rest of this
@@ -2522,19 +2523,20 @@ impl Drop for EndSessionOnDrop {
 /// binaries, their ELF interpreter, and their shared-library closure) *outside* the workdir, in
 /// addition to the workdir's own grant (which withholds device-node and unix-socket creation, see
 /// `linux_enforce::WORKDIR_ACCESS_RIGHTS`) — so allowlisted programs can actually exec and
-/// dynamically link, and the only writable path outside the workdir is `/dev/null`, one of the
-/// three fixed devices in `CAPSULE_DEVICE_GRANTS`. Seccomp additionally refuses the
-/// `socket(2)` domains in `denied_socket_domains` — closing the `/var/run/docker.sock` path, which
-/// no Landlock ABI mediates for pathname sockets. The forked shell child also
-/// drops every Linux capability before `execve` (see `linux_enforce::drop_all_capabilities`).
+/// dynamically link, and the only writable paths outside the workdir are the session's temporary
+/// folder and `/dev/null`, one of the three fixed devices in `CAPSULE_DEVICE_GRANTS`. Seccomp
+/// additionally refuses the `socket(2)` domains in `denied_socket_domains` — closing the
+/// `/var/run/docker.sock` path, which no Landlock ABI mediates for pathname sockets. The forked
+/// shell child also drops every Linux capability before `execve` (see
+/// `linux_enforce::drop_all_capabilities`).
 /// `KernelFull` warns (`W_SEC_005`) rather than staying silent: the tier is a filesystem and
 /// syscall scope, not a namespace, so what it does and does not cover has to reach the operator.
 const KERNEL_ENFORCEMENT_NOTICE: &str = "capabilities.shell.allow is non-empty and this host \
 resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now grants a narrow, \
 derived read+execute scope outside the workdir (the allowlisted binaries, their loader, and their \
 shared libraries — nothing writable, no directory granted wholesale), plus a fixed device set \
-every capsule gets unconditionally: /dev/null read+write (the only writable path outside the \
-workdir), \
+every capsule gets unconditionally: /dev/null read+write (with the session's temporary folder, \
+the only writable paths outside the workdir), \
 /dev/zero and /dev/urandom read-only, and no other device — /dev/random, /dev/full, /dev/tty and \
 raw block devices stay denied. The workdir's own grant also \
 withholds device-node and unix-socket creation; seccomp refuses socket(AF_UNIX) outright unless \
@@ -2552,7 +2554,8 @@ denied, not absent: stat, access and readlink on an ungranted path still succeed
 const KERNEL_SEALED_ENFORCEMENT_NOTICE: &str = "capabilities.shell.allow is non-empty and this \
 host resolved to the sealed kernel-enforcement tier: the subprocess tree runs in a private mount \
 namespace pivoted onto a composed root (host runtime bind-mounted read-only, the session workdir \
-the only writable path, a private /dev tmpfs carrying the OCI default device set), with Landlock \
+and /tmp, the session's temporary folder, the only writable paths, a private /dev tmpfs carrying \
+the OCI default device set), with Landlock \
 and seccomp still installed inside it as defence in depth. Paths outside that root are absent \
 rather than denied — with one documented exception: /proc is a bind of the host's, not a masked \
 private procfs, because mounting one unprivileged needs a PID namespace this tier does not create, \
@@ -3608,8 +3611,9 @@ mod linux_enforce {
     ///     handles `Refer` and both folders grant it, so without it every tool that renames a
     ///     finished file into place from a sibling folder fails in the workdir. It reaches nothing
     ///     outside: a move or link needs `Refer` on both the source and the destination folder, no
-    ///     rule outside the workdir and the session's temporary folder carries it, and Landlock also refuses
-    ///     any move that would leave the file with more rights at its destination than its source.
+    ///     rule outside the workdir and the session's temporary folder carries it, and Landlock
+    ///     also refuses any move that would leave the file with more rights at its destination
+    ///     than its source.
     ///   - `Truncate` (ABI v3, Linux 6.2) — `truncate(2)`, `ftruncate(2)` and `open(O_TRUNC)`.
     ///     Below v3 Landlock does not mediate truncation at all, so a capsule could zero any host
     ///     file its uid can write. Handling it denies that everywhere except the rules that grant
@@ -4660,8 +4664,9 @@ mod linux_enforce {
     /// `sealed` carries what only `KernelSealed` opens: the synthetic `/etc` files.
     /// `temp_dir_fd`, `runtime_dir_fd` and `records_dir_fd` are the session's temporary folder's,
     /// runtime directory's and records directory's descriptors on both Landlock tiers, which
-    /// `prepare_enforcement` already took and shares with the sealed binds. Each is fail-closed — an `Err` naming the path, exactly like the workdir's own open
-    /// above, never the grant loops' shrink-not-fail `continue`.
+    /// `prepare_enforcement` already took and shares with the sealed binds. Each is fail-closed —
+    /// an `Err` naming the path, exactly like the workdir's own open above, never the grant
+    /// loops' shrink-not-fail `continue`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn open_landlock_fds(
         accessible_workdir: &Path,
@@ -7988,10 +7993,10 @@ mod linux_integration_tests {
     /// The synthetic account databases, written into `sealed-etc/` beside the runtime directory
     /// and opened by the same parent-side call.
     ///
-    /// Like the temporary-folder test above it proves nothing about kernel enforcement — that is the hand-run
-    /// in `docs/content/reference/sealed-containment-manual-verification.md`. It catches that the
-    /// files exist before `build_sealed_root` binds them, that there is an fd to build each rule
-    /// from, and that nothing is written into either workdir for them.
+    /// Like the temporary-folder test above it proves nothing about kernel enforcement — that is
+    /// the hand-run in `docs/content/reference/sealed-containment-manual-verification.md`. It
+    /// catches that the files exist before `build_sealed_root` binds them, that there is an fd to
+    /// build each rule from, and that nothing is written into either workdir for them.
     #[test]
     fn the_synthetic_etc_files_are_written_into_sealed_etc_and_opened() {
         let accessible = tempfile::tempdir().unwrap();
@@ -10505,6 +10510,49 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                 "{class:?}: the host's /tmp gained {name}"
             );
         }
+    }
+
+    /// `KernelSeccompOnly` maps `/tmp` through the same per-command mount namespace: the session
+    /// enforcement with its tier set to seccomp-only, so no Landlock domain is installed.
+    #[test]
+    fn a_literal_tmp_path_reaches_the_session_temp_folder_on_the_seccomp_only_tier() {
+        const TEST: &str =
+            "a_literal_tmp_path_reaches_the_session_temp_folder_on_the_seccomp_only_tier";
+        let base = home_tempdir();
+        let workdir = home_tempdir();
+        let policy = coreutils_policy(&[]);
+        let Some(enforcement) = mapped_enforcement(
+            TEST,
+            &policy,
+            murmur_artifact::ContainmentClass::Scoped,
+            base.path(),
+            workdir.path(),
+        ) else {
+            return;
+        };
+        let enforcement = ShellEnforcement {
+            tier: EnforcementTier::KernelSeccompOnly,
+            ..enforcement
+        };
+        assert_eq!(
+            enforcement.installed_temp_mapping(),
+            crate::temp_dir::TempMapping::MountNamespace
+        );
+        let name = unique_tmp_name("seccomp-only");
+        let result = run_bash_in(
+            workdir.path(),
+            &format!("echo x > /tmp/{name} && cat /tmp/{name} && printf '%s\\n' \"$TMPDIR\""),
+            &policy,
+            &enforcement,
+        );
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.stdout, "x\n/tmp\n");
+        let folder = enforcement.temp_dir_path().unwrap();
+        assert_eq!(std::fs::read_to_string(folder.join(&name)).unwrap(), "x\n");
+        assert!(
+            !Path::new("/tmp").join(&name).exists(),
+            "the host's /tmp gained {name}"
+        );
     }
 
     /// Two sessions' commands each see their own folder at `/tmp`.

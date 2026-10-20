@@ -187,7 +187,7 @@ pub(crate) fn temp_mapping(
 /// beneath it. A path beneath a read-write path is dropped, since that bind already carries it;
 /// a read-write path beneath a read-only one is kept and bound over it. A path given both ways is
 /// read-write.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 pub(crate) fn reexposed_paths<'a>(
     canonical_tmp: &Path,
     writable: impl IntoIterator<Item = &'a Path>,
@@ -238,7 +238,7 @@ mod linux {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicI32, Ordering};
 
-    use crate::sealed::{open_verified_dir, proc_fd_path, remount_flags_kept, PROC_FD_PATH_LEN};
+    use crate::sealed::{open_verified_dir, proc_fd_path, remount_read_only, PROC_FD_PATH_LEN};
 
     /// One path beneath the host's `/tmp` a mapped command still needs, re-exposed at its own
     /// path.
@@ -643,26 +643,11 @@ mod linux {
     ///
     /// # Safety
     /// `fd` is open on the bind's root. Allocation-free; callable post-`fork()`, pre-exec.
-    unsafe fn remount_read_only(fd: libc::c_int) -> Result<(), ()> {
+    unsafe fn remount_fd_read_only(fd: libc::c_int) -> Result<(), ()> {
         let mut path = [0u8; PROC_FD_PATH_LEN];
         proc_fd_path(fd, &mut path)?;
-        let mut stat: libc::statvfs = std::mem::zeroed();
-        let kept = if libc::fstatvfs(fd, &mut stat) == 0 {
-            remount_flags_kept(stat.f_flag)
-        } else {
-            0
-        };
-        if libc::mount(
-            std::ptr::null(),
-            path.as_ptr() as *const libc::c_char,
-            std::ptr::null(),
-            libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | libc::MS_NOSUID | kept,
-            std::ptr::null(),
-        ) != 0
-        {
-            return Err(());
-        }
-        Ok(())
+        let path = std::ffi::CStr::from_bytes_until_nul(&path).map_err(|_| ())?;
+        remount_read_only(path)
     }
 
     /// Step 5 of [`map_private_tmp`] for every re-exposure, beneath the new `/tmp` at `new_tmp`.
@@ -725,7 +710,7 @@ mod linux {
                     last.as_ptr(),
                     libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 );
-                let remounted = root >= 0 && remount_read_only(root).is_ok();
+                let remounted = root >= 0 && remount_fd_read_only(root).is_ok();
                 let failure = (!remounted).then(|| TmpMapFailure::at(Step::RemountReadOnly(index)));
                 if root >= 0 {
                     close_keeping_errno(root);
@@ -849,6 +834,7 @@ mod tests {
     /// writable, once, in path order; one beneath a writable path is dropped, a writable one
     /// beneath a read-only path is kept; `/tmp` itself, a path elsewhere and one that does not
     /// exist contribute nothing.
+    #[cfg(target_os = "linux")]
     #[test]
     fn reexposed_paths_are_exact_and_read_only_unless_writable() {
         let tmp = canonical_tmp();
