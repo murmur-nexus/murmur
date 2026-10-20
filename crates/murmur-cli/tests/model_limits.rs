@@ -208,7 +208,7 @@ fn limits(cap: u32, cap_source: &str, window: Option<u32>, window_source: &str) 
 // ── The turn cap ──────────────────────────────────────────────────────────────
 
 /// With no `inference.max_turns`, a task runs as many turns as it needs: twelve tool-calling turns
-/// and the turn that ends it, past the cap a launch used to impose.
+/// and the turn that ends it.
 #[test]
 fn no_turn_cap() {
     let home = home_with_driver(common::FIXTURE_DRIVER_MODELS);
@@ -455,6 +455,20 @@ fn doctor_warns_for_an_unknown_model_with_a_cap() {
     );
     let warned = doctor.lines("warning[W-RUN-009]");
     assert_eq!(warned.len(), 1, "{}", doctor.context());
+    // A warning, not a fix: counted in the tally, and doctor still exits 0.
+    assert_eq!(doctor.output.status.code(), Some(0), "{}", doctor.context());
+    assert!(
+        doctor.stdout.contains("0 errors found, 1 warning."),
+        "{}",
+        doctor.context()
+    );
+    assert!(
+        doctor.stdout.lines().any(|line| line.starts_with(
+            "Fix: set context.max_tokens for model 'test-model' (driver choice 'primary')"
+        )),
+        "{}",
+        doctor.context()
+    );
 
     let server = common::ScriptedServer::start(script(0));
     let launched = run(

@@ -1554,9 +1554,10 @@ model ends it. What bounds a task with no turn cap:
 | [`inference.max_session_tokens`](#inference-max-session-tokens) | The session's inference, once its tokens are spent |
 | [`spend.machine_tokens_per_day`](config.md#spend) | Every run on the machine, once the day's tokens are spent |
 | [`mur stop`](cli.md#mur-stop), or [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) | The session, or the one task |
+| [`lifecycle.delegation_deadline_secs`](#lifecycle-delegation-deadline-secs) of the capsule that delegated the task | A delegated sub-capsule |
 | A deadline the launcher imposes, such as a CI job's timeout | Whatever the launcher kills |
 
-mur sets no wall-clock limit on a session.
+mur sets no wall-clock limit on a session you launch with `mur run`.
 
 #### Output cap: `inference.max_tokens` { #inference-max-tokens }
 

@@ -1427,13 +1427,14 @@ fn run_formation_doctor(formation_dir: &Path) -> Result<(), CliError> {
 
 /// Each driver choice's output cap and context window under `transport: http`, and where each
 /// comes from, through the resolver `mur run` stages with: `W-RUN-009` in the words a launch
-/// prints, and the `E-RUN-052` refusal as a fix. `installed` is each installed artifact's
-/// declared name, `name@version` and bundled `murmur.yaml`; a choice whose driver is not
-/// installed is left to the missing line the checklist already printed.
+/// prints, counted as a warning, and the `E-RUN-052` refusal as a fix. `installed` is each
+/// installed artifact's declared name, `name@version` and bundled `murmur.yaml`; a choice whose
+/// driver is not installed is left to the missing line the checklist already printed.
 fn report_model_limits(
     runtime_manifest: &RuntimeManifest,
     installed: &[(String, String, String)],
     fixes: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) {
     let Some(inference) = runtime_manifest
         .inference
@@ -1497,14 +1498,19 @@ fn report_model_limits(
                     limits.context_window_source.wire_name()
                 );
             }
-            for warning in choices
-                .iter()
-                .filter_map(|choice| choice.warning.as_deref())
-            {
+            for choice in &choices {
+                let Some(warning) = choice.warning.as_deref() else {
+                    continue;
+                };
                 capsule_runtime::report_eprintln!(
                     "[mur doctor] {}",
                     capsule_runtime::model_limits::model_limits_warning_line(warning)
                 );
+                warnings.push(format!(
+                    "set context.max_tokens for model '{}' (driver choice '{}'), or use a release \
+                     of {} whose murmur.yaml lists the model under models:",
+                    choice.model, choice.choice, choice.driver
+                ));
             }
         }
         Err(error) => {
@@ -2074,7 +2080,12 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         }
     }
 
-    report_model_limits(&runtime_manifest, &installed_manifests, &mut fixes);
+    report_model_limits(
+        &runtime_manifest,
+        &installed_manifests,
+        &mut fixes,
+        &mut warnings,
+    );
 
     // `mur run` stages only what murmur.yaml declares, so a pin a capsule pulled on its own is
     // reported but neither fails nor warns.

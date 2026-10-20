@@ -10296,8 +10296,8 @@ inference:
 
     #[test]
     fn inference_max_tokens_absent_is_none() {
-        // Absent means "the manifest didn't set it" all the way down; the 8192 default is
-        // applied once, by the runtime, not smuggled in here.
+        // Absent means "the manifest didn't set it" all the way down; the runtime resolves each
+        // driver choice's cap from its driver's `models:` table, not here.
         let manifest = RuntimeManifest::from_yaml_str(
             r#"
 name: cap

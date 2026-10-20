@@ -854,7 +854,7 @@ For a `transport: http` capsule whose drivers are installed, a `Model limits:` b
 | Line | Meaning |
 |---|---|
 | `✓ <choice> (<driver>@<version>, model <model>): output cap <n> (<source>), context window <n \| none> (<source>)` | One per driver choice, `primary` first. Each source is `manifest`, `driver` or, for a window, `none` |
-| `[mur doctor] warning[W-RUN-009]: …` on stderr | The text [`W-RUN-009`](diagnostics.md#w-run-009) prints at launch |
+| `[mur doctor] warning[W-RUN-009]: …` on stderr | The text [`W-RUN-009`](diagnostics.md#w-run-009) prints at launch. Counted as a warning with a `Fix:` line naming `context.max_tokens`; the exit code stays `0` |
 | `✗ error[E-RUN-052]: …` | A choice with no output cap, or a driver with a malformed `models:` table. Adds a `Fix:` line and makes `mur doctor` exit `1` |
 | `Model limits: not checked, driver <name> is not installed` | A choice's driver is missing; the checklist already names it |
 
