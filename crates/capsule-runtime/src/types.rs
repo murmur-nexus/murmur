@@ -586,6 +586,12 @@ pub struct StagedSession {
     /// [`StageRequest::control`]. `None` for a capsule with no `control:` block, which mints no
     /// control token and answers `404` under `/control`.
     pub(crate) control: Option<Arc<crate::control_plane::ControlState>>,
+    /// The session's driver choices, the primary first, each with the credential staging left
+    /// it and, under `transport: http`, its model limits. `None` for a capsule with no inference
+    /// block.
+    pub(crate) driver_choices: Option<crate::driver_choice::DriverChoices>,
+    /// The output cap a hook's `run-inference` sends for each model it may call.
+    pub(crate) hook_output_caps: crate::model_limits::HookOutputCaps,
     /// Copied from [`StageRequest::door_authentication`], which the cards are built from.
     pub(crate) door_authentication: Option<murmur_artifact::NetworkAuthentication>,
     /// This session's door key and tokens, minted at staging when

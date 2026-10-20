@@ -235,7 +235,11 @@ struct SessionStartEvent {
     capsule_name: String,
     capsule_version: String,
     model: String,
-    max_turns: u32,
+    /// `inference.max_turns`. Always written, `null` when no cap applies.
+    max_turns: Option<u32>,
+    /// The primary driver choice's output cap and context window in force, and where each came
+    /// from. Always written, `null` under `transport: process`, which resolves none.
+    model_limits: Option<crate::model_limits::ResolvedModelLimits>,
     /// `inference.max_session_tokens` as this session enforces it. Always written, `null` when
     /// no session ceiling applies.
     max_session_tokens: Option<u64>,
@@ -1218,8 +1222,9 @@ struct TaskReopenedEvent {
     /// [`REOPEN_CONTEXT_CONTINUED`] or [`REOPEN_CONTEXT_RESTARTED`].
     attempt_context: &'static str,
     /// The turns the next attempt is handed: `inference.max_turns` less every turn the task's
-    /// attempts have spent so far.
-    turns_remaining: u32,
+    /// attempts have spent so far. `null` when
+    /// `inference.max_turns` sets no cap.
+    turns_remaining: Option<u32>,
 }
 
 /// A task continued once with everything it had handed off: its attempt ended with a turn left,
@@ -1244,8 +1249,9 @@ struct TaskContinuedEvent<'a> {
     /// How long the task waited, from its attempt's end until nothing was outstanding.
     waited_ms: u64,
     /// The turns the continued attempt is handed: `inference.max_turns` less every turn the
-    /// task's attempts have spent so far.
-    turns_remaining: u32,
+    /// task's attempts have spent so far. `null` when
+    /// `inference.max_turns` sets no cap.
+    turns_remaining: Option<u32>,
 }
 
 /// A spend ceiling refused a driver call before it was sent. No `inference` line accompanies it,
@@ -2163,7 +2169,8 @@ impl TraceWriter {
 
     pub(crate) async fn write_session_start(
         &mut self,
-        max_turns: u32,
+        max_turns: Option<u32>,
+        model_limits: Option<crate::model_limits::ResolvedModelLimits>,
         tools_declared: Vec<String>,
     ) -> std::io::Result<()> {
         let event = SessionStartEvent {
@@ -2176,6 +2183,7 @@ impl TraceWriter {
             capsule_version: self.capsule_version.clone(),
             model: self.model.clone(),
             max_turns,
+            model_limits,
             max_session_tokens: self.max_session_tokens,
             machine_tokens_per_day: self.machine_tokens_per_day,
             capabilities: self.capabilities.clone(),
@@ -2982,7 +2990,7 @@ impl TraceWriter {
         reason: &str,
         reopen_number: u32,
         attempt_context: &'static str,
-        turns_remaining: u32,
+        turns_remaining: Option<u32>,
     ) -> std::io::Result<()> {
         let event = TaskReopenedEvent {
             event_type: "task_reopened",
@@ -3010,7 +3018,7 @@ impl TraceWriter {
         member_calls: &[String],
         delegations: &[String],
         waited_ms: u64,
-        turns_remaining: u32,
+        turns_remaining: Option<u32>,
     ) -> std::io::Result<()> {
         let event = TaskContinuedEvent {
             event_type: "task_continued",
@@ -3575,6 +3583,8 @@ pub(crate) struct SessionInferenceChoice {
     /// Whether the credential resolved at launch. An injected credential is `true` here and is
     /// checked again when a switch asks for it.
     pub(crate) available: bool,
+    /// The choice's own output cap and context window in force, and where each came from.
+    pub(crate) model_limits: Option<crate::model_limits::ResolvedModelLimits>,
 }
 
 /// One accepted setting or secret change, as [`ResourceTraceAppender::write_control_change`]
@@ -4912,7 +4922,7 @@ mod tests {
     async fn session_start_fields() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_session_start(10, vec!["bash".to_string()])
+        w.write_session_start(Some(10), None, vec!["bash".to_string()])
             .await
             .unwrap();
         w.flush().await.unwrap();
@@ -4932,6 +4942,36 @@ mod tests {
         assert_eq!(e["containment_achieved"], "advisory");
         assert_eq!(e["workdir_exec"], false);
         assert!(e["timestamp"].as_u64().unwrap() > 0);
+        assert_eq!(e["model_limits"], serde_json::Value::Null);
+    }
+
+    /// No turn cap is written as `null`, beside the primary's limits and their sources.
+    #[tokio::test]
+    async fn session_start_writes_no_turn_cap_and_the_model_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        let limits = crate::model_limits::ResolvedModelLimits {
+            max_output_tokens: 65536,
+            max_output_tokens_source: crate::model_limits::LimitSource::Driver,
+            context_window: None,
+            context_window_source: crate::model_limits::LimitSource::None,
+        };
+        w.write_session_start(None, Some(limits), Vec::new())
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+
+        let e = &read_events(dir.path())[0];
+        assert!(e.get("max_turns").is_some_and(serde_json::Value::is_null));
+        assert_eq!(
+            e["model_limits"],
+            serde_json::json!({
+                "max_output_tokens": 65536,
+                "max_output_tokens_source": "driver",
+                "context_window": null,
+                "context_window_source": "none",
+            })
+        );
     }
 
     /// A member's formation is on the trace's first line, which is all a reader grouping sessions
@@ -4943,7 +4983,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut w = make_writer(dir.path()).await;
             w.set_formation_id(member);
-            w.write_session_start(10, Vec::new()).await.unwrap();
+            w.write_session_start(Some(10), None, Vec::new())
+                .await
+                .unwrap();
             w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
                 .await
                 .unwrap();
@@ -4991,7 +5033,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut w = make_writer(dir.path()).await;
             w.set_formation_member(member.as_ref());
-            w.write_session_start(10, Vec::new()).await.unwrap();
+            w.write_session_start(Some(10), None, Vec::new())
+                .await
+                .unwrap();
             w.write_a2a_task_received("tsk_1", "ctx_1", "msg_1", None, caller)
                 .await
                 .unwrap();
@@ -5046,7 +5090,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut w =
                 make_writer_with_prompt(dir.path(), TraceCapture::Meta, prompt, overridden).await;
-            w.write_session_start(1, Vec::new()).await.unwrap();
+            w.write_session_start(Some(1), None, Vec::new())
+                .await
+                .unwrap();
             w.flush().await.unwrap();
 
             let e = &read_events(dir.path())[0];
@@ -5072,7 +5118,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut w =
             make_writer_with_prompt(dir.path(), TraceCapture::Meta, Some("Be terse."), false).await;
-        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.write_session_start(Some(1), None, Vec::new())
+            .await
+            .unwrap();
         w.flush().await.unwrap();
 
         let e = &read_events(dir.path())[0];
@@ -5094,7 +5142,9 @@ mod tests {
             false,
         )
         .await;
-        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.write_session_start(Some(1), None, Vec::new())
+            .await
+            .unwrap();
         w.flush().await.unwrap();
 
         let event = &read_events(opted_in.path())[0];
@@ -5110,7 +5160,9 @@ mod tests {
     async fn content_capture_stores_no_prompt_blob_when_there_is_no_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer_with_prompt(dir.path(), TraceCapture::Content, None, false).await;
-        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.write_session_start(Some(1), None, Vec::new())
+            .await
+            .unwrap();
         w.flush().await.unwrap();
 
         let e = &read_events(dir.path())[0];
@@ -5125,8 +5177,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut w =
             make_writer_with_prompt(dir.path(), TraceCapture::Meta, Some("Be terse."), true).await;
-        w.write_session_start(1, Vec::new()).await.unwrap();
-        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.write_session_start(Some(1), None, Vec::new())
+            .await
+            .unwrap();
+        w.write_session_start(Some(1), None, Vec::new())
+            .await
+            .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -5172,7 +5228,9 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.write_session_start(Some(1), None, Vec::new())
+            .await
+            .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -5203,7 +5261,9 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.write_session_start(Some(1), None, Vec::new())
+            .await
+            .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -5254,7 +5314,9 @@ mod tests {
             )
             .await
             .unwrap();
-            w.write_session_start(1, Vec::new()).await.unwrap();
+            w.write_session_start(Some(1), None, Vec::new())
+                .await
+                .unwrap();
             w.flush().await.unwrap();
             let mut event = read_events(dir.path()).remove(0);
             // The one field that legitimately differs between two runs, removed so the assertion
@@ -5371,7 +5433,9 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.write_session_start(Some(1), None, Vec::new())
+            .await
+            .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -5912,7 +5976,7 @@ mod tests {
     async fn write_session_end_if_not_ended_is_noop_when_already_ended() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_session_start(10, vec![]).await.unwrap();
+        w.write_session_start(Some(10), None, vec![]).await.unwrap();
         w.write_session_end("ok").await.unwrap();
         w.write_session_end_if_not_ended("failed").await.unwrap();
         w.flush().await.unwrap();
@@ -5932,7 +5996,7 @@ mod tests {
     async fn write_session_end_if_not_ended_writes_when_started_not_ended() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_session_start(10, vec![]).await.unwrap();
+        w.write_session_start(Some(10), None, vec![]).await.unwrap();
         // Simulate error path — session_end_if_not_ended in launch_session
         w.write_session_end_if_not_ended("failed").await.unwrap();
         w.flush().await.unwrap();
@@ -5964,7 +6028,7 @@ mod tests {
     async fn session_id_on_every_event() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_session_start(10, vec!["bash".to_string()])
+        w.write_session_start(Some(10), None, vec!["bash".to_string()])
             .await
             .unwrap();
         w.write_inference(
@@ -5994,7 +6058,7 @@ mod tests {
     async fn counts_match_per_event_sum() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_session_start(10, vec![]).await.unwrap();
+        w.write_session_start(Some(10), None, vec![]).await.unwrap();
         w.write_inference(
             0,
             Some(50),
@@ -6170,7 +6234,7 @@ mod tests {
     async fn skill_call_does_not_increment_total_tool_calls() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_session_start(10, vec![]).await.unwrap();
+        w.write_session_start(Some(10), None, vec![]).await.unwrap();
         w.write_tool_call(
             0,
             "real-tool".to_string(),
@@ -6274,7 +6338,7 @@ mod tests {
             "tests still fail",
             1,
             REOPEN_CONTEXT_CONTINUED,
-            7,
+            Some(7),
         )
         .await
         .unwrap();
@@ -6291,6 +6355,26 @@ mod tests {
         assert_eq!(re["reopen_number"], 1);
         assert_eq!(re["attempt_context"], "continued");
         assert_eq!(re["turns_remaining"], 7);
+
+        w.write_task_reopened(
+            "tsk_1",
+            "gatekeeper",
+            "again",
+            2,
+            REOPEN_CONTEXT_CONTINUED,
+            None,
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+        let uncapped = read_events(dir.path())
+            .into_iter()
+            .filter(|e| e["event_type"] == "task_reopened")
+            .nth(1)
+            .unwrap();
+        assert!(uncapped
+            .get("turns_remaining")
+            .is_some_and(serde_json::Value::is_null));
         assert!(re["timestamp"].as_u64().unwrap() > 0);
     }
 
@@ -6307,7 +6391,7 @@ mod tests {
             &["mcl_b".to_string(), "mcl_a".to_string()],
             &["dlg_1".to_string()],
             1234,
-            8,
+            Some(8),
         )
         .await
         .unwrap();
@@ -6449,7 +6533,7 @@ mod tests {
     async fn every_event_carries_a_unique_id_and_parents_to_an_earlier_event() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_session_start(10, vec!["bash".to_string()])
+        w.write_session_start(Some(10), None, vec!["bash".to_string()])
             .await
             .unwrap();
         w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
@@ -6593,7 +6677,9 @@ mod tests {
                     operator_summary("fetcher", ArtifactRuntime::Tool),
                 ]);
             }
-            w.write_session_start(10, Vec::new()).await.unwrap();
+            w.write_session_start(Some(10), None, Vec::new())
+                .await
+                .unwrap();
             w.flush().await.unwrap();
             let events = read_events(dir.path());
             assert_eq!(events[0]["runtime_artifacts"], serde_json::json!([]));
@@ -6616,7 +6702,9 @@ mod tests {
                 ..runtime_summary("alpha-style", ArtifactRuntime::Skill)
             },
         ]);
-        w.write_session_start(10, Vec::new()).await.unwrap();
+        w.write_session_start(Some(10), None, Vec::new())
+            .await
+            .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -6708,7 +6796,9 @@ mod tests {
     async fn hook_origin_inference_hangs_off_the_turn_rather_than_becoming_one() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_session_start(10, Vec::new()).await.unwrap();
+        w.write_session_start(Some(10), None, Vec::new())
+            .await
+            .unwrap();
         w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
             .await
             .unwrap();
@@ -6780,7 +6870,9 @@ mod tests {
 
         let framed = tempfile::tempdir().unwrap();
         let mut w = make_writer(framed.path()).await;
-        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.write_session_start(Some(1), None, Vec::new())
+            .await
+            .unwrap();
         w.write_a2a_send(
             "http://peer",
             "msg_1",
@@ -6801,7 +6893,9 @@ mod tests {
     async fn task_rejected_names_the_task_source_cause_and_reason_under_the_session() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_session_start(10, Vec::new()).await.unwrap();
+        w.write_session_start(Some(10), None, Vec::new())
+            .await
+            .unwrap();
         w.write_task_start("tsk_ran", "ctx_ran", "a2a", event_provenance(), 3, &[], &[])
             .await
             .unwrap();
@@ -6849,7 +6943,9 @@ mod tests {
     async fn task_failed_names_the_task_turn_cause_and_capped_reason() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_session_start(10, Vec::new()).await.unwrap();
+        w.write_session_start(Some(10), None, Vec::new())
+            .await
+            .unwrap();
         assert_eq!(w.last_task_failure(), None);
         w.write_task_failed(None, TASK_FAILED_RUNTIME_ERROR, "before any task")
             .await
@@ -6900,7 +6996,9 @@ mod tests {
     async fn turn_level_events_carry_the_active_task_id() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_session_start(10, Vec::new()).await.unwrap();
+        w.write_session_start(Some(10), None, Vec::new())
+            .await
+            .unwrap();
         w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
             .await
             .unwrap();
@@ -7055,7 +7153,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
         w.set_tool_refresh(Some("immediate"));
-        w.write_session_start(10, Vec::new()).await.unwrap();
+        w.write_session_start(Some(10), None, Vec::new())
+            .await
+            .unwrap();
         w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
             .await
             .unwrap();
@@ -7116,7 +7216,10 @@ mod tests {
         let process_dir = tempfile::tempdir().unwrap();
         let mut process = make_writer(process_dir.path()).await;
         process.set_tool_refresh(None);
-        process.write_session_start(10, Vec::new()).await.unwrap();
+        process
+            .write_session_start(Some(10), None, Vec::new())
+            .await
+            .unwrap();
         process.flush().await.unwrap();
         let start = &read_events(process_dir.path())[0];
         assert!(start.as_object().unwrap().contains_key("tool_refresh"));
@@ -7129,7 +7232,9 @@ mod tests {
     async fn compaction_declined_records_turn_task_tokens_and_reason() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_session_start(10, Vec::new()).await.unwrap();
+        w.write_session_start(Some(10), None, Vec::new())
+            .await
+            .unwrap();
         w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
             .await
             .unwrap();

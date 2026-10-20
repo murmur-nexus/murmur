@@ -63,11 +63,16 @@ impl Door {
     fn tool_progress(name: &str) -> Self {
         let home = tempfile::tempdir().unwrap();
         let artifacts = tempfile::tempdir().unwrap();
-        let driver = common::create_driver_artifact(
+        let driver = common::create_driver_artifact_with_auth(
             artifacts.path(),
             "local/tool-progress-driver",
             "0.1.0",
             &common::fixture_path("tool-progress-driver/tool/tool-progress-driver.wasm"),
+            &format!(
+                "{}{}",
+                common::FIXTURE_DRIVER_AUTH,
+                common::tool_progress_driver_models()
+            ),
         );
         common::publish_local(&home, &driver).success();
         let tool = common::create_tool_artifact(

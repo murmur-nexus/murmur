@@ -35,7 +35,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use murmur_artifact::{ControlConfig, ControllableSetting, InferenceConfig};
+use murmur_artifact::{ControlConfig, ControllableSetting};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -250,17 +250,25 @@ impl SettingValue {
     }
 }
 
-/// The value `setting` starts the session with: what the manifest resolved to. A driver setting
-/// always starts on the primary, so nothing a controller or the agent chose survives a restart.
-fn launch_value(setting: ControllableSetting, inference: &InferenceConfig) -> SettingValue {
+/// The value `setting` starts the session with: what launch resolved it to. The output cap is the
+/// primary choice's. A driver setting always starts on the primary, so nothing a controller or the
+/// agent chose survives a restart.
+fn launch_value(setting: ControllableSetting, choices: &DriverChoices) -> SettingValue {
     match setting {
-        ControllableSetting::InferenceMaxTokens => SettingValue::Tokens(
-            inference
-                .max_tokens
-                .unwrap_or(crate::agent::DEFAULT_MAX_OUTPUT_TOKENS),
-        ),
+        ControllableSetting::InferenceMaxTokens => {
+            SettingValue::Tokens(choice_cap(choices.primary()))
+        }
         ControllableSetting::InferenceDriver => SettingValue::Driver(0),
     }
+}
+
+/// The output cap `choice` resolved to at launch. Every choice of a session that declares
+/// `control:` runs under `transport: http`, so every one has one.
+fn choice_cap(choice: &DriverChoice) -> u32 {
+    choice
+        .limits
+        .map(|limits| limits.max_output_tokens)
+        .unwrap_or_default()
 }
 
 /// A change refused before anything changed: its HTTP status, the trace's reason word, and the
@@ -382,15 +390,17 @@ pub(crate) struct SettingForCall {
     /// The `control_change` this call is the first to apply, `None` when the previous call read
     /// the same value.
     pub(crate) applies_change: Option<String>,
+    /// Whether a change set the value. Until one does, `inference.max_tokens` is each call's own
+    /// driver choice's cap rather than [`Self::value`].
+    pub(crate) set_by_change: bool,
 }
 
 impl ControlState {
-    /// State for a session that declares `config`, every setting at the value `inference`
-    /// resolves it to. `choices` is the session's driver choice table as staging left it, and
+    /// State for a session that declares `config`, every setting at the value launch resolved it
+    /// to. `choices` is the session's driver choice table as staging left it, limits recorded, and
     /// `secrets` the store every injected gateway credential reads.
     pub(crate) fn new(
         config: &ControlConfig,
-        inference: &InferenceConfig,
         choices: DriverChoices,
         secrets: Arc<InjectedSecrets>,
     ) -> Self {
@@ -404,7 +414,7 @@ impl ControlState {
                     .filter(|setting| !config.settings.contains(setting)),
             )
             .map(|setting| {
-                let value = launch_value(*setting, inference);
+                let value = launch_value(*setting, &choices);
                 SettingSlot {
                     setting: *setting,
                     value,
@@ -495,9 +505,9 @@ impl ControlState {
     ) -> Result<AcceptedChange, ChangeRefused> {
         let value = parse_setting_value(setting, requested, &self.choices)?;
         let mut settings = self.lock_settings();
-        let Some(slot) = settings
-            .iter_mut()
-            .find(|slot| slot.setting == setting && slot.permits(principal))
+        let Some(index) = settings
+            .iter()
+            .position(|slot| slot.setting == setting && slot.permits(principal))
         else {
             return Err(ChangeRefused::new(
                 404,
@@ -513,7 +523,8 @@ impl ControlState {
             return Err(refusal);
         }
         let change_id = crate::trace::new_event_id();
-        let previous = slot.value;
+        let previous = self.current(&settings, &settings[index]);
+        let slot = &mut settings[index];
         slot.value = value;
         slot.change_id = Some(change_id.clone());
         Ok(AcceptedChange {
@@ -552,10 +563,26 @@ impl ControlState {
     /// The value `setting` holds now, without marking it read by any call. `None` for a setting
     /// this session does not declare.
     pub(crate) fn selected(&self, setting: ControllableSetting) -> Option<SettingValue> {
-        self.lock_settings()
+        let settings = self.lock_settings();
+        settings
             .iter()
             .find(|slot| slot.setting == setting)
-            .map(|slot| slot.value)
+            .map(|slot| self.current(&settings, slot))
+    }
+
+    /// What `slot` holds now. An `inference.max_tokens` no change has set is the output cap of the
+    /// driver choice selected now, which is the one the next call uses.
+    fn current(&self, settings: &[SettingSlot], slot: &SettingSlot) -> SettingValue {
+        if slot.setting != ControllableSetting::InferenceMaxTokens || slot.change_id.is_some() {
+            return slot.value;
+        }
+        let selected = settings
+            .iter()
+            .find(|slot| slot.setting == ControllableSetting::InferenceDriver)
+            .and_then(|slot| slot.value.driver())
+            .and_then(|index| self.choices.get(index))
+            .unwrap_or_else(|| self.choices.primary());
+        SettingValue::Tokens(choice_cap(selected))
     }
 
     /// The value one inference call uses for `setting`, read once so the call never mixes two.
@@ -570,6 +597,7 @@ impl ControlState {
         Some(SettingForCall {
             value: slot.value,
             applies_change,
+            set_by_change: slot.change_id.is_some(),
         })
     }
 
@@ -606,7 +634,7 @@ impl ControlState {
             .map(|slot| {
                 let mut entry = json!({
                     "name": slot.setting.wire_name(),
-                    "value": slot.value.to_json(&self.choices),
+                    "value": self.current(&settings, slot).to_json(&self.choices),
                 });
                 if slot.setting == ControllableSetting::InferenceDriver {
                     entry["choices"] =
@@ -1144,6 +1172,7 @@ pub(crate) mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use murmur_artifact::InferenceConfig;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     const SESSION: &str = "ses_0199aaaabbbbccccddddeeeeffff0000";
@@ -1159,7 +1188,7 @@ mod tests {
             system_prompt: None,
             system_prompt_file: None,
             system_prompt_artifact: None,
-            max_turns: 10,
+            max_turns: Some(10),
             max_tokens,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
@@ -1167,11 +1196,38 @@ mod tests {
         }
     }
 
+    /// The cap a driver's table declares for every model in these tests.
+    const DRIVER_CAP: u32 = 65536;
+
+    /// `choices` with the output cap `caps[i]` recorded on choice `i`, as staging resolves them.
+    fn with_caps(mut choices: DriverChoices, caps: &[u32]) -> DriverChoices {
+        let resolved: Vec<crate::model_limits::ChoiceModelLimits> = choices
+            .iter()
+            .zip(caps)
+            .map(|(choice, cap)| crate::model_limits::ChoiceModelLimits {
+                choice: choice.name.clone(),
+                model: choice.model.clone(),
+                driver: choice.artifact.clone(),
+                limits: crate::model_limits::ResolvedModelLimits {
+                    max_output_tokens: *cap,
+                    max_output_tokens_source: crate::model_limits::LimitSource::Driver,
+                    context_window: None,
+                    context_window_source: crate::model_limits::LimitSource::None,
+                },
+                warning: None,
+            })
+            .collect();
+        choices.record_limits(&resolved);
+        choices
+    }
+
     fn state_for(config: &ControlConfig, inference: &InferenceConfig) -> ControlState {
         ControlState::new(
             config,
-            inference,
-            DriverChoices::declared(inference, &std::collections::HashMap::new()),
+            with_caps(
+                DriverChoices::declared(inference, &std::collections::HashMap::new()),
+                &[inference.max_tokens.unwrap_or(DRIVER_CAP)],
+            ),
             Arc::new(InjectedSecrets::new(&config.secrets)),
         )
     }
@@ -1409,13 +1465,11 @@ mod tests {
     }
 
     #[test]
-    fn launch_value_is_the_manifest_value_or_the_default() {
+    fn launch_value_is_the_primary_choices_resolved_cap() {
         let state = state_for(&config(), &inference(None));
         assert_eq!(
             state.selected(ControllableSetting::InferenceMaxTokens),
-            Some(SettingValue::Tokens(
-                crate::agent::DEFAULT_MAX_OUTPUT_TOKENS
-            ))
+            Some(SettingValue::Tokens(DRIVER_CAP))
         );
     }
 
@@ -1442,6 +1496,59 @@ mod tests {
 
         set(2048);
         assert_eq!(state.for_call(setting).unwrap().applies_change, None);
+    }
+
+    /// Until a controller sets `inference.max_tokens`, it is the cap of the driver choice selected
+    /// now, wherever it is read; once set, it is the cap whatever the choice.
+    #[test]
+    fn the_output_cap_follows_the_selected_choice_until_a_controller_sets_one() {
+        let (mut config, choices) = switchable(false);
+        config
+            .settings
+            .push(ControllableSetting::InferenceMaxTokens);
+        let state = ControlState::new(
+            &config,
+            choices,
+            Arc::new(InjectedSecrets::new(&config.secrets)),
+        );
+        let cap = ControllableSetting::InferenceMaxTokens;
+        let listed_cap = |state: &ControlState| {
+            state
+                .settings_listing()
+                .into_iter()
+                .find(|entry| entry["name"] == cap.wire_name())
+                .map(|entry| entry["value"].clone())
+        };
+        assert_eq!(state.selected(cap), Some(SettingValue::Tokens(DRIVER_CAP)));
+
+        state
+            .request_change(
+                Principal::Controller,
+                ControllableSetting::InferenceDriver,
+                &json!("haiku"),
+            )
+            .unwrap();
+        assert_eq!(state.selected(cap), Some(SettingValue::Tokens(1000)));
+        assert_eq!(listed_cap(&state), Some(json!(1000)));
+        assert!(!state.for_call(cap).unwrap().set_by_change);
+
+        let change = state
+            .request_change(Principal::Controller, cap, &json!(777))
+            .unwrap();
+        assert_eq!(change.previous, json!(1000));
+        let reading = state.for_call(cap).unwrap();
+        assert!(reading.set_by_change);
+        assert_eq!(reading.value, SettingValue::Tokens(777));
+
+        state
+            .request_change(
+                Principal::Controller,
+                ControllableSetting::InferenceDriver,
+                &json!("primary"),
+            )
+            .unwrap();
+        assert_eq!(state.selected(cap), Some(SettingValue::Tokens(777)));
+        assert_eq!(listed_cap(&state), Some(json!(777)));
     }
 
     #[tokio::test]
@@ -1759,7 +1866,7 @@ mod tests {
 
     /// A capsule on sonnet with alternates `haiku` (same driver), `gpt` (keyed by the injected
     /// `ALT_KEY`) and `mini` (whose credential was found nowhere), switchable by a controller.
-    fn switchable(agent: bool) -> (ControlConfig, InferenceConfig, DriverChoices) {
+    fn switchable(agent: bool) -> (ControlConfig, DriverChoices) {
         let mut inference = inference(Some(4096));
         inference.driver = Some(murmur_artifact::InferenceDriver {
             artifact: "anthropic".to_string(),
@@ -1778,7 +1885,10 @@ mod tests {
                     driver: driver.to_string(),
                 });
         }
-        let mut choices = DriverChoices::declared(&inference, &std::collections::HashMap::new());
+        let mut choices = with_caps(
+            DriverChoices::declared(&inference, &std::collections::HashMap::new()),
+            &[DRIVER_CAP, 1000, 2000, 3000],
+        );
         choices.record_credential("anthropic", "config", None, None);
         choices.record_credential("openai", "injected", Some(ALT_KEY), None);
         choices.record_credential("other", "none", None, Some("MINI_KEY"));
@@ -1795,15 +1905,14 @@ mod tests {
                 Vec::new()
             },
         };
-        (config, inference, choices)
+        (config, choices)
     }
 
     async fn switchable_fixture(agent: bool) -> Fixture {
         let workdir = tempfile::tempdir().unwrap();
-        let (config, inference, choices) = switchable(agent);
+        let (config, choices) = switchable(agent);
         let state = Arc::new(ControlState::new(
             &config,
-            &inference,
             choices,
             Arc::new(InjectedSecrets::new(&config.secrets)),
         ));
@@ -2028,27 +2137,21 @@ mod tests {
             }
         );
 
-        let (config, inference, choices) = switchable(true);
+        let (config, choices) = switchable(true);
         let config = ControlConfig {
             secrets: Vec::new(),
             ..config
         };
-        let agent_only = ControlState::new(
-            &config,
-            &inference,
-            choices,
-            Arc::new(InjectedSecrets::new(&[])),
-        );
+        let agent_only = ControlState::new(&config, choices, Arc::new(InjectedSecrets::new(&[])));
         assert!(!agent_only.has_controller_surface());
     }
 
     /// Every settings change after launch starts from the primary: a new state is the manifest.
     #[test]
     fn driver_choice_launch_value_is_primary() {
-        let (config, inference, choices) = switchable(false);
+        let (config, choices) = switchable(false);
         let state = ControlState::new(
             &config,
-            &inference,
             choices,
             Arc::new(InjectedSecrets::new(&config.secrets)),
         );

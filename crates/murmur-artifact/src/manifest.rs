@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use serde_yaml::Value;
 use thiserror::Error;
@@ -437,6 +437,229 @@ fn prefix_field(err: ManifestError, block: &str) -> ManifestError {
             got,
         },
         other => other,
+    }
+}
+
+/// One model's limits as the driver that serves it declares them, from the `models:` table of
+/// the driver's bundled `murmur.yaml`:
+///
+/// ```yaml
+/// models:
+///   glm-5.3:
+///     max_output_tokens: 131072
+///     context_window: 200000
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelLimits {
+    /// The most output tokens the model can produce in one completion.
+    pub max_output_tokens: u32,
+    /// The model's context window in tokens.
+    pub context_window: u32,
+}
+
+/// The keys one `models:` entry holds, both required.
+const MODEL_LIMITS_KEYS: [&str; 2] = ["max_output_tokens", "context_window"];
+
+/// Reads the top-level `models:` table from an artifact's bundled manifest text, keyed by the
+/// exact model id each entry names.
+///
+/// An absent key is an empty table. `Err` names the dotted field at fault: `models` that is not a
+/// mapping, declared on an artifact whose `runtime` is not `driver`, or holding a non-string or
+/// empty model id; an entry that is not a mapping, lacks a key, holds a key other than
+/// `max_output_tokens` and `context_window`, or a value that is not an integer in
+/// `1..=u32::MAX`.
+pub fn parse_model_limits(
+    manifest_yaml: &str,
+) -> Result<BTreeMap<String, ModelLimits>, ManifestError> {
+    const FIELD: &str = "models";
+    let value = parse_manifest_value(manifest_yaml)?;
+    let Some(root) = value.as_mapping() else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(block) = root.get(Value::String(FIELD.to_string())) else {
+        return Ok(BTreeMap::new());
+    };
+    let block = block
+        .as_mapping()
+        .ok_or_else(|| ManifestError::InvalidType {
+            field: FIELD.to_string(),
+            expected: "mapping of model id to limits".to_string(),
+            got: yaml_type_name(block),
+        })?;
+    let runtime = optional_string(root, "runtime").unwrap_or_default();
+    if runtime != "driver" {
+        return Err(ManifestError::InvalidValue {
+            field: FIELD.to_string(),
+            message: format!(
+                "is only valid on an artifact whose runtime is driver; this one is runtime: \
+                 {runtime}"
+            ),
+        });
+    }
+
+    let mut table = BTreeMap::new();
+    for (key, entry) in block {
+        let id = key.as_str().ok_or_else(|| ManifestError::InvalidType {
+            field: format!("{FIELD} key"),
+            expected: "string model id".to_string(),
+            got: yaml_type_name(key),
+        })?;
+        if id.trim().is_empty() {
+            return Err(ManifestError::InvalidValue {
+                field: FIELD.to_string(),
+                message: "has an empty model id".to_string(),
+            });
+        }
+        let entry_field = format!("{FIELD}.{id}");
+        let entry = entry
+            .as_mapping()
+            .ok_or_else(|| ManifestError::InvalidType {
+                field: entry_field.clone(),
+                expected: "mapping".to_string(),
+                got: yaml_type_name(entry),
+            })?;
+        if let Some(extra) = entry
+            .keys()
+            .find(|key| !key.as_str().is_some_and(|k| MODEL_LIMITS_KEYS.contains(&k)))
+        {
+            return Err(ManifestError::InvalidValue {
+                field: format!(
+                    "{entry_field}.{}",
+                    extra
+                        .as_str()
+                        .map_or_else(|| yaml_type_name(extra), str::to_string)
+                ),
+                message: "is not a model limit; an entry holds max_output_tokens and \
+                          context_window"
+                    .to_string(),
+            });
+        }
+        let limit = |name: &str| -> Result<u32, ManifestError> {
+            let field = format!("{entry_field}.{name}");
+            let value = entry.get(Value::String(name.to_string())).ok_or_else(|| {
+                ManifestError::MissingField {
+                    field: field.clone(),
+                }
+            })?;
+            let count = value.as_u64().ok_or_else(|| ManifestError::InvalidType {
+                field: field.clone(),
+                expected: "integer".to_string(),
+                got: yaml_type_name(value),
+            })?;
+            u32::try_from(count)
+                .ok()
+                .filter(|count| *count >= 1)
+                .ok_or_else(|| ManifestError::InvalidValue {
+                    field,
+                    message: format!("must be an integer from 1 to {}", u32::MAX),
+                })
+        };
+        table.insert(
+            id.to_string(),
+            ModelLimits {
+                max_output_tokens: limit(MODEL_LIMITS_KEYS[0])?,
+                context_window: limit(MODEL_LIMITS_KEYS[1])?,
+            },
+        );
+    }
+    Ok(table)
+}
+
+#[cfg(test)]
+mod model_limits_tests {
+    use super::*;
+
+    fn driver(models: &str) -> String {
+        format!("name: drv\nversion: 0.1.0\nruntime: driver\n{models}")
+    }
+
+    fn refusal(models: &str) -> String {
+        parse_model_limits(&driver(models))
+            .expect_err("the table is refused")
+            .to_string()
+    }
+
+    #[test]
+    fn a_table_maps_each_exact_model_id_to_its_limits() {
+        let table = parse_model_limits(&driver(
+            "models:\n  glm-5.3:\n    max_output_tokens: 131072\n    context_window: 200000\n  \
+             GLM-5.3-2026:\n    max_output_tokens: 1\n    context_window: 4294967295\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            table.get("glm-5.3"),
+            Some(&ModelLimits {
+                max_output_tokens: 131_072,
+                context_window: 200_000,
+            })
+        );
+        assert_eq!(table["GLM-5.3-2026"].context_window, u32::MAX);
+        assert_eq!(table.get("glm-5"), None);
+    }
+
+    #[test]
+    fn no_models_key_is_an_empty_table() {
+        assert!(parse_model_limits(&driver("")).unwrap().is_empty());
+        assert!(
+            parse_model_limits("name: t\nversion: 0.1.0\nruntime: tool\n")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_malformed_table_is_refused_naming_the_field() {
+        for (models, expected) in [
+            ("models: [a]\n", "field 'models' has invalid type (expected mapping"),
+            ("models:\n", "field 'models' has invalid type"),
+            ("models:\n  m: 5\n", "field 'models.m' has invalid type (expected mapping"),
+            (
+                "models:\n  m:\n    max_output_tokens: 10\n",
+                "missing required field 'models.m.context_window'",
+            ),
+            (
+                "models:\n  m:\n    max_output_tokens: 0\n    context_window: 10\n",
+                "field 'models.m.max_output_tokens' must be an integer from 1 to 4294967295",
+            ),
+            (
+                "models:\n  m:\n    max_output_tokens: 10\n    context_window: 4294967296\n",
+                "field 'models.m.context_window' must be an integer from 1 to 4294967295",
+            ),
+            (
+                "models:\n  m:\n    max_output_tokens: -1\n    context_window: 10\n",
+                "field 'models.m.max_output_tokens' has invalid type (expected integer",
+            ),
+            (
+                "models:\n  m:\n    max_output_tokens: \"10\"\n    context_window: 10\n",
+                "field 'models.m.max_output_tokens' has invalid type (expected integer, got string)",
+            ),
+            (
+                "models:\n  m:\n    max_output_tokens: 10\n    context_window: 10\n    \
+                 max_input_tokens: 5\n",
+                "field 'models.m.max_input_tokens' is not a model limit",
+            ),
+            (
+                "models:\n  \"\":\n    max_output_tokens: 10\n    context_window: 10\n",
+                "field 'models' has an empty model id",
+            ),
+        ] {
+            let message = refusal(models);
+            assert!(message.contains(expected), "{models:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn models_on_an_artifact_that_is_not_a_driver_is_refused() {
+        let message = parse_model_limits(
+            "name: t\nversion: 0.1.0\nruntime: tool\nmodels:\n  m:\n    max_output_tokens: 1\n    \
+             context_window: 1\n",
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(
+            message.contains("field 'models' is only valid on an artifact whose runtime is driver; this one is runtime: tool"),
+            "{message}"
+        );
     }
 }
 

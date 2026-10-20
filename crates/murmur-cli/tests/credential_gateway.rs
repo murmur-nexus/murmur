@@ -151,7 +151,7 @@ impl Project {
             DRIVER,
             VERSION,
             &fixture("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-            ANTHROPIC_AUTH,
+            &format!("{ANTHROPIC_AUTH}{}", common::FIXTURE_DRIVER_MODELS),
         );
         common::publish_local(&self.home, &artifact).success();
     }

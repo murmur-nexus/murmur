@@ -1425,6 +1425,107 @@ fn run_formation_doctor(formation_dir: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Each driver choice's output cap and context window under `transport: http`, and where each
+/// comes from, through the resolver `mur run` stages with: `W-RUN-009` in the words a launch
+/// prints, counted as a warning, and the `E-RUN-052` refusal as a fix. `installed` is each
+/// installed artifact's declared name, `name@version` and bundled `murmur.yaml`; a choice whose
+/// driver is not installed is left to the missing line the checklist already printed.
+fn report_model_limits(
+    runtime_manifest: &RuntimeManifest,
+    installed: &[(String, String, String)],
+    fixes: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(inference) = runtime_manifest
+        .inference
+        .as_ref()
+        .filter(|inference| inference.transport == "http")
+    else {
+        return;
+    };
+    let find = |driver: &str| {
+        installed.iter().find(|(name, _, _)| {
+            murmur_artifact::tool_name_of(name) == murmur_artifact::tool_name_of(driver)
+        })
+    };
+    let drivers = std::iter::once(
+        inference
+            .driver
+            .as_ref()
+            .map(|driver| driver.artifact.as_str())
+            .unwrap_or_default(),
+    )
+    .chain(
+        inference
+            .alternates
+            .iter()
+            .map(|alternate| alternate.driver.as_str()),
+    );
+    if let Some(missing) = drivers.clone().find(|driver| find(driver).is_none()) {
+        capsule_runtime::report_println!(
+            "Model limits: not checked, driver {missing} is not installed"
+        );
+        return;
+    }
+    let resolved = capsule_runtime::model_limits::resolve_model_limits(
+        inference,
+        runtime_manifest.context.as_ref(),
+        |driver| {
+            let (label, manifest_yaml) =
+                find(driver).map_or(("", ""), |(_, label, yaml)| (label.as_str(), yaml.as_str()));
+            capsule_runtime::model_limits::DriverManifest {
+                label,
+                manifest_yaml,
+            }
+        },
+    );
+    capsule_runtime::report_println!("Model limits:");
+    match resolved {
+        Ok(choices) => {
+            for choice in &choices {
+                let limits = choice.limits;
+                let window = limits
+                    .context_window
+                    .map_or_else(|| "none".to_string(), |window| window.to_string());
+                capsule_runtime::report_println!(
+                    "  \u{2713}  {} ({}, model {}): output cap {} ({}), context window {} ({})",
+                    choice.choice,
+                    choice.driver,
+                    choice.model,
+                    limits.max_output_tokens,
+                    limits.max_output_tokens_source.wire_name(),
+                    window,
+                    limits.context_window_source.wire_name()
+                );
+            }
+            for choice in &choices {
+                let Some(warning) = choice.warning.as_deref() else {
+                    continue;
+                };
+                capsule_runtime::report_eprintln!(
+                    "[mur doctor] {}",
+                    capsule_runtime::model_limits::model_limits_warning_line(warning)
+                );
+                warnings.push(format!(
+                    "set context.max_tokens for model '{}' (driver choice '{}'), or use a release \
+                     of {} whose murmur.yaml lists the model under models:",
+                    choice.model, choice.choice, choice.driver
+                ));
+            }
+        }
+        Err(error) => {
+            let refusal = crate::error::model_limits_error(&error);
+            capsule_runtime::report_println!(
+                "  \u{2717}  error[{}]: {}",
+                refusal.code,
+                refusal.message
+            );
+            fixes.push(refusal.hint.unwrap_or_default());
+        }
+    }
+    capsule_runtime::report_println!();
+}
+
 /// Print doctor's closing lines: `All checks passed.` when nothing was found, or else the tally
 /// and one `Fix:` line per fix, then per warning. Exits the process with status 1 when `fixes` is
 /// not empty; a warning alone returns.
@@ -1778,6 +1879,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let mut interface_failed: HashSet<String> = HashSet::new();
     // `name@version` of every declared artifact the checklist identified as a native tool.
     let mut native_tools: Vec<String> = Vec::new();
+    // Each installed artifact's declared name, `name@version`, and bundled `murmur.yaml`, for the
+    // model limits each driver choice resolves to.
+    let mut installed_manifests: Vec<(String, String, String)> = Vec::new();
 
     fixes.extend(env_requirements_findings.fixes);
     fixes.extend(roster_findings.fixes);
@@ -1809,6 +1913,11 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                 total_pass += 1;
             }
             ArtifactPresence::Installed(resolved) => {
+                if let Ok(yaml) =
+                    murmur_artifact::load_manifest_yaml_from_artifact_bytes(&resolved.bytes)
+                {
+                    installed_manifests.push((name.clone(), ref_str.clone(), yaml));
+                }
                 // No lockfile: presence is the whole check, as it has always been.
                 let verdict = match &lock {
                     Some(lock) => check_lock_entry(
@@ -1970,6 +2079,13 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
             }
         }
     }
+
+    report_model_limits(
+        &runtime_manifest,
+        &installed_manifests,
+        &mut fixes,
+        &mut warnings,
+    );
 
     // `mur run` stages only what murmur.yaml declares, so a pin a capsule pulled on its own is
     // reported but neither fails nor warns.

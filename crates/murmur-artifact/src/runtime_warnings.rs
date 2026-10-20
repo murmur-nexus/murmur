@@ -56,6 +56,14 @@ pub const W_RUN_007: &str = "W-RUN-007";
 /// refused at launch: the member may still be called. Printed once, at staging.
 pub const W_RUN_008: &str = "W-RUN-008";
 
+/// A driver choice whose driver's `models:` table lists no limits for its model, in a capsule
+/// that sets `inference.max_tokens` but not `context.max_tokens`.
+///
+/// The output cap is the operator's own, so nothing is refused; with no context window known,
+/// compaction does not run and no seed budget applies for that choice. Printed once per choice, at
+/// staging, and by `mur doctor` with the same text.
+pub const W_RUN_009: &str = "W-RUN-009";
+
 /// Builds the doc link for a `W-RUN-*` code, e.g. `.../diagnostics/#w-run-001`.
 pub fn runtime_warning_link(code: &str) -> String {
     crate::diagnostic_link(code)
@@ -70,7 +78,7 @@ mod tests {
     #[test]
     fn every_code_is_unique_and_well_formed() {
         let codes = [
-            W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_007, W_RUN_008,
+            W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_007, W_RUN_008, W_RUN_009,
         ];
         for code in codes {
             assert!(code.starts_with("W-RUN-"), "malformed code: {code}");

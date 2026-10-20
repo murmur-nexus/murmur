@@ -366,7 +366,7 @@ status:     ok
 duration:   4.1s
 
 ── Turns ────────────────────────────────────────
-count:      2  (max: 10)
+count:      2  (max: no cap)
 
 ── Tokens ───────────────────────────────────────
 input:      8,214  (avg 4,107/turn)

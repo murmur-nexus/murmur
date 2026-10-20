@@ -102,7 +102,10 @@ impl World {
             DRIVER_NAME,
             DRIVER_VERSION,
             "driver",
-            "runtime: driver\nupstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n",
+            &format!(
+                "runtime: driver\nupstream_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n{}",
+                common::FIXTURE_DRIVER_MODELS
+            ),
             Some((
                 "tool.wasm",
                 &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),

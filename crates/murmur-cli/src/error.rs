@@ -98,6 +98,7 @@ pub const E_RUN_048: &str = "E-RUN-048"; // `mur token` named a session whose do
 pub const E_RUN_049: &str = "E-RUN-049"; // `mur token --credential` named a credential the session did not mint
 pub const E_RUN_050: &str = "E-RUN-050"; // a runtime write, read, create or removal inside the workdir met a symbolic link or the wrong kind of file
 pub const E_RUN_051: &str = "E-RUN-051"; // a delegated child's --workdir is not the directory its parent created
+pub const E_RUN_052: &str = "E-RUN-052"; // a driver choice has no output cap, or its driver ships a malformed models: table
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -143,6 +144,7 @@ pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identif
 pub const E_BLD_002: &str = "E-BLD-002"; // requires_files entry is unsafe or collides in the archive
 pub const E_BLD_003: &str = "E-BLD-003"; // packed entry set is not a launchable payload
 pub const E_BLD_004: &str = "E-BLD-004"; // artifact manifest declares a retired block name
+pub const E_BLD_005: &str = "E-BLD-005"; // driver manifest's models: table is malformed or on a non-driver
 
 // Host I/O
 pub const E_IO_001: &str = "E-IO-001"; // file or directory not found
@@ -251,6 +253,24 @@ impl From<capsule_runtime::HomeUnusable> for CliError {
     fn from(error: capsule_runtime::HomeUnusable) -> Self {
         home_unusable(&error)
     }
+}
+
+/// `E-RUN-052`, for a launch staging refused and for the fix `mur doctor` reports.
+pub(crate) fn model_limits_error(
+    error: &capsule_runtime::model_limits::ModelLimitsError,
+) -> CliError {
+    use capsule_runtime::model_limits::ModelLimitsError;
+    let hint = match error {
+        ModelLimitsError::NoOutputCap { .. } => {
+            "set inference.max_tokens to the model's output cap, or use a release of the driver \
+             whose murmur.yaml lists the model under models:"
+        }
+        ModelLimitsError::MalformedTable { .. } => {
+            "the driver's own murmur.yaml is at fault; use a release of the driver whose models: \
+             table is well formed"
+        }
+    };
+    CliError::with_hint(E_RUN_052, error.to_string(), hint)
 }
 
 impl From<RuntimeError> for CliError {
@@ -720,6 +740,7 @@ impl From<RuntimeError> for CliError {
                 format!("inference driver '{name}' is not installed in the local tool registry"),
                 "declare the driver artifact in murmur.yaml artifacts: and run `mur run` to install it",
             ),
+            RuntimeError::ModelLimits(error) => model_limits_error(&error),
             error @ RuntimeError::GatewayArtifactDeclaresNoUpstreamAuth { .. } => {
                 CliError::with_hint(
                     E_RUN_025,
@@ -1149,6 +1170,13 @@ impl From<BuildError> for CliError {
                     "rename the block to upstream_auth: — an artifact published with \
                      {RETIRED_AUTH_BLOCK}: is refused at launch with E-RUN-025"
                 ),
+            ),
+            error @ BuildError::ModelLimits(_) => CliError::with_hint(
+                E_BLD_005,
+                error.to_string(),
+                "models: is a driver's table of model id to max_output_tokens and \
+                 context_window, each an integer from 1 to 4294967295; a driver shipped with a \
+                 malformed table is refused at launch with E-RUN-052",
             ),
         }
     }

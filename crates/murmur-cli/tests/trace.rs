@@ -249,7 +249,7 @@ fn trace_two_turn_session_all_event_types() {
         .find(|e| e["event_type"] == "session_start")
         .unwrap();
     assert_eq!(ss["model"], "test-model");
-    assert_eq!(ss["max_turns"], 10_u64);
+    assert_eq!(ss["max_turns"], serde_json::Value::Null);
     assert!(
         ss["capsule_name"].as_str().is_some(),
         "capsule_name required"

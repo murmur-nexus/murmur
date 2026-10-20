@@ -48,8 +48,9 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
                 system_prompt: None,
                 system_prompt_file: None,
                 system_prompt_artifact: None,
-                max_turns: 10,
-                max_tokens: None,
+                max_turns: Some(10),
+                // No driver is staged, so no `models:` table is read: the cap is the manifest's.
+                max_tokens: Some(4096),
                 max_session_tokens: None,
                 tool_refresh: murmur_artifact::ToolRefresh::Compaction,
                 alternates: Vec::new(),

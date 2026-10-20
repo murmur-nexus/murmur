@@ -12,6 +12,7 @@ section that explains it.
 | `E-BLD-002` | `requires_files:` entry is unsafe (absolute, `..`, symlink) or collides inside the archive | [E-BLD-002](#e-bld-002) |
 | `E-BLD-003` | Packed entry set is not a launchable wasm payload | [E-BLD-003](#e-bld-003) |
 | `E-BLD-004` | Artifact manifest declares `inference_auth:`, the former name of `upstream_auth:` | [E-BLD-004](#e-bld-004) |
+| `E-BLD-005` | A driver's `models:` table is malformed, or `models:` is declared on an artifact that is not a driver | [E-BLD-005](#e-bld-005) |
 | `E-CAP-001` | A `capabilities.network.allow` entry could not be parsed | [E-CAP-001](#e-cap-001) |
 | `E-CAP-002` | A `filesystem.scope` is not relative to the workdir, or escapes it via `..` | [E-CAP-002](#e-cap-002) |
 | `E-CAP-003` | Declared containment floor (`advisory`\|`scoped`\|`sealed`) is not achievable on this host | [E-CAP-003](#e-cap-003) |
@@ -127,6 +128,7 @@ section that explains it.
 | `E-RUN-049` | `mur token --credential` named a credential the session did not mint | [E-RUN-049](#e-run-049) |
 | `E-RUN-050` | The runtime met a symbolic link, or the wrong kind of file, inside the workdir — while staging the session, or during the task `mur run` ran | [E-RUN-050](#e-run-050) |
 | `E-RUN-051` | A delegated child's `--workdir` is not the directory its parent created; nothing was written | [E-RUN-051](#e-run-051) |
+| `E-RUN-052` | A driver choice has no output cap — its driver lists no limits for its model and the manifest sets no `inference.max_tokens` — or its driver ships a malformed `models:` table | [E-RUN-052](#e-run-052) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -148,6 +150,7 @@ section that explains it.
 | `W-RUN-004` | A tool's `input_schema` is malformed where the required-field check reads it, so its calls run unchecked | [W-RUN-004](#w-run-004) |
 | `W-RUN-007` | A session carries a formation id but no lifeline, so it does not wind down when its formation ends | [W-RUN-007](#w-run-007) |
 | `W-RUN-008` | A formation member the roster lets call another reaches no member's door with its `capabilities.network.allow` | [W-RUN-008](#w-run-008) |
+| `W-RUN-009` | A driver choice's driver lists no limits for its model, so it runs on `inference.max_tokens` with no context window | [W-RUN-009](#w-run-009) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -1321,6 +1324,31 @@ error[E-RUN-051]: the workdir /home/dev/project/.murmur/children/worker-3f9c2a1b
 The delegation fails at the child's start, as any child that cannot launch does. Nothing was
 written under either directory.
 
+### E-RUN-052 — a driver choice has no output cap { #e-run-052 }
+
+Each driver choice of a `transport: http` capsule takes its
+[output cap](manifest.md#inference-max-tokens) from `inference.max_tokens`, or else from the
+[`models:`](manifest.md#driver-models) entry its driver declares for its model. With neither, the
+launch is refused before any request leaves:
+
+```text
+error[E-RUN-052]: driver choice 'primary' has no output cap: driver murmur/driver-openai@1.0.0 declares no limits for model 'gpt-5.6-luna' and the manifest sets no inference.max_tokens
+  hint: set inference.max_tokens to the model's output cap, or use a release of the driver whose murmur.yaml lists the model under models:
+```
+
+The choice is `primary` or an `inference.alternates` entry's `name`. The model id is matched by
+exact string equality, so a dated id and its alias are separate entries. Set `inference.max_tokens`
+in the capsule's manifest, or install a release of the driver that lists the model.
+[`mur doctor`](cli.md#mur-doctor) reports the same condition as a fix.
+
+A driver whose own `models:` table is malformed refuses the launch under the same code, naming the
+driver and the field:
+
+```text
+error[E-RUN-052]: driver local/driver-glm@0.1.0 ships a malformed models: table: murmur.yaml: field 'models.glm-5.3.max_output_tokens' must be an integer from 1 to 4294967295
+  hint: the driver's own murmur.yaml is at fault; use a release of the driver whose models: table is well formed
+```
+
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
 A `staged_runtime` grant is staged into a composed root, and a composed root is built only for a
@@ -1885,6 +1913,27 @@ The artifact's `murmur.yaml` declares `inference_auth:`, the former name of the
 [`upstream_auth:` block](manifest.md#upstream-auth). `mur build` refuses before writing the
 `.mur.zip`, including when `upstream_auth:` is also declared. Rename the block; its fields are
 unchanged.
+
+### E-BLD-005 — malformed `models:` table { #e-bld-005 }
+
+```text
+error[E-BLD-005]: murmur.yaml: field 'models.glm-5.3.max_output_tokens' must be an integer from 1 to 4294967295
+  hint: models: is a driver's table of model id to max_output_tokens and context_window, each an integer from 1 to 4294967295; a driver shipped with a malformed table is refused at launch with E-RUN-052
+```
+
+`mur build` refuses before writing the `.mur.zip`, naming the field:
+
+| `models:` | Field named |
+|---|---|
+| Not a mapping | `models` |
+| An empty model id | `models` |
+| Declared on an artifact whose `runtime` is not `driver` | `models` |
+| An entry that is not a mapping | `models.<id>` |
+| An entry missing `max_output_tokens` or `context_window` | `models.<id>.<key>` |
+| A value that is not an integer from `1` to `4294967295` | `models.<id>.<key>` |
+| An entry holding any other key | `models.<id>.<key>` |
+
+The block's shape is in [`models:` block](manifest.md#driver-models).
 
 ### W-BLD-001 — declaration names a reserved archive entry { #w-bld-001 }
 
@@ -2498,7 +2547,8 @@ which is over by the time a turn happens.
 
 The provider reported `stop_reason: "max_tokens"`: it generated the whole budget
 [`inference.max_tokens`](manifest.md#inference-max-tokens) allowed and stopped mid-reply. The cap
-named in the warning is the value that was in force — the manifest's, or the `8192` default.
+named in the warning is the value that was in force — the manifest's `inference.max_tokens`, the
+driver's [`models:`](manifest.md#driver-models) entry for the model, or a controller's change.
 
 What the turn leaves behind:
 
@@ -2613,6 +2663,27 @@ The warning prints once, at staging, to stderr and the member's `logs/bootstrap.
 refused: the member launches and may still be called, and each `call-member` call it makes fails
 in the same turn, naming `capabilities.network.allow`. Declare `localhost` in the member's
 `capabilities.network.allow`. See [Giving a member work](roster.md#member-calls).
+
+### W-RUN-009 — a driver lists no limits for the model { #w-run-009 }
+
+```text
+[capsule-runtime] warning[W-RUN-009]: driver murmur/driver-openai@1.0.0 declares no limits for model 'gpt-5.6-luna' (driver choice 'primary'), so the session uses inference.max_tokens (16384) as its output cap and knows no context window: compaction does not run and no seed budget applies; set context.max_tokens to give it one (https://docs.murmur.nexus/reference/diagnostics/#w-run-009)
+```
+
+The choice's driver has no [`models:`](manifest.md#driver-models) entry for its model, the
+manifest sets `inference.max_tokens`, and it sets no `context.max_tokens`. The launch goes ahead on
+the manifest's output cap, and for that choice:
+
+| Without a context window | Effect |
+|---|---|
+| Compaction | Does not run |
+| An `on-task-start` seed, when the choice is the primary | Refused with `reason: "no_budget"` |
+
+The warning prints once per such choice, at staging, to stderr and `logs/bootstrap.log`, and
+[`mur doctor`](cli.md#mur-doctor) prints the same text. A manifest that sets both
+`inference.max_tokens` and `context.max_tokens` needs nothing from the table and draws no warning.
+Set `context.max_tokens` to the model's context window, or install a release of the driver that
+lists the model.
 
 ---
 

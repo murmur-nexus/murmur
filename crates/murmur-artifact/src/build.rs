@@ -13,7 +13,9 @@ use zip::{
 
 use crate::build_info::{BuildInfo, BUILD_INFO_FILE};
 use crate::fit::newest_fitting_level;
-use crate::manifest::{load_manifest, refuse_retired_auth_block, Manifest, ManifestError};
+use crate::manifest::{
+    load_manifest, parse_model_limits, refuse_retired_auth_block, Manifest, ManifestError,
+};
 use crate::manifest_path::{resolve_manifest_path, MANIFEST_FILENAME};
 use crate::payload_shape::{select_root_wasm_from_entries, PayloadShapeError};
 use crate::registry::RuntimeType;
@@ -117,6 +119,10 @@ pub enum BuildError {
     /// launch whenever its entry declares `gateway:`, so it is never packed.
     #[error(transparent)]
     RetiredAuthBlock(ManifestError),
+    /// The manifest's `models:` table is malformed, or declared on an artifact whose `runtime` is
+    /// not `driver`. A driver that shipped it would refuse every launch on it.
+    #[error(transparent)]
+    ModelLimits(ManifestError),
 }
 
 /// One file the packer will write into the archive.
@@ -170,6 +176,7 @@ pub fn build_artifact(
             source,
         })?;
     refuse_retired_auth_block(&manifest_yaml).map_err(BuildError::RetiredAuthBlock)?;
+    parse_model_limits(&manifest_yaml).map_err(BuildError::ModelLimits)?;
 
     // Everything that decides *what* ships — name validation, per-entry path safety, curation
     // and archive-name collisions — happens here, and is the same computation the build lints

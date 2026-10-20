@@ -149,7 +149,7 @@ impl Capsule {
             driver,
             DRIVER_VERSION,
             wasm,
-            auth_block,
+            &format!("{auth_block}{}", common::FIXTURE_DRIVER_MODELS),
         );
         common::publish_local(&home, &artifact).success();
         let manifest = project.path().join("murmur.yaml");

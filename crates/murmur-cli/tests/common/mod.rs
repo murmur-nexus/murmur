@@ -621,9 +621,75 @@ fn stage_agent_session_inner(
     .unwrap()
 }
 
+/// The `max_output_tokens` every model in [`FIXTURE_DRIVER_MODELS`] declares.
+pub const FIXTURE_MAX_OUTPUT_TOKENS: u32 = 8192;
+/// The `context_window` every model in [`FIXTURE_DRIVER_MODELS`] declares: wider than any test
+/// conversation, so nothing compacts unless its manifest sets `context.max_tokens`.
+pub const FIXTURE_CONTEXT_WINDOW: u32 = 1_000_000;
+
+/// The `models:` table the fixture drivers declare, for every model id the suites' manifests name.
+/// A `transport: http` capsule takes its output cap and context window from its driver's table,
+/// so a driver that lists none of them refuses a capsule that sets no `inference.max_tokens`.
+pub const FIXTURE_DRIVER_MODELS: &str = "models:
+  test-model:
+    max_output_tokens: 8192
+    context_window: 1000000
+  test:
+    max_output_tokens: 8192
+    context_window: 1000000
+  some-model:
+    max_output_tokens: 8192
+    context_window: 1000000
+  my-model:
+    max_output_tokens: 8192
+    context_window: 1000000
+  claude-x:
+    max_output_tokens: 8192
+    context_window: 1000000
+  claude-test-model:
+    max_output_tokens: 8192
+    context_window: 1000000
+  claude-haiku-4-5:
+    max_output_tokens: 8192
+    context_window: 1000000
+  claude-sonnet-4-5:
+    max_output_tokens: 8192
+    context_window: 1000000
+  gpt-4:
+    max_output_tokens: 8192
+    context_window: 1000000
+  gpt-5:
+    max_output_tokens: 8192
+    context_window: 1000000
+";
+
+/// The tool-progress fixture driver's `models:` table: it reads its model as the way to report a
+/// tool call, so each mode is a model it serves, beside every model in [`FIXTURE_DRIVER_MODELS`].
+pub fn tool_progress_driver_models() -> String {
+    let modes: String = [
+        "tool-progress",
+        "tool-progress-streaming",
+        "tool-progress-large",
+        "tool-progress-unruly",
+    ]
+    .iter()
+    .map(|mode| {
+        format!(
+            "  {mode}:\n    max_output_tokens: {FIXTURE_MAX_OUTPUT_TOKENS}\n    context_window: \
+             {FIXTURE_CONTEXT_WINDOW}\n"
+        )
+    })
+    .collect();
+    format!("{FIXTURE_DRIVER_MODELS}{modes}")
+}
+
+/// The `upstream_auth:` block [`create_driver_artifact`] packs: the provider takes the key as
+/// `x-api-key`.
+pub const FIXTURE_DRIVER_AUTH: &str = "upstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
+
 /// A WASM driver artifact. Like every `create_*_artifact` helper here, `name` may be a full name:
 /// the artifact is packed and its file named by the bare part, so installing the file files it as
-/// `local/<bare>`.
+/// `local/<bare>`. Its manifest declares [`FIXTURE_DRIVER_AUTH`] and [`FIXTURE_DRIVER_MODELS`].
 pub fn create_driver_artifact(dir: &Path, name: &str, version: &str, wasm_path: &Path) -> PathBuf {
     // A `transport: http` capsule refuses a driver that does not say how its provider takes the key.
     create_driver_artifact_with_auth(
@@ -631,12 +697,12 @@ pub fn create_driver_artifact(dir: &Path, name: &str, version: &str, wasm_path: 
         name,
         version,
         wasm_path,
-        "upstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n",
+        &format!("{FIXTURE_DRIVER_AUTH}{FIXTURE_DRIVER_MODELS}"),
     )
 }
 
 /// [`create_driver_artifact`] with `auth_block` appended verbatim to the bundled `murmur.yaml`
-/// (empty for none).
+/// (empty for none) in place of its `upstream_auth:` and `models:` blocks.
 pub fn create_driver_artifact_with_auth(
     dir: &Path,
     name: &str,

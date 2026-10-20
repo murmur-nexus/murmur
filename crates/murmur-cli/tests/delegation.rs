@@ -354,8 +354,9 @@ fn publish_driver(registry_root: &Path) {
         zip.write_all(
             format!(
                 "name: {}\nversion: {DRIVER_VERSION}\nruntime: driver\n\
-                 upstream_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n",
-                murmur_artifact::tool_name_of(DRIVER)
+                 upstream_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n{}",
+                murmur_artifact::tool_name_of(DRIVER),
+                common::FIXTURE_DRIVER_MODELS
             )
             .as_bytes(),
         )
@@ -770,7 +771,7 @@ fn agent_capsule_manifest_with(endpoint: &str, lifecycle: &str) -> String {
 struct ParentConfig {
     task_acceptance: TaskAcceptance,
     after_task: AfterTask,
-    /// `inference.max_turns`, or the default when `None`.
+    /// `inference.max_turns`; `None` sets no cap.
     max_turns: Option<u32>,
     /// A `task.md` written into the project before launch, which the session runs as its first
     /// task.

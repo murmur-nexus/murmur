@@ -16,10 +16,7 @@ use wasmtime::{
 };
 
 use crate::{
-    agent::{
-        build_driver_payload, count_tokens, parse_driver_usage, DriverUsage,
-        DEFAULT_MAX_OUTPUT_TOKENS,
-    },
+    agent::{build_driver_payload, count_tokens, parse_driver_usage, DriverUsage},
     bindings::{
         hook::murmur::runtime::inference::{InferenceRequest, InferenceResponse},
         host::murmur::tool::run::{Status, ToolInput},
@@ -104,6 +101,8 @@ pub(crate) struct HookInferenceCtx {
     pub(crate) driver_component: Component,
     /// The manifest's primary `inference.model` — what `model: none` resolves to.
     pub(crate) model: String,
+    /// The output cap each completion sends and admits spend against, by the model it calls.
+    pub(crate) output_caps: crate::model_limits::HookOutputCaps,
     pub(crate) engine: Engine,
     pub(crate) accessible_workdir: PathBuf,
     /// The session's bookkeeping directory, where a credential failure writes `out/result.txt`.
@@ -144,12 +143,13 @@ impl HookInferenceCtx {
         // retry — a caller wanting fallback calls again with `none` itself.
         let messages = wire_messages(&request);
         let model = request.model.unwrap_or_else(|| self.model.clone());
-        // Hook completions keep the built-in default cap rather than the manifest's
-        // `inference.max_tokens`: that field is documented as the *agent turn* output cap, and a
-        // small value chosen for the agent loop would silently truncate a compaction summary.
+        // The primary driver's declared ceiling for the model called, ahead of the manifest's
+        // `inference.max_tokens`: that is the *agent turn* output cap, and a small value chosen
+        // for the agent loop would silently truncate a compaction summary.
+        let max_output_tokens = self.output_caps.for_model(&model);
         let payload = build_driver_payload(
             &model,
-            DEFAULT_MAX_OUTPUT_TOKENS,
+            max_output_tokens,
             &messages,
             &[],
             request.system_prompt.as_deref().unwrap_or(""),
@@ -165,10 +165,7 @@ impl HookInferenceCtx {
 
         // Refused before dispatch: the guest gets the refusal text as `err`, and the trace gets a
         // refusal line rather than an `inference` record for a call that never happened.
-        let admission = match self
-            .spend
-            .admit(input_tokens, u64::from(DEFAULT_MAX_OUTPUT_TOKENS))
-        {
+        let admission = match self.spend.admit(input_tokens, u64::from(max_output_tokens)) {
             Ok(admission) => admission,
             Err(refusal) => {
                 let text = refusal.to_string();
@@ -806,6 +803,12 @@ mod tests {
         Engine::new(&config).expect("engine builds")
     }
 
+    /// The one model the primary driver's `models:` table lists in these tests, and its ceiling.
+    const DECLARED_MODEL: &str = "declared-model";
+    const DECLARED_CAP: u32 = 1_048_576;
+    /// The primary choice's resolved cap, what a model the table does not list gets.
+    const PRIMARY_CAP: u32 = 4096;
+
     fn ctx(engine: &Engine, workdir: &std::path::Path, driver: Component) -> HookInferenceCtx {
         ctx_with_spend(engine, workdir, driver, Arc::new(SpendMeter::unlimited()))
     }
@@ -820,6 +823,16 @@ mod tests {
             driver_name: "mock-driver".to_string(),
             driver_component: driver,
             model: "manifest-model".to_string(),
+            output_caps: crate::model_limits::HookOutputCaps::new(
+                std::collections::BTreeMap::from([(
+                    DECLARED_MODEL.to_string(),
+                    murmur_artifact::ModelLimits {
+                        max_output_tokens: DECLARED_CAP,
+                        context_window: 2_000_000,
+                    },
+                )]),
+                PRIMARY_CAP,
+            ),
             engine: engine.clone(),
             accessible_workdir: workdir.to_path_buf(),
             workdir: crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
@@ -854,18 +867,15 @@ mod tests {
     /// `input_tokens` against it proves the resolved model really went onto the
     /// wire, not just into `model-used`.
     fn expected_input_tokens(model: &str) -> u64 {
+        expected_input_tokens_at(model, PRIMARY_CAP)
+    }
+
+    /// [`expected_input_tokens`] for a payload carrying `max_tokens: cap`.
+    fn expected_input_tokens_at(model: &str, cap: u32) -> u64 {
         let messages = vec![
             serde_json::json!({"role":"user","content":[{"type":"text","text":"summarize this"}]}),
         ];
-        let payload = build_driver_payload(
-            model,
-            DEFAULT_MAX_OUTPUT_TOKENS,
-            &messages,
-            &[],
-            "",
-            None,
-            None,
-        );
+        let payload = build_driver_payload(model, cap, &messages, &[], "", None, None);
         u64::from(count_tokens(&serde_json::to_string(&payload).unwrap()))
     }
 
@@ -1039,6 +1049,43 @@ mod tests {
         assert!(!serialized.contains("inserted_by"));
         assert!(!serialized.contains("inserted-by"));
         assert!(!serialized.contains("replace-context"));
+    }
+
+    /// A completion on a model the primary driver's table lists sends that model's ceiling, and
+    /// one on any other model sends the primary's resolved cap; spend is admitted against the
+    /// same number, so a session ceiling between the two refuses only the first.
+    #[test]
+    fn run_inference_caps_at_the_table_ceiling_else_the_primary_cap() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine();
+        let ctx = ctx(&engine, dir.path(), driver_double(&engine, 0, CANNED));
+        let declared = block_on(ctx.run("hook:compact", request(Some(DECLARED_MODEL)))).unwrap();
+        assert_eq!(
+            declared.input_tokens,
+            expected_input_tokens_at(DECLARED_MODEL, DECLARED_CAP)
+        );
+        assert_ne!(
+            expected_input_tokens_at(DECLARED_MODEL, DECLARED_CAP),
+            expected_input_tokens_at(DECLARED_MODEL, PRIMARY_CAP),
+            "the two caps must tokenize differently for this test to discriminate"
+        );
+        let unlisted = block_on(ctx.run("hook:compact", request(None))).unwrap();
+        assert_eq!(
+            unlisted.input_tokens,
+            expected_input_tokens_at("manifest-model", PRIMARY_CAP)
+        );
+
+        let meter = Arc::new(SpendMeter::new(Some(100_000), None));
+        let ctx = ctx_with_spend(
+            &engine,
+            dir.path(),
+            driver_double(&engine, 0, CANNED),
+            Arc::clone(&meter),
+        );
+        block_on(ctx.run("hook:compact", request(None))).expect("4096 fits under the ceiling");
+        let err = block_on(ctx.run("hook:compact", request(Some(DECLARED_MODEL))))
+            .expect_err("the declared ceiling does not");
+        assert!(err.starts_with("spend ceiling reached"), "{err}");
     }
 
     /// A spend ceiling refuses a hook's completion before dispatch — both a ceiling too small for

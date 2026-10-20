@@ -73,6 +73,8 @@ fn create_fixture_driver_artifact(dir: &Path, name: &str, wasm: &str) -> PathBuf
     writeln!(zip, "upstream_auth:").unwrap();
     writeln!(zip, "  header: x-api-key").unwrap();
     writeln!(zip, "  value: \"{{key}}\"").unwrap();
+    zip.write_all(common::tool_progress_driver_models().as_bytes())
+        .unwrap();
     zip.start_file("tool.wasm", options).unwrap();
     zip.write_all(&fs::read(common::fixture_path(wasm)).unwrap())
         .unwrap();

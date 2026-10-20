@@ -849,6 +849,15 @@ Every green line means the artifact resolved from the project store (`.murmur/ar
 
 There is no hardcoded artifact list: the checklist is derived entirely from `murmur.yaml`'s `artifacts:` block. Editing a version pin or adding/removing an artifact changes what `mur doctor` checks, with no code change.
 
+For a `transport: http` capsule whose drivers are installed, a `Model limits:` block follows the checklist, resolved the way `mur run` resolves it at launch — see [Output cap](manifest.md#inference-max-tokens):
+
+| Line | Meaning |
+|---|---|
+| `✓ <choice> (<driver>@<version>, model <model>): output cap <n> (<source>), context window <n \| none> (<source>)` | One per driver choice, `primary` first. Each source is `manifest`, `driver` or, for a window, `none` |
+| `[mur doctor] warning[W-RUN-009]: …` on stderr | The text [`W-RUN-009`](diagnostics.md#w-run-009) prints at launch. Counted as a warning with a `Fix:` line naming `context.max_tokens`; the exit code stays `0` |
+| `✗ error[E-RUN-052]: …` | A choice with no output cap, or a driver with a malformed `models:` table. Adds a `Fix:` line and makes `mur doctor` exit `1` |
+| `Model limits: not checked, driver <name> is not installed` | A choice's driver is missing; the checklist already names it |
+
 Ahead of the checklist it prints these blocks. None of them affects the exit code.
 
 | Block | What it reports |
@@ -2636,7 +2645,7 @@ The **Turns** section lists every [failed model call](observability-schemas.md#i
 
 ```text
 ── Turns ────────────────────────────────────────
-count:      0  (max: 10)
+count:      0  (max: no cap)
 failed:     turn 0  credential_rejected  HTTP 401
             the provider rejected the inference credential credentials.OPENAI_API_KEY in /home/me/.murmur/config.yaml (HTTP 401)
 ```

@@ -1214,11 +1214,12 @@ pub struct InferenceConfig {
     /// prompt. Mutually exclusive with `system_prompt` and `system_prompt_file`. The skill is
     /// excluded from the callable tool inventory (it's already in the system prompt).
     pub system_prompt_artifact: Option<String>,
-    /// Maximum LLM turns per capsule task. Defaults to 10 when absent in the manifest.
-    /// Enforced as a hard ceiling by the runtime.
-    pub max_turns: u32,
+    /// `inference.max_turns`: the most inference turns one task may take, across its reopens and
+    /// continuations, enforced as a hard ceiling by the runtime. `None` sets no cap.
+    pub max_turns: Option<u32>,
     /// Maximum output tokens the model may generate per turn (`max_tokens` in the driver wire
-    /// payload). None means the manifest didn't set it; the runtime applies its own default.
+    /// payload). `None` means the manifest didn't set it, and each driver choice's cap is the
+    /// `max_output_tokens` its driver's `models:` table declares for its model.
     /// `transport: http` only — rejected at parse time under `transport: process`.
     ///
     /// Unrelated to [`ContextConfig::max_tokens`], which is the session-wide token budget that
@@ -1306,7 +1307,9 @@ pub const DEFAULT_SEED_OVERFLOW_MARGIN: f32 = 0.10;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextConfig {
-    /// Token budget for this session; None disables compaction.
+    /// `context.max_tokens`: the context window compaction and the seed budget measure against,
+    /// for every driver choice. `None` leaves each choice the `context_window` its driver's
+    /// `models:` table declares for its model, and a choice with neither has no window.
     pub max_tokens: Option<u32>,
     /// Whether the runtime keeps a durable conversation record for this capsule. `true` unless
     /// the manifest says `record: off`; `false` turns the mechanism off entirely, creating
@@ -5189,16 +5192,13 @@ fn parse_inference(
         });
     }
 
-    let max_turns = match raw.max_turns {
-        None => 10,
-        Some(0) => {
-            return Err(RuntimeManifestError::InvalidInferenceConfig {
-                field: "inference.max_turns".to_string(),
-                message: "must be greater than 0".to_string(),
-            });
-        }
-        Some(n) => n,
-    };
+    if raw.max_turns == Some(0) {
+        return Err(RuntimeManifestError::InvalidInferenceConfig {
+            field: "inference.max_turns".to_string(),
+            message: "must be greater than 0".to_string(),
+        });
+    }
+    let max_turns = raw.max_turns;
 
     // The reopen budget is a lifecycle knob, read from `lifecycle.max_task_reopens`. Nothing
     // here consumes the `inference` spelling, so it would be silently inert — reject it rather
@@ -10296,8 +10296,8 @@ inference:
 
     #[test]
     fn inference_max_tokens_absent_is_none() {
-        // Absent means "the manifest didn't set it" all the way down; the 8192 default is
-        // applied once, by the runtime, not smuggled in here.
+        // Absent means "the manifest didn't set it" all the way down; the runtime resolves each
+        // driver choice's cap from its driver's `models:` table, not here.
         let manifest = RuntimeManifest::from_yaml_str(
             r#"
 name: cap
@@ -11000,11 +11000,11 @@ context:
     }
 
     #[test]
-    fn inference_max_turns_defaults_to_10() {
+    fn inference_max_turns_absent_sets_no_cap() {
         let manifest = RuntimeManifest::from_yaml_str(
             "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  model: test-model\n  driver:\n    artifact: murmur/driver-anthropic\n",
         ).unwrap();
-        assert_eq!(manifest.inference.unwrap().max_turns, 10);
+        assert_eq!(manifest.inference.unwrap().max_turns, None);
     }
 
     #[test]
@@ -11012,7 +11012,7 @@ context:
         let manifest = RuntimeManifest::from_yaml_str(
             "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  model: test-model\n  max_turns: 20\n  driver:\n    artifact: murmur/driver-anthropic\n",
         ).unwrap();
-        assert_eq!(manifest.inference.unwrap().max_turns, 20);
+        assert_eq!(manifest.inference.unwrap().max_turns, Some(20));
     }
 
     #[test]

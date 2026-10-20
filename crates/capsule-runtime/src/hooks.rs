@@ -404,13 +404,12 @@ pub(crate) enum HookEvent {
         source: String,
         input_bytes: u64,
         /// Token ceiling a `seed-context` returned from this event is enforced
-        /// against: `floor(context.max_tokens * context.seed_budget)`. `0` when
-        /// the capsule declares no `context.max_tokens`, which the WIT contract
-        /// reads as "not computed" rather than "unbounded".
+        /// against: `floor(context_window * context.seed_budget)`. `0` when the
+        /// primary choice has no window, which the WIT contract reads as "not
+        /// computed" rather than "unbounded".
         budget_tokens: u64,
-        /// The capsule's `context.max_tokens`, from
-        /// [`crate::runtime::resolve_context_window`], or `0` when the manifest
-        /// declares no `context:` block.
+        /// The primary driver choice's context window: `context.max_tokens`, else
+        /// its driver's `models:` entry for the model, or `0` when neither gives one.
         context_window: u64,
         /// Tokens already occupied by the conversation record this task will load
         /// under `lifecycle.conversation: threaded`. `0` under every other
@@ -3559,6 +3558,7 @@ mod tests {
             driver_name: "mock-driver".to_string(),
             driver_component: driver,
             model: "manifest-model".to_string(),
+            output_caps: crate::model_limits::HookOutputCaps::new(Default::default(), 1024),
             engine: engine.clone(),
             accessible_workdir: accessible.path().to_path_buf(),
             workdir: WorkdirRoot::open(accessible.path()).unwrap(),
