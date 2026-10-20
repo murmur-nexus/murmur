@@ -350,14 +350,15 @@ docker run --rm -it --cap-add SYS_ADMIN \
 
 ## Scenario 7 — the refusal on a host that cannot create the namespace { #scenario-7 }
 
-The negative control. A host that cannot give the subprocess tree a network namespace must refuse
-the launch, name which of the two reasons applies, and never run the subprocess without the
-namespace.
+The negative control. A host where the subprocess tree's network namespace cannot be created must
+refuse the launch, name the call that failed and its `errno`, give the likely cause from the host
+readings, and never run the subprocess without the namespace.
 
 | Reason | Host condition | The message names |
 |---|---|---|
-| Capability grant missing | AppArmor's `restrict_unprivileged_userns` is on and the `mur-sealed` profile is not confining `mur`, or `unshare` is refused inside a container | The `apparmor_parser` command, the checkout-build script, and `--cap-add SYS_ADMIN` for a container |
-| Kernel support missing | `user.max_user_namespaces=0`, or a kernel built with `CONFIG_USER_NS=n` | The `user.max_user_namespaces` sysctl and `CONFIG_USER_NS` |
+| Capability grant missing, bare host | AppArmor's `restrict_unprivileged_userns` is on and the `mur-sealed` profile is not confining `mur` | The failed call and its `errno`, the `apparmor_parser` command, the checkout-build script, and the readings line with `kernel.apparmor_restrict_unprivileged_userns=1` |
+| Capability grant missing, container | `unshare` is refused inside a container confined by its own AppArmor profile | The failed call and its `errno`, the container's profile by name, `--cap-add SYS_ADMIN`, and the readings line naming that profile |
+| Kernel support missing | `user.max_user_namespaces=0`, or a kernel built with `CONFIG_USER_NS=n` | `unshare(CLONE_NEWUSER \| CLONE_NEWNET) failed with ENOSPC` and `user.max_user_namespaces`, or `EINVAL` and `CONFIG_USER_NS` |
 
 On an AppArmor host, with the profile unloaded:
 
@@ -367,9 +368,12 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
 cd /tmp/netns-check && mur run ; echo "exit=$?"
 ```
 
-**Expected:** `error[E-CAP-005]`, naming the missing capability grant, the exact `apparmor_parser`
-command, *and* the container remedy. No workdir is created. `mur doctor` reports the same
-`E-CAP-005` while the restriction is on. Restore the host immediately:
+**Expected:** `error[E-CAP-005]`, naming the failed call and its `errno` (typically
+`unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM (Operation not permitted)`), AppArmor's
+restriction as the likely cause, the exact `apparmor_parser` command, and the readings line
+`Host readings: kernel.apparmor_restrict_unprivileged_userns=1; AppArmor profile confining mur:
+unconfined.` No workdir is created. `mur doctor` reports the same `E-CAP-005` and
+`network namespace: refused` while the restriction is on. Restore the host immediately:
 
 ```bash
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0

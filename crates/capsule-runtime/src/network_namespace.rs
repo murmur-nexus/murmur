@@ -25,6 +25,15 @@
 //! [`SessionNetns::end`] stops the session's egress proxy and closes the descriptors, after
 //! `ShellEnforcement::end_session` has killed every process the session started.
 //!
+//! ## Whether a host can create one
+//!
+//! Answered by creating one: [`detect_egress_namespace_failure`] runs the same creator a session
+//! does, with an empty allowlist, and drops what it hands over. Staging, launch and `mur doctor`
+//! read that one cached answer, and a session's first command gets the same refusal from its own
+//! creation ([`SessionNetns::establish`]). AppArmor's unprivileged-userns restriction and the
+//! profile confining `mur` are read only to explain a failure: a container whose own profile
+//! permits the namespace is not refused because the host's restriction reads `1`.
+//!
 //! ## The syscall sequence
 //!
 //! Everything happens in the creator child, before any capsule code runs, and the join happens in
@@ -35,8 +44,8 @@
 //!      make the child the owner of both. The user namespace is not incidental: `CLONE_NEWNET`
 //!      alone needs `CAP_NET_ADMIN`, which an unprivileged process does not have, and creating it
 //!      inside a user namespace it owns is what supplies that capability *there and nowhere else*.
-//!      This is the same primitive `sealed` uses and the same AppArmor restriction governs it —
-//!      see [`EgressNamespaceBlocker`].
+//!      This is the same primitive `sealed` uses, and AppArmor's unprivileged-userns
+//!      restriction can refuse it the same way.
 //!   2. `lo` is brought up ([`bring_loopback_up`]). It is the namespace's only interface: there is
 //!      no veth pair, no bridge and no NAT, so nothing in the namespace has a path to the host's
 //!      network or to the outside world.
@@ -88,7 +97,7 @@
 //! [`crate::sandbox`]) is untouched here and remains the thing that refuses
 //! `/var/run/docker.sock`.
 
-// The probe outcome and the namespace plan stay defined everywhere so the decisions over them are
+// The creation steps and the namespace plan stay defined everywhere so the decisions over them are
 // unit-tested on every OS, but outside tests only Linux code builds or reads them, so off Linux
 // they are dead by construction.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -103,160 +112,420 @@ pub(crate) const MAX_NAMESPACE_SOCKETS: usize = crate::egress_proxy::MAX_EGRESS_
 /// it in.
 pub(crate) const MAX_SESSION_NETNS_FDS: usize = MAX_NAMESPACE_SOCKETS + 2;
 
-// ---------------------------------------------------------------- blockers
+// ---------------------------------------------------------------- the creation's steps
 
-/// Why this host cannot give a capsule its own network namespace.
+/// One step of the namespace's construction, as the creator reports it when that step fails.
 ///
-/// Exactly two variants, because they are the two things an operator can act on and their
-/// remediations do not overlap: one is a permission this host withholds from the `mur` binary,
-/// the other is a kernel that does not implement the mechanism at all. Collapsing them would send
-/// half the readers to the wrong fix.
+/// Defined outside the Linux module so [`egress_namespace_failure`], the decision over a failed
+/// step, compiles and is tested on every OS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CreationStep {
+    Unshare = 1,
+    IdentityMaps = 2,
+    Loopback = 3,
+    LocalRoute = 4,
+    TcpListener = 5,
+    Resolver = 6,
+    NamespaceHandles = 7,
+    HandOff = 8,
+}
+
+impl CreationStep {
+    const ALL: [CreationStep; 8] = [
+        Self::Unshare,
+        Self::IdentityMaps,
+        Self::Loopback,
+        Self::LocalRoute,
+        Self::TcpListener,
+        Self::Resolver,
+        Self::NamespaceHandles,
+        Self::HandOff,
+    ];
+
+    /// The step a failure record's code names, or `None` for a code no step carries.
+    pub(crate) fn from_code(code: u32) -> Option<Self> {
+        Self::ALL.into_iter().find(|step| *step as u32 == code)
+    }
+
+    /// The call or operation, as a refusal names it.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Unshare => "unshare(CLONE_NEWUSER | CLONE_NEWNET)",
+            Self::IdentityMaps => "writing uid_map/gid_map",
+            Self::Loopback => "bringing lo up",
+            Self::LocalRoute => "installing the local default route",
+            Self::TcpListener => "binding a TCP listener inside the namespace",
+            Self::Resolver => "binding UDP 53 inside the namespace",
+            Self::NamespaceHandles => "opening /proc/self/ns/user and /proc/self/ns/net",
+            Self::HandOff => "handing the namespace to the runtime",
+        }
+    }
+}
+
+/// Why an attempt to create a session's network namespace produced no namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NamespaceAttemptError {
+    /// The creator ran, and `step` failed with `errno`.
+    Step { step: CreationStep, errno: i32 },
+    /// The creator could not run, or exited without handing anything over; the runtime's own
+    /// account of it (`fork() for the namespace creator failed: …`).
+    Creator(String),
+}
+
+// ---------------------------------------------------------------- the failure
+
+/// Which remediation an [`EgressNamespaceFailure`] calls for.
 ///
-/// Deliberately **not** an `EnforcementTier` variant and deliberately not tied to
-/// `ContainmentClass`: a network namespace is required for every Linux capsule that can spawn a
-/// subprocess, at every containment class, so hanging it off the class ladder would make
-/// `advisory` capsules silently exempt from this boundary.
+/// Not an `EnforcementTier` variant and not tied to `ContainmentClass`: a network
+/// namespace is required for every Linux capsule that can spawn a subprocess, at every
+/// containment class, so hanging it off the class ladder would make `advisory` capsules silently
+/// exempt from this boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EgressNamespaceBlocker {
-    /// The kernel implements unprivileged user namespaces, but this host withholds them from this
-    /// binary: AppArmor's `restrict_unprivileged_userns` is on and the shipped profile is not
-    /// confining `mur`, or `unshare` was refused outright (the container case), or the namespace
-    /// was created and could not then be owned or configured.
+    /// The kernel implements unprivileged user namespaces and something on this host refused one
+    /// to `mur`: AppArmor's unprivileged-userns restriction, another AppArmor profile confining
+    /// `mur`, a container runtime's seccomp filter or capabilities, or another security module.
+    /// The refusal came at `unshare`, or after it while the namespace was owned or configured.
     CapabilityGrantMissing,
-    /// The kernel does not provide the mechanism at all — `CONFIG_USER_NS=n`, or
-    /// `user.max_user_namespaces=0`.
+    /// The kernel does not provide the mechanism: `unshare` failed with `ENOSPC`
+    /// (`user.max_user_namespaces`), `EINVAL` or `ENOSYS` (`CONFIG_USER_NS=n`), or `EUSERS` (the
+    /// nesting limit).
     KernelSupportMissing,
+    /// The runtime could not run the namespace creator at all — a process or descriptor limit, or
+    /// memory — so the host was never asked. Refused like the other two: a namespace nobody could
+    /// create is a namespace the capsule does not get.
+    CreatorUnavailable,
 }
 
-impl EgressNamespaceBlocker {
-    /// One sentence naming the missing mechanism, plus the exact remediation. Rendered into
-    /// [`crate::errors::RuntimeError::EgressNamespaceUnavailable`], so this is the text an
-    /// operator sees under `E-CAP-005`.
+/// A creation of the capsule network namespace that failed, with what its refusal names.
+///
+/// Every refusal of `E-CAP-005` — at staging, at launch, at a session's first command, in
+/// `mur doctor` — renders [`Self::reason`], so the places that ask cannot explain one host two
+/// ways.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressNamespaceFailure {
+    /// Decided by the failed call and its `errno` alone; the readings below never change it.
+    pub blocker: EgressNamespaceBlocker,
+    /// The call that failed, in [`CreationStep::describe`]'s words (`unshare(CLONE_NEWUSER |
+    /// CLONE_NEWNET)`, `writing uid_map/gid_map`, …), or, for
+    /// [`EgressNamespaceBlocker::CreatorUnavailable`], the runtime's account of why the creator
+    /// could not run.
+    pub failed_call: String,
+    /// The `errno` the failed call left. `None` exactly for
+    /// [`EgressNamespaceBlocker::CreatorUnavailable`], where no creation step ran.
+    pub errno: Option<i32>,
+    /// AppArmor's unprivileged-userns restriction as this process read it when the failure was
+    /// observed. Explains the failure; never decides whether there is one.
+    pub userns_grant: crate::sealed::UsernsGrant,
+    /// The profile the kernel reports as confining this process, read at the same moment.
+    pub attachment: crate::sealed::ProfileAttachment,
+}
+
+impl EgressNamespaceFailure {
+    /// `<failed call> failed with <ERRNO>`, or the creator's account: the one-line answer
+    /// `mur doctor` prints.
     #[must_use]
-    pub fn reason(self) -> String {
-        match self {
-            EgressNamespaceBlocker::CapabilityGrantMissing => format!(
-                "this host refused unshare(CLONE_NEWUSER | CLONE_NEWNET) to the mur binary. On an \
-                 AppArmor host (Ubuntu 23.10+ and derivatives) this is the unprivileged-userns \
-                 restriction: install and load the profile shipped with mur, `sudo install -m 644 \
-                 packaging/apparmor/{name} {path} && sudo apparmor_parser -r {path}` (or re-run \
-                 the mur installer as root), then re-run. Building out of a checkout, where the \
-                 binary sits at ./target/{{debug,release}}/mur and no shipped profile attaches to \
-                 it: run `scripts/install-dev-apparmor.sh`, which generates and loads the same \
-                 grant for those two paths. Inside a container it is a missing capability \
-                 instead: add `--cap-add SYS_ADMIN` to the container invocation, or create the \
-                 network namespace outside the container and run mur inside it. LAST RESORT, only \
-                 where a profile genuinely cannot be loaded: `sudo sysctl -w \
-                 kernel.apparmor_restrict_unprivileged_userns=0` — this removes \
-                 unprivileged-userns hardening from every program on the machine, not just from \
-                 mur, and is not the configuration murmur ships.",
-                name = crate::sealed::SEALED_APPARMOR_PROFILE_NAME,
-                path = crate::sealed::SEALED_APPARMOR_PROFILE_PATH,
+    pub fn summary(&self) -> String {
+        match self.errno {
+            Some(errno) => format!("{} failed with {}", self.failed_call, errno_label(errno)),
+            None => self.failed_call.clone(),
+        }
+    }
+
+    /// The text an operator sees under `E-CAP-005`: what failed, with its `errno` symbolically
+    /// and in words; the likely cause and its remedy; and, last, the host readings the cause was
+    /// chosen from.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        let what = match self.errno {
+            Some(errno) => format!(
+                "{} failed with {} ({})",
+                self.failed_call,
+                errno_label(errno),
+                errno_words(errno)
             ),
-            EgressNamespaceBlocker::KernelSupportMissing => {
-                "this kernel does not provide unprivileged user namespaces, which a capsule's \
-                 network namespace has to be created inside (CONFIG_USER_NS=n, or \
-                 user.max_user_namespaces=0). Raise `sudo sysctl -w \
-                 user.max_user_namespaces=10000` if the sysctl is merely zeroed, otherwise run on \
-                 a kernel built with CONFIG_USER_NS=y."
+            None => self.failed_call.clone(),
+        };
+        format!("{what}. {} {}", self.cause(), self.readings())
+    }
+
+    /// The step `failed_call` names, when it names one.
+    fn step(&self) -> Option<CreationStep> {
+        self.errno?;
+        CreationStep::ALL
+            .into_iter()
+            .find(|step| step.describe() == self.failed_call)
+    }
+
+    fn cause(&self) -> String {
+        match self.blocker {
+            EgressNamespaceBlocker::KernelSupportMissing => kernel_cause(self.errno).to_string(),
+            EgressNamespaceBlocker::CreatorUnavailable => {
+                "Likely cause: the runtime could not run the namespace creator — a process or \
+                 descriptor limit, or memory, ran out — so whether this host can create the \
+                 namespace is unknown, and the capsule is refused rather than run without it. \
+                 Re-run once the limit is relieved."
                     .to_string()
+            }
+            EgressNamespaceBlocker::CapabilityGrantMissing => {
+                let cause = grant_cause(self.userns_grant, &self.attachment);
+                match self.step().and_then(step_context) {
+                    Some(context) => format!("{context} {cause}"),
+                    None => cause,
+                }
             }
         }
     }
+
+    /// The readings line. AppArmor's restriction knob reads `1` for both grants decided with it
+    /// on, and `0` for the one decided with it off.
+    fn readings(&self) -> String {
+        use crate::sealed::{ProfileAttachment, UsernsGrant};
+        let restriction = match self.userns_grant {
+            UsernsGrant::ApparmorAbsent => "AppArmor not enabled",
+            UsernsGrant::RestrictionDisabledHostWide => {
+                "kernel.apparmor_restrict_unprivileged_userns=0"
+            }
+            UsernsGrant::ProfileConfining | UsernsGrant::Withheld => {
+                "kernel.apparmor_restrict_unprivileged_userns=1"
+            }
+        };
+        let profile = match &self.attachment {
+            ProfileAttachment::Sealed { profile } | ProfileAttachment::Other { profile } => {
+                profile.as_str()
+            }
+            ProfileAttachment::Unconfined => "unconfined",
+            ProfileAttachment::NotReported => "not reported",
+        };
+        format!("Host readings: {restriction}; AppArmor profile confining mur: {profile}.")
+    }
 }
 
-// ---------------------------------------------------------------- probe
+/// What a step after `unshare` failing says about the namespace, ahead of the cause.
+fn step_context(step: CreationStep) -> Option<&'static str> {
+    match step {
+        CreationStep::Unshare => None,
+        CreationStep::IdentityMaps => Some(
+            "The namespace was created and could not be owned: writing its identity map was \
+             refused.",
+        ),
+        CreationStep::Loopback | CreationStep::LocalRoute => Some(
+            "The namespace was created and owned, and configuring it was refused — the mark of a \
+             confinement that withholds CAP_NET_ADMIN inside the namespace.",
+        ),
+        CreationStep::TcpListener
+        | CreationStep::Resolver
+        | CreationStep::NamespaceHandles
+        | CreationStep::HandOff => {
+            Some("The namespace was created and configured, and handing it to the runtime failed.")
+        }
+    }
+}
 
-/// What a real `unshare(CLONE_NEWUSER | CLONE_NEWNET)` attempt in a forked child did.
+/// The likely cause of a refused namespace on a kernel that provides one, chosen from the
+/// readings.
 ///
-/// Richer than the two-valued [`EgressNamespaceBlocker`] on purpose: the probe records the step
-/// that failed, and the mapping to a blocker is then an explicit, reviewable, unit-tested
-/// decision rather than something the probe pre-decided in the dark.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum EgressNamespaceProbe {
-    /// The namespace was created, owned, and configured — `lo` came up and the local route
-    /// installed. Everything the real launch does, rehearsed.
-    Ok,
-    /// `unshare` was refused (`EPERM`).
-    Denied,
-    /// The namespace was created but writing the identity `uid_map`/`gid_map` was refused.
-    MapDenied,
-    /// Created and owned, but configuring it failed. Kept apart from `Denied` because it is the
-    /// signature of a confinement that permits namespace creation and then withholds
-    /// `CAP_NET_ADMIN` inside it.
-    ConfigDenied,
-    /// The kernel does not implement it, or the probe could not run at all.
-    #[default]
-    Unsupported,
+/// AppArmor absent comes first because `/proc/self/attr/current` then reports another security
+/// module's label, which is no AppArmor profile. A process another profile confines is next: the
+/// host's restriction knob does not govern it, whatever it reads.
+fn grant_cause(
+    userns_grant: crate::sealed::UsernsGrant,
+    attachment: &crate::sealed::ProfileAttachment,
+) -> String {
+    use crate::sealed::{
+        ProfileAttachment, UsernsGrant, SEALED_APPARMOR_PROFILE_NAME, SEALED_APPARMOR_PROFILE_PATH,
+    };
+    const CONTAINER_REMEDY: &str = "Inside a container, run it with a seccomp policy that \
+         permits unshare(CLONE_NEWUSER), or with `--cap-add SYS_ADMIN`, or create the network \
+         namespace outside the container and run mur inside it.";
+    match (userns_grant, attachment) {
+        (UsernsGrant::ApparmorAbsent, _) => format!(
+            "Likely cause: not AppArmor, which is not enabled on this host — a container \
+             runtime's seccomp filter or a missing CAP_SYS_ADMIN, or another security module's \
+             policy. {CONTAINER_REMEDY} On a bare host, check the policy of the security module \
+             in use."
+        ),
+        (_, ProfileAttachment::Other { profile }) => format!(
+            "Likely cause: the AppArmor profile `{profile}` confines mur. \
+             kernel.apparmor_restrict_unprivileged_userns does not govern a process another \
+             profile confines: that profile, and a container runtime's seccomp filter and \
+             capabilities, decide whether it may create a user namespace. Run the container with \
+             an AppArmor profile and seccomp policy that permit unshare(CLONE_NEWUSER), or with \
+             `--cap-add SYS_ADMIN`, or create the network namespace outside the container and run \
+             mur inside it."
+        ),
+        (UsernsGrant::ProfileConfining, _) | (_, ProfileAttachment::Sealed { .. }) => format!(
+            "Likely cause: the {SEALED_APPARMOR_PROFILE_NAME} AppArmor profile confines mur and \
+             the creation still failed, so the profile the kernel has loaded may be stale. Reload \
+             it with `sudo apparmor_parser -r {SEALED_APPARMOR_PROFILE_PATH}` (for a checkout \
+             build, re-run `scripts/install-dev-apparmor.sh`), and check `mur doctor`'s \
+             comparison of the installed profile with the one this build ships."
+        ),
+        (UsernsGrant::RestrictionDisabledHostWide, _) => format!(
+            "Likely cause: not AppArmor, whose unprivileged-userns restriction is off on this host \
+             — a container runtime's seccomp filter or a missing CAP_SYS_ADMIN, or another \
+             security module's policy. {CONTAINER_REMEDY}"
+        ),
+        (UsernsGrant::Withheld, _) => format!(
+            "Likely cause: AppArmor's unprivileged-userns restriction \
+             (kernel.apparmor_restrict_unprivileged_userns=1) applies to this binary, which no \
+             {SEALED_APPARMOR_PROFILE_NAME} profile confines. Install and load the profile shipped \
+             with mur, `sudo install -m 644 packaging/apparmor/{SEALED_APPARMOR_PROFILE_NAME} \
+             {SEALED_APPARMOR_PROFILE_PATH} && sudo apparmor_parser -r \
+             {SEALED_APPARMOR_PROFILE_PATH}` (or re-run the mur installer as root), then re-run. \
+             Building out of a checkout, where the binary sits at ./target/{{debug,release}}/mur \
+             and no shipped profile attaches to it: run `scripts/install-dev-apparmor.sh`, which \
+             generates and loads the same grant for those two paths. LAST RESORT, only where a \
+             profile genuinely cannot be loaded: `sudo sysctl -w \
+             kernel.apparmor_restrict_unprivileged_userns=0` — this removes unprivileged-userns \
+             hardening from every program on the machine, not just from mur, and is not the \
+             configuration murmur ships."
+        ),
+    }
 }
 
-/// Everything the host probe learned, kept separate from the decision that uses it so
-/// [`egress_namespace_blocker`] stays pure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct EgressNamespaceSupport {
-    /// Where this host's permission for an unprivileged user namespace comes from.
-    ///
-    /// Answered by `sealed`'s own probe of exactly the same question: the restriction is on
-    /// `CLONE_NEWUSER`, which both mechanisms need, so asking it twice with two implementations
-    /// could only ever produce two answers that disagree about one host.
-    pub(crate) userns_grant: crate::sealed::UsernsGrant,
-    pub(crate) namespace: EgressNamespaceProbe,
+/// The likely cause of an `unshare` the kernel could not honour, by its `errno`.
+fn kernel_cause(errno: Option<i32>) -> &'static str {
+    match errno {
+        Some(libc::ENOSPC) => {
+            "Likely cause: the kernel's limit on user namespaces — user.max_user_namespaces is 0, \
+             or every namespace it allows is in use. Raise it where it is set, on the host or in \
+             the user namespace mur runs in (`sudo sysctl -w user.max_user_namespaces=10000`), \
+             then re-run."
+        }
+        Some(libc::EUSERS) => {
+            "Likely cause: the kernel's nesting limit for user namespaces — mur already runs \
+             inside as many nested user namespaces as the kernel allows. Run it fewer levels \
+             deep."
+        }
+        _ => {
+            "Likely cause: this kernel does not provide user namespaces (built with \
+             CONFIG_USER_NS=n). Run mur on a kernel built with CONFIG_USER_NS=y."
+        }
+    }
 }
 
-/// Which of the two blockers to name, given the probe. Pure, and unit-testable on any OS.
+/// The symbolic name of the `errno` values a namespace creation can leave.
+pub(crate) fn errno_name(errno: i32) -> Option<&'static str> {
+    Some(match errno {
+        libc::EPERM => "EPERM",
+        libc::ENOENT => "ENOENT",
+        libc::EACCES => "EACCES",
+        libc::EINVAL => "EINVAL",
+        libc::ENOSPC => "ENOSPC",
+        libc::ENOSYS => "ENOSYS",
+        libc::EUSERS => "EUSERS",
+        libc::ENOMEM => "ENOMEM",
+        libc::EAGAIN => "EAGAIN",
+        libc::EADDRINUSE => "EADDRINUSE",
+        libc::EMFILE => "EMFILE",
+        libc::ENFILE => "ENFILE",
+        _ => return None,
+    })
+}
+
+/// [`errno_name`], or `errno <n>` for a value outside it.
+fn errno_label(errno: i32) -> String {
+    errno_name(errno).map_or_else(|| format!("errno {errno}"), str::to_string)
+}
+
+/// The C library's description of `errno`, without the `(os error <n>)` suffix `std` appends.
+fn errno_words(errno: i32) -> String {
+    let rendered = std::io::Error::from_raw_os_error(errno).to_string();
+    rendered
+        .strip_suffix(&format!(" (os error {errno})"))
+        .map_or_else(|| rendered.clone(), str::to_string)
+}
+
+/// Whether a namespace attempt is an `E-CAP-005` failure, and which. Pure, and unit-testable on
+/// any OS.
 ///
-/// `None` means this host can give a capsule its own network namespace.
-pub(crate) fn egress_namespace_blocker(
+/// The attempt alone decides: `None` exactly when it succeeded. The readings only choose the
+/// words of the refusal.
+pub(crate) fn egress_namespace_failure(
     is_linux: bool,
-    support: EgressNamespaceSupport,
-) -> Option<EgressNamespaceBlocker> {
-    // Not Linux: there is no network namespace here, and there was no seccomp interception
-    // either. A non-Linux host resolves to `EnforcementTier::EnvironmentOnly`, installs no kernel
-    // subprocess sandbox at all, and says so loudly (`W_SEC_001`). Refusing here would turn every
-    // macOS run into an error about a mechanism macOS has never had.
+    attempt: Result<(), NamespaceAttemptError>,
+    userns_grant: crate::sealed::UsernsGrant,
+    attachment: crate::sealed::ProfileAttachment,
+) -> Option<EgressNamespaceFailure> {
+    // Not Linux: there is no network namespace here. A non-Linux host resolves to
+    // `EnforcementTier::EnvironmentOnly`, installs no kernel subprocess sandbox at all, and says
+    // so loudly (`W_SEC_001`). Refusing here would turn every macOS run into an error about a
+    // mechanism macOS has never had.
     if !is_linux {
         return None;
     }
-    // AppArmor before the namespace outcome, for the reason `sealed_blocker` documents: when the
-    // restriction is on and our profile is absent, the `unshare` failure is a *consequence*, and
-    // blaming the kernel would send an Ubuntu desktop user somewhere useless.
-    if !support.userns_grant.permits_userns() {
-        return Some(EgressNamespaceBlocker::CapabilityGrantMissing);
-    }
-    match support.namespace {
-        EgressNamespaceProbe::Ok => None,
-        EgressNamespaceProbe::Denied
-        | EgressNamespaceProbe::MapDenied
-        | EgressNamespaceProbe::ConfigDenied => {
-            Some(EgressNamespaceBlocker::CapabilityGrantMissing)
+    attempt
+        .err()
+        .map(|error| failure_of(error, userns_grant, attachment))
+}
+
+/// The failure a failed attempt is, classified by its step and `errno`.
+fn failure_of(
+    error: NamespaceAttemptError,
+    userns_grant: crate::sealed::UsernsGrant,
+    attachment: crate::sealed::ProfileAttachment,
+) -> EgressNamespaceFailure {
+    let (blocker, failed_call, errno) = match error {
+        NamespaceAttemptError::Step { step, errno } => {
+            let blocker = match (step, errno) {
+                (
+                    CreationStep::Unshare,
+                    libc::ENOSPC | libc::EINVAL | libc::ENOSYS | libc::EUSERS,
+                ) => EgressNamespaceBlocker::KernelSupportMissing,
+                _ => EgressNamespaceBlocker::CapabilityGrantMissing,
+            };
+            (blocker, step.describe().to_string(), Some(errno))
         }
-        EgressNamespaceProbe::Unsupported => Some(EgressNamespaceBlocker::KernelSupportMissing),
+        NamespaceAttemptError::Creator(detail) => {
+            (EgressNamespaceBlocker::CreatorUnavailable, detail, None)
+        }
+    };
+    EgressNamespaceFailure {
+        blocker,
+        failed_call,
+        errno,
+        userns_grant,
+        attachment,
     }
 }
 
-/// Which blocker, if any, stands between this host and a capsule network namespace.
+/// Whether this host can give a capsule its own network namespace, answered by creating one.
 ///
-/// Reads a process-cached probe, so the refusal an operator sees at staging time and the
-/// mechanism a launch actually installs can never disagree about the host.
+/// The probe is the launch's own construction — [`linux::create_session_netns`] with an empty
+/// allowlist, the namespace it hands over dropped at once — so it cannot pass where a launch
+/// would fail, or fail where a launch would pass. The AppArmor readings are taken only to explain
+/// a failure. Process-cached, so staging, launch and `mur doctor` read one answer.
 #[cfg(target_os = "linux")]
 #[must_use]
-pub fn detect_egress_namespace_blocker() -> Option<EgressNamespaceBlocker> {
-    static SUPPORT: std::sync::OnceLock<EgressNamespaceSupport> = std::sync::OnceLock::new();
-    let support = *SUPPORT.get_or_init(linux::probe_egress_namespace);
-    egress_namespace_blocker(true, support)
+pub fn detect_egress_namespace_failure() -> Option<EgressNamespaceFailure> {
+    static FAILURE: std::sync::OnceLock<Option<EgressNamespaceFailure>> =
+        std::sync::OnceLock::new();
+    FAILURE
+        .get_or_init(|| {
+            let attempt =
+                linux::create_session_netns(&CapsuleNetnsPlan::resolve(Vec::new())).map(drop);
+            egress_namespace_failure(
+                true,
+                attempt,
+                crate::sealed::userns_grant(),
+                crate::sealed::inspect_profile_attachment(),
+            )
+        })
+        .clone()
 }
 
 #[cfg(not(target_os = "linux"))]
 #[must_use]
-pub fn detect_egress_namespace_blocker() -> Option<EgressNamespaceBlocker> {
-    egress_namespace_blocker(false, EgressNamespaceSupport::default())
+pub fn detect_egress_namespace_failure() -> Option<EgressNamespaceFailure> {
+    None
 }
 
 /// Whether a test that needs a capsule network namespace must stand down on this host, printing
-/// the blocker when it must.
+/// the failure when it must.
 ///
-/// Test support, not a runtime code path. Asked through [`detect_egress_namespace_blocker`], the
+/// Test support, not a runtime code path. Asked through [`detect_egress_namespace_failure`], the
 /// same probe `stage_session` consults, so the gate and the staging refusal cannot reach different
 /// conclusions about the host.
 ///
@@ -264,9 +533,9 @@ pub fn detect_egress_namespace_blocker() -> Option<EgressNamespaceBlocker> {
 /// scope: a test driving `execute_shell` directly needs the namespace and nothing else, and
 /// standing down on the cgroup half would skip it on hosts where it runs perfectly well.
 pub fn skip_without_egress_namespace(test_name: &str) -> bool {
-    match detect_egress_namespace_blocker() {
-        Some(blocker) => {
-            crate::runtime_err!("[SKIP-HOST] {test_name}: {}", blocker.reason());
+    match detect_egress_namespace_failure() {
+        Some(failure) => {
+            crate::runtime_err!("[SKIP-HOST] {test_name}: {}", failure.reason());
             true
         }
         None => false,
@@ -285,17 +554,40 @@ pub fn skip_without_egress_namespace(test_name: &str) -> bool {
 /// exactly the capsules that asked for none run with the most.
 pub fn check_egress_namespace(
     can_spawn_subprocess: bool,
-    blocker: Option<EgressNamespaceBlocker>,
+    failure: Option<&EgressNamespaceFailure>,
 ) -> Result<(), crate::errors::RuntimeError> {
-    if !can_spawn_subprocess {
-        return Ok(());
+    match failure {
+        Some(failure) if can_spawn_subprocess => Err(unavailable(failure)),
+        _ => Ok(()),
     }
-    match blocker {
-        None => Ok(()),
-        Some(blocker) => Err(crate::errors::RuntimeError::EgressNamespaceUnavailable {
-            blocker,
-            reason: blocker.reason(),
-        }),
+}
+
+/// The `E-CAP-005` refusal of `failure`.
+fn unavailable(failure: &EgressNamespaceFailure) -> crate::errors::RuntimeError {
+    crate::errors::RuntimeError::EgressNamespaceUnavailable {
+        blocker: failure.blocker,
+        reason: failure.reason(),
+    }
+}
+
+/// What [`SessionNetns::establish`] reports when the session's namespace cannot be created.
+///
+/// A failed step is the `E-CAP-005` refusal staging would have rendered for it, with the readings
+/// passed in. A creator that could not run is the runtime's own account: that spawn fails, and
+/// the next one tries again.
+fn session_netns_creation_error(
+    error: NamespaceAttemptError,
+    userns_grant: crate::sealed::UsernsGrant,
+    attachment: crate::sealed::ProfileAttachment,
+) -> String {
+    match error {
+        NamespaceAttemptError::Creator(detail) => {
+            format!("sandbox: could not create this session's network namespace: {detail}")
+        }
+        step => format!(
+            "sandbox: E-CAP-005: {}",
+            unavailable(&failure_of(step, userns_grant, attachment))
+        ),
     }
 }
 
@@ -405,6 +697,10 @@ impl SessionNetns {
     /// The handles a command joins the session's namespace through, creating the namespace and
     /// starting the session's egress proxy on the first call.
     ///
+    /// A creation step that fails is refused with `E-CAP-005` in the words staging uses, so a
+    /// native tool pulled mid-session, whose first call is the first time anything asks, is
+    /// refused the way a launch would have been.
+    ///
     /// Serialised on one mutex, so concurrent first commands create exactly one namespace. A
     /// failed creation leaves the namespace not yet created and leaks nothing, so that command's
     /// spawn fails and the next one tries again. `tcp_ports` and `policy` are read on the call
@@ -431,11 +727,18 @@ impl SessionNetns {
             SessionNetnsState::NotYetCreated => {}
         }
         let plan = CapsuleNetnsPlan::resolve(tcp_ports.to_vec());
-        let established = linux::create_session_netns(&plan)
-            .and_then(|created| created.serve(policy))
-            .map_err(|detail| {
-                format!("sandbox: could not create this session's network namespace: {detail}")
-            })?;
+        // The readings are taken here, in the runtime, when a creation has failed: the creator
+        // child exits as soon as it reports.
+        let created = linux::create_session_netns(&plan).map_err(|error| {
+            session_netns_creation_error(
+                error,
+                crate::sealed::userns_grant(),
+                crate::sealed::inspect_profile_attachment(),
+            )
+        })?;
+        let established = created.serve(policy).map_err(|detail| {
+            format!("sandbox: could not create this session's network namespace: {detail}")
+        })?;
         let join = established.join();
         *state = SessionNetnsState::Established(established);
         #[cfg(test)]
@@ -491,7 +794,7 @@ mod linux {
     use std::sync::Arc;
 
     use super::{
-        CapsuleNetnsPlan, EgressNamespaceProbe, EgressNamespaceSupport, SessionNetnsJoin,
+        CapsuleNetnsPlan, CreationStep, NamespaceAttemptError, SessionNetnsJoin,
         MAX_NAMESPACE_SOCKETS, MAX_SESSION_NETNS_FDS,
     };
 
@@ -523,122 +826,7 @@ mod linux {
     const RTATTR_OIF_LEN: usize = 8;
     const ROUTE_REQUEST_LEN: usize = NLMSGHDR_LEN + RTMSG_LEN + RTATTR_OIF_LEN;
 
-    // ------------------------------------------------------------ probe
-
-    /// Rehearses, in a forked child, exactly what a real launch does: create the namespace, own
-    /// it, bring `lo` up and install the local route.
-    ///
-    /// Forking rather than testing in-process is required, not defensive — `unshare(CLONE_NEWUSER)`
-    /// is irreversible for the calling process, and putting the whole runtime into a user
-    /// namespace as a side effect of a capability check is the "probe that changes the thing it
-    /// measures" mistake `sealed::probe_namespace` documents avoiding.
-    pub(super) fn probe_egress_namespace() -> EgressNamespaceSupport {
-        EgressNamespaceSupport {
-            userns_grant: crate::sealed::userns_grant(),
-            namespace: probe_namespace(),
-        }
-    }
-
-    // Exit codes the probe child reports, so the parent learns the failing *step* with no IPC
-    // beyond `waitpid`. Same convention as `sealed::probe_namespace`.
-    const PROBE_OK: i32 = 0;
-    const PROBE_UNSHARE_DENIED: i32 = 1;
-    const PROBE_UNSHARE_UNSUPPORTED: i32 = 2;
-    const PROBE_MAP_DENIED: i32 = 3;
-    const PROBE_CONFIG_DENIED: i32 = 4;
-
-    fn probe_namespace() -> EgressNamespaceProbe {
-        // Read before the fork, and therefore before `unshare`. See `CapsuleNetnsPlan::uid`.
-        // SAFETY: `getuid`/`getgid` take no arguments and cannot fail.
-        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-
-        // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the child
-        // touches nothing but async-signal-safe primitives. The child below calls `unshare`,
-        // `prctl`, the `open`/`write`/`close` triples that write the identity maps, `socket`,
-        // `ioctl`, `sendto`/`recv` and `_exit` — every one async-signal-safe, with no allocation,
-        // no locks and no stdio.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            return EgressNamespaceProbe::Unsupported;
-        }
-        if pid == 0 {
-            // SAFETY: forked-child context, syscalls only; every branch ends in `_exit`.
-            unsafe {
-                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) != 0 {
-                    let errno = *libc::__errno_location();
-                    libc::_exit(match errno {
-                        libc::EPERM => PROBE_UNSHARE_DENIED,
-                        _ => PROBE_UNSHARE_UNSUPPORTED,
-                    });
-                }
-                if write_identity_maps(uid, gid).is_err() {
-                    libc::_exit(PROBE_MAP_DENIED);
-                }
-                if bring_loopback_up().is_err() || add_local_default_route().is_err() {
-                    libc::_exit(PROBE_CONFIG_DENIED);
-                }
-                libc::_exit(PROBE_OK);
-            }
-        }
-
-        let mut status: libc::c_int = 0;
-        // SAFETY: `pid` is the child just forked; `status` is a live local.
-        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if waited != pid || !libc::WIFEXITED(status) {
-            return EgressNamespaceProbe::Unsupported;
-        }
-        match libc::WEXITSTATUS(status) {
-            PROBE_OK => EgressNamespaceProbe::Ok,
-            PROBE_UNSHARE_DENIED => EgressNamespaceProbe::Denied,
-            PROBE_MAP_DENIED => EgressNamespaceProbe::MapDenied,
-            PROBE_CONFIG_DENIED => EgressNamespaceProbe::ConfigDenied,
-            _ => EgressNamespaceProbe::Unsupported,
-        }
-    }
-
     // ------------------------------------------------------------ the creator child
-
-    /// The step of the namespace's construction that failed, as the creator reports it.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) enum CreationStep {
-        Unshare = 1,
-        IdentityMaps = 2,
-        Loopback = 3,
-        LocalRoute = 4,
-        TcpListener = 5,
-        Resolver = 6,
-        NamespaceHandles = 7,
-        HandOff = 8,
-    }
-
-    impl CreationStep {
-        fn from_code(code: u32) -> Option<Self> {
-            Some(match code {
-                1 => Self::Unshare,
-                2 => Self::IdentityMaps,
-                3 => Self::Loopback,
-                4 => Self::LocalRoute,
-                5 => Self::TcpListener,
-                6 => Self::Resolver,
-                7 => Self::NamespaceHandles,
-                8 => Self::HandOff,
-                _ => return None,
-            })
-        }
-
-        fn describe(self) -> &'static str {
-            match self {
-                Self::Unshare => "unshare(CLONE_NEWUSER | CLONE_NEWNET)",
-                Self::IdentityMaps => "writing uid_map/gid_map",
-                Self::Loopback => "bringing lo up",
-                Self::LocalRoute => "installing the local default route",
-                Self::TcpListener => "binding a TCP listener inside the namespace",
-                Self::Resolver => "binding UDP 53 inside the namespace",
-                Self::NamespaceHandles => "opening /proc/self/ns/user and /proc/self/ns/net",
-                Self::HandOff => "handing the namespace to the runtime",
-            }
-        }
-    }
 
     /// A failed step and the `errno` it left, carried out of the creator as a fixed-size record.
     ///
@@ -680,14 +868,12 @@ mod linux {
         }
     }
 
-    impl std::fmt::Display for CreationFailure {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(
-                f,
-                "{} failed: {}",
-                self.step.describe(),
-                io::Error::from_raw_os_error(self.errno)
-            )
+    impl From<CreationFailure> for NamespaceAttemptError {
+        fn from(failure: CreationFailure) -> Self {
+            NamespaceAttemptError::Step {
+                step: failure.step,
+                errno: failure.errno,
+            }
         }
     }
 
@@ -850,15 +1036,21 @@ mod linux {
     /// The creator is a child of its own rather than a command's `pre_exec` step, so no command is
     /// special: a command that fails cannot take the session's namespace with it, and creation
     /// never depends on what any command is.
-    pub(super) fn create_session_netns(plan: &CapsuleNetnsPlan) -> Result<CreatedNetns, String> {
+    ///
+    /// A failed step is [`NamespaceAttemptError::Step`] with the step and the `errno` the creator
+    /// reported; every way the creator itself could not run or report is
+    /// [`NamespaceAttemptError::Creator`].
+    pub(super) fn create_session_netns(
+        plan: &CapsuleNetnsPlan,
+    ) -> Result<CreatedNetns, NamespaceAttemptError> {
         // Checked here because the creator indexes a fixed buffer of this size and must not be the
         // place an oversized plan is discovered.
         if plan.socket_count() > MAX_NAMESPACE_SOCKETS {
-            return Err(format!(
+            return Err(NamespaceAttemptError::Creator(format!(
                 "{} namespace sockets requested, more than the {MAX_NAMESPACE_SOCKETS} one \
                  hand-off carries",
                 plan.socket_count()
-            ));
+            )));
         }
 
         let mut pair = [0i32; 2];
@@ -872,10 +1064,10 @@ mod linux {
             )
         };
         if rc != 0 {
-            return Err(format!(
+            return Err(NamespaceAttemptError::Creator(format!(
                 "socketpair() for the namespace hand-off failed: {}",
                 io::Error::last_os_error()
-            ));
+            )));
         }
         // SAFETY: both fds were just returned by the successful `socketpair` above and nothing
         // else owns them.
@@ -890,10 +1082,10 @@ mod linux {
         // with no allocation, no locks and no stdio.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            return Err(format!(
+            return Err(NamespaceAttemptError::Creator(format!(
                 "fork() for the namespace creator failed: {}",
                 io::Error::last_os_error()
-            ));
+            )));
         }
         if pid == 0 {
             // SAFETY: forked-child context, syscalls only; both branches end in `_exit`, so no
@@ -911,8 +1103,10 @@ mod linux {
         }
         drop(creator_end);
 
-        let status = wait_for_creator(pid)?;
-        match receive_session_netns(parent_end.as_raw_fd(), plan.socket_count())? {
+        let status = wait_for_creator(pid).map_err(NamespaceAttemptError::Creator)?;
+        match receive_session_netns(parent_end.as_raw_fd(), plan.socket_count())
+            .map_err(NamespaceAttemptError::Creator)?
+        {
             Received::Handles(mut fds) => {
                 let net_ns = fds.pop().expect("the count was checked on receipt");
                 let user_ns = fds.pop().expect("the count was checked on receipt");
@@ -922,10 +1116,10 @@ mod linux {
                     net_ns,
                 })
             }
-            Received::Failure(failure) => Err(failure.to_string()),
-            Received::Nothing => Err(format!(
+            Received::Failure(failure) => Err(failure.into()),
+            Received::Nothing => Err(NamespaceAttemptError::Creator(format!(
                 "the namespace creator exited without handing anything over ({status})"
-            )),
+            ))),
         }
     }
 
@@ -954,16 +1148,16 @@ mod linux {
         })
     }
 
-    /// Encodes and decodes a failure record as the creator and the parent do, rendered as the
-    /// parent renders it.
+    /// Encodes and decodes a failure record as the creator and the parent do, as the error the
+    /// parent returns for it.
     #[cfg(test)]
-    pub(super) fn describe_failure_record(step: u32, errno: i32) -> Option<String> {
+    pub(super) fn decode_failure_record(step: u32, errno: i32) -> Option<NamespaceAttemptError> {
         let mut record = [0u8; FAILURE_RECORD_LEN];
         record[..4].copy_from_slice(&step.to_ne_bytes());
         record[4..].copy_from_slice(&errno.to_ne_bytes());
         CreationFailure::decode(&record).map(|failure| {
             assert_eq!(failure.encode(), record);
-            failure.to_string()
+            failure.into()
         })
     }
 
@@ -1381,47 +1575,197 @@ const DNS_PORT_BE: u16 = crate::egress_proxy::EGRESS_DNS_PORT.to_be();
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sealed::{ProfileAttachment, UsernsGrant};
 
-    fn support(apparmor: bool, namespace: EgressNamespaceProbe) -> EgressNamespaceSupport {
-        EgressNamespaceSupport {
-            userns_grant: if apparmor {
-                crate::sealed::UsernsGrant::ProfileConfining
-            } else {
-                crate::sealed::UsernsGrant::Withheld
+    fn attachments() -> [ProfileAttachment; 4] {
+        [
+            ProfileAttachment::Sealed {
+                profile: "mur-sealed".to_string(),
             },
-            namespace,
+            ProfileAttachment::Other {
+                profile: "docker-default".to_string(),
+            },
+            ProfileAttachment::Unconfined,
+            ProfileAttachment::NotReported,
+        ]
+    }
+
+    fn step(step: CreationStep, errno: i32) -> Result<(), NamespaceAttemptError> {
+        Err(NamespaceAttemptError::Step { step, errno })
+    }
+
+    fn failure(
+        attempt: Result<(), NamespaceAttemptError>,
+        grant: UsernsGrant,
+        attachment: ProfileAttachment,
+    ) -> EgressNamespaceFailure {
+        egress_namespace_failure(true, attempt, grant, attachment)
+            .expect("a failed attempt is a failure")
+    }
+
+    // ---- the decision ----------------------------------------------------------------------
+
+    /// A namespace that was created is never refused, whatever AppArmor reads: a container whose
+    /// own profile permits it, on a host whose restriction reads `1`, gets its namespace.
+    #[test]
+    fn a_created_namespace_is_never_refused_whatever_the_readings() {
+        for grant in UsernsGrant::ALL {
+            for attachment in attachments() {
+                assert_eq!(
+                    egress_namespace_failure(true, Ok(()), *grant, attachment.clone()),
+                    None,
+                    "{grant:?} / {attachment:?}"
+                );
+            }
         }
     }
 
-    /// The blocker decision reads only `UsernsGrant::permits_userns()`. Every grant that permits
-    /// the namespace must therefore reach the same verdict — naming the provenance reports a host
-    /// fact and never changes one.
+    /// A namespace that was not created is refused, whatever AppArmor reads, and the blocker is
+    /// the same for every reading.
     #[test]
-    fn every_permitting_userns_grant_reaches_the_same_verdict() {
-        for grant in crate::sealed::UsernsGrant::ALL {
-            let support = EgressNamespaceSupport {
-                userns_grant: *grant,
-                namespace: EgressNamespaceProbe::Ok,
-            };
-            let expected = if grant.permits_userns() {
-                None
-            } else {
-                Some(EgressNamespaceBlocker::CapabilityGrantMissing)
-            };
+    fn a_failed_creation_is_refused_whatever_the_readings() {
+        let attempts = [
+            (
+                step(CreationStep::Unshare, libc::EPERM),
+                EgressNamespaceBlocker::CapabilityGrantMissing,
+            ),
+            (
+                step(CreationStep::Unshare, libc::ENOSPC),
+                EgressNamespaceBlocker::KernelSupportMissing,
+            ),
+            (
+                Err(NamespaceAttemptError::Creator("fork() failed".to_string())),
+                EgressNamespaceBlocker::CreatorUnavailable,
+            ),
+        ];
+        for (attempt, blocker) in attempts {
+            for grant in UsernsGrant::ALL {
+                for attachment in attachments() {
+                    let failure =
+                        egress_namespace_failure(true, attempt.clone(), *grant, attachment.clone())
+                            .unwrap_or_else(|| {
+                                panic!("{attempt:?} under {grant:?} / {attachment:?}")
+                            });
+                    assert_eq!(failure.blocker, blocker, "{grant:?} / {attachment:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_an_unshare_the_kernel_cannot_honour_is_missing_kernel_support() {
+        for errno in [libc::ENOSPC, libc::EINVAL, libc::ENOSYS, libc::EUSERS] {
             assert_eq!(
-                egress_namespace_blocker(true, support),
-                expected,
-                "grant {grant:?} must decide only through permits_userns()"
+                failure(
+                    step(CreationStep::Unshare, errno),
+                    UsernsGrant::Withheld,
+                    ProfileAttachment::Unconfined
+                )
+                .blocker,
+                EgressNamespaceBlocker::KernelSupportMissing,
+                "errno {errno}"
+            );
+        }
+        for (failed, errno) in [
+            (CreationStep::Unshare, libc::EPERM),
+            (CreationStep::Unshare, libc::EACCES),
+            (CreationStep::IdentityMaps, libc::EPERM),
+            (CreationStep::Loopback, libc::EPERM),
+            (CreationStep::LocalRoute, libc::EINVAL),
+            (CreationStep::Resolver, libc::ENOSPC),
+        ] {
+            assert_eq!(
+                failure(
+                    step(failed, errno),
+                    UsernsGrant::Withheld,
+                    ProfileAttachment::Unconfined
+                )
+                .blocker,
+                EgressNamespaceBlocker::CapabilityGrantMissing,
+                "{failed:?} errno {errno}"
             );
         }
     }
 
-    /// Both refusal texts put the profile first and label the sysctl as what it costs. The sysctl
-    /// is a legitimate answer on a host where no profile can be loaded, so the text still carries
-    /// it — but a reader must not be able to take it for a peer alternative to the profile.
     #[test]
-    fn the_capability_grant_reason_offers_the_profile_before_the_sysctl() {
-        let reason = EgressNamespaceBlocker::CapabilityGrantMissing.reason();
+    fn a_creator_that_could_not_run_is_unavailable_and_keeps_its_detail() {
+        let detail = "fork() for the namespace creator failed: Resource temporarily unavailable \
+                      (os error 11)";
+        let failure = failure(
+            Err(NamespaceAttemptError::Creator(detail.to_string())),
+            UsernsGrant::Withheld,
+            ProfileAttachment::Unconfined,
+        );
+        assert_eq!(failure.blocker, EgressNamespaceBlocker::CreatorUnavailable);
+        assert_eq!(failure.errno, None);
+        let reason = failure.reason();
+        assert!(reason.starts_with(detail), "{reason}");
+        assert!(!reason.contains("apparmor_parser"), "{reason}");
+        assert!(!reason.contains("CONFIG_USER_NS"), "{reason}");
+        assert!(!reason.contains("user.max_user_namespaces"), "{reason}");
+    }
+
+    #[test]
+    fn non_linux_is_never_refused_for_a_mechanism_it_never_had() {
+        for attempt in [
+            Ok(()),
+            step(CreationStep::Unshare, libc::EPERM),
+            Err(NamespaceAttemptError::Creator("fork() failed".to_string())),
+        ] {
+            assert_eq!(
+                egress_namespace_failure(
+                    false,
+                    attempt,
+                    UsernsGrant::Withheld,
+                    ProfileAttachment::NotReported
+                ),
+                None
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(detect_egress_namespace_failure(), None);
+    }
+
+    #[test]
+    fn the_check_refuses_exactly_a_capsule_that_can_spawn_on_a_failing_host() {
+        let failure = failure(
+            step(CreationStep::Unshare, libc::EPERM),
+            UsernsGrant::Withheld,
+            ProfileAttachment::Unconfined,
+        );
+        match check_egress_namespace(true, Some(&failure)) {
+            Err(crate::errors::RuntimeError::EgressNamespaceUnavailable { blocker, reason }) => {
+                assert_eq!(blocker, failure.blocker);
+                assert_eq!(reason, failure.reason());
+            }
+            other => panic!("expected the E-CAP-005 refusal, got {other:?}"),
+        }
+        assert!(check_egress_namespace(false, Some(&failure)).is_ok());
+        assert!(check_egress_namespace(true, None).is_ok());
+        assert!(check_egress_namespace(false, None).is_ok());
+    }
+
+    // ---- the reason ------------------------------------------------------------------------
+
+    #[test]
+    fn an_unconfined_binary_on_a_restricted_host_is_told_the_profile_before_the_sysctl() {
+        let reason = failure(
+            step(CreationStep::Unshare, libc::EPERM),
+            UsernsGrant::Withheld,
+            ProfileAttachment::Unconfined,
+        )
+        .reason();
+        assert!(
+            reason.starts_with(
+                "unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM (Operation not \
+                 permitted)."
+            ),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("kernel.apparmor_restrict_unprivileged_userns=1"),
+            "{reason}"
+        );
         let profile = reason
             .find("apparmor_parser -r")
             .expect("the profile install command must be named");
@@ -1432,87 +1776,263 @@ mod tests {
             profile < sysctl,
             "the profile install must come first: {reason}"
         );
+        assert!(reason.contains("LAST RESORT"), "{reason}");
+        assert!(reason.contains("every program on the machine"), "{reason}");
         assert!(
-            reason.contains("LAST RESORT"),
-            "the sysctl must be labelled a fallback, not offered as a peer: {reason}"
+            reason.contains("scripts/install-dev-apparmor.sh"),
+            "{reason}"
         );
         assert!(
-            reason.contains("every program on the machine"),
-            "the sysctl's host-wide cost must be stated: {reason}"
-        );
-    }
-
-    // ---- `egress_namespace_blocker` ------------------------------------------------------
-
-    #[test]
-    fn a_working_namespace_blocks_nothing() {
-        assert_eq!(
-            egress_namespace_blocker(true, support(true, EgressNamespaceProbe::Ok)),
-            None
+            reason.ends_with(
+                "Host readings: kernel.apparmor_restrict_unprivileged_userns=1; AppArmor profile \
+                 confining mur: unconfined."
+            ),
+            "{reason}"
         );
     }
 
     #[test]
-    fn apparmor_is_blamed_before_the_namespace_outcome() {
-        // The `unshare` failure is a *consequence* of the restriction, so naming the kernel here
-        // would send an Ubuntu desktop user to entirely the wrong fix.
-        assert_eq!(
-            egress_namespace_blocker(true, support(false, EgressNamespaceProbe::Unsupported)),
-            Some(EgressNamespaceBlocker::CapabilityGrantMissing)
+    fn a_binary_another_profile_confines_is_given_the_container_remedy_not_the_sysctl() {
+        let reason = failure(
+            step(CreationStep::Unshare, libc::EPERM),
+            UsernsGrant::Withheld,
+            ProfileAttachment::Other {
+                profile: "docker-default".to_string(),
+            },
+        )
+        .reason();
+        assert!(reason.contains("`docker-default`"), "{reason}");
+        assert!(reason.contains("--cap-add SYS_ADMIN"), "{reason}");
+        assert!(reason.contains("seccomp"), "{reason}");
+        assert!(
+            !reason.contains("kernel.apparmor_restrict_unprivileged_userns=0"),
+            "{reason}"
+        );
+        assert!(!reason.contains("apparmor_parser"), "{reason}");
+        assert!(
+            reason.ends_with("AppArmor profile confining mur: docker-default."),
+            "{reason}"
         );
     }
 
     #[test]
-    fn every_refusal_of_a_supported_mechanism_is_a_capability_grant_problem() {
-        for probe in [
-            EgressNamespaceProbe::Denied,
-            EgressNamespaceProbe::MapDenied,
-            EgressNamespaceProbe::ConfigDenied,
+    fn a_failure_under_the_sealed_profile_points_at_a_stale_load() {
+        let reason = failure(
+            step(CreationStep::Unshare, libc::EPERM),
+            UsernsGrant::ProfileConfining,
+            ProfileAttachment::Sealed {
+                profile: "mur-sealed".to_string(),
+            },
+        )
+        .reason();
+        assert!(
+            reason.contains("sudo apparmor_parser -r /etc/apparmor.d/mur-sealed"),
+            "{reason}"
+        );
+        assert!(reason.contains("stale"), "{reason}");
+        assert!(!reason.contains("LAST RESORT"), "{reason}");
+    }
+
+    #[test]
+    fn without_the_restriction_the_cause_is_not_apparmor() {
+        for (grant, readings) in [
+            (
+                UsernsGrant::RestrictionDisabledHostWide,
+                "kernel.apparmor_restrict_unprivileged_userns=0",
+            ),
+            (UsernsGrant::ApparmorAbsent, "AppArmor not enabled"),
         ] {
-            assert_eq!(
-                egress_namespace_blocker(true, support(true, probe)),
-                Some(EgressNamespaceBlocker::CapabilityGrantMissing),
-                "{probe:?}"
+            for attachment in [
+                ProfileAttachment::Unconfined,
+                ProfileAttachment::NotReported,
+            ] {
+                let reason =
+                    failure(step(CreationStep::Unshare, libc::EPERM), grant, attachment).reason();
+                assert!(
+                    !reason.contains("apparmor_restrict_unprivileged_userns=1"),
+                    "{reason}"
+                );
+                assert!(!reason.contains("apparmor_parser"), "{reason}");
+                assert!(reason.contains("--cap-add SYS_ADMIN"), "{reason}");
+                assert!(
+                    reason.contains(&format!("Host readings: {readings};")),
+                    "{reason}"
+                );
+            }
+        }
+    }
+
+    /// On a host without AppArmor `/proc/self/attr/current` carries another module's label, which
+    /// is no AppArmor profile to blame.
+    #[test]
+    fn another_security_modules_label_is_not_blamed_as_an_apparmor_profile() {
+        let reason = failure(
+            step(CreationStep::Unshare, libc::EPERM),
+            UsernsGrant::ApparmorAbsent,
+            ProfileAttachment::Other {
+                profile: "unconfined_u:unconfined_r:unconfined_t:s0".to_string(),
+            },
+        )
+        .reason();
+        assert!(reason.contains("not AppArmor"), "{reason}");
+        assert!(!reason.contains("the AppArmor profile `"), "{reason}");
+    }
+
+    #[test]
+    fn a_namespace_created_and_then_refused_says_which_half_failed() {
+        let configure = failure(
+            step(CreationStep::Loopback, libc::EPERM),
+            UsernsGrant::RestrictionDisabledHostWide,
+            ProfileAttachment::Unconfined,
+        )
+        .reason();
+        assert!(
+            configure.starts_with("bringing lo up failed with EPERM"),
+            "{configure}"
+        );
+        assert!(configure.contains("CAP_NET_ADMIN"), "{configure}");
+
+        let owned = failure(
+            step(CreationStep::IdentityMaps, libc::EACCES),
+            UsernsGrant::RestrictionDisabledHostWide,
+            ProfileAttachment::Unconfined,
+        )
+        .reason();
+        assert!(
+            owned.starts_with("writing uid_map/gid_map failed with EACCES (Permission denied)."),
+            "{owned}"
+        );
+        assert!(owned.contains("could not be owned"), "{owned}");
+    }
+
+    #[test]
+    fn missing_kernel_support_names_the_limit_or_the_config_symbol_and_no_apparmor() {
+        for (errno, named) in [
+            (libc::ENOSPC, "user.max_user_namespaces"),
+            (libc::EINVAL, "CONFIG_USER_NS"),
+            (libc::ENOSYS, "CONFIG_USER_NS"),
+            (libc::EUSERS, "nesting limit"),
+        ] {
+            let reason = failure(
+                step(CreationStep::Unshare, errno),
+                UsernsGrant::Withheld,
+                ProfileAttachment::Unconfined,
+            )
+            .reason();
+            assert!(reason.contains(named), "{reason}");
+            assert!(
+                reason.contains(errno_name(errno).expect("a named errno")),
+                "{reason}"
+            );
+            assert!(!reason.contains("apparmor_parser"), "{reason}");
+            assert!(!reason.contains("LAST RESORT"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn an_unnamed_errno_is_rendered_by_number() {
+        assert_eq!(errno_name(libc::EPERM), Some("EPERM"));
+        assert_eq!(errno_name(-7), None);
+        let failure = failure(
+            step(CreationStep::HandOff, 4095),
+            UsernsGrant::Withheld,
+            ProfileAttachment::Unconfined,
+        );
+        assert_eq!(
+            failure.summary(),
+            "handing the namespace to the runtime failed with errno 4095"
+        );
+    }
+
+    #[test]
+    fn the_summary_names_the_call_and_the_errno() {
+        let failed = failure(
+            step(CreationStep::Unshare, libc::EPERM),
+            UsernsGrant::Withheld,
+            ProfileAttachment::Unconfined,
+        );
+        assert_eq!(
+            failed.summary(),
+            "unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM"
+        );
+        let creator = failure(
+            Err(NamespaceAttemptError::Creator("fork() failed".to_string())),
+            UsernsGrant::Withheld,
+            ProfileAttachment::Unconfined,
+        );
+        assert_eq!(creator.summary(), "fork() failed");
+    }
+
+    #[test]
+    fn every_step_round_trips_through_its_code() {
+        for step in CreationStep::ALL {
+            assert_eq!(CreationStep::from_code(step as u32), Some(step));
+        }
+        assert_eq!(CreationStep::from_code(0), None);
+        assert_eq!(CreationStep::from_code(99), None);
+    }
+
+    // ---- one probe, one reason -------------------------------------------------------------
+
+    /// A step that fails in a session's own creation is refused with exactly the text staging
+    /// renders for the same step, `errno` and readings.
+    #[test]
+    fn a_session_creation_failure_is_refused_in_the_staging_words() {
+        for (failed, errno, grant, attachment) in [
+            (
+                CreationStep::Unshare,
+                libc::EPERM,
+                UsernsGrant::Withheld,
+                ProfileAttachment::Unconfined,
+            ),
+            (
+                CreationStep::LocalRoute,
+                libc::EPERM,
+                UsernsGrant::Withheld,
+                ProfileAttachment::Other {
+                    profile: "docker-default".to_string(),
+                },
+            ),
+            (
+                CreationStep::Unshare,
+                libc::ENOSPC,
+                UsernsGrant::RestrictionDisabledHostWide,
+                ProfileAttachment::Unconfined,
+            ),
+        ] {
+            let staging =
+                egress_namespace_failure(true, step(failed, errno), grant, attachment.clone());
+            let staging_refusal = check_egress_namespace(true, staging.as_ref())
+                .expect_err("staging refuses")
+                .to_string();
+            let establish = session_netns_creation_error(
+                NamespaceAttemptError::Step {
+                    step: failed,
+                    errno,
+                },
+                grant,
+                attachment,
+            );
+            assert_eq!(establish, format!("sandbox: E-CAP-005: {staging_refusal}"));
+            assert!(
+                establish.contains(&staging.expect("a failure").reason()),
+                "{establish}"
             );
         }
     }
 
     #[test]
-    fn a_kernel_without_the_mechanism_is_named_separately() {
+    fn a_session_creator_that_could_not_run_keeps_the_runtime_account() {
+        let error = session_netns_creation_error(
+            NamespaceAttemptError::Creator("fork() for the namespace creator failed".to_string()),
+            UsernsGrant::Withheld,
+            ProfileAttachment::Unconfined,
+        );
         assert_eq!(
-            egress_namespace_blocker(true, support(true, EgressNamespaceProbe::Unsupported)),
-            Some(EgressNamespaceBlocker::KernelSupportMissing)
+            error,
+            "sandbox: could not create this session's network namespace: fork() for the \
+             namespace creator failed"
         );
-    }
-
-    #[test]
-    fn non_linux_is_never_refused_for_a_mechanism_it_never_had() {
-        for probe in [
-            EgressNamespaceProbe::Ok,
-            EgressNamespaceProbe::Denied,
-            EgressNamespaceProbe::Unsupported,
-        ] {
-            assert_eq!(egress_namespace_blocker(false, support(false, probe)), None);
-        }
-    }
-
-    // ---- refusal text --------------------------------------------------------------------
-
-    #[test]
-    fn the_capability_grant_refusal_names_both_remediations() {
-        let reason = EgressNamespaceBlocker::CapabilityGrantMissing.reason();
-        assert!(reason.contains("apparmor_parser"), "names the AppArmor fix");
-        assert!(
-            reason.contains("--cap-add SYS_ADMIN"),
-            "names the container fix"
-        );
-    }
-
-    #[test]
-    fn the_kernel_refusal_names_the_sysctl_and_the_config_symbol() {
-        let reason = EgressNamespaceBlocker::KernelSupportMissing.reason();
-        assert!(reason.contains("user.max_user_namespaces"));
-        assert!(reason.contains("CONFIG_USER_NS"));
     }
 
     // ---- the socket plan --------------------------------------------------------------------
@@ -1624,12 +2144,31 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_creation_failure_names_its_step_and_errno() {
-        let text = linux::describe_failure_record(4, libc::EPERM).expect("a known step decodes");
-        assert!(
-            text.starts_with("installing the local default route failed:"),
-            "{text}"
+        assert_eq!(
+            linux::decode_failure_record(4, libc::EPERM),
+            Some(NamespaceAttemptError::Step {
+                step: CreationStep::LocalRoute,
+                errno: libc::EPERM,
+            })
         );
-        assert!(text.contains("Operation not permitted"), "{text}");
-        assert_eq!(linux::describe_failure_record(99, 0), None);
+        assert_eq!(linux::decode_failure_record(99, 0), None);
+    }
+
+    /// The probe is the launch's own construction, so on a host where it reports no failure a
+    /// session creates its namespace, and on one where it reports a failure the session's
+    /// creation fails at the same step.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_probe_and_a_session_creation_agree_about_this_host() {
+        let probe = detect_egress_namespace_failure();
+        let session = linux::create_session_netns(&CapsuleNetnsPlan::resolve(Vec::new())).map(drop);
+        match (&probe, &session) {
+            (None, Ok(())) => {}
+            (Some(failure), Err(NamespaceAttemptError::Step { step, errno })) => {
+                assert_eq!(failure.failed_call, step.describe());
+                assert_eq!(failure.errno, Some(*errno));
+            }
+            other => panic!("the probe and a session creation disagree: {other:?}"),
+        }
     }
 }

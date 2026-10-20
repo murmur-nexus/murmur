@@ -127,8 +127,8 @@ pub use containment::{
 pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
 pub use murmur_home::{usable_murmur_home, HomeUnusable, HOME_UNUSABLE_HINT};
 pub use network_namespace::{
-    check_egress_namespace, detect_egress_namespace_blocker, skip_without_egress_namespace,
-    EgressNamespaceBlocker,
+    check_egress_namespace, detect_egress_namespace_failure, skip_without_egress_namespace,
+    EgressNamespaceBlocker, EgressNamespaceFailure,
 };
 pub use records_dir::{
     records_dir_root, records_group, records_group_under, RecordsDir, HOOKS_SUBDIR,

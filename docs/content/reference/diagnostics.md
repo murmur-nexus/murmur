@@ -17,7 +17,7 @@ section that explains it.
 | `E-CAP-002` | A `filesystem.scope` is not relative to the workdir, or escapes it via `..` | [E-CAP-002](#e-cap-002) |
 | `E-CAP-003` | Declared containment floor (`advisory`\|`scoped`\|`sealed`) is not achievable on this host | [E-CAP-003](#e-cap-003) |
 | `E-CAP-004` | `capabilities.shell.staged_runtime` is declared below an effective `sealed` containment floor | [E-CAP-004](#e-cap-004) |
-| `E-CAP-005` | This host cannot give the capsule's native subprocess tree — shell commands, spawned capsules and native tools — its own network namespace, so `capabilities.network.allow` cannot be enforced for it | [E-CAP-005](#e-cap-005) |
+| `E-CAP-005` | Creating a network namespace for the capsule's native subprocess tree — shell commands, spawned capsules and native tools — failed on this host, so `capabilities.network.allow` cannot be enforced for it | [E-CAP-005](#e-cap-005) |
 | `E-CAP-006` | Nothing declared makes an allowlisted interpreted entrypoint's package tree reachable inside a `sealed` composed root | [E-CAP-006](#e-cap-006) |
 | `E-CAP-007` | an export root resolves outside the accessible workdir | [E-CAP-007](#e-cap-007) |
 | `E-CAP-008` | a persistent capsule declares `exports.peer_files` without a short enough `max_ttl` | [E-CAP-008](#e-cap-008) |
@@ -1394,18 +1394,30 @@ The check reads the declared floor alone, so it fires identically on a host that
 
 `capabilities.network.allow` is enforced for a native subprocess by putting its whole tree in a
 network namespace of its own, whose only way out is an egress proxy in the runtime process. A
-Linux host that cannot create that namespace refuses the launch:
+Linux host where that namespace cannot be created refuses the launch:
 
 ```text
-error[E-CAP-005]: this host cannot give the capsule's subprocess tree its own network namespace, so capabilities.network.allow cannot be enforced for it: <reason>
+error[E-CAP-005]: this host cannot give the capsule's subprocess tree its own network namespace, so capabilities.network.allow cannot be enforced for it: <failed call> failed with <ERRNO> (<description>). <likely cause and remedy> Host readings: kernel.apparmor_restrict_unprivileged_userns=<0|1>; AppArmor profile confining mur: <profile>.
 ```
 
-Two host conditions produce it, and the refusal text names which one:
+`mur` decides by creating the namespace: a short-lived child runs exactly the construction a
+launch runs, and its result is the answer. AppArmor's unprivileged-userns restriction
+(`kernel.apparmor_restrict_unprivileged_userns`) and the profile confining `mur` are read only to
+explain a refusal. A container confined by its own AppArmor profile, on a host whose restriction
+reads `1`, is not refused when the namespace can be created inside it.
 
-| Reason reported | What to do |
-|---|---|
-| The kernel provides unprivileged user namespaces but this host withholds them — AppArmor's `restrict_unprivileged_userns` is on and the shipped profile is not confining `mur`, `unshare` was refused outright (the container case), or the namespace could not be owned or configured | Install and load the AppArmor profile shipped with `mur`. Inside a container, add `--cap-add SYS_ADMIN` to the container invocation — the one capability the namespace needs — or create the network namespace outside the container and run `mur` inside it. The refusal text names the exact command for the host it printed on |
-| The kernel does not provide the mechanism at all — `CONFIG_USER_NS=n`, or `user.max_user_namespaces=0` | Enable user namespaces on the host |
+The refusal names the failed call, its `errno` and the host readings. Together they identify the
+host condition:
+
+| Failed call and `errno` | Readings line | Host condition | What to do |
+|---|---|---|---|
+| `unshare(CLONE_NEWUSER \| CLONE_NEWNET)`, `EPERM` | `=1`; profile `unconfined` or `not reported` | AppArmor's restriction applies to `mur`, and no `mur-sealed` profile confines it | Install and load the AppArmor profile shipped with `mur`; for a checkout build, run `scripts/install-dev-apparmor.sh`. The refusal gives both commands. Setting the restriction to `0` host-wide is the last resort |
+| Any call, usually `unshare(…)` with `EPERM` | Profile is another name, such as `docker-default` | A container confined by its own AppArmor profile; that profile, the container runtime's seccomp filter and its capabilities refused the namespace. The restriction setting does not govern it | Run the container with an AppArmor profile and seccomp policy that permit `unshare(CLONE_NEWUSER)`, or with `--cap-add SYS_ADMIN`, or create the network namespace outside the container and run `mur` inside it |
+| Any call, usually `unshare(…)` with `EPERM` | `=0`, or `AppArmor not enabled` | A container runtime's seccomp filter or a missing `CAP_SYS_ADMIN`, or another security module such as SELinux | The container remedies in the row above; on a bare host, the policy of the security module in use |
+| Any call | Profile `mur-sealed` | The `mur-sealed` profile confines `mur` and the namespace still failed: the loaded profile may be out of date | `sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`, then compare the installed profile in `mur doctor` |
+| `writing uid_map/gid_map`, `bringing lo up` or `installing the local default route` | Any | The namespace was created and then could not be owned (`uid_map`) or configured (`lo`, route) — a confinement that withholds `CAP_NET_ADMIN` inside the namespace | As the row matching the readings line |
+| `unshare(…)`, `ENOSPC`, `EINVAL`, `ENOSYS` or `EUSERS` | Any | The kernel does not provide the mechanism: `user.max_user_namespaces` is `0` or exhausted (`ENOSPC`), the kernel is built with `CONFIG_USER_NS=n` (`EINVAL`, `ENOSYS`), or the nesting limit for user namespaces is reached (`EUSERS`) | Raise `user.max_user_namespaces`, run on a kernel built with `CONFIG_USER_NS=y`, or run `mur` fewer user namespaces deep |
+| No call: the runtime's own message, such as `fork() for the namespace creator failed` | Any | The runtime could not run the namespace creator: a process or descriptor limit, or memory, ran out | Re-run once the limit is relieved |
 
 This applies to **every** Linux capsule that can spawn a subprocess, including one whose
 `capabilities.network.allow` is empty: with the namespace missing, an empty allowlist would mean
@@ -1419,11 +1431,14 @@ different point:
 | `capabilities.shell.allow` or `capabilities.spawn.allow` is non-empty | At staging, before any artifact is pulled |
 | `capabilities.install.tool` is non-empty: a pattern can match a native tool a pull installs | At staging, before any artifact is pulled |
 | A declared `runtime: tool` artifact ships a native implementation | At launch, once the artifacts are staged and before any component is instantiated |
-| A native tool pulled into the session by `manage.pull` or `pull-artifact` | At that tool's first call, which fails with the same reason |
+| A native tool pulled into the session by `manage.pull` or `pull-artifact` | At that tool's first call, which fails with `E-CAP-005` and the same reason |
+
+All four check points and `mur doctor` run the same probe and print the same reason. `mur doctor`
+reports its answer as the `network namespace:` line of its `AppArmor / user namespaces` block, for
+every project.
 
 It is not part of the containment ladder — every class needs the namespace equally — so neither
-raising nor lowering a declared floor changes this answer. `mur doctor` reports the same condition
-ahead of a run.
+raising nor lowering a declared floor changes this answer.
 
 ### E-CAP-006 — interpreted entrypoint unreachable under `sealed` { #e-cap-006 }
 

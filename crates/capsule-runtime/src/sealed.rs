@@ -144,10 +144,11 @@ impl UsernsGrant {
 
     /// Whether an unprivileged `unshare(CLONE_NEWUSER)` gets through on this host.
     ///
-    /// The whole of what the runtime decisions read: [`sealed_blocker`],
-    /// [`crate::network_namespace::egress_namespace_blocker`] and `sandbox::tier_from_probe`
-    /// consult this and nothing else about the grant, so provenance is reported without ever
-    /// changing an outcome.
+    /// The whole of what the `sealed` decisions read: [`sealed_blocker`] and
+    /// `sandbox::tier_from_probe` consult this and nothing else about the grant, so provenance is
+    /// reported without ever changing an outcome. Whether a capsule gets its network namespace
+    /// does not read it at all: that is decided by creating one
+    /// ([`crate::network_namespace::detect_egress_namespace_failure`]).
     #[must_use]
     pub fn permits_userns(self) -> bool {
         !matches!(self, UsernsGrant::Withheld)
@@ -185,7 +186,7 @@ impl UsernsGrant {
             }
             UsernsGrant::Withheld => {
                 "the restriction is on and no mur-sealed AppArmor profile is confining this \
-                 binary, so unprivileged user namespaces are withheld from mur"
+                 binary, so nothing murmur ships grants it a user namespace"
             }
         }
     }
