@@ -50,10 +50,11 @@ plus every reopen's feedback so far. When a task continues with
 [`call-member`](runtime-provided-tools.md#call-member) answers on an attempt that restarts rather
 than continuing its conversation, the rewrite also holds every batch of answers so far.
 
-The capsule reads it at `$MURMUR_RUNTIME_DIR/task.md` in a shell command and at
-`murmur-runtime/task.md` in a file tool, and cannot change it where the host can enforce that — see
-[What protects it](#what-protects-it). A `task.md` the capsule writes in its
-own workdir is its own file.
+An agent receives the task as its first message; neither the `[Capsule]` block nor `MURMUR.md`
+names the file. The capsule's commands can read the file by the names in
+[How the capsule reaches it](#how-the-capsule-reaches-it), and cannot change it where the host can
+enforce that — see [What protects it](#what-protects-it). A `task.md` the capsule writes in its own
+workdir is its own file.
 
 A task whose text is empty or only whitespace fails without a request to the model, with a message
 saying the task is empty. A launch that receives no task at all ends after its
@@ -131,14 +132,20 @@ created is refused with [`E-IO-004`](diagnostics.md#e-io-004) before anything is
 | `sealed-etc/` | The `passwd` and `group` a `sealed` capsule's composed root binds at `/etc/passwd` and `/etc/group` |
 | `harness/<run-id>/` | The files a `transport: process` driver asked for, present while its harness runs |
 
-### How the capsule reaches it
+### How the capsule reaches it { #how-the-capsule-reaches-it }
 
 | Reader | Where |
 |---|---|
-| A shell command, a plan's `shell` step, a native tool, a `transport: process` harness | `$MURMUR_RUNTIME_DIR`, the absolute path of `runtime/`. Set by the runtime last, so neither `capabilities.env.allow`, a shell baseline variable nor the host can change it |
-| A script capsule's own component, a `runtime: tool` artifact with no `capabilities.filesystem.scope` | `murmur-runtime/`, beside the workdir it sees as its current directory, read-only. A script capsule reads its task at `murmur-runtime/task.md` |
+| A shell command, a plan's `shell` step, a native tool, a `transport: process` harness | `$MURMUR_RUNTIME_DIR` in its environment, the absolute path of `runtime/`. Set by the runtime last, so neither `capabilities.env.allow`, a shell baseline variable nor the host can change it. A shell interpreter expands it in a command; a native tool or a binary allowed on its own is handed its arguments as written, so a path argument must be absolute |
+| A script capsule's own component, a WASM `runtime: tool` artifact with no `capabilities.filesystem.scope` | `murmur-runtime/`, beside the workdir it sees as its current directory, read-only. A script capsule reads its task at `murmur-runtime/task.md` |
 | A tool with a `scope`, a driver, a hook | Nothing |
-| The model | The [`[Capsule]` block](../concepts/session-loop.md#capsule-block) and [`MURMUR.md`](../concepts/session-loop.md#murmur-md) name both ways in |
+
+The model is told the names that work for the tools it has:
+
+| Text | Names |
+|---|---|
+| The [`[Capsule]` block](../concepts/session-loop.md#capsule-block), and the `transport: process` system prompt | `$MURMUR_RUNTIME_DIR` when `capabilities.shell.allow` names a shell interpreter; `murmur-runtime/` with the declared tools preopened there. Neither, and the `Runtime files:` line is left out |
+| [`MURMUR.md`](../concepts/session-loop.md#murmur-md) | The absolute path, then the name for a shell command, the tools installed now that use `murmur-runtime/`, and the absolute path for any other tool given a path |
 
 `sealed-etc/` and `harness/` are reached by no command.
 

@@ -2826,6 +2826,12 @@ pub fn stage_session(
     // tooling that inspects the runtime directory after staging (tests, debuggers).
     // `launch_session` rewrites it after port binding with the capsule URL.
     let murmur_md = request.inference.as_ref().map(|inference| {
+        let runtime_dir_tools =
+            crate::runtime_dir::runtime_dir_preopened_tools(&installed_artifacts, |name| {
+                artifact_grants
+                    .get(name)
+                    .is_some_and(|grant| grant.filesystem_scope.is_some())
+            });
         let inputs = murmur_md::MurmurMdInputs {
             identity: CapsuleIdentity {
                 capsule_name: request.capsule_name.clone(),
@@ -2848,11 +2854,13 @@ pub fn stage_session(
                 &request.capability_policy,
                 inference,
                 &lifecycle,
+                runtime_dir_tools.clone(),
             ),
             // `session_root`, which `WorkdirGuard` measures, is the accessible workdir only
             // without `--workdir`.
             work_folder_ceiling: (request.workdir.is_none() && inference.transport != "process")
                 .then_some(request.capability_policy.resources.workdir_max_bytes),
+            runtime_dir_tools,
         };
         murmur_md::write_murmur_md(&runtime_root, &inputs);
         inputs
@@ -8242,13 +8250,24 @@ impl CapsuleStoreState {
             .await
     }
 
+    /// Whether the operator's entry for tool `name` declares a `capabilities.filesystem.scope`.
+    fn declares_filesystem_scope(&self, name: &str) -> bool {
+        self.artifact_grants
+            .get(name)
+            .is_some_and(|grant| grant.filesystem_scope.is_some())
+    }
+
+    /// The installed tools whose guest is preopened at `murmur-runtime/`, sorted.
+    pub(crate) fn runtime_dir_preopened_tools(&self) -> Vec<String> {
+        crate::runtime_dir::runtime_dir_preopened_tools(&self.installed_artifacts, |name| {
+            self.declares_filesystem_scope(name)
+        })
+    }
+
     /// The runtime directory, when `name`'s guest is preopened into it read-only at
     /// `murmur-runtime/` ([`crate::runtime_dir::gets_runtime_dir_preopen`]).
     fn runtime_dir_preopen(&self, name: &str) -> Option<&Path> {
-        let scoped = self
-            .artifact_grants
-            .get(name)
-            .is_some_and(|grant| grant.filesystem_scope.is_some());
+        let scoped = self.declares_filesystem_scope(name);
         let gets = self.installed_artifacts.iter().any(|artifact| {
             murmur_artifact::tool_name_of(&artifact.name) == name
                 && crate::runtime_dir::gets_runtime_dir_preopen(&artifact.runtime, scoped)
@@ -16163,6 +16182,7 @@ inference:
             let outcome = try_compact_via_hooks(
                 &mut messages,
                 &mut None,
+                None,
                 &mut session_tokens,
                 &occupancy,
                 &mut state,
@@ -16371,6 +16391,113 @@ inference:
             AgentLoopHarness::new(&mut state, &workdir, trigger, CALLS_LAUNCH_SKILL).await;
         harness.run_task(&mut state, "tsk_1").await;
         harness.events().await
+    }
+
+    /// A reopened attempt with no conversation to continue starts a fresh context from the
+    /// rewritten `task.md`. That message, not the one an earlier attempt held, is the task a
+    /// compaction keeps at the head of the context.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fresh_attempt_keeps_the_task_it_read_through_compaction() {
+        let (_dir, workdir, mut state) = launch_skill_session();
+        let mut harness = AgentLoopHarness::new(
+            &mut state,
+            &workdir,
+            murmur_artifact::ToolRefresh::Immediate,
+            ENDS_THE_TURN,
+        )
+        .await;
+        harness.hooks =
+            crate::hooks::test_support::echo_compaction_hooks(&state.engine, &workdir, "user")
+                .await;
+        fs::write(workdir.join("task.md"), "REWRITTEN TASK").unwrap();
+        harness
+            .trace
+            .write_task_start(
+                "tsk_1",
+                "ctx_1",
+                "task_md",
+                TaskProvenance::derive(TaskOrigin::User, None),
+                3,
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        let mut thread = agent::TaskThread {
+            task_message: Some(serde_json::json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "ORIGINAL TASK"}],
+                "id": "msg_original",
+            })),
+            ..agent::TaskThread::default()
+        };
+        let run_config = agent::AgentRunConfig {
+            // Any context at all is over this fraction of the window: the first response
+            // compacts.
+            context_window: 100_000,
+            compaction_threshold: 0.000_01,
+            compaction_model: Some("SUMMARY".to_string()),
+            compaction_system_prompt: None,
+            compaction_dump_summaries: false,
+            max_output_tokens: 1024,
+            choices: crate::driver_choice::DriverChoices::declared(
+                &harness.inference,
+                &HashMap::new(),
+            ),
+            control: None,
+            seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
+            seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
+            conversation_root: None,
+            record_owner: None,
+            harness_sessions: None,
+            resume: None,
+            formation_member: None,
+        };
+        let root = crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap();
+        agent::run_agent_loop(
+            &mut state,
+            &root,
+            &harness.inference,
+            Some(3),
+            None,
+            run_config,
+            &mut harness.hooks,
+            &mut harness.trace,
+            &mut harness.otel,
+            Some("tsk_1".to_string()),
+            None,
+            &root,
+            "cap",
+            "0.1.0",
+            ConversationMode::Stateless,
+            Some("ctx_1".to_string()),
+            None,
+            None,
+            &mut thread,
+            Some(agent::Continuation::ReopenFeedback("try again".to_string())),
+        )
+        .await
+        .expect("the attempt ends its turn");
+
+        let events = harness.events().await;
+        assert!(
+            events.iter().any(|e| e["event_type"] == "compaction"),
+            "{events:?}"
+        );
+        let held = thread
+            .task_message
+            .clone()
+            .expect("the attempt held its task");
+        assert_eq!(held["content"][0]["text"], "REWRITTEN TASK");
+        assert_eq!(thread.messages[0], held, "{:?}", thread.messages);
+        assert_eq!(thread.messages[1]["content"][0]["text"], "SUMMARY");
+        assert!(
+            !serde_json::to_string(&thread.messages)
+                .unwrap()
+                .contains("ORIGINAL TASK"),
+            "{:?}",
+            thread.messages
+        );
     }
 
     /// The number of `heading (JSON):` blocks in `log`.
@@ -25428,6 +25555,7 @@ mod murmur_md_tests {
                 policy,
                 &inference,
                 &LifecycleConfig::default(),
+                Vec::new(),
             ),
             work_folder_ceiling: http.then_some(policy.resources.workdir_max_bytes),
             ..crate::murmur_md::test_inputs()
@@ -25470,7 +25598,7 @@ mod murmur_md_tests {
             assert!(!content.contains(absent), "{absent:?} in: {content}");
         }
         assert!(
-            content.contains("$MURMUR_RUNTIME_DIR/\n├── MURMUR.md\n├── murmur.yaml\n└── tools/\n"),
+            content.contains("/\n├── MURMUR.md\n├── murmur.yaml\n└── tools/\n"),
             "no plans/ until a plan exists: {content}"
         );
         assert!(content.contains("\n## Running Shell Commands\n"));

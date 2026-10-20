@@ -87,7 +87,7 @@ fn compact_not_declared_threshold_reached_warning_logged() {
     common::publish_local(&home, &driver_artifact).success();
 
     let manifest_path =
-        create_compaction_manifest(project.path(), &server.endpoint, DRIVER_ANTHROPIC_NAME);
+        create_compaction_manifest(project.path(), &server.endpoint, DRIVER_ANTHROPIC_NAME, "");
 
     let staged = stage_compaction_session(&home, project.path(), &manifest_path);
     // Do NOT create murmur-compact tool dir → compact_tool_name = None
@@ -182,8 +182,14 @@ fn compact_not_declared_threshold_reached_warning_logged() {
 }
 
 /// Create a test project manifest for compaction tests: context.max_tokens=200 and
-/// compaction.threshold=0.01, so compaction fires on the very first turn, and bash allowed.
-fn create_compaction_manifest(project_dir: &Path, endpoint: &str, driver_name: &str) -> PathBuf {
+/// compaction.threshold=0.01, so compaction fires on the very first turn, bash allowed, and
+/// `hooks` (YAML `artifacts:` entries) declared beside the driver.
+fn create_compaction_manifest(
+    project_dir: &Path,
+    endpoint: &str,
+    driver_name: &str,
+    hooks: &str,
+) -> PathBuf {
     // Build the manifest string with explicit indentation — never use `\` line
     // continuations in format! when indentation matters.
     let manifest = format!(
@@ -199,6 +205,7 @@ fn create_compaction_manifest(project_dir: &Path, endpoint: &str, driver_name: &
             "    gateway:\n",
             "      endpoint: {endpoint}\n",
             "      api_key: test-key\n",
+            "{hooks}",
             "capabilities:\n",
             "  network:\n",
             "    allow:\n",
@@ -217,6 +224,7 @@ fn create_compaction_manifest(project_dir: &Path, endpoint: &str, driver_name: &
         driver_name = driver_name,
         driver_version = DRIVER_VERSION,
         endpoint = endpoint,
+        hooks = hooks,
     );
 
     fs::write(project_dir.join("murmur.yaml"), manifest).unwrap();
@@ -301,16 +309,19 @@ fn run_compacting(responses: Vec<String>, window: u64, with_hook: bool, task: &s
         String::new()
     };
 
-    let manifest =
-        create_compaction_manifest(project.path(), &server.endpoint, DRIVER_ANTHROPIC_NAME);
+    let manifest = create_compaction_manifest(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        &hook,
+    );
     let text = fs::read_to_string(&manifest)
         .unwrap()
         .replace("  max_tokens: 200\n", &format!("  max_tokens: {window}\n"))
         .replace(
             "    threshold: 0.01\n",
             &format!("    threshold: {THRESHOLD}\n"),
-        )
-        .replace("capabilities:\n", &format!("{hook}capabilities:\n"));
+        );
     fs::write(&manifest, text).unwrap();
 
     let staged = stage_compaction_session(&home, project.path(), &manifest);
@@ -504,4 +515,92 @@ fn compaction_measures_messages_added_after_the_report() {
         compactions[0]["tokens_before"],
         estimate(inference_at(&events, 1))
     );
+}
+
+/// The text of a message's first content block.
+fn first_text(message: &Value) -> &str {
+    message["content"][0]["text"].as_str().unwrap_or("")
+}
+
+/// A compaction whose hook returns only its summary keeps the task: the request after it opens
+/// with the task message the first request opened with, then the summary, and the conversation
+/// record holds the task once.
+#[test]
+fn the_task_survives_compaction() {
+    if common::skip_without_host_support("the_task_survives_compaction") {
+        return;
+    }
+    let server = ScriptedServer::start(two_turn_responses());
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let driver_artifact = create_driver_artifact(
+        artifact_dir.path(),
+        DRIVER_ANTHROPIC_NAME,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+    let hook = create_hook_zip(
+        artifact_dir.path(),
+        "compact-hook",
+        "on-compaction",
+        "replace-context",
+        &compaction_hook_wasm(SUMMARY),
+    );
+    common::publish_local(&home, &hook).success();
+
+    let manifest_path = create_compaction_manifest(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        "  - name: local/compact-hook\n    version: 0.1.0\n    runtime: hook\n",
+    );
+    let staged = stage_compaction_session(&home, project.path(), &manifest_path);
+    fs::write(staged.workdir.join("task.md"), TASK).unwrap();
+    let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
+
+    let trace = fs::read_to_string(launched.records_dir.join("trace.jsonl")).unwrap_or_default();
+    let events: Vec<Value> = trace
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("every trace line must be valid JSON"))
+        .collect();
+    assert!(
+        events.iter().any(|e| e["event_type"] == "compaction"),
+        "the first turn compacts: {trace}"
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    let first = requests[0]["messages"].as_array().unwrap();
+    let after = requests[1]["messages"].as_array().unwrap();
+    assert_eq!(first_text(&first[0]), TASK, "{first:?}");
+    assert_eq!(first_text(&after[0]), first_text(&first[0]), "{after:?}");
+    assert_eq!(after[0]["role"], "user");
+    // Two `user` messages at the head: the task, then the hook's summary.
+    assert_eq!(first_text(&after[1]), SUMMARY, "{after:?}");
+    assert_eq!(after[1]["role"], "user");
+
+    let context_id = events
+        .iter()
+        .find_map(|event| event["context_id"].as_str())
+        .unwrap_or_else(|| panic!("the trace names a context id:\n{trace}"));
+    let record_path = PathBuf::from(std::env::var_os("HOME").expect("staging set $HOME"))
+        .join(".murmur/conversations/agent-capsule")
+        .join(context_id)
+        .join("conversation.jsonl");
+    let record: Vec<Value> = fs::read_to_string(&record_path)
+        .unwrap_or_else(|err| panic!("reading {}: {err}", record_path.display()))
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("every record line must be valid JSON"))
+        .collect();
+    let tasks: Vec<&Value> = record
+        .iter()
+        .filter(|line| line["role"] == "user" && first_text(line) == TASK)
+        .collect();
+    assert_eq!(tasks.len(), 1, "{record:?}");
+    assert_eq!(tasks[0].get("inserted_by"), None, "{record:?}");
 }

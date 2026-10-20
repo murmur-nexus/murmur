@@ -50,6 +50,33 @@ pub(crate) fn gets_runtime_dir_preopen(
     *runtime == murmur_artifact::ArtifactRuntime::Tool && !declares_filesystem_scope
 }
 
+/// The tool names, sorted, of the artifacts in `installed` whose guest is preopened at
+/// [`RUNTIME_DIR_GUEST_PATH`]: the WASM ones [`gets_runtime_dir_preopen`] holds for. `scoped`
+/// answers, by tool name, whether the operator's entry declares a `capabilities.filesystem.scope`.
+/// A native tool is a host process and sees no preopen, whatever its runtime.
+pub(crate) fn runtime_dir_preopened_tools<'a>(
+    installed: impl IntoIterator<Item = &'a crate::types::InstalledArtifactSummary>,
+    scoped: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut names: Vec<String> = installed
+        .into_iter()
+        .filter(|artifact| {
+            artifact.implementation == Some(murmur_artifact::ArtifactImplementation::Wasm)
+        })
+        .map(|artifact| {
+            (
+                murmur_artifact::tool_name_of(&artifact.name),
+                &artifact.runtime,
+            )
+        })
+        .filter(|(name, runtime)| gets_runtime_dir_preopen(runtime, scoped(name)))
+        .map(|(name, _)| name.to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// `~/.murmur/sessions`, relative to the murmur home.
 pub const SESSIONS_DIR_NAME: &str = "sessions";
 
