@@ -128,9 +128,9 @@ Compaction is not built into the Murmur runtime — it is externalized as an art
 
 ## Step 3 — set the compaction threshold
 
-The threshold controls when compaction fires. It is a fraction of the context window. The default is `0.98` — compaction fires when the session has consumed 98% of the token budget.
+The threshold controls when compaction fires. It is a fraction of the context window. The default is `0.98` — compaction fires when the context reaches 98% of the context window.
 
-The runtime checks it after each response, against the provider's own count of the call when the driver reports [usage](../reference/wit-interfaces.md#driver-usage), and against its own estimate when it does not. The estimate runs high, so a driver that reports nothing compacts somewhat earlier than one that does. The trace's `compaction` line says which number fired it in `tokens_before_source`: `"actual"` or `"estimate"`.
+The runtime checks it after each response, against the provider's own count of the call when the driver reports [usage](../reference/wit-interfaces.md#driver-usage), and against its own estimate when it does not. The estimate can be several percent above or below the provider's count, so a driver that reports nothing compacts somewhat earlier or later than one that does. The trace's `compaction` line says which number fired it in `tokens_before_source`: `"actual"` or `"estimate"`.
 
 For long-running tasks where you want compaction to kick in earlier and leave headroom for recovery, add `compaction.threshold` under `inference`:
 
@@ -362,7 +362,7 @@ compaction.
 |---|---|
 | `context.max_tokens: N` | Sets the context window, over the driver's `models:` entry |
 | `murmur/hook-compact` with `runtime: hook` (or any hook bound to `on-compaction`) | Provides the compaction hook; required to enable compaction |
-| `inference.compaction.threshold: 0.85` | Compaction fires when session tokens reach 85% of the budget |
+| `inference.compaction.threshold: 0.85` | Compaction fires when the context reaches 85% of the context window |
 | `inference.compaction.model: claude-haiku-4-5` | Uses a different (typically cheaper) model for compaction calls |
 | `inference.compaction.dump_summaries: true` | Appends every committed compaction's summary to `out/compaction-summaries.jsonl`; default `false` |
 | No hook bound to `on-compaction` | Non-fatal — session continues with the uncompacted history; `compaction_declined` written to the trace |

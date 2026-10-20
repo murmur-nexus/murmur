@@ -2,10 +2,10 @@
 //!
 //! A hook that imports this interface measures text with the host's own
 //! `cl100k_base` tokenizer — [`crate::agent::count_tokens`], the counter behind
-//! the compaction trigger and [`crate::agent::ContextOccupancy`]. That shared
-//! definition is the point: a hook sizing a payload against a budget and the
-//! host enforcing that budget agree on what the payload costs, which two
-//! independent tokenizers would not.
+//! [`crate::agent::ContextOccupancy`] and the seed budget. A hook sizing a
+//! payload with it agrees with every estimate the host makes. It does not agree
+//! with a driver's reported usage, which steers compaction and spend once a
+//! call reports it.
 //!
 //! Counting is pure computation — no side effect, no host resource, nothing to
 //! withhold — so the import is registered on every hook linker unconditionally

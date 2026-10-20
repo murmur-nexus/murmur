@@ -8,9 +8,11 @@ package murmur:runtime@0.4.0;
 interface tokens {
     /// The host's own `cl100k_base` count of `text`.
     ///
-    /// The same number the compaction trigger and the context-occupancy
-    /// calculation use, so a hook measuring a payload against a budget and the
-    /// host enforcing that budget agree on what the payload costs. A hook that
-    /// brings its own tokenizer is measuring something the host does not.
+    /// The same counter behind the host's own estimates: a request's size
+    /// before it is sent, a seed's budget, and the compaction trigger when the
+    /// driver reported no usage. Once a driver reports usage, the compaction
+    /// trigger and the spend meter use the provider's count instead, which no
+    /// local tokenizer reproduces. A hook that brings its own tokenizer is
+    /// measuring something the host does not.
     count: func(text: string) -> u64;
 }

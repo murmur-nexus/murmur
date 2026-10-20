@@ -454,7 +454,8 @@ fn compaction_with_no_usage_fires_on_the_estimate() {
 
 /// Messages added after a report are estimated on their own and added to it: turn 1, which
 /// reported nothing, is measured as turn 0's reported request and completion plus the tool
-/// result and assistant turn since, and not as the whole payload again.
+/// result since, and not as the whole payload again. That estimate is what crosses the
+/// threshold, so the compaction it fires says `estimate`.
 #[test]
 fn compaction_measures_messages_added_after_the_report() {
     if common::skip_without_host_support("compaction_measures_messages_added_after_the_report") {
@@ -470,9 +471,10 @@ fn compaction_measures_messages_added_after_the_report() {
             ),
             response(None, None),
         ],
-        // Large enough that nothing here crosses, with no hook to fire.
-        1_000_000,
-        false,
+        // Compaction fires at 200 tokens: turn 0's report (15) stays under it, turn 1's estimate
+        // (at least 315) crosses it.
+        2_000,
+        true,
         // Long enough that the whole first request outweighs what turn 0 adds. The report covers
         // it, so turn 1 does not count it again.
         &format!("{TASK}{}", " context".repeat(1_000)),
@@ -492,5 +494,14 @@ fn compaction_measures_messages_added_after_the_report() {
     assert!(
         turn_1 < whole,
         "turn 1 {turn_1} is anchored on the report, not the whole payload ({whole} on turn 0)"
+    );
+
+    let compactions = of_type(&events, "compaction");
+    assert_eq!(compactions.len(), 1, "{events:#?}");
+    assert_eq!(compactions[0]["turn"], 1);
+    assert_eq!(compactions[0]["tokens_before_source"], "estimate");
+    assert_eq!(
+        compactions[0]["tokens_before"],
+        estimate(inference_at(&events, 1))
     );
 }

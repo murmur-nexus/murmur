@@ -564,6 +564,11 @@ fail-closed rule that governs a policy hook's failures.
 
 ### Event field notes
 
+- `compaction-event.session-tokens` is the number the runtime compared against
+  `inference.compaction.threshold`: the provider's count of the call that crossed it when the
+  driver reported [usage](#driver-usage), the runtime's estimate otherwise. The trace's
+  [`compaction`](observability-schemas.md#session-trace-tracejsonl) line records which in
+  `tokens_before_source`. `compaction-event.threshold` is `session-tokens` over the context window.
 - `compaction-event.model` and `compaction-event.system-prompt` carry
   `inference.compaction.model` and `inference.compaction.system_prompt` verbatim, so a compaction
   hook knows which model and which prompt to use for its own summarization call. Setting
@@ -679,10 +684,11 @@ own `inference` line.
 A runtime-provided import available to any hook component that declares it. It needs no
 capability grant and no manifest entry: counting text reaches no resource.
 
-`count` returns the runtime's own `cl100k_base` count of the string — the same number behind the
-compaction trigger and the context-occupancy calculation. A hook measuring a payload against a
-budget and the runtime enforcing that budget therefore agree on what the payload costs, which a
-hook's own tokenizer would not guarantee.
+`count` returns the runtime's own `cl100k_base` count of the string — the same count behind every
+estimate the runtime makes: a request's size before it is sent, a seed's budget, and the compaction
+threshold when the driver reports no usage. Once a driver reports [usage](#driver-usage), the
+compaction threshold and the spend ceilings use the provider's count instead, which `count` does
+not reproduce.
 
 ---
 

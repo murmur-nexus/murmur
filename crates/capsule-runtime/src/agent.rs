@@ -4176,7 +4176,9 @@ fn message_tokens(message: &Value) -> u64 {
 /// request and are the largest launch-invariant part of the prefix.
 ///
 /// This is an estimate — an OpenAI tokenizer over a JSON string, for whatever model the
-/// session runs — and it runs high. It measures a request no provider has counted: a task's
+/// session runs — and it can miss the provider's count in either direction: the JSON keys push
+/// it up, a provider that adds its own tool and system framing counts more than it sees. Do not
+/// treat it as an upper bound. It measures a request no provider has counted: a task's
 /// first, the one after a commit, and every request of a driver that reports nothing. Once a
 /// call reports [`ProviderCounts`], [`request_estimate`] measures from that count instead.
 pub(crate) struct ContextOccupancy<'a> {

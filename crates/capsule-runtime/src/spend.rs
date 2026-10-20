@@ -1,15 +1,19 @@
 //! Inference spend ceilings: how many tokens a session, and every session on this machine, may
 //! spend before a driver call is refused without reaching the provider.
 //!
-//! Every number here is `input_tokens` plus `output_tokens`, exactly what the trace's
-//! `inference` lines carry — so an operator checks a ceiling by summing the trace. What those
-//! two carry differs by transport and the meter's definition does not: under `http` they are the
-//! runtime's own tiktoken measurement, and the provider's reported `usage` never enters; under
-//! `process` they are the harness's own reported counts, which are the only measurement of that
-//! transport there is. Cache reads, cache writes and thinking are never folded into either.
+//! Every charge here is an input count plus an output count. What they are differs by transport:
+//!
+//! - `http`, a call whose driver reported both `input_tokens` and `output_tokens`: the provider's
+//!   request, `input_tokens + cached_tokens + cache_write_tokens`, and its `output_tokens`
+//!   (`crate::agent::provider_counts`). Thinking is never added.
+//! - `http`, any other call: the runtime's own tiktoken counts, the `input_tokens` and
+//!   `output_tokens` its `inference` line carries.
+//! - `process`: the harness's own reported counts, the only measurement of that transport there is.
+//!
+//! The reservation an admission makes before an `http` call is always the runtime's estimate.
 //!
 //! [`SpendMeter`] is the one per-session account. Under `http` a call is admitted against it
-//! before dispatch and settled once its output is measured; the [`SpendAdmission`] guard releases
+//! before dispatch and settled once its response is parsed; the [`SpendAdmission`] guard releases
 //! its reservation on every other path, and the inference gateway sends nothing unless an
 //! admission is open, so a driver invocation that skipped admission cannot reach the provider
 //! with the key.

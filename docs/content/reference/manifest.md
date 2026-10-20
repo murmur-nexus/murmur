@@ -1234,7 +1234,7 @@ these fields are accepted and inert:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `inference.compaction.threshold` | float (0.0–1.0] | no | Fraction of the context window at which compaction fires. Default: `0.98`. |
+| `inference.compaction.threshold` | float (0.0–1.0] | no | Fraction of the context window at which compaction fires. Default: `0.98`. Checked after each response against the provider's count of the call when the driver reports usage, and the runtime's estimate otherwise — see [Context compaction](../concepts/context.md). |
 | `inference.compaction.model` | string | no | Model override for compaction calls. Defaults to the primary inference model. |
 | `inference.compaction.system_prompt` | string | no | System prompt override for compaction calls, passed verbatim to the compaction hook. No trimming, length limit or format check. Omitted, the compaction hook picks its own default prompt. Mutually exclusive with `inference.compaction.system_prompt_file`. |
 | `inference.compaction.system_prompt_file` | string | no | Path to a file whose content is passed verbatim as the compaction system prompt. Relative to the manifest directory; read when the session launches. Mutually exclusive with `inference.compaction.system_prompt`. |

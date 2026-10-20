@@ -74,8 +74,8 @@ conversation carries that call and its result faithfully; a provider that insist
 reasoning on that turn is its driver's to accommodate.
 
 **Token counts are the provider's when it reports them, and an estimate otherwise.** The
-estimate counts with one tokenizer (`cl100k`), whatever the provider, and runs high over the JSON
-the runtime counts. Where each number comes from:
+estimate counts with one tokenizer (`cl100k`), whatever the provider, and can be several percent
+above or below the provider's own count. Where each number comes from:
 
 | Number | Source |
 |---|---|
