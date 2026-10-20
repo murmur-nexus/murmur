@@ -376,18 +376,29 @@ fn session_status_fields_match_the_trace() {
         })
     );
 
-    let last = before.last().unwrap();
+    // Every scripted call reports usage, so the context and the spend are the provider's counts:
+    // the request (`input_tokens_actual` with both cache members) plus the completion.
+    let provider_count = |record: &Value| {
+        [
+            "input_tokens_actual",
+            "cached_tokens",
+            "cache_write_tokens",
+            "output_tokens_actual",
+        ]
+        .iter()
+        .map(|key| record[*key].as_u64().unwrap())
+        .sum::<u64>()
+    };
     assert_eq!(
         status["context"],
         json!({
-            "used_tokens": last["input_tokens"].as_u64().unwrap()
-                + last["output_tokens"].as_u64().unwrap(),
+            "used_tokens": provider_count(before.last().unwrap()),
             "window_tokens": 50000,
-            "measured_by": "estimate",
+            "measured_by": "actual",
         })
     );
 
-    let spent = sum(&before, "input_tokens").unwrap() + sum(&before, "output_tokens").unwrap();
+    let spent: u64 = before.iter().map(|record| provider_count(record)).sum();
     assert_eq!(
         status["spend"],
         json!({"tokens": spent, "ceiling": 1000000, "machine": "none"})
@@ -616,6 +627,8 @@ const NOTICE_TOOL_IDS: [&str; 4] = ["toolu_1", "toolu_2", "toolu_3", "toolu_4"];
 struct NoticeRun {
     run: Run,
     requests: Vec<Value>,
+    /// The scripted provider's address, which the capsule's network allowlist names.
+    endpoint: String,
     _home: TempDir,
     _project: Project,
 }
@@ -635,6 +648,7 @@ fn notice_run(lifecycle: &'static str, extra: &'static [&'static str]) -> Notice
     NoticeRun {
         run,
         requests: server.requests(),
+        endpoint: server.endpoint.clone(),
         _home: home,
         _project: project,
     }
@@ -723,8 +737,19 @@ fn the_deadline_notice_is_sent_once() {
             a["messages"].as_array().unwrap().len(),
             b["messages"].as_array().unwrap().len()
         );
-        assert_eq!(a["system"], b["system"], "the system prompt is unchanged");
-        assert_eq!(a["tools"], b["tools"], "the tool array is unchanged");
+        // Each run has its own provider, and the system text names its address.
+        let own =
+            |run: &NoticeRun, part: &Value| part.to_string().replace(&run.endpoint, "<provider>");
+        assert_eq!(
+            own(&with, &a["system"]),
+            own(&without, &b["system"]),
+            "the system prompt is unchanged"
+        );
+        assert_eq!(
+            own(&with, &a["tools"]),
+            own(&without, &b["tools"]),
+            "the tool array is unchanged"
+        );
     }
     for id in ["toolu_1", "toolu_2", "toolu_4"] {
         let (text, _) = split_notice(&raw_tool_result(&with.requests, id));

@@ -1697,9 +1697,9 @@ pub(crate) async fn run_agent_loop(
         // replacement it committed, against the window it compared it with.
         if let Some(status) = &store_state.session_status {
             status.set_context(
-                session_tokens,
+                session_tokens.tokens,
                 (context_window > 0).then_some(context_window),
-                crate::session_status::MEASURED_BY_ESTIMATE,
+                session_tokens.basis,
             );
         }
 

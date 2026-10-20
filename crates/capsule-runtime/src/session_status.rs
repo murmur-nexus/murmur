@@ -13,14 +13,11 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::agent::DriverUsage;
+use crate::agent::{DriverUsage, OccupancyBasis};
 use crate::spend::SpendMeter;
 
 /// The runtime-provided tool every agent capsule has, on both transports, with no grant.
 pub const SESSION_STATUS_TOOL: &str = "session-status";
-
-/// `context.measured_by` for the runtime's own cl100k count, the one compaction compares.
-pub(crate) const MEASURED_BY_ESTIMATE: &str = "estimate";
 
 /// What a field reads when its limit is not set.
 const NONE: &str = "none";
@@ -144,7 +141,7 @@ impl SpendReading {
 struct ContextReading {
     used_tokens: u32,
     window_tokens: Option<u32>,
-    measured_by: &'static str,
+    measured_by: OccupancyBasis,
 }
 
 /// What the funnels have fed so far.
@@ -285,7 +282,7 @@ impl SessionStatus {
         &self,
         used_tokens: u32,
         window_tokens: Option<u32>,
-        measured_by: &'static str,
+        measured_by: OccupancyBasis,
     ) {
         self.fed().context = Some(ContextReading {
             used_tokens,
@@ -444,7 +441,8 @@ pub fn description_http() -> String {
         "Report where this session stands, measured at the moment of the call. Takes no input and \
          returns one JSON object. {FIELDS} `context`: `used_tokens`, the conversation's size as \
          the runtime last counted it, `window_tokens`, the model's context window, and \
-         `measured_by`, how the count was made (\"estimate\": the runtime's own count). `tokens`: \
+         `measured_by`, how the count was made (\"actual\": the provider's own count of the last \
+         call; \"estimate\": the runtime's own count). `tokens`: \
          the `input`, `output`, `cached` and `cache_write` tokens the provider reported for this \
          session's inference calls, and `unreported_calls`, the calls it reported none for. \
          {SPEND_AND_VALUES}"
@@ -516,7 +514,7 @@ mod tests {
             Some(30),
             Some(&usage(Some(1_200), Some(70), Some(0), Some(10))),
         );
-        status.set_context(61_234, Some(200_000), MEASURED_BY_ESTIMATE);
+        status.set_context(61_234, Some(200_000), OccupancyBasis::Estimate);
         let now = started + Duration::from_millis(1_834_900);
         let spend = SpendReading {
             used: 1_920,
@@ -578,7 +576,7 @@ mod tests {
             Some(40),
             Some(&usage(Some(7), None, None, None)),
         );
-        status.set_context(940, None, MEASURED_BY_ESTIMATE);
+        status.set_context(940, None, OccupancyBasis::Estimate);
         let value = report(&status, started + Duration::from_secs(3), no_spend());
         assert_eq!(
             value["tokens"],
@@ -591,6 +589,13 @@ mod tests {
         );
         assert_eq!(value["turns"]["used"], 2);
         assert_eq!(value["time"]["task_elapsed_secs"], 3);
+
+        // The provider's count of the last call, when it reported one, is named as such.
+        status.set_context(1_010, None, OccupancyBasis::Actual);
+        assert_eq!(
+            report(&status, started, no_spend())["context"],
+            json!({"used_tokens": 1010, "window_tokens": "none", "measured_by": "actual"})
+        );
     }
 
     #[test]
@@ -606,7 +611,7 @@ mod tests {
         );
         status.record_inference(2, None, None, None);
         // A process session is never fed a context reading, and one fed anyway is not reported.
-        status.set_context(1, Some(2), MEASURED_BY_ESTIMATE);
+        status.set_context(1, Some(2), OccupancyBasis::Estimate);
         let value = report(&status, started, no_spend());
         assert_eq!(value["context"], json!("unknown"));
         assert_eq!(
@@ -755,6 +760,7 @@ mod tests {
             }
         }
         assert!(description_http().contains("measured_by"));
+        assert!(description_http().contains("\"actual\""));
         assert!(description_process().contains("the harness keeps its own context"));
     }
 }

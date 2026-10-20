@@ -110,7 +110,7 @@ Seconds are whole, rounded down.
 | `turns.cap` | `inference.max_turns` | `"none"` with no cap |
 | `context.used_tokens` | The conversation's size as the compaction check last counted it | `context` is `"unknown"` before the first turn, and always under `transport: process` |
 | `context.window_tokens` | The context window that check compared it with, the serving driver choice's | `"none"` when the choice has none |
-| `context.measured_by` | `"estimate"`: the runtime's own count | — |
+| `context.measured_by` | `"actual"`: the provider's own count of the last call, its request plus its completion. `"estimate"`: the runtime's own count, when that call reported none. The same values as the [`compaction`](observability-schemas.md) record's `tokens_before_source` | — |
 | `tokens.input`, `tokens.output`, `tokens.cached`, `tokens.cache_write` | Sums of what the provider reported over the session's `inference` records so far | `"unknown"` for a member no record carried |
 | `tokens.unreported_calls` | `inference` records that carried no count | — |
 | `spend.tokens` | Tokens the spend ceilings count for this session | — |
