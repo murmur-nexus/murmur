@@ -449,9 +449,11 @@ parsed its arguments and reached the front-end exec); the compile did not finish
 refusing an `execve` on a path that is present and readable inside the root, which is precisely
 what `executable: false` on the fixed sealed tree means.
 
-`export TMPDIR="$PWD"` is needed because `cc` writes its intermediate files to `$TMPDIR`, and the
-composed root's `/tmp` is not writable by the capsule. Without it the run fails one step earlier,
-which is a real (and separate) constraint worth recording:
+`export TMPDIR="$PWD"` was needed for this run because `cc` writes its intermediate files to
+`$TMPDIR`, and the build under test left the composed root's `/tmp` unwritable to the capsule.
+Without it that run failed one step earlier. A composed root's `/tmp` is the
+[session's temporary folder](containment.md#temp-folder), writable, and `TMPDIR` names it, so the
+export is not needed to reproduce step 3:
 
 ```console
 ERR: bash: line 1: /usr/bin/head: Permission denied

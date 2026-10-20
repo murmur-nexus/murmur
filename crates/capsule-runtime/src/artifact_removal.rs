@@ -790,9 +790,12 @@ mod tests {
             .unwrap()
             .contains(SKILL_TEXT));
 
-        set_mode(&dir, 0o555);
+        // Removal gives the owner `rwx` on every directory it empties, so a read-only parent is
+        // what keeps the emptied directory from being unlinked.
+        let parent = dir.parent().unwrap().to_path_buf();
+        set_mode(&parent, 0o555);
         let delete_failed = remove(&mut state, SKILL);
-        set_mode(&dir, 0o755);
+        set_mode(&parent, 0o755);
         let err = delete_failed.expect_err("the directory cannot be deleted");
         let prefix = format!(
             "'{SKILL}' is removed from this session and from murmur.lock, but {} could not be \
@@ -800,7 +803,7 @@ mod tests {
             dir.display()
         );
         assert!(err.starts_with(&prefix), "{err}");
-        assert!(dir.join("skill.md").is_file());
+        assert!(dir.is_dir());
         assert!(!project.locked(SKILL));
         assert!(state.installed_artifacts.iter().all(|a| a.name != SKILL));
         assert_eq!(

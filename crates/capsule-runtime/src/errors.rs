@@ -550,8 +550,8 @@ pub enum RuntimeError {
     CgroupDelegationUnavailable { reason: String },
 
     #[error(
-        "session workdir grew to {observed_bytes} bytes, past the {max_bytes} byte ceiling \
-         (capabilities.resources.workdir_max_bytes)"
+        "session workdir and temporary folder grew to {observed_bytes} bytes, past the \
+         {max_bytes} byte ceiling (capabilities.resources.workdir_max_bytes)"
     )]
     WorkdirSizeExceeded { max_bytes: u64, observed_bytes: u64 },
 

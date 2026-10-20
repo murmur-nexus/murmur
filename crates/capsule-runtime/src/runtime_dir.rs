@@ -237,6 +237,10 @@ pub struct RuntimeDirRoots {
     /// read-only rule and bind as `runtime/`. `None` for roots held outside a session, where no
     /// records directory exists.
     pub records: Option<WorkdirRoot>,
+    /// The session's temporary folder, `tmp/` in its records directory: `$TMPDIR` in every
+    /// command, and `/tmp` wherever the session maps it ([`crate::temp_dir`]). `None` for roots
+    /// held outside a session, whose commands are told of no temporary folder.
+    pub temp: Option<WorkdirRoot>,
 }
 
 impl RuntimeDirRoots {
@@ -249,6 +253,7 @@ impl RuntimeDirRoots {
             sealed_etc,
             harness,
             records: None,
+            temp: None,
         }
     }
 
@@ -256,6 +261,13 @@ impl RuntimeDirRoots {
     #[must_use]
     pub fn with_records(mut self, records: WorkdirRoot) -> Self {
         self.records = Some(records);
+        self
+    }
+
+    /// These roots with `temp` as the session's temporary folder.
+    #[must_use]
+    pub fn with_temp(mut self, temp: WorkdirRoot) -> Self {
+        self.temp = Some(temp);
         self
     }
 }
@@ -326,12 +338,11 @@ impl RuntimeDir {
             session_id: session_id.to_string(),
             sessions,
             _lock: lock,
-            roots: RuntimeDirRoots {
-                runtime: open(RUNTIME_SUBDIR)?,
-                sealed_etc: open(SEALED_ETC_SUBDIR)?,
-                harness: open(HARNESS_SUBDIR)?,
-                records: None,
-            },
+            roots: RuntimeDirRoots::new(
+                open(RUNTIME_SUBDIR)?,
+                open(SEALED_ETC_SUBDIR)?,
+                open(HARNESS_SUBDIR)?,
+            ),
         })
     }
 

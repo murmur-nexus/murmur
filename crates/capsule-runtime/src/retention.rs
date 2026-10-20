@@ -1001,6 +1001,45 @@ mod tests {
         assert_eq!(names(workdirs.path()), kept);
     }
 
+    /// A pruned session's temporary folder goes with its records directory, even when a command
+    /// left a read-only directory holding a file and a directory no one can open in it.
+    #[test]
+    fn pruning_a_session_removes_its_temp_folder() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let old = ses(NOW - 2000, 1);
+        let current = ses(NOW, 2);
+        make_sessions(root.path(), &[old.clone(), current.clone()]);
+        let folder = root
+            .path()
+            .join(&old)
+            .join(crate::temp_dir::SESSION_TEMP_DIR_NAME);
+        let read_only = folder.join("read-only");
+        let sealed_shut = folder.join("sealed-shut");
+        std::fs::create_dir_all(&read_only).unwrap();
+        std::fs::create_dir_all(&sealed_shut).unwrap();
+        std::fs::write(read_only.join("file"), b"left behind").unwrap();
+        std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(&sealed_shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let pruned = prune_sessions(
+            &crate::workdir_fs::WorkdirRoot::open(root.path()).unwrap(),
+            None,
+            &current,
+            &TraceRetainConfig {
+                max_sessions: Some(1),
+                max_age_secs: None,
+            },
+            NOW,
+        );
+
+        assert_eq!(pruned.len(), 1, "{pruned:?}");
+        assert_eq!(pruned[0].name, old);
+        assert!(!root.path().join(&old).exists(), "the session went whole");
+        assert_eq!(names(root.path()), vec![current]);
+    }
+
     /// A link planted where a session workdir directory belongs is refused, not followed: the
     /// directory it points at survives the pruning of the session it is named for.
     #[test]

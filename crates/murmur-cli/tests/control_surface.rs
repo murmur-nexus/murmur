@@ -1371,11 +1371,15 @@ fn the_control_token_is_unreachable_from_inside_the_capsule() {
     );
 
     // The paths under ~/.murmur a capsule may name are its own read-only runtime directory,
-    // under `sessions/`, and its records directory, under `records/`; the control tokens sit under
-    // `running/`, outside both.
+    // under `sessions/`, its records directory, under `records/`, and the temporary folder inside
+    // that; the control tokens sit under `running/`, outside all three.
     let mut scope = common::explain_scope_json(&home.dir, &project.manifest_path());
     let murmur_home = home.path().join(".murmur");
-    for (key, parent) in [("runtime_dir", "sessions"), ("records_dir", "records")] {
+    for (key, parent) in [
+        ("runtime_dir", "sessions"),
+        ("records_dir", "records"),
+        ("temp_dir", "records"),
+    ] {
         let dir = scope[key]["path"].as_str().unwrap().to_string();
         assert!(
             Path::new(&dir).starts_with(murmur_home.join(parent)),
@@ -1429,8 +1433,11 @@ fn the_control_token_is_unreachable_from_inside_the_capsule() {
 
     if shell_half {
         let cat_result = String::from_utf8_lossy(&requests[2].body).into_owned();
+        // Landlock refuses the read; under a mapped `/tmp`, a token beneath the host's `/tmp` is
+        // not there at all.
         assert!(
-            cat_result.contains("Permission denied"),
+            cat_result.contains("Permission denied")
+                || cat_result.contains("No such file or directory"),
             "the shell read the token file: {cat_result}"
         );
     } else if !landlock {

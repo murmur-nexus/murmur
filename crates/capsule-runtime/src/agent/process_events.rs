@@ -1065,6 +1065,10 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                    crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                        crate::sandbox::EnforcementTier::EnvironmentOnly,
+                        murmur_artifact::ContainmentClass::Advisory,
+                    )),
                     crate::cgroup::IoMaxReport::default(),
                 ),
                 murmur_artifact::TraceCapture::Meta,

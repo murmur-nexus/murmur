@@ -23,14 +23,11 @@
 //! declaration describes the `--workdir` layout in both cases, so that it is one fixed answer a
 //! consumer can compare against rather than two.
 //!
-//! # What is filtered and what is labelled
+//! # What is labelled
 //!
-//! [`RuntimeWriteCondition`] names when a path is present. Only [`RuntimeWriteCondition::Sealed`]
-//! filters the set: the enforcement tier is host state the report has already probed, so a report
-//! that omitted the sealed rows on a host that will use them — or listed them on a host that
-//! cannot — would be describing a different launch than the one it is about. Every other condition
-//! turns on what the session does after it starts, which no report can know, so those rows are
-//! always declared and the condition says when the path appears.
+//! [`RuntimeWriteCondition`] names when a path is present. Every condition turns on what the
+//! session does after it starts, which no report can know, so every row is always declared,
+//! whatever the tier, and the condition says when the path appears.
 //!
 //! # What is not here
 //!
@@ -41,9 +38,10 @@
 //! the session — `trace.jsonl`, `blobs/`, `logs/bootstrap.log`, `logs/otel.log`,
 //! `logs/hook-<name>.log`, a delegated child's `completion.json` and the `hooks/` a records-granted
 //! hook writes in — goes into the session's records directory,
-//! `~/.murmur/records/<workdir root>/<session-id>`. None of them is a runtime write inside the
-//! workdir, so none is declared here; [`crate::runtime_dir`] and [`crate::records_dir`] describe
-//! them.
+//! `~/.murmur/records/<workdir root>/<session-id>`. The session's temporary folder, which commands
+//! reach as `/tmp` and `$TMPDIR`, is `tmp/` in that records directory. None of them is a runtime
+//! write inside the workdir, so none is declared here; [`crate::runtime_dir`],
+//! [`crate::records_dir`] and [`crate::temp_dir`] describe them.
 //!
 //! # Adding an entry
 //!
@@ -55,8 +53,6 @@
 //! `records_root`, and is declared in its `RECORDS_DIR_WRITES`.
 
 use serde::Serialize;
-
-use crate::sandbox::EnforcementTier;
 
 /// The literal segment a declared path carries in place of a real session id.
 ///
@@ -113,9 +109,6 @@ impl RuntimeWriteScope {
 }
 
 /// When a declared entry is present on disk.
-///
-/// [`Self::Sealed`] is the one value that also decides whether the row appears in the report at
-/// all — see the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeWriteCondition {
@@ -131,8 +124,6 @@ pub enum RuntimeWriteCondition {
     PeerFetch,
     /// Written when this capsule launches a sub-capsule, which needs `capabilities.spawn.allow`.
     Spawn,
-    /// Written only where the enforcement tier composes a sealed root.
-    Sealed,
 }
 
 impl RuntimeWriteCondition {
@@ -146,7 +137,6 @@ impl RuntimeWriteCondition {
             Self::Shell => "shell",
             Self::PeerFetch => "peer-fetch",
             Self::Spawn => "spawn",
-            Self::Sealed => "sealed",
         }
     }
 }
@@ -262,33 +252,15 @@ const DECLARED_WRITES: &[DeclaredWrite] = &[
         scope: RuntimeWriteScope::Session,
         condition: RuntimeWriteCondition::Shell,
     },
-    DeclaredWrite {
-        // The bind source the composed root mounts at `/tmp`. The capsule sees `/tmp` and never a
-        // workdir path.
-        entry: ".mur-tmp",
-        kind: RuntimeWriteKind::Directory,
-        scope: RuntimeWriteScope::Session,
-        condition: RuntimeWriteCondition::Sealed,
-    },
 ];
 
 /// Every path the runtime writes inside this launch's workdir, in declaration order.
 ///
 /// Pure and filesystem-free: `mur run --explain-scope` returns before a workdir exists, so a
-/// declaration that touched one would make the diagnostic create the thing it describes.
-///
-/// `tier` is the tier the session would actually install — [`crate::sandbox::applied_tier`], the
-/// host's own tier capped by the declared floor — never the declared class on its own. A capsule
-/// declaring `scoped` on a sealed-capable host composes no root; under an unmet `sealed` floor the
-/// launch refuses anyway. Either way the honest answer is the set the mechanism that will really
-/// run writes.
-pub(crate) fn runtime_writes(tier: EnforcementTier) -> Vec<RuntimeWriteReport> {
-    let sealed = tier == EnforcementTier::KernelSealed;
-    DECLARED_WRITES
-        .iter()
-        .filter(|declared| sealed || declared.condition != RuntimeWriteCondition::Sealed)
-        .map(DeclaredWrite::report)
-        .collect()
+/// declaration that touched one would make the diagnostic create the thing it describes. The same
+/// set on every tier.
+pub(crate) fn runtime_writes() -> Vec<RuntimeWriteReport> {
+    DECLARED_WRITES.iter().map(DeclaredWrite::report).collect()
 }
 
 /// The `Runtime writes` block of `mur run --explain-scope`'s human rendering.
@@ -374,7 +346,6 @@ mod tests {
         ("MANIFEST_FILENAME", murmur_artifact::MANIFEST_FILENAME),
         ("COMPLETION_FILE", crate::delegation::COMPLETION_FILE),
         ("BLOB_DIR_NAME", crate::trace_blobs::BLOB_DIR_NAME),
-        ("SEALED_TMP_DIR_NAME", crate::sealed::SEALED_TMP_DIR_NAME),
         (
             "SYNTHETIC_HOME_DIR_NAME",
             crate::shell::SYNTHETIC_HOME_DIR_NAME,
@@ -387,6 +358,10 @@ mod tests {
         ("TRACE_FILE_NAME", crate::trace::TRACE_FILE_NAME),
         ("CHILDREN_DIR", crate::child_launch::CHILDREN_DIR),
         ("HOOKS_SUBDIR", crate::records_dir::HOOKS_SUBDIR),
+        (
+            "SESSION_TEMP_DIR_NAME",
+            crate::temp_dir::SESSION_TEMP_DIR_NAME,
+        ),
     ];
 
     /// Entry names the scanner resolves that are deliberately not declared, each with the reason.
@@ -652,6 +627,11 @@ mod tests {
         (
             "hooks",
             "The `\".\"` of every hook declared `capabilities.filesystem.records: true`.",
+        ),
+        (
+            "tmp",
+            "The session's temporary folder, `/tmp` and `$TMPDIR` to its commands. Created \
+             empty at staging; the runtime writes nothing in it.",
         ),
     ];
 
@@ -1335,66 +1315,32 @@ mod tests {
         assert_eq!(resolve_entry_name("format!(\"{}/x\", a)"), None);
     }
 
-    /// Sealed is the one condition that changes the reported set, and it adds nothing a consumer
-    /// diffing the accessible workdir's top level would see.
-    #[test]
-    fn the_sealed_tier_adds_exactly_the_tmp_store() {
-        let scoped = runtime_writes(EnforcementTier::KernelFull);
-        let sealed = runtime_writes(EnforcementTier::KernelSealed);
-
-        assert!(
-            scoped.iter().all(|write| sealed.contains(write)),
-            "the sealed declaration must be a superset of the scoped one"
-        );
-        let added: Vec<&RuntimeWriteReport> = sealed
-            .iter()
-            .filter(|write| !scoped.contains(write))
-            .collect();
-        assert_eq!(
-            added
-                .iter()
-                .map(|write| write.path.as_str())
-                .collect::<Vec<_>>(),
-            vec![".murmur/<session-id>/.mur-tmp"]
-        );
-        for write in added {
-            assert_eq!(write.condition, RuntimeWriteCondition::Sealed);
-            assert_eq!(write.scope, RuntimeWriteScope::Session);
-            assert_eq!(write.kind, RuntimeWriteKind::Directory);
-        }
-    }
-
     /// The files the runtime owns are in the runtime directory, so the workdir declaration names
-    /// none of them, on any tier.
+    /// none of them.
     #[test]
     fn runtime_writes_lists_none_of_the_runtime_directory_files() {
-        for tier in [
-            EnforcementTier::KernelSealed,
-            EnforcementTier::KernelFull,
-            EnforcementTier::KernelSeccompOnly,
-            EnforcementTier::EnvironmentOnly,
-        ] {
-            for write in runtime_writes(tier) {
-                let last = write.path.rsplit('/').next().unwrap_or_default();
-                assert!(
-                    !MOVED_OUT_OF_THE_WORKDIR.contains(&last),
-                    "{} is declared as a workdir write",
-                    write.path
-                );
-            }
+        for write in runtime_writes() {
+            let last = write.path.rsplit('/').next().unwrap_or_default();
+            assert!(
+                !MOVED_OUT_OF_THE_WORKDIR.contains(&last),
+                "{} is declared as a workdir write",
+                write.path
+            );
         }
     }
 
-    /// Every non-sealed tier reports the same set, so a host's Landlock or seccomp availability
-    /// cannot quietly change what a consumer subtracts.
+    /// The session's temporary folder is in the records directory, so no row names a temp store
+    /// inside the workdir.
     #[test]
-    fn only_the_sealed_tier_changes_the_declared_set() {
-        let baseline = runtime_writes(EnforcementTier::EnvironmentOnly);
-        assert_eq!(baseline, runtime_writes(EnforcementTier::KernelSeccompOnly));
-        assert_eq!(baseline, runtime_writes(EnforcementTier::KernelFull));
-        assert!(baseline
-            .iter()
-            .all(|write| write.condition != RuntimeWriteCondition::Sealed));
+    fn no_declared_path_is_a_temp_store() {
+        for write in runtime_writes() {
+            let last = write.path.rsplit('/').next().unwrap_or_default();
+            assert!(
+                !last.contains("tmp"),
+                "{} is declared as a workdir write",
+                write.path
+            );
+        }
     }
 
     /// Serialized rows carry exactly the four documented keys, in declaration order, with the
@@ -1405,7 +1351,7 @@ mod tests {
     /// bytes `--explain-scope --json` and `trace.jsonl` actually carry.
     #[test]
     fn a_serialized_row_carries_exactly_path_kind_scope_and_condition() {
-        for write in runtime_writes(EnforcementTier::KernelSealed) {
+        for write in runtime_writes() {
             let line = serde_json::to_string(&write).unwrap();
             assert_eq!(
                 line,
@@ -1424,7 +1370,7 @@ mod tests {
     /// accessible one never is.
     #[test]
     fn session_scoped_paths_carry_the_murmur_prefix_and_the_literal_session_id() {
-        for write in runtime_writes(EnforcementTier::KernelSealed) {
+        for write in runtime_writes() {
             match write.scope {
                 RuntimeWriteScope::Session => {
                     let prefix = format!(".murmur/{SESSION_ID_PLACEHOLDER}/");
@@ -1454,7 +1400,7 @@ mod tests {
     /// matched.
     #[test]
     fn no_declared_path_is_reported_twice() {
-        let writes = runtime_writes(EnforcementTier::KernelSealed);
+        let writes = runtime_writes();
         let mut paths: Vec<&str> = writes.iter().map(|write| write.path.as_str()).collect();
         paths.sort_unstable();
         let count = paths.len();
@@ -1464,7 +1410,7 @@ mod tests {
 
     #[test]
     fn the_rendering_names_every_declared_path_and_the_placeholder_rule() {
-        let writes = runtime_writes(EnforcementTier::KernelSealed);
+        let writes = runtime_writes();
         let rendered = render_runtime_writes(&writes);
         assert!(rendered.contains("`<session-id>` is a literal segment"));
         for write in &writes {

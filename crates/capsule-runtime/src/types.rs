@@ -671,6 +671,10 @@ pub struct StagedSession {
     /// rather than taking a new one, so the mechanisms installed at launch are the ones
     /// [`Self::scope_report`] already claims.
     pub(crate) host_probe: crate::sandbox::HostProbe,
+    /// Whether a literal `/tmp` reaches the session's temporary folder, decided once by
+    /// `stage_session` from [`Self::host_probe`]: [`Self::scope_report`]'s `temp_dir` says it and
+    /// `launch_session` hands it to the enforcement that installs it.
+    pub(crate) temp_mapping: crate::temp_dir::TempMapping,
     /// The declared read-only surface, lowered and validated by `stage_session` — a malformed
     /// entry refuses the launch there rather than surfacing at the first call. Empty for every
     /// capsule that declared no `capabilities.filesystem.read_only`.

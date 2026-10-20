@@ -4740,6 +4740,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(tier, declared)),
             crate::cgroup::IoMaxReport::default(),
         )
     }
@@ -5293,6 +5294,10 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                    EnforcementTier::KernelSealed,
+                    ContainmentClass::Sealed,
+                )),
                 crate::cgroup::IoMaxReport::default(),
             );
             let dir = tempfile::tempdir().unwrap();
@@ -5352,6 +5357,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::EnvironmentOnly,
+                ContainmentClass::Advisory,
+            )),
             crate::cgroup::IoMaxReport::default(),
         );
         assert!(
@@ -5411,6 +5420,10 @@ mod tests {
                 runtime_dir_reach: Some(crate::containment::RuntimeDirReach::MurmurRuntime),
             }],
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
             crate::cgroup::IoMaxReport::default(),
         );
 

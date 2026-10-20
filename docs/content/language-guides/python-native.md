@@ -150,19 +150,21 @@ mur run
 
 When the capsule invokes `py-echo-native`, the runtime executes the packaged binary and forwards the normalized result back to the caller.
 
-The binary does not inherit the host's environment as-is: `HOME` is replaced with a session-scoped synthetic directory, credential-shaped variables (`GITHUB_TOKEN`, `*_API_KEY`, `AWS_*`, etc.) are stripped, and only a safe baseline (`PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TMPDIR`, `TEMP`, `TMP`, `CARGO_HOME`, `RUSTUP_HOME`, `TERM`) passes through — the same sanitization [shell tool subprocesses](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) get, applied regardless of whether the capsule declares `capabilities.shell.allow`.
+The binary does not inherit the host's environment as-is: `HOME` is replaced with a session-scoped synthetic directory, credential-shaped variables (`GITHUB_TOKEN`, `*_API_KEY`, `AWS_*`, etc.) are stripped, and only a safe baseline (`PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `CARGO_HOME`, `RUSTUP_HOME`, `TERM`) passes through — the same sanitization [shell tool subprocesses](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) get, applied regardless of whether the capsule declares `capabilities.shell.allow`.
 
 On Linux the binary also runs in the same sandbox as a shell command, with the capsule's grants:
 
 | The tool… | Needs |
 |---|---|
-| Reads or writes files | The files inside the session workdir. On the Full tier nothing outside it is readable or writable, including `/tmp` |
+| Reads or writes files | The files inside the session workdir, or in the session's temporary folder at `$TMPDIR`. On the Full tier nothing else outside the workdir is readable or writable |
 | Runs another program | That program in `capabilities.shell.allow` |
 | Connects to a host | That host in `capabilities.network.allow` |
 
-A PyInstaller `--onefile` build unpacks itself into `$TMPDIR`, or `/tmp` when that is unset, before
-it runs your code. Under `scoped` that directory is outside the workdir and the write is refused.
-Under `sealed`, `/tmp` is a private directory inside the workdir and the build unpacks there.
+A PyInstaller `--onefile` build unpacks itself into `$TMPDIR` before it runs your code. The runtime
+sets `TMPDIR`, `TMP` and `TEMP` to the session's private temporary folder, `tmp/` in its records
+directory, on every tier: as `/tmp` where the host maps `/tmp` onto that folder, and as the folder's
+absolute path where it does not. See
+[The session's temporary folder](../reference/containment.md#temp-folder).
 
 ---
 

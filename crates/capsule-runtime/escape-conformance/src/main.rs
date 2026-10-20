@@ -281,11 +281,12 @@ fn list_cases() {
          but nothing can pass or fail, because there is no claim to compare the result against. \
          It appears for two different reasons and they must not be conflated.\n\
          In the `advisory` column it means the *class* has no mechanism that could back a claim.\n\
-         In the `sealed` column it appears for exactly two cases — `hardlink-escape` and \
-         `rename-across-boundary` — and there it means the *case's own shape* cannot reach its \
-         premise at that class: `sealed` composes its root out of independent bind mounts, so \
-         link(2)/rename(2) hit EXDEV at a mount boundary before Landlock is consulted, for every \
-         destination reachable from the workdir. Every other `sealed` expectation is graded, \
+         In the `sealed` column it appears for two cases — `hardlink-escape` and \
+         `rename-across-boundary` — whose own shape cannot reach its premise at that class: \
+         `sealed` composes its root out of independent bind mounts, so link(2)/rename(2) hit \
+         EXDEV at a mount boundary before Landlock is consulted, for every destination reachable \
+         from the workdir. It also appears for `write-outside-workdir`, whose `/var/tmp` target \
+         has not been measured against a composed root. Every other `sealed` expectation is graded, \
          against the verdict a real composed root produced on 2026-08-09. See each case's \
          attribution note in a record, and {}.",
         murmur_artifact::docs_reference_url!("containment/#verification")

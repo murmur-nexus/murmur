@@ -730,7 +730,8 @@ impl WorkdirRoot {
     /// Removes the directory `rel` and everything in it, by descriptor: each child directory is
     /// opened no-follow from its parent's descriptor, so no part of the removal resolves a path
     /// from the root. A link at `rel` or at a parent is refused; a link inside is unlinked, not
-    /// followed.
+    /// followed. Each directory is given owner `rwx` before it is emptied, so one a command left
+    /// unreadable or unwritable is removed too.
     pub fn remove_dir_all(&self, rel: impl AsRef<Path>) -> Result<(), WorkdirError> {
         let rel = rel.as_ref().to_string_lossy();
         let op = WorkdirOperation::Remove;
@@ -746,6 +747,7 @@ impl WorkdirRoot {
             Some(FileType::Directory) => {}
             Some(_) => return Err(self.io(&rel, std::io::ErrorKind::NotADirectory.into())),
         }
+        self.grant_owner_rwx(&parent, name, &rel)?;
         let dir = self.open_dir(&parent, name, &rel, &rel, op)?;
         self.empty_dir(&dir, &rel)?;
         rustix::fs::unlinkat(&parent, name, AtFlags::REMOVEDIR)
@@ -756,6 +758,7 @@ impl WorkdirRoot {
         for (name, file_type) in self.children(dir, rel)? {
             let child = format!("{rel}/{}", name.to_string_lossy());
             if file_type == FileType::Directory {
+                self.grant_owner_rwx(dir, &name, &child)?;
                 let sub = self.open_dir(dir, &name, &child, &child, WorkdirOperation::Remove)?;
                 self.empty_dir(&sub, &child)?;
                 rustix::fs::unlinkat(dir, &name, AtFlags::REMOVEDIR)
@@ -765,6 +768,60 @@ impl WorkdirRoot {
             .map_err(|errno| self.io(&child, errno.into()))?;
         }
         Ok(())
+    }
+
+    /// Adds owner `rwx` to the mode of the directory `name` in `parent`, reached with no link
+    /// followed. A directory whose owner bits are already `rwx` is left as it is.
+    fn grant_owner_rwx(
+        &self,
+        parent: &impl AsFd,
+        name: &OsStr,
+        rel: &str,
+    ) -> Result<(), WorkdirError> {
+        const OWNER_RWX: RawMode = 0o700;
+        // `O_PATH | O_DIRECTORY | O_NOFOLLOW` needs no permission on the directory itself and
+        // fails on a link; the mode is changed through the descriptor's `/proc/self/fd` entry,
+        // since `fchmod` refuses an `O_PATH` descriptor.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = rustix::fs::openat(
+                parent,
+                name,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|errno| self.io(rel, errno.into()))?;
+            let stat = rustix::fs::fstat(&fd).map_err(|errno| self.io(rel, errno.into()))?;
+            let mode = stat.st_mode as RawMode & 0o7777;
+            if mode & OWNER_RWX == OWNER_RWX {
+                return Ok(());
+            }
+            rustix::fs::chmod(
+                format!("/proc/self/fd/{}", fd.as_raw_fd()),
+                Mode::from_raw_mode(mode | OWNER_RWX),
+            )
+            .map_err(|errno| self.io(rel, errno.into()))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let stat = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|errno| self.io(rel, errno.into()))?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+                return Err(self.io(rel, std::io::ErrorKind::NotADirectory.into()));
+            }
+            let mode = stat.st_mode as RawMode & 0o7777;
+            if mode & OWNER_RWX == OWNER_RWX {
+                return Ok(());
+            }
+            rustix::fs::chmodat(
+                parent,
+                name,
+                Mode::from_raw_mode(mode | OWNER_RWX),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|errno| self.io(rel, errno.into()))
+        }
     }
 
     /// The names in `dir` other than `.` and `..`, each with the type `fstatat(AT_SYMLINK_NOFOLLOW)`

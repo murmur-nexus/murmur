@@ -1,6 +1,6 @@
 # Verification — sealed containment (mount namespace + `pivot_root`)
 
-!!! success "Status: **RUN — 2026-08-05, partial.** Steps 1–4 and 6 pass on a real host through a live capsule's shell tool; step 5 (container) was not run. Addenda: 2026-08-07, directory enumeration inside the composed root; 2026-08-08, reading its `/etc` allowlist and completing a verified TLS handshake; 2026-08-09, the first full-registry escape-conformance run at `--class sealed` against a *gated* suite (exit 0, 26 of 28 cases asserted and passing); 2026-10-06, the escape-conformance gate running again through its own process driver at `scoped` and `sealed` (exit 4: every boundary case passes, `resource-memory-hog` fails)."
+!!! success "Status: **RUN — 2026-08-05, partial.** Steps 1–4 and 6 pass on a real host through a live capsule's shell tool; step 5 (container) was not run. Addenda: 2026-08-07, directory enumeration inside the composed root; 2026-08-08, reading its `/etc` allowlist and completing a verified TLS handshake; 2026-08-09, the first full-registry escape-conformance run at `--class sealed` against a *gated* suite (exit 0, 26 of 28 cases asserted and passing); 2026-10-06, the escape-conformance gate running again through its own process driver at `scoped` and `sealed` (exit 4: every boundary case passes, `resource-memory-hog` fails); 2026-10-20, step 7, the session temporary folder mapped at `/tmp` at `advisory` and `scoped`."
 
     Steps 0–4 and 6 were executed on a bare Ubuntu host on 2026-08-05, driven through a real,
     live capsule session (`claude` as the inference driver, a real `bash` tool call), and every
@@ -488,8 +488,8 @@ ls: cannot access '/dev/loop*': No such file or directory
 
 ### 3d — writability
 
-The session workdir is the only writable path. `$PWD` is the workdir, at the same absolute path it
-has on the host:
+The session workdir and `/tmp` are the only writable paths. `$PWD` is the workdir, at the same
+absolute path it has on the host:
 
 ```sh
 pwd
@@ -509,10 +509,14 @@ touch: cannot touch '/etc/writable-there': Read-only file system
 touch: cannot touch '/writable-there': Read-only file system
 ```
 
-`/tmp` is writable, and it is backed by a directory *inside* the workdir — so it counts against
-`capabilities.resources.workdir_max_bytes` and is discarded with the session:
+`/tmp` is writable: the composed root binds the
+[session's temporary folder](containment.md#temp-folder) there. That folder is `tmp/` in the
+session's records directory, `~/.murmur/records/<workdir root>/<session-id>/tmp`, outside the
+workdir; it counts against `capabilities.resources.workdir_max_bytes` together with the workdir and
+is removed with the records directory by `trace.retain`. `TMPDIR` names it as `/tmp`:
 
 ```sh
+echo "TMPDIR=$TMPDIR"
 echo probe > /tmp/sealed-probe && cat /tmp/sealed-probe
 ls -a /tmp
 ```
@@ -520,29 +524,33 @@ ls -a /tmp
 Expected:
 
 ```text
+TMPDIR=/tmp
 probe
 .
 ..
 sealed-probe
 ```
 
-Confirm from the **host** side, after the session ends, that the bytes landed in the workdir:
+Confirm from the **host** side, after the session ends, that the bytes landed in the records
+directory and not in the workdir. With `--workdir ~/sealed-check/workdir`, the workdir root is that
+directory, and `<session-id>` is the `ses_…` value on the `session:` line `mur run` printed:
 
 ```sh
-cat ~/sealed-check/workdir/.mur-tmp/sealed-probe
+cat ~/.murmur/records$HOME/sealed-check/workdir/<session-id>/tmp/sealed-probe
+ls ~/sealed-check/workdir/sealed-probe 2>&1
 ```
 
 Expected:
 
 ```text
 probe
+ls: cannot access '/home/<you>/sealed-check/workdir/sealed-probe': No such file or directory
 ```
 
-The mount alone is not enough, and this is worth checking with the tools that actually broke.
-`plan_composed_root` has bind-mounted `.mur-tmp` at `/tmp` read-write since the composed root
-existed, but Landlock inside the root matches an access to `/tmp/x` against the **bind's own root
-inode**, never the workdir's — so until `apply_landlock_scope` grew a rule for it, every one of
-these failed `EACCES` on a genuinely writable mount:
+The mount alone is not enough, and this is worth checking with the tools that need it. Landlock
+inside the root matches an access to `/tmp/x` against the **bind's own root inode**, so the folder
+needs a Landlock rule of its own; without one, every one of these fails `EACCES` on a genuinely
+writable mount:
 
 ```sh
 python3 -c "open('/tmp/probe','w').write('y')"; echo "rc=$?"; cat /tmp/probe; echo
@@ -574,8 +582,7 @@ rc=0
     unchanged decision, verified on
     [its own page](workdir-exec-landlock-manual-verification.md).
 
-The size guard needs no `/tmp`-specific check and must not grow one: `.mur-tmp` is an ordinary
-subdirectory of the workdir, so `resources::directory_size_bytes` already walks it. With a small
+The size guard measures the session workdir and the temporary folder together. With a small
 `capabilities.resources.workdir_max_bytes` declared, filling `/tmp` past the ceiling must latch the
 same breach an oversized write straight into the workdir would:
 
@@ -587,8 +594,10 @@ Expected, on the *next* shell tool call (the guard checks on an interval, then r
 boundary rather than mid-write):
 
 ```text
-workdir grew to 4000000 bytes, past the 1000000 byte ceiling (capabilities.resources.workdir_max_bytes)
+workdir and temporary folder grew to <N> bytes, past the 1000000 byte ceiling (capabilities.resources.workdir_max_bytes)
 ```
+
+`<N>` is the sum of both, at least 4000000.
 
 ### 3e — `/proc`
 
@@ -725,7 +734,133 @@ existing file) rather than `No such file or directory`, and `ls /` must show the
 If step 3a's output is identical under both classes, the probes are not measuring what this page
 claims and the result must not be recorded as a pass.
 
+## Step 7 — the session temporary folder at `advisory` and `scoped`
+
+Below `sealed`, each command enters a private mount namespace in which the session's
+[temporary folder](containment.md#temp-folder) is bound over `/tmp`. This step checks, through a
+live model, that a literal `/tmp` write lands in that folder and never on the host.
+
+The capsule needs an OpenAI driver installed as `local/murmur-driver-openai` and the key in
+`credentials.OPENAI_API_KEY` of `~/.murmur/config.yaml`. `MUR` is the `mur` built from the branch
+under test.
+
+```sh
+MUR=<checkout>/target/debug/mur
+mkdir -p ~/tmp-check && cd ~/tmp-check
+cat > murmur.yaml <<'YAML'
+name: tmp-check
+version: 0.1.0
+artifacts:
+  - name: local/murmur-driver-openai
+    version: 0.9.0
+    runtime: driver
+    gateway:
+      endpoint: https://api.openai.com/v1
+      api_key: ${OPENAI_API_KEY}
+capabilities:
+  shell:
+    allow:
+      - bash
+      - cat
+inference:
+  transport: http
+  model: gpt-5.6-luna
+  driver:
+    artifact: local/murmur-driver-openai
+trace:
+  capture: content
+YAML
+
+test ! -e /tmp/a && echo host-clean-before
+"$MUR" run --explain-scope | sed -n '/^Temporary folder/,/^$/p'
+"$MUR" run --explain-scope --containment scoped | sed -n '/^Temporary folder/,/^$/p'
+"$MUR" doctor | sed -n '/^Temporary folder/,/^$/p'
+
+TASK='Run exactly this bash command and reply with its output: echo x > /tmp/a && cat /tmp/a'
+systemd-run --user --scope --property=Delegate=yes "$MUR" run --task "$TASK"
+systemd-run --user --scope --property=Delegate=yes "$MUR" run --containment scoped --task "$TASK"
+
+test ! -e /tmp/a && echo host-clean
+cat ~/.murmur/records$HOME/tmp-check/workdir/<session-id>/tmp/a
+```
+
+`cat` is in `shell.allow` because the command runs it: with `bash` alone, Landlock refuses to
+execute `cat` and the call exits `126` after `echo` has already written the file.
+
+| Check | Expected |
+|---|---|
+| The three report blocks | `Temporary folder`, `TMPDIR:    /tmp`, `/tmp:      mapped (mount-namespace)` |
+| Each run's `tool_call.output` in `trace.jsonl` | `Exit code: 0` with `x` on stdout |
+| `session_start.effective_grants.temp_dir` | `"tmpdir": "/tmp"`, `"tmp_mapped": true`, `"mapped_by": "mount-namespace"` |
+| `test ! -e /tmp/a` after both runs | prints `host-clean` |
+| `cat <records dir>/tmp/a` for each session | `x` |
+
+On a host that prints `/tmp:      not mapped — …` the step does not apply: the reason names what
+the host lacks, and the shell call's `/tmp` write is refused (Landlock tier) or reaches the host's
+own `/tmp` (no Landlock).
+
 ## Recording the result
+
+### Run of 2026-10-20 — step 7, the session temporary folder
+
+**Host.** `agape`, bare Ubuntu 24.04, kernel `7.0.0-28-generic`, uid 1000, enforcement tier
+`mountns+pivot_root+landlock+seccomp`, `kernel.apparmor_restrict_unprivileged_userns=0`
+(`W-SEC-013`). `mur` was `target/debug/mur` built from branch
+`transit/9562ea94-writes-to-tmp-are-refused-outside-the-se` at `2962e959` with this card's changes,
+run under a scratch `HOME` holding only the OpenAI credential, with the driver published from its
+release `.mur.zip` as `local/murmur-driver-openai@0.9.0`.
+
+`host-clean-before` printed. `--explain-scope` at the default class and at `--containment scoped`,
+and `mur doctor`, each printed:
+
+```text
+Temporary folder
+  path:      /home/agape/card9562-home/.murmur/records/home/agape/tmp-check/workdir/<session-id>/tmp
+  TMPDIR:    /tmp
+  /tmp:      mapped (mount-namespace)
+```
+
+| | Default class | `--containment scoped` |
+|---|---|---|
+| Session | `ses_01a157fd3d9b77b0855b8dfce3654a82` | `ses_01a157fd60067b32a924cd43bed1e98d` |
+| `containment_declared` | `advisory` | `scoped` |
+| `shell` event | `exit_code: 0` | `exit_code: 0` |
+| `effective_grants.temp_dir` | `{"path": "…/workdir/<session-id>/tmp", "tmpdir": "/tmp", "tmp_mapped": true, "mapped_by": "mount-namespace", "not_mapped_because": null}` | the same |
+| `cat <records dir>/tmp/a` | `x` | `x` |
+
+`tool_call.output`, verbatim, default class:
+
+```text
+<untrusted-content source=tool:bash>
+$ echo x > /tmp/a && cat /tmp/a
+Exit code: 0
+Stdout:
+x
+
+Stderr:
+bash: /etc/bash.bashrc: Permission denied
+
+</untrusted-content>
+```
+
+`--containment scoped`:
+
+```text
+<untrusted-content source=tool:bash>
+$ echo x > /tmp/a && cat /tmp/a
+Exit code: 0
+Stdout:
+x
+
+Stderr:
+
+</untrusted-content>
+```
+
+The default-class stderr line is the model's `bash` reading the host's `/etc/bash.bashrc`, which
+Landlock does not grant; it is unrelated to `/tmp`. After both runs `test ! -e /tmp/a && echo
+host-clean` printed `host-clean`.
+
 
 ### Run of 2026-10-08 — `resource-memory-hog` with swap bounded
 
@@ -1109,13 +1244,15 @@ dated record's `## Summary`, verbatim:
 Twenty-six of the 28 cases print `PASS` rather than `recorded (not asserted at this class)`; the two
 that do not are `hardlink-escape` and `rename-across-boundary`, for a structural reason given below.
 
-**The promoted expectation table.** This is the `sealed` column as it now stands in
-`crates/capsule-runtime/escape-conformance/src/cases.rs`. Nothing in it is `Documented(_)` any more.
+**The promoted expectation table.** This is the `sealed` column as it stood in
+`crates/capsule-runtime/escape-conformance/src/cases.rs` for this run. Nothing in it was
+`Documented(_)`. `write-outside-workdir` and `rename-across-boundary` have since been retargeted at
+`/var/tmp`: `Must(Refused)` at `scoped`, and not asserted at `sealed`.
 
 | case | `sealed` expectation | actual on this run |
 |---|---|---|
 | `read-etc-shadow` | `Must(Refused)` | REFUSED (ENOENT — absent from the root) |
-| `write-outside-workdir` | `Must(Allowed)` | ALLOWED (`/tmp` is workdir-backed) |
+| `write-outside-workdir` | `Must(Allowed)` | ALLOWED (`/tmp` in that release was a directory inside the workdir) |
 | `stat-outside-workdir` | `Must(Refused)` | REFUSED (ENOENT — no inode to stat) |
 | `symlink-escape` | `Must(Allowed)` | ALLOWED (`/etc/passwd` is allowlisted) |
 | `hardlink-escape` | `NotAsserted` | INCONCLUSIVE (EXDEV) |
@@ -1189,8 +1326,8 @@ second copy of it.
   (`sealed::plan_composed_root`): staged runtime trees, the `/etc` allowlist, `/dev`, `/proc`, `/tmp`,
   and last the workdir at its own absolute path. `link(2)`/`rename(2)` return `EXDEV` whenever source
   and destination are on different mounts, whatever their sources' filesystems — which is why
-  `rename-across-boundary` fails even though `/tmp`'s bind source is
-  `workdir.join(SEALED_TMP_DIR_NAME)`, a subdirectory of the very same workdir. No destination
+  `rename-across-boundary` failed even though `/tmp`'s bind source in that release was a
+  subdirectory of the very same workdir. No destination
   avoids it: every path reachable from the workdir is either another independent bind or the base
   root the workdir bind sits on, because giving the workdir its own mount is the mechanism that makes
   everything else read-only-or-absent, and a path with no bind at all answers `ENOENT` without
@@ -1432,6 +1569,9 @@ earlier entry — no container runtime installed.
 
 ### Run of 2026-08-08 — `/tmp` is writable inside the composed root (step 3d)
 
+The `/tmp` this entry exercises is the workdir-backed store of that release; step 3d describes the
+[session's temporary folder](containment.md#temp-folder) in the records directory.
+
 A targeted run, not a re-run of steps 1–6: it records step 3d's `/tmp` claim, which **no earlier run
 on this page had ever exercised**. The 2026-08-05 entry tested step 3's writability through
 `echo hi > "$PWD/canary.txt"` only, and the 2026-08-03 run's harness stopped before Landlock
@@ -1509,7 +1649,7 @@ touch: cannot touch '/usr/testfile': Read-only file system
 heredoc-ok
 ```
 
-Host side, after both sessions ended: `<workdir>/.mur-tmp/` contained `probe` (1 byte, `y`),
+Host side, after both sessions ended: the workdir directory that release bound at `/tmp` contained `probe` (1 byte, `y`),
 `sealed-probe` (`probe`), the `mktemp` file `tmp.IOF7QFO79k`, and — from the `cc` run — nothing left
 behind, gcc having cleaned up its own intermediates. The compiled `t` sits in the workdir proper.
 This is the bind-mount identity holding, the same way `canary.txt` demonstrated it for the workdir
@@ -1561,8 +1701,8 @@ through the same live shell-tool path:
 --E--  python3 -c "open('/tmp/probe','w')…"    init_fs_encoding fatal (rc=1), unrelated and pre-existing
 ```
 
-and **no `.mur-tmp` directory exists in the scoped session's workdir at all** — the tier gate is on
-the fd, so `scoped` neither creates the store nor grants it. The same probe run before and after the
+and **no workdir-backed `/tmp` directory exists in the scoped session's workdir at all** — the tier
+gate is on the fd, so `scoped` neither creates the store nor grants it. The same probe run before and after the
 change under `scoped` diffs empty modulo a CPython thread id, a pid and the elapsed time. Note the
 contrast with the sealed column and with step 6: under `scoped`, `/usr` is the host's and reports
 `Permission denied`; under `sealed` it is a read-only bind and reports `Read-only file system`.
@@ -1776,7 +1916,7 @@ output this page states. Notably: all nine 3a targets reported `No such file or 
 `ls -1 /etc` produced only the `SEALED_ETC_PATHS` entries this host has; `/dev` carried exactly the
 OCI default set at `1:3 1:5 1:7 1:8 1:9` with `/dev/null` still writable and no block device
 reachable; the workdir was writable at its own absolute path while `/usr`, `/etc` and `/` reported
-`Read-only file system`; and `/tmp` was backed by `<workdir>/.mur-tmp`. `/proc` came out as the
+`Read-only file system`; and `/tmp` was backed by a directory inside the workdir. `/proc` came out as the
 bind fallback (`- proc proc rw`, `nosuid,nodev,noexec`, 356 host PIDs visible), which is the
 documented outcome for a bare host — see the warning under step 3e.
 
@@ -1817,9 +1957,11 @@ root while the same paths exist and `stat` cleanly outside it.
 
 ### What still needs a hand-run
 
-- Step 5, on a host with a container runtime. This is the only remaining gap; every other step has
-  now been run end to end through a live capsule's shell tool (see the 2026-08-05 run above, and the
+- Step 5, on a host with a container runtime. Every other step has been run end to end through a
+  live capsule's shell tool (see the 2026-08-05 run above, and the
   2026-08-08 run for step 3d's `/tmp` claim, which that entry had left untested).
+- Step 3d's `/tmp` checks against the session's temporary folder in the records directory: no
+  entry under [Recording the result](#recording-the-result) records them yet.
 
 A caution this page earned the hard way: an "Expected:" block here is a claim about a mechanism, not
 evidence about one. Step 3d's `/tmp` block sat on this page for three runs, describing behaviour no

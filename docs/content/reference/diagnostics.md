@@ -90,7 +90,7 @@ section that explains it.
 | `E-RUN-010` | `network.internal_port` is already bound | — |
 | `E-RUN-011` | A native subprocess was killed for exceeding a `capabilities.resources` limit | [Which limit a subprocess hit](resource-limits.md#which-limit) |
 | `E-RUN-012` | The capsule can spawn native subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only) | [Platform behavior](resource-limits.md#platform-behavior) |
-| `E-RUN-013` | Session workdir grew past `capabilities.resources.workdir_max_bytes` | [Host resource limits](resource-limits.md#host-resource-limits) |
+| `E-RUN-013` | Session workdir and temporary folder together grew past `capabilities.resources.workdir_max_bytes` | [Host resource limits](resource-limits.md#host-resource-limits) |
 | `E-RUN-014` | A `sealed` session cleared the host probe at launch but its composed root could not be built for a subprocess | [Containment class](containment.md#field-containment) |
 | `E-RUN-015` | `mur run --resume` and `--context` were both given | [E-RUN-015](#e-run-015) |
 | `E-RUN-016` | The session `--resume` named records no `task_start` carrying a context id | [E-RUN-016](#e-run-016) |

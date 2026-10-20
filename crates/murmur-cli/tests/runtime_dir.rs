@@ -396,19 +396,17 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
             continue;
         }
         assert_ne!(status, "0", "the attempt must fail: {line}");
-        let expected = if label.ends_with(":link-out") {
-            "Invalid cross-device link"
-        } else if floor == ContainmentClass::Sealed {
-            "Read-only file system"
+        let expected: &[&str] = if label.ends_with(":link-out") {
+            &["Invalid cross-device link"]
         } else {
-            "Permission denied"
+            write_refusals(floor, &runtime_dir)
         };
         assert!(
-            error.contains(expected)
+            expected.iter().any(|text| error.contains(text))
                 || (label.ends_with(":rename-over")
                     && (error.contains("Permission denied")
                         || error.contains("Read-only file system"))),
-            "{label} must fail with '{expected}': {line}"
+            "{label} must fail with {expected:?}: {line}"
         );
     }
     assert_eq!(attempts, runtime_files().len() * 6 + 1, "{attack}");
@@ -432,11 +430,7 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
 
     // The native tool's writes fail, its own entrypoint included; its reads return the
     // originals.
-    let native_refusal = if floor == ContainmentClass::Sealed {
-        "Read-only file system"
-    } else {
-        "Permission denied"
-    };
+    let native_refusals = write_refusals(floor, &runtime_dir);
     for label in runtime_files()
         .into_iter()
         .map(|(label, _)| label)
@@ -450,8 +444,8 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
         // the shell's attempts on the same file above are what show Landlock refusing it.
         let own_image = label == "entrypoint" && error.contains("Text file busy");
         assert!(
-            error.contains(native_refusal) || own_image,
-            "{label} must fail with '{native_refusal}': {data}"
+            native_refusals.iter().any(|text| error.contains(text)) || own_image,
+            "{label} must fail with {native_refusals:?}: {data}"
         );
     }
     if truncate_mediated {
@@ -700,17 +694,13 @@ fn pulled_tool_cannot_be_rewritten(test: &str, floor: ContainmentClass) {
     }
     // A native tool cannot change another tool's pulled entrypoint either.
     let native = probe_data(&server, "toolu_native_write");
-    let native_refusal = if floor == ContainmentClass::Sealed {
-        "Read-only file system"
-    } else {
-        "Permission denied"
-    };
+    let native_refusals = write_refusals(floor, &staged_runtime_dir);
     assert_eq!(native["ok"], false, "{native}");
     assert!(
         native["error"]
             .as_str()
-            .is_some_and(|error| error.contains(native_refusal)),
-        "the native write must fail with '{native_refusal}': {native}"
+            .is_some_and(|error| native_refusals.iter().any(|text| error.contains(text))),
+        "the native write must fail with {native_refusals:?}: {native}"
     );
     let after = result_text(&server, "toolu_after");
     assert!(!after.contains("pwned"), "{after}");
@@ -1764,4 +1754,20 @@ fn runtime_dir_workdir_identity_refuses_a_link_swapped_onto_the_created_director
         0,
         "the outside directory gains nothing"
     );
+}
+
+/// The refusal texts a write into `dir` may fail with at `floor`: a sealed root's read-only bind,
+/// Landlock's, or, with `dir` under a `/tmp` the session maps onto its temporary folder, the
+/// read-only bind that re-exposes it.
+fn write_refusals(floor: ContainmentClass, dir: &Path) -> &'static [&'static str] {
+    let tmp = fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let under_tmp = dir.starts_with(&tmp) || dir.starts_with("/tmp");
+    if floor == ContainmentClass::Sealed {
+        &["Read-only file system"]
+    } else if under_tmp {
+        &["Permission denied", "Read-only file system"]
+    } else {
+        &["Permission denied"]
+    }
 }

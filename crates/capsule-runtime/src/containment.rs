@@ -563,7 +563,7 @@ const PATH_REWRITING_NOT_PROTECTED: &str =
 pub(crate) fn filesystem_boundary(applied: EnforcementTier) -> FilesystemBoundaryReport {
     // The path-rewriting statement rides along with the mechanism-specific one rather than standing
     // on its own, so a composed root — where the paths outside it are absent, and the `~` rewrite
-    // lands inside the only writable path in that root — discloses nothing at all.
+    // lands inside the workdir — discloses nothing at all.
     let (restriction, filesystem) = match applied {
         EnforcementTier::KernelSealed => (FilesystemRestriction::Absent, None),
         EnforcementTier::KernelFull => (
@@ -771,6 +771,65 @@ fn render_protected_dir(dir: ProtectedDir, report: &RuntimeDirReport) -> String 
         "{}\n  path:      {}\n  commands:  {commands}\n",
         dir.heading(),
         report.path
+    )
+}
+
+/// The session's temporary folder, and whether a literal `/tmp` reaches it —
+/// `--explain-scope`'s `Temporary folder` block, `session_start.effective_grants.temp_dir` and
+/// `mur doctor`'s section, all from [`temp_dir_report`]. Field names are the JSON keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TempDirReport {
+    /// `<home>/.murmur/records/<workdir root>/<session-id>/tmp`, with the literal `<session-id>`
+    /// segment the records directory's path carries.
+    pub path: String,
+    /// The value of `TMPDIR`, `TMP` and `TEMP` in every command: `/tmp` when mapped, [`Self::path`]
+    /// when not.
+    pub tmpdir: String,
+    /// Whether a literal `/tmp` is the folder.
+    pub tmp_mapped: bool,
+    /// The mechanism that maps it: `composed-root` on the sealed tier, `mount-namespace` on the
+    /// tiers below it, `null` when not mapped.
+    pub mapped_by: Option<&'static str>,
+    /// Why `/tmp` is not mapped and what a literal `/tmp` path reaches instead; `null` when
+    /// mapped.
+    pub not_mapped_because: Option<String>,
+}
+
+/// What the session's temporary folder is to its commands under `mapping`, with the folder's path
+/// from `placement`. Pure.
+#[must_use]
+pub(crate) fn temp_dir_report(
+    mapping: crate::temp_dir::TempMapping,
+    placement: &RuntimeDirPlacement,
+) -> TempDirReport {
+    let path = std::path::Path::new(&placement.records_report_path())
+        .join(crate::temp_dir::SESSION_TEMP_DIR_NAME)
+        .display()
+        .to_string();
+    TempDirReport {
+        tmpdir: mapping.tmpdir_value(std::path::Path::new(&path)),
+        path,
+        tmp_mapped: mapping.is_mapped(),
+        mapped_by: mapping.mapped_by(),
+        not_mapped_because: match mapping {
+            crate::temp_dir::TempMapping::NotMapped(reason) => Some(reason.describe().to_string()),
+            _ => None,
+        },
+    }
+}
+
+/// The `Temporary folder` block of `--explain-scope` and `mur doctor`: its path, the value of
+/// `TMPDIR`, and whether a literal `/tmp` reaches it. Ends with a newline.
+#[must_use]
+pub fn render_temp_dir(report: &TempDirReport) -> String {
+    let tmp = match (report.mapped_by, &report.not_mapped_because) {
+        (Some(mechanism), _) => format!("mapped ({mechanism})"),
+        (None, Some(reason)) => format!("not mapped — {reason}"),
+        (None, None) => "not mapped".to_string(),
+    };
+    format!(
+        "Temporary folder\n  path:      {}\n  TMPDIR:    {}\n  /tmp:      {tmp}\n",
+        report.path, report.tmpdir
     )
 }
 
@@ -1022,6 +1081,10 @@ pub struct ScopeReport {
     /// the same inputs. Always serialized; its reason, when set, is also a
     /// [`FilesystemBoundaryReport::not_protected`] statement.
     pub records_dir: RuntimeDirReport,
+    /// The session's temporary folder and whether a literal `/tmp` reaches it, from
+    /// [`temp_dir_report`] on the session's [`crate::temp_dir::temp_mapping`] answer — the one
+    /// its enforcement installs. Always serialized.
+    pub temp_dir: TempDirReport,
 }
 
 impl ScopeReport {
@@ -1062,6 +1125,8 @@ impl ScopeReport {
         out.push_str(&render_runtime_dir(&self.runtime_dir));
         out.push('\n');
         out.push_str(&render_records_dir(&self.records_dir));
+        out.push('\n');
+        out.push_str(&render_temp_dir(&self.temp_dir));
 
         out.push_str(&render_not_protected(&self.filesystem_boundary));
 
@@ -1317,6 +1382,11 @@ pub fn explain_scope(
 ) -> Result<ScopeReport, crate::murmur_home::HomeUnusable> {
     let placement = crate::runtime_dir::runtime_dir_placement(workdir)?;
     let probe = crate::sandbox::HostProbe::probe();
+    let temp_mapping = crate::temp_dir::temp_mapping(
+        crate::sandbox::applied_tier(probe.tier(), declared),
+        probe.mount_namespace_usable(),
+        &placement.workdir,
+    );
     Ok(scope_report_for_tier(
         policy,
         declared,
@@ -1329,13 +1399,15 @@ pub fn explain_scope(
         configured_artifacts,
         preopens,
         &placement,
+        temp_mapping,
         io_max,
     ))
 }
 
-/// `mur doctor`'s `Runtime directory` and `Records directory` sections for a capsule declaring
-/// `declared`, run from `workdir`: the same [`runtime_dir_report`] and [`records_dir_report`] on
-/// this host's applied tier and ruleset ABI, or why `HOME` cannot hold either.
+/// `mur doctor`'s `Runtime directory`, `Records directory` and `Temporary folder` sections for a
+/// capsule declaring `declared`, run from `workdir`: the same [`runtime_dir_report`],
+/// [`records_dir_report`] and [`temp_dir_report`] on this host's applied tier, ruleset ABI and
+/// mount namespace, or why `HOME` cannot hold them.
 pub fn doctor_runtime_dir(
     declared: ContainmentClass,
     workdir: &std::path::Path,
@@ -1344,9 +1416,12 @@ pub fn doctor_runtime_dir(
     let probe = crate::sandbox::HostProbe::probe();
     let applied = crate::sandbox::applied_tier(probe.tier(), declared);
     let abi = crate::sandbox::ruleset_landlock_abi(probe.landlock_kernel_abi(), applied);
+    let temp_mapping =
+        crate::temp_dir::temp_mapping(applied, probe.mount_namespace_usable(), &placement.workdir);
     Ok(DoctorDirReports {
         runtime_dir: runtime_dir_report(applied, abi, &placement),
         records_dir: records_dir_report(applied, abi, &placement),
+        temp_dir: temp_dir_report(temp_mapping, &placement),
         placement,
     })
 }
@@ -1356,6 +1431,7 @@ pub fn doctor_runtime_dir(
 pub struct DoctorDirReports {
     pub runtime_dir: RuntimeDirReport,
     pub records_dir: RuntimeDirReport,
+    pub temp_dir: TempDirReport,
     pub placement: RuntimeDirPlacement,
 }
 
@@ -1374,6 +1450,7 @@ pub(crate) fn scope_report_for_tier(
     configured_artifacts: Vec<String>,
     preopens: Vec<PreopenReport>,
     runtime_dir_placement: &RuntimeDirPlacement,
+    temp_mapping: crate::temp_dir::TempMapping,
     io_max: IoMaxReport,
 ) -> ScopeReport {
     let achieved = achieved_containment_class(
@@ -1470,12 +1547,10 @@ pub(crate) fn scope_report_for_tier(
                 )
             })
             .collect(),
-        // A capsule declaring `scoped` on a sealed-capable host composes no root and writes no
-        // `/tmp` store, so a declaration keyed on the bare host tier would name two directories
-        // that never appear. Nothing here touches the filesystem: `--explain-scope` returns before
-        // a workdir exists, and a diagnostic that created the directory it describes would be
-        // answering a question it had changed.
-        runtime_writes: crate::workdir_writes::runtime_writes(applied),
+        // Nothing here touches the filesystem: `--explain-scope` returns before a workdir exists,
+        // and a diagnostic that created the directory it describes would be answering a question
+        // it had changed.
+        runtime_writes: crate::workdir_writes::runtime_writes(),
         // Established by performing the `io.max` write, never inferred: `prepare_scope` fills it
         // at launch and `cgroup::probe_io_max` fills it under `--explain-scope`. Like every field
         // above it, it reaches no class and no floor.
@@ -1486,6 +1561,7 @@ pub(crate) fn scope_report_for_tier(
         filesystem_boundary,
         runtime_dir,
         records_dir,
+        temp_dir: temp_dir_report(temp_mapping, runtime_dir_placement),
     }
 }
 
@@ -1962,6 +2038,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
             IoMaxReport::default(),
         );
 
@@ -2006,6 +2086,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
             IoMaxReport::default(),
         );
 
@@ -2046,6 +2130,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
             IoMaxReport::default(),
         ))
         .unwrap();
@@ -2065,6 +2153,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
             IoMaxReport {
                 declared_bytes_per_sec: 52_428_800,
                 status: IoMaxStatus::Enforced,
@@ -2093,6 +2185,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
             IoMaxReport {
                 declared_bytes_per_sec: 52_428_800,
                 status: IoMaxStatus::Unavailable,
@@ -2127,6 +2223,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
             IoMaxReport::default(),
         ))
         .unwrap();
@@ -2161,6 +2261,10 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                    *tier,
+                    ContainmentClass::Sealed,
+                )),
                 IoMaxReport::default(),
             );
             assert_eq!(
@@ -2194,6 +2298,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
             IoMaxReport::default(),
         );
         assert!(report.staged_runtime_grants.is_empty());
@@ -2217,6 +2325,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Sealed,
+            )),
             IoMaxReport::default(),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Scoped);
@@ -2237,6 +2349,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::EnvironmentOnly,
+                ContainmentClass::Sealed,
+            )),
             IoMaxReport::default(),
         );
 
@@ -2261,6 +2377,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelSealed,
+                ContainmentClass::Sealed,
+            )),
             IoMaxReport::default(),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Sealed);
@@ -2285,6 +2405,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelSeccompOnly,
+                ContainmentClass::Advisory,
+            )),
             IoMaxReport::default(),
         );
         let value: serde_json::Value = serde_json::to_value(&report).unwrap();
@@ -2314,6 +2438,10 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                    tier,
+                    ContainmentClass::Scoped,
+                )),
                 IoMaxReport::default(),
             )
         };
@@ -2368,6 +2496,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelSealed,
+                ContainmentClass::Advisory,
+            )),
             IoMaxReport::default(),
         );
 
@@ -2384,6 +2516,10 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                    EnforcementTier::KernelSealed,
+                    ContainmentClass::Advisory,
+                )),
                 IoMaxReport::default(),
             );
             assert_eq!(report.achieved_containment, baseline.achieved_containment);
@@ -2419,6 +2555,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Sealed,
+            )),
             IoMaxReport::default(),
         )
         .render();
@@ -2458,6 +2598,10 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                    crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                        *tier,
+                        ContainmentClass::Scoped,
+                    )),
                     IoMaxReport::default(),
                 );
                 let with = scope_report_for_tier(
@@ -2476,6 +2620,10 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                    crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                        *tier,
+                        ContainmentClass::Scoped,
+                    )),
                     IoMaxReport::default(),
                 );
                 assert_eq!(
@@ -2538,6 +2686,10 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                    crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                        *tier,
+                        ContainmentClass::Scoped,
+                    )),
                     IoMaxReport::default(),
                 );
                 let with = scope_report_for_tier(
@@ -2556,6 +2708,10 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                    crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                        *tier,
+                        ContainmentClass::Scoped,
+                    )),
                     IoMaxReport::default(),
                 );
                 assert_eq!(
@@ -2607,6 +2763,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelSealed,
+                ContainmentClass::Advisory,
+            )),
             IoMaxReport::default(),
         ))
         .unwrap();
@@ -2636,6 +2796,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelSealed,
+                ContainmentClass::Advisory,
+            )),
             IoMaxReport::default(),
         ))
         .unwrap();
@@ -2663,6 +2827,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelSealed,
+                ContainmentClass::Advisory,
+            )),
             IoMaxReport::default(),
         )
         .render();
@@ -2693,6 +2861,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelSealed,
+                ContainmentClass::Advisory,
+            )),
             IoMaxReport::default(),
         )
         .render();
@@ -2721,6 +2893,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                tier,
+                ContainmentClass::Scoped,
+            )),
             IoMaxReport::default(),
         )
     }
@@ -2805,6 +2981,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
             IoMaxReport::default(),
         );
         let with = scope_report_for_tier(
@@ -2819,6 +2999,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
             IoMaxReport::default(),
         );
 
@@ -2900,6 +3084,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
             IoMaxReport::default(),
         );
         let with = scope_report_for_tier(
@@ -2914,6 +3102,10 @@ mod tests {
             Vec::new(),
             preopens.clone(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
             IoMaxReport::default(),
         );
 
@@ -2993,6 +3185,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Advisory,
+            )),
             IoMaxReport::default(),
         ))
         .unwrap();
@@ -3018,6 +3214,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Advisory,
+            )),
             IoMaxReport::default(),
         ))
         .unwrap();
@@ -3041,6 +3241,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Advisory,
+            )),
             IoMaxReport::default(),
         )
         .render();
@@ -3069,6 +3273,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Advisory,
+            )),
             IoMaxReport::default(),
         )
         .render();
@@ -3103,6 +3311,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
             IoMaxReport::default(),
         )
     }
@@ -3305,6 +3517,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+            )),
             IoMaxReport::default(),
         ))
         .unwrap();
@@ -3335,6 +3551,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(tier, declared)),
             IoMaxReport::default(),
         )
     }
@@ -3555,6 +3772,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &inside,
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelFull,
+                ContainmentClass::Advisory,
+            )),
             IoMaxReport::default(),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Advisory);
@@ -3714,6 +3935,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                EnforcementTier::KernelSealed,
+                ContainmentClass::Advisory,
+            )),
             IoMaxReport::default(),
         );
 
@@ -3824,6 +4049,10 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                    probe.tier(),
+                    declared,
+                )),
                 IoMaxReport::default(),
             );
 
@@ -3877,5 +4106,217 @@ mod tests {
                     .map(|(name, _)| name.to_string())
             })
             .collect()
+    }
+
+    /// Every row of the per-tier `/tmp` table, through the decision staging makes and the report
+    /// built from it: exact `tmp_mapped`, `mapped_by` and `tmpdir`, and a reason exactly when not
+    /// mapped. The report the session records is the one `scope_report_for_tier` builds from the
+    /// same answer.
+    #[test]
+    fn the_temp_dir_report_follows_the_per_tier_table() {
+        use crate::temp_dir::temp_mapping;
+
+        let placement = RuntimeDirPlacement::outside_for_test();
+        let folder = "/home/test/.murmur/records/work/<session-id>/tmp";
+        let tmp = crate::temp_dir::canonical_tmp();
+        let elsewhere = std::path::Path::new("/work");
+        // (host tier, declared, mount namespace usable, workdir, tmp_mapped, mapped_by)
+        let rows = [
+            (
+                EnforcementTier::KernelSealed,
+                ContainmentClass::Sealed,
+                true,
+                elsewhere,
+                true,
+                Some("composed-root"),
+            ),
+            (
+                EnforcementTier::KernelSealed,
+                ContainmentClass::Scoped,
+                true,
+                elsewhere,
+                true,
+                Some("mount-namespace"),
+            ),
+            (
+                EnforcementTier::KernelSealed,
+                ContainmentClass::Advisory,
+                true,
+                elsewhere,
+                true,
+                Some("mount-namespace"),
+            ),
+            (
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+                true,
+                elsewhere,
+                true,
+                Some("mount-namespace"),
+            ),
+            (
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+                false,
+                elsewhere,
+                false,
+                None,
+            ),
+            (
+                EnforcementTier::KernelSeccompOnly,
+                ContainmentClass::Advisory,
+                true,
+                elsewhere,
+                true,
+                Some("mount-namespace"),
+            ),
+            (
+                EnforcementTier::KernelSeccompOnly,
+                ContainmentClass::Advisory,
+                false,
+                elsewhere,
+                false,
+                None,
+            ),
+            (
+                EnforcementTier::EnvironmentOnly,
+                ContainmentClass::Advisory,
+                false,
+                elsewhere,
+                false,
+                None,
+            ),
+            (
+                EnforcementTier::KernelFull,
+                ContainmentClass::Scoped,
+                true,
+                tmp.as_path(),
+                false,
+                None,
+            ),
+            (
+                EnforcementTier::KernelSeccompOnly,
+                ContainmentClass::Advisory,
+                true,
+                tmp.as_path(),
+                false,
+                None,
+            ),
+        ];
+        for (tier, declared, usable, workdir, mapped, mapped_by) in rows {
+            let applied = crate::sandbox::applied_tier(tier, declared);
+            let mapping = temp_mapping(applied, usable, workdir);
+            let report = temp_dir_report(mapping, &placement);
+            let row = format!(
+                "{tier:?} {declared:?} usable={usable} workdir={}",
+                workdir.display()
+            );
+            assert_eq!(report.path, folder, "{row}");
+            assert_eq!(report.tmp_mapped, mapped, "{row}");
+            assert_eq!(report.mapped_by, mapped_by, "{row}");
+            assert_eq!(report.tmpdir, if mapped { "/tmp" } else { folder }, "{row}");
+            assert_eq!(
+                report
+                    .not_mapped_because
+                    .as_deref()
+                    .is_some_and(|reason| !reason.is_empty()),
+                !mapped,
+                "{row}"
+            );
+
+            let scope = scope_report_for_tier(
+                &CapabilityPolicy::default(),
+                declared,
+                tier,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                &placement,
+                mapping,
+                IoMaxReport::default(),
+            );
+            assert_eq!(scope.temp_dir, report, "{row}");
+        }
+
+        let reason = |tier, usable, workdir| {
+            temp_dir_report(temp_mapping(tier, usable, workdir), &placement)
+                .not_mapped_because
+                .unwrap()
+        };
+        assert!(reason(EnforcementTier::EnvironmentOnly, false, elsewhere)
+            .starts_with("this host has no kernel containment for capsule commands"));
+        assert!(reason(EnforcementTier::KernelSeccompOnly, false, elsewhere)
+            .contains("neither a private mount namespace nor Landlock"));
+        assert!(reason(EnforcementTier::KernelFull, false, elsewhere)
+            .contains("a literal /tmp path is refused"));
+        assert!(reason(EnforcementTier::KernelFull, true, tmp.as_path())
+            .starts_with("the workdir is /tmp itself"));
+    }
+
+    /// The `Temporary folder` block: its shape mapped and not, its JSON keys, and its place after
+    /// the records directory in `--explain-scope`.
+    #[test]
+    fn the_temp_folder_block_renders_after_the_records_directory() {
+        use crate::temp_dir::{NotMappedReason, TempMapping};
+
+        let placement = RuntimeDirPlacement::outside_for_test();
+        let mapped = temp_dir_report(TempMapping::MountNamespace, &placement);
+        assert_eq!(
+            render_temp_dir(&mapped),
+            "Temporary folder\n  path:      /home/test/.murmur/records/work/<session-id>/tmp\n  \
+             TMPDIR:    /tmp\n  /tmp:      mapped (mount-namespace)\n"
+        );
+        let unmapped = temp_dir_report(
+            TempMapping::NotMapped(NotMappedReason::NoMountNamespace),
+            &placement,
+        );
+        assert_eq!(
+            render_temp_dir(&unmapped),
+            format!(
+                "Temporary folder\n  path:      {path}\n  TMPDIR:    {path}\n  /tmp:      not \
+                 mapped — {}\n",
+                NotMappedReason::NoMountNamespace.describe(),
+                path = "/home/test/.murmur/records/work/<session-id>/tmp"
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(&mapped).unwrap(),
+            serde_json::json!({
+                "path": "/home/test/.murmur/records/work/<session-id>/tmp",
+                "tmpdir": "/tmp",
+                "tmp_mapped": true,
+                "mapped_by": "mount-namespace",
+                "not_mapped_because": null,
+            })
+        );
+
+        let scope = scope_report_for_tier(
+            &CapabilityPolicy::default(),
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &placement,
+            TempMapping::MountNamespace,
+            IoMaxReport::default(),
+        );
+        let rendered = scope.render();
+        let records = rendered.find("Records directory\n").expect("records block");
+        let temp = rendered.find("Temporary folder\n").expect("temp block");
+        assert!(records < temp, "{rendered}");
+        assert!(rendered.contains(&render_temp_dir(&mapped)), "{rendered}");
+        assert!(serde_json::to_value(&scope)
+            .unwrap()
+            .get("temp_dir")
+            .is_some());
     }
 }

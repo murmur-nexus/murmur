@@ -254,9 +254,10 @@ fn assert_allowed(ran: &Ran, id: &str) -> Value {
     probe
 }
 
-/// A host directory outside every workdir, holding `secret.txt`.
+/// A host directory outside every workdir and outside the host's `/tmp`, which a mapped command
+/// does not see at all, holding `secret.txt`.
 fn outside_dir() -> TempDir {
-    let outside = TempDir::new().unwrap();
+    let outside = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     fs::write(outside.path().join("secret.txt"), "host secret\n").unwrap();
     outside
 }
