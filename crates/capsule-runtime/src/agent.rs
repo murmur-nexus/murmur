@@ -582,6 +582,10 @@ pub(crate) struct TaskThread {
     /// How the current attempt ended, recorded by the site that ended it; `None` until it does,
     /// and for an attempt that returned a `?`-propagated error. Cleared before each attempt.
     pub(crate) ending: Option<AttemptEnding>,
+    /// The provider's count of [`Self::messages`] as of the last `http` call that reported one,
+    /// or `None` when no call has since the list was last replaced. A continued attempt measures
+    /// its new message on top of it.
+    pub(crate) reported: Option<ReportedOccupancy>,
 }
 
 impl TaskThread {
@@ -898,15 +902,20 @@ pub(crate) async fn run_agent_loop(
     // taken by the next call's refresh: the model calls what it pulled on its very next turn.
     let mut agent_changed = false;
 
-    // Current context occupancy, not a running total: every turn assigns its own
-    // full-context input count before anything reads it. The initial value is what a seed
-    // commit recounts into, and is read by nothing else.
-    let mut session_tokens: u32 = 0;
+    // Current context occupancy, not a running total: every turn assigns its own after the
+    // response before anything reads it. The initial value is what a seed commit recounts into,
+    // and is read by nothing else.
+    let mut session_tokens = SessionOccupancy::estimate(0);
 
     // The task's own message list, worked on in place for the whole attempt: every way out of
     // this function leaves it as it stood, which is what a reopened attempt continues from.
-    let messages = &mut thread.messages;
-    let ending = &mut thread.ending;
+    // `reported` travels with it, so a continued attempt measures only what it adds.
+    let TaskThread {
+        messages,
+        ending,
+        reported,
+        ..
+    } = thread;
 
     match continuation {
         // A continued attempt continues the conversation its task already built — a rejected
@@ -924,7 +933,11 @@ pub(crate) async fn run_agent_loop(
             // starts from what the record already holds — including messages written by an
             // earlier session, with the ids those lines carry. `mur run --resume` loads on the
             // same terms whatever the capsule declared. Loaded messages are never appended again.
-            *messages = load_recorded_history(record.as_mut(), &mode, resume.is_some());
+            replace_context(
+                messages,
+                reported,
+                load_recorded_history(record.as_mut(), &mode, resume.is_some()),
+            );
 
             // `--resume-mode compact`: the same hook, the same commit site and the same record
             // rules the per-turn threshold trigger uses, reached from a second place — as the
@@ -936,9 +949,10 @@ pub(crate) async fn run_agent_loop(
             // Staging already refused a `compact` resume on a capsule with no hook bound to
             // `on-compaction`.
             if resume == Some(ResumeMode::Compact) && !messages.is_empty() {
-                session_tokens = occupancy.count(messages);
+                session_tokens = SessionOccupancy::estimate(occupancy.count(messages));
                 let compacted = try_compact_via_hooks(
                     messages,
+                    reported,
                     &mut session_tokens,
                     &occupancy,
                     store_state,
@@ -992,6 +1006,7 @@ pub(crate) async fn run_agent_loop(
                 apply_seed_context(
                     seed,
                     messages,
+                    reported,
                     &mut session_tokens,
                     &occupancy,
                     store_state,
@@ -1139,6 +1154,7 @@ pub(crate) async fn run_agent_loop(
             std::mem::take(&mut compaction_committed),
             std::mem::take(&mut agent_changed),
         );
+        let tools_refreshed = refresh.is_some();
         if let Some(refresh) = refresh {
             trace
                 .write_tools_refreshed(
@@ -1196,16 +1212,18 @@ pub(crate) async fn run_agent_loop(
             RuntimeError::AgentLoopFailed(format!("failed to encode driver payload: {e}"))
         })?;
 
-        // Token accounting is ALWAYS computed from the full logical `messages` array, never
-        // from the (possibly smaller) incremental wire payload — so the compaction-threshold
-        // check fires at the same point whether or not continuation is active. That is what
-        // `ContextOccupancy::count` guarantees; when no continuation is active it recomputes
-        // the payload `payload_json` already holds, byte for byte.
-        let input_tokens = occupancy.count(messages);
-        // Assign: `input_tokens` already counts the FULL current context,
-        // so `session_tokens` tracks live occupancy rather than lifetime throughput — the
-        // same notion `try_compact_via_hooks` resets it to after a replace-context commit.
-        session_tokens = input_tokens;
+        // The request's estimate always measures the full logical `messages` array, never the
+        // (possibly smaller) incremental wire payload, so it is the same whether or not a
+        // continuation is active. It anchors on the provider's last count of this context when
+        // that count still applies, and counts the whole payload otherwise. The one number feeds
+        // the spend admission, the trace, the `on-inference` hook and the span.
+        let input_tokens = request_estimate(
+            reported,
+            &occupancy,
+            messages,
+            &choice.name,
+            tools_refreshed,
+        );
 
         // The checkpoint before every inference request: a refusal latched since the last one —
         // by this turn's inventory read, a hook's log, an idle-time write — ends the attempt
@@ -1239,8 +1257,9 @@ pub(crate) async fn run_agent_loop(
             .clear_writing();
 
         // Admitted after the call is measured and before anything is sent. The guard is settled
-        // once the response's output is counted; every other way out of this turn drops it, which
-        // charges the input alone.
+        // once the response is parsed, with the provider's counts when it reported them; a
+        // failed call that reported them settles with them too. Every other way out of this turn
+        // drops it, which charges the input estimate alone.
         let admission = match store_state
             .spend
             .admit(u64::from(input_tokens), u64::from(max_output_tokens))
@@ -1382,6 +1401,9 @@ pub(crate) async fn run_agent_loop(
                 .as_deref()
                 .and_then(|data| serde_json::from_str::<Value>(data).ok())
                 .and_then(|response| parse_driver_usage(&response));
+            if let Some(counts) = usage.as_ref().and_then(provider_counts) {
+                admission.settle(counts.request, counts.completion);
+            }
             failed_call(cause, error_text.clone())
                 .write(trace, usage.as_ref(), message_ids)
                 .await;
@@ -1412,12 +1434,11 @@ pub(crate) async fn run_agent_loop(
         };
 
         let output_tokens = count_tokens(raw);
-        session_tokens = session_tokens.saturating_add(output_tokens);
-        admission.settle(u64::from(input_tokens), u64::from(output_tokens));
 
         let response: Value = match serde_json::from_str(raw) {
             Ok(response) => response,
             Err(e) => {
+                admission.settle(u64::from(input_tokens), u64::from(output_tokens));
                 let msg = format!("failed to parse driver response: {e}");
                 failed_call(
                     INFERENCE_ERROR_MALFORMED_RESPONSE,
@@ -1429,14 +1450,23 @@ pub(crate) async fn run_agent_loop(
             }
         };
 
-        // The provider's own counts, when the driver reported them. Recorded alongside the
-        // estimate, never in place of it and never fed back into `session_tokens`.
+        // The provider's own counts, when the driver reported them. The trace records them beside
+        // the estimate; a report that carries both `input_tokens` and `output_tokens` is what
+        // the spend meter is charged and what the compaction trigger compares.
         let driver_usage = parse_driver_usage(&response);
+        let counts = driver_usage.as_ref().and_then(provider_counts);
 
         let stop_reason = response
             .get("stop_reason")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        // A response that says the call failed is charged like any failed call: its report, or
+        // its input estimate alone.
+        match (counts, stop_reason == "error") {
+            (Some(counts), _) => admission.settle(counts.request, counts.completion),
+            (None, true) => drop(admission),
+            (None, false) => admission.settle(u64::from(input_tokens), u64::from(output_tokens)),
+        }
         // A capped turn reports `"text"` here: `decision` names what the loop does next, and a
         // capped turn ends the task the same way an `end_turn` does. `stop_reason`, recorded
         // verbatim beside it, is the field that says it was cut off.
@@ -1581,66 +1611,75 @@ pub(crate) async fn run_agent_loop(
             None => store_state.clear_continuation(),
         }
 
+        // Measured after the response, before the turn is processed: the provider's count of
+        // this request and its completion when it reported one, the estimate otherwise.
+        session_tokens = response_occupancy(
+            reported,
+            counts,
+            input_tokens,
+            output_tokens,
+            send_len,
+            &choice.name,
+        );
+
         // Check compaction after receiving response, before processing the turn, against the
         // window of the choice that served it.
         let context_window = run_config.context_window_for(&choice);
-        if context_window > 0 {
-            let ratio = session_tokens as f32 / context_window as f32;
-            if ratio >= run_config.compaction_threshold {
-                let compacted = try_compact_via_hooks(
-                    messages,
-                    &mut session_tokens,
-                    &occupancy,
-                    store_state,
-                    turn,
-                    context_window,
-                    workdir,
-                    &records_root,
+        if session_tokens.crosses(context_window, run_config.compaction_threshold) {
+            let compacted = try_compact_via_hooks(
+                messages,
+                reported,
+                &mut session_tokens,
+                &occupancy,
+                store_state,
+                turn,
+                context_window,
+                workdir,
+                &records_root,
+                hooks,
+                trace,
+                otel,
+                run_config.compaction_model.clone(),
+                run_config.compaction_system_prompt.clone(),
+                run_config.compaction_dump_summaries,
+                record.as_mut(),
+            )
+            .await;
+            if compacted == Ok(CompactionOutcome::Committed) {
+                compaction_committed = true;
+            }
+            // A declared compaction hook that returned `Err` ends the session the
+            // same way a driver inference error does — there is no fallback
+            // compactor behind it, so continuing would mean another turn on a
+            // context we already know is over budget. An `Err` that followed a refused
+            // `run-inference` call is the spend ceiling's stop, and ends as one.
+            if let Err(CompactionFailure::SpendRefused(refusal)) = &compacted {
+                return finish_spend_refused_turn(
                     hooks,
                     trace,
                     otel,
-                    run_config.compaction_model.clone(),
-                    run_config.compaction_system_prompt.clone(),
-                    run_config.compaction_dump_summaries,
-                    record.as_mut(),
+                    workdir,
+                    ending,
+                    turn_u32,
+                    refusal,
+                    RefusalLine::AlreadyWritten,
                 )
                 .await;
-                if compacted == Ok(CompactionOutcome::Committed) {
-                    compaction_committed = true;
-                }
-                // A declared compaction hook that returned `Err` ends the session the
-                // same way a driver inference error does — there is no fallback
-                // compactor behind it, so continuing would mean another turn on a
-                // context we already know is over budget. An `Err` that followed a refused
-                // `run-inference` call is the spend ceiling's stop, and ends as one.
-                if let Err(CompactionFailure::SpendRefused(refusal)) = &compacted {
-                    return finish_spend_refused_turn(
-                        hooks,
-                        trace,
-                        otel,
-                        workdir,
-                        ending,
-                        turn_u32,
-                        refusal,
-                        RefusalLine::AlreadyWritten,
-                    )
-                    .await;
-                }
-                if let Err(CompactionFailure::Hook(error)) = compacted {
-                    crate::runtime_err!("compaction failed: {error}");
-                    return finish_failed_turn(
-                        hooks,
-                        trace,
-                        otel,
-                        workdir,
-                        ending,
-                        turn_u32,
-                        TASK_FAILED_COMPACTION_HOOK,
-                        &error,
-                        SESSION_ENDED_STATUS_MESSAGE,
-                    )
-                    .await;
-                }
+            }
+            if let Err(CompactionFailure::Hook(error)) = compacted {
+                crate::runtime_err!("compaction failed: {error}");
+                return finish_failed_turn(
+                    hooks,
+                    trace,
+                    otel,
+                    workdir,
+                    ending,
+                    turn_u32,
+                    TASK_FAILED_COMPACTION_HOOK,
+                    &error,
+                    SESSION_ENDED_STATUS_MESSAGE,
+                )
+                .await;
             }
         }
 
@@ -2032,6 +2071,7 @@ pub(crate) async fn run_agent_loop(
                     })),
                     producer.as_ref(),
                 ));
+                ReportedOccupancy::advance(reported, counts);
                 messages.extend(tool_messages);
                 // The turn's whole contribution, in the order it entered the context: the
                 // assistant message that asked for the tools, then each tool result.
@@ -2045,6 +2085,8 @@ pub(crate) async fn run_agent_loop(
                     hooks,
                     record.as_mut(),
                     messages,
+                    reported,
+                    counts,
                     content,
                     workdir,
                     mode,
@@ -2075,6 +2117,8 @@ pub(crate) async fn run_agent_loop(
                     hooks,
                     record.as_mut(),
                     messages,
+                    reported,
+                    counts,
                     content,
                     workdir,
                     mode,
@@ -2490,6 +2534,8 @@ async fn finish_completed_turn(
     hooks: &mut HookRuntime,
     record: Option<&mut crate::conversation::ConversationRecord>,
     messages: &mut Vec<Value>,
+    reported: &mut Option<ReportedOccupancy>,
+    counts: Option<ProviderCounts>,
     content: Vec<Value>,
     workdir: &WorkdirRoot,
     mode: ConversationMode,
@@ -2534,6 +2580,7 @@ async fn finish_completed_turn(
     }
     append_to_record(record, std::slice::from_ref(&assistant));
     messages.push(assistant);
+    ReportedOccupancy::advance(reported, counts);
     // The assistant just recorded is known to the driver (it generated it), so advance the acked
     // length past it: the next request in this context — a same-context task under `threaded`,
     // or a reopened attempt continuing this task under either mode — then wires only the user
@@ -3159,11 +3206,11 @@ async fn record_compaction_declined(
     trace: &mut TraceWriter,
     records_root: &WorkdirRoot,
     turn: u32,
-    tokens: u32,
+    tokens: SessionOccupancy,
     reason: &str,
 ) {
     if let Err(e) = trace
-        .write_compaction_declined(turn, u64::from(tokens), reason)
+        .write_compaction_declined(turn, u64::from(tokens.tokens), tokens.basis, reason)
         .await
     {
         append_bootstrap_log(
@@ -3176,7 +3223,8 @@ async fn record_compaction_declined(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_compact_via_hooks(
     messages: &mut Vec<Value>,
-    session_tokens: &mut u32,
+    reported: &mut Option<ReportedOccupancy>,
+    session_tokens: &mut SessionOccupancy,
     occupancy: &ContextOccupancy<'_>,
     store_state: &mut CapsuleStoreState,
     turn: usize,
@@ -3194,12 +3242,12 @@ pub(crate) async fn try_compact_via_hooks(
     let wit_messages = to_wit_messages(messages);
 
     let tokens_before = *session_tokens;
-    let threshold = f64::from(tokens_before) / f64::from(context_window).max(1.0);
+    let threshold = f64::from(tokens_before.tokens) / f64::from(context_window).max(1.0);
 
     let dispatched = hooks
         .dispatch_compaction(
             wit_messages,
-            u64::from(*session_tokens),
+            u64::from(tokens_before.tokens),
             threshold,
             // `inference.compaction.model` / `.system_prompt` verbatim — `None` stays
             // `None`; picking a default is the receiving hook's job, not this dispatch
@@ -3263,26 +3311,28 @@ pub(crate) async fn try_compact_via_hooks(
     // summary message discards every cached prefix past the system block, so the next turn is
     // a full cache miss on everything the summary stands in for.
     //
-    // Recounted through the same `ContextOccupancy` the compaction trigger reads, so
-    // `tokens_before` and `tokens_after` on the `compaction` event are the same measurement
-    // taken twice — the reported drop is the saving the provider actually sees.
+    // `tokens_after` is always the estimate: no provider has counted a context that has not been
+    // sent yet. The first `inference` line after the commit carries the provider's count of it.
     // The summary joins the conversation, so it joins the record — beside, not instead of, the
     // messages it replaced. A message the hook handed back verbatim carries the id it was
     // written under and is not written a second time.
     append_to_record(record, &candidate_messages);
     commit_context_messages(
         messages,
+        reported,
         session_tokens,
         occupancy,
         store_state,
         candidate_messages,
     );
+    let tokens_after = session_tokens.tokens;
 
     if let Err(e) = trace
         .write_compaction(
             turn_u32,
-            u64::from(tokens_before),
-            u64::from(*session_tokens),
+            u64::from(tokens_before.tokens),
+            tokens_before.basis,
+            u64::from(tokens_after),
         )
         .await
     {
@@ -3291,7 +3341,7 @@ pub(crate) async fn try_compact_via_hooks(
             &format!("[compaction] trace write failed: {e}; continuing"),
         );
     }
-    otel.emit_compaction(u64::from(tokens_before), u64::from(*session_tokens))
+    otel.emit_compaction(u64::from(tokens_before.tokens), u64::from(tokens_after))
         .await;
     // Placed after the commit on purpose: both early returns above (no hook returned
     // replace-context, and the safety net rejecting a mismatched tool_call) leave without
@@ -3302,8 +3352,8 @@ pub(crate) async fn try_compact_via_hooks(
         dump_summaries,
         workdir,
         turn_u32,
-        tokens_before,
-        *session_tokens,
+        tokens_before.tokens,
+        tokens_after,
         messages,
     ) {
         append_bootstrap_log(
@@ -3313,9 +3363,7 @@ pub(crate) async fn try_compact_via_hooks(
     }
     append_bootstrap_log(
         records_root,
-        &format!(
-            "[compaction] hook compaction at turn {turn}; new session_tokens: {session_tokens}"
-        ),
+        &format!("[compaction] hook compaction at turn {turn}; new session_tokens: {tokens_after}"),
     );
     Ok(CompactionOutcome::Committed)
 }
@@ -3324,7 +3372,9 @@ pub(crate) async fn try_compact_via_hooks(
 ///
 /// Both universal replace-context rules fire here, together and unconditionally, so any hook
 /// output that produces a new context inherits them by routing through this function:
-///   (1) `session_tokens` is recomputed from the actual post-commit context; and
+///   (1) `session_tokens` is recomputed as the estimate of the post-commit context, and the
+///       provider's count of the old one in `reported` is dropped, so the next request is
+///       measured whole; and
 ///   (2) any held driver continuation id (and its bookkeeping) is dropped — the next turn is
 ///       a full resend of whatever `messages` now holds, never a tail of a list the driver no
 ///       longer has.
@@ -3332,14 +3382,25 @@ pub(crate) async fn try_compact_via_hooks(
 /// transcript it is still holding, which is the one shape neither side can detect.
 fn commit_context_messages(
     messages: &mut Vec<Value>,
-    session_tokens: &mut u32,
+    reported: &mut Option<ReportedOccupancy>,
+    session_tokens: &mut SessionOccupancy,
     occupancy: &ContextOccupancy<'_>,
     store_state: &mut CapsuleStoreState,
     new_messages: Vec<Value>,
 ) {
-    *messages = new_messages;
-    *session_tokens = occupancy.count(messages);
+    replace_context(messages, reported, new_messages);
+    *session_tokens = SessionOccupancy::estimate(occupancy.count(messages));
     store_state.clear_continuation();
+}
+
+/// Replace a task's message list, dropping the provider's count of the list it replaces.
+fn replace_context(
+    messages: &mut Vec<Value>,
+    reported: &mut Option<ReportedOccupancy>,
+    new_messages: Vec<Value>,
+) {
+    *messages = new_messages;
+    *reported = None;
 }
 
 /// What the runtime decided to do with a proposed seed, before any compaction has run.
@@ -3611,7 +3672,8 @@ async fn record_seed_rejection(
 pub(crate) async fn apply_seed_context(
     seed: HookSeed,
     messages: &mut Vec<Value>,
-    session_tokens: &mut u32,
+    reported: &mut Option<ReportedOccupancy>,
+    session_tokens: &mut SessionOccupancy,
     occupancy: &ContextOccupancy<'_>,
     store_state: &mut CapsuleStoreState,
     records_root: &WorkdirRoot,
@@ -3745,6 +3807,7 @@ pub(crate) async fn apply_seed_context(
     new_messages.extend(messages.iter().cloned());
     commit_context_messages(
         messages,
+        reported,
         session_tokens,
         occupancy,
         store_state,
@@ -3978,8 +4041,8 @@ pub(crate) fn extract_resource_id(metadata: &[(String, String)]) -> Option<Strin
 /// added. Otherwise the full `messages` array is embedded with no `continuation_id` key —
 /// byte-for-byte identical to the pre-continuation payload shape, so any driver that never
 /// returns the metadata key sees zero behavior change. Note this is the *wire* payload:
-/// `session_tokens` accounting is always computed from a full-messages payload by the caller,
-/// never from this (possibly smaller) one.
+/// occupancy accounting always measures the full message list, never this (possibly smaller)
+/// payload.
 ///
 /// `prompt_cache_key`, when `Some` and non-empty, is added as a reserved top-level field —
 /// never inside `params`, which drivers copy verbatim into the provider body and where an
@@ -4112,14 +4175,12 @@ fn message_tokens(message: &Value) -> u64 {
 /// understates it by the system prompt and the tool inventory, which are resent on every
 /// request and are the largest launch-invariant part of the prefix.
 ///
-/// Every site that needs an occupancy number goes through [`ContextOccupancy::count`], so the
-/// compaction trigger and the post-commit recount cannot drift apart: a `tokens_before` and a
-/// `tokens_after` produced by different definitions report a saving that was never made.
-///
 /// This is an estimate — an OpenAI tokenizer over a JSON string, for whatever model the
-/// session runs — and it is deliberately the only number that steers the loop, because the
-/// decision it feeds is made before the request is sent. The provider's own counts arrive
-/// afterwards and are recorded, not acted on (see [`DriverUsage`]).
+/// session runs — and it can miss the provider's count in either direction: the JSON keys push
+/// it up, a provider that adds its own tool and system framing counts more than it sees. Do not
+/// treat it as an upper bound. It measures a request no provider has counted: a task's
+/// first, the one after a commit, and every request of a driver that reports nothing. Once a
+/// call reports [`ProviderCounts`], [`request_estimate`] measures from that count instead.
 pub(crate) struct ContextOccupancy<'a> {
     pub(crate) model: &'a str,
     pub(crate) max_output_tokens: u32,
@@ -4153,8 +4214,8 @@ impl ContextOccupancy<'_> {
 
 /// The provider's own token counts for one completion, as reported by the driver.
 ///
-/// Recorded into the trace and the OTel span and nothing else: no member of this ever reaches
-/// `session_tokens`, the compaction ratio, or any other decision the loop makes. Every member
+/// Recorded into the trace and the OTel span. A record that makes [`ProviderCounts`] is also
+/// what the compaction trigger compares and what the spend meter is charged. Every member
 /// is independently optional because a driver reports whatever its provider gave it — a
 /// provider with no prompt cache reports no cache members, and that is not an error.
 ///
@@ -4200,6 +4261,166 @@ pub(crate) fn parse_driver_usage(response: &Value) -> Option<DriverUsage> {
         thinking_tokens: member("thinking_tokens"),
     };
     (parsed != DriverUsage::default()).then_some(parsed)
+}
+
+/// The provider's count of one call, in the two numbers the runtime acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderCounts {
+    /// Everything the request put in front of the model: `input_tokens + cached_tokens +
+    /// cache_write_tokens`.
+    pub(crate) request: u64,
+    /// `output_tokens`, the completion the call generated.
+    pub(crate) completion: u64,
+}
+
+/// The provider's counts in `usage`, or `None` when they are no report.
+///
+/// A report needs both `input_tokens` and `output_tokens`. The cache members sit beside
+/// `input_tokens`, never inside it, so each is added once, and an absent one counts as `0`.
+/// `thinking_tokens` is a subset of `output_tokens` and is never added. The compaction trigger
+/// and the spend settle both read a call's numbers through this function.
+pub(crate) fn provider_counts(usage: &DriverUsage) -> Option<ProviderCounts> {
+    let input = usage.input_tokens?;
+    let completion = usage.output_tokens?;
+    let request = input
+        .saturating_add(usage.cached_tokens.unwrap_or(0))
+        .saturating_add(usage.cache_write_tokens.unwrap_or(0));
+    Some(ProviderCounts {
+        request,
+        completion,
+    })
+}
+
+/// Which kind of number a context occupancy is. Written on the `compaction` and
+/// `compaction_declined` trace lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OccupancyBasis {
+    /// The provider's own count of the request and its completion.
+    Actual,
+    /// The runtime's cl100k estimate.
+    Estimate,
+}
+
+/// A context occupancy, with the kind of number it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionOccupancy {
+    pub(crate) tokens: u32,
+    pub(crate) basis: OccupancyBasis,
+}
+
+impl SessionOccupancy {
+    pub(crate) fn estimate(tokens: u32) -> Self {
+        Self {
+            tokens,
+            basis: OccupancyBasis::Estimate,
+        }
+    }
+
+    /// Whether this occupancy reaches `threshold` of `context_window`. A window of `0` is no
+    /// window, and never crosses.
+    pub(crate) fn crosses(self, context_window: u32, threshold: f32) -> bool {
+        context_window > 0 && self.tokens as f32 / context_window as f32 >= threshold
+    }
+}
+
+/// The provider's count of a task's context, as of the last call that reported one.
+///
+/// Held on [`TaskThread::reported`]. `tokens` counts `messages[..covered]` as the provider saw
+/// them under the driver choice `choice`, so the next request is measured as `tokens` plus the
+/// messages added since, and the whole payload is not counted again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReportedOccupancy {
+    pub(crate) tokens: u32,
+    /// How many leading messages of [`TaskThread::messages`] `tokens` covers.
+    pub(crate) covered: usize,
+    /// The name of the driver choice whose call reported `tokens`.
+    pub(crate) choice: String,
+}
+
+impl ReportedOccupancy {
+    /// Whether this count can anchor the next request under `choice`: the same choice reported
+    /// it, and `messages` still holds every message it covers.
+    fn applies(&self, messages: &[Value], choice: &str) -> bool {
+        self.choice == choice && messages.len() >= self.covered
+    }
+
+    /// Count the assistant message the reporting call produced, as it is appended right after
+    /// the covered messages.
+    pub(crate) fn advance(reported: &mut Option<Self>, counts: Option<ProviderCounts>) {
+        if let (Some(reported), Some(counts)) = (reported.as_mut(), counts) {
+            reported.tokens = reported
+                .tokens
+                .saturating_add(saturating_u32(counts.completion));
+            reported.covered += 1;
+        }
+    }
+}
+
+/// The pre-send estimate of the request carrying `messages` under `choice`.
+///
+/// With a report that applies, this is the reported count plus the per-message count of every
+/// message added after it. Otherwise it is [`ContextOccupancy::count`], the whole payload. A call
+/// whose tool array changed (`tools_refreshed`) sends a prefix no report covered, so the report
+/// is dropped first.
+pub(crate) fn request_estimate(
+    reported: &mut Option<ReportedOccupancy>,
+    occupancy: &ContextOccupancy<'_>,
+    messages: &[Value],
+    choice: &str,
+    tools_refreshed: bool,
+) -> u32 {
+    if tools_refreshed {
+        *reported = None;
+    }
+    match reported
+        .as_ref()
+        .filter(|reported| reported.applies(messages, choice))
+    {
+        Some(reported) => {
+            let added = messages[reported.covered..]
+                .iter()
+                .map(message_tokens)
+                .fold(0, u64::saturating_add);
+            reported.tokens.saturating_add(saturating_u32(added))
+        }
+        None => occupancy.count(messages),
+    }
+}
+
+/// The occupancy the compaction trigger compares after a response, recording the provider's
+/// count of the request in `reported` when the response carried one.
+///
+/// A reporting response is measured as `request + completion`, basis `actual`, and anchors the
+/// next request at `covered = send_len`. One that reports nothing is measured as the request's
+/// estimate plus `raw_tokens`, basis `estimate`, and leaves `reported` as it stood.
+pub(crate) fn response_occupancy(
+    reported: &mut Option<ReportedOccupancy>,
+    counts: Option<ProviderCounts>,
+    request_estimate: u32,
+    raw_tokens: u32,
+    send_len: usize,
+    choice: &str,
+) -> SessionOccupancy {
+    match counts {
+        Some(counts) => {
+            let request = saturating_u32(counts.request);
+            *reported = Some(ReportedOccupancy {
+                tokens: request,
+                covered: send_len,
+                choice: choice.to_string(),
+            });
+            SessionOccupancy {
+                tokens: request.saturating_add(saturating_u32(counts.completion)),
+                basis: OccupancyBasis::Actual,
+            }
+        }
+        None => SessionOccupancy::estimate(request_estimate.saturating_add(raw_tokens)),
+    }
+}
+
+fn saturating_u32(tokens: u64) -> u32 {
+    u32::try_from(tokens).unwrap_or(u32::MAX)
 }
 
 /// Untrusted-content notice. Prompt injection has no complete structural fix, and a
@@ -6421,118 +6642,6 @@ mod tests {
         assert_eq!(msgs[0]["content"], json!([{"type": "text", "text": "ok"}]));
     }
 
-    /// Mirrors `run_agent_loop`'s per-turn token accounting and compaction trigger:
-    /// `session_tokens` is ASSIGNED this turn's full-context `input_tokens`, this turn's
-    /// response is then added on top, and the ratio is compared against the threshold
-    /// (only when `context_window > 0`). Returns the 0-based index of the first turn that
-    /// trips the trigger, or `None` if it never does.
-    ///
-    /// The loop's accounting is three inline statements inside an `async fn` that needs a
-    /// live wasm driver, `CapsuleStoreState`, `HookRuntime`, `TraceWriter` and
-    /// `OtelEmitter` to reach, so the sequence is mirrored here rather than extracted.
-    fn first_compacting_turn(
-        turns: &[(u32, u32)],
-        context_window: u32,
-        compaction_threshold: f32,
-    ) -> Option<usize> {
-        // No initial value, exactly as in `run_agent_loop`: each turn assigns its own.
-        let mut session_tokens: u32;
-        for (turn, (input_tokens, output_tokens)) in turns.iter().enumerate() {
-            session_tokens = *input_tokens;
-            session_tokens = session_tokens.saturating_add(*output_tokens);
-            if context_window > 0 {
-                let ratio = session_tokens as f32 / context_window as f32;
-                if ratio >= compaction_threshold {
-                    return Some(turn);
-                }
-            }
-        }
-        None
-    }
-
-    /// The pre-fix accounting, kept so the tests below can show they discriminate between
-    /// the two: `input_tokens` was ACCUMULATED onto the running total every turn, so
-    /// `session_tokens` grew with `turns * context_size` instead of tracking occupancy.
-    fn first_compacting_turn_pre_fix(
-        turns: &[(u32, u32)],
-        context_window: u32,
-        compaction_threshold: f32,
-    ) -> Option<usize> {
-        let mut session_tokens: u32 = 0;
-        for (turn, (input_tokens, output_tokens)) in turns.iter().enumerate() {
-            session_tokens = session_tokens.saturating_add(*input_tokens);
-            session_tokens = session_tokens.saturating_add(*output_tokens);
-            if context_window > 0 {
-                let ratio = session_tokens as f32 / context_window as f32;
-                if ratio >= compaction_threshold {
-                    return Some(turn);
-                }
-            }
-        }
-        None
-    }
-
-    /// A long run whose live context stays far below the threshold must never compact, however
-    /// large the cumulative token throughput grows. Compacting on the cumulative figure fires
-    /// mid-run while each turn's context is a fraction of the window.
-    #[test]
-    fn stable_per_turn_context_never_triggers_compaction() {
-        let context_window = 1_000_000;
-        let threshold = 0.85;
-        let turns: Vec<(u32, u32)> = (0..20).map(|_| (80_000, 2_000)).collect();
-
-        assert_eq!(
-            first_compacting_turn(&turns, context_window, threshold),
-            None,
-            "live context is ~82k of a 1M window (~8%) every turn; compaction must not fire"
-        );
-
-        // Cumulative throughput across these same turns is 20 * 82_000 = 1_640_000 tokens,
-        // far past 0.85 * 1_000_000 — which is exactly what the pre-fix accounting tripped on.
-        assert_eq!(
-            first_compacting_turn_pre_fix(&turns, context_window, threshold),
-            Some(10),
-            "pre-fix accounting fired on cumulative throughput at turn 11 (0-based 10)"
-        );
-    }
-
-    /// A run whose live context genuinely fills must still compact — on exactly the turn
-    /// whose own `input_tokens + output_tokens` crosses `threshold * context_window`,
-    /// neither earlier (from unrelated prior turns) nor later.
-    #[test]
-    fn genuinely_growing_context_triggers_compaction_on_the_crossing_turn() {
-        let context_window = 1_000_000;
-        let threshold = 0.85;
-        // Turn n carries 50_000 * (n + 1) input tokens plus a 5_000-token response, so the
-        // first turn at or above 850_000 is turn 16 (0-based): 850_000 + 5_000.
-        let turns: Vec<(u32, u32)> = (0..20).map(|n| (50_000 * (n + 1), 5_000)).collect();
-
-        assert_eq!(turns[15], (800_000, 5_000), "turn 16 (0-based 15) is under");
-        assert_eq!(turns[16], (850_000, 5_000), "turn 17 (0-based 16) crosses");
-        assert_eq!(
-            first_compacting_turn(&turns, context_window, threshold),
-            Some(16),
-            "compaction must fire on the turn whose own context crosses the threshold"
-        );
-
-        // ...and a run that grows but stops short of the threshold still must not compact.
-        let short: Vec<(u32, u32)> = (0..16).map(|n| (50_000 * (n + 1), 5_000)).collect();
-        assert_eq!(
-            first_compacting_turn(&short, context_window, threshold),
-            None,
-            "peak live context 805_000 < 850_000; compaction must not fire"
-        );
-    }
-
-    /// Compaction is disabled when the choice has no context window (neither
-    /// `context.max_tokens` nor its driver's `models:` entry gives one), regardless of token
-    /// counts.
-    #[test]
-    fn zero_context_window_never_triggers_compaction() {
-        let turns: Vec<(u32, u32)> = (0..20).map(|_| (900_000, 90_000)).collect();
-        assert_eq!(first_compacting_turn(&turns, 0, 0.85), None);
-    }
-
     // ── inference.compaction.dump_summaries: out/compaction-summaries.jsonl ─────────
 
     /// The dumped summary is the hook's own string byte-for-byte: what the hook encoded with
@@ -6847,6 +6956,338 @@ mod tests {
             tools.len(),
             occupancy.count(&[])
         );
+    }
+
+    // ── Occupancy: the provider's count and the request estimate ────────────────────
+
+    fn usage(
+        input: Option<u64>,
+        output: Option<u64>,
+        cached: Option<u64>,
+        cache_write: Option<u64>,
+        thinking: Option<u64>,
+    ) -> DriverUsage {
+        DriverUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: cached,
+            cache_write_tokens: cache_write,
+            thinking_tokens: thinking,
+        }
+    }
+
+    /// The cache members sit beside `input_tokens`, so the request is the three summed, each
+    /// once.
+    #[test]
+    fn provider_counts_sum_each_cache_member_once() {
+        let counts = provider_counts(&usage(Some(12043), Some(218), Some(11780), Some(7), None));
+        assert_eq!(
+            counts,
+            Some(ProviderCounts {
+                request: 12043 + 11780 + 7,
+                completion: 218,
+            })
+        );
+    }
+
+    #[test]
+    fn provider_counts_count_an_absent_cache_member_as_zero() {
+        let request = |cached, cache_write| {
+            provider_counts(&usage(Some(100), Some(9), cached, cache_write, None))
+                .map(|counts| counts.request)
+        };
+        assert_eq!(request(None, None), Some(100));
+        assert_eq!(request(Some(40), None), Some(140));
+        assert_eq!(request(None, Some(5)), Some(105));
+    }
+
+    /// A `usage` missing either required member is no report, whatever else it carries.
+    #[test]
+    fn provider_counts_need_both_input_and_output() {
+        assert_eq!(
+            provider_counts(&usage(Some(100), None, Some(40), Some(5), None)),
+            None
+        );
+        assert_eq!(
+            provider_counts(&usage(None, Some(9), Some(40), Some(5), None)),
+            None
+        );
+        let input_only = parse_driver_usage(&json!({"usage": {"input_tokens": 100}}))
+            .expect("one valid member is still a usage block");
+        assert_eq!(provider_counts(&input_only), None);
+    }
+
+    /// `thinking_tokens` is part of `output_tokens` already.
+    #[test]
+    fn provider_counts_never_add_thinking() {
+        let counts = provider_counts(&usage(Some(100), Some(60), None, None, Some(50)));
+        assert_eq!(
+            counts,
+            Some(ProviderCounts {
+                request: 100,
+                completion: 60,
+            })
+        );
+    }
+
+    const CHOICE: &str = "primary";
+
+    fn report(tokens: u32, covered: usize) -> Option<ReportedOccupancy> {
+        Some(ReportedOccupancy {
+            tokens,
+            covered,
+            choice: CHOICE.to_string(),
+        })
+    }
+
+    fn tool_result(text: &str) -> Value {
+        with_new_id(json!({
+            "role": "tool",
+            "tool_call_id": "c1",
+            "is_error": false,
+            "content": [{"type": "text", "text": text}],
+        }))
+    }
+
+    fn tokens_of(message: &Value) -> u32 {
+        u32::try_from(message_tokens(message)).unwrap()
+    }
+
+    /// With a report that applies, the request is the reported count plus each message added
+    /// after it, measured on its own and without the runtime's identity keys.
+    #[test]
+    fn occupancy_estimate_is_the_report_plus_the_messages_added_after_it() {
+        let occupancy = occupancy_fixture(&[], "sys");
+        let mut messages = occupancy_messages();
+        let mut reported = report(500, messages.len());
+
+        assert_eq!(
+            request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+            500,
+            "nothing added since the report"
+        );
+
+        messages.push(tool_result("a tool result the provider has not counted"));
+        let added = tokens_of(&messages[2]);
+        assert!(added > 0);
+        assert_eq!(
+            request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+            500 + added
+        );
+        let mut without_id = messages[2].clone();
+        without_id.as_object_mut().unwrap().remove(MESSAGE_ID_KEY);
+        assert_eq!(
+            added,
+            tokens_of(&without_id),
+            "the message id never reaches the count"
+        );
+    }
+
+    #[test]
+    fn occupancy_without_a_report_is_the_whole_payload() {
+        let occupancy = occupancy_fixture(&[], "sys");
+        let messages = occupancy_messages();
+        assert_eq!(
+            request_estimate(&mut None, &occupancy, &messages, CHOICE, false),
+            occupancy.count(&messages)
+        );
+    }
+
+    /// A reporting response is measured as the provider counted it, and anchors the next
+    /// request on the messages it was sent.
+    #[test]
+    fn occupancy_of_a_reporting_response_is_request_plus_completion() {
+        let mut reported = None;
+        let counts = provider_counts(&usage(Some(900), Some(40), Some(100), None, Some(30)));
+
+        let measured = response_occupancy(&mut reported, counts, 5000, 70, 3, CHOICE);
+
+        assert_eq!(
+            measured,
+            SessionOccupancy {
+                tokens: 1040,
+                basis: OccupancyBasis::Actual,
+            }
+        );
+        assert_eq!(reported, report(1000, 3));
+    }
+
+    /// A response that reports nothing is the estimate of its request plus its raw response,
+    /// and leaves an earlier report standing.
+    #[test]
+    fn occupancy_of_a_silent_response_is_the_estimate_and_keeps_the_report() {
+        let mut reported = report(1000, 3);
+
+        let measured = response_occupancy(&mut reported, None, 1200, 70, 5, CHOICE);
+
+        assert_eq!(measured, SessionOccupancy::estimate(1270));
+        assert_eq!(reported, report(1000, 3));
+    }
+
+    /// The assistant message a reporting call produced is counted by its completion, so only
+    /// the tool results after it are estimated.
+    #[test]
+    fn occupancy_advances_on_the_assistant_push() {
+        let occupancy = occupancy_fixture(&[], "sys");
+        let mut messages = occupancy_messages();
+        let mut reported = None;
+        let counts = provider_counts(&usage(Some(800), Some(25), None, None, None));
+        response_occupancy(&mut reported, counts, 0, 0, messages.len(), CHOICE);
+
+        messages.push(with_new_id(json!({
+            "role": "assistant",
+            "content": [{"type": "tool_call", "id": "c1", "name": "bash", "input": {}}],
+        })));
+        ReportedOccupancy::advance(&mut reported, counts);
+        assert_eq!(reported, report(825, 3));
+
+        messages.push(tool_result("hello"));
+        assert_eq!(
+            request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+            825 + tokens_of(&messages[3])
+        );
+
+        // An assistant message from a call that reported nothing is a new message, estimated.
+        ReportedOccupancy::advance(&mut reported, None);
+        assert_eq!(reported, report(825, 3));
+    }
+
+    /// A continued attempt keeps the report, so a reopen's feedback and a member-answers
+    /// message are each measured on top of it.
+    #[test]
+    fn occupancy_counts_a_reopen_and_member_answers_after_the_report() {
+        let occupancy = occupancy_fixture(&[], "sys");
+        let mut messages = occupancy_messages();
+        let mut reported = report(640, messages.len());
+
+        for continuation in [
+            Continuation::ReopenFeedback("the answer missed the second file".to_string()),
+            Continuation::Outcomes("member reviewer answered: looks right".to_string()),
+        ] {
+            let before = request_estimate(&mut reported, &occupancy, &messages, CHOICE, false);
+            let message = user_message(continuation.into_payload(None));
+            let added = tokens_of(&message);
+            messages.push(message);
+            assert_eq!(
+                request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+                before + added
+            );
+        }
+        assert_eq!(
+            request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+            640 + tokens_of(&messages[2]) + tokens_of(&messages[3])
+        );
+    }
+
+    /// A call whose tool array changed sends a prefix no report covered.
+    #[test]
+    fn occupancy_report_is_dropped_by_a_refresh() {
+        let occupancy = occupancy_fixture(&[], "sys");
+        let messages = occupancy_messages();
+        let mut reported = report(10, messages.len());
+
+        assert_eq!(
+            request_estimate(&mut reported, &occupancy, &messages, CHOICE, true),
+            occupancy.count(&messages)
+        );
+        assert_eq!(reported, None);
+    }
+
+    /// A fresh attempt replaces the list it loads, so its first request is measured whole.
+    #[test]
+    fn occupancy_report_is_dropped_by_a_fresh_context() {
+        let occupancy = occupancy_fixture(&[], "sys");
+        let mut messages = occupancy_messages();
+        let mut reported = report(10, messages.len());
+
+        replace_context(
+            &mut messages,
+            &mut reported,
+            occupancy_messages()[..1].to_vec(),
+        );
+
+        assert_eq!(reported, None);
+        assert_eq!(
+            request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+            occupancy.count(&messages)
+        );
+    }
+
+    /// A commit drops the report and recounts the committed context as an estimate.
+    #[test]
+    fn occupancy_report_is_dropped_by_a_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = crate::runtime::build_test_state(
+            Arc::new(murmur_artifact::LocalRegistry::new(
+                dir.path().join("registry"),
+            )),
+            dir.path().to_path_buf(),
+            dir.path().join("murmur.lock"),
+        );
+        let occupancy = occupancy_fixture(&[], "sys");
+        let mut messages = occupancy_messages();
+        let mut reported = report(9000, messages.len());
+        let mut session_tokens = SessionOccupancy {
+            tokens: 9040,
+            basis: OccupancyBasis::Actual,
+        };
+        let summary = json!({"role": "user", "content": [{"type": "text", "text": "summary"}]});
+
+        commit_context_messages(
+            &mut messages,
+            &mut reported,
+            &mut session_tokens,
+            &occupancy,
+            &mut state,
+            vec![summary],
+        );
+
+        assert_eq!(reported, None);
+        assert_eq!(
+            session_tokens,
+            SessionOccupancy::estimate(occupancy.count(&messages))
+        );
+    }
+
+    /// A report is ignored, not dropped, under another choice, and ignored when the list no
+    /// longer holds every message it covers.
+    #[test]
+    fn occupancy_report_is_ignored_under_another_choice_or_a_shorter_list() {
+        let occupancy = occupancy_fixture(&[], "sys");
+        let messages = occupancy_messages();
+        let whole = occupancy.count(&messages);
+
+        let mut reported = report(10, messages.len());
+        assert_eq!(
+            request_estimate(&mut reported, &occupancy, &messages, "gpt", false),
+            whole
+        );
+        assert_eq!(reported, report(10, messages.len()));
+        assert_eq!(
+            request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+            10,
+            "switching back finds it"
+        );
+
+        let mut reported = report(10, messages.len() + 1);
+        assert_eq!(
+            request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+            whole
+        );
+    }
+
+    /// The trigger's test is `>=` against `threshold × context_window`, whatever the basis, and a
+    /// choice with no window never compacts.
+    #[test]
+    fn occupancy_crosses_at_the_threshold_and_never_without_a_window() {
+        let actual = |tokens| SessionOccupancy {
+            tokens,
+            basis: OccupancyBasis::Actual,
+        };
+        assert!(actual(850).crosses(1000, 0.85));
+        assert!(!actual(849).crosses(1000, 0.85));
+        assert!(SessionOccupancy::estimate(850).crosses(1000, 0.85));
+        assert!(!actual(u32::MAX).crosses(0, 0.85));
     }
 }
 

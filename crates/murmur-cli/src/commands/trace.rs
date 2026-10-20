@@ -5503,6 +5503,25 @@ mod tests {
         }
     }
 
+    /// `compaction` carries `tokens_before_source` and `compaction_declined` carries
+    /// `tokens_source`. Neither event struct declares them, so `mur trace show` reads both
+    /// unchanged.
+    #[test]
+    fn compaction_records_with_a_token_source_still_parse() {
+        let compaction = r#"{"event_type":"compaction","session_id":"s","timestamp":1,"turn":3,"tokens_before":620,"tokens_before_source":"actual","tokens_after":180}"#;
+        match serde_json::from_str::<TraceEvent>(compaction).expect("unknown keys are ignored") {
+            TraceEvent::Compaction(e) => {
+                assert_eq!((e.turn, e.tokens_before, e.tokens_after), (3, 620, 180))
+            }
+            other => panic!("expected a compaction event, got {other:?}"),
+        }
+        let declined = r#"{"event_type":"compaction_declined","session_id":"s","timestamp":1,"turn":2,"tokens":4321,"tokens_source":"estimate","reason":"no_hook_replacement"}"#;
+        match serde_json::from_str::<TraceEvent>(declined).expect("unknown keys are ignored") {
+            TraceEvent::CompactionDeclined(e) => assert_eq!(e.tokens, 4321),
+            other => panic!("expected a compaction_declined event, got {other:?}"),
+        }
+    }
+
     const UNENDED_START: &str = r#"{"event_type":"session_start","session_id":"ses_child","timestamp":1791000000000,"capsule_name":"worker","capsule_version":"0.1.0","model":"m","max_turns":5}"#;
     const UNENDED_TASK: &str = r#"{"event_type":"task_start","event_id":"evt_1","session_id":"ses_child","timestamp":1791000001000,"task_id":"tsk_1","context_id":"ctx_1","source":"a2a","message_parts_bytes":9}"#;
     const UNENDED_TURN: &str = r#"{"event_type":"inference","event_id":"evt_2","session_id":"ses_child","timestamp":1791000004500,"turn":0,"task_id":"tsk_1","input_tokens":10,"output_tokens":5,"decision":"end_turn","stop_reason":"end_turn","tool_name":null}"#;

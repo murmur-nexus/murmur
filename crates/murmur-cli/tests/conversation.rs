@@ -88,7 +88,8 @@ fn assert_dir_mode(path: &Path, expected: u32) {
     );
 }
 
-/// One Anthropic response that ends the turn.
+/// One Anthropic response that ends the turn. The responses here report no `usage`, so the
+/// runtime's estimate is what crosses a small `context.max_tokens` and fires compaction.
 fn end_turn(text: &str) -> String {
     json!({
         "id": "msg_1",
@@ -97,8 +98,7 @@ fn end_turn(text: &str) -> String {
         "model": "test-model",
         "content": [{"type": "text", "text": text}],
         "stop_reason": "end_turn",
-        "stop_sequence": Value::Null,
-        "usage": {"input_tokens": 10, "output_tokens": 5}
+        "stop_sequence": Value::Null
     })
     .to_string()
 }
@@ -898,8 +898,7 @@ fn tool_call_named(call_id: &str, name: &str) -> String {
             "input": {"command": "echo hello"}
         }],
         "stop_reason": "tool_use",
-        "stop_sequence": Value::Null,
-        "usage": {"input_tokens": 10, "output_tokens": 5}
+        "stop_sequence": Value::Null
     })
     .to_string()
 }

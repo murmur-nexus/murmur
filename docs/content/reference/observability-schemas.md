@@ -99,8 +99,8 @@ before the first task begins
 |---|---|---|
 | `turn` | u32 | Zero-based turn index, counted across every attempt of the task: a task an `on-task-end` hook reopened, or that continued with the outcomes of handed-off work, carries on from its last turn. Starts again at 0 for each task. A hook's `run-inference` record carries the number of the turn it ran inside |
 | `task_id` | string \| null | The task this turn belongs to. `null` when no task is in scope |
-| `input_tokens` | u64 | What this turn's input cost, and the number the task and session totals accumulate. Under `transport: http` the runtime's own tiktoken (`cl100k_base`) estimate of the request, counted before it was sent, and the number the compaction threshold runs on; under `transport: process` the count the harness reported and its driver relayed. Absent when nothing counted the turn: a process driver reporting no usage, or a [failed call](#inference-failed) that is not counted — never the same fact as `0` |
-| `output_tokens` | u64 | What this turn's output cost, on the same terms as `input_tokens` |
+| `input_tokens` | u64 | What this turn's input cost, and the number the task and session totals accumulate. Under `transport: http` the runtime's pre-send estimate of the request, the number its spend reservation was made on: the provider's count from the last call in the task that reported one, plus the tiktoken (`cl100k_base`) count of each message added since, or the tiktoken count of the whole request when no reported count applies. Under `transport: process` the count the harness reported and its driver relayed. Absent when nothing counted the turn: a process driver reporting no usage, or a [failed call](#inference-failed) that is not counted — never the same fact as `0` |
+| `output_tokens` | u64 | What this turn's output cost. Under `transport: http` the tiktoken count of the raw driver response; under `transport: process` the harness's count |
 | `decision` | string | `"tool_call"` \| `"end_turn"` \| `"text"` \| `"error"` — what the loop does next. A turn the provider cut off at the output cap reads `"text"`; `stop_reason` beside it is the field that says it was cut off. `"error"` is a [failed call](#inference-failed) |
 | `stop_reason` | string | The provider's own stop reason, verbatim as the loop dispatched on it — `"max_tokens"` for a turn stopped at [`inference.max_tokens`](manifest.md#inference-max-tokens). Written on every agent-loop turn, and as `""` when the driver reported none. `"error"` on every failed call, on both transports and for a hook's `run-inference`. Absent on any other record no driver response was parsed for: a hook's successful `run-inference` and a `process` turn that ended |
 | `tool_name` | string \| null | The tool the response asked for; `null` when it asked for none |
@@ -130,7 +130,7 @@ of measurements:
 
 | Transport | `input_tokens` / `output_tokens` | `*_actual` | `cached_tokens`, `cache_write_tokens`, `thinking_tokens` |
 |---|---|---|---|
-| `http` | The runtime's own estimate, always present | The provider's own counts, beside the estimate so drift is a subtraction on one line | Present when the driver reported them |
+| `http` | The runtime's own estimate, always present | The provider's own counts, beside the estimate so drift is a subtraction on one line. With both present, they are what the compaction trigger compares and what the spend meter charged | Present when the driver reported them |
 | `process` | The harness's own reported counts, absent when its driver reports none | Always absent: there is one count on this transport and it is recorded once | Present when the driver reported them |
 
 #### Failed calls { #inference-failed }
@@ -466,13 +466,14 @@ nothing to report about it.
 |---|---|---|
 | `turn` | u32 | |
 | `task_id` | string \| null | The task this compaction belongs to. `null` when no task is in scope |
-| `tokens_before` | u64 | Context occupancy before the replacement |
-| `tokens_after` | u64 | Context occupancy after it |
+| `tokens_before` | u64 | Context occupancy the trigger compared against the threshold |
+| `tokens_before_source` | string | Which number `tokens_before` is. Always written |
+| `tokens_after` | u64 | The runtime's estimate of the committed context: the tiktoken count of the whole serialized driver payload, system prompt, tool inventory and `messages` array. Always the estimate; the next `inference` line carries the provider's first count of it |
 
-Both are the same measurement: occupancy is the tiktoken count of the whole serialized driver
-payload — system prompt, tool inventory and the complete `messages` array — because that is what
-consumes the provider's context window. `tokens_before` is the same number the turn's
-`input_tokens` carries.
+| `tokens_before_source` | `tokens_before` |
+|---|---|
+| `"actual"` | The provider's count of the turn's call: `input_tokens_actual + cached_tokens + cache_write_tokens + output_tokens_actual`, an absent cache member counted as `0`. Written when that call reported both `*_actual` members |
+| `"estimate"` | The turn's `input_tokens + output_tokens`. Written when the call reported no usable count, and always for [`mur run --resume-mode compact`](cli.md#mur-run), which compacts a loaded context no call has counted |
 
 **`compaction_declined`** — written when the compaction threshold is crossed and the context is
 left as it was
@@ -482,6 +483,7 @@ left as it was
 | `turn` | u32 | The turn that crossed the threshold |
 | `task_id` | string \| null | The task this turn belongs to. `null` when no task is in scope |
 | `tokens` | u64 | Context occupancy at the moment of the decline — the same measurement `compaction` records as `tokens_before`, and the budget the session went on running over |
+| `tokens_source` | string | `"actual"` \| `"estimate"`: which number `tokens` is, on the terms of `compaction`'s `tokens_before_source`. Always written |
 | `reason` | string | `"no_hook_replacement"` when no bound hook returned `replace-context`; `"unresolved_tool_call"` when a hook's replacement was discarded because its tool calls and tool results did not pair up |
 
 The session continues over budget on both. Each decline is also written to

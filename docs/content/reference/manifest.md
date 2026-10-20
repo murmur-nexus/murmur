@@ -1234,7 +1234,7 @@ these fields are accepted and inert:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `inference.compaction.threshold` | float (0.0–1.0] | no | Fraction of the context window at which compaction fires. Default: `0.98`. |
+| `inference.compaction.threshold` | float (0.0–1.0] | no | Fraction of the context window at which compaction fires. Default: `0.98`. Checked after each response against the provider's count of the call when the driver reports usage, and the runtime's estimate otherwise — see [Context compaction](../concepts/context.md). |
 | `inference.compaction.model` | string | no | Model override for compaction calls. Defaults to the primary inference model. |
 | `inference.compaction.system_prompt` | string | no | System prompt override for compaction calls, passed verbatim to the compaction hook. No trimming, length limit or format check. Omitted, the compaction hook picks its own default prompt. Mutually exclusive with `inference.compaction.system_prompt_file`. |
 | `inference.compaction.system_prompt_file` | string | no | Path to a file whose content is passed verbatim as the compaction system prompt. Relative to the manifest directory; read when the session launches. Mutually exclusive with `inference.compaction.system_prompt`. |
@@ -1609,26 +1609,24 @@ provider names the same condition differently normalizes it to that value.
 
 `inference.max_session_tokens` caps the tokens one session spends on inference. It counts every
 driver call the session makes — each agent turn, and each hook's `run-inference` call, including
-compaction and seed summarization. What it counts is `input_tokens + output_tokens`, the same
-numbers the trace's [`inference`](observability-schemas.md#session-trace-tracejsonl) lines carry,
-so summing those lines checks the ceiling. Cache reads, cache writes and thinking are never folded
-into either number.
+compaction and seed summarization. What each call is charged depends on the transport and on what
+the provider reported, and each line of the trace's
+[`inference`](observability-schemas.md#session-trace-tracejsonl) records shows which:
 
-Those two numbers mean something different on each transport, and the ceiling's definition does
-not change with them:
-
-| Transport | What the ceiling counts |
+| Call | Charged |
 |---|---|
-| `transport: http` | The runtime's own measurement of each request it builds and each response it reads |
-| `transport: process` | The counts the harness reports and its driver relays — see [`transport: process`](#transport-process) |
+| `transport: http`, the line carries both `input_tokens_actual` and `output_tokens_actual` | The provider's request, `input_tokens_actual + cached_tokens + cache_write_tokens`, plus its completion, `output_tokens_actual`. Thinking is never added |
+| `transport: http`, any other line | `input_tokens + output_tokens`, the runtime's own counts of the request it built and the response it read |
+| `transport: http`, a [failed call](observability-schemas.md#inference-failed) | The provider's request plus completion when its error payload reported both, otherwise the runtime's estimate of the request alone |
+| `transport: process` | `input_tokens + output_tokens`, the counts the harness reports and its driver relays — see [`transport: process`](#transport-process) |
 
 Under `transport: http`, before each driver call the runtime admits the call only if these three
 fit under the ceiling together:
 
 | Part | Value |
 |---|---|
-| Used | Every earlier call's `input_tokens + output_tokens`, plus what calls still in flight reserved |
-| The call's input | `input_tokens` of the request about to be sent |
+| Used | What every earlier call was charged, plus what calls still in flight reserved |
+| The call's input | `input_tokens` of the request about to be sent: the runtime's estimate, anchored on the provider's last count of the conversation when there is one |
 | The call's most output | The [output cap](#inference-max-tokens) the call sends |
 
 A session with `inference.max_session_tokens` set therefore reserves the whole output cap for every

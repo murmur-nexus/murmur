@@ -9,7 +9,7 @@ use tokio::{
 };
 
 use crate::{
-    agent::DriverUsage,
+    agent::{DriverUsage, OccupancyBasis},
     containment::ScopeReport,
     formation::FormationId,
     gateway_credential::CredentialChange,
@@ -758,7 +758,13 @@ struct CompactionEvent {
     timestamp: u64,
     turn: u32,
     task_id: Option<String>,
+    /// The occupancy the trigger compared: the provider's count of the request and its
+    /// completion, or the estimate when the call reported none.
     tokens_before: u64,
+    /// Which kind of number `tokens_before` is.
+    tokens_before_source: OccupancyBasis,
+    /// The estimate of the committed context. No provider has counted it yet; the next
+    /// `inference` line carries the first count.
     tokens_after: u64,
 }
 
@@ -777,6 +783,8 @@ struct CompactionDeclinedEvent {
     /// Context occupancy at the moment of the decline — the same measurement `compaction`
     /// records as `tokens_before`, and the budget the session went on running over.
     tokens: u64,
+    /// Which kind of number `tokens` is.
+    tokens_source: OccupancyBasis,
     /// `"no_hook_replacement"` when no bound hook returned `replace-context`;
     /// `"unresolved_tool_call"` when the replacement's tool calls and tool results did not pair.
     reason: String,
@@ -3065,6 +3073,7 @@ impl TraceWriter {
         &mut self,
         turn: u32,
         tokens_before: u64,
+        tokens_before_source: OccupancyBasis,
         tokens_after: u64,
     ) -> std::io::Result<()> {
         let event = CompactionEvent {
@@ -3076,19 +3085,22 @@ impl TraceWriter {
             turn,
             task_id: self.active_task_id.clone(),
             tokens_before,
+            tokens_before_source,
             tokens_after,
         };
         self.write_event(&event).await
     }
 
     /// Record that compaction was attempted and declined, leaving the context over budget.
-    /// `tokens` is the occupancy at the moment of the decline; `reason` is
+    /// `tokens` is the occupancy at the moment of the decline and `tokens_source` the kind of
+    /// number it is; `reason` is
     /// [`COMPACTION_DECLINED_NO_HOOK_REPLACEMENT`] or
     /// [`COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL`].
     pub(crate) async fn write_compaction_declined(
         &mut self,
         turn: u32,
         tokens: u64,
+        tokens_source: OccupancyBasis,
         reason: &str,
     ) -> std::io::Result<()> {
         let event = CompactionDeclinedEvent {
@@ -3100,6 +3112,7 @@ impl TraceWriter {
             turn,
             task_id: self.active_task_id.clone(),
             tokens,
+            tokens_source,
             reason: reason.to_string(),
         };
         self.write_event(&event).await
@@ -5899,7 +5912,12 @@ mod tests {
     async fn compaction_fields() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_compaction(3, 80000, 20000).await.unwrap();
+        w.write_compaction(3, 80000, OccupancyBasis::Actual, 20000)
+            .await
+            .unwrap();
+        w.write_compaction(4, 30000, OccupancyBasis::Estimate, 10000)
+            .await
+            .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -5907,7 +5925,9 @@ mod tests {
         assert_eq!(e["event_type"], "compaction");
         assert_eq!(e["turn"], 3);
         assert_eq!(e["tokens_before"], 80000);
+        assert_eq!(e["tokens_before_source"], "actual");
         assert_eq!(e["tokens_after"], 20000);
+        assert_eq!(events[1]["tokens_before_source"], "estimate");
     }
 
     #[tokio::test]
@@ -7039,7 +7059,9 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_compaction(0, 100, 40).await.unwrap();
+        w.write_compaction(0, 100, OccupancyBasis::Estimate, 40)
+            .await
+            .unwrap();
         w.write_task_end("tsk_1", "ok", 0).await.unwrap();
         w.write_inference(
             1,
@@ -7265,9 +7287,14 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_compaction_declined(2, 4321, COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL)
-            .await
-            .unwrap();
+        w.write_compaction_declined(
+            2,
+            4321,
+            OccupancyBasis::Actual,
+            COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL,
+        )
+        .await
+        .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -7281,6 +7308,7 @@ mod tests {
         assert_eq!(d["turn"], 2);
         assert_eq!(d["task_id"], "tsk_1");
         assert_eq!(d["tokens"], 4321);
+        assert_eq!(d["tokens_source"], "actual");
         assert!(d["event_id"].as_str().unwrap().starts_with("evt_"));
         assert_eq!(
             d["parent_id"],

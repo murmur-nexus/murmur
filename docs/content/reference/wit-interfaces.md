@@ -177,8 +177,22 @@ Where the two provider shapes carry each number:
 | `thinking_tokens` | `usage.output_tokens_details.thinking_tokens` | `usage.completion_tokens_details.reasoning_tokens` |
 
 The runtime records the reported numbers on the call's `inference` trace event and its
-`capsule.inference` span, and acts on none of them: the compaction threshold and every budget
-decision keep running on the runtime's own pre-flight estimate. See
+`capsule.inference` span. A report that carries both `input_tokens` and `output_tokens` is also
+what the runtime acts on, as two numbers:
+
+| Number | Sum |
+|---|---|
+| Request | `input_tokens + cached_tokens + cache_write_tokens`, an absent cache member counted as `0` |
+| Completion | `output_tokens`. `thinking_tokens` is part of it and is never added |
+
+| Decision | With a report | Without one |
+|---|---|---|
+| [Compaction threshold](../concepts/context.md), checked after each agent-loop response | Request plus completion | The runtime's estimate of the request plus its count of the raw response |
+| [Spend](manifest.md#inference-max-session-tokens) charged for the call, agent loop and a hook's `run-inference` alike | Request plus completion | The runtime's own counts of the request and the response |
+| Spend reserved before the call is sent | The runtime's estimate | The runtime's estimate |
+
+A `usage` missing `input_tokens` or `output_tokens` is recorded but steers nothing. A driver that
+folds its cache counts into `input_tokens` has them counted twice. See
 [Observability schemas](observability-schemas.md#session-trace-tracejsonl) for the field names.
 
 A malformed report degrades to no report rather than failing the call:
@@ -550,6 +564,11 @@ fail-closed rule that governs a policy hook's failures.
 
 ### Event field notes
 
+- `compaction-event.session-tokens` is the number the runtime compared against
+  `inference.compaction.threshold`: the provider's count of the call that crossed it when the
+  driver reported [usage](#driver-usage), the runtime's estimate otherwise. The trace's
+  [`compaction`](observability-schemas.md#session-trace-tracejsonl) line records which in
+  `tokens_before_source`. `compaction-event.threshold` is `session-tokens` over the context window.
 - `compaction-event.model` and `compaction-event.system-prompt` carry
   `inference.compaction.model` and `inference.compaction.system_prompt` verbatim, so a compaction
   hook knows which model and which prompt to use for its own summarization call. Setting
@@ -665,10 +684,11 @@ own `inference` line.
 A runtime-provided import available to any hook component that declares it. It needs no
 capability grant and no manifest entry: counting text reaches no resource.
 
-`count` returns the runtime's own `cl100k_base` count of the string — the same number behind the
-compaction trigger and the context-occupancy calculation. A hook measuring a payload against a
-budget and the runtime enforcing that budget therefore agree on what the payload costs, which a
-hook's own tokenizer would not guarantee.
+`count` returns the runtime's own `cl100k_base` count of the string — the same count behind every
+estimate the runtime makes: a request's size before it is sent, a seed's budget, and the compaction
+threshold when the driver reports no usage. Once a driver reports [usage](#driver-usage), the
+compaction threshold and the spend ceilings use the provider's count instead, which `count` does
+not reproduce.
 
 ---
 

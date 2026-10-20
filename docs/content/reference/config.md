@@ -282,9 +282,10 @@ spend:
 |---|---|---|---|
 | `machine_tokens_per_day` | integer | no | Most tokens every run on this `~/.murmur` may spend per UTC day. No default: absent sets no machine ceiling. `0` is refused with `E-IO-003` when the config is loaded |
 
-It counts what [`inference.max_session_tokens`](manifest.md#inference-max-session-tokens) counts,
-against the same per-transport measurement: `input_tokens + output_tokens` for every agent turn and
-every hook's `run-inference` call. Under `transport: http`, before each call a run adds the day's
+It charges every agent turn and every hook's `run-inference` call what
+[`inference.max_session_tokens`](manifest.md#inference-max-session-tokens)
+charges it: under `transport: http`, the provider's request and completion when the call reported
+both, and the runtime's own counts otherwise. Under `transport: http`, before each call a run adds the day's
 total, its own calls still in flight and the call's input plus its most output; a call that would
 cross the ceiling is refused before it is sent. Under [`transport: process`](manifest.md#transport-process)
 there is nothing to admit: each turn is charged the counts the harness reported once it closes, and
@@ -329,7 +330,14 @@ from projects with different ceilings each stop at their own.
 | Path | `~/.murmur/spend/<YYYY-MM-DD>.jsonl` |
 | Modes | Directory `0700`, file `0600` |
 | Line | `{"ts":<unix ms>,"session_id":"ses_…","input_tokens":<n>,"output_tokens":<n>}` |
-| When written | Once per settled call. A call cancelled, refused at dispatch or failed is written with its `input_tokens` and `output_tokens: 0` |
+| When written | Once per settled call. A call cancelled, refused at dispatch or failed is written with its `input_tokens` and `output_tokens: 0`, unless the failed call's provider reported both counts |
+
+What each line's two numbers are, by the call's [`inference`](observability-schemas.md#session-trace-tracejsonl) line:
+
+| The `inference` line | `input_tokens` on the ledger | `output_tokens` on the ledger |
+|---|---|---|
+| `transport: http`, carries both `input_tokens_actual` and `output_tokens_actual` | `input_tokens_actual + cached_tokens + cache_write_tokens`, an absent cache member counted as `0` | `output_tokens_actual` |
+| Any other line | Its `input_tokens` | Its `output_tokens`, or `0` for a call cancelled, refused at dispatch or failed |
 | Retention | A run that opens the ledger removes `<YYYY-MM-DD>.jsonl` files dated more than 30 days before today. Other names are left alone |
 
 A run that cannot create or open the ledger refuses to start with
