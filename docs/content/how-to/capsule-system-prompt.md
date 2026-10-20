@@ -166,7 +166,7 @@ At launch, the runtime reads the skill's `skill.md` from the session's
 ```markdown
 ## Installed Skills
 
-- **code-review-conventions** — Project PR review conventions *(bound as system prompt — already in context, not separately callable)*
+- **code-review-conventions** — Project PR review conventions *(bound as system prompt — already in context, not separately callable; /home/you/.murmur/sessions/ses_…/runtime/tools/code-review-conventions/skill.md)*
 ```
 
 Validation happens at parse time:

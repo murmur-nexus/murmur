@@ -996,7 +996,7 @@ fn the_runtime_dir_copies_the_launched_manifest() {
         let system = common::system_text(&server.requests()[0]["system"]).unwrap();
         assert!(
             system.contains(&format!(
-                "Runtime files: MURMUR.md, task.md, {launched} and the installed tools are"
+                "Runtime files: MURMUR.md, {launched} and the installed tools are"
             )),
             "{system}"
         );
@@ -1066,8 +1066,7 @@ fn an_installed_capsule_s_runtime_dir_holds_and_names_no_manifest() {
     println!("── [Capsule] notice\n{notice}");
     assert!(
         system.contains(
-            "Runtime files: MURMUR.md, task.md and the installed tools are in a directory you can \
-             read and cannot change"
+            "Runtime files: MURMUR.md and the installed tools are in a read-only directory"
         ),
         "{system}"
     );
@@ -1081,10 +1080,7 @@ fn an_installed_capsule_s_runtime_dir_holds_and_names_no_manifest() {
         !entries.iter().any(|entry| entry.ends_with(".yaml")),
         "an installed capsule's runtime directory holds no manifest: {listing}"
     );
-    assert!(
-        !murmur_md.contains("← the capsule's manifest"),
-        "{murmur_md}"
-    );
+    assert!(!murmur_md.contains(".yaml"), "{murmur_md}");
     assert!(!workdir.path().join("murmur.yaml").exists());
 }
 

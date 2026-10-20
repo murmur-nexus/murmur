@@ -30,6 +30,7 @@ use crate::streaming::{
 };
 use crate::types::{CapabilityPolicy, InstalledArtifactSummary};
 
+#[derive(Debug, Clone)]
 pub(crate) struct CapsuleIdentity {
     pub capsule_name: String,
     pub capsule_version: String,

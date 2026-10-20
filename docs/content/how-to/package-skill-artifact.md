@@ -336,7 +336,7 @@ Skills are callable: invoke a skill by name (no input) to receive its full guida
 as the tool result. The content is returned just-in-time — it is not pre-injected
 into context. No file-read capability is required.
 
-- **code-review-conventions** — Project PR review conventions *(call by name to load guidance)*
+- **code-review-conventions** — Project PR review conventions *(call by name to load guidance; /home/you/.murmur/sessions/ses_…/runtime/tools/code-review-conventions/skill.md)*
 ```
 
 The runtime returns the full `skill.md` content as the tool result.

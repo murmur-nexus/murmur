@@ -231,7 +231,18 @@ impl CapsuleStoreState {
             Chosen::Source(version) => self.fetch_from_source(&artifact_name, &version, &lock)?,
         };
         self.check_payload(&artifact_name, &payload, &lock)?;
-        self.install_payload(&artifact_name, payload, lock, notes)
+        let pulled = self.install_payload(&artifact_name, payload, lock, notes)?;
+        self.rewrite_murmur_md();
+        Ok(pulled)
+    }
+
+    /// Rewrite an agent session's `MURMUR.md` from the inputs it was launched with, after a pull
+    /// or removal changed what `tools/` holds, so every tool it names is installed. A script
+    /// capsule has no `MURMUR.md` to rewrite.
+    fn rewrite_murmur_md(&self) {
+        if let Some(inputs) = &self.murmur_md {
+            crate::murmur_md::write_murmur_md(&self.runtime_root, inputs);
+        }
     }
 
     /// Take `name` out of this session, under the bound [`crate::artifact_removal`] states.
@@ -283,7 +294,7 @@ impl CapsuleStoreState {
         // Removed by descriptor beneath the runtime directory: a link at `tools` or at the tool's
         // directory is refused, never followed into what it names.
         let rel = format!("tools/{tool}");
-        match self.runtime_root.remove_dir_all(&rel) {
+        let removed = match self.runtime_root.remove_dir_all(&rel) {
             Ok(()) => Ok(true),
             Err(err) if err.is_not_found() => Ok(true),
             Err(WorkdirError::Refused(refusal)) => Err(refusal.to_string()),
@@ -294,7 +305,12 @@ impl CapsuleStoreState {
                     &source,
                 ))
             }
+        };
+        // 4. `MURMUR.md`, once the files are gone.
+        if removed.is_ok() {
+            self.rewrite_murmur_md();
         }
+        removed
     }
 
     /// Every artifact `pattern` reaches that this session may pull, in the places

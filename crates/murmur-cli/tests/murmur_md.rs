@@ -129,16 +129,16 @@ fn murmur_md_written_after_staging() {
         "MURMUR.md should mention murmur-runtime"
     );
     assert!(
-        content.contains("## Directory Layout"),
-        "MURMUR.md should include the directory layout section"
+        content.contains("## Runtime Directory"),
+        "MURMUR.md should include the runtime directory section"
+    );
+    assert!(
+        content.contains("## Limits"),
+        "MURMUR.md should include the limits section"
     );
     assert!(
         content.contains("## Installed Tools"),
         "MURMUR.md should include the installed tools section"
-    );
-    assert!(
-        content.contains("## Managing Artifacts at Runtime"),
-        "MURMUR.md should include the managing artifacts section"
     );
 }
 

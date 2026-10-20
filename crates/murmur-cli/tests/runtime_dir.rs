@@ -36,9 +36,9 @@ const PROBE_TOOL: &str = "runtime-dir-probe";
 const PULLED_ARTIFACT: &str = "local/tool-pulled";
 const PULLED_TOOL: &str = "tool-pulled";
 const PROBE_ARTIFACT: &str = "local/runtime-dir-probe";
-const NOTICE: &str = "Runtime files: MURMUR.md, task.md, murmur.yaml and the installed tools are \
-                      in a directory you can read and cannot change — $MURMUR_RUNTIME_DIR in a \
-                      shell command, murmur-runtime/ in a file tool.";
+const NOTICE: &str = "Runtime files: MURMUR.md, murmur.yaml and the installed tools are in a \
+                      read-only directory — $MURMUR_RUNTIME_DIR in a shell command, \
+                      murmur-runtime/ in a file tool.";
 
 /// What every command a test runs is allowed to execute.
 const SHELL_ALLOW: &[&str] = &[
@@ -864,11 +864,96 @@ fn runtime_dir_scoped_wasm_tool_has_no_murmur_runtime() {
 
 // ── what the agent is told ───────────────────────────────────────────────────
 
-/// The `[Capsule]` block: everything before the first blank line of the system prompt.
-fn capsule_block(server: &common::ScriptedServer) -> String {
-    let request = &server.requests()[0];
+/// The `[Capsule]` block of `request`: everything before the first blank line of its system
+/// prompt.
+fn block_of(request: &Value) -> String {
     let system = common::system_text(&request["system"]).expect("a system prompt");
     system.split("\n\n").next().expect("a block").to_string()
+}
+
+/// S1: one manifest's block is byte-identical whichever way the task arrives — `mur run --task`,
+/// a `task.md` in the workdir, an A2A message — and in each the task is the first user message.
+/// The block names no `task.md`, no checkpoint and, with the plan tool granted, no plan tool.
+#[test]
+#[allow(clippy::print_stdout)]
+fn capsule_block_is_the_same_whichever_way_the_task_arrives() {
+    if common::skip_without_host_support("capsule_block_is_the_same_whichever_way_the_task_arrives")
+    {
+        return;
+    }
+    // One server and one project for all three, so the manifest — and the endpoint its network
+    // allowlist names — is the same.
+    let server =
+        common::ScriptedServer::start(vec![end_turn("one"), end_turn("two"), end_turn("three")]);
+    let p = project(
+        &server.endpoint,
+        &Spec {
+            plan: true,
+            ..Spec::default()
+        },
+    )
+    .unwrap();
+
+    let cli_workdir = TempDir::new().unwrap();
+    Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", p.home.path())
+        .args([
+            "run",
+            "--manifest",
+            p.manifest.to_str().unwrap(),
+            "--workdir",
+            cli_workdir.path().to_str().unwrap(),
+            "--task",
+            "CLI TASK",
+        ])
+        .assert()
+        .success();
+
+    let file_workdir = TempDir::new().unwrap();
+    fs::write(file_workdir.path().join("task.md"), "FILE TASK").unwrap();
+    let staged = common::stage_agent_session_at_floor(
+        &p.home,
+        p.project.path(),
+        &p.manifest,
+        ContainmentClass::Advisory,
+        Some(file_workdir.path()),
+    );
+    launch_session(staged, |_| {}).expect("the session runs");
+
+    let a2a_workdir = TempDir::new().unwrap();
+    let staged = common::stage_agent_session_at_floor(
+        &p.home,
+        p.project.path(),
+        &p.manifest,
+        ContainmentClass::Advisory,
+        Some(a2a_workdir.path()),
+    );
+    let _ = send_one_message(staged, "A2A TASK").join();
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3, "one request per launch");
+    let blocks: Vec<String> = requests.iter().map(block_of).collect();
+    println!("── [Capsule] block\n{}", blocks[0]);
+    for (request, task) in requests.iter().zip(["CLI TASK", "FILE TASK", "A2A TASK"]) {
+        assert_eq!(
+            request["messages"].as_array().map(Vec::len),
+            Some(1),
+            "{request}"
+        );
+        assert!(
+            common::last_user_text(request).contains(task),
+            "the task is the first user message: {request}"
+        );
+    }
+    assert_eq!(blocks[0], blocks[1], "mur run --task and task.md");
+    assert_eq!(blocks[0], blocks[2], "mur run --task and A2A");
+    let block = &blocks[0];
+    assert!(block.starts_with("[Capsule]\nName: rd-capsule\nVersion: 0.1.0\nWork folder: ./"));
+    assert!(block.contains(NOTICE), "{block}");
+    for absent in ["task.md", "Checkpoint", "submit-plan"] {
+        assert!(!block.contains(absent), "{absent:?} in:\n{block}");
+    }
 }
 
 #[test]
@@ -880,25 +965,32 @@ fn runtime_dir_murmur_md_and_the_capsule_block_name_the_runtime_dir() {
         return;
     }
     std::env::set_var(capsule_runtime::RUNTIME_DIR_ENV, "/host/says/otherwise");
+    // One server and one project for both rounds: the block names the network allowlist, which
+    // names the server's endpoint.
+    let env_call = |round: usize| {
+        tool_call(
+            round,
+            &format!("toolu_env{round}"),
+            "bash",
+            bash("echo \"ENV|$MURMUR_RUNTIME_DIR\""),
+        )
+    };
+    let server = common::ScriptedServer::start(vec![
+        env_call(0),
+        end_turn("done"),
+        env_call(1),
+        end_turn("done"),
+    ]);
+    let p = project(
+        &server.endpoint,
+        &Spec {
+            env_allow: &[capsule_runtime::RUNTIME_DIR_ENV],
+            ..Spec::default()
+        },
+    )
+    .unwrap();
     let mut blocks = Vec::new();
     for round in 0..2 {
-        let server = common::ScriptedServer::start(vec![
-            tool_call(
-                1,
-                "toolu_env",
-                "bash",
-                bash("echo \"ENV|$MURMUR_RUNTIME_DIR\""),
-            ),
-            end_turn("done"),
-        ]);
-        let p = project(
-            &server.endpoint,
-            &Spec {
-                env_allow: &[capsule_runtime::RUNTIME_DIR_ENV],
-                ..Spec::default()
-            },
-        )
-        .unwrap();
         let workdir = TempDir::new().unwrap();
         let staged = common::stage_agent_session_at_floor(
             &p.home,
@@ -925,12 +1017,12 @@ fn runtime_dir_murmur_md_and_the_capsule_block_name_the_runtime_dir() {
 
         launch_session(staged, |_| {}).expect("the session runs");
 
-        let env = result_text(&server, "toolu_env");
+        let env = result_text(&server, &format!("toolu_env{round}"));
         assert!(
             env.contains(&format!("ENV|{}", runtime_dir.display())),
             "round {round}: {env}"
         );
-        let block = capsule_block(&server);
+        let block = block_of(&server.requests()[round * 2]);
         assert!(block.contains(NOTICE), "{block}");
         assert!(
             !block.contains("Manifest: murmur.yaml (in your workdir)"),
@@ -947,6 +1039,153 @@ fn runtime_dir_murmur_md_and_the_capsule_block_name_the_runtime_dir() {
         blocks[0], blocks[1],
         "the block is byte-identical across launches"
     );
+}
+
+/// The text of MURMUR.md's `## {heading}` section, up to the next heading.
+fn md_section<'a>(doc: &'a str, heading: &str) -> &'a str {
+    let start = doc
+        .find(&format!("\n## {heading}\n"))
+        .unwrap_or_else(|| panic!("no ## {heading}: {doc}"));
+    let rest = &doc[start + 1..];
+    let end = rest[3..].find("\n## ").map_or(rest.len(), |end| end + 3);
+    &rest[..end]
+}
+
+/// The `- **<name>**` entries of a MURMUR.md section, each with its line.
+fn md_entries(section: &str) -> Vec<(String, &str)> {
+    section
+        .lines()
+        .filter_map(|line| {
+            let name = line.strip_prefix("- **")?.split("**").next()?;
+            Some((name.to_string(), line))
+        })
+        .collect()
+}
+
+/// S7: every tool MURMUR.md names is in the session's tool list, the skill bound as system prompt
+/// is named as bound and is not, and every path the document names exists.
+#[test]
+#[allow(clippy::print_stdout)]
+fn murmur_md_names_resolve() {
+    if common::skip_without_host_support("murmur_md_names_resolve") {
+        return;
+    }
+    const BOUND: &str = "rd-bound";
+    let server = common::ScriptedServer::start(vec![end_turn("done")]);
+    let entries = format!(
+        "  - name: {PROBE_ARTIFACT}\n    version: 0.1.0\n    runtime: tool\n  - name: {BOUND}\n    \
+         source: ./skills/{BOUND}/skill.md\n    runtime: skill\n"
+    );
+    let p = project(
+        &server.endpoint,
+        &Spec {
+            plan: true,
+            extra_artifacts: &entries,
+            extra_capabilities: "  install:\n    tool: [\"murmur/tool-*\"]\n",
+            ..Spec::default()
+        },
+    )
+    .unwrap();
+    let bound_dir = p.project.path().join("skills").join(BOUND);
+    fs::create_dir_all(&bound_dir).unwrap();
+    fs::write(bound_dir.join("skill.md"), "You are the bound skill.\n").unwrap();
+    let manifest = fs::read_to_string(&p.manifest).unwrap().replace(
+        "inference:\n  transport: http\n",
+        &format!("inference:\n  transport: http\n  system_prompt_artifact: {BOUND}\n"),
+    );
+    fs::write(&p.manifest, manifest).unwrap();
+    let staging = TempDir::new().unwrap();
+    let probe = common::create_tool_artifact(
+        staging.path(),
+        PROBE_ARTIFACT,
+        "0.1.0",
+        &common::fixture_path("runtime-dir-probe/tool/runtime-dir-probe.wasm"),
+    );
+    common::publish_local(&p.home, &probe).success();
+    let workdir = TempDir::new().unwrap();
+    let staged = common::stage_agent_session_at_floor(
+        &p.home,
+        p.project.path(),
+        &p.manifest,
+        ContainmentClass::Advisory,
+        Some(workdir.path()),
+    );
+    let runtime_dir = staged.runtime_dir.clone();
+    let doc = fs::read_to_string(runtime_dir.join("MURMUR.md")).unwrap();
+    println!("── MURMUR.md\n{doc}");
+
+    let tools = md_entries(md_section(&doc, "Installed Tools"));
+    let skills = md_entries(md_section(&doc, "Installed Skills"));
+    let tree: Vec<String> = md_section(&doc, "Runtime Directory")
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("├── ")
+                .or_else(|| line.strip_prefix("└── "))
+        })
+        .map(|entry| entry.trim_end_matches('/').to_string())
+        .collect();
+    // Every absolute path, wherever it stands: a token opening with `/`, without the Markdown
+    // and punctuation that close it.
+    let paths: Vec<PathBuf> = doc
+        .split_whitespace()
+        .filter(|token| token.starts_with('/'))
+        .map(|token| PathBuf::from(token.trim_end_matches([')', '*', ';', ','])))
+        .collect();
+    // Checked before the launch, which removes the runtime directory when it ends.
+    assert!(paths.len() >= 4, "{paths:?}");
+    for path in &paths {
+        assert!(path.exists(), "{} does not exist", path.display());
+    }
+    assert_eq!(tree, ["MURMUR.md", "murmur.yaml", "tools"], "{doc}");
+    for entry in &tree {
+        assert!(runtime_dir.join(entry).exists(), "{entry}");
+    }
+
+    fs::write(workdir.path().join("task.md"), TASK).unwrap();
+    launch_session(staged, |_| {}).expect("the session runs");
+    let offered: Vec<String> = server.requests()[0]["tools"]
+        .as_array()
+        .expect("a tools array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+        .collect();
+    println!("── tools\n{offered:?}");
+
+    let names: Vec<&str> = tools.iter().map(|(name, _)| name.as_str()).collect();
+    for expected in [
+        "bash",
+        PROBE_TOOL,
+        SKILL,
+        "submit-plan",
+        "pull-artifact",
+        "remove-artifact",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "{expected} not listed: {names:?}"
+        );
+    }
+    for name in &names {
+        assert!(
+            offered.iter().any(|tool| tool == name),
+            "{name} not offered: {offered:?}"
+        );
+    }
+    for (name, line) in &skills {
+        if name == BOUND {
+            assert!(line.contains("bound as system prompt"), "{line}");
+            assert!(!offered.iter().any(|tool| tool == name), "{offered:?}");
+            assert!(!names.contains(&BOUND), "{names:?}");
+        } else {
+            assert!(line.contains("call by name"), "{line}");
+            assert!(
+                offered.iter().any(|tool| tool == name),
+                "{name}: {offered:?}"
+            );
+        }
+    }
+    assert!(skills.iter().any(|(name, _)| name == BOUND), "{skills:?}");
+    assert!(skills.iter().any(|(name, _)| name == SKILL), "{skills:?}");
 }
 
 // ── the task's way in ────────────────────────────────────────────────────────

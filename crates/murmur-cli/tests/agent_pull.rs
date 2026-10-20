@@ -527,6 +527,62 @@ fn s1_a_pulled_tool_is_offered_and_called_from_the_next_turn() {
     assert_eq!(p.stores(), stores_before, "neither store changed");
 }
 
+/// MURMUR.md follows the session's tools: a pulled tool is listed under `## Installed Tools` once
+/// the pull commits, and a removed one is gone once the removal does.
+#[test]
+#[allow(clippy::print_stdout)]
+fn murmur_md_follows_pull_and_remove() {
+    if capsule_runtime::skip_without_egress_namespace("murmur_md_follows_pull_and_remove") {
+        return;
+    }
+    let cat = || json!({"command": "cat \"$MURMUR_RUNTIME_DIR/MURMUR.md\""});
+    let server = common::ScriptedServer::start(vec![
+        tool_use(
+            1,
+            "toolu_pull",
+            "pull-artifact",
+            json!({"artifact": EDITOR}),
+        ),
+        tool_use(2, "toolu_cat_pulled", "bash", cat()),
+        tool_use(
+            3,
+            "toolu_remove",
+            "remove-artifact",
+            json!({"artifact": EDITOR_TOOL}),
+        ),
+        tool_use(4, "toolu_cat_removed", "bash", cat()),
+        end_turn("done"),
+    ]);
+    let capabilities = format!("{GRANT}  shell:\n    allow: [bash, cat]\n");
+    let p = project(&server.endpoint, &capabilities, "");
+    publish_editors(&p.global_store());
+
+    p.run();
+
+    let requests = server.requests();
+    let installed_tools = |id: &str| {
+        let (text, is_error) = result(&requests, id);
+        assert!(!is_error, "{text}");
+        let doc = common::unfence(&text);
+        let start = doc
+            .find("## Installed Tools\n")
+            .unwrap_or_else(|| panic!("{id}: {doc}"));
+        let rest = &doc[start..];
+        let end = rest[3..].find("\n## ").map_or(rest.len(), |end| end + 3);
+        rest[..end].to_string()
+    };
+    let pulled = installed_tools("toolu_cat_pulled");
+    println!("after the pull:\n{pulled}");
+    assert!(
+        pulled.contains(&format!("- **{EDITOR_TOOL}** (v0.2.0, tool) — ")),
+        "{pulled}"
+    );
+    let removed = installed_tools("toolu_cat_removed");
+    println!("after the removal:\n{removed}");
+    assert!(!removed.contains(EDITOR_TOOL), "{removed}");
+    assert!(removed.contains("- **remove-artifact** "), "{removed}");
+}
+
 // ── S2 ───────────────────────────────────────────────────────────────────────
 
 #[test]
