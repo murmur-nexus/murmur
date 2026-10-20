@@ -561,25 +561,7 @@ mod tests {
 
     /// The facts of the capsule whose limits `capsule_facts_equal_the_enforced_values` pins.
     fn enforced_limits_facts() -> (CapabilityPolicy, CapsuleFacts) {
-        let policy = CapabilityPolicy {
-            shell_allow: vec!["bash".to_string()],
-            resources: crate::resources::HostResourceLimits {
-                memory_bytes: 1_073_741_824,
-                cpu_seconds: 120,
-                workdir_max_bytes: 536_870_912,
-                ..crate::resources::HostResourceLimits::resolve(None)
-            },
-            ..CapabilityPolicy::default()
-        };
-        let inference = murmur_artifact::InferenceConfig {
-            max_turns: Some(7),
-            max_session_tokens: Some(50_000),
-            ..crate::capsule_facts::test_http_inference()
-        };
-        let lifecycle = murmur_artifact::LifecycleConfig {
-            shell_grace_secs: 30,
-            ..murmur_artifact::LifecycleConfig::default()
-        };
+        let (policy, inference, lifecycle) = crate::capsule_facts::test_enforced_limits();
         let facts = CapsuleFacts::resolve(&policy, &inference, &lifecycle);
         (policy, facts)
     }

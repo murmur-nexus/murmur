@@ -168,10 +168,36 @@ pub(crate) fn test_default_facts() -> CapsuleFacts {
     )
 }
 
+/// An http capsule declaring every limit: `max_turns: 7`, `max_session_tokens: 50000`, 1 GiB
+/// memory, 120 s CPU, a 512 MiB `workdir_max_bytes`, `shell_grace_secs: 30` and `shell.allow:
+/// [bash]`.
+#[cfg(test)]
+pub(crate) fn test_enforced_limits() -> (CapabilityPolicy, InferenceConfig, LifecycleConfig) {
+    let policy = CapabilityPolicy {
+        shell_allow: vec!["bash".to_string()],
+        resources: crate::resources::HostResourceLimits {
+            memory_bytes: 1_073_741_824,
+            cpu_seconds: 120,
+            workdir_max_bytes: 536_870_912,
+            ..crate::resources::HostResourceLimits::resolve(None)
+        },
+        ..CapabilityPolicy::default()
+    };
+    let inference = InferenceConfig {
+        max_turns: Some(7),
+        max_session_tokens: Some(50_000),
+        ..test_http_inference()
+    };
+    let lifecycle = LifecycleConfig {
+        shell_grace_secs: 30,
+        ..LifecycleConfig::default()
+    };
+    (policy, inference, lifecycle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resources::HostResourceLimits;
 
     #[test]
     fn capsule_facts_bytes_render_in_the_largest_whole_unit() {
@@ -197,26 +223,7 @@ mod tests {
     /// block and lifecycle.
     #[test]
     fn capsule_facts_equal_the_enforced_values() {
-        let resources = HostResourceLimits {
-            memory_bytes: 1_073_741_824,
-            cpu_seconds: 120,
-            workdir_max_bytes: 536_870_912,
-            ..HostResourceLimits::resolve(None)
-        };
-        let policy = CapabilityPolicy {
-            shell_allow: vec!["bash".to_string()],
-            resources,
-            ..CapabilityPolicy::default()
-        };
-        let inference = InferenceConfig {
-            max_turns: Some(7),
-            max_session_tokens: Some(50_000),
-            ..test_http_inference()
-        };
-        let lifecycle = LifecycleConfig {
-            shell_grace_secs: 30,
-            ..LifecycleConfig::default()
-        };
+        let (policy, inference, lifecycle) = test_enforced_limits();
         let facts = CapsuleFacts::resolve(&policy, &inference, &lifecycle);
         assert_eq!(
             facts.dispatch_limits,
