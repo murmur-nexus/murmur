@@ -2849,6 +2849,10 @@ pub fn stage_session(
                 inference,
                 &lifecycle,
             ),
+            // `session_root`, which `WorkdirGuard` measures, is the accessible workdir only
+            // without `--workdir`.
+            work_folder_ceiling: (request.workdir.is_none() && inference.transport != "process")
+                .then_some(request.capability_policy.resources.workdir_max_bytes),
         };
         murmur_md::write_murmur_md(&runtime_root, &inputs);
         inputs
@@ -3879,6 +3883,8 @@ fn launch(
                         live_delegations: Arc::clone(&live_delegations),
                         detached: Some(Arc::clone(&detached)),
                         shell_grace_secs: effective_lifecycle.shell_grace_secs,
+                        background_results_delivered: effective_lifecycle
+                            .can_receive_background_tasks(),
                         a2a_task_registry: Some(Arc::clone(&task_registry)),
                         a2a_sse: Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
                         a2a_task: None,
@@ -4896,6 +4902,7 @@ fn launch(
         // foreground.
         detached: None,
         shell_grace_secs: 0,
+        background_results_delivered: false,
         a2a_task_registry: None,
         a2a_sse: None,
         a2a_task: None,
@@ -7006,6 +7013,9 @@ pub(crate) struct CapsuleStoreState {
     /// `lifecycle.shell_grace_secs`: how long a shell command runs in the foreground before it
     /// is demoted. Read from the resolved lifecycle once per launch.
     pub(crate) shell_grace_secs: u64,
+    /// Whether a demoted command's completion reaches the model as a later task: the effective
+    /// lifecycle's `can_receive_background_tasks`, the predicate `W-SEC-022` warns on.
+    pub(crate) background_results_delivered: bool,
     // ── A2A request-input support ────────────────────────────────────────────────
     /// Shared task registry — Some in A2A mode, None for script capsules.
     pub(crate) a2a_task_registry: Option<Arc<Mutex<TaskRegistry>>>,
@@ -8616,6 +8626,7 @@ impl CapsuleStoreState {
             let detach = match (&self.detached, &self.current_context_id) {
                 (Some(registry), Some(context_id)) => Some(DetachPolicy {
                     grace: std::time::Duration::from_secs(self.shell_grace_secs),
+                    delivered: self.background_results_delivered,
                     registry: Arc::clone(registry),
                     command: String::new(),
                     context_id: context_id.clone(),
@@ -11300,6 +11311,8 @@ fn dispatch_shell_tool(
     } = resolved;
     let args: Vec<&str> = argv.iter().map(String::as_str).collect();
 
+    // Only a command given a policy can be demoted, so the flag is read before it moves.
+    let delivered = detach.as_ref().is_some_and(|detach| detach.delivered);
     let detach = detach.map(|detach| DetachPolicy {
         command: command.clone(),
         ..detach
@@ -11348,7 +11361,7 @@ fn dispatch_shell_tool(
         // the fields `ShellDispatchInfo` exists to carry — hence `shell: None`, and hence no
         // `HookEvent::Shell`. What it did produce is the handle.
         Ok(ShellOutcome::Detached(info)) => {
-            let result = demotion_tool_result(&info.work_id);
+            let result = demotion_tool_result(&info.work_id, delivered);
             DispatchOutcome {
                 detached: Some(info),
                 ..DispatchOutcome::tool(result)
@@ -13147,6 +13160,34 @@ inference:
         assert!(log.contains("lifecycle.shell_grace_secs"), "log was: {log}");
         assert!(log.contains("lifecycle.task_acceptance"), "log was: {log}");
         assert!(log.contains("lifecycle.after_task"), "log was: {log}");
+    }
+
+    /// The demotion result the model reads and `W-SEC-022`, which the operator reads, agree on
+    /// whether a demoted command's result arrives: `launch` hands the dispatch path the same
+    /// predicate the warning fires on.
+    #[test]
+    fn the_demotion_text_agrees_with_unreachable_shell_completions_warning() {
+        for lifecycle in [
+            lifecycle(TaskAcceptance::Single, AfterTask::Exit),
+            lifecycle(TaskAcceptance::Queue, AfterTask::Exit),
+            lifecycle(TaskAcceptance::Queue, AfterTask::Sleep),
+        ] {
+            let delivered = lifecycle.can_receive_background_tasks();
+            let warned = unreachable_shell_completions_warning(true, &lifecycle).is_some();
+            assert_eq!(delivered, !warned, "{lifecycle:?}");
+            let data = demotion_tool_result("wrk_1", delivered).data.unwrap();
+            assert_eq!(
+                data.contains("will not reach you"),
+                warned,
+                "{lifecycle:?}: {data}"
+            );
+            assert_eq!(
+                data.contains("will arrive later"),
+                !warned,
+                "{lifecycle:?}: {data}"
+            );
+        }
+        assert!(!LifecycleConfig::default().can_receive_background_tasks());
     }
 
     /// The only lifecycle a completion can reach is `queue` + `sleep`; a capsule that declares no
@@ -15380,6 +15421,7 @@ inference:
             live_delegations: Arc::new(crate::cancel::LiveDelegations::new()),
             detached: None,
             shell_grace_secs: 0,
+            background_results_delivered: false,
             a2a_task_registry: None,
             a2a_sse: None,
             a2a_task: None,
@@ -18424,7 +18466,7 @@ inference:
                     binary: "/bin/sh".to_string(),
                     grace_ms: 1,
                 }),
-                ..DispatchOutcome::tool(demotion_tool_result("work_1"))
+                ..DispatchOutcome::tool(demotion_tool_result("work_1", false))
             },
             DispatchOutcome::skill(tool_result_with(Some("# how to deploy"), None)),
         ];
@@ -25383,6 +25425,7 @@ mod murmur_md_tests {
                 &inference,
                 &LifecycleConfig::default(),
             ),
+            work_folder_ceiling: http.then_some(policy.resources.workdir_max_bytes),
             ..crate::murmur_md::test_inputs()
         };
         murmur_md::write_murmur_md(&root, &inputs);

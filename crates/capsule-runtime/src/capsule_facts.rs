@@ -7,8 +7,10 @@
 //!
 //! Nothing here varies between launches of one manifest. Left out on purpose: the per-turn output
 //! cap, which a `control:` block can change mid-session; the delegation deadline, which
-//! `MURMUR_DELEGATION_TIMEOUT_SECS` can change per launch; and any wall-clock limit, because the
-//! runtime enforces none.
+//! `MURMUR_DELEGATION_TIMEOUT_SECS` can change per launch; whether a demoted shell command's result
+//! is delivered, which the `--lifecycle-*` flags decide; the work-folder ceiling, which bounds the
+//! work folder only for a session launched without `--workdir`; and any wall-clock limit, because
+//! the runtime enforces none.
 
 use murmur_artifact::{InferenceConfig, LifecycleConfig};
 
@@ -30,16 +32,13 @@ pub(crate) struct CapsuleFacts {
     pub(crate) dispatch_limits: Option<DispatchLimits>,
 }
 
-/// The limits the runtime applies to every shell command and native tool it spawns, and to the
-/// work folder they write.
+/// The limits the runtime applies to every shell command and native tool it spawns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DispatchLimits {
     /// `HostResourceLimits::memory_bytes`: `RLIMIT_AS` (`RLIMIT_DATA` on macOS) per command.
     pub(crate) memory_bytes: u64,
     /// `HostResourceLimits::cpu_seconds`: `RLIMIT_CPU` per command.
     pub(crate) cpu_seconds: u64,
-    /// `HostResourceLimits::workdir_max_bytes`.
-    pub(crate) workdir_max_bytes: u64,
     /// `lifecycle.shell_grace_secs`, when the model's tool list holds a runtime shell tool
     /// (`capabilities.shell.allow` is not empty).
     pub(crate) shell_grace_secs: Option<u64>,
@@ -56,7 +55,6 @@ impl CapsuleFacts {
         let dispatch_limits = (inference.transport != "process").then(|| DispatchLimits {
             memory_bytes: policy.resources.memory_bytes,
             cpu_seconds: policy.resources.cpu_seconds,
-            workdir_max_bytes: policy.resources.workdir_max_bytes,
             shell_grace_secs: (!policy.shell_allow.is_empty())
                 .then_some(lifecycle.shell_grace_secs),
         });
@@ -70,7 +68,7 @@ impl CapsuleFacts {
     }
 
     /// Each limit the runtime enforces on this session, as a sentence fragment, in a fixed order:
-    /// turns, session tokens, per-command resources, the work folder, shell demotion. The
+    /// turns, session tokens, per-command resources, shell demotion. The
     /// `[Capsule]` block and the process prompt join them into one sentence; MURMUR.md lists
     /// them.
     pub(crate) fn limit_parts(&self) -> Vec<String> {
@@ -88,14 +86,9 @@ impl CapsuleFacts {
                 render_bytes(limits.memory_bytes),
                 limits.cpu_seconds
             ));
-            parts.push(format!(
-                "{} in the work folder",
-                render_bytes(limits.workdir_max_bytes)
-            ));
             if let Some(grace) = limits.shell_grace_secs {
                 parts.push(format!(
-                    "a shell command still running after {grace} s moves to the background and \
-                     its result arrives in a later message"
+                    "a shell command still running after {grace} s moves to the background"
                 ));
             }
         }
@@ -121,6 +114,12 @@ impl CapsuleFacts {
             self.network_allow.join(", ")
         }
     }
+}
+
+/// The work-folder ceiling as a limit part, in the form [`CapsuleFacts::limit_parts`] renders.
+/// MURMUR.md alone states it, and only where `WorkdirGuard` measures the work folder itself.
+pub(crate) fn work_folder_ceiling_part(workdir_max_bytes: u64) -> String {
+    format!("{} in the work folder", render_bytes(workdir_max_bytes))
 }
 
 /// `bytes` as a whole number of GiB or MiB when it is one, else as bytes.
@@ -188,8 +187,7 @@ mod tests {
         let facts = test_default_facts();
         assert_eq!(
             facts.limits_sentence(),
-            "10 turns per task; 2 GiB memory and 3600 s CPU time per command; 10 GiB in the work \
-             folder."
+            "10 turns per task; 2 GiB memory and 3600 s CPU time per command."
         );
         assert_eq!(facts.network_allowlist(), "none");
         assert!(facts.read_only_paths.is_empty());
@@ -225,7 +223,6 @@ mod tests {
             Some(DispatchLimits {
                 memory_bytes: policy.resources.memory_bytes,
                 cpu_seconds: policy.resources.cpu_seconds,
-                workdir_max_bytes: policy.resources.workdir_max_bytes,
                 shell_grace_secs: Some(lifecycle.shell_grace_secs),
             })
         );
@@ -234,8 +231,11 @@ mod tests {
         assert_eq!(
             facts.limits_sentence(),
             "7 turns per task; 50000 tokens per session; 1 GiB memory and 120 s CPU time per \
-             command; 512 MiB in the work folder; a shell command still running after 30 s moves \
-             to the background and its result arrives in a later message."
+             command; a shell command still running after 30 s moves to the background."
+        );
+        assert_eq!(
+            work_folder_ceiling_part(policy.resources.workdir_max_bytes),
+            "512 MiB in the work folder"
         );
     }
 

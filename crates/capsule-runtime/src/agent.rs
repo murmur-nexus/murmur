@@ -4592,8 +4592,7 @@ mod tests {
                 "[Capsule]\nName: my-capsule\nVersion: 1.0.0\n\
                  Work folder: ./ (your current directory). You may write anywhere in it.\n\
                  Network allowlist: none\n\
-                 Limits: 10 turns per task; 2 GiB memory and 3600 s CPU time per command; 10 GiB \
-                 in the work folder.\n\
+                 Limits: 10 turns per task; 2 GiB memory and 3600 s CPU time per command.\n\
                  {RUNTIME_DIR_NOTICE}\n{NOTICES}\n\ncustom"
             )
         );
@@ -4617,8 +4616,8 @@ mod tests {
                  tests, Cargo.lock (read-only).\n\
                  Network allowlist: api.openai.com, pypi.org:443\n\
                  Limits: 7 turns per task; 50000 tokens per session; 1 GiB memory and 120 s CPU \
-                 time per command; 512 MiB in the work folder; a shell command still running \
-                 after 30 s moves to the background and its result arrives in a later message.\n\
+                 time per command; a shell command still running after 30 s moves to the \
+                 background.\n\
                  {RUNTIME_DIR_NOTICE}\n{NOTICES}\n\n"
             )
         );

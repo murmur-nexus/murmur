@@ -123,6 +123,8 @@ struct Spec<'a> {
     plan: bool,
     extra_artifacts: &'a str,
     extra_capabilities: &'a str,
+    /// Binaries allowed beside [`SHELL_ALLOW`].
+    extra_shell: &'a [&'a str],
     env_allow: &'a [&'a str],
 }
 
@@ -164,6 +166,7 @@ fn project(endpoint: &str, spec: &Spec<'_>) -> Option<Project> {
 
     let shell = SHELL_ALLOW
         .iter()
+        .chain(spec.extra_shell)
         .map(|binary| format!("      - {binary}\n"))
         .collect::<String>();
     let plan = if spec.plan {
@@ -1186,6 +1189,123 @@ fn murmur_md_names_resolve() {
     }
     assert!(skills.iter().any(|(name, _)| name == BOUND), "{skills:?}");
     assert!(skills.iter().any(|(name, _)| name == SKILL), "{skills:?}");
+}
+
+// ── the work-folder ceiling ──────────────────────────────────────────────────
+
+/// A 1 MiB `workdir_max_bytes`, with `sleep` allowed and a grace period that keeps a 12 s command
+/// in the foreground.
+fn ceiling_project(endpoint: &str) -> Project {
+    let p = project(
+        endpoint,
+        &Spec {
+            extra_capabilities: "  resources:\n    workdir_max_bytes: 1048576\n",
+            extra_shell: &["sleep"],
+            ..Spec::default()
+        },
+    )
+    .unwrap();
+    let mut manifest = fs::read_to_string(&p.manifest).unwrap();
+    manifest.push_str("lifecycle:\n  shell_grace_secs: 30\n");
+    fs::write(&p.manifest, manifest).unwrap();
+    p
+}
+
+fn cat_murmur_md(index: usize) -> String {
+    tool_call(
+        index,
+        "toolu_md",
+        "bash",
+        bash("cat \"$MURMUR_RUNTIME_DIR/MURMUR.md\""),
+    )
+}
+
+/// Under `--workdir` the guard measures `.murmur/<session-id>` beneath the work folder, not the
+/// work folder itself, so neither the block nor MURMUR.md states a ceiling for it.
+#[test]
+#[allow(clippy::print_stdout)]
+fn work_folder_ceiling_is_not_claimed_under_workdir() {
+    if common::skip_without_host_support("work_folder_ceiling_is_not_claimed_under_workdir") {
+        return;
+    }
+    let server = common::ScriptedServer::start(vec![cat_murmur_md(1), end_turn("done")]);
+    let p = ceiling_project(&server.endpoint);
+    let workdir = TempDir::new().unwrap();
+    Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", p.home.path())
+        .args([
+            "run",
+            "--manifest",
+            p.manifest.to_str().unwrap(),
+            "--workdir",
+            workdir.path().to_str().unwrap(),
+            "--task",
+            TASK,
+        ])
+        .assert()
+        .success();
+    let block = block_of(&server.requests()[0]);
+    println!("── [Capsule] block\n{block}");
+    let murmur_md = result_text(&server, "toolu_md");
+    assert!(murmur_md.contains("\n## Limits\n"), "{murmur_md}");
+    for text in [&block, &murmur_md] {
+        assert!(!text.contains("in the work folder"), "{text}");
+    }
+}
+
+/// Without `--workdir` the guard measures the work folder, MURMUR.md states its ceiling, and a
+/// write past it ends the session. The `[Capsule]` block, the same for every launch, states none.
+#[test]
+#[allow(clippy::print_stdout)]
+fn work_folder_ceiling_stated_without_workdir_is_enforced() {
+    if common::skip_without_host_support("work_folder_ceiling_stated_without_workdir_is_enforced") {
+        return;
+    }
+    let server = common::ScriptedServer::start(vec![
+        cat_murmur_md(1),
+        tool_call(
+            2,
+            "toolu_write",
+            "bash",
+            bash("head -c 5000000 /dev/zero > big.bin"),
+        ),
+        // Longer than the guard's 10 s check interval.
+        tool_call(3, "toolu_sleep", "bash", bash("sleep 12")),
+        end_turn("never sent: the breach ends the session first"),
+    ]);
+    let p = ceiling_project(&server.endpoint);
+    let output = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", p.home.path())
+        .args([
+            "run",
+            "--manifest",
+            p.manifest.to_str().unwrap(),
+            "--task",
+            TASK,
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("── stderr\n{stderr}");
+    let block = block_of(&server.requests()[0]);
+    assert!(!block.contains("in the work folder"), "{block}");
+    let murmur_md = result_text(&server, "toolu_md");
+    assert!(
+        md_section(&murmur_md, "Limits").contains("\n- 1 MiB in the work folder\n"),
+        "{murmur_md}"
+    );
+    assert!(!output.status.success(), "the breach fails the run");
+    assert!(
+        stderr.contains("past the 1048576 byte ceiling (capabilities.resources.workdir_max_bytes)"),
+        "{stderr}"
+    );
+    assert_eq!(
+        server.requests().len(),
+        3,
+        "no turn follows the command the breach was seen during"
+    );
 }
 
 // ── the task's way in ────────────────────────────────────────────────────────

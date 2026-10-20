@@ -4,7 +4,7 @@ use murmur_artifact::{ArtifactRuntime, PACKED_MANIFEST_ENTRY};
 use serde_yaml::Value;
 
 use crate::{
-    capsule_facts::CapsuleFacts,
+    capsule_facts::{work_folder_ceiling_part, CapsuleFacts},
     formation_credentials::FormationMember,
     identity::CapsuleIdentity,
     shell::is_shell_interpreter,
@@ -90,6 +90,11 @@ pub(crate) struct MurmurMdInputs {
     /// The manifest file the launch copied into the runtime directory, if it read one.
     pub(crate) manifest_file: Option<String>,
     pub(crate) facts: CapsuleFacts,
+    /// `capabilities.resources.workdir_max_bytes`, when `WorkdirGuard` measures the accessible
+    /// workdir itself and a breach ends the session: `transport: http` launched without
+    /// `--workdir`. Under `--workdir` the guard measures `.murmur/<session-id>` beneath it, and on
+    /// `transport: process` the harness's own writes are not refused, so neither states a ceiling.
+    pub(crate) work_folder_ceiling: Option<u64>,
 }
 
 /// Write MURMUR.md to the session's runtime directory, `runtime_root`, which the capsule's
@@ -140,7 +145,7 @@ fn generate_murmur_md(runtime_root: &WorkdirRoot, inputs: &MurmurMdInputs) -> St
 
     let max_tokens_display = inputs
         .context_window
-        .map(|n| n.to_string())
+        .map(|n| format!("{n} tokens"))
         .unwrap_or_else(|| "not set".to_string());
 
     // Compaction is dispatched by lifecycle binding, not by artifact name: it fires when the
@@ -169,7 +174,8 @@ fn generate_murmur_md(runtime_root: &WorkdirRoot, inputs: &MurmurMdInputs) -> St
     let network = facts.network_allowlist();
     let limits: String = facts
         .limit_parts()
-        .iter()
+        .into_iter()
+        .chain(inputs.work_folder_ceiling.map(work_folder_ceiling_part))
         .map(|part| format!("- {part}\n"))
         .collect();
 
@@ -213,7 +219,7 @@ fn generate_murmur_md(runtime_root: &WorkdirRoot, inputs: &MurmurMdInputs) -> St
          ## Limits\n\
          \n\
          {limits}\
-         - Context budget: {max_tokens_display} tokens ({compaction_status})\n\
+         - Context budget: {max_tokens_display} ({compaction_status})\n\
          \n\
          ## Runtime Directory\n\
          \n\
@@ -447,7 +453,8 @@ fn build_shell_section(shell_allow: &[String]) -> String {
     out
 }
 
-/// The inputs of an http agent session declaring nothing optional, launched from `murmur.yaml`.
+/// The inputs of an http agent session declaring nothing optional, launched from `murmur.yaml`
+/// without `--workdir`.
 #[cfg(test)]
 pub(crate) fn test_inputs() -> MurmurMdInputs {
     MurmurMdInputs {
@@ -466,6 +473,7 @@ pub(crate) fn test_inputs() -> MurmurMdInputs {
         shell_allow: Vec::new(),
         manifest_file: Some("murmur.yaml".to_string()),
         facts: crate::capsule_facts::test_default_facts(),
+        work_folder_ceiling: Some(crate::resources::DEFAULT_WORKDIR_MAX_BYTES),
     }
 }
 
@@ -518,6 +526,7 @@ mod tests {
             inputs.model = inference.model.clone();
             inputs.context_window = Some(200_000);
             inputs.facts = facts.clone();
+            inputs.work_folder_ceiling = Some(policy.resources.workdir_max_bytes);
         });
         let runtime_dir = tmp.path().display();
         let expected = format!(
@@ -535,9 +544,8 @@ mod tests {
              - 10 turns per task\n\
              - 50000 tokens per session\n\
              - 2 GiB memory and 3600 s CPU time per command\n\
+             - a shell command still running after 10 s moves to the background\n\
              - 10 GiB in the work folder\n\
-             - a shell command still running after 10 s moves to the background and its result \
-             arrives in a later message\n\
              - Context budget: 200000 tokens (compaction not configured)\n\
              \n\
              ## Runtime Directory\n"
@@ -549,6 +557,75 @@ mod tests {
                 "{part:?} missing"
             );
         }
+    }
+
+    /// The facts of the capsule whose limits `capsule_facts_equal_the_enforced_values` pins.
+    fn enforced_limits_facts() -> (CapabilityPolicy, CapsuleFacts) {
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            resources: crate::resources::HostResourceLimits {
+                memory_bytes: 1_073_741_824,
+                cpu_seconds: 120,
+                workdir_max_bytes: 536_870_912,
+                ..crate::resources::HostResourceLimits::resolve(None)
+            },
+            ..CapabilityPolicy::default()
+        };
+        let inference = murmur_artifact::InferenceConfig {
+            max_turns: Some(7),
+            max_session_tokens: Some(50_000),
+            ..crate::capsule_facts::test_http_inference()
+        };
+        let lifecycle = murmur_artifact::LifecycleConfig {
+            shell_grace_secs: 30,
+            ..murmur_artifact::LifecycleConfig::default()
+        };
+        let facts = CapsuleFacts::resolve(&policy, &inference, &lifecycle);
+        (policy, facts)
+    }
+
+    const ENFORCED_LIMIT_BULLETS: &str = "## Limits\n\
+         \n\
+         - 7 turns per task\n\
+         - 50000 tokens per session\n\
+         - 1 GiB memory and 120 s CPU time per command\n\
+         - a shell command still running after 30 s moves to the background\n";
+
+    /// Launched without `--workdir`, the guard measures the work folder, so its ceiling follows
+    /// the block's parts.
+    #[test]
+    fn capsule_facts_in_murmur_md_without_workdir_state_the_work_folder_ceiling() {
+        let tmp = TempDir::new().unwrap();
+        let (policy, facts) = enforced_limits_facts();
+        let content = render(&tmp, |inputs| {
+            inputs.facts = facts;
+            inputs.work_folder_ceiling = Some(policy.resources.workdir_max_bytes);
+        });
+        let expected = format!(
+            "{ENFORCED_LIMIT_BULLETS}- 512 MiB in the work folder\n- Context budget: not set \
+             (compaction not configured)\n"
+        );
+        assert!(content.contains(&expected), "content: {content}");
+    }
+
+    /// Launched with `--workdir`, the guard measures `.murmur/<session-id>` beneath the work
+    /// folder, so no ceiling is stated for it.
+    #[test]
+    fn capsule_facts_in_murmur_md_under_workdir_state_no_work_folder_ceiling() {
+        let tmp = TempDir::new().unwrap();
+        let (_, facts) = enforced_limits_facts();
+        let content = render(&tmp, |inputs| {
+            inputs.facts = facts;
+            inputs.work_folder_ceiling = None;
+        });
+        let expected = format!(
+            "{ENFORCED_LIMIT_BULLETS}- Context budget: not set (compaction not configured)\n"
+        );
+        assert!(content.contains(&expected), "content: {content}");
+        assert!(
+            !content.contains("in the work folder"),
+            "content: {content}"
+        );
     }
 
     #[test]
@@ -670,7 +747,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
         let content = render(&tmp, |_| {});
-        assert!(content.contains("- Context budget: not set tokens (compaction not configured)\n"));
+        assert!(content.contains("- Context budget: not set (compaction not configured)\n"));
     }
 
     #[test]

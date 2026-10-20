@@ -524,8 +524,7 @@ fn agent_system_prompt_includes_capsule_context() {
     for line in [
         "\nWork folder: ./ (your current directory). You may write anywhere in it.\n".to_string(),
         format!("\nNetwork allowlist: {}\n", server.endpoint),
-        "\nLimits: 2 GiB memory and 3600 s CPU time per command; 10 GiB in the work folder.\n"
-            .to_string(),
+        "\nLimits: 2 GiB memory and 3600 s CPU time per command.\n".to_string(),
     ] {
         assert!(
             system_field.contains(&line),
@@ -638,7 +637,7 @@ fn prompt_prefix_is_identical_across_two_launches() {
             "[Capsule] block must be first; got:\n{system}"
         );
         assert!(
-            system.contains("\nLimits: 2 GiB memory and 3600 s CPU time per command;"),
+            system.contains("\nLimits: 2 GiB memory and 3600 s CPU time per command.\n"),
             "the block states the limits; got:\n{system}"
         );
     }

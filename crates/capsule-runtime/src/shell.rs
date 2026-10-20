@@ -1947,6 +1947,7 @@ mod tests {
             &ShellEnforcement::environment_only(),
             Some(DetachPolicy {
                 grace: Duration::from_secs(60),
+                delivered: true,
                 registry: Arc::clone(&registry),
                 command: "sleep 5".to_string(),
                 context_id: "ctx_abandon_test".to_string(),

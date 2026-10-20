@@ -2366,8 +2366,9 @@ Every command starts in the foreground and the clock decides.
 | `N` (positive integer) | The same, with an `N`-second window. |
 | `0` | The first check after the spawn moves the command to the background, unless it has already exited by then. |
 
-A backgrounded command hands the turn a handle of the form `wrk_<id>` and the fact that it is
-still running. Its full stdout and stderr are written to `logs/<work_id>.log` under the
+A backgrounded command hands the turn a handle of the form `wrk_<id>`, the fact that it is
+still running, and whether its result will reach the model — it will only under
+`task_acceptance: queue` with `after_task: sleep`, as described below. Its full stdout and stderr are written to `logs/<work_id>.log` under the
 [capsule workdir](workdir.md), and stay there — the turn is told the path, never the contents.
 
 Nothing accepts a work id, so the handle cannot be used to ask after the command. The result
