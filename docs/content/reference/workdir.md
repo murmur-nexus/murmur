@@ -88,7 +88,6 @@ The capsule's commands can write these like any other file in the workdir.
 | `logs/<work-id>.log` | The same, for a command demoted to the background. The completion carries the path |
 | `peer-in/<handle-id>-<name>` | Bytes fetched by redeeming a peer handle. See [Resource plane](resource-plane.md) |
 | `out/result.txt` | A script capsule's final output. An agent session writes it to the session workdir instead |
-| `checkpoints/` | `summary.md`, `plan.json` and `decisions.json`. `MURMUR.md` directs the agent to write state here to survive compaction; the runtime neither reads nor writes them |
 
 Everything else in this directory belongs to the capsule.
 
@@ -122,7 +121,7 @@ created is refused with [`E-IO-004`](diagnostics.md#e-io-004) before anything is
 
 | Path | Holds |
 |---|---|
-| `runtime/MURMUR.md` | The capsule's generated inventory: identity (for a formation member, also its roster name and formation id), both directories, installed tools and skills, shell access. Agent sessions only. Written at staging and rewritten once the capsule's port is bound |
+| `runtime/MURMUR.md` | The capsule's generated inventory: identity (for a formation member, also its roster name and formation id), both directories, the network allowlist, the limits, the runtime directory's entries, installed tools and skills, shell access. See [`MURMUR.md`](../concepts/session-loop.md#murmur-md). Agent sessions only. Written at staging, rewritten once the capsule's port is bound, and rewritten after every pull or removal that commits |
 | `runtime/task.md` | The task. See [Task input](#task-input) |
 | `runtime/<manifest file>` | A copy of the manifest file the launch read — `--manifest`, or the project's `murmur.yaml` — under its own name. A capsule launched by name with `--capsule` read none and has none |
 | `runtime/tools/<name>/murmur.yaml` | A staged or pulled artifact's manifest. `<name>` is the artifact's bare name, the part of its full name after the `/`, which is also its tool name |
@@ -139,7 +138,7 @@ created is refused with [`E-IO-004`](diagnostics.md#e-io-004) before anything is
 | A shell command, a plan's `shell` step, a native tool, a `transport: process` harness | `$MURMUR_RUNTIME_DIR`, the absolute path of `runtime/`. Set by the runtime last, so neither `capabilities.env.allow`, a shell baseline variable nor the host can change it |
 | A script capsule's own component, a `runtime: tool` artifact with no `capabilities.filesystem.scope` | `murmur-runtime/`, beside the workdir it sees as its current directory, read-only. A script capsule reads its task at `murmur-runtime/task.md` |
 | A tool with a `scope`, a driver, a hook | Nothing |
-| The model | The [`[Capsule]` block and `MURMUR.md`](../concepts/session-loop.md#murmur-md) name both ways in |
+| The model | The [`[Capsule]` block](../concepts/session-loop.md#capsule-block) and [`MURMUR.md`](../concepts/session-loop.md#murmur-md) name both ways in |
 
 `sealed-etc/` and `harness/` are reached by no command.
 

@@ -212,8 +212,10 @@ fn upstream_request_matches_recording() {
             .to_string(),
     ));
     let recording = std::env::var_os("MURMUR_RECORD_GOLDEN").is_some();
-    // A runtime without the gateway reaches the provider only through `network.allow`. The entry
-    // changes nothing about the request itself, so it is present only while recording.
+    // A runtime without the gateway reaches the provider only through `network.allow`, so the
+    // entry is present only while recording. The system text names it on its `Network
+    // allowlist:` line, which the committed recording reads as `none`, with `content-length` to
+    // match: a new recording needs both put back by hand.
     let allow = if recording {
         format!(
             "capabilities:\n  network:\n    allow:\n      - {}\n",

@@ -2131,6 +2131,12 @@ pub fn stage_session(
         if let Some(source) = &artifact.source {
             let skill_md = load_local_skill_md(&request.manifest_dir, source)?;
             skill_files.push((artifact.name.clone(), skill_md));
+            // The manifest a published skill carries in its package, so the skill is in the
+            // model's tool list, and MURMUR.md names it, on the same terms.
+            installed_manifests.push((
+                artifact.name.clone(),
+                local_skill_manifest_yaml(&artifact.name, &artifact.version),
+            ));
             installed_artifacts.push(InstalledArtifactSummary {
                 name: artifact.name.clone(),
                 version: artifact.version.clone(),
@@ -2809,32 +2815,48 @@ pub fn stage_session(
         request.capability_policy.hook_limits(),
     )?;
 
-    // Write MURMUR.md now for agent sessions so that tooling that inspects the workdir after
-    // staging (e.g. tests, debuggers) can read it. launch_session overwrites this file after
-    // port binding with the complete identity including capsule_url.
-    if let Some(ref inference) = request.inference {
-        let partial_identity = CapsuleIdentity {
-            capsule_name: request.capsule_name.clone(),
-            capsule_version: request.capsule_version.clone(),
-            session_id: session_id.clone(),
-            capsule_url: String::new(),
-        };
-        murmur_md::write_murmur_md(
-            &runtime_root,
-            &accessible_workdir,
-            Some(inference),
-            primary_context_window(driver_choices.as_ref(), request.context.as_ref()),
-            has_compaction_hook(&hook_components),
-            &request.capability_policy,
-            &partial_identity,
-            request.formation_member.as_deref(),
-            manifest_file_name.as_deref(),
-        );
-    }
-
     // The manifest this launch read, beside `MURMUR.md`, for the agent to read; nothing is copied
     // into the workdir.
     copy_manifest_into_runtime_dir(request.manifest_file.as_deref(), &runtime_root)?;
+
+    // Resolve lifecycle: manifest config + any override
+    let lifecycle = resolve_lifecycle(request.lifecycle, request.lifecycle_override.as_ref());
+
+    // Written now for agent sessions, after the manifest copy so its tree can list the file, for
+    // tooling that inspects the runtime directory after staging (tests, debuggers).
+    // `launch_session` rewrites it after port binding with the capsule URL.
+    let murmur_md = request.inference.as_ref().map(|inference| {
+        let inputs = murmur_md::MurmurMdInputs {
+            identity: CapsuleIdentity {
+                capsule_name: request.capsule_name.clone(),
+                capsule_version: request.capsule_version.clone(),
+                session_id: session_id.clone(),
+                capsule_url: String::new(),
+            },
+            formation: request.formation_member.clone(),
+            model: inference.model.clone(),
+            system_prompt_artifact: inference.system_prompt_artifact.clone(),
+            accessible_workdir: accessible_workdir.clone(),
+            context_window: primary_context_window(
+                driver_choices.as_ref(),
+                request.context.as_ref(),
+            ),
+            compaction_hook_registered: has_compaction_hook(&hook_components),
+            shell_allow: request.capability_policy.shell_allow.clone(),
+            manifest_file: manifest_file_name.clone(),
+            facts: crate::capsule_facts::CapsuleFacts::resolve(
+                &request.capability_policy,
+                inference,
+                &lifecycle,
+            ),
+            // `session_root`, which `WorkdirGuard` measures, is the accessible workdir only
+            // without `--workdir`.
+            work_folder_ceiling: (request.workdir.is_none() && inference.transport != "process")
+                .then_some(request.capability_policy.resources.workdir_max_bytes),
+        };
+        murmur_md::write_murmur_md(&runtime_root, &inputs);
+        inputs
+    });
 
     // Every refusal latched while staging — including one a best-effort writer above swallowed,
     // such as `MURMUR.md` or an `on-stage` hook's manifest — fails the launch. No trace exists
@@ -2842,9 +2864,6 @@ pub fn stage_session(
     if let Some(refusal) = accessible_root.take_refusals().into_iter().next() {
         return Err(RuntimeError::WorkdirPathRefused { refusal });
     }
-
-    // Resolve lifecycle: manifest config + any override
-    let lifecycle = resolve_lifecycle(request.lifecycle, request.lifecycle_override.as_ref());
 
     Ok(StagedSession {
         session_id,
@@ -2859,6 +2878,7 @@ pub fn stage_session(
         records_dir: records_dir.path().to_path_buf(),
         records_root,
         manifest_file_name,
+        murmur_md,
         manifest_dir: request.manifest_dir,
         capsule_artifact: request.capsule_artifact.unwrap_or_else(|| {
             format!("{}/{}", murmur_artifact::LOCAL_SCOPE, request.capsule_name)
@@ -3352,17 +3372,13 @@ fn launch(
         all_env.push(("MURMUR_SESSION_ID".to_string(), session_id.clone()));
         all_env.push(("MURMUR_CAPSULE_URL".to_string(), capsule_url.clone()));
 
-        murmur_md::write_murmur_md(
-            &runtime_root,
-            &staged.accessible_workdir,
-            Some(inference),
-            primary_context_window(staged.driver_choices.as_ref(), staged.context.as_ref()),
-            has_compaction_hook(&staged.hook_components),
-            &staged.capability_policy,
-            &capsule_identity,
-            staged.formation_member.as_deref(),
-            staged.manifest_file_name.as_deref(),
-        );
+        // Rewritten now that the capsule URL is known, and held on the session for the rewrite a
+        // committed pull or removal makes.
+        let murmur_md_inputs = staged.murmur_md.take().map(|mut inputs| {
+            inputs.identity = capsule_identity.clone();
+            murmur_md::write_murmur_md(&runtime_root, &inputs);
+            inputs
+        });
 
         sandbox::warn_for_enforcement_tier(
             shell_enforcement.tier,
@@ -3841,6 +3857,7 @@ fn launch(
                         runtime_dirs: staged.runtime_dirs.clone(),
                         records_root: records_root.clone(),
                         manifest_file_name: staged.manifest_file_name.clone(),
+                        murmur_md: murmur_md_inputs,
                         tool_components,
                         native_entrypoints,
                         process_driver: process_driver_for_state.clone(),
@@ -3866,6 +3883,8 @@ fn launch(
                         live_delegations: Arc::clone(&live_delegations),
                         detached: Some(Arc::clone(&detached)),
                         shell_grace_secs: effective_lifecycle.shell_grace_secs,
+                        background_results_delivered: effective_lifecycle
+                            .can_receive_background_tasks(),
                         a2a_task_registry: Some(Arc::clone(&task_registry)),
                         a2a_sse: Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
                         a2a_task: None,
@@ -4853,6 +4872,7 @@ fn launch(
         runtime_dirs: staged.runtime_dirs.clone(),
         records_root: staged.records_root.clone(),
         manifest_file_name: staged.manifest_file_name.clone(),
+        murmur_md: None,
         tool_components: staged.tool_components,
         native_entrypoints: staged.native_entrypoints,
         // A script capsule runs no agent loop, so nothing here would ever drive a harness.
@@ -4882,6 +4902,7 @@ fn launch(
         // foreground.
         detached: None,
         shell_grace_secs: 0,
+        background_results_delivered: false,
         a2a_task_registry: None,
         a2a_sse: None,
         a2a_task: None,
@@ -6886,6 +6907,10 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) records_root: WorkdirRoot,
     /// [`StagedSession::manifest_file_name`], which the `[Capsule]` notice names.
     pub(crate) manifest_file_name: Option<String>,
+    /// [`StagedSession::murmur_md`], completed with the capsule URL: what a committed pull or
+    /// removal rewrites `MURMUR.md` from, and the facts both transports' system prompts state.
+    /// `None` on the script path, which writes no `MURMUR.md`.
+    pub(crate) murmur_md: Option<crate::murmur_md::MurmurMdInputs>,
     /// [`StagedSession::accessible_root`]. Its refusal latch is the session's: the agent loop's
     /// checkpoints drain it through here.
     pub(crate) accessible_root: WorkdirRoot,
@@ -6988,6 +7013,9 @@ pub(crate) struct CapsuleStoreState {
     /// `lifecycle.shell_grace_secs`: how long a shell command runs in the foreground before it
     /// is demoted. Read from the resolved lifecycle once per launch.
     pub(crate) shell_grace_secs: u64,
+    /// Whether a demoted command's completion reaches the model as a later task: the effective
+    /// lifecycle's `can_receive_background_tasks`, the predicate `W-SEC-022` warns on.
+    pub(crate) background_results_delivered: bool,
     // ── A2A request-input support ────────────────────────────────────────────────
     /// Shared task registry — Some in A2A mode, None for script capsules.
     pub(crate) a2a_task_registry: Option<Arc<Mutex<TaskRegistry>>>,
@@ -7040,6 +7068,21 @@ pub(crate) struct CapsuleStoreState {
 }
 
 impl CapsuleStoreState {
+    /// The facts both transports' system prompts state, staged for every agent session.
+    pub(crate) fn capsule_facts(
+        &self,
+    ) -> Result<&crate::capsule_facts::CapsuleFacts, RuntimeError> {
+        self.murmur_md
+            .as_ref()
+            .map(|inputs| &inputs.facts)
+            .ok_or_else(|| {
+                RuntimeError::AgentLoopFailed(
+                    "the session was launched without the capsule facts an agent loop states"
+                        .to_string(),
+                )
+            })
+    }
+
     /// This session's cancel flag for the task now in scope, or `None` outside an A2A task.
     ///
     /// Both halves are needed: the registry mints the signal and the task id names which task's.
@@ -8583,6 +8626,7 @@ impl CapsuleStoreState {
             let detach = match (&self.detached, &self.current_context_id) {
                 (Some(registry), Some(context_id)) => Some(DetachPolicy {
                     grace: std::time::Duration::from_secs(self.shell_grace_secs),
+                    delivered: self.background_results_delivered,
                     registry: Arc::clone(registry),
                     command: String::new(),
                     context_id: context_id.clone(),
@@ -10730,6 +10774,19 @@ fn switch_driver_tool_manifest(choices: &crate::driver_choice::DriverChoices) ->
     native_tool_manifest_yaml(SWITCH_DRIVER_TOOL, description, schema.to_string())
 }
 
+/// The `murmur.yaml` staged for a skill declared with `source:`, which has no package to carry
+/// one. With no `description`, its tool description is the first line of its `skill.md`.
+fn local_skill_manifest_yaml(name: &str, version: &str) -> String {
+    let mut manifest = serde_yaml::Mapping::new();
+    for (key, value) in [("name", name), ("version", version), ("runtime", "skill")] {
+        manifest.insert(
+            Value::String(key.to_string()),
+            Value::String(value.to_string()),
+        );
+    }
+    serde_yaml::to_string(&manifest).unwrap_or_default()
+}
+
 /// A runtime-provided tool's `murmur.yaml`, built from YAML values rather than text so a
 /// description carrying a quote, a colon or a backtick cannot break it.
 fn native_tool_manifest_yaml(name: &str, description: String, input_schema: String) -> String {
@@ -11254,6 +11311,8 @@ fn dispatch_shell_tool(
     } = resolved;
     let args: Vec<&str> = argv.iter().map(String::as_str).collect();
 
+    // Only a command given a policy can be demoted, so the flag is read before it moves.
+    let delivered = detach.as_ref().is_some_and(|detach| detach.delivered);
     let detach = detach.map(|detach| DetachPolicy {
         command: command.clone(),
         ..detach
@@ -11302,7 +11361,7 @@ fn dispatch_shell_tool(
         // the fields `ShellDispatchInfo` exists to carry — hence `shell: None`, and hence no
         // `HookEvent::Shell`. What it did produce is the handle.
         Ok(ShellOutcome::Detached(info)) => {
-            let result = demotion_tool_result(&info.work_id);
+            let result = demotion_tool_result(&info.work_id, delivered);
             DispatchOutcome {
                 detached: Some(info),
                 ..DispatchOutcome::tool(result)
@@ -13101,6 +13160,34 @@ inference:
         assert!(log.contains("lifecycle.shell_grace_secs"), "log was: {log}");
         assert!(log.contains("lifecycle.task_acceptance"), "log was: {log}");
         assert!(log.contains("lifecycle.after_task"), "log was: {log}");
+    }
+
+    /// The demotion result the model reads and `W-SEC-022`, which the operator reads, agree on
+    /// whether a demoted command's result arrives: `launch` hands the dispatch path the same
+    /// predicate the warning fires on.
+    #[test]
+    fn the_demotion_text_agrees_with_unreachable_shell_completions_warning() {
+        for lifecycle in [
+            lifecycle(TaskAcceptance::Single, AfterTask::Exit),
+            lifecycle(TaskAcceptance::Queue, AfterTask::Exit),
+            lifecycle(TaskAcceptance::Queue, AfterTask::Sleep),
+        ] {
+            let delivered = lifecycle.can_receive_background_tasks();
+            let warned = unreachable_shell_completions_warning(true, &lifecycle).is_some();
+            assert_eq!(delivered, !warned, "{lifecycle:?}");
+            let data = demotion_tool_result("wrk_1", delivered).data.unwrap();
+            assert_eq!(
+                data.contains("will not reach you"),
+                warned,
+                "{lifecycle:?}: {data}"
+            );
+            assert_eq!(
+                data.contains("will arrive later"),
+                !warned,
+                "{lifecycle:?}: {data}"
+            );
+        }
+        assert!(!LifecycleConfig::default().can_receive_background_tasks());
     }
 
     /// The only lifecycle a completion can reach is `queue` + `sleep`; a capsule that declares no
@@ -15305,6 +15392,7 @@ inference:
             .with_records(root.clone()),
             records_root: root.clone(),
             manifest_file_name: Some("murmur.yaml".to_string()),
+            murmur_md: Some(crate::murmur_md::test_inputs()),
             session_root: root.clone(),
             accessible_root: root,
             accessible_workdir: workdir,
@@ -15333,6 +15421,7 @@ inference:
             live_delegations: Arc::new(crate::cancel::LiveDelegations::new()),
             detached: None,
             shell_grace_secs: 0,
+            background_results_delivered: false,
             a2a_task_registry: None,
             a2a_sse: None,
             a2a_task: None,
@@ -18377,7 +18466,7 @@ inference:
                     binary: "/bin/sh".to_string(),
                     grace_ms: 1,
                 }),
-                ..DispatchOutcome::tool(demotion_tool_result("work_1"))
+                ..DispatchOutcome::tool(demotion_tool_result("work_1", false))
             },
             DispatchOutcome::skill(tool_result_with(Some("# how to deploy"), None)),
         ];
@@ -23144,22 +23233,7 @@ inference:
         planted.link(&planted.sentinel, "tools/x/skill.md");
         let state = planted.state();
 
-        crate::murmur_md::write_murmur_md(
-            &state.session_root,
-            std::path::Path::new("/work"),
-            None,
-            None,
-            false,
-            &CapabilityPolicy::default(),
-            &CapsuleIdentity {
-                capsule_name: "cap".to_string(),
-                capsule_version: "0.1.0".to_string(),
-                session_id: "ses_test".to_string(),
-                capsule_url: String::new(),
-            },
-            None,
-            Some("murmur.yaml"),
-        );
+        crate::murmur_md::write_murmur_md(&state.session_root, &crate::murmur_md::test_inputs());
 
         let murmur_md = fs::read_to_string(planted.workdir.join("MURMUR.md")).unwrap();
         assert!(!murmur_md.contains("SECRET-TOKEN"));
@@ -25313,5 +25387,128 @@ mod submitting_task_tests {
         signal.cancel();
         assert!(task.is_canceled());
         assert!(!submitting(&live, None).is_canceled());
+    }
+}
+
+/// MURMUR.md over a runtime directory holding the manifests staging writes.
+#[cfg(test)]
+mod murmur_md_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A runtime directory staged for `policy` with one WASM tool and `murmur.yaml`, and its
+    /// MURMUR.md as written for an http or a process agent session.
+    fn staged_murmur_md(policy: &CapabilityPolicy, http: bool) -> String {
+        let tmp = TempDir::new().unwrap();
+        let root = WorkdirRoot::open(tmp.path()).unwrap();
+        root.create_dir_all("tools/echo", DEFAULT_DIR_MODE).unwrap();
+        root.write_file(
+            "tools/echo/murmur.yaml",
+            b"name: echo\nversion: 1.0.0\nruntime: tool\ndescription: Echoes its input\n",
+            DEFAULT_FILE_MODE,
+        )
+        .unwrap();
+        root.write_file("murmur.yaml", b"name: cap\n", DEFAULT_FILE_MODE)
+            .unwrap();
+        write_shell_tool_manifests(&root, &policy.shell_allow).unwrap();
+        write_submit_plan_tool_manifest(&root, policy.plan_submit).unwrap();
+        artifact_change::write_artifact_change_tool_manifests(&root, policy, http).unwrap();
+
+        let inference = InferenceConfig {
+            transport: if http { "http" } else { "process" }.to_string(),
+            ..crate::capsule_facts::test_http_inference()
+        };
+        let inputs = crate::murmur_md::MurmurMdInputs {
+            shell_allow: policy.shell_allow.clone(),
+            facts: crate::capsule_facts::CapsuleFacts::resolve(
+                policy,
+                &inference,
+                &LifecycleConfig::default(),
+            ),
+            work_folder_ceiling: http.then_some(policy.resources.workdir_max_bytes),
+            ..crate::murmur_md::test_inputs()
+        };
+        murmur_md::write_murmur_md(&root, &inputs);
+        fs::read_to_string(tmp.path().join("MURMUR.md")).unwrap()
+    }
+
+    fn bash_policy() -> CapabilityPolicy {
+        CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        }
+    }
+
+    /// The text of `## Installed Tools`, up to the next heading.
+    fn installed_tools(content: &str) -> &str {
+        let start = content.find("## Installed Tools\n").unwrap();
+        let rest = &content[start + 1..];
+        &rest[..rest.find("\n## ").unwrap()]
+    }
+
+    /// No install grant. The tools are the staged ones, and the tree lists what exists.
+    #[test]
+    fn murmur_md_without_an_install_grant_lists_the_staged_tools_only() {
+        let content = staged_murmur_md(&bash_policy(), true);
+        let tools = installed_tools(&content);
+        assert!(tools.contains("- **bash** ("), "tools: {tools}");
+        assert!(tools.contains("- **echo** (v1.0.0, tool) — Echoes its input\n"));
+        for absent in [
+            "pull-artifact",
+            "remove-artifact",
+            "find(",
+            "describe(",
+            "list()",
+            "pull(",
+            "remove(",
+            "task.md",
+        ] {
+            assert!(!content.contains(absent), "{absent:?} in: {content}");
+        }
+        assert!(
+            content.contains("$MURMUR_RUNTIME_DIR/\n├── MURMUR.md\n├── murmur.yaml\n└── tools/\n"),
+            "no plans/ until a plan exists: {content}"
+        );
+        assert!(content.contains("\n## Running Shell Commands\n"));
+    }
+
+    /// An install grant puts both tools under `## Installed Tools` on http, with their own
+    /// descriptions, and nothing at all on process, where the tools are not staged.
+    #[test]
+    fn murmur_md_with_an_install_grant_lists_the_install_tools_on_http_only() {
+        let policy = CapabilityPolicy {
+            install_tool: vec!["murmur/tool-*".to_string()],
+            ..bash_policy()
+        };
+        let http = staged_murmur_md(&policy, true);
+        let tools = installed_tools(&http);
+        assert!(
+            tools.contains(&format!(
+                "- **pull-artifact** (v0.0.0, tool) — {}\n",
+                murmur_md::sanitize_description(&artifact_change::pull_artifact_description(
+                    &policy
+                ))
+            )),
+            "tools: {tools}"
+        );
+        assert!(
+            tools.contains(&format!(
+                "- **remove-artifact** (v0.0.0, tool) — {}\n",
+                murmur_md::sanitize_description(artifact_change::REMOVE_ARTIFACT_DESCRIPTION)
+            )),
+            "tools: {tools}"
+        );
+        for absent in ["find(", "describe(", "list()", "Managing Artifacts"] {
+            assert!(!http.contains(absent), "{absent:?} in: {http}");
+        }
+
+        let process = staged_murmur_md(&policy, false);
+        for absent in [
+            "pull-artifact",
+            "remove-artifact",
+            "Install a skill or tool",
+        ] {
+            assert!(!process.contains(absent), "{absent:?} in: {process}");
+        }
     }
 }

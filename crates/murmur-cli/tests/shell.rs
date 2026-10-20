@@ -437,6 +437,11 @@ fn shell_detaches_a_slow_command_and_the_turn_continues() {
         demotion.to_lowercase().contains("background"),
         "the result says the command is still running:\n{demotion}"
     );
+    // The default lifecycle delivers no background result, and the text says so.
+    assert!(
+        demotion.contains("will not reach you") && !demotion.contains("will arrive later"),
+        "the result says the command's result will not arrive:\n{demotion}"
+    );
 
     let events = trace_events(&launched.records_dir);
     let detached = events_of_type(&events, "shell_detached");

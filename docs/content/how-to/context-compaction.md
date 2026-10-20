@@ -231,7 +231,7 @@ If left unset, `compaction-event.system-prompt` arrives at the hook as `none`, a
 mur run
 ```
 
-At startup the runtime writes a generated `MURMUR.md` into the session's [runtime directory](../reference/workdir.md#runtime-directory), which exists while the session runs. Its **Capsule** section reports compaction status — check it from a shell command the capsule runs, or from the host while the session is up, to confirm compaction was configured correctly:
+At startup the runtime writes a generated `MURMUR.md` into the session's [runtime directory](../reference/workdir.md#runtime-directory), which exists while the session runs. Its **Limits** section reports compaction status — check it from a shell command the capsule runs, or from the host while the session is up, to confirm compaction was configured correctly:
 
 ```bash
 grep "Context budget" ~/.murmur/sessions/<session_id>/runtime/MURMUR.md

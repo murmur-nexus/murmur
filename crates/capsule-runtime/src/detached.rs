@@ -149,23 +149,34 @@ pub(crate) struct DetachedDispatchInfo {
     pub grace_ms: u64,
 }
 
-/// The tool result a demoted command hands back to the turn.
+/// The tool result a demoted command hands back to the turn. `delivered` is
+/// [`DetachPolicy::delivered`]: whether the completion will reach the model as a later task.
 ///
-/// Constant size by construction: nothing here derives from the command, its arguments or its
-/// output, so no input can make the text the model reads grow. It names no path either — the
-/// output location arrives with the completion, which is the only thing that can say the file is
-/// finished being written.
-pub(crate) fn demotion_tool_result(work_id: &str) -> ToolResult {
+/// Constant size by construction for either value of `delivered`: nothing here derives from the
+/// command, its arguments or its output, so no input can make the text the model reads grow. It
+/// names no path either — the output location arrives with the completion, which is the only
+/// thing that can say the file is finished being written.
+pub(crate) fn demotion_tool_result(work_id: &str, delivered: bool) -> ToolResult {
+    let data = if delivered {
+        format!(
+            "The command did not finish in time and is now running in the background as {work_id}. \
+             Its result will arrive later as a separate task; there is nothing to poll and no way \
+             to ask about it."
+        )
+    } else {
+        format!(
+            "The command did not finish in time and is now running in the background as {work_id}. \
+             This capsule's lifecycle delivers no background result: the result will not reach \
+             you, and the operator is told what became of the command when the session ends. \
+             There is nothing to poll and no way to ask about it."
+        )
+    };
     ToolResult {
         status: Status::Passed,
         summary: Some(format!(
             "Command still running in the background as {work_id}."
         )),
-        data: Some(format!(
-            "The command did not finish in time and is now running in the background as {work_id}. \
-             Its result will arrive later as a separate task; there is nothing to poll and no way \
-             to ask about it. Continue with other work."
-        )),
+        data: Some(data),
         data_path: None,
         truncated: false,
         metadata: vec![("work_id".to_string(), work_id.to_string())],
@@ -241,6 +252,9 @@ impl DetachedRegistry {
 /// so neither has anywhere to deliver a completion.
 pub(crate) struct DetachPolicy {
     pub grace: Duration,
+    /// Whether the completion reaches the model as a later task, which only `task_acceptance:
+    /// queue` with `after_task: sleep` does. Decides what [`demotion_tool_result`] tells it.
+    pub delivered: bool,
     pub registry: Arc<DetachedRegistry>,
     /// The command text as the model wrote it, without the binary name — the same string a
     /// foreground `shell` trace record carries. `run_shell` only sees the argv it was handed, so
@@ -565,6 +579,7 @@ mod tests {
             &ShellEnforcement::environment_only(),
             Some(DetachPolicy {
                 grace,
+                delivered: true,
                 registry: Arc::clone(&registry),
                 command: script.to_string(),
                 context_id: "ctx_detached_tests".to_string(),
@@ -821,12 +836,50 @@ mod tests {
         assert_eq!(await_completion(&mut receiver).status(), "ok");
     }
 
+    /// Each text states whether the result will reach the model, and neither prescribes what to
+    /// do next.
+    #[test]
+    fn the_demotion_result_states_whether_the_result_arrives() {
+        let delivered = demotion_tool_result("wrk_1", true);
+        let discarded = demotion_tool_result("wrk_1", false);
+        assert_eq!(
+            delivered.data.as_deref(),
+            Some(
+                "The command did not finish in time and is now running in the background as \
+                 wrk_1. Its result will arrive later as a separate task; there is nothing to poll \
+                 and no way to ask about it."
+            )
+        );
+        assert_eq!(
+            discarded.data.as_deref(),
+            Some(
+                "The command did not finish in time and is now running in the background as \
+                 wrk_1. This capsule's lifecycle delivers no background result: the result will \
+                 not reach you, and the operator is told what became of the command when the \
+                 session ends. There is nothing to poll and no way to ask about it."
+            )
+        );
+        for result in [&delivered, &discarded] {
+            assert_eq!(
+                result.summary.as_deref(),
+                Some("Command still running in the background as wrk_1.")
+            );
+            assert!(!result.data.as_deref().unwrap().contains("other work"));
+        }
+    }
+
     /// No input can make the demotion text grow: two work ids of equal length cost the same, and
     /// the cost is small.
     #[test]
     fn the_demotion_result_is_a_constant_size() {
+        for delivered in [true, false] {
+            the_demotion_result_is_a_constant_size_when(delivered);
+        }
+    }
+
+    fn the_demotion_result_is_a_constant_size_when(delivered: bool) {
         let reduce = |work_id: &str| {
-            let result = demotion_tool_result(work_id);
+            let result = demotion_tool_result(work_id, delivered);
             result
                 .data
                 .or(result.summary)

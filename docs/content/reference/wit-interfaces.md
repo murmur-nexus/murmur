@@ -126,12 +126,13 @@ Forward it only where the provider defines a field of its own for it: the OpenAI
 Responses APIs accept `prompt_cache_key` in the request body, and the Anthropic Messages API
 rejects a body carrying any field it does not define.
 
-The `[Capsule]` block the runtime prepends to every system prompt is a pure function of the
-capsule's name and version and, for a formation member, its roster name, plus one fixed line
-saying where the runtime directory is found. It names no host-specific path and no formation id,
-so it is byte-identical across every launch of the same capsule and version, and of the same roster member. Prefix caching depends on that stability: a
-provider matches its cache against the bytes it has seen before, and the first block of every
-prompt would otherwise never repeat.
+The [`[Capsule]` block](../concepts/session-loop.md#capsule-block) the runtime prepends to every
+system prompt is a pure function of the manifest: the capsule's name and version, for a formation
+member its roster name, and the facts the manifest fixes — read-only paths, network allowlist,
+limits and the manifest file name. It names no host-specific path, session id or formation id, so
+it is byte-identical across every launch of the same manifest, and of the same roster member.
+Prefix caching depends on that stability: a provider matches its cache against the bytes it has
+seen before, and the first block of every prompt would otherwise never repeat.
 
 ### Reported token usage { #driver-usage }
 

@@ -853,6 +853,14 @@ fn lifecycle_a_detached_command_completes_as_a_background_task() {
             detached[0]["work_id"].as_str().unwrap()
         ))
     );
+
+    // Under queue + sleep the demotion result tells the model the result will arrive.
+    let after_demotion = server.requests()[1].to_string();
+    assert!(
+        after_demotion.contains("Its result will arrive later as a separate task")
+            && !after_demotion.contains("will not reach you"),
+        "{after_demotion}"
+    );
 }
 
 /// A person's request is not made to wait behind a completion: the peer task runs first even

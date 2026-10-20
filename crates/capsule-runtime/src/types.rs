@@ -559,6 +559,9 @@ pub struct StagedSession {
     /// The file name the launched manifest was copied into the runtime directory under, which
     /// the `[Capsule]` notice and `MURMUR.md` name. `None` when the launch read no manifest file.
     pub(crate) manifest_file_name: Option<String>,
+    /// What `MURMUR.md` is rendered from, for an agent session; `None` for a script capsule,
+    /// which gets no `MURMUR.md`. Its identity's capsule URL is empty until launch.
+    pub(crate) murmur_md: Option<crate::murmur_md::MurmurMdInputs>,
     /// Owns the runtime directory: dropping it removes the directory, so it is held until the
     /// session ends — `launch` takes it and drops it on return, and a `StagedSession` dropped
     /// unlaunched drops it with itself.

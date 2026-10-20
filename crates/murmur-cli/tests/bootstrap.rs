@@ -520,6 +520,21 @@ fn agent_system_prompt_includes_capsule_context() {
         !system_field.contains("Workdir:"),
         "system field must not name a host workdir; got:\n{system_field}"
     );
+    // It states the manifest's facts, and names no file the task could be read from.
+    for line in [
+        "\nWork folder: ./ (your current directory). You may write anywhere in it.\n".to_string(),
+        format!("\nNetwork allowlist: {}\n", server.endpoint),
+        "\nLimits: 2 GiB memory and 3600 s CPU time per command.\n".to_string(),
+    ] {
+        assert!(
+            system_field.contains(&line),
+            "{line:?} missing; got:\n{system_field}"
+        );
+    }
+    assert!(
+        !system_field.contains("task.md"),
+        "the task is the first message; got:\n{system_field}"
+    );
     assert!(
         system_field.contains(manifest_system_prompt),
         "system field should contain the manifest system prompt; got:\n{system_field}"
@@ -620,6 +635,10 @@ fn prompt_prefix_is_identical_across_two_launches() {
         assert!(
             system.starts_with("[Capsule]\nName: "),
             "[Capsule] block must be first; got:\n{system}"
+        );
+        assert!(
+            system.contains("\nLimits: 2 GiB memory and 3600 s CPU time per command.\n"),
+            "the block states the limits; got:\n{system}"
         );
     }
     for (i, system) in [first, second].iter().enumerate() {

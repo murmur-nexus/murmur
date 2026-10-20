@@ -17,6 +17,7 @@ pub(crate) mod artifact_removal;
 pub mod artifact_supply;
 pub mod bindings;
 pub(crate) mod cancel;
+pub(crate) mod capsule_facts;
 pub(crate) mod cgroup;
 pub mod child_launch;
 pub(crate) mod compiled_forms;

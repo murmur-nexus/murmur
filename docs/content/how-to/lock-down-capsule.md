@@ -325,8 +325,9 @@ The capsule's `MURMUR.md`, which the agent reads at `$MURMUR_RUNTIME_DIR/MURMUR.
 ```text
 ## Running Shell Commands
 
-Declared shell binaries: bash
-Call them via the shell-execution interface or directly from bash if `bash` is in the allowlist.
+Shell interpreter(s) available: bash. Pass a complete command string in the `command` field — the interpreter runs it via `-c`.
+
+Direct binaries exposed as tools: git. Each appears as a named tool in the Installed Tools section above. Call it directly — put the arguments (not the binary name) in the `command` field.
 ```
 
 Each shell invocation the agent makes appears in the session's [`trace.jsonl`](../reference/workdir.md#records-directory) as a `shell` event:
