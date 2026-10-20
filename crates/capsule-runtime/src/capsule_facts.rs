@@ -1,5 +1,6 @@
 //! The manifest-fixed facts an agent session's model is told about its own capsule: where it may
-//! write, where it may connect, and the limits the runtime enforces on it.
+//! write, where it may connect, the limits the runtime enforces on it, and the names its tools
+//! reach the runtime directory by.
 //!
 //! One value, built at staging from the manifest as resolved there, feeds all three texts that
 //! state them: the `[Capsule]` block (`transport: http`), the `transport: process` system prompt
@@ -30,6 +31,14 @@ pub(crate) struct CapsuleFacts {
     /// The limits on what the runtime itself spawns. `None` on `transport: process`: the harness
     /// is spawned without the session's rlimits and runs its own commands outside them.
     pub(crate) dispatch_limits: Option<DispatchLimits>,
+    /// Whether `capabilities.shell.allow` names a shell interpreter. The interpreter's tool runs
+    /// its `command` through `-c` with `$MURMUR_RUNTIME_DIR` set, so the variable expands there; a
+    /// binary allowed on its own is handed its arguments unexpanded.
+    pub(crate) shell_interpreter: bool,
+    /// The staged tools whose guest is preopened at `murmur-runtime/`, sorted
+    /// ([`crate::runtime_dir::runtime_dir_preopened_tools`]). A tool pulled mid-session is not
+    /// added: MURMUR.md lists the current set.
+    pub(crate) runtime_dir_tools: Vec<String>,
 }
 
 /// The limits the runtime applies to every shell command and native tool it spawns.
@@ -46,12 +55,16 @@ pub(crate) struct DispatchLimits {
 
 impl CapsuleFacts {
     /// The facts for an agent session staged from `policy`, `inference` and the resolved
-    /// `lifecycle`. The `--lifecycle-*` overrides change neither field read from `lifecycle`.
+    /// `lifecycle`, whose staged tools preopened at `murmur-runtime/` are `runtime_dir_tools`. The
+    /// `--lifecycle-*` overrides change neither field read from `lifecycle`.
     pub(crate) fn resolve(
         policy: &CapabilityPolicy,
         inference: &InferenceConfig,
         lifecycle: &LifecycleConfig,
+        mut runtime_dir_tools: Vec<String>,
     ) -> Self {
+        runtime_dir_tools.sort();
+        runtime_dir_tools.dedup();
         let dispatch_limits = (inference.transport != "process").then(|| DispatchLimits {
             memory_bytes: policy.resources.memory_bytes,
             cpu_seconds: policy.resources.cpu_seconds,
@@ -64,6 +77,11 @@ impl CapsuleFacts {
             max_turns: inference.max_turns,
             max_session_tokens: inference.max_session_tokens,
             dispatch_limits,
+            shell_interpreter: policy
+                .shell_allow
+                .iter()
+                .any(|binary| crate::shell::is_shell_interpreter(binary)),
+            runtime_dir_tools,
         }
     }
 
@@ -165,6 +183,7 @@ pub(crate) fn test_default_facts() -> CapsuleFacts {
         &CapabilityPolicy::default(),
         &test_http_inference(),
         &LifecycleConfig::default(),
+        Vec::new(),
     )
 }
 
@@ -224,7 +243,7 @@ mod tests {
     #[test]
     fn capsule_facts_equal_the_enforced_values() {
         let (policy, inference, lifecycle) = test_enforced_limits();
-        let facts = CapsuleFacts::resolve(&policy, &inference, &lifecycle);
+        let facts = CapsuleFacts::resolve(&policy, &inference, &lifecycle, Vec::new());
         assert_eq!(
             facts.dispatch_limits,
             Some(DispatchLimits {
@@ -259,7 +278,8 @@ mod tests {
             max_session_tokens: Some(9_000),
             ..test_http_inference()
         };
-        let facts = CapsuleFacts::resolve(&policy, &inference, &LifecycleConfig::default());
+        let facts =
+            CapsuleFacts::resolve(&policy, &inference, &LifecycleConfig::default(), Vec::new());
         assert_eq!(facts.dispatch_limits, None);
         assert_eq!(
             facts.limits_sentence(),
@@ -279,6 +299,7 @@ mod tests {
             &CapabilityPolicy::default(),
             &http,
             &LifecycleConfig::default(),
+            Vec::new(),
         );
         assert!(!facts.limits_sentence().contains("turns"));
         let process = InferenceConfig {
@@ -289,6 +310,7 @@ mod tests {
             &CapabilityPolicy::default(),
             &process,
             &LifecycleConfig::default(),
+            Vec::new(),
         );
         assert_eq!(facts.limits_sentence(), "none");
     }
@@ -300,8 +322,12 @@ mod tests {
             read_only_paths: vec!["src".to_string(), "Cargo.lock".to_string()],
             ..CapabilityPolicy::default()
         };
-        let facts =
-            CapsuleFacts::resolve(&policy, &test_http_inference(), &LifecycleConfig::default());
+        let facts = CapsuleFacts::resolve(
+            &policy,
+            &test_http_inference(),
+            &LifecycleConfig::default(),
+            Vec::new(),
+        );
         assert_eq!(facts.network_allowlist(), "b.example, a.example:443");
         assert_eq!(facts.read_only_paths, ["src", "Cargo.lock"]);
     }

@@ -283,6 +283,24 @@ fired:      no
 
 `inference.max_turns` counts inference calls, so a compaction hook that summarizes through `run-inference` spends one of the task's turns on each call it makes, and a hook that replaces the context without calling `run-inference` spends none. The model continues from where it left off with the condensed history.
 
+### The task is kept { #the-task-is-kept }
+
+The message that opened the current task stays in context through every compaction. When the
+hook's replacement leaves it out, the runtime puts it back ahead of what the hook returned:
+
+| The hook returns | The next turn starts from |
+|---|---|
+| A summary alone, as `murmur/hook-compact` does | The task message, then the summary |
+| The task message among its own messages | What the hook returned, with the task message where the hook put it |
+
+The task message is put back unchanged, under its own id, so the conversation record holds it once
+and the next compaction hands it to the hook with the other messages. The token count after the
+compaction includes it. On a reopened attempt that starts from a fresh context, the task message is
+the rewritten task that attempt began with.
+
+The launch-time `mur run --resume-mode compact` pass runs before the task message exists, so it
+commits what the hook returned as it is.
+
 ---
 
 ## Step 6 — inspect the compaction summaries
@@ -299,7 +317,8 @@ inference:
     dump_summaries: true
 ```
 
-Each committed compaction then appends one line to `out/compaction-summaries.jsonl`:
+Each committed compaction then appends one line to `out/compaction-summaries.jsonl`, holding
+what the hook returned and not the task message the runtime kept ahead of it:
 
 ```json
 {"turn":17,"tokens_before":81501,"tokens_after":334,"summary":"1. THE BUG: ..."}
@@ -371,3 +390,4 @@ compaction.
 | A bound hook returns an error after a spend ceiling refused its `run-inference` call | Fatal — the session ends with `exit_status: "spend_ceiling_reached"`, not `failed`; see [Compaction failure modes](#compaction-failure-modes) |
 | Token count the threshold compares | The provider's count of the call when the driver reports usage, the runtime's estimate otherwise |
 | Token count after compaction | Reset to the estimate of the new (compacted) history, not to zero; the next call's reported count replaces it |
+| A replacement that leaves out the current task's message | The task message is put back at its head, unchanged; see [The task is kept](#the-task-is-kept) |

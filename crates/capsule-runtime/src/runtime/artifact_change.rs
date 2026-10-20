@@ -237,10 +237,13 @@ impl CapsuleStoreState {
     }
 
     /// Rewrite an agent session's `MURMUR.md` from the inputs it was launched with, after a pull
-    /// or removal changed what `tools/` holds, so every tool it names is installed. A script
-    /// capsule has no `MURMUR.md` to rewrite.
-    fn rewrite_murmur_md(&self) {
-        if let Some(inputs) = &self.murmur_md {
+    /// or removal changed what `tools/` holds, so every tool it names is installed and the tools
+    /// it says open the runtime directory at `murmur-runtime/` are the ones installed now. A
+    /// script capsule has no `MURMUR.md` to rewrite.
+    fn rewrite_murmur_md(&mut self) {
+        let runtime_dir_tools = self.runtime_dir_preopened_tools();
+        if let Some(inputs) = &mut self.murmur_md {
+            inputs.runtime_dir_tools = runtime_dir_tools;
             crate::murmur_md::write_murmur_md(&self.runtime_root, inputs);
         }
     }

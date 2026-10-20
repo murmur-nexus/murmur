@@ -34,7 +34,7 @@ ends. See [Async hook execution](../reference/manifest.md#hook-overflow) for ove
 | `commit_policy` | What the runtime does | Typical use |
 |---|---|---|
 | `none` | Discards the output | Observability hooks |
-| `replace-context` | Replaces the conversation history | Compaction |
+| `replace-context` | Replaces the conversation history. When the hook's messages leave out the current task's message, the runtime puts that message back at their head, unchanged — see [Context compaction](../how-to/context-compaction.md#the-task-is-kept) | Compaction |
 | `write-manifests` | Writes tool manifest records to `tools/<binary>/murmur.yaml` in the session's [runtime directory](../reference/workdir.md#runtime-directory), overwriting any existing file | Shell tool enrichment during staging |
 | `reopen-task` | Continues the task's conversation with the hook's feedback as one new message instead of finalizing it, within the task's turn budget — see [Task reopening](session-loop.md#task-reopening-commit_policy-reopen-task) | Review and retry hooks |
 | `seed-context` | Places the hook's messages at the head of the task's first message list, under the [`context.seed_budget`](../reference/manifest.md#field-context) ceiling — see [Context seeding](session-loop.md#context-seeding-commit_policy-seed-context) | Memory |

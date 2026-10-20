@@ -36,9 +36,10 @@ const PROBE_TOOL: &str = "runtime-dir-probe";
 const PULLED_ARTIFACT: &str = "local/tool-pulled";
 const PULLED_TOOL: &str = "tool-pulled";
 const PROBE_ARTIFACT: &str = "local/runtime-dir-probe";
+/// The runtime-files line of a [`project`] declaring no WASM tool: `bash` is its one tool that
+/// opens the runtime directory by a fixed name.
 const NOTICE: &str = "Runtime files: MURMUR.md, murmur.yaml and the installed tools are in a \
-                      read-only directory — $MURMUR_RUNTIME_DIR in a shell command, \
-                      murmur-runtime/ in a file tool.";
+                      read-only directory: $MURMUR_RUNTIME_DIR in a shell command.";
 
 /// What every command a test runs is allowed to execute.
 const SHELL_ALLOW: &[&str] = &[
@@ -1014,8 +1015,9 @@ fn runtime_dir_murmur_md_and_the_capsule_block_name_the_runtime_dir() {
             murmur_md.contains(&workdir.path().display().to_string()),
             "{murmur_md}"
         );
-        assert!(murmur_md.contains("$MURMUR_RUNTIME_DIR"));
-        assert!(murmur_md.contains("murmur-runtime/"));
+        assert!(murmur_md.contains("\n  - a shell command: `$MURMUR_RUNTIME_DIR`\n"));
+        // No tool of this capsule is preopened there.
+        assert!(!murmur_md.contains("murmur-runtime/"), "{murmur_md}");
         fs::write(workdir.path().join("task.md"), TASK).unwrap();
 
         launch_session(staged, |_| {}).expect("the session runs");
@@ -1189,6 +1191,155 @@ fn murmur_md_names_resolve() {
     }
     assert!(skills.iter().any(|(name, _)| name == BOUND), "{skills:?}");
     assert!(skills.iter().any(|(name, _)| name == SKILL), "{skills:?}");
+}
+
+/// The tool `tool-pulled-probe`, the WASM probe under a second name, which an install grant
+/// lets a session pull.
+const PULLED_PROBE_ARTIFACT: &str = "local/tool-pulled-probe";
+const PULLED_PROBE_TOOL: &str = "tool-pulled-probe";
+
+/// The `- Runtime directory:` entry of MURMUR.md, up to the next bullet of `## Capsule`.
+fn runtime_dir_entry(doc: &str) -> &str {
+    let start = doc
+        .find("- Runtime directory: ")
+        .unwrap_or_else(|| panic!("no runtime-directory entry: {doc}"));
+    let end = doc[start..]
+        .find("\n- Writable:")
+        .unwrap_or_else(|| panic!("no Writable entry: {doc}"));
+    &doc[start..start + end]
+}
+
+/// The tools the `murmur-runtime/` sub-bullet of `entry` names, or none.
+fn murmur_runtime_tools(entry: &str) -> Vec<String> {
+    entry
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("  - ")?
+                .strip_suffix(": `murmur-runtime/`")
+        })
+        .flat_map(|names| names.split(", "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// MURMUR.md gives the runtime directory's absolute path and the name each kind of tool opens it
+/// by: `$MURMUR_RUNTIME_DIR` for a shell command, `murmur-runtime/` for exactly the tools preopened
+/// there, the absolute path for any other. A tool pulled mid-session joins the `murmur-runtime/`
+/// list once the pull commits.
+#[test]
+#[allow(clippy::print_stdout)]
+fn murmur_md_runtime_directory_names() {
+    if common::skip_without_host_support("murmur_md_runtime_directory_names")
+        || capsule_runtime::skip_without_egress_namespace("murmur_md_runtime_directory_names")
+    {
+        return;
+    }
+    let server = common::ScriptedServer::start(vec![
+        tool_call(
+            1,
+            "toolu_env",
+            "bash",
+            bash("echo \"ENV|$MURMUR_RUNTIME_DIR\""),
+        ),
+        tool_call(
+            2,
+            "toolu_pull",
+            "pull-artifact",
+            json!({"artifact": PULLED_PROBE_ARTIFACT}),
+        ),
+        tool_call(
+            3,
+            "toolu_cat",
+            "bash",
+            bash("cat \"$MURMUR_RUNTIME_DIR/MURMUR.md\""),
+        ),
+        end_turn("done"),
+    ]);
+    let entries = format!("  - name: {PROBE_ARTIFACT}\n    version: 0.1.0\n    runtime: tool\n");
+    let p = project(
+        &server.endpoint,
+        &Spec {
+            extra_artifacts: &entries,
+            extra_capabilities: "  install:\n    tool: [\"local/tool-*\"]\n",
+            ..Spec::default()
+        },
+    )
+    .unwrap();
+    let staging = TempDir::new().unwrap();
+    for name in [PROBE_ARTIFACT, PULLED_PROBE_ARTIFACT] {
+        let probe = common::create_tool_artifact(
+            staging.path(),
+            name,
+            "0.1.0",
+            &common::fixture_path("runtime-dir-probe/tool/runtime-dir-probe.wasm"),
+        );
+        common::publish_local(&p.home, &probe).success();
+    }
+    let workdir = TempDir::new().unwrap();
+    let staged = common::stage_agent_session_at_floor(
+        &p.home,
+        p.project.path(),
+        &p.manifest,
+        ContainmentClass::Advisory,
+        Some(workdir.path()),
+    );
+    let runtime_dir = staged.runtime_dir.clone();
+    let preopens = staged.scope_report().preopens.clone();
+    let doc = fs::read_to_string(runtime_dir.join("MURMUR.md")).unwrap();
+    let entry = runtime_dir_entry(&doc).to_string();
+    println!("── staged entry\n{entry}");
+
+    assert!(!doc.contains("task.md"), "{doc}");
+    let absolute = runtime_dir.display().to_string();
+    assert!(
+        entry.starts_with(&format!(
+            "- Runtime directory: {absolute} (read-only). The name to use depends on what opens \
+             it:\n"
+        )),
+        "{entry}"
+    );
+    // Checked before the launch, which removes the runtime directory when it ends.
+    assert!(runtime_dir.is_dir());
+    assert!(entry.contains("\n  - a shell command: `$MURMUR_RUNTIME_DIR`\n"));
+    assert!(entry.ends_with(&format!("\n  - any other tool given a path: `{absolute}`")));
+    assert_eq!(murmur_runtime_tools(&entry), [PROBE_TOOL], "{entry}");
+    // Every tool named there is preopened there.
+    for tool in murmur_runtime_tools(&entry) {
+        let report = preopens
+            .iter()
+            .find(|report| {
+                report.artifact == tool || report.artifact.ends_with(&format!("/{tool}"))
+            })
+            .unwrap_or_else(|| panic!("{tool}: {preopens:?}"));
+        assert_eq!(
+            report.runtime_dir_reach,
+            Some(capsule_runtime::RuntimeDirReach::MurmurRuntime),
+            "{report:?}"
+        );
+    }
+
+    fs::write(workdir.path().join("task.md"), TASK).unwrap();
+    launch_session(staged, |_| {}).expect("the session runs");
+
+    let env = result_text(&server, "toolu_env");
+    assert!(env.contains(&format!("ENV|{absolute}\n")), "{env}");
+    let offered: Vec<String> = server.requests()[0]["tools"]
+        .as_array()
+        .expect("a tools array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(offered.iter().any(|tool| tool == PROBE_TOOL), "{offered:?}");
+
+    let pulled = common::unfence(&result_text(&server, "toolu_cat"));
+    let pulled_entry = runtime_dir_entry(&pulled);
+    println!("── entry after the pull\n{pulled_entry}");
+    assert_eq!(
+        murmur_runtime_tools(pulled_entry),
+        [PROBE_TOOL, PULLED_PROBE_TOOL],
+        "{pulled_entry}"
+    );
+    assert!(!pulled.contains("task.md"), "{pulled}");
 }
 
 // ── the work-folder ceiling ──────────────────────────────────────────────────

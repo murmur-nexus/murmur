@@ -7,6 +7,7 @@ use crate::{
     capsule_facts::{work_folder_ceiling_part, CapsuleFacts},
     formation_credentials::FormationMember,
     identity::CapsuleIdentity,
+    runtime_dir::{RUNTIME_DIR_ENV, RUNTIME_DIR_GUEST_PATH},
     shell::is_shell_interpreter,
     workdir_fs::{EntryKind, WorkdirRoot, DEFAULT_FILE_MODE},
 };
@@ -95,6 +96,10 @@ pub(crate) struct MurmurMdInputs {
     /// `--workdir`. Under `--workdir` the guard measures `.murmur/<session-id>` beneath it, and on
     /// `transport: process` the harness's own writes are not refused, so neither states a ceiling.
     pub(crate) work_folder_ceiling: Option<u64>,
+    /// The installed tools whose guest is preopened at `murmur-runtime/`, sorted
+    /// ([`crate::runtime_dir::runtime_dir_preopened_tools`]). The staged set at first; a committed
+    /// pull or removal replaces it before the rewrite.
+    pub(crate) runtime_dir_tools: Vec<String>,
 }
 
 /// Write MURMUR.md to the session's runtime directory, `runtime_root`, which the capsule's
@@ -108,6 +113,35 @@ pub(crate) fn write_murmur_md(runtime_root: &WorkdirRoot, inputs: &MurmurMdInput
     if let Err(err) = runtime_root.write_file("MURMUR.md", content.as_bytes(), DEFAULT_FILE_MODE) {
         crate::runtime_err!("warning: failed to write MURMUR.md: {err}");
     }
+}
+
+/// The `- Runtime directory:` entry of `## Capsule`: the directory's absolute path, then the name
+/// each kind of tool opens it by. `$MURMUR_RUNTIME_DIR` is given only when `shell_interpreter`,
+/// and `murmur-runtime/` only for `runtime_dir_tools`, the tools preopened there. A native tool
+/// does not expand the variable in a path argument, so it, like every other tool, takes the
+/// absolute path.
+fn runtime_dir_entry(
+    runtime_dir: &str,
+    shell_interpreter: bool,
+    runtime_dir_tools: &[String],
+) -> String {
+    let mut out = format!(
+        "- Runtime directory: {runtime_dir} (read-only). The name to use depends on what opens \
+         it:\n"
+    );
+    if shell_interpreter {
+        out.push_str(&format!("  - a shell command: `${RUNTIME_DIR_ENV}`\n"));
+    }
+    if !runtime_dir_tools.is_empty() {
+        out.push_str(&format!(
+            "  - {}: `{RUNTIME_DIR_GUEST_PATH}/`\n",
+            runtime_dir_tools.join(", ")
+        ));
+    }
+    out.push_str(&format!(
+        "  - any other tool given a path: `{runtime_dir}`\n"
+    ));
+    out
 }
 
 /// The candidates the `## Runtime Directory` tree lists, each kept only when it exists:
@@ -126,7 +160,7 @@ fn runtime_dir_tree(runtime_root: &WorkdirRoot, manifest_file: Option<&str>) -> 
             entries.push(format!("{dir}/"));
         }
     }
-    let mut out = String::from("$MURMUR_RUNTIME_DIR/\n");
+    let mut out = format!("{}/\n", runtime_root.path().display());
     for (index, entry) in entries.iter().enumerate() {
         let branch = if index + 1 == entries.len() {
             "└──"
@@ -164,7 +198,11 @@ fn generate_murmur_md(runtime_root: &WorkdirRoot, inputs: &MurmurMdInputs) -> St
     let skills_section = build_skills_section(runtime_root, system_prompt_artifact);
     let shell_section = build_shell_section(&inputs.shell_allow);
     let workdir = inputs.accessible_workdir.display();
-    let runtime_dir = runtime_root.path().display();
+    let runtime_dir_entry = runtime_dir_entry(
+        &runtime_root.path().display().to_string(),
+        facts.shell_interpreter,
+        &inputs.runtime_dir_tools,
+    );
     let tree = runtime_dir_tree(runtime_root, inputs.manifest_file.as_deref());
     let except = if facts.read_only_paths.is_empty() {
         String::new()
@@ -211,8 +249,7 @@ fn generate_murmur_md(runtime_root: &WorkdirRoot, inputs: &MurmurMdInputs) -> St
          \n\
          - Model: {model}\n\
          - Work folder: {workdir}  (`./`)\n\
-         - Runtime directory: {runtime_dir}  (`$MURMUR_RUNTIME_DIR` in a shell command, \
-         `murmur-runtime/` in a file tool — read-only)\n\
+         {runtime_dir_entry}\
          - Writable: the work folder{except}\n\
          - Network allowlist: {network}\n\
          \n\
@@ -474,6 +511,7 @@ pub(crate) fn test_inputs() -> MurmurMdInputs {
         manifest_file: Some("murmur.yaml".to_string()),
         facts: crate::capsule_facts::test_default_facts(),
         work_folder_ceiling: Some(crate::resources::DEFAULT_WORKDIR_MAX_BYTES),
+        runtime_dir_tools: Vec::new(),
     }
 }
 
@@ -521,6 +559,7 @@ mod tests {
             &policy,
             &inference,
             &murmur_artifact::LifecycleConfig::default(),
+            Vec::new(),
         );
         let content = render(&tmp, |inputs| {
             inputs.model = inference.model.clone();
@@ -534,8 +573,10 @@ mod tests {
              \n\
              - Model: gpt-test\n\
              - Work folder: /work  (`./`)\n\
-             - Runtime directory: {runtime_dir}  (`$MURMUR_RUNTIME_DIR` in a shell command, \
-             `murmur-runtime/` in a file tool — read-only)\n\
+             - Runtime directory: {runtime_dir} (read-only). The name to use depends on what \
+             opens it:\n\
+             \x20 - a shell command: `$MURMUR_RUNTIME_DIR`\n\
+             \x20 - any other tool given a path: `{runtime_dir}`\n\
              - Writable: the work folder, except tests, Cargo.lock (read-only)\n\
              - Network allowlist: api.openai.com, pypi.org\n\
              \n\
@@ -559,10 +600,100 @@ mod tests {
         }
     }
 
+    /// The runtime-directory entry of a session with a shell interpreter or not, and with
+    /// `runtime_dir_tools` installed.
+    fn runtime_dir_entry_of(shell: bool, runtime_dir_tools: &[&str]) -> (String, String) {
+        let tmp = TempDir::new().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: if shell {
+                vec!["bash".to_string(), "cat".to_string()]
+            } else {
+                vec!["cat".to_string()]
+            },
+            ..CapabilityPolicy::default()
+        };
+        let content = render(&tmp, |inputs| {
+            inputs.shell_allow = policy.shell_allow.clone();
+            inputs.facts = CapsuleFacts::resolve(
+                &policy,
+                &crate::capsule_facts::test_http_inference(),
+                &murmur_artifact::LifecycleConfig::default(),
+                Vec::new(),
+            );
+            inputs.runtime_dir_tools = runtime_dir_tools.iter().map(|t| t.to_string()).collect();
+        });
+        assert!(!content.contains("task.md"), "content: {content}");
+        assert!(!content.contains("in a file tool"), "content: {content}");
+        let start = content.find("- Runtime directory: ").unwrap();
+        let end = content.find("- Writable:").unwrap();
+        (
+            content[start..end].to_string(),
+            tmp.path().display().to_string(),
+        )
+    }
+
+    #[test]
+    fn murmur_md_runtime_directory_names_the_shell_and_the_preopened_tools() {
+        let (entry, dir) = runtime_dir_entry_of(true, &["runtime-dir-probe", "tool-editor"]);
+        assert_eq!(
+            entry,
+            format!(
+                "- Runtime directory: {dir} (read-only). The name to use depends on what opens \
+                 it:\n\
+                 \x20 - a shell command: `$MURMUR_RUNTIME_DIR`\n\
+                 \x20 - runtime-dir-probe, tool-editor: `murmur-runtime/`\n\
+                 \x20 - any other tool given a path: `{dir}`\n"
+            )
+        );
+    }
+
+    #[test]
+    fn murmur_md_runtime_directory_names_the_shell_alone() {
+        let (entry, dir) = runtime_dir_entry_of(true, &[]);
+        assert_eq!(
+            entry,
+            format!(
+                "- Runtime directory: {dir} (read-only). The name to use depends on what opens \
+                 it:\n\
+                 \x20 - a shell command: `$MURMUR_RUNTIME_DIR`\n\
+                 \x20 - any other tool given a path: `{dir}`\n"
+            )
+        );
+    }
+
+    #[test]
+    fn murmur_md_runtime_directory_names_the_preopened_tools_alone() {
+        let (entry, dir) = runtime_dir_entry_of(false, &["tool-editor"]);
+        assert_eq!(
+            entry,
+            format!(
+                "- Runtime directory: {dir} (read-only). The name to use depends on what opens \
+                 it:\n\
+                 \x20 - tool-editor: `murmur-runtime/`\n\
+                 \x20 - any other tool given a path: `{dir}`\n"
+            )
+        );
+    }
+
+    /// A binary allowed on its own and every other tool take the absolute path.
+    #[test]
+    fn murmur_md_runtime_directory_gives_the_absolute_path_alone_without_either() {
+        let (entry, dir) = runtime_dir_entry_of(false, &[]);
+        assert_eq!(
+            entry,
+            format!(
+                "- Runtime directory: {dir} (read-only). The name to use depends on what opens \
+                 it:\n\
+                 \x20 - any other tool given a path: `{dir}`\n"
+            )
+        );
+        assert!(!entry.contains("MURMUR_RUNTIME_DIR"));
+    }
+
     /// The facts of the capsule whose limits `capsule_facts_equal_the_enforced_values` pins.
     fn enforced_limits_facts() -> (CapabilityPolicy, CapsuleFacts) {
         let (policy, inference, lifecycle) = crate::capsule_facts::test_enforced_limits();
-        let facts = CapsuleFacts::resolve(&policy, &inference, &lifecycle);
+        let facts = CapsuleFacts::resolve(&policy, &inference, &lifecycle, Vec::new());
         (policy, facts)
     }
 
@@ -629,10 +760,11 @@ mod tests {
     #[test]
     fn murmur_md_runtime_directory_tree_lists_only_entries_that_exist() {
         let tmp = TempDir::new().unwrap();
+        let root = tmp.path().display();
         fs::write(tmp.path().join("task.md"), "do it").unwrap();
         let bare = render(&tmp, |_| {});
         assert!(
-            bare.contains("```\n$MURMUR_RUNTIME_DIR/\n└── MURMUR.md\n```\n"),
+            bare.contains(&format!("```\n{root}/\n└── MURMUR.md\n```\n")),
             "content: {bare}"
         );
 
@@ -640,18 +772,18 @@ mod tests {
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
         let staged = render(&tmp, |_| {});
         assert!(
-            staged.contains(
-                "```\n$MURMUR_RUNTIME_DIR/\n├── MURMUR.md\n├── murmur.yaml\n└── tools/\n```\n"
-            ),
+            staged.contains(&format!(
+                "```\n{root}/\n├── MURMUR.md\n├── murmur.yaml\n└── tools/\n```\n"
+            )),
             "content: {staged}"
         );
 
         fs::create_dir_all(tmp.path().join("plans")).unwrap();
         let planned = render(&tmp, |_| {});
         assert!(
-            planned.contains(
-                "$MURMUR_RUNTIME_DIR/\n├── MURMUR.md\n├── murmur.yaml\n├── plans/\n└── tools/\n"
-            ),
+            planned.contains(&format!(
+                "{root}/\n├── MURMUR.md\n├── murmur.yaml\n├── plans/\n└── tools/\n"
+            )),
             "content: {planned}"
         );
         assert!(!planned.contains("task.md"), "content: {planned}");
