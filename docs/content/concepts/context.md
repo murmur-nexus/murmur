@@ -4,9 +4,16 @@ Long-running agent sessions accumulate tokens with every message. Context compac
 automatically condenses the message history so the session can continue without hitting a
 hard limit:
 
-1. The runtime tracks `session_tokens` on every turn.
-2. After each driver response, it checks whether `session_tokens` over the context window of the
-   driver choice that served the call has crossed `inference.compaction.threshold`. The window is
+1. After each driver response, the runtime measures how much of the context window the call
+   used, its `session_tokens`:
+
+    | The response | `session_tokens` |
+    |---|---|
+    | Reported [usage](../reference/wit-interfaces.md#driver-usage) with both `input_tokens` and `output_tokens` | The provider's count: `input_tokens + cached_tokens + cache_write_tokens + output_tokens` |
+    | Reported nothing | The runtime's estimate of the request plus its count of the response |
+
+2. It checks whether `session_tokens` over the context window of the driver choice that served the
+   call has crossed `inference.compaction.threshold`. The window is
    [`context.max_tokens`](../reference/manifest.md#field-context), or the `context_window` the
    driver's [`models:`](../reference/manifest.md#driver-models) table declares for the model.
 3. Once crossed, the runtime fires the `on-compaction` lifecycle event with the full message
@@ -66,12 +73,21 @@ conversation keeps those marks, so reasoning an alternate wrote is not replayed 
 conversation carries that call and its result faithfully; a provider that insists on seeing its own
 reasoning on that turn is its driver's to accommodate.
 
-**Token counts are an estimate, and a switch makes them a worse one.** Context occupancy, the
-compaction trigger and the spend admission all count the request with one tokenizer (`cl100k`),
-whatever the provider. After a switch they count against a model whose tokenizer may differ more
-from that estimate. Each choice has its own [output cap and context window](../reference/manifest.md#inference-max-tokens),
-resolved at launch, and the compaction trigger measures against the window of the choice that
-served the turn. Each turn's `inference` line in `trace.jsonl` names the choice that served it, beside the
+**Token counts are the provider's when it reports them, and an estimate otherwise.** The
+estimate counts with one tokenizer (`cl100k`), whatever the provider, and runs high over the JSON
+the runtime counts. Where each number comes from:
+
+| Number | Source |
+|---|---|
+| The compaction trigger's `session_tokens` | The provider's count of the call when it reported one, the estimate otherwise |
+| A request's estimate, before it is sent | The provider's count from the last call that reported one, plus the estimate of each message added since. The whole request is estimated when no count applies: a task's first request, after a compaction or seed replaced the context, after the tool list changed, on another driver choice, and for a driver that reports nothing |
+| Spend charged for a call | The provider's count when it reported one, the estimate otherwise |
+| Spend reserved before a call | The estimate, plus the call's output cap |
+
+A switch to another choice measures its first request whole. Each choice has its own
+[output cap and context window](../reference/manifest.md#inference-max-tokens), resolved at
+launch, and the compaction trigger measures against the window of the choice that served the turn.
+Each turn's `inference` line in `trace.jsonl` names the choice that served it, beside the
 provider's own counts in `input_tokens_actual` and `output_tokens_actual`, so the gap between the
 estimate and each model's own count is visible per model.
 

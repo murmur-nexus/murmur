@@ -16,7 +16,7 @@ use wasmtime::{
 };
 
 use crate::{
-    agent::{build_driver_payload, count_tokens, parse_driver_usage, DriverUsage},
+    agent::{build_driver_payload, count_tokens, parse_driver_usage, provider_counts, DriverUsage},
     bindings::{
         hook::murmur::runtime::inference::{InferenceRequest, InferenceResponse},
         host::murmur::tool::run::{Status, ToolInput},
@@ -187,9 +187,13 @@ impl HookInferenceCtx {
             Ok((raw, text, usage)) => {
                 // `input-tokens`/`output-tokens` on the WIT response are documented as the
                 // runtime's own tiktoken counts, so a driver-reported `usage` never lands
-                // there — it goes to the trace record below and nowhere else.
+                // there. It goes to the trace record below, and its counts are what the spend
+                // meter is charged when they make a report.
                 let output_tokens = u64::from(count_tokens(&raw));
-                admission.settle(input_tokens, output_tokens);
+                match usage.as_ref().and_then(provider_counts) {
+                    Some(counts) => admission.settle(counts.request, counts.completion),
+                    None => admission.settle(input_tokens, output_tokens),
+                }
                 (
                     Some(output_tokens),
                     usage,
@@ -205,7 +209,12 @@ impl HookInferenceCtx {
                 )
             }
             Err(failure) => {
-                drop(admission);
+                // A failed call is charged what the provider reported for it, and its input
+                // estimate alone when it reported nothing.
+                match failure.usage.as_ref().and_then(provider_counts) {
+                    Some(counts) => admission.settle(counts.request, counts.completion),
+                    None => drop(admission),
+                }
                 let message = failure.message.clone();
                 (None, failure.usage.clone(), Some(*failure), Err(message))
             }
@@ -1176,6 +1185,79 @@ mod tests {
         assert_eq!(
             failure.provider_status, None,
             "the context holds no gateway"
+        );
+    }
+
+    /// A completion that reports usage is charged the provider's request and completion, cache
+    /// members included and thinking not added; one that reports nothing is charged the
+    /// runtime's own counts of its payload and raw response.
+    #[test]
+    fn run_inference_charges_the_reported_counts() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine();
+        let charged = |response: &str| {
+            let meter = Arc::new(SpendMeter::new(Some(1_000_000), None));
+            let ctx = ctx_with_spend(
+                &engine,
+                dir.path(),
+                driver_double(&engine, 0, response),
+                Arc::clone(&meter),
+            );
+            let resp = block_on(ctx.run("hook:compact", request(None))).unwrap();
+            (meter.used(), resp)
+        };
+
+        let reporting = r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"s"}],"usage":{"input_tokens":70,"output_tokens":12,"cached_tokens":30,"cache_write_tokens":3,"thinking_tokens":5}}"#;
+        let (used, resp) = charged(reporting);
+        assert_eq!(used, 70 + 30 + 3 + 12);
+        assert_eq!(
+            resp.input_tokens,
+            expected_input_tokens("manifest-model"),
+            "the WIT counts stay the runtime's own"
+        );
+
+        let (used, _) = charged(CANNED);
+        assert_eq!(
+            used,
+            expected_input_tokens("manifest-model") + u64::from(count_tokens(CANNED))
+        );
+
+        // Input alone is no report.
+        let input_only = r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"s"}],"usage":{"input_tokens":70}}"#;
+        let (used, _) = charged(input_only);
+        assert_eq!(
+            used,
+            expected_input_tokens("manifest-model") + u64::from(count_tokens(input_only))
+        );
+    }
+
+    /// A failed completion that reported usage is charged it; one that reported nothing is
+    /// charged its input estimate alone.
+    #[test]
+    fn run_inference_charges_a_failed_call_its_reported_counts() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine();
+        let charged = |response: &str| {
+            let meter = Arc::new(SpendMeter::new(Some(1_000_000), None));
+            let ctx = ctx_with_spend(
+                &engine,
+                dir.path(),
+                driver_double(&engine, 2, response),
+                Arc::clone(&meter),
+            );
+            block_on(ctx.run("hook:compact", request(None))).expect_err("a failed call");
+            meter.used()
+        };
+
+        assert_eq!(
+            charged(
+                r#"{"stop_reason":"error","error":"HTTP 500","usage":{"input_tokens":40,"output_tokens":2,"cached_tokens":8}}"#
+            ),
+            40 + 8 + 2
+        );
+        assert_eq!(
+            charged(r#"{"stop_reason":"error","error":"HTTP 500"}"#),
+            expected_input_tokens("manifest-model")
         );
     }
 

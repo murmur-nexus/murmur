@@ -40,6 +40,9 @@ const DRIVER_VERSION: &str = "0.1.0";
 const MAX_OUTPUT: u64 = 1_000;
 
 // ── Scripted provider responses ───────────────────────────────────────────────
+//
+// These report no `usage`, so the meter charges each call the runtime's own counts, the same
+// numbers its `inference` line records. [`with_usage`] makes one that reports.
 
 fn end_turn(id: &str, text: &str) -> String {
     json!({
@@ -48,8 +51,7 @@ fn end_turn(id: &str, text: &str) -> String {
         "role": "assistant",
         "model": "test-model",
         "content": [{"type": "text", "text": text}],
-        "stop_reason": "end_turn",
-        "usage": {"input_tokens": 1, "output_tokens": 1}
+        "stop_reason": "end_turn"
     })
     .to_string()
 }
@@ -62,10 +64,16 @@ fn tool_call(id: &str) -> String {
         "role": "assistant",
         "model": "test-model",
         "content": [{"type": "tool_use", "id": "toolu_spend", "name": "no-such-tool", "input": {}}],
-        "stop_reason": "tool_use",
-        "usage": {"input_tokens": 1, "output_tokens": 1}
+        "stop_reason": "tool_use"
     })
     .to_string()
+}
+
+/// `response` reporting the anthropic `usage` block `usage`.
+fn with_usage(response: String, usage: Value) -> String {
+    let mut response: Value = serde_json::from_str(&response).unwrap();
+    response["usage"] = usage;
+    response.to_string()
 }
 
 fn two_turns() -> Vec<String> {
@@ -759,6 +767,55 @@ fn machine_ceiling_spans_processes() {
         events(&trace_b, "session_start")[0]["machine_tokens_per_day"],
         json!(ceiling)
     );
+}
+
+/// The machine ledger holds what the meter charged each call: the provider's request, cache
+/// members included, and completion when the call reported them, and the runtime's own counts
+/// when it did not.
+#[test]
+fn machine_ledger_charges_the_reported_counts() {
+    println!("machine_ledger_charges_the_reported_counts");
+    let home = home_with_driver();
+    set_machine_ceiling(&home, 1_000_000_000);
+    let server = common::ScriptedServer::start(vec![
+        with_usage(
+            tool_call("msg_1"),
+            json!({
+                "input_tokens": 7,
+                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 3,
+                "output_tokens": 2
+            }),
+        ),
+        end_turn("msg_2", "done"),
+    ]);
+    let project = project(&http_manifest("spend-ledger", &server.endpoint, ""));
+    let run = run_task(&home, &project);
+    let trace = run.trace();
+    assert_eq!(exit_status(&trace, "session_end"), "ok", "{}", run.stderr);
+    let turns = agent_turns(&trace);
+    assert_eq!(turns.len(), 2, "{}", run.stderr);
+
+    let today = format!("{}.jsonl", chrono::Utc::now().format("%Y-%m-%d"));
+    let ledger = fs::read_to_string(home.path().join(".murmur/spend").join(today)).unwrap();
+    println!("ledger:\n{}", ledger.trim_end());
+    let lines: Vec<Value> = ledger
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["input_tokens"], json!(7 + 30 + 3));
+    assert_eq!(lines[0]["output_tokens"], json!(2));
+    assert_eq!(lines[1]["input_tokens"], json!(turns[1].0));
+    assert_eq!(lines[1]["output_tokens"], json!(turns[1].1));
+
+    // The trace keeps the provider's numbers beside the runtime's estimate.
+    let first = events(&trace, "inference")[0];
+    assert_eq!(first["input_tokens_actual"], json!(7));
+    assert_eq!(first["cached_tokens"], json!(30));
+    assert_eq!(first["cache_write_tokens"], json!(3));
+    assert_eq!(first["output_tokens_actual"], json!(2));
+    assert_ne!(first["input_tokens"], json!(7 + 30 + 3));
 }
 
 #[test]

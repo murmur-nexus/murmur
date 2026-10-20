@@ -130,6 +130,8 @@ Compaction is not built into the Murmur runtime — it is externalized as an art
 
 The threshold controls when compaction fires. It is a fraction of the context window. The default is `0.98` — compaction fires when the session has consumed 98% of the token budget.
 
+The runtime checks it after each response, against the provider's own count of the call when the driver reports [usage](../reference/wit-interfaces.md#driver-usage), and against its own estimate when it does not. The estimate runs high, so a driver that reports nothing compacts somewhat earlier than one that does. The trace's `compaction` line says which number fired it in `tokens_before_source`: `"actual"` or `"estimate"`.
+
 For long-running tasks where you want compaction to kick in earlier and leave headroom for recovery, add `compaction.threshold` under `inference`:
 
 === "Anthropic"
@@ -367,4 +369,5 @@ compaction.
 | A bound hook returns a replacement with an unpaired tool call | Non-fatal — the replacement is discarded and the session continues with the uncompacted history; `compaction_declined` written to the trace |
 | A bound hook returns an error with no refused `run-inference` call behind it | Fatal — the session ends as failed; see [Compaction failure modes](#compaction-failure-modes) |
 | A bound hook returns an error after a spend ceiling refused its `run-inference` call | Fatal — the session ends with `exit_status: "spend_ceiling_reached"`, not `failed`; see [Compaction failure modes](#compaction-failure-modes) |
-| Token count after compaction | Reset to the count of the new (compacted) history, not to zero |
+| Token count the threshold compares | The provider's count of the call when the driver reports usage, the runtime's estimate otherwise |
+| Token count after compaction | Reset to the estimate of the new (compacted) history, not to zero; the next call's reported count replaces it |

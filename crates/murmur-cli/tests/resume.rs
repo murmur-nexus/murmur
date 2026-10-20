@@ -453,11 +453,13 @@ fn resume_mode_compact_summarises_the_loaded_record() {
     let before = record_lines(&f.home, "ctx_compact");
     assert_eq!(before.len(), 2, "{before:?}");
 
-    f.run(
-        "second task",
-        &["--resume", "@1", "--resume-mode", "compact"],
-    )
-    .success();
+    let records = records_of(
+        f.run(
+            "second task",
+            &["--resume", "@1", "--resume-mode", "compact"],
+        )
+        .success(),
+    );
 
     let requests = f.server.requests();
     let second = request_text(&requests[1]);
@@ -465,6 +467,21 @@ fn resume_mode_compact_summarises_the_loaded_record() {
     assert!(
         !second.contains("verbatim assistant text"),
         "compaction replaced the context it stood for: {second}"
+    );
+
+    // No provider has counted a context loaded off the record, so the resume measures it with
+    // the estimate.
+    let trace = fs::read_to_string(records.join("trace.jsonl")).unwrap();
+    let compactions: Vec<Value> = trace
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["event_type"] == "compaction")
+        .collect();
+    assert_eq!(compactions.len(), 1, "{trace}");
+    assert_eq!(
+        compactions[0]["tokens_before_source"], "estimate",
+        "{trace}"
     );
 
     let after = record_lines(&f.home, "ctx_compact");

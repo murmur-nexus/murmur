@@ -16105,7 +16105,9 @@ inference:
     /// `compaction_declined`.
     #[tokio::test(flavor = "multi_thread")]
     async fn compaction_reports_whether_it_replaced_the_context() {
-        use crate::agent::{try_compact_via_hooks, CompactionOutcome, ContextOccupancy};
+        use crate::agent::{
+            try_compact_via_hooks, CompactionOutcome, ContextOccupancy, SessionOccupancy,
+        };
         use crate::hooks::test_support::{echo_compaction_hooks, no_hooks};
 
         let unresolved = r#"[{"type":"tool_call","id":"c9","name":"x","input":{}}]"#;
@@ -16156,10 +16158,11 @@ inference:
                 "role": "user",
                 "content": [{"type": "text", "text": "a long conversation"}],
             })];
-            let mut session_tokens = occupancy.count(&messages);
+            let mut session_tokens = SessionOccupancy::estimate(occupancy.count(&messages));
 
             let outcome = try_compact_via_hooks(
                 &mut messages,
+                &mut None,
                 &mut session_tokens,
                 &occupancy,
                 &mut state,
@@ -16189,6 +16192,7 @@ inference:
                 Some(reason) => {
                     assert_eq!(declined.len(), 1, "role {role:?}");
                     assert_eq!(declined[0]["reason"], reason);
+                    assert_eq!(declined[0]["tokens_source"], "estimate");
                     assert_eq!(messages[0]["content"][0]["text"], "a long conversation");
                 }
                 None => {

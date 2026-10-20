@@ -195,6 +195,8 @@ fn trace_events(records_dir: &Path) -> Vec<Value> {
         .collect()
 }
 
+/// The responses here report no `usage`, so the runtime's estimate is what crosses a small
+/// `context.max_tokens` and fires compaction.
 fn skill_turn(tool_id: &str, name: &str) -> String {
     json!({
         "id": "msg_1",
@@ -203,8 +205,7 @@ fn skill_turn(tool_id: &str, name: &str) -> String {
         "model": "test-model",
         "content": [{"type": "tool_use", "id": tool_id, "name": name, "input": {}}],
         "stop_reason": "tool_use",
-        "stop_sequence": Value::Null,
-        "usage": {"input_tokens": 1, "output_tokens": 1}
+        "stop_sequence": Value::Null
     })
     .to_string()
 }
@@ -217,8 +218,7 @@ fn end_turn(text: &str) -> String {
         "model": "test-model",
         "content": [{"type": "text", "text": text}],
         "stop_reason": "end_turn",
-        "stop_sequence": Value::Null,
-        "usage": {"input_tokens": 1, "output_tokens": 1}
+        "stop_sequence": Value::Null
     })
     .to_string()
 }

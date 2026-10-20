@@ -177,8 +177,22 @@ Where the two provider shapes carry each number:
 | `thinking_tokens` | `usage.output_tokens_details.thinking_tokens` | `usage.completion_tokens_details.reasoning_tokens` |
 
 The runtime records the reported numbers on the call's `inference` trace event and its
-`capsule.inference` span, and acts on none of them: the compaction threshold and every budget
-decision keep running on the runtime's own pre-flight estimate. See
+`capsule.inference` span. A report that carries both `input_tokens` and `output_tokens` is also
+what the runtime acts on, as two numbers:
+
+| Number | Sum |
+|---|---|
+| Request | `input_tokens + cached_tokens + cache_write_tokens`, an absent cache member counted as `0` |
+| Completion | `output_tokens`. `thinking_tokens` is part of it and is never added |
+
+| Decision | With a report | Without one |
+|---|---|---|
+| [Compaction threshold](../concepts/context.md), checked after each agent-loop response | Request plus completion | The runtime's estimate of the request plus its count of the raw response |
+| [Spend](manifest.md#inference-max-session-tokens) charged for the call, agent loop and a hook's `run-inference` alike | Request plus completion | The runtime's own counts of the request and the response |
+| Spend reserved before the call is sent | The runtime's estimate | The runtime's estimate |
+
+A `usage` missing `input_tokens` or `output_tokens` is recorded but steers nothing. A driver that
+folds its cache counts into `input_tokens` has them counted twice. See
 [Observability schemas](observability-schemas.md#session-trace-tracejsonl) for the field names.
 
 A malformed report degrades to no report rather than failing the call:
