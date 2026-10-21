@@ -10,7 +10,7 @@ use clap::Subcommand;
 use serde::Deserialize;
 
 use capsule_runtime::formation_launch::formation_member_roots;
-use capsule_runtime::running::{self, ProcessState, RecordScan};
+use capsule_runtime::running::{self, RecordScan};
 use capsule_runtime::{formation::FORMATION_ID_PREFIX, FormationId};
 use capsule_runtime::{EntryKind, RunningRecord, WorkdirError, WorkdirRoot};
 
@@ -5604,11 +5604,7 @@ pub(crate) fn run_trace_list(workdir: Option<PathBuf>, json: bool) -> Result<(),
 /// `mur trace rm` refuses to remove one. Layers 1 and 2 alone, with no door probe.
 fn running_record<'a>(scan: &'a RecordScan, session_id: &str) -> Option<&'a RunningRecord> {
     scan.records.iter().find(|record| {
-        record.session_id == session_id
-            && matches!(
-                running::process_state(record),
-                ProcessState::Alive | ProcessState::Unverified(_)
-            )
+        record.session_id == session_id && running::process_state(record).is_running()
     })
 }
 

@@ -358,7 +358,8 @@ fn end_process(process: &Mutex<ChildProcess>) -> Result<(), std::io::Error> {
 /// A running child capsule and the handles to end it.
 pub struct LaunchedChild {
     /// The directory the parent created for this child, and passed as its `--workdir`. The
-    /// child's own session artifacts land at `<workdir>/.murmur/<session_id>/`.
+    /// child's session workdir is `<workdir>/.murmur/<session_id>/`; its trace and
+    /// `completion.json` are in [`Self::records_dir`].
     pub workdir: PathBuf,
     /// [`Self::workdir`] relative to [`Self::parent_root`], the form every runtime read and write
     /// of the child's files goes through.
@@ -372,9 +373,8 @@ pub struct LaunchedChild {
     /// workdir, whose `.murmur/children/` the parent's commands can replace with a link.
     pub records_dir: PathBuf,
     /// [`Self::records_dir`], held, sharing [`Self::parent_root`]'s refusal latch: every read and
-    /// write of the child's `completion.json` goes through it. `None` until the readiness line
-    /// has been read.
-    pub(crate) records_root: Option<WorkdirRoot>,
+    /// write of the child's `completion.json` goes through it.
+    pub(crate) records_root: WorkdirRoot,
     /// The child's A2A endpoint, `http://host:port`. Empty for a script capsule, which binds no
     /// port and has already finished by the time it reports.
     pub capsule_url: String,
@@ -640,21 +640,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
     })?;
     #[cfg(unix)]
     lifeline.spawned();
-    let write_result =
-        write_result.map_err(|error| format!("failed to hand the child its launch grant: {error}"));
-    let mut launched = LaunchedChild {
-        workdir,
-        workdir_rel,
-        parent_root: request.parent_accessible_root.clone(),
-        session_id: String::new(),
-        records_dir: PathBuf::new(),
-        records_root: None,
-        capsule_url: String::new(),
-        argv,
-        env,
-        delegation_id: handle.as_ref().map(|handle| handle.delegation_id.clone()),
-        door_token: None,
-        formation_id: None,
+    let unclaimed = UnclaimedChild {
         process: Arc::new(Mutex::new(ChildProcess {
             child: Some(child),
             deliberate: false,
@@ -663,54 +649,33 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
             #[cfg(unix)]
             lifeline: Some(lifeline),
         })),
-        stderr_tail: Arc::clone(&stderr_tail),
-        started,
-        watcher: None,
+        claimed: false,
     };
-    if let Err(reason) = write_result {
-        return Err(RuntimeError::Runtime(reason));
+    if let Err(error) = write_result {
+        return Err(RuntimeError::Runtime(format!(
+            "failed to hand the child its launch grant: {error}"
+        )));
     }
 
-    let line = first_json_line(&mut launched, &stderr_tail)?;
-    let report: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
-        RuntimeError::Runtime(format!(
-            "the child capsule's first --json line did not parse: {error}"
-        ))
-    })?;
-    let session_id = report
-        .get("session_id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            RuntimeError::Runtime(
-                "the child capsule's --json line carried no session_id".to_string(),
-            )
-        })?;
-    let url = report
-        .get("url")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-
-    launched.session_id = session_id.to_string();
-    launched.records_dir = readiness_records_dir(&report, session_id)?;
-    launched.records_root = Some(
-        WorkdirRoot::open_sharing_latch_absolute(&launched.records_dir, &launched.parent_root)
-            .map_err(|error| {
-                RuntimeError::Runtime(format!(
-                    "the child capsule's records directory could not be opened: {error}"
-                ))
-            })?,
-    );
-    launched.door_token = readiness_door_token(&report);
-    launched.formation_id = report
-        .get("formation_id")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|id| FormationId::parse(id).ok());
-    // A script capsule binds no port and reports an empty url; promoting that to `http://` would
-    // manufacture an address nothing answers on.
-    launched.capsule_url = if url.is_empty() {
-        String::new()
-    } else {
-        format!("http://{url}")
+    let parent_root = request.parent_accessible_root.clone();
+    let readiness = read_readiness(&unclaimed.process, &workdir, &stderr_tail, &parent_root)?;
+    let mut launched = LaunchedChild {
+        workdir,
+        workdir_rel,
+        parent_root,
+        session_id: readiness.session_id,
+        records_dir: readiness.records_dir,
+        records_root: readiness.records_root,
+        capsule_url: readiness.capsule_url,
+        argv,
+        env,
+        delegation_id: handle.as_ref().map(|handle| handle.delegation_id.clone()),
+        door_token: readiness.door_token,
+        formation_id: readiness.formation_id,
+        process: unclaimed.claim(),
+        stderr_tail,
+        started,
+        watcher: None,
     };
 
     // Started only for a launch somebody wants told about. A lineage-only handle names no
@@ -729,6 +694,95 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         }
     }
     Ok(launched)
+}
+
+/// A started child process not yet held by a [`LaunchedChild`]: dropped unclaimed, it ends and
+/// reaps the child as `Drop for LaunchedChild` does, so a launch that fails, or panics, between
+/// starting the process and reading its readiness line leaves no capsule process behind.
+struct UnclaimedChild {
+    process: Arc<Mutex<ChildProcess>>,
+    claimed: bool,
+}
+
+impl UnclaimedChild {
+    /// The process, for a [`LaunchedChild`] that ends it from here on.
+    fn claim(mut self) -> Arc<Mutex<ChildProcess>> {
+        self.claimed = true;
+        Arc::clone(&self.process)
+    }
+}
+
+impl Drop for UnclaimedChild {
+    fn drop(&mut self) {
+        if !self.claimed {
+            let _ = end_process(&self.process);
+        }
+    }
+}
+
+/// What a child's `--json` readiness line reports, validated.
+struct Readiness {
+    session_id: String,
+    records_dir: PathBuf,
+    /// `records_dir`, held, sharing the parent root's refusal latch.
+    records_root: WorkdirRoot,
+    door_token: Option<crate::door_auth::DoorToken>,
+    formation_id: Option<FormationId>,
+    /// `http://host:port`, or empty for a script capsule.
+    capsule_url: String,
+}
+
+/// Read the child's readiness line and validate what it reports. The `Err` refuses the
+/// delegation; ending the child is the caller's.
+fn read_readiness(
+    process: &Mutex<ChildProcess>,
+    workdir: &Path,
+    stderr_tail: &StderrTail,
+    parent_root: &WorkdirRoot,
+) -> Result<Readiness, RuntimeError> {
+    let line = first_json_line(process, workdir, stderr_tail)?;
+    let report: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
+        RuntimeError::Runtime(format!(
+            "the child capsule's first --json line did not parse: {error}"
+        ))
+    })?;
+    let session_id = report
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            RuntimeError::Runtime(
+                "the child capsule's --json line carried no session_id".to_string(),
+            )
+        })?;
+    let url = report
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+
+    let records_dir = readiness_records_dir(&report, session_id)?;
+    let records_root = WorkdirRoot::open_sharing_latch_absolute(&records_dir, parent_root)
+        .map_err(|error| {
+            RuntimeError::Runtime(format!(
+                "the child capsule's records directory could not be opened: {error}"
+            ))
+        })?;
+    Ok(Readiness {
+        session_id: session_id.to_string(),
+        records_dir,
+        records_root,
+        door_token: readiness_door_token(&report),
+        formation_id: report
+            .get("formation_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| FormationId::parse(id).ok()),
+        // A script capsule binds no port and reports an empty url; promoting that to `http://`
+        // would manufacture an address nothing answers on.
+        capsule_url: if url.is_empty() {
+            String::new()
+        } else {
+            format!("http://{url}")
+        },
+    })
 }
 
 /// The records directory a child's `--json` readiness line carries under `records_dir`: an
@@ -819,14 +873,7 @@ fn watch_for_completion(
     let process = Arc::clone(&launched.process);
     let stderr_tail = Arc::clone(&launched.stderr_tail);
     let workdir = launched.workdir.clone();
-    let Some(records_root) = launched.records_root.clone() else {
-        crate::runtime_err!(
-            "[capsule-runtime] delegation {}: the child reported no records directory, so its \
-             completion cannot be watched",
-            handle.delegation_id
-        );
-        return None;
-    };
+    let records_root = launched.records_root.clone();
     let session_id = launched.session_id.clone();
     let capsule_name = capsule_name.to_string();
     let capsule_version = capsule_version.to_string();
@@ -1143,10 +1190,11 @@ fn drain_stderr(child: &mut Child, prefix: Option<&str>) -> Arc<StderrTail> {
 /// The drain matters: a child whose stdout pipe fills blocks forever, and a capsule that logs
 /// after its launch line would otherwise deadlock against a parent that had stopped reading.
 fn first_json_line(
-    launched: &mut LaunchedChild,
+    process: &Mutex<ChildProcess>,
+    workdir: &Path,
     stderr_tail: &StderrTail,
 ) -> Result<String, RuntimeError> {
-    let stdout = lock(&launched.process)
+    let stdout = lock(process)
         .child
         .as_mut()
         .and_then(|child| child.stdout.take())
@@ -1159,7 +1207,7 @@ fn first_json_line(
     match rx.recv_timeout(CHILD_READY_TIMEOUT) {
         Ok(Some(line)) => Ok(line),
         Ok(None) => {
-            let status = lock(&launched.process)
+            let status = lock(process)
                 .child
                 .as_mut()
                 .and_then(|child| child.wait().ok())
@@ -1171,12 +1219,12 @@ fn first_json_line(
             let reason = stderr_tail.lines_at_end().join("\n");
             Err(RuntimeError::Runtime(format!(
                 "the child capsule '{}' exited without reporting a launch line ({status}): {reason}",
-                launched.workdir.display()
+                workdir.display()
             )))
         }
         Err(_) => Err(RuntimeError::Runtime(format!(
             "the child capsule '{}' did not report a launch line within {}s",
-            launched.workdir.display(),
+            workdir.display(),
             CHILD_READY_TIMEOUT.as_secs()
         ))),
     }
@@ -1722,7 +1770,7 @@ mod tests {
             parent_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
             session_id: "ses_child".to_string(),
             records_dir: PathBuf::new(),
-            records_root: None,
+            records_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
             capsule_url: "http://localhost:1".to_string(),
             argv: Vec::new(),
             env: Vec::new(),
@@ -1894,7 +1942,7 @@ mod tests {
                 parent_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
                 session_id: "ses_child".to_string(),
                 records_dir: PathBuf::new(),
-                records_root: None,
+                records_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
                 capsule_url: String::new(),
                 argv: Vec::new(),
                 env: Vec::new(),
@@ -1959,7 +2007,7 @@ mod tests {
                 parent_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
                 session_id: "ses_child".to_string(),
                 records_dir: PathBuf::new(),
-                records_root: None,
+                records_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
                 capsule_url: String::new(),
                 argv: Vec::new(),
                 env: Vec::new(),
@@ -2028,7 +2076,7 @@ mod tests {
             parent_root: WorkdirRoot::open(dir.path()).unwrap(),
             session_id: "ses_child".to_string(),
             records_dir: dir.path().to_path_buf(),
-            records_root: Some(WorkdirRoot::open(dir.path()).unwrap()),
+            records_root: WorkdirRoot::open(dir.path()).unwrap(),
             capsule_url: String::new(),
             argv: Vec::new(),
             env: Vec::new(),
@@ -2104,7 +2152,7 @@ mod tests {
             parent_root: WorkdirRoot::open(dir.path()).unwrap(),
             session_id: "ses_child".to_string(),
             records_dir: dir.path().to_path_buf(),
-            records_root: Some(WorkdirRoot::open(dir.path()).unwrap()),
+            records_root: WorkdirRoot::open(dir.path()).unwrap(),
             capsule_url: String::new(),
             argv: Vec::new(),
             env: Vec::new(),

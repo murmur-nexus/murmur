@@ -144,12 +144,12 @@ fn read_and_prune() -> Result<Candidates, CliError> {
     let mut alive = Vec::new();
     let mut gone = Vec::new();
     for record in running::list().map_err(|reason| records_unreadable(&reason))? {
-        match running::process_state(&record) {
-            ProcessState::Alive | ProcessState::Unverified(_) => alive.push(record),
-            ProcessState::Gone(reason) => {
-                running::prune(&record);
-                gone.push((record, reason));
-            }
+        let state = running::process_state(&record);
+        if state.is_running() {
+            alive.push(record);
+        } else if let ProcessState::Gone(reason) = state {
+            running::prune(&record);
+            gone.push((record, reason));
         }
     }
     Ok(Candidates { alive, gone })

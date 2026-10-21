@@ -380,7 +380,7 @@ curl -s -X POST http://localhost:$PORT \
 The worker's answer is the `response` artifact. Poll until `status.state` is `TASK_STATE_COMPLETED` or `TASK_STATE_FAILED`. The task registry on the worker capsule remembers completed tasks, so you can query a task ID after the task has already finished.
 
 !!! note "The HTTP server shuts down with the session"
-    Once the worker capsule exits (idle timeout, or after the last queued task), its HTTP server is released. Final status is always available in `trace.jsonl` in the worker capsule's workdir.
+    Once the worker capsule exits (idle timeout, or after the last queued task), its HTTP server is released. Final status is always available in the worker session's `trace.jsonl`, in its [records directory](../reference/workdir.md#records-directory).
 
 ---
 

@@ -397,6 +397,18 @@ pub enum ProcessState {
     Gone(String),
 }
 
+impl ProcessState {
+    /// Whether the record still names a running capsule: `Alive`, or `Unverified` because
+    /// something holds the pid and it may be the capsule.
+    ///
+    /// A reading of the state already taken; it prunes and signals nothing. Only the negation,
+    /// `Gone`, licenses unlinking the record.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        matches!(self, ProcessState::Alive | ProcessState::Unverified(_))
+    }
+}
+
 /// Layers 1 and 2: the pid is alive, and the process holding it is the one that wrote the record.
 ///
 /// Local and cheap, which is what makes this the candidacy test — a reader can apply it to every
@@ -899,6 +911,13 @@ pub(crate) fn probe_door_session_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alive_and_unverified_are_running_and_gone_is_not() {
+        assert!(ProcessState::Alive.is_running());
+        assert!(ProcessState::Unverified("start time unreadable".to_string()).is_running());
+        assert!(!ProcessState::Gone("no process holds the pid".to_string()).is_running());
+    }
 
     #[test]
     fn prune_removes_the_record_and_its_control_token() {

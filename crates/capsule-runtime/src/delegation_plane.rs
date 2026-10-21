@@ -1067,11 +1067,8 @@ fn end_for_canceled_task(
     if let Err(error) = child.shutdown() {
         crate::runtime_err!("[capsule-runtime] delegation {delegation_id}: {error}");
     }
-    let Some(records_root) = child.records_root.as_ref() else {
-        return;
-    };
     crate::delegation::record_terminated(
-        records_root,
+        &child.records_root,
         crate::delegation::DelegationOutcome {
             delegation_id: delegation_id.to_string(),
             capsule_name: request.capsule.clone(),

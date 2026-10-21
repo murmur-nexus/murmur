@@ -652,11 +652,13 @@ on the second line is the host's:
 
 ## Step 4 — `trace.jsonl`
 
-The trace lives under `<workdir>/.murmur/<session-id>/trace.jsonl`, one directory per session — not
-at the top of the workdir. From the host, after the session:
+The trace lives in the session's [records directory](workdir.md#records-directory),
+`~/.murmur/records/<workdir root>/<session-id>/trace.jsonl`, outside the workdir.
+`mur trace list --workdir ~/sealed-check/workdir` lists this workdir's sessions, newest first. From
+the host, after the session:
 
 ```sh
-find ~/sealed-check/workdir -name trace.jsonl \
+find ~/.murmur/records$HOME/sealed-check/workdir -name trace.jsonl \
   -exec grep -o '"containment_[a-z]*":"[a-z]*"' {} \; | head -2
 ```
 
@@ -1943,6 +1945,8 @@ those steps.
 
 Read from `~/sealed-check/workdir/.murmur/ses_019fc9e0643f7b218186aa07204443f6/trace.jsonl`, from a
 session launched under `systemd-run --user --scope --property=Delegate=yes`.
+That path is where the trace lived when this run was recorded; a session's trace lives in its
+records directory, `~/.murmur/records/<workdir root>/<session-id>/trace.jsonl`.
 
 **Step 5 — the container refusal: NOT RUN.** No container runtime is installed on this host
 (`command -v docker podman` finds nothing) and none could be installed. This is the one acceptance

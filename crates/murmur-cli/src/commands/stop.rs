@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use capsule_runtime::errors::RuntimeError;
 use capsule_runtime::formation_launch::MEMBER_STOP_GRACE;
 use capsule_runtime::running::ProcessIdentity;
-use capsule_runtime::{running, FormationId, ProcessState, RunningRecord, SignalOutcome};
+use capsule_runtime::{running, FormationId, RunningRecord, SignalOutcome};
 use serde_json::Value;
 
 use crate::error::{CliError, E_RUN_022, E_RUN_024};
@@ -182,12 +182,11 @@ fn stop_formation(address: &str, grace: Duration) -> Result<(), CliError> {
         if record.formation_id.as_ref() != Some(&formation_id) {
             continue;
         }
-        match running::process_state(&record) {
-            ProcessState::Alive | ProcessState::Unverified(_) => members.push(record),
-            ProcessState::Gone(_) => {
-                running::prune(&record);
-                pruned += 1;
-            }
+        if running::process_state(&record).is_running() {
+            members.push(record);
+        } else {
+            running::prune(&record);
+            pruned += 1;
         }
     }
     if members.is_empty() {
@@ -416,7 +415,7 @@ fn wait_for_members(members: &[RunningRecord]) -> Vec<&str> {
     let mut pending: Vec<&RunningRecord> = members.iter().collect();
     loop {
         pending.retain(|member| {
-            let gone = matches!(running::process_state(member), ProcessState::Gone(_));
+            let gone = !running::process_state(member).is_running();
             if gone {
                 running::prune(member);
             }
@@ -475,7 +474,7 @@ fn recorded_ending(trace_path: &Path) -> String {
 fn wait_for_exit(identity: &ProcessIdentity, grace: Duration) -> bool {
     let deadline = Instant::now() + grace;
     loop {
-        if matches!(running::identity_state(identity), ProcessState::Gone(_)) {
+        if !running::identity_state(identity).is_running() {
             return true;
         }
         if Instant::now() >= deadline {

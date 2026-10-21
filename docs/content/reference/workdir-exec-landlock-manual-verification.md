@@ -429,9 +429,15 @@ For the `trace.jsonl` half you need a capsule that actually starts a session —
 
 ```sh
 "$BIN" run --manifest <a real capsule's murmur.yaml> --task 'exit'
+records_dir=$("$BIN" trace list --workdir <workdir> --json \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["sessions"][0]["records_dir"])')
 python3 -c 'import json,sys;print(json.dumps(json.loads(open(sys.argv[1]).readline()),indent=2))' \
-  <workdir>/<session_id>/trace.jsonl
+  "$records_dir/trace.jsonl"
 ```
+
+`<workdir>` is the directory the run used as its workdir: `workdir` beside the manifest when the
+run is given no `--workdir`. The trace is in the newest session's
+[records directory](workdir.md#records-directory).
 
 Expected — `workdir_exec` present on `session_start`, next to the class it forced:
 

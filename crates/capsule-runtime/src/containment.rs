@@ -1456,7 +1456,7 @@ pub(crate) fn scope_report_for_tier(
     let achieved = achieved_containment_class(
         tier,
         policy.workdir_exec_allowed,
-        runtime_dir_placement.inside_workdir,
+        runtime_dir_placement.inside_workdir(),
     );
     // The tier this session would actually install: the host reading `enforcement_tier`
     // reports, capped by the declared floor, which is the same `sandbox::applied_tier`
@@ -3646,7 +3646,6 @@ mod tests {
             workdir: std::path::PathBuf::from("/home/dev"),
             sessions_inside_workdir: true,
             records_inside_workdir: true,
-            inside_workdir: true,
         }
     }
 

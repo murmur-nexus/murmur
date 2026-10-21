@@ -2163,7 +2163,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
             capsule_runtime::report_print!("{}", render_records_dir(&reports.records_dir));
             capsule_runtime::report_println!();
             capsule_runtime::report_print!("{}", render_temp_dir(&reports.temp_dir));
-            if reports.placement.inside_workdir {
+            if reports.placement.inside_workdir() {
                 capsule_runtime::report_eprintln!(
                     "[mur doctor] {}",
                     runtime_dir_inside_warning(&reports.placement)

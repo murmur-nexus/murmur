@@ -79,7 +79,7 @@ fn suite() -> &'static Suite {
                  env:\n    allow: [{A_ONLY}, {B_ONLY}, MURMUR_TEST_ALLOWED_VAR]\n  \
                  spawn:\n    allow: [local/child-agent, local/child-a, local/child-b, \
                  local/child-escape, local/child-sealed, local/child-leak, local/child-reader, \
-                 local/child-repeat, local/child-handed]\n",
+                 local/child-repeat, local/child-handed, local/child-misreported]\n",
                 endpoint = inference.authority(),
             ),
             Some(&component("capsule-env-echo.wasm")),
@@ -109,7 +109,11 @@ fn suite() -> &'static Suite {
 
         // Script children that read the paths their parent named, and report what each attempt
         // was served.
-        for name in ["local/child-reader", "local/child-repeat"] {
+        for name in [
+            "local/child-reader",
+            "local/child-repeat",
+            "local/child-misreported",
+        ] {
             common::publish_capsule(
                 &registry_path,
                 name,
@@ -173,6 +177,11 @@ fn suite() -> &'static Suite {
 /// `mur` makes itself non-dumpable as its first act, which closes its `/proc/<pid>/environ` and
 /// `/proc/<pid>/fd` to every non-root reader, this test included. The script runs in the same
 /// process before that `exec`, so what it records is exactly what the launch handed the child.
+///
+/// A launch of `child-misreported` never reaches `mur`: the script records its pid
+/// (`misreported.pid`), prints a readiness line naming a records directory outside
+/// `~/.murmur/records`, and sleeps in the same process.
+///
 /// Every other launch passes straight through.
 fn recording_wrapper(home: &Path, mur: &Path) -> PathBuf {
     let wrapper = home.join("mur-recording-wrapper");
@@ -185,6 +194,11 @@ fn recording_wrapper(home: &Path, mur: &Path) -> PathBuf {
                  env > handed.env
                  ls -l /proc/$$/fd > handed.fd
                  cat \"/proc/$$/fdinfo/$MURMUR_SPAWNER_LIFELINE\" > handed.fdinfo
+                 ;;
+  *\" local/child-misreported \"*)
+                 echo $$ > misreported.pid
+                 echo '{{\"session_id\":\"ses_misreported\",\"url\":\"\",\"records_dir\":\"/tmp/ses_misreported\"}}'
+                 exec sleep 300
                  ;;
 esac
              exec '{}' \"$@\"
@@ -950,6 +964,38 @@ fn a_launched_child_lives_exactly_as_long_as_its_handle() {
         "the child to end with its handle",
         Duration::from_secs(10),
         || !process_is_alive(pid),
+    );
+}
+
+/// A child whose readiness line names a records directory outside `~/.murmur/records` is refused,
+/// and the launch that refuses it ends and reaps it before returning: there is no handle left to
+/// do so later.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_child_refused_at_its_readiness_line_is_ended_and_reaped() {
+    let parent = Parent::new();
+    let error = parent
+        .try_launch("local/child-misreported", &[])
+        .expect_err("a records_dir outside ~/.murmur/records refuses the launch");
+    let message = error.to_string();
+    assert!(
+        message.contains("named /tmp/ses_misreported as its records directory"),
+        "{message}"
+    );
+
+    let children = parent.dir().join(".murmur").join("children");
+    let dir = dirs_under(&children)
+        .into_iter()
+        .next()
+        .expect("the launch created the child's directory");
+    let pid: u32 = std::fs::read_to_string(dir.join("misreported.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        !process_is_alive(pid),
+        "the refused child is still in the process table"
     );
 }
 

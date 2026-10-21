@@ -3034,15 +3034,17 @@ pub(crate) fn prepare_enforcement(
         EnforcementTier::KernelFull | EnforcementTier::KernelSealed
     ) {
         Some(linux_enforce::open_landlock_fds(
-            accessible_workdir,
-            &enforcement.landlock_grants,
-            &landlock_device_grants(enforcement.tier),
-            enforcement.workdir_exec,
-            enforcement.landlock_abi,
-            sealed_sources.as_ref(),
-            temp_dir_fd,
-            runtime_dir_fd,
-            records_dir_fd,
+            linux_enforce::LandlockFdRequest {
+                accessible_workdir,
+                landlock_grants: &enforcement.landlock_grants,
+                device_grants: &landlock_device_grants(enforcement.tier),
+                workdir_exec: enforcement.workdir_exec,
+                abi: enforcement.landlock_abi,
+                sealed: sealed_sources.as_ref(),
+                temp_dir_fd,
+                runtime_dir_fd,
+                records_dir_fd,
+            },
         )?)
     } else {
         None
@@ -4647,6 +4649,58 @@ mod linux_enforce {
         Ok(())
     }
 
+    /// What [`open_landlock_fds`] opens, or carries through, for one launch.
+    pub(super) struct LandlockFdRequest<'a> {
+        /// The workdir the capsule's commands run in. Fail-closed: a workdir that cannot be
+        /// opened is an `Err` naming the path.
+        pub(super) accessible_workdir: &'a Path,
+        /// The manifest-derived grants. A grant path that fails to open is dropped
+        /// (shrink-not-fail).
+        pub(super) landlock_grants: &'a [LandlockGrant],
+        /// The tier's fixed device set, [`super::CAPSULE_DEVICE_GRANTS`] on `KernelFull` and the
+        /// composed root's own OCI default set on `KernelSealed`, chosen by
+        /// `super::landlock_device_grants`. Opened by the grants' rules: the list is a
+        /// compile-time constant rather than manifest-derived, and a host where one entry cannot
+        /// be opened — unusual, but a broken or minimal `/dev` is possible — loses that one device
+        /// rather than failing the launch. A lost device, `/dev/null` included, narrows the
+        /// capsule's scope and never widens it.
+        pub(super) device_grants: &'a [super::CapsuleDeviceGrant],
+        /// Carried into [`LandlockChildFds::workdir_exec`].
+        pub(super) workdir_exec: bool,
+        /// Carried into [`LandlockChildFds::abi`].
+        pub(super) abi: Option<u8>,
+        /// What only `KernelSealed` opens: the synthetic `/etc` files. Fail-closed.
+        pub(super) sealed: Option<&'a super::SealedSourceFds>,
+        /// The session's temporary folder's descriptor on both Landlock tiers, which
+        /// `prepare_enforcement` already took and shares with the sealed binds. Fail-closed — an
+        /// `Err` naming the path, exactly like the workdir's own open, never the grant loops'
+        /// shrink-not-fail `continue`.
+        pub(super) temp_dir_fd: Option<std::sync::Arc<OwnedFd>>,
+        /// The runtime directory's descriptor, on the same terms as [`Self::temp_dir_fd`].
+        pub(super) runtime_dir_fd: Option<std::sync::Arc<OwnedFd>>,
+        /// The records directory's descriptor, on the same terms as [`Self::temp_dir_fd`].
+        pub(super) records_dir_fd: Option<std::sync::Arc<OwnedFd>>,
+    }
+
+    impl<'a> LandlockFdRequest<'a> {
+        /// `accessible_workdir` and nothing else: no grants, no devices, no sealed sources and
+        /// no directory fds.
+        #[cfg(test)]
+        pub(super) fn workdir_only(accessible_workdir: &'a Path) -> Self {
+            Self {
+                accessible_workdir,
+                landlock_grants: &[],
+                device_grants: &[],
+                workdir_exec: false,
+                abi: None,
+                sealed: None,
+                temp_dir_fd: None,
+                runtime_dir_fd: None,
+                records_dir_fd: None,
+            }
+        }
+    }
+
     /// Opens (in the PARENT, before fork) the workdir fd and every grant fd Landlock needs, using
     /// `O_PATH | O_CLOEXEC` — the exact flags `landlock::PathFd` uses. Moving these `open()` calls
     /// out of the child's `pre_exec` window is the whole point: a workdir that cannot be resolved
@@ -4658,32 +4712,22 @@ mod linux_enforce {
     /// opened — see the comment on the grant loop. Same discipline as the drop above: narrowing
     /// only, never widening.
     ///
-    /// `device_grants` — the tier's fixed device set, [`super::CAPSULE_DEVICE_GRANTS`] on
-    /// `KernelFull` and the composed root's own OCI default set on `KernelSealed`, chosen by
-    /// `super::landlock_device_grants` — is opened here too, by the same rules: the list is a
-    /// compile-time constant rather than manifest-derived, and a host where one entry cannot be
-    /// opened — unusual, but a broken or minimal `/dev` is possible — loses that one device rather
-    /// than failing the launch. Losing `/dev/null` here degrades to exactly the behavior that
-    /// existed before this mechanism, which is a strictly narrower scope, never a wider one.
-    ///
-    /// `sealed` carries what only `KernelSealed` opens: the synthetic `/etc` files.
-    /// `temp_dir_fd`, `runtime_dir_fd` and `records_dir_fd` are the session's temporary folder's,
-    /// runtime directory's and records directory's descriptors on both Landlock tiers, which
-    /// `prepare_enforcement` already took and shares with the sealed binds. Each is fail-closed —
-    /// an `Err` naming the path, exactly like the workdir's own open above, never the grant
-    /// loops' shrink-not-fail `continue`.
-    #[allow(clippy::too_many_arguments)]
+    /// The request's devices are opened by the same rules as its grants, and its directory fds
+    /// move into the returned [`LandlockChildFds`]. See [`LandlockFdRequest`] for each field.
     pub(super) fn open_landlock_fds(
-        accessible_workdir: &Path,
-        landlock_grants: &[LandlockGrant],
-        device_grants: &[super::CapsuleDeviceGrant],
-        workdir_exec: bool,
-        abi: Option<u8>,
-        sealed: Option<&super::SealedSourceFds>,
-        temp_dir_fd: Option<std::sync::Arc<OwnedFd>>,
-        runtime_dir_fd: Option<std::sync::Arc<OwnedFd>>,
-        records_dir_fd: Option<std::sync::Arc<OwnedFd>>,
+        request: LandlockFdRequest<'_>,
     ) -> Result<LandlockChildFds, String> {
+        let LandlockFdRequest {
+            accessible_workdir,
+            landlock_grants,
+            device_grants,
+            workdir_exec,
+            abi,
+            sealed,
+            temp_dir_fd,
+            runtime_dir_fd,
+            records_dir_fd,
+        } = request;
         let workdir_fd = open_o_path(accessible_workdir)
             .map(OwnedFd::from)
             .map_err(|error| {
@@ -7119,17 +7163,10 @@ mod tests {
         .for_native_entrypoint(&native)
         .landlock_grants;
         let open = |grants: &[LandlockGrant]| {
-            linux_enforce::open_landlock_fds(
-                accessible.path(),
-                grants,
-                &[],
-                false,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            linux_enforce::open_landlock_fds(linux_enforce::LandlockFdRequest {
+                landlock_grants: grants,
+                ..linux_enforce::LandlockFdRequest::workdir_only(accessible.path())
+            })
             .unwrap()
             .grant_count()
         };
@@ -7920,17 +7957,13 @@ mod linux_integration_tests {
             enforcement.temp_dir_path().unwrap(),
             "the composed root binds the session's temporary folder at /tmp"
         );
-        let fds = linux_enforce::open_landlock_fds(
-            accessible.path(),
-            &[],
-            &[],
-            false,
-            None,
-            Some(&sources),
+        let fds = linux_enforce::open_landlock_fds(linux_enforce::LandlockFdRequest {
+            sealed: Some(&sources),
             temp_dir_fd,
-            Some(Arc::clone(&sources.runtime_dir)),
-            sources.records_dir.as_ref().map(|(fd, _)| Arc::clone(fd)),
-        )
+            runtime_dir_fd: Some(Arc::clone(&sources.runtime_dir)),
+            records_dir_fd: sources.records_dir.as_ref().map(|(fd, _)| Arc::clone(fd)),
+            ..linux_enforce::LandlockFdRequest::workdir_only(accessible.path())
+        })
         .expect("a real, writable workdir must yield sealed Landlock fds");
 
         assert!(fds.temp_dir_fd().is_some());
@@ -7953,17 +7986,9 @@ mod linux_integration_tests {
             );
         }
 
-        let fds = linux_enforce::open_landlock_fds(
+        let fds = linux_enforce::open_landlock_fds(linux_enforce::LandlockFdRequest::workdir_only(
             accessible.path(),
-            &[],
-            &[],
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        ))
         .expect("a real, writable workdir must yield Landlock fds on any tier");
         assert!(
             fds.temp_dir_fd().is_none(),
@@ -8015,17 +8040,10 @@ mod linux_integration_tests {
             temp_dir_fd_of(&enforcement).as_ref(),
         )
         .unwrap();
-        let fds = linux_enforce::open_landlock_fds(
-            accessible.path(),
-            &[],
-            &[],
-            false,
-            None,
-            Some(&sources),
-            None,
-            None,
-            None,
-        )
+        let fds = linux_enforce::open_landlock_fds(linux_enforce::LandlockFdRequest {
+            sealed: Some(&sources),
+            ..linux_enforce::LandlockFdRequest::workdir_only(accessible.path())
+        })
         .expect("a real, writable workdir must yield sealed Landlock fds");
 
         let synthetic: Vec<&crate::sealed::SealedEtcPath> = crate::sealed::SEALED_ETC_PATHS
@@ -8054,17 +8072,9 @@ mod linux_integration_tests {
             );
         }
 
-        let fds = linux_enforce::open_landlock_fds(
+        let fds = linux_enforce::open_landlock_fds(linux_enforce::LandlockFdRequest::workdir_only(
             accessible.path(),
-            &[],
-            &[],
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        ))
         .unwrap();
         assert_eq!(fds.sealed_identity_fd_count(), 0);
     }

@@ -1036,16 +1036,14 @@ fn formation_is_live(
     marker: &FormationMarker,
     records: Option<&[crate::running::RunningRecord]>,
 ) -> bool {
-    let not_gone = |state| !matches!(state, crate::running::ProcessState::Gone(_));
     let Some(records) = records else {
         return true;
     };
-    not_gone(crate::running::process_state_of(
-        marker.launcher_pid,
-        &marker.launcher_start,
-    )) || records.iter().any(|record| {
-        record.formation_id.as_ref() == Some(id) && not_gone(crate::running::process_state(record))
-    })
+    crate::running::process_state_of(marker.launcher_pid, &marker.launcher_start).is_running()
+        || records.iter().any(|record| {
+            record.formation_id.as_ref() == Some(id)
+                && crate::running::process_state(record).is_running()
+        })
 }
 
 /// Make `member`'s directory under `formations_dir`, owner-only, and return it.
