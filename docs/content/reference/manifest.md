@@ -2393,6 +2393,41 @@ lifecycle:
   shell_grace_secs: 2
 ```
 
+#### When a command exits while something it started holds its output { #shell-output-holders }
+
+Each shell command starts as the leader of its own process group, with `/dev/null` as its stdin.
+A process it starts in the background with `&` stays in that group and, unless its output is
+redirected, holds the call's stdout and stderr open after the command itself has exited. Once the
+command's own process exits, the call:
+
+1. Waits up to 1 second for its stdout and stderr to close, and never past the end of the
+   `lifecycle.shell_grace_secs` window. Output a background process prints and exits within that
+   second is part of the result.
+2. Kills every process still in the command's process group with `SIGKILL`, if the output is
+   still open, and returns what was read, including what the dying processes wrote.
+3. Stops waiting 2 seconds after the kill if the output is still open, and returns what was read
+   by then.
+
+A command that moved to the background is finished the same way when it exits, so its completion
+arrives even when it left processes holding its output.
+
+When step 2 or 3 is reached, the model reads a note after the output saying what happened:
+
+| Holder | Note |
+|---|---|
+| Processes in the command's process group | They were still holding the output and were killed |
+| A process that left the group, such as one started with `setsid` | It still holds the output and keeps running until the session ends, which kills it |
+
+A process meant to keep running after its call returns redirects its output away from the call:
+
+```bash
+server >server.log 2>&1 &
+```
+
+It holds neither pipe, so the call returns as soon as the command exits, nothing kills it, and
+later calls in the same session can reach it. The session's end kills it with everything else the
+session started.
+
 #### When a session ends with a command still running
 
 The session does not wait for it. It kills it, together with every other process the session

@@ -11537,11 +11537,15 @@ fn dispatch_shell_tool(
                 resource_limit: result.resource_limit_hit.clone(),
             };
             // A note rather than part of `data`: inside the fence it would read exactly like
-            // output the command could have printed itself.
-            let runtime_note = result
+            // output the command could have printed itself. One line per thing to report.
+            let notes: Vec<String> = result
                 .resource_limit_hit
                 .as_deref()
-                .map(crate::resources::resource_limit_line);
+                .map(crate::resources::resource_limit_line)
+                .into_iter()
+                .chain(result.output_holders.note())
+                .collect();
+            let runtime_note = (!notes.is_empty()).then(|| notes.join("\n"));
             DispatchOutcome {
                 shell: Some(shell),
                 runtime_note,
@@ -18189,6 +18193,172 @@ inference:
         assert!(data.contains("capabilities.resources.cgroup_pids_max"));
     }
 
+    /// A command that exits while something it started in the background still holds its
+    /// output returns what it printed, and the model is told after the fence that the holders
+    /// were killed and how to keep a process running.
+    #[test]
+    fn a_shell_call_whose_background_holds_its_output_says_they_were_killed() {
+        let tmp = TempDir::new().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+
+        let mut outcome = dispatch_shell_tool(
+            "bash",
+            murmur::tool::run::ToolInput {
+                data: Some(r#"{"command":"sleep 300 & echo started"}"#.to_string()),
+                log_path: None,
+            },
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &[],
+            &policy,
+            &sandbox::ShellEnforcement::environment_only(),
+            None,
+        );
+
+        assert_eq!(outcome.shell.as_ref().map(|shell| shell.exit_code), Some(0));
+        let note = crate::shell::OutputHolders::Killed.note();
+        assert_eq!(outcome.runtime_note, note);
+        let note = note.unwrap();
+
+        fence_and_label("bash", &LockOrigin::Operator, &mut outcome);
+        let data = outcome.result.data.expect("a finished call renders text");
+        assert!(data.contains("started"), "{data}");
+        assert!(
+            data.ends_with(&format!("{}\n{note}", crate::fence::FENCE_CLOSE)),
+            "the holders note must follow the fence:\n{data}"
+        );
+    }
+
+    /// The fork bomb `bash` leaves behind when it exits keeps the call's output open from every
+    /// copy of itself. The call returns within seconds of `bash` exiting, names `pids.max`, keeps
+    /// the refused forks' stderr, and leaves the scope empty for the next command.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fork_bomb_call_returns_and_its_stragglers_are_killed() {
+        const TEST: &str = "a_fork_bomb_call_returns_and_its_stragglers_are_killed";
+        if !crate::cgroup::cgroup_delegation_available() {
+            crate::runtime_err!("[SKIP-HOST] {TEST}: this host cannot delegate a cgroup v2 scope");
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let runtime = TempDir::new().unwrap();
+        let limits = crate::resources::HostResourceLimits {
+            cgroup_pids_max: 32,
+            ..crate::resources::HostResourceLimits::default()
+        };
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".into()],
+            resources: limits,
+            ..CapabilityPolicy::default()
+        };
+        let prepared = crate::cgroup::prepare_scope(
+            true,
+            &limits,
+            &format!("ses_forkbomb_{}", uuid::Uuid::now_v7().simple()),
+            tmp.path(),
+        )
+        .expect("this host delegates a cgroup scope");
+        // A records directory, so the grace-period path is the one taken.
+        let mut enforcement = sandbox::ShellEnforcement::environment_only()
+            .with_runtime_dir(sandbox::test_runtime_dir(runtime.path()), None)
+            .with_host_bounding(prepared.scope, None);
+        enforcement.resource_limits = limits;
+
+        let workdir = tmp.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let (registry, _reports) = crate::detached::DetachedRegistry::new();
+            let outcome = dispatch_shell_tool(
+                "bash",
+                murmur::tool::run::ToolInput {
+                    data: Some(r#"{"command":"bomb() { bomb | bomb & }; bomb"}"#.to_string()),
+                    log_path: None,
+                },
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+                &[],
+                &policy,
+                &enforcement,
+                Some(DetachPolicy {
+                    grace: std::time::Duration::from_secs(10),
+                    delivered: true,
+                    registry,
+                    command: String::new(),
+                    context_id: "ctx_fork_bomb".to_string(),
+                    provenance: Some(crate::origin::TaskProvenance::derive(
+                        crate::origin::TaskOrigin::User,
+                        None,
+                    )),
+                    abandoned: None,
+                }),
+            );
+            let _ = sender.send((outcome, enforcement, policy));
+        });
+        let (mut outcome, enforcement, policy) = receiver
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("the fork bomb's call did not return within 60 s"));
+        let elapsed = started.elapsed();
+
+        let bound = std::time::Duration::from_secs(10)
+            + crate::shell::LEFTOVER_KILL_WAIT
+            + std::time::Duration::from_secs(3);
+        assert!(elapsed < bound, "the call took {elapsed:?}, past {bound:?}");
+        assert_eq!(
+            outcome
+                .shell
+                .as_ref()
+                .and_then(|shell| shell.resource_limit.as_deref()),
+            Some("cgroup_pids_max"),
+            "{:?}",
+            outcome.result.data
+        );
+        assert_eq!(
+            outcome.runtime_note,
+            Some(format!(
+                "{}\n{}",
+                crate::resources::resource_limit_line("cgroup_pids_max"),
+                crate::shell::OutputHolders::Killed.note().unwrap()
+            ))
+        );
+        fence_and_label("bash", &LockOrigin::Operator, &mut outcome);
+        let data = outcome.result.data.expect("a finished call renders text");
+        assert!(data.contains("Resource temporarily unavailable"), "{data}");
+
+        let scope = enforcement
+            .cgroup_scope
+            .clone()
+            .expect("the enforcement holds the scope");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !scope.member_pids().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            scope.member_pids(),
+            Vec::<i32>::new(),
+            "the fork bomb's stragglers are still in the scope"
+        );
+
+        let next = crate::shell::execute_shell(
+            "bash",
+            &["-c", "echo next"],
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &policy,
+            &enforcement,
+        )
+        .expect("the next command runs");
+        assert_eq!(next.exit_code, 0, "{next:?}");
+        assert_eq!(next.stdout.trim(), "next");
+
+        enforcement.end_session();
+    }
+
     /// A command that runs past `capabilities.resources.cpu_seconds` is stopped by `SIGXCPU` at
     /// that limit, so the trace's `shell` event names `cpu_seconds`, the exit code is
     /// `128 + SIGXCPU`, and the model reads the limit line after the fence while the call stays
@@ -18306,6 +18476,7 @@ inference:
                 truncated: false,
                 full_output_path: None,
                 resource_limit_hit: None,
+                output_holders: crate::shell::OutputHolders::Closed,
             },
         );
         assert!(failed.metadata.is_empty());
@@ -18328,6 +18499,7 @@ inference:
                     truncated: true,
                     full_output_path: full_output_path.map(str::to_string),
                     resource_limit_hit: None,
+                    output_holders: crate::shell::OutputHolders::Closed,
                 },
             )
         };

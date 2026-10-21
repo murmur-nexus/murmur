@@ -97,6 +97,9 @@ pub(crate) struct DetachedCompletion {
     /// Bytes written to that file, header included.
     pub output_bytes: u64,
     pub resource_limit: Option<String>,
+    /// Whether anything the command started was still holding its output when it exited, as on
+    /// [`crate::shell::ShellResult::output_holders`].
+    pub output_holders: crate::shell::OutputHolders,
     /// The conversation the command was started from. The completion task runs under this id, so
     /// the result joins the thread that asked for it rather than opening a new one.
     pub context_id: String,
@@ -111,7 +114,8 @@ impl DetachedCompletion {
     /// the duration and the output path. Never the output itself.
     ///
     /// An attributed limit adds the [`crate::resources::resource_limit_line`] a foreground call
-    /// would get, naming the limit and what to do about it.
+    /// would get, naming the limit and what to do about it, and output holders that were killed
+    /// or left running add their [`crate::shell::OutputHolders::note`].
     pub(crate) fn message_text(&self) -> String {
         let mut text = format!(
             "Background shell command finished.\n\
@@ -134,6 +138,10 @@ impl DetachedCompletion {
         if let Some(limit) = &self.resource_limit {
             text.push('\n');
             text.push_str(&crate::resources::resource_limit_line(limit));
+        }
+        if let Some(note) = self.output_holders.note() {
+            text.push('\n');
+            text.push_str(&note);
         }
         if let Some(error) = &self.error {
             text.push_str(&format!("\nwait_error: {error}"));
@@ -697,6 +705,7 @@ mod tests {
             output_path: "/home/test/.murmur/records/work/ses_1/logs/wrk_0001.log".to_string(),
             output_bytes: 0,
             resource_limit: None,
+            output_holders: crate::shell::OutputHolders::Closed,
             context_id: "ctx_1".to_string(),
             provenance: completion_provenance(),
             error: None,
@@ -731,6 +740,7 @@ mod tests {
             output_path: "/home/test/.murmur/records/work/ses_1/logs/wrk_0001.log".to_string(),
             output_bytes: 0,
             resource_limit: Some("cgroup_pids_max".into()),
+            output_holders: crate::shell::OutputHolders::Closed,
             context_id: "ctx_1".to_string(),
             provenance: completion_provenance(),
             error: None,
@@ -748,6 +758,70 @@ mod tests {
         );
         assert_eq!(completion.status(), "error");
         assert!(text.ends_with("are not reproduced here."), "{text}");
+    }
+
+    /// A demoted command that exits while a process it started still holds its output completes
+    /// anyway: the holder is killed, the completion says so, and the log has what was printed.
+    #[test]
+    fn a_demoted_command_completes_when_its_background_holders_are_killed() {
+        let workdir = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let (outcome, _registry, mut receiver) = detached_run(
+            workdir.path(),
+            runtime.path(),
+            "sleep 2; sleep 300 & echo $! > sleeper.pid; echo started",
+            Duration::from_secs(1),
+        );
+        let ShellOutcome::Detached(info) = outcome else {
+            panic!("a two-second command must not finish inside a one-second grace: {outcome:?}");
+        };
+
+        let waiting = Instant::now();
+        let completion = await_completion(&mut receiver);
+        let waited = waiting.elapsed();
+        assert!(
+            waited < Duration::from_secs(15),
+            "the completion took {waited:?}"
+        );
+        assert_eq!(completion.work_id, info.work_id);
+        assert_eq!(completion.exit_code, 0);
+        assert_eq!(
+            completion.output_holders,
+            crate::shell::OutputHolders::Killed
+        );
+        let note = crate::shell::OutputHolders::Killed.note().unwrap();
+        let text = completion.message_text();
+        assert!(text.lines().any(|line| line == note), "{text}");
+        assert!(text.ends_with("are not reproduced here."), "{text}");
+        let log = std::fs::read_to_string(&completion.output_path).unwrap();
+        assert!(log.contains("started"), "{log}");
+
+        let sleeper: i32 = std::fs::read_to_string(workdir.path().join("sleeper.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let dead = loop {
+            let dead =
+                std::fs::read_to_string(format!("/proc/{sleeper}/stat")).map_or(true, |stat| {
+                    stat.rsplit_once(')')
+                        .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+                });
+            if dead || Instant::now() >= deadline {
+                break dead;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if !dead {
+            // SAFETY: `kill` takes two integers and dereferences nothing. `sleeper` is the
+            // positive pid of the test's sleeper.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::kill(sleeper, libc::SIGKILL);
+            }
+        }
+        assert!(dead, "the background sleeper {sleeper} is still running");
     }
 
     /// The whole argument of demotion: the call returns long before the command does, and the
