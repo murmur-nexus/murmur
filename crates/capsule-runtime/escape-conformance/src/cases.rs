@@ -1479,8 +1479,8 @@ def main():
                       Unix platform. Lifted from scenario 1, but with the declared ceiling raised \
                       from that document's 64 to 128: see the comment on the tight resources block \
                       in runner.rs, where 16 is shown to make every spawn fail outright rather \
-                      than bound anything, and where 64 is shown to have stopped being enough \
-                      once slice fb1eea97 added the `SEALED_ETC_PATHS` grant fds.\
+                      than bound anything, and where 64 is shown to be too few for this \
+                      harness's `sealed` capsule once the `SEALED_ETC_PATHS` grant fds are held. \
                       Measured CONTAINED at `sealed`: EMFILE after 125 descriptors against a \
                       declared max_open_files of 128, read back from the child's own \
                       RLIMIT_NOFILE. Both halves of the grading held — at or under the declared \

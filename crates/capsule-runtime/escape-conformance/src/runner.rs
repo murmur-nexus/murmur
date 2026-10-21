@@ -173,20 +173,17 @@ pub fn derive_interpreter_dirs(python: &str) -> Result<Vec<(String, bool)>, Stri
 /// process bound.
 fn tight_resources_yaml() -> &'static str {
     "  resources:\n\
-    \x20   # 128 rather than the document's 64, and the difference is a finding rather than a\n\
-    \x20   # preference. `apply_hard_rlimits` runs first in the child's pre_exec window, so every\n\
-    \x20   # later step in that window lives under this ceiling — and the Landlock grant fds, the\n\
-    \x20   # netns/uid_map setup and the seccomp filter all need descriptors while it holds.\n\
-    \x20   # Observed on Linux 7.0.0/libseccomp 2.5.5: at 16 and at 32 every spawn dies with\n\
-    \x20   # `shell enforcement setup failed before exec: There was a system failure beyond the\n\
-    \x20   # control of libseccomp`. 64 worked until slice fb1eea97 added one Landlock grant per\n\
-    \x20   # `SEALED_ETC_PATHS` entry: sixteen more fds held open across that window put a `sealed`\n\
-    \x20   # capsule back over the line, and every resource case reported\n\
-    \x20   # `egress-netns: writing uid_map/gid_map failed` instead of its ceiling. Measured on\n\
-    \x20   # that host, a [bash, python3] sealed capsule spawns at 72 and refuses at 64; 128 is\n\
-    \x20   # that floor with room for a grant set that grows again. The ceiling still bites, and\n\
-    \x20   # still far below the host default, so the fd-exhauster case stays runnable — which is\n\
-    \x20   # the constraint that rules out simply raising it to the sky.\n\
+    \x20   # 128 rather than the document's 64. `apply_hard_rlimits` runs first in the child's\n\
+    \x20   # pre_exec window, so every later step in that window lives under this ceiling — and\n\
+    \x20   # the Landlock grant fds, the netns/uid_map setup and the seccomp filter all need\n\
+    \x20   # descriptors while it holds. At 16 and at 32 every spawn dies with `shell enforcement\n\
+    \x20   # setup failed before exec: There was a system failure beyond the control of\n\
+    \x20   # libseccomp`. At 64 the one Landlock grant per `SEALED_ETC_PATHS` entry puts this\n\
+    \x20   # harness's `sealed` capsule over the line, and every resource case reports\n\
+    \x20   # `egress-netns: writing uid_map/gid_map failed` instead of its ceiling: a\n\
+    \x20   # [bash, python3] sealed capsule spawns at 72 and refuses at 64. 128 is that floor with\n\
+    \x20   # room for a grant set that grows. Do not raise it toward the host default: the\n\
+    \x20   # fd-exhauster case needs a ceiling far below 1024 to grade anything.\n\
     \x20   max_open_files: 128\n\
     \x20   max_file_size_bytes: 10485760      # 10 MiB\n\
     \x20   # 60 rather than the document's 5: pids.max is hit in milliseconds, so a generous CPU\n\

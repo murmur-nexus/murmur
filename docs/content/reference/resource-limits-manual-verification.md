@@ -106,9 +106,9 @@ runtime:
 3. enables `memory`, `pids`, `cpu` (and `io`, if delegated) in that base's `cgroup.subtree_control`
    — moving *itself* into `<base>/murmur-supervisor` first if the base still holds processes,
    which cgroup v2's "no internal processes" rule requires;
-4. creates `<base>/murmur-<session_id>` and writes `memory.max`, `memory.swap.max` (`0`),
-   `pids.max`, `cpu.max` (fatal on failure; a `memory.swap.max` the kernel does not expose is
-   skipped) and `io.max` (non-fatal, reported in
+4. creates the session's cgroup, `<base>/murmur-<session_id>-<pid>-<n>`, and writes `memory.max`,
+   `memory.swap.max` (`0`), `pids.max`, `cpu.max` (fatal on failure; a `memory.swap.max` the
+   kernel does not expose is skipped) and `io.max` (non-fatal, reported in
    [`io_max`](resource-limits.md#io-max-report) and by
    [`W-SEC-021`](diagnostics.md#w-sec-021));
 5. opens that scope's `cgroup.procs` write-only, and every subprocess writes its own pid there
@@ -121,14 +121,25 @@ for its own scope inside it — but is not required for the launch to succeed:
 systemd-run --user --scope --property=Delegate=yes -- mur run --manifest murmur.yaml
 ```
 
-Inspect a live scope while a capsule runs:
+The session's cgroup exists only while the session runs, and `mur` removes it when the session
+ends. It sits under the scope `mur` took in step 1, not under the cgroup of the shell that started
+`mur`, so read it from another terminal while the session runs. This function prints the named
+files of every running session's cgroup twice a second until you stop it with Ctrl-C:
 
 ```bash
-CG=/sys/fs/cgroup$(grep '^0::' /proc/self/cgroup | cut -d: -f3)
-ls -d "$CG"/murmur-*
-cat "$CG"/murmur-*/memory.max "$CG"/murmur-*/memory.swap.max "$CG"/murmur-*/pids.max \
-    "$CG"/murmur-*/cpu.max
+watch_scope() {
+  while :; do
+    for s in $(find /sys/fs/cgroup -type d -name 'murmur-ses_*' 2>/dev/null); do
+      for f in "$@"; do echo "${s##*/} $f: $(cat "$s/$f" 2>/dev/null | tr '\n' ' ')"; done
+    done
+    sleep 0.5
+  done
+}
+
+watch_scope memory.max memory.swap.max pids.max cpu.max
 ```
+
+Start it before the `mur run` it is meant to observe. The scenarios below use it the same way.
 
 ## The test capsule
 
@@ -179,6 +190,9 @@ capabilities:
     cgroup_cpu_percent: 50
     workdir_max_bytes: 52428800        # 50 MiB
 
+lifecycle:
+  shell_grace_secs: 60
+
 inference:
   transport: http
   model: gpt-5.6-luna
@@ -194,6 +208,7 @@ inference:
 | `interpreter_runtime` | `python3` starts only with its standard library and `lib-dynload` readable ([scenario 3](#scenario-3)). Both paths differ between hosts; replace them with the directory the comment's command prints and its `lib-dynload`. Declaring the grant prints `W-SEC-009` on every run. |
 | `context.max_tokens`, `inference.max_tokens` | `murmur/driver-openai` `0.10.0` declares no limits for `gpt-5.6-luna`. Without an output cap the launch is refused with [`E-RUN-052`](diagnostics.md#e-run-052); without a context window `mur doctor` warns [`W-RUN-009`](diagnostics.md#w-run-009). |
 | `max_open_files: 64` | Far enough below the 1024 default that [scenario 1](#scenario-1)'s probe reaches `EMFILE` within its loop, and the value [scenario 8](#scenario-8) checks on a native tool. |
+| `lifecycle.shell_grace_secs: 60` | A command still running after [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs) moves to the background, and its trace records neither `exit_code` nor `resource_limit`. At `cgroup_cpu_percent: 50`, scenario 4's 5 CPU-seconds take about 10 seconds, the default. |
 
 Any driver works, but the model must follow the scenario's instructions exactly. Asked plainly to
 run a fork bomb, a model declines it; asked plainly to run a CPU hog, it wraps the command in its
@@ -239,7 +254,9 @@ The host staying responsive throughout is part of every expected result, and is 
 
 ## Reading a session's trace { #reading-the-trace }
 
-`mur run` prints the session's id on stdout as `session: ses_<32 hex>`. The session's
+`mur run` prints the session's id on stdout as `session: ses_<32 hex>`. It does not print the
+model's answer: that is in `workdir/<session_id>/out/result.txt`, and it is what a scenario's
+expected output is compared with. The session's
 [records directory](workdir.md#records-directory) holds its `trace.jsonl`, one JSON event per
 line. Every `shell` event carries the call's `exit_code` and a `resource_limit`: the
 `capabilities.resources` field the runtime attributed the call's end to, or `null`.
@@ -297,13 +314,16 @@ All three come from a manifest that declares no `resources:` block at all.
   `RLIMIT_NPROC` on a subprocess in a cgroup scope, where threads the rest of the host starts
   during the session would fail its `fork()` calls.
 
-Confirm the cgroup scope exists for this run too:
+Confirm the session's cgroup exists for this run too, with
+[`watch_scope`](#what-the-runtime-does-with-the-delegation) started in another terminal before
+the run:
 
 ```bash
-CG=/sys/fs/cgroup$(grep '^0::' /proc/self/cgroup | cut -d: -f3)
-cat "$CG"/murmur-*/pids.max     # expected: 256 (default)
-cat "$CG"/murmur-*/memory.max   # expected: 4294967296 (default, 4 GiB)
-cat "$CG"/murmur-*/memory.swap.max  # expected: 0
+watch_scope pids.max memory.max memory.swap.max
+# expected, while the session runs:
+#   murmur-ses_… pids.max: 256 (default)
+#   murmur-ses_… memory.max: 4294967296 (default, 4 GiB)
+#   murmur-ses_… memory.swap.max: 0
 ```
 
 ---
@@ -371,12 +391,12 @@ jq -r 'select(.resource_limit) | .resource_limit' "$D/trace.jsonl"
 # expected: cgroup_pids_max
 ```
 
-- and the kernel's own counter agrees, read from the live scope:
+- and the kernel's own counter agrees, read with
+  [`watch_scope`](#what-the-runtime-does-with-the-delegation) while the session runs:
 
 ```bash
-CG=/sys/fs/cgroup$(grep '^0::' /proc/self/cgroup | cut -d: -f3)
-cat "$CG"/murmur-*/pids.events
-# expected: max <nonzero>
+watch_scope pids.events
+# expected: murmur-ses_… pids.events: max <nonzero>
 ```
 
 **The specific claim being verified:** the trace says `cgroup_pids_max`, not a generic failure and
@@ -420,10 +440,15 @@ jq -r 'select(.event_type == "shell") | .exit_code' "$D/trace.jsonl"
 # expected: 137
 jq -r 'select(.resource_limit) | .resource_limit' "$D/trace.jsonl"
 # expected: cgroup_memory_bytes
+```
 
-CG=/sys/fs/cgroup$(grep '^0::' /proc/self/cgroup | cut -d: -f3)
-cat "$CG"/murmur-*/memory.events
-# expected: oom_kill <nonzero>
+- and the kernel's own counters agree, read with
+  [`watch_scope`](#what-the-runtime-does-with-the-delegation) while the session runs:
+
+```bash
+watch_scope memory.events memory.swap.current
+# expected: murmur-ses_… memory.events: … oom_kill <nonzero> …
+#           murmur-ses_… memory.swap.current: 0
 ```
 
 **Attribution note:** the per-process `memory_bytes` (`RLIMIT_AS`) is *not* attributed, ever. An
@@ -585,11 +610,11 @@ mur run --manifest murmur.yaml --task 'First, with bash, run exactly: git init -
 Then use the git tool, not bash, to show the status of ./repo, and report how many untracked files it lists.'
 ```
 
-While the tool runs, confirm it is inside the scope:
+While the tool runs, confirm it is inside the session's cgroup, with
+[`watch_scope`](#what-the-runtime-does-with-the-delegation) started before the run:
 
 ```bash
-CG=/sys/fs/cgroup$(grep '^0::' /proc/self/cgroup | cut -d: -f3)
-cat "$CG"/murmur-*/cgroup.procs        # the native tool's pid must appear here
+watch_scope cgroup.procs                          # the native tool's pid must appear here
 grep -E '^Max (open files|processes)' /proc/<pid>/limits
 ```
 
