@@ -1323,7 +1323,7 @@ fn mur_install_resolves_the_driver_from_the_local_store() {
     // the same full name. A name absent from the host store fails here naming itself.
     let manifest_source = common::fixture_path("subscription-e2e/murmur.yaml");
     let manifest_text = fs::read_to_string(&manifest_source).unwrap();
-    let manifest: serde_yaml::Value = serde_yaml::from_str(&manifest_text).unwrap();
+    let manifest: serde_norway::Value = serde_norway::from_str(&manifest_text).unwrap();
     let store = artifact_store();
     let declared: Vec<(String, String)> = manifest["artifacts"]
         .as_sequence()

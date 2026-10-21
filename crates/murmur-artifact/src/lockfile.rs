@@ -494,10 +494,10 @@ pub fn read_lockfile(path: &Path) -> Result<MurmurLock, LockfileError> {
     })?;
 
     let parse_error =
-        |err: serde_yaml::Error| LockfileError::Invalid(format!("YAML parse error: {err}"));
-    let version: LockVersionOnly = serde_yaml::from_str(&raw).map_err(parse_error)?;
+        |err: serde_norway::Error| LockfileError::Invalid(format!("YAML parse error: {err}"));
+    let version: LockVersionOnly = serde_norway::from_str(&raw).map_err(parse_error)?;
     check_lock_version(version.lock_version)?;
-    let lock: MurmurLock = serde_yaml::from_str(&raw).map_err(parse_error)?;
+    let lock: MurmurLock = serde_norway::from_str(&raw).map_err(parse_error)?;
 
     lock.validate()?;
     Ok(lock)
@@ -513,7 +513,7 @@ pub fn write_lockfile_atomic(path: &Path, lock: &MurmurLock) -> Result<(), Lockf
         })?;
     }
 
-    let yaml = serde_yaml::to_string(lock)
+    let yaml = serde_norway::to_string(lock)
         .map_err(|err| LockfileError::Invalid(format!("YAML serialize error: {err}")))?;
 
     let tmp = temp_path(path);

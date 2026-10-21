@@ -1448,7 +1448,7 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
             .join("murmur.yaml"),
     )
     .expect("a granted capsule is written a delegate-task manifest");
-    let declared: serde_yaml::Value = serde_yaml::from_str(&manifest).unwrap();
+    let declared: serde_norway::Value = serde_norway::from_str(&manifest).unwrap();
     let schema: Value = serde_json::from_str(declared["input_schema"].as_str().unwrap()).unwrap();
     assert_eq!(
         schema["required"],
@@ -1780,7 +1780,7 @@ fn delegate_task_offers_the_bare_name_and_spawns_the_full_one() {
             .join("murmur.yaml"),
     )
     .expect("a granted capsule is written a delegate-task manifest");
-    let declared: serde_yaml::Value = serde_yaml::from_str(&manifest).unwrap();
+    let declared: serde_norway::Value = serde_norway::from_str(&manifest).unwrap();
     let schema: Value = serde_json::from_str(declared["input_schema"].as_str().unwrap()).unwrap();
     assert_eq!(
         schema["properties"]["capsule"]["enum"],

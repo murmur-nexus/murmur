@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use murmur_artifact::{ArtifactRuntime, PACKED_MANIFEST_ENTRY};
-use serde_yaml::Value;
+use serde_norway::Value;
 
 use crate::{
     capsule_facts::{work_folder_ceiling_part, CapsuleFacts},
@@ -299,7 +299,7 @@ fn build_tools_section(runtime_root: &WorkdirRoot, system_prompt_artifact: Optio
                 Ok(Some(c)) => c,
                 _ => continue,
             };
-            let value: Value = match serde_yaml::from_str(&manifest_content) {
+            let value: Value = match serde_norway::from_str(&manifest_content) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -397,7 +397,7 @@ fn build_skills_section(
                     .read_to_string(format!("tools/{name}/{PACKED_MANIFEST_ENTRY}"))
                     .ok()
                     .flatten()
-                    .and_then(|c| serde_yaml::from_str::<Value>(&c).ok())
+                    .and_then(|c| serde_norway::from_str::<Value>(&c).ok())
                     .and_then(|v| {
                         v.get("description")
                             .and_then(|d| d.as_str())

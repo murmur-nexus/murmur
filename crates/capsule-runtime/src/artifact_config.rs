@@ -54,15 +54,15 @@ pub const MAX_ARTIFACT_CONFIG_BYTES: usize = 65_536;
 /// | it serialises to JSON | the channel carries JSON and nothing else |
 /// | the JSON is within [`MAX_ARTIFACT_CONFIG_BYTES`] | an environment variable is not a file |
 ///
-/// A `config:` written with nothing under it arrives here as [`serde_yaml::Value::Null`] and is
+/// A `config:` written with nothing under it arrives here as [`serde_norway::Value::Null`] and is
 /// refused by the first rule: a written declaration that carries nothing is a mistake worth
 /// naming, on the same terms `capabilities.state.store: ""` is.
 ///
-/// The serialisation is `serde_json`'s compact form over a `serde_yaml::Mapping`, which preserves
+/// The serialisation is `serde_json`'s compact form over a `serde_norway::Mapping`, which preserves
 /// declaration order, so the same manifest always produces the same bytes.
 pub fn lower_artifact_config(
     artifact: &str,
-    config: &serde_yaml::Value,
+    config: &serde_norway::Value,
 ) -> Result<String, RuntimeError> {
     let refuse = |message: String| RuntimeError::InvalidArtifactConfig {
         artifact: artifact.to_string(),
@@ -112,7 +112,7 @@ pub fn lower_artifact_config(
 /// belongs in the manifest and in no diagnostic this produces.
 pub fn configured_artifact_names<'a, I>(artifacts: I) -> Result<Vec<String>, RuntimeError>
 where
-    I: IntoIterator<Item = (&'a str, Option<&'a serde_yaml::Value>)>,
+    I: IntoIterator<Item = (&'a str, Option<&'a serde_norway::Value>)>,
 {
     let mut names = Vec::new();
     for (name, config) in artifacts {
@@ -127,11 +127,11 @@ where
 
 /// A scalar rendered the way it reads in the manifest, so a refusal can quote the offending key.
 /// Non-scalars fall back to their JSON form, which is still something the operator can search for.
-fn render_yaml_scalar(value: &serde_yaml::Value) -> String {
+fn render_yaml_scalar(value: &serde_norway::Value) -> String {
     match value {
-        serde_yaml::Value::Bool(value) => value.to_string(),
-        serde_yaml::Value::Number(value) => value.to_string(),
-        serde_yaml::Value::String(value) => format!("'{value}'"),
+        serde_norway::Value::Bool(value) => value.to_string(),
+        serde_norway::Value::Number(value) => value.to_string(),
+        serde_norway::Value::String(value) => format!("'{value}'"),
         other => serde_json::to_string(other).unwrap_or_else(|_| "<unprintable>".to_string()),
     }
 }
@@ -140,8 +140,8 @@ fn render_yaml_scalar(value: &serde_yaml::Value) -> String {
 mod tests {
     use super::*;
 
-    fn yaml(source: &str) -> serde_yaml::Value {
-        serde_yaml::from_str(source).expect("fixture parses as YAML")
+    fn yaml(source: &str) -> serde_norway::Value {
+        serde_norway::from_str(source).expect("fixture parses as YAML")
     }
 
     /// The shape the channel promises: JSON, with scalars carried across unchanged. An integer
@@ -237,10 +237,10 @@ mod tests {
     /// JSON that would fail somewhere far from the manifest line that caused it.
     #[test]
     fn an_oversized_block_names_the_size_and_the_cap() {
-        let mut block = serde_yaml::Mapping::new();
+        let mut block = serde_norway::Mapping::new();
         block.insert("blob".into(), "x".repeat(70_000).into());
         let err =
-            lower_artifact_config("config-echo", &serde_yaml::Value::Mapping(block)).unwrap_err();
+            lower_artifact_config("config-echo", &serde_norway::Value::Mapping(block)).unwrap_err();
 
         let message = err.to_string();
         assert!(
@@ -257,13 +257,13 @@ mod tests {
     #[test]
     fn a_block_exactly_at_the_cap_is_accepted() {
         // `{"blob":"…"}` is 11 bytes of envelope around the padding.
-        let mut block = serde_yaml::Mapping::new();
+        let mut block = serde_norway::Mapping::new();
         block.insert(
             "blob".into(),
             "x".repeat(MAX_ARTIFACT_CONFIG_BYTES - 11).into(),
         );
         let json =
-            lower_artifact_config("config-echo", &serde_yaml::Value::Mapping(block)).unwrap();
+            lower_artifact_config("config-echo", &serde_norway::Value::Mapping(block)).unwrap();
         assert_eq!(json.len(), MAX_ARTIFACT_CONFIG_BYTES);
     }
 

@@ -226,11 +226,11 @@ pub fn read_tool_implementation(
 /// Parse `implementation:` from an in-memory manifest YAML string.
 /// Defaults to `Wasm` when the field is absent or unparseable.
 pub fn parse_tool_implementation_from_yaml(yaml: &str) -> ArtifactImplementation {
-    serde_yaml::from_str::<serde_yaml::Value>(yaml)
+    serde_norway::from_str::<serde_norway::Value>(yaml)
         .map(|v| {
             v.as_mapping()
-                .and_then(|m| m.get(serde_yaml::Value::String("implementation".to_string())))
-                .and_then(serde_yaml::Value::as_str)
+                .and_then(|m| m.get(serde_norway::Value::String("implementation".to_string())))
+                .and_then(serde_norway::Value::as_str)
                 .map(|s| match s {
                     "native" => ArtifactImplementation::Native,
                     _ => ArtifactImplementation::Wasm,
@@ -460,13 +460,13 @@ pub fn read_hook_config(artifact_manifest_path: &Path) -> Result<HookConfig, Run
 /// written to judge — with every failure to answer, including a trap or a timeout, refusing
 /// the call. The binding is therefore required to name which of the two events the hook gates.
 pub fn parse_hook_config_from_yaml(yaml: &str) -> Result<HookConfig, String> {
-    let v: serde_yaml::Value =
-        serde_yaml::from_str(yaml).map_err(|e| format!("YAML parse error: {e}"))?;
+    let v: serde_norway::Value =
+        serde_norway::from_str(yaml).map_err(|e| format!("YAML parse error: {e}"))?;
 
     let binding = v
         .as_mapping()
-        .and_then(|m| m.get(serde_yaml::Value::String("binding".to_string())))
-        .and_then(serde_yaml::Value::as_str)
+        .and_then(|m| m.get(serde_norway::Value::String("binding".to_string())))
+        .and_then(serde_norway::Value::as_str)
         .map(|s| match s {
             "on-stage" => Ok(HookBinding::OnStage),
             "on-session-start" => Ok(HookBinding::OnSessionStart),
@@ -487,8 +487,8 @@ pub fn parse_hook_config_from_yaml(yaml: &str) -> Result<HookConfig, String> {
 
     let execution_mode = v
         .as_mapping()
-        .and_then(|m| m.get(serde_yaml::Value::String("execution_mode".to_string())))
-        .and_then(serde_yaml::Value::as_str)
+        .and_then(|m| m.get(serde_norway::Value::String("execution_mode".to_string())))
+        .and_then(serde_norway::Value::as_str)
         .map(|s| match s {
             "blocking" => Ok(HookExecutionMode::Blocking),
             "async" => Ok(HookExecutionMode::Async),
@@ -501,8 +501,8 @@ pub fn parse_hook_config_from_yaml(yaml: &str) -> Result<HookConfig, String> {
 
     let commit_policy = v
         .as_mapping()
-        .and_then(|m| m.get(serde_yaml::Value::String("commit_policy".to_string())))
-        .and_then(serde_yaml::Value::as_str)
+        .and_then(|m| m.get(serde_norway::Value::String("commit_policy".to_string())))
+        .and_then(serde_norway::Value::as_str)
         .map(|s| match s {
             "none" => Ok(HookCommitPolicy::None),
             "replace-context" => Ok(HookCommitPolicy::ReplaceContext),
@@ -1103,7 +1103,7 @@ pub struct RuntimeArtifact {
     ///
     /// Plaintext in a file that is also an audit record: secrets belong in `${VAR}` references
     /// and the credential-stripping path, not here.
-    pub config: Option<serde_yaml::Value>,
+    pub config: Option<serde_norway::Value>,
     /// The third-party upstream this artifact reaches through the credential gateway, and the
     /// key the runtime presents there on its behalf, declared via `gateway:` on this entry.
     ///
@@ -1988,36 +1988,36 @@ struct RawRuntimeManifest {
     /// `deploy.mur_version`. Present-detection rather than a typed value, so a number, a blank
     /// string and a bare `mur_version:` are all refused.
     #[serde(default, deserialize_with = "deserialize_present")]
-    mur_version: Option<serde_yaml::Value>,
+    mur_version: Option<serde_norway::Value>,
     /// Captured only to refuse it. `config:` is delivered to one artifact through that artifact's
     /// own grant, so a capsule-wide block reaches nothing; without this field it would be one of
     /// the unrecognized top-level keys this manifest silently ignores.
     #[serde(default, deserialize_with = "deserialize_present")]
-    config: Option<serde_yaml::Value>,
+    config: Option<serde_norway::Value>,
     /// Read by `mur build` and `mur publish` off this same file to select the packaging type.
     /// Declared here so a manifest that is both runnable and publishable does not report its own
     /// build-side keys as unrecognized; the run path takes no meaning from it and never inspects
     /// the value, so any shape parses.
     #[serde(default)]
     #[allow(dead_code)]
-    runtime: Option<serde_yaml::Value>,
+    runtime: Option<serde_norway::Value>,
     /// Read by `mur build` and `mur publish`: it separates a native tool from a wasm one, both in
     /// the derived packaging type and in `mur publish`'s platform tagging. Ignored on the run
     /// path, and untyped for the same reason as `runtime:` above.
     #[serde(default)]
     #[allow(dead_code)]
-    implementation: Option<serde_yaml::Value>,
+    implementation: Option<serde_norway::Value>,
     /// Read by `mur build` and `mur publish` as the declared packaging type, which overrides the
     /// one derived from `runtime:` and `implementation:`. Ignored on the run path, and untyped for
     /// the same reason as `runtime:` above.
     #[serde(default)]
     #[allow(dead_code)]
-    execution: Option<serde_yaml::Value>,
+    execution: Option<serde_norway::Value>,
     /// Read by `mur build` as the list of companion files to pack beside the manifest. Ignored on
     /// the run path, and untyped for the same reason as `runtime:` above.
     #[serde(default)]
     #[allow(dead_code)]
-    requires_files: Option<serde_yaml::Value>,
+    requires_files: Option<serde_norway::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2036,11 +2036,11 @@ struct RawControl {
     /// [`RuntimeManifestError::InvalidControl`] naming the field rather than as a serde type error
     /// naming a line number.
     #[serde(default)]
-    settings: Option<serde_yaml::Value>,
+    settings: Option<serde_norway::Value>,
     #[serde(default)]
-    secrets: Option<serde_yaml::Value>,
+    secrets: Option<serde_norway::Value>,
     #[serde(default)]
-    agent_settings: Option<serde_yaml::Value>,
+    agent_settings: Option<serde_norway::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2075,9 +2075,9 @@ struct RawPeerFilesExport {
     /// bare `1800` is a YAML integer, and a wrong-shaped value has to reach the parser to be
     /// reported as an [`RuntimeManifestError::InvalidExports`] naming the field.
     #[serde(default)]
-    max_ttl: Option<serde_yaml::Value>,
+    max_ttl: Option<serde_norway::Value>,
     #[serde(default)]
-    max_bytes: Option<serde_yaml::Value>,
+    max_bytes: Option<serde_norway::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2093,7 +2093,7 @@ struct RawFileExport {
     /// [`RuntimeManifestError::InvalidExports`] naming the field rather than as a serde type
     /// error naming a line number.
     #[serde(default)]
-    max_bytes: Option<serde_yaml::Value>,
+    max_bytes: Option<serde_norway::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2149,7 +2149,7 @@ struct RawDoorCredential {
     /// [`RuntimeManifestError::InvalidNetworkConfig`] naming the field rather than as a serde type
     /// error naming a line number.
     #[serde(default)]
-    scopes: Option<serde_yaml::Value>,
+    scopes: Option<serde_norway::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2170,7 +2170,7 @@ struct RawContextConfig {
     /// Untyped so an empty block, a null block and an unknown key inside it are each reported
     /// as an invalid `context.retain` rather than as a serde message about a struct field.
     #[serde(default, deserialize_with = "present_yaml_value")]
-    retain: Option<serde_yaml::Value>,
+    retain: Option<serde_norway::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2194,7 +2194,7 @@ struct RawTraceConfig {
     capture: Option<String>,
     /// Untyped for the same reason as `context.retain` — see [`RawContextConfig::retain`].
     #[serde(default, deserialize_with = "present_yaml_value")]
-    retain: Option<serde_yaml::Value>,
+    retain: Option<serde_norway::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2240,7 +2240,7 @@ struct RawArtifact {
     /// collapsing into the absent case. The two mean different things: absent grants no variable,
     /// while an empty declaration is a written statement that carries nothing and is refused.
     #[serde(default, deserialize_with = "deserialize_present")]
-    config: Option<serde_yaml::Value>,
+    config: Option<serde_norway::Value>,
     /// `Some(None)` is `gateway:` written with nothing under it, refused as a block with no
     /// endpoint rather than collapsed into the absent case.
     #[serde(default, deserialize_with = "deserialize_present")]
@@ -2259,7 +2259,7 @@ struct RawArtifactGateway {
     api_key: Option<Option<String>>,
     /// Untyped, so a non-boolean is refused as an invalid declaration naming the field.
     #[serde(default)]
-    keyless: Option<serde_yaml::Value>,
+    keyless: Option<serde_norway::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2518,12 +2518,12 @@ struct RawInferenceConfig {
     /// Removed: the driver's upstream is `gateway.endpoint` on its artifact entry. Deserialized
     /// only so `parse_inference` can refuse it by name, naming where it moved.
     #[serde(default, deserialize_with = "deserialize_present")]
-    endpoint: Option<serde_yaml::Value>,
+    endpoint: Option<serde_norway::Value>,
     model: Option<String>,
     /// Removed: the driver's key is `gateway.api_key` on its artifact entry. Deserialized only so
     /// `parse_inference` can refuse it by name, naming where it moved.
     #[serde(default, deserialize_with = "deserialize_present")]
-    api_key: Option<serde_yaml::Value>,
+    api_key: Option<serde_norway::Value>,
     #[serde(default)]
     command: Option<String>,
     #[serde(default)]
@@ -2581,7 +2581,7 @@ struct RawCompactionConfig {
 struct RawInferenceDriver {
     artifact: Option<String>,
     #[serde(default)]
-    config: Option<serde_yaml::Value>,
+    config: Option<serde_norway::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -3172,7 +3172,7 @@ impl RawBlock for RawInferenceDriver {
 /// Walks a parsed raw manifest and reports every key no block of it claimed, each block's own
 /// keys before the blocks it owns, in the order the blocks appear in the manifest's own type.
 ///
-/// Called once, immediately after `serde_yaml` returns and before any field is moved out, so the
+/// Called once, immediately after `serde_norway` returns and before any field is moved out, so the
 /// result covers the whole document rather than the parts validation happens to reach. Reporting
 /// only; nothing here can refuse a manifest.
 fn collect_unknown_keys(raw: &RawRuntimeManifest) -> Vec<UnknownManifestKey> {
@@ -3285,7 +3285,7 @@ struct ReferencedGatewayFields {
 /// same `parse_env_reference` the resolving parse applies, so a name reported here is exactly a
 /// name [`RuntimeManifest::from_yaml_str`] would have looked up.
 pub fn referenced_env_variables(manifest_yaml: &str) -> Vec<ReferencedEnvVariable> {
-    let Ok(raw) = serde_yaml::from_str::<ReferencedManifestFields>(manifest_yaml) else {
+    let Ok(raw) = serde_norway::from_str::<ReferencedManifestFields>(manifest_yaml) else {
         return Vec::new();
     };
 
@@ -3341,7 +3341,7 @@ impl RuntimeManifest {
     }
 
     fn parse(input: &str, secrets: SecretResolution) -> Result<Self, RuntimeManifestError> {
-        let raw: RawRuntimeManifest = serde_yaml::from_str(input).map_err(|err| {
+        let raw: RawRuntimeManifest = serde_norway::from_str(input).map_err(|err| {
             if let Some(location) = err.location() {
                 RuntimeManifestError::YamlSyntax(format!(
                     "{}: YAML syntax error at line {}, column {}: {}",
@@ -4018,21 +4018,21 @@ fn check_driver_setting(inference: &InferenceConfig) -> Result<(), String> {
 /// `value` as a list of strings, trimmed, for `field`. Absent and YAML null are the empty list.
 fn control_string_list(
     field: &str,
-    value: Option<serde_yaml::Value>,
+    value: Option<serde_norway::Value>,
 ) -> Result<Vec<String>, RuntimeManifestError> {
     let refuse = || RuntimeManifestError::InvalidControl {
         field: field.to_string(),
         message: "must be a list of names".to_string(),
     };
     let items = match value {
-        None | Some(serde_yaml::Value::Null) => return Ok(Vec::new()),
-        Some(serde_yaml::Value::Sequence(items)) => items,
+        None | Some(serde_norway::Value::Null) => return Ok(Vec::new()),
+        Some(serde_norway::Value::Sequence(items)) => items,
         Some(_) => return Err(refuse()),
     };
     items
         .into_iter()
         .map(|item| match item {
-            serde_yaml::Value::String(name) => Ok(name.trim().to_string()),
+            serde_norway::Value::String(name) => Ok(name.trim().to_string()),
             _ => Err(refuse()),
         })
         .collect()
@@ -4118,19 +4118,19 @@ fn is_valid_credential_name(name: &str) -> bool {
 /// One credential's `scopes`: required, non-empty, each in [`DOOR_SCOPES`] and listed once.
 fn door_scope_list(
     field: &str,
-    value: Option<serde_yaml::Value>,
+    value: Option<serde_norway::Value>,
 ) -> Result<Vec<String>, RuntimeManifestError> {
     let refuse = |message: String| RuntimeManifestError::InvalidNetworkConfig {
         field: field.to_string(),
         message,
     };
     let items = match value {
-        None | Some(serde_yaml::Value::Null) => {
+        None | Some(serde_norway::Value::Null) => {
             return Err(refuse(
                 "is required: a credential reaches only the scopes it lists".to_string(),
             ))
         }
-        Some(serde_yaml::Value::Sequence(items)) => items,
+        Some(serde_norway::Value::Sequence(items)) => items,
         Some(_) => return Err(refuse("must be a list of scopes".to_string())),
     };
     if items.is_empty() {
@@ -4140,7 +4140,7 @@ fn door_scope_list(
     }
     let mut scopes: Vec<String> = Vec::new();
     for item in items {
-        let serde_yaml::Value::String(scope) = item else {
+        let serde_norway::Value::String(scope) = item else {
             return Err(refuse("must be a list of scopes".to_string()));
         };
         let scope = scope.trim().to_string();
@@ -4307,20 +4307,20 @@ fn parse_peer_files_export(
 /// or a sequence — a shape neither parser could report on without quoting the whole node.
 /// `Some` for a key that is present, whatever its value — including an explicit null.
 ///
-/// The plain `Option<serde_yaml::Value>` a `#[serde(default)]` field gets collapses `retain:`
+/// The plain `Option<serde_norway::Value>` a `#[serde(default)]` field gets collapses `retain:`
 /// with nothing under it into the same `None` an absent key produces, and those two say opposite
 /// things: absent means "keep everything", and empty is refused.
-fn present_yaml_value<'de, D>(deserializer: D) -> Result<Option<serde_yaml::Value>, D::Error>
+fn present_yaml_value<'de, D>(deserializer: D) -> Result<Option<serde_norway::Value>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    serde_yaml::Value::deserialize(deserializer).map(Some)
+    serde_norway::Value::deserialize(deserializer).map(Some)
 }
 
-fn scalar_text(value: &serde_yaml::Value) -> Option<String> {
+fn scalar_text(value: &serde_norway::Value) -> Option<String> {
     match value {
-        serde_yaml::Value::String(text) => Some(text.clone()),
-        serde_yaml::Value::Number(number) => Some(number.to_string()),
+        serde_norway::Value::String(text) => Some(text.clone()),
+        serde_norway::Value::Number(number) => Some(number.to_string()),
         _ => None,
     }
 }
@@ -5434,7 +5434,7 @@ fn parse_alternates(
         if driver
             .config
             .as_ref()
-            .is_some_and(|config| !matches!(config, serde_yaml::Value::Null))
+            .is_some_and(|config| !matches!(config, serde_norway::Value::Null))
         {
             return Err(refuse(
                 "driver.config",
@@ -5565,13 +5565,13 @@ fn parse_retain_block(
     block: &str,
     count_key: &str,
     accepted: &[&str],
-    raw: serde_yaml::Value,
+    raw: serde_norway::Value,
     invalid: &dyn Fn(String, String) -> RuntimeManifestError,
 ) -> Result<(Option<u32>, Option<u64>), RuntimeManifestError> {
     let mapping = match raw {
-        serde_yaml::Value::Mapping(mapping) => mapping,
+        serde_norway::Value::Mapping(mapping) => mapping,
         // `retain:` with nothing under it parses as null and means exactly `retain: {}`.
-        serde_yaml::Value::Null => {
+        serde_norway::Value::Null => {
             return Err(invalid(block.to_string(), RETAIN_EMPTY_BLOCK.to_string()))
         }
         other => {
@@ -5639,7 +5639,7 @@ fn parse_retain_block(
 }
 
 fn parse_trace_retain(
-    raw: Option<serde_yaml::Value>,
+    raw: Option<serde_norway::Value>,
 ) -> Result<Option<TraceRetainConfig>, RuntimeManifestError> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -5658,7 +5658,7 @@ fn parse_trace_retain(
 }
 
 fn parse_context_retain(
-    raw: Option<serde_yaml::Value>,
+    raw: Option<serde_norway::Value>,
 ) -> Result<Option<ContextRetainConfig>, RuntimeManifestError> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -5810,8 +5810,8 @@ fn parse_artifact_gateway(
         .map_err(|message| RuntimeManifestError::InvalidArtifact { index, message })?;
 
     let keyless = match keyless {
-        None | Some(serde_yaml::Value::Null) | Some(serde_yaml::Value::Bool(false)) => false,
-        Some(serde_yaml::Value::Bool(true)) => true,
+        None | Some(serde_norway::Value::Null) | Some(serde_norway::Value::Bool(false)) => false,
+        Some(serde_norway::Value::Bool(true)) => true,
         Some(_) => {
             return Err(RuntimeManifestError::InvalidArtifact {
                 index,
@@ -6197,17 +6197,17 @@ fn parse_inference_driver(
 }
 
 fn parse_inference_driver_config(
-    raw: Option<serde_yaml::Value>,
+    raw: Option<serde_norway::Value>,
 ) -> Result<Option<String>, RuntimeManifestError> {
     let Some(raw) = raw else {
         return Ok(None);
     };
 
-    if matches!(raw, serde_yaml::Value::Null) {
+    if matches!(raw, serde_norway::Value::Null) {
         return Ok(None);
     }
 
-    if !matches!(raw, serde_yaml::Value::Mapping(_)) {
+    if !matches!(raw, serde_norway::Value::Mapping(_)) {
         return Err(RuntimeManifestError::InvalidInferenceConfig {
             field: "inference.driver.config".to_string(),
             message: "expected mapping/object".to_string(),
@@ -11647,7 +11647,7 @@ artifacts:
             .expect("a declared block parses");
         assert_eq!(
             config["read_recent"]["max"],
-            serde_yaml::Value::Number(100.into())
+            serde_norway::Value::Number(100.into())
         );
     }
 
@@ -11689,7 +11689,7 @@ artifacts:
 
         assert_eq!(
             manifest.artifacts[0].config,
-            Some(serde_yaml::Value::Null),
+            Some(serde_norway::Value::Null),
             "an empty block must survive parsing as a declaration, not vanish into None"
         );
     }
@@ -11984,7 +11984,7 @@ capabilities:
             "\"scoped\""
         );
         assert_eq!(
-            serde_yaml::from_str::<ContainmentClass>("sealed").unwrap(),
+            serde_norway::from_str::<ContainmentClass>("sealed").unwrap(),
             ContainmentClass::Sealed
         );
     }
@@ -13038,7 +13038,7 @@ capabilities:
     /// to reach the walk. What is under test here is which blocks are descended into, which the
     /// validator has no part in.
     fn raw_unknown_keys(yaml: &str) -> Vec<(String, String)> {
-        let raw: RawRuntimeManifest = serde_yaml::from_str(yaml).expect("fixture must parse");
+        let raw: RawRuntimeManifest = serde_norway::from_str(yaml).expect("fixture must parse");
         collect_unknown_keys(&raw)
             .into_iter()
             .map(|key| (key.key, key.block_path))

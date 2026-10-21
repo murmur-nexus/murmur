@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use serde_yaml::Value;
+use serde_norway::Value;
 
 use crate::manifest::ManifestError;
 
@@ -22,7 +22,7 @@ pub fn scan_yaml_secrets(path: &Path) -> Result<Vec<SecretWarning>, ManifestErro
         source,
     })?;
 
-    let value: Value = serde_yaml::from_str(&content).map_err(|err| {
+    let value: Value = serde_norway::from_str(&content).map_err(|err| {
         if let Some(location) = err.location() {
             ManifestError::YamlSyntax(format!(
                 "{}: YAML syntax error at line {}, column {}: {}",

@@ -16,7 +16,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use serde_yaml::Value;
+use serde_norway::Value;
 use thiserror::Error;
 
 use crate::artifact_name::ArtifactName;
@@ -153,14 +153,15 @@ pub fn member_name_format_error(name: &str) -> Option<String> {
 impl Roster {
     /// Parse `roster.yaml` text. Every refusal is [`RosterError::Malformed`].
     pub fn from_yaml_str(input: &str) -> Result<Self, RosterError> {
-        let document: Value = serde_yaml::from_str(input).map_err(|err| match err.location() {
-            Some(location) => malformed(format!(
-                "{ROSTER_FILENAME}: YAML syntax error at line {}, column {}: {err}",
-                location.line(),
-                location.column()
-            )),
-            None => malformed(format!("{ROSTER_FILENAME}: YAML syntax error: {err}")),
-        })?;
+        let document: Value =
+            serde_norway::from_str(input).map_err(|err| match err.location() {
+                Some(location) => malformed(format!(
+                    "{ROSTER_FILENAME}: YAML syntax error at line {}, column {}: {err}",
+                    location.line(),
+                    location.column()
+                )),
+                None => malformed(format!("{ROSTER_FILENAME}: YAML syntax error: {err}")),
+            })?;
 
         let Value::Mapping(top) = document else {
             return Err(malformed(format!(
@@ -239,10 +240,10 @@ impl Roster {
             }
         };
 
-        // A `serde_yaml::Value` holds an unquoted `1.10` as the float 1.1, so the version text is
+        // A `serde_norway::Value` holds an unquoted `1.10` as the float 1.1, so the version text is
         // read a second time through `String`, which keeps the scalar exactly as written — the
         // same reading `artifacts[].version` gets in `murmur.yaml`.
-        let texts: VersionTexts = serde_yaml::from_str(input)
+        let texts: VersionTexts = serde_norway::from_str(input)
             .map_err(|err| malformed(format!("{ROSTER_FILENAME}: members[].version: {err}")))?;
         for (member, text) in members.iter_mut().zip(texts.members) {
             if let Some(text) = text.version {
@@ -472,7 +473,7 @@ fn present(value: Option<&Value>) -> Option<&Value> {
 }
 
 fn refuse_unknown_keys(
-    fields: &serde_yaml::Mapping,
+    fields: &serde_norway::Mapping,
     known: &[&str],
     path: &str,
     member: Option<&str>,
@@ -482,7 +483,7 @@ fn refuse_unknown_keys(
         .filter(|key| !key.as_str().is_some_and(|key| known.contains(&key)))
         .map(|key| match key {
             Value::String(key) => key.clone(),
-            other => serde_yaml::to_string(other)
+            other => serde_norway::to_string(other)
                 .map(|text| text.trim_end().to_string())
                 .unwrap_or_else(|_| describe_yaml_shape(other).to_string()),
         })

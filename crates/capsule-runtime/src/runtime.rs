@@ -22,7 +22,7 @@ use murmur_artifact::{
     W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018,
     W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
 };
-use serde_yaml::Value;
+use serde_norway::Value;
 use wasmtime::{
     component::{Component, HasSelf, Linker, ResourceTable},
     Config, Engine, Store,
@@ -6414,7 +6414,7 @@ fn warn_on_unenforceable_native_capabilities(
 /// deliver `MURMUR_ARTIFACT_CONFIG`, and the runtime will not write an operator's config block
 /// into a capsule-wide environment to fake it. A declared block is therefore wholly inert, and
 /// gets the `W-SEC-015` treatment its `capabilities:` sibling above gets.
-fn warn_on_inert_native_config(artifact_name: &str, config: Option<&serde_yaml::Value>) {
+fn warn_on_inert_native_config(artifact_name: &str, config: Option<&serde_norway::Value>) {
     if config.is_none() {
         return;
     }
@@ -8512,7 +8512,7 @@ impl CapsuleStoreState {
         {
             return None;
         }
-        let manifest: Value = serde_yaml::from_str(
+        let manifest: Value = serde_norway::from_str(
             &self
                 .runtime_root
                 .read_to_string(format!("tools/{name}/{PACKED_MANIFEST_ENTRY}"))
@@ -10117,7 +10117,7 @@ fn read_artifact_info_from_manifest(
     manifest_rel: &str,
     fallback: &InstalledArtifactSummary,
 ) -> Result<manage::ArtifactInfo, String> {
-    let value: Value = serde_yaml::from_str(manifest_content)
+    let value: Value = serde_norway::from_str(manifest_content)
         .map_err(|err| format!("failed to parse {manifest_rel}: {err}"))?;
 
     let root = value.as_mapping();
@@ -10941,20 +10941,20 @@ fn switch_driver_tool_manifest(choices: &crate::driver_choice::DriverChoices) ->
 /// The `murmur.yaml` staged for a skill declared with `source:`, which has no package to carry
 /// one. With no `description`, its tool description is the first line of its `skill.md`.
 fn local_skill_manifest_yaml(name: &str, version: &str) -> String {
-    let mut manifest = serde_yaml::Mapping::new();
+    let mut manifest = serde_norway::Mapping::new();
     for (key, value) in [("name", name), ("version", version), ("runtime", "skill")] {
         manifest.insert(
             Value::String(key.to_string()),
             Value::String(value.to_string()),
         );
     }
-    serde_yaml::to_string(&manifest).unwrap_or_default()
+    serde_norway::to_string(&manifest).unwrap_or_default()
 }
 
 /// A runtime-provided tool's `murmur.yaml`, built from YAML values rather than text so a
 /// description carrying a quote, a colon or a backtick cannot break it.
 fn native_tool_manifest_yaml(name: &str, description: String, input_schema: String) -> String {
-    let mut manifest = serde_yaml::Mapping::new();
+    let mut manifest = serde_norway::Mapping::new();
     for (key, value) in [
         ("name", name.to_string()),
         ("version", "0.0.0".to_string()),
@@ -10965,7 +10965,7 @@ fn native_tool_manifest_yaml(name: &str, description: String, input_schema: Stri
     ] {
         manifest.insert(Value::String(key.to_string()), Value::String(value));
     }
-    serde_yaml::to_string(&manifest).unwrap_or_default()
+    serde_norway::to_string(&manifest).unwrap_or_default()
 }
 
 /// Tool a capsule gains from `control.agent_settings: [inference.driver]`.
@@ -12520,8 +12520,8 @@ mod tests {
             "local/worker".to_string(),
             "ana/reviewer".to_string(),
         ]);
-        let parsed: serde_yaml::Value =
-            serde_yaml::from_str(&manifest).expect("the generated manifest is YAML");
+        let parsed: serde_norway::Value =
+            serde_norway::from_str(&manifest).expect("the generated manifest is YAML");
         assert_eq!(parsed["name"].as_str(), Some("delegate-task"));
         assert_eq!(parsed["runtime"].as_str(), Some("tool"));
         assert_eq!(parsed["implementation"].as_str(), Some("native"));
@@ -12555,8 +12555,8 @@ mod tests {
     #[test]
     fn delegate_task_enum_offers_the_bare_parts_of_spawn_allow() {
         let manifest = super::delegate_task_tool_manifest(&["local/worker".to_string()]);
-        let parsed: serde_yaml::Value =
-            serde_yaml::from_str(&manifest).expect("the generated manifest is YAML");
+        let parsed: serde_norway::Value =
+            serde_norway::from_str(&manifest).expect("the generated manifest is YAML");
         let schema: serde_json::Value =
             serde_json::from_str(parsed["input_schema"].as_str().expect("a schema string"))
                 .expect("the schema is JSON");
@@ -12625,8 +12625,8 @@ mod tests {
         use crate::delegation_plane::{DelegationResult, DelegationStatus};
 
         let manifest = super::delegate_task_tool_manifest(&["worker".to_string()]);
-        let parsed: serde_yaml::Value =
-            serde_yaml::from_str(&manifest).expect("the generated manifest is YAML");
+        let parsed: serde_norway::Value =
+            serde_norway::from_str(&manifest).expect("the generated manifest is YAML");
         let description = parsed["description"].as_str().expect("a description");
 
         let started = DelegationResult {
@@ -12696,8 +12696,8 @@ mod tests {
                 .join(PACKED_MANIFEST_ENTRY),
         )
         .expect("the manifest is written");
-        let parsed: serde_yaml::Value =
-            serde_yaml::from_str(&written).expect("the written manifest is YAML");
+        let parsed: serde_norway::Value =
+            serde_norway::from_str(&written).expect("the written manifest is YAML");
         let description = parsed["description"]
             .as_str()
             .expect("a description")
@@ -12742,8 +12742,8 @@ mod tests {
     /// three things the schema cannot say.
     #[test]
     fn the_plan_manifest_declares_one_object_argument() {
-        let parsed: serde_yaml::Value =
-            serde_yaml::from_str(super::SUBMIT_PLAN_TOOL_MANIFEST).expect("the manifest is YAML");
+        let parsed: serde_norway::Value =
+            serde_norway::from_str(super::SUBMIT_PLAN_TOOL_MANIFEST).expect("the manifest is YAML");
         assert_eq!(parsed["name"].as_str(), Some("submit-plan"));
         assert_eq!(parsed["version"].as_str(), Some("0.0.0"));
         assert_eq!(parsed["runtime"].as_str(), Some("tool"));
@@ -12836,8 +12836,8 @@ mod tests {
     /// listing every choice with its model. A model string carrying YAML punctuation survives.
     #[test]
     fn driver_choice_switch_manifest_lists_every_choice() {
-        let parsed: serde_yaml::Value =
-            serde_yaml::from_str(&super::switch_driver_tool_manifest(&switchable_choices()))
+        let parsed: serde_norway::Value =
+            serde_norway::from_str(&super::switch_driver_tool_manifest(&switchable_choices()))
                 .expect("the manifest is YAML");
         assert_eq!(parsed["name"].as_str(), Some("switch-driver"));
         assert_eq!(parsed["runtime"].as_str(), Some("tool"));
@@ -13051,7 +13051,7 @@ mod tests {
                 Some(&inference),
             )
             .unwrap();
-            let manifest: Value = serde_yaml::from_str(
+            let manifest: Value = serde_norway::from_str(
                 &std::fs::read_to_string(
                     agent
                         .path()
@@ -19912,7 +19912,7 @@ inference:
             source: None,
             on_overflow: Default::default(),
             capabilities: None,
-            config: Some(serde_yaml::from_str("who: a\n").unwrap()),
+            config: Some(serde_norway::from_str("who: a\n").unwrap()),
             gateway: None,
         };
 
@@ -19994,7 +19994,7 @@ inference:
             source: None,
             on_overflow: Default::default(),
             capabilities: None,
-            config: Some(serde_yaml::from_str("[a, b]").unwrap()),
+            config: Some(serde_norway::from_str("[a, b]").unwrap()),
             gateway: None,
         };
 
@@ -24001,7 +24001,7 @@ mod member_call_tests {
             Some(&member(&["worker", "reviewer"], "http://localhost:1")),
         )
         .unwrap();
-        let manifest: serde_yaml::Value = serde_yaml::from_str(
+        let manifest: serde_norway::Value = serde_norway::from_str(
             &std::fs::read_to_string(
                 with.path()
                     .join("tools")
@@ -25528,7 +25528,7 @@ mod member_call_tests {
             Some(&caller),
         )
         .unwrap();
-        let manifest: serde_yaml::Value = serde_yaml::from_str(
+        let manifest: serde_norway::Value = serde_norway::from_str(
             &std::fs::read_to_string(
                 with.path()
                     .join("tools")

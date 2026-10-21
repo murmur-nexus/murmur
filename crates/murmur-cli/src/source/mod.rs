@@ -1875,7 +1875,7 @@ mod tests {
     }
 
     fn config_error(yaml: &str) -> CliError {
-        let registry: crate::config::MurConfig = serde_yaml::from_str(yaml).unwrap();
+        let registry: crate::config::MurConfig = serde_norway::from_str(yaml).unwrap();
         configured_sources(Path::new("/home/x/.murmur/config.yaml"), &registry.registry)
             .unwrap_err()
     }
@@ -1911,7 +1911,7 @@ mod tests {
 
     #[test]
     fn the_default_artifacts_repository_only_lends_the_built_in_source_its_token() {
-        let registry: crate::config::MurConfig = serde_yaml::from_str(
+        let registry: crate::config::MurConfig = serde_norway::from_str(
             "registry:\n  sources:\n    - repo: murmur-nexus/default-artifacts\n      token: abc\n    - repo: ana/a\n",
         )
         .unwrap();

@@ -117,7 +117,7 @@ pub struct RegistryConfig {
     /// (`E-CFG-003`) while commands that never build them still load the file. Kept on a rewrite
     /// for the same reason.
     #[serde(default, rename = "default", skip_serializing_if = "Option::is_none")]
-    pub removed_default: Option<serde_yaml::Value>,
+    pub removed_default: Option<serde_norway::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<SourceConfig>,
     /// Override URL for the public artifact index fetched by `mur search`.
@@ -139,11 +139,11 @@ pub struct SourceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<serde_yaml::Value>,
+    pub name: Option<serde_norway::Value>,
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
-    pub removed_type: Option<serde_yaml::Value>,
+    pub removed_type: Option<serde_norway::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<serde_yaml::Value>,
+    pub url: Option<serde_norway::Value>,
 }
 
 impl SourceConfig {
@@ -414,7 +414,7 @@ pub(crate) fn read_mur_config_file(config_path: &Path) -> Result<Option<MurConfi
         )
     })?;
 
-    let config = serde_yaml::from_str::<MurConfig>(&raw).map_err(|source| {
+    let config = serde_norway::from_str::<MurConfig>(&raw).map_err(|source| {
         CliError::new(
             E_IO_003,
             format!("failed to parse {}: {source}", config_path.display()),
@@ -448,7 +448,7 @@ fn write_mur_config_file(
     private: bool,
 ) -> Result<(), CliError> {
     if private {
-        let serialized = serde_yaml::to_string(config).map_err(|source| {
+        let serialized = serde_norway::to_string(config).map_err(|source| {
             CliError::new(E_IO_003, format!("failed to serialize config: {source}"))
         })?;
         if let Some(parent) = config_path.parent() {
@@ -480,7 +480,7 @@ fn write_mur_config_file(
         })?;
     }
 
-    let serialized = serde_yaml::to_string(config).map_err(|source| {
+    let serialized = serde_norway::to_string(config).map_err(|source| {
         CliError::new(E_IO_003, format!("failed to serialize config: {source}"))
     })?;
 
@@ -635,7 +635,7 @@ mod tests {
         let config = MurConfig::default();
         assert!(config.registry.sources.is_empty());
         assert!(config.registry.removed_default.is_none());
-        let rendered = serde_yaml::to_string(&config).unwrap();
+        let rendered = serde_norway::to_string(&config).unwrap();
         assert!(!rendered.contains("sources"), "{rendered}");
     }
 
@@ -678,7 +678,7 @@ mod tests {
         assert!(config.registry.removed_default.is_some());
         assert!(source.name.is_some() && source.removed_type.is_some() && source.url.is_some());
 
-        let rendered = serde_yaml::to_string(&config).unwrap();
+        let rendered = serde_norway::to_string(&config).unwrap();
         for key in [
             "default: official",
             "name: official",
@@ -849,21 +849,21 @@ mod tests {
     #[test]
     fn spend_config_parses_and_survives_a_config_yaml_round_trip() {
         let parsed: MurConfig =
-            serde_yaml::from_str("spend:\n  machine_tokens_per_day: 2000000\n").unwrap();
+            serde_norway::from_str("spend:\n  machine_tokens_per_day: 2000000\n").unwrap();
         assert_eq!(
             parsed.spend,
             Some(SpendConfig {
                 machine_tokens_per_day: Some(2_000_000)
             })
         );
-        let rendered = serde_yaml::to_string(&parsed).unwrap();
+        let rendered = serde_norway::to_string(&parsed).unwrap();
         assert!(
             rendered.contains("machine_tokens_per_day: 2000000"),
             "{rendered}"
         );
-        let bare: MurConfig = serde_yaml::from_str("{}").unwrap();
+        let bare: MurConfig = serde_norway::from_str("{}").unwrap();
         assert_eq!(bare.spend, None);
-        assert!(!serde_yaml::to_string(&bare).unwrap().contains("spend"));
+        assert!(!serde_norway::to_string(&bare).unwrap().contains("spend"));
     }
 
     #[test]
@@ -972,10 +972,10 @@ mod tests {
 
     #[test]
     fn containment_parses_from_and_survives_a_config_yaml_round_trip() {
-        let parsed: MurConfig = serde_yaml::from_str("containment: scoped\n").unwrap();
+        let parsed: MurConfig = serde_norway::from_str("containment: scoped\n").unwrap();
         assert_eq!(parsed.containment, Some(ContainmentClass::Scoped));
 
-        let rendered = serde_yaml::to_string(&parsed).unwrap();
+        let rendered = serde_norway::to_string(&parsed).unwrap();
         assert!(
             rendered.contains("containment: scoped"),
             "expected the wire name in {rendered}"
@@ -983,9 +983,9 @@ mod tests {
 
         // Absent key stays absent on the way back out, so writing a config file never
         // silently pins a floor the operator did not ask for.
-        let bare: MurConfig = serde_yaml::from_str("registry:\n  index_url: x\n").unwrap();
+        let bare: MurConfig = serde_norway::from_str("registry:\n  index_url: x\n").unwrap();
         assert_eq!(bare.containment, None);
-        assert!(!serde_yaml::to_string(&bare)
+        assert!(!serde_norway::to_string(&bare)
             .unwrap()
             .contains("containment"));
     }
@@ -1016,11 +1016,11 @@ mod tests {
 
     #[test]
     fn credentials_empty_map_is_not_serialized() {
-        let rendered = serde_yaml::to_string(&MurConfig::default()).unwrap();
+        let rendered = serde_norway::to_string(&MurConfig::default()).unwrap();
         assert!(!rendered.contains("credentials"), "{rendered}");
 
         let parsed: MurConfig =
-            serde_yaml::from_str("credentials:\n  PROVIDER_KEY: some-value\n").unwrap();
+            serde_norway::from_str("credentials:\n  PROVIDER_KEY: some-value\n").unwrap();
         assert_eq!(
             parsed.credentials.get("PROVIDER_KEY").map(String::as_str),
             Some("some-value")

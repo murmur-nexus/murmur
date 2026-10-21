@@ -226,7 +226,7 @@ pub fn extract_declared_env_allow(
     manifest_yaml: &str,
 ) -> Result<Vec<String>, RuntimeError> {
     let declared: DeclaredAllows =
-        serde_yaml::from_str(manifest_yaml).map_err(|err| RuntimeError::ArtifactArchive {
+        serde_norway::from_str(manifest_yaml).map_err(|err| RuntimeError::ArtifactArchive {
             name: artifact_name.to_string(),
             version: artifact_version.to_string(),
             message: format!(
@@ -255,7 +255,7 @@ pub fn extract_declared_spawn_allow(
     manifest_yaml: &str,
 ) -> Result<Vec<String>, RuntimeError> {
     let declared: DeclaredAllows =
-        serde_yaml::from_str(manifest_yaml).map_err(|err| RuntimeError::ArtifactArchive {
+        serde_norway::from_str(manifest_yaml).map_err(|err| RuntimeError::ArtifactArchive {
             name: artifact_name.to_string(),
             version: artifact_version.to_string(),
             message: format!(
