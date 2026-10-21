@@ -99,6 +99,7 @@ pub const E_RUN_049: &str = "E-RUN-049"; // `mur token --credential` named a cre
 pub const E_RUN_050: &str = "E-RUN-050"; // a runtime write, read, create or removal inside the workdir met a symbolic link or the wrong kind of file
 pub const E_RUN_051: &str = "E-RUN-051"; // a delegated child's --workdir is not the directory its parent created
 pub const E_RUN_052: &str = "E-RUN-052"; // a driver choice has no output cap, or its driver ships a malformed models: table
+pub const E_RUN_053: &str = "E-RUN-053"; // the session reached its mur run --deadline, or a launch cannot enforce the deadline it was staged with
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -944,6 +945,11 @@ impl From<RuntimeError> for CliError {
                 "MURMUR_SPAWNER_LIFELINE is set by a parent capsule's runtime for each child it \
                  launches, beside MURMUR_SPAWNER, and is not for operators; unset it to run this \
                  capsule directly",
+            ),
+            error @ RuntimeError::SessionDeadlineUnenforceable { .. } => CliError::with_hint(
+                E_RUN_053,
+                error.to_string(),
+                "only `mur run` enforces a deadline, for an agent capsule; drop --deadline",
             ),
             error @ RuntimeError::FormationIdUnreadable { .. } => CliError::with_hint(
                 E_RUN_044,

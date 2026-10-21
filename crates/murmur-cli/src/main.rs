@@ -328,6 +328,7 @@ enum Commands {
                 "explain_scope",
                 "readiness_tokens",
                 "workdir_identity",
+                "deadline",
             ]
         )]
         roster: Option<PathBuf>,
@@ -354,6 +355,20 @@ enum Commands {
         /// Requires an agent capsule (a manifest with an inference: block).
         #[arg(long, value_name = "TEXT")]
         system_prompt: Option<String>,
+
+        /// End the session this many seconds after `mur run` started, whatever it is doing.
+        /// Reached, the runtime cancels the running task and ends the session as a first SIGTERM
+        /// does, records deadline_reached, and exits non-zero with E-RUN-053. The agent is told
+        /// once, on a tool result, when lifecycle.deadline_notice_secs are left, and its
+        /// session-status tool reports the time left. Requires an agent capsule (a manifest with
+        /// an inference: block). At most 315360000 (ten years).
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            value_parser = clap::value_parser!(u64)
+                .range(1..=capsule_runtime::session_status::MAX_DEADLINE_SECS)
+        )]
+        deadline: Option<u64>,
 
         /// Context id for this run's task, making its conversation record reachable by name.
         /// Two runs given the same id share one record, and a hook granted
@@ -756,6 +771,7 @@ fn main() {
             spawn_grant_stdin,
             task,
             system_prompt,
+            deadline,
             context,
             resume,
             resume_mode,
@@ -780,6 +796,7 @@ fn main() {
             spawn_grant_stdin,
             task.as_deref(),
             system_prompt.as_deref(),
+            deadline,
             context.as_deref(),
             resume.as_deref(),
             resume_mode.unwrap_or_default().into(),

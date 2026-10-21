@@ -68,6 +68,10 @@ pub(crate) struct DispatchOutcome {
     ///
     /// `None` on every other outcome. The unfenced route of
     /// [`crate::runtime::CapsuleStoreState::dispatch_submit_plan`] never reads it.
+    ///
+    /// The session's one deadline notice is not a note: it is appended after the note, by
+    /// [`crate::runtime::CapsuleStoreState::deliver_deadline_notice`], on whichever dispatched
+    /// outcome is first handed back inside the notice margin.
     pub runtime_note: Option<String>,
 }
 
@@ -502,6 +506,12 @@ pub struct StageRequest {
     /// Set by a delegating parent through `mur run --workdir-identity`, for the child directory it
     /// created. `None` checks nothing.
     pub expected_workdir_identity: Option<(u64, u64)>,
+    /// The hard limit `mur run --deadline` set, counted from the moment `mur run` started. Only
+    /// [`crate::launch_session_handling_sigterm`] on an agent capsule enforces one: reached, it
+    /// ends the session through the termination routine a first `SIGTERM` begins. Every other
+    /// launch of a session staged with one is refused with
+    /// [`crate::RuntimeError::SessionDeadlineUnenforceable`]. `None` sets no limit.
+    pub session_deadline: Option<crate::session_status::SessionDeadline>,
     /// The manifest file this launch read, copied into the runtime directory under its own file
     /// name: `--manifest`, or the project's `murmur.yaml`. `None` for a launch that read none from
     /// disk — an installed capsule run by name — which copies nothing.
@@ -745,6 +755,8 @@ pub struct StagedSession {
     /// [`Self::formation_lifeline`].
     #[cfg(unix)]
     pub(crate) spawner_lifeline: Option<crate::lifeline::SpawnerLifeline>,
+    /// [`StageRequest::session_deadline`], carried to the launch that enforces it.
+    pub(crate) session_deadline: Option<crate::session_status::SessionDeadline>,
 }
 
 impl StagedSession {
@@ -838,6 +850,10 @@ pub enum LaunchEnding {
     /// The session's formation ended while it was running a task, and the wind-down that followed
     /// cancelled that task: `session_end.exit_status` `formation_ended`.
     FormationEnded,
+    /// The session reached its `mur run --deadline`, and the wind-down that followed cancelled
+    /// the task it was running, or it reached it before any task ran:
+    /// `session_end.exit_status` `deadline_reached`.
+    DeadlineReached,
 }
 
 impl LaunchEnding {
@@ -846,6 +862,7 @@ impl LaunchEnding {
         match self {
             Self::Completed => "ok",
             Self::FormationEnded => "formation_ended",
+            Self::DeadlineReached => "deadline_reached",
         }
     }
 }

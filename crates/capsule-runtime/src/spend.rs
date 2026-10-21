@@ -249,10 +249,17 @@ impl SpendMeter {
         self.lock().open > 0
     }
 
-    /// Settled tokens so far.
-    #[cfg(test)]
+    /// Settled tokens so far: what the session ceiling counts, and what `session-status` reports
+    /// as `spend.tokens`.
     pub(crate) fn used(&self) -> u64 {
         self.lock().used
+    }
+
+    /// The machine ledger's day total, read now, and its ceiling, when this meter keeps a ledger.
+    pub(crate) fn machine_reading(&self) -> Option<(u64, u64)> {
+        self.machine
+            .as_ref()
+            .map(|ledger| (ledger.refresh_total(), ledger.ceiling))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MeterState> {

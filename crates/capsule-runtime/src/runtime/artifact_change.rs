@@ -967,6 +967,7 @@ impl CapsuleStoreState {
             _ => return self.dispatch_agent_tool_async(name, input, gate).await,
         };
         fence_and_label(name, &self.artifact_origin(name), &mut outcome);
+        self.deliver_deadline_notice(name, &mut outcome).await;
         Ok(outcome)
     }
 

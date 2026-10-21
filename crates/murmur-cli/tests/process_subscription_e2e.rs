@@ -793,6 +793,7 @@ fn stage(home: &TempDir, manifest_path: &Path, repo: &Path) -> capsule_runtime::
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            session_deadline: None,
             manifest_file: None,
             credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
@@ -1083,8 +1084,8 @@ fn a_coding_task_edits_a_file_through_the_bridge_and_completes() {
     );
     assert_eq!(
         starts[0]["bridge_tools"],
-        json!([EDITOR_NAME]),
-        "the bridge offered something other than the capsule's one tool: {}",
+        json!(["session-status", EDITOR_NAME]),
+        "the bridge offered something other than the capsule's one tool and session-status: {}",
         starts[0]
     );
 

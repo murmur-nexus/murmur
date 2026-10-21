@@ -472,6 +472,25 @@ pub fn stage_agent_session(
         None,
         None,
         ContainmentClass::Advisory,
+        None,
+    )
+}
+
+/// `stage_agent_session` for a launch staged with `deadline`, as `mur run --deadline` stages one.
+pub fn stage_agent_session_with_deadline(
+    home: &TempDir,
+    project_dir: &Path,
+    manifest_path: &Path,
+    deadline: capsule_runtime::session_status::SessionDeadline,
+) -> StagedSession {
+    stage_agent_session_inner(
+        home,
+        project_dir,
+        manifest_path,
+        None,
+        None,
+        ContainmentClass::Advisory,
+        Some(deadline),
     )
 }
 
@@ -492,6 +511,7 @@ pub fn stage_agent_session_at_floor(
         None,
         workdir.map(Path::to_path_buf),
         floor,
+        None,
     )
 }
 
@@ -513,6 +533,7 @@ pub fn stage_agent_session_with_workdir(
         None,
         Some(workdir.to_path_buf()),
         ContainmentClass::Advisory,
+        None,
     )
 }
 
@@ -532,6 +553,7 @@ pub fn stage_agent_session_resuming(
         Some((from_session.to_string(), context_id.to_string())),
         None,
         ContainmentClass::Advisory,
+        None,
     )
 }
 
@@ -542,6 +564,7 @@ fn stage_agent_session_inner(
     resume: Option<(String, String)>,
     workdir: Option<PathBuf>,
     floor: ContainmentClass,
+    session_deadline: Option<capsule_runtime::session_status::SessionDeadline>,
 ) -> StagedSession {
     let runtime_manifest = load_runtime_manifest(manifest_path).unwrap();
 
@@ -572,6 +595,7 @@ fn stage_agent_session_inner(
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            session_deadline,
             manifest_file: Some(manifest_path.to_path_buf()),
             credentials_file: None,
             manifest_dir: project_dir.to_path_buf(),

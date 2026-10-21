@@ -133,6 +133,10 @@ pub(crate) struct TraceWriter {
     /// The spend ceilings `session_start` records. Set by [`Self::set_spend_ceilings`].
     max_session_tokens: Option<u64>,
     machine_tokens_per_day: Option<u64>,
+    /// What `session-status` reads, fed by this writer's `inference`, `task_start` and `task_end`
+    /// writes and named by `session_start.deadline`. Set by [`Self::set_session_status`]; `None`
+    /// feeds nothing.
+    session_status: Option<std::sync::Arc<crate::session_status::SessionStatus>>,
 }
 
 /// Provenance of an inference record that did **not** come from the agent
@@ -246,6 +250,8 @@ struct SessionStartEvent {
     /// `spend.machine_tokens_per_day` when this session keeps the machine ledger. Always written,
     /// `null` when the machine ceiling does not cover this session.
     machine_tokens_per_day: Option<u64>,
+    /// The `mur run --deadline` this session runs under. Always written, `null` when none was set.
+    deadline: Option<SessionStartDeadline>,
     capabilities: Vec<String>,
     tools_declared: Vec<String>,
     /// Strongest containment class any source asked for. A *requirement*, not an observation.
@@ -358,6 +364,18 @@ struct SessionStartEvent {
     /// Present exactly when `formation_member` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     formation_callees: Option<Vec<String>>,
+}
+
+/// `session_start.deadline`.
+#[derive(Serialize)]
+struct SessionStartDeadline {
+    /// When the runtime ends the session, RFC 3339 UTC.
+    at: String,
+    /// The `--deadline` value: seconds from `mur run`'s start.
+    secs: u64,
+    /// The notice margin in force, `lifecycle.deadline_notice_secs` or its default; `0` sends
+    /// none.
+    notice_secs: u64,
 }
 
 #[derive(Serialize)]
@@ -1562,6 +1580,56 @@ struct FormationEndedEvent {
     formation_id: String,
 }
 
+/// One `session-status` call: the object the model was handed, measured at the call.
+#[derive(Serialize)]
+struct SessionStatusEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// The task that made the call. Absent outside a task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    status: &'a crate::session_status::StatusReport,
+}
+
+/// The one deadline notice, appended to the tool result named here.
+#[derive(Serialize)]
+struct DeadlineNoticeEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// The task whose tool result carried it. Absent outside a task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    /// The tool whose result carried it.
+    tool_name: &'a str,
+    /// When the runtime ends the session, RFC 3339 UTC.
+    deadline_at: &'a str,
+    /// Whole seconds left when the result was handed back.
+    left_secs: u64,
+    /// The margin it was due under.
+    notice_secs: u64,
+}
+
+/// The session reached its `mur run --deadline`, and is winding down because of it. Written by
+/// the termination routine before any task is cancelled.
+#[derive(Serialize)]
+struct DeadlineReachedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// When the deadline fell, RFC 3339 UTC.
+    deadline_at: String,
+    /// The `--deadline` value.
+    deadline_secs: u64,
+}
+
 /// A delegated child's spawner lifeline read EOF: the process that spawned this session has
 /// ended, and this session is winding down because of it. Written only when that lifeline is what
 /// began the session's termination.
@@ -2003,7 +2071,17 @@ impl TraceWriter {
             last_task_failure: None,
             max_session_tokens: None,
             machine_tokens_per_day: None,
+            session_status: None,
         })
+    }
+
+    /// The session's standing, which every later `inference`, `task_start` and `task_end` write
+    /// feeds and whose deadline every later `session_start` records.
+    pub(crate) fn set_session_status(
+        &mut self,
+        status: std::sync::Arc<crate::session_status::SessionStatus>,
+    ) {
+        self.session_status = Some(status);
     }
 
     /// The spend ceilings this session runs under, written into every later `session_start`.
@@ -2194,6 +2272,13 @@ impl TraceWriter {
             model_limits,
             max_session_tokens: self.max_session_tokens,
             machine_tokens_per_day: self.machine_tokens_per_day,
+            deadline: self.session_status.as_ref().and_then(|status| {
+                status.deadline().map(|deadline| SessionStartDeadline {
+                    at: deadline.at_rfc3339(),
+                    secs: deadline.secs(),
+                    notice_secs: status.notice_secs(),
+                })
+            }),
             capabilities: self.capabilities.clone(),
             tools_declared,
             containment_declared: self.effective_grants.declared_containment,
@@ -2406,22 +2491,26 @@ impl TraceWriter {
         if origin.is_none() {
             self.task_agent_turns = self.task_agent_turns.saturating_add(1);
         }
-        if !counted {
-            return Ok(());
+        if counted {
+            // A turn nothing counted contributes nothing to the totals. The totals are plain
+            // `u64` because a session's spend is a sum, and the sum of no measurements is zero;
+            // the absent/zero distinction lives on the record itself.
+            let (input, output) = (input_tokens.unwrap_or(0), output_tokens.unwrap_or(0));
+            self.total_turns = self.total_turns.saturating_add(1);
+            self.total_input_tokens = self.total_input_tokens.saturating_add(input);
+            self.total_output_tokens = self.total_output_tokens.saturating_add(output);
+            self.task_turns = self.task_turns.saturating_add(1);
+            if origin.is_some() {
+                self.task_hook_inferences = self.task_hook_inferences.saturating_add(1);
+            }
+            self.task_input_tokens = self.task_input_tokens.saturating_add(input);
+            self.task_output_tokens = self.task_output_tokens.saturating_add(output);
         }
-        // A turn nothing counted contributes nothing to the totals. The totals are plain `u64`
-        // because a session's spend is a sum, and the sum of no measurements is zero; the
-        // absent/zero distinction lives on the record itself.
-        let (input_tokens, output_tokens) = (input_tokens.unwrap_or(0), output_tokens.unwrap_or(0));
-        self.total_turns = self.total_turns.saturating_add(1);
-        self.total_input_tokens = self.total_input_tokens.saturating_add(input_tokens);
-        self.total_output_tokens = self.total_output_tokens.saturating_add(output_tokens);
-        self.task_turns = self.task_turns.saturating_add(1);
-        if origin.is_some() {
-            self.task_hook_inferences = self.task_hook_inferences.saturating_add(1);
+        // Every record, counted or not: the provider may have reported a call the turn and token
+        // totals do not count.
+        if let Some(status) = &self.session_status {
+            status.record_inference(self.task_turns, input_tokens, output_tokens, usage);
         }
-        self.task_input_tokens = self.task_input_tokens.saturating_add(input_tokens);
-        self.task_output_tokens = self.task_output_tokens.saturating_add(output_tokens);
         Ok(())
     }
 
@@ -2807,8 +2896,12 @@ impl TraceWriter {
         self.task_shell_calls = 0;
         self.task_agent_turns = 0;
         self.task_hook_inferences = 0;
-        self.task_start_instant = Some(Instant::now());
+        let started = Instant::now();
+        self.task_start_instant = Some(started);
         self.active_task_id = Some(task_id.to_string());
+        if let Some(status) = &self.session_status {
+            status.task_started(task_id, started);
+        }
 
         let event_id = new_event_id();
         self.task_event_id = Some(event_id.clone());
@@ -2869,6 +2962,9 @@ impl TraceWriter {
         self.task_event_id = None;
         self.turn_event_id = None;
         self.task_agent_turns = 0;
+        if let Some(status) = &self.session_status {
+            status.task_ended();
+        }
         self.write_event(&event).await
     }
 
@@ -3880,6 +3976,65 @@ impl ResourceTraceAppender {
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             formation_id: formation_id.as_str().to_string(),
+        };
+        self.append(&event).await;
+    }
+
+    /// Records one `session-status` call, hung off the session node. Failures are swallowed: the
+    /// call is answered whether or not its record lands.
+    pub(crate) async fn write_session_status(
+        &self,
+        task_id: Option<String>,
+        status: &crate::session_status::StatusReport,
+    ) {
+        let event = SessionStatusEvent {
+            event_type: "session_status",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id,
+            status,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records the deadline notice `tool_name`'s result carried, hung off the session node.
+    pub(crate) async fn write_deadline_notice(
+        &self,
+        task_id: Option<String>,
+        tool_name: &str,
+        notice: &crate::session_status::DeadlineNotice,
+    ) {
+        let event = DeadlineNoticeEvent {
+            event_type: "deadline_notice",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id,
+            tool_name,
+            deadline_at: &notice.at,
+            left_secs: notice.left_secs,
+            notice_secs: notice.notice_secs,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records `deadline_reached`, hung off the session node. Failures are swallowed: a session
+    /// whose trace cannot be written still ends at its deadline.
+    pub(crate) async fn write_deadline_reached(
+        &self,
+        deadline: &crate::session_status::SessionDeadline,
+    ) {
+        let event = DeadlineReachedEvent {
+            event_type: "deadline_reached",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            deadline_at: deadline.at_rfc3339(),
+            deadline_secs: deadline.secs(),
         };
         self.append(&event).await;
     }

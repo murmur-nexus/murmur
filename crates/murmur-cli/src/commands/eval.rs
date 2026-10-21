@@ -708,6 +708,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             formation_member: None,
             source_supply: source_supply.clone(),
             expected_workdir_identity: None,
+            session_deadline: None,
             manifest_file: Some(manifest_path.clone()),
         };
 

@@ -91,6 +91,7 @@ use crate::{
     registration::SessionOutcome,
     resources, running, sandbox,
     sealed::UsernsGrant,
+    session_status::SESSION_STATUS_TOOL,
     shell::{
         build_declared_env, build_shell_env, is_shell_interpreter, run_shell,
         shell_tool_manifest_yaml, split_shell_words, ShellExecError, ShellOutcome, ShellResult,
@@ -1482,10 +1483,11 @@ struct LaunchOutcome {
     result: Result<AgentLoopExit, RuntimeError>,
     /// The `task_failed` reason the run behind `result` wrote, or `None` when it wrote none.
     failure_reason: Option<String>,
-    /// Whether the session's formation ended while it was running a task, and the wind-down
-    /// cancelled that task. Such a run is not folded into `result`: the launch ends
-    /// `formation_ended` rather than `canceled` unless an earlier run already decided otherwise.
-    formation_ended: bool,
+    /// The ending the session's termination gave the launch: its formation ended, or its
+    /// deadline was reached, and the wind-down cancelled the task it was running — or, for the
+    /// deadline, ended it with no task running. Such a run is not folded into `result`: the launch
+    /// ends this way rather than `canceled` unless an earlier run already decided otherwise.
+    terminated_as: Option<LaunchEnding>,
 }
 
 impl LaunchOutcome {
@@ -1494,37 +1496,37 @@ impl LaunchOutcome {
         Self {
             result: Ok(AgentLoopExit::Ok),
             failure_reason: None,
-            formation_ended: false,
+            terminated_as: None,
         }
     }
 
     /// Fold in a run the session's termination may have cancelled: the launch's own task, which
     /// only the termination cancels, or the task a terminating session was running.
-    /// `ended_by_formation` says the formation's end began the termination: a run that ended
-    /// `canceled` is then that end's doing, and is recorded as the formation ending rather than
-    /// folded in as a cancel. Every other run, and every run under any other cause, is folded in
-    /// by [`Self::record`].
+    /// `terminated_as` is the ending the termination's cause gives the launch — the formation's
+    /// end or the deadline — and `None` under a `SIGTERM` or the spawner lifeline. A run that
+    /// ended `canceled` under such a cause is that cause's doing, and is recorded as that ending
+    /// rather than folded in as a cancel. Every other run is folded in by [`Self::record`].
     fn record_terminated(
         &mut self,
         result: Result<AgentLoopExit, RuntimeError>,
-        ended_by_formation: bool,
+        terminated_as: Option<LaunchEnding>,
         trace: &TraceWriter,
         failures_before: u64,
     ) {
-        if ended_by_formation && matches!(result, Ok(AgentLoopExit::Canceled)) {
-            self.formation_ended = true;
-        } else {
-            self.record(result, trace, failures_before);
+        match terminated_as {
+            Some(ending) if matches!(result, Ok(AgentLoopExit::Canceled)) => self.ended_as(ending),
+            _ => self.record(result, trace, failures_before),
         }
+    }
+
+    /// Record that the termination gave the launch `ending`.
+    fn ended_as(&mut self, ending: LaunchEnding) {
+        self.terminated_as = Some(ending);
     }
 
     /// How a launch whose every folded run completed ended.
     fn ending(&self) -> LaunchEnding {
-        if self.formation_ended {
-            LaunchEnding::FormationEnded
-        } else {
-            LaunchEnding::Completed
-        }
+        self.terminated_as.unwrap_or(LaunchEnding::Completed)
     }
 
     /// Fold in one run's result. `failures_before` is [`TraceWriter::task_failures_written`] as it
@@ -2786,6 +2788,7 @@ pub fn stage_session(
             })
             .map(|control| control.choices()),
     )?;
+    write_session_status_tool_manifest(&runtime_root, request.inference.as_ref())?;
 
     // Read once, here, from the manifests just staged: the schema is fixed before the session
     // starts, so an annotation is the tool author's statement and never a call-time choice. A
@@ -2966,6 +2969,7 @@ pub fn stage_session(
         formation_lifeline: None,
         #[cfg(unix)]
         spawner_lifeline: None,
+        session_deadline: request.session_deadline,
     })
 }
 
@@ -3074,6 +3078,28 @@ fn launch(
                      lifeline ends the process"
                 .to_string(),
         });
+    }
+    // A deadline is enforced by the termination routine, on the terms a lifeline is: only a launch
+    // that owns its process, and only an agent session, has one.
+    let session_deadline = staged.session_deadline;
+    if session_deadline.is_some() {
+        let unenforceable = if !handle_sigterm {
+            Some(
+                "this session was launched by a caller that does not own its process, and the \
+                 deadline ends the process",
+            )
+        } else if staged.inference.is_none() {
+            Some("a script capsule has no termination routine to end it at its deadline")
+        } else if cfg!(not(unix)) {
+            Some("this platform has no termination routine to end the session at its deadline")
+        } else {
+            None
+        };
+        if let Some(reason) = unenforceable {
+            return Err(RuntimeError::SessionDeadlineUnenforceable {
+                reason: reason.to_string(),
+            });
+        }
     }
 
     let network_allow_rules = parse_network_allow_rules(&staged.capability_policy.network_allow)?;
@@ -3638,6 +3664,19 @@ fn launch(
                 None => RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")),
             })?;
             trace.set_spend_ceilings(spend.session_ceiling(), spend.machine_ceiling());
+            let session_status = Arc::new(crate::session_status::SessionStatus::new(
+                std::time::Instant::now(),
+                inference.transport == "process",
+                inference.max_turns,
+                session_deadline,
+                session_deadline.map_or(0, |deadline| {
+                    crate::session_status::notice_secs(
+                        effective_lifecycle.deadline_notice_secs,
+                        deadline.secs(),
+                    )
+                }),
+            ));
+            trace.set_session_status(Arc::clone(&session_status));
 
             // The session frame is written once per launch, around the task loop, so it frames
             // the `on-session-start`/`on-session-end` hook pair. It goes in before anything
@@ -3738,6 +3777,11 @@ fn launch(
                 spawned_by: spawner_lineage.0,
                 delegation_id: spawner_lineage.1,
             });
+            #[cfg(unix)]
+            let deadline_end_trace = resource_trace
+                .clone()
+                .zip(session_deadline)
+                .map(|(appender, deadline)| DeadlineEndTrace { appender, deadline });
             // The same file again, for the same reason and on the same terms: a plan's steps run
             // on blocking threads, so they cannot be lent the agent loop's own writer. A trace
             // that cannot be opened leaves a plan unrecorded and still runs it.
@@ -3851,6 +3895,7 @@ fn launch(
                         peer_plane: Some(std::sync::Arc::clone(&peer_plane)),
                         peer_own_audience: own_peer_audience,
                         peer_trace: resource_trace,
+                        session_status: Some(Arc::clone(&session_status)),
                         delegation: delegation_plane,
                         plan_trace,
                         plan_counter: AtomicU64::new(0),
@@ -4075,28 +4120,47 @@ fn launch(
                     // cancel races it, and the loop takes no new work once it is up, so the
                     // session falls through to the same teardown a clean exit runs.
                     let terminating = crate::cancel::CancelSignal::new();
-                    // Raised by the termination routine before `terminating`, when the formation
-                    // lifeline's EOF began it, so a task the wind-down cancelled is read as the
-                    // formation's end rather than as a cancel. Nothing raises it on a platform
-                    // without lifelines.
-                    let ended_by_formation = Arc::new(AtomicBool::new(false));
+                    // Set by the termination routine before `terminating`, when the formation
+                    // lifeline's EOF or the deadline began it, so a task the wind-down cancelled
+                    // is read as that ending rather than as a cancel. Nothing sets it on a
+                    // platform without a termination routine.
+                    let termination_ending = Arc::new(TerminationEnding::default());
                     #[cfg(unix)]
                     {
-                        let sources = TerminationSources {
+                        let mut sources = TerminationSources {
                             sigterm,
                             formation_closed,
                             spawner_closed,
+                            deadline: session_deadline,
                         };
+                        let ends = EndTraces {
+                            formation: formation_end_trace,
+                            spawner: spawner_end_trace,
+                            deadline: deadline_end_trace,
+                        };
+                        // A deadline already past ends the session here, before the task loop
+                        // can start a task, rather than on the routine's first poll.
+                        if sources.deadline.is_some_and(|deadline| {
+                            deadline.left(std::time::Instant::now()).is_zero()
+                        }) {
+                            sources.deadline = None;
+                            start_termination(
+                                TerminationCause::Deadline,
+                                &ends,
+                                &task_registry,
+                                &terminating,
+                                &termination_ending,
+                                &shell_enforcement_for_teardown,
+                            )
+                            .await;
+                        }
                         if sources.any() {
                             tokio::spawn(run_termination(
                                 sources,
-                                EndTraces {
-                                    formation: formation_end_trace,
-                                    spawner: spawner_end_trace,
-                                },
+                                ends,
                                 Arc::clone(&task_registry),
                                 terminating.clone(),
-                                Arc::clone(&ended_by_formation),
+                                Arc::clone(&termination_ending),
                                 shell_enforcement_for_teardown.clone(),
                             ));
                         }
@@ -4199,7 +4263,7 @@ fn launch(
                                         let failed = result.is_err();
                                         outcome.record_terminated(
                                             result,
-                                            ended_by_formation.load(Ordering::Acquire),
+                                            termination_ending.get(),
                                             &trace,
                                             failures_before,
                                         );
@@ -4283,7 +4347,7 @@ fn launch(
                                         // lifecycle, queue+sleep included, whatever runs next.
                                         outcome.record_terminated(
                                             result,
-                                            ended_by_formation.load(Ordering::Acquire),
+                                            termination_ending.get(),
                                             &trace,
                                             failures_before,
                                         );
@@ -4565,7 +4629,7 @@ fn launch(
                         if terminating.is_canceled() {
                             outcome.record_terminated(
                                 loop_result,
-                                ended_by_formation.load(Ordering::Acquire),
+                                termination_ending.get(),
                                 &trace,
                                 failures_before,
                             );
@@ -4611,6 +4675,15 @@ fn launch(
                         }
                     }
                     // ── LOOP BODY ENDS HERE ────────────────────────────────
+
+                    // A deadline that ended the session ends it `deadline_reached` even when it
+                    // cancelled no run: it fell before a task started, or while the session
+                    // waited for one.
+                    if terminating.is_canceled()
+                        && termination_ending.get() == Some(LaunchEnding::DeadlineReached)
+                    {
+                        outcome.ended_as(LaunchEnding::DeadlineReached);
+                    }
 
                     // Every task the door accepted reaches a terminal state before the door
                     // closes. One still queued here is refused, not run: the session has stopped
@@ -4859,6 +4932,7 @@ fn launch(
         peer_plane: None,
         peer_own_audience: String::new(),
         peer_trace: None,
+        session_status: None,
         // Nor a plan surface: `submit-plan` is an agent-loop tool too, so a script capsule that
         // declares `capabilities.plan.submit` has nothing to call and nothing to record.
         plan_trace: None,
@@ -6867,11 +6941,15 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) peer_plane: Option<Arc<crate::peer_handoff::PeerPlane>>,
     /// This capsule's own audience, asserted on every redeem it issues.
     pub(crate) peer_own_audience: String,
-    /// Where the peer-handoff tools write their records. The concurrent `O_APPEND` sink rather
-    /// than the loop's `TraceWriter`, which is `&mut`-owned by the loop and out of reach here —
-    /// so a mint and a fetch land at the moment of the event rather than at the next task
-    /// boundary.
+    /// Where the runtime-provided tools write their records — a peer handoff's mint and fetch, a
+    /// driver switch, a `session-status` call and the deadline notice among them. The concurrent
+    /// `O_APPEND` sink rather than the loop's `TraceWriter`, which is `&mut`-owned by the loop and
+    /// out of reach here, so each lands at the moment of the event rather than at the next task
+    /// boundary, on both transports.
     pub(crate) peer_trace: Option<Arc<crate::trace::ResourceTraceAppender>>,
+    /// What `session-status` reports and when the deadline notice is due. `Some` for every agent
+    /// session; `None` for a script capsule, which has no such tool.
+    pub(crate) session_status: Option<Arc<crate::session_status::SessionStatus>>,
     /// This session's authority to delegate. `None` — no `capabilities.spawn.allow`, so no
     /// registration and no credential — means no `delegate-task` tool manifest was written. The
     /// dispatch branch still refuses on `None` rather than assuming the tool could not have been
@@ -8348,6 +8426,7 @@ impl CapsuleStoreState {
             || name == SWITCH_DRIVER_TOOL
             || name == PULL_ARTIFACT_TOOL
             || name == REMOVE_ARTIFACT_TOOL
+            || name == SESSION_STATUS_TOOL
         {
             return as_tool();
         }
@@ -8511,7 +8590,36 @@ impl CapsuleStoreState {
             .dispatch_agent_tool_unfenced(name, input, gate, abandon)
             .await?;
         fence_and_label(name, &self.artifact_origin(name), &mut outcome);
+        self.deliver_deadline_notice(name, &mut outcome).await;
         Ok(outcome)
+    }
+
+    /// Append the deadline notice to `outcome`, a dispatched result about to be handed back to
+    /// the model, when it is due and no result has carried it yet: after the fence and any
+    /// [`DispatchOutcome::runtime_note`], on its own line. Recorded as `deadline_notice`.
+    ///
+    /// Called by every path that hands a dispatched outcome back — [`Self::dispatch_fenced`] and
+    /// `dispatch_agent_tool_exclusive`'s own branches — and never for a dispatch that failed, so a
+    /// failure does not use the notice up.
+    pub(crate) async fn deliver_deadline_notice(&self, name: &str, outcome: &mut DispatchOutcome) {
+        let Some(status) = &self.session_status else {
+            return;
+        };
+        let Some(notice) = status.take_due_notice(std::time::Instant::now()) else {
+            return;
+        };
+        let text = notice.text();
+        outcome.result.data = Some(
+            match outcome.result.data.take().or(outcome.result.summary.take()) {
+                Some(data) => format!("{data}\n{text}"),
+                None => text,
+            },
+        );
+        if let Some(trace) = &self.peer_trace {
+            trace
+                .write_deadline_notice(status.task_id(), name, &notice)
+                .await;
+        }
     }
 
     /// [`Self::dispatch_agent_tool_async`]'s branches, before the fence. Private: whatever this
@@ -8583,6 +8691,12 @@ impl CapsuleStoreState {
         if name == SWITCH_DRIVER_TOOL {
             return self
                 .dispatch_switch_driver(input)
+                .await
+                .map(DispatchOutcome::tool);
+        }
+        if name == SESSION_STATUS_TOOL {
+            return self
+                .dispatch_session_status()
                 .await
                 .map(DispatchOutcome::tool);
         }
@@ -9298,6 +9412,32 @@ impl CapsuleStoreState {
              calls finish, and {caller} is told you gave none."
         );
         Ok((result, note))
+    }
+
+    /// `session-status`: where this session stands, measured now, recorded as `session_status`.
+    async fn dispatch_session_status(&self) -> Result<murmur::tool::run::ToolResult, String> {
+        let Some(status) = &self.session_status else {
+            return Err(format!(
+                "'{SESSION_STATUS_TOOL}' is not available in this session"
+            ));
+        };
+        let report = status.snapshot(crate::session_status::SpendReading::of(&self.spend));
+        if let Some(trace) = &self.peer_trace {
+            trace.write_session_status(status.task_id(), &report).await;
+        }
+        // Serialized from the report itself rather than through a `Value`, so the top-level fields
+        // and the `time`, `turns`, `tokens` and `spend` members keep the order the description
+        // names them in. The nested `deadline`, `context` and `machine` objects are `Value`s and
+        // serialize with their keys sorted.
+        let data = serde_json::to_string(&report).map_err(|error| error.to_string())?;
+        Ok(murmur::tool::run::ToolResult {
+            status: murmur::tool::run::Status::Passed,
+            summary: Some("session status".to_string()),
+            data: Some(data),
+            data_path: None,
+            truncated: false,
+            metadata: Vec::new(),
+        })
     }
 
     /// `switch-driver`: the agent selects the driver choice its next inference call is served by.
@@ -10077,7 +10217,7 @@ impl WasiHttpView for ToolStoreState {
 /// Shell binary names are deliberately absent: they are operator-chosen through
 /// `capabilities.shell.allow`, so there is no fixed set to reserve, and
 /// `write_shell_tool_manifests` already yields to an artifact manifest that is already on disk.
-pub(crate) const RESERVED_TOOL_NAMES: [&str; 9] = [
+pub(crate) const RESERVED_TOOL_NAMES: [&str; 10] = [
     SHARE_FILE_TOOL,
     FETCH_PEER_FILE_TOOL,
     DELEGATE_TASK_TOOL,
@@ -10087,6 +10227,7 @@ pub(crate) const RESERVED_TOOL_NAMES: [&str; 9] = [
     END_WITHOUT_ANSWER_TOOL,
     PULL_ARTIFACT_TOOL,
     REMOVE_ARTIFACT_TOOL,
+    SESSION_STATUS_TOOL,
 ];
 
 /// Whether `name` is answered by the runtime itself rather than by an artifact.
@@ -10825,6 +10966,32 @@ fn native_tool_manifest_yaml(name: &str, description: String, input_schema: Stri
 
 /// Tool a capsule gains from `control.agent_settings: [inference.driver]`.
 pub(crate) const SWITCH_DRIVER_TOOL: &str = "switch-driver";
+
+/// Writes `session-status`'s synthetic manifest for every agent capsule, with the description for
+/// its transport, and for no script capsule. It needs no grant: the file exists exactly when
+/// `inference` does.
+fn write_session_status_tool_manifest(
+    runtime_root: &WorkdirRoot,
+    inference: Option<&InferenceConfig>,
+) -> Result<(), RuntimeError> {
+    let Some(inference) = inference else {
+        return Ok(());
+    };
+    let description = if inference.transport == "process" {
+        crate::session_status::description_process()
+    } else {
+        crate::session_status::description_http()
+    };
+    write_runtime_provided_tool_manifest(
+        runtime_root,
+        SESSION_STATUS_TOOL,
+        &native_tool_manifest_yaml(
+            SESSION_STATUS_TOOL,
+            description,
+            crate::session_status::INPUT_SCHEMA.to_string(),
+        ),
+    )
+}
 
 /// What a running plan asks of the session that was handed it. The scheduler thread that sent
 /// one is parked on its `oneshot` until this session replies.
@@ -11755,21 +11922,51 @@ struct TerminationSources {
     formation_closed: Option<tokio::sync::oneshot::Receiver<()>>,
     /// Fired once by the spawner lifeline's watcher thread, at EOF, for a delegated child.
     spawner_closed: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// The `mur run --deadline` the session ends at.
+    deadline: Option<crate::session_status::SessionDeadline>,
 }
 
 #[cfg(unix)]
 impl TerminationSources {
     /// Whether anything is left to listen to.
     fn any(&self) -> bool {
-        self.sigterm.is_some() || self.formation_closed.is_some() || self.spawner_closed.is_some()
+        self.sigterm.is_some()
+            || self.formation_closed.is_some()
+            || self.spawner_closed.is_some()
+            || self.deadline.is_some()
     }
 }
 
-/// Where a lifeline-begun termination records why it began.
+/// Where a termination records why it began, for every cause that writes a record.
 #[cfg(unix)]
 struct EndTraces {
     formation: Option<FormationEndTrace>,
     spawner: Option<SpawnerEndTrace>,
+    deadline: Option<DeadlineEndTrace>,
+}
+
+/// Where a deadline-begun termination records `deadline_reached`, and the deadline it names.
+#[cfg(unix)]
+struct DeadlineEndTrace {
+    appender: Arc<crate::trace::ResourceTraceAppender>,
+    deadline: crate::session_status::SessionDeadline,
+}
+
+/// The ending a run the session's termination cancelled is read as: set once, by the first cause
+/// that begins the termination and gives one, before `terminating` is raised. Unset under a
+/// `SIGTERM` or the spawner lifeline, which leave a cancelled run `canceled`.
+#[derive(Debug, Default)]
+struct TerminationEnding(std::sync::OnceLock<LaunchEnding>);
+
+impl TerminationEnding {
+    #[cfg(unix)]
+    fn set(&self, ending: LaunchEnding) {
+        let _ = self.0.set(ending);
+    }
+
+    fn get(&self) -> Option<LaunchEnding> {
+        self.0.get().copied()
+    }
 }
 
 /// Where a formation-lifeline-begun termination records `formation_ended`.
@@ -11797,6 +11994,19 @@ enum TerminationCause {
     FormationEnded,
     /// EOF on the spawner lifeline: the process that spawned this session has ended.
     SpawnerEnded,
+    /// The `mur run --deadline` timer fired.
+    Deadline,
+}
+
+/// Wait until the deadline, or forever when there is none.
+#[cfg(unix)]
+async fn deadline_reached(deadline: Option<crate::session_status::SessionDeadline>) {
+    match deadline {
+        Some(deadline) => {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline.instant())).await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// Wait for a lifeline watcher's signal, or forever when there is no watcher.
@@ -11819,17 +12029,18 @@ async fn lifeline_closed(closed: &mut Option<tokio::sync::oneshot::Receiver<()>>
 ///
 /// * The first `SIGTERM` begins it. A second exits with status 143 at once; lifeline EOF never
 ///   counts toward that, so a `SIGTERM` after EOF is a first `SIGTERM`, and changes nothing.
-/// * EOF on either lifeline begins it only when nothing has yet: `formation_ended` or
-///   `spawner_ended`, for the lifeline that closed, is then appended before any live task is
-///   cancelled, so it precedes every record the wind-down writes. EOF after anything else began
-///   the termination writes nothing; the trace already says why the session ended.
+/// * EOF on either lifeline, and the deadline, begin it only when nothing has yet:
+///   `formation_ended`, `spawner_ended` or `deadline_reached` is then appended before any live
+///   task is cancelled, so it precedes every record the wind-down writes. One of them after
+///   anything else began the termination writes nothing; the trace already says why the session
+///   ended.
 #[cfg(unix)]
 async fn run_termination(
     mut sources: TerminationSources,
     ends: EndTraces,
     task_registry: Arc<Mutex<TaskRegistry>>,
     terminating: crate::cancel::CancelSignal,
-    ended_by_formation: Arc<AtomicBool>,
+    termination_ending: Arc<TerminationEnding>,
     shell_enforcement: sandbox::ShellEnforcement,
 ) {
     let mut sigterms = 0u32;
@@ -11863,51 +12074,81 @@ async fn run_termination(
                 sources.spawner_closed = None;
                 TerminationCause::SpawnerEnded
             }
+            () = deadline_reached(sources.deadline) => {
+                sources.deadline = None;
+                TerminationCause::Deadline
+            }
         };
         if begun || terminating.is_canceled() {
             continue;
         }
         begun = true;
-        match cause {
-            TerminationCause::Sigterm => {}
-            TerminationCause::FormationEnded => {
-                if let Some(trace) = &ends.formation {
-                    trace
-                        .appender
-                        .write_formation_ended(&trace.formation_id)
-                        .await;
-                }
-            }
-            TerminationCause::SpawnerEnded => {
-                if let Some(trace) = &ends.spawner {
-                    trace
-                        .appender
-                        .write_spawner_ended(
-                            trace.spawned_by.as_deref(),
-                            trace.delegation_id.as_deref(),
-                        )
-                        .await;
-                }
-            }
-        }
-        begin_termination(
+        start_termination(
+            cause,
+            &ends,
             &task_registry,
             &terminating,
-            &ended_by_formation,
-            cause,
+            &termination_ending,
             &shell_enforcement,
-        );
+        )
+        .await;
     }
 }
 
-/// Cancel every live task, raise `ended_by_formation` when the formation's end is the cause, raise
-/// `terminating`, say why, and arm [`TERMINATE_TEARDOWN_DEADLINE`], after which the session's
-/// processes are killed and the process exits with status 143 whatever it is doing.
+/// Write the record `cause` writes, then [`begin_termination`].
+#[cfg(unix)]
+async fn start_termination(
+    cause: TerminationCause,
+    ends: &EndTraces,
+    task_registry: &Mutex<TaskRegistry>,
+    terminating: &crate::cancel::CancelSignal,
+    termination_ending: &TerminationEnding,
+    shell_enforcement: &sandbox::ShellEnforcement,
+) {
+    match cause {
+        TerminationCause::Sigterm => {}
+        TerminationCause::FormationEnded => {
+            if let Some(trace) = &ends.formation {
+                trace
+                    .appender
+                    .write_formation_ended(&trace.formation_id)
+                    .await;
+            }
+        }
+        TerminationCause::SpawnerEnded => {
+            if let Some(trace) = &ends.spawner {
+                trace
+                    .appender
+                    .write_spawner_ended(
+                        trace.spawned_by.as_deref(),
+                        trace.delegation_id.as_deref(),
+                    )
+                    .await;
+            }
+        }
+        TerminationCause::Deadline => {
+            if let Some(trace) = &ends.deadline {
+                trace.appender.write_deadline_reached(&trace.deadline).await;
+            }
+        }
+    }
+    begin_termination(
+        task_registry,
+        terminating,
+        termination_ending,
+        cause,
+        shell_enforcement,
+    );
+}
+
+/// Cancel every live task, set the launch's ending when the formation's end or the deadline is
+/// the cause, raise `terminating`, say why, and arm [`TERMINATE_TEARDOWN_DEADLINE`], after which
+/// the session's processes are killed and the process exits with status 143 whatever it is doing.
 #[cfg(unix)]
 fn begin_termination(
     task_registry: &Mutex<TaskRegistry>,
     terminating: &crate::cancel::CancelSignal,
-    ended_by_formation: &AtomicBool,
+    termination_ending: &TerminationEnding,
     cause: TerminationCause,
     shell_enforcement: &sandbox::ShellEnforcement,
 ) {
@@ -11915,8 +12156,10 @@ fn begin_termination(
     // already `Canceled`.
     let _ = task_registry.lock().unwrap().cancel_every_live();
     // Before `terminating`, so the task loop that wakes on it reads the cause already set.
-    if cause == TerminationCause::FormationEnded {
-        ended_by_formation.store(true, Ordering::Release);
+    match cause {
+        TerminationCause::FormationEnded => termination_ending.set(LaunchEnding::FormationEnded),
+        TerminationCause::Deadline => termination_ending.set(LaunchEnding::DeadlineReached),
+        TerminationCause::Sigterm | TerminationCause::SpawnerEnded => {}
     }
     terminating.cancel();
     match cause {
@@ -11929,6 +12172,10 @@ fn begin_termination(
         ),
         TerminationCause::SpawnerEnded => crate::runtime_err!(
             "{SPAWNER_LIFELINE_CLOSED}; cancelling live tasks and ending the session"
+        ),
+        TerminationCause::Deadline => crate::runtime_err!(
+            "[capsule-runtime] session deadline reached — cancelling live tasks and ending the \
+             session"
         ),
     }
     let ending = shell_enforcement.clone();
@@ -12740,10 +12987,10 @@ mod tests {
     /// tool added without extending it has to fail here rather than ship shadowed by an artifact
     /// of the same name. The arity assertion is the part that catches that.
     #[test]
-    fn the_reserved_set_covers_every_runtime_provided_tool() {
+    fn reserved_tool_names_cover_every_runtime_provided_tool() {
         assert_eq!(
             super::RESERVED_TOOL_NAMES.len(),
-            9,
+            10,
             "a new runtime-provided tool must be added to RESERVED_TOOL_NAMES, and this arity \
              raised, before its writer can succeed"
         );
@@ -12757,6 +13004,7 @@ mod tests {
             super::END_WITHOUT_ANSWER_TOOL,
             super::PULL_ARTIFACT_TOOL,
             super::REMOVE_ARTIFACT_TOOL,
+            super::SESSION_STATUS_TOOL,
         ] {
             assert!(
                 super::is_reserved_tool_name(name),
@@ -12767,6 +13015,59 @@ mod tests {
         assert!(!super::is_reserved_tool_name("bash"));
         // Case-sensitive, because artifact names are.
         assert!(!super::is_reserved_tool_name("Delegate-Task"));
+    }
+
+    /// `session-status` needs no grant: its manifest is written for every agent capsule, with
+    /// its transport's description and an empty-object schema, and for no script capsule.
+    #[test]
+    fn session_status_manifest_is_written_for_every_agent_capsule_and_no_script_capsule() {
+        let script = tempfile::tempdir().unwrap();
+        super::write_session_status_tool_manifest(
+            &crate::workdir_fs::WorkdirRoot::open(script.path()).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert!(!script
+            .path()
+            .join("tools")
+            .join(SESSION_STATUS_TOOL)
+            .exists());
+
+        for (transport, description) in [
+            ("http", crate::session_status::description_http()),
+            ("process", crate::session_status::description_process()),
+        ] {
+            let agent = tempfile::tempdir().unwrap();
+            let inference = murmur_artifact::InferenceConfig {
+                transport: transport.to_string(),
+                ..inference_without_prompt()
+            };
+            super::write_session_status_tool_manifest(
+                &crate::workdir_fs::WorkdirRoot::open(agent.path()).unwrap(),
+                Some(&inference),
+            )
+            .unwrap();
+            let manifest: Value = serde_yaml::from_str(
+                &std::fs::read_to_string(
+                    agent
+                        .path()
+                        .join("tools")
+                        .join(SESSION_STATUS_TOOL)
+                        .join(PACKED_MANIFEST_ENTRY),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manifest["name"].as_str(), Some(SESSION_STATUS_TOOL));
+            assert_eq!(manifest["version"].as_str(), Some("0.0.0"));
+            assert_eq!(manifest["runtime"].as_str(), Some("tool"));
+            assert_eq!(manifest["implementation"].as_str(), Some("native"));
+            assert_eq!(manifest["description"].as_str(), Some(description.as_str()));
+            assert_eq!(
+                manifest["input_schema"].as_str(),
+                Some(crate::session_status::INPUT_SCHEMA)
+            );
+        }
     }
 
     /// The funnel guard on the artifact side. `manage.pull()` writes through this function with no
@@ -13951,6 +14252,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            session_deadline: None,
             manifest_file: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
@@ -14054,6 +14356,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            session_deadline: None,
             manifest_file: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
@@ -14146,6 +14449,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            session_deadline: None,
             manifest_file: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
@@ -14237,6 +14541,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            session_deadline: None,
             manifest_file: None,
             credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
@@ -14389,6 +14694,7 @@ inference:
         let request = StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            session_deadline: None,
             manifest_file: None,
             credentials_file: None,
             manifest_dir: project.path().to_path_buf(),
@@ -14499,6 +14805,7 @@ inference:
         StageRequest {
             source_supply: None,
             expected_workdir_identity: None,
+            session_deadline: None,
             manifest_file: None,
             credentials_file: None,
             manifest_dir: project.to_path_buf(),
@@ -15392,6 +15699,7 @@ inference:
             peer_plane: None,
             peer_own_audience: String::new(),
             peer_trace: None,
+            session_status: None,
             plan_trace: None,
             plan_counter: AtomicU64::new(0),
             delegation: None,
@@ -20896,7 +21204,7 @@ inference:
         let outcome = LaunchOutcome {
             result: Ok(AgentLoopExit::NoAnswer),
             failure_reason: None,
-            formation_ended: false,
+            terminated_as: None,
         };
         assert!(matches!(
             outcome.into_launch_result(),
@@ -20948,7 +21256,7 @@ inference:
         let outcome = |result, failure_reason: Option<&str>| LaunchOutcome {
             result,
             failure_reason: failure_reason.map(str::to_string),
-            formation_ended: false,
+            terminated_as: None,
         };
         assert!(outcome(Ok(AgentLoopExit::Ok), None)
             .into_launch_result()
@@ -21013,15 +21321,31 @@ inference:
             outcome
         };
 
-        let ended = terminated(None, AgentLoopExit::Canceled, true);
+        let ended = terminated(
+            None,
+            AgentLoopExit::Canceled,
+            Some(LaunchEnding::FormationEnded),
+        );
         assert_eq!(ended.exit_status(), "formation_ended");
         assert_eq!(
             ended.into_launch_result().unwrap(),
             LaunchEnding::FormationEnded
         );
 
+        // The deadline ends it the same way, under its own name.
+        let reached = terminated(
+            None,
+            AgentLoopExit::Canceled,
+            Some(LaunchEnding::DeadlineReached),
+        );
+        assert_eq!(reached.exit_status(), "deadline_reached");
+        assert_eq!(
+            reached.into_launch_result().unwrap(),
+            LaunchEnding::DeadlineReached
+        );
+
         // `SIGTERM`, `murmur.StopSession` or the spawner's end: still a cancel.
-        let canceled = terminated(None, AgentLoopExit::Canceled, false);
+        let canceled = terminated(None, AgentLoopExit::Canceled, None);
         assert_eq!(canceled.exit_status(), "canceled");
         assert!(matches!(
             canceled.into_launch_result(),
@@ -21037,9 +21361,12 @@ inference:
             AgentLoopExit::MaxTurnsReached,
             AgentLoopExit::SpendCeilingReached,
         ] {
-            assert_eq!(terminated(None, exit, true).exit_status(), exit.as_str());
+            assert_eq!(
+                terminated(None, exit, Some(LaunchEnding::FormationEnded)).exit_status(),
+                exit.as_str()
+            );
         }
-        let completed = terminated(None, AgentLoopExit::Ok, true);
+        let completed = terminated(None, AgentLoopExit::Ok, Some(LaunchEnding::FormationEnded));
         assert_eq!(completed.exit_status(), "ok");
         assert_eq!(
             completed.into_launch_result().unwrap(),
@@ -21047,7 +21374,11 @@ inference:
         );
 
         // An earlier run that did not complete still decides the launch.
-        let failed = terminated(Some(AgentLoopExit::Failed), AgentLoopExit::Canceled, true);
+        let failed = terminated(
+            Some(AgentLoopExit::Failed),
+            AgentLoopExit::Canceled,
+            Some(LaunchEnding::FormationEnded),
+        );
         assert_eq!(failed.exit_status(), "failed");
         assert!(matches!(
             failed.into_launch_result(),
@@ -21059,6 +21390,10 @@ inference:
 
         // An idle session: nothing was running, so nothing was cancelled.
         assert_eq!(LaunchOutcome::new().exit_status(), "ok");
+        // Unless the deadline ended it, which says so whether or not a run was cancelled.
+        let mut idle_at_deadline = LaunchOutcome::new();
+        idle_at_deadline.ended_as(LaunchEnding::DeadlineReached);
+        assert_eq!(idle_at_deadline.exit_status(), "deadline_reached");
     }
 
     /// The cancelled-task marker replaces whatever `out/result.txt` held, and under a threaded

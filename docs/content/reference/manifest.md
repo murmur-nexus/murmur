@@ -1297,6 +1297,7 @@ verbatim and unredacted — bodies can be large, and a blob holds the wire paylo
 | `lifecycle.max_task_reopens` | integer | no | Default: `1`. Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. `0` is a valid explicit value and disables reopening. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). |
 | `lifecycle.shell_grace_secs` | integer | no | Default: `10`. Seconds a shell command runs in the foreground before it is demoted to the background — see [`lifecycle.shell_grace_secs`](#lifecycle-shell-grace-secs). |
 | `lifecycle.delegation_deadline_secs` | integer | no | Default: `600`. Seconds a delegated sub-capsule may run before it is ended, and a [`call-member`](runtime-provided-tools.md#call-member) call may spend offering a busy member the task and waiting for its answer — see [`lifecycle.delegation_deadline_secs`](#lifecycle-delegation-deadline-secs). |
+| `lifecycle.deadline_notice_secs` | integer | no | Default: five minutes, or a tenth of the deadline when that is shorter, and at least `1`. Seconds before a [`mur run --deadline`](cli.md#mur-run-deadline) at which the agent is told, once, that the session is about to end — see [The deadline notice](runtime-provided-tools.md#deadline-notice). `0` sends no notice. Must be ≥ 0. Inert without `--deadline`. |
 
 #### `exports` { #field-exports }
 

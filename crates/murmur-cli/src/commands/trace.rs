@@ -208,6 +208,17 @@ struct SessionStartEvent {
     /// from a runtime predating the key, which reads as none.
     #[serde(default)]
     runtime_artifacts: Vec<RuntimeArtifactEntry>,
+    /// The `mur run --deadline` the session ran under; `null` or absent for none.
+    #[serde(default)]
+    deadline: Option<SessionDeadline>,
+}
+
+/// `session_start.deadline`.
+#[derive(Debug, Clone, Deserialize)]
+struct SessionDeadline {
+    at: String,
+    secs: u64,
+    notice_secs: u64,
 }
 
 /// One element of `session_start.runtime_artifacts`.
@@ -535,6 +546,27 @@ struct TaskRejectedEvent {
 #[derive(Debug, Deserialize)]
 struct FormationEndedEvent {
     formation_id: String,
+}
+
+/// One `session-status` call and the object it returned.
+#[derive(Debug, Deserialize)]
+struct SessionStatusEvent {
+    status: serde_json::Value,
+}
+
+/// The one deadline notice, and the tool result that carried it.
+#[derive(Debug, Deserialize)]
+struct DeadlineNoticeEvent {
+    tool_name: String,
+    deadline_at: String,
+    left_secs: u64,
+}
+
+/// The session reached its `mur run --deadline`, and that began its wind-down.
+#[derive(Debug, Deserialize)]
+struct DeadlineReachedEvent {
+    deadline_at: String,
+    deadline_secs: u64,
 }
 
 /// A delegated child's spawner lifeline closed: the session that delegated to it ended, and that
@@ -933,6 +965,9 @@ enum TraceEvent {
     TaskFailed(TaskFailedEvent),
     FormationEnded(FormationEndedEvent),
     SpawnerEnded(SpawnerEndedEvent),
+    SessionStatus(SessionStatusEvent),
+    DeadlineNotice(DeadlineNoticeEvent),
+    DeadlineReached(DeadlineReachedEvent),
     CallDenied(CallDeniedEvent),
     ProtectedPathDenied(ProtectedPathDeniedEvent),
     ToolInputRefused(ToolInputRefusedEvent),
@@ -1250,6 +1285,10 @@ struct TraceMetrics {
     formation_ended: Option<String>,
     /// The `spawner_ended` record, when the session wound down because its spawner ended.
     spawner_ended: Option<SpawnerEndedEvent>,
+    /// `session_start.deadline`.
+    deadline: Option<SessionDeadline>,
+    /// The `session_status`, `deadline_notice` and `deadline_reached` rows, in file order.
+    deadline_rows: Vec<String>,
     /// Every `task_failed` record, in file order — one per failing attempt.
     failures: Vec<TaskFailedEvent>,
     /// Every `task_reopened` record, in file order — one per `on-task-end` reopen.
@@ -1420,6 +1459,74 @@ fn rejected_show_row(r: &TaskRejectedEvent) -> String {
         r.task_id,
         r.cause,
         r.source.as_deref().unwrap_or("unknown")
+    )
+}
+
+/// `session_start.deadline` as the Session section's `deadline:` line.
+fn session_deadline_line(d: &SessionDeadline) -> String {
+    let notice = if d.notice_secs == 0 {
+        "no notice".to_string()
+    } else {
+        format!("notice {}s before", d.notice_secs)
+    };
+    format!("{}  ({}s after mur run started; {notice})", d.at, d.secs)
+}
+
+/// A `session_status.status` member as a row reads it: a number with thousands separators, a
+/// string as written, `-` for anything else.
+fn status_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Number(n) => n.as_u64().map_or_else(|| n.to_string(), fmt_thousands),
+        serde_json::Value::String(s) => s.clone(),
+        _ => "-".to_string(),
+    }
+}
+
+/// One `session_status` record's row: what the call returned, on one line.
+fn session_status_row(status: &serde_json::Value) -> String {
+    let deadline = &status["time"]["deadline"];
+    let left = if deadline.is_object() {
+        format!("{}s", status_value(&deadline["left_secs"]))
+    } else {
+        status_value(deadline)
+    };
+    let context = &status["context"];
+    let context = if context.is_object() {
+        format!(
+            "{}/{} ({})",
+            status_value(&context["used_tokens"]),
+            status_value(&context["window_tokens"]),
+            status_value(&context["measured_by"])
+        )
+    } else {
+        status_value(context)
+    };
+    format!(
+        "session_status  elapsed {}s  left {left}  turns {}/{}  context {context}  tokens in {} \
+         out {}  spend {}/{}",
+        status_value(&status["time"]["elapsed_secs"]),
+        status_value(&status["turns"]["used"]),
+        status_value(&status["turns"]["cap"]),
+        status_value(&status["tokens"]["input"]),
+        status_value(&status["tokens"]["output"]),
+        status_value(&status["spend"]["tokens"]),
+        status_value(&status["spend"]["ceiling"]),
+    )
+}
+
+/// The `deadline_notice` record's row.
+fn deadline_notice_row(e: &DeadlineNoticeEvent) -> String {
+    format!(
+        "deadline_notice  {}  {}s left; the session ends at {}",
+        e.tool_name, e.left_secs, e.deadline_at
+    )
+}
+
+/// The `deadline_reached` record's row.
+fn deadline_reached_row(e: &DeadlineReachedEvent) -> String {
+    format!(
+        "deadline_reached  {}  the --deadline of {}s fell; this session wound down",
+        e.deadline_at, e.deadline_secs
     )
 }
 
@@ -1946,6 +2053,7 @@ fn compute_metrics(
     let mut rejections: Vec<TaskRejectedEvent> = Vec::new();
     let mut formation_ended: Option<String> = None;
     let mut spawner_ended: Option<SpawnerEndedEvent> = None;
+    let mut deadline_rows: Vec<String> = Vec::new();
     let mut failures: Vec<TaskFailedEvent> = Vec::new();
     let mut reopens: Vec<ReopenRecord> = Vec::new();
     let mut continuations: Vec<TaskContinuedEvent> = Vec::new();
@@ -2106,6 +2214,9 @@ fn compute_metrics(
             TraceEvent::TaskRejected(e) => rejections.push(e),
             TraceEvent::FormationEnded(e) => formation_ended = Some(e.formation_id),
             TraceEvent::SpawnerEnded(e) => spawner_ended = Some(e),
+            TraceEvent::SessionStatus(e) => deadline_rows.push(session_status_row(&e.status)),
+            TraceEvent::DeadlineNotice(e) => deadline_rows.push(deadline_notice_row(&e)),
+            TraceEvent::DeadlineReached(e) => deadline_rows.push(deadline_reached_row(&e)),
             TraceEvent::TaskFailed(e) => failures.push(e),
             TraceEvent::TaskReopened(e) => {
                 reopens.push(ReopenRecord {
@@ -2407,6 +2518,8 @@ fn compute_metrics(
             rejections,
             formation_ended,
             spawner_ended,
+            deadline: ss.deadline,
+            deadline_rows,
             failures,
             reopens,
             continuations,
@@ -2767,6 +2880,9 @@ fn print_show(m: &TraceMetrics) {
         };
         capsule_runtime::report_println!("{:<11} {}{}", "prompt:", source, sha);
     }
+    if let Some(deadline) = &m.deadline {
+        capsule_runtime::report_println!("{:<11} {}", "deadline:", session_deadline_line(deadline));
+    }
     capsule_runtime::report_println!();
 
     // Beside the hook failures: on a `transport: process` session these are the only account of
@@ -3066,6 +3182,14 @@ fn print_show(m: &TraceMetrics) {
         capsule_runtime::report_println!();
         capsule_runtime::report_println!("── Spawner ended ────────────────────────────────");
         capsule_runtime::report_println!("{}", spawner_ended_show_row(spawner));
+    }
+
+    if !m.deadline_rows.is_empty() {
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Session status and deadline ──────────────────");
+        for row in &m.deadline_rows {
+            capsule_runtime::report_println!("{row}");
+        }
     }
 
     if !m.cancels.is_empty() {
@@ -4238,6 +4362,21 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             fmt_id_short(&e.task_id, 12)
         ),
         TraceEvent::FormationEnded(e) => format!("{}{}", kind("formation_ended"), e.formation_id),
+        TraceEvent::SessionStatus(e) => format!(
+            "{}turns {}/{}",
+            kind("session_status"),
+            status_value(&e.status["turns"]["used"]),
+            status_value(&e.status["turns"]["cap"])
+        ),
+        TraceEvent::DeadlineNotice(e) => format!(
+            "{}{}  {}s left",
+            kind("deadline_notice"),
+            e.tool_name,
+            e.left_secs
+        ),
+        TraceEvent::DeadlineReached(e) => {
+            format!("{}{}", kind("deadline_reached"), e.deadline_at)
+        }
         TraceEvent::SpawnerEnded(e) => format!(
             "{}{}",
             kind("spawner_ended"),
@@ -5846,6 +5985,78 @@ mod tests {
             "formation_ended  frm_0192a5b3c4d57e6f8a9b0c1d2e3f4a5b  the formation ended; this \
              session wound down"
         );
+    }
+
+    /// A `session_status` record renders as one row with the time left, turns, context, tokens and
+    /// spend it returned; `"none"` and `"unknown"` read as written.
+    #[test]
+    fn session_status_renders_a_steps_row_and_a_show_row() {
+        let line = r#"{"event_type":"session_status","event_id":"evt_9","parent_id":"evt_1","session_id":"s","timestamp":9,"task_id":"tsk_1","status":{"time":{"elapsed_secs":1834,"task_elapsed_secs":1790,"deadline":{"at":"2026-10-20T14:00:00Z","left_secs":5366}},"turns":{"used":42,"cap":"none"},"context":{"used_tokens":61234,"window_tokens":200000,"measured_by":"estimate"},"tokens":{"input":812345,"output":23456,"cached":600000,"cache_write":10000,"unreported_calls":0},"spend":{"tokens":835801,"ceiling":"none","machine":"none"}}}"#;
+        assert_eq!(row(line), "session_status turns 42/none");
+        let TraceEvent::SessionStatus(e) = serde_json::from_str::<TraceEvent>(line).unwrap() else {
+            panic!("a session_status line parses as SessionStatus");
+        };
+        assert_eq!(
+            session_status_row(&e.status),
+            "session_status  elapsed 1,834s  left 5,366s  turns 42/none  context 61,234/200,000 \
+             (estimate)  tokens in 812,345 out 23,456  spend 835,801/none"
+        );
+        let process = serde_json::json!({
+            "time": {"elapsed_secs": 3, "task_elapsed_secs": 2, "deadline": "none"},
+            "turns": {"used": 1, "cap": 10},
+            "context": "unknown",
+            "tokens": {"input": "unknown", "output": "unknown", "cached": "unknown",
+                       "cache_write": "unknown", "unreported_calls": 1},
+            "spend": {"tokens": 0, "ceiling": 1000, "machine": "none"},
+        });
+        assert_eq!(
+            session_status_row(&process),
+            "session_status  elapsed 3s  left none  turns 1/10  context unknown  tokens in unknown \
+             out unknown  spend 0/1,000"
+        );
+    }
+
+    /// The deadline notice and the deadline's end each render as one row, and `session_start`'s
+    /// deadline as the Session section's `deadline:` line.
+    #[test]
+    fn deadline_records_render_a_steps_row_and_a_show_row() {
+        let notice = r#"{"event_type":"deadline_notice","event_id":"evt_10","parent_id":"evt_1","session_id":"s","timestamp":10,"task_id":"tsk_1","tool_name":"sleep","deadline_at":"2026-10-20T14:00:00Z","left_secs":19,"notice_secs":20}"#;
+        assert_eq!(row(notice), "deadline_notice sleep  19s left");
+        let TraceEvent::DeadlineNotice(e) = serde_json::from_str::<TraceEvent>(notice).unwrap()
+        else {
+            panic!("a deadline_notice line parses as DeadlineNotice");
+        };
+        assert_eq!(
+            deadline_notice_row(&e),
+            "deadline_notice  sleep  19s left; the session ends at 2026-10-20T14:00:00Z"
+        );
+
+        let reached = r#"{"event_type":"deadline_reached","event_id":"evt_11","parent_id":"evt_1","session_id":"s","timestamp":11,"deadline_at":"2026-10-20T14:00:00Z","deadline_secs":30}"#;
+        assert_eq!(row(reached), "deadline_reached 2026-10-20T14:00:00Z");
+        let TraceEvent::DeadlineReached(e) = serde_json::from_str::<TraceEvent>(reached).unwrap()
+        else {
+            panic!("a deadline_reached line parses as DeadlineReached");
+        };
+        assert_eq!(
+            deadline_reached_row(&e),
+            "deadline_reached  2026-10-20T14:00:00Z  the --deadline of 30s fell; this session \
+             wound down"
+        );
+
+        let deadline = SessionDeadline {
+            at: "2026-10-20T14:00:00Z".to_string(),
+            secs: 600,
+            notice_secs: 60,
+        };
+        assert_eq!(
+            session_deadline_line(&deadline),
+            "2026-10-20T14:00:00Z  (600s after mur run started; notice 60s before)"
+        );
+        let silent = SessionDeadline {
+            notice_secs: 0,
+            ..deadline
+        };
+        assert!(session_deadline_line(&silent).ends_with("; no notice)"));
     }
 
     /// A `spawner_ended` record's `steps` row names the spawning session, and its `show` row names

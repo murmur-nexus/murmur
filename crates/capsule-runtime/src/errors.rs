@@ -744,6 +744,16 @@ pub enum RuntimeError {
     )]
     SpawnerLifelineUnreadable { reason: String },
 
+    /// A session staged with a `mur run --deadline` was launched where the deadline cannot be
+    /// enforced: by a caller that does not own its process, for a script capsule, or on a platform
+    /// without the termination routine.
+    #[error(
+        "this session was staged with a deadline the launch cannot enforce: {reason}; a session \
+         that outlived its deadline would keep running past its launcher's limit, so the launch is \
+         refused"
+    )]
+    SessionDeadlineUnenforceable { reason: String },
+
     /// A native tool's `bin/<name>` payload was built for another operating system or CPU
     /// architecture than this host.
     ///

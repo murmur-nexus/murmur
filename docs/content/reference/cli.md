@@ -1304,6 +1304,7 @@ mur run --roster [<path>] [--task <path-or-text>] [--json]
 | `--no-env-file` | off | Skip auto-loading the workspace-root `.env` file for this invocation. Recommended default for CI/CD pipelines |
 | `--containment` | — | Require at least this containment class (`advisory`\|`scoped`\|`sealed`). Combines with the manifest's `capabilities.containment` and the workspace `containment` config by taking the strongest of the three — this flag can only raise the effective floor, never lower one another source already set. See [Containment class](containment.md#field-containment) |
 | `--explain-scope` | off | Print the effective grant set and the declared/achieved containment classes, then exit `0` without staging or launching anything — no artifact pull, no component compile, no workdir. Reports even when the declared floor is not met. The `Resource plane` block, and `io_max` under `--json`, report whether the declared [`cgroup_io_bytes_per_sec`](resource-limits.md#io-max-report) ceiling applies on this host. Also lists every path the runtime writes into the workdir, as `runtime_writes` under `--json` — see [Session workdir](workdir.md). A `Runtime directory` block after `Containment` gives the session's [runtime directory](workdir.md#runtime-directory) and whether the capsule's commands can change it, a `Records directory` block after it does the same for the [records directory](workdir.md#records-directory), and a `Temporary folder` block after that gives the [session's temporary folder](containment.md#temp-folder), the value of `TMPDIR`, and whether a literal `/tmp` reaches the folder; `--json` carries them as `runtime_dir`, `records_dir` and `temp_dir`. Refused with [`E-IO-004`](diagnostics.md#e-io-004) when `HOME` cannot hold `~/.murmur`, as the launch would be. Unless the session composes a sealed root, a `Not protected here` block prints under `Containment`, naming what its filesystem mechanism leaves unrestricted and why a `~`-based probe is not evidence of containment — see [Testing containment honestly](containment.md#testing-containment); `--json` carries the same statements as `filesystem_boundary` |
+| `--deadline` | — | End the session this many seconds after `mur run` started, staging included, whatever it is doing. A whole number from `1` to `315360000` (ten years). The runtime ends the session as a first [`SIGTERM`](#mur-run-sigterm) does, records `deadline_reached`, and exits with [`E-RUN-053`](diagnostics.md#e-run-053); see [The deadline](#mur-run-deadline). Requires an agent capsule: on a manifest with no `inference:` block the run fails with `error[E-IO-003]` before anything is staged. Cannot be combined with `--roster` |
 | `--system-prompt` | — | Replace the manifest's system prompt for this invocation only. Overrides `inference.system_prompt`, `inference.system_prompt_file` and `inference.system_prompt_artifact` alike, whichever the manifest used — and applies just as well when it declared none. The value is trimmed; an empty or whitespace-only value clears the prompt rather than setting one. `murmur.yaml` is not modified. Requires an agent capsule: on a manifest with no `inference:` block the run fails with `error[E-IO-003]` before anything is staged. Inert under `--explain-scope`. See [Override the prompt for a single run](../how-to/capsule-system-prompt.md#step-8-override-the-prompt-for-a-single-run) |
 
 For the output modes, the read-only pre-flight checks and driving a capsule over HTTP, see
@@ -1404,6 +1405,7 @@ When the session ends, `mur run` prints one `status:` line and exits:
 | `max_turns_reached` | 1 | Ran a task that used every turn `inference.max_turns` allows, and prints `E-RUN-040` |
 | `spend_ceiling_reached` | 1 | Ran a task a [spend ceiling](manifest.md#inference-max-session-tokens) stopped, and prints `E-RUN-040` |
 | `canceled` | 1 | Ran a task that was canceled — by `CancelTask`, [`murmur.StopSession`](agent-card.md#stop-session), [`mur stop`](#mur-stop), `SIGTERM`, or the end of the session that [delegated](roost-api.md#spawner-lifeline) it — and prints `E-RUN-040` |
+| `deadline_reached` | 1 | Reached its [`--deadline`](#mur-run-deadline), and prints [`E-RUN-053`](diagnostics.md#e-run-053). The task it was running ends `canceled` |
 | `formation_ended` | 0 | Was a formation member running a task when its formation ended, and the [wind-down](roster.md#launch-stop) canceled that task. Prints no error. The task itself still ends `canceled` |
 | `trapped` | 1 | Ran a script capsule that stopped with an error |
 
@@ -1460,6 +1462,19 @@ ends `status:  canceled` and exits `1`; one that was waiting for a task ends `st
 A teardown cut short by either bound, or by `SIGKILL`, leaves the rest undone. A script capsule,
 and every session that `mur eval run` or `mur new` runs, has no `SIGTERM` handling: the process
 ends at once.
+
+### The deadline { #mur-run-deadline }
+
+`--deadline <SECONDS>` is a hard limit on the whole `mur run`, counted from the moment the command
+started.
+
+| Aspect | Behaviour |
+|---|---|
+| Reached | The session ends as a first [`SIGTERM`](#mur-run-sigterm) ends it, under the same 20-second bound: every live task is cancelled and ends `canceled`, and the teardown runs |
+| Trace | `deadline_reached` before the wind-down's records, then `session_end` with `exit_status: "deadline_reached"`; `session_start.deadline` names it from the start. See [`trace.jsonl`](observability-schemas.md#deadline-reached) |
+| Exit | `status:  deadline_reached`, exit code `1`, [`E-RUN-053`](diagnostics.md#e-run-053) — unless an earlier task already failed, which keeps its own status |
+| Already past at launch | The session ends before any task runs |
+| The agent | Is told once, on a tool result, when [`lifecycle.deadline_notice_secs`](manifest.md#field-lifecycle) are left, and its [`session-status`](runtime-provided-tools.md#session-status) tool reports the time left — see [The deadline notice](runtime-provided-tools.md#deadline-notice) |
 
 ### Launching a formation (`--roster`) { #mur-run-roster }
 
