@@ -18128,6 +18128,67 @@ inference:
         assert!(data.contains("capabilities.resources.cgroup_pids_max"));
     }
 
+    /// A command that runs past `capabilities.resources.cpu_seconds` is stopped by `SIGXCPU` at
+    /// that limit, so the trace's `shell` event names `cpu_seconds`, the exit code is
+    /// `128 + SIGXCPU`, and the model reads the limit line after the fence while the call stays
+    /// `Passed`. `SIGXCPU` arrives only because `RLIMIT_CPU`'s soft slot sits below its hard
+    /// slot; with the two equal the kernel sends only `SIGKILL`, which exits 137 and names no
+    /// limit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_foreground_command_over_cpu_seconds_names_the_limit_and_what_to_do() {
+        let tmp = TempDir::new().unwrap();
+        let limits = crate::resources::HostResourceLimits {
+            cpu_seconds: 1,
+            ..crate::resources::HostResourceLimits::default()
+        };
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".into()],
+            resources: limits,
+            ..CapabilityPolicy::default()
+        };
+        let mut enforcement = sandbox::ShellEnforcement::environment_only();
+        enforcement.resource_limits = limits;
+
+        let mut outcome = dispatch_shell_tool(
+            "bash",
+            murmur::tool::run::ToolInput {
+                data: Some(r#"{"command":"while :; do :; done"}"#.to_string()),
+                log_path: None,
+            },
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
+            &[],
+            &policy,
+            &enforcement,
+            None,
+        );
+
+        let line = crate::resources::resource_limit_line("cpu_seconds");
+        let shell = outcome.shell.as_ref().unwrap();
+        assert_eq!(
+            shell.resource_limit.as_deref(),
+            Some("cpu_seconds"),
+            "exit code {}: {:?}",
+            shell.exit_code,
+            outcome.result.data
+        );
+        assert_eq!(shell.exit_code, 128 + libc::SIGXCPU);
+        assert_eq!(outcome.result.status, murmur::tool::run::Status::Passed);
+        assert!(outcome
+            .result
+            .metadata
+            .contains(&("resource_limit".to_string(), "cpu_seconds".to_string())));
+        assert_eq!(outcome.runtime_note.as_deref(), Some(line.as_str()));
+
+        fence_and_label("bash", &LockOrigin::Operator, &mut outcome);
+        let data = outcome.result.data.expect("a finished call renders text");
+        assert!(
+            data.ends_with(&format!("{}\n{line}", crate::fence::FENCE_CLOSE)),
+            "the limit line must follow the fence:\n{data}"
+        );
+    }
+
     /// A call nothing was attributed to carries no note and no `resource_limit` metadata, and no
     /// limit is guessed from a non-zero exit.
     #[test]

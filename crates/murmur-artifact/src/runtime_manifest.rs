@@ -1669,7 +1669,8 @@ pub struct ResourceCapabilities {
     pub max_open_files: Option<u64>,
     /// `RLIMIT_FSIZE` hard ceiling, in bytes, on each spawned subprocess.
     pub max_file_size_bytes: Option<u64>,
-    /// `RLIMIT_CPU` hard ceiling, in CPU-seconds, on each spawned subprocess.
+    /// CPU time, in CPU-seconds, after which `RLIMIT_CPU` sends each spawned subprocess
+    /// `SIGXCPU`, with `SIGKILL` one second later.
     pub cpu_seconds: Option<u64>,
     /// `RLIMIT_AS` (Linux) / `RLIMIT_DATA` (macOS) hard ceiling, in bytes, on each spawned
     /// subprocess.
