@@ -1216,21 +1216,25 @@ mod tests {
     }
 
     /// A command printing `seq 1 <last>`, past [`MAX_SHELL_OUTPUT_BYTES`] for any `last` over
-    /// 4,000, run in `workdir` with a session workdir of its own, so `$HOME` adds nothing to
-    /// `workdir`.
-    fn print_seq(workdir: &Path, enforcement: &ShellEnforcement, last: u32) -> ShellResult {
+    /// 4,000, run in `workdir` with `session` as its session workdir. The two are different
+    /// directories, so `$HOME` adds nothing to `workdir`.
+    fn print_seq(
+        workdir: &Path,
+        session: &Path,
+        enforcement: &ShellEnforcement,
+        last: u32,
+    ) -> ShellResult {
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
             ..CapabilityPolicy::default()
         };
         let command = format!("seq 1 {last}");
-        let session = tempdir().unwrap();
         execute_shell(
             "bash",
             &["-c", &command],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(session).unwrap(),
             &policy,
             enforcement,
         )
@@ -1246,8 +1250,9 @@ mod tests {
         let enforcement = ShellEnforcement::environment_only()
             .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None);
         let records_root = enforcement.records_root().unwrap().clone();
+        let session = tempdir().unwrap();
 
-        let result = print_seq(workdir.path(), &enforcement, 20_000);
+        let result = print_seq(workdir.path(), session.path(), &enforcement, 20_000);
 
         assert!(result.truncated);
         assert_eq!(result.stdout.len(), MAX_SHELL_OUTPUT_BYTES);
@@ -1281,6 +1286,7 @@ mod tests {
             "nothing is written into the accessible workdir"
         );
         assert_eq!(fs::read_dir(workdir.path()).unwrap().count(), 0);
+        assert!(!session.path().join("logs").exists());
     }
 
     /// Outside a session there is no records directory, so a truncated command writes no log in
@@ -1306,7 +1312,8 @@ mod tests {
 
         for enforcement in [&without_roots, &roots_without_records] {
             let workdir = tempdir().unwrap();
-            let result = print_seq(workdir.path(), enforcement, 20_000);
+            let session = tempdir().unwrap();
+            let result = print_seq(workdir.path(), session.path(), enforcement, 20_000);
             assert!(result.truncated);
             assert_eq!(result.stdout.len(), MAX_SHELL_OUTPUT_BYTES);
             assert_eq!(result.full_output_path, None);
@@ -1314,6 +1321,10 @@ mod tests {
                 fs::read_dir(workdir.path()).unwrap().count(),
                 0,
                 "nothing is written into the workdir"
+            );
+            assert!(
+                !session.path().join("logs").exists(),
+                "nothing is written into the session workdir"
             );
         }
         assert!(!runtime.path().join("logs").exists());

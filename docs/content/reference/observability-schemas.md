@@ -412,11 +412,11 @@ down
 
 The last three are omitted rather than written as `null`, so a command still running produces a
 line carrying only the first four fields — `null` would read as a known-absent exit code rather
-than an unknown one. Their absence means no exit code exists and no log was
-written or ever will be: that file is written from the command's own runtime thread after the
+than an unknown one. Their absence means no exit code exists and no output log was written or
+ever will be: that file is written from the command's own runtime thread after the
 command exits, and that thread ends with the session.
 
-No task carries the result either way. The session does not wait for the command, its end kills
+No task carries the result either way. The session does not wait for the command; its end kills
 it, and one grouped report naming every discarded command is written to stderr and to
 `logs/bootstrap.log` in the session's [records directory](workdir.md#records-directory) — see
 [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs). A capsule whose `lifecycle`

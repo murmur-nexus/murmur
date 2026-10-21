@@ -2370,8 +2370,7 @@ still running, and whether its result will reach the model — it does only unde
 `task_acceptance: queue` with `after_task: sleep`, as described below. Its full stdout and stderr
 are written to `logs/<work_id>.log` in the session's
 [records directory](workdir.md#records-directory) and stay there; a result that reaches the model
-carries that file's absolute path, never the contents. A command run outside a session, where
-there is no records directory, is never moved to the background.
+carries that file's absolute path, never the contents.
 
 Nothing accepts a work id, so the handle cannot be used to ask after the command. The result
 arrives on its own, as a task with
@@ -2398,9 +2397,9 @@ lifecycle:
 
 The session does not wait for it. It kills it, together with every other process the session
 started — a server a shell call put in the background with `&` included — and the result is lost.
-The kill is stated rather than left silent. One report goes to stderr and to `logs/bootstrap.log`
-in the session's [records directory](workdir.md#records-directory), naming every such command's work id, binary, command text
-and how long it had been running, and each command also gets a
+One report goes to stderr and to `logs/bootstrap.log` in the session's
+[records directory](workdir.md#records-directory), naming every such command's work id, binary,
+command text and how long it had been running, and each command also gets a
 [`shell_abandoned`](observability-schemas.md#session-trace-tracejsonl) line in `trace.jsonl`.
 
 ```text

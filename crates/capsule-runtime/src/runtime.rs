@@ -4795,7 +4795,11 @@ fn launch(
                     // not `trace.jsonl`: there is no turn left to tell the agent in, so every
                     // remaining surface is the operator's.
                     if !abandoned.is_empty() {
-                        let report = detached::abandonment_report_text(&session_id, &records_root, &abandoned);
+                        let report = detached::abandonment_report_text(
+                            &session_id,
+                            &records_root,
+                            &abandoned,
+                        );
                         crate::runtime_err!("{report}");
                         agent::append_bootstrap_log(&records_root, &report);
                         for work in &abandoned {
