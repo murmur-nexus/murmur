@@ -1894,6 +1894,7 @@ pub(crate) async fn run_agent_loop(
                                         status.clone(),
                                         state_effect.clone(),
                                         resource_id.clone(),
+                                        outcome.runtime_error.as_deref(),
                                     )
                                     .await
                                     .map_err(|e| {
@@ -2023,6 +2024,7 @@ pub(crate) async fn run_agent_loop(
                                     // neither a state effect nor a resource identity.
                                     None,
                                     None,
+                                    Some(&error),
                                 )
                                 .await
                                 .map_err(|e| {

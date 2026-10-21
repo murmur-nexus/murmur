@@ -1184,6 +1184,60 @@ mod tests {
         }
     }
 
+    /// The same ceiling through a kernel tier's `pre_exec` setup while this process holds more
+    /// descriptors than the limit: the child inherits them until `execve`, so every descriptor the
+    /// setup creates is numbered above 16, and the rlimit must not be in force until that setup
+    /// is done.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kernel_tier_command_starts_under_a_limit_below_the_held_descriptors() {
+        const TEST: &str = "a_kernel_tier_command_starts_under_a_limit_below_the_held_descriptors";
+        if crate::network_namespace::skip_without_egress_namespace(TEST) {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            resources: crate::resources::HostResourceLimits {
+                max_open_files: 16,
+                ..crate::resources::HostResourceLimits::default()
+            },
+            ..CapabilityPolicy::default()
+        };
+        let enforcement = ShellEnforcement::resolve(
+            &policy,
+            murmur_artifact::ContainmentClass::Scoped,
+            crate::sandbox::HostProbe::probe(),
+        )
+        .unwrap()
+        .with_runtime_dir(crate::sandbox::test_runtime_dir(temp.path()), None);
+        if enforcement.tier != crate::sandbox::EnforcementTier::KernelFull {
+            crate::runtime_err!(
+                "[SKIP-HOST] {TEST}: this host resolves {:?}, the test needs KernelFull",
+                enforcement.tier
+            );
+            return;
+        }
+        let held: Vec<fs::File> = (0..128)
+            .map(|_| fs::File::open("/dev/null").unwrap())
+            .collect();
+
+        let result = execute_shell(
+            "bash",
+            &["-c", "ulimit -Hn"],
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &policy,
+            &enforcement,
+        )
+        .expect("bash must start under the limit");
+        drop(held);
+
+        assert_eq!(result.stdout.trim(), "16", "stderr was: {}", result.stderr);
+        assert_eq!(result.exit_code, 0, "stderr was: {}", result.stderr);
+    }
+
     /// With `RLIMIT_NPROC` left alone, `pids.max` is the only process bound on a scoped capsule,
     /// and it has to stop a fork bomb by itself and be named as what did. The children sleep
     /// rather than exit so every one of them holds a task in the scope until the loop gives up.

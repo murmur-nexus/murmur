@@ -572,6 +572,13 @@ struct ToolCallEvent {
     output_bytes: u64,
     duration_ms: u64,
     status: String,
+    /// The runtime's own text when it could not run the call, such as a native tool or shell
+    /// command whose sandbox setup failed before exec. Written under every [`TraceCapture`],
+    /// unlike `output`; peer handle tokens are redacted and the text is capped at
+    /// [`MAX_TASK_FAILURE_REASON_BYTES`] on a character boundary. Absent when the tool ran,
+    /// including when it reported its own failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
     /// The tool's self-declared `state_effect` for this call (`read`/`mutate`),
     /// lifted verbatim from `tool-result.metadata`. Absent when the tool declared
     /// nothing; consumers treat absence conservatively. See `wit/tool.wit`.
@@ -2568,6 +2575,7 @@ impl TraceWriter {
         status: String,
         state_effect: Option<String>,
         resource_id: Option<String>,
+        error: Option<&str>,
     ) -> std::io::Result<()> {
         // A peer handle reaches this event by an ordinary route — it is an argument the model
         // passed to `fetch-peer-file`, and every call's arguments are recorded. It is also a
@@ -2595,6 +2603,11 @@ impl TraceWriter {
             output_bytes,
             duration_ms,
             status,
+            error: error.map(|error| {
+                let redacted = crate::peer_handoff::redact_handle_tokens(error);
+                crate::agent::truncate_on_char_boundary(&redacted, MAX_TASK_FAILURE_REASON_BYTES)
+                    .to_string()
+            }),
             state_effect,
             resource_id,
         };
@@ -5936,6 +5949,7 @@ mod tests {
             "ok".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -5972,6 +5986,7 @@ mod tests {
             "ok".to_string(),
             Some("read".to_string()),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -6000,6 +6015,7 @@ mod tests {
             "ok".to_string(),
             Some("read".to_string()),
             Some("sym:Foo".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -6026,6 +6042,7 @@ mod tests {
             3,
             5,
             "ok".to_string(),
+            None,
             None,
             None,
         )
@@ -6142,6 +6159,7 @@ mod tests {
             20,
             5,
             "ok".to_string(),
+            None,
             None,
             None,
         )
@@ -6281,6 +6299,7 @@ mod tests {
             "ok".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -6358,6 +6377,7 @@ mod tests {
             "ok".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -6368,6 +6388,77 @@ mod tests {
         assert_eq!(e["event_type"], "tool_call");
         assert_eq!(e["input"]["command"], "ls -la");
         assert!(e.get("input").is_some(), "input must always be present");
+    }
+
+    /// The `tool_call` record `w` writes for one failed call carrying `error`, read back.
+    async fn tool_call_with_error(
+        dir: &std::path::Path,
+        capture: TraceCapture,
+        error: Option<&str>,
+    ) -> Value {
+        let mut w = make_writer_with_opts(dir, capture).await;
+        w.write_tool_call(
+            0,
+            "tool-fixture".to_string(),
+            Some("toolu_1".to_string()),
+            serde_json::json!({}),
+            2,
+            "native tool execution failed",
+            28,
+            3,
+            "error".to_string(),
+            None,
+            None,
+            error,
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+        read_events(dir).remove(0)
+    }
+
+    #[tokio::test]
+    async fn tool_call_error_is_written_without_output_under_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "sandbox: native tool enforcement setup failed before exec: Landlock: \
+                    Too many open files (os error 24)";
+        let e = tool_call_with_error(dir.path(), TraceCapture::Meta, Some(text)).await;
+        assert_eq!(e["error"], text);
+        assert!(e.get("output").is_none(), "meta stores no output: {e}");
+    }
+
+    #[tokio::test]
+    async fn tool_call_error_is_written_under_every_capture() {
+        for capture in [
+            TraceCapture::None,
+            TraceCapture::Meta,
+            TraceCapture::Content,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let e = tool_call_with_error(dir.path(), capture, Some("spawn failed")).await;
+            assert_eq!(e["error"], "spawn failed", "{capture:?}: {e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_error_is_capped_on_a_char_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        // 3,000 characters: one ASCII byte, then two-byte characters, so the cap's byte offset
+        // falls inside a character.
+        let long = format!("a{}", "é".repeat(2_999));
+        assert_eq!(long.chars().count(), 3_000);
+        let e = tool_call_with_error(dir.path(), TraceCapture::Meta, Some(&long)).await;
+        let error = e["error"].as_str().unwrap();
+        assert!(error.len() <= MAX_TASK_FAILURE_REASON_BYTES);
+        assert!(error.len() > MAX_TASK_FAILURE_REASON_BYTES - 2);
+        assert!(long.starts_with(error));
+    }
+
+    #[tokio::test]
+    async fn tool_call_without_an_error_has_no_error_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tool_call_with_error(dir.path(), TraceCapture::Meta, None).await;
+        assert!(e.get("error").is_none(), "{e}");
     }
 
     #[tokio::test]
@@ -6384,6 +6475,7 @@ mod tests {
             90,
             8,
             "ok".to_string(),
+            None,
             None,
             None,
         )
@@ -6443,6 +6535,7 @@ mod tests {
             "ok".to_string(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -6484,6 +6577,7 @@ mod tests {
             60,
             5,
             "ok".to_string(),
+            None,
             None,
             None,
         )
@@ -6759,6 +6853,7 @@ mod tests {
             3,
             5,
             "ok".to_string(),
+            None,
             None,
             None,
         )
@@ -7286,6 +7381,7 @@ mod tests {
                 0,
                 1,
                 "ok".to_string(),
+                None,
                 None,
                 None,
             )
