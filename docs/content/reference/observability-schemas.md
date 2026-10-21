@@ -488,7 +488,7 @@ left as it was
 | `reason` | string | `"no_hook_replacement"` when no bound hook returned `replace-context`; `"unresolved_tool_call"` when a hook's replacement was discarded because its tool calls and tool results did not pair up |
 
 The session continues over budget on both. Each decline is also written to
-`workdir/logs/bootstrap.log`. A trace can hold any number of them, and a `compaction_declined` on
+`logs/bootstrap.log` in the session's records directory. A trace can hold any number of them, and a `compaction_declined` on
 one turn does not stop a later turn from compacting successfully.
 
 **`context_seed`**{ #context-seed } — written once per task whose `on-task-start` hook returned
@@ -521,7 +521,7 @@ one turn does not stop a later turn from compacting successfully.
 
 A rejection never fails the task: the seed is dropped, the task runs without it, and a
 `hook_dispatch_error` with `arm: "seed-rejected"` is written alongside naming the same hook. Every
-outcome is also written to `workdir/logs/bootstrap.log`. A capsule with no seeding hook, or one
+outcome is also written to `logs/bootstrap.log` in the session's records directory. A capsule with no seeding hook, or one
 whose bound hook returned `none`, writes no `context_seed` line at all.
 
 **`session_end`** — written once per launch, after the `on-session-end` hooks fire and the task
@@ -1389,7 +1389,7 @@ failed early. A `"canceled"` run settles every step, so its counts sum to `steps
 
 - A trace write that fails ends the session with `E-RUN-007` (see [Diagnostics](diagnostics.md)).
   The exceptions are `compaction`, `compaction_declined` and `context_seed`: that failure is
-  logged to `workdir/logs/bootstrap.log` and the session continues.
+  logged to `logs/bootstrap.log` in the session's records directory and the session continues.
 - When the launch fails before `session_start` is written (a missing driver artifact, for
   example), `trace.jsonl` is created but empty. No `session_end` is written, because no session
   started.

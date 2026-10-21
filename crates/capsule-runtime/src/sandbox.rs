@@ -4662,9 +4662,8 @@ mod linux_enforce {
         /// `super::landlock_device_grants`. Opened by the grants' rules: the list is a
         /// compile-time constant rather than manifest-derived, and a host where one entry cannot
         /// be opened — unusual, but a broken or minimal `/dev` is possible — loses that one device
-        /// rather than failing the launch. Losing `/dev/null` here degrades to exactly the
-        /// behavior that existed before this mechanism, which is a strictly narrower scope, never
-        /// a wider one.
+        /// rather than failing the launch. A lost device, `/dev/null` included, narrows the
+        /// capsule's scope and never widens it.
         pub(super) device_grants: &'a [super::CapsuleDeviceGrant],
         /// Carried into [`LandlockChildFds::workdir_exec`].
         pub(super) workdir_exec: bool,

@@ -134,7 +134,7 @@ cat workdir/*/out/result.txt
 
 ## Step 5 — inspect the run
 
-Every session writes a structured `trace.jsonl` under its workdir. `mur trace show` reads the most recent one and prints a human-readable summary — turns, token usage, tool calls, and exit status:
+Every session writes a structured `trace.jsonl` to its records directory. `mur trace show` reads the most recent one and prints a human-readable summary — turns, token usage, tool calls, and exit status:
 
 ```bash
 mur trace show

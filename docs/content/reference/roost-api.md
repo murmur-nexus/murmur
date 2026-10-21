@@ -446,7 +446,7 @@ it are composed by the capsule's own runtime, so **a delegating capsule needs no
 | `session_id` | string | `ses_…`, the child's own session |
 | `capsule`, `version` | string | The artifact that was launched, `capsule` by its bare name |
 | `status` | string | `started` or `failed`. A refused call returns no object — see below |
-| `child_workdir` | string | The child's directory, relative to the delegating capsule's accessible workdir — where its own `trace.jsonl` is, and where its result will be. Present only on `started` |
+| `child_workdir` | string | The child's directory, relative to the delegating capsule's accessible workdir — where its result will be. Its `trace.jsonl` is in its own [records directory](workdir.md#records-directory). Present only on `started` |
 | `output` | string | Why there is no delegation, on `failed`. Absent on `started`, which has produced nothing yet |
 
 `started` means the sub-capsule is running **and holding its task**, not merely that a process

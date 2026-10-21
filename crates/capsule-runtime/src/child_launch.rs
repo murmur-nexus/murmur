@@ -358,7 +358,8 @@ fn end_process(process: &Mutex<ChildProcess>) -> Result<(), std::io::Error> {
 /// A running child capsule and the handles to end it.
 pub struct LaunchedChild {
     /// The directory the parent created for this child, and passed as its `--workdir`. The
-    /// child's own session artifacts land at `<workdir>/.murmur/<session_id>/`.
+    /// child's session workdir is `<workdir>/.murmur/<session_id>/`; its trace and
+    /// `completion.json` are in [`Self::records_dir`].
     pub workdir: PathBuf,
     /// [`Self::workdir`] relative to [`Self::parent_root`], the form every runtime read and write
     /// of the child's files goes through.

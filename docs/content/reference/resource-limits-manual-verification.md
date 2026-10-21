@@ -456,9 +456,9 @@ error[E-RUN-012]: this capsule can spawn native subprocesses but no cgroup v2 sc
 `{reason}` names what the host is missing, such as the delegated cgroup directory or a
 controller the runtime needs.
 
-Confirm no shell subprocess ran at all — the newest session's `trace.jsonl` in its
-[records directory](workdir.md#records-directory), which `mur trace list --workdir workdir` names,
-must contain no `shell` event.
+Confirm no shell subprocess ran at all: the newest session `mur trace list --workdir workdir`
+lists is the refused launch, and its [records directory](workdir.md#records-directory) holds no
+`trace.jsonl`, so no `shell` event was recorded.
 
 **7b — WASM-only capsule, no delegation → launch proceeds.** Delete the whole `capabilities:`
 block (or leave only `network:`), keeping delegation removed:
