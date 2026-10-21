@@ -10071,6 +10071,13 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
     #[test]
     #[allow(clippy::print_stdout)]
     fn a_truncated_log_reads_back_through_the_shell_tool_and_refuses_a_write() {
+        // A host that cannot give the session its network namespace refuses the session at
+        // staging, so there is no session enforcement to run under.
+        if crate::network_namespace::skip_without_egress_namespace(
+            "a_truncated_log_reads_back_through_the_shell_tool_and_refuses_a_write",
+        ) {
+            return;
+        }
         let base = home_tempdir();
         let workdir = home_tempdir();
         let policy = CapabilityPolicy {
