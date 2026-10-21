@@ -2368,8 +2368,9 @@ Every command starts in the foreground and the clock decides.
 A backgrounded command hands the turn a handle of the form `wrk_<id>`, the fact that it is
 still running, and whether its result will reach the model — it does only under
 `task_acceptance: queue` with `after_task: sleep`, as described below. Its full stdout and stderr
-are written to `logs/<work_id>.log` under the [capsule workdir](workdir.md) and stay there; a
-result that reaches the model carries the path, never the contents.
+are written to `logs/<work_id>.log` in the session's
+[records directory](workdir.md#records-directory) and stay there; a result that reaches the model
+carries that file's absolute path, never the contents.
 
 Nothing accepts a work id, so the handle cannot be used to ask after the command. The result
 arrives on its own, as a task with
@@ -2396,9 +2397,9 @@ lifecycle:
 
 The session does not wait for it. It kills it, together with every other process the session
 started — a server a shell call put in the background with `&` included — and the result is lost.
-The kill is stated rather than left silent. One report goes to stderr and to `logs/bootstrap.log`
-under the [capsule workdir](workdir.md), naming every such command's work id, binary, command text
-and how long it had been running, and each command also gets a
+One report goes to stderr and to `logs/bootstrap.log` in the session's
+[records directory](workdir.md#records-directory), naming every such command's work id, binary,
+command text and how long it had been running, and each command also gets a
 [`shell_abandoned`](observability-schemas.md#session-trace-tracejsonl) line in `trace.jsonl`.
 
 ```text
@@ -2410,7 +2411,7 @@ work_id: wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2
 binary: /usr/bin/bash
 command: sleep 45; echo done
 state: killed at session end after 45012 ms
-result: none — it was killed before it finished, so no task carries an exit code. Whatever it wrote reaches logs/wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2.log only if the runtime wrote that file before it exited.
+result: none — it was killed before it finished, so no task carries an exit code. Whatever it wrote reaches /home/dev/.murmur/records/home/dev/proj/ses_01k4m2y7xq8f9v3n5r7t9w1c2e/logs/wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2.log only if the runtime wrote that file before it exited.
 
 A session's end kills every command it demoted and every process its shell calls started in the background. Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep for a session that outlives its task and can be told the result instead.
 ```
@@ -2423,7 +2424,7 @@ instead:
 state: finished during teardown after 2014 ms
 status: ok
 exit_code: 0
-output: logs/wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2.log (91 bytes, in the capsule workdir)
+output: /home/dev/.murmur/records/home/dev/proj/ses_01k4m2y7xq8f9v3n5r7t9w1c2e/logs/wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2.log (91 bytes)
 result: on disk — it finished too late for any task to carry it back to the agent.
 ```
 

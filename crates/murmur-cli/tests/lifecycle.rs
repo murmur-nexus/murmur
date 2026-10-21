@@ -847,13 +847,17 @@ fn lifecycle_a_detached_command_completes_as_a_background_task() {
     );
     assert_eq!(completed[0]["exit_code"], 0);
     assert_eq!(completed[0]["status"], "ok");
+    let log = trace_path
+        .parent()
+        .unwrap()
+        .join("logs")
+        .join(format!("{}.log", detached[0]["work_id"].as_str().unwrap()));
     assert_eq!(
         completed[0]["output_path"],
-        Value::String(format!(
-            "logs/{}.log",
-            detached[0]["work_id"].as_str().unwrap()
-        ))
+        Value::String(log.to_string_lossy().into_owned()),
+        "the completion names the log by its absolute path in the records directory"
     );
+    assert!(log.exists(), "the named log is on disk");
 
     // Under queue + sleep the demotion result tells the model the result will arrive.
     let after_demotion = server.requests()[1].to_string();
@@ -1044,9 +1048,11 @@ fn lifecycle_a_command_still_running_at_exit_is_reported_to_the_operator() {
         "the report says the session's end killed it, and how long it had been running; report \
          was: {report}"
     );
+    let log = records_dir.join("logs").join(format!("{work_id}.log"));
     assert!(
-        report.contains(&format!("logs/{work_id}.log only if")),
-        "the report names the output file without promising it; report was: {report}"
+        report.contains(&format!("{} only if", log.display())),
+        "the report names the output file by its absolute path without promising it; report \
+         was: {report}"
     );
 }
 
@@ -1188,18 +1194,24 @@ fn lifecycle_a_command_that_finished_during_teardown_is_reported_with_its_result
     assert_eq!(abandoned[0]["work_id"], detached[0]["work_id"]);
     assert_eq!(abandoned[0]["exit_code"], 0);
     let work_id = detached[0]["work_id"].as_str().unwrap();
+    let log = records_dir.join("logs").join(format!("{work_id}.log"));
     assert_eq!(
         abandoned[0]["output_path"],
-        Value::String(format!("logs/{work_id}.log"))
+        Value::String(log.to_string_lossy().into_owned())
+    );
+    assert!(
+        report.contains(&format!("output: {} (", log.display())),
+        "report was: {report}"
     );
     assert!(
         abandoned[0]["output_bytes"].as_u64().unwrap() > 0,
         "the output log was written before the sweep ran: {}",
         abandoned[0]
     );
+    assert!(log.exists(), "the report names a file that is on disk");
     assert!(
-        workdir.join("logs").join(format!("{work_id}.log")).exists(),
-        "the report names a file that is on disk"
+        !workdir.join("logs").exists(),
+        "nothing is written into the work folder"
     );
     assert!(
         events_named(&events, "shell_completed").is_empty(),

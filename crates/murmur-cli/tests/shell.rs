@@ -559,6 +559,11 @@ fn shell_records_work_abandoned_when_the_session_ends() {
         stderr.contains(work_id),
         "stderr must name the abandoned work id {work_id}:\n{stderr}"
     );
+    let log = records_dir.join("logs").join(format!("{work_id}.log"));
+    assert!(
+        stderr.contains(&format!("reaches {} only if", log.display())),
+        "the report names the log by its absolute path in the records directory:\n{stderr}"
+    );
 
     let session_end = events_of_type(&events, "session_end");
     assert_eq!(session_end.len(), 1, "the session still ends normally");
@@ -790,7 +795,7 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
         "the report must not open like a completion:\n{message}"
     );
     assert!(
-        !message.contains(&format!("logs/{work_id}.log")),
+        !message.contains(&format!("{work_id}.log")),
         "no log file exists, so the report names none:\n{message}"
     );
 
@@ -818,10 +823,13 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
             );
         }
     }
-    assert!(
-        !resumed_workdir.join(format!("logs/{work_id}.log")).exists(),
-        "a killed runtime writes no output log"
-    );
+    for dir in [&killed_dir, &resumed_dir] {
+        assert!(
+            !dir.join("logs").join(format!("{work_id}.log")).exists(),
+            "a killed runtime writes no output log"
+        );
+    }
+    assert!(!resumed_workdir.join("logs").exists());
 
     // ── Second resume: the marker has cleared it ──
     let status = spawn_mur_run(

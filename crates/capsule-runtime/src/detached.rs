@@ -39,11 +39,32 @@ pub fn new_work_id() -> String {
     format!("{WORK_ID_PREFIX}{}", uuid::Uuid::now_v7().simple())
 }
 
-/// Where a demoted command's full output lands, relative to the capsule workdir.
+/// A shell command's full-output log in the session's records directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutputLog {
+    /// Relative to the records directory, `logs/<stem>.log`: what the writer opens and measures
+    /// through the records root.
+    pub relative: String,
+    /// The absolute host path, the one name every text gives the log. A shell command, a plan
+    /// shell step, a native tool and a process harness can all open it; a WASM tool cannot.
+    pub path: String,
+}
+
+/// Where the full output of the shell command named `stem` lands: `logs/<stem>.log` in the
+/// session's records directory. The stem is the work id for a demoted command and `shell-<ms>`
+/// for a foreground command whose output passed [`crate::shell::MAX_SHELL_OUTPUT_BYTES`].
 ///
-/// One rule, used by the writer and by every reader that has to find the file again.
-pub(crate) fn output_path_for(work_id: &str) -> String {
-    format!("logs/{work_id}.log")
+/// One rule, used by the writer and by every reader that has to name the file.
+pub(crate) fn output_path_for(
+    records_root: &crate::workdir_fs::WorkdirRoot,
+    stem: &str,
+) -> OutputLog {
+    let relative = format!("logs/{stem}.log");
+    let path = records_root
+        .host_path(&relative)
+        .to_string_lossy()
+        .into_owned();
+    OutputLog { relative, path }
 }
 
 /// A demoted command the session is no longer waiting for.
@@ -70,8 +91,8 @@ pub(crate) struct DetachedCompletion {
     pub command: String,
     pub exit_code: i32,
     pub duration_ms: u64,
-    /// Workdir-relative, always `logs/<work_id>.log`. Named even when [`Self::error`] is set, so
-    /// a reader knows where the output was meant to be.
+    /// The log's absolute path, [`output_path_for`]'s [`OutputLog::path`] for this work id. Named
+    /// even when [`Self::error`] is set, so a reader knows where the output was meant to be.
     pub output_path: String,
     /// Bytes written to that file, header included.
     pub output_bytes: u64,
@@ -100,7 +121,7 @@ impl DetachedCompletion {
              status: {}\n\
              exit_code: {}\n\
              duration_ms: {}\n\
-             output: {} ({} bytes, in the capsule workdir)",
+             output: {} ({} bytes)",
             self.work_id,
             self.binary,
             self.command,
@@ -313,7 +334,7 @@ impl DetachPolicy {
 #[derive(Debug, Clone)]
 pub(crate) enum AbandonedDisposition {
     /// Running when the session ended, and killed with it. No exit code reaches any task.
-    /// `logs/<work_id>.log` is written only if the command's own runtime thread reaps it and
+    /// Its log is written only if the command's own runtime thread reaps it and
     /// writes the file before the process exits, so the report neither promises nor denies it.
     StillRunning {
         /// From spawn to the sweep, foreground portion included.
@@ -326,8 +347,7 @@ pub(crate) enum AbandonedDisposition {
         exit_code: i32,
         /// From spawn to exit, foreground portion included.
         duration_ms: u64,
-        /// Workdir-relative, always `logs/<work_id>.log`, and on disk by the time this arm is
-        /// built.
+        /// As [`DetachedCompletion::output_path`], and on disk by the time this arm is built.
         output_path: String,
         output_bytes: u64,
         resource_limit: Option<String>,
@@ -379,7 +399,8 @@ impl AbandonedWork {
 }
 
 /// The grouped operator report for every command one session discarded, as it lands on stderr and
-/// in `logs/bootstrap.log`.
+/// in the records directory's `logs/bootstrap.log`. `records_root` is the session's records
+/// directory, which a still-running command's log path is named in.
 ///
 /// One block for the whole session rather than a line per command: a session that discarded ten
 /// commands must state the condition once and then enumerate, or the condition is lost in the
@@ -387,7 +408,11 @@ impl AbandonedWork {
 /// recovered and nothing can be, which is false here: this session's registry was alive, so the
 /// running time is known, and a command that finished during teardown has its exit code and its
 /// output log on disk.
-pub(crate) fn abandonment_report_text(session_id: &str, abandoned: &[AbandonedWork]) -> String {
+pub(crate) fn abandonment_report_text(
+    session_id: &str,
+    records_root: &crate::workdir_fs::WorkdirRoot,
+    abandoned: &[AbandonedWork],
+) -> String {
     let count = abandoned.len();
     let plural = if count == 1 { "command" } else { "commands" };
     let mut text = format!(
@@ -409,7 +434,7 @@ pub(crate) fn abandonment_report_text(session_id: &str, abandoned: &[AbandonedWo
                      result: none — it was killed before it finished, so no task carries an exit \
                      code. Whatever it wrote reaches {} only if the runtime wrote that file \
                      before it exited.\n",
-                    output_path_for(&work.work_id)
+                    output_path_for(records_root, &work.work_id).path
                 ));
             }
             AbandonedDisposition::FinishedTooLate {
@@ -433,7 +458,7 @@ pub(crate) fn abandonment_report_text(session_id: &str, abandoned: &[AbandonedWo
                     text.push_str(&format!("wait_error: {error}\n"));
                 }
                 text.push_str(&format!(
-                    "output: {output_path} ({output_bytes} bytes, in the capsule workdir)\n\
+                    "output: {output_path} ({output_bytes} bytes)\n\
                      result: on disk — it finished too late for any task to carry it back to the \
                      agent.\n"
                 ));
@@ -456,7 +481,7 @@ pub(crate) fn abandonment_report_text(session_id: &str, abandoned: &[AbandonedWo
 /// Reconstructed from the prior session's `shell_detached` line, which is the only trace of it
 /// that survives: [`DetachedRegistry`] lives in process memory, and [`crate::shell`] writes the
 /// output log from a runtime thread after `child.wait()` returns, so a runtime killed with
-/// `SIGKILL` leaves no `logs/<work id>.log` even for a command that ran to a clean exit.
+/// `SIGKILL` leaves no output log even for a command that ran to a clean exit.
 #[derive(Debug, Clone)]
 pub(crate) struct LostWork {
     pub work_id: String,
@@ -539,7 +564,7 @@ mod tests {
     use super::*;
 
     use std::{
-        path::Path,
+        path::{Path, PathBuf},
         time::{Duration, Instant},
     };
 
@@ -557,10 +582,37 @@ mod tests {
         }
     }
 
+    /// The records directory [`crate::sandbox::test_runtime_dir`] creates under `base`.
+    fn records_dir(base: &Path) -> PathBuf {
+        base.join(crate::records_dir::RECORDS_DIR_NAME)
+    }
+
     /// `run_shell` against `bash -c <script>` with a grace period, returning the outcome and the
-    /// registry the completion (if any) will arrive on.
+    /// registry the completion (if any) will arrive on. The session's runtime directory roots,
+    /// its records directory among them, are created under `runtime_base`.
     fn detached_run(
         workdir: &Path,
+        runtime_base: &Path,
+        script: &str,
+        grace: Duration,
+    ) -> (
+        ShellOutcome,
+        Arc<DetachedRegistry>,
+        UnboundedReceiver<DetachedReport>,
+    ) {
+        detached_run_with(
+            workdir,
+            &ShellEnforcement::environment_only()
+                .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime_base), None),
+            script,
+            grace,
+        )
+    }
+
+    /// [`detached_run`] under `enforcement`.
+    fn detached_run_with(
+        workdir: &Path,
+        enforcement: &ShellEnforcement,
         script: &str,
         grace: Duration,
     ) -> (
@@ -576,7 +628,7 @@ mod tests {
             &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             &bash_policy(),
-            &ShellEnforcement::environment_only(),
+            enforcement,
             Some(DetachPolicy {
                 grace,
                 delivered: true,
@@ -642,7 +694,7 @@ mod tests {
             command: "sleep 3".to_string(),
             exit_code: 0,
             duration_ms: 3_000,
-            output_path: "logs/wrk_0001.log".to_string(),
+            output_path: "/home/test/.murmur/records/work/ses_1/logs/wrk_0001.log".to_string(),
             output_bytes: 0,
             resource_limit: None,
             context_id: "ctx_1".to_string(),
@@ -676,7 +728,7 @@ mod tests {
             command: "make -j64".to_string(),
             exit_code: 1,
             duration_ms: 3_000,
-            output_path: "logs/wrk_0001.log".to_string(),
+            output_path: "/home/test/.murmur/records/work/ses_1/logs/wrk_0001.log".to_string(),
             output_bytes: 0,
             resource_limit: Some("cgroup_pids_max".into()),
             context_id: "ctx_1".to_string(),
@@ -703,11 +755,13 @@ mod tests {
     #[test]
     fn a_command_outrunning_the_grace_period_is_demoted() {
         let workdir = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
         let started = Instant::now();
         // The output word is spelled nowhere in the command, so finding it in the completion
         // would mean the output leaked into the turn rather than merely being echoed back.
         let (outcome, registry, mut receiver) = detached_run(
             workdir.path(),
+            runtime.path(),
             "sleep 3; printf 'fin%s' 'ished-marker'",
             Duration::from_secs(1),
         );
@@ -747,10 +801,14 @@ mod tests {
         assert_eq!(completion.work_id, info.work_id);
         assert_eq!(completion.exit_code, 0);
         assert_eq!(completion.status(), "ok");
+        let expected_path = records_dir(runtime.path())
+            .join("logs")
+            .join(format!("{}.log", info.work_id));
+        assert!(expected_path.is_absolute());
         assert_eq!(
             completion.output_path,
-            format!("logs/{}.log", info.work_id),
-            "the completion names logs/<work_id>.log"
+            expected_path.to_string_lossy(),
+            "the completion names <records dir>/logs/<work_id>.log by its absolute path"
         );
         assert_eq!(completion.provenance.origin(), TaskOrigin::Completion);
         assert_eq!(completion.provenance.trust(), TrustClass::Trusted);
@@ -760,25 +818,75 @@ mod tests {
             "a completed command is no longer outstanding"
         );
 
-        let log = std::fs::read_to_string(workdir.path().join(&completion.output_path))
+        let log = std::fs::read_to_string(&completion.output_path)
             .expect("the completion's output file exists");
         assert!(
             log.contains("finished-marker"),
             "the output is in the log: {log}"
         );
+        assert_eq!(completion.output_bytes, log.len() as u64);
+        let text = completion.message_text();
         assert!(
-            !completion.message_text().contains("finished-marker"),
-            "the output never reaches the agent: {}",
-            completion.message_text()
+            !text.contains("finished-marker"),
+            "the output never reaches the agent: {text}"
         );
+        assert!(
+            text.contains(&format!(
+                "output: {} ({} bytes)",
+                completion.output_path, completion.output_bytes
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("in the capsule workdir"), "{text}");
+        assert!(
+            !workdir.path().join("logs").exists(),
+            "nothing is written into the accessible workdir"
+        );
+    }
+
+    /// With no records directory there is nowhere to keep a demoted command's output, so a
+    /// command that outruns its grace period runs to completion in the foreground instead.
+    #[test]
+    fn with_no_records_directory_a_slow_command_is_not_demoted() {
+        let workdir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let (outcome, registry, mut receiver) = detached_run_with(
+            workdir.path(),
+            &ShellEnforcement::environment_only(),
+            "sleep 2; echo done",
+            Duration::from_millis(200),
+        );
+
+        let result = match outcome {
+            ShellOutcome::Finished(result) => result,
+            ShellOutcome::Detached(info) => {
+                panic!(
+                    "no records directory, yet the command was demoted as {}",
+                    info.work_id
+                )
+            }
+        };
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert_eq!(result.stdout.trim(), "done");
+        assert!(registry.outstanding().is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(!workdir.path().join("logs").exists());
     }
 
     /// A command that beats the grace period returns its result to the turn and registers nothing.
     #[test]
     fn a_fast_command_finishes_in_the_foreground() {
         let workdir = tempfile::tempdir().unwrap();
-        let (outcome, registry, mut receiver) =
-            detached_run(workdir.path(), "echo hi", Duration::from_secs(10));
+        let runtime = tempfile::tempdir().unwrap();
+        let (outcome, registry, mut receiver) = detached_run(
+            workdir.path(),
+            runtime.path(),
+            "echo hi",
+            Duration::from_secs(10),
+        );
 
         let result = match outcome {
             ShellOutcome::Finished(result) => result,
@@ -804,8 +912,10 @@ mod tests {
     #[test]
     fn a_failing_detached_command_completes_with_its_exit_code() {
         let workdir = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
         let (outcome, _registry, mut receiver) = detached_run(
             workdir.path(),
+            runtime.path(),
             "sleep 3; echo to-stderr >&2; exit 7",
             Duration::from_secs(1),
         );
@@ -820,7 +930,7 @@ mod tests {
             completion.message_text()
         );
 
-        let log = std::fs::read_to_string(workdir.path().join(&completion.output_path)).unwrap();
+        let log = std::fs::read_to_string(&completion.output_path).unwrap();
         let stderr_section = log
             .split("Stderr:")
             .nth(1)
@@ -830,8 +940,12 @@ mod tests {
             "stderr is in the log's Stderr section: {log}"
         );
 
-        let (outcome, _registry, mut receiver) =
-            detached_run(workdir.path(), "sleep 3; exit 0", Duration::from_secs(1));
+        let (outcome, _registry, mut receiver) = detached_run(
+            workdir.path(),
+            runtime.path(),
+            "sleep 3; exit 0",
+            Duration::from_secs(1),
+        );
         assert!(matches!(outcome, ShellOutcome::Detached(_)));
         assert_eq!(await_completion(&mut receiver).status(), "ok");
     }
@@ -975,7 +1089,17 @@ mod tests {
         }
     }
 
-    fn finished_too_late(work_id: &str) -> AbandonedWork {
+    /// A records directory for the report tests, which name paths in it and write nothing.
+    fn report_records() -> (tempfile::TempDir, crate::workdir_fs::WorkdirRoot) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap();
+        (dir, root)
+    }
+
+    fn finished_too_late(
+        records_root: &crate::workdir_fs::WorkdirRoot,
+        work_id: &str,
+    ) -> AbandonedWork {
         AbandonedWork {
             work_id: work_id.to_string(),
             binary: "/usr/bin/bash".to_string(),
@@ -983,7 +1107,7 @@ mod tests {
             disposition: AbandonedDisposition::FinishedTooLate {
                 exit_code: 0,
                 duration_ms: 2_014,
-                output_path: output_path_for(work_id),
+                output_path: output_path_for(records_root, work_id).path,
                 output_bytes: 91,
                 resource_limit: None,
                 wait_error: None,
@@ -998,7 +1122,12 @@ mod tests {
     /// promising it.
     #[test]
     fn a_still_running_command_is_reported_as_killed_with_what_is_known() {
-        let text = abandonment_report_text("ses_abc", &[still_running("wrk_0a1b", 45_012)]);
+        let (records, records_root) = report_records();
+        let text = abandonment_report_text(
+            "ses_abc",
+            &records_root,
+            &[still_running("wrk_0a1b", 45_012)],
+        );
 
         assert!(
             text.contains("1 background shell command discarded"),
@@ -1012,7 +1141,11 @@ mod tests {
             text.contains("state: killed at session end after 45012 ms"),
             "{text}"
         );
-        assert!(text.contains("reaches logs/wrk_0a1b.log only if"), "{text}");
+        let path = records.path().join("logs/wrk_0a1b.log");
+        assert!(
+            text.contains(&format!("reaches {} only if", path.display())),
+            "the report names the log by its absolute path: {text}"
+        );
         assert!(
             !text.contains("will be written"),
             "the file is neither promised nor denied: {text}"
@@ -1036,7 +1169,12 @@ mod tests {
     /// fidelity a clean exit has and a killed runtime does not.
     #[test]
     fn a_command_that_finished_during_teardown_is_reported_with_its_result() {
-        let text = abandonment_report_text("ses_abc", &[finished_too_late("wrk_0c2d")]);
+        let (records, records_root) = report_records();
+        let text = abandonment_report_text(
+            "ses_abc",
+            &records_root,
+            &[finished_too_late(&records_root, "wrk_0c2d")],
+        );
 
         assert!(
             text.contains("state: finished during teardown after 2014 ms"),
@@ -1044,10 +1182,12 @@ mod tests {
         );
         assert!(text.contains("status: ok"), "{text}");
         assert!(text.contains("exit_code: 0"), "{text}");
+        let path = records.path().join("logs/wrk_0c2d.log");
         assert!(
-            text.contains("output: logs/wrk_0c2d.log (91 bytes, in the capsule workdir)"),
+            text.contains(&format!("output: {} (91 bytes)\n", path.display())),
             "{text}"
         );
+        assert!(!text.contains("in the capsule workdir"), "{text}");
         assert!(!text.contains("killed at session end"), "{text}");
     }
 
@@ -1055,9 +1195,14 @@ mod tests {
     /// states the condition once and enumerates below it.
     #[test]
     fn the_report_states_the_condition_once_and_enumerates_every_command() {
+        let (_records, records_root) = report_records();
         let text = abandonment_report_text(
             "ses_abc",
-            &[still_running("wrk_0a1b", 12), finished_too_late("wrk_0c2d")],
+            &records_root,
+            &[
+                still_running("wrk_0a1b", 12),
+                finished_too_late(&records_root, "wrk_0c2d"),
+            ],
         );
 
         assert_eq!(
@@ -1074,7 +1219,8 @@ mod tests {
     /// [`DetachedCompletion::message_text`] carries it.
     #[test]
     fn an_attributed_resource_limit_is_named_in_the_report() {
-        let mut work = finished_too_late("wrk_0c2d");
+        let (_records, records_root) = report_records();
+        let mut work = finished_too_late(&records_root, "wrk_0c2d");
         if let AbandonedDisposition::FinishedTooLate {
             resource_limit,
             exit_code,
@@ -1086,7 +1232,7 @@ mod tests {
             *exit_code = 137;
             *status = "error";
         }
-        let text = abandonment_report_text("ses_abc", &[work]);
+        let text = abandonment_report_text("ses_abc", &records_root, &[work]);
 
         assert!(text.contains("resource_limit: memory"), "{text}");
         assert!(text.contains("status: error"), "{text}");
@@ -1100,11 +1246,13 @@ mod tests {
         assert_eq!(still_running("wrk_0a1b", 45_012).running_ms(), 45_012);
         assert!(still_running("wrk_0a1b", 45_012).recovered().is_none());
 
-        let finished = finished_too_late("wrk_0c2d");
+        let (records, records_root) = report_records();
+        let finished = finished_too_late(&records_root, "wrk_0c2d");
+        let path = records.path().join("logs/wrk_0c2d.log");
         assert_eq!(finished.running_ms(), 2_014);
         assert_eq!(
             finished.recovered(),
-            Some((0, "logs/wrk_0c2d.log", 91)),
+            Some((0, path.to_str().unwrap(), 91)),
             "the exit code, the output path and its byte count travel together"
         );
     }
@@ -1114,7 +1262,8 @@ mod tests {
     /// withholds the only thing that explains it.
     #[test]
     fn a_failed_wait_is_named_beside_the_status_it_explains() {
-        let mut work = finished_too_late("wrk_0c2d");
+        let (_records, records_root) = report_records();
+        let mut work = finished_too_late(&records_root, "wrk_0c2d");
         if let AbandonedDisposition::FinishedTooLate {
             wait_error, status, ..
         } = &mut work.disposition
@@ -1122,7 +1271,7 @@ mod tests {
             *wait_error = Some("no child processes".to_string());
             *status = "error";
         }
-        let text = abandonment_report_text("ses_abc", &[work]);
+        let text = abandonment_report_text("ses_abc", &records_root, &[work]);
 
         assert!(text.contains("status: error"), "{text}");
         assert!(text.contains("wait_error: no child processes"), "{text}");
@@ -1132,7 +1281,9 @@ mod tests {
     /// nothing was recovered and nothing can be, which is false here.
     #[test]
     fn the_report_does_not_claim_nothing_is_recoverable() {
-        let text = abandonment_report_text("ses_abc", &[still_running("wrk_0a1b", 12)]);
+        let (_records, records_root) = report_records();
+        let text =
+            abandonment_report_text("ses_abc", &records_root, &[still_running("wrk_0a1b", 12)]);
         assert!(
             !text.contains("Nothing about them was recovered"),
             "the clean-exit report is not the crash report: {text}"

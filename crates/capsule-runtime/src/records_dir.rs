@@ -8,6 +8,8 @@
 //!         ├── trace.jsonl
 //!         ├── blobs/<sha256>
 //!         ├── logs/bootstrap.log | otel.log | hook-<name>.log
+//!         ├── logs/shell-<ms>.log | <work-id>.log
+//!         │                                       a shell command's full output
 //!         ├── completion.json                     a delegated child's outcome
 //!         └── hooks/                              `.` of every hook declared
 //!                                                 `capabilities.filesystem.records: true`

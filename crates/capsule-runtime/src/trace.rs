@@ -664,7 +664,8 @@ struct ShellCompletedEvent {
     command: String,
     exit_code: i32,
     duration_ms: u64,
-    /// Workdir-relative path of the file holding the command's full stdout and stderr.
+    /// Absolute path of the file holding the command's full stdout and stderr,
+    /// `logs/<work_id>.log` in the session's records directory.
     output_path: String,
     output_bytes: u64,
     /// Attributed the same way [`ShellEvent::resource_limit`] is, and omitted on the same terms.
@@ -703,9 +704,9 @@ struct ShellAbandonedEvent {
     /// running.
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_code: Option<i32>,
-    /// Workdir-relative path of the file holding the command's full stdout and stderr, always
-    /// `logs/<work_id>.log`. Absent for a command still running, for which that file was never
-    /// written and never will be.
+    /// Absolute path of the file holding the command's full stdout and stderr,
+    /// `logs/<work_id>.log` in the session's records directory. Absent for a command still
+    /// running, for which that file was never written and never will be.
     #[serde(skip_serializing_if = "Option::is_none")]
     output_path: Option<String>,
     /// Size of that file. Present exactly when [`Self::output_path`] is.
@@ -5027,7 +5028,11 @@ mod tests {
                 "/usr/bin/bash",
                 "sleep 2; echo done",
                 2_014,
-                Some((0, "logs/wrk_0a1b2c3d4e5f6a7b.log", 91)),
+                Some((
+                    0,
+                    "/home/test/.murmur/records/work/ses_1/logs/wrk_0a1b2c3d4e5f6a7b.log",
+                    91,
+                )),
             )
             .await
             .unwrap();
@@ -5036,7 +5041,10 @@ mod tests {
         assert_eq!(event["event_type"], "shell_abandoned");
         assert_eq!(event["running_ms"], 2_014);
         assert_eq!(event["exit_code"], 0);
-        assert_eq!(event["output_path"], "logs/wrk_0a1b2c3d4e5f6a7b.log");
+        assert_eq!(
+            event["output_path"],
+            "/home/test/.murmur/records/work/ses_1/logs/wrk_0a1b2c3d4e5f6a7b.log"
+        );
         assert_eq!(event["output_bytes"], 91);
     }
 

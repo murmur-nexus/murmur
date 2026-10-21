@@ -2250,12 +2250,17 @@ impl ShellEnforcement {
         self.runtime_dir.as_ref().map(|roots| roots.runtime.path())
     }
 
-    /// The records directory's absolute path, the value of `$MURMUR_RECORDS_DIR`. `None` for an
-    /// enforcement held outside a session.
-    pub(crate) fn records_dir_path(&self) -> Option<&Path> {
+    /// The session's records directory, held. `None` for an enforcement held outside a session.
+    pub(crate) fn records_root(&self) -> Option<&crate::workdir_fs::WorkdirRoot> {
         self.runtime_dir
             .as_ref()
             .and_then(|roots| roots.records.as_ref())
+    }
+
+    /// The records directory's absolute path, the value of `$MURMUR_RECORDS_DIR`. `None` for an
+    /// enforcement held outside a session.
+    pub(crate) fn records_dir_path(&self) -> Option<&Path> {
+        self.records_root()
             .map(crate::workdir_fs::WorkdirRoot::path)
     }
 
@@ -9992,8 +9997,10 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             return;
         }
         let temp = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
         let policy = server_policy(&[]);
-        let enforcement = session_enforcement(&policy);
+        let enforcement =
+            session_enforcement(&policy).with_runtime_dir(test_runtime_dir(base.path()), None);
         let (registry, mut reports) = DetachedRegistry::new();
 
         let outcome = crate::shell::run_shell(
@@ -10040,7 +10047,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                 Err(error) => panic!("the demoted server never completed: {error}"),
             }
         };
-        let log = std::fs::read_to_string(temp.path().join(&completion.output_path))
+        let log = std::fs::read_to_string(&completion.output_path)
             .expect("the demoted command's log is written");
         println!(
             "demoted as {}; client exit {}; completion {} exit {}; log has ping: {}",
@@ -10054,6 +10061,101 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         assert_eq!(completion.exit_code, 0, "log: {log}");
         assert!(log.contains("ping"), "log: {log}");
 
+        enforcement.end_session();
+    }
+
+    /// A truncated command's log, named by its absolute path in the session's records directory,
+    /// reads back under the session's own enforcement: through the shell interpreter and through
+    /// a binary allowed on its own that gets the path as an argument. A write to it is refused,
+    /// on any tier that installs Landlock.
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn a_truncated_log_reads_back_through_the_shell_tool_and_refuses_a_write() {
+        // A host that cannot give the session its network namespace refuses the session at
+        // staging, so there is no session enforcement to run under.
+        if crate::network_namespace::skip_without_egress_namespace(
+            "a_truncated_log_reads_back_through_the_shell_tool_and_refuses_a_write",
+        ) {
+            return;
+        }
+        let base = home_tempdir();
+        let workdir = home_tempdir();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string(), "grep".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let enforcement = ShellEnforcement::resolve(
+            &policy,
+            murmur_artifact::ContainmentClass::Scoped,
+            HostProbe::probe(),
+        )
+        .expect("the policy resolves")
+        .with_runtime_dir(test_runtime_dir(base.path()), None);
+        let landlock = matches!(
+            enforcement.tier,
+            EnforcementTier::KernelFull | EnforcementTier::KernelSealed
+        );
+        println!(
+            "tier {:?}; landlock ABI {:?}",
+            enforcement.tier,
+            detect_landlock_abi()
+        );
+
+        // A builtin loop: only `bash` and `grep` are executable under Landlock.
+        let printed = run_bash_in(
+            workdir.path(),
+            "for ((i = 1; i <= 20000; i++)); do echo $i; done",
+            &policy,
+            &enforcement,
+        );
+        assert_eq!(printed.exit_code, 0, "{}", printed.stderr);
+        assert!(printed.truncated);
+        let path = printed
+            .full_output_path
+            .clone()
+            .expect("a truncated command names its log");
+        assert!(path.starts_with(enforcement.records_dir_path().unwrap().to_str().unwrap()));
+        let before = std::fs::read(&path).unwrap();
+
+        let through_bash = run_bash_in(
+            workdir.path(),
+            &format!("grep -x 20000 {path}"),
+            &policy,
+            &enforcement,
+        );
+        assert_eq!(through_bash.exit_code, 0, "{}", through_bash.stderr);
+        assert_eq!(through_bash.stdout, "20000\n");
+
+        let through_grep = crate::shell::execute_shell(
+            "grep",
+            &["-x", "20000", &path],
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
+            &policy,
+            &enforcement,
+        )
+        .unwrap();
+        assert_eq!(through_grep.exit_code, 0, "{}", through_grep.stderr);
+        assert_eq!(through_grep.stdout, "20000\n");
+
+        if landlock {
+            let write = run_bash_in(
+                workdir.path(),
+                &format!("echo x >> {path}"),
+                &policy,
+                &enforcement,
+            );
+            assert_ne!(write.exit_code, 0, "a command appended to its own log");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        } else {
+            println!(
+                "[SKIP-HOST] a_truncated_log_reads_back_through_the_shell_tool_and_refuses_a_write: \
+                 the write half needs Landlock; detected {:?}",
+                enforcement.tier
+            );
+        }
+        assert!(!workdir.path().join("logs").exists());
         enforcement.end_session();
     }
 

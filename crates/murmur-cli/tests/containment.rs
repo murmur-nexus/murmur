@@ -314,6 +314,13 @@ fn explain_scope_declares_what_the_runtime_writes_and_creates_nothing() {
             "{moved}: {declared:?}"
         );
     }
+    // Every shell log is a record in the session's records directory, shell allowed or not.
+    assert!(
+        !declared
+            .iter()
+            .any(|path| *path == "logs" || path.starts_with("logs/")),
+        "{declared:?}"
+    );
 
     assert!(
         !project.path().join(".murmur").exists(),

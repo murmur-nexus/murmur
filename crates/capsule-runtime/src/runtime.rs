@@ -4795,7 +4795,11 @@ fn launch(
                     // not `trace.jsonl`: there is no turn left to tell the agent in, so every
                     // remaining surface is the operator's.
                     if !abandoned.is_empty() {
-                        let report = detached::abandonment_report_text(&session_id, &abandoned);
+                        let report = detached::abandonment_report_text(
+                            &session_id,
+                            &records_root,
+                            &abandoned,
+                        );
                         crate::runtime_err!("{report}");
                         agent::append_bootstrap_log(&records_root, &report);
                         for work in &abandoned {
@@ -18183,6 +18187,46 @@ inference:
             },
         );
         assert!(failed.metadata.is_empty());
+    }
+
+    /// A truncated result names the log by the path it carries, and a command run with no
+    /// records directory, which writes no log, says it was truncated and names nothing.
+    #[test]
+    fn a_truncated_result_names_its_log_or_with_no_records_directory_nothing() {
+        let truncated = |full_output_path: Option<&str>| {
+            shell_result_to_tool_result(
+                "bash",
+                "seq 1 20000",
+                ShellResult {
+                    binary: "/usr/bin/bash".to_string(),
+                    exit_code: 0,
+                    stdout: "1\n".to_string(),
+                    stderr: String::new(),
+                    duration_ms: 1,
+                    truncated: true,
+                    full_output_path: full_output_path.map(str::to_string),
+                    resource_limit_hit: None,
+                },
+            )
+        };
+
+        let path = "/home/test/.murmur/records/work/ses_1/logs/shell-1.log";
+        let named = truncated(Some(path));
+        assert!(named.data.as_deref().unwrap().ends_with(&format!(
+            "\n\nOutput truncated. Full output written to {path}"
+        )));
+        assert_eq!(
+            named.metadata,
+            vec![("full_output_path".to_string(), path.to_string())]
+        );
+
+        let unnamed = truncated(None);
+        assert!(unnamed
+            .data
+            .as_deref()
+            .unwrap()
+            .ends_with("\n\nOutput truncated."));
+        assert!(unnamed.metadata.is_empty());
     }
 
     /// Text a command prints stays inside the fence however much it looks like the runtime's
