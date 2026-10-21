@@ -364,7 +364,7 @@ mod tests {
     fn a_command_already_accounted_for_is_not_reported() {
         for accounting in [
             r#"{"event_type":"shell_abandoned","event_id":"evt_a","session_id":"ses_prior","timestamp":9,"work_id":"wrk_one","binary":"/usr/bin/bash","command":"sleep 60","running_ms":30000}"#,
-            r#"{"event_type":"shell_completed","event_id":"evt_c","session_id":"ses_prior","timestamp":9,"work_id":"wrk_one","binary":"/usr/bin/bash","command":"sleep 60","exit_code":0,"duration_ms":1,"output_path":"logs/wrk_one.log","output_bytes":1,"status":"ok","completion_task_id":"tsk_2"}"#,
+            r#"{"event_type":"shell_completed","event_id":"evt_c","session_id":"ses_prior","timestamp":9,"work_id":"wrk_one","binary":"/usr/bin/bash","command":"sleep 60","exit_code":0,"duration_ms":1,"output_path":"/home/test/.murmur/records/work/ses_prior/logs/wrk_one.log","output_bytes":1,"status":"ok","completion_task_id":"tsk_2"}"#,
         ] {
             let (_root, root) =
                 sessions_root_with("ses_prior", &trace_with(&format!("{accounting}\n")));

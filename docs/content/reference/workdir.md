@@ -85,8 +85,6 @@ The capsule's commands can write these like any other file in the workdir.
 | `task.md`, `input.txt` | The operator's task, read once when the session starts. See [Task input](#task-input) |
 | `.murmur/<session-id>/` | The session workdir |
 | `.murmur/children/<capsule>-<suffix>/` | One directory per sub-capsule launch, each the child's own accessible workdir. Created mode `0700` |
-| `logs/shell-<timestamp>.log` | Full stdout and stderr of one shell command, written when either stream exceeds 16 KB. The tool result carries the path |
-| `logs/<work-id>.log` | The same, for a command demoted to the background. The completion carries the path |
 | `peer-in/<handle-id>-<name>` | Bytes fetched by redeeming a peer handle. See [Resource plane](resource-plane.md) |
 | `out/result.txt` | A script capsule's final output. An agent session writes it to the session workdir instead |
 
@@ -219,6 +217,7 @@ workdir, kept after the session ends:
         ├── trace.jsonl
         ├── blobs/<sha256>
         ├── logs/bootstrap.log | otel.log | hook-<hook-name>.log
+        ├── logs/shell-<timestamp>.log | <work-id>.log
         ├── completion.json
         ├── hooks/
         └── tmp/                                  0700, created at staging
@@ -243,6 +242,8 @@ stays under the old path.
 | `logs/bootstrap.log` | Staging and agent-loop diagnostics: the installed tool inventory, once per session and again each time it changes, compaction decisions, non-fatal write failures, and any line the runtime could not write to a [closed standard output or standard error](cli.md#mur-run-closed-stream) |
 | `logs/otel.log` | OpenTelemetry exporter diagnostics |
 | `logs/hook-<hook-name>.log` | Errors from one hook, one per line. `<hook-name>` is the bare name: `hook-grafana` for `murmur/hook-grafana` |
+| `logs/shell-<timestamp>.log` | Full stdout and stderr of one shell command, written when either stream exceeds 16 KB. Outside a session there is no records directory, and the command writes no log |
+| `logs/<work-id>.log` | The same, for a command [demoted to the background](manifest.md#lifecycle-shell-grace-secs) |
 | `completion.json` | How a delegated child ended: written by the child at the end of its session and by the launcher that started it, read by that launcher |
 | `hooks/` | The current directory of every hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities), read-write. `murmur/hook-eval` writes `hooks/eval.jsonl` and `hooks/logs/hook-hook-eval.log` here. Created only when such a hook is declared |
 | `tmp/` | The [session's temporary folder](containment.md#temp-folder): `/tmp` and `$TMPDIR` to the session's shell commands, plan shell steps and native tools, which read and write it. The runtime writes nothing in it. Counted with the session workdir against `capabilities.resources.workdir_max_bytes` |
@@ -255,6 +256,10 @@ stays under the old path.
 | A shell command, a plan's `shell` step, a native tool | `tmp/`, read-write, as `$TMPDIR`, `$TMP` and `$TEMP`, and as `/tmp` where the session maps it. See [The session's temporary folder](containment.md#temp-folder) |
 | A hook declared `capabilities.filesystem.records: true` | `hooks/`, as its current directory, read-write |
 | A WASM tool, a driver, any other hook | Nothing |
+
+The shell tool's result and a demoted command's completion name a shell log by its absolute path. A
+shell command, a plan's `shell` step, a native tool and a `transport: process` harness can read it
+there; a WASM tool cannot.
 
 ### What protects it
 

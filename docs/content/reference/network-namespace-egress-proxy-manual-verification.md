@@ -453,7 +453,8 @@ nc -N -w 5 127.0.0.1 8080 </dev/null ; echo "exit=$?"
 ```
 
 **Expected:** `pong` and `exit=0`. The demoted server then exits, and its completion arrives as a
-`completion`-origin task naming `logs/wrk_<id>.log` with `exit_code: 0`.
+`completion`-origin task naming `<records dir>/logs/wrk_<id>.log`, an absolute path in the session's
+[records directory](workdir.md#records-directory), with `exit_code: 0`.
 
 ---
 

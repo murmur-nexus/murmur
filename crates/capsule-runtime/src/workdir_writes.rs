@@ -36,8 +36,10 @@
 //! `~/.murmur/sessions/<session-id>/runtime`, never into the workdir, and the synthetic `/etc`
 //! files and a `transport: process` harness's files go beside it. Every record it writes about
 //! the session — `trace.jsonl`, `blobs/`, `logs/bootstrap.log`, `logs/otel.log`,
-//! `logs/hook-<name>.log`, a delegated child's `completion.json` and the `hooks/` a records-granted
-//! hook writes in — goes into the session's records directory,
+//! `logs/hook-<name>.log`, a shell command's full-output log (`logs/shell-<ms>.log` for a
+//! truncated foreground command, `logs/<work-id>.log` for a demoted one), a delegated child's
+//! `completion.json` and the `hooks/` a records-granted hook writes in — goes into the session's
+//! records directory,
 //! `~/.murmur/records/<workdir root>/<session-id>`. The session's temporary folder, which commands
 //! reach as `/tmp` and `$TMPDIR`, is `tmp/` in that records directory. None of them is a runtime
 //! write inside the workdir, so none is declared here; [`crate::runtime_dir`],
@@ -202,15 +204,6 @@ const DECLARED_WRITES: &[DeclaredWrite] = &[
         kind: RuntimeWriteKind::Directory,
         scope: RuntimeWriteScope::Accessible,
         condition: RuntimeWriteCondition::Always,
-    },
-    DeclaredWrite {
-        // `logs/shell-<ms>.log` for a foreground command whose output was truncated, and
-        // `logs/<work-id>.log` for a demoted one. Stays at the top level because the shell tool
-        // returns this path, workdir-relative, in the result the model reads.
-        entry: "logs",
-        kind: RuntimeWriteKind::Directory,
-        scope: RuntimeWriteScope::Accessible,
-        condition: RuntimeWriteCondition::Shell,
     },
     DeclaredWrite {
         // Where a redeemed peer handle's bytes land. A documented resource-plane path.
@@ -428,12 +421,6 @@ mod tests {
              own.",
         ),
         (
-            "shell.rs",
-            "&relative_path",
-            "A command's full-output log, `logs/<stem>.log`, composed on the line above. Declared \
-             through the `logs` entry.",
-        ),
-        (
             "child_launch.rs",
             "rel",
             "One child's directory, `.murmur/children/<name>-<16 hex>`, composed by \
@@ -617,7 +604,9 @@ mod tests {
         ),
         (
             "logs",
-            "`bootstrap.log`, `otel.log` and one `hook-<name>.log` per failing hook.",
+            "`bootstrap.log`, `otel.log`, one `hook-<name>.log` per failing hook, and a shell \
+             command's full output: `shell-<ms>.log` for a truncated foreground command and \
+             `<work-id>.log` for a demoted one.",
         ),
         (
             "completion.json",
@@ -635,9 +624,16 @@ mod tests {
         ),
     ];
 
-    /// The session's own log files, which share the `logs` name with the accessible workdir's
-    /// shell output logs and are told apart by the rest of their path.
-    const MOVED_LOG_PREFIXES: &[&str] = &["logs/bootstrap.log", "logs/otel.log", "logs/hook-"];
+    /// Writes through `records_root` whose argument is not a literal or a named constant, each
+    /// with the [`RECORDS_DIR_WRITES`] entry it lies under and the reason. Matched only through
+    /// `records_root`: the same argument through a workdir root resolves to nothing and fails.
+    const RECORDS_DIR_DYNAMIC: &[(&str, &str, &str, &str)] = &[(
+        "shell.rs",
+        "&log.relative",
+        "logs",
+        "A shell command's full-output log, `logs/shell-<ms>.log` or `logs/<work-id>.log`, \
+         composed by `detached::output_path_for`.",
+    )];
 
     /// The literal text a path argument opens with — a string literal, or a `format!` string up
     /// to its first `{` — or `None` when it opens with no literal.
@@ -651,13 +647,10 @@ mod tests {
         Some(literal.split('{').next().unwrap_or(literal))
     }
 
-    /// Whether a write of `argument` names one of the session's own log files.
-    fn names_a_moved_log(argument: &str) -> bool {
-        literal_prefix(argument).is_some_and(|literal| {
-            MOVED_LOG_PREFIXES
-                .iter()
-                .any(|prefix| literal.starts_with(prefix))
-        })
+    /// Whether a write of `argument` names a log file. Every log is a record.
+    fn names_a_log(argument: &str) -> bool {
+        literal_prefix(argument)
+            .is_some_and(|literal| literal == "logs" || literal.starts_with("logs/"))
     }
 
     /// The receivers that name a directory beside the runtime directory, outside every workdir:
@@ -806,6 +799,7 @@ mod tests {
 
         let mut scanned = 0usize;
         let mut dynamic_rows_used = vec![false; DYNAMIC_EXEMPT.len()];
+        let mut records_dynamic_rows_used = vec![false; RECORDS_DIR_DYNAMIC.len()];
         for (file, source) in SCANNED {
             let text = production_text(source);
             let arguments = workdir_join_arguments(text)
@@ -820,11 +814,27 @@ mod tests {
                 let runtime_dir = receiver == RUNTIME_DIR_ROOT;
                 let records_dir = receiver == RECORDS_DIR_ROOT;
                 assert!(
-                    records_dir || !names_a_moved_log(&argument),
-                    "{file} writes ({argument}) through `{receiver}`, a workdir root. The \
-                     session's own logs are records: they go through the records directory's root \
+                    records_dir || !names_a_log(&argument),
+                    "{file} writes ({argument}) through `{receiver}`, a workdir root. Every log \
+                     the runtime writes is a record: it goes through the records directory's root \
                      (`records_root`), which no capsule command can write."
                 );
+                if records_dir {
+                    if let Some(row) = RECORDS_DIR_DYNAMIC.iter().position(
+                        |(dynamic_file, dynamic_argument, _, _)| {
+                            dynamic_file == file && *dynamic_argument == argument
+                        },
+                    ) {
+                        let entry = RECORDS_DIR_DYNAMIC[row].2;
+                        assert!(
+                            RECORDS_DIR_WRITES.iter().any(|(name, _)| *name == entry),
+                            "RECORDS_DIR_DYNAMIC row ({file:?}, {argument:?}) names `{entry}`, \
+                             which RECORDS_DIR_WRITES does not declare."
+                        );
+                        records_dynamic_rows_used[row] = true;
+                        continue;
+                    }
+                }
                 let Some(entry) = resolve_entry_name(&argument) else {
                     let row =
                         DYNAMIC_EXEMPT
@@ -884,6 +894,16 @@ mod tests {
              what the runtime has — the scanner is broken, not the runtime",
             SCANNED.len()
         );
+
+        for ((file, argument, _, _), used) in
+            RECORDS_DIR_DYNAMIC.iter().zip(records_dynamic_rows_used)
+        {
+            assert!(
+                used,
+                "RECORDS_DIR_DYNAMIC row ({file:?}, {argument:?}) matches no write through \
+                 `records_root` in {file}; remove it so the table names only what the runtime does"
+            );
+        }
 
         for ((file, argument, _), used) in DYNAMIC_EXEMPT.iter().zip(dynamic_rows_used) {
             assert!(
@@ -1336,6 +1356,27 @@ mod tests {
                 "{} is declared as a workdir write",
                 write.path
             );
+        }
+    }
+
+    /// Every shell log is a record in the session's records directory, so no row names `logs`,
+    /// and the accessible-scope rows left are conditioned on nothing a shell call does.
+    #[test]
+    fn no_declared_path_is_a_shell_log() {
+        for write in runtime_writes() {
+            assert!(
+                write.path != "logs" && !write.path.starts_with("logs/"),
+                "{} is declared as a workdir write",
+                write.path
+            );
+            if write.scope == RuntimeWriteScope::Accessible {
+                assert_ne!(
+                    write.condition,
+                    RuntimeWriteCondition::Shell,
+                    "{}",
+                    write.path
+                );
+            }
         }
     }
 

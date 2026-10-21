@@ -352,7 +352,7 @@ The contract for running an allowlisted shell binary. The runtime implements it 
 | Behaviour | Detail |
 |---|---|
 | Non-zero exit code | Data, not an error — the call only errs on spawn/IO failure |
-| `truncated: true` | stdout or stderr exceeded 16 KiB and was cut; `full-output-path` points at the untruncated log in the workdir |
+| `truncated: true` | stdout or stderr exceeded 16 KiB and was cut; `full-output-path` is the absolute path of the untruncated log, `logs/shell-<timestamp>.log` in the session's [records directory](workdir.md#records-directory) |
 | Allowlist | `binary` must appear in `capabilities.shell.allow`; anything else is rejected before the process is spawned |
 
 ---

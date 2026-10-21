@@ -30,6 +30,13 @@ struct Run {
     accessible: PathBuf,
     session_id: String,
     runtime_writes: Vec<Value>,
+    /// The session's records directory, under the scratch home kept beside it.
+    records_dir: PathBuf,
+    /// Every line of the run's `trace.jsonl`.
+    events: Vec<Value>,
+    /// Every request the scripted driver endpoint received, in order.
+    requests: Vec<Value>,
+    _home: tempfile::TempDir,
 }
 
 impl Run {
@@ -69,6 +76,29 @@ impl Run {
             }
             write["kind"] == "directory" && path.starts_with(&format!("{declared}/"))
         })
+    }
+
+    /// The run's trace lines of `event_type`.
+    fn events_of_type(&self, event_type: &str) -> Vec<&Value> {
+        self.events
+            .iter()
+            .filter(|event| event["event_type"] == event_type)
+            .collect()
+    }
+
+    /// The work folder holds nothing under `logs`, and the run's declaration names no `logs`
+    /// row: every shell log is a record.
+    fn assert_no_logs_in_the_work_folder(&self) {
+        assert!(
+            !self.accessible.join("logs").exists(),
+            "a shell log was written into the work folder"
+        );
+        for write in &self.runtime_writes {
+            assert!(
+                !write["path"].as_str().unwrap().starts_with("logs"),
+                "the declaration still names a logs row: {write}"
+            );
+        }
     }
 
     /// Every declared row that is in the accessible workdir and claims to be written by every
@@ -144,6 +174,110 @@ fn a_capsule_that_wrote_one_file_leaves_exactly_that_file() {
     assert!(!run.accessible.join(".capsule-home").exists());
 }
 
+/// A command whose output passes the 16 KiB cap: its full output goes to the records directory,
+/// the result the model reads names it by its absolute path, and the work folder is left exactly
+/// as the capsule left it.
+#[test]
+fn a_truncated_command_leaves_its_log_in_the_records_directory() {
+    if common::skip_without_host_support(
+        "a_truncated_command_leaves_its_log_in_the_records_directory",
+    ) {
+        return;
+    }
+    // A builtin loop: `bash` is the one binary declared, and on a kernel-enforcement host
+    // nothing else is executable.
+    let run = run_session(vec![
+        bash_response(
+            "msg_1",
+            "toolu_seq",
+            "for ((i = 1; i <= 20000; i++)); do echo $i; done",
+        ),
+        text_response("msg_2", "done"),
+    ]);
+
+    run.assert_no_logs_in_the_work_folder();
+    assert_eq!(
+        run.left_after_subtracting_the_declaration(),
+        BTreeSet::new(),
+        "the capsule wrote nothing, and the declaration must account for everything else"
+    );
+
+    let result = common::tool_result_text(&run.requests, "toolu_seq")
+        .expect("the next request carries the seq result");
+    let prefix = format!(
+        "Full output written to {}/logs/shell-",
+        run.records_dir.display()
+    );
+    let path = result
+        .lines()
+        .find_map(|line| {
+            line.find(&prefix)
+                .map(|at| line[at + "Full output written to ".len()..].trim_end())
+        })
+        .unwrap_or_else(|| panic!("no `{prefix}` line in the tool result:\n{result}"));
+    let log = fs::read_to_string(path).expect("the named log is on disk");
+    assert!(
+        log.lines().any(|line| line == "20000"),
+        "the log holds the full output"
+    );
+}
+
+/// A command demoted past `lifecycle.shell_grace_secs` that finishes while the session is alive:
+/// its log goes to the records directory, the trace names it by its absolute path, and the work
+/// folder is left exactly as the capsule left it.
+///
+/// Every response is held three seconds, so the command is demoted at one second, exits a second
+/// later and is on disk before the end-turn response ends the session.
+#[test]
+fn a_demoted_command_leaves_its_log_in_the_records_directory() {
+    if common::skip_without_host_support(
+        "a_demoted_command_leaves_its_log_in_the_records_directory",
+    ) {
+        return;
+    }
+    let run = run_session_with(
+        vec![
+            bash_response(
+                "msg_1",
+                "toolu_build",
+                "sleep 2; for ((i = 1; i <= 50; i++)); do echo $i; done",
+            ),
+            text_response("msg_2", "build started"),
+        ],
+        std::time::Duration::from_secs(3),
+        &["sleep"],
+        "lifecycle:\n  shell_grace_secs: 1\n",
+    );
+
+    run.assert_no_logs_in_the_work_folder();
+    assert_eq!(
+        run.left_after_subtracting_the_declaration(),
+        BTreeSet::new(),
+        "the capsule wrote nothing, and the declaration must account for everything else"
+    );
+
+    let detached = run.events_of_type("shell_detached");
+    assert_eq!(detached.len(), 1, "the command was demoted");
+    let work_id = detached[0]["work_id"].as_str().unwrap();
+    let output_path = run
+        .events_of_type("shell_completed")
+        .into_iter()
+        .chain(run.events_of_type("shell_abandoned"))
+        .find(|event| event["work_id"] == work_id)
+        .and_then(|event| event["output_path"].as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "no shell_completed or shell_abandoned line names an output path for {work_id}: \
+                 {:?}",
+                run.events
+            )
+        });
+    let expected = run.records_dir.join("logs").join(format!("{work_id}.log"));
+    assert_eq!(Path::new(output_path), expected);
+    let log = fs::read_to_string(&expected).expect("the named log is on disk");
+    assert!(log.lines().any(|line| line == "50"), "{log}");
+}
+
 /// The declaration a run publishes is the declaration `mur run --explain-scope` prints, so a
 /// consumer can capture it before the run and compare it to what the run reports.
 #[test]
@@ -183,7 +317,18 @@ fn the_trace_carries_the_same_declaration_explain_scope_prints() {
 /// takes, and the only shape in which the two workdirs are different directories — script the
 /// driver with `responses`, and read the declaration back out of the run's own trace.
 fn run_session(responses: Vec<String>) -> Run {
-    let server = ScriptedServer::start(responses);
+    run_session_with(responses, std::time::Duration::ZERO, &[], "")
+}
+
+/// [`run_session`], holding each scripted response for `delay`, allowing `extra_shell` beside
+/// `bash`, and appending `lifecycle_yaml` to the manifest verbatim.
+fn run_session_with(
+    responses: Vec<String>,
+    delay: std::time::Duration,
+    extra_shell: &[&str],
+    lifecycle_yaml: &str,
+) -> Run {
+    let server = ScriptedServer::start_with_delay(responses, delay);
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -197,7 +342,12 @@ fn run_session(responses: Vec<String>) -> Run {
     );
     common::publish_local(&home, &driver_artifact).success();
 
-    let manifest_path = write_manifest(project.path(), &server.endpoint);
+    let manifest_path = write_manifest(
+        project.path(),
+        &server.endpoint,
+        extra_shell,
+        lifecycle_yaml,
+    );
     let staged = common::stage_agent_session_with_workdir(
         &home,
         project.path(),
@@ -213,10 +363,13 @@ fn run_session(responses: Vec<String>) -> Run {
     launch_session(staged, |_| {}).expect("the session must launch");
 
     let trace = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap();
-    let start: Value = trace
+    let events: Vec<Value> = trace
         .lines()
         .filter(|line| !line.is_empty())
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let start = events
+        .iter()
         .find(|event| event["event_type"] == "session_start")
         .expect("every session writes a session_start line");
     assert_eq!(start["session_id"], session_id.as_str());
@@ -233,6 +386,10 @@ fn run_session(responses: Vec<String>) -> Run {
         accessible,
         session_id,
         runtime_writes,
+        records_dir,
+        events,
+        requests: server.requests(),
+        _home: home,
     }
 }
 
@@ -260,16 +417,26 @@ fn walk(base: &Path, root: &Path) -> Vec<String> {
     found
 }
 
-fn write_manifest(project_dir: &Path, endpoint: &str) -> PathBuf {
+fn write_manifest(
+    project_dir: &Path,
+    endpoint: &str,
+    extra_shell: &[&str],
+    lifecycle_yaml: &str,
+) -> PathBuf {
     let manifest = project_dir.join("murmur.yaml");
+    let extra_shell_yaml: String = extra_shell
+        .iter()
+        .map(|binary| format!("      - {binary}\n"))
+        .collect();
     fs::write(
         &manifest,
         format!(
             "name: workdir-writes-capsule\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    \
              version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      \
              endpoint: {endpoint}\n      api_key: test-key\ncapabilities:\n  network:\n    \
-             allow:\n      - {endpoint}\n  shell:\n    allow:\n      - bash\ninference:\n  \
-             transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n"
+             allow:\n      - {endpoint}\n  shell:\n    allow:\n      - bash\n{extra_shell_yaml}inference:\n  \
+             transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n\
+             {lifecycle_yaml}"
         ),
     )
     .unwrap();

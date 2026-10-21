@@ -390,7 +390,7 @@ result as a task
 | `command` | string | As on `shell` |
 | `exit_code` | i32 | `128 + signal` for a signal kill |
 | `duration_ms` | u64 | From spawn to exit, foreground portion included |
-| `output_path` | string | Where the command's full stdout and stderr were written, relative to the [capsule workdir](workdir.md): always `logs/<work_id>.log` |
+| `output_path` | string | The absolute path of the file holding the command's full stdout and stderr: `logs/<work_id>.log` in the session's [records directory](workdir.md#records-directory) |
 | `output_bytes` | u64 | Size of that file. `0` when it could not be written |
 | `resource_limit` | string | As on `shell`, and omitted on the same terms |
 | `status` | string | `"ok"` \| `"error"`. `"error"` for a non-zero exit, a signal kill, an attributed `resource_limit`, or a wait that itself failed |
@@ -412,13 +412,13 @@ down
 
 The last three are omitted rather than written as `null`, so a command still running produces a
 line carrying only the first four fields — `null` would read as a known-absent exit code rather
-than an unknown one. Their absence means no exit code exists and no `logs/<work_id>.log` was
+than an unknown one. Their absence means no exit code exists and no log was
 written or ever will be: that file is written from the command's own runtime thread after the
 command exits, and that thread ends with the session.
 
-No task carries the result either way. The session does not wait for the command and does not kill
+No task carries the result either way. The session does not wait for the command, its end kills
 it, and one grouped report naming every discarded command is written to stderr and to
-`logs/bootstrap.log` under the [capsule workdir](workdir.md) — see
+`logs/bootstrap.log` in the session's [records directory](workdir.md#records-directory) — see
 [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs). A capsule whose `lifecycle`
 block cannot receive a completion at all is warned before the run with
 [`W-SEC-022`](diagnostics.md#w-sec-022).
@@ -441,7 +441,7 @@ started it rather than to the resuming session's own
 An unmatched `shell_detached` means the session was killed outright: the teardown sweep that
 writes `shell_abandoned` runs on every clean exit. This line carries no `exit_code`, no `status`,
 no `duration_ms`, no `output_path` and no `output_bytes`, because a command whose runtime was
-killed produced none of them — including no `logs/<work_id>.log`, which is written from inside the
+killed produced none of them — including no output log, which is written from inside the
 runtime after the command exits. Its presence is also what keeps a second resume of the same
 session from reporting the same work id again.
 

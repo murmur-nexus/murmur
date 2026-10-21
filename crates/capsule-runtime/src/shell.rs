@@ -11,7 +11,7 @@ use crate::{
     workdir_fs::{WorkdirRoot, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE},
 };
 
-const MAX_SHELL_OUTPUT_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_SHELL_OUTPUT_BYTES: usize = 16 * 1024;
 
 const SHELL_INTERPRETERS: &[&str] = &["bash", "sh", "zsh", "fish", "dash", "ksh"];
 const DEFAULT_ENV_BASELINE: &[&str] = &[
@@ -145,6 +145,10 @@ pub(crate) struct ShellResult {
     pub(crate) stderr: String,
     pub(crate) duration_ms: u64,
     pub(crate) truncated: bool,
+    /// The absolute path of the log holding the full output when [`Self::truncated`] is set:
+    /// [`crate::detached::output_path_for`]'s path for a `shell-<ms>` stem in the session's
+    /// records directory. `None` for output that fit, and for a truncated command run with no
+    /// records directory, which writes no log.
     pub(crate) full_output_path: Option<String>,
     /// The `capabilities.resources` field this subprocess was killed for exceeding, when the
     /// evidence names exactly one — see [`classify_resource_limit`]. `None` covers both "ran
@@ -326,6 +330,9 @@ const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// one plain OS thread — not a `spawn_blocking` task — so runtime teardown never waits on it. The
 /// session's end kills it with every other process the session started.
 ///
+/// A detach policy is honoured only when `enforcement` holds a records directory, where a demoted
+/// command's log goes. Without one the command runs to completion in the foreground.
+///
 /// Every command runs in the session's one network namespace, so a server one call starts — in
 /// the background, or demoted — is reachable from the next call of the same session.
 ///
@@ -414,6 +421,11 @@ pub(crate) fn run_shell(
     // which is what lets the wait below be either blocking or polled.
     let readers = OutputReaders::spawn(&mut child);
 
+    // Demotion keeps the output in the records directory and points the agent at it. With no
+    // records directory there is nowhere to keep it, so the command runs in the foreground.
+    let records_root = enforcement.records_root();
+    let detach = detach.filter(|_| records_root.is_some());
+
     let status = match &detach {
         None => child.wait().map_err(|error| error.to_string())?,
         Some(policy) => {
@@ -436,7 +448,9 @@ pub(crate) fn run_shell(
                                 readers,
                                 DemotionContext {
                                     policy: detach.expect("the detach policy was matched above"),
-                                    accessible_workdir: accessible_workdir.clone(),
+                                    records_root: records_root
+                                        .expect("a detach policy is kept only with a records root")
+                                        .clone(),
                                     invoked_binary: binary.to_string(),
                                     resolved_binary,
                                     args: args.iter().map(|arg| (*arg).to_string()).collect(),
@@ -482,15 +496,17 @@ pub(crate) fn run_shell(
             &mut stderr,
             String::from_utf8_lossy(&stderr_bytes[..stderr_cut]).to_string(),
         );
-        full_output_path = Some(write_shell_output_log(
-            accessible_workdir,
-            &format!("shell-{}", crate::trace::timestamp_ms()),
-            binary,
-            args,
-            exit_code,
-            &full_stdout,
-            &full_stderr,
-        )?);
+        if let Some(records_root) = records_root {
+            full_output_path = Some(write_shell_output_log(
+                records_root,
+                &format!("shell-{}", crate::trace::timestamp_ms()),
+                binary,
+                args,
+                exit_code,
+                &full_stdout,
+                &full_stderr,
+            )?);
+        }
     }
 
     Ok(ShellOutcome::Finished(ShellResult {
@@ -586,9 +602,9 @@ impl OutputReaders {
 /// Everything the background thread needs to describe the command it is finishing.
 struct DemotionContext {
     policy: DetachPolicy,
-    /// Where the command ran, and where its `logs/<work-id>.log` goes — the path the completion
-    /// reports back, workdir-relative.
-    accessible_workdir: WorkdirRoot,
+    /// The session's records directory, where the command's log goes and which the completion
+    /// names it in.
+    records_root: WorkdirRoot,
     /// The name as invoked, which is what the log header records.
     invoked_binary: String,
     /// The same name resolved to a path where the host `PATH` named one — what the trace and the
@@ -649,7 +665,7 @@ fn demote(
     let provenance = context.policy.completion_provenance();
     let DemotionContext {
         policy,
-        accessible_workdir,
+        records_root,
         invoked_binary,
         resolved_binary,
         args,
@@ -686,9 +702,9 @@ fn demote(
         let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
         let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let output_path = crate::detached::output_path_for(&work_id);
+        let log = crate::detached::output_path_for(&records_root, &work_id);
         if let Err(failure) = write_shell_output_log(
-            &accessible_workdir,
+            &records_root,
             &work_id,
             &invoked_binary,
             &arg_refs,
@@ -701,8 +717,8 @@ fn demote(
                 None => failure,
             });
         }
-        let output_bytes = accessible_workdir
-            .file_len(&output_path)
+        let output_bytes = records_root
+            .file_len(&log.relative)
             .ok()
             .flatten()
             .unwrap_or(0);
@@ -715,7 +731,7 @@ fn demote(
                 command: policy.command.clone(),
                 exit_code,
                 duration_ms,
-                output_path,
+                output_path: log.path,
                 output_bytes,
                 resource_limit,
                 context_id: policy.context_id.clone(),
@@ -994,14 +1010,14 @@ fn env_name_matches_pattern(pattern: &str, key: &str) -> bool {
     pattern == key
 }
 
-/// Write one command's full stdout and stderr to `logs/<file_stem>.log`, returning the
-/// workdir-relative path.
+/// Write one command's full stdout and stderr to its log in the session's records directory,
+/// returning the log's absolute path. [`crate::detached::output_path_for`] places it.
 ///
 /// Two callers, one content format: a foreground command whose output exceeded
 /// [`MAX_SHELL_OUTPUT_BYTES`] passes a `shell-<ms>` stem, and a demoted command passes its work
 /// id. A reader that finds either file reads the same header, `Stdout:` and `Stderr:` sections.
 fn write_shell_output_log(
-    accessible_workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     file_stem: &str,
     binary: &str,
     args: &[&str],
@@ -1009,7 +1025,7 @@ fn write_shell_output_log(
     stdout: &str,
     stderr: &str,
 ) -> Result<String, String> {
-    let relative_path = format!("logs/{file_stem}.log");
+    let log = crate::detached::output_path_for(records_root, file_stem);
 
     let command = if args.is_empty() {
         binary.to_string()
@@ -1021,11 +1037,11 @@ fn write_shell_output_log(
         "Command: {command}\nExit code: {exit_code}\n\nStdout:\n{stdout}\n\nStderr:\n{stderr}\n"
     );
 
-    accessible_workdir
-        .write_file(&relative_path, content.as_bytes(), DEFAULT_FILE_MODE)
+    records_root
+        .write_file(&log.relative, content.as_bytes(), DEFAULT_FILE_MODE)
         .map_err(|error| format!("failed to write shell log: {error}"))?;
 
-    Ok(relative_path)
+    Ok(log.path)
 }
 
 #[cfg(test)]
@@ -1149,10 +1165,9 @@ mod tests {
         );
     }
 
-    /// Under `--workdir` the two workdirs are different directories, and each of the three things
+    /// Under `--workdir` the two workdirs are different directories, and each of the two things
     /// `execute_shell` does with one has to pick the right one: the subprocess runs in the
-    /// accessible workdir, `$HOME` resolves into the session workdir, and the truncated-output log
-    /// stays where the tool result says it is.
+    /// accessible workdir and `$HOME` resolves into the session workdir.
     ///
     /// Asserted through a real subprocess rather than through `build_shell_env` alone, because
     /// `$HOME` naming a directory that was never created is exactly the failure this split can
@@ -1198,6 +1213,115 @@ mod tests {
             !accessible.path().join(SYNTHETIC_HOME_DIR_NAME).exists(),
             "the synthetic home must add nothing to the top level of the accessible workdir"
         );
+    }
+
+    /// A command printing `seq 1 <last>`, past [`MAX_SHELL_OUTPUT_BYTES`] for any `last` over
+    /// 4,000, run in `workdir` with a session workdir of its own, so `$HOME` adds nothing to
+    /// `workdir`.
+    fn print_seq(workdir: &Path, enforcement: &ShellEnforcement, last: u32) -> ShellResult {
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let command = format!("seq 1 {last}");
+        let session = tempdir().unwrap();
+        execute_shell(
+            "bash",
+            &["-c", &command],
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+            &policy,
+            enforcement,
+        )
+        .expect("bash must run")
+    }
+
+    /// A truncated command's full output goes to `logs/shell-<ms>.log` in the session's records
+    /// directory, and the result names it by its absolute path. The work folder gains nothing.
+    #[test]
+    fn a_truncated_output_log_lands_in_the_records_directory() {
+        let workdir = tempdir().unwrap();
+        let runtime = tempdir().unwrap();
+        let enforcement = ShellEnforcement::environment_only()
+            .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None);
+        let records_root = enforcement.records_root().unwrap().clone();
+
+        let result = print_seq(workdir.path(), &enforcement, 20_000);
+
+        assert!(result.truncated);
+        assert_eq!(result.stdout.len(), MAX_SHELL_OUTPUT_BYTES);
+        let path = result
+            .full_output_path
+            .expect("a truncated command names its log");
+        let file_name = Path::new(&path).file_name().unwrap().to_str().unwrap();
+        let ms = file_name
+            .strip_prefix("shell-")
+            .and_then(|rest| rest.strip_suffix(".log"))
+            .unwrap_or_else(|| panic!("{path} is not logs/shell-<ms>.log"));
+        assert!(ms.chars().all(|c| c.is_ascii_digit()), "{path}");
+        assert_eq!(
+            Path::new(&path),
+            records_root.host_path("logs").join(file_name),
+        );
+        assert!(Path::new(&path).is_absolute(), "{path}");
+
+        let log = fs::read_to_string(&path).unwrap();
+        let expected: String = (1..=20_000).map(|n| format!("{n}\n")).collect();
+        let stdout = log
+            .split_once("\nStdout:\n")
+            .and_then(|(_, rest)| rest.split_once("\n\nStderr:\n"))
+            .map(|(stdout, _)| stdout)
+            .expect("the log keeps its Stdout: and Stderr: sections");
+        assert_eq!(stdout, expected, "the log holds the full stdout");
+        assert!(log.starts_with("Command: bash -c seq 1 20000\nExit code: 0\n"));
+
+        assert!(
+            !workdir.path().join("logs").exists(),
+            "nothing is written into the accessible workdir"
+        );
+        assert_eq!(fs::read_dir(workdir.path()).unwrap().count(), 0);
+    }
+
+    /// Outside a session there is no records directory, so a truncated command writes no log in
+    /// either workdir and names no path. Roots built without records are the same case as no
+    /// roots at all.
+    #[test]
+    fn with_no_records_directory_a_truncated_command_writes_no_log() {
+        let without_roots = ShellEnforcement::environment_only();
+        let runtime = tempdir().unwrap();
+        let open = |sub: &str| {
+            let path = runtime.path().join(sub);
+            fs::create_dir_all(&path).unwrap();
+            crate::workdir_fs::WorkdirRoot::open(&path).unwrap()
+        };
+        let roots_without_records = ShellEnforcement::environment_only().with_runtime_dir(
+            crate::runtime_dir::RuntimeDirRoots::new(
+                open(crate::runtime_dir::RUNTIME_SUBDIR),
+                open(crate::runtime_dir::SEALED_ETC_SUBDIR),
+                open(crate::runtime_dir::HARNESS_SUBDIR),
+            ),
+            None,
+        );
+
+        for enforcement in [&without_roots, &roots_without_records] {
+            let workdir = tempdir().unwrap();
+            let result = print_seq(workdir.path(), enforcement, 20_000);
+            assert!(result.truncated);
+            assert_eq!(result.stdout.len(), MAX_SHELL_OUTPUT_BYTES);
+            assert_eq!(result.full_output_path, None);
+            assert_eq!(
+                fs::read_dir(workdir.path()).unwrap().count(),
+                0,
+                "nothing is written into the workdir"
+            );
+        }
+        assert!(!runtime.path().join("logs").exists());
+        assert!(!runtime
+            .path()
+            .join(crate::runtime_dir::RUNTIME_SUBDIR)
+            .join("logs")
+            .exists());
     }
 
     /// A subprocess that exits normally must never be reported as limit-killed — the negative
@@ -1920,6 +2044,7 @@ mod tests {
         };
 
         let temp = tempdir().unwrap();
+        let runtime = tempdir().unwrap();
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
             ..CapabilityPolicy::default()
@@ -1944,7 +2069,8 @@ mod tests {
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
-            &ShellEnforcement::environment_only(),
+            &ShellEnforcement::environment_only()
+                .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None),
             Some(DetachPolicy {
                 grace: Duration::from_secs(60),
                 delivered: true,

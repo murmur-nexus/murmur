@@ -6115,10 +6115,10 @@ mod tests {
 
     #[test]
     fn shell_completed_row_names_the_work_id_the_exit_code_and_the_output_path() {
-        let line = r#"{"event_type":"shell_completed","event_id":"evt_2","session_id":"s","timestamp":2,"work_id":"wrk_0a1b2c3d4e5f6a7b","binary":"/usr/bin/bash","command":"make -j8","exit_code":0,"duration_ms":42000,"output_path":"logs/wrk_0a1b2c3d4e5f6a7b.log","output_bytes":900,"status":"ok","completion_task_id":"tsk_2"}"#;
+        let line = r#"{"event_type":"shell_completed","event_id":"evt_2","session_id":"s","timestamp":2,"work_id":"wrk_0a1b2c3d4e5f6a7b","binary":"/usr/bin/bash","command":"make -j8","exit_code":0,"duration_ms":42000,"output_path":"/home/test/.murmur/records/work/s/logs/wrk_0a1b2c3d4e5f6a7b.log","output_bytes":900,"status":"ok","completion_task_id":"tsk_2"}"#;
         assert_eq!(
             row(line),
-            "shell_completed /usr/bin/bash  wrk_0a1b2c3d…  exit 0 ✓  42.0s  logs/wrk_0a1b2c3d4e5f6a7b.log"
+            "shell_completed /usr/bin/bash  wrk_0a1b2c3d…  exit 0 ✓  42.0s  /home/test/.murmur/records/work/s/logs/wrk_0a1b2c3d4e5f6a7b.log"
         );
     }
 
