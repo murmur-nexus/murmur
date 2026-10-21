@@ -6455,6 +6455,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_call_error_redacts_a_peer_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = crate::peer_handoff::mint(
+            &crate::peer_handoff::PeerMintKey::generate().unwrap(),
+            &crate::peer_handoff::HandlePayload {
+                v: 1,
+                iss: "ses_1".to_string(),
+                p: "report.md".to_string(),
+                exp: timestamp_ms() + 3_600_000,
+                n: "0123456789abcdef0123456789abcdef".to_string(),
+            },
+            "a@b",
+        )
+        .unwrap();
+        let text = format!("fetch-peer-file {token} failed");
+        let e = tool_call_with_error(dir.path(), TraceCapture::Meta, Some(&text)).await;
+        let id = crate::peer_handoff::handle_id(&token);
+        assert_eq!(e["error"], format!("fetch-peer-file <handle:{id}> failed"));
+    }
+
+    #[tokio::test]
     async fn tool_call_without_an_error_has_no_error_key() {
         let dir = tempfile::tempdir().unwrap();
         let e = tool_call_with_error(dir.path(), TraceCapture::Meta, None).await;

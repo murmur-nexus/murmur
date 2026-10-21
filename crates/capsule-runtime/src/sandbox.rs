@@ -2932,8 +2932,9 @@ pub(crate) fn prepare_enforcement(
 
 /// Linux implementation of `prepare_enforcement`. See the module-level docs and the `linux_enforce`
 /// submodule for the mechanics: the session's network namespace is established in the parent,
-/// and the `pre_exec` closure joins the cgroup scope, then the namespace, then maps `/tmp` or
-/// installs the composed root, then seccomp and Landlock, and applies the rlimits last.
+/// and the `pre_exec` closure sets `RLIMIT_NPROC` or joins the cgroup scope, then joins the
+/// namespace, then maps `/tmp` or installs the composed root, then seccomp and Landlock, and
+/// applies the per-process rlimits last.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 pub(crate) fn prepare_enforcement(
@@ -3117,7 +3118,8 @@ pub(crate) fn prepare_enforcement(
 
     // SAFETY: this closure runs in the forked child, after fork() but before execve() — the
     // narrow pre_exec window where only async-signal-safe operations are permitted. In order, it
-    // performs: when a cgroup scope exists, one `write` to the `cgroup.procs` descriptor the
+    // performs: without a cgroup scope, the `RLIMIT_NPROC` `getrlimit`/`setrlimit` pair of
+    // `resources::apply_nproc_bound`; with one, one `write` to the `cgroup.procs` descriptor the
     // parent opened; two `setns` calls into the session's namespaces; on a `MountNamespace` spawn
     // the `unshare`/`mount`/`open`/`mkdirat`/`chdir` sequence of `temp_dir::map_private_tmp`, and
     // on `KernelSealed` the `unshare`/`open`/`write`/`mount`/`pivot_root` sequence of
@@ -3127,7 +3129,7 @@ pub(crate) fn prepare_enforcement(
     // allocation-free `open`/`read`/`close` of `/proc/sys/kernel/cap_last_cap`; libseccomp filter
     // construction/load (kernel syscalls); on `KernelFull`/`KernelSealed` Landlock ruleset
     // construction/`restrict_self` against already-open fds (also kernel syscalls); and last, the
-    // `getrlimit`/`setrlimit` pairs of `resources::apply_hard_rlimits`. No `canonicalize()`, no
+    // `getrlimit`/`setrlimit` pairs of `resources::apply_per_process_rlimits`. No `canonicalize()`, no
     // path lookup beyond those prepared paths and `cap_last_cap`, no locks beyond what those
     // syscalls need. On any failure it writes the real error message to the CLOEXEC diagnostic
     // pipe (best-effort, bounded, raw `write` loop) before returning `Err`. `diag_write`, the
@@ -3135,6 +3137,14 @@ pub(crate) fn prepare_enforcement(
     // reaches the exec'd program.
     unsafe {
         command.pre_exec(move || {
+            // `RLIMIT_NPROC` first: the composed root's `unshare(CLONE_NEWUSER)` below fixes the
+            // session namespace's task bound at this child's limit as of that call, and a later
+            // `setrlimit` would bound only the new namespace's own tasks. It is set only without
+            // a cgroup scope (`NprocBound::Headroom`) and creates no descriptor.
+            if let Err(error) = crate::resources::apply_nproc_bound(&resource_limits, nproc) {
+                linux_enforce::write_diagnostic(diag_write.as_raw_fd(), &error.to_string());
+                return Err(error);
+            }
             if let Some(scope) = cgroup_scope.as_ref() {
                 if let Err(error) = scope.join_current_process() {
                     linux_enforce::write_diagnostic(diag_write.as_raw_fd(), &error.to_string());
@@ -3156,20 +3166,18 @@ pub(crate) fn prepare_enforcement(
                 return Err(error);
             }
 
-            // The rlimits come last, as the final call before `execve`. They cannot come first:
-            // every descriptor the steps above create (the `/tmp` mapping's `O_PATH` fds, the
-            // composed root's `/proc/self/*_map` writes and `MkFile` steps, `cap_last_cap`, the
-            // Landlock ruleset) must be numbered below `RLIMIT_NOFILE`, and this child holds every
-            // descriptor `mur` had open at the fork, so the lowest free number can be above a
-            // modest `max_open_files`. Last still bounds the exec'd program from its first
-            // instruction: a step above that fails returns `Err`, which aborts the exec, so no
-            // capsule code runs in this child; a failing `setrlimit` aborts it the same way; and
-            // `prlimit64`/`getrlimit`/`setrlimit` are in `SECCOMP_SYSCALL_ALLOWLIST`, and lowering
-            // a limit needs no capability, so neither the filter nor the capability drop stops
-            // them. `RLIMIT_NPROC` is set only without a cgroup scope (`NprocBound::Headroom`),
-            // and `sealed` always has one, so it is never set after the composed root's
-            // `unshare(CLONE_NEWUSER)`; seccomp denies the capsule `unshare` itself.
-            if let Err(error) = crate::resources::apply_hard_rlimits(&resource_limits, nproc) {
+            // The per-process rlimits come last, as the final call before `execve`. They cannot
+            // come first: every descriptor the steps above create (the `/tmp` mapping's `O_PATH`
+            // fds, the composed root's `/proc/self/*_map` writes and `MkFile` steps,
+            // `cap_last_cap`, the Landlock ruleset) must be numbered below `RLIMIT_NOFILE`, and
+            // this child holds every descriptor `mur` had open at the fork, so the lowest free
+            // number can be above a modest `max_open_files`. Last still bounds the exec'd program
+            // from its first instruction: a step above that fails returns `Err`, which aborts the
+            // exec, so no capsule code runs in this child; a failing `setrlimit` aborts it the
+            // same way; and `prlimit64`/`getrlimit`/`setrlimit` are in
+            // `SECCOMP_SYSCALL_ALLOWLIST`, and lowering a limit needs no capability, so neither
+            // the filter nor the capability drop stops them.
+            if let Err(error) = crate::resources::apply_per_process_rlimits(&resource_limits) {
                 linux_enforce::write_diagnostic(diag_write.as_raw_fd(), &error.to_string());
                 return Err(error);
             }
