@@ -499,6 +499,38 @@ The same spawn also installs the seccomp filter, the Landlock scope and the sess
 namespace; [Native tools](containment.md#native-tools) describes them, and
 `crates/murmur-cli/tests/native_tool_confinement.rs` checks them.
 
+On a host that reaches `sealed`, also check that a native tool starts under a low ceiling while
+`mur` holds more descriptors than that ceiling:
+
+1. Confirm the host reaches `sealed`: `mur run --explain-scope` on a capsule declaring
+   `capabilities.containment: sealed` prints `achieved:  sealed`, as in
+   [step 2 of the sealed verification](sealed-containment-manual-verification.md#step-2-load-the-profile-and-confirm-the-host-now-reaches-sealed).
+   The test below runs the session inside its own test binary, which no AppArmor profile attaches
+   to, so on a host where `kernel.apparmor_restrict_unprivileged_userns` is `1` it prints
+   `[SKIP-HOST]` instead of running.
+2. From a checkout, run:
+
+    ```bash
+    cargo nextest run -p murmur-cli --test native_tool_confinement \
+      a_native_tool_starts_under_a_low_max_open_files_sealed --no-capture
+    ```
+
+    **Expected:** the test passes, and no `[SKIP-HOST]` line is printed. The capsule declares
+    `max_open_files: 64`; the fixture tool reads `64` soft and hard from its own `RLIMIT_NOFILE`,
+    fails to open a 64th descriptor with `Too many open files`, and `ulimit -Sn; ulimit -Hn` in
+    `bash` prints `64` twice.
+
+3. When it fails, print the runtime's reason for each call it could not run from the session's
+   trace:
+
+    ```bash
+    jq -r 'select(.event_type == "tool_call" and .status == "error") | .error' <trace.jsonl>
+    ```
+
+    The [`tool_call` record's `error`](observability-schemas.md#tool-call) is written under
+    every `trace.capture` mode, so the default `meta` carries it too. The test's own failure
+    message prints the same record.
+
 ---
 
 ## Scenario 9 — macOS: rlimits apply, cgroups do not, and it says so { #scenario-9 }
@@ -537,11 +569,3 @@ reported as **its own category** — denial of service — and is never merged i
 findings. That is not a substitute for running them here: it grades each scenario from a single
 automated signal, while the scenarios above also ask a person to watch the host stay responsive and
 to read `dmesg`, `pids.events` and `memory.events` directly.
-
-One finding from that work is worth carrying here, because it changes what a manifest should
-declare: on the Linux Full tier the rlimits are applied *before* the seccomp filter is installed,
-and installing the filter needs file descriptors of its own. A `max_open_files` in the low tens —
-including the `16` declared by [the test capsule](#the-test-capsule) above — makes **every**
-subprocess spawn fail outright with a libseccomp setup error rather than merely capping descriptors.
-Use a ceiling with headroom (64 was the lowest value observed to both spawn and still bite) when the
-intent is to bound a real workload rather than to demonstrate the limit.

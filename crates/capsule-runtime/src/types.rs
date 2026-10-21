@@ -73,6 +73,14 @@ pub(crate) struct DispatchOutcome {
     /// [`crate::runtime::CapsuleStoreState::deliver_deadline_notice`], on whichever dispatched
     /// outcome is first handed back inside the notice margin.
     pub runtime_note: Option<String>,
+    /// The runtime's own text, unfenced, when it could not run the call: the
+    /// [`crate::shell::ShellExecError`] a native tool or shell dispatch returned, the same text
+    /// `result.data` carries before the fence wraps it. The agent loop records it as the
+    /// `tool_call` trace record's `error`.
+    ///
+    /// `None` whenever the tool ran, including when the tool itself reported failure or exited
+    /// non-zero.
+    pub runtime_error: Option<String>,
 }
 
 impl DispatchOutcome {
@@ -85,6 +93,7 @@ impl DispatchOutcome {
             fence_source: None,
             fatal: None,
             runtime_note: None,
+            runtime_error: None,
         }
     }
 
@@ -97,6 +106,7 @@ impl DispatchOutcome {
             fence_source: None,
             fatal: None,
             runtime_note: None,
+            runtime_error: None,
         }
     }
 }

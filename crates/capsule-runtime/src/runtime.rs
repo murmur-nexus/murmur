@@ -11366,8 +11366,8 @@ fn dispatch_native_tool(
 }
 
 /// The dispatch outcome of one [`dispatch_native_tool`] call. A failure becomes an error tool
-/// result carrying its text, with `fatal` set when it ends the session, the way
-/// [`dispatch_shell_tool`] reports a failed shell command.
+/// result carrying its text, the same text in `runtime_error`, and `fatal` set when it ends the
+/// session, the way [`dispatch_shell_tool`] reports a failed shell command.
 fn native_tool_outcome(
     result: Result<murmur::tool::run::ToolResult, ShellExecError>,
 ) -> DispatchOutcome {
@@ -11375,6 +11375,7 @@ fn native_tool_outcome(
         Ok(result) => DispatchOutcome::tool(result),
         Err(error) => DispatchOutcome {
             fatal: error.session_fatal(),
+            runtime_error: Some(error.to_string()),
             ..DispatchOutcome::tool(murmur::tool::run::ToolResult {
                 status: murmur::tool::run::Status::Error,
                 summary: Some("native tool execution failed".to_string()),
@@ -11562,6 +11563,7 @@ fn dispatch_shell_tool(
             // attempted; `fatal` is what tells the agent turn loop that this particular failure
             // is not one the capsule gets another turn to react to.
             fatal: error.session_fatal(),
+            runtime_error: Some(error.to_string()),
             ..DispatchOutcome::tool(murmur::tool::run::ToolResult {
                 status: murmur::tool::run::Status::Error,
                 summary: Some("shell execution failed".to_string()),
@@ -16705,6 +16707,65 @@ inference:
         harness.events().await
     }
 
+    /// A `shell.allow` binary no `PATH` entry holds, so its spawn fails in the runtime.
+    const UNSPAWNABLE_SHELL_BINARY: &str = "murmur-test-no-such-binary";
+
+    /// A driver double's answer calling [`UNSPAWNABLE_SHELL_BINARY`] as `c1` and a tool no
+    /// capsule declares as `c2`.
+    const CALLS_AN_UNSPAWNABLE_COMMAND_AND_AN_UNKNOWN_TOOL: &str = r#"{"stop_reason":"tool_call","content":[{"type":"tool_call","id":"c1","name":"murmur-test-no-such-binary","input":{"command":"--version"}},{"type":"tool_call","id":"c2","name":"no-such-tool","input":{}}]}"#;
+
+    /// Under the default `trace.capture: meta`, a call the runtime could not run records the
+    /// runtime's own text as the `tool_call` record's `error`, with no `output`: a shell command
+    /// whose spawn failed, through a dispatch outcome, and a tool the session does not have,
+    /// through a dispatch error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_the_runtime_could_not_run_records_its_error_under_meta() {
+        let (_dir, workdir, mut state) = launch_skill_session();
+        state.capability_policy.shell_allow = vec![UNSPAWNABLE_SHELL_BINARY.to_string()];
+        let mut harness = AgentLoopHarness::new(
+            &mut state,
+            &workdir,
+            murmur_artifact::ToolRefresh::Immediate,
+            CALLS_AN_UNSPAWNABLE_COMMAND_AND_AN_UNKNOWN_TOOL,
+        )
+        .await;
+        harness.run_task(&mut state, "tsk_1").await;
+        let events = harness.events().await;
+
+        let record = |id: &str| {
+            of_type(&events, "tool_call")
+                .into_iter()
+                .find(|record| record["tool_call_id"] == id)
+                .unwrap_or_else(|| panic!("no tool_call record for {id}: {events:?}"))
+                .clone()
+        };
+        let shell = record("c1");
+        assert_eq!(shell["status"], "error", "{shell}");
+        assert!(
+            shell.get("output").is_none(),
+            "meta stores no output: {shell}"
+        );
+        let error = shell["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("No such file or directory"),
+            "the record must carry the spawn's own error: {shell}"
+        );
+        assert!(
+            !error.contains("untrusted-content"),
+            "the runtime's text is recorded unfenced: {shell}"
+        );
+
+        let unknown = record("c2");
+        assert_eq!(unknown["status"], "error", "{unknown}");
+        assert!(unknown.get("output").is_none(), "{unknown}");
+        assert!(
+            unknown["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
+            "a dispatch error is recorded as the record's error: {unknown}"
+        );
+    }
+
     /// A reopened attempt with no conversation to continue starts a fresh context from the
     /// rewritten `task.md`. That message, not the one an earlier attempt held, is the task a
     /// compaction keeps at the head of the context.
@@ -18725,6 +18786,147 @@ inference:
             !data.contains("os error 22"),
             "the bare errno must not stand in for the step: {data}"
         );
+    }
+
+    /// A native tool or shell command the runtime could not start carries the runtime's own text
+    /// out as `runtime_error`, the same text the tool result's `data` holds before the fence, so
+    /// the `tool_call` trace record has it under every capture mode.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dispatch_the_runtime_could_not_start_carries_its_runtime_error() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "a_dispatch_the_runtime_could_not_start_carries_its_runtime_error",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let binary = write_env_echo_native_tool(tmp.path(), "echo-home", &["HOME"]);
+        let workdir = crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap();
+        let kernel_full = sandbox::ShellEnforcement {
+            tier: sandbox::EnforcementTier::KernelFull,
+            ..sandbox::ShellEnforcement::environment_only()
+        };
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+
+        sandbox::FORCE_LANDLOCK_FAILURE.with(|flag| flag.set(true));
+        let native = native_tool_outcome(dispatch_native_tool(
+            "echo-home",
+            murmur::tool::run::ToolInput {
+                data: None,
+                log_path: None,
+            },
+            &installed_native_tool(&binary, tmp.path()),
+            tmp.path(),
+            &workdir,
+            &CapabilityPolicy::default(),
+            &kernel_full,
+        ));
+        let shell = dispatch_shell_tool(
+            "bash",
+            murmur::tool::run::ToolInput {
+                data: Some(r#"{"command":"echo hi"}"#.to_string()),
+                log_path: None,
+            },
+            &workdir,
+            &workdir,
+            &[],
+            &policy,
+            &kernel_full,
+            None,
+        );
+        sandbox::FORCE_LANDLOCK_FAILURE.with(|flag| flag.set(false));
+
+        for (what, outcome) in [("native tool", &native), ("shell", &shell)] {
+            let error = outcome
+                .runtime_error
+                .as_deref()
+                .unwrap_or_else(|| panic!("{what}: a failed start must carry runtime_error"));
+            assert!(
+                error.contains("enforcement setup failed before exec")
+                    && error.contains("landlock"),
+                "{what}: runtime_error must name the failed step: {error}"
+            );
+            assert_eq!(
+                outcome.result.data.as_deref(),
+                Some(error),
+                "{what}: runtime_error is the tool result's own text"
+            );
+        }
+
+        let sealed = {
+            let _guard = sandbox::ForceSealedRootFailureGuard::new();
+            native_tool_outcome(dispatch_native_tool(
+                "echo-home",
+                murmur::tool::run::ToolInput {
+                    data: None,
+                    log_path: None,
+                },
+                &installed_native_tool(&binary, tmp.path()),
+                tmp.path(),
+                &workdir,
+                &CapabilityPolicy::default(),
+                &sandbox::sealed_test_enforcement(),
+            ))
+        };
+        let error = sealed
+            .runtime_error
+            .as_deref()
+            .expect("a composed-root failure carries runtime_error too");
+        assert!(error.contains("composed root"), "{error}");
+        assert_eq!(sealed.result.data.as_deref(), Some(error));
+    }
+
+    /// A native tool or shell command that ran and failed on its own leaves `runtime_error`
+    /// unset: the failure is the tool's, and its text is the tool's output.
+    #[test]
+    fn a_tool_that_ran_and_failed_has_no_runtime_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let binary = tmp.path().join("exits-three");
+        fs::write(&binary, "#!/bin/sh\ncat >/dev/null\necho broken\nexit 3\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let workdir = crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap();
+
+        let native = native_tool_outcome(dispatch_native_tool(
+            "exits-three",
+            murmur::tool::run::ToolInput {
+                data: None,
+                log_path: None,
+            },
+            &installed_native_tool(&binary, tmp.path()),
+            tmp.path(),
+            &workdir,
+            &CapabilityPolicy::default(),
+            &sandbox::ShellEnforcement::environment_only(),
+        ));
+        assert!(
+            !matches!(native.result.status, murmur::tool::run::Status::Passed),
+            "the tool's own failure still reads as a failed call"
+        );
+        assert_eq!(native.runtime_error, None);
+
+        let shell = dispatch_shell_tool(
+            "bash",
+            murmur::tool::run::ToolInput {
+                data: Some(r#"{"command":"exit 3"}"#.to_string()),
+                log_path: None,
+            },
+            &workdir,
+            &workdir,
+            &[],
+            &CapabilityPolicy {
+                shell_allow: vec!["bash".to_string()],
+                ..CapabilityPolicy::default()
+            },
+            &sandbox::ShellEnforcement::environment_only(),
+            None,
+        );
+        assert_eq!(shell.shell.as_ref().map(|info| info.exit_code), Some(3));
+        assert_eq!(shell.runtime_error, None);
     }
 
     /// A namespace creation refused because the kernel has no user namespaces left to give.

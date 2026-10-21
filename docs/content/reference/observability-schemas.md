@@ -316,7 +316,7 @@ the `[Capsule]` block was prepended.
 `tool_call` redacts out of its own `input` and `output`. Setting `capture: content` opts in to
 storing the wire payload as sent; the default, `meta`, stores no bodies at all.
 
-**`tool_call`** — written after each tool invocation returns
+**`tool_call`**{ #tool-call } — written after each tool invocation returns
 
 | Field | Type | Notes |
 |---|---|---|
@@ -330,6 +330,7 @@ storing the wire payload as sent; the default, `meta`, stores no bodies at all.
 | `output_bytes` | u64 | Byte length of the tool output text, fence markers included |
 | `duration_ms` | u64 | |
 | `status` | string | `"ok"` \| `"error"` |
+| `error` | string | The runtime's own text when it could not run the call, such as a native tool or shell command whose sandbox setup failed before exec. Written under every [`trace.capture`](manifest.md#field-trace) mode, with peer handle tokens redacted, and capped at 2,000 bytes. Absent when the tool ran, including when the tool reported its own failure |
 | `state_effect` | string | `"read"` \| `"mutate"`, as the tool declared it. Absent when the tool declared none — see [`state_effect`](wit-interfaces.md#murmurtoolrun) |
 | `resource_id` | string | The resource this call addressed, as the tool declared it. An opaque, tool-defined string. Absent when the tool declared none |
 

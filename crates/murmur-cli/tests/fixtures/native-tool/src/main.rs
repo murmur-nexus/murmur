@@ -30,6 +30,8 @@
 //!   unix_socket —                         -> {ok}           | {ok: false, error}
 //!   exec        — path, args?             -> {ok, code, stdout} | {ok: false, error}
 //!   netns       —                         -> {ok, netns}    | {ok: false, error}
+//!   rlimit_nofile —                       -> {ok, soft, hard} | {ok: false, error}
+//!   open_until_refused — max? (default 200) -> {ok, opened, error: <text> | null}
 //! A relative `path` resolves against the working directory.
 
 use std::{
@@ -106,6 +108,8 @@ fn run(raw: &str) -> Value {
         "unix_socket" => probe(op_unix_socket()),
         "exec" => probe(op_exec(&op)),
         "netns" => probe(op_netns()),
+        "rlimit_nofile" => probe(op_rlimit_nofile()),
+        "open_until_refused" => probe(Ok(op_open_until_refused(&op))),
         other => failed(format!("unknown operation '{other}'")),
     }
 }
@@ -271,6 +275,51 @@ fn op_exec(op: &Value) -> Result<Value, String> {
 fn op_netns() -> Result<Value, String> {
     let link = fs::read_link("/proc/self/ns/net").map_err(|err| err.to_string())?;
     Ok(json!({"netns": link.to_string_lossy()}))
+}
+
+/// `RLIMIT_NOFILE` in `<sys/resource.h>`, the same on Linux x86_64 and aarch64.
+const RLIMIT_NOFILE: i32 = 7;
+
+/// `struct rlimit` on 64-bit Linux: two `rlim_t` (`u64`) fields.
+#[repr(C)]
+struct Rlimit {
+    cur: u64,
+    max: u64,
+}
+
+extern "C" {
+    fn getrlimit(resource: i32, rlim: *mut Rlimit) -> i32;
+}
+
+/// The process's own descriptor bound, read with `getrlimit` rather than from `/proc/self/limits`,
+/// which Landlock may not grant the tool.
+fn op_rlimit_nofile() -> Result<Value, String> {
+    let mut limit = Rlimit { cur: 0, max: 0 };
+    // SAFETY: `limit` is a live, writable `struct rlimit` with the C layout `getrlimit` fills, and
+    // the call writes nothing beyond it.
+    let rc = unsafe { getrlimit(RLIMIT_NOFILE, &mut limit) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(json!({"soft": limit.cur, "hard": limit.max}))
+}
+
+/// Opens `/dev/null` until an open fails or `max` descriptors are held, all of them kept open
+/// until the count is taken.
+fn op_open_until_refused(op: &Value) -> Value {
+    let max = op.get("max").and_then(Value::as_u64).unwrap_or(200);
+    let mut held = Vec::new();
+    let mut error = None;
+    while (held.len() as u64) < max {
+        match fs::File::open("/dev/null") {
+            Ok(file) => held.push(file),
+            Err(err) => {
+                error = Some(err.to_string());
+                break;
+            }
+        }
+    }
+    json!({"opened": held.len(), "error": error})
 }
 
 fn failed(summary: impl Into<String>) -> Value {

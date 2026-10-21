@@ -71,6 +71,8 @@ struct Capsule {
     network_allow: Vec<String>,
     shell_allow: Vec<String>,
     unix_sockets: bool,
+    /// `capabilities.resources.max_open_files`, rendered only when set.
+    max_open_files: Option<u64>,
 }
 
 impl Capsule {
@@ -106,6 +108,11 @@ impl Capsule {
                 manifest.push_str(&format!("      - {binary}\n"));
             }
         }
+        if let Some(max_open_files) = self.max_open_files {
+            manifest.push_str(&format!(
+                "  resources:\n    max_open_files: {max_open_files}\n"
+            ));
+        }
         manifest.push_str(&format!(
             "inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: \
              {DRIVER_NAME}\n"
@@ -114,10 +121,10 @@ impl Capsule {
     }
 }
 
-/// What a launched session left behind: each tool call's result text, keyed by its id, and the
-/// session's workdirs.
+/// What a launched session left behind: each tool call's result text, keyed by its id (`None` when
+/// the model never received one), and the session's workdirs.
 struct Ran {
-    results: Vec<(String, String)>,
+    results: Vec<(String, Option<String>)>,
     accessible_workdir: PathBuf,
     /// The scratch home, artifact folder and project, kept until the test has read the workdir.
     _dirs: [TempDir; 3],
@@ -125,17 +132,65 @@ struct Ran {
 
 impl Ran {
     fn text(&self, id: &str) -> &str {
-        self.results
-            .iter()
-            .find(|(call, _)| call == id)
-            .map(|(_, text)| text.as_str())
-            .unwrap_or_else(|| panic!("no tool_result for {id}: {:?}", self.results))
+        match self.results.iter().find(|(call, _)| call == id) {
+            Some((_, Some(text))) => text.as_str(),
+            _ => panic!(
+                "no tool_result for {id}; trace record: {}",
+                self.tool_call_record(id)
+            ),
+        }
     }
 
     /// A probe's `data` object.
     fn probe(&self, id: &str) -> Value {
         let text = self.text(id);
-        serde_json::from_str(text).unwrap_or_else(|_| panic!("{id} returned no probe: {text}"))
+        serde_json::from_str(text).unwrap_or_else(|_| {
+            panic!(
+                "{id} returned no probe: {text}\ntrace record: {}",
+                self.tool_call_record(id)
+            )
+        })
+    }
+
+    /// The session's `trace.jsonl`. An in-process session keeps its records under this process's
+    /// `$HOME`, the scratch home `common` points it at, mirrored from the session workdir's path.
+    fn trace_path(&self) -> Result<PathBuf, String> {
+        let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is unset")?);
+        let session = &self.accessible_workdir;
+        let (Some(root), Some(id)) = (session.parent(), session.file_name()) else {
+            return Err(format!("{} names no session", session.display()));
+        };
+        let trace = common::records_group(&home, root)
+            .join(id)
+            .join("trace.jsonl");
+        if trace.is_file() {
+            Ok(trace)
+        } else {
+            Err(format!("no trace at {}", trace.display()))
+        }
+    }
+
+    /// Every `tool_call` record in the session's `trace.jsonl`.
+    fn tool_call_records(&self) -> Vec<Value> {
+        let trace = self
+            .trace_path()
+            .unwrap_or_else(|missing| panic!("{missing}"));
+        common::read_whole_trace(&trace)
+            .into_iter()
+            .filter(|record| record["event_type"] == "tool_call")
+            .collect()
+    }
+
+    /// The `tool_call` record of call `id`, for a failure message: `null` when the trace holds
+    /// none, and the reason when there is no trace to read.
+    fn tool_call_record(&self, id: &str) -> Value {
+        match self.trace_path() {
+            Ok(trace) => common::read_whole_trace(&trace)
+                .into_iter()
+                .find(|record| record["event_type"] == "tool_call" && record["tool_call_id"] == id)
+                .unwrap_or(Value::Null),
+            Err(missing) => Value::String(missing),
+        }
     }
 }
 
@@ -213,23 +268,32 @@ fn run_in(
     let accessible_workdir = staged.accessible_workdir.clone();
     fs::write(accessible_workdir.join("task.md"), "Run the probes.").unwrap();
 
-    launch_session(staged, |_| {}).expect("the session launches");
+    let launch_error = launch_session(staged, |_| {})
+        .err()
+        .map(|error| error.to_string());
 
     let requests = server.requests();
     let results = calls
         .iter()
         .map(|(id, _, _)| {
-            let text = common::tool_result_text(&requests, id)
-                .unwrap_or_else(|| panic!("no tool_result for {id}"));
-            println!("{id}: {text}");
+            let text = common::tool_result_text(&requests, id);
+            println!("{id}: {text:?}");
             (id.to_string(), text)
         })
         .collect();
-    Some(Ran {
+    let ran = Ran {
         results,
         accessible_workdir,
         _dirs: [home, artifact_dir, project],
-    })
+    };
+    if let Some(error) = launch_error {
+        let records: Vec<Value> = calls
+            .iter()
+            .map(|(id, _, _)| ran.tool_call_record(id))
+            .collect();
+        panic!("the session must launch: {error}\ntool_call records: {records:?}");
+    }
+    Some(ran)
 }
 
 fn probe(operation: &str, fields: Value) -> Value {
@@ -314,6 +378,84 @@ fn host_server(reply: &'static str) -> u16 {
         }
     });
     port
+}
+
+/// 256 `/dev/null` descriptors held by this process, the `mur` whose descriptors a spawned child
+/// inherits at the fork. std opens them `O_CLOEXEC`, so none reaches an exec'd program; they only
+/// push the lowest free descriptor number in the child above a low `max_open_files`.
+fn hold_many_descriptors() -> Vec<fs::File> {
+    let held: Vec<fs::File> = (0..256)
+        .map(|_| fs::File::open("/dev/null").unwrap())
+        .collect();
+    let open = fs::read_dir("/proc/self/fd").unwrap().count();
+    assert!(
+        open > 64,
+        "the test process must hold more than 64 descriptors, holds {open}"
+    );
+    held
+}
+
+/// A native tool, and a shell command beside it, started at `floor` under
+/// `max_open_files: 64` while this process holds more than 64 descriptors: both run with exactly
+/// 64 soft and hard, the tool cannot open a 64th descriptor, and no call fails to start.
+fn assert_low_max_open_files_holds(test: &str, floor: ContainmentClass) {
+    let held = hold_many_descriptors();
+    let capsule = Capsule {
+        shell_allow: vec!["bash".into()],
+        max_open_files: Some(64),
+        ..Capsule::default()
+    };
+    let calls = vec![
+        (
+            "toolu_rlimit_nofile",
+            FIXTURE_TOOL,
+            probe("rlimit_nofile", json!({})),
+        ),
+        (
+            "toolu_open_until_refused",
+            FIXTURE_TOOL,
+            probe("open_until_refused", json!({"max": 200})),
+        ),
+        (
+            "toolu_shell_ulimit",
+            "bash",
+            json!({"command": "ulimit -Sn; ulimit -Hn"}),
+        ),
+    ];
+    let Some(ran) = run(&capsule, &[], &calls, floor) else {
+        eprintln!("[SKIP] {test}: the fixture tool could not be built");
+        return;
+    };
+
+    let limit = assert_allowed(&ran, "toolu_rlimit_nofile");
+    assert_eq!(limit["soft"], 64, "soft RLIMIT_NOFILE: {limit}");
+    assert_eq!(limit["hard"], 64, "hard RLIMIT_NOFILE: {limit}");
+
+    let opened = assert_allowed(&ran, "toolu_open_until_refused");
+    assert!(
+        opened["opened"].as_u64().is_some_and(|count| count < 64),
+        "the tool must not hold 64 descriptors: {opened}"
+    );
+    let error = opened["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("Too many open files"),
+        "the open past the bound must fail with EMFILE: {opened}"
+    );
+
+    let shell = ran.text("toolu_shell_ulimit");
+    assert!(
+        shell.contains("64\n64"),
+        "bash must run under 64 soft and hard: {shell}\ntrace record: {}",
+        ran.tool_call_record("toolu_shell_ulimit")
+    );
+
+    let records = ran.tool_call_records();
+    assert_eq!(records.len(), calls.len(), "tool_call records: {records:?}");
+    for record in &records {
+        assert_eq!(record["status"], "ok", "tool_call record: {record}");
+        assert!(record.get("error").is_none(), "tool_call record: {record}");
+    }
+    drop(held);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -589,6 +731,29 @@ fn a_script_native_tool_gets_its_interpreter_and_nothing_more() {
     let ran = run(&with_id, &scripts, &calls, ContainmentClass::Scoped).unwrap();
     assert_eq!(ran.text("toolu_builtin"), "script-ok");
     assert_eq!(ran.text("toolu_id"), "id-ran");
+}
+
+/// Under `scoped`, a capsule declaring `max_open_files: 64` starts a native tool and a shell
+/// command under exactly that bound, however many descriptors `mur` holds at the spawn.
+#[test]
+#[allow(clippy::print_stdout)]
+fn a_native_tool_starts_under_a_low_max_open_files_scoped() {
+    let test = "a_native_tool_starts_under_a_low_max_open_files_scoped";
+    if skip_host(test, ContainmentClass::Scoped) {
+        return;
+    }
+    assert_low_max_open_files_holds(test, ContainmentClass::Scoped);
+}
+
+/// The same under `sealed`, where the child also builds the composed root before it execs.
+#[test]
+#[allow(clippy::print_stdout)]
+fn a_native_tool_starts_under_a_low_max_open_files_sealed() {
+    let test = "a_native_tool_starts_under_a_low_max_open_files_sealed";
+    if skip_host(test, ContainmentClass::Sealed) {
+        return;
+    }
+    assert_low_max_open_files_holds(test, ContainmentClass::Sealed);
 }
 
 // ── the default-artifacts native tools ───────────────────────────────────────

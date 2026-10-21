@@ -318,12 +318,28 @@ pub(crate) enum NprocBound {
 /// unrelated thread elsewhere on the host to fail a `fork()` here, so the inherited value is left
 /// in place.
 #[cfg(unix)]
-// The `as u32` on each `RLIMIT_*` below is redundant on Linux, where the constants are already
-// `__rlimit_resource_t` (`c_uint`), and load-bearing on macOS, where they are `c_int`. Clippy only
-// ever sees one of the two platforms at a time, so on Linux it reads the portability cast as a
-// no-op.
-#[allow(clippy::unnecessary_cast)]
 pub(crate) fn apply_hard_rlimits(
+    limits: &HostResourceLimits,
+    nproc: NprocBound,
+) -> std::io::Result<()> {
+    apply_nproc_bound(limits, nproc)?;
+    apply_per_process_rlimits(limits)
+}
+
+/// The `RLIMIT_NPROC` half of [`apply_hard_rlimits`]: set for [`NprocBound::Headroom`], left
+/// alone for [`NprocBound::CgroupPidsMax`]. Same `pre_exec` restrictions.
+///
+/// A kernel-tier spawn must call this before any `unshare(CLONE_NEWUSER)` in its `pre_exec`
+/// closure. A new user namespace caps its parent namespace's task count at the creator's
+/// `RLIMIT_NPROC` as of the `unshare`, and a later `setrlimit` bounds only the tasks inside the
+/// new namespace.
+#[cfg(unix)]
+// The `as u32` on each `RLIMIT_*` here and in `apply_per_process_rlimits` is redundant on Linux,
+// where the constants are already `__rlimit_resource_t` (`c_uint`), and load-bearing on macOS,
+// where they are `c_int`. Clippy only ever sees one of the two platforms at a time, so on Linux it
+// reads the portability cast as a no-op.
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn apply_nproc_bound(
     limits: &HostResourceLimits,
     nproc: NprocBound,
 ) -> std::io::Result<()> {
@@ -333,6 +349,18 @@ pub(crate) fn apply_hard_rlimits(
             baseline.saturating_add(limits.max_processes),
         )?;
     }
+    Ok(())
+}
+
+/// Every limit of [`apply_hard_rlimits`] except `RLIMIT_NPROC`: the ones that bound this process
+/// alone. Same `pre_exec` restrictions.
+///
+/// A kernel-tier spawn calls this last in its `pre_exec` closure. After `RLIMIT_NOFILE` is set,
+/// every descriptor the child opens must be numbered below it, and the child holds every
+/// descriptor its parent had open at the fork.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn apply_per_process_rlimits(limits: &HostResourceLimits) -> std::io::Result<()> {
     set_hard_rlimit(libc::RLIMIT_NOFILE as u32, limits.max_open_files)?;
     set_hard_rlimit(libc::RLIMIT_FSIZE as u32, limits.max_file_size_bytes)?;
     set_cpu_rlimit(limits.cpu_seconds)?;
@@ -383,7 +411,7 @@ fn set_hard_rlimit(resource: u32, value: u64) -> std::io::Result<()> {
 /// One `getrlimit`/`setrlimit` pair for `RLIMIT_CPU`: read the inherited hard limit, then write
 /// the two slots [`cpu_rlimit_slots`] derives from it.
 #[cfg(unix)]
-// See `apply_hard_rlimits` for why the `as u32` is kept.
+// See `apply_nproc_bound` for why the `as u32` is kept.
 #[allow(clippy::unnecessary_cast)]
 fn set_cpu_rlimit(cpu_seconds: u64) -> std::io::Result<()> {
     let resource = libc::RLIMIT_CPU as u32;
@@ -1087,7 +1115,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[allow(unsafe_code)]
-    // Same portability cast as `apply_hard_rlimits`: `RLIMIT_CORE` is `c_uint` on Linux and
+    // Same portability cast as `apply_per_process_rlimits`: `RLIMIT_CORE` is `c_uint` on Linux and
     // `c_int` on macOS, so the cast only looks redundant from whichever platform clippy runs on.
     #[allow(clippy::unnecessary_cast)]
     fn set_hard_rlimit_writes_both_the_soft_and_hard_slot() {

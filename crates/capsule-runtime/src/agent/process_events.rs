@@ -477,6 +477,7 @@ impl<'a> ProcessEventSink<'a> {
                         status.to_string(),
                         None,
                         None,
+                        None,
                     )
                     .await;
                 hooks

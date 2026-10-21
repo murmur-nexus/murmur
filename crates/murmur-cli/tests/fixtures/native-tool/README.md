@@ -3,8 +3,9 @@
 A small host-native tool binary used by `crates/murmur-cli/tests/git_tool.rs`,
 `crates/murmur-cli/tests/native_tool_packaging.rs` and
 `crates/murmur-cli/tests/native_tool_confinement.rs`. Its probe operations
-(`read`, `write`, `connect`, `unix_socket`, `exec`, `netns`) are what the
-confinement tests drive to check what the sandbox refuses.
+(`read`, `write`, `connect`, `unix_socket`, `exec`, `netns`, `rlimit_nofile`,
+`open_until_refused`) are what the confinement tests drive to check what the
+sandbox refuses.
 
 Unlike the other crates under `tests/fixtures/`, this one is **not** a
 `wasm32-wasip2` component and its build output is **not** checked in. Native

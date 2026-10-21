@@ -494,12 +494,6 @@ resolve and agree with `$HOME`; **no host account name appears inside the capsul
 gives: without a composed root these rules would apply to the host's own `/etc` — its real trust
 store, its real `resolv.conf`, its real account databases.
 
-**One operational consequence.** Each of these entries holds a file descriptor open while the
-capsule starts, under whatever [`capabilities.resources.max_open_files`](resource-limits.md#host-resource-limits)
-the manifest declared. A `sealed` capsule allowing an interpreter and a shell needs roughly seventy
-descriptors to launch, and below that it is refused at startup rather than silently weakened. A
-manifest with a very tight `max_open_files` may need to raise it.
-
 ## What the composed root contains { #composed-root-listability }
 
 A capsule that declares [`capabilities.containment: sealed`](#field-containment) on a host that
