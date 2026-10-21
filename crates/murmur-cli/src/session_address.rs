@@ -98,7 +98,8 @@ pub(crate) fn is_literal_path(address: &str) -> bool {
     !address.starts_with('@') && (address.contains('/') || address.ends_with(".jsonl"))
 }
 
-/// Whether `address` is spelled as a full session id: `ses_` and 32 hex characters.
+/// Whether `address` is spelled as a full session id: `ses_` and 32 more characters, 36 in all.
+/// The characters themselves are not checked.
 pub(crate) fn is_full_session_id(address: &str) -> bool {
     address.starts_with("ses_") && address.len() == 36
 }

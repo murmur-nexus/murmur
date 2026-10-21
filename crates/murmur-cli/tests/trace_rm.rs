@@ -279,7 +279,7 @@ impl Drop for Stray {
     }
 }
 
-// ── S8. Two sessions of one root, removed one at a time ──────────────────────
+// ── Two sessions of one root, removed one at a time ──────────────────────────
 
 #[test]
 fn rm_removes_exactly_one_session_of_a_root() {
@@ -348,7 +348,7 @@ fn rm_removes_exactly_one_session_of_a_root() {
     assert!(listed_ids(f.home.path(), &root).is_empty());
 }
 
-// ── S9. A run without --workdir ──────────────────────────────────────────────
+// ── A run without --workdir ──────────────────────────────────────────────────
 
 #[test]
 fn rm_removes_the_session_directory_of_a_run_without_workdir() {
@@ -368,7 +368,7 @@ fn rm_removes_the_session_directory_of_a_run_without_workdir() {
     assert!(root.is_dir(), "the workdir root stays");
 }
 
-// ── S10. A running session is refused; a stale record goes with the session ──
+// ── A running session is refused; a stale record goes with the session ───────
 
 #[test]
 fn rm_refuses_a_running_session_and_prunes_a_stale_record() {
@@ -397,7 +397,7 @@ fn rm_refuses_a_running_session_and_prunes_a_stale_record() {
     assert!(!records.exists() && !session.exists());
 }
 
-// ── S11. What an address may name, and what is never followed ────────────────
+// ── What an address may name, and what is never followed ─────────────────────
 
 #[test]
 fn rm_refuses_paths_unknown_ids_and_links_and_finishes_a_half_removal() {

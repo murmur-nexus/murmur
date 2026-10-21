@@ -20,9 +20,6 @@ use crate::error::{CliError, E_RUN_022, E_RUN_023, E_RUN_028};
 /// The address an omitted argument means: the most recent running session.
 pub(crate) const LATEST: &str = "@1";
 
-/// Length of a full session id: `ses_` and 32 hex characters.
-const SESSION_ID_LEN: usize = 36;
-
 /// The shortest suffix that may name a session.
 const MIN_SUFFIX_LEN: usize = 4;
 
@@ -205,7 +202,7 @@ fn candidate(address: &str) -> Result<RunningRecord, CliError> {
         return Err(nothing_matches(&alive, format!("@{n}")));
     }
 
-    if address.starts_with("ses_") && address.len() == SESSION_ID_LEN {
+    if crate::session_address::is_full_session_id(address) {
         if let Some(record) = alive.iter().find(|record| record.session_id == address) {
             return Ok(record.clone());
         }

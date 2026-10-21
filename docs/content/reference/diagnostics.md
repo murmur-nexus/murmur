@@ -703,6 +703,10 @@ the same code, as `formation <id> could not be ended: <reason>`:
 | `SIGTERM to its launcher, pid N, was refused: …` | The launcher could not be confirmed or may not be signalled by this user; nothing was signalled and every member is still running |
 | `SIGKILL to its launcher, pid N, was refused: …` | The same, at the escalation step |
 | `its launcher, pid N, was still running 5 seconds after SIGKILL` | The kernel accepted the signal and the launcher has not gone |
+| `N of its members were still running 25 seconds later: <session>, …` | Those members' processes outlived the wait; their records are kept |
+
+A member started by hand that could not be ended is reported as `error: …` in the
+[report](cli.md#mur-stop-formation) and counted among the members still running.
 
 [`mur trace rm`](cli.md#mur-trace-rm) refuses a session that a running-capsule record names while
 its process is alive, or alive with a start time that could not be read, and removes nothing:
@@ -711,10 +715,6 @@ its process is alive, or alive with a start time that could not be read, and rem
 error[E-RUN-024]: session ses_019f0193c7d871a5b2e30ff41a7c0ce1 is still running (pid 48213); nothing was removed
   hint: stop it with `mur stop ses_019f0193c7d871a5b2e30ff41a7c0ce1` first, then remove it
 ```
-| `N of its members were still running 25 seconds later: <session>, …` | Those members' processes outlived the wait; their records are kept |
-
-A member started by hand that could not be ended is reported as `error: …` in the
-[report](cli.md#mur-stop-formation) and counted among the members still running.
 
 ### E-RUN-025 — an artifact with a gateway declares no usable `upstream_auth:` block { #e-run-025 }
 
