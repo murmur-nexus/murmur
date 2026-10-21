@@ -37,6 +37,12 @@
 //! hostile agent a soft-only cap is therefore advisory: one `setrlimit` call from inside the
 //! capsule undoes it. Every limit this module sets writes `rlim_cur == rlim_max`, leaving no
 //! ceiling to raise into, and lowering `rlim_max` is irreversible for an unprivileged process.
+//!
+//! `RLIMIT_CPU` is the one exception: its soft slot is `cpu_seconds` and its hard slot one second
+//! above ([`cpu_rlimit_slots`]). The kernel sends `SIGXCPU`, the signal [`limit_from_signal`]
+//! attributes, only while the soft slot sits below the hard one. The bound is the hard slot: a
+//! process that raises its soft slot to the hard one, or ignores `SIGXCPU`, gets `SIGKILL` at
+//! `cpu_seconds + 1`, so CPU time per process stays within `cpu_seconds` plus one second.
 
 use std::{
     path::{Path, PathBuf},
@@ -60,7 +66,8 @@ pub const DEFAULT_MAX_OPEN_FILES: u64 = 1024;
 /// Default `RLIMIT_FSIZE` hard ceiling — 4 GiB, the largest single file a subprocess may write.
 pub const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Default `RLIMIT_CPU` hard ceiling — one hour of CPU time per spawned subprocess.
+/// Default CPU time per spawned subprocess at which `RLIMIT_CPU` sends `SIGXCPU` — one hour,
+/// with `SIGKILL` one second later.
 pub const DEFAULT_CPU_SECONDS: u64 = 3600;
 
 /// Default `RLIMIT_AS` (Linux) / `RLIMIT_DATA` (macOS) hard ceiling — 2 GiB per subprocess.
@@ -104,7 +111,8 @@ pub struct HostResourceLimits {
     pub max_open_files: u64,
     /// `RLIMIT_FSIZE` hard ceiling, in bytes.
     pub max_file_size_bytes: u64,
-    /// `RLIMIT_CPU` hard ceiling, in CPU-seconds.
+    /// CPU time, in CPU-seconds, at which `RLIMIT_CPU` sends a spawned subprocess `SIGXCPU`, with
+    /// `SIGKILL` one second later ([`cpu_rlimit_slots`]).
     pub cpu_seconds: u64,
     /// `RLIMIT_AS` on Linux, `RLIMIT_DATA` on macOS (which has no `RLIMIT_AS`), in bytes.
     pub memory_bytes: u64,
@@ -187,7 +195,9 @@ pub(crate) fn resolve(
 ///
 /// Only two signals qualify, and the list is deliberately not longer:
 ///
-/// * `SIGXCPU` — the kernel raises exactly this for an `RLIMIT_CPU` overrun. Unambiguous.
+/// * `SIGXCPU` — the kernel raises exactly this for an `RLIMIT_CPU` overrun, at the soft limit,
+///   which [`apply_hard_rlimits`] places one second below the hard one so that it is raised at
+///   all. Unambiguous.
 /// * `SIGXFSZ` — likewise for `RLIMIT_FSIZE`. Unambiguous.
 ///
 /// Everything else stays unattributed **on purpose**. `RLIMIT_AS`/`RLIMIT_DATA` overrun surfaces
@@ -196,7 +206,9 @@ pub(crate) fn resolve(
 /// fact. `RLIMIT_NPROC` and `RLIMIT_NOFILE` do not kill anything at all: they fail a
 /// `fork()`/`open()` inside the child with `EAGAIN`/`EMFILE`, visible in that child's own stderr
 /// and exit code. A bare `SIGKILL` with no cgroup evidence has too many causes (host OOM killer,
-/// an operator, an unrelated crash) to name one.
+/// an operator, an unrelated crash) to name one. That includes the `SIGKILL` `RLIMIT_CPU` sends
+/// one second after `SIGXCPU` to a process that ignored or handled it: it stays unattributed like
+/// every other bare `SIGKILL`.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn limit_from_signal(signal: i32) -> Option<&'static str> {
     match signal {
@@ -273,9 +285,11 @@ pub(crate) enum NprocBound {
     Headroom { baseline: u64 },
 }
 
-/// Sets every [`HostResourceLimits`] rlimit field as a **hard** limit (`rlim_cur == rlim_max`),
-/// plus `RLIMIT_CORE = 0`. `RLIMIT_NPROC` is set only for [`NprocBound::Headroom`]; for
-/// [`NprocBound::CgroupPidsMax`] no `RLIMIT_NPROC` call is made at all.
+/// Sets every [`HostResourceLimits`] rlimit field as a **hard** limit (`rlim_cur == rlim_max`)
+/// except `RLIMIT_CPU`, whose soft slot sits one second below its hard slot
+/// ([`cpu_rlimit_slots`]), plus `RLIMIT_CORE = 0`. `RLIMIT_NPROC` is set only for
+/// [`NprocBound::Headroom`]; for [`NprocBound::CgroupPidsMax`] no `RLIMIT_NPROC` call is made at
+/// all.
 ///
 /// Called from inside a forked child's `pre_exec` closure, so everything here is restricted to
 /// async-signal-safe operations: two syscalls per limit and no allocation, no locking, and no
@@ -289,7 +303,8 @@ pub(crate) enum NprocBound {
 /// A requested value above the inherited hard limit is **clamped down to it** rather than
 /// treated as an error: an unprivileged process cannot raise `rlim_max`, so the inherited value
 /// is the real ceiling either way, and failing the spawn would replace an unwidenable bound with
-/// no subprocess at all.
+/// no subprocess at all. For `RLIMIT_CPU` the hard slot clamps to the inherited hard limit and the
+/// soft slot stays one second below it.
 ///
 /// ## `RLIMIT_NPROC`: headroom without a scope, untouched with one
 ///
@@ -303,7 +318,6 @@ pub(crate) enum NprocBound {
 /// unrelated thread elsewhere on the host to fail a `fork()` here, so the inherited value is left
 /// in place.
 #[cfg(unix)]
-#[allow(unsafe_code)]
 // The `as u32` on each `RLIMIT_*` below is redundant on Linux, where the constants are already
 // `__rlimit_resource_t` (`c_uint`), and load-bearing on macOS, where they are `c_int`. Clippy only
 // ever sees one of the two platforms at a time, so on Linux it reads the portability cast as a
@@ -321,7 +335,7 @@ pub(crate) fn apply_hard_rlimits(
     }
     set_hard_rlimit(libc::RLIMIT_NOFILE as u32, limits.max_open_files)?;
     set_hard_rlimit(libc::RLIMIT_FSIZE as u32, limits.max_file_size_bytes)?;
-    set_hard_rlimit(libc::RLIMIT_CPU as u32, limits.cpu_seconds)?;
+    set_cpu_rlimit(limits.cpu_seconds)?;
     set_hard_rlimit(libc::RLIMIT_CORE as u32, 0)?;
 
     // `memory_bytes` maps to `RLIMIT_AS` (total address space) on Linux, where it is enforced
@@ -345,17 +359,8 @@ pub(crate) fn apply_hard_rlimits(
 /// One `getrlimit`/`setrlimit` pair: read the inherited hard limit, clamp `value` to it, then
 /// write the result to **both** the soft and hard slot.
 #[cfg(unix)]
-#[allow(unsafe_code)]
 fn set_hard_rlimit(resource: u32, value: u64) -> std::io::Result<()> {
-    let mut current = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `resource` is one of the `libc::RLIMIT_*` constants (cast to the width this
-    // platform's `setrlimit` takes) and `current` is a live, correctly-sized stack `rlimit`.
-    if unsafe { libc::getrlimit(resource as _, &mut current) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    let current = read_rlimit(resource)?;
 
     // `rlim_t` is 64-bit on every platform this runtime targets, but saturate rather than cast
     // so a 32-bit `rlim_t` would clamp to its own maximum instead of silently wrapping.
@@ -366,12 +371,87 @@ fn set_hard_rlimit(resource: u32, value: u64) -> std::io::Result<()> {
         requested.min(current.rlim_max)
     };
 
-    let limit = libc::rlimit {
-        rlim_cur: target,
-        rlim_max: target,
+    write_rlimit(
+        resource,
+        &libc::rlimit {
+            rlim_cur: target,
+            rlim_max: target,
+        },
+    )
+}
+
+/// One `getrlimit`/`setrlimit` pair for `RLIMIT_CPU`: read the inherited hard limit, then write
+/// the two slots [`cpu_rlimit_slots`] derives from it.
+#[cfg(unix)]
+// See `apply_hard_rlimits` for why the `as u32` is kept.
+#[allow(clippy::unnecessary_cast)]
+fn set_cpu_rlimit(cpu_seconds: u64) -> std::io::Result<()> {
+    let resource = libc::RLIMIT_CPU as u32;
+    let current = read_rlimit(resource)?;
+    write_rlimit(resource, &cpu_rlimit_slots(cpu_seconds, current.rlim_max))
+}
+
+/// The `RLIMIT_CPU` slots for a declared `cpu_seconds`, given the hard limit this process
+/// inherited: the hard slot one second above `cpu_seconds` and the soft slot one second below
+/// the hard one.
+///
+/// The kernel sends `SIGXCPU` when a process reaches its soft limit and `SIGKILL` when it reaches
+/// its hard limit, and with the two equal the hard check fires first, so only `SIGKILL` is ever
+/// sent. `SIGXCPU` is the signal [`limit_from_signal`] can attribute; the gap of one second is
+/// what makes the kernel send it at `cpu_seconds`.
+///
+/// * The hard slot is `cpu_seconds + 1`, clamped down to a finite `inherited_hard`.
+/// * The soft slot is the hard slot minus one, except that it equals the hard slot when that is
+///   `RLIM_INFINITY` (a `cpu_seconds` that saturates) or `≤ 1` (an inherited hard limit of 1).
+///
+/// Pure arithmetic with no allocation, because it runs inside `pre_exec`.
+#[cfg(unix)]
+// `RLIM_INFINITY` is `u64::MAX` on Linux but `i64::MAX` on macOS, so every value is capped at it
+// rather than at `rlim_t::MAX`. On Linux the cap equals the type's maximum, which clippy reads as
+// a no-op `min`.
+#[allow(clippy::unnecessary_min_or_max)]
+fn cpu_rlimit_slots(cpu_seconds: u64, inherited_hard: libc::rlim_t) -> libc::rlimit {
+    let requested = libc::rlim_t::try_from(cpu_seconds)
+        .unwrap_or(libc::RLIM_INFINITY)
+        .min(libc::RLIM_INFINITY);
+    let mut hard = requested.saturating_add(1).min(libc::RLIM_INFINITY);
+    if inherited_hard != libc::RLIM_INFINITY {
+        hard = hard.min(inherited_hard);
+    }
+    let soft = if hard == libc::RLIM_INFINITY || hard <= 1 {
+        hard
+    } else {
+        hard - 1
     };
-    // SAFETY: same as above; `limit` is a live stack `rlimit` and is only read by the call.
-    if unsafe { libc::setrlimit(resource as _, &limit) } != 0 {
+    libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: hard,
+    }
+}
+
+/// `getrlimit(resource)`, with a failure returned as the bare OS error.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn read_rlimit(resource: u32) -> std::io::Result<libc::rlimit> {
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `resource` is one of the `libc::RLIMIT_*` constants (cast to the width this
+    // platform's `getrlimit` takes) and `current` is a live, correctly-sized stack `rlimit`.
+    if unsafe { libc::getrlimit(resource as _, &mut current) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(current)
+}
+
+/// `setrlimit(resource, limit)`, with a failure returned as the bare OS error.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn write_rlimit(resource: u32, limit: &libc::rlimit) -> std::io::Result<()> {
+    // SAFETY: `resource` is one of the `libc::RLIMIT_*` constants (cast to the width this
+    // platform's `setrlimit` takes) and `limit` is a live `rlimit` that the call only reads.
+    if unsafe { libc::setrlimit(resource as _, limit) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
@@ -1027,5 +1107,29 @@ mod tests {
             current.rlim_max, 0,
             "the hard slot must be set, not only the soft one"
         );
+    }
+
+    /// The `RLIMIT_CPU` slot rule: the hard slot one second above `cpu_seconds` and clamped to a
+    /// finite inherited hard limit, the soft slot one second below the hard one, and both equal
+    /// when the hard slot is `RLIM_INFINITY` or 1.
+    #[cfg(unix)]
+    #[test]
+    fn cpu_rlimit_slots_warn_one_second_before_the_hard_ceiling() {
+        let inf = libc::RLIM_INFINITY;
+        let cases: [(u64, libc::rlim_t, (libc::rlim_t, libc::rlim_t)); 5] = [
+            (5, inf, (5, 6)),
+            (3600, 100, (99, 100)),
+            (5, 6, (5, 6)),
+            (5, 1, (1, 1)),
+            (u64::MAX, inf, (inf, inf)),
+        ];
+        for (cpu_seconds, inherited_hard, expected) in cases {
+            let slots = cpu_rlimit_slots(cpu_seconds, inherited_hard);
+            assert_eq!(
+                (slots.rlim_cur, slots.rlim_max),
+                expected,
+                "cpu_seconds {cpu_seconds}, inherited hard {inherited_hard}"
+            );
+        }
     }
 }

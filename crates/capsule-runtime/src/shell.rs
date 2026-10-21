@@ -1086,6 +1086,104 @@ mod tests {
         assert_eq!(result.resource_limit_hit, None);
     }
 
+    /// Runs `bash -c script` through `execute_shell` with `limits` both declared and applied.
+    #[cfg(target_os = "linux")]
+    fn run_bash_with_limits(
+        limits: crate::resources::HostResourceLimits,
+        script: &str,
+    ) -> ShellResult {
+        let temp = tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            resources: limits,
+            ..CapabilityPolicy::default()
+        };
+        let mut enforcement = ShellEnforcement::environment_only();
+        enforcement.resource_limits = limits;
+
+        execute_shell(
+            "bash",
+            &["-c", script],
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &policy,
+            &enforcement,
+        )
+        .expect("bash must run")
+    }
+
+    /// The bound behind `cpu_seconds` is the hard slot: a subshell that ignores `SIGXCPU` keeps
+    /// running past `cpu_seconds` and is killed with `SIGKILL` one second later. That kill names
+    /// no limit, and the subshell's CPU time, read from bash's `times` (whose second line is the
+    /// reaped children's user and system time), stays within `cpu_seconds` plus one second, with
+    /// slack for accounting granularity.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_command_that_ignores_sigxcpu_is_killed_one_second_later() {
+        let result = run_bash_with_limits(
+            crate::resources::HostResourceLimits {
+                cpu_seconds: 1,
+                ..crate::resources::HostResourceLimits::default()
+            },
+            "( trap '' XCPU; while :; do :; done ); echo \"status=$?\"; times",
+        );
+
+        assert_eq!(result.exit_code, 0, "stderr was: {}", result.stderr);
+        assert!(
+            result.stdout.contains("status=137"),
+            "the subshell must die of SIGKILL; stdout was: {}",
+            result.stdout
+        );
+        assert_eq!(result.resource_limit_hit, None);
+
+        let children = result
+            .stdout
+            .lines()
+            .last()
+            .unwrap_or_else(|| panic!("no children line from `times`: {}", result.stdout));
+        let cpu: f64 = children
+            .split_whitespace()
+            .map(|field| {
+                let (minutes, seconds) = field.trim_end_matches('s').split_once('m').unwrap();
+                minutes.parse::<f64>().unwrap() * 60.0 + seconds.parse::<f64>().unwrap()
+            })
+            .sum();
+        assert!(
+            cpu <= 2.5,
+            "the subshell ran {cpu} CPU-seconds, past cpu_seconds + 1"
+        );
+    }
+
+    /// `RLIMIT_CPU` reaches the child with its soft slot at `cpu_seconds` and its hard slot one
+    /// second above, while every other rlimit keeps soft = hard, and an unprivileged child cannot
+    /// raise the hard slot.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_cpu_limit_warns_one_second_before_its_hard_ceiling() {
+        let result = run_bash_with_limits(
+            crate::resources::HostResourceLimits {
+                cpu_seconds: 5,
+                max_open_files: 64,
+                ..crate::resources::HostResourceLimits::default()
+            },
+            r#"echo "$(ulimit -St) $(ulimit -Ht) $(ulimit -Sn) $(ulimit -Hn)"; ulimit -Ht 10 2>/dev/null || echo "raise refused""#,
+        );
+
+        let mut lines = result.stdout.lines();
+        assert_eq!(
+            lines.next(),
+            Some("5 6 64 64"),
+            "stderr was: {}",
+            result.stderr
+        );
+        // SAFETY: `geteuid` takes no arguments, touches no memory of the caller and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(lines.next(), Some("raise refused"));
+        }
+    }
+
     /// With `RLIMIT_NPROC` left alone, `pids.max` is the only process bound on a scoped capsule,
     /// and it has to stop a fork bomb by itself and be named as what did. The children sleep
     /// rather than exit so every one of them holds a task in the scope until the loop gives up.

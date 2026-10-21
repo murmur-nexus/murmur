@@ -194,7 +194,7 @@ mur run --manifest murmur-defaults.yaml --task 'run this shell command and repor
 |---|---|---|
 | `ulimit -Hn` | `1024` (`max_open_files`) | `1024` |
 | `ulimit -Hu` | The value `ulimit -Hu` prints in the shell that launched `mur`. A subprocess in a cgroup scope keeps the `RLIMIT_NPROC` `mur` inherited, and `cgroup_pids_max` bounds it instead | The account's process count at that spawn plus 128 (`max_processes`). Compare against `ps -u "$(id -un)" \| wc -l` run just before |
-| `ulimit -Ht` | `3600` (`cpu_seconds`) | `3600` |
+| `ulimit -Ht` | `3601` (`cpu_seconds` + 1) | `3601` (`cpu_seconds` + 1) |
 
 All three come from a manifest that declares no `resources:` block at all.
 
@@ -203,6 +203,8 @@ All three come from a manifest that declares no `resources:` block at all.
 - `unlimited` on the `-Hn` or `-Ht` line. That would mean the defaulting path was skipped and the
   subprocess is unbounded — the exact failure mode `capabilities.limits` already guards against
   and this block must match.
+- `3600` on the `-Ht` line. That means the soft and hard `RLIMIT_CPU` slots are equal, so a
+  command that uses up its CPU time is killed with `SIGKILL` and its `shell` event names no limit.
 - On Linux, a `-Hu` line that differs from the launching shell's value. That means `mur` set
   `RLIMIT_NPROC` on a subprocess in a cgroup scope, where threads the rest of the host starts
   during the session would fail its `fork()` calls.
