@@ -148,7 +148,7 @@ fn read_entry(path: &Path, name: &str) -> (Option<FileStamp>, EntryRead) {
     if file.read_to_string(&mut text).is_err() {
         return (stamp, EntryRead::Unreadable("unreadable"));
     }
-    let Ok(parsed) = serde_yaml::from_str::<CredentialsFile>(&text) else {
+    let Ok(parsed) = serde_norway::from_str::<CredentialsFile>(&text) else {
         return (stamp, EntryRead::Unreadable("unparseable"));
     };
     let read = match parsed.credentials.get(name) {

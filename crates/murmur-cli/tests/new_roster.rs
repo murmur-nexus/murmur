@@ -841,8 +841,8 @@ fn the_key_step_comes_first_and_writes_no_registry_source() {
     assert!(steps[1].contains("murmur/"), "{steps:?}");
     assert!(!scratch.config_path().exists());
     store_key(&scratch, &steps[0], "ANTHROPIC_API_KEY");
-    let config: serde_yaml::Value =
-        serde_yaml::from_str(&std::fs::read_to_string(scratch.config_path()).unwrap()).unwrap();
+    let config: serde_norway::Value =
+        serde_norway::from_str(&std::fs::read_to_string(scratch.config_path()).unwrap()).unwrap();
     assert!(config["registry"]["sources"].is_null(), "{config:?}");
     assert!(config["registry"]["default"].is_null(), "{config:?}");
     assert_eq!(

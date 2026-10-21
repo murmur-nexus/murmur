@@ -231,9 +231,9 @@ pub fn bind_mount_staged_runtimes(
             )
         })?;
 
-        // A NUL byte cannot reach here from a parsed manifest (serde_yaml rejects it in a scalar),
-        // but the conversion is fallible, so report it as the mount-point failure it functionally
-        // is rather than unwrapping in a function that may one day run near a fork.
+        // A NUL byte cannot reach here from a parsed manifest (the YAML parser rejects it in a
+        // scalar), but the conversion is fallible, so report it as the mount-point failure it
+        // functionally is rather than unwrapping in a function that may one day run near a fork.
         let c_source = CString::new(source.as_os_str().as_bytes())
             .map_err(|_| fail(StagedRuntimeMountStage::CreateMountPoint, libc::EINVAL))?;
         let c_target = CString::new(target.as_os_str().as_bytes())

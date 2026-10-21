@@ -42,7 +42,7 @@ tracing = { version = "0.1", default-features = false, features = ["release_max_
 # so the records were already unobservable; this strips the dead call sites.
 log = { version = "0.4", default-features = false, features = ["release_max_level_off"] }
 serde_json = "1"
-serde_yaml = "0.9"
+serde_norway = "0.9.42"
 # Candidate global allocators, one selected by the `jemalloc`/`mimalloc` features below and
 # declared in `src/allocator.rs`. Both build C sources; `cc` and `ar` are already needed by
 # `ring` and `wasmtime` in every build, but jemalloc runs its own `configure` and `make`, so

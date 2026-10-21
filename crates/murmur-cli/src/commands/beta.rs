@@ -121,13 +121,13 @@ mod tests {
         use crate::config::MurConfig;
         let mut cfg = MurConfig::default();
         cfg.beta.enabled = vec!["foo".to_string(), "bar".to_string()];
-        let s = serde_yaml::to_string(&cfg).unwrap();
+        let s = serde_norway::to_string(&cfg).unwrap();
         assert!(s.contains("beta:"), "expected beta: key in YAML output");
         assert!(
             s.contains("foo") && s.contains("bar"),
             "expected enabled list"
         );
-        let back: MurConfig = serde_yaml::from_str(&s).unwrap();
+        let back: MurConfig = serde_norway::from_str(&s).unwrap();
         assert_eq!(back.beta.enabled, vec!["foo", "bar"]);
     }
 
@@ -147,7 +147,7 @@ inference:
   api_key: sk-test
   endpoint: ""
 "#;
-        let cfg: MurConfig = serde_yaml::from_str(yaml_str).unwrap();
+        let cfg: MurConfig = serde_norway::from_str(yaml_str).unwrap();
         assert!(cfg.beta.enabled.is_empty());
         assert_eq!(
             cfg.inference.as_ref().map(|i| i.provider.as_str()),

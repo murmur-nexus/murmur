@@ -569,13 +569,13 @@ impl ToolAnnotationMap {
 /// The single reader for that field: the analyser must judge the same schema
 /// [`crate::agent::inventory`] offers the model, so a manifest whose schema one of them reads and
 /// the other does not is a hole rather than a difference of opinion.
-pub(crate) fn declared_input_schema(manifest: &serde_yaml::Value) -> Option<Value> {
+pub(crate) fn declared_input_schema(manifest: &serde_norway::Value) -> Option<Value> {
     let schema = manifest
         .get("input_schema")
         .or_else(|| manifest.get("input"))?;
     match schema {
         // The common shape: a YAML string holding JSON.
-        serde_yaml::Value::String(text) => serde_json::from_str(text).ok(),
+        serde_norway::Value::String(text) => serde_json::from_str(text).ok(),
         // A YAML mapping written out directly still describes the same schema.
         other => serde_json::to_value(other).ok(),
     }
@@ -583,7 +583,7 @@ pub(crate) fn declared_input_schema(manifest: &serde_yaml::Value) -> Option<Valu
 
 /// The `input_schema` of one staged tool manifest, as JSON text.
 pub(crate) fn schema_from_manifest_yaml(manifest_yaml: &str) -> Option<String> {
-    let manifest: serde_yaml::Value = serde_yaml::from_str(manifest_yaml).ok()?;
+    let manifest: serde_norway::Value = serde_norway::from_str(manifest_yaml).ok()?;
     Some(declared_input_schema(&manifest)?.to_string())
 }
 

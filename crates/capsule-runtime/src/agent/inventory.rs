@@ -29,7 +29,7 @@ pub(crate) const RUNTIME_ORIGIN_MARKER: &str = "[origin: runtime, trust: untrust
 /// against their `input_schema` are exactly the ones this inventory offers that schema for. An
 /// absent or unrecognised value is [`ArtifactRuntime::Tool`], which covers `tool` and the legacy
 /// `wasm` and `native` spellings.
-pub(crate) fn staged_manifest_runtime(manifest: &serde_yaml::Value) -> ArtifactRuntime {
+pub(crate) fn staged_manifest_runtime(manifest: &serde_norway::Value) -> ArtifactRuntime {
     match manifest
         .get("runtime")
         .and_then(|v| v.as_str())
@@ -82,7 +82,7 @@ pub(crate) fn build_tool_inventory(
                 _ => continue,
             };
 
-        let value: serde_yaml::Value = match serde_yaml::from_str(&manifest_content) {
+        let value: serde_norway::Value = match serde_norway::from_str(&manifest_content) {
             Ok(v) => v,
             Err(_) => continue,
         };

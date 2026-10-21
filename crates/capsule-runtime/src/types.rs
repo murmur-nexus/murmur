@@ -135,7 +135,7 @@ pub struct ArtifactRequest {
     /// `runtime: tool` and `runtime: driver`; the manifest parser rejects the key on
     /// `runtime: skill`, and a native tool warns `W-SEC-015` because it reads no per-artifact
     /// environment at all.
-    pub config: Option<serde_yaml::Value>,
+    pub config: Option<serde_norway::Value>,
     /// This artifact's operator-declared `gateway:` block, copied verbatim from its entry in the
     /// capsule operator's own manifest (`murmur_artifact::RuntimeArtifact::gateway`) — the same
     /// operator-only sourcing rule `capabilities` above follows. Built into the artifact's

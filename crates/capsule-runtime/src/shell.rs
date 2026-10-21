@@ -2022,20 +2022,21 @@ mod tests {
     #[test]
     fn shell_tool_manifest_yaml_is_valid_yaml_for_interpreter() {
         let yaml = shell_tool_manifest_yaml("bash");
-        serde_yaml::from_str::<serde_yaml::Value>(&yaml).expect("bash manifest must be valid YAML");
+        serde_norway::from_str::<serde_norway::Value>(&yaml)
+            .expect("bash manifest must be valid YAML");
     }
 
     #[test]
     fn shell_tool_manifest_yaml_is_valid_yaml_for_non_interpreter() {
         let yaml = shell_tool_manifest_yaml("curl");
-        serde_yaml::from_str::<serde_yaml::Value>(&yaml)
-            .expect("curl manifest must be valid YAML — embedded quotes break serde_yaml parsing");
+        serde_norway::from_str::<serde_norway::Value>(&yaml)
+            .expect("curl manifest must be valid YAML — embedded quotes break YAML parsing");
     }
 
     #[test]
     fn shell_tool_manifest_yaml_non_interpreter_has_tool_runtime() {
         let yaml = shell_tool_manifest_yaml("curl");
-        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let value: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         assert_eq!(
             value.get("runtime").and_then(|v| v.as_str()),
             Some("tool"),

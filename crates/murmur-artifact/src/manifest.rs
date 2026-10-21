@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
-use serde_yaml::Value;
+use serde_norway::Value;
 use thiserror::Error;
 
 use crate::manifest_path::MANIFEST_FILENAME;
@@ -108,7 +108,7 @@ impl Manifest {
 
     #[must_use = "parsed manifest is required to proceed with build"]
     pub fn from_yaml_str(input: &str) -> Result<Self, ManifestError> {
-        let value: Value = serde_yaml::from_str(input).map_err(|err| {
+        let value: Value = serde_norway::from_str(input).map_err(|err| {
             if let Some(location) = err.location() {
                 ManifestError::YamlSyntax(format!(
                     "{}: YAML syntax error at line {}, column {}: {}",
@@ -169,7 +169,7 @@ fn default_requires_files(runtime: &str) -> Vec<String> {
 /// Parses `execution:` into a [`RuntimeType`]. An unparseable value is a hard error rather than a
 /// silent fall-back to the derived default — a typo'd packaging type must not publish as `wasm`.
 fn optional_runtime_type(
-    root: &serde_yaml::Mapping,
+    root: &serde_norway::Mapping,
     field: &str,
 ) -> Result<Option<RuntimeType>, ManifestError> {
     let key = Value::String(field.to_string());
@@ -193,7 +193,7 @@ fn optional_runtime_type(
 }
 
 fn optional_string_seq(
-    root: &serde_yaml::Mapping,
+    root: &serde_norway::Mapping,
     field: &str,
 ) -> Result<Option<Vec<String>>, ManifestError> {
     let key = Value::String(field.to_string());
@@ -224,12 +224,12 @@ fn optional_string_seq(
         .map(Some)
 }
 
-fn optional_string(root: &serde_yaml::Mapping, field: &str) -> Option<String> {
-    let key = serde_yaml::Value::String(field.to_string());
+fn optional_string(root: &serde_norway::Mapping, field: &str) -> Option<String> {
+    let key = serde_norway::Value::String(field.to_string());
     root.get(&key)?.as_str().map(str::to_string)
 }
 
-fn required_string(root: &serde_yaml::Mapping, field: &str) -> Result<String, ManifestError> {
+fn required_string(root: &serde_norway::Mapping, field: &str) -> Result<String, ManifestError> {
     let key = Value::String(field.to_string());
     let value = root.get(&key).ok_or_else(|| ManifestError::MissingField {
         field: field.into(),
@@ -349,7 +349,7 @@ fn refuse_retired_key(value: &Value) -> Result<(), ManifestError> {
 }
 
 fn parse_manifest_value(manifest_yaml: &str) -> Result<Value, ManifestError> {
-    serde_yaml::from_str(manifest_yaml).map_err(|err| {
+    serde_norway::from_str(manifest_yaml).map_err(|err| {
         ManifestError::YamlSyntax(format!("{MANIFEST_FILENAME}: YAML syntax error: {err}"))
     })
 }

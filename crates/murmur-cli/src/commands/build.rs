@@ -352,7 +352,7 @@ pub(crate) fn build_skill_artifact(
         Some(bytes) => {
             // Always validate runtime: skill.
             let runtime = {
-                let yaml: serde_yaml::Value = serde_yaml::from_slice(&bytes).map_err(|e| {
+                let yaml: serde_norway::Value = serde_norway::from_slice(&bytes).map_err(|e| {
                     CliError::new(E_MAN_002, format!("murmur.yaml: YAML parse error: {e}"))
                 })?;
                 yaml.get("runtime")
@@ -371,16 +371,17 @@ pub(crate) fn build_skill_artifact(
             // Only re-serialize when summary is being added; otherwise keep the file verbatim
             // so original YAML formatting (quoting, ordering) is preserved.
             if let Some(desc) = summary {
-                let mut yaml: serde_yaml::Value = serde_yaml::from_slice(&bytes).map_err(|e| {
-                    CliError::new(E_MAN_002, format!("murmur.yaml: YAML parse error: {e}"))
-                })?;
+                let mut yaml: serde_norway::Value =
+                    serde_norway::from_slice(&bytes).map_err(|e| {
+                        CliError::new(E_MAN_002, format!("murmur.yaml: YAML parse error: {e}"))
+                    })?;
                 if let Some(mapping) = yaml.as_mapping_mut() {
                     mapping.insert(
-                        serde_yaml::Value::String("description".to_string()),
-                        serde_yaml::Value::String(desc.to_string()),
+                        serde_norway::Value::String("description".to_string()),
+                        serde_norway::Value::String(desc.to_string()),
                     );
                 }
-                serde_yaml::to_string(&yaml)
+                serde_norway::to_string(&yaml)
                     .map_err(|e| {
                         CliError::new(E_MAN_002, format!("murmur.yaml serialization error: {e}"))
                     })?
