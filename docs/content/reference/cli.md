@@ -25,12 +25,15 @@ Every `mur` command, its flags, and what each one does.
 | `mur deploy ls` | List all deployed capsules |
 | `mur destroy` | Remove a deployment record from the local tracking list |
 | `mur conversation ls` | List the durable conversation records, or place one message id in them |
+| `mur conversation show` | Print one context: its record header, every message and its harness session |
 | `mur conversation rm` | Remove one context's record directory, whole |
 | `mur conversation truncate` | Drop the oldest messages from a record, keeping the newest N |
 | `mur trace show` | Human-readable summary of a single `trace.jsonl` session |
 | `mur trace steps` | Turn-by-turn tree of what one session's agent did |
 | `mur trace diff` | Side-by-side metric comparison of two sessions |
 | `mur trace report` | Aggregate statistics across a set of sessions |
+| `mur trace list` | List the sessions of one workdir root, newest first |
+| `mur trace rm` | Remove one ended session's records directory, session directory and stale running record |
 | `mur eval show` | Human-readable (or JSON) summary of a single `eval.jsonl` session |
 | `mur eval diff` | Side-by-side scorer comparison of two eval sessions |
 | `mur eval run` | Drive a multi-case dataset and collect `eval.jsonl` per run |
@@ -1562,12 +1565,13 @@ unchanged. See [Removing formation directories](roster.md#formation-retention).
 List the capsules running on this machine, with the address each one answers on.
 
 ```bash
-mur ps [--verbose]
+mur ps [--verbose | --json]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--verbose` | off | Name every record the listing removes, one line each, and add a summary line for every formation known only from removed records |
+| `--json` | off | Print one JSON object, the [stable interface](#mur-ps-json), instead of the table. Removes nothing. Given with `--verbose`, it is a usage error, exit 2 |
 
 `mur ps` is host-scoped, exactly like `docker ps`: a capsule deployed onto another machine writes
 its [record](#running-capsule-records) on *that* machine, so it is that machine's `mur ps` that
@@ -1662,6 +1666,76 @@ A capsule whose process is alive reads `unreachable` when:
 Rows are sorted by session id descending — the same order [`@N` counts in](#session-addresses) —
 so the first row is what `@1` names. When a formation is listed, its members are kept together, so
 past the first row count `@N` by session id, not by row.
+
+### `mur ps --json` { #mur-ps-json }
+
+List the same capsules as the table, as one pretty-printed JSON object, and remove nothing.
+
+```bash
+mur ps --json
+```
+
+```json
+{
+  "capsules": [
+    {
+      "session_id": "ses_019f01a940ce7761854e768ecbe3d399",
+      "status": "running",
+      "url": "localhost:41235",
+      "pid": 48213,
+      "process_start": "9123456",
+      "capsule_name": "my-worker",
+      "capsule_version": "0.1.0",
+      "workdir": "/home/me/proj/.murmur/ses_019f01a940ce7761854e768ecbe3d399",
+      "records_dir": "/home/me/.murmur/records/home/me/proj/ses_019f01a940ce7761854e768ecbe3d399",
+      "outlives_launcher": true,
+      "started_at": "2026-10-20T09:12:44Z",
+      "formation_id": null,
+      "formation_member": null
+    }
+  ]
+}
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `capsules` | array | One entry for each record `mur ps` would print a row for, sorted by session id descending. Empty when nothing runs, and when `~/.murmur/running/` is absent or empty |
+| `capsules[].session_id` | string | The session the door answers for |
+| `capsules[].status` | string | `running` or `unreachable`: the `STATUS` column `mur ps` prints for this record, from the [same three layers](#mur-ps-verification), door probe included |
+| `capsules[].url` | string | The `host:port` the A2A door is bound to, with no scheme |
+| `capsules[].pid` | integer | The process holding the door |
+| `capsules[].process_start` | string | That process's start time, an opaque token local to this machine |
+| `capsules[].capsule_name` | string | `name:` from the manifest the session was launched from |
+| `capsules[].capsule_version` | string | `version:` from that manifest |
+| `capsules[].workdir` | string | The session workdir, as the record holds it |
+| `capsules[].records_dir` | string | The session's [records directory](workdir.md#records-directory) |
+| `capsules[].outlives_launcher` | boolean | Whether the capsule [survives the window that launched it](#outlives-launcher) |
+| `capsules[].started_at` | string | When the session started, RFC 3339 UTC, as the record holds it |
+| `capsules[].formation_id` | string or `null` | The formation this session is a member of. `null` for a session in no formation |
+| `capsules[].formation_member` | string or `null` | The member's roster name, set only for a member [`mur run --roster`](#mur-run-formation) launched. `null` otherwise |
+
+A record's door token and credentials are never printed.
+
+| Record | `mur ps --json` | Plain `mur ps` |
+|---|---|---|
+| All three layers pass | Listed, `running` | Listed, `running` |
+| Process alive, door quiet or start time unreadable | Listed, `unreachable` | Listed, `unreachable` |
+| Process gone | Left out, record kept | Left out, record removed |
+| File that is not a readable record | Kept | Removed |
+| A record an older `mur` wrote | Kept, named on stderr as a `skipped:` line | Kept, named on stderr as a `skipped:` line |
+
+A missing `~/.murmur/running/` is not created. Stderr carries only the `skipped:` lines.
+
+These keys are a stable interface. Each keeps its name, type and meaning. New keys may be added, and
+a consumer ignores keys it does not know.
+
+| Exit | When |
+|---|---|
+| `0` | The records were read, whether or not any capsule is listed |
+| `1` | [`E-RUN-028`](diagnostics.md#e-run-028): `~/.murmur/running/` exists and cannot be listed, or `HOME` cannot locate it |
+| `2` | `--json` and `--verbose` were given together |
+
+A failure prints nothing on stdout.
 
 ### Formations { #mur-ps-formations }
 
@@ -2373,8 +2447,8 @@ Inspect and prune the [durable conversation records](workdir.md#the-conversation
 or launch a capsule, and they need no manifest.
 
 A context id is unique inside one record store and nowhere else. When one appears under more than
-one store, `rm` and `truncate` refuse with [`E-CNV-002`](diagnostics.md#e-cnv-002) rather than
-guess, and `--record <NAME>` says which store to act on.
+one store, `show`, `rm` and `truncate` refuse with [`E-CNV-002`](diagnostics.md#e-cnv-002) rather
+than guess, and `--record <NAME>` says which store to act on.
 
 ### `mur conversation ls`
 
@@ -2419,6 +2493,82 @@ Answers one of three things about a `msg_` id, which is what an artifact that st
 | `truncated` | The id is not a line, the record's header carries a truncation marker, and the id's own uuid-v7 timestamp is at or before the `last_dropped_id`'s | The record, the context, how many were dropped, and the oldest surviving id |
 | `unknown` | Anything else | Nothing further |
 
+### `mur conversation show` { #mur-conversation-show }
+
+Print one context: its [record header](workdir.md#record-header), every message of its
+[`conversation.jsonl`](workdir.md#the-conversation-record), and its
+[harness session](workdir.md#harness-session-map).
+
+```bash
+mur conversation show <CONTEXT-ID> [--record <NAME>] [--json]
+```
+
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<CONTEXT-ID>` | — | The context id: the directory under a record store. `mur trace list --json` prints it as `context_id` |
+| `--record` | every store | The record store to read, when the context id appears under more than one |
+| `--json` | off | Print one JSON object, the stable interface below, instead of the summary |
+
+The context is found by its id alone, in every record store under `~/.murmur/conversations/`. A
+context exists for `show` when its directory holds `conversation.jsonl`, `harness-session.json`, or
+both, so a context on [`inference.transport: process`](manifest.md#transport-process), which has only the second, is
+found too. The command reads only.
+
+With `--json`, it prints one pretty-printed JSON object:
+
+```json
+{
+  "record": "my-agent",
+  "context_id": "ctx_019f0193c7e07c3a9d5e1b2f4a6c8e01",
+  "dir": "/home/me/.murmur/conversations/my-agent/ctx_019f0193c7e07c3a9d5e1b2f4a6c8e01",
+  "header": {
+    "capsule": "my-agent",
+    "created_ms": 1760951564123,
+    "truncated": null
+  },
+  "messages": [
+    {"role": "user", "content": "Summarise the open issues.", "id": "msg_019f0193c7e1712a8b3c4d5e6f7a8b90"},
+    {"role": "assistant", "content": [{"type": "text", "text": "There are three."}], "id": "msg_019f0193c9a27b3c9d4e5f6a7b8c9d01"}
+  ],
+  "harness_session": null
+}
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `record` | string | The record store the context was found in: the directory under `~/.murmur/conversations/` |
+| `context_id` | string | The context id: the directory under that store |
+| `dir` | string | The context directory, absolute |
+| `header` | object or `null` | The [header line](workdir.md#record-header), when the first line of `conversation.jsonl` is one: `capsule` (string), `created_ms` (integer) and `truncated` (`null`, or an object with `dropped`, `oldest_surviving_id`, `last_dropped_id` and `at_ms`). `null` when there is no `conversation.jsonl`, or its first line is not a header, as in a record no capsule owns |
+| `messages` | array | Every message line of `conversation.jsonl`, oldest first, each the line's JSON object as recorded with every key, `id` included. A line that is not a JSON object with a string `role` is skipped, as the runtime skips it: the header, a torn final line, a line being written. Empty when there is no `conversation.jsonl` |
+| `harness_session` | object or `null` | The context's [harness session](workdir.md#harness-session-map): `session_id`, `harness`, `driver`, `created_ms` and `updated_ms`. `null` when the file is absent, does not parse, carries another `type`, or names no session: the cases in which the runtime starts a new conversation |
+
+These keys are a stable interface. Each keeps its name, type and meaning. New keys may be added, and
+a consumer ignores keys it does not know.
+
+Without `--json`, it prints a summary, then one line per message with its position, its role and the
+first line of its text:
+
+```text
+record:   my-agent
+context:  ctx_019f0193c7e07c3a9d5e1b2f4a6c8e01
+messages: 2
+   1  user       Summarise the open issues.
+   2  assistant  There are three.
+```
+
+A context with a harness session also prints `harness session: <session_id> (<harness>, <driver>)`
+after `messages:`. The summary's layout may change; `--json` is the interface to parse.
+
+| Exit | When |
+|---|---|
+| `0` | The context was found and read |
+| `1` | [`E-CNV-001`](diagnostics.md#e-cnv-001): no record store holds the context, or its directory holds neither file |
+| `1` | [`E-CNV-002`](diagnostics.md#e-cnv-002): more than one store holds it and `--record` was not given |
+| `1` | `E-IO-003`: `conversation.jsonl` exists and cannot be read, or `HOME` cannot locate `~/.murmur/conversations` |
+
+A failure prints nothing on stdout.
+
 ### `mur conversation rm` { #mur-conversation-rm }
 
 ```bash
@@ -2447,7 +2597,8 @@ original whole. Every surviving message keeps the exact `id` it carried.
 
 ## `mur trace`
 
-Read and analyze `trace.jsonl` files produced by `mur run`. These commands are read-only — they do not modify any file and do not launch a capsule.
+Read and analyze `trace.jsonl` files produced by `mur run`, and remove ended sessions. Every command
+but [`mur trace rm`](#mur-trace-rm) is read-only: it modifies no file and launches no capsule.
 
 See [Session trace (`trace.jsonl`)](observability-schemas.md#session-trace-tracejsonl) for the file format.
 
@@ -3084,6 +3235,90 @@ no sessions in workdir at /home/me/proj/workdir (records in /home/me/.murmur/rec
 | `1` | [`E-RUN-028`](diagnostics.md#e-run-028): `~/.murmur/running/` exists and cannot be listed |
 
 A failure prints nothing on stdout, with or without `--json`.
+
+### `mur trace rm` { #mur-trace-rm }
+
+Remove everything `mur` keeps for one ended session of one workdir root.
+
+```bash
+mur trace rm <session> [--workdir <dir>] [--json]
+```
+
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<session>` | — | `@N`, a full `ses_` id, or a suffix of 4 or more characters of one, as under [session addresses](#session-addresses). A literal path is refused |
+| `--workdir` | `./workdir` | The workdir root the session belongs to: the directory a run was given as `--workdir`, or `<manifest-dir>/workdir`. Its sessions' [records directories](workdir.md#records-directory) are read from `~/.murmur/records` |
+| `--json` | off | Print one JSON object, the stable interface below, instead of one line per removal |
+
+`@N` and a suffix name a session in the root's records group, as [`mur trace list`](#mur-trace-list)
+lists it. A full `ses_` id is also accepted while only the session directory is left, so a session
+an earlier removal only half removed can be removed again.
+
+What is removed, in this order:
+
+| What | Where | Removed when |
+|---|---|---|
+| Session directory | `<root>/.murmur/<session_id>` for a run given `--workdir <root>`, or else `<root>/<session_id>` for a run without `--workdir` | One of the two exists. `.murmur/<session_id>` is looked for first |
+| Records directory | `<records group>/<session_id>`, as `mur trace list` names it | It exists |
+| Stale running record | `~/.murmur/running/<session_id>.json` and its `.control` file | A [record](#running-capsule-records) names the session and its process is gone |
+
+Both directories are removed without following a link. A link, or a file where a directory belongs,
+anywhere on the way is refused with [`E-RUN-050`](diagnostics.md#e-run-050), and nothing the link
+points at is touched. A removal that fails part way leaves the session listed by `mur trace list`,
+and running `mur trace rm` again finishes it.
+
+A session is running when a record names it and its process is alive, or alive with a start time
+that could not be read: the rule behind `running` in `mur trace list --json`. A running session is
+refused with [`E-RUN-024`](diagnostics.md#e-run-024) and nothing is removed. End it with
+[`mur stop`](#mur-stop) first.
+
+Nothing else is removed:
+
+- the records group, `<root>/.murmur/` and `<root>/.murmur/children/`
+- the session of any capsule this one delegated to
+- the [conversation record](workdir.md#the-conversation-record). A conversation spans every session
+  that resumed it; [`mur conversation rm`](#mur-conversation-rm) removes one
+
+Without `--json`, it prints one line per removal:
+
+```text
+removed session directory /home/me/proj/.murmur/ses_019f0193c7d871a5b2e30ff41a7c0ce1
+removed records /home/me/.murmur/records/home/me/proj/ses_019f0193c7d871a5b2e30ff41a7c0ce1
+removed running record /home/me/.murmur/running/ses_019f0193c7d871a5b2e30ff41a7c0ce1.json
+```
+
+With `--json`, it prints one pretty-printed JSON object:
+
+```json
+{
+  "session_id": "ses_019f0193c7d871a5b2e30ff41a7c0ce1",
+  "records_dir": "/home/me/.murmur/records/home/me/proj/ses_019f0193c7d871a5b2e30ff41a7c0ce1",
+  "session_dir": "/home/me/proj/.murmur/ses_019f0193c7d871a5b2e30ff41a7c0ce1",
+  "running_record": null
+}
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `session_id` | string | The session that was removed |
+| `records_dir` | string or `null` | The records directory removed, absolute. `null` when there was none |
+| `session_dir` | string or `null` | The session directory removed, absolute. `null` when there was none |
+| `running_record` | string or `null` | The stale running record removed. `null` when no record named the session |
+
+These keys are a stable interface. Each keeps its name, type and meaning. New keys may be added, and
+a consumer ignores keys it does not know.
+
+| Exit | When |
+|---|---|
+| `0` | The session was removed |
+| `1` | `E-TRC-002`: the argument is a literal path, or the address names no session of this root, including a full id with neither directory left |
+| `1` | [`E-IO-004`](diagnostics.md#e-io-004): `HOME` cannot hold `~/.murmur` |
+| `1` | [`E-RUN-028`](diagnostics.md#e-run-028): `~/.murmur/running/` exists and cannot be listed |
+| `1` | [`E-RUN-024`](diagnostics.md#e-run-024): the session is running |
+| `1` | [`E-RUN-050`](diagnostics.md#e-run-050): a link or the wrong kind of file is in the way |
+| `1` | `E-IO-003`: a removal failed for another reason, or the root cannot be made absolute |
+
+A failure prints nothing on stdout.
 
 ---
 

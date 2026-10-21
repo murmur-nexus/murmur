@@ -233,9 +233,10 @@ pub use resources::HostResourceLimits;
 // consumes six of its entry points and four of its types, and a facade that wide is a second
 // place for the names to drift.
 pub use retention::{
-    list_records, locate_message, prune_records, prune_sessions, remove_record, truncate_record,
-    MessageLocation, MessageStatus, PrunedRecord, PrunedSession, RecordHeader, RecordSummary,
-    RemovedRecord, TruncationMarker, TruncationOutcome,
+    find_context_dirs, list_records, locate_message, prune_records, prune_sessions,
+    read_context_dir, remove_record, truncate_record, ContextContents, ContextDir,
+    HarnessSessionEntry, MessageLocation, MessageStatus, PrunedRecord, PrunedSession, RecordHeader,
+    RecordSummary, RemovedRecord, TruncationMarker, TruncationOutcome,
 };
 pub use roster::{
     admit_roster, admit_roster_file, caller_overflow_fix, caller_overflow_warning, AdmittedMember,

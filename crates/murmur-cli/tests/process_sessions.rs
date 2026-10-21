@@ -25,7 +25,7 @@ use std::{
 };
 
 use assert_cmd::Command;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tempfile::TempDir;
 
 const DRIVER: &str = "local/fixture-process-driver";
@@ -1506,4 +1506,50 @@ fn forget_session_needs_a_context_and_refuses_a_resume() {
         !capsule.conversations_root().exists(),
         "neither refusal stages a capsule"
     );
+}
+
+// ── mur conversation show on a process transport ──────────────────────────────
+
+/// A context on `inference.transport: process` has a map file and no record. `mur conversation
+/// show` finds it all the same and reports the harness session the map file holds, with no
+/// header and no messages.
+#[test]
+fn conversation_show_reports_the_harness_session_of_a_process_context() {
+    let capsule = Built::new().build();
+    capsule.task("memory", "ctx-show", SECRET_TASK).succeeded();
+    let entry = capsule.map_entry("ctx-show");
+    let map_before = fs::read(capsule.map_file("ctx-show")).unwrap();
+
+    let output = capsule
+        .mur("memory")
+        .args(["conversation", "show", "ctx-show", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
+    println!("mur conversation show --json:\n{shown:#}");
+    assert_eq!(shown["record"], CAPSULE);
+    assert_eq!(shown["context_id"], "ctx-show");
+    assert_eq!(
+        shown["dir"],
+        capsule
+            .map_file("ctx-show")
+            .parent()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    assert!(shown["header"].is_null(), "{shown:#}");
+    assert_eq!(shown["messages"], json!([]));
+    assert_eq!(
+        shown["harness_session"],
+        json!({
+            "session_id": entry["session_id"],
+            "harness": entry["harness"],
+            "driver": entry["driver"],
+            "created_ms": entry["created_ms"],
+            "updated_ms": entry["updated_ms"],
+        })
+    );
+    assert_eq!(fs::read(capsule.map_file("ctx-show")).unwrap(), map_before);
 }

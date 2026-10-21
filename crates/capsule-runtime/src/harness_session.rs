@@ -44,7 +44,7 @@ pub(crate) const FORGET_BY_A2A: &str = "a2a";
 
 /// One context's harness session, as the file holds it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct HarnessSessionEntry {
+pub struct HarnessSessionEntry {
     /// Always [`HARNESS_SESSION_TYPE`].
     #[serde(rename = "type")]
     pub kind: String,
@@ -250,7 +250,7 @@ pub(crate) fn new_harness_session_id() -> String {
 ///
 /// Every one of those reads as "this context has no session", which starts a new conversation
 /// rather than handing the harness something it cannot use.
-fn read_entry(path: &Path) -> Option<HarnessSessionEntry> {
+pub(crate) fn read_entry(path: &Path) -> Option<HarnessSessionEntry> {
     let raw = std::fs::read(path).ok()?;
     let entry: HarnessSessionEntry = serde_json::from_slice(&raw).ok()?;
     if entry.kind != HARNESS_SESSION_TYPE || entry.session_id.is_empty() {

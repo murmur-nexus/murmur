@@ -6,7 +6,9 @@
 //! any of them reaches to parse an ordinal, match a suffix, recognise a full `ses_` id or pass a
 //! literal path through; every command reaches it through a [`SessionQuery`] carrying the three
 //! things the vocabulary itself cannot know. `mur trace list` prints the candidates in the order
-//! ordinals count them, through [`sessions_newest_first`].
+//! ordinals count them, through [`sessions_newest_first`]. `mur trace rm` speaks the vocabulary
+//! less the literal path, which it refuses by [`is_literal_path`], and accepts a full id by
+//! [`is_full_session_id`] while either half of that session is left.
 //!
 //! The candidates are the sessions of one **workdir root** — the directory a run was given as
 //! `--workdir`, or `<manifest-dir>/workdir` — whose records directories sit in that root's records
@@ -90,6 +92,18 @@ pub(crate) fn sessions_newest_first(group: &Path) -> Result<Vec<String>, CliErro
     Ok(entries)
 }
 
+/// Whether `address` is spelled as a literal path rather than as a session address: anything
+/// that is not an ordinal and contains `/` or ends in `.jsonl`.
+pub(crate) fn is_literal_path(address: &str) -> bool {
+    !address.starts_with('@') && (address.contains('/') || address.ends_with(".jsonl"))
+}
+
+/// Whether `address` is spelled as a full session id: `ses_` and 32 more characters, 36 in all.
+/// The characters themselves are not checked.
+pub(crate) fn is_full_session_id(address: &str) -> bool {
+    address.starts_with("ses_") && address.len() == 36
+}
+
 /// The record file a session address names, among the sessions of the workdir root `workdir`.
 ///
 /// Four forms, and nothing else: an `@N` ordinal counting back from the most recent session, a
@@ -106,7 +120,7 @@ pub(crate) fn resolve(
     let address = address.unwrap_or(LATEST);
 
     // A literal path is taken verbatim; the records group is not consulted.
-    if !address.starts_with('@') && (address.contains('/') || address.ends_with(".jsonl")) {
+    if is_literal_path(address) {
         return Ok(PathBuf::from(address));
     }
     let root = workdir;
@@ -144,8 +158,7 @@ pub(crate) fn resolve(
         return Ok(workdir.join(&entries[n - 1]).join(query.record_file));
     }
 
-    // Full session ID: "ses_" prefix + 32-char hex = 36 chars total.
-    if address.starts_with("ses_") && address.len() == 36 {
+    if is_full_session_id(address) {
         let path = workdir.join(address).join(query.record_file);
         if !path.exists() {
             return Err(query.err(format!(

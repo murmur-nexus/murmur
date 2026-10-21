@@ -2,15 +2,17 @@
 //!
 //! A conversation record is the agent's memory — durable and outside every workdir. `ls` is what
 //! makes a store an operator can reason about; `rm` and `truncate` are what makes one they can
-//! act on. Between them they are also the only way to reclaim a record no capsule owns:
-//! automatic retention skips a record whose header line names no capsule, so an abandoned
+//! act on. `show` reads one context whole, harness session included, so a program never reads
+//! the store by path. `rm` and `truncate` are also the only way to reclaim a record no capsule
+//! owns: automatic retention skips a record whose header line names no capsule, so an abandoned
 //! conversation is reachable here and nowhere else.
 
 use capsule_runtime::{
-    list_records, locate_message, remove_record, truncate_record, MessageStatus, RecordSummary,
+    find_context_dirs, list_records, locate_message, read_context_dir, remove_record,
+    truncate_record, ContextContents, MessageStatus, RecordSummary, TruncationMarker,
 };
 use clap::Subcommand;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::error::{CliError, E_CNV_001, E_CNV_002, E_CNV_003, E_IO_003};
 
@@ -25,6 +27,17 @@ pub(crate) enum ConversationCommand {
         #[arg(long, value_name = "MSG-ID")]
         message: Option<String>,
         /// Print the same values as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print one context: its record header, every message, and its harness session
+    Show {
+        /// Context id: the directory under a record store
+        context_id: String,
+        /// The record store to read, when the context id appears under more than one
+        #[arg(long, value_name = "NAME")]
+        record: Option<String>,
+        /// Print one JSON object, the stable interface documented under mur conversation show
         #[arg(long)]
         json: bool,
     },
@@ -180,6 +193,134 @@ fn report_message(message_id: &str, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+// ── show ──────────────────────────────────────────────────────────────────────
+
+/// `mur conversation show --json`: a stable interface. Keys keep their names, types and meanings
+/// and serialize in declaration order; a key may be added, never removed or renamed. A key with no
+/// value is `null`, never omitted.
+#[derive(Debug, serde::Serialize)]
+struct ShownContext {
+    /// The record store the context was found in.
+    record: String,
+    context_id: String,
+    /// The context directory, absolute.
+    dir: String,
+    header: Option<ShownHeader>,
+    /// Every message line of `conversation.jsonl`, oldest first, every key kept.
+    messages: Vec<Value>,
+    harness_session: Option<ShownHarnessSession>,
+}
+
+/// The record header, without its `type`.
+#[derive(Debug, serde::Serialize)]
+struct ShownHeader {
+    capsule: String,
+    created_ms: u64,
+    truncated: Option<TruncationMarker>,
+}
+
+/// The harness session entry, without its `type`.
+#[derive(Debug, serde::Serialize)]
+struct ShownHarnessSession {
+    session_id: String,
+    harness: String,
+    driver: String,
+    created_ms: u64,
+    updated_ms: u64,
+}
+
+/// Print the one context `context_id` names: its record header, every message and its harness
+/// session, as a short summary or, with `json`, as one [`ShownContext`].
+///
+/// A context is found in every record store, `--record` narrowing the search, and counts when its
+/// directory holds `conversation.jsonl`, `harness-session.json` or both, so a context on
+/// `inference.transport: process` is found too. No manifest is read. Absence and ambiguity are
+/// refused as `rm` refuses them; a `HOME` that cannot locate the store and a `conversation.jsonl`
+/// that cannot be read are `E-IO-003`. Every failure prints nothing on stdout. Reads only.
+pub(crate) fn run_conversation_show(
+    context_id: &str,
+    record: Option<String>,
+    json: bool,
+) -> Result<(), CliError> {
+    let found = find_context_dirs(context_id).map_err(|reason| CliError::new(E_IO_003, reason))?;
+    let target = one_context(context_id, record.as_deref(), found, |dir| &dir.record)?;
+    let ContextContents {
+        header,
+        messages,
+        harness_session,
+    } = read_context_dir(&target.path).map_err(|reason| CliError::new(E_IO_003, reason))?;
+    let shown = ShownContext {
+        record: target.record,
+        context_id: target.context_id,
+        dir: target.path.display().to_string(),
+        header: header.map(|header| ShownHeader {
+            capsule: header.capsule,
+            created_ms: header.created_ms,
+            truncated: header.truncated,
+        }),
+        messages,
+        harness_session: harness_session.map(|entry| ShownHarnessSession {
+            session_id: entry.session_id,
+            harness: entry.harness,
+            driver: entry.driver,
+            created_ms: entry.created_ms,
+            updated_ms: entry.updated_ms,
+        }),
+    };
+
+    if json {
+        capsule_runtime::report_println!(
+            "{}",
+            serde_json::to_string_pretty(&shown).expect("a JSON value always serializes")
+        );
+        return Ok(());
+    }
+
+    capsule_runtime::report_println!("record:   {}", shown.record);
+    capsule_runtime::report_println!("context:  {}", shown.context_id);
+    capsule_runtime::report_println!("messages: {}", shown.messages.len());
+    if let Some(session) = &shown.harness_session {
+        capsule_runtime::report_println!(
+            "harness session: {} ({}, {})",
+            session.session_id,
+            session.harness,
+            session.driver
+        );
+    }
+    for (index, message) in shown.messages.iter().enumerate() {
+        capsule_runtime::report_println!(
+            "{:>4}  {:<10} {}",
+            index + 1,
+            message.get("role").and_then(Value::as_str).unwrap_or("-"),
+            first_line(message)
+        );
+    }
+    Ok(())
+}
+
+/// The first line of a message's text, or `[<type>]` of its first content block when no block
+/// carries text, as for a tool result.
+fn first_line(message: &Value) -> String {
+    match message.get("content") {
+        Some(Value::String(text)) => text.lines().next().unwrap_or("").to_string(),
+        Some(Value::Array(blocks)) => {
+            match blocks
+                .iter()
+                .find_map(|block| block.get("text").and_then(Value::as_str))
+            {
+                Some(text) => text.lines().next().unwrap_or("").to_string(),
+                None => blocks
+                    .first()
+                    .and_then(|block| block.get("type"))
+                    .and_then(Value::as_str)
+                    .map(|kind| format!("[{kind}]"))
+                    .unwrap_or_default(),
+            }
+        }
+        _ => String::new(),
+    }
+}
+
 // ── rm ────────────────────────────────────────────────────────────────────────
 
 pub(crate) fn run_conversation_rm(
@@ -235,16 +376,30 @@ pub(crate) fn run_conversation_truncate(
 // ── Resolution ────────────────────────────────────────────────────────────────
 
 /// The one record a `<context-id>` names, refusing ambiguity and absence by name.
+fn resolve_context(context_id: &str, record: Option<&str>) -> Result<RecordSummary, CliError> {
+    let summaries = list_records().map_err(|reason| CliError::new(E_IO_003, reason))?;
+    let named = summaries
+        .into_iter()
+        .filter(|summary| summary.context_id == context_id)
+        .collect();
+    one_context(context_id, record, named, |summary| &summary.record)
+}
+
+/// The one of `found` — the contexts named `context_id`, as `store` names each one's record
+/// store — that lies in `record` when given, refusing ambiguity and absence by name.
 ///
 /// A context id is unique inside a record store and nowhere else: two capsules can be handed the
 /// same id, and `--record` is how an operator says which one they mean. Guessing between them
-/// would delete or rewrite the wrong conversation.
-fn resolve_context(context_id: &str, record: Option<&str>) -> Result<RecordSummary, CliError> {
-    let summaries = list_records().map_err(|reason| CliError::new(E_IO_003, reason))?;
-    let matches: Vec<RecordSummary> = summaries
+/// would read, delete or rewrite the wrong conversation.
+fn one_context<T>(
+    context_id: &str,
+    record: Option<&str>,
+    found: Vec<T>,
+    store: impl Fn(&T) -> &str,
+) -> Result<T, CliError> {
+    let mut matches: Vec<T> = found
         .into_iter()
-        .filter(|summary| summary.context_id == context_id)
-        .filter(|summary| record.is_none_or(|name| summary.record == name))
+        .filter(|context| record.is_none_or(|name| store(context) == name))
         .collect();
 
     match matches.len() {
@@ -263,12 +418,9 @@ fn resolve_context(context_id: &str, record: Option<&str>) -> Result<RecordSumma
                 "`mur conversation ls` lists every record and context on this host",
             ))
         }
-        1 => Ok(matches.into_iter().next().expect("one match")),
+        1 => Ok(matches.remove(0)),
         _ => {
-            let stores: Vec<&str> = matches
-                .iter()
-                .map(|summary| summary.record.as_str())
-                .collect();
+            let stores: Vec<&str> = matches.iter().map(&store).collect();
             Err(CliError::with_hint(
                 E_CNV_002,
                 format!(

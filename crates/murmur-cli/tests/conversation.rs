@@ -1108,3 +1108,223 @@ fn a_rejected_answer_is_fixed_in_one_more_turn_without_rerunning_a_tool() {
         drop(f.project);
     }
 }
+
+// ── mur conversation show ────────────────────────────────────────────────────
+
+/// `mur conversation show <args…>` under `home`, which must succeed; its stdout.
+fn show(home: &Path, args: &[&str]) -> String {
+    let assert = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home)
+        .args(["conversation", "show"])
+        .args(args)
+        .assert()
+        .code(0);
+    String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+}
+
+/// [`show`] with `--json`, parsed, holding every documented key.
+fn show_json(home: &Path, args: &[&str]) -> Value {
+    let mut full = args.to_vec();
+    full.push("--json");
+    let stdout = show(home, &full);
+    let value: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("stdout is one JSON object ({err}): {stdout}"));
+    let object = value.as_object().expect("one JSON object");
+    for key in [
+        "record",
+        "context_id",
+        "dir",
+        "header",
+        "messages",
+        "harness_session",
+    ] {
+        assert!(object.contains_key(key), "{key} is missing: {stdout}");
+    }
+    value
+}
+
+/// `mur conversation show <args…>` under `home`, which must fail with exit 1, `code` on stderr
+/// and nothing on stdout; its stderr.
+fn show_refused(home: &Path, args: &[&str], code: &str) -> String {
+    let assert = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home)
+        .args(["conversation", "show"])
+        .args(args)
+        .assert()
+        .code(1);
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(stderr.contains(&format!("error[{code}]")), "{stderr}");
+    assert!(
+        output.stdout.is_empty(),
+        "a failure prints nothing on stdout"
+    );
+    stderr
+}
+
+/// The context id `mur trace list --json` names for the newest session of the workdir root
+/// `root`.
+fn listed_context(home: &Path, root: &Path) -> String {
+    let assert = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home)
+        .args([
+            "trace",
+            "list",
+            "--workdir",
+            root.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success();
+    let listing: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    listing["sessions"][0]["context_id"]
+        .as_str()
+        .expect("a session that took a task names its context")
+        .to_string()
+}
+
+/// A real session's conversation, found by the context id `mur trace list` names: the record
+/// store is the capsule's name, the messages are the record's message lines in order with every
+/// key, `--record` narrows to the same answer, and nothing is written. With `context.retain`
+/// declared the record carries a header naming the capsule.
+#[test]
+fn show_prints_a_real_session_conversation_as_recorded() {
+    for (blocks, header) in [
+        ("", false),
+        ("context:\n  retain:\n    max_messages: 50\n", true),
+    ] {
+        let f = fixture(vec![end_turn("remembered")], blocks, &[]);
+        let root = f.project.path().join("D");
+        fs::create_dir(&root).unwrap();
+        run(&f.home, &f.manifest, &["--workdir", root.to_str().unwrap()]).success();
+        let context_id = listed_context(f.home.path(), &root);
+        let record = record_path(&f.home, CAPSULE_NAME, &context_id);
+        let before = fs::read(&record).unwrap();
+
+        let shown = show_json(f.home.path(), &[&context_id]);
+        println!("mur conversation show --json:\n{shown:#}");
+        assert_eq!(shown["record"], CAPSULE_NAME);
+        assert_eq!(shown["context_id"], context_id.as_str());
+        assert_eq!(shown["dir"], record.parent().unwrap().to_str().unwrap());
+        let recorded: Vec<Value> = record_messages(&f.home, CAPSULE_NAME, &context_id)
+            .into_iter()
+            .filter(|line| line.get("role").is_some())
+            .collect();
+        assert_eq!(recorded.len(), 2, "the task and the reply");
+        assert_eq!(shown["messages"], Value::Array(recorded), "{blocks}");
+        assert!(shown["harness_session"].is_null());
+        if header {
+            assert_eq!(shown["header"]["capsule"], CAPSULE_NAME, "{shown:#}");
+            assert!(shown["header"]["created_ms"].is_u64(), "{shown:#}");
+            assert!(shown["header"]["truncated"].is_null(), "{shown:#}");
+            assert!(shown["header"].get("type").is_none(), "{shown:#}");
+        } else {
+            assert!(shown["header"].is_null(), "{shown:#}");
+        }
+
+        let narrowed = show_json(f.home.path(), &[&context_id, "--record", CAPSULE_NAME]);
+        assert_eq!(narrowed, shown);
+        assert_eq!(fs::read(&record).unwrap(), before, "show writes nothing");
+        drop(f.project);
+    }
+}
+
+/// Fabricated stores: an unknown context and a context directory holding neither file are both
+/// absent, one id in two stores is ambiguous until `--record` says which, a harness file of
+/// another tool reads as no session, and the human form counts and lists the messages.
+#[test]
+fn show_refuses_absence_and_ambiguity_as_rm_does() {
+    let home = tempfile::tempdir().unwrap();
+    let conversations = home.path().join(".murmur/conversations");
+    let a = conversations.join("store-a/ctx_shared");
+    let b = conversations.join("store-b/ctx_shared");
+    let empty = conversations.join("store-a/ctx_empty");
+    for dir in [&a, &b, &empty] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let user =
+        json!({"role": "user", "content": "first line\nsecond line", "id": "msg_1", "extra": 7});
+    let reply = json!({"role": "assistant", "content": [{"type": "text", "text": "a reply"}], "id": "msg_2"});
+    fs::write(
+        a.join("conversation.jsonl"),
+        format!("{user}\n{reply}\n{{\"role\": \"us"),
+    )
+    .unwrap();
+    fs::write(
+        b.join("harness-session.json"),
+        json!({"type": "another-tool", "session_id": "s", "harness": "h", "driver": "d",
+               "created_ms": 1, "updated_ms": 2})
+        .to_string(),
+    )
+    .unwrap();
+
+    let stderr = show_refused(home.path(), &["ctx_unknown"], "E-CNV-001");
+    assert!(
+        stderr.contains("no context 'ctx_unknown' in any record under ~/.murmur/conversations/"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("`mur conversation ls` lists every record and context on this host"),
+        "{stderr}"
+    );
+    show_refused(home.path(), &["ctx_empty"], "E-CNV-001");
+
+    let stderr = show_refused(home.path(), &["ctx_shared"], "E-CNV-002");
+    assert!(
+        stderr.contains("context 'ctx_shared' is present under 2 record stores: store-a, store-b"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("pass --record <NAME> to say which one, e.g. --record store-a"),
+        "{stderr}"
+    );
+
+    let other_tool = show_json(home.path(), &["ctx_shared", "--record", "store-b"]);
+    assert_eq!(
+        other_tool,
+        json!({
+            "record": "store-b",
+            "context_id": "ctx_shared",
+            "dir": b.to_str().unwrap(),
+            "header": null,
+            "messages": [],
+            "harness_session": null,
+        })
+    );
+
+    let shown = show_json(home.path(), &["ctx_shared", "--record", "store-a"]);
+    assert_eq!(
+        shown["messages"],
+        json!([user, reply]),
+        "the torn line is skipped"
+    );
+
+    let human = show(home.path(), &["ctx_shared", "--record", "store-a"]);
+    println!("mur conversation show:\n{human}");
+    let lines: Vec<&str> = human.lines().collect();
+    assert_eq!(lines.len(), 5, "{human}");
+    assert!(
+        lines[0].starts_with("record:") && lines[0].ends_with("store-a"),
+        "{human}"
+    );
+    assert!(
+        lines[1].starts_with("context:") && lines[1].ends_with("ctx_shared"),
+        "{human}"
+    );
+    assert!(
+        lines[2].starts_with("messages:") && lines[2].ends_with('2'),
+        "{human}"
+    );
+    assert!(
+        lines[3].contains('1') && lines[3].contains("user"),
+        "{human}"
+    );
+    assert!(lines[3].ends_with("first line"), "{human}");
+    assert!(
+        lines[4].contains("assistant") && lines[4].ends_with("a reply"),
+        "{human}"
+    );
+}

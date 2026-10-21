@@ -241,6 +241,14 @@ fn containment_floor_hint(
     }
 }
 
+/// The `E-RUN-050` hint for a link or wrong file type found at `refused_at`.
+pub(crate) fn workdir_refused_hint(refused_at: &str) -> String {
+    format!(
+        "the runtime never follows a link inside the workdir; replace {refused_at} with a regular \
+         file or directory, or remove it, and run again"
+    )
+}
+
 /// `E-IO-004` for a `HOME` that cannot hold `~/.murmur`: the cause, and what to set.
 pub(crate) fn home_unusable(error: &capsule_runtime::HomeUnusable) -> CliError {
     CliError::with_hint(
@@ -416,11 +424,7 @@ impl From<RuntimeError> for CliError {
             RuntimeError::WorkdirPathRefused { refusal } => CliError::with_hint(
                 E_RUN_050,
                 refusal.to_string(),
-                format!(
-                    "the runtime never follows a link inside the workdir; replace {} with a \
-                     regular file or directory, or remove it, and run again",
-                    refusal.refused_at
-                ),
+                workdir_refused_hint(&refusal.refused_at),
             ),
             error @ RuntimeError::WorkdirIdentityMismatch { .. } => CliError::with_hint(
                 E_RUN_051,

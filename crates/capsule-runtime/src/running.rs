@@ -266,6 +266,14 @@ pub fn running_dir_location() -> Result<PathBuf, String> {
     Ok(crate::state_store::murmur_home_dir()?.join(RUNNING_DIR))
 }
 
+/// `~/.murmur/running/<session_id>.json`, the record a running session is listed by, resolved as
+/// [`running_dir_location`] resolves the directory: nothing is created.
+///
+/// The `Err` is [`running_dir_location`]'s.
+pub fn record_location(session_id: &str) -> Result<PathBuf, String> {
+    Ok(record_path(&running_dir_location()?, session_id))
+}
+
 /// What one pass over a running directory found.
 #[derive(Debug, Default)]
 pub struct RecordScan {
