@@ -1477,7 +1477,7 @@ def main():
                       or under that ceiling, and the ceiling itself must be far below the 1024 \
                       default. Asserted at `advisory` too, since setrlimit applies on every \
                       Unix platform. Lifted from scenario 1, but with the declared ceiling raised \
-                      from that document's 16 to 128: see the comment on the tight resources block \
+                      from that document's 64 to 128: see the comment on the tight resources block \
                       in runner.rs, where 16 is shown to make every spawn fail outright rather \
                       than bound anything, and where 64 is shown to have stopped being enough \
                       once slice fb1eea97 added the `SEALED_ETC_PATHS` grant fds.\

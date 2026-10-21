@@ -173,7 +173,7 @@ pub fn derive_interpreter_dirs(python: &str) -> Result<Vec<(String, bool)>, Stri
 /// process bound.
 fn tight_resources_yaml() -> &'static str {
     "  resources:\n\
-    \x20   # 128 rather than the document's 16, and the difference is a finding rather than a\n\
+    \x20   # 128 rather than the document's 64, and the difference is a finding rather than a\n\
     \x20   # preference. `apply_hard_rlimits` runs first in the child's pre_exec window, so every\n\
     \x20   # later step in that window lives under this ceiling — and the Landlock grant fds, the\n\
     \x20   # netns/uid_map setup and the seccomp filter all need descriptors while it holds.\n\
@@ -1213,7 +1213,7 @@ mod tests {
         let yaml = manifest_yaml(case, &config(), ContainmentClass::Scoped, &log());
         assert!(yaml.contains("cgroup_pids_max: 32"));
         assert!(yaml.contains("workdir_max_bytes: 52428800"));
-        // 128, not the manual-verification document's 16: the child's pre_exec window has to
+        // 128, not the manual-verification document's 64: the child's pre_exec window has to
         // install a seccomp filter, write uid_map/gid_map for the egress netns, and hold one
         // Landlock grant fd per granted path, all under this ceiling. Below roughly 64 the
         // seccomp install fails; at 64 a `sealed` capsule fails on uid_map once the

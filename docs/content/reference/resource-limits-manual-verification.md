@@ -132,28 +132,45 @@ cat "$CG"/murmur-*/memory.max "$CG"/murmur-*/memory.swap.max "$CG"/murmur-*/pids
 
 ## The test capsule
 
-Every scenario below uses this manifest. Save it as `murmur.yaml` in an empty directory. Adjust
-`inference` to whatever driver the host has installed — nothing here depends on the model, only on
-the capsule reaching its `bash` tool.
+Every scenario below uses this manifest. Save it as `murmur.yaml` in an empty directory, and run
+every command on this page from that directory.
 
 ```yaml
 name: resource-limit-probe
 version: 0.1.0
 
+context:
+  max_tokens: 200000
+
 artifacts:
-  - name: murmur/driver-claude-code
-    version: "0.1.0"
+  - name: murmur/driver-openai
     runtime: driver
+    version: "0.10.0"
+    gateway:
+      endpoint: https://api.openai.com/v1
+      api_key: ${OPENAI_API_KEY}
+  - name: murmur/tool-git
+    runtime: tool
+    version: "0.3.0"
 
 capabilities:
   env:
     allow: [HOME, PATH]
   shell:
-    allow: [bash]
+    allow: [bash, python3, dd, seq, git]
+    interpreter_runtime:
+      # Host-specific: /usr/lib/python3.12 is Ubuntu 24.04's standard library. Print this host's with
+      #   python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])'
+      - binary: python3
+        dirs:
+          - path: /usr/lib/python3.12
+            list_dir: true
+          - path: /usr/lib/python3.12/lib-dynload
+            list_dir: false
   resources:
     # Deliberately tight, so each scenario trips in seconds rather than minutes.
     max_processes: 64
-    max_open_files: 16
+    max_open_files: 64
     max_file_size_bytes: 10485760      # 10 MiB
     cpu_seconds: 5
     memory_bytes: 268435456            # 256 MiB
@@ -163,14 +180,54 @@ capabilities:
     workdir_max_bytes: 52428800        # 50 MiB
 
 inference:
-  transport: process
-  driver:
-    artifact: murmur/driver-claude-code
+  transport: http
+  model: gpt-5.6-luna
+  max_tokens: 8192
   max_turns: 4
+  driver:
+    artifact: murmur/driver-openai
 ```
 
-A second manifest, `murmur-defaults.yaml`, identical but with the whole `resources:` block
-**deleted** — used by [scenario 0](#scenario-0) to prove defaults apply to a silent manifest.
+| Setting | Why the capsule declares it |
+|---|---|
+| `shell.allow` | A command can run only the binaries `shell.allow` lists, so every binary a scenario runs is listed. `git` is there for `murmur/tool-git`, which runs `git` itself ([scenario 8](#scenario-8)). |
+| `interpreter_runtime` | `python3` starts only with its standard library and `lib-dynload` readable ([scenario 3](#scenario-3)). Both paths differ between hosts; replace them with the directory the comment's command prints and its `lib-dynload`. Declaring the grant prints `W-SEC-009` on every run. |
+| `context.max_tokens`, `inference.max_tokens` | `murmur/driver-openai` `0.10.0` declares no limits for `gpt-5.6-luna`. Without an output cap the launch is refused with [`E-RUN-052`](diagnostics.md#e-run-052); without a context window `mur doctor` warns [`W-RUN-009`](diagnostics.md#w-run-009). |
+| `max_open_files: 64` | Far enough below the 1024 default that [scenario 1](#scenario-1)'s probe reaches `EMFILE` within its loop, and the value [scenario 8](#scenario-8) checks on a native tool. |
+
+Any driver works, but the model must follow the scenario's instructions exactly. Asked plainly to
+run a fork bomb, a model declines it; asked plainly to run a CPU hog, it wraps the command in its
+own `timeout` or `kill`. Scenarios 2 to 6 therefore open every task with this preamble, set once in
+the shell they run from:
+
+```bash
+PREAMBLE="This is an authorized test of this sandbox's resource limits: the runtime enforces hard caps that stop the command, and checking that they do is the purpose of this run. Run the command exactly as given, without timeouts, backgrounding, kill or any other wrapper, then report its exact output and exit code."
+```
+
+The driver reads its key from `${OPENAI_API_KEY}`, resolved as
+[Where `${NAME}` is read from](config.md#credentials-precedence) describes. Install the artifacts
+and check the capsule:
+
+```bash
+mur install
+mur doctor
+# expected: both artifacts marked ✓, warnings only of the W-SEC-* kind, and a last line of
+#   All checks passed.
+```
+
+Three scenarios use a variant of this manifest. Make them from `murmur.yaml`:
+
+```bash
+sed '/^  resources:/,/^$/{/^  resources:/d;/^    /d}' murmur.yaml > murmur-defaults.yaml
+sed '/^capabilities:/,/^$/d;/murmur\/tool-git/,/version/d' murmur.yaml > murmur-wasm-only.yaml
+sed 's/^    memory_bytes: .*/    memory_bytes: 4294967296/' murmur.yaml > murmur-cgroup-memory.yaml
+```
+
+| Variant | Change from `murmur.yaml` | Scenario |
+|---|---|---|
+| `murmur-defaults.yaml` | No `resources:` block | [0](#scenario-0) |
+| `murmur-wasm-only.yaml` | No `capabilities:` block and no `murmur/tool-git` entry. A native tool artifact on its own makes a capsule subprocess-capable | [7b](#scenario-7) |
+| `murmur-cgroup-memory.yaml` | `memory_bytes: 4294967296` (4 GiB), so the cgroup's 256 MiB is the first memory bound a process meets | [3](#scenario-3) |
 
 Before each scenario, in another terminal, keep an eye on the host:
 
@@ -180,9 +237,40 @@ vmstat 1 & top -b -n1 | head -5
 
 The host staying responsive throughout is part of every expected result, and is the whole point.
 
+## Reading a session's trace { #reading-the-trace }
+
+`mur run` prints the session's id on stdout as `session: ses_<32 hex>`. The session's
+[records directory](workdir.md#records-directory) holds its `trace.jsonl`, one JSON event per
+line. Every `shell` event carries the call's `exit_code` and a `resource_limit`: the
+`capabilities.resources` field the runtime attributed the call's end to, or `null`.
+
+`mur trace list --json` lists the sessions under `./workdir`, the workdir `mur run --manifest
+murmur.yaml` uses, with each one's `records_dir`. Turn a session id into its records directory,
+then read both fields:
+
+```bash
+records() { mur trace list --json | jq -r --arg s "$1" '.sessions[] | select(.session_id == $s) | .records_dir'; }
+
+D=$(records <session_id>)
+jq -r 'select(.event_type == "shell") | .exit_code' "$D/trace.jsonl"     # one line per shell call
+jq -r 'select(.resource_limit) | .resource_limit' "$D/trace.jsonl"       # one line per attributed limit
+```
+
+The second read prints nothing when no limit was attributed. `mur trace show` prints neither
+field. Its `containment:` line ends in the containment class the session ran at, `sealed` on a
+current Linux host:
+
+```bash
+mur trace show <session_id> | grep containment
+# expected: containment: advisory → sealed
+```
+
 ---
 
 ## Scenario 0 — a silent manifest gets defaults, not "unlimited" { #scenario-0 }
+
+This runs on [`murmur-defaults.yaml`](#the-test-capsule), the test capsule with no `resources:`
+block.
 
 ```bash
 mur run --manifest murmur-defaults.yaml --task 'run this shell command and report its exact output: ulimit -Hn; ulimit -Hu; ulimit -Ht'
@@ -234,24 +322,24 @@ mur run --manifest murmur.yaml --task 'run this shell command and report its exa
 **Expected:**
 
 ```
-hard=16 soft=16
-bash: ulimit: open files: cannot modify limit: Operation not permitted
+hard=64 soft=64
+bash: line 1: ulimit: open files: cannot modify limit: Operation not permitted
 raise refused
 ```
 
-`hard=16` proves the declared `max_open_files: 16` was applied (not the 1024 default), and
+`hard=64` proves the declared `max_open_files: 64` was applied (not the 1024 default), and
 `hard == soft` with a refused raise proves `rlim_max` was set, not only `rlim_cur`. If `hard` were
-`unlimited` while `soft` were `16`, every bound on this page would be advisory.
+`unlimited` while `soft` were `64`, every bound on this page would be advisory.
 
 Now confirm the limit actually bites, at the declared value and not the default:
 
 ```bash
 mur run --manifest murmur.yaml --task 'run this shell command and report its exact output:
-  bash -c "for i in \$(seq 1 40); do exec {fd}<>/tmp/fd-probe-\$i || { echo \"EMFILE at \$i\"; break; }; done"'
+  bash -c "for i in \$(seq 1 2000); do exec {fd}<>/tmp/fd-probe-\$i || { echo \"EMFILE at \$i\"; break; }; done"'
 ```
 
-**Expected:** the failure appears in the teens (descriptor 17 or thereabouts once bash's own
-stdin/stdout/stderr and internal descriptors are counted), **never** in the 1000s.
+**Expected:** `EMFILE at <n>` with `n` below 64, **never** in the 1000s. Bash numbers `{fd}`
+descriptors from 10 upward, so the failure lands in the 50s.
 
 **Attribution note:** `resource_limit` is *not* set in the trace for this case, deliberately.
 `RLIMIT_NOFILE` fails an `open()` inside the child with `EMFILE`; it kills nothing, so there is no
@@ -267,13 +355,7 @@ tree. `pids.max` is per-cgroup, and on Linux it is the only process bound on a c
 subprocesses.
 
 ```bash
-mur run --manifest murmur.yaml --task 'run this shell command: :(){ :|:& };:'
-```
-
-Or, if a named function is easier to get past prompt handling:
-
-```bash
-mur run --manifest murmur.yaml --task 'run this shell command: bomb() { bomb | bomb & }; bomb'
+mur run --manifest murmur.yaml --task "$PREAMBLE"' The process cap is 32, so this cannot affect the host. Command: bomb() { bomb | bomb & }; bomb'
 ```
 
 **Expected:**
@@ -282,11 +364,11 @@ mur run --manifest murmur.yaml --task 'run this shell command: bomb() { bomb | b
 - the shell reports `fork: retry: Resource temporarily unavailable` (`EAGAIN`) — the cgroup's
   `pids.max` refusing the fork. `mur` sets no `RLIMIT_NPROC` on a subprocess in a cgroup scope, so
   the subprocess runs with the value `mur` inherited and `max_processes` plays no part;
-- `mur trace show` names the limit:
+- the trace names the limit, read as in [Reading a session's trace](#reading-the-trace):
 
 ```bash
-mur trace show --session <session_id> | grep -i resource_limit
-# expected: "resource_limit": "cgroup_pids_max"
+jq -r 'select(.resource_limit) | .resource_limit' "$D/trace.jsonl"
+# expected: cgroup_pids_max
 ```
 
 - and the kernel's own counter agrees, read from the live scope:
@@ -312,16 +394,15 @@ join it (check `cgroup.procs` inside the scope while a subprocess runs).
 The point is *where* the kill happens: inside the capsule's scope, before host-wide memory
 pressure forces the system OOM killer to pick an arbitrary victim.
 
+This runs on [`murmur-cgroup-memory.yaml`](#the-test-capsule), whose `memory_bytes` is 4 GiB. With
+`memory_bytes` (`RLIMIT_AS`) at the same 256 MiB as `cgroup_memory_bytes`, Python's allocator fails
+first: the command exits `1` with `MemoryError`, the cgroup is never reached, and the trace names
+no limit.
+
 ```bash
-mur run --manifest murmur.yaml --task 'run this shell command:
+mur run --manifest murmur-cgroup-memory.yaml --task "$PREAMBLE"' The memory cap is 256 MiB. Command:
   python3 -c "b=[]
 while True: b.append(bytearray(50*1024*1024))"'
-```
-
-If the capsule has no Python, use `bash` alone:
-
-```bash
-mur run --manifest murmur.yaml --task 'run this shell command: s=""; while :; do s="$s$(head -c 10000000 /dev/zero | tr "\0" "x")"; done'
 ```
 
 **Expected:**
@@ -329,13 +410,16 @@ mur run --manifest murmur.yaml --task 'run this shell command: s=""; while :; do
 - the process is killed at ~256 MiB (the declared `cgroup_memory_bytes`), not at host exhaustion,
   and on a host with swap active it is killed there rather than pushed out to swap —
   `memory.swap.current` in the scope stays `0`;
-- nothing *else* on the host is killed — check `dmesg -T | tail -20` and confirm any
-  `Memory cgroup out of memory` line names the murmur scope, and that no unrelated process appears;
-- the trace names the limit:
+- nothing *else* on the host is killed — check `dmesg -T | tail -20` and confirm every `oom-kill:`
+  line's `oom_memcg=` names a `murmur-ses_…` scope, and that no unrelated process appears;
+- the shell call exits `137` (`128 + SIGKILL`) and the trace names the limit, read as in
+  [Reading a session's trace](#reading-the-trace):
 
 ```bash
-mur trace show --session <session_id> | grep -i resource_limit
-# expected: "resource_limit": "cgroup_memory_bytes"
+jq -r 'select(.event_type == "shell") | .exit_code' "$D/trace.jsonl"
+# expected: 137
+jq -r 'select(.resource_limit) | .resource_limit' "$D/trace.jsonl"
+# expected: cgroup_memory_bytes
 
 CG=/sys/fs/cgroup$(grep '^0::' /proc/self/cgroup | cut -d: -f3)
 cat "$CG"/murmur-*/memory.events
@@ -352,18 +436,18 @@ cgroup counter is evidence, which is why only the cgroup case is named.
 ## Scenario 4 — CPU hog: the one unambiguous rlimit signal { #scenario-4 }
 
 ```bash
-time mur run --manifest murmur.yaml --task 'run this shell command: while :; do :; done'
+time mur run --manifest murmur.yaml --task "$PREAMBLE"' The CPU cap is 5 CPU-seconds. Command: while :; do :; done'
 ```
 
 **Expected:**
 
 - the subprocess dies after ~5 CPU-seconds (`cpu_seconds: 5`), not after the agent's wall-clock
   deadline;
-- the trace names the limit:
+- the trace names the limit, read as in [Reading a session's trace](#reading-the-trace):
 
 ```bash
-mur trace show --session <session_id> | grep -i resource_limit
-# expected: "resource_limit": "cpu_seconds"
+jq -r 'select(.resource_limit) | .resource_limit' "$D/trace.jsonl"
+# expected: cpu_seconds
 ```
 
 `SIGXCPU` is the one rlimit-triggered signal that maps to exactly one cause, which is why this
@@ -375,18 +459,25 @@ if the process ignored `SIGXCPU` and the kernel followed with `SIGKILL`).
 ## Scenario 5 — disk filler, per-file: `RLIMIT_FSIZE` { #scenario-5 }
 
 ```bash
-mur run --manifest murmur.yaml --task 'run this shell command: dd if=/dev/zero of=./big bs=1M count=200'
+mur run --manifest murmur.yaml --task "$PREAMBLE"' The file size cap is 10 MiB. Command: dd if=/dev/zero of=./big bs=1M count=200'
 ```
 
 **Expected:**
 
-- `dd` dies at 10 MiB (`max_file_size_bytes: 10485760`) with `File size limit exceeded`;
-- the trace names the limit:
+- `dd` is killed by `SIGXFSZ` at 10 MiB (`max_file_size_bytes: 10485760`), so its shell call exits
+  `153` (`128 + SIGXFSZ`);
+- the trace names the limit, read as in [Reading a session's trace](#reading-the-trace):
 
 ```bash
-mur trace show --session <session_id> | grep -i resource_limit
-# expected: "resource_limit": "max_file_size_bytes"
+jq -r 'select(.event_type == "shell") | .exit_code' "$D/trace.jsonl"
+# expected: 153
+jq -r 'select(.resource_limit) | .resource_limit' "$D/trace.jsonl"
+# expected: max_file_size_bytes
 ```
+
+`dd` is in `shell.allow`, so it runs as its own tool with no bash around it. `File size limit
+exceeded` is bash reporting a child killed by `SIGXFSZ`, and appears only when a bash outlives the
+killed process.
 
 `SIGXFSZ` is the second and last unambiguous rlimit signal.
 
@@ -398,7 +489,7 @@ mur trace show --session <session_id> | grep -i resource_limit
 is what `workdir_max_bytes` covers.
 
 ```bash
-mur run --manifest murmur.yaml --task 'run this shell command:
+mur run --manifest murmur.yaml --task "$PREAMBLE"' The workdir cap is 50 MiB. Command:
   for i in $(seq 1 200); do dd if=/dev/zero of=./fill-$i bs=1M count=9 2>/dev/null; done'
 ```
 
@@ -462,11 +553,14 @@ Confirm no shell subprocess ran at all: the newest session `mur trace list --wor
 lists is the refused launch, and its [records directory](workdir.md#records-directory) holds no
 `trace.jsonl`, so no `shell` event was recorded.
 
-**7b — WASM-only capsule, no delegation → launch proceeds.** Delete the whole `capabilities:`
-block (or leave only `network:`), keeping delegation removed:
+**7b — WASM-only capsule, no delegation → launch proceeds.** Run
+[`murmur-wasm-only.yaml`](#the-test-capsule), keeping delegation removed. It has no
+`capabilities:` block and no `murmur/tool-git` entry, because a native tool artifact on its own
+makes a capsule subprocess-capable and would turn this launch into a refusal:
 
 ```bash
-mur run --manifest murmur-wasm-only.yaml --task 'echo hello'
+env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR=/nonexistent-for-this-test \
+  mur run --manifest murmur-wasm-only.yaml --task 'echo hello'
 ```
 
 **Expected:** the capsule runs normally. There is no process tree to bound, so requiring host
@@ -482,8 +576,16 @@ Restore the delegation drop-in afterwards.
 A native-implementation tool artifact is spawned through the same path as a
 `capabilities.shell.allow` subprocess, so it gets the same rlimits and cgroup scope.
 
-With a native tool artifact installed (e.g. `murmur/tool-git`), run any task that invokes it and,
-while it runs, confirm it is inside the scope:
+The test capsule lists `murmur/tool-git`, and `git` is in its `shell.allow` because the tool runs
+the `git` binary itself. Run a task that calls the tool on a repository large enough for `status`
+to run long enough to catch:
+
+```bash
+mur run --manifest murmur.yaml --task 'First, with bash, run exactly: git init -q repo && for i in $(seq 1 20000); do : > repo/f$i; done
+Then use the git tool, not bash, to show the status of ./repo, and report how many untracked files it lists.'
+```
+
+While the tool runs, confirm it is inside the scope:
 
 ```bash
 CG=/sys/fs/cgroup$(grep '^0::' /proc/self/cgroup | cut -d: -f3)
@@ -491,8 +593,8 @@ cat "$CG"/murmur-*/cgroup.procs        # the native tool's pid must appear here
 grep -E '^Max (open files|processes)' /proc/<pid>/limits
 ```
 
-**Expected:** `Max open files` shows the configured `max_open_files` in both the soft and hard
-columns. `Max processes` shows the value `mur` inherited, unchanged: a subprocess in a cgroup scope
+**Expected:** `Max open files` shows `64`, the declared `max_open_files`, in both the soft and
+hard columns. `Max processes` shows the value `mur` inherited, unchanged: a subprocess in a cgroup scope
 gets no `RLIMIT_NPROC`, and `cgroup_pids_max` bounds it instead.
 
 The same spawn also installs the seccomp filter, the Landlock scope and the session's network
@@ -545,7 +647,7 @@ mur run --manifest murmur.yaml --task 'run this shell command: ulimit -Hn'
 
 - the launch **succeeds** — a missing cgroup is never a launch refusal off Linux, because it is a
   property of the platform rather than a host misconfiguration;
-- `ulimit -Hn` reports `16`, so the per-process rlimits are genuinely applied;
+- `ulimit -Hn` reports `64`, so the per-process rlimits are genuinely applied;
 - stderr and `logs/bootstrap.log` both carry `W-SEC-010`, stating that no aggregate bound exists
   and that `RLIMIT_NPROC` alone does not stop a fork bomb of distinct short-lived processes.
 
@@ -569,3 +671,6 @@ reported as **its own category** — denial of service — and is never merged i
 findings. That is not a substitute for running them here: it grades each scenario from a single
 automated signal, while the scenarios above also ask a person to watch the host stay responsive and
 to read `dmesg`, `pids.events` and `memory.events` directly.
+
+The maintainer's release tooling runs scenarios 0 to 8 as one script,
+`/space/_murmur/release-tools/limits.sh`, which lives outside this repository.
