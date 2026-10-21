@@ -413,7 +413,9 @@ mur run --manifest murmur.yaml --task 'run this shell command:
 error[E-RUN-013]: session workdir and temporary folder grew to 57671680 bytes, past the 52428800 byte ceiling (capabilities.resources.workdir_max_bytes)
 ```
 
-- `workdir/<session_id>/logs/bootstrap.log` carries the same wording from the watcher thread.
+- `logs/bootstrap.log` in the session's
+  [records directory](workdir.md#records-directory) carries the same wording from the watcher
+  thread. `mur trace list --workdir workdir` names that directory.
 
 **Scope note.** The workdir ceiling is enforced by the *periodic check*, on every containment
 class including `sealed`; the workdir is not a size-mounted tmpfs. The watcher runs in the parent
@@ -454,8 +456,9 @@ error[E-RUN-012]: this capsule can spawn native subprocesses but no cgroup v2 sc
 `{reason}` names what the host is missing, such as the delegated cgroup directory or a
 controller the runtime needs.
 
-Confirm no shell subprocess ran at all — `workdir/<session_id>/trace.jsonl` must contain no
-`shell` event.
+Confirm no shell subprocess ran at all — the newest session's `trace.jsonl` in its
+[records directory](workdir.md#records-directory), which `mur trace list --workdir workdir` names,
+must contain no `shell` event.
 
 **7b — WASM-only capsule, no delegation → launch proceeds.** Delete the whole `capabilities:`
 block (or leave only `network:`), keeping delegation removed:

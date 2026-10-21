@@ -51,8 +51,7 @@ impl Inherited {
         jobs: &HashMap<String, JobRecord>,
         state_of: impl Fn(&RunningRecord) -> ProcessState,
     ) -> u32 {
-        self.records
-            .retain(|record| !matches!(state_of(record), ProcessState::Gone(_)));
+        self.records.retain(|record| state_of(record).is_running());
         self.records
             .iter()
             .filter(|record| !jobs.contains_key(&record.session_id))
@@ -127,12 +126,11 @@ pub fn inherit_with(
     let mut kept = Vec::with_capacity(scan.records.len());
     let mut stale = 0u32;
     for mut record in scan.records {
-        match state_of(&record) {
-            ProcessState::Gone(_) => stale += 1,
-            ProcessState::Alive | ProcessState::Unverified(_) => {
-                record.door_token = None;
-                kept.push(record);
-            }
+        if state_of(&record).is_running() {
+            record.door_token = None;
+            kept.push(record);
+        } else {
+            stale += 1;
         }
     }
 

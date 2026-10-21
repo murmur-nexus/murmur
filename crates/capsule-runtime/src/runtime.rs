@@ -1850,7 +1850,7 @@ pub fn stage_session(
     let achieved_containment = achieved_containment_class(
         enforcement_tier,
         workdir_exec,
-        runtime_dir_placement.inside_workdir,
+        runtime_dir_placement.inside_workdir(),
     );
     check_containment_floor(
         request.declared_containment_floor,
@@ -5709,7 +5709,7 @@ pub fn warn_on_workdir_exec(workdir_exec: bool) {
 /// Prints `W-SEC-033` once when the session's runtime directory lies inside its workdir. A launch
 /// that reaches here runs below a `scoped` floor, so its achieved class is already `advisory`.
 fn warn_on_runtime_dir_inside_workdir(placement: &crate::runtime_dir::RuntimeDirPlacement) {
-    if placement.inside_workdir {
+    if placement.inside_workdir() {
         crate::runtime_err!(
             "[capsule-runtime] {}",
             crate::runtime_dir::runtime_dir_inside_warning(placement)

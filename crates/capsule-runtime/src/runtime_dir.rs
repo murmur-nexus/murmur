@@ -116,16 +116,20 @@ pub struct RuntimeDirPlacement {
     pub sessions_inside_workdir: bool,
     /// Whether this session's records directory lies inside `workdir`, resolved the same way.
     pub records_inside_workdir: bool,
-    /// Either of the two: the capsule's commands can change a directory the runtime keeps out of
-    /// their reach.
-    pub inside_workdir: bool,
 }
 
 impl RuntimeDirPlacement {
+    /// Whether either directory lies inside the workdir: the capsule's commands can change a
+    /// directory the runtime keeps out of their reach.
+    #[must_use]
+    pub fn inside_workdir(&self) -> bool {
+        self.sessions_inside_workdir || self.records_inside_workdir
+    }
+
     /// `Some(self)` when the runtime directory or the records directory lies inside the workdir.
     #[must_use]
     pub fn inside(&self) -> Option<&Self> {
-        self.inside_workdir.then_some(self)
+        self.inside_workdir().then_some(self)
     }
 
     /// A runtime directory and a records group under `/home/test` and a workdir under `/work`,
@@ -138,7 +142,6 @@ impl RuntimeDirPlacement {
             workdir: PathBuf::from("/work"),
             sessions_inside_workdir: false,
             records_inside_workdir: false,
-            inside_workdir: false,
         }
     }
 
@@ -165,7 +168,11 @@ impl RuntimeDirPlacement {
 
     /// The directory, or both, that lies inside the workdir, and what the capsule's commands can
     /// therefore change, as `(subject with its verb, what can be changed)`.
+    ///
+    /// Called only for a placement [`Self::inside_workdir`] holds for, so a placement with
+    /// neither directory inside reads as the records directory alone.
     fn inside_subject(&self) -> (String, &'static str) {
+        debug_assert!(self.inside_workdir());
         let runtime = format!("the runtime directory {}", self.sessions_dir.display());
         let records = format!("the records directory {}", self.records_report_path());
         match (self.sessions_inside_workdir, self.records_inside_workdir) {
@@ -179,12 +186,11 @@ impl RuntimeDirPlacement {
                 format!("{runtime} lies"),
                 "the files the runtime owns — task.md, MURMUR.md, plans and installed tools",
             ),
-            (false, true) => (
+            (false, _) => (
                 format!("{records} lies"),
                 "the records the runtime keeps about the session — its trace, logs, eval scores \
                  and delegation outcome",
             ),
-            (false, false) => (String::new(), ""),
         }
     }
 
@@ -245,7 +251,6 @@ pub fn runtime_dir_placement(
         workdir,
         sessions_inside_workdir,
         records_inside_workdir,
-        inside_workdir: sessions_inside_workdir || records_inside_workdir,
     })
 }
 
@@ -603,7 +608,7 @@ mod tests {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
         let both = runtime_dir_placement(&home).unwrap();
         assert!(both.sessions_inside_workdir && both.records_inside_workdir);
-        assert!(both.inside_workdir);
+        assert!(both.inside_workdir());
         assert!(runtime_dir_inside_warning(&both).contains("the records directory"));
 
         let records = home
@@ -611,13 +616,13 @@ mod tests {
             .join(crate::records_dir::RECORDS_DIR_NAME);
         let records_only = runtime_dir_placement(&records).unwrap();
         assert!(!records_only.sessions_inside_workdir);
-        assert!(records_only.records_inside_workdir && records_only.inside_workdir);
+        assert!(records_only.records_inside_workdir && records_only.inside_workdir());
         let reason = records_only.inside_shortfall();
         assert!(reason.starts_with("the records directory "), "{reason}");
         assert!(reason.contains("run with a --workdir that does not contain ~/.murmur"));
 
         let elsewhere = runtime_dir_placement(&home.join("project/workdir")).unwrap();
-        assert!(!elsewhere.inside_workdir);
+        assert!(!elsewhere.inside_workdir());
         assert_eq!(
             elsewhere.records_report_path(),
             crate::records_dir::records_group(&home.join("project/workdir"))
