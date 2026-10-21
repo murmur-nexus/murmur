@@ -198,7 +198,7 @@ Containment
 | `apparmor_absent` | AppArmor is not enabled on this host | nothing was ever restricted; no profile is needed |
 | `profile_confining` | the shipped `mur-sealed` AppArmor profile is confining this binary | `mur` alone — the configuration murmur ships |
 | `restriction_disabled_host_wide` | `kernel.apparmor_restrict_unprivileged_userns` is `0` | every program on the machine; reported as [`W-SEC-013`](diagnostics.md#w-sec-013) |
-| `withheld` | nothing | `sealed` is refused with `E-CAP-003`, and a capsule that spawns a subprocess with `E-CAP-005` |
+| `withheld` | nothing murmur ships: the restriction is on and no `mur-sealed` profile confines `mur` | `sealed` is refused with `E-CAP-003`. Whether a capsule that spawns a subprocess gets its network namespace is decided by creating one, so it is refused with [`E-CAP-005`](diagnostics.md#e-cap-005) only when that creation fails |
 
 The line is `n/a` off Linux, where AppArmor does not exist. The same value is written to
 `session_start.userns_grant` in

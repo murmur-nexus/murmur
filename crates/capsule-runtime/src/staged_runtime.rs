@@ -468,8 +468,8 @@ mod tests {
 
     /// True when this host lets an unprivileged process create a user namespace.
     ///
-    /// Answered by `detect_egress_namespace_blocker`, which forks and attempts the `unshare` for
-    /// real rather than reading a knob. Reading knobs gets this wrong on Ubuntu 23.10 and later:
+    /// Answered by `detect_egress_namespace_failure`, which forks and creates a namespace for real
+    /// rather than reading a knob. Reading knobs gets this wrong on Ubuntu 23.10 and later:
     /// `/proc/sys/kernel/unprivileged_userns_clone` no longer exists there, and the fallback
     /// question -- whether `/proc/self/ns/user` exists -- is yes on every kernel built with
     /// `CONFIG_USER_NS` regardless of whether the `unshare` is permitted. AppArmor's
@@ -481,7 +481,7 @@ mod tests {
     /// to both, so the probe answers the question this guard is asking.
     #[cfg(target_os = "linux")]
     fn unprivileged_userns_available() -> bool {
-        crate::network_namespace::detect_egress_namespace_blocker().is_none()
+        crate::network_namespace::detect_egress_namespace_failure().is_none()
     }
 
     /// What the forked child reports back through its exit status. `Ok` is 0; every other value

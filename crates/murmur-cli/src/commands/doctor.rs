@@ -6,7 +6,7 @@ use capsule_runtime::{
     applied_mechanism, caller_overflow_fix, caller_overflow_warning,
     capability_policy_from_runtime_manifest, check_egress_namespace,
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
-    detect_egress_namespace_blocker, detect_landlock_abi, detect_userns_grant, doctor_runtime_dir,
+    detect_egress_namespace_failure, detect_landlock_abi, detect_userns_grant, doctor_runtime_dir,
     find_on_path, has_subprocess_route_at_staging, inspect_installed_profile,
     inspect_profile_attachment, install_from_places, landlock_doctor_lines, preopen_reports,
     read_only_advisory_for, render_install, render_read_only, render_records_dir,
@@ -15,7 +15,7 @@ use capsule_runtime::{
     warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
     warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
     warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
-    warn_on_workdir_exec, wit_levels, ArtifactRequest, EgressNamespaceBlocker,
+    warn_on_workdir_exec, wit_levels, ArtifactRequest, EgressNamespaceFailure,
     InstalledProfileState, ProfileAttachment, UsernsGrant, HOME_UNUSABLE_HINT,
     SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
@@ -135,14 +135,26 @@ fn render_native_tools(native_tools: &[String], mechanism: &str) -> String {
 /// give it a network namespace, or `None` when `mur run` would not refuse it for that.
 fn egress_namespace_warning(
     can_spawn_subprocess: bool,
-    blocker: Option<EgressNamespaceBlocker>,
+    failure: Option<&EgressNamespaceFailure>,
 ) -> Option<String> {
-    let error = check_egress_namespace(can_spawn_subprocess, blocker).err()?;
+    let error = check_egress_namespace(can_spawn_subprocess, failure).err()?;
     Some(format!(
         "[mur doctor] warning[{E_CAP_005}]: {error}\n  \
          `mur run` will refuse this capsule on this host until that is resolved. Nothing in \
          murmur.yaml can change it — the refusal is about this machine, not the manifest."
     ))
+}
+
+/// The `network namespace:` line of the `AppArmor / user namespaces` block: the answer of the
+/// probe `mur run` consults, printed for every project whatever it declares.
+fn network_namespace_line(is_linux: bool, failure: Option<&EgressNamespaceFailure>) -> String {
+    match failure {
+        _ if !is_linux => "n/a (a capsule network namespace is a Linux mechanism)".to_string(),
+        None => "created (a real probe created one; the readings above explain a refusal, they \
+                 never cause one)"
+            .to_string(),
+        Some(failure) => format!("refused \u{2014} {}", failure.summary()),
+    }
 }
 
 /// The verdict for one installed artifact when `murmur.lock` is present. Mirrors the
@@ -350,6 +362,13 @@ fn report_userns_grant() {
             capsule_runtime::report_println!("  userns grant: n/a (AppArmor is a Linux mechanism)")
         }
     }
+    capsule_runtime::report_println!(
+        "  network namespace: {}",
+        network_namespace_line(
+            cfg!(target_os = "linux"),
+            detect_egress_namespace_failure().as_ref()
+        )
+    );
 
     match inspect_installed_profile() {
         InstalledProfileState::Matches => {
@@ -1763,9 +1782,10 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         .and_then(|caps| caps.spawn.as_ref())
         .is_some_and(|spawn| !spawn.allow.is_empty());
     let can_spawn_subprocess = has_subprocess_route_at_staging(&capability_policy);
-    if let Some(warning) =
-        egress_namespace_warning(can_spawn_subprocess, detect_egress_namespace_blocker())
-    {
+    if let Some(warning) = egress_namespace_warning(
+        can_spawn_subprocess,
+        detect_egress_namespace_failure().as_ref(),
+    ) {
         capsule_runtime::report_eprintln!("{warning}");
     }
 
@@ -2123,7 +2143,8 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         // The half of the E-CAP-005 check above that needed this loop: a capsule whose only
         // subprocess route is a native tool.
         if !can_spawn_subprocess {
-            if let Some(warning) = egress_namespace_warning(true, detect_egress_namespace_blocker())
+            if let Some(warning) =
+                egress_namespace_warning(true, detect_egress_namespace_failure().as_ref())
             {
                 capsule_runtime::report_eprintln!("{warning}");
             }
@@ -2201,12 +2222,23 @@ mod tests {
         );
     }
 
+    /// A namespace creation refused because the kernel has no user namespaces left to give.
+    fn kernel_support_missing() -> EgressNamespaceFailure {
+        EgressNamespaceFailure {
+            blocker: capsule_runtime::EgressNamespaceBlocker::KernelSupportMissing,
+            failed_call: "unshare(CLONE_NEWUSER | CLONE_NEWNET)".to_string(),
+            errno: Some(libc::ENOSPC),
+            userns_grant: UsernsGrant::RestrictionDisabledHostWide,
+            attachment: ProfileAttachment::Unconfined,
+        }
+    }
+
     /// A capsule whose only subprocess route is a native tool gets the same `E-CAP-005` warning
     /// as one declaring `shell.allow`, on a host that cannot create the namespace.
     #[test]
     fn a_native_only_capsule_on_a_host_without_a_namespace_warns_e_cap_005() {
-        let blocker = Some(EgressNamespaceBlocker::KernelSupportMissing);
-        let warning = egress_namespace_warning(true, blocker).expect("a warning");
+        let failure = kernel_support_missing();
+        let warning = egress_namespace_warning(true, Some(&failure)).expect("a warning");
         assert!(
             warning.starts_with(&format!("[mur doctor] warning[{E_CAP_005}]: ")),
             "{warning}"
@@ -2215,8 +2247,9 @@ mod tests {
             warning.contains("`mur run` will refuse this capsule"),
             "{warning}"
         );
+        assert!(warning.contains(&failure.reason()), "{warning}");
         assert_eq!(egress_namespace_warning(true, None), None);
-        assert_eq!(egress_namespace_warning(false, blocker), None);
+        assert_eq!(egress_namespace_warning(false, Some(&failure)), None);
     }
 
     /// An `install.tool` grant is a subprocess route for the pre-checklist warning, as it is for
@@ -2233,13 +2266,28 @@ mod tests {
         };
         let tool = policy("    tool: [\"local/tool-*\"]\n");
         let skill = policy("    skill: [\"local/skill-*\"]\n");
-        let blocker = Some(EgressNamespaceBlocker::KernelSupportMissing);
+        let failure = kernel_support_missing();
         assert!(
-            egress_namespace_warning(has_subprocess_route_at_staging(&tool), blocker).is_some()
+            egress_namespace_warning(has_subprocess_route_at_staging(&tool), Some(&failure))
+                .is_some()
         );
         assert!(
-            egress_namespace_warning(has_subprocess_route_at_staging(&skill), blocker).is_none()
+            egress_namespace_warning(has_subprocess_route_at_staging(&skill), Some(&failure))
+                .is_none()
         );
+    }
+
+    /// The `network namespace:` line reports the probe's answer, and names the failed call and
+    /// its `errno` when it refused.
+    #[test]
+    fn the_network_namespace_line_reports_the_probe() {
+        assert!(network_namespace_line(true, None).starts_with("created ("));
+        assert_eq!(
+            network_namespace_line(true, Some(&kernel_support_missing())),
+            "refused \u{2014} unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with ENOSPC"
+        );
+        assert!(network_namespace_line(false, None).starts_with("n/a"));
+        assert!(network_namespace_line(false, Some(&kernel_support_missing())).starts_with("n/a"));
     }
 
     #[test]

@@ -2016,7 +2016,7 @@ pub fn stage_session(
     // instead (`check_native_artifact_egress_namespace`), still before anything is instantiated.
     crate::network_namespace::check_egress_namespace(
         has_subprocess_route_at_staging(&request.capability_policy),
-        crate::network_namespace::detect_egress_namespace_blocker(),
+        crate::network_namespace::detect_egress_namespace_failure().as_ref(),
     )?;
     // Lowered here, in the same pre-registry-pull seam and for the same reason a state store name
     // is: an entry that cannot be a workdir subtree refuses the launch before anything is pulled,
@@ -3136,7 +3136,7 @@ fn launch(
     check_native_artifact_egress_namespace(
         &staged.capability_policy,
         has_native_artifact,
-        crate::network_namespace::detect_egress_namespace_blocker(),
+        crate::network_namespace::detect_egress_namespace_failure().as_ref(),
     )?;
     let requires_process_bounding =
         cgroup::requires_process_bounding(&staged.capability_policy, has_native_artifact);
@@ -11187,12 +11187,12 @@ fn write_shell_tool_manifests(
 fn check_native_artifact_egress_namespace(
     policy: &CapabilityPolicy,
     has_native_artifact: bool,
-    blocker: Option<crate::network_namespace::EgressNamespaceBlocker>,
+    failure: Option<&crate::network_namespace::EgressNamespaceFailure>,
 ) -> Result<(), RuntimeError> {
     let checked_at_staging = has_subprocess_route_at_staging(policy);
     crate::network_namespace::check_egress_namespace(
         has_native_artifact && !checked_at_staging,
-        blocker,
+        failure,
     )
 }
 
@@ -18622,26 +18622,38 @@ inference:
         );
     }
 
+    /// A namespace creation refused because the kernel has no user namespaces left to give.
+    fn kernel_support_missing() -> crate::network_namespace::EgressNamespaceFailure {
+        crate::network_namespace::EgressNamespaceFailure {
+            blocker: crate::network_namespace::EgressNamespaceBlocker::KernelSupportMissing,
+            failed_call: "unshare(CLONE_NEWUSER | CLONE_NEWNET)".to_string(),
+            errno: Some(libc::ENOSPC),
+            userns_grant: crate::sealed::UsernsGrant::RestrictionDisabledHostWide,
+            attachment: crate::sealed::ProfileAttachment::Unconfined,
+        }
+    }
+
     /// `launch`'s half of `E-CAP-005`: a capsule whose only subprocess route is a native tool is
     /// refused on a host that cannot give it a network namespace. A capsule with `shell.allow` is
     /// not asked again here, because `stage_session` already asked it.
     #[test]
     fn a_native_only_capsule_needs_an_egress_namespace() {
-        let blocker = Some(crate::network_namespace::EgressNamespaceBlocker::KernelSupportMissing);
+        let failure = kernel_support_missing();
+        let failed = Some(&failure);
         let native_only = CapabilityPolicy::default();
 
         assert!(matches!(
-            check_native_artifact_egress_namespace(&native_only, true, blocker),
+            check_native_artifact_egress_namespace(&native_only, true, failed),
             Err(RuntimeError::EgressNamespaceUnavailable { .. })
         ));
-        assert!(check_native_artifact_egress_namespace(&native_only, false, blocker).is_ok());
+        assert!(check_native_artifact_egress_namespace(&native_only, false, failed).is_ok());
         assert!(check_native_artifact_egress_namespace(&native_only, true, None).is_ok());
 
         let with_shell = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
             ..CapabilityPolicy::default()
         };
-        assert!(check_native_artifact_egress_namespace(&with_shell, true, blocker).is_ok());
+        assert!(check_native_artifact_egress_namespace(&with_shell, true, failed).is_ok());
     }
 
     /// `install.tool` can match a native tool a pull installs, so it is a subprocess route at
@@ -18649,7 +18661,8 @@ inference:
     /// install grant is not refused a second time after it.
     #[test]
     fn native_artifact_egress_counts_install_tool_at_staging_and_not_twice() {
-        let blocker = Some(crate::network_namespace::EgressNamespaceBlocker::KernelSupportMissing);
+        let failure = kernel_support_missing();
+        let failed = Some(&failure);
         let tool_grant = CapabilityPolicy {
             install_tool: vec!["local/tool-*".to_string()],
             ..CapabilityPolicy::default()
@@ -18664,19 +18677,19 @@ inference:
         assert!(matches!(
             crate::network_namespace::check_egress_namespace(
                 has_subprocess_route_at_staging(&tool_grant),
-                blocker
+                failed
             ),
             Err(RuntimeError::EgressNamespaceUnavailable { .. })
         ));
         assert!(crate::network_namespace::check_egress_namespace(
             has_subprocess_route_at_staging(&skill_grant),
-            blocker
+            failed
         )
         .is_ok());
         // Already refused at staging, so `launch` does not ask again.
-        assert!(check_native_artifact_egress_namespace(&tool_grant, true, blocker).is_ok());
+        assert!(check_native_artifact_egress_namespace(&tool_grant, true, failed).is_ok());
         assert!(matches!(
-            check_native_artifact_egress_namespace(&skill_grant, true, blocker),
+            check_native_artifact_egress_namespace(&skill_grant, true, failed),
             Err(RuntimeError::EgressNamespaceUnavailable { .. })
         ));
     }
