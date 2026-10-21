@@ -192,9 +192,10 @@ pub enum EgressNamespaceBlocker {
     /// (`user.max_user_namespaces`), `EINVAL` or `ENOSYS` (`CONFIG_USER_NS=n`), or `EUSERS` (the
     /// nesting limit).
     KernelSupportMissing,
-    /// The runtime could not run the namespace creator at all — a process or descriptor limit, or
-    /// memory — so the host was never asked. Refused like the other two: a namespace nobody could
-    /// create is a namespace the capsule does not get.
+    /// The runtime could not run the namespace creator, or the creator stopped without reporting
+    /// a step — a process or descriptor limit, memory, or a policy that killed it — so the host's
+    /// answer is unknown. Refused like the other two: a namespace nobody could create is a
+    /// namespace the capsule does not get.
     CreatorUnavailable,
 }
 
@@ -262,10 +263,11 @@ impl EgressNamespaceFailure {
         match self.blocker {
             EgressNamespaceBlocker::KernelSupportMissing => kernel_cause(self.errno).to_string(),
             EgressNamespaceBlocker::CreatorUnavailable => {
-                "Likely cause: the runtime could not run the namespace creator — a process or \
-                 descriptor limit, or memory, ran out — so whether this host can create the \
-                 namespace is unknown, and the capsule is refused rather than run without it. \
-                 Re-run once the limit is relieved."
+                "Likely cause: the namespace creator could not run or stopped before reporting — \
+                 a process or descriptor limit, or memory, ran out, or a policy killed it (its \
+                 account then reads `killed by signal`) — so whether this host can create \
+                 the namespace is unknown, and the capsule is refused rather than run without \
+                 it. Re-run once the limit is relieved, or allow the creator's syscalls."
                     .to_string()
             }
             EgressNamespaceBlocker::CapabilityGrantMissing => {

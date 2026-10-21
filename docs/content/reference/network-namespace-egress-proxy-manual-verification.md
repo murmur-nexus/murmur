@@ -368,11 +368,12 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
 cd /tmp/netns-check && mur run ; echo "exit=$?"
 ```
 
-**Expected:** `error[E-CAP-005]`, naming the failed call and its `errno` (typically
-`unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM (Operation not permitted)`), AppArmor's
-restriction as the likely cause, the exact `apparmor_parser` command, and the readings line
-`Host readings: kernel.apparmor_restrict_unprivileged_userns=1; AppArmor profile confining mur:
-unconfined.` No workdir is created. `mur doctor` reports the same `E-CAP-005` and
+**Expected:** `error[E-CAP-005]`, naming the failed call and its `errno` (on Ubuntu,
+`writing uid_map/gid_map failed with EPERM (Operation not permitted)`: the restriction lets the
+`unshare` through and refuses the identity map), AppArmor's restriction as the likely cause, the
+exact `apparmor_parser` command, and the readings line `Host readings:
+kernel.apparmor_restrict_unprivileged_userns=1; AppArmor profile confining mur: unconfined.` No
+workdir is created. `mur doctor` reports the same `E-CAP-005` and
 `network namespace: refused` while the restriction is on. Restore the host immediately:
 
 ```bash
