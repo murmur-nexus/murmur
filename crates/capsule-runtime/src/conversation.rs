@@ -566,6 +566,24 @@ fn read_record(
         Err(err) => return Err(err.to_string()),
     };
 
+    Ok(record_messages(&raw, |line_number| {
+        if !*reported {
+            *reported = true;
+            report(
+                workdir,
+                &format!(
+                    "[conversation] {}: line {line_number} is not a message and was skipped",
+                    path.display()
+                ),
+            );
+        }
+    }))
+}
+
+/// Every message line of `raw`, a record's whole contents, oldest first, by
+/// [`parse_message_line`]. A blank line is passed over; every other line that is not a message —
+/// the header, a torn final line — is skipped and its 1-based number handed to `skipped`.
+pub(crate) fn record_messages(raw: &str, mut skipped: impl FnMut(usize)) -> Vec<Value> {
     let mut messages = Vec::new();
     for (index, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
@@ -573,22 +591,10 @@ fn read_record(
         }
         match parse_message_line(line) {
             Some(message) => messages.push(message),
-            None => {
-                if !*reported {
-                    *reported = true;
-                    report(
-                        workdir,
-                        &format!(
-                            "[conversation] {}: line {} is not a message and was skipped",
-                            path.display(),
-                            index + 1
-                        ),
-                    );
-                }
-            }
+            None => skipped(index + 1),
         }
     }
-    Ok(messages)
+    messages
 }
 
 /// One record line as a message, or `None` when it is not one. A message is a JSON object

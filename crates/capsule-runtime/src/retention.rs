@@ -34,14 +34,16 @@
 use std::path::{Path, PathBuf};
 
 use crate::conversation::{
-    header_line, message_id_timestamp_ms, parse_message_line, read_header, CONVERSATION_ROOT_DIR,
-    RECORD_FILE_NAME,
+    header_line, message_id_timestamp_ms, parse_header, parse_message_line, read_header,
+    record_messages, CONVERSATION_ROOT_DIR, RECORD_FILE_NAME,
 };
 
 use crate::formation::FormationId;
 use crate::formation_launch::FormationMarker;
+use crate::harness_session::{read_entry, HARNESS_SESSION_FILE_NAME};
 
 pub use crate::conversation::{RecordHeader, TruncationMarker};
+pub use crate::harness_session::HarnessSessionEntry;
 
 /// A session directory that was removed, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +147,30 @@ pub struct RemovedRecord {
     pub path: PathBuf,
     /// Messages it held.
     pub messages: u64,
+}
+
+/// One context directory of the record store: a directory under a record store holding
+/// `conversation.jsonl`, `harness-session.json`, or both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextDir {
+    /// Record store: the directory under `~/.murmur/conversations/`.
+    pub record: String,
+    /// Context id: the directory under the record store.
+    pub context_id: String,
+    /// The context directory itself.
+    pub path: PathBuf,
+}
+
+/// What one context directory holds, read the way the runtime reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextContents {
+    /// The header line, when `conversation.jsonl`'s first line is one.
+    pub header: Option<RecordHeader>,
+    /// Every message line of `conversation.jsonl`, oldest first, as recorded. Empty when there is
+    /// no `conversation.jsonl`, which is the case on `inference.transport: process`.
+    pub messages: Vec<serde_json::Value>,
+    /// The context's harness session, `None` wherever the runtime reads "no session".
+    pub harness_session: Option<HarnessSessionEntry>,
 }
 
 // ── Session pruning ──────────────────────────────────────────────────────────
@@ -715,6 +741,57 @@ pub fn locate_message(message_id: &str) -> Result<Vec<MessageLocation>, String> 
     Ok(found)
 }
 
+/// Every context directory named `context_id`, in every record store, ordered by record store.
+///
+/// A context counts when its directory holds `conversation.jsonl` or `harness-session.json`, so a
+/// context on `inference.transport: process`, which has only the second, is found as well;
+/// [`list_records`] counts the first alone. An empty list is no such context. The `Err` is `HOME`
+/// being unusable.
+pub fn find_context_dirs(context_id: &str) -> Result<Vec<ContextDir>, String> {
+    Ok(find_context_dirs_in(&conversations_root()?, context_id))
+}
+
+fn find_context_dirs_in(root: &Path, context_id: &str) -> Vec<ContextDir> {
+    let mut found = Vec::new();
+    for record in child_dirs(root) {
+        for (name, path) in context_dirs(&root.join(&record)) {
+            if name != context_id {
+                continue;
+            }
+            if path.join(RECORD_FILE_NAME).exists() || path.join(HARNESS_SESSION_FILE_NAME).exists()
+            {
+                found.push(ContextDir {
+                    record: record.clone(),
+                    context_id: name,
+                    path,
+                });
+            }
+        }
+    }
+    found
+}
+
+/// What the context directory `dir` holds: the header and messages of its `conversation.jsonl`
+/// and its harness session.
+///
+/// Reads with the runtime's own rules — [`parse_header`] on line 1, [`record_messages`] for the
+/// messages, [`read_entry`] for the harness session — and writes nothing. A missing
+/// `conversation.jsonl` is no header and no messages. The `Err` is `conversation.jsonl` existing
+/// and not being readable, and names the path.
+pub fn read_context_dir(dir: &Path) -> Result<ContextContents, String> {
+    let record = dir.join(RECORD_FILE_NAME);
+    let raw = match std::fs::read_to_string(&record) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(format!("{}: {err}", record.display())),
+    };
+    Ok(ContextContents {
+        header: raw.lines().next().and_then(parse_header),
+        messages: record_messages(&raw, |_| {}),
+        harness_session: read_entry(&dir.join(HARNESS_SESSION_FILE_NAME)),
+    })
+}
+
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
 /// `~/.murmur/conversations`, resolved and not created.
@@ -781,7 +858,6 @@ fn last_touched_ms(path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::parse_header;
     use murmur_artifact::{ContextRetainConfig, TraceRetainConfig};
     use serde_json::json;
 
@@ -1747,5 +1823,120 @@ mod tests {
             [(gone, crate::trace::RETENTION_REASON_MAX_AGE)]
         );
         assert!(stuck_dir.is_dir());
+    }
+
+    // ── The record store, as `mur conversation show` reads it ────────────────
+
+    fn harness_entry_json(kind: &str, session_id: &str) -> String {
+        json!({"type": kind, "session_id": session_id, "harness": "h", "driver": "d",
+               "created_ms": 1, "updated_ms": 2})
+        .to_string()
+    }
+
+    /// A context counts with either file; a context with neither, and anything dotted, does not;
+    /// and an id present in two stores is found in both, store by store.
+    #[test]
+    fn the_context_finder_sees_either_file_in_every_store() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = |store: &str, context: &str| {
+            let path = root.path().join(store).join(context);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        };
+        std::fs::write(dir("b", "ctx").join(RECORD_FILE_NAME), "").unwrap();
+        std::fs::write(
+            dir("a", "ctx").join(HARNESS_SESSION_FILE_NAME),
+            harness_entry_json(crate::harness_session::HARNESS_SESSION_TYPE, "s"),
+        )
+        .unwrap();
+        dir("c", "ctx");
+        std::fs::write(dir(".hidden", "ctx").join(RECORD_FILE_NAME), "").unwrap();
+        std::fs::write(dir("a", ".ctx").join(RECORD_FILE_NAME), "").unwrap();
+
+        let found = find_context_dirs_in(root.path(), "ctx");
+        let stores: Vec<&str> = found.iter().map(|dir| dir.record.as_str()).collect();
+        assert_eq!(stores, ["a", "b"]);
+        assert!(found.iter().all(|dir| dir.context_id == "ctx"));
+        assert_eq!(found[1].path, root.path().join("b").join("ctx"));
+        assert!(find_context_dirs_in(root.path(), ".ctx").is_empty());
+        assert!(find_context_dirs_in(root.path(), "other").is_empty());
+        assert!(find_context_dirs_in(&root.path().join("absent"), "ctx").is_empty());
+    }
+
+    /// Every key of every message is kept; the header is read from line 1 only and is not a
+    /// message; a torn last line is skipped; and a missing record is no header and no messages.
+    #[test]
+    fn the_context_reader_reads_as_the_runtime_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = RecordHeader {
+            kind: crate::conversation::RECORD_HEADER_TYPE.to_string(),
+            capsule: "owner".to_string(),
+            created_ms: 7,
+            truncated: None,
+        };
+        let first = json!({"role": "user", "content": "hi", "id": "msg_1", "kept": {"x": 1}});
+        let second = json!({"role": "assistant", "content": [{"type": "text", "text": "yo"}]});
+        std::fs::write(
+            dir.path().join(RECORD_FILE_NAME),
+            format!(
+                "{}{first}\n\n{second}\n{}\n{{\"role\": \"us",
+                header_line(&header).unwrap(),
+                header_line(&header).unwrap().trim_end()
+            ),
+        )
+        .unwrap();
+
+        let contents = read_context_dir(dir.path()).unwrap();
+        assert_eq!(contents.header, Some(header.clone()));
+        assert_eq!(contents.messages, vec![first.clone(), second]);
+        assert_eq!(contents.harness_session, None);
+
+        std::fs::write(
+            dir.path().join(RECORD_FILE_NAME),
+            format!("{first}\n{}", header_line(&header).unwrap()),
+        )
+        .unwrap();
+        let contents = read_context_dir(dir.path()).unwrap();
+        assert_eq!(contents.header, None, "a header below line 1 is no header");
+        assert_eq!(contents.messages, vec![first]);
+
+        let empty = tempfile::tempdir().unwrap();
+        let contents = read_context_dir(empty.path()).unwrap();
+        assert_eq!(contents.header, None);
+        assert!(contents.messages.is_empty());
+
+        std::fs::create_dir(empty.path().join(RECORD_FILE_NAME)).unwrap();
+        assert!(
+            read_context_dir(empty.path()).is_err(),
+            "an unreadable record"
+        );
+    }
+
+    /// The harness session is read by the runtime's own rule: no file, a file that is not JSON,
+    /// another tool's file and an entry naming no session all read as no session.
+    #[test]
+    fn the_context_reader_reads_no_session_where_the_runtime_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(HARNESS_SESSION_FILE_NAME);
+        assert_eq!(read_context_dir(dir.path()).unwrap().harness_session, None);
+
+        let session_type = crate::harness_session::HARNESS_SESSION_TYPE;
+        for (body, expected) in [
+            ("{not json".to_string(), false),
+            (harness_entry_json("another-tool", "s"), false),
+            (harness_entry_json(session_type, ""), false),
+            (harness_entry_json(session_type, "s"), true),
+        ] {
+            std::fs::write(&file, &body).unwrap();
+            let session = read_context_dir(dir.path()).unwrap().harness_session;
+            assert_eq!(session.is_some(), expected, "{body}");
+            if let Some(session) = session {
+                assert_eq!(
+                    (session.session_id.as_str(), session.harness.as_str()),
+                    ("s", "h")
+                );
+                assert_eq!((session.created_ms, session.updated_ms), (1, 2));
+            }
+        }
     }
 }

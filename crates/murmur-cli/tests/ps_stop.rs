@@ -2900,3 +2900,231 @@ fn pruning_summary_is_silent_with_nothing_stale() {
         assert!(output.stdout.is_empty(), "{args:?}");
     }
 }
+
+// ── mur ps --json ─────────────────────────────────────────────────────────────
+
+/// Every key `mur ps --json` documents for one capsule.
+const PS_JSON_KEYS: [&str; 13] = [
+    "session_id",
+    "status",
+    "url",
+    "pid",
+    "process_start",
+    "capsule_name",
+    "capsule_version",
+    "workdir",
+    "records_dir",
+    "outlives_launcher",
+    "started_at",
+    "formation_id",
+    "formation_member",
+];
+
+/// Record keys that never leave the record through `mur ps --json`.
+const PS_JSON_WITHHELD: [&str; 5] = [
+    "door_token",
+    "credentials",
+    "formation_lifeline",
+    "formation_launcher",
+    "spawned_by",
+];
+
+/// A successful `mur ps --json`'s parsed stdout and its stderr.
+fn ps_json(home: &Path) -> (Value, String) {
+    let (stdout, stderr) = ps_output_with(home, &["--json"]);
+    let listing = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("mur ps --json printed no JSON object ({e}):\n{stdout}"));
+    (listing, stderr)
+}
+
+/// The capsules array of a `mur ps --json` listing, each entry holding exactly the documented
+/// keys and none of the withheld ones.
+fn listed_capsules(listing: &Value) -> Vec<Value> {
+    let capsules = listing["capsules"]
+        .as_array()
+        .expect("capsules is an array");
+    for capsule in capsules {
+        let entry = capsule.as_object().expect("each capsule is an object");
+        for key in PS_JSON_KEYS {
+            assert!(entry.contains_key(key), "{key} is missing from {capsule}");
+        }
+        for key in PS_JSON_WITHHELD {
+            assert!(!entry.contains_key(key), "{key} leaked into {capsule}");
+        }
+    }
+    capsules.clone()
+}
+
+/// `mur ps --json` on one real running capsule: the startup line's values, the manifest's name and
+/// version, `running`, no formation, no secret, and the record left byte for byte.
+#[test]
+fn ps_json_lists_a_running_capsule_as_its_startup_line_names_it() {
+    let server = common::ScriptedServer::start(vec![end_turn_response("msg_1", "hello")]);
+    let home = driver_home();
+    let capsule = start_agent(&home, &server, "ps-json");
+    let record = record_for(home.path(), &capsule.session_id());
+    let record_before = fs::read(&record).unwrap();
+
+    let (listing, stderr) = ps_json(home.path());
+    println!("mur ps --json:\n{listing:#}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let capsules = listed_capsules(&listing);
+    assert_eq!(capsules.len(), 1, "{listing:#}");
+    let entry = &capsules[0];
+    for key in ["session_id", "url", "pid", "workdir", "records_dir"] {
+        assert_eq!(entry[key], capsule.startup[key], "{key}");
+    }
+    assert_eq!(entry["capsule_name"], "ps-json");
+    assert_eq!(entry["capsule_version"], "0.1.0");
+    assert_eq!(entry["status"], "running");
+    assert!(entry["formation_id"].is_null(), "{entry}");
+    assert!(entry["formation_member"].is_null(), "{entry}");
+    assert!(entry["outlives_launcher"].is_boolean(), "{entry}");
+    assert!(entry["process_start"].is_string(), "{entry}");
+    assert!(entry["started_at"].is_string(), "{entry}");
+    assert_eq!(fs::read(&record).unwrap(), record_before);
+}
+
+/// `mur ps --json` lists what `mur ps` would and removes nothing: the dead record, the unreadable
+/// file and the older-mur record all stay byte for byte, and only the older-mur one is named on
+/// stderr. A plain `mur ps` afterwards still prunes what it always pruned.
+#[test]
+fn ps_json_prunes_nothing_and_lists_only_what_ps_would() {
+    let home = tempfile::tempdir().unwrap();
+    let stray = Stray::sleeping();
+
+    let dead = fabricated_id("dead");
+    let quiet = fabricated_id("beef");
+    write_record(home.path(), &dead, "127.0.0.1:1", DEAD_PID, "1");
+    write_record(
+        home.path(),
+        &quiet,
+        "127.0.0.1:1",
+        stray.pid(),
+        &stray.token(),
+    );
+    let junk = running_dir(home.path()).join("junk.json");
+    fs::write(&junk, "{").unwrap();
+    let older_id = fabricated_id("060");
+    let older = record_for(home.path(), &older_id);
+    fs::write(
+        &older,
+        serde_json::to_vec_pretty(&json!({
+            "session_id": older_id,
+            "url": "127.0.0.1:1",
+            "pid": DEAD_PID,
+            "process_start": "1",
+            "capsule_name": "fabricated",
+            "capsule_version": "0.1.0",
+            "workdir": "/tmp/fabricated",
+            "outlives_launcher": true,
+            "started_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let files = [
+        record_for(home.path(), &dead),
+        record_for(home.path(), &quiet),
+        junk.clone(),
+        older.clone(),
+    ];
+    let before: Vec<Vec<u8>> = files.iter().map(|path| fs::read(path).unwrap()).collect();
+
+    let (listing, stderr) = ps_json(home.path());
+    let capsules = listed_capsules(&listing);
+    assert_eq!(capsules.len(), 1, "{listing:#}");
+    assert_eq!(capsules[0]["session_id"], quiet.as_str());
+    assert_eq!(capsules[0]["status"], "unreachable");
+    assert_eq!(capsules[0]["pid"], stray.pid());
+    assert_eq!(stderr, format!("{}\n", skipped_line(&older)));
+    for (path, bytes) in files.iter().zip(&before) {
+        assert_eq!(&fs::read(path).unwrap(), bytes, "{}", path.display());
+    }
+
+    ps_output(home.path());
+    assert!(
+        !record_for(home.path(), &dead).exists(),
+        "plain ps prunes the dead record"
+    );
+    assert!(!junk.exists(), "plain ps prunes the unreadable file");
+    assert!(older.exists());
+}
+
+/// A formation member's record: its formation id and roster name are listed, and its door token
+/// and formation bookkeeping are not, on either stream.
+#[test]
+fn ps_json_carries_the_formation_and_never_the_token() {
+    let home = tempfile::tempdir().unwrap();
+    let stray = Stray::sleeping();
+    let session_id = fabricated_id("f0f0");
+    let formation = capsule_runtime::FormationId::mint().to_string();
+    let token = "mdt1.ps-json-never-prints-this";
+    write_launched_member_record(
+        home.path(),
+        &session_id,
+        (stray.pid(), &stray.token()),
+        &formation,
+        (DEAD_PID, "1"),
+    );
+    let path = record_for(home.path(), &session_id);
+    let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["formation_member"] = json!("worker");
+    record["door_token"] = json!(token);
+    record["spawned_by"] = json!(fabricated_id("0001"));
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let (stdout, stderr) = ps_output_with(home.path(), &["--json"]);
+    assert!(!stdout.contains(token), "{stdout}");
+    assert!(!stderr.contains(token), "{stderr}");
+    let listing: Value = serde_json::from_str(&stdout).unwrap();
+    let capsules = listed_capsules(&listing);
+    assert_eq!(capsules.len(), 1, "{listing:#}");
+    assert_eq!(capsules[0]["formation_id"], formation.as_str());
+    assert_eq!(capsules[0]["formation_member"], "worker");
+}
+
+/// No running directory and an empty one both list nothing, and the missing one is not created;
+/// a running directory that cannot be listed is `E-RUN-028` with nothing on stdout; and `--json`
+/// beside `--verbose` is a usage error.
+#[test]
+fn ps_json_on_an_empty_machine_an_unreadable_one_and_with_verbose() {
+    let home = tempfile::tempdir().unwrap();
+    let (stdout, stderr) = ps_output_with(home.path(), &["--json"]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap(),
+        json!({"capsules": []})
+    );
+    assert!(stderr.is_empty(), "{stderr}");
+    assert!(
+        !running_dir(home.path()).exists(),
+        "--json created the directory"
+    );
+    assert!(
+        !home.path().join(".murmur").exists(),
+        "--json created ~/.murmur"
+    );
+
+    fs::create_dir_all(running_dir(home.path())).unwrap();
+    let (empty, _) = ps_output_with(home.path(), &["--json"]);
+    assert_eq!(empty, stdout);
+
+    let unreadable = tempfile::tempdir().unwrap();
+    fs::create_dir(unreadable.path().join(".murmur")).unwrap();
+    fs::write(running_dir(unreadable.path()), "not a directory\n").unwrap();
+    let output = mur(unreadable.path())
+        .args(["ps", "--json"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(stderr.contains("error[E-RUN-028]"), "{stderr}");
+    assert!(output.stdout.is_empty());
+
+    mur(home.path())
+        .args(["ps", "--json", "--verbose"])
+        .assert()
+        .code(2)
+        .stdout("");
+}

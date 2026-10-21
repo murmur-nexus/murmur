@@ -101,7 +101,7 @@ section that explains it.
 | `E-RUN-021` | A staged native tool's binary is built for another operating system or CPU architecture | [E-RUN-021](#e-run-021) |
 | `E-RUN-022` | A session address or formation id names no capsule running on this machine | [E-RUN-022](#e-run-022) |
 | `E-RUN-023` | The capsule a session address named is running and did not answer | [E-RUN-023](#e-run-023) |
-| `E-RUN-024` | The session or formation named could not be ended and is still running | [E-RUN-024](#e-run-024) |
+| `E-RUN-024` | The session or formation named could not be ended and is still running, or `mur trace rm` named a session that is still running | [E-RUN-024](#e-run-024) |
 | `E-RUN-025` | An artifact whose entry declares `gateway:` has no usable `upstream_auth:` block | [E-RUN-025](#e-run-025) |
 | `E-RUN-026` | `spend.machine_tokens_per_day` is set and the spend ledger under `~/.murmur/spend` cannot be used | [E-RUN-026](#e-run-026) |
 | `E-RUN-027` | The provider kept rejecting the inference credential after it was re-read | [E-RUN-027](#e-run-027) |
@@ -126,7 +126,7 @@ section that explains it.
 | `E-RUN-047` | An installed capsule's bytes no longer hash to the sha256 roster admission bound its member to | [E-RUN-047](#e-run-047) |
 | `E-RUN-048` | `mur token` named a session whose door is public, which minted no token | [E-RUN-048](#e-run-048) |
 | `E-RUN-049` | `mur token --credential` named a credential the session did not mint | [E-RUN-049](#e-run-049) |
-| `E-RUN-050` | The runtime met a symbolic link, or the wrong kind of file, inside the workdir — while staging the session, or during the task `mur run` ran | [E-RUN-050](#e-run-050) |
+| `E-RUN-050` | The runtime met a symbolic link, or the wrong kind of file, inside the workdir — while staging the session, or during the task `mur run` ran — or `mur trace rm` met one on the way to a directory it removes | [E-RUN-050](#e-run-050) |
 | `E-RUN-051` | A delegated child's `--workdir` is not the directory its parent created; nothing was written | [E-RUN-051](#e-run-051) |
 | `E-RUN-052` | A driver choice has no output cap — its driver lists no limits for its model and the manifest sets no `inference.max_tokens` — or its driver ships a malformed `models:` table | [E-RUN-052](#e-run-052) |
 | `E-RUN-053` | The session reached its `mur run --deadline` and was ended, or a launch was handed a deadline it cannot enforce | [E-RUN-053](#e-run-053) |
@@ -134,7 +134,7 @@ section that explains it.
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
 | `E-TRC-001` | Trace file parse error (malformed JSON, missing required `session_start`, empty file); unknown event types are silently skipped. `mur trace show` reads a trace with no `session_end`, and skips a torn final line; `mur trace diff` and `mur trace report` refuse both, and a formation member's missing `session_end` names its formation and `mur trace show <formation-id>`. Also a `mur trace show --body` selector that names no recorded hash, or a hash whose body was never stored, a `--turn` that names several turns, `--body` or `--turn` with a formation id, and `mur trace steps` with a formation id, which names the `mur trace show <formation-id>` that lists its members and calls | [`trace.jsonl` schema](observability-schemas.md#session-trace-tracejsonl), [`mur trace show --body`](cli.md#mur-trace-show-body), [Listing a formation](cli.md#mur-trace-show-formation), [`mur trace steps`](cli.md#mur-trace-steps) |
-| `E-TRC-002` | No session found in the workdir, or a session selector matched none or several. Also a `frm_` argument to `mur trace show` that is not a formation id, or a formation no session under any searched root belongs to | [`mur trace`](cli.md#mur-trace), [Listing a formation](cli.md#mur-trace-show-formation) |
+| `E-TRC-002` | No session found in the workdir, or a session selector matched none or several. Also a `frm_` argument to `mur trace show` that is not a formation id, or a formation no session under any searched root belongs to, and a literal path given to `mur trace rm` | [`mur trace`](cli.md#mur-trace), [Listing a formation](cli.md#mur-trace-show-formation), [`mur trace rm`](cli.md#mur-trace-rm) |
 | `E-WIT-LEVEL-001` | A driver a launch stages, an artifact version `mur install` names, or a version a runtime pull resolves, does not fit the WIT level this `mur` serves | [E-WIT-LEVEL-001](#e-wit-level-001) |
 | `W-BLD-001` | A declaration names an archive entry the packer already fills | [W-BLD-001](#w-bld-001) |
 | `W-BLD-002` | `capsule.wasm` shadows another root `*.wasm` | [W-BLD-002](#w-bld-002) |
@@ -407,7 +407,7 @@ error[E-IO-004]: HOME is not set, so there is no ~/.murmur to hold this session'
 |---|---|
 | `mur run` | Before any artifact store, lockfile or registry is read; also under `--explain-scope` |
 | `mur eval run` | When a case is staged |
-| `mur trace show`, `steps`, `diff`, `report`, `list`, `mur eval show`, `diff`, `mur run --resume` | When the address needs a records group, which `list` always does; the path form needs none |
+| `mur trace show`, `steps`, `diff`, `report`, `list`, `rm`, `mur eval show`, `diff`, `mur run --resume` | When the address needs a records group, which `list` and `rm` always do; the path form needs none |
 | `mur doctor` | In place of the runtime and records directory paths, counted as a failed check |
 
 ### E-RUN-006 — a harness binary was not found { #e-run-006 }
@@ -666,6 +666,11 @@ has on it. Try again, or read what the session is doing with
 
 ### E-RUN-024 — the session could not be ended { #e-run-024 }
 
+| Raised by | When |
+|---|---|
+| [`mur stop`](cli.md#mur-stop) | The session or formation could not be ended |
+| [`mur trace rm`](cli.md#mur-trace-rm) | The session to remove is still running |
+
 [`mur stop`](cli.md#mur-stop) could not end the process a [running-capsule
 record](cli.md#running-capsule-records) names: a signal was refused, or the process is still there
 afterwards.
@@ -698,6 +703,14 @@ the same code, as `formation <id> could not be ended: <reason>`:
 | `SIGTERM to its launcher, pid N, was refused: …` | The launcher could not be confirmed or may not be signalled by this user; nothing was signalled and every member is still running |
 | `SIGKILL to its launcher, pid N, was refused: …` | The same, at the escalation step |
 | `its launcher, pid N, was still running 5 seconds after SIGKILL` | The kernel accepted the signal and the launcher has not gone |
+
+[`mur trace rm`](cli.md#mur-trace-rm) refuses a session that a running-capsule record names while
+its process is alive, or alive with a start time that could not be read, and removes nothing:
+
+```text
+error[E-RUN-024]: session ses_019f0193c7d871a5b2e30ff41a7c0ce1 is still running (pid 48213); nothing was removed
+  hint: stop it with `mur stop ses_019f0193c7d871a5b2e30ff41a7c0ce1` first, then remove it
+```
 | `N of its members were still running 25 seconds later: <session>, …` | Those members' processes outlived the wait; their records are kept |
 
 A member started by hand that could not be ended is reported as `error: …` in the
@@ -776,9 +789,11 @@ and is reported as the driver reports it.
 ### E-RUN-028 — the running-capsule records could not be read { #e-run-028 }
 
 [`mur ps`](cli.md#mur-ps), [`mur watch`](cli.md#mur-watch), [`mur cancel`](cli.md#mur-cancel),
-[`mur stop`](cli.md#mur-stop) and [`mur trace list`](cli.md#mur-trace-list) read the
+[`mur stop`](cli.md#mur-stop), [`mur ps --json`](cli.md#mur-ps-json),
+[`mur trace list`](cli.md#mur-trace-list) and [`mur trace rm`](cli.md#mur-trace-rm) read the
 [running-capsule records](cli.md#running-capsule-records) under `~/.murmur/running/`, and that
-directory could not be created, held at `0700`, or listed. `mur trace list` only lists it.
+directory could not be created, held at `0700`, or listed. `mur ps --json`, `mur trace list` and
+`mur trace rm` only list it, and also report a `HOME` from which it cannot be located.
 Which capsules are running is unknown, so nothing is listed, nothing is removed and nothing is
 signalled.
 
@@ -1305,6 +1320,15 @@ error[E-RUN-050]: refused to create directory .murmur/ses_01a0…: .murmur is a 
   hint: the runtime never follows a link inside the workdir; replace .murmur with a regular file or directory, or remove it, and run again
 ```
 
+[`mur trace rm`](cli.md#mur-trace-rm) raises it too, for a link or a file that is not a directory
+on the way to the session directory or records directory it removes. Nothing is removed, and
+nothing the link points at is touched. The message names the directory the path is relative to:
+
+```text
+error[E-RUN-050]: refused to read .murmur/ses_019f0193c7d871a5b2e30ff41a7c0ce1: .murmur is a symbolic link inside the workdir (in /home/me/proj)
+  hint: the runtime never follows a link inside the workdir; replace /home/me/proj/.murmur with a regular file or directory, or remove it, and run again
+```
+
 Remove the link, or replace it with the regular file or directory it stands in for. A refusal during
 a task also writes a [`workdir_path_refused`](observability-schemas.md#workdir-path-refused) trace
 line naming the path, and an A2A task that meets one ends `failed` with the refusal as its status
@@ -1805,8 +1829,9 @@ anything is read or written.
 
 ### E-CNV-001 — no such record or context { #e-cnv-001 }
 
-`rm` and `truncate` name one context id, optionally narrowed with `--record`. Nothing matching it
-is refused naming what was looked for and where:
+`show`, `rm` and `truncate` name one context id, optionally narrowed with `--record`. Nothing
+matching it is refused naming what was looked for and where. For `show`, a context directory that
+holds neither `conversation.jsonl` nor `harness-session.json` matches nothing:
 
 ```text
 error[E-CNV-001]: no context 'ctx_nowhere' in any record under ~/.murmur/conversations/
@@ -1818,7 +1843,8 @@ error[E-CNV-001]: no context 'ctx_nowhere' in any record under ~/.murmur/convers
 A context id is unique inside one record store and nowhere else: two capsules can be handed the
 same one, and two capsules can be pointed at one
 [`context.record_store`](manifest.md#field-context). An id present under more than one store is
-refused naming every store it is in, rather than guessing which conversation to delete or rewrite:
+refused naming every store it is in, rather than guessing which conversation to show, delete or
+rewrite:
 
 ```text
 error[E-CNV-002]: context 'ctx_fixed' is present under 2 record stores: store-a, store-b

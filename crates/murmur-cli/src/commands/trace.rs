@@ -10,10 +10,11 @@ use clap::Subcommand;
 use serde::Deserialize;
 
 use capsule_runtime::formation_launch::formation_member_roots;
-use capsule_runtime::running::{self, ProcessState};
+use capsule_runtime::running::{self, ProcessState, RecordScan};
 use capsule_runtime::{formation::FORMATION_ID_PREFIX, FormationId};
+use capsule_runtime::{EntryKind, RunningRecord, WorkdirError, WorkdirRoot};
 
-use crate::error::{CliError, E_IO_001, E_IO_003};
+use crate::error::{workdir_refused_hint, CliError, E_IO_001, E_IO_003, E_RUN_024, E_RUN_050};
 use crate::formation_trace::{
     fold_member_call, fold_member_call_busy, fold_member_call_start, formation_calls,
     no_answer_below_note, search_formation, CallEnding, FormationCall, FormationSearch,
@@ -111,6 +112,19 @@ pub(crate) enum TraceCommand {
         #[arg(long)]
         workdir: Option<PathBuf>,
         /// Print one JSON object, the stable interface documented under mur trace list
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove an ended session: its records directory, its session directory and a stale running
+    /// record
+    Rm {
+        /// Session: @N, a full ses_ id, or a suffix of one (4+ characters)
+        session: String,
+        /// The directory a run was given as --workdir, or <manifest-dir>/workdir, whose sessions'
+        /// records are read from ~/.murmur/records (default: ./workdir)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        /// Print one JSON object, the stable interface documented under mur trace rm
         #[arg(long)]
         json: bool,
     },
@@ -5557,13 +5571,7 @@ pub(crate) fn run_trace_list(workdir: Option<PathBuf>, json: bool) -> Result<(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(trace_read_error(&records_dir.join("trace.jsonl"), &e)),
         };
-        let running = scan.records.iter().any(|record| {
-            record.session_id == session_id
-                && matches!(
-                    running::process_state(record),
-                    ProcessState::Alive | ProcessState::Unverified(_)
-                )
-        });
+        let running = running_record(&scan, &session_id).is_some();
         sessions.push(ListedSession {
             started_at: capsule_runtime::retention::session_id_timestamp_ms(&session_id)
                 .map(fmt_timestamp_ms),
@@ -5589,6 +5597,19 @@ pub(crate) fn run_trace_list(workdir: Option<PathBuf>, json: bool) -> Result<(),
         print_session_listing(&listing);
     }
     Ok(())
+}
+
+/// The record in `scan` naming `session_id` whose process is alive, or alive with a start time
+/// that could not be read: the one rule by which `mur trace list` reports a session `running` and
+/// `mur trace rm` refuses to remove one. Layers 1 and 2 alone, with no door probe.
+fn running_record<'a>(scan: &'a RecordScan, session_id: &str) -> Option<&'a RunningRecord> {
+    scan.records.iter().find(|record| {
+        record.session_id == session_id
+            && matches!(
+                running::process_state(record),
+                ProcessState::Alive | ProcessState::Unverified(_)
+            )
+    })
 }
 
 /// The table form of `mur trace list`, or the one line an empty group gets.
@@ -5617,6 +5638,222 @@ fn print_session_listing(listing: &SessionListing) {
         );
     }
     capsule_runtime::report_println!("records: {}", listing.records_group);
+}
+
+// ── Rm ────────────────────────────────────────────────────────────────────────
+
+/// `mur trace rm --json`: a stable interface. Keys keep their names, types and meanings and
+/// serialize in declaration order; a key may be added, never removed or renamed. Each path is what
+/// was removed, or `null` when nothing was there.
+#[derive(Debug, serde::Serialize)]
+struct RemovedSession {
+    session_id: String,
+    records_dir: Option<String>,
+    session_dir: Option<String>,
+    running_record: Option<String>,
+}
+
+/// A directory `mur trace rm` removes: `rel`, one or two segments beneath the directory `base`,
+/// which is held by descriptor so that nothing beneath it is resolved by path.
+struct Doomed {
+    base: WorkdirRoot,
+    rel: String,
+}
+
+impl Doomed {
+    fn path(&self) -> PathBuf {
+        self.base.host_path(&self.rel)
+    }
+
+    fn remove(&self) -> Result<(), CliError> {
+        self.base
+            .remove_dir_all(&self.rel)
+            .map_err(|error| removal_error(self.base.path(), error))
+    }
+}
+
+/// Remove everything `mur` keeps for one ended session of the workdir root `workdir` (default
+/// `./workdir`): its session directory, its records directory, and a running record whose process
+/// is gone, in that order, so a partial failure leaves the session listed and removable again.
+///
+/// `session` is `@N`, a suffix, or a full `ses_` id, which is accepted while either directory is
+/// left. A literal path is refused, so a removal is only ever scoped to one root's own sessions.
+/// The session directory is `<root>/.murmur/<id>`, or else `<root>/<id>`: the two places staging
+/// makes it. Both directories are removed by descriptor and no link is followed; a link or a
+/// wrong file type on the way is `E-RUN-050`, and a session whose record names a live process is
+/// `E-RUN-024`. Nothing else is touched: not the records group, not `<root>/.murmur`, not a
+/// delegated child's session, not the conversation record. Every failure prints nothing on stdout.
+pub(crate) fn run_trace_rm(
+    session: String,
+    workdir: Option<PathBuf>,
+    json: bool,
+) -> Result<(), CliError> {
+    if session_address::is_literal_path(&session) {
+        return Err(CliError::new(
+            E_TRC_002,
+            format!(
+                "'{session}' is not a session address: mur trace rm takes @N, a ses_ id or a \
+                 suffix of one"
+            ),
+        ));
+    }
+    let root = workdir.unwrap_or_else(|| PathBuf::from("workdir"));
+    let group = session_address::records_group(&root)?;
+    let root = std::path::absolute(&root).map_err(|e| {
+        CliError::new(
+            E_IO_003,
+            format!("cannot make {} absolute: {e}", root.display()),
+        )
+    })?;
+
+    let session_id = if session_address::is_full_session_id(&session) {
+        session
+    } else {
+        let query = SessionQuery {
+            record_file: "",
+            code: E_TRC_002,
+            label: None,
+        };
+        let records_dir = session_address::resolve(Some(&session), &root, &query)?;
+        records_dir
+            .file_name()
+            .expect("an address other than a path resolves to a directory in the group")
+            .to_string_lossy()
+            .into_owned()
+    };
+    let session_dir = match directory_beneath(&root, &format!(".murmur/{session_id}"))? {
+        Some(dir) => Some(dir),
+        None => directory_beneath(&root, &session_id)?,
+    };
+    let records_dir = directory_beneath(&group, &session_id)?;
+    if session_dir.is_none() && records_dir.is_none() {
+        return Err(CliError::new(
+            E_TRC_002,
+            format!("session {session_id} not found in {}", group.display()),
+        ));
+    }
+
+    let scan = running::running_dir_location()
+        .and_then(|dir| running::scan(&dir))
+        .map_err(|reason| records_unreadable(&reason))?;
+    if let Some(record) = running_record(&scan, &session_id) {
+        return Err(CliError::with_hint(
+            E_RUN_024,
+            format!(
+                "session {session_id} is still running (pid {}); nothing was removed",
+                record.pid
+            ),
+            format!("stop it with `mur stop {session_id}` first, then remove it"),
+        ));
+    }
+    let stale = scan
+        .records
+        .iter()
+        .find(|record| record.session_id == session_id);
+
+    let mut removed = RemovedSession {
+        session_id: session_id.clone(),
+        records_dir: None,
+        session_dir: None,
+        running_record: None,
+    };
+    if let Some(dir) = &session_dir {
+        dir.remove()?;
+        removed.session_dir = Some(dir.path().display().to_string());
+    }
+    if let Some(dir) = &records_dir {
+        dir.remove()?;
+        removed.records_dir = Some(dir.path().display().to_string());
+    }
+    if let Some(record) = stale {
+        let path =
+            running::record_location(&session_id).map_err(|reason| records_unreadable(&reason))?;
+        running::prune(record);
+        if path.exists() {
+            return Err(CliError::new(
+                E_IO_003,
+                format!("cannot remove the running record {}", path.display()),
+            ));
+        }
+        removed.running_record = Some(path.display().to_string());
+    }
+
+    if json {
+        capsule_runtime::report_println!(
+            "{}",
+            serde_json::to_string_pretty(&removed).expect("a record of strings always serializes")
+        );
+        return Ok(());
+    }
+    for (what, path) in [
+        ("session directory", &removed.session_dir),
+        ("records", &removed.records_dir),
+        ("running record", &removed.running_record),
+    ] {
+        if let Some(path) = path {
+            capsule_runtime::report_println!("removed {what} {path}");
+        }
+    }
+    Ok(())
+}
+
+/// The directory `rel` beneath `base`, reached with no link followed, or `None` when `base` or
+/// `rel` is absent. A link or a file that is not a directory anywhere on the way is `E-RUN-050`,
+/// so a refusal is never read as absence.
+fn directory_beneath(base: &Path, rel: &str) -> Result<Option<Doomed>, CliError> {
+    let held = match WorkdirRoot::open(base) {
+        Ok(held) => held,
+        Err(error) if error.is_not_found() => return Ok(None),
+        Err(error) => return Err(removal_error(base, error)),
+    };
+    match held
+        .entry_kind(rel)
+        .map_err(|error| removal_error(base, error))?
+    {
+        None => Ok(None),
+        Some(EntryKind::Directory) => Ok(Some(Doomed {
+            base: held,
+            rel: rel.to_string(),
+        })),
+        Some(EntryKind::Symlink) => Err(refused(
+            base,
+            rel,
+            format!("refused to remove {rel}: {rel} is a symbolic link"),
+        )),
+        Some(EntryKind::File | EntryKind::Other) => Err(refused(
+            base,
+            rel,
+            format!("refused to remove {rel}: {rel} is not a directory"),
+        )),
+    }
+}
+
+/// A [`WorkdirError`] met beneath `base`: a refusal, or a segment that is not a directory, is
+/// `E-RUN-050`; any other I/O failure is `E-IO-003`.
+fn removal_error(base: &Path, error: WorkdirError) -> CliError {
+    match error {
+        WorkdirError::Refused(refusal) => refused(base, &refusal.refused_at, refusal.to_string()),
+        WorkdirError::Io { path, source } if source.kind() == std::io::ErrorKind::NotADirectory => {
+            refused(
+                base,
+                &path,
+                format!("refused to remove beneath {path}: it is not a directory"),
+            )
+        }
+        error => CliError::new(
+            E_IO_003,
+            format!("cannot remove beneath {}: {error}", base.display()),
+        ),
+    }
+}
+
+/// `E-RUN-050` for `refused_at`, a path relative to `base`.
+fn refused(base: &Path, refused_at: &str, message: String) -> CliError {
+    CliError::with_hint(
+        E_RUN_050,
+        format!("{message} (in {})", base.display()),
+        workdir_refused_hint(&base.join(refused_at).display().to_string()),
+    )
 }
 
 #[cfg(test)]

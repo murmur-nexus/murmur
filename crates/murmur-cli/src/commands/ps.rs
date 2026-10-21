@@ -64,7 +64,12 @@ const STATUS_UNREACHABLE: &str = "unreachable";
 ///
 /// A record directory that cannot be read fails with `E-RUN-028` and prints nothing on stdout.
 /// Nothing a formation summary reads can fail the command.
-pub(crate) fn run_ps(verbose: bool) -> Result<(), CliError> {
+///
+/// With `json` the listing is [`run_ps_json`]'s instead, which prunes nothing.
+pub(crate) fn run_ps(verbose: bool, json: bool) -> Result<(), CliError> {
+    if json {
+        return run_ps_json();
+    }
     let listing = running::list_reporting().map_err(|reason| records_unreadable(&reason))?;
     for path in &listing.older_mur {
         capsule_runtime::report_eprintln!("skipped: {} — {OLDER_MUR_SKIPPED}", path.display());
@@ -120,6 +125,83 @@ pub(crate) fn run_ps(verbose: bool) -> Result<(), CliError> {
     for formation in formations_in_order(&rows, keyed) {
         capsule_runtime::report_println!("{}", summary_line(&formation, &rows, &pruned));
     }
+    Ok(())
+}
+
+/// `mur ps --json`: a stable interface. Keys keep their names, types and meanings and serialize
+/// in declaration order; a key may be added, never removed or renamed.
+#[derive(Debug, serde::Serialize)]
+struct CapsuleListing {
+    /// One entry per record `mur ps` would print a row for, most recent session first.
+    capsules: Vec<ListedCapsule>,
+}
+
+/// One running record, with the status its row would carry. The record's door token,
+/// credentials and formation bookkeeping are never part of it.
+#[derive(Debug, serde::Serialize)]
+struct ListedCapsule {
+    session_id: String,
+    /// [`STATUS_RUNNING`] or [`STATUS_UNREACHABLE`], from [`running::verify`].
+    status: &'static str,
+    url: String,
+    pid: u32,
+    process_start: String,
+    capsule_name: String,
+    capsule_version: String,
+    workdir: String,
+    records_dir: String,
+    outlives_launcher: bool,
+    started_at: String,
+    formation_id: Option<String>,
+    formation_member: Option<String>,
+}
+
+/// `mur ps --json`: the rows `mur ps` would print, as one [`CapsuleListing`].
+///
+/// Each record is verified by [`running::verify`] exactly as the table's rows are, and a `Gone`
+/// one is left out. Nothing is created, re-moded, unlinked or signalled: the directory is read
+/// with [`running::scan`], so a missing `~/.murmur/running` stays missing, and a record that is
+/// gone or unreadable stays where it is. A record an older `mur` wrote is named on stderr as the
+/// table names it. A directory that cannot be listed, or a `HOME` it cannot be located from,
+/// fails with `E-RUN-028` and prints nothing on stdout.
+fn run_ps_json() -> Result<(), CliError> {
+    let scan = running::running_dir_location()
+        .and_then(|dir| running::scan(&dir))
+        .map_err(|reason| records_unreadable(&reason))?;
+    for path in &scan.older_mur {
+        capsule_runtime::report_eprintln!("skipped: {} — {OLDER_MUR_SKIPPED}", path.display());
+    }
+    let mut capsules = Vec::new();
+    for record in scan.records {
+        let status = match running::verify(&record) {
+            Liveness::Live => STATUS_RUNNING,
+            Liveness::Unreachable(_) => STATUS_UNREACHABLE,
+            Liveness::Gone(_) => continue,
+        };
+        capsules.push(ListedCapsule {
+            status,
+            url: record.url,
+            pid: record.pid,
+            process_start: record.process_start,
+            capsule_name: record.capsule_name,
+            capsule_version: record.capsule_version,
+            workdir: record.workdir.display().to_string(),
+            records_dir: record.records_dir.display().to_string(),
+            outlives_launcher: record.outlives_launcher,
+            started_at: record.started_at,
+            formation_id: record
+                .formation_id
+                .as_ref()
+                .map(|id| id.as_str().to_string()),
+            formation_member: record.formation_member,
+            session_id: record.session_id,
+        });
+    }
+    capsule_runtime::report_println!(
+        "{}",
+        serde_json::to_string_pretty(&CapsuleListing { capsules })
+            .expect("a listing of strings, integers and booleans always serializes")
+    );
     Ok(())
 }
 

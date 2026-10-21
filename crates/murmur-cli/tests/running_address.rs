@@ -824,9 +824,9 @@ fn a_home_that_cannot_be_written_warns_and_the_capsule_still_serves() {
     assert!(records(home.path()).is_empty());
 }
 
-/// A launch, a scope report and a reader with `HOME` unset, relative, or naming a home whose
-/// `~/.murmur` cannot be written are each refused with `E-IO-004`, naming `HOME`, its cause and
-/// what to set — and write nothing, the temp directory included.
+/// A launch, a scope report, a reader and `mur trace rm` with `HOME` unset, relative, or naming a
+/// home whose `~/.murmur` cannot be written are each refused with `E-IO-004`, naming `HOME`, its
+/// cause and what to set — and write nothing, the temp directory included.
 #[test]
 fn a_run_with_no_home_at_all_is_refused_with_e_io_004() {
     let project = tempfile::tempdir().unwrap();
@@ -888,6 +888,8 @@ fn a_run_with_no_home_at_all_is_refused_with_e_io_004() {
     };
     let list = ["trace", "list"];
     let list_json = ["trace", "list", "--json"];
+    let rm = ["trace", "rm", "@1"];
+    let rm_json = ["trace", "rm", "@1", "--json"];
     let run = [
         "run",
         "--manifest",
@@ -909,7 +911,7 @@ fn a_run_with_no_home_at_all_is_refused_with_e_io_004() {
         &run,
         "HOME is 'relative', which is not an absolute path",
     );
-    for args in [&list[..], &list_json[..]] {
+    for args in [&list[..], &list_json[..], &rm[..], &rm_json[..]] {
         listing_refused(None, args, "HOME is not set");
         listing_refused(
             Some(Path::new("relative")),
@@ -923,7 +925,7 @@ fn a_run_with_no_home_at_all_is_refused_with_e_io_004() {
             &run,
             "cannot hold this session's runtime and records directories",
         );
-        for args in [&list[..], &list_json[..]] {
+        for args in [&list[..], &list_json[..], &rm[..], &rm_json[..]] {
             listing_refused(
                 Some(closed.path()),
                 args,

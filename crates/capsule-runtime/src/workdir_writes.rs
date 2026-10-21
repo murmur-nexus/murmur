@@ -1063,6 +1063,16 @@ mod tests {
         ),
         (
             "retention.rs",
+            "find_context_dirs_in",
+            "Context directories beneath the conversation record root, on `prune_records`'s terms.",
+        ),
+        (
+            "retention.rs",
+            "read_context_dir",
+            "A context directory's record file, on `prune_records`'s terms.",
+        ),
+        (
+            "retention.rs",
             "count_messages",
             "A conversation record file, on `prune_records`'s terms.",
         ),

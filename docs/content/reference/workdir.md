@@ -494,10 +494,12 @@ that opens it under `mur run --context` writes the header and applies its policy
 | [`trace.retain`](manifest.md#trace-retain) | A whole session: its [records directory](#records-directory), with its `trace.jsonl` and `blobs/`, and its session workdir |
 | [`context.retain.max_messages`](manifest.md#context-retain) | The oldest message lines of one `conversation.jsonl`. The file, the directory and every surviving `id` stay |
 | [`context.retain.max_age`](manifest.md#context-retain) | A whole `<context-id>/` directory under the record store |
+| [`mur trace rm`](cli.md#mur-trace-rm) | One ended session, named by the operator: its session workdir, its [records directory](#records-directory), and a running-capsule record left by a process that is gone. Its conversation record stays |
 
-Pruning runs at launch, in the runtime, immediately after the session's `session_start`. Every
-deletion is written to that session's own trace as a
-[`retention` event](observability-schemas.md#retention).
+The three policies prune at launch, in the runtime, immediately after the session's
+`session_start`, and every deletion is written to that session's own trace as a
+[`retention` event](observability-schemas.md#retention). `mur trace rm` removes when it is run and
+writes no trace.
 
 ### What it means for a run
 

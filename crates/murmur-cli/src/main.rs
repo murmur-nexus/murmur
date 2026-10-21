@@ -41,7 +41,8 @@ use commands::{
     config_cmd::{run_config, ConfigCommand},
     control::{run_control, ControlCommand},
     conversation::{
-        run_conversation_ls, run_conversation_rm, run_conversation_truncate, ConversationCommand,
+        run_conversation_ls, run_conversation_rm, run_conversation_show, run_conversation_truncate,
+        ConversationCommand,
     },
     doctor::run_doctor,
     eval::{run_eval_diff, run_eval_run, run_eval_show, EvalCommand},
@@ -58,8 +59,8 @@ use commands::{
     stop::run_stop,
     token::run_token,
     trace::{
-        run_trace_diff, run_trace_list, run_trace_report, run_trace_show, run_trace_steps,
-        TraceCommand,
+        run_trace_diff, run_trace_list, run_trace_report, run_trace_rm, run_trace_show,
+        run_trace_steps, TraceCommand,
     },
     version::run_version,
     watch::run_watch,
@@ -523,12 +524,17 @@ enum Commands {
     ///
     /// Listing also removes the record of every capsule whose process is gone, and of every
     /// record file that cannot be read: the record directory is a hint, and the listing is what
-    /// keeps it true. One stderr line counts what was removed; --verbose names each.
+    /// keeps it true. One stderr line counts what was removed; --verbose names each. --json
+    /// lists the same capsules and removes nothing.
     Ps {
         /// Name every record removed because its capsule is gone, and summarise formations known
         /// only from removed records
         #[arg(long)]
         verbose: bool,
+        /// Print one JSON object, the stable interface documented under mur ps --json. Removes
+        /// nothing
+        #[arg(long, conflicts_with = "verbose")]
+        json: bool,
     },
     /// Print a door token of a running capsule
     Token {
@@ -819,6 +825,11 @@ fn main() {
                 message,
                 json,
             } => run_conversation_ls(record, message, json),
+            ConversationCommand::Show {
+                context_id,
+                record,
+                json,
+            } => run_conversation_show(&context_id, record, json),
             ConversationCommand::Rm { context_id, record } => {
                 run_conversation_rm(&context_id, record)
             }
@@ -852,6 +863,11 @@ fn main() {
                 workdir,
             } => run_trace_report(sessions, last, since, workdir),
             TraceCommand::List { workdir, json } => run_trace_list(workdir, json),
+            TraceCommand::Rm {
+                session,
+                workdir,
+                json,
+            } => run_trace_rm(session, workdir, json),
         },
         Commands::Eval { command } => match command {
             EvalCommand::Show {
@@ -886,7 +902,7 @@ fn main() {
         } => cancel_arguments(session, task_id, url)
             .and_then(|(target, task_id)| run_cancel(&target, &task_id)),
         Commands::Control { command } => run_control(command),
-        Commands::Ps { verbose } => run_ps(verbose),
+        Commands::Ps { verbose, json } => run_ps(verbose, json),
         Commands::Token {
             session,
             credential,
