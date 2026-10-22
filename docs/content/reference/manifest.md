@@ -2379,33 +2379,41 @@ Every command starts in the foreground and the clock decides.
 | `N` (positive integer) | The same, with an `N`-second window. |
 | `0` | The first check after the spawn moves the command to the background, unless it has already exited by then. |
 
-A backgrounded command hands the turn a handle of the form `wrk_<id>`, the fact that it is
-still running, and whether its result will reach the model — it does only under
-`task_acceptance: queue` with `after_task: sleep`, as described below. Its full stdout and stderr
-are written to `logs/<work_id>.log` in the session's
-[records directory](workdir.md#records-directory) and stay there; a result that reaches the model
-carries that file's absolute path, never the contents.
+A backgrounded command hands the turn a work id of the form `wrk_<hex>` and the fact that it is
+still running. The work id is valid for the rest of the session. The runtime-provided
+[`background-command`](runtime-provided-tools.md#background-command) tool takes it and reports the
+command's state and output so far, waits for it to exit, or stops it.
 
-Nothing accepts a work id, so the handle cannot be used to ask after the command. The result
-arrives on its own, as a task with
-[origin](../concepts/access-control.md#task-origin-and-trust-class) `completion` in the `bg`
-lane, carrying the exit code and the output path. A non-zero exit, a signal kill and a
-[resource limit](resource-limits.md#which-limit) all arrive the same way, told apart by the
-`status` field on the command's
-[`shell_completed`](observability-schemas.md#session-trace-tracejsonl) record.
+From the moment it moves to the background, the command's stdout and stderr are written to
+`logs/<work_id>.log` in the session's [records directory](workdir.md#records-directory) as they
+are read:
 
-That completion reaches only a capsule that outlives the task which started the command. Under
-the default `after_task: exit` the session ends when the task does, and nothing arrives; a capsule
-that runs shell commands and leaves its `lifecycle` block that way is warned at launch with
-[`W-SEC-022`](diagnostics.md#w-sec-022). A capsule that means to receive completions declares
-`task_acceptance: queue` and `after_task: sleep`:
+```text
+Command: <binary> <arguments>
 
-```yaml
-lifecycle:
-  task_acceptance: queue
-  after_task: sleep
-  shell_grace_secs: 2
+<output: what was read before the move, stdout then stderr, then both streams in the order read>
+
+Exit code: <n>
 ```
+
+The `Exit code:` line is appended when the command exits. A foreground command whose output passed
+16 KiB writes `logs/shell-<ms>.log` instead, once, with `Stdout:` and `Stderr:` sections.
+
+How the exit reaches the agent:
+
+| Lifecycle | Delivery |
+|---|---|
+| Any | `background-command` returns the exit code, `status` and the last 16 KiB of output once the command has exited |
+| `task_acceptance: queue` with `after_task: sleep` | Also a task with [origin](../concepts/access-control.md#task-origin-and-trust-class) `completion` in the `bg` lane, carrying the exit code and the log's path. Not enqueued when `background-command` already returned the exit |
+
+A non-zero exit, a signal kill and a [resource limit](resource-limits.md#which-limit) are told
+apart by the `status` field on the command's
+[`shell_completed`](observability-schemas.md#session-trace-tracejsonl) record, which is written
+either way.
+
+A task that ends while background commands are still running names them in its A2A result, as
+[`metadata.murmur.runningCommands`](agent-card.md#no-answer-metadata), and in the `running_commands`
+field of its `task_end` record. The session's end kills them.
 
 #### When a command exits while something it started holds its output { #shell-output-holders }
 
@@ -2422,8 +2430,8 @@ command's own process exits, the call:
 3. Stops waiting 2 seconds after the kill if the output is still open, and returns what was read
    by then.
 
-A command that moved to the background is finished the same way when it exits, so its completion
-arrives even when it left processes holding its output.
+A command that moved to the background is finished the same way when it exits, so its exit is
+recorded even when it left processes holding its output.
 
 When step 2 or 3 is reached, the model reads a note after the output saying what happened:
 
@@ -2448,7 +2456,8 @@ background process a command starts.
 #### When a session ends with a command still running
 
 The session does not wait for it. It kills it, together with every other process the session
-started — a server a shell call put in the background with `&` included — and the result is lost.
+started — a server a shell call put in the background with `&` included. The command's log keeps
+what it printed before the kill.
 One report goes to stderr and to `logs/bootstrap.log` in the session's
 [records directory](workdir.md#records-directory), naming every such command's work id, binary,
 command text and how long it had been running, and each command also gets a
@@ -2463,14 +2472,13 @@ work_id: wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2
 binary: /usr/bin/bash
 command: sleep 45; echo done
 state: killed at session end after 45012 ms
-result: none — it was killed before it finished, so no task carries an exit code. Whatever it wrote reaches /home/dev/.murmur/records/home/dev/proj/ses_01k4m2y7xq8f9v3n5r7t9w1c2e/logs/wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2.log only if the runtime wrote that file before it exited.
+result: none — it was killed before it finished, so no task carries an exit code. What it printed before the kill is in /home/dev/.murmur/records/home/dev/proj/ses_01k4m2y7xq8f9v3n5r7t9w1c2e/logs/wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2.log.
 
 A session's end kills every command it demoted and every process its shell calls started in the background. Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep for a session that outlives its task and can be told the result instead.
 ```
 
-A command that finishes during teardown — too late for any task to carry its result, but with its
-exit code and `logs/<work_id>.log` already written — is reported with that better information
-instead:
+A command that finishes during teardown, after the agent last read it, is reported with its exit
+code instead:
 
 ```text
 state: finished during teardown after 2014 ms
@@ -2491,9 +2499,9 @@ Every way a session ends — its task finishing, `SIGTERM`, a spawner or formati
 the commands it moved to the background. A runtime that is itself killed — `SIGKILL` or an
 out-of-memory kill — takes them with it on Linux: the session's cgroup scope has a watcher process
 that kills everything in it once the runtime is gone (see
-[Network reach limits](containment.md#network-reach-limits) for when they outlive it). Either way,
-nothing of their results survives: no exit code, no `logs/<work_id>.log`, no record of whether
-they finished. The work is a full run's compute spent for nothing, so
+[Network reach limits](containment.md#network-reach-limits) for when they outlive it). Either way, no
+exit code survives: `logs/<work_id>.log` keeps the output written before the kill, with no
+`Exit code:` line. The work is a full run's compute spent for nothing, so
 `lifecycle.shell_grace_secs` is also a decision about how much compute one lost host can waste.
 
 The record of the demotion does survive. The `shell_detached` line is written and flushed at the

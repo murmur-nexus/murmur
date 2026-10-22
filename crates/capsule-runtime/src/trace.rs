@@ -682,8 +682,36 @@ struct ShellCompletedEvent {
     /// one without reading its prose.
     status: String,
     /// The `completion`-origin task this completion was enqueued as, which is what makes "which
-    /// command produced this task" answerable from `trace.jsonl` alone.
-    completion_task_id: String,
+    /// command produced this task" answerable from `trace.jsonl` alone. Absent when no task was
+    /// enqueued because `background-command` had already returned the exit to the agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_task_id: Option<String>,
+}
+
+/// One answered `background-command` call. Hangs off the session, as `session_status` does.
+#[derive(Serialize)]
+struct BackgroundCommandEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// The task that made the call. Absent outside a task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    work_id: &'a str,
+    /// `status`, `wait` or `stop`.
+    operation: &'static str,
+    /// `running`, `exited` or `stopped`, as the call returned it.
+    state: &'static str,
+    /// Present once the command has exited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    /// How long a `wait` blocked. Absent for the other operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waited_ms: Option<u64>,
+    /// Bytes in the log's output section, as the call returned it.
+    output_bytes: u64,
 }
 
 /// A detached command the session ended without carrying its result back. No task will ever report
@@ -1009,6 +1037,10 @@ struct TaskEndEvent {
     /// How many times this task's agent loop was reopened by an `on-task-end` hook
     /// before the terminal outcome. `0` for a task that ran once (the common case).
     reopen_count: u32,
+    /// The work ids of the background shell commands still running when the task ended, oldest
+    /// first. Absent when there were none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    running_commands: Vec<String>,
 }
 
 /// A person stopped this task. Written where the loop actually stopped, so the record names the
@@ -2720,7 +2752,9 @@ impl TraceWriter {
     }
 
     /// A detached command finishing, written by the task loop as it turns the completion into a
-    /// task. `completion_task_id` is that task's id, so the two records join.
+    /// task. `completion_task_id` is that task's id, so the two records join, and `None` when no
+    /// task was enqueued because the agent had already read the exit through
+    /// `background-command`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_shell_completed(
         &mut self,
@@ -2733,7 +2767,7 @@ impl TraceWriter {
         output_bytes: u64,
         resource_limit: Option<String>,
         status: &str,
-        completion_task_id: &str,
+        completion_task_id: Option<&str>,
     ) -> std::io::Result<()> {
         let event = ShellCompletedEvent {
             event_type: "shell_completed",
@@ -2750,7 +2784,7 @@ impl TraceWriter {
             output_bytes,
             resource_limit,
             status: status.to_string(),
-            completion_task_id: completion_task_id.to_string(),
+            completion_task_id: completion_task_id.map(str::to_string),
         };
         self.write_event(&event).await
     }
@@ -2949,6 +2983,7 @@ impl TraceWriter {
         task_id: &str,
         exit_status: &str,
         reopen_count: u32,
+        running_commands: Vec<String>,
     ) -> std::io::Result<()> {
         let duration_ms = self
             .task_start_instant
@@ -2971,6 +3006,7 @@ impl TraceWriter {
             tool_calls: self.task_tool_calls,
             shell_calls: self.task_shell_calls,
             reopen_count,
+            running_commands,
         };
         self.active_task_id = None;
         self.task_event_id = None;
@@ -4009,6 +4045,36 @@ impl ResourceTraceAppender {
             timestamp: timestamp_ms(),
             task_id,
             status,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records one answered `background-command` call, hung off the session node. Failures are
+    /// swallowed: the call is answered whether or not its record lands.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_background_command(
+        &self,
+        task_id: Option<String>,
+        work_id: &str,
+        operation: &'static str,
+        state: &'static str,
+        exit_code: Option<i32>,
+        waited_ms: Option<u64>,
+        output_bytes: u64,
+    ) {
+        let event = BackgroundCommandEvent {
+            event_type: "background_command",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id,
+            work_id,
+            operation,
+            state,
+            exit_code,
+            waited_ms,
+            output_bytes,
         };
         self.append(&event).await;
     }
@@ -6623,7 +6689,9 @@ mod tests {
         w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
             .await
             .unwrap();
-        w.write_task_end("tsk_1", "ok", 2).await.unwrap();
+        w.write_task_end("tsk_1", "ok", 2, Vec::new())
+            .await
+            .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -6634,6 +6702,72 @@ mod tests {
         assert_eq!(end["task_id"], "tsk_1");
         assert_eq!(end["exit_status"], "ok");
         assert_eq!(end["reopen_count"], 2);
+    }
+
+    /// `task_end` names the background commands still running, and has no such field when there
+    /// were none.
+    #[tokio::test]
+    async fn task_end_names_the_commands_still_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        for (task_id, running) in [
+            ("tsk_1", vec!["wrk_0a".to_string(), "wrk_0b".to_string()]),
+            ("tsk_2", Vec::new()),
+        ] {
+            w.write_task_start(task_id, "ctx_1", "a2a", event_provenance(), 3, &[], &[])
+                .await
+                .unwrap();
+            w.write_task_end(task_id, "ok", 0, running).await.unwrap();
+        }
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let ends: Vec<_> = events
+            .iter()
+            .filter(|e| e["event_type"] == "task_end")
+            .collect();
+        assert_eq!(
+            ends[0]["running_commands"],
+            serde_json::json!(["wrk_0a", "wrk_0b"])
+        );
+        assert!(ends[1].get("running_commands").is_none(), "{}", ends[1]);
+    }
+
+    /// A completion the agent already read is recorded with no `completion_task_id` at all, and
+    /// one enqueued as a task names it.
+    #[tokio::test]
+    async fn shell_completed_without_a_completion_task_omits_the_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        for task in [None, Some("tsk_2")] {
+            w.write_shell_completed(
+                "wrk_0a",
+                "/usr/bin/bash",
+                "sleep 3",
+                0,
+                3_000,
+                "/records/logs/wrk_0a.log",
+                10,
+                None,
+                "ok",
+                task,
+            )
+            .await
+            .unwrap();
+        }
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let completed: Vec<_> = events
+            .iter()
+            .filter(|e| e["event_type"] == "shell_completed")
+            .collect();
+        assert!(
+            completed[0].get("completion_task_id").is_none(),
+            "{}",
+            completed[0]
+        );
+        assert_eq!(completed[1]["completion_task_id"], "tsk_2");
     }
 
     #[tokio::test]
@@ -6809,7 +6943,9 @@ mod tests {
         assert_eq!(w.task_agent_turns(), 2);
         assert_eq!(w.task_turns(), 3);
         assert_eq!(w.task_hook_inferences(), 1);
-        w.write_task_end("tsk_1", "completed", 0).await.unwrap();
+        w.write_task_end("tsk_1", "completed", 0, Vec::new())
+            .await
+            .unwrap();
         assert_eq!(
             w.task_agent_turns(),
             0,
@@ -6899,7 +7035,9 @@ mod tests {
         ))
         .await
         .unwrap();
-        w.write_task_end("tsk_1", "ok", 0).await.unwrap();
+        w.write_task_end("tsk_1", "ok", 0, Vec::new())
+            .await
+            .unwrap();
         w.write_session_end("ok").await.unwrap();
         w.flush().await.unwrap();
 
@@ -7211,7 +7349,9 @@ mod tests {
         w.write_task_start("tsk_ran", "ctx_ran", "a2a", event_provenance(), 3, &[], &[])
             .await
             .unwrap();
-        w.write_task_end("tsk_ran", "ok", 0).await.unwrap();
+        w.write_task_end("tsk_ran", "ok", 0, Vec::new())
+            .await
+            .unwrap();
         w.write_task_rejected(
             "tsk_1",
             "ctx_1",
@@ -7269,7 +7409,9 @@ mod tests {
         w.write_task_failed(Some(2), TASK_FAILED_DRIVER_ERROR, &long)
             .await
             .unwrap();
-        w.write_task_end("tsk_1", "failed", 0).await.unwrap();
+        w.write_task_end("tsk_1", "failed", 0, Vec::new())
+            .await
+            .unwrap();
         w.flush().await.unwrap();
 
         assert_eq!(w.task_failures_written(), 2);
@@ -7341,7 +7483,9 @@ mod tests {
         w.write_compaction(0, 100, OccupancyBasis::Estimate, 40)
             .await
             .unwrap();
-        w.write_task_end("tsk_1", "ok", 0).await.unwrap();
+        w.write_task_end("tsk_1", "ok", 0, Vec::new())
+            .await
+            .unwrap();
         w.write_inference(
             1,
             Some(1),

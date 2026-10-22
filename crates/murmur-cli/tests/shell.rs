@@ -437,10 +437,11 @@ fn shell_detaches_a_slow_command_and_the_turn_continues() {
         demotion.to_lowercase().contains("background"),
         "the result says the command is still running:\n{demotion}"
     );
-    // The default lifecycle delivers no background result, and the text says so.
+    // The text names the tool that takes the work id. The default lifecycle delivers no
+    // completion task, so it does not mention one.
     assert!(
-        demotion.contains("will not reach you") && !demotion.contains("will arrive later"),
-        "the result says the command's result will not arrive:\n{demotion}"
+        demotion.contains("background-command") && !demotion.contains("separate task"),
+        "the result names the tool and no later task:\n{demotion}"
     );
 
     let events = trace_events(&launched.records_dir);
@@ -561,7 +562,7 @@ fn shell_records_work_abandoned_when_the_session_ends() {
     );
     let log = records_dir.join("logs").join(format!("{work_id}.log"));
     assert!(
-        stderr.contains(&format!("reaches {} only if", log.display())),
+        stderr.contains(&format!("before the kill is in {}.", log.display())),
         "the report names the log by its absolute path in the records directory:\n{stderr}"
     );
 
@@ -579,6 +580,247 @@ fn shell_records_work_abandoned_when_the_session_ends() {
         "the session ended {}ms after the demotion, so it waited on a 30-second command",
         ended_at - detached_at
     );
+}
+
+/// One scripted `tool_use` response calling `name` with `input`.
+fn tool_call(id: &str, tool_use_id: &str, name: &str, input: Value) -> String {
+    json!({
+        "id": id,
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [{"type": "tool_use", "id": tool_use_id, "name": name, "input": input}],
+        "stop_reason": "tool_use",
+        "stop_sequence": Value::Null,
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+    .to_string()
+}
+
+/// The first `wrk_<hex>` id in `text`.
+fn work_id_in(text: &str) -> Option<String> {
+    let start = text.find("wrk_")?;
+    let hex: String = text[start + 4..]
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        .collect();
+    (!hex.is_empty()).then(|| format!("wrk_{hex}"))
+}
+
+/// Whether `pid` has exited within `timeout`: gone, or a zombie nobody has reaped yet.
+fn process_gone_within(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !common::formation::alive(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Kills the pid written in each file that still names a live process when dropped, so a
+/// failing test leaves nothing running.
+struct KillPidFilesOnDrop(Vec<PathBuf>);
+
+impl Drop for KillPidFilesOnDrop {
+    fn drop(&mut self) {
+        for file in &self.0 {
+            if let Some(pid) = fs::read_to_string(file)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+                .filter(|pid| *pid > 1)
+            {
+                common::signal(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// The agent reads a demoted command's progress and then its exit through the work id, so its
+/// result arrives inside the task that started it and no completion task follows.
+#[test]
+fn a_demoted_command_is_read_back_through_its_handle() {
+    if common::skip_without_host_support("a_demoted_command_is_read_back_through_its_handle") {
+        return;
+    }
+    let server = ScriptedServer::start_answering(4, {
+        let mut turn = 0;
+        let mut work_id = String::new();
+        move |request: &Value| {
+            turn += 1;
+            match turn {
+                1 => bash_call(
+                    "msg_1",
+                    "toolu_ticks",
+                    "for i in 1 2 3; do echo tick $i; sleep 1; done; echo 'RESULT 42 passed'; \
+                     exit 0",
+                ),
+                2 => {
+                    let demotion = find_tool_result_block(request, "toolu_ticks")
+                        .map(tool_result_text)
+                        .unwrap_or_default();
+                    work_id = work_id_in(&demotion).unwrap_or_default();
+                    tool_call(
+                        "msg_2",
+                        "toolu_status",
+                        "background-command",
+                        json!({"operation": "status", "work_id": work_id}),
+                    )
+                }
+                3 => tool_call(
+                    "msg_3",
+                    "toolu_wait",
+                    "background-command",
+                    json!({"operation": "wait", "work_id": work_id, "wait_secs": 30}),
+                ),
+                _ => end_turn("msg_4", "RESULT 42 passed, exit 0."),
+            }
+        }
+    });
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let driver_artifact = create_driver_artifact(
+        artifact_dir.path(),
+        DRIVER_ANTHROPIC_NAME,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+    let manifest_path = create_agent_project_with_lifecycle(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        &["bash", "sleep"],
+        "lifecycle:\n  shell_grace_secs: 1\n",
+    );
+    let staged = stage_agent_session(&home, project.path(), &manifest_path);
+    fs::write(staged.workdir.join("task.md"), "Run the suite and report.").unwrap();
+
+    let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4, "four turns were scripted");
+
+    let status = tool_result_text(
+        find_tool_result_block(&requests[2], "toolu_status").expect("the status call's result"),
+    );
+    assert!(
+        status.contains("state: running") || status.contains("state: exited"),
+        "{status}"
+    );
+    assert!(status.contains("tick 1"), "{status}");
+    let waited = tool_result_text(
+        find_tool_result_block(&requests[3], "toolu_wait").expect("the wait call's result"),
+    );
+    for expected in [
+        "state: exited",
+        "exit_code: 0",
+        "status: ok",
+        "RESULT 42 passed",
+    ] {
+        assert!(waited.contains(expected), "{expected}: {waited}");
+    }
+
+    let events = trace_events(&launched.records_dir);
+    let detached = events_of_type(&events, "shell_detached");
+    assert_eq!(detached.len(), 1, "exactly one command was demoted");
+    let work_id = detached[0]["work_id"].as_str().unwrap();
+    let operations = events_of_type(&events, "background_command");
+    assert_eq!(operations.len(), 2, "{operations:?}");
+    assert_eq!(operations[0]["operation"], "status");
+    assert_eq!(operations[0]["work_id"], work_id);
+    assert_eq!(operations[1]["operation"], "wait");
+    assert_eq!(operations[1]["state"], "exited");
+    assert_eq!(operations[1]["exit_code"], 0);
+    let completed = events_of_type(&events, "shell_completed");
+    assert_eq!(completed.len(), 1, "{completed:?}");
+    assert_eq!(completed[0]["work_id"], work_id);
+    assert!(
+        completed[0].get("completion_task_id").is_none(),
+        "no completion task was enqueued: {}",
+        completed[0]
+    );
+    assert!(events_of_type(&events, "shell_abandoned").is_empty());
+    let task_ends = events_of_type(&events, "task_end");
+    assert_eq!(task_ends.len(), 1, "no completion task ran: {task_ends:?}");
+    assert!(
+        task_ends[0].get("running_commands").is_none(),
+        "{}",
+        task_ends[0]
+    );
+    assert!(
+        events_of_type(&events, "task_start")
+            .iter()
+            .all(|start| start["source"] != "detached_shell"),
+        "no detached_shell task started"
+    );
+}
+
+/// A task that ends with a demoted command still running names it on its `task_end` record, and
+/// the session's end kills the command and the process it started in its group.
+#[test]
+fn a_task_that_ends_with_a_command_running_says_so_and_the_session_kills_it() {
+    const TEST: &str = "a_task_that_ends_with_a_command_running_says_so_and_the_session_kills_it";
+    if common::skip_without_host_support(TEST) {
+        return;
+    }
+    let server = ScriptedServer::start(vec![
+        bash_call(
+            "msg_1",
+            "toolu_server",
+            "echo $$ > leader.pid; sleep 300 > /dev/null 2>&1 & echo $! > child.pid; sleep 300",
+        ),
+        end_turn("msg_2", "Started it."),
+    ]);
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let driver_artifact = create_driver_artifact(
+        artifact_dir.path(),
+        DRIVER_ANTHROPIC_NAME,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+    let manifest_path = create_agent_project_with_lifecycle(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        &["bash", "sleep"],
+        "lifecycle:\n  shell_grace_secs: 1\n",
+    );
+    let staged = stage_agent_session(&home, project.path(), &manifest_path);
+    let workdir = staged.workdir.clone();
+    let _guard = KillPidFilesOnDrop(vec![workdir.join("leader.pid"), workdir.join("child.pid")]);
+    fs::write(workdir.join("task.md"), "Start the server.").unwrap();
+
+    let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
+
+    let events = trace_events(&launched.records_dir);
+    let detached = events_of_type(&events, "shell_detached");
+    assert_eq!(detached.len(), 1, "exactly one command was demoted");
+    let work_id = detached[0]["work_id"].as_str().unwrap();
+    let task_ends = events_of_type(&events, "task_end");
+    assert_eq!(task_ends.len(), 1);
+    assert_eq!(task_ends[0]["running_commands"], json!([work_id]));
+    let abandoned = events_of_type(&events, "shell_abandoned");
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned[0]["work_id"], work_id);
+
+    for file in ["leader.pid", "child.pid"] {
+        let pid: u32 = fs::read_to_string(workdir.join(file))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            process_gone_within(pid, std::time::Duration::from_secs(2)),
+            "{file}'s process {pid} outlived its session"
+        );
+    }
 }
 
 /// The records directories of `project_dir`'s sessions under `home`, newest last. The launch
@@ -796,7 +1038,7 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
     );
     assert!(
         !message.contains(&format!("{work_id}.log")),
-        "no log file exists, so the report names none:\n{message}"
+        "the report names no log path:\n{message}"
     );
 
     let killed_events = trace_events(&killed_dir);
@@ -823,12 +1065,19 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
             );
         }
     }
-    for dir in [&killed_dir, &resumed_dir] {
-        assert!(
-            !dir.join("logs").join(format!("{work_id}.log")).exists(),
-            "a killed runtime writes no output log"
-        );
-    }
+    // The log is written as the command runs, so the killed session's holds a header and no
+    // exit code; the resumed session writes none.
+    let killed_log = fs::read_to_string(killed_dir.join("logs").join(format!("{work_id}.log")))
+        .expect("the demoted command's log is written as it runs");
+    assert!(killed_log.starts_with("Command: "), "{killed_log}");
+    assert!(
+        !killed_log.contains("Exit code:"),
+        "a killed runtime records no exit code: {killed_log}"
+    );
+    assert!(!resumed_dir
+        .join("logs")
+        .join(format!("{work_id}.log"))
+        .exists());
     assert!(!resumed_workdir.join("logs").exists());
 
     // ── Second resume: the marker has cleared it ──

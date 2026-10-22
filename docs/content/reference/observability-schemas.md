@@ -39,7 +39,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
 | `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
-| `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended`, `session_status`, `deadline_notice`, `deadline_reached` | The session node |
+| `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended`, `session_status`, `background_command`, `deadline_notice`, `deadline_reached` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `control_change`, `control_refused` | The session node — written as the control surface answers, outside any turn |
 | `control_applied`, `tools_refreshed` | The task node, or the session node between tasks. Written just before the turn's own `inference` line |
@@ -381,8 +381,9 @@ A demoted command raises `total_shell_calls` and its task's `shell_calls` here, 
 `shell_completed` line does not, so each shell command is counted exactly once whichever way it
 ran.
 
-**`shell_completed`** — written when a demoted command finishes and the runtime enqueues its
-result as a task
+**`shell_completed`** — written when a demoted command finishes: where the task loop enqueues its
+result as a task, or skips that because [`background-command`](runtime-provided-tools.md#background-command)
+already returned the exit, or during teardown for a command whose exit the agent already read
 
 | Field | Type | Notes |
 |---|---|---|
@@ -392,10 +393,10 @@ result as a task
 | `exit_code` | i32 | `128 + signal` for a signal kill |
 | `duration_ms` | u64 | From spawn to exit, foreground portion included |
 | `output_path` | string | The absolute path of the file holding the command's full stdout and stderr: `logs/<work_id>.log` in the session's [records directory](workdir.md#records-directory) |
-| `output_bytes` | u64 | Size of that file. `0` when it could not be written |
+| `output_bytes` | u64 | Size of that file, header and `Exit code:` line included. `0` when it could not be written |
 | `resource_limit` | string | As on `shell`, and omitted on the same terms |
 | `status` | string | `"ok"` \| `"error"`. `"error"` for a non-zero exit, a signal kill, an attributed `resource_limit`, or a wait that itself failed |
-| `completion_task_id` | string | The `task_id` of the `completion`-origin task this result was enqueued as, so a reader can join a command to the task that reported it |
+| `completion_task_id` | string | The `task_id` of the `completion`-origin task this result was enqueued as, so a reader can join a command to the task that reported it. Absent when no task was enqueued because `background-command` had already returned the exit |
 
 **`shell_abandoned`** — written once per demoted command the session ended without carrying its
 result back, whether it was still running when the session ended or finished while it was shutting
@@ -413,16 +414,14 @@ down
 
 The last three are omitted rather than written as `null`, so a command still running produces a
 line carrying only the first four fields — `null` would read as a known-absent exit code rather
-than an unknown one. Their absence means no exit code exists and no output log was written or
-ever will be: that file is written from the command's own runtime thread after the
-command exits, and that thread ends with the session.
+than an unknown one. Their absence means no exit code exists. The command's log holds the output
+written before the kill, with no `Exit code:` line.
 
 No task carries the result either way. The session does not wait for the command; its end kills
 it, and one grouped report naming every discarded command is written to stderr and to
 `logs/bootstrap.log` in the session's [records directory](workdir.md#records-directory) — see
-[`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs). A capsule whose `lifecycle`
-block cannot receive a completion at all is warned before the run with
-[`W-SEC-022`](diagnostics.md#w-sec-022).
+[`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs). A command whose exit the
+agent already read through `background-command` is recorded as `shell_completed` instead.
 
 **`shell_lost`** — written once per demoted command a later `mur run --resume` found with no
 `shell_completed` and no `shell_abandoned`, and appended to the `trace.jsonl` of the session that
@@ -611,6 +610,7 @@ for every task, on every exit path
 | `tool_calls` | u32 | Tool calls for this task only |
 | `shell_calls` | u32 | Shell calls for this task only |
 | `reopen_count` | u32 | Times an `on-task-end` hook reopened this task before it ended. `0` for a task that ran once (the common case). A reader that finds no `reopen_count` field should default it to `0` |
+| `running_commands` | array of string | The `work_id`s of the shell commands moved to the background and still running when the task ended, oldest first — the same commands the task's A2A result names in [`metadata.murmur.runningCommands`](agent-card.md#no-answer-metadata). Absent when there were none |
 
 **`task_canceled`**{ #task-canceled } — written where the agent loop stopped because a person
 called [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task)
@@ -619,7 +619,7 @@ called [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-t
 |---|---|---|
 | `task_id` | string | The task that was stopped |
 | `turn` | u32 | The turn that was in flight, 0-based. Absent for a task cancelled before it ran |
-| `phase` | string | `"queued"` \| `"turn"` \| `"inference"` \| `"input"` \| `"delegation"` \| `"member_call"` \| `"harness"` \| `"plan"` — which wait the cancel interrupted. `"delegation"` is a wait on a `delegate-task` delegation: its child coming up, or a finished attempt waiting for its outcome. `"member_call"` is a wait on a [`call-member`](runtime-provided-tools.md#call-member) call: reaching the member's door, or waiting for its answer. `"harness"` is a [`transport: process`](manifest.md#transport-process) run, where the harness itself is interrupted. `"plan"` is a `submit-plan` call running its steps, which stops the plan and ends any `capsule` step's sub-capsule — see [When the task is cancelled](plans.md#when-the-task-is-cancelled) |
+| `phase` | string | `"queued"` \| `"turn"` \| `"inference"` \| `"input"` \| `"delegation"` \| `"member_call"` \| `"harness"` \| `"plan"` \| `"background_wait"` — which wait the cancel interrupted. `"delegation"` is a wait on a `delegate-task` delegation: its child coming up, or a finished attempt waiting for its outcome. `"member_call"` is a wait on a [`call-member`](runtime-provided-tools.md#call-member) call: reaching the member's door, or waiting for its answer. `"harness"` is a [`transport: process`](manifest.md#transport-process) run, where the harness itself is interrupted. `"plan"` is a `submit-plan` call running its steps, which stops the plan and ends any `capsule` step's sub-capsule — see [When the task is cancelled](plans.md#when-the-task-is-cancelled). `"background_wait"` is a [`background-command`](runtime-provided-tools.md#background-command) `wait`, which ends while the command keeps running |
 | `detached_work_ids` | array of string | Demoted shell commands still running when the loop stopped |
 | `delegation_ids` | array of string | Delegations in flight when the loop stopped, named before the task ended them |
 
@@ -711,6 +711,24 @@ lifeline writes none.
 |---|---|---|
 | `task_id` | string | The task that made the call. Absent outside a task |
 | `status` | object | The object the call returned, field for field — see [`session-status`](runtime-provided-tools.md#session-status) |
+
+**`background_command`**{ #background-command } — written once per answered
+[`background-command`](runtime-provided-tools.md#background-command) call, at the call, on both
+transports. A refused call writes none
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The task that made the call. Absent outside a task |
+| `work_id` | string | The `shell_detached` line's `work_id` |
+| `operation` | string | `"status"` \| `"wait"` \| `"stop"` |
+| `state` | string | `"running"` \| `"exited"` \| `"stopped"`, as the call returned it |
+| `exit_code` | i32 | As on `shell_completed`. Present for `"exited"` and `"stopped"` |
+| `waited_ms` | u64 | How long a `wait` waited. Present on `"wait"` only |
+| `output_bytes` | u64 | Bytes of output in the command's log, as the call returned it |
+
+```json
+{"event_type":"background_command","event_id":"evt_01a15992…","parent_id":"evt_01a15991…","session_id":"ses_01a15991…","timestamp":1792504131519,"task_id":"tsk_01a15991…","work_id":"wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2","operation":"wait","state":"exited","exit_code":1,"waited_ms":312004,"output_bytes":48213}
+```
 
 **`deadline_notice`**{ #deadline-notice } — written once, when a tool result carries the
 [deadline notice](runtime-provided-tools.md#deadline-notice)

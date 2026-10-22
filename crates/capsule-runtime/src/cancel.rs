@@ -55,6 +55,9 @@ pub(crate) const PHASE_MEMBER_CALL: &str = "member_call";
 pub(crate) const PHASE_HARNESS: &str = "harness";
 /// Cancelled while a `submit-plan` call was running its steps.
 pub(crate) const PHASE_PLAN: &str = "plan";
+/// Cancelled while a `background-command` call was waiting for a background shell command. The
+/// wait ends; the command keeps running.
+pub(crate) const PHASE_BACKGROUND_WAIT: &str = "background_wait";
 
 /// What the terminal `TASK_STATE_CANCELED` status says. One constant for every transport: a client
 /// cannot tell from the status which one ran the task.
@@ -673,9 +676,11 @@ mod tests {
             PHASE_HARNESS,
             PHASE_MEMBER_CALL,
             PHASE_PLAN,
+            PHASE_BACKGROUND_WAIT,
         ];
         assert_eq!(phases[5], "harness");
         assert_eq!(PHASE_PLAN, "plan");
+        assert_eq!(PHASE_BACKGROUND_WAIT, "background_wait");
         assert_eq!(
             phases
                 .iter()

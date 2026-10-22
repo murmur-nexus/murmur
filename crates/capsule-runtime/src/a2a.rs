@@ -585,9 +585,10 @@ pub(crate) struct A2aTask {
     pub status: TaskStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<Vec<A2aArtifact>>,
-    /// `{"murmur": {...}}` for a terminal task with something to say about answers it lacks:
-    /// `noAnswer: true` for one ended through `end-without-answer`, and `noAnswerBelow`, the
-    /// members further down that gave it none. Absent when it has neither.
+    /// `{"murmur": {...}}` for a terminal task with something to say: `noAnswer: true` for one
+    /// ended through `end-without-answer`, `noAnswerBelow`, the members further down that gave it
+    /// none, and `runningCommands`, the background shell commands still running when it ended.
+    /// Absent when it has none of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
@@ -744,7 +745,24 @@ struct TaskEnding {
     no_answer: bool,
     /// `(member, status)` for each member further down that gave the task no answer.
     no_answer_below: Vec<(String, String)>,
+    /// The background shell commands still running when the task ended, oldest first.
+    running_commands: Vec<RunningCommand>,
 }
+
+/// A background shell command still running when a task ended, as the task's
+/// `metadata.murmur.runningCommands` names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunningCommand {
+    pub work_id: String,
+    pub binary: String,
+    /// The command text the model wrote, without the binary name.
+    pub command: String,
+    /// From spawn to the task's end.
+    pub running_ms: u64,
+}
+
+/// The most characters of a running command's text the metadata carries, before the `…`.
+const RUNNING_COMMAND_TEXT_CHARS: usize = 200;
 
 impl TaskEnding {
     /// The `metadata` `GetTask` carries for this ending, or `None` when it says nothing.
@@ -760,6 +778,37 @@ impl TaskEnding {
                 .map(|(member, status)| serde_json::json!({"member": member, "status": status}))
                 .collect();
             murmur.insert("noAnswerBelow".to_string(), serde_json::Value::Array(below));
+        }
+        if !self.running_commands.is_empty() {
+            let running = self
+                .running_commands
+                .iter()
+                .map(|running| {
+                    let mut command: String = running
+                        .command
+                        .chars()
+                        .take(RUNNING_COMMAND_TEXT_CHARS)
+                        .collect();
+                    if running
+                        .command
+                        .chars()
+                        .nth(RUNNING_COMMAND_TEXT_CHARS)
+                        .is_some()
+                    {
+                        command.push('…');
+                    }
+                    serde_json::json!({
+                        "workId": running.work_id,
+                        "binary": running.binary,
+                        "command": command,
+                        "runningMs": running.running_ms,
+                    })
+                })
+                .collect();
+            murmur.insert(
+                "runningCommands".to_string(),
+                serde_json::Value::Array(running),
+            );
         }
         (!murmur.is_empty()).then(|| serde_json::json!({ "murmur": murmur }))
     }
@@ -1437,8 +1486,9 @@ impl TaskRegistry {
 
     /// Record how `task_id` ended: its final status's `message`, and its `response` when it
     /// completed. A response on any other state is not kept. `no_answer` is whether it ended
-    /// through `end-without-answer`, and `no_answer_below` the `(member, status)` of each member
-    /// further down that gave it no answer.
+    /// through `end-without-answer`, `no_answer_below` the `(member, status)` of each member
+    /// further down that gave it no answer, and `running_commands` the background shell commands
+    /// still running when it ended.
     pub(crate) fn record_ending(
         &mut self,
         task_id: &str,
@@ -1446,6 +1496,7 @@ impl TaskRegistry {
         response: Option<&str>,
         no_answer: bool,
         no_answer_below: &[(String, String)],
+        running_commands: &[RunningCommand],
     ) {
         let completed = matches!(self.history.get(task_id), Some((TaskState::Completed, _)));
         self.endings.insert(
@@ -1455,6 +1506,7 @@ impl TaskRegistry {
                 response: response.filter(|_| completed).map(str::to_string),
                 no_answer,
                 no_answer_below: no_answer_below.to_vec(),
+                running_commands: running_commands.to_vec(),
             },
         );
         self.touch(task_id);
@@ -2049,7 +2101,7 @@ mod tests {
     fn a_completed_task_carries_its_response_artifact_and_status_message() {
         let mut r = running_registry("tsk_1");
         r.finish_task(TaskState::Completed);
-        r.record_ending("tsk_1", "done", Some("the answer is 4"), false, &[]);
+        r.record_ending("tsk_1", "done", Some("the answer is 4"), false, &[], &[]);
         let task = serde_json::to_value(r.get_task("tsk_1").unwrap()).unwrap();
         assert_eq!(
             task,
@@ -2076,6 +2128,47 @@ mod tests {
         );
     }
 
+    /// A task that ended with background commands running names each in
+    /// `metadata.murmur.runningCommands`, its text cut to 200 characters; a task with none
+    /// carries no such key.
+    #[test]
+    fn a_task_ending_with_commands_running_names_them_in_its_metadata() {
+        let long = "x".repeat(250);
+        let running = [
+            RunningCommand {
+                work_id: "wrk_0a".to_string(),
+                binary: "/usr/bin/bash".to_string(),
+                command: "sleep 300".to_string(),
+                running_ms: 12_000,
+            },
+            RunningCommand {
+                work_id: "wrk_0b".to_string(),
+                binary: "/usr/bin/bash".to_string(),
+                command: long.clone(),
+                running_ms: 3_000,
+            },
+        ];
+        let mut r = running_registry("tsk_1");
+        r.finish_task(TaskState::Completed);
+        r.record_ending("tsk_1", "done", Some("4"), false, &[], &running);
+        let task = serde_json::to_value(r.get_task("tsk_1").unwrap()).unwrap();
+        assert_eq!(
+            task["metadata"],
+            serde_json::json!({"murmur": {"runningCommands": [
+                {"workId": "wrk_0a", "binary": "/usr/bin/bash", "command": "sleep 300",
+                 "runningMs": 12_000},
+                {"workId": "wrk_0b", "binary": "/usr/bin/bash",
+                 "command": format!("{}…", &long[..200]), "runningMs": 3_000},
+            ]}})
+        );
+
+        let mut r = running_registry("tsk_2");
+        r.finish_task(TaskState::Completed);
+        r.record_ending("tsk_2", "done", Some("4"), false, &[], &[]);
+        let task = serde_json::to_value(r.get_task("tsk_2").unwrap()).unwrap();
+        assert!(task.get("metadata").is_none(), "{task}");
+    }
+
     /// A task ended through `end-without-answer` carries `metadata.murmur.noAnswer` and the
     /// members further down that gave it none; a completed task with members missing below it
     /// carries its response and `noAnswerBelow` but no `noAnswer`; any other ending carries no
@@ -2085,7 +2178,7 @@ mod tests {
         let below = [("q".to_string(), "timed_out".to_string())];
         let mut r = running_registry("tsk_1");
         r.finish_task(TaskState::Failed);
-        r.record_ending("tsk_1", "q gave no answer", None, true, &below);
+        r.record_ending("tsk_1", "q gave no answer", None, true, &below, &[]);
         let task = serde_json::to_value(r.get_task("tsk_1").unwrap()).unwrap();
         assert_eq!(task["status"]["state"], "TASK_STATE_FAILED");
         assert_eq!(
@@ -2102,7 +2195,14 @@ mod tests {
 
         let mut r = running_registry("tsk_2");
         r.finish_task(TaskState::Completed);
-        r.record_ending("tsk_2", "task completed", Some("none came"), false, &below);
+        r.record_ending(
+            "tsk_2",
+            "task completed",
+            Some("none came"),
+            false,
+            &below,
+            &[],
+        );
         let task = serde_json::to_value(r.get_task("tsk_2").unwrap()).unwrap();
         assert_eq!(
             task["artifacts"],
@@ -2119,7 +2219,7 @@ mod tests {
         for state in [TaskState::Completed, TaskState::Failed] {
             let mut r = running_registry("tsk_3");
             r.finish_task(state);
-            r.record_ending("tsk_3", "ended", Some("4"), false, &[]);
+            r.record_ending("tsk_3", "ended", Some("4"), false, &[], &[]);
             let task = serde_json::to_value(r.get_task("tsk_3").unwrap()).unwrap();
             assert!(task.get("metadata").is_none(), "{task}");
         }
@@ -2133,7 +2233,14 @@ mod tests {
     fn a_failed_task_carries_its_status_message_and_no_response() {
         let mut r = running_registry("tsk_1");
         r.finish_task(TaskState::Failed);
-        r.record_ending("tsk_1", "the driver failed", Some("partial"), false, &[]);
+        r.record_ending(
+            "tsk_1",
+            "the driver failed",
+            Some("partial"),
+            false,
+            &[],
+            &[],
+        );
         let task = r.get_task("tsk_1").unwrap();
         assert!(task.artifacts.is_none());
         let message = task.status.message.unwrap();
@@ -2147,7 +2254,7 @@ mod tests {
         let mut r = running_registry("tsk_1");
         r.finish_task(TaskState::Completed);
         assert!(r.get_task("tsk_1").unwrap().artifacts.is_none());
-        r.record_ending("tsk_1", "ok", Some(""), false, &[]);
+        r.record_ending("tsk_1", "ok", Some(""), false, &[], &[]);
         let task = r.get_task("tsk_1").unwrap();
         assert!(task.artifacts.is_none());
         assert_eq!(task.status.message.unwrap().text(), Some("ok"));
@@ -2204,9 +2311,9 @@ mod tests {
         assert_eq!(all(&r), ["tsk_a", "tsk_b", "tsk_c"]);
         r.deliver_input("tsk_a", "left".to_string()).unwrap();
         r.finish_task(TaskState::Completed);
-        r.record_ending("tsk_c", "", None, false, &[]);
+        r.record_ending("tsk_c", "", None, false, &[], &[]);
         assert_eq!(all(&r), ["tsk_c", "tsk_a", "tsk_b"]);
-        r.record_ending("tsk_a", "done", Some("four"), false, &[]);
+        r.record_ending("tsk_a", "done", Some("four"), false, &[], &[]);
         assert_eq!(all(&r), ["tsk_a", "tsk_c", "tsk_b"]);
         r.close_to_new_work();
         assert_eq!(all(&r), ["tsk_c", "tsk_a", "tsk_b"], "tsk_c was rejected");
@@ -2301,7 +2408,7 @@ mod tests {
         assert!(instant(&completed) > instant(&working));
 
         a_tick();
-        r.record_ending("tsk_a", "done", Some("four"), false, &[]);
+        r.record_ending("tsk_a", "done", Some("four"), false, &[], &[]);
         assert!(r.revisions["tsk_a"] > completed_revision);
         assert!(instant(&timestamp_of(&r, "tsk_a")) > instant(&completed));
     }
@@ -3578,10 +3685,10 @@ mod tests {
         }
         r.start_task("tsk_a".to_string(), "ctx_001".to_string(), TaskLane::Bg);
         r.finish_task(TaskState::Completed);
-        r.record_ending("tsk_a", "done", Some("four ```"), false, &[]);
+        r.record_ending("tsk_a", "done", Some("four ```"), false, &[], &[]);
         r.start_task("tsk_b".to_string(), "ctx_001".to_string(), TaskLane::Bg);
         r.finish_task(TaskState::Failed);
-        r.record_ending("tsk_b", "the driver\nfailed", None, false, &[]);
+        r.record_ending("tsk_b", "the driver\nfailed", None, false, &[], &[]);
         r.start_task("tsk_c".to_string(), "ctx_001".to_string(), TaskLane::Bg);
         r.record_owner("tsk_e", "member:reviewer");
         let ids: Vec<String> = ["tsk_a", "tsk_b", "tsk_c", "tsk_d", "tsk_e"]

@@ -649,39 +649,53 @@ pub(crate) fn execute_shell(
 ///
 /// Each thread appends what it reads to a buffer the call can take at any time, so the call can
 /// stop waiting for EOF without joining: a process the command left behind can hold a pipe open
-/// for as long as it runs.
+/// for as long as it runs. A demoted command's threads append to its log instead; see
+/// [`OutputReaders::go_live`].
 struct OutputReaders {
     stdout: Option<PipeReader>,
     stderr: Option<PipeReader>,
 }
 
-/// One pipe's reading thread and the bytes it has stored.
+/// Where one pipe's reading thread puts what it reads.
+enum PipeSink {
+    /// Kept in memory until the call takes it.
+    Buffer(Vec<u8>),
+    /// Appended to a demoted command's log as it is read.
+    Live(std::sync::Arc<std::sync::Mutex<crate::detached::LiveOutput>>),
+    /// Read and dropped: the call has answered. A holder that writes forever neither costs memory
+    /// nor gets `SIGPIPE`.
+    Discard,
+}
+
+/// One pipe's reading thread and where it puts what it reads.
 struct PipeReader {
     thread: std::thread::JoinHandle<()>,
-    /// What the thread has read so far. `None` once [`OutputReaders::take`] has taken it, after
-    /// which the thread keeps reading to EOF and stores nothing, so a holder that writes forever
-    /// neither costs memory nor gets `SIGPIPE`.
-    stored: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    sink: std::sync::Arc<std::sync::Mutex<PipeSink>>,
+}
+
+fn lock_sink(sink: &std::sync::Mutex<PipeSink>) -> std::sync::MutexGuard<'_, PipeSink> {
+    sink.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl PipeReader {
     fn spawn(mut pipe: impl std::io::Read + Send + 'static) -> Self {
-        let stored = std::sync::Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(PipeSink::Buffer(Vec::new())));
         let thread = {
-            let stored = std::sync::Arc::clone(&stored);
+            let sink = std::sync::Arc::clone(&sink);
             std::thread::spawn(move || {
                 let mut chunk = [0u8; 8192];
                 loop {
                     match pipe.read(&mut chunk) {
                         Ok(0) => break,
-                        Ok(read) => {
-                            let mut stored = stored
+                        Ok(read) => match &mut *lock_sink(&sink) {
+                            PipeSink::Buffer(buffer) => buffer.extend_from_slice(&chunk[..read]),
+                            PipeSink::Live(output) => output
                                 .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if let Some(buffer) = stored.as_mut() {
-                                buffer.extend_from_slice(&chunk[..read]);
-                            }
-                        }
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .append(&chunk[..read]),
+                            PipeSink::Discard => {}
+                        },
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                         // A read error loses whatever was not yet read and keeps what was; there
                         // is no better outcome available, and failing the whole call over it
@@ -691,18 +705,16 @@ impl PipeReader {
                 }
             })
         };
-        Self { thread, stored }
+        Self { thread, sink }
     }
 
-    /// The bytes stored so far, leaving the thread to discard the rest. A thread that panicked
-    /// yields empty bytes.
+    /// The bytes buffered so far, leaving the thread to discard the rest. Empty for a reader
+    /// writing to a log, and for a thread that panicked.
     fn take(self) -> Vec<u8> {
-        let taken = self
-            .stored
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .unwrap_or_default();
+        let taken = match std::mem::replace(&mut *lock_sink(&self.sink), PipeSink::Discard) {
+            PipeSink::Buffer(buffer) => buffer,
+            PipeSink::Live(_) | PipeSink::Discard => Vec::new(),
+        };
         if self.thread.is_finished() && self.thread.join().is_err() {
             return Vec::new();
         }
@@ -715,6 +727,29 @@ impl OutputReaders {
         Self {
             stdout: child.stdout.take().map(PipeReader::spawn),
             stderr: child.stderr.take().map(PipeReader::spawn),
+        }
+    }
+
+    /// Moves both readers onto `output`: what each has buffered is appended, stdout's then
+    /// stderr's, and from then on each appends every chunk as it reads it.
+    ///
+    /// Both sinks are held across the switch, so no chunk read meanwhile lands ahead of the
+    /// buffered bytes.
+    fn go_live(&self, output: &std::sync::Arc<std::sync::Mutex<crate::detached::LiveOutput>>) {
+        let mut sinks: Vec<_> = [&self.stdout, &self.stderr]
+            .into_iter()
+            .flatten()
+            .map(|reader| lock_sink(&reader.sink))
+            .collect();
+        let mut live = output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for sink in &mut sinks {
+            if let PipeSink::Buffer(buffer) =
+                std::mem::replace(&mut **sink, PipeSink::Live(std::sync::Arc::clone(output)))
+            {
+                live.append(&buffer);
+            }
         }
     }
 
@@ -741,8 +776,8 @@ impl OutputReaders {
         }
     }
 
-    /// `(stdout, stderr)` as read so far, without waiting. A thread still reading keeps reading
-    /// to EOF and stores nothing more.
+    /// `(stdout, stderr)` as buffered so far, without waiting. A thread still reading keeps
+    /// reading to EOF and stores and writes nothing more.
     fn take(self) -> (Vec<u8>, Vec<u8>) {
         let take = |reader: Option<PipeReader>| reader.map(PipeReader::take).unwrap_or_default();
         (take(self.stdout), take(self.stderr))
@@ -823,13 +858,16 @@ struct DemotionContext {
 
 /// Hand a still-running command to a thread of its own and return the handle for it.
 ///
-/// The work is registered before this returns, so the session-end sweep can never miss work that
+/// The command's log is opened in the records directory and its readers switched onto it before
+/// this returns, so the output read so far and everything after are on disk while it runs. The
+/// work is registered before this returns too, so the session-end sweep can never miss work that
 /// finished being registered after it looked.
 ///
-/// The thread finishes the output the way a foreground call does: once the command's process has
-/// exited, [`finish_output`] waits at most [`PIPE_DRAIN_AFTER_EXIT`] for its pipes and then kills
-/// what is still holding them, so the completion arrives even when the command left background
-/// processes writing to its output.
+/// The thread observes the command's own process exiting with `waitid(WNOWAIT)`, tells the
+/// registry, and only then reaps it: a group is signalled only while its leader is unreaped. It
+/// then finishes the output the way a foreground call does: [`finish_output`] waits at most
+/// [`PIPE_DRAIN_AFTER_EXIT`] for its pipes and then kills what is still holding them, so the
+/// completion arrives even when the command left background processes writing to its output.
 fn demote(
     mut child: std::process::Child,
     readers: OutputReaders,
@@ -848,10 +886,17 @@ fn demote(
             .unwrap_or(u64::MAX),
     };
 
-    context
-        .policy
-        .registry
-        .register(crate::detached::DetachedWork {
+    let arg_refs: Vec<&str> = context.args.iter().map(String::as_str).collect();
+    let log = crate::detached::output_path_for(&context.records_root, &work_id);
+    let output = std::sync::Arc::new(std::sync::Mutex::new(crate::detached::LiveOutput::open(
+        &context.records_root,
+        &log.relative,
+        &log_command_line(&context.invoked_binary, &arg_refs),
+    )));
+    readers.go_live(&output);
+
+    context.policy.registry.register(
+        crate::detached::DetachedWork {
             work_id: work_id.clone(),
             binary: context.resolved_binary.clone(),
             command: context.policy.command.clone(),
@@ -868,25 +913,31 @@ fn demote(
                     .try_into()
                     .unwrap_or(u64::MAX),
             ),
-        });
+        },
+        context.started,
+        context.pgid,
+        log.path.clone(),
+        std::sync::Arc::clone(&output),
+    );
 
     let provenance = context.policy.completion_provenance();
     let DemotionContext {
         policy,
         records_root,
-        invoked_binary,
         resolved_binary,
-        args,
         started,
         pgid,
         cgroup_scope,
         cgroup_counters_before,
         cgroup_occupancy,
+        ..
     } = context;
 
     std::thread::spawn(move || {
+        let observed = wait_for_exit_unreaped(pgid);
+        policy.registry.leader_exited(&work_id);
         let waited = child.wait();
-        let (stdout_bytes, stderr_bytes, output_holders) =
+        let (_, _, output_holders) =
             finish_output(readers, pgid, Instant::now() + PIPE_DRAIN_AFTER_EXIT);
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
@@ -908,20 +959,15 @@ fn demote(
             ),
         };
         drop(cgroup_occupancy);
+        if let (Err(failure), None) = (observed, &error) {
+            error = Some(format!("observing the command's exit failed: {failure}"));
+        }
 
-        let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
-        let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let log = crate::detached::output_path_for(&records_root, &work_id);
-        if let Err(failure) = write_shell_output_log(
-            &records_root,
-            &work_id,
-            &invoked_binary,
-            &arg_refs,
-            exit_code,
-            &stdout,
-            &stderr,
-        ) {
+        let write_error = output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finish(exit_code);
+        if let Some(failure) = write_error {
             error = Some(match error {
                 Some(existing) => format!("{existing}; {failure}"),
                 None => failure,
@@ -952,6 +998,30 @@ fn demote(
     });
 
     info
+}
+
+/// Blocks until the child `pid` has exited, leaving it unreaped.
+///
+/// Until it is reaped the pid stays the child's, so its process group, which it leads, cannot be
+/// taken by an unrelated process while anything signals it. `NOWAIT` leaves the child waitable,
+/// so `Child::wait` still reaps it afterwards.
+fn wait_for_exit_unreaped(pid: i32) -> std::io::Result<()> {
+    use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+
+    let pid = (pid > 0)
+        .then(|| Pid::from_raw(pid))
+        .flatten()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    loop {
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(errno) => return Err(errno.into()),
+        }
+    }
 }
 
 /// Exit code for a finished subprocess, keeping the signal that killed it legible.
@@ -1221,12 +1291,22 @@ fn env_name_matches_pattern(pattern: &str, key: &str) -> bool {
     pattern == key
 }
 
-/// Write one command's full stdout and stderr to its log in the session's records directory,
-/// returning the log's absolute path. [`crate::detached::output_path_for`] places it.
+/// The command as a log's `Command:` line names it: the invoked binary and its arguments.
+fn log_command_line(binary: &str, args: &[&str]) -> String {
+    if args.is_empty() {
+        binary.to_string()
+    } else {
+        format!("{binary} {}", args.join(" "))
+    }
+}
+
+/// Write a foreground command's full stdout and stderr to its `shell-<ms>` log in the session's
+/// records directory, returning the log's absolute path. [`crate::detached::output_path_for`]
+/// places it.
 ///
-/// Two callers, one content format: a foreground command whose output exceeded
-/// [`MAX_SHELL_OUTPUT_BYTES`] passes a `shell-<ms>` stem, and a demoted command passes its work
-/// id. A reader that finds either file reads the same header, `Stdout:` and `Stderr:` sections.
+/// The file holds a `Command:` and an `Exit code:` line, then `Stdout:` and `Stderr:` sections. A
+/// demoted command's log has its own layout, written as it runs; see
+/// [`crate::detached::LiveOutput`].
 fn write_shell_output_log(
     records_root: &WorkdirRoot,
     file_stem: &str,
@@ -1237,12 +1317,7 @@ fn write_shell_output_log(
     stderr: &str,
 ) -> Result<String, String> {
     let log = crate::detached::output_path_for(records_root, file_stem);
-
-    let command = if args.is_empty() {
-        binary.to_string()
-    } else {
-        format!("{binary} {}", args.join(" "))
-    };
+    let command = log_command_line(binary, args);
 
     let content = format!(
         "Command: {command}\nExit code: {exit_code}\n\nStdout:\n{stdout}\n\nStderr:\n{stderr}\n"

@@ -9,7 +9,7 @@ The model sees no difference. A runtime-provided tool has the same manifest shap
 same inventory, and is called the same way as a tool artifact. What differs is where it comes from
 and what decides whether it may run.
 
-## The eleven
+## The twelve
 
 Each one appears only when the declaration in the second column is present.
 
@@ -26,6 +26,7 @@ Each one appears only when the declaration in the second column is present.
 | `pull-artifact` | [`capabilities.install`](manifest.md#field-install), under `transport: http` | Installs a skill or tool into the running session, usable from the next turn, or lists what the capsule may pull — see [`pull-artifact`](#pull-artifact) |
 | `remove-artifact` | The same grant as `pull-artifact` | Takes out an artifact the session pulled — see [`remove-artifact`](#remove-artifact) |
 | `session-status` | An [`inference:`](manifest.md#field-inference) block: every agent capsule, on both transports | Reports the time the session has run and has left, its turns, context, tokens and spend — see [`session-status`](#session-status) |
+| `background-command` | An [`inference:`](manifest.md#field-inference) block and a non-empty [`capabilities.shell.allow`](manifest.md#shell-allow), on both transports | Reports on, waits for or stops a shell command that moved to the background, by its work id — see [`background-command`](#background-command) |
 
 Every one of their manifests carries `version: 0.0.0`, `runtime: tool` and
 `implementation: native`. Nothing was fetched, so nothing is version-pinned, nothing is
@@ -34,9 +35,9 @@ hash-verified, and no entry appears for them in `murmur.lock` or in `mur list`.
 ## The grant is the tool's existence
 
 `share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member`,
-`end-without-answer`, `pull-artifact`, `remove-artifact` and `session-status` are answered before
-the tool allowlist is consulted. The allowlist governs which tool *artifacts* may run; it has no say
-over these ten.
+`end-without-answer`, `pull-artifact`, `remove-artifact`, `session-status` and `background-command`
+are answered before the tool allowlist is consulted. The allowlist governs which tool *artifacts*
+may run; it has no say over these eleven.
 
 `session-status` needs no grant: staging writes its manifest for every agent capsule and for no
 script capsule.
@@ -51,7 +52,7 @@ nothing under `tools/<name>/`, so:
 So `capabilities.spawn.allow` decides whether `delegate-task` exists, rather than whether a call to
 it succeeds. The same holds for the two peer-handoff tools, for `submit-plan`, for
 `switch-driver`, for `call-member` and `end-without-answer`, for `pull-artifact` and
-`remove-artifact`, and for their grants.
+`remove-artifact`, for `background-command`, and for their grants.
 
 `capabilities.plan.submit` also decides whether the model is told *when* to plan: the runtime's
 plan guidance is part of the system prompt exactly when the tool exists.
@@ -62,7 +63,8 @@ are additionally checked against that list again at dispatch.
 ## Reserved names
 
 `share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member`,
-`end-without-answer`, `pull-artifact`, `remove-artifact` and `session-status` are reserved.
+`end-without-answer`, `pull-artifact`, `remove-artifact`, `session-status` and
+`background-command` are reserved.
 The check is made on an artifact's tool name, the part of its full name after the `/`, so a
 capsule declaring `murmur/delegate-task` or `ana/pull-artifact` is refused at staging, before any
 artifact is pulled, with [`E-CAP-013`](diagnostics.md#e-cap-013). The same refusal covers an
@@ -151,6 +153,81 @@ Session deadline: the runtime ends this session at 2026-10-20T14:00:00Z, in 297 
 
 Nothing else the runtime adds to the conversation changes. What happens when the deadline is
 reached is described under [The deadline](cli.md#mur-run-deadline).
+
+## `background-command` { #background-command }
+
+A shell command that runs past [`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs)
+moves to the background, and its shell call returns a work id of the form `wrk_<hex>`.
+`background-command` takes that id:
+
+```json
+{"type":"object","properties":{"operation":{"type":"string","enum":["status","wait","stop"]},"work_id":{"type":"string"},"wait_secs":{"type":"integer","minimum":0}},"required":["operation","work_id"]}
+```
+
+| `operation` | Behaviour |
+|---|---|
+| `status` | Returns at once |
+| `wait` | Returns when the command exits or after `wait_secs` seconds, whichever is first. `wait_secs` defaults to `600`; a larger value is taken as `600`, and `0` returns at once. A cancel of the task ends the wait at once, recorded as phase [`background_wait`](observability-schemas.md#task-canceled) |
+| `stop` | Sends `SIGTERM` to the command's process group, `SIGKILL` 2 seconds later if the command has not exited, then waits up to 3 seconds more for it to finish. A command that already exited is sent nothing |
+
+A `stop` reaches the command and every process in its process group. A process that left the
+group, such as one started with `setsid`, is not reached; the session's end kills it.
+
+Each operation returns the same text, `Passed` whatever the command's exit code:
+
+```text
+work_id: wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2
+command: /usr/bin/bash cargo test --workspace
+state: exited
+elapsed_secs: 312
+waited_secs: 41
+exit_code: 101
+status: error
+output: /home/dev/.murmur/records/home/dev/proj/ses_01k4m2y7xq8f9v3n5r7t9w1c2e/logs/wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2.log
+output_bytes: 48213
+output_shown: last 16384 bytes
+
+<the last 16384 bytes of output>
+```
+
+| Line | Value | Present |
+|---|---|---|
+| `work_id` | The work id | Always |
+| `command` | The resolved binary and the command text the model wrote | Always |
+| `state` | `running`, `exited`, or `stopped` for a command that ended after a `stop` reached it | Always |
+| `elapsed_secs` | Whole seconds from the command's start to now, or to its exit | Always |
+| `waited_secs` | Whole seconds this call waited | `wait` only |
+| `exit_code` | The exit code; `128 + signal` for a signal kill | `exited` and `stopped` |
+| `status` | `ok` for a zero exit with no resource limit and no wait error, `error` otherwise | `exited` and `stopped` |
+| `wait_error` | A failure in waiting for the command, or in writing its log | When there was one |
+| `output` | The absolute path of the command's log in the session's [records directory](workdir.md#records-directory), which holds all of its output | Always |
+| `output_bytes` | Bytes of output in the log so far | Always |
+| `output_shown` | `all`, or `last 16384 bytes` when the output is longer | Always |
+
+The output, both streams in the order read, follows a blank line. A
+[resource limit](resource-limits.md#which-limit) the command was stopped by, and processes left
+holding its output, are reported in a note after the [untrusted fence](untrusted-fence.md), as on a foreground shell result. A
+stopped command has no resource limit attributed.
+
+A work id is valid for the rest of the session that issued it. An id from another session, a
+resumed one included, is unknown in this one. A command still running when the session ends is
+killed with its process group, on every host. A task that ends while commands are still running
+names them in [`runningCommands`](agent-card.md#no-answer-metadata) and on its
+[`task_end`](observability-schemas.md#task-end) record.
+
+Under `task_acceptance: queue` with `after_task: sleep`, a command that exits also arrives as a
+`completion` task, unless `background-command` already returned its exit.
+
+| Refused input | Message |
+|---|---|
+| An id this session never issued | ``no background command with work id `<id>` in this session`` |
+| An id not of the form `wrk_<hex>` | Names the value and the form |
+| No `work_id` | Names `work_id` |
+| An `operation` outside `status`, `wait`, `stop` | Names the value and the accepted operations |
+| A `wait_secs` that is not a whole number of seconds | Names the value |
+
+A refused call writes no record. Each answered call writes one
+[`background_command`](observability-schemas.md#background-command) record.
 
 ## `switch-driver` { #switch-driver }
 

@@ -16,13 +16,14 @@ use predicates::prelude::*;
 use tempfile::TempDir;
 
 const CAPSULE_NAME: &str = "reserved-name-capsule";
-const RESERVED: [&str; 6] = [
+const RESERVED: [&str; 7] = [
     "share-file",
     "fetch-peer-file",
     "delegate-task",
     "submit-plan",
     "end-without-answer",
     "session-status",
+    "background-command",
 ];
 
 /// An agent capsule declaring one tool artifact whose tool name is `tool`, under
@@ -133,7 +134,7 @@ fn the_refusal_does_not_depend_on_the_grant_that_provides_the_tool() {
 }
 
 /// Every name the runtime answers itself, in the order `E-CAP-013` lists them.
-const ALL_RESERVED: [&str; 10] = [
+const ALL_RESERVED: [&str; 11] = [
     "share-file",
     "fetch-peer-file",
     "delegate-task",
@@ -144,6 +145,7 @@ const ALL_RESERVED: [&str; 10] = [
     "pull-artifact",
     "remove-artifact",
     "session-status",
+    "background-command",
 ];
 
 /// The two artifact tools are reserved under any scope: an artifact a capsule declared, or one it
@@ -172,7 +174,7 @@ fn the_artifact_tools_are_reserved_under_any_scope() {
         let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
         assert!(
             stderr.contains(&ALL_RESERVED.join(", ")),
-            "the refusal lists all ten names: {stderr}"
+            "the refusal lists all eleven names: {stderr}"
         );
         assert!(!stderr.contains("E-REG-001"), "{stderr}");
     }

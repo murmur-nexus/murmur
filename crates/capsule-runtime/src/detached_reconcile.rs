@@ -8,7 +8,7 @@
 //!
 //! The job is accounting. No pid was recorded, no liveness is checked, no orphan is adopted and no
 //! result is recovered, because none can be — see [`crate::detached::LostWork`] for why a killed
-//! runtime leaves no output log even for a command that ran to a clean exit.
+//! runtime leaves no exit code even for a command that ran to a clean exit.
 //!
 //! The reader lives beside the writer that owns the format rather than in `murmur-cli`: the
 //! dependency runs cli → runtime and not back, and a delegated child is launched from a parent's
