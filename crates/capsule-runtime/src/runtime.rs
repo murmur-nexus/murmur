@@ -2394,6 +2394,7 @@ pub fn stage_session(
                 warn_on_inert_hook_capabilities(&artifact.name, artifact.capabilities.as_ref());
                 hook_components.push(StagedHookArtifact {
                     name: artifact.name.clone(),
+                    entry: crate::tool_names::full_name_of(&full_names, &artifact.name).to_string(),
                     version: resolved_version.clone(),
                     component: hook_component,
                     config: hook_config,
@@ -2537,6 +2538,12 @@ pub fn stage_session(
             )?,
             _ => Default::default(),
         };
+    let compaction_driver_config = request
+        .inference
+        .as_ref()
+        .map(compaction_driver_config)
+        .transpose()?
+        .flatten();
     // Built after the gateways, because whether a driver choice can be selected depends on the
     // credential staging left it, and after the limits, because the output cap a controller
     // starts from is the primary's.
@@ -2906,6 +2913,7 @@ pub fn stage_session(
         control,
         driver_choices,
         hook_output_caps,
+        compaction_driver_config,
         door_authentication: request.door_authentication,
         door_auth,
         system_prompt_overridden: request.system_prompt_overridden,
@@ -3605,6 +3613,7 @@ fn launch(
         let capsule_version = staged.capsule_version.clone();
         let inference_model = inference.model.clone();
         let hook_output_caps = staged.hook_output_caps.clone();
+        let compaction_driver_config = staged.compaction_driver_config.clone();
         // The driver artifact the manifest names, under either transport. Only a
         // `transport: http` driver can back a hook's `run-inference`: a process
         // driver never enters `tool_components` (see `hook_inference`).
@@ -4000,6 +4009,10 @@ fn launch(
                                     accessible_workdir: state.accessible_workdir.clone(),
                                     workdir: state.session_root.clone(),
                                     inference_env: state.inference_env.clone(),
+                                    compaction_inference_env: compaction_inference_env(
+                                        &state.inference_env,
+                                        compaction_driver_config.as_deref(),
+                                    ),
                                     capability_policy: state.capability_policy.clone(),
                                     network_allow_rules: state.network_allow_rules.clone(),
                                     driver_grant,
@@ -6214,10 +6227,11 @@ fn warn_on_inert_capsule_wide_conversation(conversation_declared: bool) {
 }
 
 /// A per-hook `capabilities:` block reuses the whole [`murmur_artifact::Capabilities`]
-/// vocabulary, but only `network`, `filesystem`, `state` and `task_io` govern a hook — the rest are
-/// capsule-wide concerns nothing reads per-artifact. Warn rather than reject (the block is
-/// structurally valid) so an operator who declared, say, `shell.allow` on a hook entry learns
-/// it is inert instead of assuming it was applied. Infallible and non-fatal, like
+/// vocabulary, but only `network`, `filesystem`, `state`, `task_io`, `conversation` and
+/// `limits.deadline_seconds` govern a hook — the rest are capsule-wide concerns nothing reads
+/// per-artifact. Warn rather than reject (the block is structurally valid) so an operator who
+/// declared, say, `shell.allow` on a hook entry learns it is inert instead of assuming it was
+/// applied. Infallible and non-fatal, like
 /// [`warn_if_bash_network_bypass`], and carries the same `W-SEC-*` registry code + doc link
 /// convention as every other non-fatal capability warning (see `security_warnings.rs`).
 ///
@@ -6228,17 +6242,41 @@ fn warn_on_inert_hook_capabilities(
     hook_name: &str,
     capabilities: Option<&murmur_artifact::Capabilities>,
 ) {
-    let inert = inert_capability_sub_blocks(capabilities);
+    let inert = inert_hook_capability_keys(capabilities);
     if !inert.is_empty() {
         let link = security_warning_link(W_SEC_006);
         crate::runtime_err!(
             "[capsule-runtime] warning[{W_SEC_006}]: hook '{hook_name}' declares capabilities.{} \
              which the runtime does not apply per-hook — only capabilities.network, \
-             capabilities.filesystem, capabilities.state and capabilities.task_io govern a hook \
+             capabilities.filesystem, capabilities.state, capabilities.task_io, \
+             capabilities.conversation and capabilities.limits.deadline_seconds govern a hook \
              ({link})",
             inert.join(", capabilities.")
         );
     }
+}
+
+/// The keys under `capabilities.` a hook entry declares that nothing reads for it:
+/// [`inert_capability_sub_blocks`], with `limits` narrowed to the fields other than
+/// `deadline_seconds`, which is the hook's own call deadline.
+fn inert_hook_capability_keys(
+    capabilities: Option<&murmur_artifact::Capabilities>,
+) -> Vec<&'static str> {
+    let limits = capabilities.and_then(|capabilities| capabilities.limits.as_ref());
+    inert_capability_sub_blocks(capabilities)
+        .into_iter()
+        .flat_map(|key| match (key, limits) {
+            ("limits", Some(limits)) => [
+                ("limits.memory_bytes", limits.memory_bytes.is_some()),
+                ("limits.table_elements", limits.table_elements.is_some()),
+                ("limits.instances", limits.instances.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(key, present)| present.then_some(key))
+            .collect(),
+            _ => vec![key],
+        })
+        .collect()
 }
 
 /// The sub-blocks a per-artifact `capabilities:` grant never reads, whichever role declared
@@ -6644,6 +6682,63 @@ fn driver_choice_env(
             (key.clone(), value)
         })
         .collect()
+}
+
+/// `inference.driver.config` with `inference.compaction.driver_config` laid over it, as the compact
+/// JSON a compaction call's driver reads, or `None` when the manifest sets no overlay.
+///
+/// Shallow: each top-level key of the overlay replaces the same-named key or is added, and every
+/// other key of the base is kept. The runtime reads no key: the driver validates the result as it
+/// validates `inference.driver.config`, and names it that in its refusal.
+fn compaction_driver_config(
+    inference: &murmur_artifact::InferenceConfig,
+) -> Result<Option<String>, RuntimeError> {
+    let Some(overlay) = inference
+        .compaction
+        .as_ref()
+        .and_then(|compaction| compaction.driver_config.as_deref())
+    else {
+        return Ok(None);
+    };
+    // The manifest lowers both keys from mappings, so each is a JSON object.
+    let object = |json: &str, key: &str| {
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json)
+            .map_err(|err| RuntimeError::Runtime(format!("{key} is not a JSON object: {err}")))
+    };
+    let mut merged = inference
+        .driver
+        .as_ref()
+        .and_then(|driver| driver.config.as_deref())
+        .map(|base| object(base, "inference.driver.config"))
+        .transpose()?
+        .unwrap_or_default();
+    merged.extend(object(overlay, "inference.compaction.driver_config")?);
+    serde_json::to_string(&merged)
+        .map(Some)
+        .map_err(|err| RuntimeError::Runtime(format!("failed to encode JSON: {err}")))
+}
+
+/// `env` with `MURMUR_INFERENCE_DRIVER_CONFIG` set to `driver_config`, the variable appended when
+/// `env` has none. Order is kept, and `None` returns `env` as it is.
+fn compaction_inference_env(
+    env: &[(String, String)],
+    driver_config: Option<&str>,
+) -> Vec<(String, String)> {
+    let Some(driver_config) = driver_config else {
+        return env.to_vec();
+    };
+    let mut env = env.to_vec();
+    match env
+        .iter_mut()
+        .find(|(key, _)| key == "MURMUR_INFERENCE_DRIVER_CONFIG")
+    {
+        Some((_, value)) => *value = driver_config.to_string(),
+        None => env.push((
+            "MURMUR_INFERENCE_DRIVER_CONFIG".to_string(),
+            driver_config.to_string(),
+        )),
+    }
+    env
 }
 
 /// Suspend an A2A task in the InputRequired state, await external input, and resume.
@@ -7788,6 +7883,10 @@ fn stage_model_limits(
                 )
                 .unwrap_or_default(),
                 primary.limits.max_output_tokens,
+                inference
+                    .compaction
+                    .as_ref()
+                    .and_then(|compaction| compaction.max_tokens),
             )
         })
         .unwrap_or_default();
@@ -13973,6 +14072,8 @@ inference:
             system_prompt: system_prompt.map(str::to_string),
             system_prompt_file: system_prompt_file.map(str::to_string),
             dump_summaries: None,
+            max_tokens: None,
+            driver_config: None,
         }
     }
 
@@ -20529,6 +20630,132 @@ inference:
         assert!(inert_capability_sub_blocks(None).is_empty());
     }
 
+    /// A hook entry's `limits.deadline_seconds` is applied, so only the other `limits` fields
+    /// are inert, each named by its full key. Tools and drivers still report `limits` whole.
+    #[test]
+    fn a_hook_entry_reports_only_its_inert_limits_fields() {
+        let with_limits = |limits: murmur_artifact::ResourceLimits| murmur_artifact::Capabilities {
+            peer_fetch: None,
+            network: None,
+            filesystem: None,
+            shell: None,
+            spawn: None,
+            env: None,
+            limits: Some(limits),
+            resources: None,
+            state: None,
+            task_io: None,
+            conversation: None,
+            plan: None,
+            install: None,
+            containment: None,
+        };
+        let deadline_only = with_limits(murmur_artifact::ResourceLimits {
+            memory_bytes: None,
+            table_elements: None,
+            instances: None,
+            deadline_seconds: Some(2),
+        });
+        assert!(inert_hook_capability_keys(Some(&deadline_only)).is_empty());
+        assert_eq!(
+            inert_capability_sub_blocks(Some(&deadline_only)),
+            vec!["limits"],
+            "W-SEC-008 is unchanged"
+        );
+        let both = with_limits(murmur_artifact::ResourceLimits {
+            memory_bytes: Some(1 << 20),
+            table_elements: None,
+            instances: Some(4),
+            deadline_seconds: Some(2),
+        });
+        assert_eq!(
+            inert_hook_capability_keys(Some(&both)),
+            vec!["limits.memory_bytes", "limits.instances"]
+        );
+        let mut shell_too = both.clone();
+        shell_too.shell = Some(murmur_artifact::ShellCapabilities {
+            allow: vec!["bash".to_string()],
+            strip_env: None,
+            baseline_env: None,
+            interpreter_runtime: Vec::new(),
+            staged_runtime: Vec::new(),
+        });
+        assert_eq!(
+            inert_hook_capability_keys(Some(&shell_too)),
+            vec!["shell", "limits.memory_bytes", "limits.instances"]
+        );
+        assert!(inert_hook_capability_keys(None).is_empty());
+    }
+
+    #[test]
+    fn the_compaction_driver_config_overlays_the_driver_config_shallowly() {
+        let inference =
+            |driver_config: Option<&str>, overlay: Option<&str>| murmur_artifact::InferenceConfig {
+                driver: Some(murmur_artifact::InferenceDriver {
+                    artifact: "drv".to_string(),
+                    config: driver_config.map(str::to_string),
+                }),
+                compaction: Some(murmur_artifact::CompactionConfig {
+                    threshold: None,
+                    model: None,
+                    system_prompt: None,
+                    system_prompt_file: None,
+                    dump_summaries: None,
+                    max_tokens: None,
+                    driver_config: overlay.map(str::to_string),
+                }),
+                ..inference_without_prompt()
+            };
+        let merged = |base, overlay| compaction_driver_config(&inference(base, overlay)).unwrap();
+        let base = r#"{"effort":"max","nested":{"a":1,"b":2},"store":false}"#;
+        // Replaces and adds at the top level, keeps the rest, and never merges a nested object.
+        assert_eq!(
+            merged(
+                Some(base),
+                Some(r#"{"effort":"low","nested":{"a":9},"extra":true}"#)
+            ),
+            Some(r#"{"effort":"low","extra":true,"nested":{"a":9},"store":false}"#.to_string())
+        );
+        // An empty overlay leaves the base object as it is.
+        assert_eq!(
+            merged(Some(base), Some("{}")),
+            Some(r#"{"effort":"max","nested":{"a":1,"b":2},"store":false}"#.to_string())
+        );
+        // With no base config, the overlay alone is sent.
+        assert_eq!(
+            merged(None, Some(r#"{"effort":"low"}"#)),
+            Some(r#"{"effort":"low"}"#.to_string())
+        );
+        assert_eq!(merged(Some(base), None), None);
+    }
+
+    #[test]
+    fn the_compaction_env_sets_the_driver_config_and_keeps_everything_else() {
+        let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
+        let session = vec![
+            pair("MURMUR_INFERENCE_MODEL", "m"),
+            pair("MURMUR_INFERENCE_DRIVER_CONFIG", r#"{"effort":"max"}"#),
+            pair("MURMUR_PEERS", "x"),
+        ];
+        assert_eq!(compaction_inference_env(&session, None), session);
+        assert_eq!(
+            compaction_inference_env(&session, Some(r#"{"effort":"low"}"#)),
+            vec![
+                pair("MURMUR_INFERENCE_MODEL", "m"),
+                pair("MURMUR_INFERENCE_DRIVER_CONFIG", r#"{"effort":"low"}"#),
+                pair("MURMUR_PEERS", "x"),
+            ]
+        );
+        let no_config = vec![pair("MURMUR_INFERENCE_MODEL", "m")];
+        assert_eq!(
+            compaction_inference_env(&no_config, Some(r#"{"effort":"low"}"#)),
+            vec![
+                pair("MURMUR_INFERENCE_MODEL", "m"),
+                pair("MURMUR_INFERENCE_DRIVER_CONFIG", r#"{"effort":"low"}"#),
+            ]
+        );
+    }
+
     // ── End-to-end reopen loop (real Wasmtime hook + real process transport) ──────
 
     /// The committed fixture process driver, staged as this session's. Its toy line format is
@@ -20875,6 +21102,7 @@ inference:
     ) -> HookRuntime {
         let staged_hook = StagedHookArtifact {
             name: "gatekeeper".to_string(),
+            entry: "gatekeeper".to_string(),
             version: "0.0.1".to_string(),
             component: on_task_end_reopen_double(&state.engine, reopen_limit, REOPEN_REASON),
             config: murmur_artifact::HookConfig {
@@ -21322,6 +21550,7 @@ inference:
 
         let staged_hook = StagedHookArtifact {
             name: "gatekeeper".to_string(),
+            entry: "gatekeeper".to_string(),
             version: "0.0.1".to_string(),
             component: reader_double(&state.engine),
             config: murmur_artifact::HookConfig {
@@ -21339,6 +21568,7 @@ inference:
                 state_store: None,
                 state_dir: None,
                 config_json: None,
+                deadline_seconds: None,
             },
             on_overflow: Default::default(),
             gateway: None,
@@ -22004,11 +22234,12 @@ inference:
             driver_name: "mock-driver".to_string(),
             driver_component: driver,
             model: "test-model".to_string(),
-            output_caps: crate::model_limits::HookOutputCaps::new(Default::default(), 1024),
+            output_caps: crate::model_limits::HookOutputCaps::new(Default::default(), 1024, None),
             engine: state.engine.clone(),
             accessible_workdir: workdir.clone(),
             workdir: crate::workdir_fs::WorkdirRoot::open(&workdir.clone()).unwrap(),
             inference_env: Vec::new(),
+            compaction_inference_env: Vec::new(),
             capability_policy: CapabilityPolicy::default(),
             network_allow_rules: Vec::new(),
             driver_grant: None,

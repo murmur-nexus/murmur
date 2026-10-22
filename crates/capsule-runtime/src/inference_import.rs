@@ -89,6 +89,22 @@ pub(crate) struct SpendRefusalRecord {
     pub(crate) refusal: SpendRefusal,
 }
 
+/// What a hook's `run-inference` call is made for, read from the calling hook's store: the
+/// lifecycle event that store is serving when the call arrives.
+///
+/// Kept per store rather than per session because an async hook on another event can call
+/// `run-inference` while a compaction is being dispatched, and that call is not a compaction
+/// call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum HookInferencePurpose {
+    /// Any event but `on-compaction`, and `on-stage`.
+    #[default]
+    Lifecycle,
+    /// `on-compaction`: the call sends `inference.compaction.max_tokens` and runs the driver
+    /// under `inference.compaction.driver_config`.
+    Compaction,
+}
+
 /// Everything the host needs to run one inference-driver call from inside a
 /// hook's wasm call.
 ///
@@ -101,13 +117,18 @@ pub(crate) struct HookInferenceCtx {
     pub(crate) driver_component: Component,
     /// The manifest's primary `inference.model` — what `model: none` resolves to.
     pub(crate) model: String,
-    /// The output cap each completion sends and admits spend against, by the model it calls.
+    /// The output cap each completion sends and admits spend against, by the model it calls and
+    /// what it is called for.
     pub(crate) output_caps: crate::model_limits::HookOutputCaps,
     pub(crate) engine: Engine,
     pub(crate) accessible_workdir: PathBuf,
     /// The session's bookkeeping directory, where a credential failure writes `out/result.txt`.
     pub(crate) workdir: crate::workdir_fs::WorkdirRoot,
     pub(crate) inference_env: Vec<(String, String)>,
+    /// The driver's environment for a [`HookInferencePurpose::Compaction`] call:
+    /// [`Self::inference_env`] with `inference.compaction.driver_config` laid over its
+    /// `MURMUR_INFERENCE_DRIVER_CONFIG`. Equal to it when the manifest sets no overlay.
+    pub(crate) compaction_inference_env: Vec<(String, String)>,
     pub(crate) capability_policy: CapabilityPolicy,
     pub(crate) network_allow_rules: Vec<NetworkAllowRule>,
     /// The driver artifact's own per-artifact narrowing, cloned from the capsule store's
@@ -136,6 +157,7 @@ impl HookInferenceCtx {
     async fn run(
         &self,
         origin: &str,
+        purpose: HookInferencePurpose,
         request: InferenceRequest,
     ) -> Result<InferenceResponse, String> {
         // `none` resolves to the manifest's primary model; `some(m)` is sent
@@ -143,10 +165,11 @@ impl HookInferenceCtx {
         // retry — a caller wanting fallback calls again with `none` itself.
         let messages = wire_messages(&request);
         let model = request.model.unwrap_or_else(|| self.model.clone());
-        // The primary driver's declared ceiling for the model called, ahead of the manifest's
+        // `inference.compaction.max_tokens` for a compaction call when set; otherwise the primary
+        // driver's declared ceiling for the model called, ahead of the manifest's
         // `inference.max_tokens`: that is the *agent turn* output cap, and a small value chosen
         // for the agent loop would silently truncate a compaction summary.
-        let max_output_tokens = self.output_caps.for_model(&model);
+        let max_output_tokens = self.output_caps.for_call(&model, purpose);
         let payload = build_driver_payload(
             &model,
             max_output_tokens,
@@ -180,7 +203,7 @@ impl HookInferenceCtx {
         };
 
         let started = Instant::now();
-        let outcome = self.dispatch(payload_json).await;
+        let outcome = self.dispatch(payload_json, self.env_for(purpose)).await;
         let duration_ms = started.elapsed().as_millis() as u64;
 
         let (output_tokens, usage, failure, result) = match outcome {
@@ -236,6 +259,14 @@ impl HookInferenceCtx {
         result
     }
 
+    /// The driver environment a call made for `purpose` runs under.
+    fn env_for(&self, purpose: HookInferencePurpose) -> &[(String, String)] {
+        match purpose {
+            HookInferencePurpose::Lifecycle => &self.inference_env,
+            HookInferencePurpose::Compaction => &self.compaction_inference_env,
+        }
+    }
+
     /// Dispatch the payload through the shared tool-invocation path and pull the
     /// completion text and the optional `usage` block out of the driver's response.
     /// Returns `(raw, text, usage)`. The failure is boxed because it is far larger than the
@@ -243,12 +274,13 @@ impl HookInferenceCtx {
     async fn dispatch(
         &self,
         payload_json: String,
+        inference_env: &[(String, String)],
     ) -> Result<(String, String, Option<DriverUsage>), Box<HookInferenceFailure>> {
         // The status the gateway receives during this dispatch belongs to this call.
         if let Some(gateway) = &self.gateway {
             gateway.take_upstream_status();
         }
-        let outcome = self.dispatch_driver(payload_json).await;
+        let outcome = self.dispatch_driver(payload_json, inference_env).await;
         let provider_status = self
             .gateway
             .as_ref()
@@ -272,6 +304,7 @@ impl HookInferenceCtx {
     async fn dispatch_driver(
         &self,
         payload_json: String,
+        inference_env: &[(String, String)],
     ) -> Result<(String, String, Option<DriverUsage>), (&'static str, String, Option<DriverUsage>)>
     {
         let result = invoke_tool_component(
@@ -280,7 +313,7 @@ impl HookInferenceCtx {
                 accessible_workdir: &self.accessible_workdir,
                 // A driver is handed no runtime directory.
                 runtime_dir: None,
-                inference_env: &self.inference_env,
+                inference_env,
                 capability_policy: &self.capability_policy,
                 network_allow_rules: &self.network_allow_rules,
                 artifact_grant: self.driver_grant.as_ref(),
@@ -480,12 +513,14 @@ impl InferenceUnavailable {
 /// Register `murmur:runtime/inference@0.4.0#run-inference` on a hook linker.
 ///
 /// `origin` is the `hook:<name>` tag attached to every trace record this hook's
-/// calls produce. `ctx` is `Err` when the capsule has no inference driver a hook
+/// calls produce. `purpose` reads, from the calling store, what the call is made for.
+/// `ctx` is `Err` when the capsule has no inference driver a hook
 /// can call: the import is still *defined* (so a hook that imports it links and
 /// runs), it just always returns the reason's `err`.
 pub(crate) fn add_inference_to_linker<T: 'static>(
     linker: &mut Linker<T>,
     origin: String,
+    purpose: fn(&T) -> HookInferencePurpose,
     ctx: Result<Arc<HookInferenceCtx>, InferenceUnavailable>,
 ) -> Result<(), String> {
     let origin = Arc::new(origin);
@@ -494,7 +529,8 @@ pub(crate) fn add_inference_to_linker<T: 'static>(
         .map_err(|e| format!("failed to define {INFERENCE_IFACE_VERSIONED}: {e}"))?
         .func_wrap_async(
             "run-inference",
-            move |_store: wasmtime::StoreContextMut<'_, T>, (request,): (InferenceRequest,)| {
+            move |store: wasmtime::StoreContextMut<'_, T>, (request,): (InferenceRequest,)| {
+                let purpose = purpose(store.data());
                 let ctx = ctx.clone();
                 let origin = Arc::clone(&origin);
                 let fut: Box<
@@ -503,7 +539,7 @@ pub(crate) fn add_inference_to_linker<T: 'static>(
                         > + Send,
                 > = Box::new(async move {
                     let result = match ctx {
-                        Ok(ctx) => ctx.run(&origin, request).await,
+                        Ok(ctx) => ctx.run(&origin, purpose, request).await,
                         Err(reason) => Err(reason.message().to_string()),
                     };
                     Ok((result,))
@@ -817,6 +853,24 @@ mod tests {
     const DECLARED_CAP: u32 = 1_048_576;
     /// The primary choice's resolved cap, what a model the table does not list gets.
     const PRIMARY_CAP: u32 = 4096;
+    const LIFECYCLE: HookInferencePurpose = HookInferencePurpose::Lifecycle;
+    const COMPACTION: HookInferencePurpose = HookInferencePurpose::Compaction;
+
+    /// [`ctx_with_spend`]'s primary driver table and cap, with `compaction` as
+    /// `inference.compaction.max_tokens`.
+    fn output_caps(compaction: Option<u32>) -> crate::model_limits::HookOutputCaps {
+        crate::model_limits::HookOutputCaps::new(
+            std::collections::BTreeMap::from([(
+                DECLARED_MODEL.to_string(),
+                murmur_artifact::ModelLimits {
+                    max_output_tokens: DECLARED_CAP,
+                    context_window: 2_000_000,
+                },
+            )]),
+            PRIMARY_CAP,
+            compaction,
+        )
+    }
 
     fn ctx(engine: &Engine, workdir: &std::path::Path, driver: Component) -> HookInferenceCtx {
         ctx_with_spend(engine, workdir, driver, Arc::new(SpendMeter::unlimited()))
@@ -832,20 +886,12 @@ mod tests {
             driver_name: "mock-driver".to_string(),
             driver_component: driver,
             model: "manifest-model".to_string(),
-            output_caps: crate::model_limits::HookOutputCaps::new(
-                std::collections::BTreeMap::from([(
-                    DECLARED_MODEL.to_string(),
-                    murmur_artifact::ModelLimits {
-                        max_output_tokens: DECLARED_CAP,
-                        context_window: 2_000_000,
-                    },
-                )]),
-                PRIMARY_CAP,
-            ),
+            output_caps: output_caps(None),
             engine: engine.clone(),
             accessible_workdir: workdir.to_path_buf(),
             workdir: crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             inference_env: Vec::new(),
+            compaction_inference_env: Vec::new(),
             capability_policy: CapabilityPolicy::default(),
             network_allow_rules: Vec::new(),
             driver_grant: None,
@@ -901,7 +947,7 @@ mod tests {
         let engine = engine();
         let ctx = ctx(&engine, dir.path(), driver_double(&engine, 0, CANNED));
 
-        let resp = block_on(ctx.run("hook:test", request(None)))
+        let resp = block_on(ctx.run("hook:test", LIFECYCLE, request(None)))
             .expect("the driver double returns a well-formed completion");
 
         assert_eq!(resp.text, "compacted summary");
@@ -929,6 +975,7 @@ mod tests {
 
         let resp = block_on(ctx.run(
             "hook:test",
+            LIFECYCLE,
             request(Some("override-model-with-longer-name")),
         ))
         .expect("override model still completes against the double");
@@ -962,7 +1009,7 @@ mod tests {
         );
         let ctx = ctx(&engine, dir.path(), driver);
 
-        let err = block_on(ctx.run("hook:test", request(Some("nope"))))
+        let err = block_on(ctx.run("hook:test", LIFECYCLE, request(Some("nope"))))
             .expect_err("a driver-reported error must not be swallowed");
         assert!(err.contains("unknown model: nope"), "got: {err}");
 
@@ -1068,7 +1115,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let engine = engine();
         let ctx = ctx(&engine, dir.path(), driver_double(&engine, 0, CANNED));
-        let declared = block_on(ctx.run("hook:compact", request(Some(DECLARED_MODEL)))).unwrap();
+        let declared =
+            block_on(ctx.run("hook:compact", LIFECYCLE, request(Some(DECLARED_MODEL)))).unwrap();
         assert_eq!(
             declared.input_tokens,
             expected_input_tokens_at(DECLARED_MODEL, DECLARED_CAP)
@@ -1078,7 +1126,7 @@ mod tests {
             expected_input_tokens_at(DECLARED_MODEL, PRIMARY_CAP),
             "the two caps must tokenize differently for this test to discriminate"
         );
-        let unlisted = block_on(ctx.run("hook:compact", request(None))).unwrap();
+        let unlisted = block_on(ctx.run("hook:compact", LIFECYCLE, request(None))).unwrap();
         assert_eq!(
             unlisted.input_tokens,
             expected_input_tokens_at("manifest-model", PRIMARY_CAP)
@@ -1091,10 +1139,86 @@ mod tests {
             driver_double(&engine, 0, CANNED),
             Arc::clone(&meter),
         );
-        block_on(ctx.run("hook:compact", request(None))).expect("4096 fits under the ceiling");
-        let err = block_on(ctx.run("hook:compact", request(Some(DECLARED_MODEL))))
+        block_on(ctx.run("hook:compact", LIFECYCLE, request(None)))
+            .expect("4096 fits under the ceiling");
+        let err = block_on(ctx.run("hook:compact", LIFECYCLE, request(Some(DECLARED_MODEL))))
             .expect_err("the declared ceiling does not");
         assert!(err.starts_with("spend ceiling reached"), "{err}");
+    }
+
+    /// A call made for `on-compaction` sends `inference.compaction.max_tokens` and admits spend
+    /// against it, on any model; every other call keeps the table ceiling else the primary cap.
+    /// With the key unset, a compaction call caps as any other does.
+    #[test]
+    fn run_inference_for_compaction_caps_at_the_compaction_cap() {
+        const COMPACTION_CAP: u32 = 2000;
+        let dir = TempDir::new().unwrap();
+        let engine = engine();
+        let mut ctx = ctx(&engine, dir.path(), driver_double(&engine, 0, CANNED));
+        ctx.output_caps = output_caps(Some(COMPACTION_CAP));
+        for (purpose, model, cap) in [
+            (COMPACTION, DECLARED_MODEL, COMPACTION_CAP),
+            (COMPACTION, "manifest-model", COMPACTION_CAP),
+            (LIFECYCLE, DECLARED_MODEL, DECLARED_CAP),
+            (LIFECYCLE, "manifest-model", PRIMARY_CAP),
+        ] {
+            let resp = block_on(ctx.run("hook:compact", purpose, request(Some(model)))).unwrap();
+            assert_eq!(
+                resp.input_tokens,
+                expected_input_tokens_at(model, cap),
+                "{purpose:?} on {model}"
+            );
+        }
+        assert_ne!(
+            expected_input_tokens_at(DECLARED_MODEL, COMPACTION_CAP),
+            expected_input_tokens_at(DECLARED_MODEL, DECLARED_CAP),
+            "the two caps must tokenize differently for this test to discriminate"
+        );
+
+        let unset = self::ctx(&engine, dir.path(), driver_double(&engine, 0, CANNED));
+        let resp =
+            block_on(unset.run("hook:compact", COMPACTION, request(Some(DECLARED_MODEL)))).unwrap();
+        assert_eq!(
+            resp.input_tokens,
+            expected_input_tokens_at(DECLARED_MODEL, DECLARED_CAP)
+        );
+
+        // Spend is reserved at the compaction cap: a ceiling between it and the table ceiling
+        // admits the compaction call and refuses the same call made for any other event.
+        let meter = Arc::new(SpendMeter::new(Some(100_000), None));
+        let mut ctx = ctx_with_spend(
+            &engine,
+            dir.path(),
+            driver_double(&engine, 0, CANNED),
+            Arc::clone(&meter),
+        );
+        ctx.output_caps = output_caps(Some(COMPACTION_CAP));
+        block_on(ctx.run("hook:compact", COMPACTION, request(Some(DECLARED_MODEL))))
+            .expect("the compaction cap fits under the ceiling");
+        let err = block_on(ctx.run("hook:compact", LIFECYCLE, request(Some(DECLARED_MODEL))))
+            .expect_err("the declared ceiling does not");
+        assert!(err.starts_with("spend ceiling reached"), "{err}");
+    }
+
+    /// A compaction call runs the driver under the compaction environment, every other call
+    /// under the session's.
+    #[test]
+    fn run_inference_for_compaction_dispatches_with_the_compaction_env() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine();
+        let mut ctx = ctx(&engine, dir.path(), driver_double(&engine, 0, CANNED));
+        let session = vec![(
+            "MURMUR_INFERENCE_DRIVER_CONFIG".to_string(),
+            r#"{"effort":"max"}"#.to_string(),
+        )];
+        let compaction = vec![(
+            "MURMUR_INFERENCE_DRIVER_CONFIG".to_string(),
+            r#"{"effort":"low"}"#.to_string(),
+        )];
+        ctx.inference_env = session.clone();
+        ctx.compaction_inference_env = compaction.clone();
+        assert_eq!(ctx.env_for(LIFECYCLE), session.as_slice());
+        assert_eq!(ctx.env_for(COMPACTION), compaction.as_slice());
     }
 
     /// A spend ceiling refuses a hook's completion before dispatch — both a ceiling too small for
@@ -1120,7 +1244,7 @@ mod tests {
                 driver_double(&engine, 2, "the driver was invoked"),
                 Arc::clone(&meter),
             );
-            let err = block_on(ctx.run("hook:compact", request(None)))
+            let err = block_on(ctx.run("hook:compact", LIFECYCLE, request(None)))
                 .expect_err("a refused call is an err");
             assert!(
                 err.starts_with("spend ceiling reached: inference.max_session_tokens is"),
@@ -1157,7 +1281,8 @@ mod tests {
         let response = r#"{"stop_reason":"error","error":"HTTP 500: boom"}"#;
         let ctx = ctx(&engine, dir.path(), driver_double(&engine, 2, response));
 
-        let err = block_on(ctx.run("hook:compactor", request(None))).expect_err("an error");
+        let err =
+            block_on(ctx.run("hook:compactor", LIFECYCLE, request(None))).expect_err("an error");
         assert_eq!(
             err,
             format!("inference driver returned an error: {response}")
@@ -1203,7 +1328,7 @@ mod tests {
                 driver_double(&engine, 0, response),
                 Arc::clone(&meter),
             );
-            let resp = block_on(ctx.run("hook:compact", request(None))).unwrap();
+            let resp = block_on(ctx.run("hook:compact", LIFECYCLE, request(None))).unwrap();
             (meter.used(), resp)
         };
 
@@ -1245,7 +1370,7 @@ mod tests {
                 driver_double(&engine, 2, response),
                 Arc::clone(&meter),
             );
-            block_on(ctx.run("hook:compact", request(None))).expect_err("a failed call");
+            block_on(ctx.run("hook:compact", LIFECYCLE, request(None))).expect_err("a failed call");
             meter.used()
         };
 
@@ -1268,8 +1393,8 @@ mod tests {
         let engine = engine();
         let ctx = ctx(&engine, dir.path(), driver_double(&engine, 2, "boom"));
 
-        let err =
-            block_on(ctx.run("hook:test", request(None))).expect_err("status: error must surface");
+        let err = block_on(ctx.run("hook:test", LIFECYCLE, request(None)))
+            .expect_err("status: error must surface");
         assert!(err.contains("boom"), "got: {err}");
         assert_eq!(ctx.drain_records()[0].decision, "error");
     }

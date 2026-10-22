@@ -15,6 +15,9 @@
 //! choice whose model the table does not list draws `W-RUN-009` unless the manifest sets both
 //! keys. With no window, compaction does not run and no seed budget applies for that choice.
 //!
+//! `inference.compaction.max_tokens` is checked here too: above the primary driver's ceiling for
+//! the compaction model it is refused, `E-RUN-054`.
+//!
 //! Staging and `mur doctor` both resolve through [`resolve_model_limits`], so the two never
 //! disagree on a number or on the warning's text. `transport: process` resolves nothing: the
 //! harness owns its model and its output.
@@ -25,6 +28,8 @@ use murmur_artifact::{
     ContextConfig, InferenceConfig, ModelLimits, PRIMARY_DRIVER_CHOICE, W_RUN_009,
 };
 use serde::Serialize;
+
+use crate::inference_import::HookInferencePurpose;
 
 /// Where a limit in force came from, as `session_start` names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -88,7 +93,8 @@ pub struct DriverManifest<'a> {
     pub manifest_yaml: &'a str,
 }
 
-/// Why a launch is refused: `E-RUN-052`.
+/// Why a launch is refused: `E-RUN-052`, or `E-RUN-054` for
+/// [`ModelLimitsError::CompactionCapAboveCeiling`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ModelLimitsError {
     /// A choice has no output cap: its driver's table does not list its model and the manifest
@@ -105,6 +111,18 @@ pub enum ModelLimitsError {
     /// A choice's driver ships a `models:` table that does not parse.
     #[error("driver {driver} ships a malformed models: table: {reason}")]
     MalformedTable { driver: String, reason: String },
+    /// `inference.compaction.max_tokens` exceeds the primary driver's `max_output_tokens` for the
+    /// compaction model.
+    #[error(
+        "inference.compaction.max_tokens ({max_tokens}) is above the output ceiling of \
+         {ceiling} that driver {driver} declares for compaction model '{model}'"
+    )]
+    CompactionCapAboveCeiling {
+        max_tokens: u32,
+        ceiling: u32,
+        model: String,
+        driver: String,
+    },
 }
 
 /// Resolves the output cap and context window of every driver choice `inference` declares, the
@@ -192,7 +210,44 @@ pub fn resolve_model_limits<'a>(
             warning,
         });
     }
+    check_compaction_cap(inference, primary_driver, &tables, &resolved)?;
     Ok(resolved)
+}
+
+/// Refuses an `inference.compaction.max_tokens` above the primary driver's ceiling for the
+/// compaction model: the primary driver serves every compaction call. A model its table does not
+/// list has no ceiling to check against.
+fn check_compaction_cap(
+    inference: &InferenceConfig,
+    primary_driver: &str,
+    tables: &BTreeMap<&str, BTreeMap<String, ModelLimits>>,
+    resolved: &[ChoiceModelLimits],
+) -> Result<(), ModelLimitsError> {
+    let Some(compaction) = inference.compaction.as_ref() else {
+        return Ok(());
+    };
+    let Some(max_tokens) = compaction.max_tokens else {
+        return Ok(());
+    };
+    let model = compaction.model.as_deref().unwrap_or(&inference.model);
+    let Some(declared) = tables
+        .get(primary_driver)
+        .and_then(|table| table.get(model))
+    else {
+        return Ok(());
+    };
+    if max_tokens <= declared.max_output_tokens {
+        return Ok(());
+    }
+    Err(ModelLimitsError::CompactionCapAboveCeiling {
+        max_tokens,
+        ceiling: declared.max_output_tokens,
+        model: model.to_string(),
+        driver: resolved
+            .first()
+            .map(|primary| primary.driver.clone())
+            .unwrap_or_default(),
+    })
 }
 
 /// `W-RUN-009` as staging and `mur doctor` print it, `message` being
@@ -205,28 +260,44 @@ pub fn model_limits_warning_line(message: &str) -> String {
     )
 }
 
-/// The output cap a hook's `run-inference` sends: the primary driver's table entry for the model
+/// The output cap a hook's `run-inference` sends: `inference.compaction.max_tokens` while the hook
+/// serves `on-compaction` and the key is set, else the primary driver's table entry for the model
 /// it calls, else the primary choice's resolved cap. `inference.max_tokens` is an agent-turn cap,
 /// so it reaches a hook completion only through that fallback: a small one never truncates a
-/// compaction summary for a model the table knows.
+/// compaction summary for a model the table knows. A compaction call is capped by its own key
+/// instead, which the operator sets for that call alone.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct HookOutputCaps {
     /// The primary driver's `models:` table.
     table: BTreeMap<String, ModelLimits>,
     /// The primary choice's resolved output cap.
     fallback: u32,
+    /// `inference.compaction.max_tokens`.
+    compaction: Option<u32>,
 }
 
 impl HookOutputCaps {
-    pub(crate) fn new(table: BTreeMap<String, ModelLimits>, fallback: u32) -> Self {
-        Self { table, fallback }
+    pub(crate) fn new(
+        table: BTreeMap<String, ModelLimits>,
+        fallback: u32,
+        compaction: Option<u32>,
+    ) -> Self {
+        Self {
+            table,
+            fallback,
+            compaction,
+        }
     }
 
-    /// The cap a completion on `model` sends and admits spend against.
-    pub(crate) fn for_model(&self, model: &str) -> u32 {
-        self.table
-            .get(model)
-            .map_or(self.fallback, |limits| limits.max_output_tokens)
+    /// The cap a completion on `model` made for `purpose` sends and admits spend against.
+    pub(crate) fn for_call(&self, model: &str, purpose: HookInferencePurpose) -> u32 {
+        match (purpose, self.compaction) {
+            (HookInferencePurpose::Compaction, Some(cap)) => cap,
+            _ => self
+                .table
+                .get(model)
+                .map_or(self.fallback, |limits| limits.max_output_tokens),
+        }
     }
 }
 
@@ -408,10 +479,87 @@ mod tests {
 
     #[test]
     fn a_hook_completion_caps_at_the_table_entry_else_the_primary_cap() {
-        let caps = HookOutputCaps::new(murmur_artifact::parse_model_limits(DRIVER).unwrap(), 4096);
-        assert_eq!(caps.for_model("m"), 65536);
-        assert_eq!(caps.for_model("alt-m"), 1000);
-        assert_eq!(caps.for_model("unknown"), 4096);
+        let table = murmur_artifact::parse_model_limits(DRIVER).unwrap();
+        let lifecycle = HookInferencePurpose::Lifecycle;
+        let compaction = HookInferencePurpose::Compaction;
+        let caps = HookOutputCaps::new(table.clone(), 4096, None);
+        for purpose in [lifecycle, compaction] {
+            assert_eq!(caps.for_call("m", purpose), 65536);
+            assert_eq!(caps.for_call("alt-m", purpose), 1000);
+            assert_eq!(caps.for_call("unknown", purpose), 4096);
+        }
+        let capped = HookOutputCaps::new(table, 4096, Some(2000));
+        assert_eq!(capped.for_call("m", lifecycle), 65536);
+        assert_eq!(capped.for_call("unknown", lifecycle), 4096);
+        assert_eq!(capped.for_call("m", compaction), 2000);
+        assert_eq!(capped.for_call("unknown", compaction), 2000);
+    }
+
+    fn compaction_cap(max_tokens: u32, model_line: &str) -> String {
+        format!("  compaction:\n{model_line}    max_tokens: {max_tokens}\n")
+    }
+
+    #[test]
+    fn a_compaction_cap_above_the_ceiling_is_refused_naming_it() {
+        let refused = resolve(&manifest("m", &compaction_cap(65537, ""), ""));
+        assert_eq!(
+            refused,
+            Err(ModelLimitsError::CompactionCapAboveCeiling {
+                max_tokens: 65537,
+                ceiling: 65536,
+                model: "m".to_string(),
+                driver: "local/drv@0.1.0".to_string(),
+            })
+        );
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            "inference.compaction.max_tokens (65537) is above the output ceiling of 65536 that \
+             driver local/drv@0.1.0 declares for compaction model 'm'"
+        );
+        let at_ceiling = resolve(&manifest("m", &compaction_cap(65536, ""), "")).unwrap();
+        assert_eq!(
+            at_ceiling[0].limits.max_output_tokens, 65536,
+            "the compaction cap leaves the agent-turn cap alone"
+        );
+    }
+
+    #[test]
+    fn the_compaction_model_is_the_one_checked() {
+        let model_line = |model: &str| format!("    model: {model}\n");
+        // alt-m's ceiling is 1000, so a value fine for the primary model is refused for it.
+        assert_eq!(
+            resolve(&manifest(
+                "m",
+                &compaction_cap(2000, &model_line("alt-m")),
+                ""
+            )),
+            Err(ModelLimitsError::CompactionCapAboveCeiling {
+                max_tokens: 2000,
+                ceiling: 1000,
+                model: "alt-m".to_string(),
+                driver: "local/drv@0.1.0".to_string(),
+            })
+        );
+        // ...and a value above the primary model's ceiling passes when compaction uses another.
+        assert!(resolve(&manifest(
+            "alt-m",
+            &compaction_cap(60000, &model_line("m")),
+            ""
+        ))
+        .is_ok());
+        // An unlisted compaction model has no ceiling to check against.
+        assert!(resolve(&manifest(
+            "m",
+            &compaction_cap(u32::MAX, &model_line("unlisted")),
+            ""
+        ))
+        .is_ok());
+        assert!(resolve(&manifest(
+            "M",
+            &format!("  max_tokens: 4096\n{}", compaction_cap(u32::MAX, "")),
+            ""
+        ))
+        .is_ok());
     }
 
     #[test]

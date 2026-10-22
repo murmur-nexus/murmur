@@ -405,6 +405,14 @@ artifacts:
     capabilities:
       filesystem:
         records: true
+
+  # each of its calls may run for up to two minutes
+  - name: murmur/hook-compact
+    version: 1.0.0
+    runtime: hook
+    capabilities:
+      limits:
+        deadline_seconds: 120
 ```
 
 | Key | Type | Required | Description |
@@ -414,6 +422,7 @@ artifacts:
 | `state.store` | string | no | Directory name under `~/.murmur/state/`. Omitted, the capsule name is used. See [Durable state](workdir.md#state-store). |
 | `filesystem.scope` | string | no | A directory of the workdir mounted as the hook's current directory. See the rules below. |
 | `filesystem.records` | bool | no | Mount the session [records directory](workdir.md#records-directory)'s `hooks/` as the hook's current directory, read-write, in place of a `scope`. Default: `false`. Recognized only on a `runtime: hook` entry; declared `true` together with `filesystem.scope`, on any other role, or in the capsule-wide [`capabilities`](#field-capabilities) block, it fails with `E-MAN-003`. |
+| `limits.deadline_seconds` | integer | no | Wall-clock budget for each of this hook's lifecycle calls, in seconds, `on-stage` included. Default: the capsule-wide [`capabilities.limits.deadline_seconds`](#field-capabilities), else 30. Must be > 0. A call past it ends with a message naming this key on this entry. |
 
 Rules:
 
@@ -453,9 +462,10 @@ Rules:
   any role other than `runtime: hook` fails with `E-MAN-003`; declaring it in the capsule-wide
   [`capabilities`](#field-capabilities) block is inert and prints
   [`W-SEC-016`](diagnostics.md#w-sec-016).
-- **Only `network`, `filesystem`, `state`, `task_io` and `conversation` govern a hook.** `shell`,
-  `spawn`, `env`, `limits`, `resources` and `containment` parse here but are capsule-wide concerns
-  the runtime does not apply per-hook; declaring one prints
+- **Only `network`, `filesystem`, `state`, `task_io`, `conversation` and
+  `limits.deadline_seconds` govern a hook.** `shell`, `spawn`, `env`, `limits.memory_bytes`,
+  `limits.table_elements`, `limits.instances`, `resources` and `containment` parse here but are
+  capsule-wide concerns the runtime does not apply per-hook; declaring one prints
   [`W-SEC-006`](diagnostics.md#w-sec-006).
 
 ##### Tool and driver capabilities { #tool-capabilities }
@@ -834,7 +844,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.limits.memory_bytes` | integer | no | Cap on how much memory a component may allocate, in bytes. Default: 536870912 (512 MiB). Must be > 0. |
 | `capabilities.limits.table_elements` | integer | no | Cap on a component's table growth, in elements. Default: 100000. Must be > 0. |
 | `capabilities.limits.instances` | integer | no | Cap on the number of component instances one call may create. Default: 1000. Must be > 0. |
-| `capabilities.limits.deadline_seconds` | integer | no | Wall-clock budget for a single component call, in seconds. Default: 600 for a capsule, tool or driver call; 30 for a hook lifecycle call. An explicit value overrides both defaults, hooks included. Must be > 0. |
+| `capabilities.limits.deadline_seconds` | integer | no | Wall-clock budget for a single component call, in seconds. Default: 600 for a capsule, tool or driver call; 30 for a hook lifecycle call. An explicit value overrides both defaults, hooks included. A hook's own entry can set its deadline ahead of this value — see [Hook capabilities](#hook-capabilities). Must be > 0. |
 | `capabilities.resources.max_processes` | integer | no | `RLIMIT_NPROC` headroom for a native subprocess with no cgroup scope: the account's count at that spawn plus this value, in threads on Linux and processes on macOS. No effect on Linux when the subprocess runs in a cgroup scope, where `cgroup_pids_max` is the bound. Default: 128. Must be > 0. See [`max_processes` by platform](resource-limits.md#max-processes-headroom). |
 | `capabilities.resources.max_open_files` | integer | no | `RLIMIT_NOFILE` hard ceiling on each native subprocess. Default: 1024. Must be > 0. |
 | `capabilities.resources.max_file_size_bytes` | integer | no | `RLIMIT_FSIZE` hard ceiling — largest single file a subprocess may write, in bytes. Default: 4294967296 (4 GiB). Must be > 0. |
@@ -1228,9 +1238,10 @@ These fields are read under `transport: process`:
 | `inference.command` | string | no | The executable to run instead of the one the [process driver](#process-driver)'s `describe()` names. A value containing `/` is used as a path; a bare name is looked up on `PATH`. Invalid for `transport: http`. |
 | `inference.model` | string | no | Model identifier handed to the driver. Omitted, the harness uses its own configured default. |
 
-The `inference.compaction` block parses under either transport but takes effect only under
-`transport: http`; the process transport has no compaction step, so under `transport: process`
-these fields are accepted and inert:
+The `inference.compaction` block takes effect only under `transport: http`; the process transport
+has no compaction step. Under `transport: process`, `threshold`, `model`, `system_prompt`,
+`system_prompt_file` and `dump_summaries` are accepted and inert, and `max_tokens` and
+`driver_config` are refused with "is not valid with transport: process".
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
@@ -1239,6 +1250,8 @@ these fields are accepted and inert:
 | `inference.compaction.system_prompt` | string | no | System prompt override for compaction calls, passed verbatim to the compaction hook. No trimming, length limit or format check. Omitted, the compaction hook picks its own default prompt. Mutually exclusive with `inference.compaction.system_prompt_file`. |
 | `inference.compaction.system_prompt_file` | string | no | Path to a file whose content is passed verbatim as the compaction system prompt. Relative to the manifest directory; read when the session launches. Mutually exclusive with `inference.compaction.system_prompt`. |
 | `inference.compaction.dump_summaries` | bool | no | Default: `false`. When `true`, every committed compaction appends one JSON line to `out/compaction-summaries.jsonl` in the session workdir, recording the verbatim summary text plus token counts. |
+| `inference.compaction.max_tokens` | integer | no | Output cap of every `run-inference` call a hook makes while it serves `on-compaction` — the threshold trigger, [`mur run --resume … --resume-mode compact`](cli.md#mur-run) and a seed's overflow summary — and the amount a [spend ceiling](#inference-max-session-tokens) reserves for each. Default: the cap any other hook call sends, under [Output cap sent](#inference-max-tokens). Must be > 0. A value above the `max_output_tokens` the primary driver's [`models:`](#driver-models) table declares for the compaction model (`inference.compaction.model`, else `inference.model`) refuses the launch with [`E-RUN-054`](diagnostics.md#e-run-054); a model the table does not list takes any value. Invalid for `transport: process`. |
+| `inference.compaction.driver_config` | mapping | no | Laid over [`inference.driver.config`](#inference-config) for the same calls `inference.compaction.max_tokens` caps, and no others. Shallow: each top-level key replaces the same-named key of `inference.driver.config` or is added beside it, and every other key is kept; a nested mapping replaces the whole value. With no `inference.driver.config`, the mapping alone is sent. The driver validates the merged object as it validates `inference.driver.config`, and names it `inference.driver.config` in its refusal. Default: none, so compaction calls get `inference.driver.config` unchanged. A non-mapping value is refused. Invalid for `transport: process`. |
 
 #### `context` { #field-context }
 
@@ -1592,7 +1605,8 @@ own error at request time.
 | Call | Output cap sent |
 |---|---|
 | An agent-loop turn | The cap of the choice serving it. A controller's change to `inference.max_tokens` through the [control surface](control-surface.md) is the cap of every later turn, whatever the choice; until one is made, `GET /control` shows the cap the next turn uses |
-| A hook's `run-inference`: compaction, seed summarization | The `max_output_tokens` the primary driver's table declares for the model the hook calls — its own model, `inference.compaction.model`, or `inference.model`. When the table lists none, the primary choice's cap |
+| A hook's `run-inference` while the hook serves `on-compaction`: the threshold trigger, `mur run --resume … --resume-mode compact`, seed summarization | [`inference.compaction.max_tokens`](#field-inference) when set; otherwise as any other hook's call |
+| Any other hook's `run-inference` | The `max_output_tokens` the primary driver's table declares for the model the hook calls — its own model, `inference.compaction.model`, or `inference.model`. When the table lists none, the primary choice's cap |
 
 The anthropic driver caps extended thinking's `budget_tokens` to `max_tokens - 1`, so lowering
 this value also squeezes a configured thinking budget.
@@ -1774,7 +1788,7 @@ inference:
 | Token counts | The harness's own, as its driver reports them, in the `inference` line's `input_tokens` and `output_tokens` — this transport has no runtime estimate, so `input_tokens_actual` and `output_tokens_actual` stay absent. A driver that reports no usage leaves both counts absent, which is not the same as zero. |
 | Spend ceilings | [`inference.max_session_tokens`](#inference-max-session-tokens) and [`spend.machine_tokens_per_day`](config.md#spend) are enforced against those reported counts. |
 | Hook `run-inference` | Unavailable: a hook's [`run-inference`](wit-interfaces.md#murmurruntimeinference) call returns an error, sends nothing, counts toward no spend ceiling, and writes nothing to the trace. |
-| Compaction | Does not run. `context.max_tokens` and `inference.compaction` parse but are inert under this transport; the harness manages its own context. |
+| Compaction | Does not run. `context.max_tokens` and `inference.compaction` parse but are inert under this transport, except `inference.compaction.max_tokens` and `inference.compaction.driver_config`, which are refused; the harness manages its own context. |
 | Tool refresh | The harness's. [`inference.tool_refresh`](#inference-tool-refresh) is refused with `E-MAN-003`; the tool list is bound once per task. |
 | Context seeding | Does not run. The `context.seed_budget` keys parse but are inert, and a `seed-context` an `on-task-start` hook returns is recorded as a rejected [`context_seed`](observability-schemas.md#context-seed) with `reason: "unsupported_transport"`. |
 | Conversation | The harness's. Murmur keeps no message list and writes no `conversation.jsonl`; it maps each context to the harness's own session id in a [harness session map](workdir.md#harness-session-map), which is what [`lifecycle.conversation: threaded`](#lifecycle-conversation) and [`mur run --resume`](cli.md#mur-run) continue. A session the harness cannot find fails the turn with [`E-RUN-036`](diagnostics.md#e-run-036). |
@@ -1871,7 +1885,7 @@ observability:
 | Failure handling | A hook that returns an error does not abort the agent loop. The error is appended to `logs/hook-<name>.log` in the session's [records directory](workdir.md#records-directory). For an `execution_mode: async` hook it is also recorded as a `hook_dispatch_error` event in `trace.jsonl`, since the log is otherwise the only place it appears. A blocking hook's error is additionally surfaced to the agent loop, which is fatal only for compaction. |
 | Workdir access | A hook sees one directory, and only where its entry in the capsule manifest grants a `filesystem.scope` — see [Hook capabilities](#hook-capabilities). |
 | Reference hook | `murmur/hook-debug` writes one JSON object per event to `workdir/hook-debug.jsonl`. |
-| Call deadline | Each hook lifecycle call gets its own wall-clock budget: `capabilities.limits.deadline_seconds` when the manifest sets it, otherwise 30 seconds — well below the capsule-wide 600-second default, so one wedged hook cannot stall a session for most of ten minutes per event. |
+| Call deadline | Each hook lifecycle call gets its own wall-clock budget: `capabilities.limits.deadline_seconds` on the hook's own `artifacts:` entry, else the capsule-wide `capabilities.limits.deadline_seconds`, else 30 seconds — well below the capsule-wide 600-second default, so one wedged hook cannot stall a session for most of ten minutes per event. Time a hook spends waiting on its own `run-inference` calls counts against it. |
 
 ### Hook contract fields { #hook-contract-fields }
 
