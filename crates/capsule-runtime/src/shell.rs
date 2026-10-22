@@ -155,7 +155,64 @@ pub(crate) struct ShellResult {
     /// normally" and "died for a reason no single limit can be pinned to", which are
     /// deliberately not distinguished here: inventing an attribution is worse than declining one.
     pub(crate) resource_limit_hit: Option<String>,
+    /// Whether anything the command started was still holding its output once it exited, and
+    /// what became of it.
+    pub(crate) output_holders: OutputHolders,
 }
+
+/// What held a shell command's stdout or stderr open after its own process exited.
+///
+/// A command's pipes close only when every process holding a copy has exited or closed it, so a
+/// process the command started in the background without redirecting its output keeps the call's
+/// output open for as long as it runs. [`finish_output`] waits for the pipes for a bounded time
+/// and then decides which of these it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputHolders {
+    /// Both pipes reached EOF; nothing was killed.
+    Closed,
+    /// Processes in the command's process group were still holding its output after
+    /// [`PIPE_DRAIN_AFTER_EXIT`] and were killed with `SIGKILL`.
+    Killed,
+    /// Something outside the command's process group still held its output
+    /// [`LEFTOVER_KILL_WAIT`] after the kill. The result has what was read before the call
+    /// returned; the holder runs until the session ends and kills it.
+    Escaped,
+}
+
+impl OutputHolders {
+    /// The runtime note telling the model what happened to the holders, or `None` when there
+    /// were none. One line of fixed text, so it never grows with the command's output.
+    pub(crate) fn note(self) -> Option<String> {
+        const REDIRECT: &str = "A process meant to keep running in the background needs its \
+            output redirected away from the call, e.g. `server >server.log 2>&1 &`.";
+        match self {
+            Self::Closed => None,
+            Self::Killed => Some(format!(
+                "The command exited, but processes it started were still holding its output \
+                 after the wait and were killed. {REDIRECT}"
+            )),
+            Self::Escaped => Some(format!(
+                "The command exited, but processes it started outside its process group still \
+                 hold its output; the result has what was read before the call returned, and \
+                 those processes keep running until the session ends. {REDIRECT}"
+            )),
+        }
+    }
+}
+
+/// How long a shell call waits, once the command's own process has exited, for its stdout and
+/// stderr to close before it kills what is still holding them.
+///
+/// Background work that finishes and prints inside this window is returned as part of the
+/// call's output.
+const PIPE_DRAIN_AFTER_EXIT: Duration = Duration::from_secs(1);
+
+/// How long a shell call keeps killing its process group and waiting for its pipes to close
+/// after [`PIPE_DRAIN_AFTER_EXIT`], before it returns with the pipes still held.
+pub(crate) const LEFTOVER_KILL_WAIT: Duration = Duration::from_secs(2);
+
+/// How often [`OutputReaders`] is checked for EOF while a call waits on its pipes.
+const PIPE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Why [`execute_shell`] produced no result.
 ///
@@ -321,6 +378,13 @@ const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Run a shell command, demoting it to the background if it outruns `detach`'s grace period.
 ///
+/// The command starts as the leader of a new process group, with `/dev/null` as its stdin. Once
+/// its own process has exited, the call waits at most [`PIPE_DRAIN_AFTER_EXIT`] — never past the
+/// grace deadline — for its stdout and stderr to close, then kills every process still in that
+/// group and waits at most [`LEFTOVER_KILL_WAIT`] more; see [`finish_output`]. A background
+/// process whose output is redirected away from the call holds neither pipe, so it never triggers
+/// the kill, but the kill takes the whole group, it included, when anything else in it does.
+///
 /// With `detach: None` the child is waited for with a plain blocking wait and nothing is polled —
 /// the path `plan.rs` and the script-capsule store state take, because neither runs a task loop
 /// and so neither has anywhere to deliver a completion.
@@ -349,6 +413,8 @@ pub(crate) fn run_shell(
     enforcement: &crate::sandbox::ShellEnforcement,
     detach: Option<DetachPolicy>,
 ) -> Result<ShellOutcome, ShellExecError> {
+    use std::os::unix::process::CommandExt as _;
+
     if !policy.shell_allow.iter().any(|allowed| allowed == binary) {
         return Err(ShellExecError::Failed(format!(
             "binary '{binary}' is not in capabilities.shell.allow"
@@ -379,8 +445,14 @@ pub(crate) fn run_shell(
         .current_dir(accessible_workdir.path())
         .env_clear()
         .envs(env)
+        // A command in its own process group that read `mur`'s terminal would be stopped by
+        // `SIGTTIN`, and under process transport `mur`'s stdin is a protocol pipe.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Its own group, so what it leaves holding its pipes can be killed without touching
+        // anything an earlier call started. std calls `setpgid` before any `pre_exec` closure.
+        .process_group(0);
 
     // Fail-closed: if kernel enforcement setup fails unexpectedly, propagate the error and
     // never call `.spawn()` at all — no code path here lets a Linux host silently run this
@@ -415,6 +487,8 @@ pub(crate) fn run_shell(
             ))
         }
     };
+    // The child is its group's leader, so its pid names the group.
+    let pgid = child.id() as i32;
 
     // `wait_with_output` reads both pipes and waits in one uninterruptible step, so it cannot be
     // given a deadline. Draining each pipe on its own thread separates reading from waiting,
@@ -426,13 +500,21 @@ pub(crate) fn run_shell(
     let records_root = enforcement.records_root();
     let detach = detach.filter(|_| records_root.is_some());
 
-    let status = match &detach {
-        None => child.wait().map_err(|error| error.to_string())?,
+    let (status, drain_deadline) = match &detach {
+        None => {
+            let status = child.wait().map_err(|error| error.to_string())?;
+            (status, Instant::now() + PIPE_DRAIN_AFTER_EXIT)
+        }
         Some(policy) => {
             let deadline = started + policy.grace;
             loop {
                 match child.try_wait().map_err(|error| error.to_string())? {
-                    Some(status) => break status,
+                    Some(status) => {
+                        break (
+                            status,
+                            (Instant::now() + PIPE_DRAIN_AFTER_EXIT).min(deadline),
+                        )
+                    }
                     None => {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         // A caller that stopped waiting gets the same demotion the deadline
@@ -455,6 +537,7 @@ pub(crate) fn run_shell(
                                     resolved_binary,
                                     args: args.iter().map(|arg| (*arg).to_string()).collect(),
                                     started,
+                                    pgid,
                                     cgroup_scope: enforcement.cgroup_scope.clone(),
                                     cgroup_counters_before,
                                     cgroup_occupancy,
@@ -467,9 +550,11 @@ pub(crate) fn run_shell(
             }
         }
     };
-    let (stdout_bytes, stderr_bytes) = readers.join();
+    let (stdout_bytes, stderr_bytes, output_holders) = finish_output(readers, pgid, drain_deadline);
     let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
+    // After `finish_output`, so forks refused while the holders were still running are in the
+    // delta.
     let resource_limit_hit = classify_resource_limit(
         &status,
         enforcement.cgroup_scope.as_deref(),
@@ -518,6 +603,7 @@ pub(crate) fn run_shell(
         truncated,
         full_output_path,
         resource_limit_hit,
+        output_holders,
     }))
 }
 
@@ -560,43 +646,157 @@ pub(crate) fn execute_shell(
 /// Both must be running before the child is waited for: a child writing more than a pipe buffer
 /// holds while nobody reads deadlocks, which is the reason `wait_with_output` reads and waits
 /// together in the first place.
+///
+/// Each thread appends what it reads to a buffer the call can take at any time, so the call can
+/// stop waiting for EOF without joining: a process the command left behind can hold a pipe open
+/// for as long as it runs.
 struct OutputReaders {
-    stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
-    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+    stdout: Option<PipeReader>,
+    stderr: Option<PipeReader>,
+}
+
+/// One pipe's reading thread and the bytes it has stored.
+struct PipeReader {
+    thread: std::thread::JoinHandle<()>,
+    /// What the thread has read so far. `None` once [`OutputReaders::take`] has taken it, after
+    /// which the thread keeps reading to EOF and stores nothing, so a holder that writes forever
+    /// neither costs memory nor gets `SIGPIPE`.
+    stored: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+}
+
+impl PipeReader {
+    fn spawn(mut pipe: impl std::io::Read + Send + 'static) -> Self {
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+        let thread = {
+            let stored = std::sync::Arc::clone(&stored);
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            let mut stored = stored
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if let Some(buffer) = stored.as_mut() {
+                                buffer.extend_from_slice(&chunk[..read]);
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        // A read error loses whatever was not yet read and keeps what was; there
+                        // is no better outcome available, and failing the whole call over it
+                        // would throw away the command's exit status too.
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        Self { thread, stored }
+    }
+
+    /// The bytes stored so far, leaving the thread to discard the rest. A thread that panicked
+    /// yields empty bytes.
+    fn take(self) -> Vec<u8> {
+        let taken = self
+            .stored
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        if self.thread.is_finished() && self.thread.join().is_err() {
+            return Vec::new();
+        }
+        taken
+    }
 }
 
 impl OutputReaders {
     fn spawn(child: &mut std::process::Child) -> Self {
-        fn drain(
-            pipe: Option<impl std::io::Read + Send + 'static>,
-        ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
-            let mut pipe = pipe?;
-            Some(std::thread::spawn(move || {
-                let mut buffer = Vec::new();
-                // A read error loses whatever was not yet read and keeps what was; there is no
-                // better outcome available, and failing the whole call over it would throw away
-                // the command's exit status too.
-                let _ = pipe.read_to_end(&mut buffer);
-                buffer
-            }))
-        }
-
         Self {
-            stdout: drain(child.stdout.take()),
-            stderr: drain(child.stderr.take()),
+            stdout: child.stdout.take().map(PipeReader::spawn),
+            stderr: child.stderr.take().map(PipeReader::spawn),
         }
     }
 
-    /// `(stdout, stderr)`, waiting for both pipes to reach EOF. A reader thread that panicked
-    /// yields empty bytes rather than propagating.
-    fn join(self) -> (Vec<u8>, Vec<u8>) {
-        let take = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
-            handle
-                .map(|handle| handle.join().unwrap_or_default())
-                .unwrap_or_default()
-        };
+    /// Whether both pipes have reached EOF (or failed to read).
+    fn at_eof(&self) -> bool {
+        [&self.stdout, &self.stderr]
+            .into_iter()
+            .flatten()
+            .all(|reader| reader.thread.is_finished())
+    }
+
+    /// Wait until both pipes reach EOF or `deadline` passes, whichever is first. `true` when they
+    /// reached EOF.
+    fn wait_for_eof(&self, deadline: Instant) -> bool {
+        loop {
+            if self.at_eof() {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            std::thread::sleep(remaining.min(PIPE_POLL_INTERVAL));
+        }
+    }
+
+    /// `(stdout, stderr)` as read so far, without waiting. A thread still reading keeps reading
+    /// to EOF and stores nothing more.
+    fn take(self) -> (Vec<u8>, Vec<u8>) {
+        let take = |reader: Option<PipeReader>| reader.map(PipeReader::take).unwrap_or_default();
         (take(self.stdout), take(self.stderr))
     }
+}
+
+/// `(stdout, stderr)` of a command whose own process has exited, and what was left holding them.
+///
+/// Waits for both pipes until `drain_deadline`. If they are still open then, signals the
+/// command's process group `pgid` with `SIGKILL` until the group is gone, and waits for the pipes
+/// at most [`LEFTOVER_KILL_WAIT`] more. Signalling stops at the first `kill` that fails: the
+/// group's number stays reserved only while the group has members, so once it is gone the number
+/// may name an unrelated group. A holder that left the group (`setsid`, `setpgid`) is beyond this
+/// kill; its pipe is given up on and the session's end kills it.
+fn finish_output(
+    readers: OutputReaders,
+    pgid: i32,
+    drain_deadline: Instant,
+) -> (Vec<u8>, Vec<u8>, OutputHolders) {
+    if readers.wait_for_eof(drain_deadline) {
+        let (stdout, stderr) = readers.take();
+        return (stdout, stderr, OutputHolders::Closed);
+    }
+
+    let give_up = Instant::now() + LEFTOVER_KILL_WAIT;
+    let mut group_alive = true;
+    let mut killed = false;
+    let closed = loop {
+        if group_alive {
+            // Refuses a `pgid` of 0 or 1, which would name `mur`'s own group or every process.
+            if crate::formation_launch::signal_group(i64::from(pgid), libc::SIGKILL) {
+                killed = true;
+            } else {
+                group_alive = false;
+            }
+        }
+        if readers.at_eof() {
+            break true;
+        }
+        let remaining = give_up.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break false;
+        }
+        std::thread::sleep(remaining.min(PIPE_POLL_INTERVAL));
+    };
+
+    let (stdout, stderr) = readers.take();
+    let holders = match (closed, killed) {
+        (true, true) => OutputHolders::Killed,
+        // The pipes closed on their own just after a zero-length window.
+        (true, false) => OutputHolders::Closed,
+        (false, _) => OutputHolders::Escaped,
+    };
+    (stdout, stderr, holders)
 }
 
 /// Everything the background thread needs to describe the command it is finishing.
@@ -612,6 +812,9 @@ struct DemotionContext {
     resolved_binary: String,
     args: Vec<String>,
     started: Instant,
+    /// The command's process group, which [`finish_output`] kills if it is still holding the
+    /// command's output after it exits.
+    pgid: i32,
     cgroup_scope: Option<std::sync::Arc<crate::cgroup::CgroupScope>>,
     cgroup_counters_before: Option<crate::cgroup::CgroupEventCounters>,
     /// The command's stay in the scope, held on the background thread until it exits.
@@ -622,6 +825,11 @@ struct DemotionContext {
 ///
 /// The work is registered before this returns, so the session-end sweep can never miss work that
 /// finished being registered after it looked.
+///
+/// The thread finishes the output the way a foreground call does: once the command's process has
+/// exited, [`finish_output`] waits at most [`PIPE_DRAIN_AFTER_EXIT`] for its pipes and then kills
+/// what is still holding them, so the completion arrives even when the command left background
+/// processes writing to its output.
 fn demote(
     mut child: std::process::Child,
     readers: OutputReaders,
@@ -670,6 +878,7 @@ fn demote(
         resolved_binary,
         args,
         started,
+        pgid,
         cgroup_scope,
         cgroup_counters_before,
         cgroup_occupancy,
@@ -677,7 +886,8 @@ fn demote(
 
     std::thread::spawn(move || {
         let waited = child.wait();
-        let (stdout_bytes, stderr_bytes) = readers.join();
+        let (stdout_bytes, stderr_bytes, output_holders) =
+            finish_output(readers, pgid, Instant::now() + PIPE_DRAIN_AFTER_EXIT);
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
         let (exit_code, resource_limit, mut error) = match waited {
@@ -734,6 +944,7 @@ fn demote(
                 output_path: log.path,
                 output_bytes,
                 resource_limit,
+                output_holders,
                 context_id: policy.context_id.clone(),
                 provenance,
                 error,
@@ -1049,6 +1260,7 @@ mod tests {
     use std::{fs, path::Path};
     use tempfile::tempdir;
 
+    use super::test_support::{process_dead_within, read_pid, KillPidFileOnDrop};
     use super::*;
     use crate::sandbox::ShellEnforcement;
 
@@ -2265,6 +2477,234 @@ mod tests {
         );
     }
 
+    /// `run` on a thread of its own, failing the test after 30 s instead of hanging it.
+    fn returns_within_30_s<T: Send + 'static>(run: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(run());
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("the shell call did not return within 30 s"))
+    }
+
+    /// A command that exits while a process it started in the background still holds its stdout
+    /// returns well inside its grace period, and the holder is killed.
+    #[test]
+    fn a_background_holder_does_not_hold_a_graced_call() {
+        use std::sync::Arc;
+
+        use crate::{
+            detached::{DetachPolicy, DetachedRegistry},
+            origin::{TaskOrigin, TaskProvenance},
+        };
+
+        let temp = tempdir().unwrap();
+        let runtime = tempdir().unwrap();
+        let _sleeper = KillPidFileOnDrop(temp.path().join("sleeper.pid"));
+        let workdir = temp.path().to_path_buf();
+        let runtime_base = runtime.path().to_path_buf();
+        let script = "sleep 300 & echo $! > sleeper.pid; echo started";
+
+        let started = Instant::now();
+        let outcome = returns_within_30_s(move || {
+            let (registry, _reports) = DetachedRegistry::new();
+            run_shell(
+                "bash",
+                &["-c", script],
+                &[],
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+                &CapabilityPolicy {
+                    shell_allow: vec!["bash".to_string()],
+                    ..CapabilityPolicy::default()
+                },
+                &ShellEnforcement::environment_only()
+                    .with_runtime_dir(crate::sandbox::test_runtime_dir(&runtime_base), None),
+                Some(DetachPolicy {
+                    grace: Duration::from_secs(5),
+                    delivered: true,
+                    registry: Arc::clone(&registry),
+                    command: script.to_string(),
+                    context_id: "ctx_holder_test".to_string(),
+                    provenance: Some(TaskProvenance::derive(TaskOrigin::User, None)),
+                    abandoned: None,
+                }),
+            )
+            .expect("a declared binary runs")
+        });
+        let elapsed = started.elapsed();
+
+        let ShellOutcome::Finished(result) = outcome else {
+            panic!("a command that exits at once must finish, got {outcome:?}");
+        };
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the call took {elapsed:?}, past its 5 s grace"
+        );
+        assert!(result.stdout.contains("started"), "{result:?}");
+        assert_eq!(result.exit_code, 0, "{result:?}");
+        let sleeper = read_pid(&temp.path().join("sleeper.pid"));
+        assert!(
+            process_dead_within(sleeper, Duration::from_secs(2)),
+            "the background sleeper {sleeper} is still running"
+        );
+    }
+
+    /// The same holder on the path with no grace period, which plan shell steps and the
+    /// script-capsule store state take.
+    #[test]
+    fn a_background_holder_does_not_hold_an_ungraced_call() {
+        let temp = tempdir().unwrap();
+        let _sleeper = KillPidFileOnDrop(temp.path().join("sleeper.pid"));
+        let workdir = temp.path().to_path_buf();
+
+        let started = Instant::now();
+        let result = returns_within_30_s(move || {
+            execute_shell(
+                "bash",
+                &["-c", "sleep 300 & echo $! > sleeper.pid; echo started"],
+                &[],
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+                &CapabilityPolicy {
+                    shell_allow: vec!["bash".to_string()],
+                    ..CapabilityPolicy::default()
+                },
+                &ShellEnforcement::environment_only(),
+            )
+            .expect("a declared binary runs")
+        });
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the call took {elapsed:?}"
+        );
+        assert!(result.stdout.contains("started"), "{result:?}");
+        assert_eq!(result.exit_code, 0, "{result:?}");
+        let sleeper = read_pid(&temp.path().join("sleeper.pid"));
+        assert!(
+            process_dead_within(sleeper, Duration::from_secs(2)),
+            "the background sleeper {sleeper} is still running"
+        );
+        assert_eq!(result.output_holders, OutputHolders::Killed);
+    }
+
+    /// Background work that prints and exits inside the drain window is part of the output, and
+    /// nothing is killed or reported.
+    #[test]
+    fn output_written_just_after_exit_is_kept() {
+        use std::sync::Arc;
+
+        use crate::{
+            detached::{DetachPolicy, DetachedRegistry},
+            origin::{TaskOrigin, TaskProvenance},
+        };
+
+        let temp = tempdir().unwrap();
+        let runtime = tempdir().unwrap();
+        let (registry, _reports) = DetachedRegistry::new();
+        let script = "(sleep 0.3; echo late) & echo early";
+
+        let outcome = run_shell(
+            "bash",
+            &["-c", script],
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &CapabilityPolicy {
+                shell_allow: vec!["bash".to_string()],
+                ..CapabilityPolicy::default()
+            },
+            &ShellEnforcement::environment_only()
+                .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None),
+            Some(DetachPolicy {
+                grace: Duration::from_secs(5),
+                delivered: true,
+                registry: Arc::clone(&registry),
+                command: script.to_string(),
+                context_id: "ctx_late_output_test".to_string(),
+                provenance: Some(TaskProvenance::derive(TaskOrigin::User, None)),
+                abandoned: None,
+            }),
+        )
+        .expect("a declared binary runs");
+
+        let ShellOutcome::Finished(result) = outcome else {
+            panic!("a command that exits at once must finish, got {outcome:?}");
+        };
+        assert!(result.stdout.contains("early"), "{result:?}");
+        assert!(result.stdout.contains("late"), "{result:?}");
+        assert_eq!(result.output_holders, OutputHolders::Closed);
+        assert!(OutputHolders::Closed.note().is_none());
+    }
+
+    /// A holder that left the command's process group cannot be killed by the call. The call
+    /// returns anyway, with what it read, and says the holder is still running.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_holder_outside_the_process_group_is_reported_not_waited_for() {
+        use std::sync::Arc;
+
+        use crate::{
+            detached::{DetachPolicy, DetachedRegistry},
+            origin::{TaskOrigin, TaskProvenance},
+        };
+
+        let temp = tempdir().unwrap();
+        let runtime = tempdir().unwrap();
+        let pid_file = temp.path().join("escaped.pid");
+        let escaped_guard = KillPidFileOnDrop(pid_file.clone());
+        let workdir = temp.path().to_path_buf();
+        let runtime_base = runtime.path().to_path_buf();
+        let script = "setsid sleep 300 & echo $! > escaped.pid; echo started";
+
+        let started = Instant::now();
+        let outcome = returns_within_30_s(move || {
+            let (registry, _reports) = DetachedRegistry::new();
+            run_shell(
+                "bash",
+                &["-c", script],
+                &[],
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+                &CapabilityPolicy {
+                    shell_allow: vec!["bash".to_string()],
+                    ..CapabilityPolicy::default()
+                },
+                &ShellEnforcement::environment_only()
+                    .with_runtime_dir(crate::sandbox::test_runtime_dir(&runtime_base), None),
+                Some(DetachPolicy {
+                    grace: Duration::from_secs(5),
+                    delivered: true,
+                    registry: Arc::clone(&registry),
+                    command: script.to_string(),
+                    context_id: "ctx_escaped_test".to_string(),
+                    provenance: Some(TaskProvenance::derive(TaskOrigin::User, None)),
+                    abandoned: None,
+                }),
+            )
+            .expect("a declared binary runs")
+        });
+        let elapsed = started.elapsed();
+
+        let ShellOutcome::Finished(result) = outcome else {
+            panic!("a command that exits at once must finish, got {outcome:?}");
+        };
+        let bound = Duration::from_secs(5) + LEFTOVER_KILL_WAIT + Duration::from_secs(2);
+        assert!(elapsed < bound, "the call took {elapsed:?}, past {bound:?}");
+        assert_eq!(result.stdout.trim(), "started", "{result:?}");
+        assert_eq!(result.output_holders, OutputHolders::Escaped);
+        let escaped = read_pid(&pid_file);
+        assert!(
+            !process_dead_within(escaped, Duration::ZERO),
+            "a holder outside the process group is not the call's to kill"
+        );
+        drop(escaped_guard);
+        assert!(process_dead_within(escaped, Duration::from_secs(2)));
+    }
+
     #[test]
     fn a_shared_window_attributes_no_cgroup_delta() {
         assert_eq!(
@@ -2472,6 +2912,62 @@ mod tests {
     fn the_env_baseline_names_no_temp_variable() {
         for name in crate::temp_dir::TEMP_DIR_ENV {
             assert!(!DEFAULT_ENV_BASELINE.contains(&name), "{name}");
+        }
+    }
+}
+
+/// Helpers for tests whose command leaves a process behind and writes its pid to a file.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    /// The pid the test's command wrote to `pid_file`.
+    pub(crate) fn read_pid(pid_file: &Path) -> u32 {
+        std::fs::read_to_string(pid_file)
+            .expect("the command wrote its pid file")
+            .trim()
+            .parse()
+            .expect("the pid file holds a pid")
+    }
+
+    /// Whether `pid` has exited within `timeout`: it is gone, or a zombie whichever process it
+    /// was orphaned to has not reaped yet.
+    pub(crate) fn process_dead_within(pid: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !crate::running::pid_is_alive(pid) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Kills the process whose pid the test's command wrote to the file, if it is still running
+    /// when the guard drops, so a failing test leaves nothing behind. It reads the file at drop,
+    /// so it also covers a test that panicked before reading it.
+    pub(crate) struct KillPidFileOnDrop(pub(crate) PathBuf);
+
+    impl Drop for KillPidFileOnDrop {
+        fn drop(&mut self) {
+            let Some(pid) = std::fs::read_to_string(&self.0)
+                .ok()
+                .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+                .filter(|pid| *pid > 0)
+            else {
+                return;
+            };
+            if !process_dead_within(pid.unsigned_abs(), Duration::ZERO) {
+                // SAFETY: `kill` takes two integers and dereferences nothing. `pid` is positive,
+                // so it names one process, never a group or every process.
+                #[allow(unsafe_code)]
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
         }
     }
 }

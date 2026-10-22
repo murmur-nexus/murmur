@@ -384,6 +384,11 @@ mur run --manifest murmur.yaml --task "$PREAMBLE"' The process cap is 32, so thi
 - the shell reports `fork: retry: Resource temporarily unavailable` (`EAGAIN`) — the cgroup's
   `pids.max` refusing the fork. `mur` sets no `RLIMIT_NPROC` on a subprocess in a cgroup scope, so
   the subprocess runs with the value `mur` inherited and `max_processes` plays no part;
+- the shell call returns to the model within seconds of the shell exiting, naming
+  `cgroup_pids_max` and saying the processes still holding its output were killed — see
+  [the shell output wait](manifest.md#shell-output-holders);
+- the stragglers are dead once the call returns: the scope's `pids.current` drops back and the
+  next shell command runs;
 - the trace names the limit, read as in [Reading a session's trace](#reading-the-trace):
 
 ```bash
