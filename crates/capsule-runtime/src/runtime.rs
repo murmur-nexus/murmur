@@ -21711,7 +21711,7 @@ inference:
     fn apply_decline_overrides_only_a_completed_attempt() {
         let completed = agent::AttemptEnding {
             state: TaskState::Completed,
-            message: "session ended".to_string(),
+            message: "task completed".to_string(),
             response: Some("48".to_string()),
             no_answer: false,
         };

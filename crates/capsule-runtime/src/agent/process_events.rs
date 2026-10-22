@@ -2267,7 +2267,7 @@ mod tests {
         let ending = h.a2a.ending(&Ok(crate::agent::AgentLoopExit::Ok));
         assert_eq!(ending.state, crate::a2a::TaskState::Completed);
         assert_eq!(ending.response.as_deref(), Some("the answer"));
-        assert_eq!(ending.message, "session ended");
+        assert_eq!(ending.message, "task completed");
         assert!(
             data_of(&h.frames(), "status")
                 .iter()

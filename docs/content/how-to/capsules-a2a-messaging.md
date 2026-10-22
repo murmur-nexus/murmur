@@ -361,7 +361,7 @@ curl -s -X POST http://localhost:$PORT \
                 "contextId": "ctx-001",
                 "taskId": "tsk_019ed5211c827f63a8fe4be623277c55",
                 "role": "ROLE_AGENT",
-                "parts": [{"text": "session ended", "mediaType": "text/plain"}]
+                "parts": [{"text": "task completed", "mediaType": "text/plain"}]
             },
             "timestamp": "2026-10-13T09:00:04.512Z"
         },

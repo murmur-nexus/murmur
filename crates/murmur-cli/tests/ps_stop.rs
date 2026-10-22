@@ -1658,6 +1658,104 @@ fn cancel_ends_a_task_and_stop_ends_the_session() {
     assert_eq!(ps_stdout(home.path()), "no running capsules\n");
 }
 
+/// A capsule that sleeps after its task ends each task `task completed`, and its
+/// `murmur.WatchSession` connection outlives both: only `mur stop`, which ends the process, closes
+/// it.
+#[test]
+fn each_completed_task_says_so_and_only_stop_ends_the_session() {
+    let server = common::ScriptedServer::start(vec![
+        end_turn_response("msg_1", "FIRST-ANSWER"),
+        end_turn_response("msg_2", "SECOND-ANSWER"),
+    ]);
+    let home = driver_home();
+    let capsule = start_agent(&home, &server, "completed-twice");
+    let door = capsule.url();
+
+    let mut watch = common::stream::Watch::open(&door, 0);
+
+    let mut task_ids = Vec::new();
+    for (message_id, answer) in [("m-1", "FIRST-ANSWER"), ("m-2", "SECOND-ANSWER")] {
+        let (_, events) = common::stream::stream_message(
+            &door,
+            None,
+            json!({"message": {
+                "messageId": message_id,
+                "role": "ROLE_USER",
+                "parts": [{"text": "answer once", "mediaType": "text/plain"}]
+            }}),
+            false,
+        );
+        let last = events.last().expect("the task stream wrote events");
+        assert_eq!(last.kind(), "status-update", "{events:#?}");
+        assert_eq!(last.state(), Some("TASK_STATE_COMPLETED"), "{events:#?}");
+        assert_eq!(last.status_text(), Some("task completed"), "{events:#?}");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.artifact_text() == Some(answer)),
+            "{events:#?}"
+        );
+        task_ids.push(last.task_id().unwrap().to_string());
+    }
+
+    for task_id in &task_ids {
+        let task = tasks_get(&door, task_id);
+        assert_eq!(
+            task["result"]["status"]["state"], "TASK_STATE_COMPLETED",
+            "{task}"
+        );
+        assert_eq!(
+            task["result"]["status"]["message"]["parts"][0]["text"], "task completed",
+            "{task}"
+        );
+    }
+
+    let terminal = |watch: &common::stream::Watch| {
+        watch
+            .events
+            .iter()
+            .filter(|event| event.is_terminal_status())
+            .count()
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while terminal(&watch) < 2 && !watch.closed && Instant::now() < deadline {
+        watch.read_until(Duration::from_secs(1), |event| event.is_terminal_status());
+    }
+    assert_eq!(terminal(&watch), 2, "{:#?}", watch.events);
+    // Anything still in flight after the second ending would arrive here.
+    watch.read_until(Duration::from_secs(2), |_| false);
+    assert!(
+        !watch.closed,
+        "a completed task ends its own stream, not the session's"
+    );
+
+    mur(home.path()).args(["stop", "@1"]).assert().success();
+    watch.read_until(Duration::from_secs(60), |_| false);
+    assert!(
+        watch.closed,
+        "the watch connection outlived the capsule process"
+    );
+    for event in watch
+        .events
+        .iter()
+        .filter(|event| event.is_terminal_status())
+    {
+        assert_eq!(event.state(), Some("TASK_STATE_COMPLETED"), "{event:?}");
+        assert_eq!(event.status_text(), Some("task completed"), "{event:?}");
+    }
+    // No status on the session's stream, working or terminal, says anything ended while the
+    // capsule was still running.
+    let texts: Vec<&str> = watch
+        .events
+        .iter()
+        .filter_map(|event| event.status_text())
+        .collect();
+    assert!(
+        texts.iter().all(|text| !text.contains("ended")),
+        "{texts:#?}"
+    );
+}
+
 /// Both commands are listed and their one-line descriptions distinguish task from session.
 #[test]
 fn help_distinguishes_the_task_command_from_the_session_command() {

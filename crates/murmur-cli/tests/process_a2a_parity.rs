@@ -861,6 +861,11 @@ fn text_a_tool_call_and_an_answer_write_the_same_frames() {
             "PARITY-ANSWER",
             "{transport}"
         );
+        assert_eq!(
+            final_status(events)["status"]["message"],
+            "task completed",
+            "{transport}"
+        );
     }
 }
 

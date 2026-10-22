@@ -2102,7 +2102,7 @@ mod tests {
 
         let mut r = running_registry("tsk_2");
         r.finish_task(TaskState::Completed);
-        r.record_ending("tsk_2", "session ended", Some("none came"), false, &below);
+        r.record_ending("tsk_2", "task completed", Some("none came"), false, &below);
         let task = serde_json::to_value(r.get_task("tsk_2").unwrap()).unwrap();
         assert_eq!(
             task["artifacts"],
