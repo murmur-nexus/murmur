@@ -1003,25 +1003,23 @@ fn demote(
 /// Blocks until the child `pid` has exited, leaving it unreaped.
 ///
 /// Until it is reaped the pid stays the child's, so its process group, which it leads, cannot be
-/// taken by an unrelated process while anything signals it.
+/// taken by an unrelated process while anything signals it. `NOWAIT` leaves the child waitable,
+/// so `Child::wait` still reaps it afterwards.
 fn wait_for_exit_unreaped(pid: i32) -> std::io::Result<()> {
-    let Ok(id) = libc::id_t::try_from(pid) else {
-        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
-    };
+    use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+
+    let pid = (pid > 0)
+        .then(|| Pid::from_raw(pid))
+        .flatten()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     loop {
-        // SAFETY: `info` is a plain C struct that `waitid` only writes to, and it outlives the
-        // call. `WNOWAIT` leaves the child waitable, so `Child::wait` still reaps it afterwards.
-        #[allow(unsafe_code)]
-        let result = unsafe {
-            let mut info: libc::siginfo_t = std::mem::zeroed();
-            libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT)
-        };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(errno) => return Err(errno.into()),
         }
     }
 }

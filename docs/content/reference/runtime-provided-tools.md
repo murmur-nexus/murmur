@@ -206,7 +206,7 @@ output_shown: last 16384 bytes
 
 The output, both streams in the order read, follows a blank line. A
 [resource limit](resource-limits.md#which-limit) the command was stopped by, and processes left
-holding its output, are reported in a note after the fence, as on a foreground shell result. A
+holding its output, are reported in a note after the [untrusted fence](untrusted-fence.md), as on a foreground shell result. A
 stopped command has no resource limit attributed.
 
 A work id is valid for the rest of the session that issued it. An id from another session, a

@@ -13299,16 +13299,6 @@ mod tests {
         (state, reports)
     }
 
-    /// Kills every command the registry still runs when dropped, so a failing test leaves
-    /// nothing behind.
-    struct KillDemotedOnDrop(Arc<DetachedRegistry>);
-
-    impl Drop for KillDemotedOnDrop {
-        fn drop(&mut self) {
-            self.0.kill_running();
-        }
-    }
-
     async fn call_tool(
         state: &CapsuleStoreState,
         name: &str,
@@ -13347,7 +13337,7 @@ mod tests {
         let workdir = TempDir::new().unwrap();
         let runtime = TempDir::new().unwrap();
         let (state, _reports) = background_state(workdir.path(), runtime.path());
-        let _guard = KillDemotedOnDrop(Arc::clone(state.detached.as_ref().unwrap()));
+        let _guard = detached::KillRunningOnDrop(Arc::clone(state.detached.as_ref().unwrap()));
 
         let work_id = demote_command(&state, "sleep 30").await;
         let status = call_tool(
@@ -13392,7 +13382,7 @@ mod tests {
         let workdir = TempDir::new().unwrap();
         let runtime = TempDir::new().unwrap();
         let (mut state, _reports) = background_state(workdir.path(), runtime.path());
-        let _guard = KillDemotedOnDrop(Arc::clone(state.detached.as_ref().unwrap()));
+        let _guard = detached::KillRunningOnDrop(Arc::clone(state.detached.as_ref().unwrap()));
         let mut tasks = TaskRegistry::new(4, TaskAcceptance::Queue);
         tasks.enqueue("tsk_wait", "ctx_background");
         state.a2a_task_registry = Some(Arc::new(Mutex::new(tasks)));
@@ -13433,7 +13423,7 @@ mod tests {
         let workdir = TempDir::new().unwrap();
         let runtime = TempDir::new().unwrap();
         let (mut state, _reports) = background_state(workdir.path(), runtime.path());
-        let _guard = KillDemotedOnDrop(Arc::clone(state.detached.as_ref().unwrap()));
+        let _guard = detached::KillRunningOnDrop(Arc::clone(state.detached.as_ref().unwrap()));
         let records = runtime.path().join(crate::records_dir::RECORDS_DIR_NAME);
         state.peer_trace = Some(Arc::new(
             crate::trace::ResourceTraceAppender::open(
@@ -13514,7 +13504,7 @@ mod tests {
         let runtime = TempDir::new().unwrap();
         let (state, mut reports) = background_state(workdir.path(), runtime.path());
         let detached = Arc::clone(state.detached.as_ref().unwrap());
-        let _guard = KillDemotedOnDrop(Arc::clone(&detached));
+        let _guard = detached::KillRunningOnDrop(Arc::clone(&detached));
 
         let read = demote_command(&state, "sleep 1.5").await;
         let unread = demote_command(&state, "sleep 1.5").await;

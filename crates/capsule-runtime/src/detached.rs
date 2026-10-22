@@ -542,8 +542,9 @@ impl DetachedRegistry {
             .map(|entry| entry.phase.subscribe())
     }
 
-    /// Sends `signal` to `work_id`'s process group if its leader is unreaped. `true` when sent.
-    fn signal(&self, work_id: &str, signal: libc::c_int, stopping: bool) -> bool {
+    /// Sends `stop`'s `signal` to `work_id`'s process group if its leader is unreaped, and marks
+    /// the entry stop-requested. `true` when sent.
+    fn signal_stop(&self, work_id: &str, signal: libc::c_int) -> bool {
         let mut entries = self.lock();
         let Some(entry) = entries
             .get_mut(work_id)
@@ -554,7 +555,7 @@ impl DetachedRegistry {
         let sent = crate::formation_launch::signal_group(i64::from(entry.pgid), signal);
         if sent {
             entry.signals_sent += 1;
-            entry.stop_requested |= stopping;
+            entry.stop_requested = true;
         }
         sent
     }
@@ -612,14 +613,14 @@ impl DetachedRegistry {
         let Some(mut phase) = self.phase(work_id) else {
             return false;
         };
-        if self.signal(work_id, libc::SIGTERM, true) {
+        if self.signal_stop(work_id, libc::SIGTERM) {
             let exited = tokio::time::timeout(
                 crate::background_command::STOP_TERM_GRACE,
                 phase.wait_for(|phase| *phase >= Phase::LeaderExited),
             )
             .await;
             if !matches!(exited, Ok(Ok(_))) {
-                self.signal(work_id, libc::SIGKILL, true);
+                self.signal_stop(work_id, libc::SIGKILL);
             }
         }
         let _ = tokio::time::timeout(
@@ -641,6 +642,18 @@ impl DetachedRegistry {
 
 fn millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+/// Kills the process group of every command the registry still runs when dropped, so a failing
+/// test leaves nothing behind.
+#[cfg(test)]
+pub(crate) struct KillRunningOnDrop(pub(crate) Arc<DetachedRegistry>);
+
+#[cfg(test)]
+impl Drop for KillRunningOnDrop {
+    fn drop(&mut self) {
+        self.0.kill_running();
+    }
 }
 
 /// Supplied by a dispatch that is allowed to demote.
@@ -1408,16 +1421,6 @@ mod tests {
     }
 
     // ── background-command: status, wait, stop ──────────────────────────────
-
-    /// Kills the process group of every command `registry` still runs when dropped, so a failing
-    /// test leaves nothing behind.
-    struct KillRunningOnDrop(Arc<DetachedRegistry>);
-
-    impl Drop for KillRunningOnDrop {
-        fn drop(&mut self) {
-            self.0.kill_running();
-        }
-    }
 
     fn demoted(outcome: ShellOutcome) -> DetachedDispatchInfo {
         match outcome {

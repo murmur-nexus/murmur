@@ -611,13 +611,7 @@ fn work_id_in(text: &str) -> Option<String> {
 fn process_gone_within(pid: u32, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let gone = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Err(_) => true,
-            Ok(stat) => stat
-                .rsplit_once(')')
-                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
-        };
-        if gone {
+        if !common::formation::alive(pid) {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -634,10 +628,12 @@ struct KillPidFilesOnDrop(Vec<PathBuf>);
 impl Drop for KillPidFilesOnDrop {
     fn drop(&mut self) {
         for file in &self.0 {
-            if let Ok(pid) = fs::read_to_string(file) {
-                let _ = std::process::Command::new("kill")
-                    .args(["-9", pid.trim()])
-                    .status();
+            if let Some(pid) = fs::read_to_string(file)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+                .filter(|pid| *pid > 1)
+            {
+                common::signal(pid, libc::SIGKILL);
             }
         }
     }

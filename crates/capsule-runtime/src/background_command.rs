@@ -291,7 +291,7 @@ mod tests {
         }
     }
 
-    /// The schema is the one the card fixed, and it parses.
+    /// The schema parses, offers the three operations and requires `operation` and `work_id`.
     #[test]
     fn the_input_schema_names_the_three_operations() {
         let schema: serde_json::Value = serde_json::from_str(INPUT_SCHEMA).unwrap();
