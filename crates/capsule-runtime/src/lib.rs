@@ -15,6 +15,7 @@ pub mod artifact;
 pub mod artifact_config;
 pub(crate) mod artifact_removal;
 pub mod artifact_supply;
+pub mod background_command;
 pub mod bindings;
 pub(crate) mod cancel;
 pub(crate) mod capsule_facts;

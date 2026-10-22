@@ -319,25 +319,32 @@ in is on its `task_start` record and on the task row of `mur trace steps`.
 
 A shell command that runs longer than
 [`lifecycle.shell_grace_secs`](../reference/manifest.md#lifecycle-shell-grace-secs) — 10 seconds
-by default — moves to the background and the turn carries on. The turn receives a handle of the
-form `wrk_<id>`, the fact that the command is still running, and whether its result will reach the
-model, which the lifecycle decides as described below; the command's stdout and stderr
-go to a file under the [capsule workdir](../reference/workdir.md) instead of into the
-conversation, so a long command costs the same handful of tokens whatever it prints.
+by default — moves to the background and the turn carries on. The turn receives a work id of the
+form `wrk_<hex>` and the fact that the command is still running. From then on the command's stdout
+and stderr are written to a log in the session's
+[records directory](../reference/workdir.md#records-directory) as they arrive, instead of into the
+conversation.
 
 Every command starts in the foreground and the clock decides, so the model chooses nothing here
 and a command that finishes inside the grace period returns its output to the turn.
 
-The handle is a label, not an address: nothing accepts a work id, so a capsule cannot spend turns
-asking whether the command is done. When the command finishes, the runtime enqueues a task on the
-capsule itself with origin `completion` under the `contextId` the command was started from, so
-the result rejoins the conversation that asked for it. That task waits in the `bg` lane, behind
-every `user` and `peer` task, and a failure arrives on the same path as a success.
+The work id is an address for the rest of the session. The runtime-provided
+[`background-command`](../reference/runtime-provided-tools.md#background-command) tool takes it
+and returns the command's state, its exit code once it has one, and the last 16 KiB of its output,
+either at once, after waiting up to 600 seconds for it to exit, or after stopping it. A long test
+suite therefore needs no long grace period: the agent waits on the work id, as many times as it
+takes.
 
-Delivery depends on the capsule still being alive. Under the default `after_task: exit` the
-session ends with the task that started the command, and a command still running is recorded as
-`shell_abandoned` — once in `trace.jsonl` and once on stderr — with its result lost. A capsule
-that means to hear back runs `task_acceptance: queue` with `after_task: sleep`.
+How the result can reach the agent:
+
+| Path | Lifecycle |
+|---|---|
+| `background-command`, inside any task of the session | Every lifecycle |
+| A task with origin `completion` under the `contextId` the command was started from, in the `bg` lane behind every `user` and `peer` task | `task_acceptance: queue` with `after_task: sleep`, and only when `background-command` has not already returned the exit |
+
+A task that ends while background commands of its session are still running names them in its A2A result as
+`metadata.murmur.runningCommands`. The session's end kills every command still running, on every
+host, and records each as `shell_abandoned` — once in `trace.jsonl` and once on stderr.
 
 ### What a resume reports about the session before it
 
@@ -347,9 +354,9 @@ leaves its `shell_detached` lines standing on their own.
 
 `mur run --resume <session>` reads the resumed-from session's `trace.jsonl` and reports every such
 command as one task with origin `completion` in the `bg` lane, naming the work id, the binary, the
-command and when it was detached. It is a report of loss, not a result: there is no exit code, no
-output and no log file for a command whose runtime died, and whether the command itself finished
-is unknown. Nothing is recovered, nothing is adopted, and the command — which the kernel does not
+command and when it was detached. It is a report of loss, not a result: there is no exit code for
+a command whose runtime died, its log in the earlier session's records directory stops where that
+runtime died, and whether the command itself finished is unknown. Nothing is recovered, nothing is adopted, and the command — which the kernel does not
 kill along with the runtime — is left to run out on its own.
 
 The report is a task the capsule generated for itself, so `lifecycle.task_acceptance` does not

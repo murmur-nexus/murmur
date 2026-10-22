@@ -1129,7 +1129,7 @@ is required: a `GetTask` without one, or with `""`, is answered `-32602` `GetTas
 | `status.message` | On a terminal task — `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_CANCELED` or `TASK_STATE_REJECTED` — whose final status said something: a `ROLE_AGENT` message with one text part, as the task's [terminal status](streaming-protocol.md#one-final-status) on a stream carries it |
 | `artifacts: [{"artifactId": "response", …}]` | On a `TASK_STATE_COMPLETED` task that produced a response: its answer, as one text part |
 | `artifacts: [{"artifactId": "prompt", …}]` | On a `TASK_STATE_INPUT_REQUIRED` task: the question it is waiting on |
-| `metadata.murmur` | On a terminal task with something to say about answers it lacks — see [No-answer metadata](#no-answer-metadata) |
+| `metadata.murmur` | On a terminal task with something to say about answers it lacks or background commands it left running — see [Task metadata](#no-answer-metadata) |
 
 ```json
 {"id": "tsk_…", "contextId": "ctx_…",
@@ -1171,15 +1171,16 @@ A `SendMessage` the door has no room for answers a `TASK_STATE_REJECTED` task wh
 `status.message` says why: `task rejected: capsule is busy`, or
 `task rejected: the session is closing`.
 
-##### No-answer metadata { #no-answer-metadata }
+##### Task metadata { #no-answer-metadata }
 
-A formation member's task says, in `metadata.murmur`, which answers it lacks. `metadata` is absent
-when neither key is present.
+A terminal task says, in `metadata.murmur`, which answers it lacks and which background commands
+it left running. `metadata` is absent when none of these keys is present.
 
 | Key | Type | Present |
 |---|---|---|
-| `noAnswer` | `true` | On a `TASK_STATE_FAILED` task the member ended with [`end-without-answer`](runtime-provided-tools.md#end-without-answer). Absent otherwise |
+| `noAnswer` | `true` | On a `TASK_STATE_FAILED` task a formation member ended with [`end-without-answer`](runtime-provided-tools.md#end-without-answer). Absent otherwise |
 | `noAnswerBelow` | array of `{"member": "<roster name>", "status": "<status>"}` | On a terminal task when a member it called gave it no answer: each such member, then each member those reported below them, each once, at most 8. `status` is a [`member_call`](observability-schemas.md#member-call) status other than `completed`. Absent when empty |
+| `runningCommands` | array of `{"workId": "wrk_…", "binary": "<path>", "command": "<text>", "runningMs": <n>}` | On a terminal task that ended while shell commands moved to the background were still running, oldest first. `command` is the text the model wrote, cut to 200 characters followed by `…`; `runningMs` counts from the command's start to the task's end. Each `workId` is a [`background-command`](runtime-provided-tools.md#background-command) handle. Absent when empty |
 
 ```json
 {"id": "tsk_…", "contextId": "ctx_…",
@@ -1192,9 +1193,17 @@ when neither key is present.
                          "noAnswerBelow": [{"member": "q", "status": "timed_out"}]}}}
 ```
 
-A completed task with `noAnswerBelow` keeps its `response` artifact. A caller that is not a
-formation member can ignore `metadata`: the task reads as an ordinary `TASK_STATE_FAILED` or
-`TASK_STATE_COMPLETED` one.
+```json
+{"id": "tsk_…", "contextId": "ctx_…",
+ "status": {"state": "TASK_STATE_COMPLETED", "timestamp": "2026-10-13T09:00:00.123Z"},
+ "metadata": {"murmur": {"runningCommands": [
+   {"workId": "wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2", "binary": "/usr/bin/bash",
+    "command": "cargo test --workspace", "runningMs": 312004}]}}}
+```
+
+A completed task with `noAnswerBelow` or `runningCommands` keeps its `response` artifact. A caller
+that does not read these keys can ignore `metadata`: the task reads as an ordinary
+`TASK_STATE_FAILED` or `TASK_STATE_COMPLETED` one.
 
 #### `ListTasks` { #list-tasks }
 

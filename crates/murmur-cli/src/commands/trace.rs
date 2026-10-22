@@ -442,6 +442,18 @@ struct ShellCompletedEvent {
     status: String,
 }
 
+/// One answered `background-command` call on a demoted command.
+#[derive(Debug, Deserialize)]
+struct BackgroundCommandEvent {
+    work_id: String,
+    operation: String,
+    state: String,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    waited_ms: Option<u64>,
+}
+
 /// That command still running when the session ended, so its result was lost.
 #[derive(Debug, Deserialize)]
 struct ShellAbandonedEvent {
@@ -966,6 +978,7 @@ enum TraceEvent {
     ShellCompleted(ShellCompletedEvent),
     ShellAbandoned(ShellAbandonedEvent),
     ShellLost(ShellLostEvent),
+    BackgroundCommand(BackgroundCommandEvent),
     Compaction(CompactionEvent),
     CompactionDeclined(CompactionDeclinedEvent),
     ContextSeed(ContextSeedEvent),
@@ -1303,6 +1316,8 @@ struct TraceMetrics {
     deadline: Option<SessionDeadline>,
     /// The `session_status`, `deadline_notice` and `deadline_reached` rows, in file order.
     deadline_rows: Vec<String>,
+    /// One row per `background_command` record, in file order.
+    background_rows: Vec<String>,
     /// Every `task_failed` record, in file order — one per failing attempt.
     failures: Vec<TaskFailedEvent>,
     /// Every `task_reopened` record, in file order — one per `on-task-end` reopen.
@@ -1494,6 +1509,24 @@ fn status_value(value: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         _ => "-".to_string(),
     }
+}
+
+/// One `background_command` record's row:
+/// `background_command <operation>  <work id>  <state>[  exit <n>][  waited <secs>]`.
+fn background_command_row(e: &BackgroundCommandEvent) -> String {
+    let mut row = format!(
+        "background_command {}  {}  {}",
+        e.operation,
+        fmt_id_short(&e.work_id, 12),
+        e.state
+    );
+    if let Some(exit_code) = e.exit_code {
+        row.push_str(&format!("  exit {exit_code}"));
+    }
+    if let Some(waited_ms) = e.waited_ms {
+        row.push_str(&format!("  waited {}", fmt_dur(waited_ms)));
+    }
+    row
 }
 
 /// One `session_status` record's row: what the call returned, on one line.
@@ -2068,6 +2101,7 @@ fn compute_metrics(
     let mut formation_ended: Option<String> = None;
     let mut spawner_ended: Option<SpawnerEndedEvent> = None;
     let mut deadline_rows: Vec<String> = Vec::new();
+    let mut background_rows: Vec<String> = Vec::new();
     let mut failures: Vec<TaskFailedEvent> = Vec::new();
     let mut reopens: Vec<ReopenRecord> = Vec::new();
     let mut continuations: Vec<TaskContinuedEvent> = Vec::new();
@@ -2187,6 +2221,7 @@ fn compute_metrics(
             }
             TraceEvent::ShellDetached(_) => seen_shell_calls += 1,
             TraceEvent::ShellAbandoned(_) | TraceEvent::ShellLost(_) => {}
+            TraceEvent::BackgroundCommand(e) => background_rows.push(background_command_row(&e)),
             TraceEvent::Compaction(e) => {
                 compaction = Some(CompactionRecord {
                     turn: e.turn,
@@ -2534,6 +2569,7 @@ fn compute_metrics(
             spawner_ended,
             deadline: ss.deadline,
             deadline_rows,
+            background_rows,
             failures,
             reopens,
             continuations,
@@ -3166,6 +3202,14 @@ fn print_show(m: &TraceMetrics) {
         );
     }
     capsule_runtime::report_println!();
+
+    if !m.background_rows.is_empty() {
+        capsule_runtime::report_println!("── Background commands ──────────────────────────");
+        for row in &m.background_rows {
+            capsule_runtime::report_println!("{row}");
+        }
+        capsule_runtime::report_println!();
+    }
 
     capsule_runtime::report_println!("── Compaction ───────────────────────────────────");
     match &m.compaction {
@@ -4300,6 +4344,7 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             fmt_id_short(&e.work_id, 12),
             fmt_dur(e.running_ms)
         ),
+        TraceEvent::BackgroundCommand(e) => background_command_row(e),
         TraceEvent::ShellLost(e) => format!(
             "{}{}  {}  detached at {}  no result, reported by {}",
             kind("shell_lost"),
@@ -6115,6 +6160,20 @@ mod tests {
         assert_eq!(
             row(line),
             "shell_completed /usr/bin/bash  wrk_0a1b2c3d…  exit 0 ✓  42.0s  /home/test/.murmur/records/work/s/logs/wrk_0a1b2c3d4e5f6a7b.log"
+        );
+    }
+
+    #[test]
+    fn background_command_row_names_the_operation_the_state_and_the_wait() {
+        let line = r#"{"event_type":"background_command","event_id":"evt_4","parent_id":"evt_1","session_id":"s","timestamp":4,"task_id":"tsk_1","work_id":"wrk_0a1b2c3d4e5f6a7b","operation":"wait","state":"exited","exit_code":1,"waited_ms":312000,"output_bytes":900}"#;
+        assert_eq!(
+            row(line),
+            "background_command wait  wrk_0a1b2c3d…  exited  exit 1  waited 312.0s"
+        );
+        let line = r#"{"event_type":"background_command","event_id":"evt_5","parent_id":"evt_1","session_id":"s","timestamp":5,"work_id":"wrk_0a1b2c3d4e5f6a7b","operation":"status","state":"running","output_bytes":12}"#;
+        assert_eq!(
+            row(line),
+            "background_command status  wrk_0a1b2c3d…  running"
         );
     }
 

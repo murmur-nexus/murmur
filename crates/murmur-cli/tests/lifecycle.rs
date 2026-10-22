@@ -859,11 +859,10 @@ fn lifecycle_a_detached_command_completes_as_a_background_task() {
     );
     assert!(log.exists(), "the named log is on disk");
 
-    // Under queue + sleep the demotion result tells the model the result will arrive.
+    // Under queue + sleep the demotion result also says the result can arrive as a task.
     let after_demotion = server.requests()[1].to_string();
     assert!(
-        after_demotion.contains("Its result will arrive later as a separate task")
-            && !after_demotion.contains("will not reach you"),
+        after_demotion.contains("its result also arrives later as a separate task"),
         "{after_demotion}"
     );
 }
@@ -1050,9 +1049,8 @@ fn lifecycle_a_command_still_running_at_exit_is_reported_to_the_operator() {
     );
     let log = records_dir.join("logs").join(format!("{work_id}.log"));
     assert!(
-        report.contains(&format!("{} only if", log.display())),
-        "the report names the output file by its absolute path without promising it; report \
-         was: {report}"
+        report.contains(&format!("before the kill is in {}.", log.display())),
+        "the report names the output file by its absolute path; report was: {report}"
     );
 }
 

@@ -4124,7 +4124,7 @@ mod tests {
             crate::lanes::TaskLane::User,
         );
         reg.finish_task(TaskState::Completed);
-        reg.record_ending("tsk_done", "done", Some("four"), false, &[]);
+        reg.record_ending("tsk_done", "done", Some("four"), false, &[], &[]);
         reg.enqueue("tsk_wait", "ctx_wait");
         reg.record_owner("tsk_wait", "member:planner");
         reg.start_task(
@@ -5600,7 +5600,7 @@ mod tests {
                 crate::lanes::TaskLane::User,
             );
             reg.finish_task(TaskState::Completed);
-            reg.record_ending(&task_id, "task completed", Some("four"), false, &[]);
+            reg.record_ending(&task_id, "task completed", Some("four"), false, &[], &[]);
         }
 
         let lost_at = std::time::Instant::now();
@@ -6063,7 +6063,7 @@ mod tests {
         {
             let mut reg = registry.lock().unwrap();
             reg.finish_task(TaskState::Completed);
-            reg.record_ending("tsk_run", "task completed", Some("four"), false, &[]);
+            reg.record_ending("tsk_run", "task completed", Some("four"), false, &[], &[]);
         }
         let lost_at = std::time::Instant::now();
         for id in 1..=3 {
@@ -6704,7 +6704,7 @@ mod tests {
         registry
             .lock()
             .unwrap()
-            .record_ending(&task_id, "done", Some("four"), false, &[]);
+            .record_ending(&task_id, "done", Some("four"), false, &[], &[]);
         let (_, answer) = client.join().unwrap();
         let task = &response_json(&answer)["result"]["task"];
         assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{answer}");
@@ -6797,7 +6797,7 @@ mod tests {
                 crate::lanes::TaskLane::User,
             );
             reg.finish_task(TaskState::Failed);
-            reg.record_ending(&task_id, "failed", None, false, &[]);
+            reg.record_ending(&task_id, "failed", None, false, &[], &[]);
         }
         sse_tx
             .send(stream_event(

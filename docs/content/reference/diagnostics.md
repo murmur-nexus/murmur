@@ -173,7 +173,6 @@ section that explains it.
 | `W-SEC-018` | An installed tool's `input_schema` leaves a path-shaped property undeclared, so calls naming it are judged by key name | [W-SEC-018](#w-sec-018) |
 | `W-SEC-019` | A key in `murmur.yaml` this build does not recognize was parsed and ignored | [W-SEC-019](#w-sec-019) |
 | `W-SEC-021` | A cgroup scope was created and the declared `cgroup_io_bytes_per_sec` ceiling did not apply to it | [W-SEC-021](#w-sec-021) |
-| `W-SEC-022` | The capsule can run shell commands, and its `lifecycle` block cannot receive a background command's completion | [W-SEC-022](#w-sec-022) |
 | `W-SEC-023` | A session opened its door and its running-capsule record could not be written | [W-SEC-023](#w-sec-023) |
 | `W-SEC-024` | `capabilities.env.allow` names a credential-shaped variable — the grant hands the capsule a secret murmur does not broker | [W-SEC-024](#w-sec-024) |
 | `W-SEC-025` | A `capabilities.network.allow` entry names an artifact's `gateway.endpoint` host — the gateway does not use the entry, and it grants direct reach to that host without the key | [W-SEC-025](#w-sec-025) |
@@ -1672,12 +1671,13 @@ rather than refused. See [Read-only paths](manifest.md#read-only-paths).
 ### E-CAP-013 — an artifact claims a runtime-provided tool name { #e-cap-013 }
 
 `share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member`,
-`end-without-answer`, `pull-artifact` and `remove-artifact` are answered by the runtime itself, so
+`end-without-answer`, `pull-artifact`, `remove-artifact`, `session-status` and
+`background-command` are answered by the runtime itself, so
 no artifact may have one of them as its tool name, the part of its full name after the `/`.
 `ana/pull-artifact` is refused as `pull-artifact` would be:
 
 ```text
-error[E-CAP-013]: artifact 'ana/pull-artifact' has the tool name 'pull-artifact', which collides with a tool the runtime provides itself; the reserved names are share-file, fetch-peer-file, delegate-task, submit-plan, switch-driver, call-member, end-without-answer, pull-artifact, remove-artifact
+error[E-CAP-013]: artifact 'ana/pull-artifact' has the tool name 'pull-artifact', which collides with a tool the runtime provides itself; the reserved names are share-file, fetch-peer-file, delegate-task, submit-plan, switch-driver, call-member, end-without-answer, pull-artifact, remove-artifact, session-status, background-command
   hint: the runtime answers these names itself, so an artifact under one of them would be shadowed at dispatch whatever the tool allowlist said. Rename the artifact, or drop the dependency if the runtime-provided tool is what you wanted — see https://docs.murmur.nexus/reference/runtime-provided-tools/
 ```
 
@@ -2781,7 +2781,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 
 | Warning | Written to |
 |---|---|
-| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-021`, `W-SEC-022`, `W-SEC-023` — decided at launch | stderr and the session's [`logs/bootstrap.log`](workdir.md#records-directory) |
+| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-021`, `W-SEC-023` — decided at launch | stderr and the session's [`logs/bootstrap.log`](workdir.md#records-directory) |
 | `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-027`, `W-SEC-028`, `W-SEC-029`, `W-SEC-030` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 | `W-SEC-031` — decided mid-session, when the harness reports its session | stderr |
@@ -3502,45 +3502,11 @@ enforced on the scope and stay fatal on failure. See
 project onto a block-device-backed filesystem if an I/O bound matters for this capsule; otherwise
 the warning is a report and the session is bounded by memory, pids and CPU as declared.
 
-### W-SEC-022 — a shell-running capsule cannot receive a completion { #w-sec-022 }
+### W-SEC-022 — retired { #w-sec-022 }
 
-**Fires when:** `capabilities.shell.allow` is non-empty and the resolved `lifecycle` block cannot
-take an inbound completion — [`lifecycle.after_task`](manifest.md#lifecycle-after-task) is `exit`,
-or [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance) is anything but `queue`.
-Once per launch, on stderr and in the session's `logs/bootstrap.log`.
-
-```text
-[capsule-runtime] warning[W-SEC-022]: this capsule declares capabilities.shell.allow, but its lifecycle block cannot receive a background command's completion: a shell command that outruns lifecycle.shell_grace_secs is demoted to the background, and its exit code and output path arrive afterwards as a background task. Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep, or every command this capsule demotes will be discarded at session end and reported to the operator instead of to the agent. (https://docs.murmur.nexus/reference/diagnostics/#w-sec-022)
-```
-
-**Why it matters:** every shell command starts in the foreground, and one that outruns
-[`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs) is demoted: the turn gets a
-`wrk_` handle, and the exit code and output path arrive afterwards as a `completion`-origin task in
-the `bg` lane. Under the default lifecycle the session ends with the task that started the command,
-and the session's end kills the command along with every other process the session started. The
-compute is spent and the agent never learns the answer.
-
-**What the runtime does about it:** nothing is refused and no exit code changes. The command runs
-until it finishes or the session ends, whichever comes first, and the completion has nowhere to
-land. At session end the kill is stated to the operator — see
-[When a session ends with a command still running](manifest.md#lifecycle-shell-grace-secs).
-
-**What to do:** declare a lifecycle that outlives the task which started the command.
-
-```yaml
-lifecycle:
-  task_acceptance: queue
-  queue_depth: 4
-  after_task: sleep
-```
-
-The warning does not read `lifecycle.shell_grace_secs`, and no value of it silences the warning:
-`0` demotes on the first check after the spawn, so a low grace makes the discard more likely rather
-than less. A capsule whose commands all finish inside the grace period never demotes one, which is
-why this is a warning and not a refusal. Work meant to outlive the task cannot be started and left
-behind: the session's end kills it. Silence the warning by not declaring
-`capabilities.shell.allow` on a capsule that runs no commands.
-
+Nothing raises this code and nothing reuses it. A shell command that moves to the background
+returns a work id on every `lifecycle`, and the agent reads the command's state, waits for it or
+stops it by that id with [`background-command`](runtime-provided-tools.md#background-command).
 
 ### W-SEC-023 — the session is not addressable { #w-sec-023 }
 

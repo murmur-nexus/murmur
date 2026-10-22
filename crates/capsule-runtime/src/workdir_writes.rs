@@ -305,6 +305,7 @@ mod tests {
         ("child_launch.rs", include_str!("child_launch.rs")),
         ("delegation.rs", include_str!("delegation.rs")),
         ("delegation_plane.rs", include_str!("delegation_plane.rs")),
+        ("detached.rs", include_str!("detached.rs")),
         ("hooks.rs", include_str!("hooks.rs")),
         ("murmur_md.rs", include_str!("murmur_md.rs")),
         ("otel.rs", include_str!("otel.rs")),
@@ -627,13 +628,22 @@ mod tests {
     /// Writes through `records_root` whose argument is not a literal or a named constant, each
     /// with the [`RECORDS_DIR_WRITES`] entry it lies under and the reason. Matched only through
     /// `records_root`: the same argument through a workdir root resolves to nothing and fails.
-    const RECORDS_DIR_DYNAMIC: &[(&str, &str, &str, &str)] = &[(
-        "shell.rs",
-        "&log.relative",
-        "logs",
-        "A shell command's full-output log, `logs/shell-<ms>.log` or `logs/<work-id>.log`, \
-         composed by `detached::output_path_for`.",
-    )];
+    const RECORDS_DIR_DYNAMIC: &[(&str, &str, &str, &str)] = &[
+        (
+            "shell.rs",
+            "&log.relative",
+            "logs",
+            "A foreground shell command's full-output log, `logs/shell-<ms>.log`, composed by \
+             `detached::output_path_for`.",
+        ),
+        (
+            "detached.rs",
+            "relative",
+            "logs",
+            "A demoted shell command's log, `logs/<work-id>.log`, composed by \
+             `detached::output_path_for` and written as the command runs.",
+        ),
+    ];
 
     /// The literal text a path argument opens with — a string literal, or a `format!` string up
     /// to its first `{` — or `None` when it opens with no literal.

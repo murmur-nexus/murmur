@@ -243,7 +243,7 @@ stays under the old path.
 | `logs/otel.log` | OpenTelemetry exporter diagnostics |
 | `logs/hook-<hook-name>.log` | Errors from one hook, one per line. `<hook-name>` is the bare name: `hook-grafana` for `murmur/hook-grafana` |
 | `logs/shell-<timestamp>.log` | Full stdout and stderr of one shell command, written when either stream exceeds 16 KiB. The tool result names it by its absolute path |
-| `logs/<work-id>.log` | The same, for a command [demoted to the background](manifest.md#lifecycle-shell-grace-secs). Its completion names it by its absolute path |
+| `logs/<work-id>.log` | Output of a command [moved to the background](manifest.md#lifecycle-shell-grace-secs), written as the command runs, with an `Exit code:` line appended at its exit. [`background-command`](runtime-provided-tools.md#background-command) and its completion name it by its absolute path |
 | `completion.json` | How a delegated child ended: written by the child at the end of its session and by the launcher that started it, read by that launcher |
 | `hooks/` | The current directory of every hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities), read-write. `murmur/hook-eval` writes `hooks/eval.jsonl` and `hooks/logs/hook-hook-eval.log` here. Created only when such a hook is declared |
 | `tmp/` | The [session's temporary folder](containment.md#temp-folder): `/tmp` and `$TMPDIR` to the session's shell commands, plan shell steps and native tools, which read and write it. The runtime writes nothing in it. Counted with the session workdir against `capabilities.resources.workdir_max_bytes` |

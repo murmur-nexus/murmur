@@ -20,7 +20,7 @@ use murmur_artifact::{
     RegistryError, RuntimeArtifact, RuntimeType, TaskAcceptance, LOCK_VERSION,
     PACKED_MANIFEST_ENTRY, W_RUN_003, W_RUN_008, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
     W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018,
-    W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
+    W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
 };
 use serde_norway::Value;
 use wasmtime::{
@@ -47,6 +47,7 @@ use crate::{
         extract_skill_md,
     },
     artifact_config::ARTIFACT_CONFIG_ENV,
+    background_command::BACKGROUND_COMMAND_TOOL,
     bindings::host::murmur::{
         self, artifact_manager::manage, message::send, tool_registry::invoke,
     },
@@ -821,8 +822,31 @@ async fn end_task(
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
     ending: agent::AttemptEnding,
 ) {
+    // The background commands still running as the task ends, which its result names.
+    let ended_at_ms = crate::trace::timestamp_ms();
+    let running_commands: Vec<crate::a2a::RunningCommand> = state
+        .detached
+        .as_ref()
+        .map(|detached| detached.outstanding())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|work| crate::a2a::RunningCommand {
+            running_ms: ended_at_ms.saturating_sub(work.started_at_ms),
+            work_id: work.work_id,
+            binary: work.binary,
+            command: work.command,
+        })
+        .collect();
     let _ = trace
-        .write_task_end(trace_task_id, exit_status, reopens_used)
+        .write_task_end(
+            trace_task_id,
+            exit_status,
+            reopens_used,
+            running_commands
+                .iter()
+                .map(|running| running.work_id.clone())
+                .collect(),
+        )
         .await;
     hooks.end_task();
     let _ = trace.flush().await;
@@ -870,6 +894,7 @@ async fn end_task(
                     ending.response.as_deref(),
                     ending.no_answer,
                     &no_answer_below,
+                    &running_commands,
                 );
             }
             let reported = reg.get_task(task_id);
@@ -881,7 +906,12 @@ async fn end_task(
     }
     let reported = reported.or_else(|| {
         let context_id = context_id?;
-        Some(unregistered_ending(task_id, &context_id, &ending))
+        Some(unregistered_ending(
+            task_id,
+            &context_id,
+            &ending,
+            &running_commands,
+        ))
     });
     if let Some(task) = reported {
         emit_task_ending(sse, &task);
@@ -890,7 +920,12 @@ async fn end_task(
 
 /// `GetTask`'s view of a task that ended as `ending` in a session with no task registry, built by
 /// the rules [`TaskRegistry::get_task`] reads an ending by.
-fn unregistered_ending(task_id: &str, context_id: &str, ending: &agent::AttemptEnding) -> A2aTask {
+fn unregistered_ending(
+    task_id: &str,
+    context_id: &str,
+    ending: &agent::AttemptEnding,
+    running_commands: &[crate::a2a::RunningCommand],
+) -> A2aTask {
     let mut registry = TaskRegistry::new(1, murmur_artifact::TaskAcceptance::Single);
     registry.enqueue(task_id, context_id);
     registry.record_state(task_id, ending.state.clone(), context_id.to_string());
@@ -900,6 +935,7 @@ fn unregistered_ending(task_id: &str, context_id: &str, ending: &agent::AttemptE
         ending.response.as_deref(),
         ending.no_answer,
         &[],
+        running_commands,
     );
     registry
         .get_task(task_id)
@@ -2796,6 +2832,11 @@ pub fn stage_session(
             .map(|control| control.choices()),
     )?;
     write_session_status_tool_manifest(&runtime_root, request.inference.as_ref())?;
+    write_background_command_tool_manifest(
+        &runtime_root,
+        request.inference.as_ref(),
+        &request.capability_policy,
+    )?;
 
     // Read once, here, from the manifests just staged: the schema is fixed before the session
     // starts, so an annotation is the tool author's statement and never a call-time choice. A
@@ -3431,11 +3472,6 @@ fn launch(
             &records_root,
             requires_process_bounding,
             shell_enforcement.cgroup_scope.is_some(),
-        );
-        warn_for_unreachable_shell_completions(
-            &records_root,
-            !staged.capability_policy.shell_allow.is_empty(),
-            &staged.lifecycle,
         );
 
         let agent_cards = identity::build_agent_cards(
@@ -4120,6 +4156,7 @@ fn launch(
                         {
                             enqueue_detached_report(
                                 DetachedReport::Lost(report),
+                                &detached,
                                 &task_registry,
                                 &mut lanes,
                                 &mut trace,
@@ -4400,6 +4437,7 @@ fn launch(
                                         while let Ok(report) = completion_rx.try_recv() {
                                             enqueue_detached_report(
                                                 report,
+                                                &detached,
                                                 &task_registry,
                                                 &mut lanes,
                                                 &mut trace,
@@ -4445,6 +4483,7 @@ fn launch(
                                                 Some(report) = completion_rx.recv() => {
                                                     enqueue_detached_report(
                                                         report,
+                                                        &detached,
                                                         &task_registry,
                                                         &mut lanes,
                                                         &mut trace,
@@ -4482,6 +4521,7 @@ fn launch(
                                                 Ok(Woke::Report(report)) => {
                                                     enqueue_detached_report(
                                                         report,
+                                                        &detached,
                                                         &task_registry,
                                                         &mut lanes,
                                                         &mut trace,
@@ -4749,11 +4789,11 @@ fn launch(
                     // session's end kills it, so the loss of its result is recorded rather than
                     // passed over in silence.
                     let abandoned_at_ms = crate::trace::timestamp_ms();
-                    // Outstanding work first, then the channel. `complete` removes a work id
-                    // before it sends, so a command finishing during this teardown is briefly in
-                    // neither place; reading `outstanding` first and draining second means it is
-                    // seen in one or the other rather than falling between them. A command
-                    // caught in both is recorded once.
+                    // Outstanding work first, then the channel. `complete` marks a command
+                    // finished before it sends, so a command finishing during this teardown is
+                    // briefly in neither place; reading `outstanding` first and draining second
+                    // means it is seen in one or the other rather than falling between them. A
+                    // command caught in both is recorded once.
                     let mut abandoned: Vec<AbandonedWork> = Vec::new();
                     for work in detached.outstanding() {
                         abandoned.push(AbandonedWork {
@@ -4769,7 +4809,10 @@ fn launch(
                     // servers and the demoted commands just read included, and its network
                     // namespace is released. After `outstanding` and before the drain below, so a
                     // command this kills is already recorded as still running, and the completion
-                    // its own thread then sends is the duplicate the drain skips.
+                    // its own thread then sends is the duplicate the drain skips. The demoted
+                    // commands' groups are killed by the registry first, which reaches them on a
+                    // host with no cgroup scope too.
+                    detached.kill_running();
                     shell_enforcement_for_teardown.end_session();
                     // Work that reported after the task loop stopped reading. No task will carry
                     // the result, so it is discarded on the same terms as work still running — but
@@ -4786,6 +4829,25 @@ fn launch(
                                     continue;
                                 }
                                 let status = completion.status();
+                                // The agent already read this exit through `background-command`,
+                                // so nothing about it was lost.
+                                if detached.exit_reported(&completion.work_id) {
+                                    let _ = trace
+                                        .write_shell_completed(
+                                            &completion.work_id,
+                                            &completion.binary,
+                                            &completion.command,
+                                            completion.exit_code,
+                                            completion.duration_ms,
+                                            &completion.output_path,
+                                            completion.output_bytes,
+                                            completion.resource_limit.clone(),
+                                            status,
+                                            None,
+                                        )
+                                        .await;
+                                    continue;
+                                }
                                 abandoned.push(AbandonedWork {
                                     work_id: completion.work_id,
                                     binary: completion.binary,
@@ -5620,46 +5682,6 @@ fn warn_on_member_calls_without_egress(
     }
 }
 
-const NO_SHELL_COMPLETION_LANE_WARNING: &str = "this capsule declares \
-capabilities.shell.allow, but its lifecycle block cannot receive a background command's \
-completion: a shell command that outruns lifecycle.shell_grace_secs is demoted to the background, \
-and its exit code and output path arrive afterwards as a background task. Declare \
-lifecycle.task_acceptance: queue with lifecycle.after_task: sleep, or every command this capsule \
-demotes will be discarded at session end and reported to the operator instead of to the agent.";
-
-/// Pure decision for the shell-lifecycle warning, split out of
-/// [`warn_for_unreachable_shell_completions`] the same way
-/// [`crate::sandbox::aggregate_bounding_warning`] is split out of its emitter, so a test can assert
-/// it without capturing stderr.
-///
-/// Fires exactly where a completion has nowhere to land: a capsule that can run shell commands and
-/// either exits after its task or accepts no second one. Deliberately not conditioned on
-/// `lifecycle.shell_grace_secs` — `0` demotes on the first check after the spawn, so a low grace
-/// makes the discard more likely rather than less, and no value of it turns demotion off.
-pub(crate) fn unreachable_shell_completions_warning(
-    can_run_shell: bool,
-    lifecycle: &LifecycleConfig,
-) -> Option<(&'static str, &'static str)> {
-    (can_run_shell && !lifecycle.can_receive_background_tasks())
-        .then_some((W_SEC_022, NO_SHELL_COMPLETION_LANE_WARNING))
-}
-
-/// Fires at every launch, not just once.
-pub(crate) fn warn_for_unreachable_shell_completions(
-    workdir: &WorkdirRoot,
-    can_run_shell: bool,
-    lifecycle: &LifecycleConfig,
-) {
-    if let Some((code, message)) = unreachable_shell_completions_warning(can_run_shell, lifecycle) {
-        let link = security_warning_link(code);
-        crate::runtime_err!("[capsule-runtime] warning[{code}]: {message} ({link})");
-        agent::append_bootstrap_log(
-            workdir,
-            &format!("[capability-policy] warning[{code}]: {message} ({link})"),
-        );
-    }
-}
-
 /// Warns (non-fatal, once per declared grant) for every `capabilities.shell.interpreter_runtime`
 /// entry. Declaring one narrows an allowlisted binary's Landlock scope to specific host
 /// directories so a path-based interpreter can reach its stdlib — but it couples the capsule to a
@@ -5755,7 +5777,8 @@ pub struct SecretShapedEnvGrant {
 
 /// Pure decision for the `capabilities.env.allow` secret warning, split out of
 /// [`warn_on_secret_shaped_env_grants`] on the same terms as
-/// [`unreachable_shell_completions_warning`], so a test can assert it without capturing stderr.
+/// [`crate::sandbox::aggregate_bounding_warning`], so a test can assert it without capturing
+/// stderr.
 ///
 /// One entry per distinct name that [`is_credential_shaped_env_name`] flags and the credential
 /// backstop keeps, in declaration order — a name repeated in `env.allow` is judged once, because
@@ -7199,7 +7222,7 @@ pub(crate) struct CapsuleStoreState {
     /// is demoted. Read from the resolved lifecycle once per launch.
     pub(crate) shell_grace_secs: u64,
     /// Whether a demoted command's completion reaches the model as a later task: the effective
-    /// lifecycle's `can_receive_background_tasks`, the predicate `W-SEC-022` warns on.
+    /// lifecycle's `can_receive_background_tasks`.
     pub(crate) background_results_delivered: bool,
     // ── A2A request-input support ────────────────────────────────────────────────
     /// Shared task registry — Some in A2A mode, None for script capsules.
@@ -8530,6 +8553,7 @@ impl CapsuleStoreState {
             || name == PULL_ARTIFACT_TOOL
             || name == REMOVE_ARTIFACT_TOOL
             || name == SESSION_STATUS_TOOL
+            || name == BACKGROUND_COMMAND_TOOL
         {
             return as_tool();
         }
@@ -8802,6 +8826,9 @@ impl CapsuleStoreState {
                 .dispatch_session_status()
                 .await
                 .map(DispatchOutcome::tool);
+        }
+        if name == BACKGROUND_COMMAND_TOOL {
+            return self.dispatch_background_command(input).await;
         }
         // They change the session, which this shared borrow cannot; the http agent loop answers
         // them through `dispatch_agent_tool_exclusive` before this table is reached.
@@ -9540,6 +9567,79 @@ impl CapsuleStoreState {
             data_path: None,
             truncated: false,
             metadata: Vec::new(),
+        })
+    }
+
+    /// `background-command`: a demoted shell command's state, a wait for it or a stop of it,
+    /// recorded as `background_command`. A refused call is an error result and writes no record.
+    ///
+    /// The wait is raced against the task's cancel on this task, never on the blocking pool, and
+    /// dropping it mid-wait leaves nothing behind.
+    async fn dispatch_background_command(
+        &self,
+        input: murmur::tool::run::ToolInput,
+    ) -> Result<DispatchOutcome, String> {
+        use crate::background_command::{self, Operation};
+
+        let Some(registry) = &self.detached else {
+            return Err(background_command::not_available());
+        };
+        let args = parse_tool_json_input(BACKGROUND_COMMAND_TOOL, &input)?;
+        let request = background_command::parse_request(&args)?;
+        let unknown = || background_command::unknown_work_id(&request.work_id);
+        let mut waited = None;
+        match request.operation {
+            Operation::Status => {}
+            Operation::Wait => {
+                let cancel = self.task_cancel_signal();
+                let started = std::time::Instant::now();
+                let end = registry
+                    .wait(
+                        &request.work_id,
+                        background_command::effective_wait(request.wait_secs),
+                        cancel.as_ref(),
+                    )
+                    .await;
+                match end {
+                    detached::WaitEnd::Unknown => return Err(unknown()),
+                    detached::WaitEnd::Canceled => {
+                        if let Some(signal) = &cancel {
+                            signal.note_phase(crate::cancel::PHASE_BACKGROUND_WAIT);
+                        }
+                    }
+                    detached::WaitEnd::Finished | detached::WaitEnd::TimedOut => {}
+                }
+                waited = Some(started.elapsed());
+            }
+            Operation::Stop => {
+                if !registry.stop(&request.work_id).await {
+                    return Err(unknown());
+                }
+            }
+        }
+        let snapshot = registry.read(&request.work_id).ok_or_else(unknown)?;
+        if let Some(trace) = &self.peer_trace {
+            trace
+                .write_background_command(
+                    self.session_status
+                        .as_ref()
+                        .and_then(|status| status.task_id()),
+                    &snapshot.work_id,
+                    request.operation.as_str(),
+                    snapshot.state.as_str(),
+                    snapshot
+                        .finished
+                        .as_ref()
+                        .map(|completion| completion.exit_code),
+                    waited.map(|waited| waited.as_millis().try_into().unwrap_or(u64::MAX)),
+                    snapshot.output_bytes,
+                )
+                .await;
+        }
+        let (result, runtime_note) = background_command::render(&snapshot, waited);
+        Ok(DispatchOutcome {
+            runtime_note,
+            ..DispatchOutcome::tool(result)
         })
     }
 
@@ -10320,7 +10420,7 @@ impl WasiHttpView for ToolStoreState {
 /// Shell binary names are deliberately absent: they are operator-chosen through
 /// `capabilities.shell.allow`, so there is no fixed set to reserve, and
 /// `write_shell_tool_manifests` already yields to an artifact manifest that is already on disk.
-pub(crate) const RESERVED_TOOL_NAMES: [&str; 10] = [
+pub(crate) const RESERVED_TOOL_NAMES: [&str; 11] = [
     SHARE_FILE_TOOL,
     FETCH_PEER_FILE_TOOL,
     DELEGATE_TASK_TOOL,
@@ -10331,6 +10431,7 @@ pub(crate) const RESERVED_TOOL_NAMES: [&str; 10] = [
     PULL_ARTIFACT_TOOL,
     REMOVE_ARTIFACT_TOOL,
     SESSION_STATUS_TOOL,
+    BACKGROUND_COMMAND_TOOL,
 ];
 
 /// Whether `name` is answered by the runtime itself rather than by an artifact.
@@ -11092,6 +11193,28 @@ fn write_session_status_tool_manifest(
             SESSION_STATUS_TOOL,
             description,
             crate::session_status::INPUT_SCHEMA.to_string(),
+        ),
+    )
+}
+
+/// Writes `background-command`'s synthetic manifest for an agent capsule that can run a shell
+/// command, on either transport, and for no other capsule. Its grant is the shell grant: the file
+/// exists exactly when `inference` does and `capabilities.shell.allow` is non-empty.
+fn write_background_command_tool_manifest(
+    runtime_root: &WorkdirRoot,
+    inference: Option<&InferenceConfig>,
+    policy: &CapabilityPolicy,
+) -> Result<(), RuntimeError> {
+    if inference.is_none() || policy.shell_allow.is_empty() {
+        return Ok(());
+    }
+    write_runtime_provided_tool_manifest(
+        runtime_root,
+        BACKGROUND_COMMAND_TOOL,
+        &native_tool_manifest_yaml(
+            BACKGROUND_COMMAND_TOOL,
+            crate::background_command::description(),
+            crate::background_command::INPUT_SCHEMA.to_string(),
         ),
     )
 }
@@ -12005,6 +12128,7 @@ async fn record_canceled_before_start(
             None,
             false,
             &[],
+            &[],
         );
         reg.get_task(&task.task_id)
     };
@@ -12380,7 +12504,7 @@ async fn refuse_undelivered_tasks(
     for (task_id, context_id) in refused {
         let reported = {
             let mut reg = task_registry.lock().unwrap();
-            reg.record_ending(&task_id, reason, None, false, &[]);
+            reg.record_ending(&task_id, reason, None, false, &[], &[]);
             reg.get_task(&task_id)
         };
         let source = sources
@@ -12414,13 +12538,35 @@ async fn refuse_undelivered_tasks(
 /// outstanding report therefore counts against `queue_depth`, and a capsule with detached work in
 /// flight has less room for new inbound requests. A loss report costs exactly one pending item
 /// however many work ids it names, and the drain loop clears it on its first pass.
+///
+/// A completion whose exit `background-command` already returned to the agent, as `detached`
+/// records, enqueues nothing: it is recorded as `shell_completed` with no task id and costs no
+/// pending item.
 async fn enqueue_detached_report(
     report: DetachedReport,
+    detached: &DetachedRegistry,
     task_registry: &Arc<Mutex<TaskRegistry>>,
     lanes: &mut LaneQueue,
     trace: &mut TraceWriter,
 ) {
     let task = match report {
+        DetachedReport::Completed(completion) if detached.exit_reported(&completion.work_id) => {
+            let _ = trace
+                .write_shell_completed(
+                    &completion.work_id,
+                    &completion.binary,
+                    &completion.command,
+                    completion.exit_code,
+                    completion.duration_ms,
+                    &completion.output_path,
+                    completion.output_bytes,
+                    completion.resource_limit.clone(),
+                    completion.status(),
+                    None,
+                )
+                .await;
+            return;
+        }
         DetachedReport::Completed(completion) => {
             let task = IncomingTask {
                 task_id: format!("tsk_{}", uuid::Uuid::now_v7().simple()),
@@ -12451,7 +12597,7 @@ async fn enqueue_detached_report(
                     completion.output_bytes,
                     completion.resource_limit.clone(),
                     completion.status(),
-                    &task.task_id,
+                    Some(&task.task_id),
                 )
                 .await;
             task
@@ -13099,7 +13245,7 @@ mod tests {
     fn reserved_tool_names_cover_every_runtime_provided_tool() {
         assert_eq!(
             super::RESERVED_TOOL_NAMES.len(),
-            10,
+            11,
             "a new runtime-provided tool must be added to RESERVED_TOOL_NAMES, and this arity \
              raised, before its writer can succeed"
         );
@@ -13114,6 +13260,7 @@ mod tests {
             super::PULL_ARTIFACT_TOOL,
             super::REMOVE_ARTIFACT_TOOL,
             super::SESSION_STATUS_TOOL,
+            super::BACKGROUND_COMMAND_TOOL,
         ] {
             assert!(
                 super::is_reserved_tool_name(name),
@@ -13124,6 +13271,400 @@ mod tests {
         assert!(!super::is_reserved_tool_name("bash"));
         // Case-sensitive, because artifact names are.
         assert!(!super::is_reserved_tool_name("Delegate-Task"));
+    }
+
+    // ── background-command ───────────────────────────────────────────────────
+
+    /// A store state that demotes a `bash` command after one second, as the A2A serve loop's
+    /// does: it holds a registry, a context id and a records directory under `runtime`.
+    fn background_state(
+        workdir: &Path,
+        runtime: &Path,
+    ) -> (
+        CapsuleStoreState,
+        tokio::sync::mpsc::UnboundedReceiver<DetachedReport>,
+    ) {
+        let mut state = build_test_state(
+            Arc::new(FakeSkillRegistry::new(Vec::new())),
+            workdir.to_path_buf(),
+            workdir.join("murmur.lock"),
+        );
+        state.capability_policy.shell_allow = vec!["bash".to_string()];
+        state.shell_enforcement = sandbox::ShellEnforcement::environment_only()
+            .with_runtime_dir(sandbox::test_runtime_dir(runtime), None);
+        let (registry, reports) = DetachedRegistry::new();
+        state.detached = Some(registry);
+        state.current_context_id = Some("ctx_background".to_string());
+        state.shell_grace_secs = 1;
+        (state, reports)
+    }
+
+    /// Kills every command the registry still runs when dropped, so a failing test leaves
+    /// nothing behind.
+    struct KillDemotedOnDrop(Arc<DetachedRegistry>);
+
+    impl Drop for KillDemotedOnDrop {
+        fn drop(&mut self) {
+            self.0.kill_running();
+        }
+    }
+
+    async fn call_tool(
+        state: &CapsuleStoreState,
+        name: &str,
+        input: serde_json::Value,
+    ) -> Result<DispatchOutcome, String> {
+        state
+            .dispatch_agent_tool_async(
+                name,
+                murmur::tool::run::ToolInput {
+                    data: Some(input.to_string()),
+                    log_path: None,
+                },
+                None,
+            )
+            .await
+    }
+
+    /// Dispatches `command` through `bash` and returns the work id it was demoted as.
+    async fn demote_command(state: &CapsuleStoreState, command: &str) -> String {
+        let outcome = call_tool(state, "bash", serde_json::json!({ "command": command }))
+            .await
+            .expect("bash dispatches");
+        outcome
+            .detached
+            .unwrap_or_else(|| panic!("{command:?} was not demoted: {:?}", outcome.result.data))
+            .work_id
+    }
+
+    fn line_value<'a>(data: &'a str, key: &str) -> Option<&'a str> {
+        data.lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}: ")))
+    }
+
+    #[tokio::test]
+    async fn a_demoted_command_returns_a_handle_the_tool_accepts() {
+        let workdir = TempDir::new().unwrap();
+        let runtime = TempDir::new().unwrap();
+        let (state, _reports) = background_state(workdir.path(), runtime.path());
+        let _guard = KillDemotedOnDrop(Arc::clone(state.detached.as_ref().unwrap()));
+
+        let work_id = demote_command(&state, "sleep 30").await;
+        let status = call_tool(
+            &state,
+            BACKGROUND_COMMAND_TOOL,
+            serde_json::json!({"operation": "status", "work_id": work_id}),
+        )
+        .await
+        .expect("the tool accepts the work id");
+        assert!(matches!(
+            status.result.status,
+            murmur::tool::run::Status::Passed
+        ));
+        let data = status.result.data.unwrap();
+        assert_eq!(
+            line_value(&data, "work_id"),
+            Some(work_id.as_str()),
+            "{data}"
+        );
+        assert_eq!(line_value(&data, "state"), Some("running"), "{data}");
+        let elapsed: u64 = line_value(&data, "elapsed_secs").unwrap().parse().unwrap();
+        assert!(elapsed >= 1, "{data}");
+        assert!(status
+            .result
+            .metadata
+            .contains(&("state".to_string(), "running".to_string())));
+
+        let stopped = call_tool(
+            &state,
+            BACKGROUND_COMMAND_TOOL,
+            serde_json::json!({"operation": "stop", "work_id": work_id}),
+        )
+        .await
+        .unwrap();
+        let data = stopped.result.data.unwrap();
+        assert_eq!(line_value(&data, "state"), Some("stopped"), "{data}");
+    }
+
+    /// A cancel of the task ends a long wait at once and is recorded as landing in it.
+    #[tokio::test]
+    async fn a_wait_ends_when_its_task_is_cancelled() {
+        let workdir = TempDir::new().unwrap();
+        let runtime = TempDir::new().unwrap();
+        let (mut state, _reports) = background_state(workdir.path(), runtime.path());
+        let _guard = KillDemotedOnDrop(Arc::clone(state.detached.as_ref().unwrap()));
+        let mut tasks = TaskRegistry::new(4, TaskAcceptance::Queue);
+        tasks.enqueue("tsk_wait", "ctx_background");
+        state.a2a_task_registry = Some(Arc::new(Mutex::new(tasks)));
+        state.a2a_task = Some(StreamTask::new("tsk_wait", "ctx_background"));
+        let signal = state.task_cancel_signal().expect("a task is in scope");
+
+        let work_id = demote_command(&state, "sleep 60").await;
+        let canceller = async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            signal.cancel();
+            std::time::Instant::now()
+        };
+        let waiting = async {
+            let outcome = call_tool(
+                &state,
+                BACKGROUND_COMMAND_TOOL,
+                serde_json::json!({"operation": "wait", "work_id": work_id, "wait_secs": 60}),
+            )
+            .await;
+            (outcome, std::time::Instant::now())
+        };
+        let ((outcome, returned), canceled) = tokio::join!(waiting, canceller);
+
+        let after_cancel = returned.saturating_duration_since(canceled);
+        assert!(
+            after_cancel < std::time::Duration::from_secs(2),
+            "the wait returned {after_cancel:?} after the cancel"
+        );
+        assert_eq!(signal.phase(), crate::cancel::PHASE_BACKGROUND_WAIT);
+        let data = outcome.unwrap().result.data.unwrap();
+        assert_eq!(line_value(&data, "state"), Some("running"), "{data}");
+    }
+
+    /// Each refused call names what it refused, and writes no `background_command` record; an
+    /// answered one writes exactly one.
+    #[tokio::test]
+    async fn an_unknown_or_malformed_work_id_is_refused_with_a_clear_message() {
+        let workdir = TempDir::new().unwrap();
+        let runtime = TempDir::new().unwrap();
+        let (mut state, _reports) = background_state(workdir.path(), runtime.path());
+        let _guard = KillDemotedOnDrop(Arc::clone(state.detached.as_ref().unwrap()));
+        let records = runtime.path().join(crate::records_dir::RECORDS_DIR_NAME);
+        state.peer_trace = Some(Arc::new(
+            crate::trace::ResourceTraceAppender::open(
+                &WorkdirRoot::open(&records).unwrap(),
+                "ses_refusals".to_string(),
+                "evt_session".to_string(),
+            )
+            .await
+            .unwrap(),
+        ));
+        let records_written = || {
+            std::fs::read_to_string(records.join("trace.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.contains("\"event_type\":\"background_command\""))
+                .count()
+        };
+
+        for (input, expected) in [
+            (
+                serde_json::json!({"operation": "status", "work_id": "wrk_0123abcd"}),
+                vec!["no background command with work id `wrk_0123abcd` in this session"],
+            ),
+            (
+                serde_json::json!({"operation": "status", "work_id": "abc"}),
+                vec!["`abc`", "wrk_<hex>"],
+            ),
+            (serde_json::json!({"operation": "wait"}), vec!["`work_id`"]),
+            (
+                serde_json::json!({"operation": "restart", "work_id": "wrk_0123abcd"}),
+                vec!["\"restart\"", "`status`, `wait`, `stop`"],
+            ),
+        ] {
+            let Err(refusal) = call_tool(&state, BACKGROUND_COMMAND_TOOL, input.clone()).await
+            else {
+                panic!("{input} was answered");
+            };
+            for part in expected {
+                assert!(
+                    refusal.contains(part),
+                    "{input}: {part} missing from {refusal}"
+                );
+            }
+        }
+        assert_eq!(records_written(), 0);
+
+        let work_id = demote_command(&state, "sleep 30").await;
+        call_tool(
+            &state,
+            BACKGROUND_COMMAND_TOOL,
+            serde_json::json!({"operation": "status", "work_id": work_id}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(records_written(), 1);
+
+        state.detached = None;
+        let Err(refusal) = call_tool(
+            &state,
+            BACKGROUND_COMMAND_TOOL,
+            serde_json::json!({"operation": "status", "work_id": work_id}),
+        )
+        .await
+        else {
+            panic!("a session with no registry answered background-command");
+        };
+        assert!(
+            refusal.contains("background commands are not available in this session"),
+            "{refusal}"
+        );
+    }
+
+    /// A completion whose exit the agent already read through `background-command` enqueues no
+    /// task and is recorded with no task id; one it never read is enqueued as before.
+    #[tokio::test]
+    async fn a_completion_the_agent_already_read_is_not_enqueued_again() {
+        let workdir = TempDir::new().unwrap();
+        let runtime = TempDir::new().unwrap();
+        let (state, mut reports) = background_state(workdir.path(), runtime.path());
+        let detached = Arc::clone(state.detached.as_ref().unwrap());
+        let _guard = KillDemotedOnDrop(Arc::clone(&detached));
+
+        let read = demote_command(&state, "sleep 1.5").await;
+        let unread = demote_command(&state, "sleep 1.5").await;
+        let mut completions = Vec::new();
+        while completions.len() < 2 {
+            let report = tokio::time::timeout(std::time::Duration::from_secs(30), reports.recv())
+                .await
+                .expect("both commands complete")
+                .unwrap();
+            completions.push(report);
+        }
+        let status = call_tool(
+            &state,
+            BACKGROUND_COMMAND_TOOL,
+            serde_json::json!({"operation": "status", "work_id": read}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            line_value(status.result.data.as_deref().unwrap(), "state"),
+            Some("exited")
+        );
+        completions.sort_by_key(|report| match report {
+            DetachedReport::Completed(completion) => completion.work_id != read,
+            DetachedReport::Lost(_) => true,
+        });
+
+        let trace_dir = TempDir::new().unwrap();
+        let mut trace = tool_refresh_trace(trace_dir.path()).await;
+        let task_registry = Arc::new(Mutex::new(TaskRegistry::new(8, TaskAcceptance::Queue)));
+        let mut lanes = LaneQueue::new();
+        let mut completions = completions.into_iter();
+
+        enqueue_detached_report(
+            completions.next().unwrap(),
+            &detached,
+            &task_registry,
+            &mut lanes,
+            &mut trace,
+        )
+        .await;
+        assert_eq!(task_registry.lock().unwrap().pending_count, 0);
+        assert!(
+            lanes.next(None).is_none(),
+            "a read completion enqueues nothing"
+        );
+
+        enqueue_detached_report(
+            completions.next().unwrap(),
+            &detached,
+            &task_registry,
+            &mut lanes,
+            &mut trace,
+        )
+        .await;
+        assert_eq!(task_registry.lock().unwrap().pending_count, 1);
+        let (_, task) = lanes.next(None).expect("an unread completion is enqueued");
+        assert_eq!(task.source, crate::a2a::SOURCE_DETACHED_SHELL);
+        assert_eq!(task.provenance.origin(), TaskOrigin::Completion);
+        assert!(task.message_text.contains(&unread), "{}", task.message_text);
+
+        trace.flush().await.unwrap();
+        let completed: Vec<serde_json::Value> =
+            std::fs::read_to_string(trace_dir.path().join("trace.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|event| event["event_type"] == "shell_completed")
+                .collect();
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0]["work_id"], read.as_str());
+        assert!(
+            completed[0].get("completion_task_id").is_none(),
+            "{}",
+            completed[0]
+        );
+        assert_eq!(completed[1]["work_id"], unread.as_str());
+        assert_eq!(completed[1]["completion_task_id"], task.task_id.as_str());
+    }
+
+    /// `background-command` exists for an agent capsule that can run a shell command, on either
+    /// transport, and for no other capsule; the policy decision point sees it as a tool call.
+    #[test]
+    fn the_tool_is_staged_only_for_an_agent_capsule_that_can_run_shell() {
+        let manifest_path = |dir: &Path| {
+            dir.join("tools")
+                .join(BACKGROUND_COMMAND_TOOL)
+                .join(PACKED_MANIFEST_ENTRY)
+        };
+        let with_shell = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        for transport in ["http", "process"] {
+            let inference = murmur_artifact::InferenceConfig {
+                transport: transport.to_string(),
+                ..inference_without_prompt()
+            };
+            let agent = TempDir::new().unwrap();
+            super::write_background_command_tool_manifest(
+                &WorkdirRoot::open(agent.path()).unwrap(),
+                Some(&inference),
+                &with_shell,
+            )
+            .unwrap();
+            let manifest: Value =
+                serde_norway::from_str(&fs::read_to_string(manifest_path(agent.path())).unwrap())
+                    .unwrap();
+            assert_eq!(manifest["name"].as_str(), Some(BACKGROUND_COMMAND_TOOL));
+            assert_eq!(manifest["implementation"].as_str(), Some("native"));
+            assert_eq!(
+                manifest["description"].as_str(),
+                Some(crate::background_command::description().as_str())
+            );
+            assert_eq!(
+                manifest["input_schema"].as_str(),
+                Some(crate::background_command::INPUT_SCHEMA)
+            );
+
+            let no_shell = TempDir::new().unwrap();
+            super::write_background_command_tool_manifest(
+                &WorkdirRoot::open(no_shell.path()).unwrap(),
+                Some(&inference),
+                &CapabilityPolicy::default(),
+            )
+            .unwrap();
+            assert!(!manifest_path(no_shell.path()).exists(), "{transport}");
+        }
+        let script = TempDir::new().unwrap();
+        super::write_background_command_tool_manifest(
+            &WorkdirRoot::open(script.path()).unwrap(),
+            None,
+            &with_shell,
+        )
+        .unwrap();
+        assert!(!manifest_path(script.path()).exists());
+
+        let state = build_test_state(
+            Arc::new(FakeSkillRegistry::new(Vec::new())),
+            script.path().to_path_buf(),
+            script.path().join("murmur.lock"),
+        );
+        let input = murmur::tool::run::ToolInput {
+            data: Some(r#"{"operation":"status","work_id":"wrk_0a"}"#.to_string()),
+            log_path: None,
+        };
+        assert!(matches!(
+            state.resolve_call(BACKGROUND_COMMAND_TOOL, &input),
+            ResolvedCall::Tool { tool_name, .. } if tool_name == BACKGROUND_COMMAND_TOOL
+        ));
     }
 
     /// `session-status` needs no grant: its manifest is written for every agent capsule, with
@@ -13565,110 +14106,6 @@ inference:
             task_acceptance,
             after_task,
             ..LifecycleConfig::default()
-        }
-    }
-
-    /// A capsule that can run shell commands and leaves `lifecycle` at its defaults is warned,
-    /// because `after_task: exit` ends the session before any demoted command's completion can
-    /// arrive.
-    #[test]
-    fn warn_for_unreachable_shell_completions_writes_the_code_and_link_to_bootstrap_log() {
-        let temp = TempDir::new().unwrap();
-        warn_for_unreachable_shell_completions(
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            true,
-            &LifecycleConfig::default(),
-        );
-        let log = bootstrap_log_contents(temp.path());
-
-        assert!(log.contains(W_SEC_022), "log was: {log}");
-        assert!(
-            log.contains(&security_warning_link(W_SEC_022)),
-            "log was: {log}"
-        );
-        assert!(log.contains("lifecycle.shell_grace_secs"), "log was: {log}");
-        assert!(log.contains("lifecycle.task_acceptance"), "log was: {log}");
-        assert!(log.contains("lifecycle.after_task"), "log was: {log}");
-    }
-
-    /// The demotion result the model reads and `W-SEC-022`, which the operator reads, agree on
-    /// whether a demoted command's result arrives: `launch` hands the dispatch path the same
-    /// predicate the warning fires on.
-    #[test]
-    fn the_demotion_text_agrees_with_unreachable_shell_completions_warning() {
-        for lifecycle in [
-            lifecycle(TaskAcceptance::Single, AfterTask::Exit),
-            lifecycle(TaskAcceptance::Queue, AfterTask::Exit),
-            lifecycle(TaskAcceptance::Queue, AfterTask::Sleep),
-        ] {
-            let delivered = lifecycle.can_receive_background_tasks();
-            let warned = unreachable_shell_completions_warning(true, &lifecycle).is_some();
-            assert_eq!(delivered, !warned, "{lifecycle:?}");
-            let data = demotion_tool_result("wrk_1", delivered).data.unwrap();
-            assert_eq!(
-                data.contains("will not reach you"),
-                warned,
-                "{lifecycle:?}: {data}"
-            );
-            assert_eq!(
-                data.contains("will arrive later"),
-                !warned,
-                "{lifecycle:?}: {data}"
-            );
-        }
-        assert!(!LifecycleConfig::default().can_receive_background_tasks());
-    }
-
-    /// The only lifecycle a completion can reach is `queue` + `sleep`; a capsule that declares no
-    /// `capabilities.shell.allow` is never warned whatever it declares.
-    #[test]
-    fn only_a_shell_running_capsule_that_cannot_be_told_is_warned() {
-        assert!(unreachable_shell_completions_warning(
-            true,
-            &lifecycle(TaskAcceptance::Queue, AfterTask::Sleep)
-        )
-        .is_none());
-        for lifecycle in [
-            lifecycle(TaskAcceptance::Queue, AfterTask::Exit),
-            lifecycle(TaskAcceptance::Single, AfterTask::Sleep),
-            lifecycle(TaskAcceptance::None, AfterTask::Sleep),
-        ] {
-            assert_eq!(
-                unreachable_shell_completions_warning(true, &lifecycle).map(|(code, _)| code),
-                Some(W_SEC_022),
-                "{lifecycle:?} cannot receive a completion"
-            );
-            assert!(
-                unreachable_shell_completions_warning(false, &lifecycle).is_none(),
-                "a capsule that cannot run shell commands is not warned about them"
-            );
-        }
-    }
-
-    /// `lifecycle.shell_grace_secs` is not part of the decision. `0` demotes on the first check
-    /// after the spawn, so a low grace makes the discard more likely rather than less, and no
-    /// value of it turns demotion off.
-    #[test]
-    fn the_shell_completion_warning_ignores_the_grace_period() {
-        for shell_grace_secs in [0, 1, 10, 3_600] {
-            let receiving = LifecycleConfig {
-                task_acceptance: TaskAcceptance::Queue,
-                after_task: AfterTask::Sleep,
-                shell_grace_secs,
-                ..LifecycleConfig::default()
-            };
-            assert!(
-                unreachable_shell_completions_warning(true, &receiving).is_none(),
-                "queue+sleep is silent at every grace period, including {shell_grace_secs}"
-            );
-            let discarding = LifecycleConfig {
-                after_task: AfterTask::Exit,
-                ..receiving
-            };
-            assert!(
-                unreachable_shell_completions_warning(true, &discarding).is_some(),
-                "exit warns at every grace period, including {shell_grace_secs}"
-            );
         }
     }
 
