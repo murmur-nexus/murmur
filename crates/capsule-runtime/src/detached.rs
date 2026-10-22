@@ -579,7 +579,11 @@ mod tests {
     use crate::{
         origin::TrustClass,
         sandbox::ShellEnforcement,
-        shell::{run_shell, ShellOutcome},
+        shell::{
+            run_shell,
+            test_support::{process_dead_within, read_pid, KillPidFileOnDrop},
+            ShellOutcome,
+        },
         types::CapabilityPolicy,
     };
 
@@ -766,6 +770,7 @@ mod tests {
     fn a_demoted_command_completes_when_its_background_holders_are_killed() {
         let workdir = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
+        let _sleeper = KillPidFileOnDrop(workdir.path().join("sleeper.pid"));
         let (outcome, _registry, mut receiver) = detached_run(
             workdir.path(),
             runtime.path(),
@@ -796,32 +801,11 @@ mod tests {
         let log = std::fs::read_to_string(&completion.output_path).unwrap();
         assert!(log.contains("started"), "{log}");
 
-        let sleeper: i32 = std::fs::read_to_string(workdir.path().join("sleeper.pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let dead = loop {
-            let dead =
-                std::fs::read_to_string(format!("/proc/{sleeper}/stat")).map_or(true, |stat| {
-                    stat.rsplit_once(')')
-                        .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
-                });
-            if dead || Instant::now() >= deadline {
-                break dead;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        if !dead {
-            // SAFETY: `kill` takes two integers and dereferences nothing. `sleeper` is the
-            // positive pid of the test's sleeper.
-            #[allow(unsafe_code)]
-            unsafe {
-                libc::kill(sleeper, libc::SIGKILL);
-            }
-        }
-        assert!(dead, "the background sleeper {sleeper} is still running");
+        let sleeper = read_pid(&workdir.path().join("sleeper.pid"));
+        assert!(
+            process_dead_within(sleeper, Duration::from_secs(2)),
+            "the background sleeper {sleeper} is still running"
+        );
     }
 
     /// The whole argument of demotion: the call returns long before the command does, and the

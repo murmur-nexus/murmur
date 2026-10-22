@@ -382,8 +382,8 @@ const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// its own process has exited, the call waits at most [`PIPE_DRAIN_AFTER_EXIT`] — never past the
 /// grace deadline — for its stdout and stderr to close, then kills every process still in that
 /// group and waits at most [`LEFTOVER_KILL_WAIT`] more; see [`finish_output`]. A background
-/// process whose output is redirected away from the call holds neither pipe, so this never
-/// touches it.
+/// process whose output is redirected away from the call holds neither pipe, so it never triggers
+/// the kill, but the kill takes the whole group, it included, when anything else in it does.
 ///
 /// With `detach: None` the child is waited for with a plain blocking wait and nothing is polled —
 /// the path `plan.rs` and the script-capsule store state take, because neither runs a task loop
@@ -768,18 +768,12 @@ fn finish_output(
     }
 
     let give_up = Instant::now() + LEFTOVER_KILL_WAIT;
-    // `kill(0, …)` and `kill(-1, …)` would signal `mur`'s own group and every process. A child's
-    // pid is never 0 or 1, but nothing below may rely on that.
-    let mut group_alive = pgid > 1;
+    let mut group_alive = true;
     let mut killed = false;
     let closed = loop {
         if group_alive {
-            // SAFETY: `kill` takes two integers and dereferences nothing. `pgid` is greater than
-            // 1, so `-pgid` names one process group: the command's own, which it leads from
-            // `process_group(0)` and which still exists, because no earlier `kill` on it failed.
-            #[allow(unsafe_code)]
-            let sent = unsafe { libc::kill(-pgid, libc::SIGKILL) } == 0;
-            if sent {
+            // Refuses a `pgid` of 0 or 1, which would name `mur`'s own group or every process.
+            if crate::formation_launch::signal_group(i64::from(pgid), libc::SIGKILL) {
                 killed = true;
             } else {
                 group_alive = false;
@@ -1266,6 +1260,7 @@ mod tests {
     use std::{fs, path::Path};
     use tempfile::tempdir;
 
+    use super::test_support::{process_dead_within, read_pid, KillPidFileOnDrop};
     use super::*;
     use crate::sandbox::ShellEnforcement;
 
@@ -2482,51 +2477,6 @@ mod tests {
         );
     }
 
-    /// Whether `pid` has exited within `timeout`: `/proc/<pid>` is gone, or its state in
-    /// `/proc/<pid>/stat` is `Z` (dead and not yet reaped by whichever process it was orphaned
-    /// to).
-    fn process_dead_within(pid: i32, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let dead = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-                Err(_) => true,
-                Ok(stat) => stat
-                    .rsplit_once(')')
-                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
-            };
-            if dead {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    /// Kills the process whose pid a test's command wrote to `pid_file`, if it is still running
-    /// when the test ends, so a failing test leaves no sleeper behind.
-    struct KillPidFileOnDrop(std::path::PathBuf);
-
-    impl Drop for KillPidFileOnDrop {
-        fn drop(&mut self) {
-            let Some(pid) = fs::read_to_string(&self.0)
-                .ok()
-                .and_then(|text| text.trim().parse::<i32>().ok())
-            else {
-                return;
-            };
-            if pid > 0 && !process_dead_within(pid, Duration::ZERO) {
-                // SAFETY: `kill` takes two integers and dereferences nothing. `pid` is positive,
-                // so it names one process.
-                #[allow(unsafe_code)]
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
-        }
-    }
-
     /// `run` on a thread of its own, failing the test after 30 s instead of hanging it.
     fn returns_within_30_s<T: Send + 'static>(run: impl FnOnce() -> T + Send + 'static) -> T {
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -2594,11 +2544,7 @@ mod tests {
         );
         assert!(result.stdout.contains("started"), "{result:?}");
         assert_eq!(result.exit_code, 0, "{result:?}");
-        let sleeper: i32 = fs::read_to_string(temp.path().join("sleeper.pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let sleeper = read_pid(&temp.path().join("sleeper.pid"));
         assert!(
             process_dead_within(sleeper, Duration::from_secs(2)),
             "the background sleeper {sleeper} is still running"
@@ -2637,11 +2583,7 @@ mod tests {
         );
         assert!(result.stdout.contains("started"), "{result:?}");
         assert_eq!(result.exit_code, 0, "{result:?}");
-        let sleeper: i32 = fs::read_to_string(temp.path().join("sleeper.pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let sleeper = read_pid(&temp.path().join("sleeper.pid"));
         assert!(
             process_dead_within(sleeper, Duration::from_secs(2)),
             "the background sleeper {sleeper} is still running"
@@ -2713,7 +2655,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let runtime = tempdir().unwrap();
         let pid_file = temp.path().join("escaped.pid");
-        let _escaped = KillPidFileOnDrop(pid_file.clone());
+        let escaped_guard = KillPidFileOnDrop(pid_file.clone());
         let workdir = temp.path().to_path_buf();
         let runtime_base = runtime.path().to_path_buf();
         let script = "setsid sleep 300 & echo $! > escaped.pid; echo started";
@@ -2754,21 +2696,12 @@ mod tests {
         assert!(elapsed < bound, "the call took {elapsed:?}, past {bound:?}");
         assert_eq!(result.stdout.trim(), "started", "{result:?}");
         assert_eq!(result.output_holders, OutputHolders::Escaped);
-        let escaped: i32 = fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let escaped = read_pid(&pid_file);
         assert!(
             !process_dead_within(escaped, Duration::ZERO),
             "a holder outside the process group is not the call's to kill"
         );
-        // SAFETY: `kill` takes two integers and dereferences nothing. `escaped` is the positive
-        // pid of the test's sleeper.
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::kill(escaped, libc::SIGKILL);
-        }
+        drop(escaped_guard);
         assert!(process_dead_within(escaped, Duration::from_secs(2)));
     }
 
@@ -2979,6 +2912,62 @@ mod tests {
     fn the_env_baseline_names_no_temp_variable() {
         for name in crate::temp_dir::TEMP_DIR_ENV {
             assert!(!DEFAULT_ENV_BASELINE.contains(&name), "{name}");
+        }
+    }
+}
+
+/// Helpers for tests whose command leaves a process behind and writes its pid to a file.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    /// The pid the test's command wrote to `pid_file`.
+    pub(crate) fn read_pid(pid_file: &Path) -> u32 {
+        std::fs::read_to_string(pid_file)
+            .expect("the command wrote its pid file")
+            .trim()
+            .parse()
+            .expect("the pid file holds a pid")
+    }
+
+    /// Whether `pid` has exited within `timeout`: it is gone, or a zombie whichever process it
+    /// was orphaned to has not reaped yet.
+    pub(crate) fn process_dead_within(pid: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !crate::running::pid_is_alive(pid) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Kills the process whose pid the test's command wrote to the file, if it is still running
+    /// when the guard drops, so a failing test leaves nothing behind. It reads the file at drop,
+    /// so it also covers a test that panicked before reading it.
+    pub(crate) struct KillPidFileOnDrop(pub(crate) PathBuf);
+
+    impl Drop for KillPidFileOnDrop {
+        fn drop(&mut self) {
+            let Some(pid) = std::fs::read_to_string(&self.0)
+                .ok()
+                .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+                .filter(|pid| *pid > 0)
+            else {
+                return;
+            };
+            if !process_dead_within(pid.unsigned_abs(), Duration::ZERO) {
+                // SAFETY: `kill` takes two integers and dereferences nothing. `pid` is positive,
+                // so it names one process, never a group or every process.
+                #[allow(unsafe_code)]
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
         }
     }
 }

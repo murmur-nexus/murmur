@@ -2424,9 +2424,12 @@ A process meant to keep running after its call returns redirects its output away
 server >server.log 2>&1 &
 ```
 
-It holds neither pipe, so the call returns as soon as the command exits, nothing kills it, and
-later calls in the same session can reach it. The session's end kills it with everything else the
-session started.
+It holds neither pipe, so the call returns as soon as the command exits and later calls in the
+same session can reach it. The session's end kills it with everything else the session started.
+
+The kill in step 2 takes the whole process group. If one command starts a redirected server and
+also leaves another process holding its output, the server is killed with it, so redirect every
+background process a command starts.
 
 #### When a session ends with a command still running
 

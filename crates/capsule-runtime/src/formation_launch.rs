@@ -583,7 +583,9 @@ pub(crate) fn kill_registered_members() {
     for slot in &MEMBER_REGISTRY {
         match slot.load(Ordering::SeqCst) {
             0 => {}
-            pid if pid > 0 => signal_group(pid, libc::SIGKILL),
+            pid if pid > 0 => {
+                signal_group(pid, libc::SIGKILL);
+            }
             pid => signal_pid(-pid, libc::SIGKILL),
         }
     }
@@ -621,27 +623,29 @@ fn signal_pid(pid: i64, signal: libc::c_int) {
     }
 }
 
+/// Send `signal` to process group `pgid`. `true` when it was delivered; `false` when the group
+/// is gone, or `pgid` is outside `2..=pid_t::MAX` and so names no single group.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn signal_group(pgid: i64, signal: libc::c_int) {
+pub(crate) fn signal_group(pgid: i64, signal: libc::c_int) -> bool {
     let Ok(pgid) = libc::pid_t::try_from(pgid) else {
-        return;
+        return false;
     };
     if pgid <= 1 {
-        return;
+        return false;
     }
     // SAFETY: `killpg` takes two integers and dereferences nothing. `pgid` is greater than 1, so
     // it names one process group, never the caller's own or every process.
-    unsafe {
-        libc::killpg(pgid, signal);
-    }
+    unsafe { libc::killpg(pgid, signal) == 0 }
 }
 
 #[cfg(not(unix))]
 fn signal_pid(_pid: i64, _signal: i32) {}
 
 #[cfg(not(unix))]
-fn signal_group(_pgid: i64, _signal: i32) {}
+pub(crate) fn signal_group(_pgid: i64, _signal: i32) -> bool {
+    false
+}
 
 // ── One member's process ──────────────────────────────────────────────────────
 
