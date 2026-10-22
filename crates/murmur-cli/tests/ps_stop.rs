@@ -2489,6 +2489,28 @@ fn a_formation_is_accounted_for_after_its_members_end() {
         .assert()
         .success();
 
+    // Both records are gone by now, so `--json` counts both members from their traces alone,
+    // and neither names a roster member: these members were started with no roster.
+    let (listing, _) = ps_json(home.path());
+    assert_eq!(
+        listing["formations"],
+        json!([{
+            "formation_id": formation.as_str(),
+            "listed": 1,
+            "ended": 1,
+            "gone_without_ending": 1,
+            "not_listed": not_listed_by_session([
+                json!({"session_id": stopped.session_id(), "formation_member": null,
+                       "reason": "ended", "record_kept": false}),
+                json!({"session_id": killed.session_id(), "formation_member": null,
+                       "reason": "gone_without_ending", "record_kept": false}),
+            ]),
+            "searched_roots": 1,
+            "unreadable_roots": 0,
+        }]),
+        "{listing:#}"
+    );
+
     let stdout = ps_stdout(home.path());
     let rows = table_rows(&stdout);
     assert_eq!(rows.len(), 1, "{stdout}");
@@ -3053,6 +3075,97 @@ fn listed_capsules(listing: &Value) -> Vec<Value> {
     capsules.clone()
 }
 
+/// `members` in the order `not_listed` lists them: by session id descending.
+fn not_listed_by_session<const N: usize>(mut members: [Value; N]) -> Vec<Value> {
+    members.sort_by(|a, b| {
+        b["session_id"]
+            .as_str()
+            .unwrap()
+            .cmp(a["session_id"].as_str().unwrap())
+    });
+    members.to_vec()
+}
+
+/// A directory set to mode `000` for the life of the value, and back to `0755` when it drops, so
+/// its temporary directory can be removed even after a failed assertion.
+struct Sealed(PathBuf);
+
+impl Sealed {
+    fn new(dir: PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for Sealed {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// A member whose records group cannot be listed: both members stay listed, the root is counted
+/// as unreadable on both streams, and nothing fails.
+#[test]
+fn ps_json_counts_a_session_root_it_cannot_read() {
+    if running_as_root() {
+        println!("skipped: root lists a mode-000 directory, so no session root is unreadable");
+        return;
+    }
+    let server = common::ScriptedServer::start(Vec::new());
+    let home = driver_home();
+    let formation = capsule_runtime::FormationId::mint();
+    let project = Arc::new(agent_project(&server.endpoint, "member", ""));
+    let live = start_member(&home, &project, formation.as_str());
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let stray = Stray::sleeping();
+    let quiet = fabricated_id("ab");
+    write_member_record(
+        home.path(),
+        &quiet,
+        stray.pid(),
+        &stray.token(),
+        Some(formation.as_str()),
+        elsewhere.path(),
+    );
+    let _sealed = Sealed::new(common::records_group(home.path(), elsewhere.path()));
+
+    let (listing, stderr) = ps_json(home.path());
+    assert!(stderr.is_empty(), "{stderr}");
+    let ids: Vec<&str> = listing["capsules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|capsule| capsule["session_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&live.session_id().as_str()), "{listing:#}");
+    assert!(ids.contains(&quiet.as_str()), "{listing:#}");
+    assert_eq!(
+        listing["formations"],
+        json!([{
+            "formation_id": formation.as_str(),
+            "listed": 2,
+            "ended": 0,
+            "gone_without_ending": 0,
+            "not_listed": [],
+            "searched_roots": 1,
+            "unreadable_roots": 1,
+        }]),
+        "{listing:#}"
+    );
+
+    let stdout = ps_stdout(home.path());
+    let summary = summary_lines(&stdout);
+    assert_eq!(summary.len(), 1, "{stdout}");
+    assert!(
+        summary[0].ends_with("; 1 session root could not be read"),
+        "{stdout}"
+    );
+}
+
 /// `mur ps --json` on one real running capsule: the startup line's values, the manifest's name and
 /// version, `running`, no formation, no secret, and the record left byte for byte.
 #[test]
@@ -3080,6 +3193,7 @@ fn ps_json_lists_a_running_capsule_as_its_startup_line_names_it() {
     assert!(entry["outlives_launcher"].is_boolean(), "{entry}");
     assert!(entry["process_start"].is_string(), "{entry}");
     assert!(entry["started_at"].is_string(), "{entry}");
+    assert_eq!(listing["formations"], json!([]), "{listing:#}");
     assert_eq!(fs::read(&record).unwrap(), record_before);
 }
 
@@ -3191,7 +3305,7 @@ fn ps_json_on_an_empty_machine_an_unreadable_one_and_with_verbose() {
     let (stdout, stderr) = ps_output_with(home.path(), &["--json"]);
     assert_eq!(
         serde_json::from_str::<Value>(&stdout).unwrap(),
-        json!({"capsules": []})
+        json!({"capsules": [], "formations": []})
     );
     assert!(stderr.is_empty(), "{stderr}");
     assert!(

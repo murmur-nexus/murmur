@@ -1679,19 +1679,43 @@ mur ps --json
 {
   "capsules": [
     {
-      "session_id": "ses_019f01a940ce7761854e768ecbe3d399",
+      "session_id": "ses_019f01a9c3e47d1a9b2c3d4e5f6a7b8c",
       "status": "running",
       "url": "localhost:41235",
       "pid": 48213,
       "process_start": "9123456",
-      "capsule_name": "my-worker",
+      "capsule_name": "planner",
       "capsule_version": "0.1.0",
-      "workdir": "/home/me/proj/.murmur/ses_019f01a940ce7761854e768ecbe3d399",
-      "records_dir": "/home/me/.murmur/records/home/me/proj/ses_019f01a940ce7761854e768ecbe3d399",
+      "workdir": "/home/me/proj/.murmur/ses_019f01a9c3e47d1a9b2c3d4e5f6a7b8c",
+      "records_dir": "/home/me/.murmur/records/home/me/proj/ses_019f01a9c3e47d1a9b2c3d4e5f6a7b8c",
       "outlives_launcher": true,
       "started_at": "2026-10-20T09:12:44Z",
-      "formation_id": null,
-      "formation_member": null
+      "formation_id": "frm_019f01a93ff27c1e9a3b5d0c4e8f2a61",
+      "formation_member": "planner"
+    }
+  ],
+  "formations": [
+    {
+      "formation_id": "frm_019f01a93ff27c1e9a3b5d0c4e8f2a61",
+      "listed": 1,
+      "ended": 1,
+      "gone_without_ending": 1,
+      "not_listed": [
+        {
+          "session_id": "ses_019f01a9b1d27c3e8f0a4b5c6d7e8f90",
+          "formation_member": "worker",
+          "reason": "gone_without_ending",
+          "record_kept": true
+        },
+        {
+          "session_id": "ses_019f01a940ce7761854e768ecbe3d399",
+          "formation_member": "reviewer",
+          "reason": "ended",
+          "record_kept": false
+        }
+      ],
+      "searched_roots": 3,
+      "unreadable_roots": 0
     }
   ]
 }
@@ -1713,6 +1737,22 @@ mur ps --json
 | `capsules[].started_at` | string | When the session started, RFC 3339 UTC, as the record holds it |
 | `capsules[].formation_id` | string or `null` | The formation this session is a member of. `null` for a session in no formation |
 | `capsules[].formation_member` | string or `null` | The member's roster name, set only for a member [`mur run --roster`](#mur-run-formation) launched. `null` otherwise |
+| `formations` | array | One entry for each formation an entry of `capsules` names, in the order of that formation's first entry in `capsules`. Empty when no entry of `capsules` names a formation. A formation known only from records whose process is gone has no entry |
+| `formations[].formation_id` | string | The `frm_` id |
+| `formations[].listed` | integer | How many entries of `capsules` carry this `formation_id` |
+| `formations[].ended` | integer | How many entries of `not_listed` have `reason: "ended"` |
+| `formations[].gone_without_ending` | integer | How many entries of `not_listed` have `reason: "gone_without_ending"` |
+| `formations[].not_listed` | array | Every member of this formation this read found that has no entry in `capsules`, sorted by session id descending: each record of the formation whose process is gone, and each session in the [session roots](#mur-ps-session-roots) whose trace's `session_start` names the formation and that has no record |
+| `formations[].not_listed[].session_id` | string | The member's session |
+| `formations[].not_listed[].formation_member` | string or `null` | The roster name: the record's `formation_member` when the record is kept, else the trace's `session_start.formation_member`. `null` when neither names one, as for a member's delegated child |
+| `formations[].not_listed[].reason` | string | `ended`: the member's trace holds a `session_end`. `gone_without_ending`: no `session_end` was found — the member was killed outright, its trace could not be read, or it never recorded one |
+| `formations[].not_listed[].record_kept` | boolean | `true` when the member's record is on disk and its process is gone: the record plain `mur ps` removes and counts as `pruned now` |
+| `formations[].searched_roots` | integer | [Session roots](#mur-ps-session-roots) that were listed |
+| `formations[].unreadable_roots` | integer | Session roots that exist and could not be listed |
+
+A `formations` entry counts what this read found and never says a formation is complete. There
+is no key for a formation's total member count: this read does not consult the roster, so a member
+that left neither a record nor a trace in a searched session root is counted nowhere.
 
 A record's door token and credentials are never printed.
 
@@ -1720,7 +1760,7 @@ A record's door token and credentials are never printed.
 |---|---|---|
 | All three layers pass | Listed, `running` | Listed, `running` |
 | Process alive, door quiet or start time unreadable | Listed, `unreachable` | Listed, `unreachable` |
-| Process gone | Left out, record kept | Left out, record removed |
+| Process gone | Left out, record kept; a formation member is counted in its formation's `not_listed` with `record_kept: true` | Left out, record removed; a formation member is counted as `pruned now` |
 | File that is not a readable record | Kept | Removed |
 | A record an older `mur` wrote | Kept, named on stderr as a `skipped:` line | Kept, named on stderr as a `skipped:` line |
 
@@ -1778,9 +1818,22 @@ formation <id>: <L> listed (<statuses>)[, <P> pruned now][; <not-listed>][; <U> 
 | `; no other member found in <k> session root(s)` | Replaces `not listed` when the session roots hold no member beyond the ones with a record |
 | `; <U> session root(s) could not be read` | Session roots that exist and could not be listed. Only when non-zero |
 
+The same counts are in [`mur ps --json`](#mur-ps-json)'s `formations` entry. For the same records,
+read with `--json` first, since it removes nothing, and plain `mur ps` second:
+
+| Summary line part | `formations[]` in `mur ps --json` |
+|---|---|
+| `<L> listed` | `listed` |
+| `, <P> pruned now` | Entries of `not_listed` with `record_kept: true` |
+| `not listed: <n> ended` | Entries of `not_listed` with `reason: "ended"` and `record_kept: false` |
+| `not listed: … <n> with no record` | Entries of `not_listed` with `reason: "gone_without_ending"` and `record_kept: false` |
+| `no other member found in <k> session root(s)` | `searched_roots`, printed when both counts above are zero |
+| `<U> session root(s) could not be read` | `unreadable_roots` |
+
 <span id="mur-ps-session-roots"></span>The session roots searched are:
 
-- each records group holding a listed or pruned member's `records_dir`;
+- each records group holding the `records_dir` of a listed member, or of a member whose process
+  is gone — the record plain `mur ps` prunes and `--json` keeps;
 - each peer's records group, the one its directory under `~/.murmur/formations/<formation-id>/`
   names, whether or not a record of that peer remains — see
   [Member directories](roster.md#member-directories).
