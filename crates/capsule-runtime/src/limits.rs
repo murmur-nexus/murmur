@@ -131,6 +131,17 @@ impl ExecutionLimits {
         }
     }
 
+    /// These hook limits for one hook whose own `artifacts:` entry declares
+    /// `capabilities.limits.deadline_seconds` as `entry_deadline_seconds`, which wins over the
+    /// session's hook deadline. Every resource cap stays capsule-wide.
+    #[must_use]
+    pub(crate) fn for_hook_entry(self, entry_deadline_seconds: Option<u64>) -> Self {
+        Self {
+            deadline_seconds: entry_deadline_seconds.unwrap_or(self.deadline_seconds),
+            ..self
+        }
+    }
+
     /// This budget expressed in epoch ticks, for `Store::set_epoch_deadline`.
     ///
     /// Rounds down to whole ticks but never to zero — a deadline of zero ticks would trap
@@ -347,6 +358,27 @@ impl GuestFailure {
             Self::Other => format!("{subject} trapped: {error}"),
         }
     }
+
+    /// [`Self::message`] for hook `hook`'s `fn_name` call. A deadline names the key on the hook's
+    /// own `artifacts:` entry, `entry`, which sets that hook's deadline ahead of the capsule-wide
+    /// one.
+    pub(crate) fn hook_message(
+        &self,
+        hook: &str,
+        entry: &str,
+        fn_name: &str,
+        error: &wasmtime::Error,
+    ) -> String {
+        let subject = format!("hook '{hook}' {fn_name}");
+        match self {
+            Self::DeadlineExceeded { seconds } => format!(
+                "{subject} exceeded its {seconds}s execution deadline \
+                 (capabilities.limits.deadline_seconds on the artifacts: entry '{entry}') and was \
+                 interrupted"
+            ),
+            _ => self.message(&subject, error),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -455,6 +487,28 @@ mod tests {
         assert_eq!(
             classify_guest_failure(&error, &limiter),
             GuestFailure::DeadlineExceeded { seconds: 7 }
+        );
+    }
+
+    #[test]
+    fn a_hook_deadline_names_the_key_on_the_hooks_entry() {
+        let error = wasmtime::Error::from(wasmtime::Trap::Interrupt);
+        let failure = GuestFailure::DeadlineExceeded { seconds: 2 };
+        assert_eq!(
+            failure.hook_message("compact", "local/compact", "on-compaction", &error),
+            "hook 'compact' on-compaction exceeded its 2s execution deadline \
+             (capabilities.limits.deadline_seconds on the artifacts: entry 'local/compact') and \
+             was interrupted"
+        );
+        assert_eq!(
+            failure.message("tool 'echo'", &error),
+            "tool 'echo' exceeded its 2s execution deadline (capabilities.limits.deadline_seconds) \
+             and was interrupted",
+            "every other guest keeps the capsule-wide key"
+        );
+        assert_eq!(
+            GuestFailure::Other.hook_message("h", "local/h", "on-stage", &error),
+            GuestFailure::Other.message("hook 'h' on-stage", &error)
         );
     }
 

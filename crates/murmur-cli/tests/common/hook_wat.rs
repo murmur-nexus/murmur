@@ -541,6 +541,52 @@ pub fn run_inference_then_err_compaction_hook_wasm() -> Vec<u8> {
     wat::parse_str(&wat).expect("run-inference compaction hook WAT parses")
 }
 
+/// Where [`run_inference_then_replace_compaction_hook_wasm`] lays its one summary message: past the
+/// `run-inference` result at 256.
+const SUMMARY_RECORD: u32 = 512;
+
+/// An `on-compaction` hook that calls `run-inference` once and returns `replace-context` with one
+/// `user` message holding the completion's text, or `err(<error>)` when the call failed.
+///
+/// On `ok` the lifted `result<hook-output, string>` at [`RETURN_AREA`] is `ok` (`0`) at 0, then the
+/// `hook-output`: discriminant `1` (`replace-context`) at 4 and the list's ptr/len at 8/12. The one
+/// 44-byte `message` record [`message_list`] describes sits at [`SUMMARY_RECORD`]: `role` is the
+/// four bytes `user` at [`STRING_POOL`], `content` the completion's ptr/len, every option `none`.
+pub fn run_inference_then_replace_compaction_hook_wasm() -> Vec<u8> {
+    let store_output = format!(
+        "(if (i32.load8_u (i32.const 256))
+        (then
+          (i32.store (i32.const {RETURN_AREA}) (i32.const 1))
+          (i32.store (i32.const {err_ptr}) (i32.load (i32.const 264)))
+          (i32.store (i32.const {err_len}) (i32.load (i32.const 268))))
+        (else
+          (i32.store (i32.const {STRING_POOL}) (i32.const {user}))
+          (i32.store (i32.const {SUMMARY_RECORD}) (i32.const {STRING_POOL}))
+          (i32.store (i32.const {role_len}) (i32.const 4))
+          (i32.store (i32.const {content_ptr}) (i32.load (i32.const 264)))
+          (i32.store (i32.const {content_len}) (i32.load (i32.const 268)))
+          (i32.store (i32.const {RETURN_AREA}) (i32.const 0))
+          (i32.store (i32.const {disc}) (i32.const 1))
+          (i32.store (i32.const {list_ptr}) (i32.const {SUMMARY_RECORD}))
+          (i32.store (i32.const {list_len}) (i32.const 1))))",
+        err_ptr = RETURN_AREA + 4,
+        err_len = RETURN_AREA + 8,
+        user = u32::from_le_bytes(*b"user"),
+        role_len = SUMMARY_RECORD + 4,
+        content_ptr = SUMMARY_RECORD + 8,
+        content_len = SUMMARY_RECORD + 12,
+        disc = RETURN_AREA + 4,
+        list_ptr = RETURN_AREA + 8,
+        list_len = RETURN_AREA + 12,
+    );
+    let wat = run_inference_hook_wat(
+        "(param i32 i32 i64 f64 i32 i32 i32 i32 i32 i32)",
+        &store_output,
+        &lifecycle_exports("on-compaction", COMPACTION_EVENT, "compaction-event"),
+    );
+    wat::parse_str(&wat).expect("run-inference replacing compaction hook WAT parses")
+}
+
 /// An `on-inference` hook that calls `run-inference` once and returns `artifact(<text>)`, where
 /// `text` is whichever string the call produced: the completion's text on `ok`, the error on
 /// `err`. Bind it with `commit_policy: none`.
@@ -708,6 +754,11 @@ fn event_shape(fn_name: &str) -> EventShape {
     (field "duration-ms" u64)
     (field "exit-status" string)))"#,
             type_exports: "    (export \"session-end-event\" (type $event))",
+        },
+        "on-compaction" => EventShape {
+            params: "(param i32 i32 i64 f64 i32 i32 i32 i32 i32 i32)",
+            decls: COMPACTION_EVENT,
+            type_exports: "    (export \"compaction-event\" (type $event))",
         },
         other => panic!("no event shape for {other}"),
     }

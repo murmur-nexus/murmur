@@ -1446,9 +1446,10 @@ fn run_formation_doctor(formation_dir: &Path) -> Result<(), CliError> {
 
 /// Each driver choice's output cap and context window under `transport: http`, and where each
 /// comes from, through the resolver `mur run` stages with: `W-RUN-009` in the words a launch
-/// prints, counted as a warning, and the `E-RUN-052` refusal as a fix. `installed` is each
-/// installed artifact's declared name, `name@version` and bundled `murmur.yaml`; a choice whose
-/// driver is not installed is left to the missing line the checklist already printed.
+/// prints, counted as a warning, and the `E-RUN-052` or `E-RUN-054` refusal as a fix.
+/// `installed` is each installed artifact's declared name, `name@version` and bundled
+/// `murmur.yaml`; a choice whose driver is not installed is left to the missing line the
+/// checklist already printed.
 fn report_model_limits(
     runtime_manifest: &RuntimeManifest,
     installed: &[(String, String, String)],

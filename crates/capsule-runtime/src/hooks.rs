@@ -25,7 +25,8 @@ use crate::{
     conversation_import::{add_conversation_to_linker, ConversationState},
     errors::RuntimeError,
     inference_import::{
-        add_inference_to_linker, HookInferenceCtx, HookInferenceRecord, InferenceUnavailable,
+        add_inference_to_linker, HookInferenceCtx, HookInferencePurpose, HookInferenceRecord,
+        InferenceUnavailable,
     },
     limits::{classify_guest_failure, ExecutionLimiter, ExecutionLimits},
     network_policy::{resolve_scoped_dir, HookCapabilityGrant},
@@ -312,6 +313,8 @@ pub(crate) struct DispatchFault {
 
 struct HookInstance {
     name: String,
+    /// [`StagedHookArtifact::entry`].
+    entry: String,
     config: HookConfig,
     store: Store<HookStoreState>,
     /// Name-based dispatch table keyed by the WIT function name
@@ -373,6 +376,9 @@ struct HookStoreState {
     /// empty rule set (the default, for a hook the operator granted no `capabilities.network`)
     /// denies every request.
     http_hooks: NetworkPolicyHooks,
+    /// What a `run-inference` call made now is for: set by [`call_hook`] for the length of each
+    /// lifecycle call, `Lifecycle` between calls.
+    inference_purpose: HookInferencePurpose,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -779,6 +785,7 @@ async fn call_stage_once(
     env_vars: &HookEnvVars<'_>,
     limits: ExecutionLimits,
 ) -> Result<HookOutput, String> {
+    let limits = limits.for_hook_entry(staged.grant.deadline_seconds);
     let mut linker: Linker<HookStoreState> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
     wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker).map_err(|e| e.to_string())?;
@@ -788,6 +795,7 @@ async fn call_stage_once(
     add_inference_to_linker(
         &mut linker,
         format!("hook:{}", staged.name),
+        |_| HookInferencePurpose::Lifecycle,
         Err(InferenceUnavailable::NotConfigured),
     )?;
     // `on-stage` runs before any task exists. A granted hook gets a state of its own so its
@@ -832,6 +840,7 @@ async fn call_stage_once(
             // `untrusted`.
             task_provenance: None,
         },
+        inference_purpose: HookInferencePurpose::Lifecycle,
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limits);
@@ -857,7 +866,7 @@ async fn call_stage_once(
 
     // `on-stage` runs on its own throwaway store, so this cannot reuse the
     // blocking-hook path.
-    call_stage_lift::<HookOutput>(&mut store, &func, evt, &staged.name, limits).await
+    call_stage_lift::<HookOutput>(&mut store, &func, evt, &staged.name, &staged.entry, limits).await
 }
 
 /// Call `on-stage` on a throwaway store, lifting its `result<O, string>` where `O` is
@@ -868,6 +877,7 @@ async fn call_stage_lift<O>(
     func: &wasmtime::component::Func,
     evt: &StageEvent,
     hook_name: &str,
+    entry: &str,
     limits: ExecutionLimits,
 ) -> Result<O, String>
 where
@@ -883,7 +893,7 @@ where
         Ok(result) => result,
         Err(err) => {
             let failure = classify_guest_failure(&err, &store.data().limits);
-            return Err(failure.message(&format!("hook '{hook_name}' on-stage"), &err));
+            return Err(failure.hook_message(hook_name, entry, "on-stage", &err));
         }
     };
     result
@@ -1584,13 +1594,20 @@ async fn instantiate_hook(
     inference: Result<Arc<HookInferenceCtx>, InferenceUnavailable>,
     host_state: &HookHostState,
 ) -> Result<HookInstance, RuntimeError> {
+    // The store keeps these for every call, so the entry's deadline holds for each event.
+    let limits = limits.for_hook_entry(staged.grant.deadline_seconds);
     let mut linker: Linker<HookStoreState> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)
         .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
     wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker)
         .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
-    add_inference_to_linker(&mut linker, format!("hook:{}", staged.name), inference)
-        .map_err(RuntimeError::Runtime)?;
+    add_inference_to_linker(
+        &mut linker,
+        format!("hook:{}", staged.name),
+        |state: &HookStoreState| state.inference_purpose,
+        inference,
+    )
+    .map_err(RuntimeError::Runtime)?;
     // An ungranted hook gets the import defined but backed by nothing, so it links exactly as
     // a granted one does and every read returns `not-granted`.
     add_task_io_to_linker(
@@ -1629,6 +1646,7 @@ async fn instantiate_hook(
             // `untrusted`.
             task_provenance: None,
         },
+        inference_purpose: HookInferencePurpose::Lifecycle,
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limits);
@@ -1661,6 +1679,7 @@ async fn instantiate_hook(
     Ok(HookInstance {
         funcs,
         name: staged.name.clone(),
+        entry: staged.entry.clone(),
         config: staged.config.clone(),
         store,
     })
@@ -1772,8 +1791,7 @@ where
             // `dispatch` isolates it via `log_hook_error` and the session continues.
             // Classification only makes the message name the limit that fired.
             let failure = classify_guest_failure(&err, &hook.store.data().limits);
-            let subject = format!("hook '{}' {fn_name}", hook.name);
-            return Err(failure.message(&subject, &err));
+            return Err(failure.hook_message(&hook.name, &hook.entry, fn_name, &err));
         }
     };
     result
@@ -1792,7 +1810,76 @@ async fn call_hook(
     elapsed: Duration,
     totals: HookTotals,
 ) -> Result<HookCallResult, String> {
-    let output = match event {
+    // Recorded on the store for the length of this call only: the decision point calls the same
+    // instance with no event of its own to record, and must find `Lifecycle` there.
+    hook.store.data_mut().inference_purpose = inference_purpose(event);
+    let output = call_event(hook, context, event, elapsed, totals).await;
+    hook.store.data_mut().inference_purpose = HookInferencePurpose::Lifecycle;
+    let output = output?;
+
+    // A single decision against `HONORED_OUTPUT_ARM`: commit the one arm this event
+    // honors, stay silent for `none` and for an absent optional function, and turn any
+    // other non-`none` arm into an unsupported-arm fault the caller logs and traces.
+    let event_fn = event_fn_name(event);
+    Ok(match output {
+        // Optional function absent from this component — never a fault; the hook
+        // simply is not dispatched for this event.
+        None => HookCallResult::None,
+        Some(out) => match classify_output(DispatchPhase::Observe, event_fn, &out) {
+            OutputDisposition::Ignore => HookCallResult::None,
+            OutputDisposition::Honored => match out {
+                HookOutput::Artifact(payload) => HookCallResult::Artifact(HookArtifact {
+                    hook_name: hook.name.clone(),
+                    payload,
+                }),
+                HookOutput::ReplaceContext(msgs) => HookCallResult::ReplaceContext(msgs),
+                // `seed-context` is honored only by `on-task-start`; the runtime's
+                // seed-application path reads this off `dispatch_task_start`.
+                HookOutput::SeedContext(messages) => HookCallResult::SeedContext {
+                    hook_name: hook.name.clone(),
+                    messages,
+                },
+                // `reopen-task` is honored only by `on-task-end`; the runtime's
+                // reopen loop reads this off `dispatch_task_end`.
+                HookOutput::ReopenTask(reason) => HookCallResult::Reopen {
+                    hook_name: hook.name.clone(),
+                    reason,
+                },
+                // `write-manifests` is honored only by `on-stage`, which is never
+                // dispatched through `call_hook`, so it cannot reach this arm as
+                // `Honored`; `none` classifies as `Ignore` before it gets here.
+                // `deny` is honored only at the decision point, which never routes through
+                // `call_hook`; from here it has already classified as a fault.
+                HookOutput::WriteManifests(_) | HookOutput::Deny(_) | HookOutput::None => {
+                    HookCallResult::None
+                }
+            },
+            OutputDisposition::Fault(arm) => HookCallResult::UnsupportedArm {
+                event: event_fn.to_string(),
+                arm: arm.to_string(),
+            },
+        },
+    })
+}
+
+/// What a `run-inference` call made while a hook serves `event` is for.
+fn inference_purpose(event: &HookEvent) -> HookInferencePurpose {
+    match event {
+        HookEvent::Compaction { .. } => HookInferencePurpose::Compaction,
+        _ => HookInferencePurpose::Lifecycle,
+    }
+}
+
+/// Builds `event`'s record and calls its lifecycle function on `hook`. `Ok(None)` when the
+/// component does not export it.
+async fn call_event(
+    hook: &mut HookInstance,
+    context: &SessionContextData,
+    event: &HookEvent,
+    elapsed: Duration,
+    totals: HookTotals,
+) -> Result<Option<HookOutput>, String> {
+    Ok(match event {
         HookEvent::SessionStart => {
             let ctx = SessionContext {
                 capsule_name: context.capsule_name.clone(),
@@ -1944,50 +2031,6 @@ async fn call_hook(
             };
             call_typed(hook, "on-session-end", evt).await?
         }
-    };
-
-    // A single decision against `HONORED_OUTPUT_ARM`: commit the one arm this event
-    // honors, stay silent for `none` and for an absent optional function, and turn any
-    // other non-`none` arm into an unsupported-arm fault the caller logs and traces.
-    let event_fn = event_fn_name(event);
-    Ok(match output {
-        // Optional function absent from this component — never a fault; the hook
-        // simply is not dispatched for this event.
-        None => HookCallResult::None,
-        Some(out) => match classify_output(DispatchPhase::Observe, event_fn, &out) {
-            OutputDisposition::Ignore => HookCallResult::None,
-            OutputDisposition::Honored => match out {
-                HookOutput::Artifact(payload) => HookCallResult::Artifact(HookArtifact {
-                    hook_name: hook.name.clone(),
-                    payload,
-                }),
-                HookOutput::ReplaceContext(msgs) => HookCallResult::ReplaceContext(msgs),
-                // `seed-context` is honored only by `on-task-start`; the runtime's
-                // seed-application path reads this off `dispatch_task_start`.
-                HookOutput::SeedContext(messages) => HookCallResult::SeedContext {
-                    hook_name: hook.name.clone(),
-                    messages,
-                },
-                // `reopen-task` is honored only by `on-task-end`; the runtime's
-                // reopen loop reads this off `dispatch_task_end`.
-                HookOutput::ReopenTask(reason) => HookCallResult::Reopen {
-                    hook_name: hook.name.clone(),
-                    reason,
-                },
-                // `write-manifests` is honored only by `on-stage`, which is never
-                // dispatched through `call_hook`, so it cannot reach this arm as
-                // `Honored`; `none` classifies as `Ignore` before it gets here.
-                // `deny` is honored only at the decision point, which never routes through
-                // `call_hook`; from here it has already classified as a fault.
-                HookOutput::WriteManifests(_) | HookOutput::Deny(_) | HookOutput::None => {
-                    HookCallResult::None
-                }
-            },
-            OutputDisposition::Fault(arm) => HookCallResult::UnsupportedArm {
-                event: event_fn.to_string(),
-                arm: arm.to_string(),
-            },
-        },
     })
 }
 
@@ -2322,6 +2365,7 @@ mod tests {
     ) -> StagedHookArtifact {
         StagedHookArtifact {
             name: "test-hook".to_string(),
+            entry: "test-hook".to_string(),
             version: "0.0.1".to_string(),
             component,
             config: HookConfig::default(),
@@ -2519,6 +2563,7 @@ mod tests {
     ) -> StagedHookArtifact {
         StagedHookArtifact {
             name: name.to_string(),
+            entry: name.to_string(),
             version: "0.0.1".to_string(),
             component,
             config: HookConfig {
@@ -3558,11 +3603,12 @@ mod tests {
             driver_name: "mock-driver".to_string(),
             driver_component: driver,
             model: "manifest-model".to_string(),
-            output_caps: crate::model_limits::HookOutputCaps::new(Default::default(), 1024),
+            output_caps: crate::model_limits::HookOutputCaps::new(Default::default(), 1024, None),
             engine: engine.clone(),
             accessible_workdir: accessible.path().to_path_buf(),
             workdir: WorkdirRoot::open(accessible.path()).unwrap(),
             inference_env: Vec::new(),
+            compaction_inference_env: Vec::new(),
             capability_policy: crate::types::CapabilityPolicy::default(),
             network_allow_rules: Vec::new(),
             driver_grant: None,
@@ -3612,6 +3658,207 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].origin.source, "hook:caller");
         assert_eq!(records[0].origin.model, "manifest-model");
+    }
+
+    /// The inference ctx [`hook_importing_run_inference_receives_the_driver_completion`] builds,
+    /// with no table, a primary cap of 1024 and `compaction_cap` as
+    /// `inference.compaction.max_tokens`.
+    fn inference_ctx(
+        engine: &wasmtime::Engine,
+        accessible: &Path,
+        compaction_cap: Option<u32>,
+    ) -> Arc<HookInferenceCtx> {
+        let driver = crate::inference_import::test_support::driver_double(
+            engine,
+            0,
+            r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello from driver"}]}"#,
+        );
+        Arc::new(HookInferenceCtx {
+            driver_name: "mock-driver".to_string(),
+            driver_component: driver,
+            model: "manifest-model".to_string(),
+            output_caps: crate::model_limits::HookOutputCaps::new(
+                Default::default(),
+                1024,
+                compaction_cap,
+            ),
+            engine: engine.clone(),
+            accessible_workdir: accessible.to_path_buf(),
+            workdir: WorkdirRoot::open(accessible).unwrap(),
+            inference_env: Vec::new(),
+            compaction_inference_env: Vec::new(),
+            capability_policy: crate::types::CapabilityPolicy::default(),
+            network_allow_rules: Vec::new(),
+            driver_grant: None,
+            gateway: None,
+            formation: None,
+            spend: Arc::new(crate::spend::SpendMeter::unlimited()),
+            records: std::sync::Mutex::new(Vec::new()),
+            spend_refusals: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The input tokens of the payload a `run-inference` call from
+    /// [`hook_inference_caller_double`] builds at `cap`: it is how a record shows the cap sent.
+    fn caller_input_tokens(cap: u32) -> u64 {
+        let payload =
+            crate::agent::build_driver_payload("manifest-model", cap, &[], &[], "", None, None);
+        u64::from(crate::agent::count_tokens(
+            &serde_json::to_string(&payload).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn only_the_compaction_event_records_the_compaction_purpose() {
+        assert_eq!(
+            inference_purpose(&HookEvent::Compaction {
+                messages: Vec::new(),
+                session_tokens: 0,
+                threshold: 0.5,
+                model: None,
+                system_prompt: None,
+            }),
+            HookInferencePurpose::Compaction
+        );
+        for event in [
+            HookEvent::SessionStart,
+            inference_event(),
+            HookEvent::TaskEnd {
+                task_id: "t".to_string(),
+                exit_status: "complete".to_string(),
+            },
+        ] {
+            assert_eq!(inference_purpose(&event), HookInferencePurpose::Lifecycle);
+        }
+    }
+
+    /// One instance on every event: its `run-inference` sends the compaction cap while it serves
+    /// `on-compaction`, and the lifecycle cap on the events before and after it.
+    #[test]
+    fn call_hook_records_the_compaction_purpose_for_that_call_only() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let ctx = inference_ctx(&engine, accessible.path(), Some(77));
+        assert_ne!(caller_input_tokens(77), caller_input_tokens(1024));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut hooks = HookRuntime::new(
+                &engine,
+                &WorkdirRoot::open(session.path()).unwrap(),
+                accessible.path(),
+                vec![staged_double_named(
+                    "caller",
+                    HookBinding::All,
+                    hook_inference_caller_double(&engine),
+                )],
+                SessionContextData {
+                    capsule_name: "test-capsule".to_string(),
+                    capsule_version: "0.1.0".to_string(),
+                    session_id: "sess-test".to_string(),
+                    model: "manifest-model".to_string(),
+                    capabilities: Vec::new(),
+                },
+                HookEnvVars::default(),
+                ExecutionLimits::default(),
+                Ok(Arc::clone(&ctx)),
+                None,
+            )
+            .await
+            .expect("the caller links");
+            let root = WorkdirRoot::open(session.path()).unwrap();
+            hooks.emit(&root, inference_event()).await;
+            let replacement = hooks
+                .dispatch_compaction(Vec::new(), 10, 0.5, None, None)
+                .await
+                .expect("the compaction call succeeds");
+            assert!(replacement.is_none());
+            assert_eq!(
+                hooks.blocking_hooks[0].store.data().inference_purpose,
+                HookInferencePurpose::Lifecycle,
+                "the purpose is reset once the call returns"
+            );
+            hooks.emit(&root, inference_event()).await;
+        });
+
+        let sent: Vec<u64> = ctx
+            .drain_records()
+            .iter()
+            .map(|record| record.input_tokens)
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                caller_input_tokens(1024),
+                caller_input_tokens(77),
+                caller_input_tokens(1024)
+            ]
+        );
+    }
+
+    /// An async hook's `run-inference` on another event, queued while a compaction is dispatched,
+    /// runs on its own store and keeps the lifecycle cap.
+    #[test]
+    fn an_async_hooks_call_during_compaction_keeps_the_lifecycle_cap() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let ctx = inference_ctx(&engine, accessible.path(), Some(77));
+
+        run_local(async {
+            let mut hooks = HookRuntime::new(
+                &engine,
+                &WorkdirRoot::open(session.path()).unwrap(),
+                accessible.path(),
+                vec![
+                    staged_double_named(
+                        "compactor",
+                        HookBinding::OnCompaction,
+                        hook_inference_caller_double(&engine),
+                    ),
+                    staged_async(
+                        "observer",
+                        HookBinding::OnInference,
+                        hook_inference_caller_double(&engine),
+                    ),
+                ],
+                SessionContextData {
+                    capsule_name: "test-capsule".to_string(),
+                    capsule_version: "0.1.0".to_string(),
+                    session_id: "sess-test".to_string(),
+                    model: "manifest-model".to_string(),
+                    capabilities: Vec::new(),
+                },
+                HookEnvVars::default(),
+                ExecutionLimits::default(),
+                Ok(Arc::clone(&ctx)),
+                None,
+            )
+            .await
+            .expect("both hooks link");
+            let root = WorkdirRoot::open(session.path()).unwrap();
+            hooks.emit(&root, inference_event()).await;
+            hooks
+                .dispatch_compaction(Vec::new(), 10, 0.5, None, None)
+                .await
+                .expect("the compaction call succeeds");
+            hooks.drain_async_hooks().await;
+        });
+
+        let mut sent: Vec<(String, u64)> = ctx
+            .drain_records()
+            .into_iter()
+            .map(|record| (record.origin.source, record.input_tokens))
+            .collect();
+        sent.sort();
+        assert_eq!(
+            sent,
+            [
+                ("hook:compactor".to_string(), caller_input_tokens(77)),
+                ("hook:observer".to_string(), caller_input_tokens(1024)),
+            ]
+        );
     }
 
     /// Same component, but the capsule has no inference driver staged. The
@@ -3728,7 +3975,8 @@ mod tests {
     /// and `model: none`, then returns whichever string the call produced —
     /// the completion text on success, the error message on failure — as
     /// `hook-output::artifact`. `on-inference` is the one event whose artifact
-    /// `dispatch` forwards, which is what makes the result observable.
+    /// `dispatch` forwards, which is what makes the result observable. On `on-compaction` it
+    /// makes the same call and returns `ok(none)`; the call's trace record is what a test reads.
     ///
     /// Memory and `realloc` live in a separate core module so the lowered import
     /// can reference them without a cyclic instantiation. `result<inference-response,
@@ -3738,7 +3986,7 @@ mod tests {
     pub(super) fn hook_inference_caller_double(engine: &wasmtime::Engine) -> Component {
         let stubs = REQUIRED_HOOK_FNS
             .iter()
-            .filter(|n| **n != "on-inference")
+            .filter(|n| !matches!(**n, "on-inference" | "on-compaction"))
             .map(|n| format!("    (export \"{n}\" (func $noop))"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -3802,6 +4050,15 @@ mod tests {
       (i32.store (i32.const 136) (i32.load (i32.const 264)))
       (i32.store (i32.const 140) (i32.load (i32.const 268)))
       (i32.const 128))
+    (func (export "oncomp") (param i32 i32 i64 f64 i32 i32 i32 i32 i32 i32) (result i32)
+      (call $run
+        (i32.const 0) (i32.const 0)
+        (i32.const 0) (i32.const 0) (i32.const 0)
+        (i32.const 0) (i32.const 0) (i32.const 0)
+        (i32.const 256))
+      (i32.store (i32.const 128) (i32.const 0))
+      (i32.store (i32.const 132) (i32.const 0))
+      (i32.const 128))
     (func (export "noop"))
   )
   (core instance $i (instantiate $m
@@ -3833,10 +4090,19 @@ mod tests {
     (field "prompt" (option string))
     (field "output" (option string))
     (field "tools" (option string))))
+  (type $compaction-event (record
+    (field "messages" (list $message))
+    (field "session-tokens" u64)
+    (field "threshold" f64)
+    (field "model" (option string))
+    (field "system-prompt" (option string))))
   (type $ft (func (param "event" $inference-event) (result (result $hook-output (error string)))))
+  (type $ct (func (param "event" $compaction-event) (result (result $hook-output (error string)))))
 
   (func $oninf (type $ft)
     (canon lift (core func $i "oninf") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $oncomp (type $ct)
+    (canon lift (core func $i "oncomp") (memory $mem) (realloc $realloc) string-encoding=utf8))
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
@@ -3845,7 +4111,9 @@ mod tests {
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
     (export "inference-event" (type $inference-event))
+    (export "compaction-event" (type $compaction-event))
     (export "on-inference" (func $oninf))
+    (export "on-compaction" (func $oncomp))
 {stubs}
   )
   (export "{LIFECYCLE_IFACE}" (instance $lc))
@@ -3920,6 +4188,71 @@ mod tests {
                 .exists(),
             "dispatch must continue to the next hook after a deadline trap"
         );
+    }
+
+    /// `capabilities.limits.deadline_seconds` on a hook's own entry is that hook's deadline,
+    /// ahead of the session's hook deadline, and the message names the key on that entry. A hook
+    /// whose entry sets none keeps the session's.
+    #[test]
+    fn a_hooks_entry_deadline_wins_over_the_session_hook_deadline() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let _ticker = crate::limits::EpochTicker::spawn(&engine);
+
+        let mut spinner =
+            staged_double_named("spinner", HookBinding::All, hook_spin_double(&engine));
+        spinner.entry = "local/spinner".to_string();
+        spinner.grant.deadline_seconds = Some(1);
+        let session_limits = ExecutionLimits {
+            deadline_seconds: 3600,
+            ..ExecutionLimits::default()
+        };
+
+        let started = Instant::now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut hooks = new_with_hooks_limited(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![spinner],
+                session_limits,
+            )
+            .await
+            .expect("the spinner instantiates");
+            assert_eq!(
+                hooks.blocking_hooks[0]
+                    .store
+                    .data()
+                    .limits
+                    .limits()
+                    .deadline_seconds,
+                1
+            );
+            hooks
+                .emit(
+                    &crate::workdir_fs::WorkdirRoot::open(session.path()).unwrap(),
+                    HookEvent::SessionStart,
+                )
+                .await;
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the entry's 1s deadline fired, not the session's hour"
+        );
+
+        let spinner_log = hook_log_text(session.path(), "spinner");
+        assert!(
+            spinner_log.contains(
+                "hook 'spinner' on-session-start exceeded its 1s execution deadline \
+                 (capabilities.limits.deadline_seconds on the artifacts: entry 'local/spinner')"
+            ),
+            "{spinner_log}"
+        );
+
+        // An entry with no deadline of its own keeps the session's hook deadline.
+        assert_eq!(session_limits.for_hook_entry(None).deadline_seconds, 3600);
     }
 
     // ── murmur:runtime/tokens: the ungated host counter ──────────────────────
@@ -4152,6 +4485,7 @@ mod tests {
                 state_store: None,
                 state_dir: None,
                 config_json: None,
+                deadline_seconds: None,
             },
             ..staged_double_named(name, binding, component)
         }
@@ -4626,6 +4960,7 @@ mod tests {
                 formation: None,
                 task_provenance: None,
             },
+            inference_purpose: HookInferencePurpose::Lifecycle,
         }
     }
 
@@ -6342,6 +6677,7 @@ artifacts:
     ) -> StagedHookArtifact {
         StagedHookArtifact {
             name: name.to_string(),
+            entry: name.to_string(),
             version: "0.0.1".to_string(),
             component,
             config: HookConfig {

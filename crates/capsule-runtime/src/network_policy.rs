@@ -345,6 +345,10 @@ pub(crate) struct HookCapabilityGrant {
     /// either without the other. Carried on the grant because dispatch already looks a grant up by
     /// artifact name, which is what scopes the value to the declaring hook alone.
     pub(crate) config_json: Option<String>,
+    /// `capabilities.limits.deadline_seconds` on this hook's entry: each of its lifecycle calls'
+    /// deadline, ahead of the capsule-wide value. `None` keeps the session's hook deadline. The
+    /// entry's other `limits` fields govern nothing.
+    pub(crate) deadline_seconds: Option<u64>,
 }
 
 impl HookCapabilityGrant {
@@ -353,9 +357,9 @@ impl HookCapabilityGrant {
     /// surfacing as a confusing denial once the hook is already running.
     ///
     /// `None` (no block declared) yields [`HookCapabilityGrant::default`] — full
-    /// default-deny. Only `network`, `filesystem`, `state` and `task_io` are read; the other
-    /// sub-blocks a [`murmur_artifact::Capabilities`] can carry govern capsule-wide concerns
-    /// that a per-hook grant does not reach.
+    /// default-deny. Only `network`, `filesystem`, `state`, `task_io`, `conversation` and
+    /// `limits.deadline_seconds` are read; the rest of what a [`murmur_artifact::Capabilities`]
+    /// can carry governs capsule-wide concerns that a per-hook grant does not reach.
     ///
     /// `capsule_name` is what an undeclared `capabilities.state.store` defaults to. It is the
     /// operator's own capsule name, on the same sourcing rule as the block itself.
@@ -391,6 +395,10 @@ impl HookCapabilityGrant {
             state_store: derive_state_store(capabilities, capsule_name)?,
             state_dir: None,
             config_json: None,
+            deadline_seconds: capabilities
+                .limits
+                .as_ref()
+                .and_then(|limits| limits.deadline_seconds),
         })
     }
 }
@@ -682,6 +690,27 @@ mod tests {
             .network_allow_rules
             .iter()
             .any(|rule| rule.matches(&target)));
+    }
+
+    /// `capabilities.limits.deadline_seconds` on the hook's entry rides the grant; the entry's
+    /// other `limits` fields do not.
+    #[test]
+    fn hook_grant_carries_the_entrys_deadline() {
+        let mut caps = capabilities_block(None, None);
+        assert_eq!(
+            HookCapabilityGrant::derive(Some(&caps), "test-capsule")
+                .unwrap()
+                .deadline_seconds,
+            None
+        );
+        caps.limits = Some(murmur_artifact::ResourceLimits {
+            memory_bytes: Some(1 << 20),
+            table_elements: None,
+            instances: None,
+            deadline_seconds: Some(2),
+        });
+        let grant = HookCapabilityGrant::derive(Some(&caps), "test-capsule").unwrap();
+        assert_eq!(grant.deadline_seconds, Some(2));
     }
 
     /// A declared-but-empty `capabilities:` block is still full default-deny — declaring

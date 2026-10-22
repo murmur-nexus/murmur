@@ -130,6 +130,7 @@ section that explains it.
 | `E-RUN-051` | A delegated child's `--workdir` is not the directory its parent created; nothing was written | [E-RUN-051](#e-run-051) |
 | `E-RUN-052` | A driver choice has no output cap — its driver lists no limits for its model and the manifest sets no `inference.max_tokens` — or its driver ships a malformed `models:` table | [E-RUN-052](#e-run-052) |
 | `E-RUN-053` | The session reached its `mur run --deadline` and was ended, or a launch was handed a deadline it cannot enforce | [E-RUN-053](#e-run-053) |
+| `E-RUN-054` | `inference.compaction.max_tokens` is above the output ceiling the primary driver's `models:` table declares for the compaction model | [E-RUN-054](#e-run-054) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -157,7 +158,7 @@ section that explains it.
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
 | `W-SEC-004` | Literal secret value found in a manifest field | [W-SEC-004](#w-sec-004) |
 | `W-SEC-005` | Linux kernel enforcement is in force — what it covers, and the one key that re-widens it | [W-SEC-005](#w-sec-005) |
-| `W-SEC-006` | A hook's `capabilities:` block declares a sub-key that is inert on hooks | [W-SEC-006](#w-sec-006) |
+| `W-SEC-006` | A hook's `capabilities:` block declares a sub-key that is inert on hooks — any but `network`, `filesystem`, `state`, `task_io`, `conversation` and `limits.deadline_seconds` | [W-SEC-006](#w-sec-006) |
 | `W-SEC-007` | A tool/driver narrowed to a host the capsule-wide ceiling does not allow — the entry was dropped | [W-SEC-007](#w-sec-007) |
 | `W-SEC-008` | A tool/driver `capabilities:` block declares something per-artifact narrowing does not apply | [W-SEC-008](#w-sec-008) |
 | `W-SEC-009` | `capabilities.shell.interpreter_runtime` couples the capsule to a specific host interpreter-version layout | [W-SEC-009](#w-sec-009) |
@@ -1390,6 +1391,23 @@ The trace records `deadline_reached` and ends with `session_end.exit_status: "de
 
 The same code refuses a session staged with a deadline that its launch cannot enforce: one launched
 by a program embedding the runtime rather than by `mur run`, or a script capsule.
+
+### E-RUN-054 — the compaction cap is above the model's ceiling { #e-run-054 }
+
+[`inference.compaction.max_tokens`](manifest.md#field-inference) caps the calls a hook makes while
+it serves `on-compaction`. The primary driver serves those calls, so a value above the
+`max_output_tokens` its [`models:`](manifest.md#driver-models) table declares for the compaction
+model — `inference.compaction.model`, else `inference.model` — refuses the launch before any request
+leaves:
+
+```text
+error[E-RUN-054]: inference.compaction.max_tokens (9000) is above the output ceiling of 8192 that driver local/murmur-driver-openai@0.1.0 declares for compaction model 'gpt-5'
+  hint: lower inference.compaction.max_tokens to at most 8192, or remove it to use the driver's ceiling
+```
+
+A value equal to the ceiling is accepted. A compaction model the table does not list has no ceiling
+to check against, and the value is used as written. [`mur doctor`](cli.md#mur-doctor) reports the
+same condition as a fix.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
@@ -2907,18 +2925,23 @@ the `CAP_MKNOD` the workdir device-node restriction exists to backstop.
 ### W-SEC-006 — Inert sub-key in a hook's `capabilities:` block { #w-sec-006 }
 
 **Fires when:** a `runtime: hook` artifact entry's `capabilities:` block declares `shell`,
-`spawn`, `env`, `limits`, `resources` or `containment`. Per-hook grants (see
-[`artifacts[].capabilities`](manifest.md#hook-capabilities)) only read `network`, `filesystem`,
-`state` and `task_io` — the other sub-blocks are structurally accepted but nothing enforces them
-per-hook.
+`spawn`, `env`, `limits.memory_bytes`, `limits.table_elements`, `limits.instances`, `resources` or
+`containment`. Per-hook grants (see [`artifacts[].capabilities`](manifest.md#hook-capabilities))
+read only `network`, `filesystem`, `state`, `task_io`, `conversation` and
+`limits.deadline_seconds` — the others are structurally accepted but nothing enforces them
+per-hook. Each is named by its full key:
+
+```text
+[capsule-runtime] warning[W-SEC-006]: hook 'compactor' declares capabilities.limits.memory_bytes which the runtime does not apply per-hook — only capabilities.network, capabilities.filesystem, capabilities.state, capabilities.task_io, capabilities.conversation and capabilities.limits.deadline_seconds govern a hook (https://docs.murmur.nexus/reference/diagnostics/#w-sec-006)
+```
 
 **Why it matters:** an operator who declares, say, `capabilities.shell.allow` on a hook entry
 expecting it to scope that hook's shell access would otherwise have no signal that the runtime
 never reads it there — it is silently inert rather than rejected.
 
-**What to do:** remove the inert sub-key from the hook's entry. Shell, spawn, env, limits,
-resources and the containment floor are capsule-wide concerns — declare them in the top-level
-`capabilities:` block instead. See [Hook capabilities](manifest.md#hook-capabilities) for
+**What to do:** remove the inert sub-key from the hook's entry. Shell, spawn, env, the memory,
+table and instance limits, resources and the containment floor are capsule-wide concerns — declare
+them in the top-level `capabilities:` block instead. See [Hook capabilities](manifest.md#hook-capabilities) for
 the full rules on what a per-hook grant does and does not cover.
 
 ---

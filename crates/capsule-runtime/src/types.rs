@@ -344,6 +344,9 @@ pub struct InstalledArtifactSummary {
 #[derive(Clone)]
 pub(crate) struct StagedHookArtifact {
     pub name: String,
+    /// The name this hook's `artifacts:` entry declares, scope included: what a message about a
+    /// setting on that entry names it by.
+    pub entry: String,
     pub version: String,
     pub component: Component,
     /// Behavioral contract (binding/execution_mode/commit_policy) from the hook artifact's
@@ -615,6 +618,10 @@ pub struct StagedSession {
     pub(crate) driver_choices: Option<crate::driver_choice::DriverChoices>,
     /// The output cap a hook's `run-inference` sends for each model it may call.
     pub(crate) hook_output_caps: crate::model_limits::HookOutputCaps,
+    /// The `MURMUR_INFERENCE_DRIVER_CONFIG` a hook's `run-inference` driver sees while the hook
+    /// serves `on-compaction`: `inference.driver.config` with `inference.compaction.driver_config`
+    /// laid over it. `None` when the manifest sets no overlay, so the call sees the session's.
+    pub(crate) compaction_driver_config: Option<String>,
     /// Copied from [`StageRequest::door_authentication`], which the cards are built from.
     pub(crate) door_authentication: Option<murmur_artifact::NetworkAuthentication>,
     /// This session's door key and tokens, minted at staging when

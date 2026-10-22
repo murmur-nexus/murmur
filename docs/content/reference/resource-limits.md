@@ -38,6 +38,14 @@ capabilities:
 
 Both are reported distinctly from a plain crash — see [CLI error codes](diagnostics.md#index).
 
+A hook's own `artifacts:` entry can set `capabilities.limits.deadline_seconds` for that hook alone.
+Its other `limits` fields are inert there and draw [`W-SEC-006`](diagnostics.md#w-sec-006).
+
+| Call | Deadline |
+|---|---|
+| Capsule `run`, tool or driver `run` | `capabilities.limits.deadline_seconds`, else 600 |
+| Hook lifecycle call | `capabilities.limits.deadline_seconds` on the hook's entry, else the capsule-wide value, else 30 |
+
 ## Host resource limits { #host-resource-limits }
 
 `capabilities.resources` bounds the operating-system processes the runtime spawns:

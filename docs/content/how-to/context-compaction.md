@@ -12,6 +12,8 @@ The relevant manifest options are:
 | [inference.compaction.system_prompt](../reference/manifest.md#field-inference) | System prompt override for the compaction call (optional; hook picks its own default when unset) |
 | [inference.compaction.system_prompt_file](../reference/manifest.md#field-inference) | Same override, loaded from a file next to the manifest (optional; mutually exclusive with `system_prompt`) |
 | [inference.compaction.dump_summaries](../reference/manifest.md#field-inference) | When `true`, appends one JSON line per committed compaction to `out/compaction-summaries.jsonl` (optional; default `false`) |
+| [inference.compaction.max_tokens](../reference/manifest.md#field-inference) | Output cap of the compaction call (optional; default: the driver's ceiling for the model) |
+| [inference.compaction.driver_config](../reference/manifest.md#field-inference) | Driver settings laid over `inference.driver.config` for the compaction call only (optional) |
 
 ---
 
@@ -330,9 +332,63 @@ a compaction the tool-call-pairing safety net rejects writes nothing.
 
 ---
 
+## Step 7 — cap the compaction call and set its effort
+
+The compaction call is an ordinary inference call through the primary driver, and by default it
+asks for the model's whole output ceiling and runs at the agent's own driver settings. A model at
+high reasoning effort can spend most of a compaction's time thinking about a summary that needs
+little of it. Set the call apart from the agent's turns under `inference.compaction`:
+
+```yaml
+inference:
+  transport: http
+  model: glm-5.3
+  max_tokens: 16000
+  driver:
+    artifact: murmur/driver-zai
+    config:
+      reasoning_effort: max
+  compaction:
+    max_tokens: 8000
+    driver_config:
+      reasoning_effort: low
+```
+
+| Key | What the compaction call gets |
+|---|---|
+| `max_tokens` | This output cap, in place of the `max_output_tokens` the driver's `models:` table declares for the compaction model. Spend ceilings reserve this amount for the call |
+| `driver_config` | `inference.driver.config` with these top-level keys replacing or added to its own. Here the call runs at `reasoning_effort: low`; every agent turn keeps `max` |
+
+Both apply to every `run-inference` call a hook makes while it serves `on-compaction`: the
+threshold trigger, `mur run --resume … --resume-mode compact`, and a seed's overflow summary. Agent
+turns, alternates and calls a hook makes for any other event keep `inference.max_tokens` and
+`inference.driver.config`. Which keys `driver_config` takes, and which values, is the driver's
+own: see the driver's README.
+
+A `max_tokens` above the driver's ceiling for the compaction model refuses the launch with
+[`E-RUN-054`](../reference/diagnostics.md#e-run-054), and [`mur doctor`](../reference/cli.md#mur-doctor)
+reports the same. Under `transport: process` both keys are refused: the harness runs its own
+compaction.
+
+A slow compaction call counts against the compaction hook's own deadline, 30 seconds by default.
+To give the hook longer without changing the deadline of every other call, set it on the hook's
+entry:
+
+```yaml
+artifacts:
+  - name: murmur/hook-compact
+    version: "{{ v.murmur_hook_compact }}"
+    runtime: hook
+    capabilities:
+      limits:
+        deadline_seconds: 120
+```
+
+---
+
 ## Compaction failure modes
 
-Four situations can prevent compaction from replacing the context, and the runtime treats them
+Several situations can prevent compaction from replacing the context, and the runtime treats them
 differently:
 
 **No hook bound to `on-compaction`.** This is not a failure — it means compaction was never
@@ -356,6 +412,29 @@ records the error, the session's `trace.jsonl` records `session_end` with `exit_
 OTel emits `session_end` as `"failed"` (if `observability.otel_endpoint` is configured), and — if
 the session has a `task_id` — the final SSE `status` event reports `state: "failed"`. The agent
 loop does not attempt another turn after this.
+
+**The driver refused a key of `inference.compaction.driver_config`.** The driver validates the
+merged settings on the compaction call before anything is sent, so an unknown key or a bad value
+fails that call, the hook returns its error, and the session ends as failed. The error names the
+key in the driver's own words, which call the merged settings `inference.driver.config`:
+
+```text
+error[E-RUN-040]: the task ended failed: compaction hook failed: hook-compact: … driver: unrecognised inference.driver.config key(s): bogus_key. Accepted keys: reasoning_effort, thinking …
+```
+
+Agent turns before the compaction run normally, since they never see the overlay. Fix the key
+under `inference.compaction.driver_config`.
+
+**The hook ran past its deadline.** The call is interrupted and the session ends as failed, with
+the deadline that fired and the key that sets it:
+
+```text
+error[E-RUN-040]: the task ended failed: compaction hook failed: hook-compact: hook 'hook-compact' on-compaction exceeded its 30s execution deadline (capabilities.limits.deadline_seconds on the artifacts: entry 'murmur/hook-compact') and was interrupted
+```
+
+Raise `capabilities.limits.deadline_seconds` on the hook's entry, as in
+[Step 7](#step-7-cap-the-compaction-call-and-set-its-effort), or lower
+`inference.compaction.max_tokens` and the effort so the call finishes sooner.
 
 **A bound hook returned an error after a spend ceiling refused its `run-inference` call.** This
 ends the session as a spend stop, not as a failure. The hook's call crossed
@@ -384,9 +463,14 @@ compaction.
 | `inference.compaction.threshold: 0.85` | Compaction fires when the context reaches 85% of the context window |
 | `inference.compaction.model: claude-haiku-4-5` | Uses a different (typically cheaper) model for compaction calls |
 | `inference.compaction.dump_summaries: true` | Appends every committed compaction's summary to `out/compaction-summaries.jsonl`; default `false` |
+| `inference.compaction.max_tokens: 8000` | Caps the compaction call at 8000 output tokens; above the driver's ceiling for the compaction model, the launch is refused with `E-RUN-054` |
+| `inference.compaction.driver_config: {reasoning_effort: low}` | Runs the compaction call with `reasoning_effort: low` laid over `inference.driver.config`; agent turns keep their own |
+| `capabilities.limits.deadline_seconds` on the hook's entry | That hook's call deadline, ahead of the capsule-wide value and the 30-second default |
 | No hook bound to `on-compaction` | Non-fatal — session continues with the uncompacted history; `compaction_declined` written to the trace |
 | A bound hook returns a replacement with an unpaired tool call | Non-fatal — the replacement is discarded and the session continues with the uncompacted history; `compaction_declined` written to the trace |
 | A bound hook returns an error with no refused `run-inference` call behind it | Fatal — the session ends as failed; see [Compaction failure modes](#compaction-failure-modes) |
+| The driver refuses a key of `inference.compaction.driver_config` | Fatal — the session ends as failed with `E-RUN-040`, naming the key; see [Compaction failure modes](#compaction-failure-modes) |
+| The compaction hook runs past its deadline | Fatal — the session ends as failed with `E-RUN-040`, naming `capabilities.limits.deadline_seconds` on the hook's entry |
 | A bound hook returns an error after a spend ceiling refused its `run-inference` call | Fatal — the session ends with `exit_status: "spend_ceiling_reached"`, not `failed`; see [Compaction failure modes](#compaction-failure-modes) |
 | Token count the threshold compares | The provider's count of the call when the driver reports usage, the runtime's estimate otherwise |
 | Token count after compaction | Reset to the estimate of the new (compacted) history, not to zero; the next call's reported count replaces it |

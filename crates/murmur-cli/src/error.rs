@@ -100,6 +100,7 @@ pub const E_RUN_050: &str = "E-RUN-050"; // a runtime write, read, create or rem
 pub const E_RUN_051: &str = "E-RUN-051"; // a delegated child's --workdir is not the directory its parent created
 pub const E_RUN_052: &str = "E-RUN-052"; // a driver choice has no output cap, or its driver ships a malformed models: table
 pub const E_RUN_053: &str = "E-RUN-053"; // the session reached its mur run --deadline, or a launch cannot enforce the deadline it was staged with
+pub const E_RUN_054: &str = "E-RUN-054"; // inference.compaction.max_tokens is above the primary driver's output ceiling for the compaction model
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -264,22 +265,34 @@ impl From<capsule_runtime::HomeUnusable> for CliError {
     }
 }
 
-/// `E-RUN-052`, for a launch staging refused and for the fix `mur doctor` reports.
+/// `E-RUN-052`, or `E-RUN-054` for a compaction cap above its ceiling, for a launch staging
+/// refused and for the fix `mur doctor` reports.
 pub(crate) fn model_limits_error(
     error: &capsule_runtime::model_limits::ModelLimitsError,
 ) -> CliError {
     use capsule_runtime::model_limits::ModelLimitsError;
-    let hint = match error {
-        ModelLimitsError::NoOutputCap { .. } => {
+    let (code, hint) = match error {
+        ModelLimitsError::NoOutputCap { .. } => (
+            E_RUN_052,
             "set inference.max_tokens to the model's output cap, or use a release of the driver \
              whose murmur.yaml lists the model under models:"
-        }
-        ModelLimitsError::MalformedTable { .. } => {
+                .to_string(),
+        ),
+        ModelLimitsError::MalformedTable { .. } => (
+            E_RUN_052,
             "the driver's own murmur.yaml is at fault; use a release of the driver whose models: \
              table is well formed"
-        }
+                .to_string(),
+        ),
+        ModelLimitsError::CompactionCapAboveCeiling { ceiling, .. } => (
+            E_RUN_054,
+            format!(
+                "lower inference.compaction.max_tokens to at most {ceiling}, or remove it to use \
+                 the driver's ceiling"
+            ),
+        ),
     };
-    CliError::with_hint(E_RUN_052, error.to_string(), hint)
+    CliError::with_hint(code, error.to_string(), hint)
 }
 
 impl From<RuntimeError> for CliError {

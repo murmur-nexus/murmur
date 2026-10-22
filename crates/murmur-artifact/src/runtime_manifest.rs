@@ -1296,6 +1296,15 @@ pub struct CompactionConfig {
     /// replacement summary to `out/compaction-summaries.jsonl` in the session workdir.
     /// None (the key absent) is equivalent to false: nothing is written.
     pub dump_summaries: Option<bool>,
+    /// Output cap of every `run-inference` call made while a hook serves `on-compaction`, and
+    /// the amount the spend meter reserves for each. Never 0. None keeps the cap other hook
+    /// calls get: the primary driver's `models:` ceiling for the model called, else the
+    /// primary choice's cap.
+    pub max_tokens: Option<u32>,
+    /// Compact JSON of `inference.compaction.driver_config`, always an object. Its top-level
+    /// keys replace or add to those of `inference.driver.config` for the calls `max_tokens`
+    /// caps, and for no other call.
+    pub driver_config: Option<String>,
 }
 
 // Threshold values are validated to (0.0, 1.0] at parse time so NaN is impossible.
@@ -2574,6 +2583,9 @@ struct RawCompactionConfig {
     system_prompt: Option<String>,
     system_prompt_file: Option<String>,
     dump_summaries: Option<bool>,
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    driver_config: Option<serde_norway::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -3157,6 +3169,8 @@ impl RawBlock for RawCompactionConfig {
         "system_prompt",
         "system_prompt_file",
         "dump_summaries",
+        "max_tokens",
+        "driver_config",
     ];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
@@ -5309,6 +5323,27 @@ fn parse_inference(
                     message: "is not valid with transport: process".to_string(),
                 });
             }
+            // The harness runs its own compaction, so no `on-compaction` call is made here for
+            // either key to shape.
+            for (present, key) in [
+                (
+                    compaction.as_ref().is_some_and(|c| c.max_tokens.is_some()),
+                    "max_tokens",
+                ),
+                (
+                    compaction
+                        .as_ref()
+                        .is_some_and(|c| c.driver_config.is_some()),
+                    "driver_config",
+                ),
+            ] {
+                if present {
+                    return Err(RuntimeManifestError::InvalidInferenceConfig {
+                        field: format!("inference.compaction.{key}"),
+                        message: "is not valid with transport: process".to_string(),
+                    });
+                }
+            }
             // The harness owns the conversation and the model it runs, so there is no agent-loop
             // call for a switch to reroute.
             if raw.alternates.is_some() {
@@ -5749,6 +5784,15 @@ fn parse_compaction(
         });
     }
 
+    if raw.max_tokens == Some(0) {
+        return Err(RuntimeManifestError::InvalidInferenceConfig {
+            field: "inference.compaction.max_tokens".to_string(),
+            message: "must be greater than 0".to_string(),
+        });
+    }
+    let driver_config =
+        driver_config_json(raw.driver_config, "inference.compaction.driver_config")?;
+
     Ok(Some(CompactionConfig {
         threshold: raw.threshold,
         model: raw.model,
@@ -5757,6 +5801,8 @@ fn parse_compaction(
         // A plain optional boolean: nothing to validate, and deliberately independent of the
         // threshold-range and prompt-source checks above.
         dump_summaries: raw.dump_summaries,
+        max_tokens: raw.max_tokens,
+        driver_config,
     }))
 }
 
@@ -6192,13 +6238,16 @@ fn parse_inference_driver(
             message: "missing required field".to_string(),
         })?;
 
-    let config = parse_inference_driver_config(raw.config)?;
+    let config = driver_config_json(raw.config, "inference.driver.config")?;
 
     Ok(InferenceDriver { artifact, config })
 }
 
-fn parse_inference_driver_config(
+/// Lowers a driver config mapping to compact JSON, or `None` when absent or null. `field` names
+/// the key in the refusal of anything but a mapping.
+fn driver_config_json(
     raw: Option<serde_norway::Value>,
+    field: &str,
 ) -> Result<Option<String>, RuntimeManifestError> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -6210,20 +6259,20 @@ fn parse_inference_driver_config(
 
     if !matches!(raw, serde_norway::Value::Mapping(_)) {
         return Err(RuntimeManifestError::InvalidInferenceConfig {
-            field: "inference.driver.config".to_string(),
+            field: field.to_string(),
             message: "expected mapping/object".to_string(),
         });
     }
 
     let value =
         serde_json::to_value(&raw).map_err(|err| RuntimeManifestError::InvalidInferenceConfig {
-            field: "inference.driver.config".to_string(),
+            field: field.to_string(),
             message: format!("failed to convert to JSON: {err}"),
         })?;
 
     serde_json::to_string(&value).map(Some).map_err(|err| {
         RuntimeManifestError::InvalidInferenceConfig {
-            field: "inference.driver.config".to_string(),
+            field: field.to_string(),
             message: format!("failed to encode JSON: {err}"),
         }
     })
@@ -9215,6 +9264,115 @@ inference:
             RuntimeManifestError::InvalidInferenceConfig { ref field, .. }
                 if field == "inference.compaction.threshold"
         ));
+    }
+
+    fn compaction_call_manifest(lines: &str) -> Result<RuntimeManifest, RuntimeManifestError> {
+        RuntimeManifest::from_yaml_str(&format!(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: murmur/driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
+inference:
+  model: test-model
+  driver:
+    artifact: murmur/driver-anthropic
+    config:
+      reasoning_effort: max
+  compaction:
+{lines}"#
+        ))
+    }
+
+    #[test]
+    fn parses_compaction_max_tokens_and_driver_config() {
+        let manifest = compaction_call_manifest(
+            "    max_tokens: 8000\n    driver_config:\n      reasoning_effort: low\n      extra: [1, 2]\n",
+        )
+        .unwrap();
+        assert!(
+            manifest.unknown_keys.is_empty(),
+            "neither key is unknown: {:?}",
+            manifest.unknown_keys
+        );
+        let compaction = manifest.inference.unwrap().compaction.unwrap();
+        assert_eq!(compaction.max_tokens, Some(8000));
+        assert_eq!(
+            compaction.driver_config.as_deref(),
+            Some(r#"{"extra":[1,2],"reasoning_effort":"low"}"#)
+        );
+
+        let compaction = compaction_call_manifest("    threshold: 0.5\n")
+            .unwrap()
+            .inference
+            .unwrap()
+            .compaction
+            .unwrap();
+        assert_eq!(compaction.max_tokens, None);
+        assert_eq!(compaction.driver_config, None);
+
+        // An empty mapping is an overlay that changes nothing, not an absent one.
+        let compaction = compaction_call_manifest("    driver_config: {}\n")
+            .unwrap()
+            .inference
+            .unwrap()
+            .compaction
+            .unwrap();
+        assert_eq!(compaction.driver_config.as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn compaction_max_tokens_zero_is_refused() {
+        match compaction_call_manifest("    max_tokens: 0\n").unwrap_err() {
+            RuntimeManifestError::InvalidInferenceConfig { field, message } => {
+                assert_eq!(field, "inference.compaction.max_tokens");
+                assert_eq!(message, "must be greater than 0");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compaction_driver_config_must_be_a_mapping() {
+        for value in ["low", "[reasoning_effort]", "3"] {
+            match compaction_call_manifest(&format!("    driver_config: {value}\n")).unwrap_err() {
+                RuntimeManifestError::InvalidInferenceConfig { field, message } => {
+                    assert_eq!(field, "inference.compaction.driver_config");
+                    assert_eq!(message, "expected mapping/object");
+                }
+                other => panic!("unexpected error for {value}: {other:?}"),
+            }
+        }
+    }
+
+    /// The harness runs its own compaction under `transport: process`, so neither key would
+    /// shape any call there.
+    #[test]
+    fn process_transport_rejects_compaction_call_keys() {
+        for (key, value) in [
+            ("max_tokens", "8000"),
+            ("driver_config", "{reasoning_effort: low}"),
+        ] {
+            let err = RuntimeManifest::from_yaml_str(&format!(
+                "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur/driver-claude-code\n    \
+                 version: 0.1.0\n    runtime: driver\ninference:\n  transport: process\n  \
+                 model: claude-haiku-4-5-20251001\n  driver:\n    artifact: murmur/driver-claude-code\n  \
+                 compaction:\n    {key}: {value}\n"
+            ))
+            .unwrap_err();
+            match err {
+                RuntimeManifestError::InvalidInferenceConfig { field, message } => {
+                    assert_eq!(field, format!("inference.compaction.{key}"));
+                    assert_eq!(message, "is not valid with transport: process");
+                }
+                other => panic!("unexpected error for {key}: {other:?}"),
+            }
+        }
     }
 
     /// Setting both compaction prompt sources is a parse error naming the compaction

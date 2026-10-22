@@ -87,7 +87,8 @@ built-in defaults — a manifest that says nothing gets the defaults, not unlimi
 The default deadline for a hook lifecycle call is 30 seconds, against 600 for a capsule, tool
 or driver call, so one wedged hook cannot stall a session for the capsule-wide budget on every
 event; a declared `deadline_seconds` replaces both defaults and applies to every component call,
-hooks included. Hitting either limit is reported distinctly from an ordinary crash. On the hook
+hooks included. A hook's own entry can set `deadline_seconds` for that hook alone, ahead of the
+capsule-wide value. Hitting either limit is reported distinctly from an ordinary crash. On the hook
 path it is handled like any other hook error: logged, and the runtime moves on to the next hook.
 
 **Caveat:** the deadline only counts down while the component's own code is running. Time it
