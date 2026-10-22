@@ -64,7 +64,7 @@ use std::{
 use crate::{
     a2a::TaskState,
     agent::{
-        failure_message, task_state_for, AgentLoopExit, AttemptEnding, SESSION_ENDED_STATUS_MESSAGE,
+        failure_message, task_state_for, AgentLoopExit, AttemptEnding, COMPLETED_STATUS_MESSAGE,
     },
     cancel::CANCELED_STATUS_MESSAGE,
     errors::RuntimeError,
@@ -310,7 +310,7 @@ impl A2aStream {
         match task_state_for(outcome) {
             TaskState::Completed => AttemptEnding {
                 state: TaskState::Completed,
-                message: SESSION_ENDED_STATUS_MESSAGE.to_string(),
+                message: COMPLETED_STATUS_MESSAGE.to_string(),
                 response: Some(self.result.clone()),
                 no_answer: false,
             },

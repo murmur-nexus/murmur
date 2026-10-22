@@ -5600,7 +5600,7 @@ mod tests {
                 crate::lanes::TaskLane::User,
             );
             reg.finish_task(TaskState::Completed);
-            reg.record_ending(&task_id, "session ended", Some("four"), false, &[]);
+            reg.record_ending(&task_id, "task completed", Some("four"), false, &[]);
         }
 
         let lost_at = std::time::Instant::now();
@@ -6063,7 +6063,7 @@ mod tests {
         {
             let mut reg = registry.lock().unwrap();
             reg.finish_task(TaskState::Completed);
-            reg.record_ending("tsk_run", "session ended", Some("four"), false, &[]);
+            reg.record_ending("tsk_run", "task completed", Some("four"), false, &[]);
         }
         let lost_at = std::time::Instant::now();
         for id in 1..=3 {

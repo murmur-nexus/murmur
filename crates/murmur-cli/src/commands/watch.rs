@@ -515,7 +515,7 @@ mod tests {
         format!(
             "{}{}",
             response(id, answer),
-            status(Some(id + 1), "TASK_STATE_COMPLETED", Some("session ended"))
+            status(Some(id + 1), "TASK_STATE_COMPLETED", Some("task completed"))
         )
     }
 
@@ -692,7 +692,7 @@ mod tests {
         let extended = format!(
             "{}{}{}",
             response(1, "done").replace("\"lastChunk\"", "\"extra\":1,\"lastChunk\""),
-            status(Some(2), "TASK_STATE_COMPLETED", Some("session ended"))
+            status(Some(2), "TASK_STATE_COMPLETED", Some("task completed"))
                 .replace("\"status\":{", "\"later\":{},\"status\":{\"newKey\":[1],"),
             task_frame(3, later)
         );

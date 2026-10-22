@@ -1015,7 +1015,7 @@ mod tests {
             context_id: "ctx_1".into(),
             status: TaskStatus::at(
                 state,
-                Some(StatusMessage::agent("tsk_1", "ctx_1", "session ended")),
+                Some(StatusMessage::agent("tsk_1", "ctx_1", "task completed")),
                 ENDED_AT.parse().unwrap(),
             ),
             artifacts: response.map(|response| {

@@ -43,9 +43,10 @@ use crate::{
     },
     trace::{
         FailedInference, TraceWriter, WireCapture, INFERENCE_ERROR_DRIVER_FAILED,
-        INFERENCE_ERROR_MALFORMED_RESPONSE, TASK_FAILED_COMPACTION_HOOK,
-        TASK_FAILED_CREDENTIAL_REJECTED, TASK_FAILED_DRIVER_ERROR, TASK_FAILED_INPUT_TIMEOUT,
-        TASK_FAILED_MALFORMED_RESPONSE, TASK_FAILED_WORKDIR_PATH_REFUSED,
+        INFERENCE_ERROR_MALFORMED_RESPONSE, MAX_TASK_FAILURE_REASON_BYTES,
+        TASK_FAILED_COMPACTION_HOOK, TASK_FAILED_CREDENTIAL_REJECTED, TASK_FAILED_DRIVER_ERROR,
+        TASK_FAILED_INPUT_TIMEOUT, TASK_FAILED_MALFORMED_RESPONSE,
+        TASK_FAILED_WORKDIR_PATH_REFUSED,
     },
     types::ResumeMode,
     workdir_fs::{EntryKind, WorkdirRoot, DEFAULT_FILE_MODE},
@@ -1091,7 +1092,6 @@ pub(crate) async fn run_agent_loop(
                 turn_u32,
                 TASK_FAILED_INPUT_TIMEOUT,
                 &reason,
-                INPUT_TIMEOUT_STATUS_MESSAGE,
             )
             .await;
         }
@@ -1426,7 +1426,6 @@ pub(crate) async fn run_agent_loop(
                 turn_u32,
                 cause,
                 &error_text,
-                SESSION_ENDED_STATUS_MESSAGE,
             )
             .await;
         }
@@ -1557,15 +1556,7 @@ pub(crate) async fn run_agent_loop(
             )
             .await;
             return finish_failed_turn(
-                hooks,
-                trace,
-                otel,
-                workdir,
-                ending,
-                turn_u32,
-                cause,
-                &error,
-                SESSION_ENDED_STATUS_MESSAGE,
+                hooks, trace, otel, workdir, ending, turn_u32, cause, &error,
             )
             .await;
         }
@@ -1678,6 +1669,9 @@ pub(crate) async fn run_agent_loop(
                 .await;
             }
             if let Err(CompactionFailure::Hook(error)) = compacted {
+                // A hook's error can quote a gateway key it was handed; stderr, the trace, the
+                // result text and the task's status all carry the redacted form.
+                let error = store_state.gateways.redact(&error);
                 crate::runtime_err!("compaction failed: {error}");
                 return finish_failed_turn(
                     hooks,
@@ -1688,7 +1682,6 @@ pub(crate) async fn run_agent_loop(
                     turn_u32,
                     TASK_FAILED_COMPACTION_HOOK,
                     &error,
-                    SESSION_ENDED_STATUS_MESSAGE,
                 )
                 .await;
             }
@@ -1726,7 +1719,6 @@ pub(crate) async fn run_agent_loop(
                         turn_u32,
                         TASK_FAILED_MALFORMED_RESPONSE,
                         "response stop_reason=tool_call but no tool_call blocks were present",
-                        SESSION_ENDED_STATUS_MESSAGE,
                     )
                     .await;
                 }
@@ -2166,7 +2158,6 @@ pub(crate) async fn run_agent_loop(
                     turn_u32,
                     TASK_FAILED_MALFORMED_RESPONSE,
                     &error,
-                    SESSION_ENDED_STATUS_MESSAGE,
                 )
                 .await;
             }
@@ -2193,8 +2184,8 @@ pub(crate) async fn run_agent_loop(
         .map_err(RuntimeError::AgentLoopFailed)?;
     flush_hook_dispatch_faults(hooks, trace).await;
     otel.emit_session_end("max_turns_reached").await;
-    // Names the budget rather than reusing the generic "session ended": the session is still up
-    // and still accepting tasks, and the caller's next move is to raise inference.max_turns.
+    // Names the budget: the session is still up and still accepting tasks, and the caller's next
+    // move is to raise inference.max_turns.
     *ending = Some(AttemptEnding::failed(exceeded));
     Ok(AgentLoopExit::MaxTurnsReached)
 }
@@ -2264,7 +2255,8 @@ pub(crate) async fn fail_on_workdir_refusals(
 /// * a `task_failed` trace line with `cause` from the `TASK_FAILED_*` vocabulary and `reason`,
 ///   which is also what a launch that ends on this outcome reports;
 /// * `error: <reason>` as the attempt's result text, in `out/result.txt`;
-/// * a `failed` [`AttemptEnding`] carrying `status_message`, in `ending`.
+/// * a `failed` [`AttemptEnding`] carrying [`failed_status_message`] of `cause` and `reason`, in
+///   `ending`.
 ///
 /// `Err` only when the result text cannot be written; the `task_failed` line is already in the
 /// trace by then.
@@ -2278,14 +2270,13 @@ async fn finish_failed_turn(
     turn: u32,
     cause: &str,
     reason: &str,
-    status_message: &str,
 ) -> Result<AgentLoopExit, RuntimeError> {
     let _ = trace.write_task_failed(Some(turn), cause, reason).await;
     record_result(hooks, workdir, &format!("error: {reason}"))
         .map_err(RuntimeError::AgentLoopFailed)?;
     flush_hook_dispatch_faults(hooks, trace).await;
     otel.emit_session_end(AgentLoopExit::Failed.as_str()).await;
-    *ending = Some(AttemptEnding::failed(status_message));
+    *ending = Some(AttemptEnding::failed(failed_status_message(cause, reason)));
     Ok(AgentLoopExit::Failed)
 }
 
@@ -2348,13 +2339,28 @@ impl FailedTurnCall<'_> {
     }
 }
 
-/// The final status message of an attempt that completed, or that [`finish_failed_turn`] ended
-/// other than on an input-wait timeout.
-pub(crate) const SESSION_ENDED_STATUS_MESSAGE: &str = "session ended";
+/// The final status message of an attempt that completed.
+pub(crate) const COMPLETED_STATUS_MESSAGE: &str = "task completed";
 
 /// The final status message of an attempt ended by a `request-input` wait that passed
 /// `lifecycle.input_timeout_secs`.
 const INPUT_TIMEOUT_STATUS_MESSAGE: &str = "input-timeout";
+
+/// The final status message of an attempt [`finish_failed_turn`] ended on `cause`, a
+/// `TASK_FAILED_*` constant: `task failed (<cause>): <reason>`, or
+/// [`INPUT_TIMEOUT_STATUS_MESSAGE`] for an input-wait timeout.
+///
+/// `reason` is capped exactly as its `task_failed` line caps it: a driver's error text is
+/// unbounded, and this message reaches every stream, `GetTask`, `ListTasks` and the model-facing
+/// referenced-tasks block.
+fn failed_status_message(cause: &str, reason: &str) -> String {
+    if cause == TASK_FAILED_INPUT_TIMEOUT {
+        INPUT_TIMEOUT_STATUS_MESSAGE.to_string()
+    } else {
+        let reason = truncate_on_char_boundary(reason, MAX_TASK_FAILURE_REASON_BYTES);
+        format!("task failed ({cause}): {reason}")
+    }
+}
 
 /// End one attempt because a person stopped the task.
 ///
@@ -2636,7 +2642,7 @@ async fn finish_completed_turn(
 
     *ending = Some(AttemptEnding {
         state: TaskState::Completed,
-        message: SESSION_ENDED_STATUS_MESSAGE.into(),
+        message: COMPLETED_STATUS_MESSAGE.into(),
         response: Some(final_text),
         no_answer: false,
     });
@@ -4785,6 +4791,53 @@ mod tests {
         }
 
         assert_eq!(TOKEN_TABLE_BUILD_SPAWNS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_status_message_names_the_cause_and_keeps_input_timeout() {
+        assert_eq!(
+            failed_status_message(TASK_FAILED_DRIVER_ERROR, "boom"),
+            "task failed (driver_error): boom"
+        );
+        assert_eq!(
+            failed_status_message(
+                TASK_FAILED_CREDENTIAL_REJECTED,
+                "error[E-RUN-027]: rejected"
+            ),
+            "task failed (credential_rejected): error[E-RUN-027]: rejected"
+        );
+        assert_eq!(
+            failed_status_message(
+                TASK_FAILED_MALFORMED_RESPONSE,
+                "unsupported stop_reason 'pause'"
+            ),
+            "task failed (malformed_response): unsupported stop_reason 'pause'"
+        );
+        assert_eq!(
+            failed_status_message(
+                TASK_FAILED_COMPACTION_HOOK,
+                "compaction hook failed: summarizer unreachable"
+            ),
+            "task failed (compaction_hook): compaction hook failed: summarizer unreachable"
+        );
+        assert_eq!(
+            failed_status_message(TASK_FAILED_INPUT_TIMEOUT, "x"),
+            "input-timeout"
+        );
+    }
+
+    #[test]
+    fn failed_status_message_caps_the_reason_as_the_trace_does() {
+        let long = "é".repeat(MAX_TASK_FAILURE_REASON_BYTES);
+        let message = failed_status_message(TASK_FAILED_DRIVER_ERROR, &long);
+        let reason = message
+            .strip_prefix("task failed (driver_error): ")
+            .expect("the cause prefix");
+        assert_eq!(
+            reason,
+            truncate_on_char_boundary(&long, MAX_TASK_FAILURE_REASON_BYTES)
+        );
+        assert!(reason.len() <= MAX_TASK_FAILURE_REASON_BYTES);
     }
 
     #[test]
