@@ -156,13 +156,13 @@ context:
 artifacts:
   - name: murmur/driver-openai
     runtime: driver
-    version: "0.10.0"
+    version: "{{ v.murmur_driver_openai }}"
     gateway:
       endpoint: https://api.openai.com/v1
       api_key: ${OPENAI_API_KEY}
   - name: murmur/tool-git
     runtime: tool
-    version: "0.3.0"
+    version: "{{ v.murmur_tool_git }}"
 
 capabilities:
   env:

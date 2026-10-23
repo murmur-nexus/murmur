@@ -730,15 +730,13 @@ pub(crate) fn resolve(
                 source: label.clone(),
                 name: name.clone(),
                 newest: newest.version.clone(),
-                fit: version_fit(&FitSubject::indexed(newest), served_wit_level(), platform),
+                fit: index_fit(newest, platform),
             })
         })?,
     };
 
     if version.is_some() && explicit == ExplicitVersion::FitChecked {
-        if let VersionFit::Unserved(mismatched) =
-            version_fit(&FitSubject::indexed(chosen), served_wit_level(), platform)
-        {
+        if let VersionFit::Unserved(mismatched) = index_fit(chosen, platform) {
             return Err(Box::new(ResolveError::DoesNotFit {
                 source: label,
                 name: name.clone(),
@@ -916,6 +914,12 @@ pub(crate) fn newest_fitting<'a>(
     platform: &str,
 ) -> Option<&'a IndexedVersion> {
     artifact.newest_fitting(served_wit_level(), platform)
+}
+
+/// Whether `version` fits this mur on `platform`, and why not when it does not: the predicate
+/// [`newest_fitting`] applies to each version.
+pub(crate) fn index_fit(version: &IndexedVersion, platform: &str) -> VersionFit {
+    version_fit(&FitSubject::indexed(version), served_wit_level(), platform)
 }
 
 /// The asset of `version` that `platform` runs: the one tagged for it, else the untagged one,

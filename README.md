@@ -39,6 +39,8 @@ cargo install murmur-cli
 ### Create a manifest
 
 Declare a capsule in `murmur.yaml` — its driver, the provider that driver reaches, and how inference runs.
+Replace `<VERSION>` with the driver version `mur search driver-anthropic` lists in its `VERSION` column:
+the newest that fits your `mur`, which `mur install -g murmur/driver-anthropic` with no version also installs.
 
 `murmur.yaml`
 ```yaml
@@ -47,7 +49,7 @@ version: "1.0.0"
 
 artifacts:
   - name: murmur/driver-anthropic
-    version: "0.10.0"
+    version: "<VERSION>"
     runtime: driver
     gateway:
       endpoint: https://api.anthropic.com

@@ -42,7 +42,9 @@ pub const E_ROS_008: &str = "E-ROS-008"; // a reachability rule calls the entry 
 pub const E_NEW_002: &str = "E-NEW-002"; // mur new --roster was given a name that is, or derives, an invalid artifact name
 pub const E_NEW_003: &str = "E-NEW-003"; // the directory mur new --roster would write already exists
 pub const E_NEW_004: &str = "E-NEW-004"; // inference.provider names a provider mur new --roster has no driver for
-pub const E_NEW_005: &str = "E-NEW-005"; // mur new <task> was given --index local, the global store the generator capsule cannot read
+pub const E_NEW_005: &str = "E-NEW-005"; // mur new was given --index local, the global store, which is no published artifact index
+pub const E_NEW_006: &str = "E-NEW-006"; // mur new could not read the artifact index it takes default-artifact versions from
+pub const E_NEW_007: &str = "E-NEW-007"; // the artifact index mur new read lists no version of a default artifact that fits this mur
 
 // Capsule execution
 pub const E_RUN_001: &str = "E-RUN-001"; // capsule trap

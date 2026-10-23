@@ -1,10 +1,16 @@
-# The published default-artifacts index
+# A published default-artifacts index
 
 `artifacts-index.json` is the schema 2 index the default artifacts publish, copied verbatim
-from a release asset. The `published_pins` unit tests in `murmur-cli` check every artifact
-version `mur` or its docs tell a user to install against it: the `mur new --roster` drivers,
-the `mur new <task>` generator, every `extra.v.murmur_*` pin in `docs/mkdocs.yml`, and the
-`README.md` quickstart.
+from a release asset. It is test data:
+
+| Reader | Uses it as |
+|---|---|
+| `default_versions` and `commands::new` unit tests in `murmur-cli` | An index the version resolver picks each default artifact's newest fitting version from |
+| `tests/new_roster.rs` | The `--index` every `mur new --roster` case passes, and the versions it expects the scaffold to pin |
+| `tests/native_tool_confinement.rs` | A real published index |
+
+No version `mur` writes, and no version the docs show, is read from it: `mur new` reads the
+latest release's index at run time, and the docs read it at build time.
 
 ## Provenance: Case A, the asset published on v0.25.0
 
@@ -23,15 +29,9 @@ gh release download v0.25.0 -R murmur-nexus/default-artifacts -p artifacts-index
 sha256sum <empty dir>/artifacts-index.json
 ```
 
-## Replacing it
+## Replacing the copy
 
-When the default artifacts publish a newer release:
-
-1. Download its `artifacts-index.json` with the command above, naming the new tag, and copy it
-   here verbatim.
+1. Download a release's `artifacts-index.json` into an empty directory with the command above,
+   naming its tag, and copy it here unchanged.
 2. Update the table above: the tag, both URLs, the date and the sha256.
-3. Run `cargo nextest run -p murmur-cli --features beta-all --bin mur published_pins`. It names
-   every pin the new index does not list.
-4. Repin each one it names: `ANTHROPIC`/`OPENAI` in `src/commands/new_roster.rs`,
-   `GENERATOR_ARTIFACTS` in `src/commands/new.rs`, `extra.v` in `docs/mkdocs.yml` (and the
-   release tag in the comment above those pins), and the `README.md` quickstart.
+3. Update the versions the tests above expect where the new copy lists other ones.

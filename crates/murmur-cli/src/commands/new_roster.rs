@@ -1,9 +1,11 @@
 //! `mur new --roster <NAME>`: write `./<NAME>/`, a two-member formation that roster admission
 //! accepts and `mur run --roster <NAME>` launches as written.
 //!
-//! The files are templates rendered from the name and the global config's `inference:` block and
-//! nothing else: no model is called, no key is read, and the config is never written. Each file is
-//! parsed by the parser that later reads it before anything touches the disk.
+//! The files are templates rendered from the name, the global config's `inference:` block, and the
+//! driver version [`DefaultVersions`] resolves: the newest that fits this `mur` in the published
+//! artifact index, which is the only thing read beyond the config. No model is called, no key is
+//! read, and the config is never written. Each file is parsed by the parser that later reads it
+//! before anything touches the disk.
 //!
 //! The layout is the convention for every roster: one directory per formation, `roster.yaml` at its
 //! root, and one subdirectory per member, named after the member, holding that member's
@@ -18,6 +20,7 @@ use murmur_artifact::{
 };
 
 use crate::config::{load_mur_config, InferenceConfig};
+use crate::default_versions::{refuse_global_store, DefaultVersions};
 use crate::error::{
     CliError, E_IO_003, E_MAN_002, E_MAN_003, E_NEW_002, E_NEW_003, E_NEW_004, E_ROS_001,
 };
@@ -29,9 +32,6 @@ pub(crate) struct Provider {
     /// The `inference.provider` value in `~/.murmur/config.yaml` that selects it.
     pub(crate) name: &'static str,
     pub(crate) driver: &'static str,
-    /// The driver version a scaffolded member pins: the `extra.v` entry `docs/mkdocs.yml` holds
-    /// for this driver, which a unit test keeps equal.
-    pub(crate) driver_version: &'static str,
     /// `gateway.endpoint` when `inference.endpoint` is empty. The driver appends its own path to
     /// the endpoint: `/v1/messages` for the Anthropic driver, `chat/completions` or `responses`
     /// for the OpenAI driver. The default therefore holds everything before that path.
@@ -45,7 +45,6 @@ pub(crate) struct Provider {
 pub(crate) const ANTHROPIC: Provider = Provider {
     name: "anthropic",
     driver: "murmur/driver-anthropic",
-    driver_version: "0.10.0",
     default_endpoint: "https://api.anthropic.com",
     default_model: "claude-haiku-4-5-20251001",
     key_var: "ANTHROPIC_API_KEY",
@@ -54,7 +53,6 @@ pub(crate) const ANTHROPIC: Provider = Provider {
 pub(crate) const OPENAI: Provider = Provider {
     name: "openai",
     driver: "murmur/driver-openai",
-    driver_version: "0.9.0",
     default_endpoint: "https://api.openai.com/v1",
     default_model: "gpt-5.6-luna",
     key_var: "OPENAI_API_KEY",
@@ -67,12 +65,37 @@ pub(crate) const PROVIDERS: [&Provider; 2] = [&ANTHROPIC, &OPENAI];
 /// The version every scaffolded capsule is written at.
 pub(crate) const SCAFFOLD_VERSION: &str = "0.1.0";
 
-/// The provider a scaffold names, and the endpoint and model its members are written with.
+/// The provider a scaffold names, and the endpoint, model and driver version its members are
+/// written with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderChoice {
     pub(crate) provider: &'static Provider,
     pub(crate) endpoint: String,
     pub(crate) model: String,
+    /// The version of [`Provider::driver`] the members pin.
+    pub(crate) driver_version: String,
+}
+
+impl ProviderChoice {
+    /// `provider` with the endpoint and model `inference:` sets, an absent block or an empty field
+    /// taking the provider's default, and its driver at `driver_version`. `inference.api_key` is
+    /// never read.
+    pub(crate) fn new(
+        provider: &'static Provider,
+        inference: Option<&InferenceConfig>,
+        driver_version: String,
+    ) -> Self {
+        let endpoint = configured(inference.map(|inference| inference.endpoint.as_str()))
+            .unwrap_or(provider.default_endpoint);
+        let model = configured(inference.map(|inference| inference.model.as_str()))
+            .unwrap_or(provider.default_model);
+        Self {
+            provider,
+            endpoint: endpoint.to_string(),
+            model: model.to_string(),
+            driver_version,
+        }
+    }
 }
 
 /// One member of the scaffolded formation.
@@ -163,11 +186,15 @@ pub(crate) fn capsule_full_name(name: &str, member: &str) -> String {
     )
 }
 
-/// Write `./<name>/` in the current directory. Nothing is written unless every file renders and
-/// parses, and nothing is left behind on any error.
-pub(crate) fn run_new_roster(name: &str) -> Result<(), CliError> {
+/// Write `./<name>/` in the current directory, its driver at the newest version that fits this
+/// `mur` in the artifact index `index` names (see [`DefaultVersions::load`]). Nothing is written
+/// unless every file renders and parses, and nothing is left behind on any error.
+pub(crate) fn run_new_roster(name: &str, index: Option<&str>) -> Result<(), CliError> {
     check_formation_name(name)?;
-    let choice = choose_provider(load_mur_config()?.inference.as_ref())?;
+    refuse_global_store(index)?;
+    let config = load_mur_config()?;
+    let inference = config.inference.as_ref();
+    let provider = choose_provider(inference)?;
     let cwd = std::env::current_dir().map_err(|source| {
         CliError::new(
             E_IO_003,
@@ -176,10 +203,16 @@ pub(crate) fn run_new_roster(name: &str) -> Result<(), CliError> {
     })?;
     let target = cwd.join(name);
     refuse_existing(name, &target)?;
+    let versions = DefaultVersions::load(index)?;
+    let choice = ProviderChoice::new(
+        provider,
+        inference,
+        versions.newest_fitting(provider.driver)?,
+    );
     let scaffold = render_scaffold(name, &choice);
     self_check(&scaffold, name, &choice)?;
     write_formation(&cwd, name, &scaffold)?;
-    capsule_runtime::report_print!("{}", render_summary(name, &choice));
+    capsule_runtime::report_print!("{}", render_summary(name, &choice, versions.label()));
     Ok(())
 }
 
@@ -210,29 +243,19 @@ pub(crate) fn check_formation_name(name: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-/// The provider `inference:` selects, with its endpoint and model. An absent block, or an empty
-/// field, takes the default; `inference.api_key` is never read. `E-NEW-004` for a provider with
-/// no entry in [`PROVIDERS`].
+/// The provider `inference.provider` selects. An absent block, or an empty field, takes the
+/// first of [`PROVIDERS`]. `E-NEW-004` for a provider with no entry there.
 pub(crate) fn choose_provider(
     inference: Option<&InferenceConfig>,
-) -> Result<ProviderChoice, CliError> {
-    let requested = configured(inference.map(|inference| inference.provider.as_str()));
-    let provider = match requested {
-        None => PROVIDERS[0],
-        Some(requested) => *PROVIDERS
+) -> Result<&'static Provider, CliError> {
+    match configured(inference.map(|inference| inference.provider.as_str())) {
+        None => Ok(PROVIDERS[0]),
+        Some(requested) => PROVIDERS
             .iter()
             .find(|provider| provider.name == requested)
-            .ok_or_else(|| unknown_provider(requested))?,
-    };
-    let endpoint = configured(inference.map(|inference| inference.endpoint.as_str()))
-        .unwrap_or(provider.default_endpoint);
-    let model = configured(inference.map(|inference| inference.model.as_str()))
-        .unwrap_or(provider.default_model);
-    Ok(ProviderChoice {
-        provider,
-        endpoint: endpoint.to_string(),
-        model: model.to_string(),
-    })
+            .copied()
+            .ok_or_else(|| unknown_provider(requested)),
+    }
 }
 
 /// A config field's value, or `None` when it is absent, empty or only whitespace.
@@ -417,10 +440,11 @@ pub(crate) fn render_scaffold(name: &str, choice: &ProviderChoice) -> Scaffold {
     Scaffold { files }
 }
 
-/// What `mur new --roster` prints on success: the files written, then the commands that install
-/// and launch the formation. The key step comes first because the key is the one value only the
-/// operator can supply, and `mur run --roster` fails without it.
-pub(crate) fn render_summary(name: &str, choice: &ProviderChoice) -> String {
+/// What `mur new --roster` prints on success: the files written, the driver version and the index
+/// `index_label` names it was taken from, then the commands that install and launch the
+/// formation. The key step comes first because the key is the one value only the operator can
+/// supply, and `mur run --roster` fails without it.
+pub(crate) fn render_summary(name: &str, choice: &ProviderChoice, index_label: &str) -> String {
     let rules = REACHABILITY
         .iter()
         .map(|(from, to)| format!("{from} may call {}", to.join(", ")))
@@ -453,6 +477,10 @@ pub(crate) fn render_summary(name: &str, choice: &ProviderChoice) -> String {
     for (path, note) in rows {
         out.push_str(&format!("  {path:<width$}{note}\n"));
     }
+    out.push_str(&format!(
+        "  Driver: {}@{}, the newest that fits this mur in {index_label}\n",
+        choice.provider.driver, choice.driver_version
+    ));
     out.push_str("\nNext:\n");
     out.push_str(&format!(
         "  mur config set -g credentials.{} <your key>\n",
@@ -460,7 +488,7 @@ pub(crate) fn render_summary(name: &str, choice: &ProviderChoice) -> String {
     ));
     out.push_str(&format!(
         "  mur install -g {}@{}\n",
-        choice.provider.driver, choice.provider.driver_version
+        choice.provider.driver, choice.driver_version
     ));
     for member in MEMBERS {
         let dir = format!("{name}/{}", member.name);
@@ -679,7 +707,7 @@ fn render_member(name: &str, member: &MemberTemplate, choice: &ProviderChoice) -
             "The artifacts the capsule runs with: its inference driver.
 
              Install the driver: mur install -g {}@{}",
-            provider.driver, provider.driver_version
+            provider.driver, choice.driver_version
         ),
     )
     .see(0, "manifest/#field-artifacts")
@@ -691,7 +719,7 @@ fn render_member(name: &str, member: &MemberTemplate, choice: &ProviderChoice) -
     )
     .line(
         4,
-        &format!("version: {}", provider.driver_version),
+        &format!("version: {}", choice.driver_version),
         "the exact driver version",
     )
     .line(
@@ -890,8 +918,20 @@ mod tests {
         AfterTask, ApiKeyReference, RosterReachability, TaskAcceptance, REACHABILITY_ALL,
     };
 
+    /// The driver version the tests hand the scaffold: one no published index lists, so a test
+    /// that finds it in a file knows the scaffold wrote what it was given.
+    const DRIVER_VERSION: &str = "7.8.9";
+
+    fn choice(inference: Option<&InferenceConfig>) -> ProviderChoice {
+        ProviderChoice::new(
+            choose_provider(inference).unwrap(),
+            inference,
+            DRIVER_VERSION.to_string(),
+        )
+    }
+
     fn default_choice() -> ProviderChoice {
-        choose_provider(None).unwrap()
+        choice(None)
     }
 
     fn files(choice: &ProviderChoice) -> (Roster, RuntimeManifest, RuntimeManifest, Scaffold) {
@@ -1075,7 +1115,7 @@ mod tests {
                 provider: provider.name.to_string(),
                 ..InferenceConfig::default()
             };
-            let (_, lead, worker, scaffold) = files(&choose_provider(Some(&config)).unwrap());
+            let (_, lead, worker, scaffold) = files(&choice(Some(&config)));
             for (path, text) in &scaffold.files {
                 for line in text.lines() {
                     assert!(
@@ -1097,14 +1137,14 @@ mod tests {
                 provider: provider.name.to_string(),
                 ..InferenceConfig::default()
             };
-            let (_, lead, worker, _) = files(&choose_provider(Some(&config)).unwrap());
+            let (_, lead, worker, _) = files(&choice(Some(&config)));
             for manifest in [lead, worker] {
                 let driver = manifest
                     .artifacts
                     .iter()
                     .find(|artifact| artifact.name == provider.driver)
                     .expect("the driver is declared");
-                assert_eq!(driver.version, provider.driver_version);
+                assert_eq!(driver.version, DRIVER_VERSION);
                 let gateway = driver.gateway.as_ref().unwrap();
                 assert_eq!(gateway.endpoint, provider.default_endpoint);
                 assert_eq!(
@@ -1134,7 +1174,7 @@ mod tests {
             model: "a model: with # in it".to_string(),
             ..InferenceConfig::default()
         };
-        for choice in [default_choice(), choose_provider(Some(&config)).unwrap()] {
+        for choice in [default_choice(), choice(Some(&config))] {
             let scaffold = render_scaffold("crew", &choice);
             for (path, text) in &scaffold.files {
                 let lines: Vec<&str> = text.lines().collect();
@@ -1200,8 +1240,7 @@ mod tests {
             endpoint: "http://127.0.0.1:4242".to_string(),
             api_key: "not-read".to_string(),
         };
-        let choice = choose_provider(Some(&config)).unwrap();
-        let (_, lead, _, scaffold) = files(&choice);
+        let (_, lead, _, scaffold) = files(&choice(Some(&config)));
         assert_eq!(lead.inference.unwrap().model, "test: model # x");
         assert_eq!(
             lead.artifacts[0].gateway.as_ref().unwrap().endpoint,
@@ -1219,7 +1258,7 @@ mod tests {
             provider: " ".to_string(),
             ..InferenceConfig::default()
         };
-        assert_eq!(choose_provider(Some(&blank)).unwrap(), default_choice());
+        assert_eq!(choice(Some(&blank)), default_choice());
         let mistral = InferenceConfig {
             provider: "mistral".to_string(),
             ..InferenceConfig::default()
@@ -1258,18 +1297,55 @@ mod tests {
         check_formation_name(&"a".repeat(93)).unwrap();
     }
 
+    /// The driver version a member pins is the one it was handed, written in exactly two places:
+    /// the header comment's install step and the artifact entry's `version:`.
     #[test]
-    fn the_summary_names_the_files_and_the_steps() {
+    fn the_driver_is_pinned_at_the_version_handed_in() {
+        for provider in PROVIDERS {
+            let config = InferenceConfig {
+                provider: provider.name.to_string(),
+                ..InferenceConfig::default()
+            };
+            let scaffold = render_scaffold("crew", &choice(Some(&config)));
+            for member in MEMBERS {
+                let text = scaffold
+                    .file(&Path::new(member.name).join(MANIFEST_FILENAME))
+                    .unwrap();
+                let pinned: Vec<&str> = text
+                    .lines()
+                    .filter(|line| line.contains(DRIVER_VERSION))
+                    .map(str::trim)
+                    .collect();
+                assert_eq!(pinned.len(), 2, "{text}");
+                assert_eq!(
+                    pinned[0],
+                    format!(
+                        "# Install the driver: mur install -g {}@{DRIVER_VERSION}",
+                        provider.driver
+                    )
+                );
+                assert!(
+                    pinned[1].starts_with(&format!("version: {DRIVER_VERSION} ")),
+                    "{}",
+                    pinned[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_summary_names_the_files_the_driver_and_the_steps() {
         assert_eq!(
-            render_summary("crew", &default_choice()),
+            render_summary("crew", &default_choice(), "github:murmur-nexus/default-artifacts v1.0.0"),
             "Scaffolded formation 'crew' in ./crew
   crew/roster.yaml          lead is the entry member; lead may call worker
   crew/lead/murmur.yaml     capsule local/crew-lead@0.1.0
   crew/worker/murmur.yaml   capsule local/crew-worker@0.1.0, serves peers
+  Driver: murmur/driver-anthropic@7.8.9, the newest that fits this mur in github:murmur-nexus/default-artifacts v1.0.0
 
 Next:
   mur config set -g credentials.ANTHROPIC_API_KEY <your key>
-  mur install -g murmur/driver-anthropic@0.10.0
+  mur install -g murmur/driver-anthropic@7.8.9
   mur build crew/lead && mur install -g crew/lead/crew-lead-0.1.0.mur.zip
   mur build crew/worker && mur install -g crew/worker/crew-worker-0.1.0.mur.zip
   mur run --roster crew --task \"<your task>\"
@@ -1284,16 +1360,5 @@ Next:
             render_scaffold("crew", &choice),
             render_scaffold("crew", &choice)
         );
-    }
-
-    #[test]
-    fn driver_pins_match_the_docs() {
-        use crate::published_pins::docs_pin;
-
-        assert_eq!(
-            ANTHROPIC.driver_version,
-            docs_pin("murmur_driver_anthropic")
-        );
-        assert_eq!(OPENAI.driver_version, docs_pin("murmur_driver_openai"));
     }
 }

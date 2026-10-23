@@ -16,10 +16,11 @@ use murmur_artifact::{
 };
 
 use super::new_roster::{Provider, ANTHROPIC, OPENAI};
-use super::search::{read_index_file_verbatim, IndexSource, DEFAULT_INDEX_URL};
+use super::search::{IndexSource, DEFAULT_INDEX_URL};
 use crate::{
     config::{load_mur_config, save_mur_config, InferenceConfig},
-    error::{CliError, E_CFG_001, E_IO_003, E_MAN_002, E_NEW_005, E_RUN_008},
+    default_versions::{read_index_text, refuse_global_store, DefaultVersions},
+    error::{CliError, E_CFG_001, E_IO_003, E_MAN_002, E_RUN_008},
 };
 
 // Temporary directory that cleans itself up on drop.
@@ -93,27 +94,22 @@ enum GeneratorIndex {
     Default,
     /// An `http(s)` URL the tool fetches, and its `<scheme>://<host>[:<port>]` origin.
     Url { url: String, origin: String },
-    /// An index file checked on the host, as read. The tool reads a copy of it in its work
+    /// An index file at `path` on the host, as read. The tool reads a copy of it in its work
     /// folder, [`ARTIFACT_INDEX_FILE_NAME`]: a host path outside that folder is unreadable to it.
-    File { text: String },
+    File { path: String, text: String },
 }
 
 impl GeneratorIndex {
-    /// Errors before anything is staged: `E-NEW-005` for `local`, the global store the capsule
-    /// cannot read; `E-IO-003` for an unparseable URL or an unreadable file; `E-IDX-002` for a
-    /// file that is not a schema 2 index.
+    /// Errors before anything is staged or any config is read: `E-NEW-005` for `local`, the
+    /// global store, which is no published index and which the capsule cannot read; `E-IO-003`
+    /// for an unparseable URL; `E-NEW-006` for an unreadable file.
     fn resolve(index: Option<&str>) -> Result<Self, CliError> {
+        refuse_global_store(index)?;
         let Some(index) = index else {
             return Ok(Self::Default);
         };
         match IndexSource::parse(index) {
-            IndexSource::GlobalStore => Err(CliError::with_hint(
-                E_NEW_005,
-                "--index local names the global artifact store on this host, which the \
-                 generator capsule cannot read",
-                "run `mur search <query> --index local` to list it, or pass an index file or an \
-                 http(s) URL",
-            )),
+            IndexSource::GlobalStore => unreachable!("refuse_global_store refuses `local`"),
             IndexSource::Url(url) => {
                 let origin = url::Url::parse(url)
                     .map(|parsed| parsed.origin())
@@ -130,10 +126,21 @@ impl GeneratorIndex {
                     origin: origin.ascii_serialization(),
                 })
             }
-            IndexSource::File(path) => {
-                let (_, text) = read_index_file_verbatim(path)?;
-                Ok(Self::File { text })
-            }
+            IndexSource::File(path) => Ok(Self::File {
+                path: path.to_string(),
+                text: read_index_text(path)?,
+            }),
+        }
+    }
+
+    /// The index the generator's artifact versions come from: the one its search tool reads.
+    /// `E-IDX-002` for a file that is not a schema 2 index; see [`DefaultVersions::load`] for the
+    /// others.
+    fn default_versions(&self) -> Result<DefaultVersions, CliError> {
+        match self {
+            Self::Default => DefaultVersions::load(None),
+            Self::Url { url, .. } => DefaultVersions::load(Some(url)),
+            Self::File { path, text } => DefaultVersions::from_text(path, text),
         }
     }
 
@@ -161,9 +168,11 @@ impl GeneratorIndex {
 
 pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     let index = GeneratorIndex::resolve(index)?;
+    let default_versions = index.default_versions()?;
 
     // Resolve inference config: config file → env var → interactive wizard.
     let inf = resolve_inference_config()?;
+    let versions = GeneratorVersions::resolve(&default_versions, generator_provider(&inf))?;
 
     let local_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
 
@@ -171,7 +180,7 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     // touches the environment — then inject the real key directly into the parsed struct.
     // This keeps the resolved key a Rust `String` in memory only; it is never round-tripped
     // through this process's own environment (which a /proc/<pid>/environ read could expose).
-    let meta_yaml = build_meta_manifest(&inf, &index.extra_network_allow());
+    let meta_yaml = build_meta_manifest(&inf, &versions, &index.extra_network_allow());
     let mut runtime_manifest = RuntimeManifest::from_yaml_str(&meta_yaml).map_err(|e| {
         CliError::new(
             E_MAN_002,
@@ -280,7 +289,7 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     staged
         .write_task_input(task_prompt.as_bytes())
         .map_err(|e| CliError::new(E_IO_003, format!("failed to write task prompt: {e}")))?;
-    if let GeneratorIndex::File { text } = &index {
+    if let GeneratorIndex::File { text, .. } = &index {
         staged
             .write_workdir_file(ARTIFACT_INDEX_FILE_NAME, text.as_bytes())
             .map_err(|e| {
@@ -487,43 +496,70 @@ fn run_wizard() -> Result<InferenceConfig, CliError> {
 /// A tool or skill the generator capsule declares besides its driver.
 pub(crate) struct GeneratorArtifact {
     pub(crate) name: &'static str,
-    /// The `extra.v` value `docs/mkdocs.yml` holds for this artifact (`murmur/tool-editor` →
-    /// `murmur_tool_editor`), which a unit test keeps equal.
-    pub(crate) version: &'static str,
     pub(crate) runtime: &'static str,
 }
 
 /// The generator capsule's tools and skill, in the order its manifest declares them. Its driver
-/// is the provider's, at [`Provider::driver_version`].
+/// is the provider's.
 pub(crate) const GENERATOR_ARTIFACTS: [GeneratorArtifact; 3] = [
     GeneratorArtifact {
         name: "murmur/tool-registry-search",
-        version: "0.2.0",
         runtime: "tool",
     },
     GeneratorArtifact {
         name: "murmur/tool-editor",
-        version: "0.6.0",
         runtime: "tool",
     },
     GeneratorArtifact {
         name: "murmur/skill-create-manifest",
-        version: "0.1.0",
         runtime: "skill",
     },
 ];
 
-/// The generator capsule's manifest. Its `capabilities.network.allow` lists
-/// [`REGISTRY_SEARCH_ORIGINS`], then `extra_network_allow`. It sets `inference.max_tokens`, so it
-/// launches whether or not the pinned driver's `models:` table lists the model.
-pub(crate) fn build_meta_manifest(
-    config: &InferenceConfig,
-    extra_network_allow: &[String],
-) -> String {
-    let provider: &Provider = match config.provider.as_str() {
+/// The versions the generator manifest pins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratorVersions {
+    /// The provider's driver.
+    pub(crate) driver: String,
+    /// One per [`GENERATOR_ARTIFACTS`] entry, in its order.
+    pub(crate) artifacts: [String; 3],
+}
+
+impl GeneratorVersions {
+    /// The newest version of `provider`'s driver and of each generator artifact that fits this
+    /// `mur` in `index`. `E-NEW-007` for the first it lists no fitting version of.
+    fn resolve(index: &DefaultVersions, provider: &Provider) -> Result<Self, CliError> {
+        let driver = index.newest_fitting(provider.driver)?;
+        let [registry_search, editor, skill] = &GENERATOR_ARTIFACTS;
+        Ok(Self {
+            driver,
+            artifacts: [
+                index.newest_fitting(registry_search.name)?,
+                index.newest_fitting(editor.name)?,
+                index.newest_fitting(skill.name)?,
+            ],
+        })
+    }
+}
+
+/// The provider whose driver the generator runs: OpenAI's for `inference.provider: openai`, else
+/// Anthropic's.
+fn generator_provider(config: &InferenceConfig) -> &'static Provider {
+    match config.provider.as_str() {
         "openai" => &OPENAI,
         _ => &ANTHROPIC,
-    };
+    }
+}
+
+/// The generator capsule's manifest, pinning exactly `versions`. Its `capabilities.network.allow`
+/// lists [`REGISTRY_SEARCH_ORIGINS`], then `extra_network_allow`. It sets `inference.max_tokens`,
+/// so it launches whether or not the pinned driver's `models:` table lists the model.
+pub(crate) fn build_meta_manifest(
+    config: &InferenceConfig,
+    versions: &GeneratorVersions,
+    extra_network_allow: &[String],
+) -> String {
+    let provider = generator_provider(config);
     let endpoint = if config.endpoint.is_empty() {
         provider.default_endpoint
     } else {
@@ -531,10 +567,11 @@ pub(crate) fn build_meta_manifest(
     };
     let others: String = GENERATOR_ARTIFACTS
         .iter()
-        .map(|artifact| {
+        .zip(&versions.artifacts)
+        .map(|(artifact, version)| {
             format!(
-                "  - name: {}\n    version: \"{}\"\n    runtime: {}\n",
-                artifact.name, artifact.version, artifact.runtime
+                "  - name: {}\n    version: \"{version}\"\n    runtime: {}\n",
+                artifact.name, artifact.runtime
             )
         })
         .collect();
@@ -568,7 +605,7 @@ inference:
     artifact: {driver_name}
 "#,
         driver_name = provider.driver,
-        driver_version = provider.driver_version,
+        driver_version = versions.driver,
         model = config.model,
     )
 }
@@ -643,11 +680,25 @@ Output only the word DONE when finished.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::E_NEW_005;
 
     /// Build key-shaped test values at runtime so the source never contains a
     /// credential-shaped literal that secret scanners could flag.
     fn fake_key(parts: &[&str]) -> String {
         parts.concat()
+    }
+
+    /// Versions no published index lists, so a test that finds one in the manifest knows it was
+    /// handed in rather than written by the code.
+    fn test_versions() -> GeneratorVersions {
+        GeneratorVersions {
+            driver: "9.1.0".to_string(),
+            artifacts: [
+                "9.2.0".to_string(),
+                "9.3.0".to_string(),
+                "9.4.0".to_string(),
+            ],
+        }
     }
 
     #[test]
@@ -658,7 +709,7 @@ mod tests {
             api_key: fake_key(&["sk-", "ant-", "test"]),
             endpoint: String::new(),
         };
-        let yaml = build_meta_manifest(&config, &[]);
+        let yaml = build_meta_manifest(&config, &test_versions(), &[]);
         assert!(
             yaml.contains("name: murmur/driver-anthropic"),
             "should use anthropic driver"
@@ -685,7 +736,7 @@ mod tests {
             api_key: fake_key(&["sk-", "test"]),
             endpoint: String::new(),
         };
-        let yaml = build_meta_manifest(&config, &[]);
+        let yaml = build_meta_manifest(&config, &test_versions(), &[]);
         assert!(
             yaml.contains("name: murmur/driver-openai"),
             "should use openai driver"
@@ -709,7 +760,7 @@ mod tests {
             api_key: fake_key(&["sk-", "ant-", "test"]),
             endpoint: "https://custom.proxy.example.com".to_string(),
         };
-        let yaml = build_meta_manifest(&config, &[]);
+        let yaml = build_meta_manifest(&config, &test_versions(), &[]);
         assert!(
             yaml.contains("custom.proxy.example.com"),
             "should use custom endpoint"
@@ -728,7 +779,7 @@ mod tests {
             api_key: fake_key(&["sk-", "ant-", "test"]),
             endpoint: String::new(),
         };
-        let yaml = build_meta_manifest(&config, &[]);
+        let yaml = build_meta_manifest(&config, &test_versions(), &[]);
         assert!(
             yaml.contains(&format!("api_key: {META_MANIFEST_KEY_PLACEHOLDER}")),
             "the driver entry must carry the placeholder key reference"
@@ -768,7 +819,7 @@ mod tests {
             api_key: fake_key(&["sk-", "ant-", "test"]),
             endpoint: String::new(),
         };
-        let yaml = build_meta_manifest(&config, &[]);
+        let yaml = build_meta_manifest(&config, &test_versions(), &[]);
         let runtime_manifest = RuntimeManifest::from_yaml_str(&yaml)
             .expect("build_meta_manifest should produce a valid runtime manifest without any env var present");
         // The generator sets its own output cap, so it launches whether or not the pinned
@@ -831,7 +882,7 @@ mod tests {
         // parse → inject the real key into the parsed struct in memory.
         let result = (|| -> Result<RuntimeManifest, CliError> {
             let inf = resolve_inference_config()?;
-            let meta_yaml = build_meta_manifest(&inf, &[]);
+            let meta_yaml = build_meta_manifest(&inf, &test_versions(), &[]);
             let mut runtime_manifest = RuntimeManifest::from_yaml_str(&meta_yaml).map_err(|e| {
                 CliError::new(
                     E_MAN_002,
@@ -1065,6 +1116,7 @@ mod tests {
         assert_eq!(
             index,
             GeneratorIndex::File {
+                path: path.to_str().unwrap().to_string(),
                 text: text.to_string()
             }
         );
@@ -1124,10 +1176,10 @@ mod tests {
     #[test]
     fn build_meta_manifest_grants_the_registry_search_hosts() {
         for config in [anthropic_inf(), openai_inf()] {
-            let yaml = build_meta_manifest(&config, &[]);
+            let yaml = build_meta_manifest(&config, &test_versions(), &[]);
             assert_eq!(
                 declared_version(&yaml, "murmur/tool-registry-search").as_deref(),
-                Some("0.2.0")
+                Some("9.2.0")
             );
             assert_eq!(
                 network_allow(&yaml),
@@ -1149,7 +1201,7 @@ mod tests {
         let extra = index.extra_network_allow();
         assert_eq!(extra, ["http://127.0.0.1:8080"]);
         for config in [anthropic_inf(), openai_inf()] {
-            let yaml = build_meta_manifest(&config, &extra);
+            let yaml = build_meta_manifest(&config, &test_versions(), &extra);
             assert_eq!(
                 network_allow(&yaml),
                 [
@@ -1186,7 +1238,7 @@ mod tests {
         .unwrap();
         assert!(index.extra_network_allow().is_empty());
         for config in [anthropic_inf(), openai_inf()] {
-            let yaml = build_meta_manifest(&config, &index.extra_network_allow());
+            let yaml = build_meta_manifest(&config, &test_versions(), &index.extra_network_allow());
             assert_eq!(
                 network_allow(&yaml),
                 [
@@ -1215,13 +1267,13 @@ mod tests {
     }
 
     #[test]
-    fn build_meta_manifest_pins_the_providers_driver_version() {
+    fn build_meta_manifest_pins_the_providers_driver_at_the_version_handed_in() {
         for (config, provider) in [(anthropic_inf(), &ANTHROPIC), (openai_inf(), &OPENAI)] {
-            let yaml = build_meta_manifest(&config, &[]);
+            let yaml = build_meta_manifest(&config, &test_versions(), &[]);
             assert_eq!(
                 declared_version(&yaml, provider.driver).as_deref(),
-                Some(provider.driver_version),
-                "the {} generator pins {} at Provider::driver_version",
+                Some("9.1.0"),
+                "the {} generator pins {} at the version handed in",
                 config.provider,
                 provider.driver
             );
@@ -1236,10 +1288,10 @@ mod tests {
     #[test]
     fn build_meta_manifest_includes_tool_editor() {
         for config in [anthropic_inf(), openai_inf()] {
-            let yaml = build_meta_manifest(&config, &[]);
+            let yaml = build_meta_manifest(&config, &test_versions(), &[]);
             assert_eq!(
                 declared_version(&yaml, "murmur/tool-editor").as_deref(),
-                Some(GENERATOR_ARTIFACTS[1].version),
+                Some("9.3.0"),
                 "must include murmur/tool-editor ({} provider)",
                 config.provider
             );
@@ -1249,10 +1301,10 @@ mod tests {
     #[test]
     fn build_meta_manifest_includes_tool_registry_search() {
         for config in [anthropic_inf(), openai_inf()] {
-            let yaml = build_meta_manifest(&config, &[]);
+            let yaml = build_meta_manifest(&config, &test_versions(), &[]);
             assert_eq!(
                 declared_version(&yaml, "murmur/tool-registry-search").as_deref(),
-                Some(GENERATOR_ARTIFACTS[0].version),
+                Some("9.2.0"),
                 "must include murmur/tool-registry-search ({} provider)",
                 config.provider
             );
@@ -1262,7 +1314,7 @@ mod tests {
     #[test]
     fn build_meta_manifest_includes_skill_create_manifest() {
         for config in [anthropic_inf(), openai_inf()] {
-            let yaml = build_meta_manifest(&config, &[]);
+            let yaml = build_meta_manifest(&config, &test_versions(), &[]);
             let manifest = RuntimeManifest::from_yaml_str(&yaml).expect("parses");
             let skill = manifest
                 .artifacts
@@ -1274,7 +1326,7 @@ mod tests {
                         config.provider
                     )
                 });
-            assert_eq!(skill.version, GENERATOR_ARTIFACTS[2].version);
+            assert_eq!(skill.version, "9.4.0");
             assert_eq!(
                 skill.runtime,
                 ArtifactRuntime::Skill,
@@ -1284,15 +1336,49 @@ mod tests {
         }
     }
 
+    /// Every version the manifest pins is one handed in, and no other version appears in it
+    /// besides the generator capsule's own.
     #[test]
-    fn generator_pins_match_the_docs() {
-        for artifact in &GENERATOR_ARTIFACTS {
-            let docs_key = artifact.name.replace(['/', '-'], "_");
-            let docs = crate::published_pins::docs_pin(&docs_key);
+    fn build_meta_manifest_writes_exactly_the_versions_handed_in() {
+        for config in [anthropic_inf(), openai_inf()] {
+            let yaml = build_meta_manifest(&config, &test_versions(), &[]);
+            let mut written: Vec<&str> = yaml
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("version: "))
+                .map(|version| version.trim_matches('"'))
+                .collect();
+            written.sort_unstable();
             assert_eq!(
-                artifact.version, docs,
-                "the generator pins {}@{}, and docs/mkdocs.yml extra.v.{docs_key} is {docs}",
-                artifact.name, artifact.version
+                written,
+                ["0.4.17", "9.1.0", "9.2.0", "9.3.0", "9.4.0"],
+                "{yaml}"
+            );
+        }
+    }
+
+    /// Over the committed copy of a default-artifacts release's index, the generator pins the
+    /// newest fitting version of each artifact that index lists.
+    #[test]
+    fn generator_versions_resolve_from_the_index() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/published-index/artifacts-index.json");
+        let index = GeneratorIndex::resolve(Some(path.to_str().unwrap()))
+            .unwrap()
+            .default_versions()
+            .unwrap();
+        for (provider, driver) in [(&ANTHROPIC, "0.10.0"), (&OPENAI, "0.9.0")] {
+            assert_eq!(
+                GeneratorVersions::resolve(&index, provider).unwrap(),
+                GeneratorVersions {
+                    driver: driver.to_string(),
+                    artifacts: [
+                        "0.2.0".to_string(),
+                        "0.6.0".to_string(),
+                        "0.1.0".to_string()
+                    ],
+                },
+                "{}",
+                provider.name
             );
         }
     }
