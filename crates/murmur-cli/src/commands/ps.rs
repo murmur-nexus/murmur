@@ -170,8 +170,8 @@ struct ListedFormation {
 #[derive(Debug, serde::Serialize)]
 struct NotListedMember {
     session_id: String,
-    /// The roster name: the running record's when one is kept, else `session_start`'s. `null`
-    /// when neither names one, as for a member's delegated child.
+    /// The roster name: the running record's when one is kept and names one, else
+    /// `session_start`'s. `null` when neither names one, as for a member's delegated child.
     formation_member: Option<String>,
     /// [`REASON_ENDED`] when the member's trace holds a `session_end`, else
     /// [`REASON_GONE_WITHOUT_ENDING`] — killed outright, its trace unreadable, or never recorded.
@@ -594,10 +594,10 @@ fn formation_census(
             }
         })
         .collect();
+    // What is left is every member found that had no record in this read at all.
     not_listed.extend(
         traced
             .into_iter()
-            .filter(|(session, _)| !recorded.contains(session.as_str()))
             .map(|(session_id, (formation_member, ended))| CensusMember {
                 session_id,
                 formation_member,
@@ -838,26 +838,6 @@ mod tests {
         std::fs::write(dir.join("trace.jsonl"), lines.join("\n") + "\n").unwrap();
     }
 
-    /// The census `summary_line` renders, rendered by `census_line`.
-    fn census_line_of(
-        formation: &FormationId,
-        rows: &[(RunningRecord, &str)],
-        gone: &[RunningRecord],
-    ) -> String {
-        let statuses: Vec<&str> = rows
-            .iter()
-            .filter(|(record, _)| record.formation_id.as_ref() == Some(formation))
-            .map(|(_, status)| *status)
-            .collect();
-        let census = formation_census(
-            formation,
-            &in_formation(formation, rows.iter().map(|(record, _)| record)),
-            &in_formation(formation, gone),
-            &recorded_sessions(rows, gone),
-        );
-        census_line(formation, &statuses, &census)
-    }
-
     /// A gone record is counted with its record kept: `ended` when its trace holds a
     /// `session_end`, with the trace's roster name when the record names none, and
     /// `gone_without_ending` with the record's roster name when it has no trace. A member known
@@ -916,10 +896,6 @@ mod tests {
                  1 with no record"
             )
         );
-        assert_eq!(
-            census_line_of(&formation, &rows, &gone),
-            summary_line(&formation, &rows, &gone)
-        );
     }
 
     /// A formation known only from gone records gets no entry, and its gone record, which this
@@ -951,12 +927,18 @@ mod tests {
         assert_eq!(entries[0].listed, 1);
         assert!(entries[0].not_listed.is_empty());
         assert_eq!(
-            census_line_of(&listed_formation, &rows, &gone),
-            summary_line(&listed_formation, &rows, &gone)
+            summary_line(&listed_formation, &rows, &gone),
+            format!(
+                "formation {listed_formation}: 1 listed (1 running); no other member found in 1 \
+                 session root"
+            )
         );
         assert_eq!(
-            census_line_of(&gone_formation, &rows, &gone),
-            summary_line(&gone_formation, &rows, &gone)
+            summary_line(&gone_formation, &rows, &gone),
+            format!(
+                "formation {gone_formation}: 0 listed, 1 pruned now; no other member found in 1 \
+                 session root"
+            )
         );
         assert!(listed_formations(&[row("ses_0", None)], &gone).is_empty());
     }
@@ -985,10 +967,6 @@ mod tests {
         assert_eq!(
             summary_line(&formation, &rows, &[]),
             format!("formation {formation}: 2 listed (2 running); not listed: 1 ended")
-        );
-        assert_eq!(
-            census_line_of(&formation, &rows, &[]),
-            summary_line(&formation, &rows, &[])
         );
     }
 
@@ -1019,7 +997,6 @@ mod tests {
         let gone = vec![member_at(&sealed, &gone, &formation, None)];
         let entries = listed_formations(&rows, &gone);
         let line = summary_line(&formation, &rows, &gone);
-        let rendered = census_line_of(&formation, &rows, &gone);
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert_eq!(entries[0].gone_without_ending, 1);
@@ -1035,7 +1012,6 @@ mod tests {
                  found in 1 session root; 1 session root could not be read"
             )
         );
-        assert_eq!(rendered, line);
     }
 
     #[test]

@@ -1744,7 +1744,7 @@ mur ps --json
 | `formations[].gone_without_ending` | integer | How many entries of `not_listed` have `reason: "gone_without_ending"` |
 | `formations[].not_listed` | array | Every member of this formation this read found that has no entry in `capsules`, sorted by session id descending: each record of the formation whose process is gone, and each session in the [session roots](#mur-ps-session-roots) whose trace's `session_start` names the formation and that has no record |
 | `formations[].not_listed[].session_id` | string | The member's session |
-| `formations[].not_listed[].formation_member` | string or `null` | The roster name: the record's `formation_member` when the record is kept, else the trace's `session_start.formation_member`. `null` when neither names one, as for a member's delegated child |
+| `formations[].not_listed[].formation_member` | string or `null` | The roster name: the record's `formation_member` when the record is kept and names one, else the trace's `session_start.formation_member`. `null` when neither names one, as for a member's delegated child |
 | `formations[].not_listed[].reason` | string | `ended`: the member's trace holds a `session_end`. `gone_without_ending`: no `session_end` was found — the member was killed outright, its trace could not be read, or it never recorded one |
 | `formations[].not_listed[].record_kept` | boolean | `true` when the member's record is on disk and its process is gone: the record plain `mur ps` removes and counts as `pruned now` |
 | `formations[].searched_roots` | integer | [Session roots](#mur-ps-session-roots) that were listed |
