@@ -42,11 +42,11 @@ use crate::{
         StreamArtifact, StreamTask,
     },
     trace::{
-        FailedInference, TraceWriter, WireCapture, INFERENCE_ERROR_DRIVER_FAILED,
-        INFERENCE_ERROR_MALFORMED_RESPONSE, MAX_TASK_FAILURE_REASON_BYTES,
-        TASK_FAILED_COMPACTION_HOOK, TASK_FAILED_CREDENTIAL_REJECTED, TASK_FAILED_DRIVER_ERROR,
-        TASK_FAILED_INPUT_TIMEOUT, TASK_FAILED_MALFORMED_RESPONSE,
-        TASK_FAILED_WORKDIR_PATH_REFUSED,
+        recorded_driver_config, FailedInference, InferenceCallSettings, TraceWriter, WireCapture,
+        INFERENCE_ERROR_DRIVER_FAILED, INFERENCE_ERROR_MALFORMED_RESPONSE,
+        MAX_TASK_FAILURE_REASON_BYTES, TASK_FAILED_COMPACTION_HOOK,
+        TASK_FAILED_CREDENTIAL_REJECTED, TASK_FAILED_DRIVER_ERROR, TASK_FAILED_INPUT_TIMEOUT,
+        TASK_FAILED_MALFORMED_RESPONSE, TASK_FAILED_WORKDIR_PATH_REFUSED,
     },
     types::ResumeMode,
     workdir_fs::{EntryKind, WorkdirRoot, DEFAULT_FILE_MODE},
@@ -1120,6 +1120,14 @@ pub(crate) async fn run_agent_loop(
         // Read once for this call, so its payload, occupancy count, spend admission and
         // truncation warning never mix a cap a controller changed partway through.
         let (max_output_tokens, applies_change) = run_config.output_cap_for_call(&choice);
+        // Every choice's driver runs under the session's `MURMUR_INFERENCE_DRIVER_CONFIG`
+        // (`driver_choice_env` replaces only the endpoint, model and driver name).
+        let call_settings = InferenceCallSettings {
+            max_output_tokens,
+            driver_config: recorded_driver_config(&store_state.inference_env, |text| {
+                store_state.gateways.redact(text)
+            }),
+        };
         if let Some(change_id) = applies_change {
             trace
                 .write_control_applied(
@@ -1361,6 +1369,7 @@ pub(crate) async fn run_agent_loop(
             error,
             provider_status,
             choice: has_alternates.then_some(&choice),
+            settings: &call_settings,
         };
         let driver_result = match dispatched {
             Ok(r) => r,
@@ -1585,6 +1594,7 @@ pub(crate) async fn run_agent_loop(
                 message_ids,
                 wire.as_ref(),
                 has_alternates.then_some(&choice),
+                Some(&call_settings),
             )
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
@@ -2311,6 +2321,7 @@ struct FailedTurnCall<'a> {
     error: String,
     provider_status: Option<u16>,
     choice: Option<&'a DriverChoice>,
+    settings: &'a InferenceCallSettings,
 }
 
 impl FailedTurnCall<'_> {
@@ -2337,6 +2348,7 @@ impl FailedTurnCall<'_> {
                 message_ids,
                 tool_name: None,
                 spent: None,
+                settings: Some(self.settings),
             })
             .await;
     }
@@ -2713,6 +2725,7 @@ async fn write_hook_inference_record(
                     message_ids: Vec::new(),
                     tool_name: None,
                     spent: Some((Some(record.input_tokens), None)),
+                    settings: Some(&record.settings),
                 })
                 .await
         }
@@ -2734,6 +2747,7 @@ async fn write_hook_inference_record(
                     // payload the runtime built and could hash.
                     Vec::new(),
                     None,
+                    Some(&record.settings),
                 )
                 .await
         }
@@ -5824,6 +5838,10 @@ mod tests {
                 provider_status: Some(500),
                 usage: None,
             }),
+            settings: crate::trace::InferenceCallSettings {
+                max_output_tokens: 2000,
+                driver_config: Some(json!({"reasoning_effort": "low"})),
+            },
         };
         write_hook_inference_record(&mut trace, 2, &record)
             .await
@@ -5841,6 +5859,8 @@ mod tests {
         assert!(event["error"].as_str().unwrap().contains("HTTP 500: boom"));
         assert_eq!(event["input_tokens"], 42);
         assert!(event.get("output_tokens").is_none());
+        assert_eq!(event["max_output_tokens"], 2000);
+        assert_eq!(event["driver_config"], json!({"reasoning_effort": "low"}));
     }
 
     /// The single event a byte-fidelity test's writer produced.
@@ -6927,6 +6947,7 @@ mod tests {
                 None,
                 Vec::new(),
                 Some(&wire),
+                None,
             )
             .await
             .unwrap();
@@ -6996,6 +7017,7 @@ mod tests {
                     None,
                     Vec::new(),
                     Some(&wire),
+                    None,
                 )
                 .await
                 .unwrap();

@@ -4070,6 +4070,7 @@ fn launch(
                                     network_allow_rules: state.network_allow_rules.clone(),
                                     driver_grant,
                                     gateway,
+                                    gateways: state.gateways.clone(),
                                     formation: state.http_hooks.formation.clone(),
                                     spend: Arc::clone(&state.spend),
                                     records: std::sync::Mutex::new(Vec::new()),
@@ -15474,6 +15475,13 @@ inference:
         if !crate::murmur_home::in_scratch_home() {
             return;
         }
+        // `shell.allow` and `spawn.allow` are subprocess routes, so staging refuses with
+        // `E-CAP-005` on a host that cannot give the session a network namespace.
+        if crate::network_namespace::skip_without_egress_namespace(
+            "murmur_md_and_the_capsule_block_name_no_runtime_folder_in_the_work_folder_inner",
+        ) {
+            return;
+        }
         const RUNTIME_OWNED: &[&str] = &[".murmur", ".capsule-home", "children", "out/", "home/"];
         let project = tempfile::tempdir().unwrap();
         let operator = tempfile::tempdir().unwrap();
@@ -22832,6 +22840,7 @@ inference:
             network_allow_rules: Vec::new(),
             driver_grant: None,
             gateway: None,
+            gateways: Default::default(),
             formation: None,
             spend: Arc::clone(&state.spend),
             records: std::sync::Mutex::new(Vec::new()),

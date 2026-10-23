@@ -711,6 +711,7 @@ impl<'a> ProcessEventSink<'a> {
                     message_ids: Vec::new(),
                     tool_name: None,
                     spent: None,
+                    settings: None,
                 })
                 .await;
             return Ok(Vec::new());
@@ -763,6 +764,7 @@ impl<'a> ProcessEventSink<'a> {
                         message_ids: Vec::new(),
                         tool_name: open.first_tool.clone(),
                         spent: Some((spent.input, spent.output)),
+                        settings: None,
                     })
                     .await
             }
@@ -780,6 +782,7 @@ impl<'a> ProcessEventSink<'a> {
                         None,
                         reported.as_ref(),
                         Vec::new(),
+                        None,
                         None,
                     )
                     .await

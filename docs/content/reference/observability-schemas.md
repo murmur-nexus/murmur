@@ -113,6 +113,8 @@ before the first task begins
 | `origin` | string | `hook:<hook name>` when a hook produced this completion through [`run-inference`](wit-interfaces.md#murmurruntimeinference). Absent for an ordinary agent-loop turn |
 | `driver_choice` | string | The [driver choice](manifest.md#inference-alternates) that served an agent-loop turn, by name. Written only when `inference.alternates` is declared |
 | `model` | string | The model this call was sent to. Written alongside `origin`, and alongside `driver_choice` |
+| `max_output_tokens` | u32 | The output cap the request carried as `max_tokens`, and the amount the spend meter reserved for the call. Written on every `transport: http` record — agent-loop turn, hook `run-inference` and failed call alike — and never under `transport: process`. See [Call settings](#inference-call-settings) |
+| `driver_config` | object \| null | The driver config the call's driver ran with, as `MURMUR_INFERENCE_DRIVER_CONFIG` handed it over, with every credential value the session holds replaced by `[redacted]`. `null` when the driver was handed none. Written exactly when `max_output_tokens` is. See [Call settings](#inference-call-settings) |
 | `message_ids` | array of string | Ids of the messages this request embedded, in the order they sat in it. Under an active [driver continuation](wit-interfaces.md#stateful-driver-continuation) only the tail the driver has not seen is sent, and this names exactly that tail. Absent when the list is empty: a hook's own completion and the `process` transport both send a message list the runtime never minted |
 | `system_sha` | string | SHA-256 (lowercase hex) of this request's `system` string — the resolved prompt with the `[Capsule]` identity block already prepended |
 | `tools_sha` | string | SHA-256 (lowercase hex) of this request's serialized `tools` array |
@@ -133,6 +135,28 @@ of measurements:
 |---|---|---|---|
 | `http` | The runtime's own estimate, always present | The provider's own counts, beside the estimate so drift is a subtraction on one line. With both present, they are what the compaction trigger compares and what the spend meter charged | Present when the driver reported them |
 | `process` | The harness's own reported counts, absent when its driver reports none | Always absent: there is one count on this transport and it is recorded once | Present when the driver reported them |
+
+#### Call settings { #inference-call-settings }
+
+`max_output_tokens` and `driver_config` say how one call was sent. Each record carries both values
+in full: `session_start` holds no baseline for them, and one session can send calls under several
+settings, because a [controller](manifest.md#field-control) can change `inference.max_tokens` from
+the next call, a driver switch changes the cap to that choice's own, and the compaction call has
+its own cap and config.
+
+| Call | `max_output_tokens` | `driver_config` |
+|---|---|---|
+| Agent-loop turn | The cap that turn sent: a value a controller set, otherwise [`inference.max_tokens`](manifest.md#inference-max-tokens), otherwise the entry for the serving [driver choice](manifest.md#inference-alternates)'s model in the driver's [`models:`](manifest.md#driver-models) table | [`inference.driver.config`](manifest.md#field-inference), the same for every driver choice |
+| A hook's `run-inference` while it serves `on-compaction` | `inference.compaction.max_tokens` when set, otherwise as any other hook call | [`inference.compaction.driver_config`](manifest.md#field-inference) laid over `inference.driver.config` |
+| Any other hook `run-inference` | The driver's declared ceiling for the model called, otherwise the agent's cap | `inference.driver.config` |
+
+Every credential value the session holds is replaced with `[redacted]` wherever it appears in an
+object key or a string, and a number whose digits contain one is written as the string
+`"[redacted]"`. The driver artifact's own [`artifacts[].config`](manifest.md#artifact-config)
+is not recorded here.
+
+A record with neither key is a `transport: process` call, where the harness runs the model and the
+runtime sets no cap, or a record from a Murmur version that did not write them.
 
 #### Failed calls { #inference-failed }
 
@@ -283,6 +307,10 @@ all happen past the wire and are invisible to the runtime.
 They are taken from the same request the driver was handed, so a `message_shas` entry hashes a
 message exactly as it was serialized into that request — after the runtime's own `id` and
 `source_id` bookkeeping keys are stripped, which is why no blob ever contains one.
+
+The hashes do not cover the output cap the request carried or the driver config, which reaches
+the driver through its environment rather than in the request; those are
+[`max_output_tokens` and `driver_config`](#inference-call-settings).
 
 All four are written under [`trace.capture`](manifest.md#field-trace) `meta` and `content`, and
 none under `none`. They are absent on a record the runtime did not build the request for: a hook's

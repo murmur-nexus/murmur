@@ -1887,6 +1887,11 @@ fn a_hook_s_run_inference_is_traced_on_its_turn_ahead_of_the_turn_on_http() {
         "{inference:#?}"
     );
     assert_eq!(inference[1]["decision"], "tool_call", "{}", inference[1]);
+    // Every http line, the hook's and the turn's alike, names the cap and driver config it sent.
+    for line in &inference {
+        assert!(line["max_output_tokens"].is_u64(), "{line}");
+        assert!(line.get("driver_config").is_some(), "{line}");
+    }
 }
 
 /// Under `transport: process` a hook's `run-inference` is answered with an error naming the
@@ -1915,6 +1920,11 @@ fn a_hook_s_run_inference_under_process_transport_is_refused_and_spends_nothing(
         .map(|line| (line["turn"].as_u64().unwrap(), line.get("origin").is_some()))
         .collect();
     assert_eq!(turns, [(0, false), (1, false)], "{inference:#?}");
+    // The harness runs the model: the runtime set no cap and handed no driver config.
+    for line in &inference {
+        assert!(line.get("max_output_tokens").is_none(), "{line}");
+        assert!(line.get("driver_config").is_none(), "{line}");
+    }
     let refusals = trace_events(&trace, "spend_ceiling_reached");
     assert!(refusals.is_empty(), "{refusals:#?}");
     let task_end = trace_events(&trace, "task_end");

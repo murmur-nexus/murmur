@@ -151,6 +151,63 @@ pub(crate) struct InferenceOrigin {
     pub(crate) model: String,
 }
 
+/// How one `transport: http` call was sent, as its `inference` line records it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct InferenceCallSettings {
+    /// The output cap the request carried as `max_tokens`, and the amount the spend meter
+    /// reserved for it.
+    pub(crate) max_output_tokens: u32,
+    /// The `MURMUR_INFERENCE_DRIVER_CONFIG` the call's driver ran with, from
+    /// [`recorded_driver_config`]. `None` when the driver saw none.
+    pub(crate) driver_config: Option<Value>,
+}
+
+/// The `MURMUR_INFERENCE_DRIVER_CONFIG` in `env`, as an `inference` line records it: `None` when
+/// `env` has none, otherwise its JSON with every object key and string leaf passed through
+/// `redact`, at any depth. A number leaf whose decimal text `redact` changes becomes the string
+/// [`crate::gateway_credential::REDACTED`]; booleans and nulls are kept as they are.
+///
+/// A value that is not JSON is recorded as `redact(value)`, a JSON string: it is what the driver
+/// saw. The manifest parser only produces JSON objects here.
+pub(crate) fn recorded_driver_config(
+    env: &[(String, String)],
+    redact: impl Fn(&str) -> String,
+) -> Option<Value> {
+    fn redact_value(value: Value, redact: &impl Fn(&str) -> String) -> Value {
+        match value {
+            Value::String(text) => Value::String(redact(&text)),
+            Value::Number(number) => {
+                let text = number.to_string();
+                if redact(&text) == text {
+                    Value::Number(number)
+                } else {
+                    Value::String(crate::gateway_credential::REDACTED.to_string())
+                }
+            }
+            Value::Array(items) => Value::Array(
+                items
+                    .into_iter()
+                    .map(|item| redact_value(item, redact))
+                    .collect(),
+            ),
+            Value::Object(entries) => Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, item)| (redact(&key), redact_value(item, redact)))
+                    .collect(),
+            ),
+            other @ (Value::Bool(_) | Value::Null) => other,
+        }
+    }
+    let (_, raw) = env
+        .iter()
+        .find(|(key, _)| key == "MURMUR_INFERENCE_DRIVER_CONFIG")?;
+    Some(match serde_json::from_str::<Value>(raw) {
+        Ok(value) => redact_value(value, &redact),
+        Err(_) => Value::String(redact(raw)),
+    })
+}
+
 /// `compaction_declined.reason` when the threshold was crossed but no bound hook returned
 /// `replace-context`.
 pub(crate) const COMPACTION_DECLINED_NO_HOOK_REPLACEMENT: &str = "no_hook_replacement";
@@ -450,6 +507,18 @@ struct InferenceEvent {
     /// record's and is not repeated per turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    /// The output cap this request carried as `max_tokens`, which is also what the spend meter
+    /// reserved for it. Written on every `transport: http` line — agent-loop turn, hook
+    /// `run-inference` and failed call alike — and on no `transport: process` line, where the
+    /// harness runs the model and the runtime sets no cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    /// The `MURMUR_INFERENCE_DRIVER_CONFIG` this call's driver ran with, every credential value
+    /// the session holds replaced with `[redacted]`. Present exactly when `max_output_tokens` is;
+    /// `null` there means the driver saw no config. The outer `Option` is the key, the inner one
+    /// its value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    driver_config: Option<Option<Value>>,
     /// Identities of the messages this request embedded, in the order they sat in it. Under an
     /// active driver continuation only the tail past the acked length is sent, and this names
     /// exactly that tail. Empty — and therefore absent — for a hook's own `run-inference` and for
@@ -1190,6 +1259,8 @@ pub(crate) struct FailedInference<'a> {
     /// `(input_tokens, output_tokens)` this call counts toward the turn and token totals. `None`
     /// is a call that is not counted at all — no turn, no tokens, and neither key on the record.
     pub(crate) spent: Option<(Option<u64>, Option<u64>)>,
+    /// How the call was sent; `None` on the `process` transport.
+    pub(crate) settings: Option<&'a InferenceCallSettings>,
 }
 
 /// One `inference` line, as the writers that share [`TraceWriter::write_inference_event`] hand
@@ -1210,6 +1281,8 @@ struct InferenceLine<'a> {
     failure: Option<(&'static str, String, Option<u16>)>,
     /// Whether the line advances the turn and token counters.
     counted: bool,
+    /// How the call was sent; `None` on the `process` transport, which writes neither key.
+    settings: Option<&'a InferenceCallSettings>,
 }
 
 /// The most `task_failed.reason` carries, in bytes. A driver's error text is provider-supplied
@@ -2366,6 +2439,9 @@ impl TraceWriter {
     /// `usage` is written verbatim beside them and accumulated into nothing. Under `http` it is
     /// the provider's own report for the same call; under `process` it carries only the cache and
     /// thinking counts, because the harness's input and output are already the two above.
+    ///
+    /// `settings` is how an `http` call was sent, written as `max_output_tokens` and
+    /// `driver_config`; `None` under `process`, which writes neither key.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_inference(
         &mut self,
@@ -2379,6 +2455,7 @@ impl TraceWriter {
         usage: Option<&DriverUsage>,
         message_ids: Vec<String>,
         wire: Option<&WireCapture>,
+        settings: Option<&InferenceCallSettings>,
     ) -> std::io::Result<()> {
         self.write_inference_event(InferenceLine {
             turn,
@@ -2394,6 +2471,7 @@ impl TraceWriter {
             choice: None,
             failure: None,
             counted: true,
+            settings,
         })
         .await
     }
@@ -2414,6 +2492,7 @@ impl TraceWriter {
         message_ids: Vec<String>,
         wire: Option<&WireCapture>,
         choice: Option<&crate::driver_choice::DriverChoice>,
+        settings: Option<&InferenceCallSettings>,
     ) -> std::io::Result<()> {
         self.write_inference_event(InferenceLine {
             turn,
@@ -2429,6 +2508,7 @@ impl TraceWriter {
             choice,
             failure: None,
             counted: true,
+            settings,
         })
         .await
     }
@@ -2462,6 +2542,7 @@ impl TraceWriter {
             choice: failed.choice,
             failure: Some((failed.error_code, error, failed.provider_status)),
             counted: failed.spent.is_some(),
+            settings: failed.settings,
         })
         .await
     }
@@ -2481,6 +2562,7 @@ impl TraceWriter {
             choice,
             failure,
             counted,
+            settings,
         } = line;
         let (error_code, error, provider_status) = match failure {
             Some((code, error, status)) => (Some(code.to_string()), Some(error), status),
@@ -2525,6 +2607,8 @@ impl TraceWriter {
             model: origin
                 .map(|o| o.model.clone())
                 .or_else(|| choice.map(|choice| choice.model.clone())),
+            max_output_tokens: settings.map(|settings| settings.max_output_tokens),
+            driver_config: settings.map(|settings| settings.driver_config.clone()),
             message_ids,
             system_sha,
             tools_sha,
@@ -5781,6 +5865,7 @@ mod tests {
             None,
             vec!["msg_0000000000000000000000000000000a".to_string()],
             None,
+            None,
         )
         .await
         .unwrap();
@@ -5837,6 +5922,7 @@ mod tests {
             Some(&usage),
             Vec::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -5874,6 +5960,7 @@ mod tests {
             message_ids: vec!["msg_1".to_string()],
             tool_name: None,
             spent: None,
+            settings: None,
         })
         .await
         .unwrap();
@@ -5892,6 +5979,7 @@ mod tests {
             message_ids: Vec::new(),
             tool_name: None,
             spent: Some((Some(10), Some(5))),
+            settings: None,
         })
         .await
         .unwrap();
@@ -5972,6 +6060,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -5990,6 +6079,7 @@ mod tests {
             message_ids: Vec::new(),
             tool_name: None,
             spent: Some((Some(40), None)),
+            settings: None,
         })
         .await
         .unwrap();
@@ -6005,6 +6095,249 @@ mod tests {
         assert_eq!(hook["model"], "m");
         assert_eq!(hook["input_tokens"], 40);
         assert!(hook.get("output_tokens").is_none());
+    }
+
+    /// Every `http` line names how its call was sent: the cap and the driver config, both keys
+    /// present, `driver_config` written as `null` when the driver saw none.
+    #[tokio::test]
+    async fn inference_call_settings_are_written_on_every_kind_of_http_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        let turn = InferenceCallSettings {
+            max_output_tokens: 4096,
+            driver_config: Some(serde_json::json!({"reasoning_effort": "high"})),
+        };
+        let unconfigured = InferenceCallSettings {
+            max_output_tokens: 1024,
+            driver_config: None,
+        };
+        let hook = InferenceCallSettings {
+            max_output_tokens: 2000,
+            driver_config: Some(serde_json::json!({"reasoning_effort": "low"})),
+        };
+        let origin = InferenceOrigin {
+            source: "hook:compactor".to_string(),
+            model: "m".to_string(),
+        };
+        w.write_turn_inference(
+            0,
+            Some(10),
+            Some(5),
+            "end_turn".to_string(),
+            Some("end_turn"),
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            Some(&turn),
+        )
+        .await
+        .unwrap();
+        w.write_turn_inference(
+            1,
+            Some(10),
+            Some(5),
+            "end_turn".to_string(),
+            Some("end_turn"),
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            Some(&unconfigured),
+        )
+        .await
+        .unwrap();
+        w.write_inference(
+            1,
+            Some(30),
+            Some(8),
+            "end_turn".to_string(),
+            None,
+            None,
+            Some(&origin),
+            None,
+            Vec::new(),
+            None,
+            Some(&hook),
+        )
+        .await
+        .unwrap();
+        w.write_failed_inference(FailedInference {
+            turn: 2,
+            error_code: INFERENCE_ERROR_DRIVER_ERROR,
+            error: "HTTP 500: boom",
+            provider_status: Some(500),
+            usage: None,
+            origin: None,
+            choice: None,
+            message_ids: Vec::new(),
+            tool_name: None,
+            spent: None,
+            settings: Some(&turn),
+        })
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let settings: Vec<(Value, Value, Value)> = events
+            .iter()
+            .filter(|e| e["event_type"] == "inference")
+            .map(|e| {
+                (
+                    e["decision"].clone(),
+                    e["max_output_tokens"].clone(),
+                    e.get("driver_config")
+                        .cloned()
+                        .expect("driver_config is written, null or not"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            settings,
+            [
+                (
+                    serde_json::json!("end_turn"),
+                    serde_json::json!(4096),
+                    serde_json::json!({"reasoning_effort": "high"})
+                ),
+                (
+                    serde_json::json!("end_turn"),
+                    serde_json::json!(1024),
+                    Value::Null
+                ),
+                (
+                    serde_json::json!("end_turn"),
+                    serde_json::json!(2000),
+                    serde_json::json!({"reasoning_effort": "low"})
+                ),
+                (
+                    serde_json::json!("error"),
+                    serde_json::json!(4096),
+                    serde_json::json!({"reasoning_effort": "high"})
+                ),
+            ]
+        );
+    }
+
+    /// A line written without settings — every `process` line — carries neither key.
+    #[tokio::test]
+    async fn an_inference_line_without_call_settings_writes_neither_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_inference(
+            0,
+            Some(10),
+            Some(5),
+            "end_turn".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        w.write_failed_inference(FailedInference {
+            turn: 1,
+            error_code: INFERENCE_ERROR_HARNESS_AUTH,
+            error: "bad login",
+            provider_status: None,
+            usage: None,
+            origin: None,
+            choice: None,
+            message_ids: Vec::new(),
+            tool_name: None,
+            spent: None,
+            settings: None,
+        })
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let lines: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["event_type"] == "inference")
+            .collect();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            assert!(line.get("max_output_tokens").is_none(), "{line}");
+            assert!(line.get("driver_config").is_none(), "{line}");
+        }
+    }
+
+    fn driver_config_env(value: &str) -> Vec<(String, String)> {
+        vec![
+            ("MURMUR_INFERENCE_MODEL".to_string(), "gpt-5".to_string()),
+            (
+                "MURMUR_INFERENCE_DRIVER_CONFIG".to_string(),
+                value.to_string(),
+            ),
+        ]
+    }
+
+    fn redact_secret(text: &str) -> String {
+        text.replace("sk-secret", crate::gateway_credential::REDACTED)
+    }
+
+    #[test]
+    fn recorded_driver_config_is_none_without_the_variable() {
+        let env = vec![("MURMUR_INFERENCE_MODEL".to_string(), "gpt-5".to_string())];
+        assert_eq!(recorded_driver_config(&env, redact_secret), None);
+    }
+
+    #[test]
+    fn recorded_driver_config_is_the_parsed_object() {
+        assert_eq!(
+            recorded_driver_config(
+                &driver_config_env(r#"{"reasoning_effort":"low"}"#),
+                redact_secret
+            ),
+            Some(serde_json::json!({"reasoning_effort": "low"}))
+        );
+    }
+
+    #[test]
+    fn recorded_driver_config_redacts_keys_and_string_leaves_at_any_depth() {
+        let env = driver_config_env(
+            r#"{"note":"x-sk-secret-y","nested":{"list":["sk-secret"]},"sk-secret":1}"#,
+        );
+        assert_eq!(
+            recorded_driver_config(&env, redact_secret),
+            Some(serde_json::json!({
+                "note": "x-[redacted]-y",
+                "nested": {"list": ["[redacted]"]},
+                "[redacted]": 1,
+            }))
+        );
+    }
+
+    #[test]
+    fn recorded_driver_config_replaces_a_number_the_redactor_changes() {
+        let redact_pin = |text: &str| text.replace("424242", crate::gateway_credential::REDACTED);
+        let env = driver_config_env(r#"{"pin":424242,"retries":3,"store":false,"seed":null}"#);
+        assert_eq!(
+            recorded_driver_config(&env, redact_pin),
+            Some(serde_json::json!({
+                "pin": "[redacted]",
+                "retries": 3,
+                "store": false,
+                "seed": null,
+            }))
+        );
+    }
+
+    #[test]
+    fn recorded_driver_config_records_text_that_is_not_json_as_a_redacted_string() {
+        assert_eq!(
+            recorded_driver_config(&driver_config_env("effort=sk-secret"), redact_secret),
+            Some(Value::String("effort=[redacted]".to_string()))
+        );
     }
 
     #[tokio::test]
@@ -6220,6 +6553,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -6330,6 +6664,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -6357,6 +6692,7 @@ mod tests {
             None,
             None,
             vec!["msg_0000000000000000000000000000000a".to_string()],
+            None,
             None,
         )
         .await
@@ -6399,6 +6735,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
             None,
         )
         .await
@@ -6893,6 +7230,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -6906,6 +7244,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
             None,
         )
         .await
@@ -6944,6 +7283,7 @@ mod tests {
                 None,
                 Vec::new(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -6969,6 +7309,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
             None,
         )
         .await
@@ -7004,6 +7345,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
             None,
         )
         .await
@@ -7271,6 +7613,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -7289,6 +7632,7 @@ mod tests {
             Some(&origin),
             None,
             Vec::new(),
+            None,
             None,
         )
         .await
@@ -7475,6 +7819,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -7504,6 +7849,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
             None,
         )
         .await
@@ -7637,6 +7983,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -7716,6 +8063,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -7769,6 +8117,7 @@ mod tests {
                 None,
                 Vec::new(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -7814,6 +8163,7 @@ mod tests {
             None,
             vec!["msg_0000000000000000000000000000000a".to_string()],
             Some(&wire),
+            None,
         )
         .await
         .unwrap();
@@ -8027,6 +8377,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -8060,6 +8411,7 @@ mod tests {
             Some(&origin),
             None,
             Vec::new(),
+            None,
             None,
         )
         .await
