@@ -297,22 +297,22 @@ fn check_workdir_identity(
 /// exhausted reopen as a failed task. In that case the terminal record's `exit_status` is
 /// `"reopen_budget_exhausted"`; otherwise it is the last attempt's `"ok"`/`"failed"`.
 ///
-/// When `agent_task_id` is `Some`, this function is the one writer of the task's terminal status,
-/// and writes exactly one, after the last `on-task-end` dispatch, after `task_end` is in the
-/// trace and after the registry slot records the terminal state — so the stream, `GetTask` and
-/// `task_end` agree. Its state, message and response are the last attempt's
-/// [`agent::AttemptEnding`], or the reopen refusal when the budget ran out. An attempt writes no
-/// terminal status of its own; between two attempts the stream gets one `working` status naming
-/// the hook, annotated with the reopen's 1-based ordinal for a client that activated the stream
-/// extension.
+/// This function is the one writer of the task's terminal status, and writes exactly one, after
+/// the last `on-task-end` dispatch, after `task_end` is in the trace and after the registry slot
+/// records the terminal state — so the stream, `GetTask` and `task_end` agree. Its state, message
+/// and response are the last attempt's [`agent::AttemptEnding`], or the reopen refusal when the
+/// budget ran out. An attempt writes no terminal status of its own; between two attempts the
+/// stream gets one `working` status naming the hook, annotated with the reopen's 1-based ordinal
+/// for a client that activated the stream extension.
 ///
 /// `seed` is whatever the task's single `on-task-start` dispatch proposed. The hook is
 /// dispatched once, at task start, and is not asked again.
 ///
-/// `agent_task_id` is what [`agent::run_agent_loop`] receives (governs A2A SSE emission);
-/// `trace_task_id` is the id used for the `task_start`/`task_reopened`/`task_end` records
-/// and the `on-task-end` hook event. The two coincide on the A2A path and differ on the
-/// backward-compat `task.md` paths, which pass `agent_task_id = None`.
+/// `task_id` is the door task's id: the registry entry this function finishes, the task `sse`
+/// carries frames for, and the id on the `task_start`/`task_reopened`/`task_end` records and the
+/// `on-task-end` hook event. Every task runs as a door task, the launch's own included, so
+/// `cancel` is the registry's cancel flag for it, which `CancelTask` and the session's
+/// termination both raise.
 #[allow(clippy::too_many_arguments)]
 async fn run_task_with_reopens(
     state: &mut CapsuleStoreState,
@@ -323,18 +323,18 @@ async fn run_task_with_reopens(
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
-    agent_task_id: Option<String>,
-    sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    sse: (SseBroadcast, Arc<Mutex<SseEventBuffer>>),
     accessible_workdir: &WorkdirRoot,
     capsule_name: &str,
     capsule_version: &str,
     mode: ConversationMode,
     context_id: Option<String>,
-    trace_task_id: &str,
+    task_id: &str,
     seed: Option<HookSeed>,
-    // This task's cancel flag, or `None` on the `task.md` paths, which run no A2A task.
-    cancel: Option<crate::cancel::CancelSignal>,
+    cancel: crate::cancel::CancelSignal,
 ) -> Result<AgentLoopExit, RuntimeError> {
+    // The stream helpers take the optional form the agent loop shares with its unit tests.
+    let sse = Some(sse);
     // The activation checkpoint: a refusal latched before the task began — its own `task.md`
     // write, or an idle-time write since the last task — fails it before anything reads the task
     // or sends a request for it.
@@ -344,10 +344,9 @@ async fn run_task_with_reopens(
             hooks,
             trace,
             &mode,
-            trace_task_id,
+            task_id,
             "failed",
             0,
-            agent_task_id.as_deref(),
             context_id,
             &sse,
             agent::AttemptEnding::failed(reason),
@@ -380,30 +379,27 @@ async fn run_task_with_reopens(
     // work reports back.
     let mut continuation: Option<agent::Continuation> = None;
     // The formation member that sent the task, which `end-without-answer` reports to; `None` for
-    // a task no formation token started, and on the `task.md` paths. The registry lock is
-    // released here, before `scope_task` takes the member-calls lock.
-    let caller = agent_task_id
-        .as_deref()
-        .zip(state.a2a_task_registry.as_ref())
-        .and_then(|(task_id, registry)| {
-            let registry = registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            registry
-                .owner(task_id)
-                .and_then(|owner| {
-                    owner.strip_prefix(crate::formation_credentials::FORMATION_CREDENTIAL_PREFIX)
-                })
-                .map(str::to_string)
-        });
+    // a task no formation token started. The registry lock is released here, before `scope_task`
+    // takes the member-calls lock.
+    let caller = state.a2a_task_registry.as_ref().and_then(|registry| {
+        let registry = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry
+            .owner(task_id)
+            .and_then(|owner| {
+                owner.strip_prefix(crate::formation_credentials::FORMATION_CREDENTIAL_PREFIX)
+            })
+            .map(str::to_string)
+    });
     // The calls and delegations this task makes are this task's: put it in scope, with the flag
     // that cancels it, until this function returns. Dropping the delegation scope ends any
     // sub-capsule still held for it, on every way out of this function.
     let _calls_scope = state
         .member_calls
         .clone()
-        .map(|calls| calls.scope_task(trace_task_id, cancel.clone(), caller));
-    let _delegations_scope = state.live_delegations.scope_task(trace_task_id);
+        .map(|calls| calls.scope_task(task_id, Some(cancel.clone()), caller));
+    let _delegations_scope = state.live_delegations.scope_task(task_id);
 
     loop {
         // This function owns the task's scope: nothing else puts a task in scope, which is why
@@ -430,7 +426,7 @@ async fn run_task_with_reopens(
             hooks,
             trace,
             otel,
-            agent_task_id.clone(),
+            Some(task_id.to_string()),
             sse.clone(),
             accessible_workdir,
             capsule_name,
@@ -440,7 +436,7 @@ async fn run_task_with_reopens(
             // Cloned per attempt rather than moved into the first: an attempt that restarts
             // from a fresh context applies it, and a continued attempt never reads it.
             seed.clone(),
-            cancel.clone(),
+            Some(cancel.clone()),
             &mut thread,
             continuation.take(),
         )
@@ -510,9 +506,9 @@ async fn run_task_with_reopens(
                 match wait_for_handed_off_work(
                     state,
                     backstop,
-                    cancel.as_ref(),
+                    Some(&cancel),
                     &sse,
-                    agent_task_id.as_deref(),
+                    Some(task_id),
                     context_id.as_ref(),
                 )
                 .await
@@ -521,7 +517,7 @@ async fn run_task_with_reopens(
                     // starter while the task waited.
                     Some(round) if round.is_empty() => {}
                     Some(round) => {
-                        record_member_calls(state, trace_task_id, &round.answers, true).await;
+                        record_member_calls(state, task_id, &round.answers, true).await;
                         let mut notices = round.ended;
                         for (delegation_id, delegation) in round.arrived {
                             notices
@@ -569,7 +565,7 @@ async fn run_task_with_reopens(
                             .collect();
                         let _ = trace
                             .write_task_continued(
-                                trace_task_id,
+                                task_id,
                                 continuations,
                                 &call_ids,
                                 &delegation_ids,
@@ -579,7 +575,7 @@ async fn run_task_with_reopens(
                             .await;
                         emit_task_working(
                             &sse,
-                            agent_task_id.as_deref(),
+                            Some(task_id),
                             context_id.as_ref(),
                             said.join("; "),
                         );
@@ -604,29 +600,27 @@ async fn run_task_with_reopens(
                     }
                     // The task was cancelled while it waited.
                     None => {
-                        if let Some(signal) = &cancel {
-                            let (outstanding, arrived) = delegations.counts();
-                            signal.note_phase(if outstanding + arrived > 0 {
-                                crate::cancel::PHASE_DELEGATION
-                            } else {
-                                crate::cancel::PHASE_MEMBER_CALL
-                            });
-                            // Taken before the delegations are ended below, so the record names
-                            // what was in flight.
-                            let residue = crate::cancel::Residue::snapshot(
-                                state.detached.as_ref(),
-                                &state.live_delegations,
-                            );
-                            let _ = trace
-                                .write_task_canceled(
-                                    trace_task_id,
-                                    None,
-                                    signal.phase(),
-                                    residue.detached_work_ids(),
-                                    residue.delegation_ids(),
-                                )
-                                .await;
-                        }
+                        let (outstanding, arrived) = delegations.counts();
+                        cancel.note_phase(if outstanding + arrived > 0 {
+                            crate::cancel::PHASE_DELEGATION
+                        } else {
+                            crate::cancel::PHASE_MEMBER_CALL
+                        });
+                        // Taken before the delegations are ended below, so the record names
+                        // what was in flight.
+                        let residue = crate::cancel::Residue::snapshot(
+                            state.detached.as_ref(),
+                            &state.live_delegations,
+                        );
+                        let _ = trace
+                            .write_task_canceled(
+                                task_id,
+                                None,
+                                cancel.phase(),
+                                residue.detached_work_ids(),
+                                residue.delegation_ids(),
+                            )
+                            .await;
                         result = Ok(AgentLoopExit::Canceled);
                         thread.ending = Some(agent::AttemptEnding {
                             state: TaskState::Canceled,
@@ -639,8 +633,8 @@ async fn run_task_with_reopens(
             }
             if let Some(calls) = &calls {
                 let left = calls.account_for_all();
-                record_member_calls(state, trace_task_id, &left.abandoned, false).await;
-                record_member_calls(state, trace_task_id, &left.undelivered, false).await;
+                record_member_calls(state, task_id, &left.abandoned, false).await;
+                record_member_calls(state, task_id, &left.undelivered, false).await;
             }
             let reason = delegation_ending_reason(&result);
             let left = delegations.take_all();
@@ -671,7 +665,7 @@ async fn run_task_with_reopens(
 
         // Let the `on-task-end` hooks inspect this attempt and decide whether to reopen.
         let reopen = hooks
-            .dispatch_task_end(trace_task_id.to_string(), exit_str.to_string())
+            .dispatch_task_end(task_id.to_string(), exit_str.to_string())
             .await;
 
         // A cancelled attempt is not reopened. The hook still saw it — `on-task-end` is
@@ -700,7 +694,7 @@ async fn run_task_with_reopens(
                     };
                     let _ = trace
                         .write_task_reopened(
-                            trace_task_id,
+                            task_id,
                             &hook_name,
                             &reason,
                             reopens_used,
@@ -710,9 +704,7 @@ async fn run_task_with_reopens(
                         .await;
                     // The attempt boundary, so a client watching the task does not read the
                     // rejected attempt's frames as its end.
-                    if let Some(task) =
-                        StreamTask::of(agent_task_id.as_deref(), context_id.as_deref())
-                    {
+                    if let Some(task) = StreamTask::of(Some(task_id), context_id.as_deref()) {
                         emit_status(
                             &sse,
                             &task,
@@ -757,10 +749,9 @@ async fn run_task_with_reopens(
                     hooks,
                     trace,
                     &mode,
-                    trace_task_id,
+                    task_id,
                     "reopen_budget_exhausted",
                     reopens_used,
-                    agent_task_id.as_deref(),
                     context_id,
                     &sse,
                     agent::AttemptEnding::failed(refusal.clone()),
@@ -775,10 +766,9 @@ async fn run_task_with_reopens(
                     hooks,
                     trace,
                     &mode,
-                    trace_task_id,
+                    task_id,
                     exit_str,
                     reopens_used,
-                    agent_task_id.as_deref(),
                     context_id,
                     &sse,
                     ending,
@@ -791,9 +781,9 @@ async fn run_task_with_reopens(
 }
 
 /// End a task [`run_task_with_reopens`] ran, in the order its readers rely on: `task_end` with
-/// `exit_status`, the hooks' task scope closed, the trace flushed, then — for an A2A task, when
-/// `agent_task_id` is `Some` — the registry slot finished and the task's one terminal status
-/// written from `GetTask`'s view of it, after its `response` artifact when it has one.
+/// `exit_status`, the hooks' task scope closed, the trace flushed, then the registry slot
+/// finished and the task's one terminal status written from `GetTask`'s view of it, after its
+/// `response` artifact when it has one.
 ///
 /// An accepted `CancelTask` the loop did not observe has already recorded `canceled`, which
 /// [`TaskRegistry::finish_task`] keeps; the stream then says `canceled` too, so it never disagrees
@@ -808,10 +798,9 @@ async fn end_task(
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     mode: &ConversationMode,
-    trace_task_id: &str,
+    task_id: &str,
     exit_status: &str,
     reopens_used: u32,
-    agent_task_id: Option<&str>,
     context_id: Option<String>,
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
     ending: agent::AttemptEnding,
@@ -833,7 +822,7 @@ async fn end_task(
         .collect();
     let _ = trace
         .write_task_end(
-            trace_task_id,
+            task_id,
             exit_status,
             reopens_used,
             running_commands
@@ -844,12 +833,6 @@ async fn end_task(
         .await;
     hooks.end_task();
     let _ = trace.flush().await;
-    let Some(task_id) = agent_task_id else {
-        if ending.state == TaskState::Canceled {
-            write_canceled_result(mode, None, &state.records_root);
-        }
-        return;
-    };
     // The members this task reports as giving no answer, read once every call is accounted for.
     let no_answer_below: Vec<(String, String)> = state
         .member_calls
@@ -896,7 +879,7 @@ async fn end_task(
         }
     };
     if ending.state == TaskState::Canceled {
-        write_canceled_result(mode, Some(task_id), &state.records_root);
+        write_canceled_result(mode, task_id, &state.records_root);
     }
     let reported = reported.or_else(|| {
         let context_id = context_id?;
@@ -937,7 +920,7 @@ fn unregistered_ending(
 }
 
 /// Write [`crate::cancel::CANCELED_RESULT_TEXT`] to the session's `out/result.txt`, and, under
-/// `lifecycle.conversation: threaded` with an A2A task id, to `out/result_<task_id>.txt`.
+/// `lifecycle.conversation: threaded`, to `out/result_<task_id>.txt`.
 ///
 /// Through [`agent::write_result`] rather than the task-output funnel: the cancelled attempt's
 /// task-io output was cleared when the attempt began, and stays unset. A failed write is reported
@@ -945,17 +928,13 @@ fn unregistered_ending(
 ///
 /// `records_root` is the session's records directory, where the marker is written and that report
 /// is logged.
-fn write_canceled_result(
-    mode: &ConversationMode,
-    task_id: Option<&str>,
-    records_root: &WorkdirRoot,
-) {
+fn write_canceled_result(mode: &ConversationMode, task_id: &str, records_root: &WorkdirRoot) {
     let text = crate::cancel::CANCELED_RESULT_TEXT;
     let mut failures = Vec::new();
     if let Err(error) = agent::write_result(records_root, text) {
         failures.push(error);
     }
-    if let (ConversationMode::Threaded, Some(task_id)) = (mode, task_id) {
+    if matches!(mode, ConversationMode::Threaded) {
         if let Err(error) = agent::write_result_for_task(records_root, task_id, text) {
             failures.push(error);
         }
@@ -1700,12 +1679,6 @@ fn check_resume_launchable(
         )));
     }
     Ok(())
-}
-
-/// Spend the launch's `--forget-session` on the task now being activated, leaving nothing for the
-/// tasks after it.
-fn take_forget_session(pending: &mut bool) -> Option<&'static str> {
-    std::mem::take(pending).then_some(crate::harness_session::FORGET_BY_CLI)
 }
 
 /// Whether this capsule has a harness session to forget, which is what decides whether a forget
@@ -4147,6 +4120,21 @@ fn launch(
                     // until the task loop has ended: a record that outlived its session would
                     // resolve an address onto a port nothing holds. Only the agent path reaches
                     // here; a script capsule binds nothing and is never addressable.
+                    // Tasks taken off the channel but not yet started. It outlives one iteration
+                    // because a task drained while another was running has to still be here when
+                    // that one finishes.
+                    let mut lanes = LaneQueue::new();
+
+                    // The launch's own task is a task on the door before the door is announced,
+                    // so the first `ListTasks` a client sends on the announcement lists it.
+                    enqueue_launch_task(
+                        &runtime_root,
+                        supplied_context_id.as_deref(),
+                        &mut pending_forget_session,
+                        &task_registry,
+                        &mut lanes,
+                    );
+
                     let _running_record = write_running_record(&running_record, &records_root);
                     on_url(&capsule_url);
 
@@ -4155,18 +4143,14 @@ fn launch(
                     let mut outcome = LaunchOutcome::new();
 
                     // Set once the loop has stopped taking new work and is running only what is
-                    // already in a lane. A task the runtime generated for itself never crossed
-                    // the peer door, so `task_acceptance` does not gate it: without this,
-                    // `single` and `none` would run the `task.md` task and leave a reconciled
-                    // loss report unread with its marker already written, which is the one
-                    // outcome reconciliation exists to prevent. Neither channel is read here, so
-                    // nothing new can arrive and the loop still ends after one pass.
+                    // already in a lane: the launch's own task and a reconciled loss report. Both
+                    // were enqueued by the runtime rather than admitted by the door, so
+                    // `task_acceptance` does not gate them: without this, `none` would run
+                    // neither, and `single` would leave a reconciled loss report unread with its
+                    // marker already written, which is the one outcome reconciliation exists to
+                    // prevent. Neither channel is read here, so nothing new can arrive and the
+                    // loop still ends after one pass.
                     let mut closing_out = false;
-
-                    // Tasks taken off the channel but not yet started. It outlives one iteration
-                    // because a task drained while another was running has to still be here when
-                    // that one finishes.
-                    let mut lanes = LaneQueue::new();
 
                     // Demoted commands the resumed-from session never accounted for. Only a
                     // resume does this, and it costs one read of a file `--resume` has already
@@ -4278,184 +4262,15 @@ fn launch(
                         } else {
                             match effective_lifecycle.task_acceptance {
                                 TaskAcceptance::None => {
-                                    // Does not accept incoming tasks; run from task.md if present
-                                    if let Some(bytes) = pending_task_input(&runtime_root) {
-                                        let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
-                                        let context_id = task_context_id(supplied_context_id.as_deref());
-                                        let provenance =
-                                            TaskProvenance::derive(TaskOrigin::User, None);
-                                        let _ = trace
-                                            .write_task_start(
-                                                &task_id,
-                                                &context_id,
-                                                "task_md",
-                                                provenance,
-                                                bytes,
-                                                &[],
-                                                &[],
-                                            )
-                                            .await;
-                                        let seed = hooks
-                                            .dispatch_task_start(
-                                                task_id.clone(),
-                                                context_id.clone(),
-                                                "task_md".to_string(),
-                                                bytes,
-                                                seed_budget_tokens,
-                                                u64::from(context_window),
-                                                agent::prior_history_tokens(
-                                                    run_config.conversation_root.as_deref(),
-                                                    &records_root,
-                                                    &conversation_mode,
-                                                    Some(&context_id),
-                                                    run_config.resume.is_some(),
-                                                ),
-                                            )
-                                            .await;
-                                        otel.begin_session(None);
-                                        state.current_traceparent = otel.outgoing_traceparent();
-                                        state.current_task_provenance = Some(provenance);
-                                        state.current_context_id = Some(context_id.clone());
-                                        state.current_forget_harness_session =
-                                            take_forget_session(&mut pending_forget_session);
-                                        // run_task_with_reopens fires on-task-end, honors any
-                                        // reopen-task within budget, and writes the terminal
-                                        // task_end (with reopen_count) itself.
-                                        let failures_before = trace.task_failures_written();
-                                        let result = run_task_with_reopens(
-                                            &mut state,
-                                            inference,
-                                            effective_lifecycle.max_task_reopens,
-                                            system_prompt.clone(),
-                                            run_config.clone(),
-                                            &mut hooks,
-                                            &mut trace,
-                                            &mut otel,
-                                            None,
-                                            None,
-                                            &accessible_root,
-                                            &capsule_name,
-                                            &capsule_version,
-                                            conversation_mode.clone(),
-                                            Some(context_id.clone()),
-                                            &task_id,
-                                            seed,
-                                            // No A2A task, so nothing a person can address a
-                                            // `CancelTask` to; only `SIGTERM` cancels it.
-                                            Some(terminating.clone()),
-                                        )
-                                        .await;
-                                        let failed = result.is_err();
-                                        outcome.record_terminated(
-                                            result,
-                                            termination_ending.get(),
-                                            &trace,
-                                            failures_before,
-                                        );
-                                        if failed {
-                                            break 'task_loop;
-                                        }
-                                        closing_out = true;
-                                        continue 'task_loop;
-                                    } else {
-                                        closing_out = true;
-                                        continue 'task_loop;
-                                    }
+                                    // The door takes no task, so the launch runs what is already
+                                    // in a lane — its own task, a reconciled loss report — and
+                                    // ends.
+                                    closing_out = true;
+                                    continue 'task_loop;
                                 }
                                 TaskAcceptance::Single | TaskAcceptance::Queue => {
-                                    if let Some(bytes) = pending_task_input(&runtime_root) {
-                                        // A `task.md` runs before any A2A message is waited for.
-                                        let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
-                                        let context_id = task_context_id(supplied_context_id.as_deref());
-                                        let provenance =
-                                            TaskProvenance::derive(TaskOrigin::User, None);
-                                        let _ = trace
-                                            .write_task_start(
-                                                &task_id,
-                                                &context_id,
-                                                "task_md",
-                                                provenance,
-                                                bytes,
-                                                &[],
-                                                &[],
-                                            )
-                                            .await;
-                                        let seed = hooks
-                                            .dispatch_task_start(
-                                                task_id.clone(),
-                                                context_id.clone(),
-                                                "task_md".to_string(),
-                                                bytes,
-                                                seed_budget_tokens,
-                                                u64::from(context_window),
-                                                agent::prior_history_tokens(
-                                                    run_config.conversation_root.as_deref(),
-                                                    &records_root,
-                                                    &conversation_mode,
-                                                    Some(&context_id),
-                                                    run_config.resume.is_some(),
-                                                ),
-                                            )
-                                            .await;
-                                        otel.begin_session(None);
-                                        state.current_traceparent = otel.outgoing_traceparent();
-                                        state.current_task_provenance = Some(provenance);
-                                        state.current_context_id = Some(context_id.clone());
-                                        state.current_forget_harness_session =
-                                            take_forget_session(&mut pending_forget_session);
-                                        let failures_before = trace.task_failures_written();
-                                        let result = run_task_with_reopens(
-                                            &mut state,
-                                            inference,
-                                            effective_lifecycle.max_task_reopens,
-                                            system_prompt.clone(),
-                                            run_config.clone(),
-                                            &mut hooks,
-                                            &mut trace,
-                                            &mut otel,
-                                            None,
-                                            None,
-                                            &accessible_root,
-                                            &capsule_name,
-                                            &capsule_version,
-                                            conversation_mode.clone(),
-                                            Some(context_id.clone()),
-                                            &task_id,
-                                            seed,
-                                            Some(terminating.clone()),
-                                        )
-                                        .await;
-                                        let _ = trace.flush().await;
-                                        let failed = result.is_err();
-                                        // The launch's own task decides its outcome under every
-                                        // lifecycle, queue+sleep included, whatever runs next.
-                                        outcome.record_terminated(
-                                            result,
-                                            termination_ending.get(),
-                                            &trace,
-                                            failures_before,
-                                        );
-                                        // Only queue+sleep outlives its task. Every other
-                                        // lifecycle, `queue` + `exit` included, ends here: it
-                                        // closes out what is already in a lane, such as a
-                                        // reconciled loss report, and never waits for more.
-                                        if !effective_lifecycle.can_receive_background_tasks()
-                                            || failed
-                                        {
-                                            if failed {
-                                                break 'task_loop;
-                                            }
-                                            closing_out = true;
-                                            continue 'task_loop;
-                                        }
-                                        // Queue+sleep: remove task.md so the next iteration
-                                        // falls through to the wait for queued tasks.
-                                        let _ = runtime_root.remove_file(TASK_INPUT_FILE);
-                                        continue 'task_loop;
-                                    }
-                                    // Wait for the next task from the mpsc channel. Reached with
-                                    // no `task.md`: on a launch given no task, or by queue+sleep
-                                    // between tasks.
+                                    // Wait for the next task. The launch's own task is already in
+                                    // its lane, so the first pass below picks it before any wait.
                                     // queue+sleep mode waits indefinitely — no self-terminating
                                     // timeout. The host (mur-roost) is responsible for shutdown.
                                     // All other modes wait MURMUR_A2A_TIMEOUT_SECS (default 30 s)
@@ -4568,8 +4383,9 @@ fn launch(
                                                 Ok(Woke::Task(None)) => break 'task_loop,
                                                 // A launch's own task — `--task`, or a workdir
                                                 // `task.md` or `input.txt` imported at session
-                                                // start — ran before this wait, so a timeout has
-                                                // nothing to send and the model is never called.
+                                                // start — is picked before this wait, so a timeout
+                                                // has nothing to send and the model is never
+                                                // called.
                                                 Err(_elapsed) => {
                                                     crate::runtime_err!(
                                                         "[capsule-runtime] no A2A message received within {idle_timeout_secs}s and there is no task to run; ending the session without calling the model"
@@ -4628,8 +4444,8 @@ fn launch(
                             );
                         }
                         // Only a task that actually arrived over the peer door gets the
-                        // received record; a completion the runtime produced for itself never
-                        // crossed that boundary.
+                        // received record; the launch's own task and a report the runtime
+                        // produced for itself never crossed that boundary.
                         if incoming.source == crate::a2a::SOURCE_A2A {
                             let _ = trace
                                 .write_a2a_task_received(
@@ -4675,9 +4491,15 @@ fn launch(
                         state.current_traceparent = otel.outgoing_traceparent();
                         state.current_task_provenance = Some(incoming.provenance);
                         state.current_context_id = Some(incoming.context_id.clone());
-                        state.current_forget_harness_session = incoming
-                            .forget_session
-                            .then_some(crate::harness_session::FORGET_BY_A2A);
+                        // A launch's own task carries `mur run --forget-session`; every other
+                        // task carries what its message asked.
+                        let launch_task = incoming.source == crate::a2a::SOURCE_TASK_MD;
+                        state.current_forget_harness_session =
+                            incoming.forget_session.then_some(if launch_task {
+                                crate::harness_session::FORGET_BY_CLI
+                            } else {
+                                crate::harness_session::FORGET_BY_A2A
+                            });
                         state.a2a_task = Some(StreamTask::new(
                             &incoming.task_id,
                             &incoming.context_id,
@@ -4692,8 +4514,7 @@ fn launch(
                             &mut hooks,
                             &mut trace,
                             &mut otel,
-                            Some(incoming.task_id.clone()),
-                            Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
+                            (sse_tx.clone(), Arc::clone(&sse_buffer)),
                             &accessible_root,
                             &capsule_name,
                             &capsule_version,
@@ -4701,7 +4522,7 @@ fn launch(
                             Some(incoming.context_id.clone()),
                             &incoming.task_id,
                             seed,
-                            Some(cancel_signal),
+                            cancel_signal,
                         )
                         .await;
 
@@ -4732,6 +4553,29 @@ fn launch(
                         }
 
                         // ── DECIDE WHETHER TO CONTINUE ──
+                        // The launch's own task decides the launch's outcome under every
+                        // lifecycle, queue+sleep included, whatever runs next. Only queue+sleep
+                        // outlives it; every other lifecycle, `queue` + `exit` included, closes
+                        // out what is already in a lane, such as a reconciled loss report, and
+                        // never waits for more.
+                        if launch_task {
+                            let failed = loop_result.is_err();
+                            outcome.record_terminated(
+                                loop_result,
+                                termination_ending.get(),
+                                &trace,
+                                failures_before,
+                            );
+                            if failed {
+                                break 'task_loop;
+                            }
+                            if !effective_lifecycle.can_receive_background_tasks() {
+                                closing_out = true;
+                                continue 'task_loop;
+                            }
+                            let _ = runtime_root.remove_file(TASK_INPUT_FILE);
+                            continue 'task_loop;
+                        }
                         // Closing out runs down whatever is already in a lane and then ends the
                         // loop, whatever `after_task` says: nothing can arrive to extend it.
                         if closing_out {
@@ -5266,8 +5110,8 @@ async fn drain_script_trace_buffers(
 /// is how `mur stop <formation id>` finds a launcher that writes no record of its own.
 /// `formation_member` is the roster name `mur run --roster` handed a member, from the same
 /// `staged.formation_member` the trace's `session_start.formation_member` comes from, so the two
-/// always agree. `spawned_by` is the delegating session's id, for a delegated child that ends with
-/// its spawner.
+/// always agree. `formation_entry` is set for the member its channel named the entry member.
+/// `spawned_by` is the delegating session's id, for a delegated child that ends with its spawner.
 fn running_record_for(
     staged: &StagedSession,
     session_id: &str,
@@ -5303,6 +5147,10 @@ fn running_record_for(
             .formation_member
             .as_ref()
             .map(|member| member.name().to_string()),
+        formation_entry: staged
+            .formation_member
+            .as_ref()
+            .is_some_and(|member| member.is_entry()),
         formation_lifeline: holds_formation_lifeline,
         formation_launcher: staged
             .formation_member
@@ -12586,6 +12434,47 @@ async fn refuse_undelivered_tasks(
     let _ = trace.flush().await;
 }
 
+/// Put the launch's own task on the door: the `task.md` waiting in the runtime directory — what
+/// `mur run --task` wrote, or what [`import_task_input`] copied from the workdir — enqueued on
+/// the registry as a [`crate::a2a::SOURCE_TASK_MD`] task and filed in its lane. Does nothing when
+/// there is no `task.md`.
+///
+/// Called once per launch, before the door is announced, so the task is listed, followed and
+/// cancelled like any task a client sent, and a `single` door refuses a second task while it
+/// runs. It has no owner: it is the operator's. `can_accept` is not consulted, as for a detached
+/// report: the launch admitted it. `mur run --forget-session` is spent on it.
+///
+/// A refused read of the task is latched, and the task fails on it at its activation checkpoint.
+fn enqueue_launch_task(
+    runtime_root: &WorkdirRoot,
+    supplied_context_id: Option<&str>,
+    pending_forget_session: &mut bool,
+    task_registry: &Mutex<TaskRegistry>,
+    lanes: &mut LaneQueue,
+) {
+    if pending_task_input(runtime_root).is_none() {
+        return;
+    }
+    let task = IncomingTask {
+        task_id: format!("tsk_{}", uuid::Uuid::now_v7().simple()),
+        context_id: task_context_id(supplied_context_id),
+        message_id: format!("msg_{}", uuid::Uuid::now_v7().simple()),
+        message_text: agent::fresh_task_text(runtime_root),
+        provenance: TaskProvenance::derive(TaskOrigin::User, None),
+        traceparent: None,
+        source: crate::a2a::SOURCE_TASK_MD,
+        forget_session: std::mem::take(pending_forget_session),
+        caller_member: None,
+        reference_task_ids: Vec::new(),
+        part_kinds: Vec::new(),
+    };
+    task_registry
+        .lock()
+        .unwrap()
+        .enqueue(&task.task_id, &task.context_id);
+    lanes.push(task);
+}
+
 /// Turn a report about work this runtime started into a queued `completion`-origin task, and
 /// record whatever join the report needs in the trace.
 ///
@@ -17357,8 +17246,7 @@ inference:
                 &mut self.hooks,
                 &mut self.trace,
                 &mut self.otel,
-                None,
-                None,
+                test_task_stream(),
                 &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
                 "cap",
                 "0.1.0",
@@ -17366,7 +17254,7 @@ inference:
                 Some("ctx_1".to_string()),
                 task_id,
                 None,
-                None,
+                crate::cancel::CancelSignal::new(),
             )
             .await;
         }
@@ -21705,6 +21593,12 @@ inference:
         }
     }
 
+    /// A stream for a door task whose frames no test reads.
+    fn test_task_stream() -> (SseBroadcast, Arc<Mutex<SseEventBuffer>>) {
+        let (sse_tx, _) = tokio::sync::broadcast::channel(64);
+        (sse_tx, Arc::new(Mutex::new(SseEventBuffer::new(64))))
+    }
+
     /// Every event in `buffer`, in order, as the `StreamResponse` an activated connection reads.
     pub(super) fn buffered_frames(buffer: &Mutex<SseEventBuffer>) -> Vec<serde_json::Value> {
         crate::streaming::buffered(buffer)
@@ -21837,9 +21731,15 @@ inference:
     ) -> ReopenRun {
         let conversation_root = run_config.conversation_root.clone();
         // A real broadcast and buffer: the buffer records every frame whether or not a receiver
-        // is attached, which is what `frames` reads back.
+        // is attached, which is what `frames` reads back. A scenario that is not streamed still
+        // runs a door task with a stream, into a buffer nothing reads.
         let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel(1024);
         let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(1024)));
+        let task_buffer = if streamed {
+            Arc::clone(&sse_buffer)
+        } else {
+            Arc::new(Mutex::new(SseEventBuffer::new(1024)))
+        };
         let mut trace = reopen_scenario_trace(workdir).await;
         let records_root = state.records_root.clone();
         let accessible_root = state.accessible_root.clone();
@@ -21869,8 +21769,7 @@ inference:
             hooks,
             &mut trace,
             &mut otel,
-            streamed.then(|| "tsk_1".to_string()),
-            streamed.then(|| (sse_tx.clone(), Arc::clone(&sse_buffer))),
+            (sse_tx.clone(), task_buffer),
             &accessible_root,
             "cap",
             "0.1.0",
@@ -21878,7 +21777,7 @@ inference:
             Some("ctx_1".to_string()),
             "tsk_1",
             seed,
-            None,
+            crate::cancel::CancelSignal::new(),
         )
         .await;
 
@@ -22295,8 +22194,7 @@ inference:
             &mut hooks,
             &mut trace,
             &mut otel,
-            None,
-            None,
+            test_task_stream(),
             &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
             "cap",
             "0.1.0",
@@ -22304,7 +22202,7 @@ inference:
             Some("ctx_1".to_string()),
             "tsk_1",
             None,
-            None,
+            crate::cancel::CancelSignal::new(),
         )
         .await;
 
@@ -22821,7 +22719,7 @@ inference:
     }
 
     /// The cancelled-task marker replaces whatever `out/result.txt` held, and under a threaded
-    /// conversation the per-task file of an A2A task as well.
+    /// conversation the per-task file as well.
     #[test]
     fn a_cancelled_task_writes_the_marker_to_its_result_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -22832,7 +22730,7 @@ inference:
 
         write_canceled_result(
             &ConversationMode::Threaded,
-            Some("tsk_a"),
+            "tsk_a",
             &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
         );
         let read = |name: &str| std::fs::read_to_string(out.join(name)).unwrap();
@@ -22846,16 +22744,11 @@ inference:
             "canceled: the task was canceled before it completed, so it has no result"
         );
 
-        // A stateless conversation keeps no per-task file, and a task.md task has no task id.
+        // A stateless conversation keeps no per-task file.
         let dir = tempfile::tempdir().unwrap();
         write_canceled_result(
             &ConversationMode::Stateless,
-            Some("tsk_b"),
-            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
-        );
-        write_canceled_result(
-            &ConversationMode::Threaded,
-            None,
+            "tsk_b",
             &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
         );
         let out = dir.path().join("out");

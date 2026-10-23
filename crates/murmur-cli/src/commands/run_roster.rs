@@ -1,4 +1,6 @@
-//! `mur run --roster`: launch the formation a project's `roster.yaml` declares, for one task.
+//! `mur run --roster`: launch the formation a project's `roster.yaml` declares. With `--task` the
+//! entry member runs that one task and the formation ends with it; without, the entry member takes
+//! tasks at its door until the formation is stopped.
 //!
 //! The launcher admits the roster, mints one formation id, starts every peer and waits for each
 //! door to answer, announces the formation, starts the entry member last, and waits on the entry

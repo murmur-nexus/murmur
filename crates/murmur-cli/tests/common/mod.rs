@@ -1011,6 +1011,30 @@ impl Drop for ScriptedServer {
     }
 }
 
+/// How long a [`held_provider`] holds its request when the test never releases it.
+pub const HELD_REQUEST_LIMIT: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// A provider answering its one request with `body`, only once the test releases it: the receiver
+/// fires when the request arrives, so the test knows the task is running and not yet finished,
+/// and a send on the sender lets it be answered. Arrival is signalled from inside the handler
+/// because [`ScriptedServer::requests`] records a request only after it is answered.
+pub fn held_provider(
+    body: String,
+) -> (
+    ScriptedServer,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let server = ScriptedServer::start_answering(1, move |_| {
+        let _ = arrived_tx.send(());
+        let _ = release_rx.recv_timeout(HELD_REQUEST_LIMIT);
+        body.clone()
+    });
+    (server, arrived_rx, release_tx)
+}
+
 /// Shared by [`ScriptedServer::start_gated`] servers: each holds its response until `expected`
 /// requests have arrived across all of them.
 pub struct RequestGate {

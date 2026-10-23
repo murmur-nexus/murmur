@@ -126,7 +126,9 @@ mur run
 The capsule starts and waits for the first incoming task. You will see no immediate agent activity — this is expected.
 
 !!! note "No `task.md` needed"
-    In queue mode the capsule does not read a `task.md` at startup — all tasks arrive as A2A messages.
+    Tasks arrive at the capsule's door as A2A messages. A `--task`, or a `task.md` in the
+    workdir, is optional: when given, it is the first task the capsule runs, listed on the door
+    like any task a client sent.
 
 ---
 

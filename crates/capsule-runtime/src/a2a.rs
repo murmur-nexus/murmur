@@ -1973,13 +1973,15 @@ pub(crate) struct IncomingTask {
     /// Why this task woke the capsule, classified at the door from the request headers. Every
     /// inbound task has one: a caller that claims nothing is an untrusted `event`.
     pub provenance: TaskProvenance,
-    /// Where the task came from, as it appears on its `task_start` record: `"a2a"` for anything
-    /// that arrived over the peer door, `"detached_shell"` for a completion the runtime produced
-    /// locally. The `a2a_task_received` record is written only for the former.
+    /// Where the task came from, as it appears on its `task_start` record: [`SOURCE_A2A`] for
+    /// anything that arrived over the peer door, [`SOURCE_TASK_MD`] for the launch's own task,
+    /// and [`SOURCE_DETACHED_SHELL`] or [`SOURCE_DETACHED_LOST`] for a report the runtime produced
+    /// locally. The `a2a_task_received` record is written only for the first.
     pub source: &'static str,
     /// Whether the message that started this task asked the capsule to drop the harness session
-    /// its context names before the turn: [`IncomingMessage::forget_session`]. `false` for every
-    /// task whose message did not ask, and for every task the runtime enqueued for itself.
+    /// its context names before the turn: [`IncomingMessage::forget_session`], or for the launch's
+    /// own task, `mur run --forget-session`. `false` for every task whose message did not ask, and
+    /// for every report the runtime enqueued for itself.
     pub forget_session: bool,
     /// The formation member that called, when the door let this task in on a formation token.
     /// Recorded as `a2a_task_received.caller_member`; `None` for every other task.
@@ -1994,6 +1996,11 @@ pub(crate) struct IncomingTask {
 
 /// The `source` of a task that arrived over the A2A door.
 pub(crate) const SOURCE_A2A: &str = "a2a";
+
+/// The `source` of a launch's own task: `--task`, or a workdir `task.md`/`input.txt` imported at
+/// session start. It is a task on the door from the moment the door is announced, but it never
+/// crossed the door, so it gets no `a2a_task_received` record.
+pub(crate) const SOURCE_TASK_MD: &str = "task_md";
 
 /// The `source` of a task the runtime enqueued for itself when a demoted shell command finished.
 pub(crate) const SOURCE_DETACHED_SHELL: &str = "detached_shell";

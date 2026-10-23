@@ -80,6 +80,7 @@ mod tests {
                 .collect::<BTreeMap<_, _>>(),
             formation_id: None,
             formation_member: None,
+            formation_entry: false,
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,

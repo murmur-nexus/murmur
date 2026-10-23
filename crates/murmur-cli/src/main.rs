@@ -314,10 +314,12 @@ enum Commands {
         )]
         store_root: Option<PathBuf>,
 
-        /// Launch the formation a roster declares, one task, then stop every member.
+        /// Launch the formation a roster declares. With --task the entry member runs that one
+        /// task, then every member stops; without, the entry member takes tasks at its door until
+        /// the formation is stopped (mur stop <frm_id>, a signal, or --deadline).
         /// Takes the roster's project directory or its roster.yaml; given with no value it means
         /// ./roster.yaml. Every member runs as its own `mur run` process: the peers first, each
-        /// ready once its door answers, then the entry member with --task. --task, --json,
+        /// ready once its door answers, then the entry member. --task, --json,
         /// --verbose, --no-env-file and --containment are passed through. --deadline bounds the
         /// whole formation: counted from this launcher's start, every member ends at it.
         #[arg(

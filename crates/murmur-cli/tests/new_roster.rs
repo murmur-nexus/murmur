@@ -663,6 +663,295 @@ fn the_scaffolded_lead_hands_the_worker_a_task() {
     assert_no_member_remains(scratch.path(), &pids, Duration::from_secs(30));
 }
 
+// ── Lead's door while the formation runs ─────────────────────────────────────
+
+/// A `mur run --roster crew --json [<args>]` launcher, every line it writes kept.
+struct RosterRun {
+    child: std::process::Child,
+    lines: mpsc::Receiver<String>,
+    stderr: mpsc::Receiver<String>,
+    /// Every stdout line read so far, in order.
+    seen: Vec<Value>,
+}
+
+impl RosterRun {
+    fn start(scratch: &Scratch, args: &[&str], env: &[(&str, &str)]) -> Self {
+        let mut command = scratch.command(&[&["run", "--roster", "crew", "--json"], args].concat());
+        let mut child = command
+            .envs(env.iter().copied())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (line_tx, lines) = mpsc::channel::<String>();
+        let out = child.stdout.take().unwrap();
+        thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                let _ = line_tx.send(line);
+            }
+        });
+        let (err_tx, stderr) = mpsc::channel::<String>();
+        let err = child.stderr.take().unwrap();
+        thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                eprintln!("[launcher] {line}");
+                let _ = err_tx.send(line);
+            }
+        });
+        Self {
+            child,
+            lines,
+            stderr,
+            seen: Vec::new(),
+        }
+    }
+
+    /// Stdout line `index`, waiting for it.
+    fn line(&mut self, index: usize) -> Value {
+        while self.seen.len() <= index {
+            let line = self
+                .lines
+                .recv_timeout(LAUNCH_LIMIT)
+                .unwrap_or_else(|_| panic!("no stdout line {index}; so far {:?}", self.seen));
+            self.seen
+                .push(serde_json::from_str(&line).unwrap_or_else(|_| panic!("not JSON: {line}")));
+        }
+        self.seen[index].clone()
+    }
+
+    fn running(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+    }
+
+    /// Waits for the launcher to exit, and returns its exit code and everything on its stderr.
+    fn finish(&mut self) -> (Option<i32>, String) {
+        let deadline = Instant::now() + LAUNCH_LIMIT;
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "the launcher did not exit");
+            thread::sleep(Duration::from_millis(50));
+        };
+        let mut stderr: Vec<String> = Vec::new();
+        while let Ok(line) = self.stderr.recv_timeout(Duration::from_millis(500)) {
+            stderr.push(line);
+        }
+        (status.code(), stderr.join("\n"))
+    }
+}
+
+impl Drop for RosterRun {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The operator token of `session`, as `mur token <session>` prints it.
+fn operator_token(scratch: &Scratch, session: &str) -> String {
+    let token = scratch.run(&["token", session]);
+    token.assert_code(0);
+    token.stdout.trim().to_string()
+}
+
+/// `mur ps --json`, parsed.
+fn ps_json(scratch: &Scratch) -> Value {
+    let ps = scratch.run(&["ps", "--json"]);
+    ps.assert_code(0);
+    serde_json::from_str(&ps.stdout).unwrap_or_else(|_| panic!("not JSON: {}", ps.stdout))
+}
+
+/// `formation_id`'s entry in a `mur ps --json` listing.
+fn listed_formation<'a>(listing: &'a Value, formation_id: &str) -> &'a Value {
+    listing["formations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|formation| formation["formation_id"] == formation_id)
+        .unwrap_or_else(|| panic!("{formation_id} is not listed: {listing}"))
+}
+
+/// The capsule entry of roster member `member` in a `mur ps --json` listing.
+fn listed_member<'a>(listing: &'a Value, member: &str) -> &'a Value {
+    listing["capsules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|capsule| capsule["formation_member"] == member)
+        .unwrap_or_else(|| panic!("{member} is not listed: {listing}"))
+}
+
+/// The tasks a `ListTasks` on `door` answers with.
+fn list_tasks(door: &str, token: &str) -> Vec<Value> {
+    let listed = common::door_capsule::rpc(door, Some(token), "ListTasks", serde_json::json!({}));
+    assert_eq!(listed.status, 200, "{listed:?}");
+    listed.json()["result"]["tasks"].as_array().unwrap().clone()
+}
+
+/// The scaffold, launched with `--task`: while lead's first model request is held, lead's door
+/// lists the formation's task as working and a stream on it ends completed, and `mur ps --json`
+/// marks lead as the formation's entry member. The launcher then exits 0 and nothing remains.
+#[test]
+fn the_entry_members_launch_task_is_on_its_door_while_it_runs() {
+    let scratch = Scratch::new();
+    // Lead's first model request is held until the test releases it.
+    let (server, arrived, release) = common::held_provider(end_turn(1, "hello back"));
+    scratch.write_config(&format!(
+        "inference:\n  provider: anthropic\n  model: test-model\n  endpoint: {}\n",
+        server.endpoint
+    ));
+    let new = scratch.new_roster("crew");
+    new.assert_code(0);
+    install_as_printed(&scratch, &next_steps(&new.stdout));
+    for member in ["lead", "worker"] {
+        let manifest = scratch.read(&format!("crew/{member}/murmur.yaml"));
+        assert!(!manifest.contains("max_tokens"), "{member}: {manifest}");
+    }
+
+    let _lock = launch_lock();
+    let mut run = RosterRun::start(&scratch, &["--task", "hello"], &[]);
+    let formation = run.line(0);
+    let formation_id = formation["formation_id"].as_str().unwrap().to_string();
+    let readiness = run.line(1);
+    let door = readiness["url"].as_str().unwrap().to_string();
+    let session = readiness["session_id"].as_str().unwrap().to_string();
+    let token = operator_token(&scratch, &session);
+    arrived
+        .recv_timeout(LAUNCH_LIMIT)
+        .expect("lead's first model request never arrived");
+
+    let tasks = list_tasks(&door, &token);
+    assert_eq!(tasks.len(), 1, "{tasks:?}");
+    assert_eq!(tasks[0]["status"]["state"], "TASK_STATE_WORKING");
+    let task_id = tasks[0]["id"].as_str().unwrap().to_string();
+
+    let listing = ps_json(&scratch);
+    let lead = listed_member(&listing, "lead");
+    assert_eq!(lead["session_id"], session.as_str());
+    assert_eq!(lead["formation_entry"], true, "{listing}");
+    assert_eq!(listed_member(&listing, "worker")["formation_entry"], false);
+    assert_eq!(
+        listed_formation(&listing, &formation_id)["entry_member"],
+        "lead",
+        "{listing}"
+    );
+
+    let (subscribed_door, subscriber_token, followed) =
+        (door.clone(), token.clone(), task_id.clone());
+    let subscription = thread::spawn(move || {
+        common::stream::subscribe(
+            &subscribed_door,
+            Some(&subscriber_token),
+            &followed,
+            false,
+            None,
+        )
+    });
+    thread::sleep(Duration::from_secs(1));
+    release.send(()).unwrap();
+    let (response, events) = subscription.join().unwrap();
+    assert_eq!(response.status, 200, "{response:?}");
+    let last = events.last().expect("the stream carried events");
+    assert!(last.is_terminal_status(), "{events:?}");
+    assert_eq!(last.state(), Some("TASK_STATE_COMPLETED"), "{events:?}");
+
+    let (code, stderr) = run.finish();
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("E-RUN-052"), "{stderr}");
+    let pids: Vec<u32> = [
+        formation["peers"][0]["pid"].as_u64(),
+        readiness["pid"].as_u64(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|pid| pid as u32)
+    .collect();
+    assert_no_member_remains(scratch.path(), &pids, Duration::from_secs(30));
+}
+
+/// The scaffold, launched with no `--task`: the formation stays up past the idle timeout, lead
+/// takes two tasks at its door one after the other without the formation ending, and `mur stop`
+/// ends everything.
+#[test]
+fn a_formation_launched_without_a_task_stays_up_until_stopped() {
+    let scratch = Scratch::new();
+    let server = ScriptedServer::start(vec![end_turn(1, "first"), end_turn(2, "second")]);
+    scratch.write_config(&format!(
+        "inference:\n  provider: anthropic\n  model: test-model\n  endpoint: {}\n",
+        server.endpoint
+    ));
+    let new = scratch.new_roster("crew");
+    new.assert_code(0);
+    install_as_printed(&scratch, &next_steps(&new.stdout));
+
+    let _lock = launch_lock();
+    let mut run = RosterRun::start(&scratch, &[], &[("MURMUR_A2A_TIMEOUT_SECS", "2")]);
+    let formation = run.line(0);
+    let formation_id = formation["formation_id"].as_str().unwrap().to_string();
+    let readiness = run.line(1);
+    let door = readiness["url"].as_str().unwrap().to_string();
+    let session = readiness["session_id"].as_str().unwrap().to_string();
+    let lead_pid = readiness["pid"].as_u64().unwrap() as u32;
+    let worker_pid = formation["peers"][0]["pid"].as_u64().unwrap() as u32;
+
+    thread::sleep(Duration::from_secs(8));
+    assert!(run.running(), "the launcher ended with no task to run");
+    assert!(common::formation::alive(lead_pid) && common::formation::alive(worker_pid));
+    let listing = ps_json(&scratch);
+    assert_eq!(
+        listed_formation(&listing, &formation_id)["entry_member"],
+        "lead",
+        "{listing}"
+    );
+    assert_eq!(listed_member(&listing, "lead")["formation_entry"], true);
+
+    let token = operator_token(&scratch, &session);
+    for (index, text) in ["first task", "second task"].into_iter().enumerate() {
+        let sent = common::door_capsule::rpc(
+            &door,
+            Some(&token),
+            "SendMessage",
+            common::door_capsule::returning_immediately(common::door_capsule::message(
+                &format!("m-{index}"),
+                text,
+            )),
+        );
+        assert_eq!(sent.status, 200, "{sent:?}");
+        let task_id = sent.json()["result"]["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let done = common::door_capsule::wait_completed(&door, Some(&token), &task_id);
+        assert_eq!(
+            done["result"]["status"]["state"], "TASK_STATE_COMPLETED",
+            "{done}"
+        );
+        thread::sleep(Duration::from_millis(500));
+        assert!(run.running(), "the formation ended after task {index}");
+        assert!(
+            common::formation::alive(lead_pid),
+            "lead ended after task {index}"
+        );
+    }
+    assert_eq!(server.requests().len(), 2);
+
+    let stop = scratch.run(&["stop", &formation_id]);
+    stop.assert_code(0);
+    let (code, stderr) = run.finish();
+    eprintln!("[new-roster] a no-task formation ended by mur stop exited {code:?}");
+    assert_eq!(code, Some(STOPPED_FORMATION_EXIT), "{stderr}");
+    assert!(!stderr.contains("E-RUN-052"), "{stderr}");
+    assert_no_member_remains(
+        scratch.path(),
+        &[lead_pid, worker_pid],
+        Duration::from_secs(30),
+    );
+}
+
+/// The launcher's exit code when `mur stop <frm_id>` ends a formation launched without a task.
+const STOPPED_FORMATION_EXIT: i32 = 143;
+
 // ── mur doctor in the formation directory ────────────────────────────────────
 
 /// The `error[…]: …` line on `stderr`, from `error[` on.

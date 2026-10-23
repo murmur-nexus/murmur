@@ -2496,6 +2496,7 @@ fn a_formation_is_accounted_for_after_its_members_end() {
         listing["formations"],
         json!([{
             "formation_id": formation.as_str(),
+            "entry_member": null,
             "listed": 1,
             "ended": 1,
             "gone_without_ending": 1,
@@ -3147,6 +3148,7 @@ fn ps_json_counts_a_session_root_it_cannot_read() {
         listing["formations"],
         json!([{
             "formation_id": formation.as_str(),
+            "entry_member": null,
             "listed": 2,
             "ended": 0,
             "gone_without_ending": 0,

@@ -190,13 +190,15 @@ an older `mur`. Its capsule may still be running, and only the `mur` that starte
 | Every command, `mur ps` included | Leaves it in place: none reads, verifies, signals or removes it, so `mur stop`, `mur watch`, `mur cancel` and `mur token` answer as if it were absent |
 
 A session that is a [member of a formation](#mur-run-formation) also records its formation, and a
-member [`mur run --roster`](#mur-run-roster) launched records its roster name. A session in no
-formation writes neither key. Both group and label records; neither grants anything.
+member [`mur run --roster`](#mur-run-roster) launched records its roster name and whether it is the
+entry member. A session in no formation writes none of these keys. They group and label records;
+none grants anything.
 
 | Key | Written when | Value |
 |---|---|---|
 | `formation_id` | The session is a member of a formation, a member's delegated sub-capsule and a session started by hand with `MURMUR_FORMATION_ID` included | The formation id |
 | `formation_member` | `mur run --roster` launched the session as a member. A member's delegated sub-capsule and a session started by hand with `MURMUR_FORMATION_ID` write no such key | The member's roster name, the `session_start.formation_member` of its [trace](observability-schemas.md#session-trace-tracejsonl). Members running the same capsule share a `capsule_name`; this name tells them apart |
+| `formation_entry` | `mur run --roster` launched the session as the formation's [entry member](roster.md#entry-member), as its formation channel says. Every other member, a member's delegated sub-capsule and a session in no formation write no such key | `true` |
 
 A record whose `formation_id` is not a formation id, or whose `formation_member` is not a
 [member name](roster.md#fields), is unreadable, and is removed on the next read like any other
@@ -360,8 +362,7 @@ section of this reference.
 | [`inference.model`](manifest.md#field-inference) | The provider's model | The same |
 | [`inference.driver.artifact`](manifest.md#field-inference) | The provider's driver | The same |
 | [`inference.system_prompt`](manifest.md#field-inference) | Names the member and the formation, and the hand-off: `lead` does not do the task itself, its first reply hands the task to `worker` with [`call-member`](runtime-provided-tools.md#call-member), it ends the turn while `worker` works, and it answers with `worker`'s answer when it arrives | One sentence naming the member and the formation |
-| [`lifecycle.task_acceptance`](manifest.md#field-lifecycle) | `single`: the formation's one task | `queue` |
-| [`lifecycle.after_task`](manifest.md#field-lifecycle) | `exit`, which stops the formation | `sleep`: it waits at its door while the formation runs |
+| [`lifecycle`](manifest.md#field-lifecycle) | Absent. A comment in its place says that [`mur run --roster`](#mur-run-roster) sets the entry member's lifecycle on every launch | `task_acceptance: queue`, `after_task: sleep`: it waits at its door while the formation runs |
 | [`capabilities.network.allow`](manifest.md#field-capabilities) | `[localhost]`, the entry through which `call-member` reaches `worker`'s door — see [Giving a member work](roster.md#member-calls) | Absent: `worker` declares no `capabilities` |
 | [`exports.peer_tasks.accept`](manifest.md#field-exports-peer-tasks) | Absent: `lead` serves no peer | `true`, because the rule calls `worker` |
 | [`network.authentication.scheme`](manifest.md#field-network-authentication) | `bearer`, because a roster with a rule needs every member's door authenticated | `bearer` |
@@ -1375,7 +1376,7 @@ mur run --roster [<path>] [--task <path-or-text>] [--json]
 | Flag | Default | Description |
 |---|---|---|
 | `--manifest` | `./murmur.yaml` | Path to the capsule manifest |
-| `--roster` | `./roster.yaml` when the flag is given with no value | Launch the formation a [roster](roster.md) declares, for one task. Takes the project directory or the `roster.yaml` inside it; any other file name refuses with [`E-ROS-001`](diagnostics.md#e-ros-001). Passes `--task`, `--json`, `--verbose`, `--no-env-file`, `--containment` and `--deadline` through to its members, and cannot be combined with any other flag. See [Launching a formation](#mur-run-roster) |
+| `--roster` | `./roster.yaml` when the flag is given with no value | Launch the formation a [roster](roster.md) declares: for one task with `--task`, else until it is stopped. Takes the project directory or the `roster.yaml` inside it; any other file name refuses with [`E-ROS-001`](diagnostics.md#e-ros-001). Passes `--task`, `--json`, `--verbose`, `--no-env-file`, `--containment` and `--deadline` through to its members, and cannot be combined with any other flag. See [Launching a formation](#mur-run-roster) |
 | `--capsule` | — | Run an installed artifact by its full name, `<scope>/<name>`, instead of a project directory; a bare name is refused with [`E-REG-007`](diagnostics.md#e-reg-007). Requires `--capsule-version`, and cannot be combined with an explicitly given `--manifest`. The capsule is resolved from the project store and then the global store, and staged from the artifact bytes in memory: no `murmur.yaml` is read from disk, and no `murmur.lock` is read or written. This is the form a parent capsule's runtime launches a delegated child on |
 | `--capsule-version` | — | Version of the `--capsule` artifact. Required with `--capsule` |
 | `--spawn-grant-stdin` | off | Read one line from standard input as this launch's spawn approval, and present it when the session registers with `mur-roost`. Set by a parent capsule's runtime when it launches a delegated child. Standard input rather than an argument or an environment variable, both of which any process running as the same user can read out of `/proc` |
@@ -1583,10 +1584,21 @@ bounds the parent's wait for a child separately, and whichever falls first ends 
 ### Launching a formation (`--roster`) { #mur-run-roster }
 
 `mur run --roster` launches every member of the formation a project's
-[`roster.yaml`](roster.md) declares, runs the entry member's one task, and then stops every member.
-Each member is a `mur run --capsule <capsule> --capsule-version <version>` process of its own; the
+[`roster.yaml`](roster.md) declares. Each member is a `mur run --capsule <capsule> --capsule-version <version>` process of its own; the
 launcher runs no session itself. The order and the rules are in
 [Launching a formation](roster.md#launch).
+
+What the entry member does, and when the formation ends, depends on `--task`:
+
+| Launch | The entry member | The formation ends |
+|---|---|---|
+| `--task "…"` | Runs that one task, then exits | When the entry member exits after its task |
+| No `--task` | Takes tasks at its door one after another, with no [idle timeout](manifest.md#idle-timeout). A client such as `nexus` drives the formation through that door, with the entry member's [operator token](#mur-token) | On [`mur stop <formation-id>`](#mur-stop-formation), a signal to the launcher, or `--deadline` |
+
+The launch sets the entry member's [lifecycle](roster.md#launch) either way, in place of the one
+its manifest declares. Either way the entry member's task is a task on its door from the moment
+the door is announced: [`ListTasks`](agent-card.md#list-tasks) lists it, `SubscribeToTask`
+follows it and `CancelTask` reaches it. No peer ever calls the entry member.
 
 | Flag | Passed to |
 |---|---|
@@ -1646,6 +1658,7 @@ member repeats it.
 | The launcher | Exits with |
 |---|---|
 | The entry member's process ended | The entry member's exit code, or 128 plus the signal that ended it |
+| [`mur stop <formation-id>`](#mur-stop-formation) ended it | 143: the stop is a `SIGTERM` to the launcher |
 | A refusal before the entry member started — admission ([`E-ROS-*`](diagnostics.md#e-ros-001), `E-REG-005`), [`E-RUN-045`](diagnostics.md#e-run-045), [`E-RUN-046`](diagnostics.md#e-run-046) | 1 |
 | The launcher received `SIGINT`, `SIGTERM` or `SIGHUP` | 130, 143 or 129 |
 
@@ -1795,12 +1808,14 @@ mur ps --json
       "outlives_launcher": true,
       "started_at": "2026-10-20T09:12:44Z",
       "formation_id": "frm_019f01a93ff27c1e9a3b5d0c4e8f2a61",
-      "formation_member": "planner"
+      "formation_member": "planner",
+      "formation_entry": true
     }
   ],
   "formations": [
     {
       "formation_id": "frm_019f01a93ff27c1e9a3b5d0c4e8f2a61",
+      "entry_member": "planner",
       "listed": 1,
       "ended": 1,
       "gone_without_ending": 1,
@@ -1841,8 +1856,10 @@ mur ps --json
 | `capsules[].started_at` | string | When the session started, RFC 3339 UTC, as the record holds it |
 | `capsules[].formation_id` | string or `null` | The formation this session is a member of. `null` for a session in no formation |
 | `capsules[].formation_member` | string or `null` | The member's roster name, set only for a member [`mur run --roster`](#mur-run-formation) launched. `null` otherwise |
+| `capsules[].formation_entry` | boolean | `true` for the [entry member](roster.md#entry-member) of a formation, `false` for every other session |
 | `formations` | array | One entry for each formation an entry of `capsules` names, in the order of that formation's first entry in `capsules`. Empty when no entry of `capsules` names a formation. A formation known only from records whose process is gone has no entry |
 | `formations[].formation_id` | string | The `frm_` id |
+| `formations[].entry_member` | string or `null` | The entry member's roster name, from the record in this read that says it is the entry member: an entry of `capsules`, else a record of the formation whose process is gone. `null` when no record in this read says so |
 | `formations[].listed` | integer | How many entries of `capsules` carry this `formation_id` |
 | `formations[].ended` | integer | How many entries of `not_listed` have `reason: "ended"` |
 | `formations[].gone_without_ending` | integer | How many entries of `not_listed` have `reason: "gone_without_ending"` |

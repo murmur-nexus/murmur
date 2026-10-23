@@ -764,6 +764,7 @@ mod tests {
             credentials: Default::default(),
             formation_id: Some(FormationId::mint()),
             formation_member: None,
+            formation_entry: false,
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,

@@ -2321,8 +2321,8 @@ lifecycle:
 
 | Value | Behaviour |
 |---|---|
-| `none` | Capsule runs from `task.md` if present, then exits. The door answers `SendMessage` with JSON-RPC error `-32601`, and `SendStreamingMessage` and `SubscribeToTask` with `-32004` — see [Agent Card: Errors](agent-card.md#errors). |
-| `single` (default) | Capsule accepts one A2A task, runs it, then exits. A second message while a task is active is answered with a task in [`TASK_STATE_REJECTED`](agent-card.md#task-states). A task accepted while a `task.md` task runs is never started: it ends `TASK_STATE_REJECTED` when the session ends — see [Tasks queued when the session ends](#queued-tasks-at-session-end). |
+| `none` | Capsule runs the launch's own task — `--task`, or a `task.md` or `input.txt` in the workdir — if it has one, then exits. The door answers `SendMessage` with JSON-RPC error `-32601`, and `SendStreamingMessage` and `SubscribeToTask` with `-32004` — see [Agent Card: Errors](agent-card.md#errors). |
+| `single` (default) | Capsule runs one task — the launch's own, or else the first A2A task — then exits. A message while a task is queued or active, the launch's own task included, is answered with a task in [`TASK_STATE_REJECTED`](agent-card.md#task-states): `task rejected: capsule is busy`. |
 | `queue` | Capsule accepts up to `queue_depth` pending tasks simultaneously. Tasks are processed serially; new tasks are accepted as soon as the pending queue drops below `queue_depth`. Under `after_task: exit`, a task still queued when the session ends is never started: it ends `TASK_STATE_REJECTED` — see [Tasks queued when the session ends](#queued-tasks-at-session-end). |
 
 ### `lifecycle.after_task` { #lifecycle-after-task }
