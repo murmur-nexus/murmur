@@ -135,21 +135,15 @@ impl Fixture {
     }
 }
 
-/// A launched run's session workdir, read off the line `mur run --verbose` prints.
-fn workdir_of(assert: Assert) -> PathBuf {
-    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    common::parse_workdir_from_stdout(&stdout)
-}
-
 /// A launched run's records directory, read off the line `mur run --verbose` prints.
 fn records_of(assert: Assert) -> PathBuf {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     common::parse_records_from_stdout(&stdout)
 }
 
-/// The session id a launched run reported, taken off its session directory.
+/// The session id a launched run reported, taken off its records directory.
 fn session_id_of(assert: Assert) -> String {
-    workdir_of(assert)
+    records_of(assert)
         .file_name()
         .unwrap()
         .to_string_lossy()
@@ -330,9 +324,9 @@ fn every_address_form_resolves_without_workdir() {
     drop(f.project);
 }
 
-/// The same three address forms under the other layout: `--workdir <dir>` puts sessions at
-/// `<dir>/.murmur/<ses_id>` and their records in `<dir>`'s records group, and `--resume` has to
-/// look in that group instead.
+/// The same three address forms under the other layout: `--workdir <dir>` puts nothing in
+/// `<dir>` and the sessions' records in `<dir>`'s records group, and `--resume` has to look in
+/// that group instead.
 #[test]
 fn every_address_form_resolves_with_workdir() {
     let f = fixture(
@@ -346,9 +340,10 @@ fn every_address_form_resolves_with_workdir() {
     let first = session_id_of(f.run("alpha task", &["--workdir", mount_arg]));
     let second = session_id_of(f.run("beta task", &["--workdir", mount_arg]));
     f.run("gamma task", &["--workdir", mount_arg]).success();
-    assert!(
-        mount.path().join(".murmur").join(&first).is_dir(),
-        "--workdir puts sessions under <dir>/.murmur"
+    assert_eq!(
+        fs::read_dir(mount.path()).unwrap().count(),
+        0,
+        "--workdir puts nothing in <dir>"
     );
 
     f.run("by full id", &["--workdir", mount_arg, "--resume", &first])
@@ -673,8 +668,8 @@ fn bare_resume_means_at_1_without_workdir() {
     drop(f.project);
 }
 
-/// The other workdir layout: `--workdir <dir>` puts sessions at `<dir>/.murmur/<ses_id>` and their
-/// records in `<dir>`'s records group, and a valueless `--resume` has to find `@1` there.
+/// The other workdir layout: `--workdir <dir>` puts the sessions' records in `<dir>`'s records
+/// group, and a valueless `--resume` has to find `@1` there.
 /// `--workdir` following it also shows that clap never takes a `--`-prefixed token as the
 /// optional value.
 #[test]

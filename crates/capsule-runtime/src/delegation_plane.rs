@@ -1092,8 +1092,7 @@ fn end_for_canceled_task(
 
 /// Where a finished child left its answer, and what it says.
 ///
-/// The candidate list is [`crate::delegation::child_result_candidates`], so the file this plane
-/// reads and the file the completion watcher names are found by one rule. Each candidate is read
+/// The candidates are [`crate::delegation::child_result_reads`], most specific first. Each is read
 /// through the held root it lies in, `child_records` (the child's records directory) or
 /// `child_workdir` (its work folder), and the returned path is absolute. A link where a candidate
 /// belongs is refused and latched on that root, and its target is never read.

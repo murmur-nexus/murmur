@@ -904,7 +904,8 @@ pub struct SealedDevice {
 /// `/dev/console` is omitted (the OCI spec creates it only for a terminal-attached container, and
 /// a capsule subprocess has pipes, not a controlling terminal). `/dev/ptmx` and `/dev/pts` come
 /// from a `devpts` mount rather than from this list, and `/dev/shm` is omitted deliberately: it is
-/// writable, and the session workdir and `/tmp` are the only writable paths in a composed root.
+/// writable, and the session workdir, `/tmp` and the home folder are the only writable paths in a
+/// composed root.
 pub const SEALED_DEVICE_NODES: &[SealedDevice] = &[
     SealedDevice {
         name: "null",
@@ -1330,8 +1331,8 @@ pub(crate) fn plan_composed_root(
     );
 
     // 6. The capsule's workdir — the accessible one, which is also the subprocess cwd — at its
-    //    own absolute path, read-write. With /tmp above, the only writable paths in the composed
-    //    root.
+    //    own absolute path, read-write. With /tmp above and the home folder below, the only
+    //    writable paths in the composed root.
     let workdir_target = rebase(base, accessible_workdir);
     builder.mkdir_p(&workdir_target);
     builder.push(

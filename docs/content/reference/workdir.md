@@ -76,6 +76,10 @@ every 10 seconds and sums their sizes; crossing the ceiling ends the session wit
 [`E-RUN-013`](diagnostics.md). `MURMUR.md` states the ceiling for every
 `inference.transport: http` session.
 
+Under `--workdir` the work folder is the whole folder you pass, including the files that were in it
+before the run. For a folder near or above the 10 GiB default, raise `workdir_max_bytes`, or the
+session ends at the first check.
+
 ---
 
 ## Task input

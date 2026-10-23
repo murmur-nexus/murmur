@@ -41,9 +41,9 @@
 //!     `linux_enforce::WORKDIR_ACCESS_RIGHTS_NO_EXEC` and `linux_enforce::workdir_access_rights`.
 //!     Outside the workdir, alongside the derived
 //!     read+execute grants, a fixed three-device set is granted unconditionally — see
-//!     `CAPSULE_DEVICE_GRANTS`: `/dev/null` read+write (with the session's temporary folder, the
-//!     only writable paths outside the workdir), `/dev/zero` and `/dev/urandom` read-only, and no
-//!     other device at all.
+//!     `CAPSULE_DEVICE_GRANTS`: `/dev/null` read+write (with the session's temporary and home
+//!     folders, the only writable paths outside the workdir), `/dev/zero` and `/dev/urandom`
+//!     read-only, and no other device at all.
 //!
 //! Both Linux tiers additionally strip the forked child's **Linux capabilities** (bounding set,
 //! then permitted/effective/inheritable, then `no_new_privs`) before `execve()` — see
@@ -2561,7 +2561,7 @@ impl Drop for EndSessionOnDrop {
 /// addition to the workdir's own grant (which withholds device-node and unix-socket creation, see
 /// `linux_enforce::WORKDIR_ACCESS_RIGHTS`) — so allowlisted programs can actually exec and
 /// dynamically link, and the only writable paths outside the workdir are the session's temporary
-/// folder and `/dev/null`, one of the three fixed devices in `CAPSULE_DEVICE_GRANTS`. Seccomp
+/// and home folders and `/dev/null`, one of the three fixed devices in `CAPSULE_DEVICE_GRANTS`. Seccomp
 /// additionally refuses the `socket(2)` domains in `denied_socket_domains` — closing the
 /// `/var/run/docker.sock` path, which no Landlock ABI mediates for pathname sockets. The forked
 /// shell child also drops every Linux capability before `execve` (see
@@ -2572,8 +2572,8 @@ const KERNEL_ENFORCEMENT_NOTICE: &str = "capabilities.shell.allow is non-empty a
 resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now grants a narrow, \
 derived read+execute scope outside the workdir (the allowlisted binaries, their loader, and their \
 shared libraries — nothing writable, no directory granted wholesale), plus a fixed device set \
-every capsule gets unconditionally: /dev/null read+write (with the session's temporary folder, \
-the only writable paths outside the workdir), \
+every capsule gets unconditionally: /dev/null read+write (with the session's temporary and home \
+folders, the only writable paths outside the workdir), \
 /dev/zero and /dev/urandom read-only, and no other device — /dev/random, /dev/full, /dev/tty and \
 raw block devices stay denied. The workdir's own grant also \
 withholds device-node and unix-socket creation; seccomp refuses socket(AF_UNIX) outright unless \
@@ -2590,9 +2590,9 @@ denied, not absent: stat, access and readlink on an ungranted path still succeed
 /// has one. Names what `sealed` adds over `scoped` so the warning is not a louder copy of it.
 const KERNEL_SEALED_ENFORCEMENT_NOTICE: &str = "capabilities.shell.allow is non-empty and this \
 host resolved to the sealed kernel-enforcement tier: the subprocess tree runs in a private mount \
-namespace pivoted onto a composed root (host runtime bind-mounted read-only, the session workdir \
-and /tmp, the session's temporary folder, the only writable paths, a private /dev tmpfs carrying \
-the OCI default device set), with Landlock \
+namespace pivoted onto a composed root (host runtime bind-mounted read-only, the session workdir, \
+its temporary folder at /tmp and its home folder at $HOME the only writable paths, a private /dev \
+tmpfs carrying the OCI default device set), with Landlock \
 and seccomp still installed inside it as defence in depth. Paths outside that root are absent \
 rather than denied — with one documented exception: /proc is a bind of the host's, not a masked \
 private procfs, because mounting one unprivileged needs a PID namespace this tier does not create, \

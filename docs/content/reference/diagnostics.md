@@ -1346,7 +1346,7 @@ another directory, between its creation and the launch:
 
 ```text
 error[E-RUN-051]: the workdir /home/dev/.murmur/records/home/dev/project/ses_019f01a9c3e47d1a9b2c3d4e5f6a7b8c/children/worker-3f9c2a1b7e4d5c60 is not the directory the delegating capsule created (expected 2049:1311021, found 2049:1311042)
-  hint: the delegating capsule's workdir changed under .murmur/children between the directory's creation and this launch; nothing was written
+  hint: the delegating capsule's child work folder in children/ changed between the directory's creation and this launch; nothing was written
 ```
 
 The delegation fails at the child's start, as any child that cannot launch does. Nothing was

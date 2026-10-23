@@ -31,8 +31,6 @@
 //! line goes to stderr; it is not retried beyond the launcher's single retry and it is not
 //! silently discarded.
 
-use std::path::{Path, PathBuf};
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -40,7 +38,7 @@ use crate::a2a::{send_message_params, user_message, A2A_PROTOCOL_VERSION, A2A_VE
 use crate::errors::RuntimeError;
 use crate::http_client::http_json;
 use crate::origin::{TaskOrigin, PEER_ORIGIN_HEADER};
-use crate::workdir_fs::{EntryKind, WorkdirRoot, DEFAULT_FILE_MODE};
+use crate::workdir_fs::{WorkdirRoot, DEFAULT_FILE_MODE};
 
 /// The variable the parent's launcher injects into a delegated child, carrying its
 /// [`SpawnerHandle`] as compact JSON.
@@ -387,29 +385,12 @@ pub(crate) fn bound_detail(detail: String) -> String {
     format!("{} […]", &detail[..end])
 }
 
-/// Where a finished child may have left its answer, most specific first, as absolute paths.
+/// Where a finished child may have left its answer, most specific first, each relative to the
+/// directory it lies in and `true` when that is the child's records directory.
 ///
 /// A capsule that stays up for more than one task overwrites the unsuffixed file, so the per-task
 /// one is preferred; and the agent loop writes into the child's records directory while a script
-/// capsule writes into its work folder directly. One rule, read by the delegating plane when it
-/// takes the answer and by the completion watcher when it names the file it did not read.
-pub fn child_result_candidates(
-    child_records_dir: &Path,
-    child_workdir: &Path,
-    task_id: &str,
-) -> [PathBuf; 4] {
-    child_result_relatives(task_id).map(|(in_records, relative)| {
-        if in_records {
-            child_records_dir
-        } else {
-            child_workdir
-        }
-        .join(relative)
-    })
-}
-
-/// [`child_result_candidates`], each relative to the directory it lies in and `true` when that is
-/// the child's records directory.
+/// capsule writes into its work folder directly.
 fn child_result_relatives(task_id: &str) -> [(bool, String); 4] {
     let per_task = format!(
         "{}/result_{task_id}.txt",
@@ -424,7 +405,7 @@ fn child_result_relatives(task_id: &str) -> [(bool, String); 4] {
     ]
 }
 
-/// [`child_result_candidates`], each paired with the held root it is read through:
+/// [`child_result_relatives`], each paired with the held root it is read through:
 /// `child_records`, the child's records directory, or `child_workdir`, its work folder.
 pub(crate) fn child_result_reads<'a>(
     child_records: &'a WorkdirRoot,
@@ -443,18 +424,6 @@ pub(crate) fn child_result_reads<'a>(
                 relative,
             )
         })
-}
-
-/// The first of [`child_result_candidates`] that is a regular file, absolute, or `None` when the
-/// child wrote no result. A link where a candidate belongs is skipped, never followed.
-pub fn child_result_path(
-    child_records: &WorkdirRoot,
-    child_workdir: &WorkdirRoot,
-    task_id: &str,
-) -> Option<PathBuf> {
-    child_result_reads(child_records, child_workdir, task_id)
-        .find(|(root, relative)| matches!(root.entry_kind(relative), Ok(Some(EntryKind::File))))
-        .map(|(root, relative)| root.host_path(&relative))
 }
 
 /// The completion the child recorded, or `None` when it recorded none.

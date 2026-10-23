@@ -312,7 +312,7 @@ Prefer scheme + host, and port when needed. Do not add broad domains "just in ca
 
 #### Filesystem
 
-Ask: **Which part of the session workdir does the capsule actually need?**
+Ask: **Which part of the work folder does the capsule actually need?**
 
 ```yaml
 capabilities:
@@ -366,7 +366,7 @@ Only override defaults when the workload needs a different hard ceiling. Useful 
 - CPU seconds;
 - per-process memory;
 - Linux cgroup aggregate memory, PID, CPU, and I/O limits;
-- total workdir size.
+- total size of the work folder, `$HOME` and `$TMPDIR` together (`workdir_max_bytes`; under `--workdir` the whole folder counts).
 
 If the capsule runs untrusted or potentially runaway developer commands, resource limits are part of the security design, not performance tuning.
 

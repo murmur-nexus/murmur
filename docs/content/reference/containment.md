@@ -60,8 +60,8 @@ subprocess routes that mechanism confines, and `--explain-scope --json` carries 
 interpreter (dynamic loader), and the transitive closure of their shared libraries — so an
 allowlisted program can exec and dynamic-link `/usr/bin/bash` and its libraries while no directory
 is granted wholesale and the only writable paths outside the workdir are `/dev/null` (see
-[the fixed capsule device set](#capsule-device-set)) and the
-[session's temporary folder](#temp-folder). A capsule may *additionally* name specific
+[the fixed capsule device set](#capsule-device-set)), the
+[session's temporary folder](#temp-folder) and its [home folder](#home-folder). A capsule may *additionally* name specific
 host directories a path-based interpreter needs (its stdlib) via
 `capabilities.shell.interpreter_runtime`, which grants exactly the directories named, each with an
 explicit per-directory `list_dir` flag (see [`W-SEC-009`](diagnostics.md#w-sec-009)). The workdir
@@ -401,7 +401,7 @@ every response reports in `x-murmur-containment`:
 | Achieved class | Rule | Why |
 |---|---|---|
 | `scoped` | Refuse any symlink on the resolved path with `symlink_refused`, and omit symlinked entries from a listing | Host-path grants are possible and the filesystem's shape stays visible, so a symlink under the export root could target a granted host path |
-| `sealed` | Follow, and serve only when the fully-resolved target is still beneath the export root | The workdir and the session's temporary folder are the only writable paths and there is no outside to name, so everything under the root is capsule-authored |
+| `sealed` | Follow, and serve only when the fully-resolved target is still beneath the export root | The workdir, the session's temporary folder and its home folder are the only writable paths and there is no outside to name, so everything under the root is capsule-authored |
 | `advisory` | Same rule as `sealed` | A convention on top of a convention; every response carries `advisory` so a reader knows what it is trusting |
 
 A symlink whose target leaves the root is refused at every class: `symlink_refused` under `scoped`,
@@ -435,7 +435,8 @@ denied, and a fourth device can appear only by editing the fixed set.
 set, so the kernel-visible device namespace is the boundary rather than a per-path grant. It holds
 six nodes — `null`, `zero`, `full` and `tty` readable and writable, `random` and `urandom` read-only
 — plus the OCI symlinks `fd`, `stdin`, `stdout`, `stderr` and `ptmx`. `/dev/shm` is deliberately
-absent: it is writable, and the workdir and `/tmp` are the only writable paths in a composed root.
+absent: it is writable, and the workdir, `/tmp` and the home folder are the only writable paths in a
+composed root.
 Landlock keeps running *inside* the composed root, so the sealed `/dev` carries Landlock rules of
 its own — without them its device nodes would be present and unopenable. The two device sets are
 independent: a `scoped` declaration on a `sealed`-capable host keeps the three-rule list above.
