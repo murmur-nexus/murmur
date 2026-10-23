@@ -156,6 +156,23 @@ jobs:
       - name: WIT package versions are single-valued and documented
         run: ./scripts/check-wit-versions.sh
 
+  dev-version:
+    name: dev-version
+    runs-on: ubuntu-latest
+    # Fails when the workspace version equals a release tag that is not on HEAD: a build from
+    # this commit would report that release. On a pull request HEAD is the merge commit, which
+    # is never a tag's commit, so a pull request whose version a release already took always
+    # fails. The release bump commit passes on its push to main because its tag does not exist
+    # yet; after the tag, main reopens at the next minor -dev (.github/RELEASE_GUIDE.md).
+    steps:
+      - uses: actions/checkout@v4
+      # The default checkout has no tags. Only the release tags and the commits they point at
+      # are fetched, at depth 1: the full history is far larger than what the check reads.
+      - name: Fetch the release tags
+        run: git fetch --no-tags --depth=1 origin '+refs/tags/v*:refs/tags/v*'
+      - name: The workspace version is not a release another commit already took
+        run: ./scripts/check-dev-version.sh
+
   glibc-floor-binary:
     name: glibc-floor-binary
     runs-on: ubuntu-latest

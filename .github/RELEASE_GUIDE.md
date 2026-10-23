@@ -6,7 +6,7 @@ keystrokes — each step names the script or workflow that does the work.
 ## Shape of a release
 
 ```
-gates green on main  →  bump + commit  →  publish to crates.io  →  tag
+gates green on main  →  bump + commit  →  publish to crates.io  →  tag  →  reopen main
                                                                     ↓
                                           CI builds, checksums, GitHub Release
                                                                     ↓
@@ -20,7 +20,7 @@ fail should fail before it.
 ## 1. Gates
 
 All of these pass on `main` before the version moves. CI enforces the first
-four on every PR; the rest are release-time only.
+six on every PR; the rest are release-time only.
 
 | Gate | Command |
 | --- | --- |
@@ -29,6 +29,7 @@ four on every PR; the rest are release-time only.
 | Lint | `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
 | Supply chain | `cargo deny check advisories bans licenses` |
 | WIT self-consistency | `./scripts/check-wit-versions.sh` |
+| Dev version | `./scripts/check-dev-version.sh` — exits 1 when the workspace version equals a release tag on another commit. It passes on the bump commit, because `vX.Y.Z` does not exist yet |
 | WIT contracts moved since the last release | `./scripts/wit-versions-changed-since.sh vX.Y.Z` — pass the *previous* release tag; exits 1 naming every `murmur:*` package whose version moved |
 | Docs | `cd docs && mkdocs build --strict` |
 | Host-only isolation tests | `docs/content/reference/resource-limits-manual-verification.md` — CI reports these as `[SKIP-HOST]`; run them by hand on a real Linux host for every release |
@@ -49,7 +50,8 @@ re-running the workflow. See [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ## 2. Bump
 
-Three things move together in one commit:
+The version goes from `X.Y.Z-dev`, what `main` carries between releases, to
+`X.Y.Z`. Three things move together in one commit:
 
 1. `[workspace.package] version` in the root `Cargo.toml`.
 2. **The pinned versions in `[workspace.dependencies]`** — `murmur-artifact` and
@@ -80,7 +82,21 @@ git push origin main --tags
 generates the changelog via `.github/scripts/release-notes.py aggregate`, and
 creates the GitHub Release with the binaries and `checksums.txt`.
 
-## 5. Changelog
+## 5. Reopen main
+
+Straight after the tag is pushed, one commit on `main` moves
+`[workspace.package] version` to the next minor with `-dev`: after `vX.Y.Z`,
+`X.(Y+1).0-dev`, so after `v0.8.0` it is `0.9.0-dev`. Both
+`[workspace.dependencies]` pins and `Cargo.lock` move with it, as in the bump.
+It lands before anything else merges.
+
+Until it does, CI's `dev-version` job (`scripts/check-dev-version.sh`) fails
+every pull request and every push to `main`: their version equals an existing
+tag on a commit that is not the tag's. A build from `main` then reports
+`X.(Y+1).0-dev` and the commit it was built from, so no build after the tag
+claims to be the release.
+
+## 6. Changelog
 
 CI generates it as a build artifact; committing it is manual.
 
@@ -90,7 +106,7 @@ CI generates it as a build artifact; committing it is manual.
   `CHANGELOG.md` in the same commit.
 - Update the changelog on murmur.nexus.
 
-## 6. Verify as a user
+## 7. Verify as a user
 
 Both published install paths, on a machine that is not the build host:
 

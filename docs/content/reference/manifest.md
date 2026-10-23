@@ -1438,7 +1438,7 @@ deploy:
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `deploy` | map | no | Absent or `deploy: {}`, every field takes its default. |
-| `deploy.mur_version` | string | no | The `mur` release `mur deploy run` downloads from GitHub releases, caches at `~/.murmur/bin/mur-{version}-{platform}` and installs on the target. Default: the version of the `mur` running `mur deploy run`. A blank value takes the default. [`--mur-binary`](cli.md#mur-deploy-run) takes precedence over it. |
+| `deploy.mur_version` | string | no | The `mur` release `mur deploy run` downloads from GitHub releases, caches at `~/.murmur/bin/mur-{version}-{platform}` and installs on the target. Default: the version of the `mur` running `mur deploy run`. A blank value takes the default. [`--mur-binary`](cli.md#mur-deploy-run) takes precedence over it. A `mur` built from `main` reports an `X.Y.Z-dev` [version](cli.md#mur-version) that has no release to download, so a deploy run from it needs `deploy.mur_version` or `--mur-binary`, and otherwise fails with `E-DEPLOY-006`. |
 
 A top-level `mur_version` key is refused with [`E-MAN-003`](diagnostics.md#e-man-003), whatever its
 value; the pin is written as `deploy.mur_version`.
