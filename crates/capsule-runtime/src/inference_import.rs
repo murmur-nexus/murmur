@@ -16,7 +16,10 @@ use wasmtime::{
 };
 
 use crate::{
-    agent::{build_driver_payload, count_tokens, parse_driver_usage, provider_counts, DriverUsage},
+    agent::{
+        build_driver_payload, count_tokens, parse_driver_usage, provider_counts, DriverUsage,
+        DRIVER_RETURNED_ERROR,
+    },
     bindings::{
         hook::murmur::runtime::inference::{InferenceRequest, InferenceResponse},
         host::murmur::tool::run::{Status, ToolInput},
@@ -396,7 +399,7 @@ impl HookInferenceCtx {
             let err = response
                 .get("error")
                 .and_then(Value::as_str)
-                .unwrap_or("driver returned error");
+                .unwrap_or(DRIVER_RETURNED_ERROR);
             return Err((
                 INFERENCE_ERROR_DRIVER_ERROR,
                 format!("inference driver returned an error: {err}"),

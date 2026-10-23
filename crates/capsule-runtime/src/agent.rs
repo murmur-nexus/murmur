@@ -2356,7 +2356,7 @@ impl FailedTurnCall<'_> {
 }
 
 /// What a failed driver call is reported by when its payload says nothing more.
-const DRIVER_RETURNED_ERROR: &str = "driver returned error";
+pub(crate) const DRIVER_RETURNED_ERROR: &str = "driver returned error";
 
 /// The error text of a driver call that answered other than `Passed`, from its `data` (or
 /// `summary`): a JSON object's string `error` member when it has one, the payload as given

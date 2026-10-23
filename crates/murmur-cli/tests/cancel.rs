@@ -822,12 +822,13 @@ fn detached_scenario(name: &str) -> (common::ScriptedServer, TempDir, Capsule, S
     (server, home, capsule, task_id)
 }
 
-/// Whether any process on this host is still running `sleep 30`.
-fn a_sleep_is_still_running() -> bool {
+/// Whether any process on this host is running `command`. The check is host-wide, so a command
+/// another test binary also runs can answer for it; `sleep 33` is one no other test runs.
+fn a_process_is_running(command: &str) -> bool {
     std::process::Command::new("ps")
         .args(["-eo", "args"])
         .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).contains("sleep 30"))
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains(command))
         .unwrap_or(false)
 }
 
@@ -869,19 +870,9 @@ fn cancel_names_a_detached_shell_still_running() {
     );
 
     assert!(
-        a_sleep_is_still_running(),
+        a_process_is_running("sleep 30"),
         "the demoted command was killed; a cancel stops the runtime waiting, not the work"
     );
-}
-
-/// Whether any process on this host is still running `sleep 33`, a duration no other test sleeps
-/// for.
-fn the_foreground_sleep_is_running() -> bool {
-    std::process::Command::new("ps")
-        .args(["-eo", "args"])
-        .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).contains("sleep 33"))
-        .unwrap_or(false)
 }
 
 /// A cancel that lands while a foreground shell command runs ends the task at once rather than
@@ -919,7 +910,7 @@ fn cancel_demotes_a_running_foreground_command() {
         .unwrap()
         .to_string();
     let running_by = Instant::now() + Duration::from_secs(120);
-    while !the_foreground_sleep_is_running() {
+    while !a_process_is_running("sleep 33") {
         assert!(Instant::now() < running_by, "the command never started");
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -952,7 +943,7 @@ fn cancel_demotes_a_running_foreground_command() {
         "the residue names the demoted command: {task_canceled}"
     );
     assert!(
-        the_foreground_sleep_is_running(),
+        a_process_is_running("sleep 33"),
         "a cancel stops the runtime waiting, not the command"
     );
 
