@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use capsule_runtime::session_status::{SessionDeadline, INHERITED_DEADLINE_FLAG};
 use capsule_runtime::{
     child_workdir_for, delegation::SPAWNER_ENV, formation::FORMATION_ID_ENV, launch_child_capsule,
     ChildLaunchRequest, FormationId, LaunchedChild, SpawnApproval, Spawner,
@@ -287,6 +288,16 @@ impl Parent {
         name: &str,
         env_allow: &[&str],
     ) -> Result<LaunchedChild, capsule_runtime::RuntimeError> {
+        self.try_launch_bounded(name, env_allow, None)
+    }
+
+    /// [`Parent::try_launch`], handing the child `deadline` as its parent's.
+    fn try_launch_bounded(
+        &self,
+        name: &str,
+        env_allow: &[&str],
+        deadline: Option<SessionDeadline>,
+    ) -> Result<LaunchedChild, capsule_runtime::RuntimeError> {
         let (grant, _) = self.approve(name);
         launch_child_capsule(ChildLaunchRequest {
             parent_accessible_root: capsule_runtime::WorkdirRoot::open(self.dir()).unwrap(),
@@ -299,6 +310,7 @@ impl Parent {
             spawner: None,
             completion_deadline: None,
             formation_id: None,
+            deadline,
         })
     }
 }
@@ -510,6 +522,7 @@ fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
         }),
         completion_deadline: None,
         formation_id: None,
+        deadline: None,
     })
     .expect("a child that declares no variables launches");
     assert_eq!(
@@ -543,6 +556,7 @@ fn a_child_joins_its_parents_formation_with_or_without_a_spawner() {
             spawner,
             completion_deadline: None,
             formation_id: Some(formation.clone()),
+            deadline: None,
         })
         .unwrap_or_else(|error| panic!("launching '{name}' failed: {error}"));
 
@@ -562,6 +576,53 @@ fn a_child_joins_its_parents_formation_with_or_without_a_spawner() {
         outside.env
     );
     assert_eq!(outside.formation_id, None);
+}
+
+/// A launch handed its parent's deadline passes it on as one moment, and the agent child runs
+/// under it, inherited; a launch handed none passes nothing.
+#[test]
+fn a_child_is_handed_its_parents_deadline_as_its_own() {
+    let parent = Parent::new();
+    let deadline = SessionDeadline::after(Instant::now(), std::time::SystemTime::now(), 300);
+    let mut child = parent
+        .try_launch_bounded("local/child-agent", &[], Some(deadline))
+        .unwrap_or_else(|error| panic!("launching the bounded child failed: {error}"));
+    let at = child
+        .argv
+        .iter()
+        .position(|arg| arg == INHERITED_DEADLINE_FLAG)
+        .unwrap_or_else(|| panic!("no {INHERITED_DEADLINE_FLAG}: {:?}", child.argv));
+    assert_eq!(
+        child.argv.get(at + 1),
+        Some(&deadline.at_unix_millis().to_string()),
+        "{:?}",
+        child.argv
+    );
+    let trace = trace_of(&child);
+    wait_for("the child's session_start", Duration::from_secs(30), || {
+        std::fs::read_to_string(&trace).is_ok_and(|text| text.contains("session_start"))
+    });
+    let start: Value = serde_json::from_str(
+        std::fs::read_to_string(&trace)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(start["deadline"]["at"], deadline.at_rfc3339(), "{start}");
+    assert_eq!(start["deadline"]["source"], "inherited", "{start}");
+    child.shutdown().unwrap();
+
+    let unbounded = parent.launch("local/child-a", &[]);
+    assert!(
+        !unbounded
+            .argv
+            .iter()
+            .any(|arg| arg == INHERITED_DEADLINE_FLAG),
+        "{:?}",
+        unbounded.argv
+    );
 }
 
 // ── 3. A child cannot reach out of its own directory ──────────────────────────
@@ -761,6 +822,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
         spawner: None,
         completion_deadline: None,
         formation_id: None,
+        deadline: None,
     })
     .expect("the leak fixture launches");
 
@@ -816,6 +878,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
         spawner: None,
         completion_deadline: None,
         formation_id: None,
+        deadline: None,
     })
     .expect_err("a child cannot register with a daemon that is not listening");
     let message = error.to_string();
@@ -1038,6 +1101,7 @@ fn a_child_holds_its_own_spawner_lifeline_read_end_and_no_formation_lifeline() {
         spawner: None,
         completion_deadline: None,
         formation_id: Some(formation.clone()),
+        deadline: None,
     });
     std::env::remove_var(FORMATION_LIFELINE_ENV);
     std::env::remove_var(SPAWNER_LIFELINE_ENV);

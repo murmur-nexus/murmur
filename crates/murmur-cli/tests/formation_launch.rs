@@ -66,10 +66,10 @@ struct MemberModel {
     arrived: Arc<AtomicUsize>,
 }
 
-/// The entry member's model: it calls `formation-probe` with `input` once and then ends its turn,
-/// holding the second reply until `release` is sent — so a case can look at a running formation
-/// before its task ends.
-fn entry_model(input: Value) -> (MemberModel, mpsc::Sender<()>) {
+/// The entry member's model: it calls `tool` with `input` once and then ends its turn, holding the
+/// second reply until `release` is sent — so a case can look at a running formation before its
+/// task ends.
+fn entry_model(tool: &'static str, input: Value) -> (MemberModel, mpsc::Sender<()>) {
     let (release, released) = mpsc::channel::<()>();
     let released = Mutex::new(released);
     let arrived = Arc::new(AtomicUsize::new(0));
@@ -77,7 +77,7 @@ fn entry_model(input: Value) -> (MemberModel, mpsc::Sender<()>) {
     let server = ScriptedServer::start_answering(2, move |_| {
         let calls = counter.fetch_add(1, Ordering::SeqCst) + 1;
         if calls == 1 {
-            tool_use_response(PROBE_CALL, PROBE_TOOL, input.clone())
+            tool_use_response(PROBE_CALL, tool, input.clone())
         } else {
             let _ = released
                 .lock()
@@ -193,6 +193,21 @@ impl Project {
     /// As [`Self::new`], with `probes` naming the input each listed member's model calls
     /// `formation-probe` with.
     fn with_probes(members: &[Member], reachability: &str, probes: &[(&str, Value)]) -> Self {
+        Self::build(members, reachability, probes, PROBE_TOOL)
+    }
+
+    /// As [`Self::new`], with the entry member's model calling `entry_tool` in place of
+    /// `formation-probe`.
+    fn with_entry_call(members: &[Member], reachability: &str, entry_tool: &'static str) -> Self {
+        Self::build(members, reachability, &[], entry_tool)
+    }
+
+    fn build(
+        members: &[Member],
+        reachability: &str,
+        probes: &[(&str, Value)],
+        entry_tool: &'static str,
+    ) -> Self {
         let dir = tempfile::Builder::new()
             .prefix("formation-launch-")
             .tempdir()
@@ -232,7 +247,8 @@ impl Project {
                 DRIVER_VERSION
             };
             let (model, lifecycle) = if member.entry {
-                let (model, sender) = entry_model(probe_of(member.name).unwrap_or(json!({})));
+                let (model, sender) =
+                    entry_model(entry_tool, probe_of(member.name).unwrap_or(json!({})));
                 release = Some(sender);
                 (model, "task_acceptance: single\n  after_task: exit")
             } else {
@@ -482,7 +498,11 @@ fn assert_formation_line(formation: &Value, entry: &str, peers: &[&str]) {
         assert_eq!(mode, 0o700, "{peer}");
     }
     let keys: Vec<&String> = formation.as_object().unwrap().keys().collect();
-    assert_eq!(keys, ["entry", "formation_id", "peers"], "{formation}");
+    assert_eq!(
+        keys,
+        ["deadline", "entry", "formation_id", "peers"],
+        "{formation}"
+    );
 }
 
 /// Every line of every peer's `trace.jsonl` parses: none was torn by the teardown. The entry
@@ -1223,9 +1243,16 @@ fn the_entry_members_end_or_the_launchers_signal_ends_the_formation() {
         for peer in ["coder", "reviewer"] {
             assert_wound_down(&project.trace_of(peer), id);
         }
+        // With no --deadline, the formation has none and no member runs under one.
+        assert_eq!(formation["deadline"], Value::Null, "{formation}");
+        for peer in ["coder", "reviewer"] {
+            let start = &project.trace_of(peer)[0];
+            assert_eq!(start["deadline"], Value::Null, "{peer}: {start}");
+        }
         if kill_launcher {
             // The entry member's lifeline is closed rather than a `SIGTERM` forwarded to it.
             let planner_trace = project.trace_of("planner");
+            assert_eq!(planner_trace[0]["deadline"], Value::Null);
             assert_wound_down(&planner_trace, id);
             assert_task_canceled(&planner_trace);
             // The entry member is a member: its formation's end cancelled its task, which is not
@@ -1249,6 +1276,130 @@ fn the_entry_members_end_or_the_launchers_signal_ends_the_formation() {
         }
         assert!(!stderr.contains("SIGTERM received"), "{stderr}");
     }
+}
+
+/// Publish the driver into the project's `HOME` compiled, so no member compiles it while the
+/// formation's deadline runs.
+fn precompile_driver(project: &Project) {
+    let artifacts = TempDir::new().unwrap();
+    let driver = common::create_driver_artifact(
+        artifacts.path(),
+        DRIVER_NAME,
+        DRIVER_VERSION,
+        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    let output = project
+        .command(&["precompile", driver.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `--deadline` bounds the whole formation: every member runs under the one moment the launcher
+/// fixed, every member ends itself there `deadline_reached` — the peers too, whose lifelines the
+/// launcher closes only after — and the launcher exits 1 with `E-RUN-053`.
+#[test]
+fn a_roster_deadline_ends_every_member_at_it() {
+    // Long enough to cover three members staging under load; the driver is precompiled.
+    const DEADLINE_SECS: u64 = 90;
+    let _lock = launch_lock();
+    let project = Project::with_entry_call(
+        &[CODER, REVIEWER, PLANNER],
+        FULL_REACH,
+        capsule_runtime::session_status::SESSION_STATUS_TOOL,
+    );
+    precompile_driver(&project);
+    let mut launcher = project.launch(&["--deadline", &DEADLINE_SECS.to_string()], &[]);
+    let begun = launcher.started;
+    let deadline_falls = begun + Duration::from_secs(DEADLINE_SECS);
+    let (formation_at, formation) =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| launcher.next_json()))
+            .unwrap_or_else(|_| {
+                panic!(
+            "the {DEADLINE_SECS}s deadline fell during the launch, before the formation line; \
+             stderr:\n{}",
+            launcher.stderr()
+        )
+            });
+    assert!(
+        formation_at < deadline_falls,
+        "the deadline fell during the launch: {formation}"
+    );
+    assert_formation_line(&formation, "planner", &["coder", "reviewer"]);
+    assert_eq!(formation["deadline"]["secs"], DEADLINE_SECS, "{formation}");
+    let at = formation["deadline"]["at"].as_str().unwrap().to_string();
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&at).is_ok() && at.ends_with('Z'),
+        "{at}"
+    );
+    let (_, planner) = launcher.next_json();
+    project.await_entry_mid_task();
+
+    let status = launcher.wait();
+    let took = begun.elapsed();
+    let stderr = launcher.stderr();
+    let stdout = launcher.stdout().join("\n");
+    let _ = project.release.send(());
+    assert_eq!(status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("E-RUN-053") || stdout.contains("E-RUN-053"),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        took <= Duration::from_secs(DEADLINE_SECS + 25),
+        "the launcher took {took:?}"
+    );
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
+
+    for member in ["coder", "reviewer", "planner"] {
+        let trace = project.trace_of(member);
+        let kinds = event_kinds(&trace);
+        let deadline = &trace[0]["deadline"];
+        assert_eq!(deadline["at"], at.as_str(), "{member}: {deadline}");
+        assert_eq!(deadline["source"], "inherited", "{member}: {deadline}");
+        let reached: Vec<&Value> = trace
+            .iter()
+            .filter(|event| event["event_type"] == "deadline_reached")
+            .collect();
+        assert_eq!(reached.len(), 1, "{member}: {kinds:?}");
+        assert_eq!(reached[0]["source"], "inherited", "{member}");
+        assert_eq!(reached[0]["deadline_at"], at.as_str(), "{member}");
+        assert!(!kinds.contains(&"formation_ended"), "{member}: {kinds:?}");
+        let session_end = trace.last().unwrap();
+        assert_eq!(
+            session_end["event_type"], "session_end",
+            "{member}: {kinds:?}"
+        );
+        assert_eq!(
+            session_end["exit_status"], "deadline_reached",
+            "{member}: {session_end}"
+        );
+    }
+
+    let planner_trace = project.trace_of("planner");
+    let status_record = planner_trace
+        .iter()
+        .find(|event| event["event_type"] == "session_status")
+        .unwrap_or_else(|| {
+            panic!(
+                "no session_status record: {:?}",
+                event_kinds(&planner_trace)
+            )
+        });
+    let reported = &status_record["status"]["time"]["deadline"];
+    assert_eq!(reported["at"], at.as_str(), "{reported}");
+    assert!(
+        reported["left_secs"].as_u64().unwrap() <= DEADLINE_SECS,
+        "{reported}"
+    );
+    assert_task_canceled(&planner_trace);
 }
 
 /// The kill path: `SIGKILL` of the launcher leaves nothing to stop the members, and every member

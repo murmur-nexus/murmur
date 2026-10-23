@@ -180,6 +180,11 @@ pub struct ChildLaunchRequest {
     /// when `Some`, whether or not [`Self::spawner`] is. Inherited from the parent and never
     /// minted here; `None` — a parent in no formation — injects nothing.
     pub formation_id: Option<FormationId>,
+    /// The parent session's deadline, handed to the child as
+    /// [`crate::session_status::INHERITED_DEADLINE_FLAG`] and its moment, so the child's own runtime
+    /// ends it there. `None` bounds nothing. A script-capsule child takes no session deadline from
+    /// it, and ends with its parent through its spawner lifeline.
+    pub deadline: Option<crate::session_status::SessionDeadline>,
 }
 
 /// How a child's process ended, as the watcher sees it.
@@ -576,7 +581,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
     let workdir = request.parent_accessible_root.host_path(&workdir_rel);
 
     let binary = mur_binary()?;
-    let argv: Vec<String> = vec![
+    let mut argv: Vec<String> = vec![
         binary.display().to_string(),
         "run".to_string(),
         "--capsule".to_string(),
@@ -592,6 +597,10 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         "--no-env-file".to_string(),
         "--spawn-grant-stdin".to_string(),
     ];
+    if let Some(deadline) = request.deadline {
+        argv.push(crate::session_status::INHERITED_DEADLINE_FLAG.to_string());
+        argv.push(deadline.at_unix_millis().to_string());
+    }
     // Minted here, once per launch: a caller holding one `Spawner` that delegates twice gets two
     // delegation ids, and neither child can report under the other's.
     let handle = request
@@ -1499,6 +1508,7 @@ mod tests {
             spawner,
             completion_deadline: None,
             formation_id: None,
+            deadline: None,
         }
     }
 

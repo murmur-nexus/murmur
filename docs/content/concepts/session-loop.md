@@ -137,6 +137,26 @@ task used by the numbers `mur trace show` prints, and how many of the calls were
 task did not complete: `GetTask` reads `TASK_STATE_FAILED`, and
 [`mur run`](../reference/cli.md#mur-run-status) exits `1`.
 
+## Deadlines { #deadlines }
+
+A deadline is a wall-clock moment at which the runtime ends the session, whatever it is doing: the
+running task is cancelled and ends `canceled`, the session ends `deadline_reached`, and `mur run`
+exits with [`E-RUN-053`](../reference/diagnostics.md#e-run-053).
+
+A session runs under the **earliest** deadline placed on it:
+
+| Deadline | Placed by |
+|---|---|
+| Its own | [`mur run --deadline`](../reference/cli.md#mur-run-deadline) |
+| Its formation's | [`mur run --roster --deadline`](../reference/roster.md#launch-stop): one moment every member shares |
+| Its parent's | The capsule that launched it with `delegate-task` or a plan `capsule` step. A child runs no longer than its parent, and a grandchild inherits the same moment |
+
+The agent sees only the effective deadline, through
+[`session-status`](../reference/runtime-provided-tools.md#session-status) and its one
+[deadline notice](../reference/runtime-provided-tools.md#deadline-notice). The parent's wait for a
+child, [`lifecycle.delegation_deadline_secs`](../reference/manifest.md#lifecycle-delegation-deadline-secs),
+is a separate bound: whichever falls first ends the child.
+
 ## Task reopening (`commit_policy: reopen-task`) { #task-reopening-commit_policy-reopen-task }
 
 A hook bound to `on-task-end` with `commit_policy: reopen-task` can veto a task's outcome

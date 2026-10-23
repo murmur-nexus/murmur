@@ -1,5 +1,5 @@
 //! Where an agent session stands: what the runtime-provided `session-status` tool reports, the
-//! hard deadline `mur run --deadline` sets, and the one notice an agent is given before it.
+//! hard deadline a session runs under, and the one notice an agent is given before it.
 //!
 //! [`SessionStatus`] holds no number of its own. It is fed at the funnels that already produce
 //! each one — the trace writer's `inference`, `task_start` and `task_end` writes, and the http
@@ -28,20 +28,45 @@ const UNKNOWN: &str = "unknown";
 /// The longest default notice margin: five minutes.
 const DEFAULT_NOTICE_CEILING_SECS: u64 = 300;
 
-/// The longest deadline `mur run --deadline` takes: ten years. A larger one overflows the clocks
+/// The longest deadline a session runs under: ten years. A larger one overflows the clocks
 /// the deadline is read against.
 pub const MAX_DEADLINE_SECS: u64 = 315_360_000;
 
-/// The hard limit `mur run --deadline` set: `secs` after the moment `mur run` started.
+/// The hidden `mur run` flag a formation launcher and a child launcher pass a deadline down with:
+/// the deadline's wall moment in milliseconds since the Unix epoch.
+pub const INHERITED_DEADLINE_FLAG: &str = "--inherited-deadline";
+
+/// Where a session's deadline came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadlineSource {
+    /// The session's own `mur run --deadline`.
+    Own,
+    /// The deadline of the formation or the capsule that launched the session.
+    Inherited,
+}
+
+impl DeadlineSource {
+    /// The `source` value the trace records carry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Own => "own",
+            Self::Inherited => "inherited",
+        }
+    }
+}
+
+/// The hard limit a session runs under: its own `mur run --deadline`, or the moment it inherited
+/// from the formation or capsule that launched it.
 ///
-/// Both clocks are read once, at that moment. The monotonic one is what the runtime enforces and
-/// counts down against; the wall one is only what `at` is spelled from, so a clock change during
-/// the session moves neither the enforcement nor `left_secs`.
+/// Both clocks are read once, at the session's start. The monotonic one is what the runtime
+/// enforces and counts down against; the wall one is only what `at` is spelled from, so a clock
+/// change during the session moves neither the enforcement nor `left_secs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionDeadline {
     at: Instant,
     at_wall: SystemTime,
     secs: u64,
+    source: DeadlineSource,
 }
 
 impl SessionDeadline {
@@ -54,12 +79,73 @@ impl SessionDeadline {
             at: started + length,
             at_wall: started_wall + length,
             secs,
+            source: DeadlineSource::Own,
         }
     }
 
-    /// The `--deadline` value: seconds from `mur run`'s start.
+    /// The inherited deadline at the wall moment `at_wall`, for a session whose start was read as
+    /// `started` and `started_wall`. What is left is `at_wall - started_wall`: zero when the moment
+    /// has passed, and at most [`MAX_DEADLINE_SECS`], beyond which `at` is that bound.
+    pub fn until(started: Instant, started_wall: SystemTime, at_wall: SystemTime) -> Self {
+        let bound = Duration::from_secs(MAX_DEADLINE_SECS);
+        let left = at_wall
+            .duration_since(started_wall)
+            .unwrap_or(Duration::ZERO);
+        let (left, at_wall) = if left > bound {
+            (bound, started_wall + bound)
+        } else {
+            (left, at_wall)
+        };
+        let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+        Self {
+            at: started + left,
+            at_wall,
+            secs,
+            source: DeadlineSource::Inherited,
+        }
+    }
+
+    /// [`SessionDeadline::until`] the moment `millis` milliseconds after the Unix epoch, as
+    /// [`INHERITED_DEADLINE_FLAG`] carries it. A moment the wall clock cannot hold is taken as the
+    /// bound.
+    pub fn from_unix_millis(started: Instant, started_wall: SystemTime, millis: u64) -> Self {
+        let bound = started_wall + Duration::from_secs(MAX_DEADLINE_SECS);
+        let at_wall = SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_millis(millis))
+            .unwrap_or(bound);
+        Self::until(started, started_wall, at_wall)
+    }
+
+    /// `at` in whole milliseconds since the Unix epoch, the value [`INHERITED_DEADLINE_FLAG`]
+    /// carries. Truncated, so the moment a session inherits is never later than this one and
+    /// spells the same second.
+    pub fn at_unix_millis(&self) -> u64 {
+        self.at_wall
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            })
+    }
+
+    /// The session's deadline: the earlier of its own and the inherited one, the inherited one on a
+    /// tie, and `None` when it has neither. Both must have been read against the same start.
+    pub fn earliest(own: Option<Self>, inherited: Option<Self>) -> Option<Self> {
+        match (own, inherited) {
+            (Some(own), Some(inherited)) if own.at < inherited.at => Some(own),
+            (_, Some(inherited)) => Some(inherited),
+            (own, None) => own,
+        }
+    }
+
+    /// Seconds from the session's start to `at`: the `--deadline` value for an own deadline, and
+    /// rounded up, `0` once passed, for an inherited one.
     pub fn secs(&self) -> u64 {
         self.secs
+    }
+
+    /// Where the deadline came from.
+    pub fn source(&self) -> DeadlineSource {
+        self.source
     }
 
     /// When the runtime ends the session, as RFC 3339 UTC to the second.
@@ -203,7 +289,7 @@ impl SessionStatus {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The session's deadline, if `mur run --deadline` set one.
+    /// The session's deadline: the earliest bound placed on it, if any.
     pub(crate) fn deadline(&self) -> Option<SessionDeadline> {
         self.deadline
     }
@@ -724,6 +810,96 @@ mod tests {
             Duration::from_secs(MAX_DEADLINE_SECS)
         );
         assert!(deadline.at_rfc3339().ends_with('Z'));
+    }
+
+    #[test]
+    fn session_status_until_leaves_the_difference_zero_when_past_and_the_bound_at_most() {
+        let started = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_792_497_600);
+        let ahead = SessionDeadline::until(started, wall, wall + Duration::from_secs(90));
+        assert_eq!(ahead.left(started), Duration::from_secs(90));
+        assert_eq!(ahead.secs(), 90);
+        assert_eq!(ahead.source(), DeadlineSource::Inherited);
+        assert_eq!(ahead.at_rfc3339(), "2026-10-20T12:01:30Z");
+
+        let past = SessionDeadline::until(started, wall, wall - Duration::from_secs(5));
+        assert_eq!(past.left(started), Duration::ZERO);
+        assert_eq!(past.secs(), 0);
+        // A passed moment still spells the moment it was.
+        assert_eq!(past.at_rfc3339(), "2026-10-20T11:59:55Z");
+
+        let far = SessionDeadline::until(
+            started,
+            wall,
+            wall + Duration::from_secs(MAX_DEADLINE_SECS + 10),
+        );
+        assert_eq!(far.left(started), Duration::from_secs(MAX_DEADLINE_SECS));
+        assert_eq!(far.secs(), MAX_DEADLINE_SECS);
+    }
+
+    #[test]
+    fn session_status_until_rounds_secs_up() {
+        let started = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_792_497_600);
+        let deadline = SessionDeadline::until(started, wall, wall + Duration::from_millis(29_001));
+        assert_eq!(deadline.secs(), 30);
+        assert_eq!(deadline.left(started), Duration::from_millis(29_001));
+        let whole = SessionDeadline::until(started, wall, wall + Duration::from_secs(29));
+        assert_eq!(whole.secs(), 29);
+        let instant = SessionDeadline::until(started, wall, wall + Duration::from_nanos(1));
+        assert_eq!(instant.secs(), 1);
+    }
+
+    #[test]
+    fn session_status_unix_millis_round_trip_to_the_same_second() {
+        let started = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_nanos(1_792_497_600_999_999_999);
+        let own = SessionDeadline::after(started, wall, 60);
+        assert_eq!(own.source(), DeadlineSource::Own);
+        let millis = own.at_unix_millis();
+        assert_eq!(millis, 1_792_497_660_999);
+        // A child that starts 3.5 s later inherits the same moment, to the millisecond.
+        let child_started = started + Duration::from_millis(3_500);
+        let child_wall = wall + Duration::from_millis(3_500);
+        let inherited = SessionDeadline::from_unix_millis(child_started, child_wall, millis);
+        assert_eq!(inherited.at_rfc3339(), own.at_rfc3339());
+        assert_eq!(inherited.at_unix_millis(), millis);
+        assert_eq!(inherited.secs(), 57);
+        assert!(own.left(child_started) - inherited.left(child_started) < Duration::from_millis(1));
+
+        // A moment the wall clock cannot hold is the bound, not a panic.
+        let overflow = SessionDeadline::from_unix_millis(started, wall, u64::MAX);
+        assert_eq!(overflow.secs(), MAX_DEADLINE_SECS);
+        assert_eq!(
+            overflow.left(started),
+            Duration::from_secs(MAX_DEADLINE_SECS)
+        );
+        let epoch = SessionDeadline::from_unix_millis(started, wall, 0);
+        assert_eq!(epoch.left(started), Duration::ZERO);
+    }
+
+    #[test]
+    fn session_status_earliest_keeps_the_earlier_and_the_inherited_on_a_tie() {
+        let started = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_792_497_600);
+        let own = SessionDeadline::after(started, wall, 60);
+        let sooner = SessionDeadline::until(started, wall, wall + Duration::from_secs(30));
+        let later = SessionDeadline::until(started, wall, wall + Duration::from_secs(90));
+        let tie = SessionDeadline::until(started, wall, wall + Duration::from_secs(60));
+
+        assert_eq!(
+            SessionDeadline::earliest(Some(own), Some(sooner)),
+            Some(sooner)
+        );
+        assert_eq!(SessionDeadline::earliest(Some(own), Some(later)), Some(own));
+        let tied = SessionDeadline::earliest(Some(own), Some(tie)).unwrap();
+        assert_eq!(tied.source(), DeadlineSource::Inherited);
+        assert_eq!(tied.secs(), 60);
+        assert_eq!(SessionDeadline::earliest(Some(own), None), Some(own));
+        assert_eq!(SessionDeadline::earliest(None, Some(later)), Some(later));
+        assert_eq!(SessionDeadline::earliest(None, None), None);
+        assert_eq!(DeadlineSource::Own.as_str(), "own");
+        assert_eq!(DeadlineSource::Inherited.as_str(), "inherited");
     }
 
     #[test]

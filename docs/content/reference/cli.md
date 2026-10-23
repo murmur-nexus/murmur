@@ -1333,7 +1333,7 @@ mur run --roster [<path>] [--task <path-or-text>] [--json]
 | Flag | Default | Description |
 |---|---|---|
 | `--manifest` | `./murmur.yaml` | Path to the capsule manifest |
-| `--roster` | `./roster.yaml` when the flag is given with no value | Launch the formation a [roster](roster.md) declares, for one task. Takes the project directory or the `roster.yaml` inside it; any other file name refuses with [`E-ROS-001`](diagnostics.md#e-ros-001). Passes `--task`, `--json`, `--verbose`, `--no-env-file` and `--containment` through to its members, and cannot be combined with any other flag. See [Launching a formation](#mur-run-roster) |
+| `--roster` | `./roster.yaml` when the flag is given with no value | Launch the formation a [roster](roster.md) declares, for one task. Takes the project directory or the `roster.yaml` inside it; any other file name refuses with [`E-ROS-001`](diagnostics.md#e-ros-001). Passes `--task`, `--json`, `--verbose`, `--no-env-file`, `--containment` and `--deadline` through to its members, and cannot be combined with any other flag. See [Launching a formation](#mur-run-roster) |
 | `--capsule` | — | Run an installed artifact by its full name, `<scope>/<name>`, instead of a project directory; a bare name is refused with [`E-REG-007`](diagnostics.md#e-reg-007). Requires `--capsule-version`, and cannot be combined with an explicitly given `--manifest`. The capsule is resolved from the project store and then the global store, and staged from the artifact bytes in memory: no `murmur.yaml` is read from disk, and no `murmur.lock` is read or written. This is the form a parent capsule's runtime launches a delegated child on |
 | `--capsule-version` | — | Version of the `--capsule` artifact. Required with `--capsule` |
 | `--spawn-grant-stdin` | off | Read one line from standard input as this launch's spawn approval, and present it when the session registers with `mur-roost`. Set by a parent capsule's runtime when it launches a delegated child. Standard input rather than an argument or an environment variable, both of which any process running as the same user can read out of `/proc` |
@@ -1351,7 +1351,7 @@ mur run --roster [<path>] [--task <path-or-text>] [--json]
 | `--no-env-file` | off | Skip auto-loading the workspace-root `.env` file for this invocation. Recommended default for CI/CD pipelines |
 | `--containment` | — | Require at least this containment class (`advisory`\|`scoped`\|`sealed`). Combines with the manifest's `capabilities.containment` and the workspace `containment` config by taking the strongest of the three — this flag can only raise the effective floor, never lower one another source already set. See [Containment class](containment.md#field-containment) |
 | `--explain-scope` | off | Print the effective grant set and the declared/achieved containment classes, then exit `0` without staging or launching anything — no artifact pull, no component compile, no workdir. Reports even when the declared floor is not met. The `Resource plane` block, and `io_max` under `--json`, report whether the declared [`cgroup_io_bytes_per_sec`](resource-limits.md#io-max-report) ceiling applies on this host. Also lists every path the runtime writes into the workdir, as `runtime_writes` under `--json` — see [Session workdir](workdir.md). A `Runtime directory` block after `Containment` gives the session's [runtime directory](workdir.md#runtime-directory) and whether the capsule's commands can change it, a `Records directory` block after it does the same for the [records directory](workdir.md#records-directory), and a `Temporary folder` block after that gives the [session's temporary folder](containment.md#temp-folder), the value of `TMPDIR`, and whether a literal `/tmp` reaches the folder; `--json` carries them as `runtime_dir`, `records_dir` and `temp_dir`. Refused with [`E-IO-004`](diagnostics.md#e-io-004) when `HOME` cannot hold `~/.murmur`, as the launch would be. Unless the session composes a sealed root, a `Not protected here` block prints under `Containment`, naming what its filesystem mechanism leaves unrestricted and why a `~`-based probe is not evidence of containment — see [Testing containment honestly](containment.md#testing-containment); `--json` carries the same statements as `filesystem_boundary` |
-| `--deadline` | — | End the session this many seconds after `mur run` started, staging included, whatever it is doing. A whole number from `1` to `315360000` (ten years). The runtime ends the session as a first [`SIGTERM`](#mur-run-sigterm) does, records `deadline_reached`, and exits with [`E-RUN-053`](diagnostics.md#e-run-053); see [The deadline](#mur-run-deadline). Requires an agent capsule: on a manifest with no `inference:` block the run fails with `error[E-IO-003]` before anything is staged. Cannot be combined with `--roster` |
+| `--deadline` | — | End the session this many seconds after `mur run` started, staging included, whatever it is doing. A whole number from `1` to `315360000` (ten years). The runtime ends the session as a first [`SIGTERM`](#mur-run-sigterm) does, records `deadline_reached`, and exits with [`E-RUN-053`](diagnostics.md#e-run-053); see [The deadline](#mur-run-deadline). Requires an agent capsule: on a manifest with no `inference:` block the run fails with `error[E-IO-003]` before anything is staged. With `--roster`, the formation's one deadline, counted from the launcher's start |
 | `--system-prompt` | — | Replace the manifest's system prompt for this invocation only. Overrides `inference.system_prompt`, `inference.system_prompt_file` and `inference.system_prompt_artifact` alike, whichever the manifest used — and applies just as well when it declared none. The value is trimmed; an empty or whitespace-only value clears the prompt rather than setting one. `murmur.yaml` is not modified. Requires an agent capsule: on a manifest with no `inference:` block the run fails with `error[E-IO-003]` before anything is staged. Inert under `--explain-scope`. See [Override the prompt for a single run](../how-to/capsule-system-prompt.md#step-8-override-the-prompt-for-a-single-run) |
 
 For the output modes, the read-only pre-flight checks and driving a capsule over HTTP, see
@@ -1521,7 +1521,21 @@ started.
 | Trace | `deadline_reached` before the wind-down's records, then `session_end` with `exit_status: "deadline_reached"`; `session_start.deadline` names it from the start. See [`trace.jsonl`](observability-schemas.md#deadline-reached) |
 | Exit | `status:  deadline_reached`, exit code `1`, [`E-RUN-053`](diagnostics.md#e-run-053) — unless an earlier task already failed, which keeps its own status |
 | Already past at launch | The session ends before any task runs |
+| A formation's deadline before its entry member started | The launcher stops every member it started and exits `1` with [`E-RUN-053`](diagnostics.md#e-run-053), naming each stopped member |
 | The agent | Is told once, on a tool result, when [`lifecycle.deadline_notice_secs`](manifest.md#field-lifecycle) are left, and its [`session-status`](runtime-provided-tools.md#session-status) tool reports the time left — see [The deadline notice](runtime-provided-tools.md#deadline-notice) |
+
+A session runs under the earliest deadline placed on it. The others are not recorded.
+
+| Deadline | Applies to | Counted from |
+|---|---|---|
+| Its own `--deadline` | The session | Its own `mur run`'s start |
+| The formation's `--deadline` | Every member of a [formation](#mur-run-roster) | The launcher's start, as one moment shared by every member |
+| Its parent's deadline | A child launched by `delegate-task` or a plan `capsule` step, and every child below it | The parent's own deadline: the child runs no longer than its parent |
+
+`session_start.deadline.source` and `deadline_reached.source` say which one it was: `own` or
+`inherited`. A script-capsule child takes no deadline from its parent; it ends when its parent
+does. [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs)
+bounds the parent's wait for a child separately, and whichever falls first ends the child.
 
 ### Launching a formation (`--roster`) { #mur-run-roster }
 
@@ -1538,6 +1552,7 @@ launcher runs no session itself. The order and the rules are in
 | `--verbose` | The entry member |
 | `--no-env-file` | Every member. The launcher itself never loads `.env` |
 | `--containment` | Every member |
+| `--deadline` | Every member, as the formation's one deadline, counted from the launcher's start. See [The deadline](#mur-run-deadline) |
 
 `--roster` cannot be combined with `--manifest`, `--capsule`, `--capsule-version`,
 `--spawn-grant-stdin`, `--system-prompt`, `--context`, `--resume`, `--resume-mode`,
@@ -1552,11 +1567,12 @@ Standard output under `--json` carries exactly two lines:
    output.
 
 ```json
-{"entry":"lead","formation_id":"frm_01a106501a1d78328710ed56d19a10a6","peers":[{"name":"worker","pid":1979177,"session_id":"ses_01a1065027fe7a5295b53597e7671a53","url":"http://localhost:36061","workdir":"/home/me/.murmur/formations/frm_01a106501a1d78328710ed56d19a10a6/worker"}]}
+{"deadline":null,"entry":"lead","formation_id":"frm_01a106501a1d78328710ed56d19a10a6","peers":[{"name":"worker","pid":1979177,"session_id":"ses_01a1065027fe7a5295b53597e7671a53","url":"http://localhost:36061","workdir":"/home/me/.murmur/formations/frm_01a106501a1d78328710ed56d19a10a6/worker"}]}
 ```
 
 | Formation line key | Value |
 |---|---|
+| `deadline` | `{"at", "secs"}` under `--deadline`: `at`, the RFC 3339 UTC moment every member ends, and `secs`, the `--deadline` value. `null` without one |
 | `entry` | The entry member's roster name |
 | `formation_id` | The id every member was launched with, `frm_` followed by 32 lowercase hex digits |
 | `peers` | One object per non-entry member, in roster order: `name`, `pid`, `session_id`, `url` as `http://host:port`, and `workdir`, the peer's own [directory](roster.md#member-directories) `~/.murmur/formations/<frm_id>/<member>` |
@@ -1567,7 +1583,8 @@ once, with or without `--json`. The formation launches all the same.
 
 Neither the formation line nor any member's output carries a door token. Without `--json`, the launcher writes the same
 information to stderr as a `formation:` block, and the entry member writes its usual startup lines
-to stdout.
+to stdout. Under `--deadline` the block's second line is
+`deadline <at>  (<secs>s after mur run started)`.
 
 Every line a peer writes to stderr, and every stdout line after its readiness line, goes to the
 launcher's stderr behind a `[<member>] ` prefix:

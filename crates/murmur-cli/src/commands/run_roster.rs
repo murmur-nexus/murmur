@@ -9,15 +9,17 @@
 // writes to the same inherited stream; a reader may close it at any point after that.
 
 use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime};
 
 use capsule_runtime::formation_launch::{
     self, render_stopped, signal_name, FormationEnding, FormationLaunchOptions,
     MemberLaunchFailure, RunningFormation,
 };
+use capsule_runtime::session_status::SessionDeadline;
 use capsule_runtime::{admit_roster_file, FormationId};
 use murmur_artifact::{LocalRegistry, TraceRetainConfig, ROSTER_FILENAME};
 
-use crate::error::{CliError, E_IO_003, E_ROS_001, E_RUN_045, E_RUN_046};
+use crate::error::{CliError, E_IO_003, E_ROS_001, E_RUN_045, E_RUN_046, E_RUN_053};
 use crate::stores::FallbackRegistry;
 
 use super::read_optional_lockfile;
@@ -31,11 +33,17 @@ pub(crate) struct RosterLaunch<'a> {
     pub(crate) verbose: bool,
     pub(crate) no_env_file: bool,
     pub(crate) containment: Option<&'a str>,
+    /// `--deadline`: seconds from this launcher's start to the formation's one deadline.
+    pub(crate) deadline: Option<u64>,
 }
 
 /// Launch the formation and run it to its end. `Ok` carries the launcher's exit status, and is
 /// returned only once every member has been stopped and reaped.
 pub(crate) fn run_roster(launch: RosterLaunch<'_>) -> Result<i32, CliError> {
+    // Read first: the formation's deadline counts from the moment the launcher started.
+    let deadline = launch
+        .deadline
+        .map(|secs| SessionDeadline::after(Instant::now(), SystemTime::now(), secs));
     refuse_inside_a_formation()?;
     let project_dir = roster_project_dir(launch.roster)?;
 
@@ -76,6 +84,7 @@ pub(crate) fn run_roster(launch: RosterLaunch<'_>) -> Result<i32, CliError> {
     options.verbose = launch.verbose;
     options.no_env_file = launch.no_env_file;
     options.containment = launch.containment.map(str::to_string);
+    options.deadline = deadline;
 
     formation_launch::catch_launcher_signals().map_err(|error| {
         CliError::new(
@@ -99,13 +108,13 @@ pub(crate) fn run_roster(launch: RosterLaunch<'_>) -> Result<i32, CliError> {
         Ok(formation) => formation,
         Err(failure) => {
             prune();
-            return refused(&failure);
+            return refused(&failure, deadline);
         }
     };
-    announce(&formation, launch.json);
+    announce(&formation, deadline, launch.json);
     if let Err(failure) = formation.start_entry() {
         prune();
-        return refused(&failure);
+        return refused(&failure, deadline);
     }
     let exit = formation.wait();
     if let FormationEnding::Signalled(signal) = exit.ending {
@@ -188,7 +197,7 @@ fn roster_project_dir(arg: &Path) -> Result<PathBuf, CliError> {
 
 /// The formation line on stdout under `--json`, or the formation block on stderr. Printed once
 /// every peer is ready and before the entry member starts. No door token appears in either.
-fn announce(formation: &RunningFormation, json: bool) {
+fn announce(formation: &RunningFormation, deadline: Option<SessionDeadline>, json: bool) {
     if json {
         let peers: Vec<serde_json::Value> = formation
             .peers()
@@ -204,6 +213,10 @@ fn announce(formation: &RunningFormation, json: bool) {
             })
             .collect();
         let line = serde_json::json!({
+            "deadline": deadline.map(|deadline| serde_json::json!({
+                "at": deadline.at_rfc3339(),
+                "secs": deadline.secs(),
+            })),
             "entry": formation.entry_name(),
             "formation_id": formation.formation_id().as_str(),
             "peers": peers,
@@ -219,6 +232,13 @@ fn announce(formation: &RunningFormation, json: bool) {
         .max()
         .unwrap_or_default();
     let mut block = format!("formation: {}", formation.formation_id());
+    if let Some(deadline) = deadline {
+        block.push_str(&format!(
+            "\n  deadline {}  ({}s after mur run started)",
+            deadline.at_rfc3339(),
+            deadline.secs()
+        ));
+    }
     for peer in formation.peers() {
         block.push_str(&format!(
             "\n  peer   {name:<width$}  {coordinate}  pid {pid}  {session}  {url}\n         \
@@ -239,12 +259,37 @@ fn announce(formation: &RunningFormation, json: bool) {
     capsule_runtime::runtime_err!("{block}");
 }
 
-/// The launcher's answer to a launch that did not complete: `E-RUN-045`, or — when what ended it
-/// was a signal the launcher caught — the signal's exit status.
-fn refused(failure: &MemberLaunchFailure) -> Result<i32, CliError> {
+/// The launcher's answer to a launch that did not complete: `E-RUN-045`; `E-RUN-053` when the
+/// formation's `deadline` fell before its entry member started; or — when what ended it was a
+/// signal the launcher caught — the signal's exit status.
+fn refused(
+    failure: &MemberLaunchFailure,
+    deadline: Option<SessionDeadline>,
+) -> Result<i32, CliError> {
     if let Some(signal) = failure.interrupted_by {
         capsule_runtime::runtime_err!("[mur run] {failure}");
         return Ok(128 + signal);
+    }
+    if failure.deadline_reached {
+        let limit = deadline.map_or_else(String::new, |d| format!(" of {} seconds", d.secs()));
+        let mut message =
+            format!("the formation reached its --deadline{limit} before its entry member started");
+        for member in &failure.failed {
+            message.push_str(&format!(
+                "\n  '{}' ({}@{}): {}",
+                member.name, member.capsule, member.version, member.reason
+            ));
+        }
+        message.push_str(&format!(
+            "\n  stopped: {}",
+            render_stopped(&failure.stopped)
+        ));
+        return Err(CliError::with_hint(
+            E_RUN_053,
+            message,
+            "raise --deadline so it covers the members' launch as well as the task; nothing the \
+             formation started is still running",
+        ));
     }
     Err(CliError::with_hint(
         E_RUN_045,
@@ -258,6 +303,48 @@ fn refused(failure: &MemberLaunchFailure) -> Result<i32, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use capsule_runtime::formation_launch::StoppedMember;
+
+    fn launch_failure(deadline_reached: bool, interrupted_by: Option<i32>) -> MemberLaunchFailure {
+        MemberLaunchFailure {
+            failed: Vec::new(),
+            stopped: vec![
+                StoppedMember {
+                    name: "coder".to_string(),
+                    pid: 41,
+                },
+                StoppedMember {
+                    name: "reviewer".to_string(),
+                    pid: 42,
+                },
+            ],
+            interrupted_by,
+            deadline_reached,
+        }
+    }
+
+    #[test]
+    fn run_roster_a_deadline_before_the_entry_member_is_e_run_053() {
+        let deadline = SessionDeadline::after(Instant::now(), SystemTime::now(), 60);
+        let error = refused(&launch_failure(true, None), Some(deadline)).unwrap_err();
+        assert_eq!(error.code, E_RUN_053);
+        assert_eq!(
+            error.message,
+            "the formation reached its --deadline of 60 seconds before its entry member \
+             started\n  stopped: coder (pid 41), reviewer (pid 42)"
+        );
+        let hint = error.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("raise --deadline"), "{hint}");
+
+        // A signal the launcher caught keeps its own exit status.
+        assert_eq!(
+            refused(&launch_failure(true, Some(libc::SIGTERM)), Some(deadline)).unwrap(),
+            128 + libc::SIGTERM
+        );
+        // Any other refusal stays E-RUN-045.
+        let other = refused(&launch_failure(false, None), Some(deadline)).unwrap_err();
+        assert_eq!(other.code, E_RUN_045);
+    }
 
     #[test]
     fn a_roster_path_names_its_project_directory() {

@@ -129,7 +129,7 @@ section that explains it.
 | `E-RUN-050` | The runtime met a symbolic link, or the wrong kind of file, inside the workdir — while staging the session, or during the task `mur run` ran — or `mur trace rm` met one on the way to a directory it removes | [E-RUN-050](#e-run-050) |
 | `E-RUN-051` | A delegated child's `--workdir` is not the directory its parent created; nothing was written | [E-RUN-051](#e-run-051) |
 | `E-RUN-052` | A driver choice has no output cap — its driver lists no limits for its model and the manifest sets no `inference.max_tokens` — or its driver ships a malformed `models:` table | [E-RUN-052](#e-run-052) |
-| `E-RUN-053` | The session reached its `mur run --deadline` and was ended, or a launch was handed a deadline it cannot enforce | [E-RUN-053](#e-run-053) |
+| `E-RUN-053` | The session reached its deadline, own or inherited, and was ended; a formation's `--deadline` fell before its entry member started; or a launch was handed a deadline it cannot enforce | [E-RUN-053](#e-run-053) |
 | `E-RUN-054` | `inference.compaction.max_tokens` is above the output ceiling the primary driver's `models:` table declares for the compaction model | [E-RUN-054](#e-run-054) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
@@ -1387,6 +1387,25 @@ error[E-RUN-053]: the session reached its --deadline of 600 seconds; the runtime
 ```
 
 The trace records `deadline_reached` and ends with `session_end.exit_status: "deadline_reached"`.
+
+A session runs under the [earliest deadline](cli.md#mur-run-deadline) placed on it. When that is
+the one it inherited, from its formation's `--deadline` or from the capsule that delegated to it,
+the message names the moment instead:
+
+```text
+error[E-RUN-053]: the session reached the deadline it inherited, at 2026-10-20T14:00:00Z, from the formation or the capsule that launched it; the runtime cancelled the running task and ended the session
+  hint: raise the --deadline the formation or the delegating capsule was launched with; `mur trace show <session>` shows where the task was when the deadline fell
+```
+
+A formation launched with [`mur run --roster --deadline`](cli.md#mur-run-roster) exits `1` with
+this code when its entry member ends at the deadline. When the deadline falls before the entry
+member has started, the launcher stops every member it started and names them:
+
+```text
+error[E-RUN-053]: the formation reached its --deadline of 60 seconds before its entry member started
+  stopped: coder (pid 41871), reviewer (pid 41872)
+  hint: raise --deadline so it covers the members' launch as well as the task; nothing the formation started is still running
+```
 
 The same code refuses a session staged with a deadline that its launch cannot enforce: one launched
 by a program embedding the runtime rather than by `mur run`, or a script capsule.

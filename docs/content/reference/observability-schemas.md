@@ -66,7 +66,7 @@ before the first task begins
 | `model_limits` | object \| null | The primary driver choice's [output cap and context window](manifest.md#inference-max-tokens): `max_output_tokens` (u32), `max_output_tokens_source` (`"manifest"` \| `"driver"`), `context_window` (u32 \| null; `null` when the choice has none) and `context_window_source` (`"manifest"` \| `"driver"` \| `"none"`). `"manifest"` is `inference.max_tokens` or `context.max_tokens`; `"driver"` is the driver's [`models:`](manifest.md#driver-models) entry. Always present; `null` under `transport: process` |
 | `max_session_tokens` | u64 \| null | [`inference.max_session_tokens`](manifest.md#inference-max-session-tokens). Always present; `null` when no session ceiling applies |
 | `machine_tokens_per_day` | u64 \| null | [`spend.machine_tokens_per_day`](config.md#spend) when this session is counted against it. Always present; `null` when no machine ceiling was in effect, and under `transport: process` |
-| `deadline` | object \| null | The [`mur run --deadline`](cli.md#mur-run-deadline) this session runs under: `at` (string, RFC 3339 UTC, when the runtime ends the session), `secs` (u64, the `--deadline` value) and `notice_secs` (u64, the [notice](runtime-provided-tools.md#deadline-notice) margin in force; `0` sends none). Always present; `null` with no `--deadline` |
+| `deadline` | object \| null | The [deadline](cli.md#mur-run-deadline) this session runs under, the earliest placed on it: `at` (string, RFC 3339 UTC, when the runtime ends the session), `secs` (u64, seconds from `mur run`'s start to `at`: the `--deadline` value, or for an inherited deadline the seconds left at the start, rounded up, `0` once passed), `notice_secs` (u64, the [notice](runtime-provided-tools.md#deadline-notice) margin in force; `0` sends none) and `source` (string, `"own"` for the session's own `--deadline`, `"inherited"` for the formation's or its parent's). Every key is always present; `null` when the session has no deadline |
 | `capabilities` | string[] | The capability categories the manifest granted anything under: `"network"`, `"filesystem"`, `"shell"` |
 | `tools_declared` | string[] | Names of the tools offered to the model: each artifact's bare name, the part of its full name after the `/` |
 | `tool_refresh` | string \| null | [`inference.tool_refresh`](manifest.md#inference-tool-refresh): `"compaction"` \| `"immediate"` under `transport: http`, `null` under `transport: process`. Always written |
@@ -535,7 +535,7 @@ loop has exited, on every exit path
 | `total_tool_calls` | u32 | Equals the count of `tool_call` lines |
 | `total_shell_calls` | u32 | Equals the count of `shell` plus `shell_detached` lines |
 | `duration_ms` | u64 | Wall-clock time from session start |
-| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"spend_ceiling_reached"` \| `"canceled"` \| `"formation_ended"` \| `"deadline_reached"` — the launch's outcome, which is the status [`mur run`](cli.md#mur-run-status) prints. The first [task that decides the launch](cli.md#mur-run-status) and ended anything but `"ok"` sets it, and no later run replaces it. `"formation_ended"`: a formation member was running a task when its [formation ended](roster.md#launch-stop), and the wind-down canceled that task. `"deadline_reached"`: the session reached its [`--deadline`](cli.md#mur-run-deadline), whether or not a task was running |
+| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"spend_ceiling_reached"` \| `"canceled"` \| `"formation_ended"` \| `"deadline_reached"` — the launch's outcome, which is the status [`mur run`](cli.md#mur-run-status) prints. The first [task that decides the launch](cli.md#mur-run-status) and ended anything but `"ok"` sets it, and no later run replaces it. `"formation_ended"`: a formation member was running a task when its [formation ended](roster.md#launch-stop), and the wind-down canceled that task. `"deadline_reached"`: the session reached its [deadline](cli.md#mur-run-deadline), own or inherited, whether or not a task was running |
 
 **`a2a_task_received`** — written when an incoming message reserves the task slot
 
@@ -689,19 +689,22 @@ because of `SIGTERM` or [`mur stop`](cli.md#mur-stop) writes none.
 ```
 
 **`deadline_reached`**{ #deadline-reached } — written once when the session reaches its
-[`mur run --deadline`](cli.md#mur-run-deadline), and is winding down because of it
+[deadline](cli.md#mur-run-deadline), and is winding down because of it
 
 | Field | Type | Notes |
 |---|---|---|
 | `deadline_at` | string | When the deadline fell, RFC 3339 UTC, as `session_start.deadline.at` names it |
-| `deadline_secs` | u64 | The `--deadline` value |
+| `deadline_secs` | u64 | `session_start.deadline.secs` |
+| `source` | string | `"own"` or `"inherited"`, as `session_start.deadline.source` names it |
 
 Written before every `task_canceled`, `task_end`, `task_rejected`, `shell_abandoned` and
-`session_end` the wind-down writes. A session already ending because of `SIGTERM`, `mur stop` or a
-lifeline writes none.
+`session_end` the wind-down writes. A `SIGTERM`, `mur stop` or lifeline EOF that arrives once the
+deadline has passed is recorded as the deadline: a formation member whose lifeline closes because
+another member ended at the shared deadline writes `deadline_reached`, not `formation_ended`. A
+session already ending because of one of them before the deadline writes none.
 
 ```json
-{"event_type":"deadline_reached","event_id":"evt_01a159926fbf70138104548d543e102b","parent_id":"evt_01a159926fa973e0999c70200a61aec4","session_id":"ses_01a159926f337512afbba4069bfd85ce","timestamp":1792504131519,"deadline_at":"2026-10-20T13:48:18Z","deadline_secs":25}
+{"event_type":"deadline_reached","event_id":"evt_01a159926fbf70138104548d543e102b","parent_id":"evt_01a159926fa973e0999c70200a61aec4","session_id":"ses_01a159926f337512afbba4069bfd85ce","timestamp":1792504131519,"deadline_at":"2026-10-20T13:48:18Z","deadline_secs":25,"source":"own"}
 ```
 
 **`session_status`**{ #session-status } — written once per

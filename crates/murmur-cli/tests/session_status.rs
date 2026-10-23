@@ -432,6 +432,7 @@ fn session_status_fields_match_the_trace() {
     let start_deadline = &first(&trace, "session_start")["deadline"];
     assert_eq!(start_deadline["secs"], 600);
     assert_eq!(start_deadline["notice_secs"], 60);
+    assert_eq!(start_deadline["source"], "own");
     assert_eq!(start_deadline["at"], status["time"]["deadline"]["at"]);
     assert!(events(&trace, "deadline_notice").is_empty(), "{trace:#?}");
 }
@@ -878,6 +879,125 @@ fn the_deadline_ends_a_process_session_and_its_harness() {
     common::assert_dead_within(pid, Duration::from_secs(5));
 }
 
+// ── Inherited deadlines ─────────────────────────────────────────────────────
+
+/// `at` milliseconds since the epoch as RFC 3339 UTC to the second, as `session_start` spells it.
+fn rfc3339_of_millis(millis: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from(UNIX_EPOCH + Duration::from_millis(millis))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// The moment `secs` from now (negative: before now) as `--inherited-deadline` takes it.
+fn millis_from_now(secs: i64) -> u64 {
+    let now = epoch_ms(SystemTime::now());
+    u64::try_from(now + secs * 1_000).unwrap()
+}
+
+/// An inherited moment earlier than the session's own `--deadline` is the one it runs under, and
+/// ends it, at the inherited moment and with the inherited message.
+#[test]
+fn an_inherited_deadline_earlier_than_its_own_ends_the_session() {
+    let home = home_with_driver(common::FIXTURE_DRIVER_MODELS);
+    let endpoint = common::never_replying();
+    let project = project(&http_manifest(&endpoint, &Http::default()));
+    let at = millis_from_now(30);
+    let begun = Instant::now();
+    let run = run(
+        &home,
+        &project,
+        &["--deadline", "300", "--inherited-deadline", &at.to_string()],
+    );
+    let took = begun.elapsed();
+    assert!(
+        took >= Duration::from_secs(25) && took < Duration::from_secs(60),
+        "{took:?}: {}",
+        run.context()
+    );
+    assert_eq!(run.output.status.code(), Some(1), "{}", run.context());
+    assert!(run.stderr.contains("error[E-RUN-053]"), "{}", run.context());
+    assert!(
+        run.stderr.contains(&format!(
+            "the session reached the deadline it inherited, at {}",
+            rfc3339_of_millis(at)
+        )),
+        "{}",
+        run.context()
+    );
+    assert!(!run.stderr.contains("of 300 seconds"), "{}", run.context());
+    let trace = run.trace();
+    let deadline = &first(&trace, "session_start")["deadline"];
+    assert_eq!(deadline["source"], "inherited", "{deadline}");
+    assert_eq!(deadline["at"], rfc3339_of_millis(at), "{deadline}");
+    assert!(deadline["secs"].as_u64().unwrap() <= 30, "{deadline}");
+    let reached = first(&trace, "deadline_reached");
+    assert_eq!(reached["source"], "inherited", "{reached}");
+    assert_eq!(reached["deadline_at"], deadline["at"]);
+    assert_within(
+        ms(reached),
+        i64::try_from(at).unwrap(),
+        5_000,
+        "deadline_reached",
+    );
+    assert_eq!(
+        trace.last().unwrap()["exit_status"],
+        "deadline_reached",
+        "{trace:#?}"
+    );
+}
+
+/// The session's own `--deadline`, when earlier than the inherited moment, is the one it runs
+/// under, and ends it with today's message.
+#[test]
+fn an_own_deadline_earlier_than_the_inherited_one_ends_the_session() {
+    let home = home_with_driver(common::FIXTURE_DRIVER_MODELS);
+    let endpoint = common::never_replying();
+    let project = project(&http_manifest(&endpoint, &Http::default()));
+    let at = millis_from_now(600);
+    let run = run(
+        &home,
+        &project,
+        &[
+            "--deadline",
+            &DEADLINE_SECS.to_string(),
+            "--inherited-deadline",
+            &at.to_string(),
+        ],
+    );
+    assert_ended_by_the_deadline(&run);
+    assert!(
+        run.stderr.contains(&format!(
+            "the session reached its --deadline of {DEADLINE_SECS} seconds"
+        )),
+        "{}",
+        run.context()
+    );
+    let trace = run.trace();
+    let deadline = &first(&trace, "session_start")["deadline"];
+    assert_eq!(deadline["source"], "own", "{deadline}");
+    assert_eq!(deadline["secs"], DEADLINE_SECS, "{deadline}");
+    assert_eq!(first(&trace, "deadline_reached")["source"], "own");
+}
+
+/// An inherited moment already past ends the session before any task.
+#[test]
+fn an_inherited_deadline_already_past_ends_the_session_before_any_task() {
+    let home = home_with_driver(common::FIXTURE_DRIVER_MODELS);
+    let endpoint = common::never_replying();
+    let project = project(&http_manifest(&endpoint, &Http::default()));
+    let at = millis_from_now(-10);
+    let run = run(&home, &project, &["--inherited-deadline", &at.to_string()]);
+    assert_eq!(run.output.status.code(), Some(1), "{}", run.context());
+    assert!(run.stderr.contains("error[E-RUN-053]"), "{}", run.context());
+    let trace = run.trace();
+    assert!(events(&trace, "task_start").is_empty(), "{trace:#?}");
+    let deadline = &first(&trace, "session_start")["deadline"];
+    assert_eq!(deadline["source"], "inherited", "{deadline}");
+    assert_eq!(deadline["secs"], 0, "{deadline}");
+    assert_eq!(deadline["at"], rfc3339_of_millis(at), "{deadline}");
+    assert_eq!(first(&trace, "deadline_reached")["source"], "inherited");
+    assert_eq!(trace.last().unwrap()["exit_status"], "deadline_reached");
+}
+
 // ── Validation ────────────────────────────────────────────────────────────
 
 fn refused(home: &TempDir, args: &[&str]) -> String {
@@ -891,8 +1011,22 @@ fn refused(home: &TempDir, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// `--deadline` takes a whole number of seconds from 1 to ten years, needs an agent capsule, and is
-/// not a `--roster` flag.
+/// Refused by argument parsing, with exit 2, before anything starts.
+fn refused_by_clap(home: &TempDir, args: &[&str]) -> String {
+    let output = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(args)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+    stderr
+}
+
+/// `--deadline` takes a whole number of seconds from 1 to ten years and needs an agent capsule,
+/// under `--roster` as on its own. The hidden `--inherited-deadline` takes a whole number of
+/// milliseconds, is no `--roster` flag, and is not in `--help`.
 #[test]
 fn deadline_arguments_are_validated() {
     let home = home_with_driver(common::FIXTURE_DRIVER_MODELS);
@@ -937,8 +1071,44 @@ fn deadline_arguments_are_validated() {
         "{stderr}"
     );
 
-    let stderr = refused(&home, &["run", "--roster", "--deadline", "30"]);
+    let roster_dir = TempDir::new().unwrap();
+    let roster = roster_dir.path().join("roster.yaml");
+    let roster = roster.to_str().unwrap();
+    for bad in ["0", "315360001"] {
+        let stderr = refused_by_clap(&home, &["run", "--roster", roster, "--deadline", bad]);
+        assert!(stderr.contains("--deadline"), "{bad}: {stderr}");
+    }
+    let stderr = refused_by_clap(
+        &home,
+        &["run", "--roster", roster, "--inherited-deadline", "1"],
+    );
     assert!(stderr.contains("cannot be used with"), "{stderr}");
+    let stderr = refused_by_clap(
+        &home,
+        &[
+            "run",
+            "--manifest",
+            manifest,
+            "--task",
+            TASK,
+            "--inherited-deadline",
+            "abc",
+        ],
+    );
+    assert!(stderr.contains("--inherited-deadline"), "{stderr}");
+    assert!(!roster_dir.path().join(".murmur").exists());
+    assert!(!agent.dir.path().join("workdir").exists());
+
+    let help = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(["run", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--deadline"), "{help}");
+    assert!(!help.contains("inherited-deadline"), "{help}");
 }
 
 /// Only the launch that owns its process enforces a deadline; `launch_session` refuses a session

@@ -147,6 +147,24 @@ impl World {
         }
     }
 
+    /// Compile the driver into this world's `HOME`, so no session compiles it while a deadline
+    /// counts down.
+    fn precompile_driver(&self) {
+        let driver = murmur_artifact::LocalRegistry::new(&self.registry).artifact_path_for(
+            &murmur_artifact::ArtifactName::parse(DRIVER_NAME).unwrap(),
+            DRIVER_VERSION,
+        );
+        let output = self
+            .mur(self.home.path(), &["precompile", driver.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn publish(&self, name: &str, body: &str) {
         publish_to_store(
             &self.registry,
@@ -613,6 +631,8 @@ fn a_parent_killed_outright_takes_its_child_with_it() {
     let start = &delegation.trace()[0];
     assert_eq!(start["event_type"], "session_start");
     assert!(start.get("formation_id").is_none(), "{start}");
+    // A parent with no deadline hands its child none.
+    assert_eq!(start["deadline"], Value::Null, "{start}");
 }
 
 // ── A child of a child ────────────────────────────────────────────────────────
@@ -1114,6 +1134,121 @@ fn a_parent_stopped_mid_plan_ends_the_plan_steps_child_first() {
     assert_eq!(completion["status"], "terminated", "{completion}");
     assert_eq!(completion["reported_by"], "launcher", "{completion}");
     common::assert_trace_ends_canceled(&delegation.child_records.join("trace.jsonl"));
+}
+
+// ── A parent with a deadline ──────────────────────────────────────────────────
+
+/// The `--deadline` a bounded parent runs under: long enough for the parent and its child to stage
+/// and the delegation to start under load, with the driver precompiled.
+const PARENT_DEADLINE_SECS: u64 = 90;
+
+/// A parent run with `--deadline`.
+fn bounded_parent(world: &World, name: &str, body: &str, model: ScriptedServer) -> Parent {
+    Parent::start(world, name, body, model, |command| {
+        command.args(["--deadline", &PARENT_DEADLINE_SECS.to_string()]);
+    })
+}
+
+/// The child ran under its parent's deadline, inherited, and ended at it `deadline_reached`; the
+/// parent ended there too, exit 1 with `E-RUN-053`; and no process names the child's directory 30
+/// seconds after the deadline.
+fn assert_bounded_by_the_parents_deadline(
+    parent: &mut Parent,
+    delegation: &Delegation,
+    started: Instant,
+) {
+    let deadline_falls = started + Duration::from_secs(PARENT_DEADLINE_SECS);
+    let parent_start = parent_trace(parent)[0].clone();
+    let deadline = &parent_start["deadline"];
+    assert_eq!(deadline["source"], "own", "{deadline}");
+    assert_eq!(deadline["secs"], PARENT_DEADLINE_SECS, "{deadline}");
+    let child_start = &delegation.trace()[0];
+    assert_eq!(child_start["event_type"], "session_start");
+    assert_eq!(
+        child_start["deadline"]["at"], deadline["at"],
+        "{child_start}"
+    );
+    assert_eq!(
+        child_start["deadline"]["source"], "inherited",
+        "{child_start}"
+    );
+    assert!(
+        Instant::now() < deadline_falls,
+        "the deadline fell before the delegation started; raise PARENT_DEADLINE_SECS"
+    );
+
+    let (status, exited) = await_exit(
+        &mut parent.proc,
+        Duration::from_secs(PARENT_DEADLINE_SECS + 60),
+    );
+    let stderr = parent.proc.stderr();
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("E-RUN-053"), "{stderr}");
+    assert!(
+        exited >= deadline_falls,
+        "the parent exited before its deadline: {stderr}"
+    );
+    let took = gone_within(delegation, deadline_falls, ONE_LEVEL);
+    eprintln!("[measure] deadline to child exit: {} ms", took.as_millis());
+
+    let parent_events = parent_trace(parent);
+    assert_eq!(
+        parent_events.last().unwrap()["exit_status"],
+        "deadline_reached",
+        "{:?}",
+        kinds(&parent_events)
+    );
+    let events = delegation.trace();
+    let child_kinds = kinds(&events);
+    let reached: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["event_type"] == "deadline_reached")
+        .collect();
+    assert_eq!(reached.len(), 1, "{child_kinds:?}");
+    assert_eq!(reached[0]["source"], "inherited", "{}", reached[0]);
+    assert!(!child_kinds.contains(&"spawner_ended"), "{child_kinds:?}");
+    let session_end = events.last().unwrap();
+    assert_eq!(session_end["event_type"], "session_end", "{child_kinds:?}");
+    assert_eq!(
+        session_end["exit_status"], "deadline_reached",
+        "{session_end}"
+    );
+}
+
+/// A parent run with `--deadline` delegates with `delegate-task` to a child that never answers:
+/// the child runs under the parent's deadline and ends at it.
+#[test]
+fn a_delegated_child_ends_at_its_parents_deadline() {
+    if common::skip_without_host_support("a_delegated_child_ends_at_its_parents_deadline") {
+        return;
+    }
+    let world = World::new(&["bounded-parent"]);
+    let model = delegating_model(MUTE, None);
+    let body = agent_body(&model.endpoint, &spawn_allow(&[MUTE]), QUEUE_SLEEP, "");
+    world.precompile_driver();
+    let started = Instant::now();
+    let mut parent = bounded_parent(&world, "bounded-parent", &body, model);
+    parent.submit();
+    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
+    assert_bounded_by_the_parents_deadline(&mut parent, &delegation, started);
+}
+
+/// A parent run with `--deadline` runs a plan whose `capsule` step names a child that never
+/// answers: the step's child runs under the parent's deadline and ends at it.
+#[test]
+fn a_plan_steps_child_ends_at_its_parents_deadline() {
+    if common::skip_without_host_support("a_plan_steps_child_ends_at_its_parents_deadline") {
+        return;
+    }
+    let world = World::new(&["bounded-planner"]);
+    let model = planning_model(MUTE);
+    let body = agent_body(&model.endpoint, &plan_capabilities(&[MUTE]), "", "");
+    world.precompile_driver();
+    let started = Instant::now();
+    let mut parent = bounded_parent(&world, "bounded-planner", &body, model);
+    parent.submit();
+    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
+    assert_bounded_by_the_parents_deadline(&mut parent, &delegation, started);
 }
 
 /// `SIGKILL` of a capsule whose plan is waiting on a `capsule` step's sub-capsule. Nothing in the

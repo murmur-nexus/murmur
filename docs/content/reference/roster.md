@@ -160,6 +160,11 @@ call a member than it holds tasks at once, [`W-ROS-001`](diagnostics.md#w-ros-00
 7. **End.** When the entry member's process ends, for any reason, the formation ends: every peer
    is stopped and the signing key is dropped. See [How a formation ends](#launch-stop).
 
+`mur run --roster --deadline <SECONDS>` fixes one moment, counted from the launcher's start, and
+passes it to every member as that member's deadline. Every member ends at the same instant however
+far apart the members started. The same moment also bounds each peer's wait in step 4. See
+[The deadline](cli.md#mur-run-deadline).
+
 | Every member | Value |
 |---|---|
 | `MURMUR_FORMATION_ID` | The formation id minted in step 2 |
@@ -270,6 +275,7 @@ it, or when the launcher's process dies by any means, `SIGKILL` and the OOM kill
 | The entry member's process ended | Closes every peer's lifeline |
 | The launcher received `SIGINT`, `SIGTERM` or `SIGHUP` | Closes every lifeline, the entry member's included |
 | A peer did not come up | Closes the lifeline of every member already started |
+| The formation's `--deadline` fell | Every member reaches it at the same moment and ends itself; the launcher then closes the remaining lifelines. Before the entry member started, the launcher stops every member it started and exits with [`E-RUN-053`](diagnostics.md#e-run-053) |
 | The launcher was killed | Is gone; the kernel closes every lifeline |
 
 [`mur stop <formation-id>`](cli.md#mur-stop-formation) ends a formation by sending its launcher
@@ -291,6 +297,7 @@ receive a result. A wound-down member reports no error of its own:
 |---|---:|---|
 | Was running a task | 0 | `formation_ended`. The task itself ends `canceled`, and its `out/result.txt` holds the [`canceled:` line](workdir.md#session-workdir-files) |
 | Was idle | 0 | `ok` |
+| Had reached the formation's `--deadline` | 1 | `deadline_reached`, with [`E-RUN-053`](diagnostics.md#e-run-053). It writes [`deadline_reached`](observability-schemas.md#deadline-reached), not `formation_ended`, even when its lifeline closed a moment after the deadline. The launcher exits with the entry member's `1` |
 
 A member already ending on a `SIGTERM` when its lifeline closed ends as that `SIGTERM` ends it: a
 task it was running ends the session `canceled`, with [`E-RUN-040`](diagnostics.md#e-run-040) and
