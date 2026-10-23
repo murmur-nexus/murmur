@@ -374,7 +374,8 @@ cd /tmp/netns-check && mur run ; echo "exit=$?"
 exact `apparmor_parser` command, and the readings line `Host readings:
 kernel.apparmor_restrict_unprivileged_userns=1; AppArmor profile confining mur: unconfined.` No
 workdir is created. `mur doctor` reports the same `E-CAP-005`, `network namespace: refused` and
-`mount namespace:` and `sealed root:` both `not attempted` while the restriction is on. Restore the host immediately:
+`mount namespace:` and `sealed root:` both `not attempted` while the restriction is on. Restore
+the host immediately:
 
 ```bash
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0

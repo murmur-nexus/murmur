@@ -1524,11 +1524,10 @@ different point:
 | A declared `runtime: tool` artifact ships a native implementation | At launch, once the artifacts are staged and before any component is instantiated |
 | A native tool pulled into the session by `manage.pull` or `pull-artifact` | At that tool's first call, which fails with `E-CAP-005` and the same reason |
 
-Staging and launch read the session's one probe, the first call of a pulled native tool creates the
-namespace itself, and `mur doctor` takes its own probe; all print the same reason. `mur doctor`
-reports the answer as the `network namespace:` line of its `AppArmor / user namespaces` block, for
-every project, beside the `mount namespace:` and `sealed root:` lines. How the three lines and the
-readings tell host conditions apart: [Telling host conditions apart](containment.md#telling-host-conditions-apart).
+Every check point and `mur doctor` print the same reason. `mur doctor` reports the answer as the
+`network namespace:` line of its `AppArmor / user namespaces` block, for every project, beside the
+`mount namespace:` and `sealed root:` lines. How the three lines and the readings tell host
+conditions apart: [Telling host conditions apart](containment.md#telling-host-conditions-apart).
 
 It is not part of the containment ladder — every class needs the namespace equally — so neither
 raising nor lowering a declared floor changes this answer.

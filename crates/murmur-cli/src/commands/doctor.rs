@@ -196,6 +196,19 @@ fn attempt_line(is_linux: bool, attempt: &MountAttempt, created: &str, mechanism
     }
 }
 
+/// Whether the install-the-profile advice applies: an attempt failed, the grant is withheld and
+/// `mur` is unconfined. Under any other profile — a container's — the profile `mur` ships cannot
+/// attach, and the refusal itself names the container's remedy.
+fn profile_advice_applies(
+    grant: Option<UsernsGrant>,
+    attachment: &ProfileAttachment,
+    attempt_failed: bool,
+) -> bool {
+    attempt_failed
+        && grant == Some(UsernsGrant::Withheld)
+        && *attachment == ProfileAttachment::Unconfined
+}
+
 /// Whether the probe saw an attempt `sealed` depends on fail — the network namespace or the
 /// composed root. The install-the-profile advice is printed only then: a withheld grant over
 /// attempts that all succeeded explains nothing.
@@ -354,7 +367,7 @@ fn report_binary_attachment(
             "    The grant below reads withheld, and the namespaces below were created regardless: \
              the reading explains a refusal when an attempt fails, and caused none here."
         );
-    } else if grant == Some(UsernsGrant::Withheld) {
+    } else if profile_advice_applies(grant, attachment, attempt_failed) {
         capsule_runtime::report_println!(
             "    This path is why the grant below is withheld: AppArmor attaches profiles by \
              executable path, and no mur-sealed profile attaches to this one."
@@ -2444,6 +2457,33 @@ mod tests {
             MountAttempt::NotAttempted,
             MountAttempt::NotAttempted
         )));
+    }
+
+    /// The install-the-profile advice is for an unconfined `mur` whose attempt failed under a
+    /// withheld grant; a container's profile, a created set of namespaces or another grant never
+    /// prints it.
+    #[test]
+    fn the_profile_advice_is_for_an_unconfined_binary_only() {
+        let docker = ProfileAttachment::Other {
+            profile: "docker-default".to_string(),
+        };
+        let withheld = Some(UsernsGrant::Withheld);
+        assert!(profile_advice_applies(
+            withheld,
+            &ProfileAttachment::Unconfined,
+            true
+        ));
+        assert!(!profile_advice_applies(withheld, &docker, true));
+        assert!(!profile_advice_applies(
+            withheld,
+            &ProfileAttachment::Unconfined,
+            false
+        ));
+        assert!(!profile_advice_applies(
+            Some(UsernsGrant::RestrictionDisabledHostWide),
+            &ProfileAttachment::Unconfined,
+            true
+        ));
     }
 
     #[test]

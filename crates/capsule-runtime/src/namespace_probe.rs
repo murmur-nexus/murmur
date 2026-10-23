@@ -25,10 +25,8 @@
 //! AppArmor's unprivileged-userns restriction and the profile confining `mur` are read with the
 //! attempts, and only ever choose the words of a refusal: no decision reads them.
 
-// The steps and the record encoding stay defined everywhere so they are unit-tested on every OS,
-// but outside tests only the Linux probe reads them, so off Linux they are dead by construction.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
-
+#[cfg(any(target_os = "linux", test))]
+use crate::network_namespace::{decode_step_record, STEP_RECORD_LEN};
 use crate::network_namespace::{
     errno_label, errno_words, EgressNamespaceFailure, NamespaceAttemptError,
 };
@@ -54,6 +52,8 @@ pub enum MountStep {
 }
 
 impl MountStep {
+    // Only the Linux probe decodes a step; tests on every OS check the encoding round-trips.
+    #[cfg(any(target_os = "linux", test))]
     const ALL: [MountStep; 11] = [
         Self::JoinSession,
         Self::UnshareMount,
@@ -69,6 +69,7 @@ impl MountStep {
     ];
 
     /// The step a rehearsal record's code names, or `None` for a code no step carries.
+    #[cfg(any(target_os = "linux", test))]
     fn from_code(code: u32) -> Option<Self> {
         Self::ALL.into_iter().find(|step| *step as u32 == code)
     }
@@ -279,22 +280,11 @@ pub(crate) fn probe_namespaces() -> NamespaceReading {
     NamespaceReading::not_linux()
 }
 
-/// Bytes in a rehearsal record: the step's code (`0` for success), then the `errno`.
-const RECORD_LEN: usize = 8;
-
-/// A rehearsal's report, as the child writes it.
-fn encode_record(code: u32, errno: i32) -> [u8; RECORD_LEN] {
-    let mut record = [0u8; RECORD_LEN];
-    record[..4].copy_from_slice(&code.to_ne_bytes());
-    record[4..].copy_from_slice(&errno.to_ne_bytes());
-    record
-}
-
-/// What a received record says: `Created` for code `0`, the failed step otherwise, or `None` for a
-/// code no step carries.
-fn decode_record(record: &[u8; RECORD_LEN]) -> Option<MountAttempt> {
-    let code = u32::from_ne_bytes([record[0], record[1], record[2], record[3]]);
-    let errno = i32::from_ne_bytes([record[4], record[5], record[6], record[7]]);
+/// What a rehearsal's step report says: `Created` for code `0`, the failed step otherwise, or
+/// `None` for a code no step carries.
+#[cfg(any(target_os = "linux", test))]
+fn decode_record(record: &[u8; STEP_RECORD_LEN]) -> Option<MountAttempt> {
+    let (code, errno) = decode_step_record(record);
     if code == 0 {
         return Some(MountAttempt::Created);
     }
@@ -310,9 +300,8 @@ mod linux {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
 
-    use super::{
-        decode_record, encode_record, MountAttempt, MountAttemptError, MountStep, RECORD_LEN,
-    };
+    use super::{decode_record, MountAttempt, MountAttemptError, MountStep, STEP_RECORD_LEN};
+    use crate::network_namespace::encode_step_record;
     use crate::sealed::{
         make_dumpable_for_map_writes, restore_dumpable, write_decimal_map, OLD_ROOT_NAME_C,
         OLD_ROOT_PIVOTED_C, SEALED_ROOT_BASE_CANDIDATES,
@@ -420,8 +409,8 @@ mod linux {
             // destructor of the parent's state runs here.
             unsafe {
                 let record = match run(rehearsal, &paths, user_fd, net_fd) {
-                    Ok(()) => encode_record(0, 0),
-                    Err((step, errno)) => encode_record(step as u32, errno),
+                    Ok(()) => encode_step_record(0, 0),
+                    Err((step, errno)) => encode_step_record(step as u32, errno),
                 };
                 libc::write(write_fd, record.as_ptr().cast(), record.len());
                 libc::_exit(0);
@@ -429,7 +418,7 @@ mod linux {
         }
         drop(write_end);
 
-        let status = match wait_for(pid) {
+        let status = match crate::network_namespace::reap_child(pid) {
             Ok(status) => status,
             Err(error) => {
                 return failed(format!(
@@ -440,11 +429,16 @@ mod linux {
         };
         // Read after the child is reaped and without blocking: the record it wrote stays in the
         // pipe, and another thread's child forked in the meantime may still hold the write end.
-        let mut record = [0u8; RECORD_LEN];
-        // SAFETY: `record` is a live stack buffer of `RECORD_LEN` bytes.
-        let read =
-            unsafe { libc::read(read_end.as_raw_fd(), record.as_mut_ptr().cast(), RECORD_LEN) };
-        if read == RECORD_LEN as isize {
+        let mut record = [0u8; STEP_RECORD_LEN];
+        // SAFETY: `record` is a live stack buffer of `STEP_RECORD_LEN` bytes.
+        let read = unsafe {
+            libc::read(
+                read_end.as_raw_fd(),
+                record.as_mut_ptr().cast(),
+                STEP_RECORD_LEN,
+            )
+        };
+        if read == STEP_RECORD_LEN as isize {
             if let Some(attempt) = decode_record(&record) {
                 return attempt;
             }
@@ -581,35 +575,12 @@ mod linux {
             )
         }
     }
-
-    /// Reaps the rehearsal child, rendering how it ended.
-    fn wait_for(pid: libc::pid_t) -> Result<String, io::Error> {
-        let mut status: libc::c_int = 0;
-        loop {
-            // SAFETY: `pid` is the child just forked; `status` is a live local.
-            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-            if waited == pid {
-                break;
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-        Ok(if libc::WIFEXITED(status) {
-            format!("exit status {}", libc::WEXITSTATUS(status))
-        } else if libc::WIFSIGNALED(status) {
-            format!("killed by signal {}", libc::WTERMSIG(status))
-        } else {
-            format!("wait status {status}")
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network_namespace::CreationStep;
+    use crate::network_namespace::{encode_step_record, CreationStep};
 
     fn created() -> NamespaceReading {
         NamespaceReading {
@@ -628,16 +599,16 @@ mod tests {
     #[test]
     fn every_record_round_trips_and_an_unknown_code_is_none() {
         assert_eq!(
-            decode_record(&encode_record(0, 0)),
+            decode_record(&encode_step_record(0, 0)),
             Some(MountAttempt::Created)
         );
         for step in MountStep::ALL {
             assert_eq!(
-                decode_record(&encode_record(step as u32, libc::EPERM)),
+                decode_record(&encode_step_record(step as u32, libc::EPERM)),
                 Some(failed(step, libc::EPERM))
             );
         }
-        assert_eq!(decode_record(&encode_record(99, 0)), None);
+        assert_eq!(decode_record(&encode_step_record(99, 0)), None);
     }
 
     #[test]

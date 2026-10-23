@@ -30,9 +30,10 @@
 //! Answered by creating one: [`crate::namespace_probe`] runs the same creator a session does, with
 //! an empty allowlist, and drops what it hands over. A staged session's staging and launch read
 //! the answer off that session's one [`crate::sandbox::HostProbe`], and a session's first command
-//! gets the same refusal from its own creation ([`SessionNetns::establish`]). AppArmor's unprivileged-userns restriction and the
-//! profile confining `mur` are read only to explain a failure: a container whose own profile
-//! permits the namespace is not refused because the host's restriction reads `1`.
+//! gets the same refusal from its own creation ([`SessionNetns::establish`]). AppArmor's
+//! unprivileged-userns restriction and the profile confining `mur` are read only to explain a
+//! failure: a container whose own profile permits the namespace is not refused because the host's
+//! restriction reads `1`.
 //!
 //! ## The syscall sequence
 //!
@@ -775,8 +776,28 @@ impl Drop for SessionNetns {
     }
 }
 
+/// Bytes in a forked child's step report: a `u32` step code, then the `errno` as an `i32`, both
+/// native-endian. The namespace creator and the namespace probe's rehearsals both report this way.
+pub(crate) const STEP_RECORD_LEN: usize = 8;
+
+/// A child's step report. Integers only, so a forked child builds it without allocating.
+pub(crate) fn encode_step_record(code: u32, errno: i32) -> [u8; STEP_RECORD_LEN] {
+    let mut record = [0u8; STEP_RECORD_LEN];
+    record[..4].copy_from_slice(&code.to_ne_bytes());
+    record[4..].copy_from_slice(&errno.to_ne_bytes());
+    record
+}
+
+/// `(code, errno)` from a child's step report.
+pub(crate) fn decode_step_record(record: &[u8; STEP_RECORD_LEN]) -> (u32, i32) {
+    (
+        u32::from_ne_bytes([record[0], record[1], record[2], record[3]]),
+        i32::from_ne_bytes([record[4], record[5], record[6], record[7]]),
+    )
+}
+
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{create_session_netns, join_session_netns};
+pub(crate) use linux::{create_session_netns, join_session_netns, reap_child};
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
@@ -786,8 +807,9 @@ mod linux {
     use std::sync::Arc;
 
     use super::{
-        CapsuleNetnsPlan, CreationStep, NamespaceAttemptError, SessionNetnsJoin,
-        MAX_NAMESPACE_SOCKETS, MAX_SESSION_NETNS_FDS,
+        decode_step_record, encode_step_record, CapsuleNetnsPlan, CreationStep,
+        NamespaceAttemptError, SessionNetnsJoin, MAX_NAMESPACE_SOCKETS, MAX_SESSION_NETNS_FDS,
+        STEP_RECORD_LEN,
     };
 
     // ------------------------------------------------------------ netlink constants
@@ -829,9 +851,6 @@ mod linux {
         errno: i32,
     }
 
-    /// Bytes in an encoded [`CreationFailure`]: the step's code, then the `errno`.
-    const FAILURE_RECORD_LEN: usize = 8;
-
     impl CreationFailure {
         /// The failure of `step`, with the `errno` the failing call just left.
         ///
@@ -844,18 +863,13 @@ mod linux {
             Self { step, errno }
         }
 
-        fn encode(self) -> [u8; FAILURE_RECORD_LEN] {
-            let mut record = [0u8; FAILURE_RECORD_LEN];
-            record[..4].copy_from_slice(&(self.step as u32).to_ne_bytes());
-            record[4..].copy_from_slice(&self.errno.to_ne_bytes());
-            record
+        fn encode(self) -> [u8; STEP_RECORD_LEN] {
+            encode_step_record(self.step as u32, self.errno)
         }
 
-        fn decode(record: &[u8; FAILURE_RECORD_LEN]) -> Option<Self> {
-            let step = CreationStep::from_code(u32::from_ne_bytes([
-                record[0], record[1], record[2], record[3],
-            ]))?;
-            let errno = i32::from_ne_bytes([record[4], record[5], record[6], record[7]]);
+        fn decode(record: &[u8; STEP_RECORD_LEN]) -> Option<Self> {
+            let (code, errno) = decode_step_record(record);
+            let step = CreationStep::from_code(code)?;
             Some(Self { step, errno })
         }
     }
@@ -1100,7 +1114,14 @@ mod linux {
         }
         drop(creator_end);
 
-        let status = wait_for_creator(pid).map_err(NamespaceAttemptError::Creator)?;
+        // The hand-off is read only after the creator is reaped: a `SOCK_DGRAM` pair reports no
+        // end-of-file when its peer closes, so reading first would block forever on a creator that
+        // died before sending, while the message a creator did send stays queued after it exits.
+        let status = reap_child(pid).map_err(|error| {
+            NamespaceAttemptError::Creator(format!(
+                "waiting for the namespace creator failed: {error}"
+            ))
+        })?;
         match receive_session_netns(parent_end.as_raw_fd(), plan.socket_count())
             .map_err(NamespaceAttemptError::Creator)?
         {
@@ -1120,20 +1141,18 @@ mod linux {
         }
     }
 
-    /// Reaps the creator. The hand-off is read only afterwards: a `SOCK_DGRAM` pair reports no
-    /// end-of-file when its peer closes, so reading first would block forever on a creator that
-    /// died before sending, while the message a creator did send stays queued after it exits.
-    fn wait_for_creator(pid: libc::pid_t) -> Result<String, String> {
+    /// Reaps the child `pid`, retrying on `EINTR`, and renders how it ended.
+    pub(crate) fn reap_child(pid: libc::pid_t) -> io::Result<String> {
         let mut status: libc::c_int = 0;
         loop {
-            // SAFETY: `pid` is the creator just forked; `status` is a live local.
+            // SAFETY: `pid` is a child this process forked; `status` is a live local.
             let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
             if waited == pid {
                 break;
             }
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
-                return Err(format!("waiting for the namespace creator failed: {error}"));
+                return Err(error);
             }
         }
         Ok(if libc::WIFEXITED(status) {
@@ -1149,9 +1168,7 @@ mod linux {
     /// parent returns for it.
     #[cfg(test)]
     pub(super) fn decode_failure_record(step: u32, errno: i32) -> Option<NamespaceAttemptError> {
-        let mut record = [0u8; FAILURE_RECORD_LEN];
-        record[..4].copy_from_slice(&step.to_ne_bytes());
-        record[4..].copy_from_slice(&errno.to_ne_bytes());
+        let record = encode_step_record(step, errno);
         CreationFailure::decode(&record).map(|failure| {
             assert_eq!(failure.encode(), record);
             failure.into()
@@ -1499,7 +1516,7 @@ mod linux {
         // SAFETY: `sock_fd` is a valid unix socket; all buffers are live locals sized for the
         // largest message the creator can send, and the control buffer is 8-byte aligned.
         unsafe {
-            let mut payload = [0u8; FAILURE_RECORD_LEN];
+            let mut payload = [0u8; STEP_RECORD_LEN];
             let mut iov = libc::iovec {
                 iov_base: payload.as_mut_ptr().cast(),
                 iov_len: payload.len(),
@@ -1526,7 +1543,7 @@ mod linux {
 
             let cmsg = libc::CMSG_FIRSTHDR(&msg);
             if cmsg.is_null() {
-                if received as usize == FAILURE_RECORD_LEN {
+                if received as usize == STEP_RECORD_LEN {
                     if let Some(failure) = CreationFailure::decode(&payload) {
                         return Ok(Received::Failure(failure));
                     }

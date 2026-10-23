@@ -4012,6 +4012,35 @@ mod tests {
             }
         }
 
+        /// An `EPERM` the readings cannot explain — a grant other than `withheld` — is the
+        /// namespace or its map refused, never the missing `mur-sealed` profile.
+        #[test]
+        fn a_refusal_under_any_other_grant_is_not_blamed_on_the_profile() {
+            for grant in [
+                UsernsGrant::ApparmorAbsent,
+                UsernsGrant::ProfileConfining,
+                UsernsGrant::RestrictionDisabledHostWide,
+            ] {
+                for (step, blocker) in [
+                    (
+                        CreationStep::Unshare,
+                        SealedBlocker::NamespaceCreationDenied,
+                    ),
+                    (CreationStep::IdentityMaps, SealedBlocker::IdMapDenied),
+                ] {
+                    let reading = NamespaceReading {
+                        userns_grant: grant,
+                        ..network_failed(step, libc::EPERM)
+                    };
+                    assert_eq!(
+                        sealed_shortfall(true, true, &reading).map(|s| s.blocker),
+                        Some(blocker),
+                        "{reading:?}"
+                    );
+                }
+            }
+        }
+
         /// The `/tmp` attempt is the mount namespace a `scoped` command uses; the composed root
         /// binds `/tmp` itself, so a refused `/tmp` mapping says nothing about `sealed`.
         #[test]

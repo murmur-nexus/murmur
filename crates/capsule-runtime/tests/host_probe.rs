@@ -68,18 +68,14 @@ fn each_standalone_host_question_takes_its_own_reading() {
 }
 
 /// One reading answers every namespace question from its attempts, on whatever host this runs:
-/// `/tmp` is mappable exactly when the network and mount attempts both created their namespaces,
 /// `E-CAP-005` is reported exactly when the network attempt failed, a failed network attempt
-/// attempts nothing after it, and `sealed` is backed only when the sealed root was built.
+/// attempts nothing after it, and `sealed` is backed only when the sealed root was built. Whether
+/// `/tmp` is mappable is crate-private; `sandbox`'s live-reading test checks it.
 #[test]
 fn one_reading_answers_every_namespace_question_from_its_attempts() {
     let probe = HostProbe::probe();
     let namespaces = probe.namespaces();
     println!("namespace reading: {namespaces:?}");
-    assert_eq!(
-        namespaces.mount_namespace_created(),
-        namespaces.network.is_ok() && namespaces.mount == MountAttempt::Created
-    );
     if cfg!(target_os = "linux") {
         assert_eq!(
             probe.egress_namespace_failure().is_some(),

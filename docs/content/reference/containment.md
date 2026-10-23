@@ -262,12 +262,14 @@ AppArmor's `kernel.apparmor_restrict_unprivileged_userns` and the profile confin
 with the attempts and only word a refusal: **the setting is never the reason for a refusal.** A
 refusal ends with the readings line, `Host readings: kernel.apparmor_restrict_unprivileged_userns=<0|1>;
 AppArmor profile confining mur: <profile>.`, and `mur doctor` prints one line per attempt in its
-`AppArmor / user namespaces` block:
+`AppArmor / user namespaces` block. Inside a container whose profile permits the namespaces, with
+the setting reading `1`:
 
 ```text
 AppArmor / user namespaces
   this binary:  /usr/local/bin/mur
-  profile attached: none (the kernel reports this binary as unconfined)
+  profile attached: docker-default
+    Some other profile confines this binary. It is not the profile mur ships and grants nothing mur asked for; it may also be narrower than unconfined.
     The grant below reads withheld, and the namespaces below were created regardless: the reading explains a refusal when an attempt fails, and caused none here.
   userns grant: withheld
     the restriction is on and no mur-sealed AppArmor profile is confining this binary, so nothing murmur ships grants it a user namespace
