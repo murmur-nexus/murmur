@@ -84,18 +84,18 @@ fn murmur_driver_anthropic_completes_one_tool_task() {
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
     fs::write(
-        staged.workdir.join("task.md"),
+        staged.accessible_workdir.join("task.md"),
         "Count lines in input.jsonl and write the result.",
     )
     .unwrap();
     fs::write(
-        staged.workdir.join("input.jsonl"),
+        staged.accessible_workdir.join("input.jsonl"),
         "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n{\"id\":4}\n{\"id\":5}\n",
     )
     .unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
-    let output = fs::read_to_string(launched.workdir.join("out/result.txt")).unwrap();
+    let output = fs::read_to_string(launched.records_dir.join("out/result.txt")).unwrap();
     assert!(output.contains("5"));
 
     let requests = server.requests();
@@ -188,18 +188,18 @@ fn murmur_driver_openai_completes_one_tool_task() {
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
     fs::write(
-        staged.workdir.join("task.md"),
+        staged.accessible_workdir.join("task.md"),
         "Count lines in input.jsonl and write the result.",
     )
     .unwrap();
     fs::write(
-        staged.workdir.join("input.jsonl"),
+        staged.accessible_workdir.join("input.jsonl"),
         "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n{\"id\":4}\n{\"id\":5}\n",
     )
     .unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
-    let output = fs::read_to_string(launched.workdir.join("out/result.txt")).unwrap();
+    let output = fs::read_to_string(launched.records_dir.join("out/result.txt")).unwrap();
     assert!(output.contains("5"));
 
     let requests = server.requests();
@@ -282,10 +282,14 @@ fn bootstrap_rejects_undeclared_tool() {
     );
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Try a missing tool").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Try a missing tool",
+    )
+    .unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("agent launch should not trap");
-    let output = fs::read_to_string(launched.workdir.join("out/result.txt")).unwrap();
+    let output = fs::read_to_string(launched.records_dir.join("out/result.txt")).unwrap();
     assert!(output.contains("non-existent-tool"));
     assert!(output.contains("not declared"));
 
@@ -408,7 +412,7 @@ fn bootstrap_driver_excluded_from_tool_list() {
     );
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Do nothing.").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Do nothing.").unwrap();
 
     launch_session(staged, |_| {}).expect("agent launch should succeed");
 
@@ -488,7 +492,7 @@ fn agent_system_prompt_includes_capsule_context() {
     .unwrap();
 
     let staged = stage_agent_session(&home, project.path(), &project.path().join("murmur.yaml"));
-    fs::write(staged.workdir.join("task.md"), "hello").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "hello").unwrap();
 
     launch_session(staged, |_| {}).expect("agent launch should succeed");
 
@@ -515,7 +519,7 @@ fn agent_system_prompt_includes_capsule_context() {
         "system field should contain capsule version; got:\n{system_field}"
     );
     // The block names no host path: it is the first text of every prompt, and a per-launch
-    // session workdir there means no request ever matches a cached prompt prefix.
+    // work folder there means no request ever matches a cached prompt prefix.
     assert!(
         !system_field.contains("Workdir:"),
         "system field must not name a host workdir; got:\n{system_field}"
@@ -601,19 +605,19 @@ fn prompt_prefix_is_identical_across_two_launches() {
         false,
     );
 
-    // No --workdir on either launch, so each gets a fresh session directory under the project.
+    // No --workdir on either launch, so each gets a fresh work folder under the project.
     let mut session_ids = Vec::new();
     let mut workdirs = Vec::new();
     for _ in 0..2 {
         let staged = stage_agent_session(&home, project.path(), &manifest_path);
         session_ids.push(staged.session_id.clone());
         workdirs.push(staged.accessible_workdir.clone());
-        fs::write(staged.workdir.join("task.md"), "hello").unwrap();
+        fs::write(staged.accessible_workdir.join("task.md"), "hello").unwrap();
         launch_session(staged, |_| {}).expect("agent launch should succeed");
     }
     assert_ne!(
         session_ids[0], session_ids[1],
-        "the two launches must not share a session directory, or the test proves nothing"
+        "the two launches must not share a work folder, or the test proves nothing"
     );
 
     let requests = server.requests();
@@ -679,7 +683,7 @@ fn prompt_cache_key_is_not_forwarded_to_the_provider() {
     );
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "hello").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "hello").unwrap();
 
     launch_session(staged, |_| {}).expect("agent launch should succeed");
 
@@ -732,7 +736,7 @@ fn prompt_cache_key_over_long_capsule_name_completes_a_session() {
     .unwrap();
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "hello").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "hello").unwrap();
 
     launch_session(staged, |_| {}).expect("agent launch should succeed");
 

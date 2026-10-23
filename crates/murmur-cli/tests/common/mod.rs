@@ -1268,7 +1268,7 @@ pub fn explain_scope_json(home: &TempDir, manifest: &Path) -> Value {
     serde_json::from_slice(&stdout).expect("--explain-scope --json emits one JSON object")
 }
 
-/// The session workdir `mur run --verbose` reports in its startup block.
+/// The work folder `mur run --verbose` reports in its startup block.
 pub fn parse_workdir_from_stdout(stdout: &str) -> PathBuf {
     parse_startup_path(stdout, "workdir: ")
 }

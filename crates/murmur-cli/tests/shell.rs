@@ -69,10 +69,14 @@ fn shell_execute_bash_and_reads_stdout() {
     );
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Run ls and summarize it.").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Run ls and summarize it.",
+    )
+    .unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
-    let output = fs::read_to_string(launched.workdir.join("out/result.txt")).unwrap();
+    let output = fs::read_to_string(launched.records_dir.join("out/result.txt")).unwrap();
     assert!(output.contains("Directory listing received."));
 
     let requests = server.requests();
@@ -141,10 +145,10 @@ fn shell_blocks_undeclared_binary() {
     );
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Try curl").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Try curl").unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("agent launch should not trap");
-    let output = fs::read_to_string(launched.workdir.join("out/result.txt")).unwrap();
+    let output = fs::read_to_string(launched.records_dir.join("out/result.txt")).unwrap();
     assert!(output.contains("curl"));
     assert!(output.contains("allowlist"));
 
@@ -213,13 +217,13 @@ fn shell_propagates_nonzero_exit_code() {
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
     fs::write(
-        staged.workdir.join("task.md"),
+        staged.accessible_workdir.join("task.md"),
         "Run a failing bash command.",
     )
     .unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
-    assert!(launched.workdir.join("out/result.txt").exists());
+    assert!(launched.records_dir.join("out/result.txt").exists());
 
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
@@ -406,7 +410,7 @@ fn shell_detaches_a_slow_command_and_the_turn_continues() {
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
     fs::write(
-        staged.workdir.join("task.md"),
+        staged.accessible_workdir.join("task.md"),
         "Run a slow build, then say hi.",
     )
     .unwrap();
@@ -698,7 +702,11 @@ fn a_demoted_command_is_read_back_through_its_handle() {
         "lifecycle:\n  shell_grace_secs: 1\n",
     );
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Run the suite and report.").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Run the suite and report.",
+    )
+    .unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
     let requests = server.requests();
@@ -793,7 +801,7 @@ fn a_task_that_ends_with_a_command_running_says_so_and_the_session_kills_it() {
         "lifecycle:\n  shell_grace_secs: 1\n",
     );
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let _guard = KillPidFilesOnDrop(vec![workdir.join("leader.pid"), workdir.join("child.pid")]);
     fs::write(workdir.join("task.md"), "Start the server.").unwrap();
 
@@ -824,7 +832,7 @@ fn a_task_that_ends_with_a_command_running_says_so_and_the_session_kills_it() {
 }
 
 /// The records directories of `project_dir`'s sessions under `home`, newest last. The launch
-/// writes one session workdir per run under `<manifest dir>/workdir`, which is where `--resume`
+/// writes one work folder per run under `<manifest dir>/workdir`, which is where `--resume`
 /// looks for the one it names, and one records directory per run in that directory's records
 /// group, named for the same session.
 fn session_records(home: &Path, project_dir: &Path) -> Vec<PathBuf> {
@@ -1154,9 +1162,9 @@ fn a_resume_over_an_unreadable_prior_trace_still_runs_its_task() {
     );
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Say something.").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Say something.").unwrap();
     let first = launch_session(staged, |_| {}).expect("the first launch should succeed");
-    let first_session = session_name(&first.workdir);
+    let first_session = first.session_id.clone();
     let context_id = trace_events(&first.records_dir)
         .iter()
         .find(|event| event["event_type"] == "task_start")
@@ -1179,11 +1187,11 @@ fn a_resume_over_an_unreadable_prior_trace_still_runs_its_task() {
         &first_session,
         &context_id,
     );
-    fs::write(staged.workdir.join("task.md"), "Continue.").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Continue.").unwrap();
     let resumed =
         launch_session(staged, |_| {}).expect("a torn prior trace must not fail a resume");
     assert!(
-        resumed.workdir.join("out/result.txt").exists(),
+        resumed.records_dir.join("out/result.txt").exists(),
         "the resumed session still ran its task"
     );
     // Read leniently: this file ends mid-record, which is the shape the scan has to tolerate.
@@ -1218,11 +1226,11 @@ fn a_resume_over_an_unreadable_prior_trace_still_runs_its_task() {
         &first_session,
         &context_id,
     );
-    fs::write(staged.workdir.join("task.md"), "Continue again.").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Continue again.").unwrap();
     let resumed =
         launch_session(staged, |_| {}).expect("an unreadable prior trace must not fail a resume");
     assert!(
-        resumed.workdir.join("out/result.txt").exists(),
+        resumed.records_dir.join("out/result.txt").exists(),
         "the resumed session still ran its task"
     );
     fs::set_permissions(&trace_path, fs::Permissions::from_mode(0o644)).unwrap();

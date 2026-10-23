@@ -350,10 +350,11 @@ Expected — every line `No such file or directory`, and **not** `Permission den
 
 !!! note "`/home` is the one line to read carefully"
 
-    If the session workdir lives under `/home` — the usual case — then `/home` and every directory
-    component down to the workdir **does** exist inside the composed root, because the workdir is
-    reproduced at its own absolute path. Expect `/home` to `stat` successfully in that case, and
-    check instead that it is empty apart from the single path leading to the workdir:
+    If the work folder lives under `/home` — the usual case — then `/home` and every directory
+    component down to the work folder **does** exist inside the composed root, because the work
+    folder, the runtime and records directories and the home folder are each reproduced at their
+    own absolute path. Expect `/home` to `stat` successfully in that case, and check instead that
+    it is empty apart from the paths leading to those directories:
 
     ```sh
     find /home -maxdepth 4 | sort
@@ -488,8 +489,8 @@ ls: cannot access '/dev/loop*': No such file or directory
 
 ### 3d — writability
 
-The session workdir and `/tmp` are the only writable paths. `$PWD` is the workdir, at the same
-absolute path it has on the host:
+The work folder, `/tmp` and the session's [home folder](containment.md#home-folder), `$HOME`, are
+the only writable paths. `$PWD` is the work folder, at the same absolute path it has on the host:
 
 ```sh
 pwd
@@ -499,7 +500,7 @@ touch /etc/writable-there 2>&1
 touch /writable-there 2>&1
 ```
 
-Expected (the `pwd` line is the host path of the session workdir — record it verbatim):
+Expected (the `pwd` line is the host path of the work folder — record it verbatim):
 
 ```text
 /home/<you>/sealed-check/workdir
@@ -512,8 +513,9 @@ touch: cannot touch '/writable-there': Read-only file system
 `/tmp` is writable: the composed root binds the
 [session's temporary folder](containment.md#temp-folder) there. That folder is `tmp/` in the
 session's records directory, `~/.murmur/records/<workdir root>/<session-id>/tmp`, outside the
-workdir; it counts against `capabilities.resources.workdir_max_bytes` together with the workdir and
-is removed with the records directory by `trace.retain`. `TMPDIR` names it as `/tmp`:
+work folder; it counts against `capabilities.resources.workdir_max_bytes` together with the work
+folder and the home folder, and is removed with the records directory by `trace.retain` or
+`mur trace rm`. `TMPDIR` names it as `/tmp`:
 
 ```sh
 echo "TMPDIR=$TMPDIR"
@@ -582,7 +584,7 @@ rc=0
     unchanged decision, verified on
     [its own page](workdir-exec-landlock-manual-verification.md).
 
-The size guard measures the session workdir and the temporary folder together. With a small
+The size guard measures the work folder, the temporary folder and the home folder together. With a small
 `capabilities.resources.workdir_max_bytes` declared, filling `/tmp` past the ceiling must latch the
 same breach an oversized write straight into the workdir would:
 
@@ -594,10 +596,10 @@ Expected, on the *next* shell tool call (the guard checks on an interval, then r
 boundary rather than mid-write):
 
 ```text
-workdir and temporary folder grew to <N> bytes, past the 1000000 byte ceiling (capabilities.resources.workdir_max_bytes)
+work folder, $HOME and $TMPDIR together grew to <N> bytes, past the 1000000 byte ceiling (capabilities.resources.workdir_max_bytes)
 ```
 
-`<N>` is the sum of both, at least 4000000.
+`<N>` is the sum of all three, at least 4000000.
 
 ### 3e — `/proc`
 

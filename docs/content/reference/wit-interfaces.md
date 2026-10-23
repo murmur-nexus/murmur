@@ -68,13 +68,13 @@ the key if your resource is a symbol, URI, or query.
 ### Returning a large result { #tool-data-path }
 
 A tool with more output than it wants to carry in `data` writes the output to a file and returns
-the filename in `data-path`. Name that file relative to the [session workdir](workdir.md), the
+the filename in `data-path`. Name that file relative to the [work folder](workdir.md#work-folder), the
 directory the tool's own `.` resolves to. When the runtime reads the file on the tool's behalf, it
 resolves the name beneath that directory and refuses anything that leaves it:
 
 | `data-path` names | Outcome |
 |---|---|
-| A regular file under the session workdir | Its contents become the result |
+| A regular file under the work folder | Its contents become the result |
 | An absolute path, or one climbing out with `..` | The call fails |
 | A path passing through a symlink, wherever the symlink points | The call fails |
 | A file that does not exist | The call fails |

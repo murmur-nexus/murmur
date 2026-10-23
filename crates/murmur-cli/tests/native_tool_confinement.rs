@@ -122,10 +122,11 @@ impl Capsule {
 }
 
 /// What a launched session left behind: each tool call's result text, keyed by its id (`None` when
-/// the model never received one), and the session's workdirs.
+/// the model never received one), the session's work folder and its records directory.
 struct Ran {
     results: Vec<(String, Option<String>)>,
     accessible_workdir: PathBuf,
+    records_dir: PathBuf,
     /// The scratch home, artifact folder and project, kept until the test has read the workdir.
     _dirs: [TempDir; 3],
 }
@@ -152,17 +153,9 @@ impl Ran {
         })
     }
 
-    /// The session's `trace.jsonl`. An in-process session keeps its records under this process's
-    /// `$HOME`, the scratch home `common` points it at, mirrored from the session workdir's path.
+    /// The session's `trace.jsonl`, in the records directory staging named.
     fn trace_path(&self) -> Result<PathBuf, String> {
-        let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is unset")?);
-        let session = &self.accessible_workdir;
-        let (Some(root), Some(id)) = (session.parent(), session.file_name()) else {
-            return Err(format!("{} names no session", session.display()));
-        };
-        let trace = common::records_group(&home, root)
-            .join(id)
-            .join("trace.jsonl");
+        let trace = self.records_dir.join("trace.jsonl");
         if trace.is_file() {
             Ok(trace)
         } else {
@@ -266,6 +259,7 @@ fn run_in(
     let staged =
         common::stage_agent_session_at_floor(&home, project.path(), &manifest_path, floor, workdir);
     let accessible_workdir = staged.accessible_workdir.clone();
+    let records_dir = staged.records_dir.clone();
     fs::write(accessible_workdir.join("task.md"), "Run the probes.").unwrap();
 
     let launch_error = launch_session(staged, |_| {})
@@ -284,6 +278,7 @@ fn run_in(
     let ran = Ran {
         results,
         accessible_workdir,
+        records_dir,
         _dirs: [home, artifact_dir, project],
     };
     if let Some(error) = launch_error {

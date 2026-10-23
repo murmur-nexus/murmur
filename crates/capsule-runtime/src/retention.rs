@@ -191,13 +191,24 @@ pub(crate) fn uuid_v7_timestamp_ms(id: &str, prefix: &str) -> Option<u64> {
     u64::from_str_radix(hex.get(..12)?, 16).ok()
 }
 
+/// The directory holding the work folders the runtime creates, which [`prune_sessions`] prunes
+/// beside the records group: `<manifest_dir>/workdir` for a launch without `--workdir`, and
+/// `None` under `--workdir`, whose folder is the operator's and is never touched.
+pub(crate) fn created_workdirs(
+    workdir_flag: Option<&std::path::Path>,
+    manifest_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    workdir_flag.is_none().then(|| manifest_dir.join("workdir"))
+}
+
 /// Remove the sessions of one records group that `policy` does not keep: each pruned session's
-/// records directory in `records_group` and, when `session_workdirs` is given, its session
-/// workdir directory of the same name there, so a session goes whole.
+/// records directory in `records_group` and, when `created_workdirs` is given
+/// ([`created_workdirs`]), the work folder of the same name the runtime created there, so a
+/// session goes whole.
 ///
-/// The decision is made on `records_group`'s `ses_*` listing alone: a session whose workdir half
-/// is already gone still goes, and a workdir directory with no records directory is never a
-/// candidate. Both removals go by descriptor through their roots, with no link followed.
+/// The decision is made on `records_group`'s `ses_*` listing alone: a session whose work folder
+/// is already gone still goes, and a work folder with no records directory is never a candidate.
+/// Both removals go by descriptor through their roots, with no link followed.
 ///
 /// `current_session_id` is a hard floor: no directory whose name sorts at or after it is ever a
 /// candidate, whatever the policy says. That is what keeps the running session's own trace, and
@@ -210,11 +221,11 @@ pub(crate) fn uuid_v7_timestamp_ms(id: &str, prefix: &str) -> Option<u64> {
 /// "too old" is the more specific statement about a directory that fails both.
 ///
 /// A records directory that cannot be removed is skipped and left out of the returned list, and
-/// its workdir half is kept with it: retention never fails a launch, and a trace event must name
+/// its work folder is kept with it: retention never fails a launch, and a trace event must name
 /// only what actually went.
 pub fn prune_sessions(
     records_group: &crate::workdir_fs::WorkdirRoot,
-    session_workdirs: Option<&crate::workdir_fs::WorkdirRoot>,
+    created_workdirs: Option<&crate::workdir_fs::WorkdirRoot>,
     current_session_id: &str,
     policy: &murmur_artifact::TraceRetainConfig,
     now_ms: u64,
@@ -259,7 +270,7 @@ pub fn prune_sessions(
             crate::trace::RETENTION_REASON_MAX_SESSIONS
         };
         if records_group.remove_dir_all(name).is_ok() {
-            if let Some(workdirs) = session_workdirs {
+            if let Some(workdirs) = created_workdirs {
                 let _ = workdirs.remove_dir_all(name);
             }
             pruned.push(PrunedSession {
@@ -1043,11 +1054,11 @@ mod tests {
         assert!(root.path().join(&current).join("trace.jsonl").exists());
     }
 
-    /// A pruned session goes whole: its records directory and its session workdir directory of
-    /// the same name both go, and a workdir directory with no records directory is never a
-    /// candidate, whatever its name says.
+    /// A pruned session goes whole: its records directory and its created work folder of the same
+    /// name both go, and a work folder with no records directory is never a candidate, whatever
+    /// its name says.
     #[test]
-    fn a_pruned_session_takes_its_records_and_its_session_workdir() {
+    fn a_pruned_session_takes_its_records_and_its_created_work_folder() {
         let records = tempfile::tempdir().unwrap();
         let workdirs = tempfile::tempdir().unwrap();
         let all: Vec<String> = (1..=3).map(|n| ses(NOW - (3 - n) * 1000, n)).collect();
@@ -1075,6 +1086,67 @@ mod tests {
         let mut kept = vec![all[1].clone(), all[2].clone(), workdir_only];
         kept.sort();
         assert_eq!(names(workdirs.path()), kept);
+    }
+
+    /// Under `--workdir` retention is handed no work folders: an old session's records go, and a
+    /// planted `.murmur/<old-id>/` and `<old-id>/` in the operator's folder both survive. Without
+    /// it, the old session's runtime-created `workdir/<old-id>` goes with its records.
+    #[test]
+    fn retention_prunes_a_created_work_folder_and_never_the_operators() {
+        let records = tempfile::tempdir().unwrap();
+        let operator = tempfile::tempdir().unwrap();
+        let manifest_dir = tempfile::tempdir().unwrap();
+        let old = ses(NOW - 2000, 1);
+        let current = ses(NOW, 2);
+        let policy = TraceRetainConfig {
+            max_sessions: Some(1),
+            max_age_secs: None,
+        };
+        let open = |path: &std::path::Path| crate::workdir_fs::WorkdirRoot::open(path).unwrap();
+
+        make_sessions(records.path(), &[old.clone(), current.clone()]);
+        let planted = [
+            operator.path().join(".murmur").join(&old),
+            operator.path().join(&old),
+        ];
+        for dir in &planted {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("keep"), b"x").unwrap();
+        }
+        assert_eq!(
+            created_workdirs(Some(operator.path()), manifest_dir.path()),
+            None
+        );
+        let pruned = prune_sessions(
+            &open(records.path()),
+            created_workdirs(Some(operator.path()), manifest_dir.path())
+                .map(|dir| open(&dir))
+                .as_ref(),
+            &current,
+            &policy,
+            NOW,
+        );
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(names(records.path()), vec![current.clone()]);
+        for dir in &planted {
+            assert!(dir.join("keep").is_file(), "{} survives", dir.display());
+        }
+
+        make_sessions(records.path(), std::slice::from_ref(&old));
+        let workdirs = created_workdirs(None, manifest_dir.path()).unwrap();
+        assert_eq!(workdirs, manifest_dir.path().join("workdir"));
+        std::fs::create_dir_all(workdirs.join(&old)).unwrap();
+        std::fs::create_dir_all(workdirs.join(&current)).unwrap();
+        let pruned = prune_sessions(
+            &open(records.path()),
+            Some(&open(&workdirs)),
+            &current,
+            &policy,
+            NOW,
+        );
+        assert_eq!(pruned.len(), 1);
+        assert!(!workdirs.join(&old).exists());
+        assert!(workdirs.join(&current).exists());
     }
 
     /// A pruned session's temporary folder goes with its records directory, even when a command
@@ -1116,10 +1188,10 @@ mod tests {
         assert_eq!(names(root.path()), vec![current]);
     }
 
-    /// A link planted where a session workdir directory belongs is refused, not followed: the
+    /// A link planted where a created work folder belongs is refused, not followed: the
     /// directory it points at survives the pruning of the session it is named for.
     #[test]
-    fn a_link_in_place_of_a_session_workdir_is_not_followed() {
+    fn a_link_in_place_of_a_created_work_folder_is_not_followed() {
         let records = tempfile::tempdir().unwrap();
         let workdirs = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();

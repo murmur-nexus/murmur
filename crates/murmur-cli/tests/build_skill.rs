@@ -419,7 +419,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
     assert!(
         skill_path.exists(),
         "tools/rt-skill/skill.md should be present after staging; workdir: {}",
-        staged.workdir.display()
+        staged.accessible_workdir.display()
     );
     let content = fs::read_to_string(&skill_path).unwrap();
     assert!(

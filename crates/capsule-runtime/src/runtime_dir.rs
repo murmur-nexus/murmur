@@ -30,6 +30,14 @@ use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags};
 use crate::protected_paths::canonicalize_existing_prefix;
 use crate::workdir_fs::WorkdirRoot;
 
+/// The literal segment a reported path carries in place of a real session id, in
+/// `--explain-scope` and `session_start.effective_grants`.
+///
+/// Substituted by the consumer, from `session_start.session_id`. Never expanded here, so the
+/// report `--explain-scope` prints before a session exists and the one the trace carries are
+/// identical.
+pub const SESSION_ID_PLACEHOLDER: &str = "<session-id>";
+
 /// The variable naming the runtime directory in every shell command's, plan shell step's, native
 /// tool's and `transport: process` harness's environment. Runtime-owned like `HOME`: no
 /// manifest, override or host value can set it.
@@ -150,7 +158,7 @@ impl RuntimeDirPlacement {
     #[must_use]
     pub fn report_path(&self) -> String {
         self.sessions_dir
-            .join(crate::workdir_writes::SESSION_ID_PLACEHOLDER)
+            .join(SESSION_ID_PLACEHOLDER)
             .join(RUNTIME_SUBDIR)
             .display()
             .to_string()
@@ -161,7 +169,7 @@ impl RuntimeDirPlacement {
     #[must_use]
     pub fn records_report_path(&self) -> String {
         self.records_group
-            .join(crate::workdir_writes::SESSION_ID_PLACEHOLDER)
+            .join(SESSION_ID_PLACEHOLDER)
             .display()
             .to_string()
     }
@@ -273,6 +281,16 @@ pub struct RuntimeDirRoots {
     /// command, and `/tmp` wherever the session maps it ([`crate::temp_dir`]). `None` for roots
     /// held outside a session, whose commands are told of no temporary folder.
     pub temp: Option<WorkdirRoot>,
+    /// The session's home folder, `home/` in its records directory: `$HOME` in every command,
+    /// granted exactly as [`Self::temp`] is. `None` for roots held outside a session, where no
+    /// command runs.
+    pub home: Option<WorkdirRoot>,
+    /// The directory every delegated child's records directory lies beneath,
+    /// `records_group(<records dir>/children)`: readable, never writable, to the session's
+    /// commands, so a parent's agent can read the result an outcome names. A path rather than a
+    /// root, because it exists only once a child has staged; a command is granted it when it
+    /// exists. `None` for a session that can delegate nothing.
+    pub children_records: Option<std::path::PathBuf>,
 }
 
 impl RuntimeDirRoots {
@@ -286,6 +304,8 @@ impl RuntimeDirRoots {
             harness,
             records: None,
             temp: None,
+            home: None,
+            children_records: None,
         }
     }
 
@@ -300,6 +320,21 @@ impl RuntimeDirRoots {
     #[must_use]
     pub fn with_temp(mut self, temp: WorkdirRoot) -> Self {
         self.temp = Some(temp);
+        self
+    }
+
+    /// These roots with `home` as the session's home folder.
+    #[must_use]
+    pub fn with_home(mut self, home: WorkdirRoot) -> Self {
+        self.home = Some(home);
+        self
+    }
+
+    /// These roots with `children_records` as the directory the session's delegated children keep
+    /// their records beneath.
+    #[must_use]
+    pub fn with_children_records(mut self, children_records: std::path::PathBuf) -> Self {
+        self.children_records = Some(children_records);
         self
     }
 }

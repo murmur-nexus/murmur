@@ -715,7 +715,7 @@ fn refusal_a_door_that_starts_no_task_answers_unsupported_operation() {
         "lifecycle:\n  task_acceptance: none\n  after_task: exit\n",
     );
     let staged = stage_door(&home, &project.path().join("murmur.yaml"), None);
-    fs::write(staged.workdir.join("task.md"), "Run the task").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Run the task").unwrap();
     let door = Door {
         addr: launch_door(staged),
         _provider: Some(provider),

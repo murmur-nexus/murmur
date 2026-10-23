@@ -626,13 +626,14 @@ impl WorkdirGuard {
     /// Spawn the checker thread for `workdir`. The returned handle owns the latch; dropping the
     /// last clone stops the thread within one interval.
     ///
-    /// `workdir` and `temp_dir`, the session's temporary folder, are the directories measured,
-    /// against one ceiling for their sum; `records_root` is the session's records directory,
-    /// where a breach is logged, or `None` outside a session, where it is reported on stderr
-    /// alone.
+    /// `workdir`, the work folder, `temp_dir`, the session's temporary folder, and `home_dir`,
+    /// its home folder, are the directories measured, against one ceiling for their sum;
+    /// `records_root` is the session's records directory, where a breach is logged, or `None`
+    /// outside a session, where it is reported on stderr alone.
     pub(crate) fn spawn(
         workdir: &crate::workdir_fs::WorkdirRoot,
         temp_dir: Option<&crate::workdir_fs::WorkdirRoot>,
+        home_dir: Option<&crate::workdir_fs::WorkdirRoot>,
         records_root: Option<&crate::workdir_fs::WorkdirRoot>,
         max_bytes: u64,
     ) -> Arc<Self> {
@@ -648,6 +649,7 @@ impl WorkdirGuard {
         let weak = Arc::downgrade(&guard);
         let workdir = workdir.clone();
         let temp_dir = temp_dir.cloned();
+        let home_dir = home_dir.cloned();
         let records_root = records_root.cloned();
         thread::spawn(move || loop {
             thread::sleep(WORKDIR_CHECK_INTERVAL);
@@ -657,7 +659,12 @@ impl WorkdirGuard {
             if guard.stop.load(Ordering::Relaxed) || guard.breach().is_some() {
                 break;
             }
-            if guard.check(&workdir, temp_dir.as_ref(), records_root.as_ref()) {
+            if guard.check(
+                &workdir,
+                temp_dir.as_ref(),
+                home_dir.as_ref(),
+                records_root.as_ref(),
+            ) {
                 break;
             }
         });
@@ -665,18 +672,25 @@ impl WorkdirGuard {
         guard
     }
 
-    /// One measurement of `workdir` and `temp_dir` together, latching a breach when their sum is
-    /// past the ceiling. `true` when it was.
+    /// One measurement of `workdir`, `temp_dir` and `home_dir` together, latching a breach when
+    /// their sum is past the ceiling. `true` when it was.
     fn check(
         &self,
         workdir: &crate::workdir_fs::WorkdirRoot,
         temp_dir: Option<&crate::workdir_fs::WorkdirRoot>,
+        home_dir: Option<&crate::workdir_fs::WorkdirRoot>,
         records_root: Option<&crate::workdir_fs::WorkdirRoot>,
     ) -> bool {
-        let observed = directory_size_bytes(workdir.path())
-            .saturating_add(temp_dir.map_or(0, |temp_dir| directory_size_bytes(temp_dir.path())));
+        let measured: Vec<&Path> = std::iter::once(workdir)
+            .chain(temp_dir)
+            .chain(home_dir)
+            .map(crate::workdir_fs::WorkdirRoot::path)
+            .collect();
+        let observed = measured.iter().fold(0u64, |sum, dir| {
+            sum.saturating_add(directory_size_bytes(dir))
+        });
         if observed > self.max_bytes {
-            self.record_breach(records_root, observed);
+            self.record_breach(records_root, observed, &measured);
             return true;
         }
         false
@@ -691,6 +705,7 @@ impl WorkdirGuard {
         &self,
         records_root: Option<&crate::workdir_fs::WorkdirRoot>,
         observed_bytes: u64,
+        measured: &[&Path],
     ) {
         let breach = WorkdirBreach {
             max_bytes: self.max_bytes,
@@ -701,7 +716,12 @@ impl WorkdirGuard {
                 *slot = Some(breach);
             }
         }
-        let message = workdir_breach_message(breach);
+        let measured = measured
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!("{}; measured: {measured}", workdir_breach_message(breach));
         crate::runtime_err!("[capsule-runtime] {message}");
         if let Some(records_root) = records_root {
             crate::agent::append_bootstrap_log(records_root, &format!("[resources] {message}"));
@@ -719,7 +739,7 @@ impl Drop for WorkdirGuard {
 /// subprocess spawn paths return, so the two cannot drift.
 pub(crate) fn workdir_breach_message(breach: WorkdirBreach) -> String {
     format!(
-        "workdir and temporary folder grew to {} bytes, past the {} byte ceiling \
+        "work folder, $HOME and $TMPDIR together grew to {} bytes, past the {} byte ceiling \
          (capabilities.resources.workdir_max_bytes)",
         breach.observed_bytes, breach.max_bytes
     )
@@ -1023,44 +1043,78 @@ mod tests {
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             None,
             None,
+            None,
             DEFAULT_WORKDIR_MAX_BYTES,
         );
         assert_eq!(guard.breach(), None);
     }
 
-    /// The session's temporary folder counts against the workdir's ceiling: 2 MiB in the folder
-    /// alone breaches 1 MiB, and the breach observes the sum of both.
-    #[test]
-    fn the_workdir_guard_counts_the_temp_folder() {
+    /// 2 MiB in `big`, written to one of the three measured directories, with 100 bytes in the
+    /// work folder: the guard spawned on all three breaches 1 MiB and observes the sum, and the
+    /// work folder alone does not.
+    fn workdir_guard_breaches_on_bytes_in(dir: usize) {
         const MIB: u64 = 1024 * 1024;
-        let workdir = tempfile::tempdir().unwrap();
-        let folder = tempfile::tempdir().unwrap();
-        std::fs::write(workdir.path().join("small"), vec![0u8; 100]).unwrap();
-        std::fs::write(folder.path().join("big"), vec![0u8; 2 * MIB as usize]).unwrap();
-        let workdir = crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap();
-        let folder = crate::workdir_fs::WorkdirRoot::open(folder.path()).unwrap();
+        let dirs = [(); 3].map(|()| tempfile::tempdir().unwrap());
+        std::fs::write(dirs[0].path().join("small"), vec![0u8; 100]).unwrap();
+        std::fs::write(dirs[dir].path().join("big"), vec![0u8; 2 * MIB as usize]).unwrap();
+        let [workdir, temp, home] =
+            [0, 1, 2].map(|i| crate::workdir_fs::WorkdirRoot::open(dirs[i].path()).unwrap());
 
-        let guard = WorkdirGuard::spawn(&workdir, Some(&folder), None, MIB);
-        assert!(
-            !guard.check(&workdir, None, None),
-            "the workdir alone is under 1 MiB"
-        );
-        assert_eq!(guard.breach(), None);
-        assert!(guard.check(&workdir, Some(&folder), None));
-        let breach = guard
-            .breach()
-            .expect("the folder's bytes breach the ceiling");
+        let guard = WorkdirGuard::spawn(&workdir, Some(&temp), Some(&home), None, MIB);
+        if dir != 0 {
+            assert!(
+                !guard.check(&workdir, None, None, None),
+                "the work folder alone is under 1 MiB"
+            );
+            assert_eq!(guard.breach(), None);
+        }
+        assert!(guard.check(&workdir, Some(&temp), Some(&home), None));
+        let breach = guard.breach().expect("the bytes breach the ceiling");
         assert_eq!(breach.max_bytes, MIB);
         assert_eq!(breach.observed_bytes, 2 * MIB + 100);
 
         let message = workdir_breach_message(breach);
-        assert!(message.contains("temporary folder"), "{message}");
+        assert!(
+            message.contains("work folder, $HOME and $TMPDIR"),
+            "{message}"
+        );
         let error = crate::errors::RuntimeError::WorkdirSizeExceeded {
             max_bytes: breach.max_bytes,
             observed_bytes: breach.observed_bytes,
         }
         .to_string();
-        assert!(error.contains("workdir and temporary folder"), "{error}");
+        assert!(error.contains("work folder, $HOME and $TMPDIR"), "{error}");
+    }
+
+    #[test]
+    fn workdir_guard_counts_the_work_folder() {
+        workdir_guard_breaches_on_bytes_in(0);
+    }
+
+    #[test]
+    fn workdir_guard_counts_the_temp_folder() {
+        workdir_guard_breaches_on_bytes_in(1);
+    }
+
+    #[test]
+    fn workdir_guard_counts_the_home_folder() {
+        workdir_guard_breaches_on_bytes_in(2);
+    }
+
+    /// A breach's bootstrap log line names every directory measured.
+    #[test]
+    fn workdir_guard_logs_what_it_measured() {
+        let dirs = [(); 4].map(|()| tempfile::tempdir().unwrap());
+        std::fs::write(dirs[0].path().join("big"), vec![0u8; 4096]).unwrap();
+        let [workdir, temp, home, records] =
+            [0, 1, 2, 3].map(|i| crate::workdir_fs::WorkdirRoot::open(dirs[i].path()).unwrap());
+        let guard = WorkdirGuard::spawn(&workdir, Some(&temp), Some(&home), None, 1024);
+        assert!(guard.check(&workdir, Some(&temp), Some(&home), Some(&records)));
+        let log = std::fs::read_to_string(dirs[3].path().join("logs/bootstrap.log")).unwrap();
+        for dir in &dirs[..3] {
+            assert!(log.contains(&dir.path().display().to_string()), "{log}");
+        }
+        assert!(log.contains("measured: "), "{log}");
     }
 
     /// The baseline must be a real, plausible count — a `0` here would silently turn

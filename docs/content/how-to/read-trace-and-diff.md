@@ -8,7 +8,7 @@ The commands in this guide are read-only — they do not modify any file and do 
 
 ## Where trace.jsonl lives
 
-After `mur run -v`, the session workdir is printed to stdout:
+After `mur run -v`, the session's work folder is printed to stdout:
 
 ```text
 murmur: url localhost:52222

@@ -19,7 +19,7 @@ section that explains it.
 | `E-CAP-004` | `capabilities.shell.staged_runtime` is declared below an effective `sealed` containment floor | [E-CAP-004](#e-cap-004) |
 | `E-CAP-005` | Creating a network namespace for the capsule's native subprocess tree — shell commands, spawned capsules and native tools — failed on this host, so `capabilities.network.allow` cannot be enforced for it | [E-CAP-005](#e-cap-005) |
 | `E-CAP-006` | Nothing declared makes an allowlisted interpreted entrypoint's package tree reachable inside a `sealed` composed root | [E-CAP-006](#e-cap-006) |
-| `E-CAP-007` | an export root resolves outside the accessible workdir | [E-CAP-007](#e-cap-007) |
+| `E-CAP-007` | an export root resolves outside the work folder | [E-CAP-007](#e-cap-007) |
 | `E-CAP-008` | a persistent capsule declares `exports.peer_files` without a short enough `max_ttl` | [E-CAP-008](#e-cap-008) |
 | `E-CAP-009` | `capabilities.state.store` does not name a usable durable store | [E-CAP-009](#e-cap-009) |
 | `E-CAP-010` | An artifact entry's `config:` block cannot be delivered as `MURMUR_ARTIFACT_CONFIG` | [E-CAP-010](#e-cap-010) |
@@ -90,7 +90,7 @@ section that explains it.
 | `E-RUN-010` | `network.internal_port` is already bound | — |
 | `E-RUN-011` | A native subprocess was killed for exceeding a `capabilities.resources` limit | [Which limit a subprocess hit](resource-limits.md#which-limit) |
 | `E-RUN-012` | The capsule can spawn native subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only) | [Platform behavior](resource-limits.md#platform-behavior) |
-| `E-RUN-013` | Session workdir and temporary folder together grew past `capabilities.resources.workdir_max_bytes` | [Host resource limits](resource-limits.md#host-resource-limits) |
+| `E-RUN-013` | The work folder, `$HOME` and `$TMPDIR` together grew past `capabilities.resources.workdir_max_bytes` | [Size ceiling](workdir.md#work-folder-ceiling) |
 | `E-RUN-014` | A `sealed` session cleared the host probe at launch but its composed root could not be built for a subprocess | [Containment class](containment.md#field-containment) |
 | `E-RUN-015` | `mur run --resume` and `--context` were both given | [E-RUN-015](#e-run-015) |
 | `E-RUN-016` | The session `--resume` named records no `task_start` carrying a context id | [E-RUN-016](#e-run-016) |
@@ -306,7 +306,7 @@ on the entry, and any scheme other than `http`/`https`, are rejected — see
 
 ### E-CAP-002 — invalid `filesystem.scope` { #e-cap-002 }
 
-A `filesystem.scope` value is not a usable subdirectory of the session workdir:
+A `filesystem.scope` value is not a usable subdirectory of the work folder:
 
 ```text
 error[E-CAP-002]: invalid filesystem scope '<scope>': scope must be relative to the workdir
@@ -353,7 +353,7 @@ a weaker class, whichever one it reports:
 **One case names the manifest rather than the host**, because no host can satisfy it:
 [`capabilities.filesystem.workdir_exec: true`](containment.md#field-workdir-exec) declared
 alongside `capabilities.containment: scoped` (or `sealed`). An executable workdir keeps the
-Landlock `Execute` right on the session workdir, so a binary the capsule compiles, downloads or
+Landlock `Execute` right on the work folder, so a binary the capsule compiles, downloads or
 renames inside it runs regardless of `capabilities.shell.allow` — the allowlist stops being an
 enforceable property of the capsule, and the achieved class is capped at `advisory` on every host.
 Remove `workdir_exec`, or lower the declared floor to `advisory`.
@@ -763,7 +763,8 @@ credential did not cure it. When a request is rejected, the runtime re-reads
 [`credentials.<NAME>`](config.md#credentials) at once. If the value there has changed, the request
 is sent once more with it. The task ends with this error when the value is unchanged, or when that
 single resend is rejected too. It replaces the driver's own error text. The same message, without
-the code, is written to `out/result.txt` and to a [`task_failed`](observability-schemas.md#task-failed)
+the code, is written to `out/result.txt` in the session's
+[records directory](workdir.md#records-directory) and to a [`task_failed`](observability-schemas.md#task-failed)
 line with `cause: "credential_rejected"`, and the task fails: `mur run` then also prints
 [`E-RUN-040`](#e-run-040) carrying the same message, and exits `1`.
 
@@ -1068,7 +1069,7 @@ prints the task's exit status on its `status:` line, prints this error and exits
 ```text
 status:  failed
 error[E-RUN-040]: the task ended failed: {"error":"driver: failed to parse Anthropic response JSON: EOF while parsing a string at line 1 column 38","stop_reason":"error"}
-  hint: the task's result text is in out/result.txt under the workdir, and `mur trace show <session>` shows the turn it ended on and why
+  hint: the task's result text is in out/result.txt in the session's records directory, and `mur trace show <session>` shows the turn it ended on and why
 ```
 
 | Exit status | Reason printed |
@@ -1083,7 +1084,7 @@ For `canceled` the hint says there is no result to read:
 ```text
 status:  canceled
 error[E-RUN-040]: the task ended canceled: the task was canceled
-  hint: the task was canceled before it completed, so out/result.txt holds no result; `mur trace show <session>` shows the turn it was canceled on and why
+  hint: the task was canceled before it completed, so out/result.txt in the session's records directory holds no result; `mur trace show <session>` shows the turn it was canceled on and why
 ```
 
 A launch reports the first task that did not complete; a later run that completed does not replace
@@ -1304,45 +1305,47 @@ launch is minted by the next launch, not this one.
 
 ### E-RUN-050 — a link inside the workdir { #e-run-050 }
 
-The runtime met a symbolic link, or the wrong kind of file, inside the workdir, refused to write,
-read, create or remove through it, and wrote nothing outside the workdir. `mur run` reports this
-code in two cases:
+The runtime met a symbolic link, or the wrong kind of file, inside the work folder, the records
+directory or the runtime directory, refused to write, read, create or remove through it, and wrote
+nothing outside them. `mur run` reports this code in two cases:
 
 | When | Typical paths |
 |---|---|
-| Staging the session, before the capsule starts | The `.murmur/<session-id>` directory |
-| During the task `mur run` ran, after the capsule created a link | The operator's `task.md` read when the session starts, `out/result.txt`, `peer-in/` |
+| Staging the session, before the capsule starts | The tools, skills and `MURMUR.md` staging writes in the runtime directory |
+| During the task `mur run` ran, after the capsule created a link | The operator's `task.md` read when the session starts, a script capsule's `out/result.txt`, `peer-in/` |
 
-The message names the path and the part of it that is the link:
+The message names the path and the part of it that is the link. A path in the work folder is named
+relative to it; a path in the runtime or records directory, by its absolute path:
 
 ```text
-error[E-RUN-050]: refused to create directory .murmur/ses_01a0…: .murmur is a symbolic link inside the workdir
-  hint: the runtime never follows a link inside the workdir; replace .murmur with a regular file or directory, or remove it, and run again
+error[E-RUN-050]: refused to create directory peer-in: peer-in is a symbolic link inside the workdir
+  hint: the runtime never follows a link inside the workdir; replace peer-in with a regular file or directory, or remove it, and run again
 ```
 
 [`mur trace rm`](cli.md#mur-trace-rm) raises it too, for a link or a file that is not a directory
-on the way to the session directory or records directory it removes. Nothing is removed, and
-nothing the link points at is touched. The message names the directory the path is relative to:
+in place of the work folder or records directory it removes. Nothing is removed, and nothing the
+link points at is touched. The message names the directory the path is relative to:
 
 ```text
-error[E-RUN-050]: refused to read .murmur/ses_019f0193c7d871a5b2e30ff41a7c0ce1: .murmur is a symbolic link inside the workdir (in /home/me/proj)
-  hint: the runtime never follows a link inside the workdir; replace /home/me/proj/.murmur with a regular file or directory, or remove it, and run again
+error[E-RUN-050]: refused to remove ses_019f0193c7d871a5b2e30ff41a7c0ce1: ses_019f0193c7d871a5b2e30ff41a7c0ce1 is a symbolic link (in /home/me/proj/workdir)
+  hint: the runtime never follows a link inside the workdir; replace /home/me/proj/workdir/ses_019f0193c7d871a5b2e30ff41a7c0ce1 with a regular file or directory, or remove it, and run again
 ```
 
 Remove the link, or replace it with the regular file or directory it stands in for. A refusal during
 a task also writes a [`workdir_path_refused`](observability-schemas.md#workdir-path-refused) trace
 line naming the path, and an A2A task that meets one ends `failed` with the refusal as its status
-message; see [Links inside the workdir](workdir.md#links-inside-the-workdir).
+message; see [Links inside the work folder](workdir.md#links-inside-the-workdir).
 
 ### E-RUN-051 — a delegated child's workdir is not the one its parent created { #e-run-051 }
 
-A capsule that delegates creates the child's directory under `.murmur/children/` and launches the
-child with that directory's identity. The child compares it with the `--workdir` it opens, before
-writing anything there, and refuses when they differ: something replaced the directory under
-`.murmur/children/`, with a link or another directory, between its creation and the launch:
+A capsule that delegates creates the child's work folder under `children/` in its own
+[records directory](workdir.md#records-directory) and launches the child with that directory's
+identity. The child compares it with the `--workdir` it opens, before writing anything there, and
+refuses when they differ: something replaced the directory under `children/`, with a link or
+another directory, between its creation and the launch:
 
 ```text
-error[E-RUN-051]: the workdir /home/dev/project/.murmur/children/worker-3f9c2a1b7e4d5c60 is not the directory the delegating capsule created (expected 2049:1311021, found 2049:1311042)
+error[E-RUN-051]: the workdir /home/dev/.murmur/records/home/dev/project/ses_019f01a9c3e47d1a9b2c3d4e5f6a7b8c/children/worker-3f9c2a1b7e4d5c60 is not the directory the delegating capsule created (expected 2049:1311021, found 2049:1311042)
   hint: the delegating capsule's workdir changed under .murmur/children between the directory's creation and this launch; nothing was written
 ```
 
@@ -1550,7 +1553,7 @@ Two neighbouring codes are easy to confuse with this one:
 
 [`exports.files.root`](manifest.md#field-exports) and
 [`exports.peer_files.root`](manifest.md#field-exports-peer-files) each name a subtree of the
-[accessible workdir](workdir.md). When one of those paths already exists and resolves somewhere
+[work folder](workdir.md#work-folder). When one of those paths already exists and resolves somewhere
 else — because it is a symlink pointing out of the workdir — `mur run` refuses at staging, before
 the workdir is created and before any session runs:
 
@@ -1643,7 +1646,7 @@ error[E-CAP-010]: invalid config for artifact 'murmur/tool-corpus': 'config:' se
 to deliver no variable at all.
 
 The refusal is decided at staging, before any registry pull, workdir creation or component
-instantiation, so no session workdir appears and no `trace.jsonl` is written.
+instantiation, so no work folder or records directory appears and no `trace.jsonl` is written.
 `mur run --explain-scope` refuses the same blocks with the same code.
 
 The runtime checks the shape and not the meaning: which keys a given artifact requires is that
@@ -1674,7 +1677,7 @@ context id is not a usable segment simply goes unrecorded, reported once to stde
 
 ### E-CAP-012 — invalid `filesystem.read_only` entry { #e-cap-012 }
 
-A `capabilities.filesystem.read_only` entry is not a usable subdirectory of the session workdir:
+A `capabilities.filesystem.read_only` entry is not a usable subdirectory of the work folder:
 
 ```text
 error[E-CAP-012]: invalid read-only path '/etc': read-only path must be relative to the workdir
@@ -2650,7 +2653,7 @@ What the turn leaves behind:
 
 | Surface | What it holds |
 |---|---|
-| `out/result.txt`, and `out/result_<task-id>.txt` under `mode: threaded` | The model's partial text, then a marker naming `inference.max_tokens` and the cap |
+| `out/result.txt` in the session's [records directory](workdir.md#records-directory), and `out/result_<task-id>.txt` under `mode: threaded` | The model's partial text, then a marker naming `inference.max_tokens` and the cap |
 | The task's [`response` artifact](streaming-protocol.md#standard-events) that `GetTask` reports, and the task output an `on-task-end` hook reads | The same marked text |
 | The [conversation record](workdir.md#the-conversation-record)'s assistant message | The model's own bytes, with `"truncated": true` on the message envelope |
 | The trace's [`inference`](observability-schemas.md#session-trace-tracejsonl) event | `"stop_reason": "max_tokens"`, beside a `decision` of `"text"` |
@@ -2796,12 +2799,12 @@ environment-only (synthetic HOME + credential env-stripping). This is permanent 
 platform. (https://docs.murmur.nexus/reference/diagnostics/#w-sec-001)
 ```
 
-Where a warning is written depends on whether a session workdir exists yet:
+Where a warning is written depends on whether the session's records directory exists yet:
 
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-021`, `W-SEC-023` — decided at launch | stderr and the session's [`logs/bootstrap.log`](workdir.md#records-directory) |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-027`, `W-SEC-028`, `W-SEC-029`, `W-SEC-030` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-027`, `W-SEC-028`, `W-SEC-029`, `W-SEC-030` — decided at staging, before the records directory exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 | `W-SEC-031` — decided mid-session, when the harness reports its session | stderr |
 | `W-SEC-032` — decided at staging by `mur run`, by `mur doctor`, and by `mur deploy run` once the port is published | stderr from `mur run` and `mur deploy run`; stdout from `mur doctor` |
@@ -3105,7 +3108,7 @@ staging, on stderr — from both `mur run` and `mur doctor`.
 
 **Why it matters:** `capabilities.shell.allow` is enforced by granting the Landlock `Execute` right
 on exactly the allowlisted binaries' own paths and withholding it everywhere the capsule can write
-— above all its own session workdir. `workdir_exec: true` gives that right back to the workdir. From
+— above all its own work folder. `workdir_exec: true` gives that right back to the workdir. From
 then on, a binary the agent compiles, downloads, unpacks or renames inside its workdir executes
 regardless of what the allowlist says. There is no name check to defeat, because there is no name
 check: the kernel is granting `Execute` on the path, and the path is inside the granted directory.
@@ -3800,7 +3803,7 @@ door, which speaks plain HTTP. Or bind to loopback.
 
 **Fires when:** `~/.murmur/sessions`, where every session's
 [runtime directory](workdir.md#runtime-directory) is created, or the session's
-[records directory](workdir.md#records-directory), lies inside the accessible workdir:
+[records directory](workdir.md#records-directory), lies inside the work folder:
 
 | From | When |
 |---|---|

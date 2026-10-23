@@ -8,7 +8,7 @@ use crate::{
     artifact_config::ARTIFACT_CONFIG_ENV,
     detached::{DetachPolicy, DetachedDispatchInfo},
     types::CapabilityPolicy,
-    workdir_fs::{WorkdirRoot, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE},
+    workdir_fs::{WorkdirRoot, DEFAULT_FILE_MODE},
 };
 
 pub(crate) const MAX_SHELL_OUTPUT_BYTES: usize = 16 * 1024;
@@ -98,19 +98,11 @@ impl HostAccountEnv {
     }
 }
 
-/// Directory name for the per-session synthetic home, created under the capsule's
-/// session workdir — `<accessible workdir>/.murmur/<session id>/` under `--workdir`, so it is
-/// under the one prefix a consumer diffing the accessible workdir excludes. Planned /proc and
-/// subprocess key isolation work depend on this exact name/location convention.
-///
-/// Nothing outside the runtime names this path: the capsule reaches it only through `$HOME`.
-/// Declared as a runtime write by [`crate::workdir_writes`].
-///
-/// `pub(crate)` for one reader outside this file: `sandbox::ensure_sealed_identity_files`, which
-/// writes the `pw_dir` field of a sealed capsule's synthetic `/etc/passwd` entry. That field and
-/// `$HOME` must be the same string — a second hand-copied `".capsule-home"` there is exactly how
-/// they would stop being one.
-pub(crate) const SYNTHETIC_HOME_DIR_NAME: &str = ".capsule-home";
+/// What a shell command, plan shell step or native tool is refused with when its enforcement holds
+/// no home folder ([`crate::sandbox::ShellEnforcement::home_root`]).
+pub(crate) const NO_HOME_FOLDER_REFUSAL: &str =
+    "no home folder: this command's enforcement holds no session home folder (home/ in the \
+     session's records directory) to be its $HOME, so it is not run";
 
 /// Credential-shaped env var patterns stripped from every subprocess, regardless of
 /// whether they came from the host process env, `env_overrides`, or
@@ -408,7 +400,6 @@ pub(crate) fn run_shell(
     args: &[&str],
     env_overrides: &[(String, String)],
     accessible_workdir: &WorkdirRoot,
-    session_workdir: &WorkdirRoot,
     policy: &CapabilityPolicy,
     enforcement: &crate::sandbox::ShellEnforcement,
     detach: Option<DetachPolicy>,
@@ -428,7 +419,7 @@ pub(crate) fn run_shell(
     let env = build_shell_env(
         policy,
         env_overrides,
-        session_workdir,
+        enforcement.home_dir_path(),
         enforcement.runtime_dir_path(),
         enforcement.records_dir_path(),
         enforcement.tmpdir_value().as_deref(),
@@ -458,12 +449,8 @@ pub(crate) fn run_shell(
     // never call `.spawn()` at all — no code path here lets a Linux host silently run this
     // subprocess with zero enforcement because setup failed. This also installs the hard
     // rlimits and (where a scope exists) cgroup membership for the child.
-    let supervisor = crate::sandbox::prepare_enforcement(
-        &mut command,
-        enforcement,
-        accessible_workdir.path(),
-        session_workdir,
-    )?;
+    let supervisor =
+        crate::sandbox::prepare_enforcement(&mut command, enforcement, accessible_workdir.path())?;
 
     // Entered before the snapshot and held until the command exits — carried to the demoted
     // thread if it gets that far — so a sibling's spawn anywhere inside this window is visible to
@@ -616,7 +603,6 @@ pub(crate) fn execute_shell(
     args: &[&str],
     env_overrides: &[(String, String)],
     accessible_workdir: &WorkdirRoot,
-    session_workdir: &WorkdirRoot,
     policy: &CapabilityPolicy,
     enforcement: &crate::sandbox::ShellEnforcement,
 ) -> Result<ShellResult, ShellExecError> {
@@ -625,7 +611,6 @@ pub(crate) fn execute_shell(
         args,
         env_overrides,
         accessible_workdir,
-        session_workdir,
         policy,
         enforcement,
         None,
@@ -1098,13 +1083,16 @@ pub(crate) fn attribute_resource_limit(
 
 /// The environment of one shell command, plan shell step or native tool: [`DEFAULT_ENV_BASELINE`]
 /// from the host, `env_overrides`, `capabilities.shell.baseline_env`, the credential backstop,
-/// and then the runtime-owned names no entry before them can set — the synthetic `HOME`,
-/// `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR` from `runtime_dir` and `records_dir`, and
-/// `TMPDIR`, `TMP` and `TEMP`, all three `tmpdir` or all three absent.
+/// and then the runtime-owned names no entry before them can set — `HOME` and `USERPROFILE` from
+/// `home_dir`, `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR` from `runtime_dir` and
+/// `records_dir`, and `TMPDIR`, `TMP` and `TEMP`, all three `tmpdir` or all three absent.
+///
+/// `home_dir` is the session's home folder, `home/` in its records directory. `None` refuses the
+/// command: no command runs without it, and none is handed a home anywhere else.
 pub(crate) fn build_shell_env(
     policy: &CapabilityPolicy,
     env_overrides: &[(String, String)],
-    session_workdir: &WorkdirRoot,
+    home_dir: Option<&std::path::Path>,
     runtime_dir: Option<&std::path::Path>,
     records_dir: Option<&std::path::Path>,
     tmpdir: Option<&str>,
@@ -1138,11 +1126,11 @@ pub(crate) fn build_shell_env(
 
     // Inserted last so neither a guest-supplied `env_overrides` entry nor a
     // manifest-declared `shell_baseline_env` entry can resurrect the real host
-    // HOME/USERPROFILE, and so no strip_env pattern can remove the synthetic one.
-    let synthetic_home = synthetic_home_dir(session_workdir)?;
-    let synthetic_home = synthetic_home.to_string_lossy().into_owned();
-    env.insert("HOME".to_string(), synthetic_home.clone());
-    env.insert("USERPROFILE".to_string(), synthetic_home);
+    // HOME/USERPROFILE, and so no strip_env pattern can remove the session's.
+    let home = home_dir.ok_or_else(|| NO_HOME_FOLDER_REFUSAL.to_string())?;
+    let home = home.to_string_lossy().into_owned();
+    env.insert("HOME".to_string(), home.clone());
+    env.insert("USERPROFILE".to_string(), home);
     // Runtime-owned on the same terms: whatever an override, a baseline entry or the host said,
     // a command reads the session's own runtime directory here, or no such variable at all.
     env.remove(crate::runtime_dir::RUNTIME_DIR_ENV);
@@ -1269,13 +1257,6 @@ pub(crate) fn build_declared_env(policy: &CapabilityPolicy) -> BTreeMap<String, 
     env
 }
 
-fn synthetic_home_dir(session_workdir: &WorkdirRoot) -> Result<std::path::PathBuf, String> {
-    session_workdir
-        .create_dir_all(SYNTHETIC_HOME_DIR_NAME, DEFAULT_DIR_MODE)
-        .map_err(|error| format!("failed to create synthetic home directory: {error}"))?;
-    Ok(session_workdir.host_path(SYNTHETIC_HOME_DIR_NAME))
-}
-
 fn env_name_matches_pattern(pattern: &str, key: &str) -> bool {
     if let Some(rest) = pattern.strip_prefix('*') {
         if let Some(middle) = rest.strip_suffix('*') {
@@ -1355,14 +1336,13 @@ mod tests {
             },
             ..CapabilityPolicy::default()
         };
-        let mut enforcement = ShellEnforcement::environment_only();
+        let mut enforcement = ShellEnforcement::environment_only().with_test_session_dirs();
         enforcement.resource_limits = policy.resources;
 
         let result = execute_shell(
             "bash",
             &["-c", "ulimit -Hn"],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
@@ -1385,14 +1365,13 @@ mod tests {
             resources: limits,
             ..CapabilityPolicy::default()
         };
-        let mut enforcement = ShellEnforcement::environment_only();
+        let mut enforcement = ShellEnforcement::environment_only().with_test_session_dirs();
         enforcement.resource_limits = limits;
 
         execute_shell(
             "bash",
             &["-c", script],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
@@ -1514,7 +1493,6 @@ mod tests {
             &["-c", "ulimit -Hn"],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -1550,7 +1528,7 @@ mod tests {
             resources: limits,
             ..CapabilityPolicy::default()
         };
-        let mut enforcement = ShellEnforcement::environment_only();
+        let mut enforcement = ShellEnforcement::environment_only().with_test_session_dirs();
         enforcement.resource_limits = limits;
         let enforcement = enforcement.with_host_bounding(scope, None);
 
@@ -1576,7 +1554,6 @@ mod tests {
             "python3",
             &["-c", script],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
@@ -1604,18 +1581,19 @@ mod tests {
         );
     }
 
-    /// Under `--workdir` the two workdirs are different directories, and each of the two things
-    /// `execute_shell` does with one has to pick the right one: the subprocess runs in the
-    /// accessible workdir and `$HOME` resolves into the session workdir.
+    /// `$HOME` is the session's home folder, `home/` in its records directory, and the command
+    /// runs in the work folder, which gains nothing.
     ///
     /// Asserted through a real subprocess rather than through `build_shell_env` alone, because
-    /// `$HOME` naming a directory that was never created is exactly the failure this split can
+    /// `$HOME` naming a directory that does not exist is exactly the failure a wrong root would
     /// produce and a pure env check would not see.
     #[test]
-    fn a_shell_command_runs_in_the_accessible_workdir_with_home_inside_the_session_one() {
+    fn home_folder_is_home_and_the_work_folder_gains_nothing() {
         let accessible = tempdir().unwrap();
-        let session = accessible.path().join(".murmur").join("ses_shell_test");
-        fs::create_dir_all(&session).unwrap();
+        let runtime = tempdir().unwrap();
+        let enforcement = ShellEnforcement::environment_only()
+            .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None);
+        let home = enforcement.home_dir_path().unwrap().to_path_buf();
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
             ..CapabilityPolicy::default()
@@ -1625,44 +1603,35 @@ mod tests {
             "bash",
             &[
                 "-c",
-                "echo marker > \"$HOME/probe\" && cat \"$HOME/probe\" && pwd",
+                "echo marker > \"$HOME/probe\" && cat \"$HOME/probe\" && echo \"$HOME\" && pwd",
             ],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(accessible.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
             &policy,
-            &ShellEnforcement::environment_only(),
+            &enforcement,
         )
         .expect("bash must run");
 
         assert_eq!(result.exit_code, 0, "stderr was: {}", result.stderr);
         let mut lines = result.stdout.lines();
         assert_eq!(lines.next(), Some("marker"));
+        assert_eq!(lines.next(), Some(home.to_str().unwrap()));
         assert_eq!(
             std::fs::canonicalize(lines.next().unwrap()).unwrap(),
             std::fs::canonicalize(accessible.path()).unwrap(),
-            "the subprocess cwd is the directory the capsule was asked to produce"
+            "the subprocess cwd is the work folder"
         );
-
+        assert_eq!(fs::read_to_string(home.join("probe")).unwrap(), "marker\n");
         assert_eq!(
-            fs::read_to_string(session.join(SYNTHETIC_HOME_DIR_NAME).join("probe")).unwrap(),
-            "marker\n"
-        );
-        assert!(
-            !accessible.path().join(SYNTHETIC_HOME_DIR_NAME).exists(),
-            "the synthetic home must add nothing to the top level of the accessible workdir"
+            fs::read_dir(accessible.path()).unwrap().count(),
+            0,
+            "the work folder gains nothing"
         );
     }
 
     /// A command printing `seq 1 <last>`, past [`MAX_SHELL_OUTPUT_BYTES`] for any `last` over
-    /// 4,000, run in `workdir` with `session` as its session workdir. The two are different
-    /// directories, so `$HOME` adds nothing to `workdir`.
-    fn print_seq(
-        workdir: &Path,
-        session: &Path,
-        enforcement: &ShellEnforcement,
-        last: u32,
-    ) -> ShellResult {
+    /// 4,000, run in `workdir`.
+    fn print_seq(workdir: &Path, enforcement: &ShellEnforcement, last: u32) -> ShellResult {
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
             ..CapabilityPolicy::default()
@@ -1673,7 +1642,6 @@ mod tests {
             &["-c", &command],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(session).unwrap(),
             &policy,
             enforcement,
         )
@@ -1689,9 +1657,8 @@ mod tests {
         let enforcement = ShellEnforcement::environment_only()
             .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None);
         let records_root = enforcement.records_root().unwrap().clone();
-        let session = tempdir().unwrap();
 
-        let result = print_seq(workdir.path(), session.path(), &enforcement, 20_000);
+        let result = print_seq(workdir.path(), &enforcement, 20_000);
 
         assert!(result.truncated);
         assert_eq!(result.stdout.len(), MAX_SHELL_OUTPUT_BYTES);
@@ -1725,15 +1692,12 @@ mod tests {
             "nothing is written into the accessible workdir"
         );
         assert_eq!(fs::read_dir(workdir.path()).unwrap().count(), 0);
-        assert!(!session.path().join("logs").exists());
     }
 
-    /// Outside a session there is no records directory, so a truncated command writes no log in
-    /// either workdir and names no path. Roots built without records are the same case as no
-    /// roots at all.
+    /// Roots built without a records directory, holding only a home folder, give a truncated
+    /// command no log to write: it writes none in the work folder and names no path.
     #[test]
     fn with_no_records_directory_a_truncated_command_writes_no_log() {
-        let without_roots = ShellEnforcement::environment_only();
         let runtime = tempdir().unwrap();
         let open = |sub: &str| {
             let path = runtime.path().join(sub);
@@ -1745,27 +1709,22 @@ mod tests {
                 open(crate::runtime_dir::RUNTIME_SUBDIR),
                 open(crate::runtime_dir::SEALED_ETC_SUBDIR),
                 open(crate::runtime_dir::HARNESS_SUBDIR),
-            ),
+            )
+            .with_home(open(crate::records_dir::HOME_SUBDIR)),
             None,
         );
 
-        for enforcement in [&without_roots, &roots_without_records] {
-            let workdir = tempdir().unwrap();
-            let session = tempdir().unwrap();
-            let result = print_seq(workdir.path(), session.path(), enforcement, 20_000);
-            assert!(result.truncated);
-            assert_eq!(result.stdout.len(), MAX_SHELL_OUTPUT_BYTES);
-            assert_eq!(result.full_output_path, None);
-            assert_eq!(
-                fs::read_dir(workdir.path()).unwrap().count(),
-                0,
-                "nothing is written into the workdir"
-            );
-            assert!(
-                !session.path().join("logs").exists(),
-                "nothing is written into the session workdir"
-            );
-        }
+        let enforcement = &roots_without_records;
+        let workdir = tempdir().unwrap();
+        let result = print_seq(workdir.path(), enforcement, 20_000);
+        assert!(result.truncated);
+        assert_eq!(result.stdout.len(), MAX_SHELL_OUTPUT_BYTES);
+        assert_eq!(result.full_output_path, None);
+        assert_eq!(
+            fs::read_dir(workdir.path()).unwrap().count(),
+            0,
+            "nothing is written into the workdir"
+        );
         assert!(!runtime.path().join("logs").exists());
         assert!(!runtime
             .path()
@@ -1789,9 +1748,8 @@ mod tests {
             &["-c", "exit 3"],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
-            &ShellEnforcement::environment_only(),
+            &ShellEnforcement::environment_only().with_test_session_dirs(),
         )
         .expect("bash must run");
 
@@ -1807,9 +1765,8 @@ mod tests {
             &["-c", "echo hi"],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(Path::new(".")).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(Path::new(".")).unwrap(),
             &policy,
-            &ShellEnforcement::environment_only(),
+            &ShellEnforcement::environment_only().with_test_session_dirs(),
         )
         .unwrap_err();
 
@@ -1829,9 +1786,8 @@ mod tests {
             &["-c", "exit 42"],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
-            &ShellEnforcement::environment_only(),
+            &ShellEnforcement::environment_only().with_test_session_dirs(),
         )
         .unwrap();
         assert_eq!(result.exit_code, 42);
@@ -1853,9 +1809,8 @@ mod tests {
             &["-c", "exit 0"],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
-            &ShellEnforcement::environment_only(),
+            &ShellEnforcement::environment_only().with_test_session_dirs(),
         )
         .unwrap();
 
@@ -1895,9 +1850,8 @@ mod tests {
             &[],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
-            &ShellEnforcement::environment_only(),
+            &ShellEnforcement::environment_only().with_test_session_dirs(),
         )
         .unwrap();
 
@@ -1909,87 +1863,68 @@ mod tests {
     }
 
     #[test]
-    fn build_shell_env_sets_synthetic_home_under_workdir() {
+    fn build_shell_env_sets_home_to_the_home_folder() {
         let temp = tempdir().unwrap();
         let policy = CapabilityPolicy::default();
 
-        let env = build_shell_env(
-            &policy,
-            &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let env = build_shell_env(&policy, &[], Some(temp.path()), None, None, None).unwrap();
 
-        let expected_home = temp.path().join(".capsule-home");
-        assert_eq!(
-            env.get("HOME"),
-            Some(&expected_home.to_string_lossy().into_owned())
-        );
-        assert_eq!(
-            env.get("USERPROFILE"),
-            Some(&expected_home.to_string_lossy().into_owned())
-        );
-        assert!(expected_home.is_dir());
+        let expected_home = temp.path().to_string_lossy().into_owned();
+        assert_eq!(env.get("HOME"), Some(&expected_home));
+        assert_eq!(env.get("USERPROFILE"), Some(&expected_home));
     }
 
     #[test]
-    fn build_shell_env_reports_synthetic_home_creation_failure() {
-        let temp = tempdir().unwrap();
-        // A file where the synthetic home belongs, so it cannot be created.
-        std::fs::write(
-            temp.path().join(SYNTHETIC_HOME_DIR_NAME),
-            b"not a directory",
-        )
-        .unwrap();
-        let policy = CapabilityPolicy::default();
-
-        let error = build_shell_env(
-            &policy,
-            &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            None,
-            None,
-            None,
-        )
-        .unwrap_err();
-
-        assert!(error.contains(SYNTHETIC_HOME_DIR_NAME), "{error}");
+    fn no_home_folder_build_shell_env_refuses() {
+        let error =
+            build_shell_env(&CapabilityPolicy::default(), &[], None, None, None, None).unwrap_err();
+        assert_eq!(error, NO_HOME_FOLDER_REFUSAL);
+        assert!(error.contains("home folder"), "{error}");
     }
 
+    /// A command whose enforcement holds no home folder — no runtime directory, or roots without
+    /// one — is refused before anything is spawned, and is handed no home anywhere else: nothing
+    /// is created in the work folder or beside it.
     #[test]
-    fn execute_shell_does_not_spawn_when_synthetic_home_creation_fails() {
-        let temp = tempdir().unwrap();
-        std::fs::write(
-            temp.path().join(SYNTHETIC_HOME_DIR_NAME),
-            b"not a directory",
-        )
-        .unwrap();
-        let workdir = temp.path().to_path_buf();
+    fn no_home_folder_execute_shell_refuses_and_creates_nothing() {
+        let parent = tempdir().unwrap();
+        let workdir = parent.path().join("work");
+        fs::create_dir(&workdir).unwrap();
+        let runtime = tempdir().unwrap();
+        let roots = crate::sandbox::test_runtime_dir(runtime.path());
+        let without_home = crate::runtime_dir::RuntimeDirRoots {
+            home: None,
+            ..roots
+        };
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
             ..CapabilityPolicy::default()
         };
-
-        let error = execute_shell(
-            "bash",
-            &["-c", "echo should-not-run"],
-            &[],
-            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
-            &policy,
-            &ShellEnforcement::environment_only(),
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains(".capsule-home"));
+        for enforcement in [
+            ShellEnforcement::environment_only(),
+            ShellEnforcement::environment_only().with_runtime_dir(without_home.clone(), None),
+        ] {
+            let error = execute_shell(
+                "bash",
+                &["-c", "touch ran"],
+                &[],
+                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
+                &policy,
+                &enforcement,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("no home folder"), "{error}");
+        }
+        assert_eq!(fs::read_dir(&workdir).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 1);
     }
 
     #[test]
-    fn execute_shell_reports_synthetic_home_not_real_host_home() {
+    fn execute_shell_reports_the_home_folder_not_real_host_home() {
         let temp = tempdir().unwrap();
+        let runtime = tempdir().unwrap();
+        let enforcement = ShellEnforcement::environment_only()
+            .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None);
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
             ..CapabilityPolicy::default()
@@ -2000,13 +1935,12 @@ mod tests {
             &["-c", "echo -n $HOME"],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
-            &ShellEnforcement::environment_only(),
+            &enforcement,
         )
         .unwrap();
 
-        let expected_home = temp.path().join(".capsule-home");
+        let expected_home = runtime.path().join("records/home");
         assert_eq!(result.stdout, expected_home.to_string_lossy());
         if let Ok(real_home) = std::env::var("HOME") {
             assert_ne!(result.stdout, real_home);
@@ -2025,15 +1959,8 @@ mod tests {
             ("SAFE_VAR".to_string(), "kept".to_string()),
         ];
 
-        let env = build_shell_env(
-            &policy,
-            &overrides,
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let env =
+            build_shell_env(&policy, &overrides, Some(temp.path()), None, None, None).unwrap();
 
         assert!(!env.contains_key("AWS_ACCESS_KEY_ID"));
         assert!(!env.contains_key("DOCKER_AUTH_CONFIG"));
@@ -2068,15 +1995,7 @@ mod tests {
             ..CapabilityPolicy::default()
         };
         let declared = build_declared_env(&policy);
-        let shell = build_shell_env(
-            &policy,
-            &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let shell = build_shell_env(&policy, &[], Some(temp.path()), None, None, None).unwrap();
         std::env::remove_var(FORMATION_LIFELINE_ENV);
         assert!(
             !declared.contains_key(FORMATION_LIFELINE_ENV),
@@ -2100,15 +2019,7 @@ mod tests {
             ..CapabilityPolicy::default()
         };
         let declared = build_declared_env(&policy);
-        let shell = build_shell_env(
-            &policy,
-            &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let shell = build_shell_env(&policy, &[], Some(temp.path()), None, None, None).unwrap();
         std::env::remove_var(SPAWNER_LIFELINE_ENV);
         assert!(!declared.contains_key(SPAWNER_LIFELINE_ENV), "{declared:?}");
         assert!(!shell.contains_key(SPAWNER_LIFELINE_ENV), "{shell:?}");
@@ -2191,20 +2102,12 @@ mod tests {
         };
         let overrides = vec![("HOME".to_string(), "/tmp/guest-controlled".to_string())];
 
-        let env = build_shell_env(
-            &policy,
-            &overrides,
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let env =
+            build_shell_env(&policy, &overrides, Some(temp.path()), None, None, None).unwrap();
 
-        let expected_home = temp.path().join(".capsule-home");
         assert_eq!(
             env.get("HOME"),
-            Some(&expected_home.to_string_lossy().into_owned())
+            Some(&temp.path().to_string_lossy().into_owned())
         );
     }
 
@@ -2214,21 +2117,13 @@ mod tests {
         let policy = CapabilityPolicy::default();
 
         std::env::set_var("CARGO_HOME", "/fake/cargo/home");
-        let env = build_shell_env(
-            &policy,
-            &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let env = build_shell_env(&policy, &[], Some(temp.path()), None, None, None).unwrap();
         std::env::remove_var("CARGO_HOME");
 
         assert_eq!(env.get("CARGO_HOME"), Some(&"/fake/cargo/home".to_string()));
     }
 
-    /// A command names the account it runs as with the host's own pair, beside a synthetic
+    /// A command names the account it runs as with the host's own pair, beside the session's
     /// `HOME`, and `strip_env` governs the account names like any other baseline entry.
     #[test]
     fn build_shell_env_carries_the_hosts_account_names() {
@@ -2240,15 +2135,22 @@ mod tests {
         std::env::set_var("USER", "murmur-test-user");
         std::env::set_var("LOGNAME", "murmur-test-login");
 
-        let env =
-            build_shell_env(&CapabilityPolicy::default(), &[], &root, None, None, None).unwrap();
+        let env = build_shell_env(
+            &CapabilityPolicy::default(),
+            &[],
+            Some(root.path()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let stripped = build_shell_env(
             &CapabilityPolicy {
                 shell_strip_env: vec!["LOGNAME".to_string()],
                 ..CapabilityPolicy::default()
             },
             &[],
-            &root,
+            Some(root.path()),
             None,
             None,
             None,
@@ -2263,10 +2165,9 @@ mod tests {
             env.get("LOGNAME").map(String::as_str),
             Some("murmur-test-login")
         );
-        let expected_home = temp.path().join(SYNTHETIC_HOME_DIR_NAME);
         assert_eq!(
             env.get("HOME"),
-            Some(&expected_home.to_string_lossy().into_owned())
+            Some(&temp.path().to_string_lossy().into_owned())
         );
         assert!(!stripped.contains_key("LOGNAME"), "{stripped:?}");
         assert_eq!(
@@ -2335,15 +2236,8 @@ mod tests {
         };
         let overrides = vec![("MYCOMPANY_SECRET".to_string(), "leaked".to_string())];
 
-        let env = build_shell_env(
-            &policy,
-            &overrides,
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let env =
+            build_shell_env(&policy, &overrides, Some(temp.path()), None, None, None).unwrap();
 
         assert!(!env.contains_key("MYCOMPANY_SECRET"));
     }
@@ -2518,7 +2412,6 @@ mod tests {
             &["-c", "sleep 5"],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &ShellEnforcement::environment_only()
                 .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None),
@@ -2589,7 +2482,6 @@ mod tests {
                 &["-c", script],
                 &[],
                 &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
-                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 &CapabilityPolicy {
                     shell_allow: vec!["bash".to_string()],
                     ..CapabilityPolicy::default()
@@ -2641,12 +2533,11 @@ mod tests {
                 &["-c", "sleep 300 & echo $! > sleeper.pid; echo started"],
                 &[],
                 &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
-                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 &CapabilityPolicy {
                     shell_allow: vec!["bash".to_string()],
                     ..CapabilityPolicy::default()
                 },
-                &ShellEnforcement::environment_only(),
+                &ShellEnforcement::environment_only().with_test_session_dirs(),
             )
             .expect("a declared binary runs")
         });
@@ -2686,7 +2577,6 @@ mod tests {
             "bash",
             &["-c", script],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &CapabilityPolicy {
                 shell_allow: vec!["bash".to_string()],
@@ -2742,7 +2632,6 @@ mod tests {
                 "bash",
                 &["-c", script],
                 &[],
-                &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 &crate::workdir_fs::WorkdirRoot::open(&workdir).unwrap(),
                 &CapabilityPolicy {
                     shell_allow: vec!["bash".to_string()],
@@ -2822,7 +2711,7 @@ mod tests {
         let env = build_shell_env(
             &policy,
             &overrides,
-            &root,
+            Some(root.path()),
             Some(std::path::Path::new("/runtime/dir")),
             None,
             None,
@@ -2834,7 +2723,8 @@ mod tests {
             Some("/runtime/dir")
         );
 
-        let without = build_shell_env(&policy, &overrides, &root, None, None, None).unwrap();
+        let without =
+            build_shell_env(&policy, &overrides, Some(root.path()), None, None, None).unwrap();
         assert!(!without.contains_key(crate::runtime_dir::RUNTIME_DIR_ENV));
         assert!(!build_declared_env(&policy).contains_key(crate::runtime_dir::RUNTIME_DIR_ENV));
     }
@@ -2860,7 +2750,7 @@ mod tests {
         let env = build_shell_env(
             &policy,
             &overrides,
-            &root,
+            Some(root.path()),
             None,
             Some(std::path::Path::new("/records/dir")),
             None,
@@ -2872,7 +2762,8 @@ mod tests {
             Some("/records/dir")
         );
 
-        let without = build_shell_env(&policy, &overrides, &root, None, None, None).unwrap();
+        let without =
+            build_shell_env(&policy, &overrides, Some(root.path()), None, None, None).unwrap();
         assert!(!without.contains_key(crate::records_dir::RECORDS_DIR_ENV));
         assert!(!build_declared_env(&policy).contains_key(crate::records_dir::RECORDS_DIR_ENV));
     }
@@ -2965,7 +2856,7 @@ mod tests {
             let env = build_shell_env(
                 &policy,
                 &overrides,
-                &root,
+                Some(root.path()),
                 None,
                 None,
                 enforcement.tmpdir_value().as_deref(),

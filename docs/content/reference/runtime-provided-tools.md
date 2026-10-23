@@ -576,7 +576,7 @@ the call and finished ends the same way.
 |---|---|
 | A2A state | `TASK_STATE_FAILED`, with the reason as its status message |
 | `GetTask` | [`metadata.murmur.noAnswer: true`](agent-card.md#no-answer-metadata), and `metadata.murmur.noAnswerBelow` naming each member further down this task had no answer from |
-| `out/result.txt` | `no answer: <reason>` |
+| `out/result.txt` in the session's [records directory](workdir.md#records-directory) | `no answer: <reason>` |
 | [`task_end.exit_status`](observability-schemas.md#task-end) and the `on-task-end` exit status | `no_answer` |
 | `task_failed` | None is written |
 | The caller's call | Ends `no_answer` — see [How the answer arrives](#call-member-answer) |

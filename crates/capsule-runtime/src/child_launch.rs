@@ -51,7 +51,7 @@ use crate::host_warnings::HOST_WARNINGS_REPORTED_ENV;
 use crate::lifeline::SPAWNER_LIFELINE_ENV;
 use crate::mac_token;
 use crate::spawn_credential::SpawnApproval;
-use crate::workdir_fs::{WorkdirRoot, DEFAULT_DIR_MODE};
+use crate::workdir_fs::WorkdirRoot;
 
 /// Environment variable naming the `mur` binary to launch children with.
 ///
@@ -145,10 +145,9 @@ const CHILD_END_POLL: Duration = Duration::from_millis(20);
 /// and again at the `POST /register` the child performs for itself.
 #[derive(Debug)]
 pub struct ChildLaunchRequest {
-    /// The parent's own accessible workdir. The child's directory is created beneath it, with no
-    /// link followed, which is what keeps the child inside the single preopen the parent's WASI
-    /// layer already has.
-    pub parent_accessible_root: WorkdirRoot,
+    /// The parent's own records directory. The child's work folder is created in its
+    /// [`CHILDREN_DIR`], with no link followed, outside the parent's work folder.
+    pub parent_records_root: WorkdirRoot,
     pub capsule_name: String,
     pub capsule_version: String,
     /// The approval `POST /spawn` returned, spent by the child's own registration.
@@ -362,23 +361,22 @@ fn end_process(process: &Mutex<ChildProcess>) -> Result<(), std::io::Error> {
 
 /// A running child capsule and the handles to end it.
 pub struct LaunchedChild {
-    /// The directory the parent created for this child, and passed as its `--workdir`. The
-    /// child's session workdir is `<workdir>/.murmur/<session_id>/`; its trace and
-    /// `completion.json` are in [`Self::records_dir`].
+    /// The directory the parent created for this child in its records directory's
+    /// [`CHILDREN_DIR`], and passed as its `--workdir`: the child's work folder. Its trace, its
+    /// `completion.json` and an agent child's `out/` are in [`Self::records_dir`].
     pub workdir: PathBuf,
-    /// [`Self::workdir`] relative to [`Self::parent_root`], the form every runtime read and write
-    /// of the child's files goes through.
-    pub(crate) workdir_rel: PathBuf,
-    /// The parent's accessible root the child's directory was created beneath.
-    pub(crate) parent_root: WorkdirRoot,
+    /// [`Self::workdir`], held, reached from the parent's records root with no link followed and
+    /// sharing its refusal latch: every runtime read of a script child's result goes through it.
+    pub(crate) workdir_root: WorkdirRoot,
     /// The session id the child's runtime minted for itself.
     pub session_id: String,
     /// The child's records directory, as the child reported it on its readiness line: where its
-    /// trace and its `completion.json` are. Never derived from a path inside the parent's
-    /// workdir, whose `.murmur/children/` the parent's commands can replace with a link.
+    /// trace, its `completion.json` and an agent child's `out/` are. Never derived from
+    /// [`Self::workdir`].
     pub records_dir: PathBuf,
-    /// [`Self::records_dir`], held, sharing [`Self::parent_root`]'s refusal latch: every read and
-    /// write of the child's `completion.json` goes through it.
+    /// [`Self::records_dir`], held, sharing [`Self::workdir_root`]'s refusal latch: every read and
+    /// write of the child's `completion.json` and every read of an agent child's result goes
+    /// through it.
     pub(crate) records_root: WorkdirRoot,
     /// The child's A2A endpoint, `http://host:port`. Empty for a script capsule, which binds no
     /// port and has already finished by the time it reports.
@@ -508,18 +506,6 @@ impl Drop for LaunchedChild {
     }
 }
 
-/// `workdir` named from `root`, falling back to the absolute path when it sits outside it.
-///
-/// One rule, used by the delegating plane wherever it names a child's directory to the parent's
-/// agent or to the parent's trace.
-pub(crate) fn workdir_relative_to(workdir: &Path, root: &Path) -> String {
-    workdir
-        .strip_prefix(root)
-        .unwrap_or(workdir)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
 /// A mutex this crate holds only for the length of one field access, so a poisoned lock is
 /// recovered from rather than turned into a panic in a `Drop`.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -528,23 +514,22 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Where a child of this parent goes: `<parent accessible workdir>/.murmur/children/<name>-<16 hex>`.
+/// Where a child of this parent goes: `<parent records dir>/children/<name>-<16 hex>`.
 ///
 /// The 16 hex characters are fresh per call, so delegating the same capsule name and version twice
-/// yields two directories rather than one shared one. Beneath `.murmur/`, alongside the parent's
-/// own session directories, so a child's tree is inside the parent's single preopen and is pruned
-/// with it. `<name>` is the bare part of a full `capsule_name`, so the directory is one segment
-/// whatever the scope.
-pub fn child_workdir_for(parent_accessible_workdir: &Path, capsule_name: &str) -> PathBuf {
-    parent_accessible_workdir.join(child_workdir_rel(capsule_name))
+/// yields two directories rather than one shared one. In the parent's records directory, outside
+/// its work folder, so `mur trace rm` and `trace.retain` remove a child's work folder with the
+/// parent's records. `<name>` is the bare part of a full `capsule_name`, so the directory is one
+/// segment whatever the scope.
+pub fn child_workdir_for(parent_records_dir: &Path, capsule_name: &str) -> PathBuf {
+    parent_records_dir.join(child_workdir_rel(capsule_name))
 }
 
-/// Every child's directory sits directly beneath this one, relative to the parent's accessible
-/// workdir.
-pub(crate) const CHILDREN_DIR: &str = ".murmur/children";
+/// Every child's directory sits directly beneath this one, relative to the parent's records
+/// directory.
+pub(crate) const CHILDREN_DIR: &str = "children";
 
-/// [`child_workdir_for`] relative to the parent's accessible workdir: `.murmur/children/<name>-<16
-/// hex>`.
+/// [`child_workdir_for`] relative to the parent's records directory: `children/<name>-<16 hex>`.
 fn child_workdir_rel(capsule_name: &str) -> PathBuf {
     let suffix = mac_token::random_hex(8).unwrap_or_else(|_| {
         // The OS CSPRNG is not expected to fail; a nanosecond clock reading still distinguishes
@@ -577,8 +562,9 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         ))
     })?;
     let workdir_rel = child_workdir_rel(&request.capsule_name);
-    let identity = create_child_dir(&request.parent_accessible_root, &workdir_rel)?;
-    let workdir = request.parent_accessible_root.host_path(&workdir_rel);
+    let workdir_root = create_child_dir(&request.parent_records_root, &workdir_rel)?;
+    let identity = workdir_root.identity()?;
+    let workdir = workdir_root.path().to_path_buf();
 
     let binary = mur_binary()?;
     let mut argv: Vec<String> = vec![
@@ -666,12 +652,10 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         )));
     }
 
-    let parent_root = request.parent_accessible_root.clone();
-    let readiness = read_readiness(&unclaimed.process, &workdir, &stderr_tail, &parent_root)?;
+    let readiness = read_readiness(&unclaimed.process, &workdir, &stderr_tail, &workdir_root)?;
     let mut launched = LaunchedChild {
         workdir,
-        workdir_rel,
-        parent_root,
+        workdir_root,
         session_id: readiness.session_id,
         records_dir: readiness.records_dir,
         records_root: readiness.records_root,
@@ -747,7 +731,7 @@ fn read_readiness(
     process: &Mutex<ChildProcess>,
     workdir: &Path,
     stderr_tail: &StderrTail,
-    parent_root: &WorkdirRoot,
+    latch_of: &WorkdirRoot,
 ) -> Result<Readiness, RuntimeError> {
     let line = first_json_line(process, workdir, stderr_tail)?;
     let report: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
@@ -769,8 +753,8 @@ fn read_readiness(
         .unwrap_or_default();
 
     let records_dir = readiness_records_dir(&report, session_id)?;
-    let records_root = WorkdirRoot::open_sharing_latch_absolute(&records_dir, parent_root)
-        .map_err(|error| {
+    let records_root =
+        WorkdirRoot::open_sharing_latch_absolute(&records_dir, latch_of).map_err(|error| {
             RuntimeError::Runtime(format!(
                 "the child capsule's records directory could not be opened: {error}"
             ))
@@ -1099,20 +1083,21 @@ pub(crate) fn mur_binary() -> Result<PathBuf, RuntimeError> {
     })
 }
 
-/// Creates `rel` beneath `root` with [`CHILD_DIR_MODE`], and `.murmur/children` above it with the
-/// default mode, no link followed, and returns the `(st_dev, st_ino)` of the directory it
-/// created, from a descriptor reached the same way. A link on the way is
+/// Creates `rel` beneath `records_root`, [`CHILDREN_DIR`] and the directory itself both at
+/// [`CHILD_DIR_MODE`], no link followed, and returns it held, reached the same way: its identity
+/// is what the child's `--workdir` is checked against. A link on the way is
 /// [`RuntimeError::WorkdirPathRefused`].
-fn create_child_dir(root: &WorkdirRoot, rel: &Path) -> Result<(u64, u64), RuntimeError> {
-    root.create_dir_all(CHILDREN_DIR, DEFAULT_DIR_MODE)?;
-    root.create_dir_all(rel, CHILD_DIR_MODE)?;
-    let created = root.open_beneath(&rel.to_string_lossy())?.ok_or_else(|| {
-        RuntimeError::Runtime(format!(
-            "the child capsule's directory {} vanished after its creation",
-            root.display_path(rel)
-        ))
-    })?;
-    Ok(created.identity()?)
+fn create_child_dir(records_root: &WorkdirRoot, rel: &Path) -> Result<WorkdirRoot, RuntimeError> {
+    records_root.create_dir_all(CHILDREN_DIR, CHILD_DIR_MODE)?;
+    records_root.create_dir_all(rel, CHILD_DIR_MODE)?;
+    records_root
+        .open_beneath(&rel.to_string_lossy())?
+        .ok_or_else(|| {
+            RuntimeError::Runtime(format!(
+                "the child capsule's directory {} vanished after its creation",
+                records_root.display_path(rel)
+            ))
+        })
 }
 
 /// The child's stderr as the parent keeps it: every line echoed to this process's stderr as it
@@ -1465,10 +1450,7 @@ mod tests {
         let second = child_workdir_for(&parent, "worker");
 
         assert_ne!(first, second);
-        assert_eq!(
-            first.parent(),
-            Some(parent.join(".murmur").join("children").as_path())
-        );
+        assert_eq!(first.parent(), Some(parent.join(CHILDREN_DIR).as_path()));
         assert!(first
             .file_name()
             .unwrap()
@@ -1488,10 +1470,7 @@ mod tests {
         let parent = PathBuf::from("/tmp/parent");
         let scoped = child_workdir_for(&parent, "local/worker");
 
-        assert_eq!(
-            scoped.parent(),
-            Some(parent.join(".murmur").join("children").as_path())
-        );
+        assert_eq!(scoped.parent(), Some(parent.join(CHILDREN_DIR).as_path()));
         let name = scoped.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("worker-"), "{name}");
         assert_eq!(name.len(), "worker-".len() + 16);
@@ -1499,7 +1478,7 @@ mod tests {
 
     fn request(env_allow: &[&str], spawner: Option<Spawner>) -> ChildLaunchRequest {
         ChildLaunchRequest {
-            parent_accessible_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
+            parent_records_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
             capsule_name: "worker".to_string(),
             capsule_version: "0.1.0".to_string(),
             grant: SpawnApproval::new("msa1.token".to_string()),
@@ -1776,8 +1755,7 @@ mod tests {
     fn child_launch_debug_prints_no_door_token() {
         let child = LaunchedChild {
             workdir: PathBuf::from("/tmp/child"),
-            workdir_rel: PathBuf::new(),
-            parent_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
+            workdir_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
             session_id: "ses_child".to_string(),
             records_dir: PathBuf::new(),
             records_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
@@ -1948,8 +1926,7 @@ mod tests {
                 process_with_lifeline("bash", &["-c", "trap '' TERM; while :; do sleep 0.1; done"]);
             LaunchedChild {
                 workdir: PathBuf::from("/tmp/child"),
-                workdir_rel: PathBuf::new(),
-                parent_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
+                workdir_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
                 session_id: "ses_child".to_string(),
                 records_dir: PathBuf::new(),
                 records_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
@@ -2013,8 +1990,7 @@ mod tests {
             let process = Arc::new(Mutex::new(process));
             let child = LaunchedChild {
                 workdir: PathBuf::from("/tmp/child"),
-                workdir_rel: PathBuf::new(),
-                parent_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
+                workdir_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
                 session_id: "ses_child".to_string(),
                 records_dir: PathBuf::new(),
                 records_root: WorkdirRoot::open(&std::env::temp_dir()).unwrap(),
@@ -2082,8 +2058,7 @@ mod tests {
         let (process, _) = process_with_lifeline("sleep", &["30"]);
         let mut child = LaunchedChild {
             workdir: dir.path().to_path_buf(),
-            workdir_rel: PathBuf::new(),
-            parent_root: WorkdirRoot::open(dir.path()).unwrap(),
+            workdir_root: WorkdirRoot::open(dir.path()).unwrap(),
             session_id: "ses_child".to_string(),
             records_dir: dir.path().to_path_buf(),
             records_root: WorkdirRoot::open(dir.path()).unwrap(),
@@ -2158,8 +2133,7 @@ mod tests {
         let (process, _) = process_with_lifeline("bash", &["-c", &script]);
         let mut child = LaunchedChild {
             workdir: dir.path().to_path_buf(),
-            workdir_rel: PathBuf::new(),
-            parent_root: WorkdirRoot::open(dir.path()).unwrap(),
+            workdir_root: WorkdirRoot::open(dir.path()).unwrap(),
             session_id: "ses_child".to_string(),
             records_dir: dir.path().to_path_buf(),
             records_root: WorkdirRoot::open(dir.path()).unwrap(),

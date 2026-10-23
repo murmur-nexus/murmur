@@ -4,8 +4,8 @@
 //!
 //! Every test publishes the fixture process driver, puts the fixture fake harness on `PATH` as
 //! `fixture-cli` under a profile that keeps a conversation of its own, and reads back
-//! `out/result.txt`, the session's `trace.jsonl` under `~/.murmur/records/` and
-//! `~/.murmur/conversations/`. The fake harness is a bash script, so these tests are Unix-only —
+//! `out/result.txt` and `trace.jsonl` from the session's records directory under
+//! `~/.murmur/records/`, and `~/.murmur/conversations/`. The fake harness is a bash script, so these tests are Unix-only —
 //! which every platform murmur targets is.
 
 #![cfg(unix)]
@@ -186,7 +186,6 @@ fn make_executable(path: &Path) {
 struct Run {
     output: Output,
     text: String,
-    workdir: PathBuf,
     /// The session's records directory, or the records root when the run never staged a session.
     records_dir: PathBuf,
 }
@@ -234,11 +233,6 @@ impl Capsule {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let workdir = if text.contains("workdir: ") {
-            common::parse_workdir_from_stdout(&text)
-        } else {
-            self.project.path().to_path_buf()
-        };
         let records_dir = if text.contains("records: ") {
             common::parse_records_from_stdout(&text)
         } else {
@@ -247,7 +241,6 @@ impl Capsule {
         Run {
             output,
             text,
-            workdir,
             records_dir,
         }
     }
@@ -335,7 +328,7 @@ impl Run {
     }
 
     fn result(&self) -> String {
-        fs::read_to_string(self.workdir.join("out").join("result.txt")).unwrap_or_default()
+        fs::read_to_string(self.records_dir.join("out").join("result.txt")).unwrap_or_default()
     }
 
     fn events(&self) -> Vec<Value> {
@@ -374,7 +367,6 @@ struct LiveCapsule {
     capsule: Capsule,
     child: std::process::Child,
     url: String,
-    workdir: PathBuf,
     records_dir: PathBuf,
 }
 
@@ -437,7 +429,6 @@ impl LiveCapsule {
             capsule,
             child,
             url: startup["url"].as_str().unwrap().to_string(),
-            workdir: PathBuf::from(startup["workdir"].as_str().unwrap()),
             records_dir: PathBuf::from(startup["records_dir"].as_str().unwrap()),
         }
     }
@@ -570,7 +561,7 @@ impl LiveCapsule {
 
     /// What the last finished task answered.
     fn result(&self) -> String {
-        fs::read_to_string(self.workdir.join("out").join("result.txt")).unwrap_or_default()
+        fs::read_to_string(self.records_dir.join("out").join("result.txt")).unwrap_or_default()
     }
 
     fn wait_for_task_ends(&self, expected: usize) {

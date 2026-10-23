@@ -240,7 +240,7 @@ fn a2a_message_send_starts_agent_loop_and_returns_submitted() {
     let launched = handle.join().expect("launch thread should not panic");
 
     // Agent ran and produced output
-    let result = fs::read_to_string(launched.workdir.join("out/result.txt"))
+    let result = fs::read_to_string(launched.records_dir.join("out/result.txt"))
         .expect("result.txt should exist");
     assert!(
         result.contains("A2A task complete"),
@@ -406,7 +406,11 @@ fn task_md_task_start_records_user_and_trusted() {
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
 
     let staged = stage_agent(&home, &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Run the fallback task").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Run the fallback task",
+    )
+    .unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("launch with task.md should succeed");
 
@@ -528,11 +532,15 @@ fn a2a_task_md_fallback_not_regressed() {
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
 
     let staged = stage_agent(&home, &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Run the fallback task").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Run the fallback task",
+    )
+    .unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("launch with task.md should succeed");
 
-    let result = fs::read_to_string(launched.workdir.join("out/result.txt"))
+    let result = fs::read_to_string(launched.records_dir.join("out/result.txt"))
         .expect("result.txt should exist");
     assert!(
         result.contains("fallback result"),
@@ -720,7 +728,11 @@ fn a_user_origin_task_line_carries_no_fence_key() {
     let server = end_turn_server("task.md done");
     let (home, manifest_path) = setup_agent_project_with_record(&server.endpoint, &record_store);
     let staged = stage_agent(&home, &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Run the fallback task").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Run the fallback task",
+    )
+    .unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("launch with task.md should succeed");
     let task_start = task_start_line(&launched.records_dir);
@@ -799,7 +811,7 @@ fn workdir_path_happy_path_writes_task_md_and_completes() {
     let server = end_turn_server("done");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let records_dir = staged.records_dir.clone();
 
     send_one_task(staged, "the task text").expect("the session runs");

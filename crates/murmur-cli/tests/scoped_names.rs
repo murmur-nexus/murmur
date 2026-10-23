@@ -938,7 +938,7 @@ fn the_model_is_offered_the_bare_tool_name_and_never_a_scope() {
     let workdir = project.path().join("pinned");
     fs::create_dir_all(&workdir).unwrap();
 
-    let assert = mur(&home, project.path(), &SilentSource::new().api_base)
+    mur(&home, project.path(), &SilentSource::new().api_base)
         .args([
             "run",
             "--manifest",
@@ -950,14 +950,6 @@ fn the_model_is_offered_the_bare_tool_name_and_never_a_scope() {
         ])
         .assert()
         .success();
-    let stdout = stdout_of(&assert);
-    let session = stdout
-        .split("session: ")
-        .nth(1)
-        .and_then(|rest| rest.lines().next())
-        .unwrap_or_else(|| panic!("no session id in stdout: {stdout}"))
-        .trim()
-        .to_string();
 
     let requests = server.requests();
     let tools = requests[0]["tools"].as_array().expect("a tool array");
@@ -972,12 +964,13 @@ fn the_model_is_offered_the_bare_tool_name_and_never_a_scope() {
         assert!(!name.contains('/'), "a tool name carries no scope: {name}");
         assert!(!description.contains("murmur/"), "{description}");
     }
-    // Staged under the bare name in the session's runtime directory, never in the workdir.
-    assert!(!workdir
-        .join(".murmur")
-        .join(&session)
-        .join("tools")
-        .exists());
+    // Staged under the bare name in the session's runtime directory, never in the workdir, which
+    // gains nothing.
+    assert_eq!(
+        fs::read_dir(&workdir).unwrap().count(),
+        0,
+        "the workdir gains nothing"
+    );
 }
 
 // ── Doctor and the old store layout ───────────────────────────────────────────

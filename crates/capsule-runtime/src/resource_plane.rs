@@ -69,10 +69,9 @@ pub struct DeclaredExport {
 }
 
 impl DeclaredExport {
-    /// Resolves a manifest's `exports.files` block against the session's accessible workdir —
-    /// the directory the agent's own tools see at `.`, and therefore the one `out/result.txt`
-    /// means. Not `StagedSession::workdir`, which is the internal `.murmur/<session_id>`
-    /// bookkeeping directory when `--workdir` is given, and holds `trace.jsonl`.
+    /// Resolves a manifest's `exports.files` block against the session's work folder — the
+    /// directory the agent's own tools see at `.`, and therefore the one a relative export root
+    /// names.
     pub fn resolve(accessible_workdir: &Path, export: &FileExport) -> Self {
         Self {
             declared_root: export.root.clone(),

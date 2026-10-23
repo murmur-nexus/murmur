@@ -2,7 +2,7 @@
 //! `$HOME/.murmur/state/<store>/` and mounted into the guest as a second preopen named `state`.
 //!
 //! Every test here drives the real `mur` binary against a real Wasmtime guest, because the whole
-//! point of the capability is a host path outside the session workdir: an in-process assertion
+//! point of the capability is a host path outside the work folder: an in-process assertion
 //! about a `WasiCtx` cannot tell you what a guest's `std::fs::write("state/notes.jsonl", ..)`
 //! actually resolves against, and that resolution is the mechanism.
 
@@ -114,7 +114,7 @@ fn fixture_component(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// What the capsule wrote into its session workdir — the tool's reported line count, or the
+/// What the capsule wrote into its work folder — the tool's reported line count, or the
 /// failure it reported instead of trapping.
 fn capsule_result(stdout: &str) -> String {
     let marker = "workdir: ";
@@ -151,7 +151,7 @@ fn explain_scope(home: &TempDir, manifest: &Path, json: bool) -> Command {
     cmd
 }
 
-/// The whole point of the capability: two launches, two different session workdirs, one store.
+/// The whole point of the capability: two launches, two different work folders, one store.
 ///
 /// Neither run passes `--workdir`, so each gets a fresh `<manifest_dir>/workdir/<session_id>` and
 /// the two share no directory at all. A count that reaches `2` can only have come from state that

@@ -1293,7 +1293,8 @@ pub struct CompactionConfig {
     /// exclusive with `system_prompt`.
     pub system_prompt_file: Option<String>,
     /// When true, every committed compaction appends one JSON line recording the
-    /// replacement summary to `out/compaction-summaries.jsonl` in the session workdir.
+    /// replacement summary to `out/compaction-summaries.jsonl` in the session's records
+    /// directory.
     /// None (the key absent) is equivalent to false: nothing is written.
     pub dump_summaries: Option<bool>,
     /// Output cap of every `run-inference` call made while a hook serves `on-compaction`, and

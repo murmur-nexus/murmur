@@ -118,7 +118,7 @@ inference:
   system_prompt_file: conventions.md
 ```
 
-The path is **relative to the directory containing `murmur.yaml`**, not to the session workdir. A typical layout:
+The path is **relative to the directory containing `murmur.yaml`**, not to the work folder. A typical layout:
 
 ```text
 my-capsule/
@@ -208,10 +208,10 @@ murmur: url localhost:52222
 session: ses_019ed2af53da75c2aefee84ee10c34af
 ```
 
-After the session completes, read the agent's output:
+After the session completes, read the agent's output from `out/result.txt` in the session's [records directory](../reference/workdir.md#records-directory):
 
 ```bash
-cat workdir/<session_id>/out/result.txt
+cat ~/.murmur/records$PWD/workdir/<session_id>/out/result.txt
 ```
 
 Replace `<session_id>` with the value printed by `mur run`. For the data analyst persona above, you would expect exactly one summary sentence and a bullet list — no preamble, no closing remarks.

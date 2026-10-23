@@ -2,8 +2,9 @@
 //!
 //! The launched cases drive the real `mur` binary against a real Wasmtime driver and a scripted
 //! provider, so what is removed is checked against the records path `mur run --verbose` printed
-//! and the session directory staging made, not against a second derivation of the layout. The
-//! fabricated cases write the running records and links no real launch leaves behind.
+//! and the work folder staging made, not against a second derivation of the layout. The
+//! fabricated cases write the running records, links and earlier runs' leftovers no launch of
+//! this runtime leaves behind.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -281,6 +282,18 @@ impl Drop for Stray {
 
 // ── Two sessions of one root, removed one at a time ──────────────────────────
 
+/// Directories an earlier runtime left in an operator's folder under the name of a session:
+/// `<root>/.murmur/<id>/` and `<root>/<id>/`, each holding a file. Never read, written or
+/// removed.
+fn plant_leftovers(root: &Path, id: &str) -> [PathBuf; 2] {
+    let planted = [root.join(".murmur").join(id), root.join(id)];
+    for dir in &planted {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("keep"), b"operator data").unwrap();
+    }
+    planted
+}
+
 #[test]
 fn rm_removes_exactly_one_session_of_a_root() {
     let f = fixture(vec![end_turn("one"), end_turn("two")]);
@@ -288,9 +301,21 @@ fn rm_removes_exactly_one_session_of_a_root() {
     let a_records = f.run("t1", Some(&root));
     let b_records = f.run("t2", Some(&root));
     let (a, b) = (name_of(&a_records), name_of(&b_records));
-    let a_session = root.join(".murmur").join(&a);
-    let b_session = root.join(".murmur").join(&b);
-    assert!(a_session.is_dir() && b_session.is_dir());
+    assert_eq!(
+        fs::read_dir(&root).unwrap().count(),
+        0,
+        "a run under --workdir creates nothing in the operator's folder"
+    );
+    // Everything the runtime kept for A is in its records directory; a delegated child's work
+    // folder would be too.
+    assert_eq!(
+        fs::read_to_string(a_records.join("out/result.txt")).unwrap(),
+        "one"
+    );
+    assert!(a_records.join("home").is_dir() && a_records.join("tmp").is_dir());
+    fs::create_dir_all(a_records.join("children/worker-0123456789abcdef")).unwrap();
+    let a_leftovers = plant_leftovers(&root, &a);
+    let b_leftovers = plant_leftovers(&root, &b);
 
     let removed = rm_json(f.home.path(), &a, &root);
     println!("mur trace rm --json:\n{removed:#}");
@@ -299,14 +324,15 @@ fn rm_removes_exactly_one_session_of_a_root() {
         json!({
             "session_id": a,
             "records_dir": a_records.to_str().unwrap(),
-            "session_dir": a_session.to_str().unwrap(),
+            "session_dir": null,
             "running_record": null,
         })
     );
-    assert!(!a_records.exists(), "A's records directory");
-    assert!(!a_session.exists(), "A's session directory");
+    assert!(
+        !a_records.exists(),
+        "A's records directory, with its out/, home/, tmp/ and children/"
+    );
     assert!(b_records.join("trace.jsonl").is_file(), "B's records");
-    assert!(b_session.is_dir(), "B's session directory");
     assert_eq!(listed_ids(f.home.path(), &root), vec![b.clone()]);
 
     let stderr = rm_refused(f.home.path(), &[&a], &root, "E-TRC-002");
@@ -321,26 +347,22 @@ fn rm_removes_exactly_one_session_of_a_root() {
     )
     .code(0);
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    assert_eq!(
-        stdout,
-        format!(
-            "removed session directory {}\nremoved records {}\n",
-            b_session.display(),
-            b_records.display()
-        )
-    );
+    assert_eq!(stdout, format!("removed records {}\n", b_records.display()));
 
     for name in [&a, &b] {
         assert!(
             named_beneath(&f.home.path().join(".murmur/records"), name).is_empty(),
             "{name} is left under ~/.murmur/records"
         );
-        assert!(
-            named_beneath(&root.join(".murmur"), name).is_empty(),
-            "{name} is left under D/.murmur"
+    }
+    for dir in a_leftovers.iter().chain(&b_leftovers) {
+        assert_eq!(
+            fs::read(dir.join("keep")).unwrap(),
+            b"operator data",
+            "{} is the operator's",
+            dir.display()
         );
     }
-    assert!(root.join(".murmur").is_dir(), "<root>/.murmur itself stays");
     assert!(
         common::records_group(f.home.path(), &root).is_dir(),
         "the records group stays"
@@ -351,19 +373,32 @@ fn rm_removes_exactly_one_session_of_a_root() {
 // ── A run without --workdir ──────────────────────────────────────────────────
 
 #[test]
-fn rm_removes_the_session_directory_of_a_run_without_workdir() {
+fn rm_removes_the_work_folder_of_a_run_without_workdir() {
     let f = fixture(vec![end_turn("one")]);
     let records = f.run("t1", None);
     let id = name_of(&records);
     let root = f.project.path().join("workdir");
-    let session = root.join(&id);
-    assert!(session.is_dir(), "staging made {}", session.display());
+    let work_folder = root.join(&id);
+    assert!(
+        work_folder.is_dir(),
+        "staging made {}",
+        work_folder.display()
+    );
+    assert_eq!(fs::read_dir(&work_folder).unwrap().count(), 0);
 
-    let removed = rm_json(f.home.path(), &id, &root);
-    assert_eq!(removed["session_dir"], session.to_str().unwrap());
+    // No --workdir: the root is `./workdir`, whose folders the runtime created.
+    let assert = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", f.home.path())
+        .current_dir(f.project.path())
+        .args(["trace", "rm", &id, "--json"])
+        .assert()
+        .code(0);
+    let removed: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(removed["session_dir"], work_folder.to_str().unwrap());
     assert_eq!(removed["records_dir"], records.to_str().unwrap());
     assert!(removed["running_record"].is_null());
-    assert!(!session.exists());
+    assert!(!work_folder.exists());
     assert!(!records.exists());
     assert!(root.is_dir(), "the workdir root stays");
 }
@@ -376,7 +411,6 @@ fn rm_refuses_a_running_session_and_prunes_a_stale_record() {
     let root = f.root("D");
     let records = f.run("t1", Some(&root));
     let id = name_of(&records);
-    let session = root.join(".murmur").join(&id);
 
     let mut stray = Stray::sleeping();
     let record = write_record(f.home.path(), &id, stray.pid(), &stray.token());
@@ -385,29 +419,28 @@ fn rm_refuses_a_running_session_and_prunes_a_stale_record() {
     assert!(stderr.contains(&id), "{stderr}");
     assert!(stderr.contains(&format!("pid {}", stray.pid())), "{stderr}");
     assert!(stderr.contains(&format!("mur stop {id}")), "{stderr}");
-    assert!(records.is_dir() && session.is_dir() && record.is_file());
+    assert!(records.is_dir() && record.is_file());
     assert!(stray.is_alive(), "mur trace rm signals nothing");
 
     write_record(f.home.path(), &id, DEAD_PID, "1");
     let removed = rm_json(f.home.path(), &id, &root);
     assert_eq!(removed["running_record"], record.to_str().unwrap());
     assert_eq!(removed["records_dir"], records.to_str().unwrap());
-    assert_eq!(removed["session_dir"], session.to_str().unwrap());
+    assert!(removed["session_dir"].is_null());
     assert!(!record.exists(), "the stale running record");
-    assert!(!records.exists() && !session.exists());
+    assert!(!records.exists());
 }
 
 // ── What an address may name, and what is never followed ─────────────────────
 
 #[test]
-fn rm_refuses_paths_unknown_ids_and_links_and_finishes_a_half_removal() {
+fn rm_refuses_paths_unknown_ids_and_links() {
     let f = fixture(vec![end_turn("one"), end_turn("two")]);
     let root = f.root("D");
     let records = f.run("t1", Some(&root));
     let id = name_of(&records);
-    let session = root.join(".murmur").join(&id);
 
-    let literal = session.to_str().unwrap().to_string();
+    let literal = records.to_str().unwrap().to_string();
     let stderr = rm_refused(f.home.path(), &[&literal], &root, "E-TRC-002");
     assert!(
         stderr.contains(&format!(
@@ -419,34 +452,36 @@ fn rm_refuses_paths_unknown_ids_and_links_and_finishes_a_half_removal() {
     rm_refused(f.home.path(), &["trace.jsonl"], &root, "E-TRC-002");
     let unknown = format!("ses_{}", "0".repeat(32));
     rm_refused(f.home.path(), &[&unknown], &root, "E-TRC-002");
-    assert!(records.is_dir() && session.is_dir(), "nothing was removed");
+    assert!(records.is_dir(), "nothing was removed");
 
-    // `<root>/.murmur` swapped for a link to a directory holding the session's name.
+    // The records directory swapped for a link to a directory holding a file.
     let elsewhere = f.project.path().join("elsewhere");
-    fs::rename(root.join(".murmur"), &elsewhere).unwrap();
-    std::os::unix::fs::symlink(&elsewhere, root.join(".murmur")).unwrap();
+    fs::rename(&records, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &records).unwrap();
     let stderr = rm_refused(f.home.path(), &[&id], &root, "E-RUN-050");
     println!("refused:\n{stderr}");
     assert!(stderr.contains("hint:"), "{stderr}");
     assert!(
-        elsewhere.join(&id).is_dir(),
+        elsewhere.join("trace.jsonl").is_file(),
         "the link's target is untouched"
     );
-    assert!(records.is_dir(), "nothing was removed");
-    fs::remove_file(root.join(".murmur")).unwrap();
-    fs::rename(&elsewhere, root.join(".murmur")).unwrap();
+    fs::remove_file(&records).unwrap();
+    fs::rename(&elsewhere, &records).unwrap();
 
-    // A full id whose records directory an earlier removal already took.
+    // Under --workdir a session whose records directory is gone has nothing left to remove.
     fs::remove_dir_all(&records).unwrap();
-    let removed = rm_json(f.home.path(), &id, &root);
-    assert!(removed["records_dir"].is_null(), "{removed:#}");
-    assert_eq!(removed["session_dir"], session.to_str().unwrap());
-    assert!(!session.exists());
+    let stderr = rm_refused(f.home.path(), &[&id], &root, "E-TRC-002");
+    assert!(
+        stderr.contains(&format!("session {id} not found")),
+        "{stderr}"
+    );
 
     // A suffix names a session through the records group alone.
     let second = f.run("t2", Some(&root));
     let suffix = &name_of(&second)[28..];
     let removed = rm_json(f.home.path(), suffix, &root);
     assert_eq!(removed["session_id"], name_of(&second).as_str());
+    assert!(removed["session_dir"].is_null());
     assert!(!second.exists());
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
 }

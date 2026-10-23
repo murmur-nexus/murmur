@@ -143,7 +143,10 @@ impl<'a> Capsule<'a> {
 struct Session {
     trace: Vec<Value>,
     trace_raw: String,
+    /// The work folder, the harness's current directory.
     workdir: PathBuf,
+    /// The session's records directory, where the runtime writes the harness's answer.
+    records_dir: PathBuf,
     _project: tempfile::TempDir,
 }
 
@@ -187,7 +190,7 @@ impl Session {
     /// What the harness was handed by the bridge, which it reports back as its result — the
     /// refusal text verbatim for every scenario where the call was refused.
     fn harness_answer(&self) -> String {
-        fs::read_to_string(self.workdir.join("out").join("result.txt")).unwrap_or_default()
+        fs::read_to_string(self.records_dir.join("out").join("result.txt")).unwrap_or_default()
     }
 
     /// Everything the run said: the harness's result and the whole trace, for the assertions
@@ -342,7 +345,7 @@ fn run_session(capsule: &Capsule<'_>) -> Session {
     let harness = write_harness(project.path(), capsule);
     let manifest_path = create_manifest(project.path(), capsule, &harness);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let records_dir = staged.records_dir.clone();
 
     fs::create_dir_all(workdir.join(PROTECTED_RULE)).unwrap();
@@ -362,6 +365,7 @@ fn run_session(capsule: &Capsule<'_>) -> Session {
         trace,
         trace_raw,
         workdir,
+        records_dir,
         _project: project,
     }
 }

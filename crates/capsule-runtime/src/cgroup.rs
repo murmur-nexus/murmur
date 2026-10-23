@@ -2504,7 +2504,7 @@ mod tests {
         .expect("a required scope on Linux is never None");
         let enforcement = crate::sandbox::ShellEnforcement {
             cgroup_scope: Some(Arc::clone(&scope)),
-            ..crate::sandbox::ShellEnforcement::environment_only()
+            ..crate::sandbox::ShellEnforcement::environment_only().with_test_session_dirs()
         };
         let mut command = std::process::Command::new("bash");
         command
@@ -2563,7 +2563,7 @@ mod tests {
             .expect("a required scope on Linux is never None");
         let enforcement = crate::sandbox::ShellEnforcement {
             cgroup_scope: Some(Arc::clone(&scope)),
-            ..crate::sandbox::ShellEnforcement::environment_only()
+            ..crate::sandbox::ShellEnforcement::environment_only().with_test_session_dirs()
         };
         let mut command = std::process::Command::new("bash");
         command

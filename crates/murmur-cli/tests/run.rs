@@ -676,7 +676,7 @@ fn an_undeclared_runtime_pin_is_not_staged() {
 }
 
 /// A declared tool whose pin a capsule pulled cannot carry `gateway:`; the refusal comes before
-/// the session directory exists.
+/// the work folder exists.
 #[test]
 fn a_runtime_pin_declared_with_a_gateway_fails_with_e_run_043() {
     let home = tempfile::tempdir().unwrap();
@@ -1023,21 +1023,22 @@ fn a_task_md_link_in_the_workdir_is_never_written_through() {
     linked.assert_outside_unchanged();
 }
 
-/// A `.murmur` that is a link to an outside directory: the session directory is never created
-/// through it.
+/// A `.murmur` that is a link to an outside directory: the runtime keeps nothing in the work
+/// folder, so the launch runs to completion and nothing is written through the link.
 #[test]
-fn workdir_path_refused_at_launch_for_a_murmur_link() {
+fn a_murmur_link_in_the_workdir_is_never_written_through() {
     let linked = LinkedWorkdir::new();
     linked.link(&linked.outside(), ".murmur");
 
     linked
         .run("x")
-        .failure()
-        .stderr(predicate::str::contains("E-RUN-050"))
-        .stderr(predicate::str::contains(
-            ".murmur is a symbolic link inside the workdir",
-        ));
+        .success()
+        .stdout(predicate::str::contains("status:  ok"));
 
+    assert!(fs::symlink_metadata(linked.workdir().join(".murmur"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
     linked.assert_outside_unchanged();
 }
 
@@ -1066,5 +1067,6 @@ fn workdir_path_with_no_links_runs_to_completion() {
 
     assert!(!linked.workdir().join("task.md").exists());
     assert!(!linked.workdir().join("murmur.yaml").exists());
+    assert!(!linked.workdir().join(".murmur").exists());
     linked.assert_outside_unchanged();
 }

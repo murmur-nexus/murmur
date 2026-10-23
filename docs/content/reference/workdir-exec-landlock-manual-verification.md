@@ -21,9 +21,9 @@ capsule can execute a binary the operator did not name.
 
 The mechanism is one Landlock right. Each allowlisted binary gets a narrow read+execute
 `PathBeneath` grant at its real host path (plus its ELF interpreter and its `DT_NEEDED` closure, so
-it can actually link). The session workdir — the one place the capsule can write — gets every right
-of the ABI the ruleset is built at except device-node and socket creation, and *except* `Execute`,
-unless the manifest declares
+it can actually link). The work folder, with the session's temporary and home folders — the
+places the capsule can write — gets every right of the ABI the ruleset is built at except
+device-node and socket creation, and *except* `Execute`, unless the manifest declares
 [`capabilities.filesystem.workdir_exec: true`](containment.md#field-workdir-exec).
 
 This replaced a seccomp-notify exec supervisor that intercepted `execve(2)`/`execveat(2)` and
@@ -35,7 +35,7 @@ Landlock now gets instead (no exec mediation at all, and no path to the `scoped`
 
 Two properties are under test, and they are opposites of each other:
 
-> **(A)** With `workdir_exec` absent or `false`, a binary sitting in the session workdir does not
+> **(A)** With `workdir_exec` absent or `false`, a binary sitting in the work folder does not
 > execute — under **any** name, including a name that appears verbatim in
 > `capabilities.shell.allow`. Not "the name is checked and rejected": the workdir carries no
 > `Execute` right, so there is nothing to name.
@@ -713,7 +713,7 @@ resolved to `EnforcementTier::KernelSealed`; the harness pinned `KernelFull` for
 the tier the property belongs to.
 
 **Steps 1–2.** Run through the scratch harness above, verbatim, with a copy of `/bin/echo` planted
-in the session workdir as `./bash` (mode `0755`) while `capabilities.shell.allow` contained only
+in the work folder as `./bash` (mode `0755`) while `capabilities.shell.allow` contained only
 `bash`. Observed:
 
 * `SCRATCH_WORKDIR_EXEC=0` → `OUT: REFUSED`, `ERR: bash: line 1: ./bash: Permission denied`.

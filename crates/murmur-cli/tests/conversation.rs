@@ -187,12 +187,6 @@ fn run(home: &TempDir, manifest: &Path, extra: &[&str]) -> Assert {
     cmd.assert()
 }
 
-/// A launched run's session workdir, read off the line `mur run --verbose` prints.
-fn workdir_of(assert: Assert) -> PathBuf {
-    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    common::parse_workdir_from_stdout(&stdout)
-}
-
 /// A launched run's records directory, read off the line `mur run --verbose` prints.
 fn records_of(assert: Assert) -> PathBuf {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
@@ -312,9 +306,9 @@ fn a_failed_task_records_what_it_sent() {
     // a failed task, and no scripted response can be mistaken for one.
     let manifest = create_manifest(project.path(), "http://127.0.0.1:1", "", &[]);
 
-    let workdir = workdir_of(run(&home, &manifest, &["--context", CONTEXT_ID]));
+    let records = records_of(run(&home, &manifest, &["--context", CONTEXT_ID]));
 
-    let result = fs::read_to_string(workdir.join("out/result.txt")).unwrap_or_default();
+    let result = fs::read_to_string(records.join("out/result.txt")).unwrap_or_default();
     assert!(
         result.starts_with("error:"),
         "the task must have failed: {result}"

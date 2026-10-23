@@ -30,7 +30,7 @@ Three mechanisms, verified separately below:
 |---|---|---|---|
 | `setrlimit(2)` hard ceilings | per process | all Unix | [1](#scenario-1), [4](#scenario-4), [5](#scenario-5) |
 | cgroup v2 scope | whole process tree | Linux, delegated | [2](#scenario-2), [3](#scenario-3) |
-| periodic workdir-size check | session workdir | all | [6](#scenario-6) |
+| periodic workdir-size check | work folder, `$TMPDIR` and `$HOME` together | all | [6](#scenario-6) |
 
 ## Install requirement — systemd user cgroup delegation
 
@@ -255,9 +255,9 @@ The host staying responsive throughout is part of every expected result, and is 
 ## Reading a session's trace { #reading-the-trace }
 
 `mur run` prints the session's id on stdout as `session: ses_<32 hex>`. It does not print the
-model's answer: that is in `workdir/<session_id>/out/result.txt`, and it is what a scenario's
-expected output is compared with. The session's
-[records directory](workdir.md#records-directory) holds its `trace.jsonl`, one JSON event per
+model's answer: that is in `out/result.txt` in the session's
+[records directory](workdir.md#records-directory), and it is what a scenario's expected output is
+compared with. The records directory also holds the session's `trace.jsonl`, one JSON event per
 line. Every `shell` event carries the call's `exit_code` and a `resource_limit`: the
 `capabilities.resources` field the runtime attributed the call's end to, or `null`.
 
@@ -271,6 +271,7 @@ records() { mur trace list --json | jq -r --arg s "$1" '.sessions[] | select(.se
 D=$(records <session_id>)
 jq -r 'select(.event_type == "shell") | .exit_code' "$D/trace.jsonl"     # one line per shell call
 jq -r 'select(.resource_limit) | .resource_limit' "$D/trace.jsonl"       # one line per attributed limit
+cat "$D/out/result.txt"                                                  # the model's answer
 ```
 
 The second read prints nothing when no limit was attributed. `mur trace show` prints neither
@@ -533,12 +534,13 @@ mur run --manifest murmur.yaml --task "$PREAMBLE"' The workdir cap is 50 MiB. Co
 - the session terminates with `E-RUN-013` naming both numbers:
 
 ```
-error[E-RUN-013]: session workdir and temporary folder grew to 57671680 bytes, past the 52428800 byte ceiling (capabilities.resources.workdir_max_bytes)
+error[E-RUN-013]: work folder, $HOME and $TMPDIR together grew to 57671680 bytes, past the 52428800 byte ceiling (capabilities.resources.workdir_max_bytes)
 ```
 
 - `logs/bootstrap.log` in the session's
   [records directory](workdir.md#records-directory) carries the same wording from the watcher
-  thread. `mur trace list --workdir workdir` names that directory.
+  thread, followed by `; measured: ` and the three directories it summed: the work folder,
+  `tmp/` and `home/`. `mur trace list --workdir workdir` names that directory.
 
 **Scope note.** The workdir ceiling is enforced by the *periodic check*, on every containment
 class including `sealed`; the workdir is not a size-mounted tmpfs. The watcher runs in the parent
@@ -546,9 +548,10 @@ process against host paths, before any `pivot_root`, so the
 [sealed](sealed-containment-manual-verification.md) composed root does not affect it. Expect the
 one-interval detection lag described above.
 
-The check measures the session workdir and the
-[session's temporary folder](containment.md#temp-folder) together, so files a command writes to
-`/tmp` or `$TMPDIR` count against `workdir_max_bytes` on every tier.
+The check measures the work folder, the
+[session's temporary folder](containment.md#temp-folder) and its
+[home folder](containment.md#home-folder) together, so files a command writes to `/tmp`,
+`$TMPDIR` or `$HOME` count against `workdir_max_bytes` on every tier.
 
 ---
 

@@ -625,7 +625,6 @@ pub(crate) async fn run_process_inference_loop(
     // `store_state` (shared &) lets the tool bridge execute declared tool artifacts through the
     // same dispatch the HTTP path uses, and carries the process driver this session staged.
     store_state: &CapsuleStoreState,
-    workdir: &WorkdirRoot,
     // `max_turns` here is this attempt's remaining budget; `task_max_turns` is the task-wide
     // ceiling a run that exceeds it names. `None` is no cap.
     inference: &InferenceConfig,
@@ -667,7 +666,6 @@ pub(crate) async fn run_process_inference_loop(
     );
     let outcome = run_attempt(
         store_state,
-        workdir,
         inference,
         task_max_turns,
         system_prompt,
@@ -696,7 +694,6 @@ struct TaskCancel {
 #[allow(clippy::too_many_arguments)]
 async fn run_attempt(
     store_state: &CapsuleStoreState,
-    workdir: &WorkdirRoot,
     inference: &InferenceConfig,
     task_max_turns: Option<u32>,
     system_prompt: Option<String>,
@@ -722,7 +719,6 @@ async fn run_attempt(
     let outcome = run_harness(
         store_state,
         &staged,
-        workdir,
         inference,
         task_max_turns,
         system_prompt.as_deref(),
@@ -753,7 +749,6 @@ async fn run_attempt(
 async fn run_harness(
     store_state: &CapsuleStoreState,
     staged: &StagedProcessDriver,
-    workdir: &WorkdirRoot,
     inference: &InferenceConfig,
     task_max_turns: Option<u32>,
     system_prompt: Option<&str>,
@@ -904,7 +899,6 @@ async fn run_harness(
     };
 
     let mut sink = ProcessEventSink::new(
-        workdir,
         &store_state.records_root,
         inference.max_turns,
         task_max_turns,
@@ -1292,7 +1286,7 @@ async fn drive_harness(
             // transport writes elsewhere: the `spend_ceiling_reached` record is the sink's, and
             // the attempt's ending and the OTel session end both come from this attempt's
             // outcome, which is what keeps each to exactly one per attempt.
-            super::record_result(hooks, sink.workdir(), &format!("stopped: {refusal}"))
+            super::record_result(hooks, sink.records_root(), &format!("stopped: {refusal}"))
                 .map_err(RuntimeError::AgentLoopFailed)?;
             Ok(AgentLoopExit::SpendCeilingReached)
         }
@@ -1338,8 +1332,12 @@ async fn drive_harness(
                 // The classify-exit event closed a turn that reached the ceiling. The run is
                 // over either way; the ceiling is what it is reported as.
                 SinkOutcome::SpendCeilingReached(refusal) => {
-                    super::record_result(hooks, sink.workdir(), &format!("stopped: {refusal}"))
-                        .map_err(RuntimeError::AgentLoopFailed)?;
+                    super::record_result(
+                        hooks,
+                        sink.records_root(),
+                        &format!("stopped: {refusal}"),
+                    )
+                    .map_err(RuntimeError::AgentLoopFailed)?;
                     Ok(AgentLoopExit::SpendCeilingReached)
                 }
                 SinkOutcome::Continue => Err(RuntimeError::ProcessDriverCallFailed {

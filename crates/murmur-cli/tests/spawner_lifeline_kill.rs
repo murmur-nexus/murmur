@@ -297,7 +297,7 @@ impl Drop for Proc {
 
 /// A standalone delegating capsule: `mur run --manifest <project>/murmur.yaml --json`.
 struct Parent {
-    project: TempDir,
+    _project: TempDir,
     proc: Proc,
     startup: Value,
     _model: ScriptedServer,
@@ -331,7 +331,7 @@ impl Parent {
         let proc = Proc::spawn(command, "parent");
         let startup = proc.next_json();
         Self {
-            project,
+            _project: project,
             proc,
             startup,
             _model: model,
@@ -363,54 +363,22 @@ impl Parent {
 
 // ── Finding what a delegation left on disk ────────────────────────────────────
 
-/// The first directory named `name` beneath `root`.
-fn find_dir(root: &Path, name: &str) -> Option<PathBuf> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name().is_some_and(|file| file == name) {
-                    return Some(path);
-                }
-                stack.push(path);
-            }
-        }
-    }
-    None
-}
-
-/// The records directory under `home` of the session whose session workdir is `session`: a run
-/// given `--workdir D` keeps its session workdir at `D/.murmur/<id>` and its records in `D`'s
-/// group, one given none at `<manifest-dir>/workdir/<id>`, in that directory's group.
-fn records_of(home: &Path, session: &Path) -> PathBuf {
-    let id = session.file_name().unwrap().to_str().unwrap();
-    let parent = session.parent().unwrap();
-    let root = if parent.ends_with(".murmur") {
-        parent.parent().unwrap()
-    } else {
-        parent
-    };
-    common::session_records_dir(home, root, id)
-}
-
 /// One delegation as the delegating session recorded it, and where its child lives.
 struct Delegation {
     delegation_id: String,
-    /// The child's session workdir.
-    child_session: PathBuf,
-    /// The child's records directory: its trace, its bootstrap log and its `completion.json`.
+    child_session_id: String,
+    /// The child's `--workdir`: `children/<capsule>-<16 hex>` in the delegating session's records
+    /// directory, as its `delegation_start` names it.
+    child_workdir: PathBuf,
+    /// The child's records directory, as `delegation_start` names it: its trace, its bootstrap log
+    /// and its `completion.json`.
     child_records: PathBuf,
 }
 
 impl Delegation {
-    /// The child's own directory: `<child>/.murmur/<ses>`'s grandparent.
+    /// The child's own directory, its `--workdir`.
     fn child_dir(&self) -> PathBuf {
-        self.child_session
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .to_path_buf()
+        self.child_workdir.clone()
     }
 
     fn trace(&self) -> Vec<Value> {
@@ -431,47 +399,41 @@ impl Delegation {
     }
 }
 
-/// Wait for the session `session_id`, its session workdir somewhere under `root` and its records
-/// under `world`'s `HOME`, to record a `delegation_start` whose child has written its own
-/// `session_start`.
-fn await_delegation(world: &World, root: &Path, session_id: &str) -> Delegation {
-    let home = world.home.path();
+/// Wait for the session whose records directory is `records` to record a `delegation_start`
+/// whose child has written its own `session_start`.
+fn await_delegation(records: &Path) -> Delegation {
     let deadline = Instant::now() + START_LIMIT;
     loop {
-        if let Some(session) = find_dir(root, session_id) {
-            let trace = std::fs::read_to_string(records_of(home, &session).join("trace.jsonl"))
-                .unwrap_or_default();
-            let events: Vec<Value> = trace
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect();
-            assert!(
-                !events
-                    .iter()
-                    .any(|event| event["event_type"] == "delegation"
-                        && (event["outcome"] == "failed" || event["outcome"] == "refused")),
-                "the delegation never started: {trace}"
-            );
-            if let Some(start) = events
+        let trace = std::fs::read_to_string(records.join("trace.jsonl")).unwrap_or_default();
+        let events: Vec<Value> = trace
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert!(
+            !events
                 .iter()
-                .find(|event| event["event_type"] == "delegation_start")
-            {
-                let child = start["child_session_id"].as_str().unwrap();
-                if let Some(child_session) = find_dir(root, child) {
-                    let child_records = records_of(home, &child_session);
-                    if child_records.join("trace.jsonl").exists() {
-                        return Delegation {
-                            delegation_id: start["delegation_id"].as_str().unwrap().to_string(),
-                            child_session,
-                            child_records,
-                        };
-                    }
-                }
+                .any(|event| event["event_type"] == "delegation"
+                    && (event["outcome"] == "failed" || event["outcome"] == "refused")),
+            "the delegation never started: {trace}"
+        );
+        if let Some(start) = events
+            .iter()
+            .find(|event| event["event_type"] == "delegation_start")
+        {
+            let child_records = PathBuf::from(start["child_records_dir"].as_str().unwrap());
+            if child_records.join("trace.jsonl").exists() {
+                return Delegation {
+                    delegation_id: start["delegation_id"].as_str().unwrap().to_string(),
+                    child_session_id: start["child_session_id"].as_str().unwrap().to_string(),
+                    child_workdir: PathBuf::from(start["child_workdir"].as_str().unwrap()),
+                    child_records,
+                };
             }
         }
         assert!(
             Instant::now() < deadline,
-            "{session_id} never started a delegation"
+            "{} never started a delegation",
+            records.display()
         );
         thread::sleep(Duration::from_millis(100));
     }
@@ -613,7 +575,7 @@ fn a_parent_killed_outright_takes_its_child_with_it() {
     let body = agent_body(&model.endpoint, &spawn_allow(&[MUTE]), QUEUE_SLEEP, "");
     let mut parent = Parent::start(&world, "lone-parent", &body, model, |_| {});
     parent.submit();
-    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
+    let delegation = await_delegation(&parent.records_dir());
     assert!(
         !delegation.processes().is_empty(),
         "the child is not running"
@@ -665,14 +627,8 @@ fn a_grandchild_winds_down_once_its_parent_has() {
     );
     let mut parent = Parent::start(&world, "root-parent", &body, model, |_| {});
     parent.submit();
-    let relay = await_delegation(&world, parent.project.path(), &parent.session_id());
-    let relay_session = relay
-        .child_session
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    let grandchild = await_delegation(&world, &relay.child_dir(), &relay_session);
+    let relay = await_delegation(&parent.records_dir());
+    let grandchild = await_delegation(&relay.child_records);
     assert!(!relay.processes().is_empty() && !grandchild.processes().is_empty());
 
     let killed = Instant::now();
@@ -816,7 +772,7 @@ fn a_parent_that_exits_after_its_task_has_its_childs_answer_first() {
 
     let (status, exited) = await_exit(&mut parent.proc, START_LIMIT);
     assert!(status.success(), "{status}: {}", parent.proc.stderr());
-    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
+    let delegation = await_delegation(&parent.records_dir());
     let running = delegation.processes();
     eprintln!(
         "[measure] processes naming the child dir {} ms after the parent exited: {}",
@@ -947,7 +903,7 @@ fn a_parent_stopped_while_it_waits_ends_its_child_first() {
     let body = agent_body(&model.endpoint, &spawn_allow(&[MUTE]), "", "");
     let mut parent = Parent::start(&world, "stopped-parent", &body, model, |_| {});
     parent.submit();
-    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
+    let delegation = await_delegation(&parent.records_dir());
     let deadline = Instant::now() + START_LIMIT;
     while parent._model.requests().len() < 2 {
         assert!(Instant::now() < deadline, "the turn never ended");
@@ -1056,7 +1012,7 @@ fn a_parent_stopped_mid_plan_ends_the_plan_steps_child_first() {
     let body = agent_body(&model.endpoint, &plan_capabilities(&[MUTE]), "", "");
     let mut parent = Parent::start(&world, "stopped-planner", &body, model, |_| {});
     parent.submit();
-    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
+    let delegation = await_delegation(&parent.records_dir());
     // The plan's step named the bare `mute-worker`; what was asked of the daemon, and recorded,
     // is the full name it stands for.
     let started = parent_trace(&parent)
@@ -1271,7 +1227,7 @@ fn a_parent_killed_mid_plan_takes_the_plan_steps_child_with_it() {
     );
     let mut parent = Parent::start(&world, "killed-planner", &body, model, |_| {});
     parent.submit();
-    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
+    let delegation = await_delegation(&parent.records_dir());
     assert!(
         !delegation.processes().is_empty(),
         "the child is not running"
@@ -1371,18 +1327,14 @@ fn a_formation_member_killed_outright_takes_its_child_with_it() {
     let formation_id = formation["formation_id"].as_str().unwrap().to_string();
     let entry_session = entry["session_id"].as_str().unwrap().to_string();
     let entry_pid = entry["pid"].as_u64().unwrap() as u32;
-    let delegation = await_delegation(&world, project.path(), &entry_session);
+    let entry_records = PathBuf::from(entry["records_dir"].as_str().unwrap());
+    let delegation = await_delegation(&entry_records);
     assert!(
         !delegation.processes().is_empty(),
         "the child is not running"
     );
     // The child is joined to the formation and has no roster name; the member that delegated has.
-    let child_session = delegation
-        .child_session
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap();
+    let child_session = delegation.child_session_id.as_str();
     let child_record = await_running_record(&world, child_session);
     assert_eq!(
         child_record["formation_id"],
@@ -1529,7 +1481,7 @@ fn without_close_range_a_child_is_launched_and_still_ends_with_its_parent() {
         under_filter(command, filter)
     });
     parent.submit();
-    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
+    let delegation = await_delegation(&parent.records_dir());
     let (child_pid, _) = delegation.processes()[0].clone();
     let status = std::fs::read_to_string(format!("/proc/{child_pid}/status")).unwrap();
     assert!(

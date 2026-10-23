@@ -272,7 +272,8 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     // Stage the session (creates workdir, installs artifacts including skill.md).
     let staged = stage_session(Arc::new(local_registry), stage_request)
         .map_err(crate::wit_level::staging_error)?;
-    let session_root = staged.session_root.clone();
+    let accessible_root = staged.accessible_root.clone();
+    let records_root = staged.records_root.clone();
 
     // Write the task prompt as task.md. The runtime reads this as the initial task when
     // task_acceptance: single and task.md exists — no A2A handshake needed.
@@ -296,23 +297,25 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     // discovers artifacts via murmur/tool-registry-search, generates the manifest, and writes
     // it to out/murmur.yaml. The session exits via after_task: exit.
     let launched = launch_session(staged, |_url| {});
+    // The agent's result text is in the generator's records directory, read before those
+    // records go.
+    let agent_output = records_root
+        .read_to_string(capsule_runtime::RESULT_FILE)
+        .ok()
+        .flatten();
     // The generator's trace is no record anybody reads again: it goes with its temp directory.
     if let Some(records) = &generator_records {
         let _ = fs::remove_dir_all(records);
     }
     launched.map_err(CliError::from)?;
 
-    // Read the manifest written by the agent via write_file("out/murmur.yaml").
-    // Read through the session root, so a link the generator left there is refused rather than
-    // followed.
-    let manifest_yaml = match session_root.read_to_string("out/murmur.yaml") {
+    // Read the manifest written by the agent via write_file("out/murmur.yaml") into its work
+    // folder. Read through the work folder's root, so a link the generator left there is refused
+    // rather than followed.
+    let manifest_yaml = match accessible_root.read_to_string("out/murmur.yaml") {
         Ok(Some(manifest_yaml)) => manifest_yaml,
         Ok(None) => {
-            let agent_output = session_root
-                .read_to_string("out/result.txt")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "(no output captured)".to_string());
+            let agent_output = agent_output.unwrap_or_else(|| "(no output captured)".to_string());
             return Err(CliError::new(
                 "E-NEW-001",
                 format!(

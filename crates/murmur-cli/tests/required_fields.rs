@@ -270,7 +270,7 @@ fn run_session(responses: Vec<String>, capsule: &Capsule<'_>) -> Session {
 
     let manifest_path = create_manifest(project.path(), &server.endpoint, capsule);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let records_dir = staged.records_dir.clone();
     fs::write(workdir.join("task.md"), "Edit the notes.").unwrap();
 

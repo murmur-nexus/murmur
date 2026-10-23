@@ -519,7 +519,7 @@ pub struct FilesystemBoundaryReport {
 /// already read on the `achieved:` line and taken for a protection.
 const ADVISORY_FILESYSTEM_NOT_PROTECTED: &str =
     "Filesystem restriction is advisory on this host: no kernel mechanism denies a read or a write \
-     outside the session workdir, so capabilities.filesystem.scope bounds what the runtime hands a \
+     outside the work folder, so capabilities.filesystem.scope bounds what the runtime hands a \
      subprocess rather than what that subprocess can reach. A Linux host with a usable Landlock \
      ABI installs a Landlock domain instead, where the kernel refuses the open.";
 
@@ -539,13 +539,13 @@ const ENFORCED_FILESYSTEM_NOT_PROTECTED: &str =
 /// What no mechanism protects, and the reason `--explain-scope` carries this block at all.
 ///
 /// Identical wherever it prints, because the rewrite it describes is identical: `HOME` is replaced
-/// with the session's synthetic home on every tier and every platform (see `crate::shell`), so the
+/// with the session's home folder on every tier and every platform (see `crate::shell`), so the
 /// obvious `~`-based containment probe answers *no such file* on a host that denies nothing.
 const PATH_REWRITING_NOT_PROTECTED: &str =
-    "Path rewriting is a convenience, not a boundary: HOME is set to <workdir>/.capsule-home on \
-     every tier, so `cat ~/.ssh/id_rsa` answers \"No such file or directory\" whether or not \
-     anything was denied — the tilde resolved into the workdir and the host file was never looked \
-     for. A ~-based probe is therefore never evidence of containment; test with an absolute path \
+    "Path rewriting is a convenience, not a boundary: HOME is set to the session's home folder, \
+     home/ in its records directory, on every tier, so `cat ~/.ssh/id_rsa` answers \"No such file \
+     or directory\" whether or not anything was denied — the tilde resolved into that folder and \
+     the host file was never looked for. A ~-based probe is therefore never evidence of containment; test with an absolute path \
      to a real file outside the workdir instead.";
 
 /// The filesystem boundary the tier a session applies actually provides, and the protections it
@@ -3614,7 +3614,7 @@ mod tests {
         let filesystem = &report.filesystem_boundary.not_protected[0];
         assert!(filesystem.contains("advisory"), "{filesystem}");
         assert!(
-            filesystem.contains("denies a read or a write outside the session workdir"),
+            filesystem.contains("denies a read or a write outside the work folder"),
             "{filesystem}"
         );
 
@@ -3880,7 +3880,7 @@ mod tests {
         );
         assert!(
             advisory.filesystem_boundary.not_protected[1]
-                .contains(crate::shell::SYNTHETIC_HOME_DIR_NAME),
+                .contains("home/ in its records directory"),
             "the statement must name the directory `shell::build_shell_env` really sets HOME to"
         );
     }
@@ -4064,7 +4064,6 @@ mod tests {
                 "bash",
                 &["-c", &command],
                 &[],
-                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 &policy,
                 &enforcement,

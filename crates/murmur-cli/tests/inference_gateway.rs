@@ -300,16 +300,12 @@ impl Run {
         }
     }
 
-    fn workdir(&self) -> PathBuf {
-        common::parse_workdir_from_stdout(&self.stdout)
-    }
-
     fn records_dir(&self) -> PathBuf {
         common::parse_records_from_stdout(&self.stdout)
     }
 
     fn result(&self) -> String {
-        fs::read_to_string(self.workdir().join("out/result.txt")).unwrap_or_else(|err| {
+        fs::read_to_string(self.records_dir().join("out/result.txt")).unwrap_or_else(|err| {
             panic!(
                 "no out/result.txt ({err}); stdout:\n{}\nstderr:\n{}",
                 self.stdout, self.stderr

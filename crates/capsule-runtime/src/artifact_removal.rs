@@ -485,7 +485,7 @@ mod tests {
         let mut state = project.session(&[SKILL], &[]);
         let names = |state: &CapsuleStoreState| -> Vec<String> {
             crate::agent::inventory::tool_names(&build_tool_inventory(
-                &state.session_root,
+                &state.runtime_root,
                 None,
                 &state.installed_artifacts,
             ))

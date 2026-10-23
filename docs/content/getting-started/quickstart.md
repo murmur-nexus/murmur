@@ -124,10 +124,10 @@ session: ses_019ed2af53da75c2aefee84ee10c34af
 status:  ok
 ```
 
-The `session:` value identifies this run. The model's final text lands under `workdir/<session_id>/` as `out/result.txt`; the structured trace (`trace.jsonl`) and runtime logs (`logs/`) are kept in the session's [records directory](../reference/workdir.md#records-directory) under `~/.murmur/records`, where `mur trace show` reads them. Read the result directly with:
+The `session:` value identifies this run. The capsule worked in `workdir/<session_id>/`. The model's final text (`out/result.txt`), the structured trace (`trace.jsonl`) and runtime logs (`logs/`) are kept in the session's [records directory](../reference/workdir.md#records-directory), `~/.murmur/records/<this directory>/workdir/<session_id>/`, where `mur trace show` reads them. Read the result directly with:
 
 ```bash
-cat workdir/*/out/result.txt
+cat ~/.murmur/records$PWD/workdir/*/out/result.txt
 ```
 
 ---
@@ -202,10 +202,10 @@ In the same directory, run the capsule with a task passed inline:
 mur run --task "When I say Ping you say?"
 ```
 
-Inspect the capsule's output at `workdir/<session_id>/out/result.txt`, for example:
+Inspect the capsule's output at `out/result.txt` in the session's records directory, for example:
 
 ```bash
-> cat workdir/*/out/result.txt
+> cat ~/.murmur/records$PWD/workdir/*/out/result.txt
 Pong! 🏓
 ```
 

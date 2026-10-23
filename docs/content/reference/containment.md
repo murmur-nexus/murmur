@@ -110,7 +110,8 @@ binary a session runs shares that session's one network namespace:
 - When the session ends, every process it started is killed, backgrounded servers included, and
   the namespace goes with them.
 
-Environment-only enforcement still gives you a synthetic `HOME` and strips credential-shaped
+Environment-only enforcement still sets `HOME` to the session's
+[home folder](#home-folder) and strips credential-shaped
 environment variables before the subprocess spawns (see
 [Lock down a capsule's capabilities](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment)),
 but nothing prevents the subprocess from reading files outside the workdir, executing an
@@ -131,7 +132,7 @@ tiers, inside the capsule's Landlock scope and composed root.
 | Sealed | The composed root, Landlock, seccomp and the session's network namespace |
 | Full | Landlock, seccomp and the session's network namespace |
 | Seccomp-only | Seccomp and the session's network namespace; no filesystem or exec scope |
-| Environment-only | The synthetic `HOME`, the credential strip and the per-process rlimits; no kernel confinement |
+| Environment-only | `HOME` set to the session's [home folder](#home-folder), the credential strip and the per-process rlimits; no kernel confinement |
 
 Its grants are the capsule's own: `capabilities.filesystem`, `capabilities.network.allow`,
 `capabilities.network.unix_sockets` and `capabilities.shell.allow` apply to it exactly as they apply
@@ -297,8 +298,8 @@ including a `sealed`-capable one. The host probe still reports what the machine 
 the capsule to. Nothing in a manifest can ever *raise* an achieved class. See
 [Executable workdirs](#field-workdir-exec).
 
-**So does a runtime directory inside the workdir.** When `~/.murmur/sessions` lies inside the
-workdir the capsule's commands write, they can change the task, `MURMUR.md`, plans and installed
+**So does a runtime directory inside the work folder.** When `~/.murmur/sessions` lies inside the
+work folder the capsule's commands write, they can change the task, `MURMUR.md`, plans and installed
 tools in its [runtime directory](workdir.md#runtime-directory), and the achieved class is capped at
 `advisory` the same way. A `scoped` or `sealed` floor is refused with
 [`E-CAP-003`](diagnostics.md#e-cap-003); below it the launch prints
@@ -487,7 +488,7 @@ bind-mounted read-only. `/etc/passwd` and `/etc/group` are not: both are world-r
 distribution, so binding the host's would hand a `sealed` capsule the machine's full account list.
 The composed root carries a synthetic pair instead — an entry for `root`, and one for the uid the
 capsule's subprocesses run as, under the account name `capsule`, whose home directory is the
-synthetic `$HOME` the subprocess environment already sets. Username, group and `~` lookups all
+session's [home folder](#home-folder), the `$HOME` the subprocess environment already sets. Username, group and `~` lookups all
 resolve and agree with `$HOME`; **no host account name appears inside the capsule.**
 
 **`scoped` gets none of this**, for the reason [the runtime-tree grant](#sealed-runtime-tree-grant)
@@ -507,8 +508,13 @@ onto. It holds exactly what the sections above put there, and every other path i
 | `/dev` | A private tmpfs carrying the [OCI device set](#capsule-device-set) | `Permission denied` |
 | `/proc` | Masked with `hidepid` where the kernel allows it, bound from the host where it does not | `Permission denied` |
 | `/tmp` | The [session's temporary folder](#temp-folder), `tmp/` in the records directory, bound read-write | lists |
-| The workdir, at its own absolute host path | The capsule's accessible workdir, read-write. It and `/tmp` are the only writable paths in the root | lists |
-| `/`, `/etc` as a directory, and each path component above the workdir | Scaffolding the runtime created so the mounts below have somewhere to land | `Permission denied` |
+| The work folder, at its own absolute host path | The capsule's work folder, read-write | lists |
+| The [runtime directory](workdir.md#runtime-directory) and the [records directory](workdir.md#records-directory), each at its own absolute host path | Bound read-only | lists |
+| The records directory's `home/`, at its own absolute host path | The session's [home folder](#home-folder), a verified read-write bind mounted after the records directory's read-only bind | lists |
+| The delegated children's records, `~/.murmur/records/<records directory>/children/`, at its own absolute host path | Present for a capsule granted `capabilities.spawn.allow` once a child has staged; bound read-only and verified | lists |
+| `/`, `/etc` as a directory, and each path component above the work folder and the bound directories | Scaffolding the runtime created so the mounts have somewhere to land | `Permission denied` |
+
+The work folder, `/tmp` and the home folder are the only writable paths in the root.
 
 **`cd` and `stat` succeed where `ls` fails, and that is the design.** With a workdir at
 `/home/you/project`, the composed root carries `/home` and `/home/you` as scaffolding holding
@@ -543,10 +549,10 @@ Every session has a private temporary folder: `tmp/` in its
 |---|---|
 | Created | At staging, mode `0700` |
 | Written by | The session's shell commands, plan shell steps and native tools. The runtime writes nothing in it |
-| Shared with | No other session. It is never inside the workdir |
-| Landlock rights | Exactly the workdir's, so with `capabilities.filesystem.workdir_exec: false` nothing written to it can run |
-| Size | Counted together with the session workdir against [`capabilities.resources.workdir_max_bytes`](resource-limits.md#host-resource-limits); a breach ends the session with `E-RUN-013` |
-| Removed | With the session's records directory, by [`trace.retain`](manifest.md#trace-retain), including any read-only directory a command left in it |
+| Shared with | No other session. It is never inside the work folder |
+| Landlock rights | Exactly the work folder's, so with `capabilities.filesystem.workdir_exec: false` nothing written to it can run |
+| Size | Counted together with the work folder and the [home folder](#home-folder) against [`capabilities.resources.workdir_max_bytes`](resource-limits.md#host-resource-limits); a breach ends the session with `E-RUN-013` |
+| Removed | With the session's records directory, by [`trace.retain`](manifest.md#trace-retain) or [`mur trace rm`](cli.md#mur-trace-rm), including any read-only directory a command left in it |
 
 The rest of the records directory stays read-only to commands: no record can be appended to,
 replaced, moved or hard-linked into the folder, and the folder itself cannot be renamed.
@@ -582,7 +588,7 @@ user namespace:
 
     | Path | Bound |
     |---|---|
-    | The workdir and the session workdir | Read-write |
+    | The work folder and the session's [home folder](#home-folder) | Read-write |
     | The runtime directory, the records directory and every Landlock grant path | Read-only |
 
     A workdir or `HOME` under `/tmp` keeps working, and the empty directories leading to each
@@ -632,6 +638,27 @@ Where `/tmp` is not mapped, the last line reads `/tmp:      not mapped — <reas
 | `TMPDIR` is the folder's full path | An unmapped tier | A program that creates a Unix socket beneath it can exceed the socket name limit: 104 bytes on macOS, 108 on Linux |
 | The folder lives under `HOME` | Every tier | Its bytes land on `HOME`'s filesystem |
 | A path the command needs lies under the host's `/tmp` | A mapped tier | It is a read-only bind unless it is the workdir, so a write there fails with `Read-only file system` rather than `Permission denied`, and it carries the folder's read and execute rights |
+
+## The session's home folder { #home-folder }
+
+Every session has a private home folder: `home/` in its
+[records directory](workdir.md#records-directory),
+`~/.murmur/records/<workdir root>/<session-id>/home`.
+
+| Property | Value |
+|---|---|
+| Created | At staging, mode `0700` |
+| Reached as | `$HOME` in every shell command, plan shell step and native tool, on every tier and every platform. No manifest key, `capabilities.shell.baseline_env` entry or host value changes it. Under `sealed`, also the home directory of the [synthetic `passwd` entry](#sealed-etc-grant) |
+| Written by | The session's shell commands, plan shell steps and native tools. The runtime writes nothing in it |
+| Shared with | No other session. It is never inside the work folder |
+| Landlock rights | A rule with exactly the work folder's rights on both Landlock tiers, `mountns+pivot_root+landlock+seccomp` and `landlock+seccomp`, so with `capabilities.filesystem.workdir_exec: false` nothing written to it can run |
+| Composed root | A verified read-write bind at its own absolute path, mounted after the records directory's read-only bind. A link swapped onto its path fails the bind rather than redirecting it |
+| Mount-namespace `/tmp` mapping | Bound back read-write at its own path when it lies under the host's `/tmp` |
+| Size | Counted together with the work folder and the [temporary folder](#temp-folder) against [`capabilities.resources.workdir_max_bytes`](resource-limits.md#host-resource-limits); a breach ends the session with `E-RUN-013` |
+| Removed | With the session's records directory, by [`trace.retain`](manifest.md#trace-retain) or [`mur trace rm`](cli.md#mur-trace-rm) |
+
+As with the temporary folder, no record can be moved or hard-linked into the home folder, and the
+folder itself cannot be renamed.
 
 ## Default-deny syscall allowlist { #default-deny-syscall-allowlist }
 
@@ -755,8 +782,9 @@ that is bypassed, not the daemon.
 
 ## Executable workdirs { #field-workdir-exec }
 
-`capabilities.filesystem.workdir_exec` decides one Landlock bit: whether the session workdir's own
-rule carries the `Execute` right.
+`capabilities.filesystem.workdir_exec` decides one Landlock bit: whether the work folder's own
+rule, and the rules on the session's [temporary folder](#temp-folder) and
+[home folder](#home-folder), carry the `Execute` right.
 
 **The default (`false`, and what every manifest that omits the key gets).** The workdir is
 readable and writable but not executable. Each binary named in `capabilities.shell.allow` gets its
@@ -891,15 +919,15 @@ gets `Permission denied` rather than `No such file or directory`.
 
 **The `~` form returns a false pass.** `cat ~/.ssh/id_rsa` answers `No such file or directory` on
 every tier, including a host that denies nothing. The tilde resolves through `HOME`, which the
-runtime rewrites to `<workdir>/.capsule-home` before every subprocess spawns, so the shell looked
-inside the workdir and the host path was never opened. The answer reports where the path landed, not
+runtime sets to the session's home folder, `home/` in its records directory, before every
+subprocess spawns, so the shell looked inside that folder and the host path was never opened. The answer reports where the path landed, not
 what was denied. This holds on macOS too, which reaches `advisory` — the same absolute path there
 reads the file.
 
 `mur run --explain-scope` says the same thing under `Not protected here` on every session that
 composes no root, and `--explain-scope --json` carries it as `filesystem_boundary.not_protected`.
 
-The rewrite is unconditional, so a capsule that writes to `~` writes inside its own workdir on
+The rewrite is unconditional, so a capsule that writes to `~` writes into its own home folder on
 every tier and every platform. See [Lock down a capsule](../how-to/lock-down-capsule.md) for the
 environment the subprocess starts with.
 
@@ -978,7 +1006,7 @@ Each procedure lives in the murmur repository on the `main` branch; the name lin
 | [**Staged runtime bind mount**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/staged-runtime-bind-mount-manual-verification.md) | That a `capabilities.shell.staged_runtime` grant lands its pinned tree read-only inside the composed root at the same absolute path it has on the host, that a missing `source_path` refuses the session with `E-RUN-014` before any shell command runs, and that the same `pin` on two hosts yields the same interpreter with no `interpreter_runtime` grant anywhere. | Whenever the staging bind, the grant's Landlock rights, or the composed-root plan changes. |
 | [**Resource limits**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/resource-limits-manual-verification.md) | The three mechanisms bounding the native subprocess tree: `setrlimit(2)` per-process ceilings, the cgroup v2 scope (fork bomb, memory hog, CPU, I/O), and the periodic workdir-size check. Ten scenarios, including the `E-RUN-012` fail-closed launch refusal and the macOS gap behind `W-SEC-010`. | On a Linux host with systemd user cgroup delegation configured, whenever `capabilities.resources` enforcement or the cgroup delegation path changes. |
 | [**Subprocess fd hygiene**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/subprocess-fd-hygiene-verification.md) | The negative property that a descriptor open in the runtime process at spawn time is not visible inside the spawned child, for shell commands and native tools, on both kernel tiers. Landlock cannot substitute for this: an inherited fd was opened before the ruleset existed. | Whenever the pre-exec window of the subprocess spawn changes. |
-| [**Workdir `Execute` rights and declared `workdir_exec`**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-exec-landlock-manual-verification.md) | That `capabilities.shell.allow` is *complete*: with the default `capabilities.filesystem.workdir_exec: false`, a binary planted in the session workdir under an allowlisted basename does not execute, because the workdir's Landlock rule carries no `Execute` right. Also the declared opt-in's whole visible surface — the binary runs, the achieved class drops to `advisory`, `--explain-scope` and `trace.jsonl` say so, and `containment: scoped` alongside it refuses with `E-CAP-003`. Also the rest of the workdir's right set: files move and hard-link between its folders as real renames, nothing moves or links across its boundary, `truncate(2)` outside it is refused, `uv venv` and `uv pip install` succeed in it, and a ruleset built at ABI v1 fails those moves with `EXDEV`. | Whenever the workdir grant's right set, the exec-grant derivation, or the tier→class mapping changes. |
+| [**Workdir `Execute` rights and declared `workdir_exec`**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-exec-landlock-manual-verification.md) | That `capabilities.shell.allow` is *complete*: with the default `capabilities.filesystem.workdir_exec: false`, a binary planted in the work folder under an allowlisted basename does not execute, because the work folder's Landlock rule carries no `Execute` right. Also the declared opt-in's whole visible surface — the binary runs, the achieved class drops to `advisory`, `--explain-scope` and `trace.jsonl` say so, and `containment: scoped` alongside it refuses with `E-CAP-003`. Also the rest of the workdir's right set: files move and hard-link between its folders as real renames, nothing moves or links across its boundary, `truncate(2)` outside it is refused, `uv venv` and `uv pip install` succeed in it, and a ruleset built at ABI v1 fails those moves with `EXDEV`. | Whenever the workdir grant's right set, the exec-grant derivation, or the tier→class mapping changes. |
 | [**Shell-binary reachability under `sealed`**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/shell-binary-reachability-manual-verification.md) | That a `capabilities.shell.allow` grant which cannot actually *function* inside a composed root fails at launch rather than deep in a run: the `E-CAP-006` refusal for an interpreted entrypoint whose package tree nothing declared reaches, the `W-SEC-012` warning for a compiler driver whose `cc1`/`as`/`ld` helpers have no `Execute` grant, and the two negative controls — a system `/usr` interpreter that needs no grant, and a declared `interpreter_runtime` that makes a real compile succeed. | Whenever the reachability checks, the fixed sealed runtime tree's right set, or the known-driver registry changes. |
 | [**Workdir device-node escape**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-device-node-manual-verification.md) | That a capsule cannot create a character- or block-device node inside its own workdir and read the raw host filesystem through it, via the Landlock workdir grant withholding those rights and the shell child's capability drop. Also that FIFO and ordinary file creation still work, and that the child is left non-dumpable. | Whenever the workdir grant's right set, the child's capability drop, or the pre-exec hardening sequence changes. |
 | [**Unmediated `AF_UNIX` sockets**](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/af-unix-sockets-manual-verification.md) | That a capsule cannot open a unix-domain socket by default and so cannot reach a host daemon socket such as `/var/run/docker.sock`; that `AF_NETLINK` and `AF_PACKET` are refused with and without the opt-in; that `capabilities.network.unix_sockets: true` really does hand the family back; and whether real workloads survive the default deny. | Whenever the `socket(2)`-domain rule, the `unix_sockets` opt-in, or the set of denied address families changes. |

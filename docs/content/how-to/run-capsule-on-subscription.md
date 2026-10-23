@@ -124,7 +124,7 @@ session: ses_019ed2af53da75c2aefee84ee10c34af
 status:  ok
 ```
 
-The harness writes its answer to `out/result.txt` in the session workdir, exactly as `transport: http` does.
+The harness's answer is written to `out/result.txt` in the session's [records directory](../reference/workdir.md#records-directory), exactly as on `transport: http`.
 
 ## Step 5 — give the agent tools
 

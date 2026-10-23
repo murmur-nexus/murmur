@@ -178,10 +178,13 @@ far apart the members started. The same moment also bounds each peer's wait in s
 
 ### Member directories { #member-directories }
 
-| Member | Accessible directory | Session workdirs | Records directories |
-|---|---|---|---|
-| Entry member | The roster's project directory | `<project>/.murmur/<ses_id>/` | `~/.murmur/records/<project>/<ses_id>/` |
-| Each peer | `~/.murmur/formations/<frm_id>/<member>/` | `~/.murmur/formations/<frm_id>/<member>/.murmur/<ses_id>/` | `~/.murmur/records/<home>/.murmur/formations/<frm_id>/<member>/<ses_id>/` |
+| Member | Work folder | Records directories |
+|---|---|---|
+| Entry member | The roster's project directory | `~/.murmur/records/<project>/<ses_id>/` |
+| Each peer | `~/.murmur/formations/<frm_id>/<member>/` | `~/.murmur/records/<home>/.murmur/formations/<frm_id>/<member>/<ses_id>/` |
+
+The runtime creates nothing in a member's work folder; each session's results, `home/` and `tmp/`
+are in its records directory.
 
 `<project>` and `<home>` are those absolute paths without their leading `/` — see
 [Records directory](workdir.md#records-directory).
@@ -295,7 +298,7 @@ receive a result. A wound-down member reports no error of its own:
 
 | The member, when its lifeline closed | Exit code | `session_end.exit_status` and `status:` |
 |---|---:|---|
-| Was running a task | 0 | `formation_ended`. The task itself ends `canceled`, and its `out/result.txt` holds the [`canceled:` line](workdir.md#session-workdir-files) |
+| Was running a task | 0 | `formation_ended`. The task itself ends `canceled`, and `out/result.txt` in its records directory holds the [`canceled:` line](workdir.md#records-directory) |
 | Was idle | 0 | `ok` |
 | Had reached the formation's `--deadline` | 1 | `deadline_reached`, with [`E-RUN-053`](diagnostics.md#e-run-053). It writes [`deadline_reached`](observability-schemas.md#deadline-reached), not `formation_ended`, even when its lifeline closed a moment after the deadline. The launcher exits with the entry member's `1` |
 

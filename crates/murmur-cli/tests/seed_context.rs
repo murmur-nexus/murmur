@@ -182,7 +182,7 @@ fn run_session(seed_budget: &str, hooks: &[(&str, &str, &str, Vec<u8>)]) -> Sess
     let manifest_path = create_manifest(project.path(), &server.endpoint, seed_budget, &hook_names);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
     let records_dir = staged.records_dir.clone();
-    fs::write(staged.workdir.join("task.md"), TASK_TEXT).unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), TASK_TEXT).unwrap();
 
     launch_session(staged, |_| {}).expect("the session must launch whatever the seed does");
 

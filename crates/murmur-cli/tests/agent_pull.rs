@@ -1256,16 +1256,9 @@ fn s7_a_pull_writes_only_its_tool_directory_the_lock_and_a_compiled_form() {
     );
     let workdir = tempfile::tempdir().unwrap();
     let s = stage(&server, GRANT, workdir.path());
-    let session = s.staged.workdir.clone();
     let tools_before = files_under(&s.staged.runtime_dir.join("tools"));
     *runtime_dir.lock().unwrap() = Some(s.staged.runtime_dir.clone());
-    let outside_session = |paths: Vec<String>| -> Vec<String> {
-        paths
-            .into_iter()
-            .filter(|path| !path.starts_with(".murmur"))
-            .collect()
-    };
-    let workdir_before = outside_session(files_under(workdir.path()));
+    let workdir_before = files_under(workdir.path());
     let project_before = files_under(s.project.path());
     let store_before = files_under(&s.home.path().join(".murmur").join("artifacts"));
     let home_before = files_under(&process_home());
@@ -1289,10 +1282,10 @@ fn s7_a_pull_writes_only_its_tool_directory_the_lock_and_a_compiled_form() {
         "under the runtime directory's tools/"
     );
     assert!(
-        !session.join("tools").exists(),
-        "the session workdir has no tools/"
+        !workdir.path().join("tools").exists(),
+        "the work folder has no tools/"
     );
-    assert_eq!(outside_session(files_under(workdir.path())), workdir_before);
+    assert_eq!(files_under(workdir.path()), workdir_before);
     let project_added: Vec<String> = files_under(s.project.path())
         .into_iter()
         .filter(|path| !project_before.contains(path))
@@ -1361,11 +1354,10 @@ fn s7_a_link_planted_in_the_workdir_redirects_no_pull() {
         )
     });
     let s = stage(&server, GRANT, workdir.path());
-    let session = s.staged.workdir.clone();
     let records = s.staged.records_dir.clone();
     *planted.lock().unwrap() = Some((
         outside.path().to_path_buf(),
-        session.join("tools").join(EDITOR_TOOL),
+        workdir.path().join("tools").join(EDITOR_TOOL),
     ));
 
     capsule_runtime::launch_session(s.staged, |_| {}).expect("the session runs");

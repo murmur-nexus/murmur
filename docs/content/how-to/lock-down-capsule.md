@@ -104,7 +104,7 @@ Create a `murmur.yaml` file. This version does the job — the agent has `bash`,
         artifact: murmur/driver-deepseek
     ```
 
-There is no `filesystem.scope`, so the capsule works out of the whole session workdir, and `bash` can run any command against the entire machine. The rest of this guide applies specific capabilities to constrain what the agent can reach — without taking away its ability to do the coding task.
+There is no `filesystem.scope`, so the capsule works out of the whole work folder, and `bash` can run any command against the entire machine. The rest of this guide applies specific capabilities to constrain what the agent can reach — without taking away its ability to do the coding task.
 
 ??? info "What are binaries?"
     A **binary** is a standalone executable program on the filesystem that your shell can invoke by name when it appears on the system `PATH`. They differ from shell built-ins (like `cd`) that only exist inside the shell process itself and cannot be called as subprocesses.
@@ -124,7 +124,7 @@ Each entry in `shell.allow` is a **bare binary name** — `bash`, `jq`, `python3
 
 ## Step 1 — set the capsule's capability ceiling
 
-The top-level `capabilities:` block is the ceiling. Add a `filesystem.scope` so the capsule works out of the repo subtree of the session workdir rather than the whole workdir, and leave `network.allow` out: the runtime reaches the inference provider itself, so the capsule needs no outbound host at all:
+The top-level `capabilities:` block is the ceiling. Add a `filesystem.scope` so the capsule works out of the repo subtree of the work folder rather than the whole folder, and leave `network.allow` out: the runtime reaches the inference provider itself, so the capsule needs no outbound host at all:
 
 ```yaml
 capabilities:
@@ -135,9 +135,9 @@ capabilities:
       - bash
 ```
 
-`filesystem.scope` is a path relative to the session workdir — here `<workdir>/repo`, created on demand, and the subtree the coding agent checks the repository out into.
+`filesystem.scope` is a path relative to the work folder — here `<workdir>/repo`, created on demand, and the subtree the coding agent checks the repository out into.
 
-WASM tools, drivers and hooks do not inherit it. Each of those works out of the directory its own entry's `capabilities.filesystem.scope` names — Step 4 declares them — and a tool or driver entry that names none works out of the whole accessible workdir. Read what each one resolves to with `mur run --explain-scope`, and see [The filesystem default](../concepts/access-control.md#filesystem-default).
+WASM tools, drivers and hooks do not inherit it. Each of those works out of the directory its own entry's `capabilities.filesystem.scope` names — Step 4 declares them — and a tool or driver entry that names none works out of the whole work folder. Read what each one resolves to with `mur run --explain-scope`, and see [The filesystem default](../concepts/access-control.md#filesystem-default).
 
 !!! warning "`bash` still reaches the whole machine on this platform"
     The ceiling's `filesystem.scope` and `network.allow` are only a real boundary for a `bash` subprocess when a kernel sandbox enforces them, and whether one does is a property of the host — see [Subprocess enforcement tiers](../reference/containment.md#subprocess-enforcement-tiers) for which hosts enforce what. Where nothing enforces them, treat these settings as advisory for `bash`: it can read and write files outside `repo` and open connections to hosts outside `network.allow` regardless of what the manifest declares ([`W-SEC-001`](../reference/diagnostics.md#w-sec-001), [`W-SEC-003`](../reference/diagnostics.md#w-sec-003)). Pairing `bash` with any external-fetch capability is the [maximum-risk combination](../concepts/access-control.md#threat-model) the threat model describes — Step 4 shows how to move work into artifacts whose scope *is* enforced on every platform.
@@ -166,14 +166,14 @@ The agent can now run `git`, `python3`, and `jq` but has no general shell. Any b
 
 The subprocess does not inherit your full host environment. It starts with a minimal baseline: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `CARGO_HOME`, `RUSTUP_HOME`, and `TERM`. Known credential-shaped variables are always stripped before the subprocess spawns, regardless of any other configuration — this includes exact names (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `HUGGING_FACE_HUB_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, `KUBECONFIG`, `NPM_TOKEN`, `PYPI_TOKEN`, `CARGO_REGISTRY_TOKEN`) and glob patterns (`AWS_*`, `DOCKER_*`, `*_API_KEY`). A `capabilities.env.allow` entry matching one of these, or a `strip_env` pattern, is refused with [E-CAP-016](../reference/diagnostics.md#e-cap-016). [Process environment](../reference/manifest.md#process-environment) lists every variable a command starts with, in the order the runtime applies them.
 
-!!! info "HOME is always synthetic"
-    `HOME` (and, on Windows, `USERPROFILE`) is never the real host home directory. The runtime always replaces it with a session-scoped directory (`<workdir>/.capsule-home`, created on demand) before the subprocess spawns. Neither `baseline_env` nor any environment override the agent supplies can restore the real host value — the synthetic path always wins. This is also why `cat ~/.ssh/id_rsa` inside a capsule answers *no such file* on every tier, including a host that denies nothing: test containment with an absolute path instead, per [Testing containment honestly](../reference/containment.md#testing-containment).
+!!! info "HOME is always the session's home folder"
+    `HOME` (and, on Windows, `USERPROFILE`) is never the real host home directory. The runtime always sets it to the session's [home folder](../reference/containment.md#home-folder), `home/` in the session's records directory, created at staging, before the subprocess spawns. Neither `baseline_env` nor any environment override the agent supplies can restore the real host value — the home folder always wins. This is also why `cat ~/.ssh/id_rsa` inside a capsule answers *no such file* on every tier, including a host that denies nothing: test containment with an absolute path instead, per [Testing containment honestly](../reference/containment.md#testing-containment).
 
 !!! info "TMPDIR, TMP and TEMP name the session's temporary folder"
     The runtime sets all three in every subprocess, to `/tmp` where the session maps `/tmp` onto its private temporary folder and to the folder's absolute path where it does not. Neither `baseline_env` nor the host's own values change them. See [The session's temporary folder](../reference/containment.md#temp-folder) for what each tier does.
 
 !!! info "Native tool artifacts get the same treatment"
-    Everything in this step — the synthetic `HOME`, the credential-pattern strip list, `strip_env`, and `baseline_env` — also applies to `runtime: tool` artifacts declared with `implementation: native` (see [Python Tool Quickstart (Native)](../language-guides/python-native.md)), even if the capsule declares no `capabilities.shell.allow` entries at all. A native tool is spawned the way a shell command is, in the same sandbox with the same environment, so there is no separate configuration surface for native tools.
+    Everything in this step — `HOME` set to the session's home folder, the credential-pattern strip list, `strip_env`, and `baseline_env` — also applies to `runtime: tool` artifacts declared with `implementation: native` (see [Python Tool Quickstart (Native)](../language-guides/python-native.md)), even if the capsule declares no `capabilities.shell.allow` entries at all. A native tool is spawned the way a shell command is, in the same sandbox with the same environment, so there is no separate configuration surface for native tools.
 
 Use `strip_env` to remove baseline variables the agent doesn't need:
 
@@ -228,7 +228,7 @@ capabilities:
       - APP_CONFIG_PATH
 ```
 
-The runtime builds the final subprocess environment in order: it starts from the default baseline, appends any variables listed in `baseline_env`, then applies `strip_env` removals (chained with the built-in credential patterns), and finally sets `HOME`/`USERPROFILE` to the synthetic session directory. This means `strip_env` always wins over `baseline_env` for everything except `HOME`/`USERPROFILE`, which are fixed last and can't be reintroduced by either setting — a variable that appears in both lists is not passed to the subprocess:
+The runtime builds the final subprocess environment in order: it starts from the default baseline, appends any variables listed in `baseline_env`, then applies `strip_env` removals (chained with the built-in credential patterns), and finally sets `HOME`/`USERPROFILE` to the session's home folder. This means `strip_env` always wins over `baseline_env` for everything except `HOME`/`USERPROFILE`, which are fixed last and can't be reintroduced by either setting — a variable that appears in both lists is not passed to the subprocess:
 
 ```yaml
 capabilities:
@@ -340,7 +340,7 @@ Each shell invocation the agent makes appears in the session's [`trace.jsonl`](.
 
 ## Step 6 — watch for warnings and keep secrets out of the manifest
 
-Per-artifact grants resolve at staging, before the session workdir exists, so any capability warning goes to stderr as the run starts. Two are worth knowing:
+Per-artifact grants resolve at staging, before the session's records directory exists, so any capability warning goes to stderr as the run starts. Two are worth knowing:
 
 - **`W-SEC-007`** — a per-artifact `network.allow` entry the ceiling does not itself cover was dropped, not granted. Nothing is ever widened, but a tool that silently cannot reach a host it looks "granted" is hard to trace back to the manifest. See [W-SEC-007](../reference/diagnostics.md#w-sec-007).
 - **`W-SEC-008`** — a per-artifact block declared `shell`, `spawn`, `env`, `limits`, `resources` or `containment`, or sat on a tool with a native (non-WASM) implementation. Only `network` and `filesystem` narrow; the rest parse but are inert. A native tool runs under the capsule-wide grants, enforced by the same sandbox as a shell command, and its per-artifact block does not narrow them: narrow the capsule-wide block itself, or ship the tool as WASM if it needs grants narrower than the rest of the capsule's. See [W-SEC-008](../reference/diagnostics.md#w-sec-008).
@@ -370,7 +370,7 @@ mur trace show
 | `shell.strip_env: [CARGO_HOME]` | Removes a specific variable from the default baseline |
 | `shell.strip_env: [AWS_*]` | Removes all vars whose name starts with `AWS_` |
 | `shell.baseline_env: [DATABASE_URL]` | Exposes an additional host variable not in the default baseline |
-| `HOME` / `USERPROFILE` | Always the synthetic session directory; cannot be overridden by `baseline_env` or a tool-supplied env value |
+| `HOME` / `USERPROFILE` | Always the session's [home folder](../reference/containment.md#home-folder), `home/` in its records directory; cannot be overridden by `baseline_env` or a tool-supplied env value |
 | `artifacts[].capabilities` present | Narrows that one tool or driver; effective grant = declaration ∩ ceiling |
 | `artifacts[].capabilities` absent | Artifact inherits the full ceiling |
 | `network.allow: []` on an artifact | Denies that one artifact all outbound HTTP; siblings keep theirs |

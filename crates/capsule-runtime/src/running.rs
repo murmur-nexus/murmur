@@ -82,8 +82,7 @@ pub struct RunningRecord {
     pub process_start: String,
     pub capsule_name: String,
     pub capsule_version: String,
-    /// The session directory. Kept for the readers that name it; the trace is in
-    /// [`Self::records_dir`].
+    /// The session's work folder. The trace and results are in [`Self::records_dir`].
     pub workdir: PathBuf,
     /// The session's records directory, `~/.murmur/records/<workdir root>/<session-id>`, where a
     /// reader finds the trace of what it is watching, outside the workdir the capsule's commands

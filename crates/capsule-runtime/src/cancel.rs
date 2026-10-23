@@ -13,7 +13,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
@@ -170,8 +170,7 @@ pub(crate) struct LiveDelegation {
     pub(crate) version: String,
     /// The session id the child's runtime minted for itself.
     pub(crate) child_session_id: String,
-    /// The child's directory as the parent's own tools address it: relative to the parent's
-    /// accessible workdir.
+    /// [`Self::workdir`] as the launch notice and the trace name it.
     pub(crate) child_workdir: String,
     /// The child's records directory, absolute, as the child reported it on its readiness line:
     /// where its `completion.json` is read from. Never derived from [`Self::child_workdir`].
@@ -193,13 +192,12 @@ pub(crate) struct LiveDelegation {
 }
 
 impl LiveDelegation {
-    /// The row for a child `task_id` has just launched, from its launch notice: no handle yet, no
-    /// outcome, and `child_root` (the parent's accessible workdir) joined to the notice's relative
-    /// child directory.
-    pub(crate) fn launched(task_id: String, child_root: &Path, notice: &DelegationLaunch) -> Self {
+    /// The row for a child `task_id` has just launched, from its launch notice: no handle yet and
+    /// no outcome.
+    pub(crate) fn launched(task_id: String, notice: &DelegationLaunch) -> Self {
         Self {
             task_id,
-            workdir: child_root.join(&notice.child_workdir),
+            workdir: PathBuf::from(&notice.child_workdir),
             capsule: notice.capsule.clone(),
             version: notice.version.clone(),
             child_session_id: notice.child_session_id.clone(),
@@ -646,7 +644,7 @@ mod tests {
             capsule: capsule.to_string(),
             version: "0.1.0".to_string(),
             child_session_id: "ses_child".to_string(),
-            child_workdir: ".murmur/children/child-1".to_string(),
+            child_workdir: "/tmp/child".to_string(),
             child_records_dir: std::path::PathBuf::from(
                 "/home/test/.murmur/records/work/ses_child",
             ),

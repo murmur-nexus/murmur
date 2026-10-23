@@ -2,7 +2,7 @@
 //!
 //! A task reaches a capsule as text and comes back as text: `--task` writes `task.md`,
 //! `read_task` reads it (then falls back to `input.txt`), the text reaches the model verbatim,
-//! and `write_result` writes `out/result.txt` and nothing else. There is no structured task
+//! and `write_result` writes `out/result.txt` in the session's records directory and nothing else. There is no structured task
 //! envelope, and there is not going to be one — an envelope has no reader on this side, so it
 //! would arrive as prose for the model to decode. A delegating parent obeys the same contract:
 //! `plan::capsule_task_text` refuses a capsule step whose input is anything but task text.
@@ -69,7 +69,8 @@ fn no_flags_falls_back_to_task_md() {
     assert_eq!(first_user_message(&server), "Legacy markdown task");
 }
 
-/// A clean turn leaves the assistant's final text in `out/result.txt`.
+/// A clean turn leaves the assistant's final text in the records directory's `out/result.txt`,
+/// and nothing in the work folder.
 #[test]
 fn result_txt_written_on_clean_completion() {
     let server = end_turn_server("structured output");
@@ -77,15 +78,21 @@ fn result_txt_written_on_clean_completion() {
 
     let session_id = run_mur(&home, &manifest_path, &["--task", "Finish cleanly"]);
 
+    let workdir = workdir_of(&manifest_path);
+    let records = common::session_records_dir(home.path(), &workdir, &session_id);
     assert_eq!(
-        fs::read_to_string(session_dir(&manifest_path, &session_id).join("out/result.txt"))
-            .unwrap(),
+        fs::read_to_string(records.join("out/result.txt")).unwrap(),
         "structured output"
+    );
+    assert_eq!(
+        fs::read_dir(&workdir).unwrap().count(),
+        0,
+        "the work folder gains nothing"
     );
 }
 
-/// A driver-side error response still terminates cleanly and still leaves `out/result.txt`
-/// rather than trapping the session.
+/// A driver-side error response still terminates cleanly and still leaves the records
+/// directory's `out/result.txt` rather than trapping the session.
 #[test]
 fn result_txt_written_on_error_response() {
     let server = common::ScriptedServer::start(vec![json!({
@@ -103,9 +110,13 @@ fn result_txt_written_on_error_response() {
 
     let staged =
         common::stage_agent_session(&home, manifest_path.parent().unwrap(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Trigger an error").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Trigger an error",
+    )
+    .unwrap();
 
-    let workdir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
     match launch_session(staged, |_| {}) {
         Err(capsule_runtime::RuntimeError::TaskDidNotComplete {
             exit_status,
@@ -114,7 +125,7 @@ fn result_txt_written_on_error_response() {
             assert_eq!(exit_status, "failed");
             assert!(reason.contains("stop_reason 'error'"), "{reason}");
             assert_eq!(
-                fs::read_to_string(workdir.join("out/result.txt")).unwrap(),
+                fs::read_to_string(records_dir.join("out/result.txt")).unwrap(),
                 format!("error: {reason}")
             );
         }
@@ -202,15 +213,6 @@ fn run_mur(home: &TempDir, manifest_path: &Path, extra_args: &[&str]) -> String 
         .unwrap_or_else(|| panic!("no session id in stdout: {stdout}"))
         .trim()
         .to_string()
-}
-
-/// Where a run's own files land, given the id it reported.
-///
-/// A pinned `--workdir` is the *accessible* directory — what the agent's tools see and where
-/// `task.md` is read from. The session's own tree, including `out/`, hangs off it under
-/// `.murmur/<session id>` (see `runtime::stage_session`).
-fn session_dir(manifest_path: &Path, session_id: &str) -> PathBuf {
-    workdir_of(manifest_path).join(".murmur").join(session_id)
 }
 
 /// The workdir every run in this file is pinned to via `--workdir`.

@@ -216,8 +216,8 @@ esac
     wrapper
 }
 
-/// One case's parent: an accessible workdir children are composed beneath, and the shared
-/// credential the daemon minted for the parent session.
+/// One case's parent: a directory standing for its records directory, whose `children/` every
+/// child's work folder is composed in.
 struct Parent {
     workdir: TempDir,
 }
@@ -262,7 +262,7 @@ impl Parent {
         targets: &[String],
         place: impl FnOnce(&Path),
     ) -> (LaunchedChild, Vec<String>) {
-        let children = self.dir().join(".murmur").join("children");
+        let children = self.dir().join("children");
         let before = dirs_under(&children);
 
         let child = std::thread::scope(|scope| {
@@ -300,7 +300,7 @@ impl Parent {
     ) -> Result<LaunchedChild, capsule_runtime::RuntimeError> {
         let (grant, _) = self.approve(name);
         launch_child_capsule(ChildLaunchRequest {
-            parent_accessible_root: capsule_runtime::WorkdirRoot::open(self.dir()).unwrap(),
+            parent_records_root: capsule_runtime::WorkdirRoot::open(self.dir()).unwrap(),
             capsule_name: name.to_string(),
             capsule_version: "0.1.0".to_string(),
             grant,
@@ -471,10 +471,16 @@ fn two_children_of_the_same_parent_are_independent() {
     std::fs::write(a.workdir.join("only-in-a.txt"), "a").unwrap();
     assert!(!b.workdir.join("only-in-a.txt").exists());
 
-    // Each child's session artifacts are under its own directory.
-    assert!(a.workdir.join(".murmur").join(&a.session_id).is_dir());
-    assert!(b.workdir.join(".murmur").join(&b.session_id).is_dir());
-    assert!(!a.workdir.join(".murmur").join(&b.session_id).exists());
+    // Each child's records are its own, named by its own session id, and nothing of the runtime's
+    // is in either work folder.
+    assert_ne!(a.records_dir, b.records_dir);
+    assert!(a.records_dir.ends_with(&a.session_id) && a.records_dir.is_dir());
+    assert!(b.records_dir.ends_with(&b.session_id) && b.records_dir.is_dir());
+    for child in [&a, &b] {
+        assert!(!child.workdir.join(".murmur").exists());
+        assert!(child.records_dir.join("home").is_dir());
+    }
+    assert!(!parent.dir().join(".murmur").exists());
 }
 
 /// The environment a child that declares nothing is handed: the names the runtime owns, and
@@ -509,7 +515,7 @@ fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
     // spawner adds and no watcher runs.
     let (grant, _) = parent.approve("local/child-b");
     let delegated = launch_child_capsule(ChildLaunchRequest {
-        parent_accessible_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
+        parent_records_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
         capsule_name: "local/child-b".to_string(),
         capsule_version: "0.1.0".to_string(),
         grant,
@@ -547,7 +553,7 @@ fn a_child_joins_its_parents_formation_with_or_without_a_spawner() {
     for (name, spawner) in [("local/child-a", Some(lineage)), ("local/child-b", None)] {
         let (grant, _) = parent.approve(name);
         let child = launch_child_capsule(ChildLaunchRequest {
-            parent_accessible_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
+            parent_records_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
             capsule_name: name.to_string(),
             capsule_version: "0.1.0".to_string(),
             grant,
@@ -643,16 +649,16 @@ fn a_child_cannot_reach_its_parents_workdir_or_its_siblings() {
     let escaping_dir = child_workdir_for(parent.dir(), "local/child-escape");
     let child = parent.launch("local/child-escape", &[]);
 
-    // Its attempt to reach `../../outside.txt` — out of its preopen and into the parent's
-    // `.murmur/` — was refused by the WASI layer rather than served.
+    // Its attempt to reach `../../outside.txt` — out of its preopen and into the parent's own
+    // directory above `children/` — was refused by the WASI layer rather than served.
     assert_eq!(
         std::fs::read_to_string(child.workdir.join("out").join("result.txt")).unwrap(),
         "blocked"
     );
-    // Nothing it tried to write landed anywhere: not in the parent's root, not in `.murmur/`, not
+    // Nothing it tried to write landed anywhere: not in the parent's root, not in `children/`, not
     // in the sibling's directory.
     assert!(!parent.dir().join("outside.txt").exists());
-    assert!(!parent.dir().join(".murmur").join("outside.txt").exists());
+    assert!(!parent.dir().join("children").join("outside.txt").exists());
     assert!(!sibling.workdir.join("outside.txt").exists());
     assert_eq!(
         std::fs::read_to_string(sibling.workdir.join("sibling-secret.txt")).unwrap(),
@@ -673,7 +679,7 @@ fn a_child_cannot_reach_its_parents_workdir_or_its_siblings() {
     let sibling_dir = sibling.workdir.file_name().unwrap().to_string_lossy();
     let mut targets = vec![
         "./input.txt".to_string(),
-        "../../../parent-secret.txt".to_string(),
+        "../../parent-secret.txt".to_string(),
         format!("../{sibling_dir}/sibling-secret.txt"),
     ];
     let mut expected = vec!["served placed by the parent", "blocked", "blocked"];
@@ -708,7 +714,7 @@ fn a_child_cannot_reach_its_parents_workdir_or_its_siblings() {
     // Every refused path names content that is really there: resolved from the reader's own
     // directory, or followed from the links planted in it, they are the parent's secret and the
     // sibling's. So `blocked` is a refusal and not a miss.
-    assert!(reader.workdir.join("../../../parent-secret.txt").is_file());
+    assert!(reader.workdir.join("../../parent-secret.txt").is_file());
     assert!(reader
         .workdir
         .join(format!("../{sibling_dir}/sibling-secret.txt"))
@@ -781,10 +787,7 @@ fn each_delegation_gets_a_directory_of_its_own() {
 
     // The naming rule, and its permissions.
     for dir in [&first.workdir, &second.workdir] {
-        assert_eq!(
-            dir.parent(),
-            Some(parent.dir().join(".murmur").join("children").as_path())
-        );
+        assert_eq!(dir.parent(), Some(parent.dir().join("children").as_path()));
         let name = dir.file_name().unwrap().to_string_lossy();
         assert_eq!(name.len(), "child-repeat-".len() + 16);
         assert!(name.starts_with("child-repeat-"));
@@ -813,7 +816,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
     let approval = grant.expose().to_string();
 
     let child = launch_child_capsule(ChildLaunchRequest {
-        parent_accessible_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
+        parent_records_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
         capsule_name: "local/child-leak".to_string(),
         capsule_version: "0.1.0".to_string(),
         grant,
@@ -869,7 +872,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
     // And not in a refusal: registering with a daemon that is not there names the daemon and the
     // reason, and nothing else.
     let error = launch_child_capsule(ChildLaunchRequest {
-        parent_accessible_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
+        parent_records_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
         capsule_name: "local/child-leak".to_string(),
         capsule_version: "0.1.0".to_string(),
         grant: SpawnApproval::new(approval.clone()),
@@ -970,7 +973,7 @@ fn the_child_directory_naming_rule_is_stable_and_unique() {
     assert_ne!(first, second);
     assert_eq!(
         first.parent(),
-        Some(parent.path().join(".murmur").join("children").as_path())
+        Some(parent.path().join("children").as_path())
     );
     let suffix = first
         .file_name()
@@ -1046,7 +1049,7 @@ fn a_child_refused_at_its_readiness_line_is_ended_and_reaped() {
         "{message}"
     );
 
-    let children = parent.dir().join(".murmur").join("children");
+    let children = parent.dir().join("children");
     let dir = dirs_under(&children)
         .into_iter()
         .next()
@@ -1089,7 +1092,7 @@ fn a_child_holds_its_own_spawner_lifeline_read_end_and_no_formation_lifeline() {
     std::env::set_var(FORMATION_LIFELINE_ENV, "4097");
     std::env::set_var(SPAWNER_LIFELINE_ENV, "4098");
     let launched = launch_child_capsule(ChildLaunchRequest {
-        parent_accessible_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
+        parent_records_root: capsule_runtime::WorkdirRoot::open(parent.dir()).unwrap(),
         capsule_name: "local/child-handed".to_string(),
         capsule_version: "0.1.0".to_string(),
         grant,

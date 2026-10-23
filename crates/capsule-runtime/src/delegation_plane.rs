@@ -35,7 +35,7 @@
 //! interpolated into a message — a missing approval is reported by naming the field, not by
 //! quoting the body that lacked it.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -44,9 +44,7 @@ use crate::a2a::{
     send_message_params, user_message, A2aTask, SendMessageResult, TaskState, A2A_PROTOCOL_VERSION,
     A2A_VERSION_HEADER, RESPONSE_ARTIFACT,
 };
-use crate::child_launch::{
-    launch_child_capsule, workdir_relative_to, ChildLaunchRequest, LaunchedChild,
-};
+use crate::child_launch::{launch_child_capsule, ChildLaunchRequest, LaunchedChild};
 use crate::delegation::{CompletionAddress, Spawner};
 use crate::errors::RuntimeError;
 use crate::formation::FormationId;
@@ -318,10 +316,9 @@ pub struct DelegationPlane {
     roost_url: String,
     /// This session's credential, read exactly once per delegation into one request header.
     credential: SpawnCredential,
-    /// The parent's accessible workdir. Child directories are created beneath it, which is what
-    /// keeps a child inside the single preopen the parent's WASI layer already has, and every
-    /// read of a child's files goes through it.
-    accessible_workdir: WorkdirRoot,
+    /// The parent's records directory. Every child's work folder is created in its `children/`,
+    /// outside the parent's work folder and read-only to the parent's commands.
+    records_root: WorkdirRoot,
     /// This plane's bound on the wait for an answer: the declared
     /// `lifecycle.delegation_deadline_secs`, or [`DELEGATION_TIMEOUT_ENV`] where it names a
     /// positive number of seconds. Read once at construction so every delegation in a session is
@@ -368,7 +365,7 @@ impl DelegationPlane {
     pub fn new(
         roost_url: String,
         credential: SpawnCredential,
-        accessible_workdir: WorkdirRoot,
+        records_root: WorkdirRoot,
         session_id: String,
         declared_deadline: Duration,
         registry: std::sync::Arc<dyn murmur_artifact::Registry>,
@@ -378,7 +375,7 @@ impl DelegationPlane {
         Self {
             roost_url: roost_url.trim_end_matches('/').to_string(),
             credential,
-            accessible_workdir,
+            records_root,
             result_timeout: handed_off_work_deadline(declared_deadline),
             session_id,
             registry,
@@ -465,12 +462,6 @@ impl DelegationPlane {
         self.credential.clone()
     }
 
-    /// A child's directory named from the parent's accessible workdir, which is the only root the
-    /// parent's own tools address.
-    fn workdir_relative(&self, workdir: &Path) -> String {
-        workdir_relative_to(workdir, self.accessible_workdir.path())
-    }
-
     /// Ask the daemon whether this session may spawn that capsule, and take the approval back.
     ///
     /// One request, and the only one: the daemon judges the session the credential names, runs the
@@ -529,7 +520,7 @@ impl DelegationPlane {
     ) -> Result<ChildLaunchRequest, RuntimeError> {
         let completion_deadline = report_to.as_ref().map(|_| self.result_timeout);
         Ok(ChildLaunchRequest {
-            parent_accessible_root: self.accessible_workdir.clone(),
+            parent_records_root: self.records_root.clone(),
             capsule_name: request.capsule.clone(),
             capsule_version: request.version.clone(),
             grant,
@@ -581,7 +572,7 @@ impl DelegationPlane {
                 capsule: request.capsule.clone(),
                 version: request.version.clone(),
                 child_session_id: child.session_id.clone(),
-                child_workdir: self.workdir_relative(&child.workdir),
+                child_workdir: child.workdir.to_string_lossy().into_owned(),
                 child_records_dir: child.records_dir.display().to_string(),
             });
         }
@@ -664,7 +655,7 @@ impl DelegationPlane {
         let delegation_id = child.delegation_id.clone().unwrap_or_default();
         self.announce(request, origin, &child, &delegation_id);
 
-        let child_workdir = self.workdir_relative(&child.workdir);
+        let child_workdir = child.workdir.to_string_lossy().into_owned();
         // `child` is dropped on every early return below, which ends and reaps it.
         let failed = |session_id: &str, output: String| {
             let (output, truncated) = bounded(output);
@@ -942,12 +933,8 @@ impl DelegationPlane {
                         .and_then(|artifact| artifact.first_text())
                         .filter(|text| !text.is_empty())
                         .map(str::to_string);
-                    let found = read_child_result(
-                        &child.parent_root,
-                        &child.workdir_rel,
-                        &child.session_id,
-                        &task_id,
-                    );
+                    let found =
+                        read_child_result(&child.records_root, &child.workdir_root, &task_id);
                     let mut result = outcome(
                         DelegationStatus::Completed,
                         &child.session_id,
@@ -955,8 +942,7 @@ impl DelegationPlane {
                             .or_else(|| found.as_ref().map(|(_, text)| text.clone()))
                             .unwrap_or_default(),
                     );
-                    result.result_path =
-                        found.map(|(path, _)| path.to_string_lossy().replace('\\', "/"));
+                    result.result_path = found.map(|(path, _)| path.to_string_lossy().into_owned());
                     return result;
                 }
                 TaskState::Failed | TaskState::Rejected => {
@@ -1107,23 +1093,23 @@ fn end_for_canceled_task(
 /// Where a finished child left its answer, and what it says.
 ///
 /// The candidate list is [`crate::delegation::child_result_candidates`], so the file this plane
-/// reads and the file the completion watcher names are found by one rule. `child_workdir` is
-/// relative to `root`, and so is the returned path. A link where a candidate belongs is refused
-/// and latched on `root`, and its target is never read.
+/// reads and the file the completion watcher names are found by one rule. Each candidate is read
+/// through the held root it lies in, `child_records` (the child's records directory) or
+/// `child_workdir` (its work folder), and the returned path is absolute. A link where a candidate
+/// belongs is refused and latched on that root, and its target is never read.
 pub(crate) fn read_child_result(
-    root: &WorkdirRoot,
-    child_workdir: &Path,
-    session_id: &str,
+    child_records: &WorkdirRoot,
+    child_workdir: &WorkdirRoot,
     task_id: &str,
 ) -> Option<(PathBuf, String)> {
-    crate::delegation::child_result_candidates(child_workdir, session_id, task_id)
-        .into_iter()
-        .find_map(|path| {
-            root.read_to_string(&path)
+    crate::delegation::child_result_reads(child_records, child_workdir, task_id).find_map(
+        |(root, relative)| {
+            root.read_to_string(&relative)
                 .ok()
                 .flatten()
-                .map(|text| (path, text))
-        })
+                .map(|text| (root.host_path(&relative), text))
+        },
+    )
 }
 
 /// `(output, truncated)`, with `output` cut by [`bound_output`] when it is over
@@ -1772,8 +1758,8 @@ through that constructor rather than composing a second request literal."
         assert_eq!(stepped.completion_deadline, None);
 
         assert_eq!(
-            started.parent_accessible_root.path(),
-            stepped.parent_accessible_root.path()
+            started.parent_records_root.path(),
+            stepped.parent_records_root.path()
         );
         assert_eq!(started.capsule_name, stepped.capsule_name);
         assert_eq!(started.capsule_version, stepped.capsule_version);

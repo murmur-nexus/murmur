@@ -668,7 +668,6 @@ fn user_message((text, fence_source): (String, Option<String>)) -> Value {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agent_loop(
     store_state: &mut CapsuleStoreState,
-    workdir: &WorkdirRoot,
     // `max_turns` here is what this attempt has left of the task's budget, and bounds its loop;
     // `None` leaves it unbounded.
     inference: &InferenceConfig,
@@ -770,7 +769,6 @@ pub(crate) async fn run_agent_loop(
         // The HTTP path below is unaffected.
         return process::run_process_inference_loop(
             store_state,
-            workdir,
             inference,
             task_max_turns,
             system_prompt,
@@ -968,7 +966,6 @@ pub(crate) async fn run_agent_loop(
                     store_state,
                     first_turn as usize,
                     run_config.context_window,
-                    workdir,
                     &records_root,
                     hooks,
                     trace,
@@ -991,7 +988,7 @@ pub(crate) async fn run_agent_loop(
                             hooks,
                             trace,
                             otel,
-                            workdir,
+                            &records_root,
                             ending,
                             first_turn,
                             &refusal,
@@ -1087,7 +1084,7 @@ pub(crate) async fn run_agent_loop(
                 hooks,
                 trace,
                 otel,
-                workdir,
+                &records_root,
                 ending,
                 turn_u32,
                 TASK_FAILED_INPUT_TIMEOUT,
@@ -1104,7 +1101,7 @@ pub(crate) async fn run_agent_loop(
             .as_ref()
             .and_then(|calls| calls.declined())
         {
-            return finish_no_answer_turn(hooks, trace, otel, workdir, ending, &reason).await;
+            return finish_no_answer_turn(hooks, trace, otel, &records_root, ending, &reason).await;
         }
 
         // Session-level half of the workdir bound. The subprocess spawn paths already refuse to
@@ -1280,7 +1277,7 @@ pub(crate) async fn run_agent_loop(
                     hooks,
                     trace,
                     otel,
-                    workdir,
+                    &records_root,
                     ending,
                     turn_u32,
                     &refusal,
@@ -1421,7 +1418,7 @@ pub(crate) async fn run_agent_loop(
                 hooks,
                 trace,
                 otel,
-                workdir,
+                &records_root,
                 ending,
                 turn_u32,
                 cause,
@@ -1556,7 +1553,14 @@ pub(crate) async fn run_agent_loop(
             )
             .await;
             return finish_failed_turn(
-                hooks, trace, otel, workdir, ending, turn_u32, cause, &error,
+                hooks,
+                trace,
+                otel,
+                &records_root,
+                ending,
+                turn_u32,
+                cause,
+                &error,
             )
             .await;
         }
@@ -1636,7 +1640,6 @@ pub(crate) async fn run_agent_loop(
                 store_state,
                 turn,
                 context_window,
-                workdir,
                 &records_root,
                 hooks,
                 trace,
@@ -1660,7 +1663,7 @@ pub(crate) async fn run_agent_loop(
                     hooks,
                     trace,
                     otel,
-                    workdir,
+                    &records_root,
                     ending,
                     turn_u32,
                     refusal,
@@ -1677,7 +1680,7 @@ pub(crate) async fn run_agent_loop(
                     hooks,
                     trace,
                     otel,
-                    workdir,
+                    &records_root,
                     ending,
                     turn_u32,
                     TASK_FAILED_COMPACTION_HOOK,
@@ -1714,7 +1717,7 @@ pub(crate) async fn run_agent_loop(
                         hooks,
                         trace,
                         otel,
-                        workdir,
+                        &records_root,
                         ending,
                         turn_u32,
                         TASK_FAILED_MALFORMED_RESPONSE,
@@ -2102,7 +2105,7 @@ pub(crate) async fn run_agent_loop(
                     reported,
                     counts,
                     content,
-                    workdir,
+                    &records_root,
                     mode,
                     &sse,
                     task_id.as_deref(),
@@ -2134,7 +2137,7 @@ pub(crate) async fn run_agent_loop(
                     reported,
                     counts,
                     content,
-                    workdir,
+                    &records_root,
                     mode,
                     &sse,
                     task_id.as_deref(),
@@ -2153,7 +2156,7 @@ pub(crate) async fn run_agent_loop(
                     hooks,
                     trace,
                     otel,
-                    workdir,
+                    &records_root,
                     ending,
                     turn_u32,
                     TASK_FAILED_MALFORMED_RESPONSE,
@@ -2171,7 +2174,7 @@ pub(crate) async fn run_agent_loop(
         .as_ref()
         .and_then(|calls| calls.declined())
     {
-        return finish_no_answer_turn(hooks, trace, otel, workdir, ending, &reason).await;
+        return finish_no_answer_turn(hooks, trace, otel, &records_root, ending, &reason).await;
     }
 
     // Only a set cap ends the loop here: an uncapped one never spends `usize::MAX` turns.
@@ -2180,7 +2183,7 @@ pub(crate) async fn run_agent_loop(
         trace.task_agent_turns(),
         trace.task_hook_inferences(),
     );
-    record_result(hooks, workdir, &format!("error: {exceeded}"))
+    record_result(hooks, &records_root, &format!("error: {exceeded}"))
         .map_err(RuntimeError::AgentLoopFailed)?;
     flush_hook_dispatch_faults(hooks, trace).await;
     otel.emit_session_end("max_turns_reached").await;
@@ -2265,14 +2268,14 @@ async fn finish_failed_turn(
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
-    workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     ending: &mut Option<AttemptEnding>,
     turn: u32,
     cause: &str,
     reason: &str,
 ) -> Result<AgentLoopExit, RuntimeError> {
     let _ = trace.write_task_failed(Some(turn), cause, reason).await;
-    record_result(hooks, workdir, &format!("error: {reason}"))
+    record_result(hooks, records_root, &format!("error: {reason}"))
         .map_err(RuntimeError::AgentLoopFailed)?;
     flush_hook_dispatch_faults(hooks, trace).await;
     otel.emit_session_end(AgentLoopExit::Failed.as_str()).await;
@@ -2286,11 +2289,11 @@ async fn finish_no_answer_turn(
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
-    workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     ending: &mut Option<AttemptEnding>,
     reason: &str,
 ) -> Result<AgentLoopExit, RuntimeError> {
-    record_result(hooks, workdir, &format!("no answer: {reason}"))
+    record_result(hooks, records_root, &format!("no answer: {reason}"))
         .map_err(RuntimeError::AgentLoopFailed)?;
     flush_hook_dispatch_faults(hooks, trace).await;
     otel.emit_session_end(AgentLoopExit::NoAnswer.as_str())
@@ -2441,7 +2444,7 @@ async fn finish_spend_refused_turn(
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
-    workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     ending: &mut Option<AttemptEnding>,
     turn: u32,
     refusal: &SpendRefusal,
@@ -2455,7 +2458,7 @@ async fn finish_spend_refused_turn(
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
     }
-    record_result(hooks, workdir, &format!("stopped: {refusal}"))
+    record_result(hooks, records_root, &format!("stopped: {refusal}"))
         .map_err(RuntimeError::AgentLoopFailed)?;
     flush_hook_dispatch_faults(hooks, trace).await;
     otel.emit_session_end(AgentLoopExit::SpendCeilingReached.as_str())
@@ -2565,7 +2568,7 @@ async fn finish_completed_turn(
     reported: &mut Option<ReportedOccupancy>,
     counts: Option<ProviderCounts>,
     content: Vec<Value>,
-    workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     mode: ConversationMode,
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
     task_id: Option<&str>,
@@ -2580,12 +2583,12 @@ async fn finish_completed_turn(
         Some(cap) => truncated_result_text(&turn_text, cap),
         None => turn_text,
     };
-    record_result(hooks, workdir, &final_text).map_err(RuntimeError::AgentLoopFailed)?;
+    record_result(hooks, records_root, &final_text).map_err(RuntimeError::AgentLoopFailed)?;
 
     // In threaded mode: write per-task result file so earlier turns aren't overwritten.
     if matches!(mode, ConversationMode::Threaded) {
         if let Some(tid) = task_id {
-            write_result_for_task(workdir, tid, &final_text)
+            write_result_for_task(records_root, tid, &final_text)
                 .map_err(RuntimeError::AgentLoopFailed)?;
         }
     }
@@ -2760,7 +2763,7 @@ async fn write_hook_inference_record(
 pub(crate) struct CallGate<'a> {
     hooks: &'a mut HookRuntime,
     trace: &'a mut TraceWriter,
-    workdir: &'a WorkdirRoot,
+    records_root: &'a WorkdirRoot,
     turn: u32,
 }
 
@@ -2768,13 +2771,13 @@ impl<'a> CallGate<'a> {
     pub(crate) fn new(
         hooks: &'a mut HookRuntime,
         trace: &'a mut TraceWriter,
-        workdir: &'a WorkdirRoot,
+        records_root: &'a WorkdirRoot,
         turn: u32,
     ) -> Self {
         Self {
             hooks,
             trace,
-            workdir,
+            records_root,
             turn,
         }
     }
@@ -2848,8 +2851,10 @@ impl<'a> CallGate<'a> {
                 .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
             return Ok(Some(protected_path_tool_result(&refusal)));
         }
-        if let CallDecision::Denied { hook_name, reason } =
-            self.hooks.decide(self.workdir, self.turn, resolved).await
+        if let CallDecision::Denied { hook_name, reason } = self
+            .hooks
+            .decide(self.records_root, self.turn, resolved)
+            .await
         {
             self.trace
                 .write_call_denied(
@@ -3175,7 +3180,7 @@ fn extract_compaction_summary_text(messages: &[Value]) -> String {
 /// accumulate rather than overwrite. Callers treat a failure here as non-fatal.
 fn dump_compaction_summary(
     enabled: bool,
-    workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     turn: u32,
     tokens_before: u32,
     tokens_after: u32,
@@ -3192,7 +3197,7 @@ fn dump_compaction_summary(
         "summary": summary,
     }))
     .map_err(|e| format!("failed to encode compaction summary: {e}"))?;
-    let mut file = workdir
+    let mut file = records_root
         .open_append("out/compaction-summaries.jsonl", DEFAULT_FILE_MODE)
         .map_err(|e| format!("failed to open compaction summary log: {e}"))?;
     file.write_all(line.as_bytes())
@@ -3261,7 +3266,6 @@ pub(crate) async fn try_compact_via_hooks(
     store_state: &mut CapsuleStoreState,
     turn: usize,
     context_window: u32,
-    workdir: &WorkdirRoot,
     records_root: &WorkdirRoot,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
@@ -3384,7 +3388,7 @@ pub(crate) async fn try_compact_via_hooks(
     // The hook's own replacement: a task message the commit put back is not part of it.
     if let Err(e) = dump_compaction_summary(
         dump_summaries,
-        workdir,
+        records_root,
         turn_u32,
         tokens_before.tokens,
         tokens_after,
@@ -4562,7 +4566,7 @@ pub(crate) fn capsule_fact_lines(facts: &CapsuleFacts, manifest_file: Option<&st
 /// prompt and providers match their cache on an exact prefix from the first token: a single
 /// per-launch value here — a workdir path, a session id, a formation id, a timestamp — means no
 /// request can ever match a cached prefix. Anything varying per launch belongs elsewhere.
-fn build_augmented_system_prompt(
+pub(crate) fn build_augmented_system_prompt(
     name: &str,
     version: &str,
     member: Option<&str>,
@@ -4720,23 +4724,27 @@ fn credential_failure(store_state: &CapsuleStoreState, choice: &DriverChoice) ->
 /// `out/result.txt` directly, without recording task output. A terminal path that returns `Err`
 /// without producing result text never reaches here, and the output stays unset — the truthful
 /// pairing with the `exit-status: failed` the hook sees.
-fn record_result(hooks: &HookRuntime, workdir: &WorkdirRoot, value: &str) -> Result<(), String> {
+fn record_result(
+    hooks: &HookRuntime,
+    records_root: &WorkdirRoot,
+    value: &str,
+) -> Result<(), String> {
     hooks.record_task_output(value);
-    write_result(workdir, value)
+    write_result(records_root, value)
 }
 
-pub(crate) fn write_result(workdir: &WorkdirRoot, value: &str) -> Result<(), String> {
-    workdir
+pub(crate) fn write_result(records_root: &WorkdirRoot, value: &str) -> Result<(), String> {
+    records_root
         .write_file("out/result.txt", value.as_bytes(), DEFAULT_FILE_MODE)
         .map_err(|e| format!("failed to write result output: {e}"))
 }
 
 pub(crate) fn write_result_for_task(
-    workdir: &WorkdirRoot,
+    records_root: &WorkdirRoot,
     task_id: &str,
     value: &str,
 ) -> Result<(), String> {
-    workdir
+    records_root
         .write_file(
             format!("out/result_{task_id}.txt"),
             value.as_bytes(),

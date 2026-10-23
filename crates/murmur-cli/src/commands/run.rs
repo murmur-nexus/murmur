@@ -910,7 +910,7 @@ pub(crate) fn run_run(
     }
 
     session_id = staged.session_id.clone();
-    workdir = staged.workdir.clone();
+    workdir = staged.accessible_workdir.clone();
 
     if let Some(task_value) = task_arg {
         // Into the session's runtime directory, where the agent reads it at
@@ -976,11 +976,7 @@ pub(crate) fn run_run(
         let capsule_name = runtime_manifest.name.clone();
         let capsule_version = runtime_manifest.version.clone();
         let pid = std::process::id();
-        // Compute accessible_workdir for JSON output (mirrors stage_session logic).
-        let accessible_workdir_for_json = match workdir_arg.as_deref() {
-            Some(wd) => absolutise(wd),
-            None => staged.workdir.clone(),
-        };
+        let accessible_workdir_for_json = staged.accessible_workdir.clone();
         let records_dir_for_json = staged.records_dir.clone();
         launch_session_handling_sigterm(staged, move |url| {
             let mut ready = serde_json::json!({
@@ -1572,7 +1568,8 @@ mod tests {
         );
         assert!(
             rendered.contains(
-                "the task was canceled before it completed, so out/result.txt holds no result"
+                "the task was canceled before it completed, so out/result.txt in the session's \
+                 records directory holds no result"
             ),
             "{rendered}"
         );

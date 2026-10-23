@@ -41,7 +41,11 @@ fn inline_system_prompt_appears_in_every_api_call() {
     );
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Run echo and report.").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Run echo and report.",
+    )
+    .unwrap();
 
     launch_session(staged, |_| {}).expect("agent launch should succeed");
 
@@ -90,7 +94,7 @@ fn system_prompt_file_contents_injected_as_system_param() {
     );
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Say hello.").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Say hello.").unwrap();
 
     launch_session(staged, |_| {}).expect("agent launch should succeed");
 
@@ -133,7 +137,7 @@ fn missing_system_prompt_file_fails_at_launch() {
     );
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Say hello.").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Say hello.").unwrap();
 
     let err =
         launch_session(staged, |_| {}).expect_err("launch should fail for missing prompt file");
@@ -173,7 +177,11 @@ fn no_system_prompt_field_sends_no_system_param() {
     let manifest_path = create_agent_manifest(project.path(), &server.endpoint, "");
 
     let staged = stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Run echo and report.").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Run echo and report.",
+    )
+    .unwrap();
 
     launch_session(staged, |_| {}).expect("agent launch should succeed");
 

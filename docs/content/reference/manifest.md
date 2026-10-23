@@ -262,8 +262,8 @@ observability:
 
 trace:
   capture: content    # optional; default meta: also store the bodies behind the trace's hashes
-  retain:             # optional; omit to keep every session directory forever
-    max_sessions: 50  # keep the newest N session directories, this launch's own included
+  retain:             # optional; omit to keep every session's records forever
+    max_sessions: 50  # keep the newest N sessions, this launch's own included
     max_age: 14d      # and/or drop anything whose ses_ id was minted longer ago than this
 
 inference:
@@ -303,11 +303,11 @@ lifecycle:
 
 exports:
   files:
-    root: out/            # required; relative to the accessible workdir
+    root: out/            # required; relative to the work folder
     mode: read-only       # required; the only accepted value
     max_bytes: 10Mi       # optional; per-file read ceiling, default 10Mi
   peer_files:
-    root: out/handoff/    # required; relative to the accessible workdir
+    root: out/handoff/    # required; relative to the work folder
     max_ttl: 15m          # optional when after_task: exit (default 1h); required, max 15m, when sleep
     max_bytes: 10Mi       # optional; per-file ceiling on a redeemed read, default 10Mi
   peer_tasks:
@@ -447,7 +447,7 @@ Rules:
   `~/.murmur/state/<store>/` as `state/`, alongside — or instead of — the
   `filesystem.scope` directory mounted as `.`. The two do not imply each other in either
   direction, so a hook can hold durable state without being handed the project directory. The
-  store is keyed by capsule, so it survives a launch that gets a fresh session workdir. See
+  store is keyed by capsule, so it survives a launch that gets a fresh work folder. See
   [Durable state](workdir.md#state-store).
 - **`task_io.read` grants a host import, not a directory.** A granted hook reads the task text
   and the result text from the runtime itself, so it needs no `filesystem.scope` for either. An
@@ -523,7 +523,7 @@ Rules:
   dropped. Write the narrowing at least as specific as the ceiling entry it sits under.
 - **`network.allow: []` is a real narrowing to zero**, distinct from omitting the key: an explicit
   empty list denies that artifact all outbound HTTP while its siblings keep the ceiling.
-- **`filesystem.scope` is a real directory grant.** `<accessible workdir>/<scope>` is mounted as
+- **`filesystem.scope` is a real directory grant.** `<work folder>/<scope>` is mounted as
   that artifact's current directory instead of the whole workdir, and is created if missing.
   `scope: "."` is the explicit "whole workdir" grant. An absolute scope, or one escaping via `..`,
   fails at staging with [`E-CAP-002`](diagnostics.md#e-cap-002). It is this scope, and not the
@@ -827,7 +827,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.peer_fetch.allow` | list<string> | see notes | Peers this capsule may redeem a [peer-file handle](resource-plane.md#peer-plane) against — see [`capabilities.peer_fetch`](#field-peer-fetch). Required and non-empty when the `peer_fetch:` block is present. Absent block means no fetching is possible and the `fetch-peer-file` tool does not exist. |
 | `capabilities.filesystem.scope` | string | no | Relative scope under the workdir; see [Filesystem scope](#filesystem-scope). Omitted, the capsule sees the whole workdir. |
 | `capabilities.filesystem.read_only` | list<string> | no | Workdir-relative subtrees the capsule may read but must not write, in the same vocabulary as `scope`. The runtime refuses, before dispatch, any tool call or shell command it can identify as writing one, records it as `protected_path_denied` and tells the model why. Omitted or `[]`, the whole workdir is writable. See [Read-only paths](#read-only-paths). |
-| `capabilities.filesystem.workdir_exec` | bool | no | Default: `false`. When false, nothing the capsule writes into the session workdir can be executed — under any name, including one that appears in `capabilities.shell.allow`. Set `true` only for compile-and-run workflows (the capsule builds a binary in its workdir and then runs it); doing so makes `shell.allow` unenforceable for anything inside the workdir, caps the capsule's achieved containment class at `advisory` on **every** host, and fires [`W-SEC-011`](diagnostics.md#w-sec-011) at staging. See [Executable workdirs](containment.md#field-workdir-exec). |
+| `capabilities.filesystem.workdir_exec` | bool | no | Default: `false`. When false, nothing the capsule writes into the work folder, its temporary folder or its home folder can be executed — under any name, including one that appears in `capabilities.shell.allow`. Set `true` only for compile-and-run workflows (the capsule builds a binary in its workdir and then runs it); doing so makes `shell.allow` unenforceable for anything inside the workdir, caps the capsule's achieved containment class at `advisory` on **every** host, and fires [`W-SEC-011`](diagnostics.md#w-sec-011) at staging. See [Executable workdirs](containment.md#field-workdir-exec). |
 | `capabilities.shell.allow` | list<string> | no | Shell binaries the agent may invoke (e.g. `bash`); see [Shell allow](#shell-allow). |
 | `capabilities.shell.strip_env` | list<string> | no | Glob patterns for env vars to strip from the subprocess environment (e.g. `AWS_*`). |
 | `capabilities.shell.baseline_env` | list<string> | no | Glob patterns for env vars to keep after stripping (e.g. `PATH`). |
@@ -854,7 +854,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.resources.cgroup_pids_max` | integer | no | cgroup v2 `pids.max` — aggregate task count across the whole subprocess tree. Default: 256. Must be > 0. Linux only. |
 | `capabilities.resources.cgroup_cpu_percent` | integer | no | cgroup v2 `cpu.max` quota as a percentage of one core (200 = two cores' worth). Default: 200. Must be > 0. Linux only. |
 | `capabilities.resources.cgroup_io_bytes_per_sec` | integer | no | cgroup v2 `io.max` read+write throughput on the workdir's backing device, in bytes/sec. Default: 104857600 (100 MiB/s). Must be > 0. Linux only, best-effort — a workdir whose backing device cannot be resolved (overlayfs, tmpfs, device-mapper) reports [`io_max.status: unavailable`](resource-limits.md#io-max-report) with [`W-SEC-021`](diagnostics.md#w-sec-021) and keeps the other three controllers. |
-| `capabilities.resources.workdir_max_bytes` | integer | no | Ceiling on the session workdir and the [session's temporary folder](containment.md#temp-folder) together, in bytes, enforced by a periodic check. Default: 10737418240 (10 GiB). Must be > 0. Every platform. |
+| `capabilities.resources.workdir_max_bytes` | integer | no | Ceiling on the work folder, the [session's temporary folder](containment.md#temp-folder) and its [home folder](containment.md#home-folder) together, in bytes, checked every 10 seconds; crossing it ends the session with `E-RUN-013`. See [Size ceiling](workdir.md#work-folder-ceiling). Default: 10737418240 (10 GiB). Must be > 0. Every platform. |
 | `capabilities.containment` | `advisory \| scoped \| sealed` | no | Minimum containment class this capsule requires, in ascending strength. Omitted, the capsule states no requirement — see [Containment class](containment.md#field-containment). Capsule-wide only; declaring it on a per-artifact entry has no effect and warns at staging — [What bounds a WASM artifact](containment.md#artifact-boundary) names the grant that scopes one artifact. |
 | `capabilities.conversation.read` | bool | no | Grant of the `murmur:conversation/read` import, applied **per hook only**. Declaring it in this capsule-wide block reaches nothing — no artifact can read the conversation record — and prints [`W-SEC-016`](diagnostics.md#w-sec-016) at staging. Put it on the hook entry that needs it: [Hook capabilities](#hook-capabilities). |
 | `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` directory is mounted — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
@@ -930,7 +930,7 @@ A shell tool call, a plan's `shell` step, or a native tool:
 | 2 | The session's identity | A shell tool call in a session with `inference:` only: `MURMUR_CAPSULE_NAME`, `MURMUR_CAPSULE_VERSION`, `MURMUR_SESSION_ID`, `MURMUR_CAPSULE_URL` and the [`MURMUR_INFERENCE_*` variables](default-artifacts.md#driver-environment) |
 | 3 | `capabilities.shell.baseline_env` | The host's value of each listed name the host sets |
 | 4 | Credential backstop and `capabilities.shell.strip_env` | Removes every name that matches a [credential pattern](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) or a `strip_env` pattern, baseline names such as `USER` and `LOGNAME` included |
-| 5 | Synthetic home | `HOME` and `USERPROFILE`, both the session-scoped `.capsule-home` directory, never the host's home |
+| 5 | The session's home folder | `HOME` and `USERPROFILE`, both the session's [home folder](containment.md#home-folder), `home/` in its records directory, never the host's home |
 | 6 | The session | `MURMUR_RUNTIME_DIR` and `MURMUR_RECORDS_DIR`, as for the harness |
 | 7 | The session's temporary folder | `TMPDIR`, `TMP` and `TEMP`: `/tmp` where the session maps `/tmp` onto its [temporary folder](containment.md#temp-folder), and the folder's absolute path where it does not. No earlier row sets them, `capabilities.shell.baseline_env` included |
 
@@ -1249,7 +1249,7 @@ has no compaction step. Under `transport: process`, `threshold`, `model`, `syste
 | `inference.compaction.model` | string | no | Model override for compaction calls. Defaults to the primary inference model. |
 | `inference.compaction.system_prompt` | string | no | System prompt override for compaction calls, passed verbatim to the compaction hook. No trimming, length limit or format check. Omitted, the compaction hook picks its own default prompt. Mutually exclusive with `inference.compaction.system_prompt_file`. |
 | `inference.compaction.system_prompt_file` | string | no | Path to a file whose content is passed verbatim as the compaction system prompt. Relative to the manifest directory; read when the session launches. Mutually exclusive with `inference.compaction.system_prompt`. |
-| `inference.compaction.dump_summaries` | bool | no | Default: `false`. When `true`, every committed compaction appends one JSON line to `out/compaction-summaries.jsonl` in the session workdir, recording the verbatim summary text plus token counts. |
+| `inference.compaction.dump_summaries` | bool | no | Default: `false`. When `true`, every committed compaction appends one JSON line to `out/compaction-summaries.jsonl` in the session's [records directory](workdir.md#compaction-summaries), recording the verbatim summary text plus token counts. |
 | `inference.compaction.max_tokens` | integer | no | Output cap of every `run-inference` call a hook makes while it serves `on-compaction` — the threshold trigger, [`mur run --resume … --resume-mode compact`](cli.md#mur-run) and a seed's overflow summary — and the amount a [spend ceiling](#inference-max-session-tokens) reserves for each. Default: the cap any other hook call sends, under [Output cap sent](#inference-max-tokens). Must be > 0. A value above the `max_output_tokens` the primary driver's [`models:`](#driver-models) table declares for the compaction model (`inference.compaction.model`, else `inference.model`) refuses the launch with [`E-RUN-054`](diagnostics.md#e-run-054); a model the table does not list takes any value. Invalid for `transport: process`. |
 | `inference.compaction.driver_config` | mapping | no | Laid over [`inference.driver.config`](#inference-config) for the same calls `inference.compaction.max_tokens` caps, and no others. Shallow: each top-level key replaces the same-named key of `inference.driver.config` or is added beside it, and every other key is kept; a nested mapping replaces the whole value. With no `inference.driver.config`, the mapping alone is sent. The driver validates the merged object as it validates `inference.driver.config`, and names it `inference.driver.config` in its refusal. Default: none, so compaction calls get `inference.driver.config` unchanged. A non-mapping value is refused. Invalid for `transport: process`. |
 
@@ -1283,8 +1283,8 @@ has no compaction step. Under `transport: process`, `threshold`, `model`, `syste
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `trace.capture` | `none \| meta \| content` | no | Default: `meta`. How much of each turn's driver request `trace.jsonl` keeps — see the table below. |
-| `trace.retain` { #trace-retain } | block | no | What bounds the sessions beside the running one: each session's [records directory](workdir.md#records-directory) and its session workdir, removed together. On a roster's entry member, it also bounds the roster's [formation directories](roster.md#formation-retention). Omitted, nothing is ever deleted. See [Retention](#retention). |
-| `trace.retain.max_sessions` | integer ≥ 1 | no | Sessions to keep in the running session's records group, counting the running session itself. The rest are removed whole: records directory, with its `trace.jsonl` and `blobs/`, and session workdir. On an entry member, also the project's formation directories to keep, counting the current formation's. |
+| `trace.retain` { #trace-retain } | block | no | What bounds the sessions beside the running one: each session's [records directory](workdir.md#records-directory), and, for a launch without `--workdir`, the work folder the runtime created for it, removed together. A `--workdir` folder is never touched. On a roster's entry member, it also bounds the roster's [formation directories](roster.md#formation-retention). Omitted, nothing is ever deleted. See [Retention](#retention). |
+| `trace.retain.max_sessions` | integer ≥ 1 | no | Sessions to keep in the running session's records group, counting the running session itself. The rest are removed whole: the records directory, with its `trace.jsonl`, `blobs/`, `out/`, `home/`, `tmp/` and `children/`, and, for a launch without `--workdir`, its work folder `<manifest-dir>/workdir/<session-id>`. On an entry member, also the project's formation directories to keep, counting the current formation's. |
 | `trace.retain.max_age` | duration | no | Age beyond which a session is removed, measured from the millisecond timestamp inside its own uuid-v7 `ses_` id. No file metadata is read. On an entry member, also the age beyond which an ended formation directory is removed, measured from its `frm_` id. |
 
 | `trace.capture` | `inference` content hashes | `blobs/` | `tool_call.output` |
@@ -1331,7 +1331,7 @@ declare any of them or none.
 | `exports.peer_files` | block | no | The peer-facing file surface, addressed by handle — see [`exports.peer_files`](#field-exports-peer-files). Absent means the capsule mints nothing and every redeem is refused with `no_peer_plane`. |
 | `exports.peer_tasks` | block | no | Whether the door serves tasks from other capsules — see [`exports.peer_tasks`](#field-exports-peer-tasks). Absent means it does not. |
 | `exports.peer_tasks.accept` | boolean | yes | `true` serves peer tasks; `false` refuses them, the same as an absent block. Omitting it inside the block is `E-MAN-003`. |
-| `exports.files.root` | string | yes | Subtree of the [accessible workdir](workdir.md) the export opens — the directory the agent's tools see as `.`. Must be relative, non-empty and free of `..`. Need not exist when the capsule launches. A root that resolves outside the workdir — because it already exists as a symlink pointing out of it — refuses the launch with `E-CAP-007`. |
+| `exports.files.root` | string | yes | Subtree of the [work folder](workdir.md#work-folder) the export opens — the directory the agent's tools see as `.`. Must be relative, non-empty and free of `..`. Need not exist when the capsule launches. A root that resolves outside the workdir — because it already exists as a symlink pointing out of it — refuses the launch with `E-CAP-007`. |
 | `exports.files.mode` | `read-only` | yes | `read-only` is the only accepted value. |
 | `exports.files.max_bytes` | integer or suffixed string | no | Default: `10Mi` (10485760). Per-file read ceiling: a file above it is still listed, with its real size, and refused on read with `too_large`. Accepts a bare byte count or one suffixed `Ki`, `Mi` or `Gi`. Must be greater than zero. |
 
@@ -1347,7 +1347,7 @@ gives the agent one [runtime-provided tool](runtime-provided-tools.md), `share-f
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `exports.peer_files.root` | string | yes | Subtree of the [accessible workdir](workdir.md) a handle may name. Must be relative, non-empty and free of `..`. Need not exist when the capsule launches. A root that resolves outside the workdir refuses the launch with `E-CAP-007`. Independent of `exports.files.root`, and neither is derived from the other. |
+| `exports.peer_files.root` | string | yes | Subtree of the [work folder](workdir.md#work-folder) a handle may name. Must be relative, non-empty and free of `..`. Need not exist when the capsule launches. A root that resolves outside the workdir refuses the launch with `E-CAP-007`. Independent of `exports.files.root`, and neither is derived from the other. |
 | `exports.peer_files.max_ttl` | integer or suffixed string | see notes | Ceiling on a minted handle's lifetime. A bare integer is seconds; `s`, `m` and `h` suffixes are accepted. Must be greater than zero. Optional under `lifecycle.after_task: exit`, where it defaults to `1h`; **required and at most `15m`** under `lifecycle.after_task: sleep`, which otherwise refuses the launch with [`E-CAP-008`](diagnostics.md#e-cap-008). |
 | `exports.peer_files.max_bytes` | integer or suffixed string | no | Default: `10Mi` (10485760). Per-file ceiling on a redeemed read; a larger file is refused with `too_large`. Accepts a bare byte count or one suffixed `Ki`, `Mi` or `Gi`. Must be greater than zero. |
 
@@ -1654,7 +1654,7 @@ A call that does not fit is never sent. The refusal appears as:
 | Surface | What it says |
 |---|---|
 | `trace.jsonl` | A [`spend_ceiling_reached`](observability-schemas.md#spend-ceiling-reached) line naming the limit, the ceiling, what was used and what the call needed |
-| `out/result.txt` | `stopped: spend ceiling reached: …`, ending with `retrying will not get past it` |
+| `out/result.txt` in the [records directory](workdir.md#records-directory) | `stopped: spend ceiling reached: …`, ending with `retrying will not get past it` |
 | A2A terminal status | `TASK_STATE_FAILED`, with the same `spend ceiling reached: …` text as its message |
 | A hook's `run-inference` | `err` with the same text |
 | `task_end`, `session_end` | `exit_status: "spend_ceiling_reached"` |
@@ -1668,7 +1668,7 @@ A compaction hook whose call is refused decides what happens next:
 | The hook returns | Outcome |
 |---|---|
 | `none` or `replace-context` | The session continues, and the next agent turn's admission decides |
-| An error | The task and session end with `exit_status: "spend_ceiling_reached"`, not `failed`, and `out/result.txt` reads `stopped: spend ceiling reached: …` |
+| An error | The task and session end with `exit_status: "spend_ceiling_reached"`, not `failed`, and `out/result.txt` in the records directory reads `stopped: spend ceiling reached: …` |
 
 A compaction hook error that follows no refused call ends the session as `failed`.
 
@@ -1784,7 +1784,7 @@ inference:
 | Inactivity limit | A run with neither a line of harness output nor a tool call for 600 seconds is killed with [`E-RUN-035`](diagnostics.md#e-run-035). A harness that is working is never interrupted for taking a long time. |
 | Interrupt grace | A harness sent a graceful interrupt has 10 seconds to end on its own before it is killed. Both this and the inactivity limit are fixed, not manifest settings. |
 | Cancellation | [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) interrupts the harness the way the driver's `describe()` declares: `stdin-message` writes the launch plan's interrupt bytes to its stdin, `signal-int` sends it `SIGINT`, and `unsupported` kills it outright. A graceful interrupt gets the interrupt grace above. The task is `TASK_STATE_CANCELED` either way, and the capsule, its queue and its conversation keep going. |
-| Result | The harness's final result text is written to `out/result.txt`. A turn the harness reports as failed is [`E-RUN-033`](diagnostics.md#e-run-033), naming why. |
+| Result | The harness's final result text is written to `out/result.txt` in the session's [records directory](workdir.md#records-directory). A turn the harness reports as failed is [`E-RUN-033`](diagnostics.md#e-run-033), naming why. |
 | Observability | Session, inference and tool hooks, `trace.jsonl` and OTel spans are all emitted normally. |
 | Token counts | The harness's own, as its driver reports them, in the `inference` line's `input_tokens` and `output_tokens` — this transport has no runtime estimate, so `input_tokens_actual` and `output_tokens_actual` stay absent. A driver that reports no usage leaves both counts absent, which is not the same as zero. |
 | Spend ceilings | [`inference.max_session_tokens`](#inference-max-session-tokens) and [`spend.machine_tokens_per_day`](config.md#spend) are enforced against those reported counts. |
@@ -1852,7 +1852,7 @@ Rules:
 
 - **At most one prompt source.** Setting more than one of `system_prompt`, `system_prompt_file`
   and [`system_prompt_artifact`](#inference-system-prompt-artifact) fails with `E-MAN-003`.
-- **File paths are relative to the directory containing `murmur.yaml`**, not to the session workdir.
+- **File paths are relative to the directory containing `murmur.yaml`**, not to the work folder.
 - **The file is read once at launch**, before any inference call. If it is missing or unreadable,
   `mur run` exits with `E-RUN-009` before making any API call.
 - **File content is used verbatim** — whitespace is preserved and no trimming is applied. Inline
@@ -2177,7 +2177,7 @@ that the block can travel that way:
 | The serialized JSON is at most 65536 bytes | [`E-CAP-010`](diagnostics.md#e-cap-010) |
 
 A block that breaks any of these fails at staging, before any registry pull, workdir creation or
-component instantiation, and leaves no session workdir behind. `mur run --explain-scope` refuses
+component instantiation, and leaves no work folder or records directory behind. `mur run --explain-scope` refuses
 the same blocks with the same code. An oversized block is refused rather than truncated, and the
 message names both the size it serialized to and the limit.
 
@@ -2256,7 +2256,7 @@ Three stores grow as capsules run:
 
 | Store | Bounded by | Enforced | Each deletion is reported as |
 |---|---|---|---|
-| Sessions: each [records directory](workdir.md#records-directory) under `~/.murmur/records/` and its session workdir | `trace.retain` | At launch, by the runtime | A [`retention` event](observability-schemas.md#retention) in the running session's trace |
+| Sessions: each [records directory](workdir.md#records-directory) under `~/.murmur/records/`, and the work folder the runtime created for a launch without `--workdir` | `trace.retain` | At launch, by the runtime | A [`retention` event](observability-schemas.md#retention) in the running session's trace |
 | [Conversation records](workdir.md#the-conversation-record) under `~/.murmur/conversations/` | `context.retain` | At launch, by the runtime | A `retention` event in the running session's trace |
 | [Formation directories](roster.md#formation-retention) under `~/.murmur/formations/`, each with its records subtree under `~/.murmur/records/` | The roster entry member's `trace.retain` | At the end of every `mur run --roster`, by the launcher | A `[mur run] retention:` line on the launcher's stderr |
 
@@ -2276,7 +2276,7 @@ seconds.
 
 | Key | Age is measured from | Unit removed |
 |---|---|---|
-| `trace.retain.max_sessions` | — | One session, whole: its records directory and its session workdir |
+| `trace.retain.max_sessions` | — | One session, whole: its records directory and, without `--workdir`, its work folder |
 | `trace.retain.max_age` | The uuid-v7 timestamp inside the `ses_` id | One session, whole |
 | `trace.retain.max_sessions`, on an entry member | — | One formation directory and its records subtree, whole |
 | `trace.retain.max_age`, on an entry member | The uuid-v7 timestamp inside the `frm_` id | One formation directory and its records subtree, whole |
@@ -2284,7 +2284,7 @@ seconds.
 | `context.retain.max_age` | The last write to `conversation.jsonl` | One context directory, whole |
 
 A session is an independent unit — nothing references it and nothing spans two of them — so it is
-removed whole: its records directory, with `trace.jsonl` and `blobs/`, and its session workdir. The
+removed whole: its records directory, with its `trace.jsonl`, `blobs/`, `out/`, `home/`, `tmp/` and `children/`, and, for a launch without `--workdir`, its work folder `<manifest-dir>/workdir/<session-id>`. The
 decision is made on the records group's `ses_*` names. A record is one unit
 that grows, so it is trimmed from the front: the newest `max_messages` stay, each keeping the `id`
 it has always carried, and the [header line](workdir.md#record-header) records what went.
@@ -2565,7 +2565,7 @@ record, which [`context.record`](#context-record) is what turns off.
 | Value | Behaviour |
 |---|---|
 | `stateless` (default) | Every task starts with an empty message history. The `contextId` on the incoming message is recorded but has no effect on context. |
-| `threaded` | A task that arrives with a `contextId` starts from the whole [conversation record](workdir.md#the-conversation-record) for that context, including messages an earlier session wrote. Each completed task also writes a per-task result to `workdir/out/result_<taskId>.txt` alongside the shared `workdir/out/result.txt`. |
+| `threaded` | A task that arrives with a `contextId` starts from the whole [conversation record](workdir.md#the-conversation-record) for that context, including messages an earlier session wrote. Each completed task also writes a per-task result to `out/result_<taskId>.txt` in the session's [records directory](workdir.md#records-directory), alongside the shared `out/result.txt`. |
 
 Under [`transport: process`](#transport-process) the harness holds the conversation, so the setting
 decides what the harness is handed rather than what the runtime loads: `stateless` launches it on a
@@ -2596,7 +2596,7 @@ How long a capsule waits for the next A2A message depends on the lifecycle it de
 | Lifecycle | Behaviour when no message arrives |
 |---|---|
 | `task_acceptance: queue` with `after_task: sleep` | Waits indefinitely. Shutdown is the host's responsibility. |
-| Every other combination | Waits 30 seconds for a task when the launch was given none — no `--task`, and no `task.md` or `input.txt` in the accessible workdir when it started. If none arrives, the session ends without calling the model. |
+| Every other combination | Waits 30 seconds for a task when the launch was given none — no `--task`, and no `task.md` or `input.txt` in the work folder when it started. If none arrives, the session ends without calling the model. |
 
 Set the `MURMUR_A2A_TIMEOUT_SECS` environment variable to change the 30-second window.
 

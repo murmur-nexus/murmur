@@ -159,7 +159,8 @@ impl Run {
     }
 
     fn result(&self) -> String {
-        fs::read_to_string(self.workdir().join("out/result.txt")).unwrap_or_else(|err| {
+        let records = common::parse_records_from_stdout(&self.stdout);
+        fs::read_to_string(records.join("out/result.txt")).unwrap_or_else(|err| {
             panic!(
                 "no out/result.txt ({err}); stdout:\n{}\nstderr:\n{}",
                 self.stdout, self.stderr
@@ -346,8 +347,8 @@ fn session_ceiling_stops_the_task() {
     let home = home_with_driver();
 
     let control_server = common::ScriptedServer::start(two_turns());
-    // Bound, not passed inline: the project directory holds the session workdir the trace is
-    // read from, and a temporary would delete it before the assertions run.
+    // Bound, not passed inline: the project directory holds the work folder whose records group
+    // the trace is read from, and a temporary would delete it before the assertions run.
     let control_project = project(&http_manifest(
         "spend-capsule",
         &control_server.endpoint,
@@ -954,7 +955,7 @@ fn unusable_ledger_refuses_launch() {
     let workdirs = project.dir.path().join("workdir");
     assert!(
         fs::read_dir(&workdirs).map_or(true, |mut entries| entries.next().is_none()),
-        "a session workdir was created"
+        "a work folder was created"
     );
 }
 
@@ -1489,7 +1490,7 @@ fn process_ceiling_against_an_unreporting_driver_is_refused() {
             "{label}: {}",
             run.stderr
         );
-        // Nothing was spawned and no session workdir was left behind.
+        // Nothing was spawned and no work folder was left behind.
         assert!(!run.stdout.contains("workdir: "), "{label}: {}", run.stdout);
     }
 

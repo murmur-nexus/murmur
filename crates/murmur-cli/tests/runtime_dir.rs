@@ -332,6 +332,7 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
         Some(workdir.path()),
     );
     let runtime_dir = staged.runtime_dir.clone();
+    let records_dir = staged.records_dir.clone();
     fs::write(workdir.path().join("task.md"), TASK).unwrap();
 
     // The native tool's own write probe on every runtime file, its own entrypoint included,
@@ -484,7 +485,11 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
         "{root}"
     );
     if floor == ContainmentClass::Sealed {
-        assert!(root.contains(".capsule-home"), "{root}");
+        let home = records_dir.join("home");
+        assert!(
+            root.contains(&format!(":{}:", home.display())),
+            "the synthetic passwd names the session's home folder: {root}"
+        );
     }
     for name in [
         "tools",
@@ -493,15 +498,13 @@ fn commands_cannot_change_the_runtime_files(test: &str, floor: ContainmentClass)
         "murmur.yaml",
         ".mur-etc",
         "created",
+        ".murmur",
+        ".capsule-home",
     ] {
         assert!(
             !workdir.path().join(name).exists(),
             "the workdir gained {name}"
         );
-        let session = common::sessions_under(&workdir.path().join(".murmur"));
-        for session in session {
-            assert!(!session.join(name).exists(), "the session gained {name}");
-        }
     }
     assert_eq!(
         fs::read_to_string(workdir.path().join("task.md")).unwrap(),
@@ -636,7 +639,7 @@ fn pulled_tool_cannot_be_rewritten(test: &str, floor: ContainmentClass) {
         floor,
         Some(workdir.path()),
     );
-    let session = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
     let staged_runtime_dir = staged.runtime_dir.clone();
     fs::write(workdir.path().join("task.md"), "Pull the fixture.").unwrap();
     let pulled_entrypoint = staged_runtime_dir.join(format!("tools/{PULLED_TOOL}/{PULLED_TOOL}"));
@@ -712,10 +715,11 @@ fn pulled_tool_cannot_be_rewritten(test: &str, floor: ContainmentClass) {
     assert_eq!(probe["ok"], true, "the tool answers as itself: {probe}");
     assert!(probe.to_string().contains("inside text"));
     assert!(
-        !session.join("tools").exists(),
-        "the session workdir has no tools/"
+        !records_dir.join("tools").exists(),
+        "the records directory has no tools/"
     );
     assert!(!workdir.path().join("tools").exists());
+    assert!(!workdir.path().join(".murmur").exists());
 }
 
 #[test]
@@ -1005,7 +1009,7 @@ fn runtime_dir_murmur_md_and_the_capsule_block_name_the_runtime_dir() {
         );
         let runtime_dir = staged.runtime_dir.clone();
         let murmur_md = fs::read_to_string(runtime_dir.join("MURMUR.md")).unwrap();
-        assert!(!staged.workdir.join("MURMUR.md").exists());
+        assert!(!staged.records_dir.join("MURMUR.md").exists());
         assert!(!workdir.path().join("MURMUR.md").exists());
         assert!(
             murmur_md.contains(&runtime_dir.display().to_string()),
@@ -1371,12 +1375,15 @@ fn cat_murmur_md(index: usize) -> String {
     )
 }
 
-/// Under `--workdir` the guard measures `.murmur/<session-id>` beneath the work folder, not the
-/// work folder itself, so neither the block nor MURMUR.md states a ceiling for it.
+/// MURMUR.md's line for a 1 MiB `workdir_max_bytes`.
+const CEILING_LINE: &str = "\n- 1 MiB across the work folder, $HOME and $TMPDIR\n";
+
+/// Under `--workdir` the guard measures the operator's work folder with the session's `home/` and
+/// `tmp/`, so MURMUR.md states the ceiling there too, and the `[Capsule]` block states none.
 #[test]
 #[allow(clippy::print_stdout)]
-fn work_folder_ceiling_is_not_claimed_under_workdir() {
-    if common::skip_without_host_support("work_folder_ceiling_is_not_claimed_under_workdir") {
+fn work_folder_ceiling_is_stated_under_workdir() {
+    if common::skip_without_host_support("work_folder_ceiling_is_stated_under_workdir") {
         return;
     }
     let server = common::ScriptedServer::start(vec![cat_murmur_md(1), end_turn("done")]);
@@ -1399,10 +1406,16 @@ fn work_folder_ceiling_is_not_claimed_under_workdir() {
     let block = block_of(&server.requests()[0]);
     println!("── [Capsule] block\n{block}");
     let murmur_md = result_text(&server, "toolu_md");
-    assert!(murmur_md.contains("\n## Limits\n"), "{murmur_md}");
-    for text in [&block, &murmur_md] {
-        assert!(!text.contains("in the work folder"), "{text}");
-    }
+    assert!(
+        md_section(&murmur_md, "Limits").contains(CEILING_LINE),
+        "{murmur_md}"
+    );
+    assert!(!block.contains("across the work folder"), "{block}");
+    assert_eq!(
+        fs::read_dir(workdir.path()).unwrap().count(),
+        0,
+        "the work folder gains nothing"
+    );
 }
 
 /// Without `--workdir` the guard measures the work folder, MURMUR.md states its ceiling, and a
@@ -1441,10 +1454,10 @@ fn work_folder_ceiling_stated_without_workdir_is_enforced() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     println!("── stderr\n{stderr}");
     let block = block_of(&server.requests()[0]);
-    assert!(!block.contains("in the work folder"), "{block}");
+    assert!(!block.contains("across the work folder"), "{block}");
     let murmur_md = result_text(&server, "toolu_md");
     assert!(
-        md_section(&murmur_md, "Limits").contains("\n- 1 MiB in the work folder\n"),
+        md_section(&murmur_md, "Limits").contains(CEILING_LINE),
         "{murmur_md}"
     );
     assert!(!output.status.success(), "the breach fails the run");
@@ -1831,7 +1844,7 @@ fn runtime_dir_is_private_locked_while_held_and_removed_when_the_session_ends() 
         !lock_is_free(&session_dir.join(".lock")),
         "the live session holds its lock"
     );
-    fs::write(staged.workdir.join("task.md"), TASK).unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), TASK).unwrap();
     launch_session(staged, |_| {}).expect("the session runs");
     assert!(!session_dir.exists(), "removed after a successful run");
 
@@ -1846,7 +1859,7 @@ fn runtime_dir_is_private_locked_while_held_and_removed_when_the_session_ends() 
         None,
     );
     let session_dir = staged.runtime_dir.parent().unwrap().to_path_buf();
-    fs::write(staged.workdir.join("task.md"), TASK).unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), TASK).unwrap();
     let _ = launch_session(staged, |_| {});
     assert!(!session_dir.exists(), "removed after a failed task");
 
@@ -2225,7 +2238,7 @@ fn runtime_dir_workdir_identity_mismatch_refuses_before_writing() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("the delegating capsule's workdir changed under .murmur/children"),
+        stderr.contains("the delegating capsule's child work folder in children/ changed"),
         "{stderr}"
     );
     assert_eq!(

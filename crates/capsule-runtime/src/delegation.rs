@@ -246,8 +246,8 @@ impl Reporter {
 /// What a delegation left behind: the notification the parent receives, and the shape of
 /// [`COMPLETION_FILE`].
 ///
-/// Carries no output. The child's result is on disk at [`Self::result_path`], relative to
-/// [`Self::workdir`], and the parent is told where, never what.
+/// Carries no output. The child's result is on disk at [`Self::result_path`], and the parent is
+/// told where, never what.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegationOutcome {
     /// The id the parent's launcher minted, injected into the child and echoed back here.
@@ -257,13 +257,13 @@ pub struct DelegationOutcome {
     /// The child's own session, so its trace is findable.
     pub session_id: String,
     pub status: DelegationStatus,
-    /// Workdir-relative, `out/result.txt` for a capsule that wrote its result where the runtime
-    /// writes one. Absent when the child wrote none — a terminal path that failed without result
-    /// text legitimately leaves no file.
+    /// Absolute: `out/result.txt` in the child's records directory for an agent capsule, or in its
+    /// work folder for a script capsule, which writes its own. Absent when the child wrote none —
+    /// a terminal path that failed without result text legitimately leaves no file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_path: Option<String>,
-    /// The child's directory, absolute — the root [`Self::result_path`] is relative to.
-    /// [`COMPLETION_FILE`] itself sits in the child's records directory.
+    /// The child's work folder, absolute. [`COMPLETION_FILE`] sits in the child's records
+    /// directory.
     pub workdir: String,
     pub duration_ms: u64,
     /// Present only for a `crashed` or `terminated` outcome: the exit status, and for a crash the
@@ -301,7 +301,7 @@ impl DelegationOutcome {
             self.workdir,
         );
         match &self.result_path {
-            Some(path) => text.push_str(&format!("result: {path} (in that workdir)")),
+            Some(path) => text.push_str(&format!("result: {path}")),
             None => text.push_str("result: none (the child wrote no result file)"),
         }
         if let Some(detail) = &self.detail {
@@ -387,41 +387,74 @@ pub(crate) fn bound_detail(detail: String) -> String {
     format!("{} […]", &detail[..end])
 }
 
-/// Where a finished child may have left its answer, most specific first.
+/// Where a finished child may have left its answer, most specific first, as absolute paths.
 ///
 /// A capsule that stays up for more than one task overwrites the unsuffixed file, so the per-task
-/// one is preferred; and the agent loop writes into the session directory beneath the child's
-/// workdir while a script capsule writes into that workdir directly. One rule, read by the
-/// delegating plane when it takes the answer and by the completion watcher when it names the file
-/// it did not read.
+/// one is preferred; and the agent loop writes into the child's records directory while a script
+/// capsule writes into its work folder directly. One rule, read by the delegating plane when it
+/// takes the answer and by the completion watcher when it names the file it did not read.
 pub fn child_result_candidates(
+    child_records_dir: &Path,
     child_workdir: &Path,
-    session_id: &str,
     task_id: &str,
 ) -> [PathBuf; 4] {
-    let session_out = child_workdir.join(".murmur").join(session_id).join("out");
-    let workdir_out = child_workdir.join("out");
-    let per_task = format!("result_{task_id}.txt");
+    child_result_relatives(task_id).map(|(in_records, relative)| {
+        if in_records {
+            child_records_dir
+        } else {
+            child_workdir
+        }
+        .join(relative)
+    })
+}
+
+/// [`child_result_candidates`], each relative to the directory it lies in and `true` when that is
+/// the child's records directory.
+fn child_result_relatives(task_id: &str) -> [(bool, String); 4] {
+    let per_task = format!(
+        "{}/result_{task_id}.txt",
+        crate::records_dir::RESULTS_SUBDIR
+    );
+    let unsuffixed = crate::records_dir::RESULT_FILE.to_string();
     [
-        session_out.join(&per_task),
-        session_out.join("result.txt"),
-        workdir_out.join(&per_task),
-        workdir_out.join("result.txt"),
+        (true, per_task.clone()),
+        (true, unsuffixed.clone()),
+        (false, per_task),
+        (false, unsuffixed),
     ]
 }
 
-/// The first of [`child_result_candidates`] that is a regular file beneath `root`, or `None` when
-/// the child wrote no result. `child_workdir` is relative to `root`; a link where a candidate
-/// belongs is skipped, never followed.
+/// [`child_result_candidates`], each paired with the held root it is read through:
+/// `child_records`, the child's records directory, or `child_workdir`, its work folder.
+pub(crate) fn child_result_reads<'a>(
+    child_records: &'a WorkdirRoot,
+    child_workdir: &'a WorkdirRoot,
+    task_id: &str,
+) -> impl Iterator<Item = (&'a WorkdirRoot, String)> {
+    child_result_relatives(task_id)
+        .into_iter()
+        .map(move |(in_records, relative)| {
+            (
+                if in_records {
+                    child_records
+                } else {
+                    child_workdir
+                },
+                relative,
+            )
+        })
+}
+
+/// The first of [`child_result_candidates`] that is a regular file, absolute, or `None` when the
+/// child wrote no result. A link where a candidate belongs is skipped, never followed.
 pub fn child_result_path(
-    root: &WorkdirRoot,
-    child_workdir: &Path,
-    session_id: &str,
+    child_records: &WorkdirRoot,
+    child_workdir: &WorkdirRoot,
     task_id: &str,
 ) -> Option<PathBuf> {
-    child_result_candidates(child_workdir, session_id, task_id)
-        .into_iter()
-        .find(|path| matches!(root.entry_kind(path), Ok(Some(EntryKind::File))))
+    child_result_reads(child_records, child_workdir, task_id)
+        .find(|(root, relative)| matches!(root.entry_kind(relative), Ok(Some(EntryKind::File))))
+        .map(|(root, relative)| root.host_path(&relative))
 }
 
 /// The completion the child recorded, or `None` when it recorded none.
@@ -607,8 +640,8 @@ mod tests {
             capsule_version: "0.1.0".to_string(),
             session_id: "ses_child".to_string(),
             status: DelegationStatus::Ok,
-            result_path: Some("out/result.txt".to_string()),
-            workdir: "/tmp/parent/.murmur/children/worker-abc".to_string(),
+            result_path: Some("/records/worker-abc/ses_child/out/result.txt".to_string()),
+            workdir: "/records/ses_parent/children/worker-abc".to_string(),
             duration_ms: 42,
             detail: None,
             reported_by: Reporter::Child,
@@ -700,7 +733,10 @@ mod tests {
         assert!(text.contains("capsule: worker@0.1.0"), "{text}");
         assert!(text.contains("session_id: ses_child"), "{text}");
         assert!(text.contains("status: ok"), "{text}");
-        assert!(text.contains("result: out/result.txt"), "{text}");
+        assert!(
+            text.contains("result: /records/worker-abc/ses_child/out/result.txt"),
+            "{text}"
+        );
         assert!(text.contains("not reproduced here"), "{text}");
 
         let mut none = outcome();
@@ -802,7 +838,10 @@ mod tests {
         assert_eq!(read.delegation_id, written.delegation_id);
         assert_eq!(read.status, DelegationStatus::Ok);
         assert!(read.delivered);
-        assert_eq!(read.result_path.as_deref(), Some("out/result.txt"));
+        assert_eq!(
+            read.result_path.as_deref(),
+            Some("/records/worker-abc/ses_child/out/result.txt")
+        );
 
         // An absent field is omitted from the file rather than written as null.
         let raw = std::fs::read_to_string(dir.path().join(COMPLETION_FILE)).unwrap();

@@ -308,40 +308,6 @@ impl WorkdirRoot {
         })
     }
 
-    /// The session root `.murmur/<session_id>` beneath this accessible root, created if absent
-    /// and reached with no link followed.
-    ///
-    /// The returned root holds its own descriptor, so swapping `.murmur` or the session directory
-    /// for a link afterwards does not redirect anything written through it.
-    pub fn session_beneath(&self, session_id: &str) -> Result<Self, WorkdirError> {
-        let rel = format!(".murmur/{session_id}");
-        let segments = self.segments(&rel, WorkdirOperation::CreateDir)?;
-        let held = self.retry_if_removed(|| {
-            self.walk(
-                &rel,
-                &segments,
-                segments.len(),
-                WorkdirOperation::CreateDir,
-                Some(DEFAULT_DIR_MODE),
-            )
-        })?;
-        let Some(Held::Opened(fd)) = held else {
-            unreachable!("a walk that creates always reaches its last segment")
-        };
-        Ok(Self {
-            anchor: Arc::new(Anchor {
-                fd: Mutex::new(Arc::new(fd)),
-                path: self.anchor.path.join(".murmur").join(session_id),
-                prefix: self.display(&rel),
-                origin: Origin::Beneath {
-                    from: self.clone(),
-                    rel,
-                },
-            }),
-            latch: Arc::clone(&self.latch),
-        })
-    }
-
     /// The existing directory `rel` beneath this root as a root of its own, reached with no link
     /// followed and sharing this root's latch, or `None` when it or a parent is absent.
     pub fn open_beneath(&self, rel: &str) -> Result<Option<Self>, WorkdirError> {
@@ -1454,11 +1420,19 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"the task");
     }
 
+    /// `records/ses_test` beneath `root`, created and held as a root of its own.
+    fn held_beneath(root: &WorkdirRoot) -> Result<WorkdirRoot, WorkdirError> {
+        root.create_dir_all("records/ses_test", DEFAULT_DIR_MODE)?;
+        Ok(root
+            .open_beneath("records/ses_test")?
+            .expect("the directory was just created"))
+    }
+
     #[test]
-    fn a_murmur_link_planted_after_the_session_root_is_held_redirects_nothing() {
+    fn a_link_planted_after_a_root_beneath_is_held_redirects_nothing() {
         let fixture = fixture();
-        let session = fixture.root.session_beneath("ses_test").unwrap();
-        let murmur = fixture.workdir.join(".murmur");
+        let session = held_beneath(&fixture.root).unwrap();
+        let murmur = fixture.workdir.join("records");
         std::fs::rename(&murmur, fixture.workdir.join("moved")).unwrap();
         symlink(&fixture.outside, &murmur).unwrap();
         let before = fixture.outside_snapshot();
@@ -1473,23 +1447,23 @@ mod tests {
     }
 
     #[test]
-    fn a_session_root_refusal_names_the_path_from_the_accessible_workdir_and_shares_the_latch() {
+    fn a_refusal_beneath_a_held_root_names_the_path_from_its_parent_and_shares_the_latch() {
         let fixture = fixture();
-        let session = fixture.root.session_beneath("ses_test").unwrap();
+        let session = held_beneath(&fixture.root).unwrap();
         symlink(
             &fixture.outside,
-            fixture.workdir.join(".murmur/ses_test/plans"),
+            fixture.workdir.join("records/ses_test/plans"),
         )
         .unwrap();
         let error = session
             .write_file("plans/plan-1.json", b"{}", 0o644)
             .unwrap_err();
         let refusal = refusal_of(&error);
-        assert_eq!(refusal.path, ".murmur/ses_test/plans/plan-1.json");
-        assert_eq!(refusal.refused_at, ".murmur/ses_test/plans");
+        assert_eq!(refusal.path, "records/ses_test/plans/plan-1.json");
+        assert_eq!(refusal.refused_at, "records/ses_test/plans");
         assert_eq!(
             error.to_string(),
-            "refused to write .murmur/ses_test/plans/plan-1.json: .murmur/ses_test/plans is a \
+            "refused to write records/ses_test/plans/plan-1.json: records/ses_test/plans is a \
              symbolic link inside the workdir"
         );
         assert_eq!(fixture.root.take_refusals(), vec![refusal.clone()]);
@@ -1497,23 +1471,23 @@ mod tests {
     }
 
     #[test]
-    fn a_murmur_link_at_session_derivation_is_refused() {
+    fn a_link_at_derivation_of_a_root_beneath_is_refused() {
         let fixture = fixture();
-        symlink(&fixture.outside, fixture.workdir.join(".murmur")).unwrap();
-        let error = fixture.root.session_beneath("ses_test").unwrap_err();
+        symlink(&fixture.outside, fixture.workdir.join("records")).unwrap();
+        let error = held_beneath(&fixture.root).unwrap_err();
         let refusal = refusal_of(&error);
-        assert_eq!(refusal.refused_at, ".murmur");
+        assert_eq!(refusal.refused_at, "records");
         assert_eq!(refusal.operation, WorkdirOperation::CreateDir);
         assert_eq!(std::fs::read_dir(&fixture.outside).unwrap().count(), 1);
     }
 
     #[test]
-    fn a_removed_session_directory_is_walked_to_again_before_a_write() {
+    fn a_removed_directory_beneath_is_walked_to_again_before_a_write() {
         for nlink_unreliable in [false, true] {
             NLINK_UNRELIABLE.with(|cell| cell.set(nlink_unreliable));
             let fixture = fixture();
-            let session = fixture.root.session_beneath("ses_test").unwrap();
-            std::fs::remove_dir_all(fixture.workdir.join(".murmur")).unwrap();
+            let session = held_beneath(&fixture.root).unwrap();
+            std::fs::remove_dir_all(fixture.workdir.join("records")).unwrap();
 
             session
                 .write_file("out/result.txt", b"answer", 0o644)
@@ -1525,27 +1499,27 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                std::fs::read(fixture.workdir.join(".murmur/ses_test/out/result.txt")).unwrap(),
+                std::fs::read(fixture.workdir.join("records/ses_test/out/result.txt")).unwrap(),
                 b"answer"
             );
             assert!(fixture
                 .workdir
-                .join(".murmur/ses_test/logs/bootstrap.log")
+                .join("records/ses_test/logs/bootstrap.log")
                 .is_file());
             assert!(fixture.root.take_refusals().is_empty());
         }
         NLINK_UNRELIABLE.with(|cell| cell.set(false));
     }
 
-    /// A session directory moved aside, not removed, stays the one written to, with no probe
+    /// A directory beneath moved aside, not removed, stays the one written to, with no probe
     /// left behind in it.
     #[test]
-    fn a_moved_session_directory_is_still_the_one_written_to() {
+    fn a_moved_directory_beneath_is_still_the_one_written_to() {
         NLINK_UNRELIABLE.with(|cell| cell.set(true));
         let fixture = fixture();
-        let session = fixture.root.session_beneath("ses_test").unwrap();
+        let session = held_beneath(&fixture.root).unwrap();
         std::fs::rename(
-            fixture.workdir.join(".murmur"),
+            fixture.workdir.join("records"),
             fixture.workdir.join("moved"),
         )
         .unwrap();
@@ -1559,7 +1533,7 @@ mod tests {
             std::fs::read(fixture.workdir.join("moved/ses_test/out/result.txt")).unwrap(),
             b"answer"
         );
-        assert!(!fixture.workdir.join(".murmur").exists());
+        assert!(!fixture.workdir.join("records").exists());
         let names: Vec<_> = std::fs::read_dir(fixture.workdir.join("moved/ses_test"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -1568,20 +1542,20 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_session_directory_replaced_by_a_link_is_refused() {
+    fn a_removed_directory_beneath_replaced_by_a_link_is_refused() {
         for nlink_unreliable in [false, true] {
             NLINK_UNRELIABLE.with(|cell| cell.set(nlink_unreliable));
             let fixture = fixture();
-            let session = fixture.root.session_beneath("ses_test").unwrap();
-            std::fs::remove_dir_all(fixture.workdir.join(".murmur")).unwrap();
-            std::os::unix::fs::symlink(&fixture.outside, fixture.workdir.join(".murmur")).unwrap();
+            let session = held_beneath(&fixture.root).unwrap();
+            std::fs::remove_dir_all(fixture.workdir.join("records")).unwrap();
+            std::os::unix::fs::symlink(&fixture.outside, fixture.workdir.join("records")).unwrap();
             let before = fixture.outside_snapshot();
 
             let error = session
                 .write_file("out/result.txt", b"answer", 0o644)
                 .unwrap_err();
 
-            assert_eq!(refusal_of(&error).refused_at, ".murmur");
+            assert_eq!(refusal_of(&error).refused_at, "records");
             assert_eq!(fixture.outside_snapshot(), before);
         }
         NLINK_UNRELIABLE.with(|cell| cell.set(false));

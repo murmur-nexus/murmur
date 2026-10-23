@@ -262,7 +262,7 @@ fn run_session_with(
         plan_submit,
     );
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let records_dir = staged.records_dir.clone();
     fs::write(workdir.join("task.md"), "Do the thing.").unwrap();
 

@@ -194,7 +194,7 @@ fn murmur_md_has_identity_section_with_correct_values() {
     let staged = stage_agent(&home, &manifest_path);
     snapshot.watch(&staged);
     let session_id = staged.session_id.clone();
-    fs::write(staged.workdir.join("task.md"), "Identity test").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Identity test").unwrap();
 
     let _launched = launch_session(staged, |_| {}).expect("launch should succeed");
 
@@ -264,7 +264,11 @@ fn identity_env_vars_are_visible_to_shell_tool() {
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path);
     let session_id = staged.session_id.clone();
-    fs::write(staged.workdir.join("task.md"), "Echo identity env.").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Echo identity env.",
+    )
+    .unwrap();
 
     launch_session(staged, |_| {}).expect("launch should succeed");
 
@@ -289,7 +293,7 @@ fn agent_card_served_at_well_known_path() {
     let staged = stage_agent(&home, &manifest_path);
     let staged_session_id = staged.session_id.clone();
 
-    fs::write(staged.workdir.join("task.md"), "Agent card test").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Agent card test").unwrap();
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let handle = std::thread::spawn(move || {
@@ -337,7 +341,7 @@ fn agent_card_served_at_well_known_path() {
 
     let launched = handle.join().expect("launch thread should not panic");
     assert!(
-        launched.workdir.join("out/result.txt").exists(),
+        launched.records_dir.join("out/result.txt").exists(),
         "result.txt should exist after agent completes"
     );
 }
@@ -351,7 +355,7 @@ fn agent_card_returns_404_for_unknown_path() {
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
 
     let staged = stage_agent(&home, &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "404 test").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "404 test").unwrap();
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let handle = std::thread::spawn(move || {
@@ -394,11 +398,11 @@ fn two_concurrent_sessions_have_distinct_capsule_urls_and_session_ids() {
         "two sessions must have distinct session IDs"
     );
 
-    let workdir1 = staged1.workdir.clone();
-    let workdir2 = staged2.workdir.clone();
+    let workdir1 = staged1.accessible_workdir.clone();
+    let workdir2 = staged2.accessible_workdir.clone();
 
-    fs::write(staged1.workdir.join("task.md"), "Concurrent 1").unwrap();
-    fs::write(staged2.workdir.join("task.md"), "Concurrent 2").unwrap();
+    fs::write(staged1.accessible_workdir.join("task.md"), "Concurrent 1").unwrap();
+    fs::write(staged2.accessible_workdir.join("task.md"), "Concurrent 2").unwrap();
 
     let h1 = std::thread::spawn(move || {
         launch_session(staged1, |_| {}).expect("session 1 should launch")
@@ -440,10 +444,10 @@ fn http_server_not_reachable_after_session_ends() {
     // own listener and nothing else.
     let staged = stage_agent_with_port(&home, &manifest_path, Some(common::free_port()));
     snapshot.watch(&staged);
-    let workdir_for_thread = staged.workdir.clone();
+    let workdir_for_thread = staged.accessible_workdir.clone();
     fs::write(workdir_for_thread.join("task.md"), "shutdown test").unwrap();
 
-    let staged_workdir = staged.workdir.clone();
+    let staged_workdir = staged.accessible_workdir.clone();
     let _launched = launch_session(staged, |_| {}).expect("launch should succeed");
 
     let content = snapshot.content();

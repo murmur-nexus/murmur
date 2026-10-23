@@ -757,7 +757,7 @@ fn subscribe_refused_before_any_stream() {
         "lifecycle:\n  task_acceptance: none\n  after_task: exit\n",
     );
     let staged = stage_door(&home, &project.path().join("murmur.yaml"), None);
-    fs::write(staged.workdir.join("task.md"), "Run the task").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Run the task").unwrap();
     let addr = launch_door(staged);
     let card = request(&addr, "GET", "/.well-known/agent-card.json", &[], "").json();
     assert_eq!(card["capabilities"]["streaming"], false, "{card}");

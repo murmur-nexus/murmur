@@ -518,11 +518,9 @@ impl Drop for MockEndpoint {
 struct E2eCapsule {
     /// `host:port` of the capsule's A2A door.
     url: String,
-    /// The internal session workdir — where `out/` is written.
-    workdir: PathBuf,
-    /// The session's records directory — where `trace.jsonl` is written.
+    /// The session's records directory — where `trace.jsonl` and `out/` are written.
     records_dir: PathBuf,
-    /// The git repository the capsule edits, mounted as its accessible workdir.
+    /// The git repository the capsule edits, its work folder.
     repo: PathBuf,
     /// The context every task in this capsule is sent under, so they share one harness session.
     context_id: String,
@@ -555,7 +553,6 @@ impl E2eCapsule {
         std::env::set_var(BASE_URL_ENV, mock.base_url());
 
         let staged = stage(&home, &manifest_path, &repo);
-        let workdir = staged.workdir.clone();
         let records_dir = staged.records_dir.clone();
         let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
@@ -569,7 +566,6 @@ impl E2eCapsule {
 
         Self {
             url,
-            workdir,
             records_dir,
             repo,
             context_id: format!("ctx-{name}"),
@@ -663,21 +659,16 @@ impl E2eCapsule {
 
     /// Every path of repository content, relative, sorted — what a case compares before and after.
     ///
-    /// `.git` and `.murmur` are skipped. Neither is content a coding task edits: the first is the
-    /// repository's own store, and the second is the session workdir the runtime creates under
-    /// the capsule's accessible directory, holding `out/`. Counting either would make "the run
-    /// wrote only what the tool call asked for" a statement about murmur's bookkeeping rather than
-    /// about the repository.
+    /// `.git` is skipped: it is the repository's own store, not content a coding task edits.
+    /// Everything else counts, so anything the runtime wrote into its work folder would show up
+    /// as a path the tool call never asked for.
     fn repo_tree(&self) -> Vec<String> {
         let mut found = Vec::new();
         let mut stack = vec![self.repo.clone()];
         while let Some(dir) = stack.pop() {
             for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
                 let path = entry.path();
-                if path
-                    .file_name()
-                    .is_some_and(|name| name == ".git" || name == ".murmur")
-                {
+                if path.file_name().is_some_and(|name| name == ".git") {
                     continue;
                 }
                 if path.is_dir() {
@@ -1182,7 +1173,8 @@ fn a_second_task_in_the_same_context_resumes_the_same_session() {
 
     // Murmur keeps no message list on this transport, so there is nothing of its own to carry.
     assert!(
-        !capsule.workdir.join("conversation.jsonl").exists(),
+        !capsule.records_dir.join("conversation.jsonl").exists()
+            && !capsule.repo.join("conversation.jsonl").exists(),
         "transport: process wrote a conversation record"
     );
 }
@@ -1299,7 +1291,7 @@ fn assert_turn_failure(name: &str, scenario: &str, kind: &str) {
     );
 
     // The endpoint's error body is not an answer, and must not have been written as one.
-    let result = capsule.workdir.join("out").join("result.txt");
+    let result = capsule.records_dir.join("out").join("result.txt");
     if let Ok(text) = fs::read_to_string(&result) {
         assert!(
             !text.contains("MOCK:"),

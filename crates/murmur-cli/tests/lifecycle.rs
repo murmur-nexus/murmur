@@ -230,7 +230,7 @@ fn lifecycle_none_rejects_message_send() {
         None,
     );
     // Write task.md so the agent loop runs (giving us a window to send HTTP requests)
-    fs::write(staged.workdir.join("task.md"), "Run the task").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Run the task").unwrap();
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let handle = std::thread::spawn(move || {
@@ -611,7 +611,7 @@ fn lifecycle_override_forces_none() {
             after_task: None,
         }),
     );
-    fs::write(staged.workdir.join("task.md"), "Override task").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Override task").unwrap();
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let handle = std::thread::spawn(move || {
@@ -1155,7 +1155,7 @@ fn lifecycle_a_command_that_finished_during_teardown_is_reported_with_its_result
         }),
         None,
     );
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let records_dir = staged.records_dir.clone();
     let trace_path = records_dir.join("trace.jsonl");
 
@@ -1698,7 +1698,7 @@ fn lifecycle_a_task_queued_behind_an_exit_task_is_rejected_when_the_session_clos
     fs::write(staged.accessible_workdir.join("task.md"), "Say done.").unwrap();
     let trace_path = staged.records_dir.join("trace.jsonl");
     let session_id = staged.session_id.clone();
-    let sessions_root = staged.workdir.parent().unwrap().to_path_buf();
+    let sessions_root = staged.accessible_workdir.parent().unwrap().to_path_buf();
 
     let (handle, capsule_url) = launch_in_background(staged);
     arrived

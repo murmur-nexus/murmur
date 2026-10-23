@@ -807,8 +807,8 @@ impl ParentConfig {
 
 struct Parent {
     project: PathBuf,
-    session_dir: PathBuf,
-    /// The session's records directory, where its trace is.
+    session_id: String,
+    /// The session's records directory, where its trace and its children's work folders are.
     records_dir: PathBuf,
     /// The session's runtime directory, where its tools are installed. Read while the parent runs.
     runtime_dir: PathBuf,
@@ -903,7 +903,7 @@ impl Parent {
             },
         )
         .expect("staging should succeed");
-        let session_dir = staged.workdir.clone();
+        let session_id = staged.session_id.clone();
         let records_dir = staged.records_dir.clone();
         let runtime_dir = staged.runtime_dir.clone();
         if let Some(task) = &config.task_md {
@@ -923,7 +923,7 @@ impl Parent {
 
         Self {
             project,
-            session_dir,
+            session_id,
             records_dir,
             runtime_dir,
             url,
@@ -933,13 +933,9 @@ impl Parent {
         }
     }
 
-    /// This launch's own session id — the name of the directory staging composed for it.
+    /// This launch's own session id — the name of its records directory.
     fn session_id(&self) -> String {
-        self.session_dir
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned()
+        self.session_id.clone()
     }
 
     fn trace(&self) -> String {
@@ -971,9 +967,10 @@ impl Parent {
         dirs.into_iter().next().unwrap()
     }
 
-    /// The directories the parent composed for its children, if any.
+    /// The directories the parent composed for its children, if any: `children/` of its records
+    /// directory.
     fn child_dirs(&self) -> Vec<PathBuf> {
-        let children = self.project.join(".murmur").join("children");
+        let children = self.records_dir.join("children");
         let Ok(entries) = std::fs::read_dir(children) else {
             return Vec::new();
         };
@@ -1528,11 +1525,12 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
         "a started delegation has no output: {result}"
     );
     assert_eq!(result.get("result_path"), None, "{result}");
+    let children = parent.records_dir.join("children");
     assert!(
         result["child_workdir"]
             .as_str()
             .unwrap_or_default()
-            .starts_with(&format!(".murmur/children/{WORKER}-")),
+            .starts_with(&format!("{}/{WORKER}-", children.display())),
         "{result}"
     );
     let delegation_id = result["delegation_id"].as_str().unwrap_or_default();
@@ -1545,8 +1543,18 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
         "{result}"
     );
 
-    // A directory of the child's own, beneath the parent's accessible workdir, with its own trace.
+    // A directory of the child's own, beneath the parent's records directory, with its own trace.
+    // The parent's work folder gains nothing.
     let child_dir = parent.only_child_dir();
+    assert_eq!(
+        result["child_workdir"],
+        json!(child_dir.display().to_string()),
+        "{result}"
+    );
+    assert!(
+        !parent.project.join(".murmur").exists(),
+        "the parent's work folder holds no .murmur"
+    );
     assert!(
         child_dir
             .file_name()
@@ -1615,9 +1623,10 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
         "{handed}"
     );
     assert!(handed.contains("status: ok"), "{handed}");
+    let child_out = child_records(&child_dir, child_session_id).join("out");
     assert!(
-        handed.contains("/out/result.txt (in that workdir)"),
-        "the outcome names the child's result file rather than carrying it: {handed}"
+        handed.contains(&format!("result: {}/result", child_out.display())),
+        "the outcome names the child's result file, absolute, rather than carrying it: {handed}"
     );
     assert!(
         !handed.contains(WORKER_ANSWER),
@@ -1728,9 +1737,6 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     needles.extend(tokens);
     for needle in needles {
         if let Some(path) = find_in_files(&parent.project, &needle) {
-            panic!("'{needle}' reached {}", path.display());
-        }
-        if let Some(path) = find_in_files(&parent.session_dir, &needle) {
             panic!("'{needle}' reached {}", path.display());
         }
         if let Some(path) = find_in_files(&parent.records_dir, &needle) {
@@ -1886,7 +1892,7 @@ fn authenticated_child_is_driven_with_its_operator_token() {
         !text.contains("mdt1."),
         "a door token reached the tool result"
     );
-    for root in [&parent.project, &parent.session_dir, &parent.records_dir] {
+    for root in [&parent.project, &parent.records_dir] {
         if let Some(path) = find_in_files(root, "mdt1.") {
             panic!("a door token reached {}", path.display());
         }
@@ -2216,7 +2222,10 @@ fn three_delegations_leave_one_turn_and_every_outcome_arrives_before_the_task_en
             result["child_workdir"]
                 .as_str()
                 .unwrap_or_default()
-                .starts_with(&format!(".murmur/children/{capsule}-")),
+                .starts_with(&format!(
+                    "{}/{capsule}-",
+                    parent.records_dir.join("children").display()
+                )),
             "{result}"
         );
         ids.push(

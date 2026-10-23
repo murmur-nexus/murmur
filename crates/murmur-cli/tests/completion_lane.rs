@@ -249,7 +249,11 @@ fn a_completion_nobody_waits_for_is_refused_and_queues_behind_nothing() {
     let (home, manifest_path) = queue_sleep_project(&server.endpoint);
     common::consent_to_peer_tasks(&manifest_path);
     let staged = stage(&home, &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "the person's task").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "the person's task",
+    )
+    .unwrap();
     let running = launch(staged);
 
     // The `task.md` task starts at launch and is held there by the scripted delay.

@@ -88,11 +88,16 @@ fn run_session(config_mode: Option<&str>) -> (String, String) {
 
     // Identical task text for both modes — the only difference between runs is the driver
     // config toggle, so the logical `messages` content (and thus token accounting) matches.
-    fs::write(staged.workdir.join("task.md"), "Please echo hello.").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Please echo hello.",
+    )
+    .unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
 
-    let result = fs::read_to_string(launched.workdir.join("out/result.txt")).unwrap_or_default();
+    let result =
+        fs::read_to_string(launched.records_dir.join("out/result.txt")).unwrap_or_default();
     let trace = fs::read_to_string(launched.records_dir.join("trace.jsonl")).unwrap_or_default();
     (result, trace)
 }

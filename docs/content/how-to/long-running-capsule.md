@@ -213,12 +213,12 @@ curl -s -X POST http://localhost:$PORT \
 
 Because `queue_depth: 2`, this second task is accepted and queued. Up to two tasks wait while one runs; a message that arrives when two are already waiting is answered with a task in `TASK_STATE_REJECTED`.
 
-When task 2 runs, the agent receives the full history from task 1 — the scores list and the answer about the count — so it can answer the follow-up without the data being repeated. Each completed task also writes a per-task result file alongside the shared `out/result.txt`:
+When task 2 runs, the agent receives the full history from task 1 — the scores list and the answer about the count — so it can answer the follow-up without the data being repeated. Each completed task also writes a per-task result file alongside the shared `out/result.txt`, both in the session's [records directory](../reference/workdir.md#records-directory):
 
 ```
-workdir/out/result.txt                              ← always updated to the latest result
-workdir/out/result_tsk_019e23bd122f77e291a065f9481325cb.txt   ← task 1 result
-workdir/out/result_tsk_019e24bc7a3f6810b5c2d9e0a71438fd.txt   ← task 2 result
+<records directory>/out/result.txt                                       ← always updated to the latest result
+<records directory>/out/result_tsk_019e23bd122f77e291a065f9481325cb.txt  ← task 1 result
+<records directory>/out/result_tsk_019e24bc7a3f6810b5c2d9e0a71438fd.txt  ← task 2 result
 ```
 
 To start a separate, independent thread, use a different `contextId`. Each `contextId` maintains its own history; threads do not share state with each other.

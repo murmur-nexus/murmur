@@ -11,8 +11,13 @@
 //!         ├── logs/shell-<ms>.log | <work-id>.log
 //!         │                                       a shell command's full output
 //!         ├── completion.json                     a delegated child's outcome
-//!         └── hooks/                              `.` of every hook declared
-//!                                                 `capabilities.filesystem.records: true`
+//!         ├── hooks/                              `.` of every hook declared
+//!         │                                       `capabilities.filesystem.records: true`
+//!         ├── out/result.txt | result_<task-id>.txt | compaction-summaries.jsonl
+//!         │                                       an agent's answers and compaction summaries
+//!         ├── tmp/                                `$TMPDIR` of every command
+//!         ├── home/                               `$HOME` of every command, created at staging
+//!         └── children/<capsule>-<16 hex>/        0700, a delegated child's `--workdir`
 //! ```
 //!
 //! The group a session's directory sits in is its **workdir root**: the directory passed to
@@ -21,7 +26,8 @@
 //! can rename or replace it, and every reader given the same directory computes the same group.
 //!
 //! The Landlock rule and sealed bind that keep it read-only to commands are the runtime
-//! directory's ([`crate::runtime_dir`]); [`crate::containment::records_dir_report`] says per tier
+//! directory's ([`crate::runtime_dir`]). `tmp/` and `home/` are the two exceptions, granted the
+//! work folder's rights by their own rule and bind; [`crate::containment::records_dir_report`] says per tier
 //! what holds. Unlike the runtime directory it is not removed when the session ends;
 //! `trace.retain` ([`crate::retention::prune_sessions`]) prunes it.
 
@@ -42,6 +48,17 @@ pub const RECORDS_DIR_ENV: &str = "MURMUR_RECORDS_DIR";
 /// The directory beneath `<session-id>/` a hook declared `capabilities.filesystem.records: true`
 /// is preopened at as `"."`, read-write.
 pub const HOOKS_SUBDIR: &str = "hooks";
+
+/// The directory beneath `<session-id>/` that is `$HOME` for every shell command, plan shell step
+/// and native tool, created at staging and granted the work folder's rights.
+pub const HOME_SUBDIR: &str = "home";
+
+/// The directory beneath `<session-id>/` an agent's `result.txt`, `result_<task-id>.txt` and
+/// `compaction-summaries.jsonl` are written to, by the runtime alone.
+pub const RESULTS_SUBDIR: &str = "out";
+
+/// [`RESULTS_SUBDIR`]'s `result.txt`, relative to `<session-id>/`.
+pub const RESULT_FILE: &str = "out/result.txt";
 
 /// The mode every directory beneath `~/.murmur/records` is created at.
 const PRIVATE_DIR_MODE: u32 = crate::murmur_home::MURMUR_HOME_DIR_MODE;

@@ -2,8 +2,8 @@
 //! harness its driver names, drives it through the driver, and records what happened.
 //!
 //! Every test publishes the fixture process driver, points `inference.command` (or `PATH`) at the
-//! fixture fake harness, and reads back `out/result.txt` and the session's `trace.jsonl` under
-//! `~/.murmur/records/`. The fake harness is a bash script, so these tests are Unix-only — which
+//! fixture fake harness, and reads back `out/result.txt` and `trace.jsonl` from the session's
+//! records directory under `~/.murmur/records/`. The fake harness is a bash script, so these tests are Unix-only — which
 //! every platform murmur targets is.
 
 #![cfg(unix)]
@@ -365,7 +365,7 @@ impl Run {
     }
 
     fn result(&self) -> String {
-        fs::read_to_string(self.workdir.join("out").join("result.txt")).unwrap_or_default()
+        fs::read_to_string(self.records_dir.join("out").join("result.txt")).unwrap_or_default()
     }
 
     fn trace_raw(&self) -> String {
@@ -740,7 +740,7 @@ fn s7_the_harness_sees_exactly_what_was_declared_and_set() {
     parts.next();
     assert_eq!(parts.next(), Some("drwx------"), "{files_note}");
     let files_dir = PathBuf::from(parts.next().unwrap());
-    // The run's files sit beside the session's runtime directory, outside the workdir.
+    // The run's files sit beside the session's runtime directory, outside the work folder.
     let sessions = capsule.home.path().join(".murmur").join("sessions");
     assert!(
         files_dir.starts_with(&sessions) && !files_dir.starts_with(&run.workdir),

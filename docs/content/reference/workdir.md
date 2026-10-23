@@ -1,36 +1,80 @@
-# Session Workdir
+# Session Directories
 
-Every session runs against four directories: the one the capsule works in, the session's own
-directory beneath it, the one holding the records the runtime keeps about the session, and the one
-holding the files the runtime writes for its own use.
+Every session has three locations: the work folder the capsule works in, the records directory
+holding what the runtime keeps about the session, and the runtime directory holding the files the
+runtime writes for its own use.
 
-| Directory | Path | Holds | The capsule's commands |
+| Location | Path | Holds | The capsule's commands |
 |---|---|---|---|
-| Accessible workdir | The directory passed to `mur run --workdir`, otherwise `<manifest-dir>/workdir/<session-id>` | The capsule's current directory — everything it writes | Read and write |
-| Session workdir | `<accessible-workdir>/.murmur/<session-id>` when `--workdir` is passed, otherwise the accessible workdir itself | The agent's results, and the `$HOME` its shell commands run under | Read and write |
-| [Records directory](#records-directory) | `~/.murmur/records/<workdir root>/<session-id>` | `trace.jsonl`, `blobs/`, `logs/`, a delegated child's `completion.json`, a scoring hook's `eval.jsonl` and the session's temporary folder `tmp/` | Read only, where the host can enforce it, apart from `tmp/`, which they read and write. Kept after the session |
-| [Runtime directory](#runtime-directory) | `~/.murmur/sessions/<session-id>/runtime` | `MURMUR.md`, `task.md`, the manifest copy, installed tools and submitted plans | Read only, where the host can enforce it |
+| [Work folder](#work-folder) | The directory passed to `mur run --workdir`, otherwise `<manifest-dir>/workdir/<session-id>/` | The capsule's current directory — everything it writes | Read and write |
+| [Records directory](#records-directory) | `~/.murmur/records/<workdir root>/<session-id>/` | `trace.jsonl`, `blobs/`, `logs/`, the agent's results in `out/`, the commands' `home/` and `tmp/`, delegated children's work folders in `children/`, a delegated child's `completion.json` and a scoring hook's `hooks/`. Kept after the session | Read only, where the host can enforce it, apart from `home/` and `tmp/`, which they read and write |
+| [Runtime directory](#runtime-directory) | `~/.murmur/sessions/<session-id>/runtime` | `MURMUR.md`, `task.md`, the manifest copy, installed tools and submitted plans. Removed when the session ends | Read only, where the host can enforce it |
 
-Without `--workdir` the first two are one directory.
-
-In a [formation](roster.md#launch), the entry member's accessible workdir is the roster's project
+In a [formation](roster.md#launch), the entry member's work folder is the roster's project
 directory, and each peer's is `~/.murmur/formations/<frm_id>/<member>/` — see
 [Member directories](roster.md#member-directories).
 
-To find what the *capsule* changed, diff the accessible workdir and subtract what the runtime wrote
-there. `mur run --explain-scope` enumerates those paths, as `runtime_writes` under `--json`:
-
-- That enumeration is authoritative; the tables below describe what each path holds.
-- `trace.jsonl` carries the same array verbatim at `session_start.effective_grants.runtime_writes`,
-  so a run reports the paths to subtract from it.
-- Paths are relative to the accessible workdir and carry the literal segment `<session-id>`, which
-  `session_start.session_id` supplies.
-- Excluding the single prefix `.murmur/` covers every runtime-written path outside the accessible
-  workdir's own top level.
-
-Two more directories sit outside the workdirs and outlive every session: a
+Two more directories sit outside these and outlive every session: a
 [durable state store](#state-store), for artifacts that ask for one by name, and the
 [conversation record](#the-conversation-record), which every `http` capsule keeps by default.
+
+---
+
+## The work folder { #work-folder }
+
+The runtime creates nothing in the work folder. A `--workdir` folder is left exactly as the agent
+left it. The runtime reads the operator's task there, and writes in it only at the capsule's own
+request:
+
+| Path | The runtime | Notes |
+|---|---|---|
+| `task.md`, `input.txt` | Reads once | The operator's task, read when the session starts. See [Task input](#task-input) |
+| `peer-in/<handle-id>-<name>` | Writes, when the agent redeems a peer handle | The fetched bytes. See [Resource plane](resource-plane.md) |
+| `out/result.txt` | Reads | A script capsule's final output, written by its own component. An agent's results are in the records directory's [`out/`](#records-directory) |
+
+Everything else in this directory belongs to the capsule. When the work folder is the project
+directory, an artifact pull the agent is granted may update the project's
+[`murmur.lock`](#lockfile-murmurlock) in it. Session folders that earlier runs left under
+`.murmur/` in a work folder are never read, written or removed.
+
+A `sealed` capsule adds nothing to this list: its `/tmp` is the
+[session's temporary folder](containment.md#temp-folder), its `$HOME` is the session's home folder,
+both in the records directory, and its synthetic `/etc` files are beside the runtime directory.
+
+### What the capsule changed { #what-the-capsule-changed }
+
+To find what the *capsule* changed, diff the work folder and subtract what the runtime wrote there.
+`mur run --explain-scope` enumerates those paths in its `Runtime writes` block:
+
+```
+Runtime writes
+  paths are relative to the work folder
+  runtime writes:
+    - peer-in (directory, peer-fetch)
+    - out (directory, script-session)
+```
+
+Under `--json` the same rows are `runtime_writes`, one object per path:
+
+| `path` | `kind` | `condition` |
+|---|---|---|
+| `peer-in` | `directory` | `peer-fetch` |
+| `out` | `directory` | `script-session` |
+
+- That enumeration is authoritative; the [work folder table](#work-folder) describes what each
+  path holds.
+- `trace.jsonl` carries the same array verbatim at `session_start.effective_grants.runtime_writes`,
+  so a run reports the paths to subtract from it.
+- Paths are relative to the work folder. The set is the same for every launch, with or without
+  `--workdir`, and on every tier.
+
+### Size ceiling { #work-folder-ceiling }
+
+[`capabilities.resources.workdir_max_bytes`](resource-limits.md#host-resource-limits) bounds the
+work folder, the records directory's `tmp/` and its `home/` together. The runtime walks the three
+every 10 seconds and sums their sizes; crossing the ceiling ends the session with
+[`E-RUN-013`](diagnostics.md). `MURMUR.md` states the ceiling for every
+`inference.transport: http` session.
 
 ---
 
@@ -42,7 +86,7 @@ there one of three ways:
 | Way in | When |
 |---|---|
 | `mur run --task <value>` | Before launch. A value naming an existing file is copied; anything else is written as text |
-| The operator's file in the accessible workdir | Once, when the session starts and the runtime directory has no `task.md`: `task.md`, else `input.txt` except under `inference.transport: process`. The workdir file is left where it is and never read again |
+| The operator's file in the work folder | Once, when the session starts and the runtime directory has no `task.md`: `task.md`, else `input.txt` except under `inference.transport: process`. The work folder's file is left where it is and never read again |
 | An A2A message | On each incoming message |
 
 The runtime also rewrites it when an `on-task-end` hook returns `reopen-task`, as the original task
@@ -54,7 +98,7 @@ An agent receives the task as its first message; neither the `[Capsule]` block n
 names the file. The capsule's commands can read the file by the names in
 [How the capsule reaches it](#how-the-capsule-reaches-it), and cannot change it where the host can
 enforce that — see [What protects it](#what-protects-it). A `task.md` the capsule writes in its own
-workdir is its own file.
+work folder is its own file.
 
 A task whose text is empty or only whitespace fails without a request to the model, with a message
 saying the task is empty. A launch that receives no task at all ends after its
@@ -65,41 +109,10 @@ Under `lifecycle.task_acceptance: queue` with `lifecycle.after_task: sleep` the 
 
 ---
 
-## Session workdir files
-
-| Path | Notes |
-|---|---|
-| `out/result.txt` | The agent's final output. Written on every terminal outcome of a task that ran; a failure writes `error: <message>`, a turn stopped at [`inference.max_tokens`](manifest.md#inference-max-tokens) writes the model's partial text followed by a truncation marker naming that field and the cap, and a task that ends `canceled` writes `canceled: the task was canceled before it completed, so it has no result`. A task canceled before it started writes nothing |
-| `out/result_<task-id>.txt` | Per-task copy of the final output, so one task does not overwrite another's: a completed task's answer, or the `canceled:` line above for a canceled one. Only under `lifecycle.conversation: threaded` |
-| `out/compaction-summaries.jsonl` | The text each committed compaction replaced the context with. See [below](#compaction-summaries) |
-| `.capsule-home` | `$HOME` for every shell command and native tool. Created on the first such call. Reached only through the variable |
-
-The capsule's commands can write these like any other file in the workdir.
-
----
-
-## Accessible workdir files
-
-| Path | Notes |
-|---|---|
-| `task.md`, `input.txt` | The operator's task, read once when the session starts. See [Task input](#task-input) |
-| `.murmur/<session-id>/` | The session workdir |
-| `.murmur/children/<capsule>-<suffix>/` | One directory per sub-capsule launch, each the child's own accessible workdir. Created mode `0700` |
-| `peer-in/<handle-id>-<name>` | Bytes fetched by redeeming a peer handle. See [Resource plane](resource-plane.md) |
-| `out/result.txt` | A script capsule's final output. An agent session writes it to the session workdir instead |
-
-Everything else in this directory belongs to the capsule.
-
-A `sealed` capsule adds nothing to this list: its `/tmp` is the
-[session's temporary folder](containment.md#temp-folder) in the records directory, and its synthetic `/etc`
-files are beside the runtime directory.
-
----
-
 ## Runtime directory { #runtime-directory }
 
 Every file the runtime writes for its own use, and reads back as input, lives in a per-session
-directory outside the workdir:
+directory outside the work folder:
 
 ```
 ~/.murmur/sessions/                       0700
@@ -135,7 +148,7 @@ created is refused with [`E-IO-004`](diagnostics.md#e-io-004) before anything is
 | Reader | Where |
 |---|---|
 | A shell command, a plan's `shell` step, a native tool, a `transport: process` harness | `$MURMUR_RUNTIME_DIR` in its environment, the absolute path of `runtime/`. Set by the runtime last, so neither `capabilities.env.allow`, a shell baseline variable nor the host can change it. A shell interpreter expands it in a command; a native tool or a binary allowed on its own is handed its arguments as written, so a path argument must be absolute |
-| A script capsule's own component, a WASM `runtime: tool` artifact with no `capabilities.filesystem.scope` | `murmur-runtime/`, beside the workdir it sees as its current directory, read-only. A script capsule reads its task at `murmur-runtime/task.md` |
+| A script capsule's own component, a WASM `runtime: tool` artifact with no `capabilities.filesystem.scope` | `murmur-runtime/`, beside the work folder it sees as its current directory, read-only. A script capsule reads its task at `murmur-runtime/task.md` |
 | A tool with a `scope`, a driver, a hook | Nothing |
 
 The model is told only the names its own tools can use: by the `Runtime files:` line of the
@@ -155,7 +168,7 @@ of [`MURMUR.md`](../concepts/session-loop.md#murmur-md), which also gives the ab
 
 A command that tries to overwrite, append to, remove, rename over or create a file there gets
 `Permission denied` under Landlock and `Read-only file system` inside a composed root; a hard link
-from it into the workdir gets `Invalid cross-device link`.
+from it into the work folder gets `Invalid cross-device link`.
 
 What Landlock does not mediate on `landlock+seccomp`:
 
@@ -166,15 +179,15 @@ What Landlock does not mediate on `landlock+seccomp`:
 
 Inside a composed root the read-only bind refuses all of them.
 
-### A runtime directory inside the workdir { #runtime-directory-inside-the-workdir }
+### A runtime directory inside the work folder { #runtime-directory-inside-the-workdir }
 
 When `~/.murmur/sessions`, or the session's [records directory](#records-directory), lies inside the
-accessible workdir — `HOME` and `--workdir` the same directory, for one — the capsule's commands can
+work folder — `HOME` and `--workdir` the same directory, for one — the capsule's commands can
 write it:
 
 | Declared containment | Outcome |
 |---|---|
-| `scoped` or `sealed` | Refused with [`E-CAP-003`](diagnostics.md#e-cap-003), naming the directory and the workdir |
+| `scoped` or `sealed` | Refused with [`E-CAP-003`](diagnostics.md#e-cap-003), naming the directory and the work folder |
 | `advisory` | The launch runs, prints [`W-SEC-033`](diagnostics.md#w-sec-033) and records `achieved_containment: advisory` |
 
 Run with a `--workdir` that does not contain `~/.murmur`.
@@ -207,8 +220,9 @@ prints the same block for the project's declared containment.
 
 ## Records directory { #records-directory }
 
-Every record the runtime writes about a session lives in a per-session directory outside the
-workdir, kept after the session ends:
+Every record the runtime writes about a session, and every file it writes for the session outside
+the runtime directory, lives in a per-session directory outside the work folder, kept after the
+session ends:
 
 ```
 ~/.murmur/records/                                0700
@@ -220,7 +234,10 @@ workdir, kept after the session ends:
         ├── logs/shell-<timestamp>.log | <work-id>.log
         ├── completion.json
         ├── hooks/
-        └── tmp/                                  0700, created at staging
+        ├── out/result.txt | result_<task-id>.txt | compaction-summaries.jsonl
+        ├── tmp/                                  0700, created at staging
+        ├── home/                                 0700, created at staging
+        └── children/<capsule>-<16 hex>/          0700
 ```
 
 The **workdir root** names the group a session's directory sits in:
@@ -230,23 +247,32 @@ The **workdir root** names the group a session's directory sits in:
 | `mur run --workdir /home/dev/proj` | `/home/dev/proj` | `~/.murmur/records/home/dev/proj/<session-id>` |
 | `mur run` from `/home/dev/proj` | `/home/dev/proj/workdir` | `~/.murmur/records/home/dev/proj/workdir/<session-id>` |
 | A [formation](roster.md#member-directories) peer | `~/.murmur/formations/<frm_id>/<member>` | That directory mirrored under `~/.murmur/records` |
+| A delegated child | `<parent records directory>/children/<capsule>-<16 hex>` | That directory mirrored under `~/.murmur/records` |
 
 The root is made absolute and resolved through its nearest existing ancestor, so a link above it
 names the directory it points at. A project moved to another path starts a new group; the old one
 stays under the old path.
 
-| Path | Holds |
-|---|---|
-| `trace.jsonl` | One JSON object per session event. See [Observability schemas](observability-schemas.md#session-trace-tracejsonl) |
-| `blobs/<sha256>` | Trace bodies too large to inline, addressed by their own digest. See [Trace blobs](observability-schemas.md#trace-blobs) |
-| `logs/bootstrap.log` | Staging and agent-loop diagnostics: the installed tool inventory, once per session and again each time it changes, compaction decisions, non-fatal write failures, and any line the runtime could not write to a [closed standard output or standard error](cli.md#mur-run-closed-stream) |
-| `logs/otel.log` | OpenTelemetry exporter diagnostics |
-| `logs/hook-<hook-name>.log` | Errors from one hook, one per line. `<hook-name>` is the bare name: `hook-grafana` for `murmur/hook-grafana` |
-| `logs/shell-<timestamp>.log` | Full stdout and stderr of one shell command, written when either stream exceeds 16 KiB. The tool result names it by its absolute path |
-| `logs/<work-id>.log` | Output of a command [moved to the background](manifest.md#lifecycle-shell-grace-secs), written as the command runs, with an `Exit code:` line appended at its exit. [`background-command`](runtime-provided-tools.md#background-command) and its completion name it by its absolute path |
-| `completion.json` | How a delegated child ended: written by the child at the end of its session and by the launcher that started it, read by that launcher |
-| `hooks/` | The current directory of every hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities), read-write. `murmur/hook-eval` writes `hooks/eval.jsonl` and `hooks/logs/hook-hook-eval.log` here. Created only when such a hook is declared |
-| `tmp/` | The [session's temporary folder](containment.md#temp-folder): `/tmp` and `$TMPDIR` to the session's shell commands, plan shell steps and native tools, which read and write it. The runtime writes nothing in it. Counted with the session workdir against `capabilities.resources.workdir_max_bytes` |
+| Path | Holds | Written by |
+|---|---|---|
+| `trace.jsonl` | One JSON object per session event. See [Observability schemas](observability-schemas.md#session-trace-tracejsonl) | The runtime |
+| `blobs/<sha256>` | Trace bodies too large to inline, addressed by their own digest. See [Trace blobs](observability-schemas.md#trace-blobs) | The runtime |
+| `logs/bootstrap.log` | Staging and agent-loop diagnostics: the installed tool inventory, once per session and again each time it changes, compaction decisions, non-fatal write failures, and any line the runtime could not write to a [closed standard output or standard error](cli.md#mur-run-closed-stream) | The runtime |
+| `logs/otel.log` | OpenTelemetry exporter diagnostics | The runtime |
+| `logs/hook-<hook-name>.log` | Errors from one hook, one per line. `<hook-name>` is the bare name: `hook-grafana` for `murmur/hook-grafana` | The runtime |
+| `logs/shell-<timestamp>.log` | Full stdout and stderr of one shell command, written when either stream exceeds 16 KiB. The tool result names it by its absolute path | The runtime |
+| `logs/<work-id>.log` | Output of a command [moved to the background](manifest.md#lifecycle-shell-grace-secs), written as the command runs, with an `Exit code:` line appended at its exit. [`background-command`](runtime-provided-tools.md#background-command) and its completion name it by its absolute path | The runtime |
+| `completion.json` | How a delegated child ended. Read by the launcher that started it | The child at the end of its session, and that launcher |
+| `hooks/` | The current directory of every hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities). `murmur/hook-eval` writes `hooks/eval.jsonl` and `hooks/logs/hook-hook-eval.log` here. Created only when such a hook is declared | Those hooks |
+| `out/result.txt` | The agent's final output. Written on every terminal outcome of a task that ran; a failure writes `error: <message>`, a turn stopped at [`inference.max_tokens`](manifest.md#inference-max-tokens) writes the model's partial text followed by a truncation marker naming that field and the cap, and a task that ends `canceled` writes `canceled: the task was canceled before it completed, so it has no result`. A task canceled before it started writes nothing | The runtime |
+| `out/result_<task-id>.txt` | Per-task copy of the final output, so one task does not overwrite another's: a completed task's answer, or the `canceled:` line above for a canceled one. Only under `lifecycle.conversation: threaded` | The runtime |
+| `out/compaction-summaries.jsonl` | The text each committed compaction replaced the context with. See [Compaction summaries](#compaction-summaries) | The runtime |
+| `tmp/` | The [session's temporary folder](containment.md#temp-folder): `/tmp`, `$TMPDIR`, `$TMP` and `$TEMP` to the session's shell commands, plan shell steps and native tools. The runtime writes nothing in it | The capsule's commands |
+| `home/` | The session's home folder: `$HOME` to every shell command, plan shell step and native tool, and the home directory of the synthetic `passwd` entry under `sealed`. The runtime writes nothing in it | The capsule's commands |
+| `children/<capsule>-<16 hex>/` | One directory per delegated child launch, each the child's `--workdir`. `<capsule>` is the bare capsule name; the 16 hex characters are fresh per launch | The runtime creates it; the child capsule writes in it |
+
+`tmp/` and `home/` count with the work folder against
+[`capabilities.resources.workdir_max_bytes`](#work-folder-ceiling).
 
 ### How the capsule reaches it
 
@@ -254,32 +280,51 @@ stays under the old path.
 |---|---|
 | A shell command, a plan's `shell` step, a native tool, a `transport: process` harness | `$MURMUR_RECORDS_DIR`, the absolute path of the session's records directory. Set by the runtime last, on `$MURMUR_RUNTIME_DIR`'s terms |
 | A shell command, a plan's `shell` step, a native tool | `tmp/`, read-write, as `$TMPDIR`, `$TMP` and `$TEMP`, and as `/tmp` where the session maps it. See [The session's temporary folder](containment.md#temp-folder) |
+| A shell command, a plan's `shell` step, a native tool | `home/`, read-write, as `$HOME` |
 | A hook declared `capabilities.filesystem.records: true` | `hooks/`, as its current directory, read-write |
 | A WASM tool, a driver, any other hook | Nothing |
 
-Every reader given `$MURMUR_RECORDS_DIR` can open a shell log by the absolute path its tool result
-or completion names. A WASM tool cannot.
+Every reader given `$MURMUR_RECORDS_DIR` can open a shell log, `out/result.txt` or a delegated
+child's work folder by its absolute path, read-only. A WASM tool cannot.
 
 ### What protects it
 
 The runtime directory's mechanisms, applied to the records directory — see
 [What protects it](#what-protects-it). A command that tries to overwrite, append to, truncate,
 remove, rename over or create a file there gets `Permission denied` under Landlock and
-`Read-only file system` inside a composed root; a hard link from it into the workdir gets
-`Invalid cross-device link`. `tmp/` is the one writable path: no record can be appended to, replaced,
-moved or hard-linked into it, and `tmp/` itself cannot be renamed. The runtime's own writes go on for the whole session. On a host with no
-kernel containment, macOS included, a command can change it.
+`Read-only file system` inside a composed root; a hard link from it into the work folder gets
+`Invalid cross-device link`. `out/` and `children/` are read-only to the capsule's commands like
+every other record.
 
-A records directory inside the workdir is judged as a runtime directory inside it is — see
-[A runtime directory inside the workdir](#runtime-directory-inside-the-workdir).
+A capsule granted `capabilities.spawn.allow` gives its commands one
+more read-only path: the records group of its `children/`,
+`~/.murmur/records/<records directory>/children/`, which holds every delegated child's records
+directory. It is granted once a child has staged, so the parent agent can read the
+`out/result.txt` a delegation outcome names, and no command can change it.
+
+`tmp/` and `home/` are the two writable paths, each granted the work folder's rights:
+
+| Mechanism | `tmp/` | `home/` |
+|---|---|---|
+| Landlock, on `mountns+pivot_root+landlock+seccomp` and `landlock+seccomp` | A rule with the work folder's rights: `Execute` only with [`capabilities.filesystem.workdir_exec`](containment.md#field-workdir-exec) | The same rule |
+| The composed root, on `mountns+pivot_root+landlock+seccomp` (`sealed`) | A verified read-write bind at `/tmp` | A verified read-write bind at its own absolute path, mounted after the records directory's read-only bind |
+| A [mount-namespace `/tmp` mapping](containment.md#temp-folder-env) | Bound over `/tmp` | Bound back read-write at its own path when it lies under the host's `/tmp` |
+
+No record can be appended to, replaced, moved or hard-linked into either, and neither can be
+renamed. The runtime's own writes go on for the whole session. On a host with no kernel
+containment, macOS included, a command can change the whole records directory.
+
+A records directory inside the work folder is judged as a runtime directory inside it is — see
+[A runtime directory inside the work folder](#runtime-directory-inside-the-workdir).
 
 ### Lifetime
 
 | When | What happens |
 |---|---|
-| Staging, after every refusal that stops a launch | The directory is created |
-| The session ends | Nothing: the directory is kept |
-| A later launch of a capsule declaring [`trace.retain`](manifest.md#trace-retain) | Each session that policy does not keep loses its records directory, `tmp/` included, and its session workdir together. A read-only directory a command left in `tmp/` does not stop the removal |
+| Staging, after every refusal that stops a launch | The directory is created, with `tmp/` and `home/` |
+| The session ends | Nothing: the directory is kept, with `out/`, `home/`, `tmp/` and `children/` |
+| A later launch of a capsule declaring [`trace.retain`](manifest.md#trace-retain) | Each session that policy does not keep loses its records directory. Without `--workdir` its runtime-created work folder, `<manifest-dir>/workdir/<session-id>`, goes with it; a `--workdir` folder is never touched. A read-only directory a command left in `tmp/` or `home/` does not stop the removal |
+| [`mur trace rm`](cli.md#mur-trace-rm) | The same removal, for one ended session the operator names |
 | An ended formation pruned by its entry member's `trace.retain` | The formation's whole records subtree goes with its formation directory |
 
 ### Reading it
@@ -307,13 +352,13 @@ carries it as `effective_grants.records_dir`, and `mur doctor` prints the same b
 
 ---
 
-## Links inside the workdir { #links-inside-the-workdir }
+## Links inside the work folder { #links-inside-the-workdir }
 
-The runtime never follows a symbolic link inside the accessible workdir, the session workdir or the
+The runtime never follows a symbolic link inside the work folder, the records directory or the
 runtime directory. Every path in the tables above, and every file the runtime reads to decide what
 to do next, is reached one directory at a time from its directory, and a link anywhere on the way
 is refused.
-Nothing outside the workdir is written, read or removed through one. The directory passed to
+Nothing outside the work folder is written, read or removed through one. The directory passed to
 `--workdir` may itself be reached through a link; only what lies beneath it is checked.
 
 | The runtime refuses | When it would |
@@ -322,15 +367,14 @@ Nothing outside the workdir is written, read or removed through one. The directo
 | A FIFO, socket, device node or directory where a regular file belongs | Append to or read it |
 | A regular file with a second hard link | Append to it, or rewrite it in place |
 
-Under `--workdir`, keep `task.md`, `input.txt` and `.murmur` in that directory as real files and
-directories: a link at `.murmur` stops the launch, and a link at the task file fails the first
-task.
+Under `--workdir`, keep `task.md` and `input.txt` in that directory as real files: a link at the
+task file fails the first task.
 
 What a refusal does depends on when it happens:
 
 | When | What happens |
 |---|---|
-| Staging: the `.murmur/<session-id>` directory, installing tools and skills, `MURMUR.md` | The launch fails with [`E-RUN-050`](diagnostics.md#e-run-050), naming the path and the link |
+| Staging: installing tools and skills, `MURMUR.md` | The launch fails with [`E-RUN-050`](diagnostics.md#e-run-050), naming the path and the link |
 | During a task, on any transport | A [`workdir_path_refused`](observability-schemas.md#workdir-path-refused) trace line for each refusal, then `task_failed` with cause `workdir_path_refused`, then `task_end` with `exit_status: failed`. No further request is sent to the model for that task. An A2A task ends `failed` with the refusal as its status message, and `mur run --task` exits with [`E-RUN-050`](diagnostics.md#e-run-050) |
 | A tool's own write — a submitted plan, `fetch-peer-file`, `manage.pull()`, `pull-artifact`, `manage.remove()` or `remove-artifact` | The tool call returns an error naming the path, and the task then fails as above |
 | Between tasks | The next task to start fails as above before it reads its task or sends a request |
@@ -339,20 +383,21 @@ What a refusal does depends on when it happens:
 
 ## Durable state store { #state-store }
 
-An artifact that declares `capabilities.state` is granted one directory outside both workdirs:
+An artifact that declares `capabilities.state` is granted one directory outside the work folder and
+the records directory:
 
 | | Path | Lifetime |
 |---|---|---|
-| Session workdir | `<accessible-workdir>` or `<accessible-workdir>/.murmur/<session-id>` | One session |
-| Accessible workdir | `--workdir`, otherwise `<manifest-dir>/workdir/<session-id>` | One session, unless `--workdir` names a directory you keep |
+| Work folder | `--workdir`, otherwise `<manifest-dir>/workdir/<session-id>` | One session, unless `--workdir` names a directory you keep |
+| Records directory | `~/.murmur/records/<workdir root>/<session-id>/` | Until [`trace.retain`](manifest.md#trace-retain) or [`mur trace rm`](cli.md#mur-trace-rm) removes it |
 | State store | `~/.murmur/state/<store>/` | Every session of that capsule, on that machine |
 
-A component sees the store as a directory named `state`, beside the workdir it sees as its
+A component sees the store as a directory named `state`, beside the work folder it sees as its
 current directory. Its code reaches the store with an ordinary relative path:
 
 ```rust
 std::fs::write("state/notes.jsonl", contents)?;   // the store
-std::fs::write("out/result.txt", summary)?;       // the workdir
+std::fs::write("out/result.txt", summary)?;       // the work folder
 ```
 
 `~/.murmur`, `~/.murmur/state/` and each store directory under it are created mode `0700`, and the
@@ -365,8 +410,8 @@ defaulting to the capsule name — never from the workdir, the session id or the
 launch that gets a fresh `<manifest-dir>/workdir/<session-id>` reads back exactly what the previous
 launch wrote.
 
-**It sits outside every workdir, and only the artifact that declared it can reach it.** A subtree
-of the workdir would be readable by anything that can reach the workdir — `murmur/tool-editor` and
+**It sits outside every work folder, and only the artifact that declared it can reach it.** A
+subtree of the work folder would be readable by anything that can reach the work folder — `murmur/tool-editor` and
 `shell` included — and `capabilities.filesystem.scope` cannot help, because it is a single path
 prefix: protecting one subtree would mean narrowing every other artifact. The capsule's own code
 declares no artifact grant and reaches no store.
@@ -381,9 +426,9 @@ containment class the store is absent from the capsule's composed root, so neith
 allowlisted by `capabilities.shell.allow` nor a sub-capsule allowlisted by
 `capabilities.spawn.allow` can open it.
 
-### What belongs in the workdir instead
+### What belongs in the work folder instead
 
-Per-project notes. The accessible workdir already *is* the project: notes about the repository the
+Per-project notes. The work folder already *is* the project: notes about the repository the
 capsule is working in belong beside that work, where they move, get committed and get deleted with
 it. A store keyed by capsule would carry them from one project to the next.
 
@@ -495,10 +540,10 @@ that opens it under `mur run --context` writes the header and applies its policy
 
 | Policy | Removed |
 |---|---|
-| [`trace.retain`](manifest.md#trace-retain) | A whole session: its [records directory](#records-directory), with its `trace.jsonl` and `blobs/`, and its session workdir |
+| [`trace.retain`](manifest.md#trace-retain) | A whole session: its [records directory](#records-directory), with its `trace.jsonl`, `blobs/`, `out/`, `home/`, `tmp/` and `children/`, and, for a launch without `--workdir`, its work folder `<manifest-dir>/workdir/<session-id>` |
 | [`context.retain.max_messages`](manifest.md#context-retain) | The oldest message lines of one `conversation.jsonl`. The file, the directory and every surviving `id` stay |
 | [`context.retain.max_age`](manifest.md#context-retain) | A whole `<context-id>/` directory under the record store |
-| [`mur trace rm`](cli.md#mur-trace-rm) | One ended session, named by the operator: its session workdir, its [records directory](#records-directory), and a running-capsule record left by a process that is gone. Its conversation record stays |
+| [`mur trace rm`](cli.md#mur-trace-rm) | One ended session, named by the operator: its [records directory](#records-directory), its work folder when the runtime created it under `./workdir`, and a running-capsule record left by a process that is gone. A `--workdir` folder and the conversation record stay |
 
 The three policies prune at launch, in the runtime, immediately after the session's
 `session_start`, and every deletion is written to that session's own trace as a
@@ -631,9 +676,10 @@ task runs on.
 
 ---
 
-## out/compaction-summaries.jsonl { #compaction-summaries }
+## Compaction summaries { #compaction-summaries }
 
-Written only when the manifest sets `inference.compaction.dump_summaries: true` (default `false`;
+`out/compaction-summaries.jsonl` in the session's [records directory](#records-directory). Written
+only when the manifest sets `inference.compaction.dump_summaries: true` (default `false`;
 see [`inference.compaction.dump_summaries`](manifest.md#field-inference)). One line per committed
 compaction, appended in the order compactions occur:
 
@@ -663,7 +709,7 @@ the turn and the two token counts, not the text.
 
 ## Lockfile (`murmur.lock`) { #lockfile-murmurlock }
 
-`murmur.lock` sits in the project directory beside `murmur.yaml`, not in the workdir. It pins every
+`murmur.lock` sits in the project directory beside `murmur.yaml`, not in the work folder. It pins every
 registry-resolved artifact to a version and a hash, and records who wrote the pin:
 
 ```yaml

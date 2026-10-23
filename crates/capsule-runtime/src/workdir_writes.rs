@@ -1,66 +1,54 @@
-//! What the runtime itself writes inside the capsule's workdir, declared rather than discovered.
+//! What the runtime itself writes inside the capsule's work folder, declared rather than
+//! discovered.
 //!
-//! A consumer for whom the workdir *is* the deliverable — a benchmark harness diffing it to score
-//! a patch, a `git-worktree` workspace whose diff becomes a pull request — has to answer "what did
-//! the *capsule* change?". Without a declaration that answer is a hand-maintained exclusion list
-//! that goes stale the moment the runtime gains an entry, and silently: nothing tells the consumer
-//! the set grew. [`runtime_writes`] is that declaration, carried by
+//! A consumer for whom the work folder *is* the deliverable — a benchmark harness diffing it to
+//! score a patch, a `git-worktree` workspace whose diff becomes a pull request — has to answer
+//! "what did the *capsule* change?". Without a declaration that answer is a hand-maintained
+//! exclusion list that goes stale the moment the runtime gains an entry, and silently: nothing
+//! tells the consumer the set grew. [`runtime_writes`] is that declaration, carried by
 //! [`crate::containment::ScopeReport`] and therefore printed by `mur run --explain-scope` and
 //! recorded verbatim in `trace.jsonl`'s `session_start.effective_grants`.
 //!
 //! # Path form
 //!
-//! Every [`RuntimeWriteReport::path`] is relative to the **accessible workdir** — the directory a
-//! `--workdir` run hands the capsule, and the directory a consumer diffs — and carries the
-//! **literal** segment `<session-id>` ([`SESSION_ID_PLACEHOLDER`]) wherever a real session id
-//! appears. `mur run --explain-scope` answers before a session exists, so there is no id to
-//! substitute; keeping the placeholder in both renderings is what lets a consumer capture the
-//! declaration ahead of a run and compare it byte for byte with the one the trace carries.
-//! `session_start.session_id` supplies the substitution.
-//!
-//! Without `--workdir` there is no separate deliverable: the accessible workdir *is* the session
-//! directory, under `<manifest dir>/workdir/<session id>/`, and the runtime owns all of it. The
-//! declaration describes the `--workdir` layout in both cases, so that it is one fixed answer a
-//! consumer can compare against rather than two.
+//! Every [`RuntimeWriteReport::path`] is relative to the **work folder**: the `--workdir`
+//! directory, or `<manifest dir>/workdir/<session id>/` for a launch without one. The runtime
+//! creates nothing else in it, so the declaration is the same fixed answer for both.
 //!
 //! # What is labelled
 //!
-//! [`RuntimeWriteCondition`] names when a path is present. Every condition turns on what the
-//! session does after it starts, which no report can know, so every row is always declared,
-//! whatever the tier, and the condition says when the path appears.
+//! [`RuntimeWriteCondition`] names when a path is present. Each turns on what the capsule does
+//! after it starts — a peer handle the agent redeems, a script capsule's own write to its `.` —
+//! which no report can know, so every row is always declared, whatever the tier, and the
+//! condition says when the path appears. Both are written only at the capsule's own request.
 //!
 //! # What is not here
 //!
 //! Every file the runtime writes for its own use — `MURMUR.md`, `task.md`, the manifest copy,
 //! `tools/` and `plans/` — is written into the session's runtime directory,
-//! `~/.murmur/sessions/<session-id>/runtime`, never into the workdir, and the synthetic `/etc`
-//! files and a `transport: process` harness's files go beside it. Every record it writes about
-//! the session — `trace.jsonl`, `blobs/`, `logs/bootstrap.log`, `logs/otel.log`,
+//! `~/.murmur/sessions/<session-id>/runtime`, and the synthetic `/etc` files and a
+//! `transport: process` harness's files go beside it. Everything else it writes about or for the
+//! session goes into the session's records directory, `~/.murmur/records/<workdir
+//! root>/<session-id>`: `trace.jsonl`, `blobs/`, `logs/bootstrap.log`, `logs/otel.log`,
 //! `logs/hook-<name>.log`, a shell command's full-output log (`logs/shell-<ms>.log` for a
 //! truncated foreground command, `logs/<work-id>.log` for a demoted one), a delegated child's
-//! `completion.json` and the `hooks/` a records-granted hook writes in — goes into the session's
-//! records directory,
-//! `~/.murmur/records/<workdir root>/<session-id>`. The session's temporary folder, which commands
-//! reach as `/tmp` and `$TMPDIR`, is `tmp/` in that records directory. None of them is a runtime
-//! write inside the workdir, so none is declared here; [`crate::runtime_dir`],
+//! `completion.json`, the `hooks/` a records-granted hook writes in, an agent's `out/result.txt`,
+//! `out/result_<task-id>.txt` and `out/compaction-summaries.jsonl`, the commands' `tmp/` and
+//! `home/`, and `children/<capsule>-<16 hex>/`, each delegated child's work folder. None of them is
+//! a runtime write inside the work folder, so none is declared here; [`crate::runtime_dir`],
 //! [`crate::records_dir`] and [`crate::temp_dir`] describe them.
 //!
 //! # Adding an entry
 //!
-//! Add a row to [`DECLARED_WRITES`]. `every_workdir_write_is_declared_or_exempted` reads the
-//! runtime's own source text and fails until a new `workdir.join(...)` is either declared here or
-//! listed in that test's exempt tables with a written reason. A file the runtime writes for its
-//! own use goes through the runtime directory's root instead and is declared in that test's
-//! `RUNTIME_DIR_WRITES`; a record about the session goes through the records directory's root,
-//! `records_root`, and is declared in its `RECORDS_DIR_WRITES`.
+//! A file the runtime writes for its own use goes through the runtime directory's root and is
+//! declared in the test module's `RUNTIME_DIR_WRITES`; anything else it writes goes through the
+//! records directory's root, `records_root`, and is declared in its `RECORDS_DIR_WRITES`.
+//! `every_workdir_write_is_declared_or_exempted` reads the runtime's own source text and fails
+//! until a new write is declared in one of those tables, in [`DECLARED_WRITES`] or in an exempt
+//! table with a written reason. A row in [`DECLARED_WRITES`] is a path the runtime writes into
+//! the operator's folder, which needs a reason the capsule asked for it.
 
 use serde::Serialize;
-
-/// The literal segment a declared path carries in place of a real session id.
-///
-/// Substituted by the consumer, from `session_start.session_id`. Never expanded here: see the
-/// module docs for why the two renderings have to stay identical.
-pub const SESSION_ID_PLACEHOLDER: &str = "<session-id>";
 
 /// Whether a declared entry is a single file or a directory whose whole subtree the runtime owns.
 ///
@@ -84,48 +72,14 @@ impl RuntimeWriteKind {
     }
 }
 
-/// Which of the two workdirs an entry lands in.
-///
-/// The distinction only exists under `--workdir`, where [`Self::Session`] paths sit under
-/// `.murmur/<session-id>/` inside the accessible workdir. Both are reported relative to the
-/// accessible workdir, so a consumer that excludes the single prefix `.murmur/` covers every
-/// [`Self::Session`] row without reading their paths at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RuntimeWriteScope {
-    /// Directly inside the directory the capsule was asked to produce.
-    Accessible,
-    /// Inside this session's own bookkeeping directory, `.murmur/<session-id>/`.
-    Session,
-}
-
-impl RuntimeWriteScope {
-    /// The wire name, identical to what [`Serialize`] emits.
-    #[must_use]
-    pub fn wire_name(self) -> &'static str {
-        match self {
-            Self::Accessible => "accessible",
-            Self::Session => "session",
-        }
-    }
-}
-
 /// When a declared entry is present on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeWriteCondition {
-    /// Written by every session, before the capsule runs.
-    Always,
-    /// Written by the agent loop, so absent from a script capsule's session.
-    AgentSession,
-    /// Written by a script capsule, whose WASI preopen `.` is the accessible workdir itself.
+    /// Written by a script capsule, whose WASI preopen `.` is the work folder itself.
     ScriptSession,
-    /// Written when a shell or native tool call runs.
-    Shell,
     /// Written when a peer handle is redeemed, which needs `capabilities.peer_fetch.allow`.
     PeerFetch,
-    /// Written when this capsule launches a sub-capsule, which needs `capabilities.spawn.allow`.
-    Spawn,
 }
 
 impl RuntimeWriteCondition {
@@ -133,52 +87,35 @@ impl RuntimeWriteCondition {
     #[must_use]
     pub fn wire_name(self) -> &'static str {
         match self {
-            Self::Always => "always",
-            Self::AgentSession => "agent-session",
             Self::ScriptSession => "script-session",
-            Self::Shell => "shell",
             Self::PeerFetch => "peer-fetch",
-            Self::Spawn => "spawn",
         }
     }
 }
 
-/// One path the runtime writes inside the capsule's workdir.
+/// One path the runtime writes inside the capsule's work folder.
 ///
-/// Field names are the JSON keys verbatim: `path`, `kind`, `scope`, `condition`.
+/// Field names are the JSON keys verbatim: `path`, `kind`, `condition`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeWriteReport {
-    /// Relative to the accessible workdir, carrying the literal [`SESSION_ID_PLACEHOLDER`].
+    /// Relative to the work folder.
     pub path: String,
     pub kind: RuntimeWriteKind,
-    pub scope: RuntimeWriteScope,
     pub condition: RuntimeWriteCondition,
 }
 
-/// One row of [`DECLARED_WRITES`]: an entry named relative to its own scope's root.
-///
-/// The `.murmur/<session-id>/` prefix a [`RuntimeWriteScope::Session`] entry carries in the report
-/// is composed by [`DeclaredWrite::report`] rather than written into each row, so the placeholder
-/// appears in one place and a row states only the part that is about the entry itself.
+/// One row of [`DECLARED_WRITES`].
 struct DeclaredWrite {
     entry: &'static str,
     kind: RuntimeWriteKind,
-    scope: RuntimeWriteScope,
     condition: RuntimeWriteCondition,
 }
 
 impl DeclaredWrite {
     fn report(&self) -> RuntimeWriteReport {
-        let path = match self.scope {
-            RuntimeWriteScope::Accessible => self.entry.to_string(),
-            RuntimeWriteScope::Session => {
-                format!(".murmur/{SESSION_ID_PLACEHOLDER}/{}", self.entry)
-            }
-        };
         RuntimeWriteReport {
-            path,
+            path: self.entry.to_string(),
             kind: self.kind,
-            scope: self.scope,
             condition: self.condition,
         }
     }
@@ -191,65 +128,31 @@ impl DeclaredWrite {
     }
 }
 
-/// Every path the runtime writes inside a capsule's workdir, in report order.
+/// Every path the runtime writes inside a capsule's work folder, in report order.
 ///
 /// The single source of truth: `mur run --explain-scope` reads it, `trace.jsonl` carries what that
 /// produced, and `every_workdir_write_is_declared_or_exempted` fails the suite when the runtime's
-/// source grows a workdir entry this table does not name.
+/// source grows a work folder entry this table does not name.
 const DECLARED_WRITES: &[DeclaredWrite] = &[
-    // ── The accessible workdir's own top level ────────────────────────────────
     DeclaredWrite {
-        // The one prefix a consumer excludes. Created by `stage_session` before anything else.
-        entry: ".murmur/<session-id>",
-        kind: RuntimeWriteKind::Directory,
-        scope: RuntimeWriteScope::Accessible,
-        condition: RuntimeWriteCondition::Always,
-    },
-    DeclaredWrite {
-        // Where a redeemed peer handle's bytes land. A documented resource-plane path.
+        // Where a redeemed peer handle's bytes land, at the agent's own fetch call. A documented
+        // resource-plane path.
         entry: "peer-in",
         kind: RuntimeWriteKind::Directory,
-        scope: RuntimeWriteScope::Accessible,
         condition: RuntimeWriteCondition::PeerFetch,
     },
     DeclaredWrite {
-        // One directory per sub-capsule launch, each its own accessible workdir. Under `.murmur/`
-        // already, but beside the session directory rather than inside it: a child outlives no
-        // session but is named for the capsule, not for the parent's id.
-        entry: ".murmur/children",
-        kind: RuntimeWriteKind::Directory,
-        scope: RuntimeWriteScope::Accessible,
-        condition: RuntimeWriteCondition::Spawn,
-    },
-    DeclaredWrite {
-        // A script capsule's WASI preopen `.` is the accessible workdir, so its `out/result.txt`
-        // lands here rather than in the session directory the agent loop writes to.
+        // A script capsule's WASI preopen `.` is the work folder, so its own `out/result.txt`
+        // lands here. The runtime only reads it.
         entry: "out",
         kind: RuntimeWriteKind::Directory,
-        scope: RuntimeWriteScope::Accessible,
         condition: RuntimeWriteCondition::ScriptSession,
-    },
-    // ── The per-session directory ─────────────────────────────────────────────
-    DeclaredWrite {
-        // `result.txt`, `result_<task-id>.txt` and `compaction-summaries.jsonl`.
-        entry: "out",
-        kind: RuntimeWriteKind::Directory,
-        scope: RuntimeWriteScope::Session,
-        condition: RuntimeWriteCondition::AgentSession,
-    },
-    DeclaredWrite {
-        // `$HOME` for every shell and native tool subprocess. Reached only through the variable;
-        // nothing outside the runtime names the literal path.
-        entry: ".capsule-home",
-        kind: RuntimeWriteKind::Directory,
-        scope: RuntimeWriteScope::Session,
-        condition: RuntimeWriteCondition::Shell,
     },
 ];
 
-/// Every path the runtime writes inside this launch's workdir, in declaration order.
+/// Every path the runtime writes inside this launch's work folder, in declaration order.
 ///
-/// Pure and filesystem-free: `mur run --explain-scope` returns before a workdir exists, so a
+/// Pure and filesystem-free: `mur run --explain-scope` returns before a work folder exists, so a
 /// declaration that touched one would make the diagnostic create the thing it describes. The same
 /// set on every tier.
 pub(crate) fn runtime_writes() -> Vec<RuntimeWriteReport> {
@@ -264,10 +167,7 @@ pub(crate) fn runtime_writes() -> Vec<RuntimeWriteReport> {
 #[must_use]
 pub fn render_runtime_writes(writes: &[RuntimeWriteReport]) -> String {
     let mut out = String::new();
-    out.push_str(
-        "  paths are relative to the accessible workdir; `<session-id>` is a literal segment, \
-         replaced by the run's own session id\n",
-    );
+    out.push_str("  paths are relative to the work folder\n");
     if writes.is_empty() {
         out.push_str("  runtime writes: <none>\n");
         return out;
@@ -275,10 +175,9 @@ pub fn render_runtime_writes(writes: &[RuntimeWriteReport]) -> String {
     out.push_str("  runtime writes:\n");
     for write in writes {
         out.push_str(&format!(
-            "    - {} ({}, {}, {})\n",
+            "    - {} ({}, {})\n",
             write.path,
             write.kind.wire_name(),
-            write.scope.wire_name(),
             write.condition.wire_name()
         ));
     }
@@ -340,10 +239,6 @@ mod tests {
         ("MANIFEST_FILENAME", murmur_artifact::MANIFEST_FILENAME),
         ("COMPLETION_FILE", crate::delegation::COMPLETION_FILE),
         ("BLOB_DIR_NAME", crate::trace_blobs::BLOB_DIR_NAME),
-        (
-            "SYNTHETIC_HOME_DIR_NAME",
-            crate::shell::SYNTHETIC_HOME_DIR_NAME,
-        ),
         ("TASK_INPUT_FILE", crate::runtime::TASK_INPUT_FILE),
         (
             "LEGACY_TASK_INPUT_FILE",
@@ -352,6 +247,9 @@ mod tests {
         ("TRACE_FILE_NAME", crate::trace::TRACE_FILE_NAME),
         ("CHILDREN_DIR", crate::child_launch::CHILDREN_DIR),
         ("HOOKS_SUBDIR", crate::records_dir::HOOKS_SUBDIR),
+        ("HOME_SUBDIR", crate::records_dir::HOME_SUBDIR),
+        ("RESULTS_SUBDIR", crate::records_dir::RESULTS_SUBDIR),
+        ("RESULT_FILE", crate::records_dir::RESULT_FILE),
         (
             "SESSION_TEMP_DIR_NAME",
             crate::temp_dir::SESSION_TEMP_DIR_NAME,
@@ -420,18 +318,6 @@ mod tests {
             "`StagedSession::write_workdir_file`'s path, named by the embedding caller for an \
              input it stages for the capsule before launch. A launch writes nothing there of its \
              own.",
-        ),
-        (
-            "child_launch.rs",
-            "rel",
-            "One child's directory, `.murmur/children/<name>-<16 hex>`, composed by \
-             `child_workdir_rel`. Declared through the `.murmur/children` entry.",
-        ),
-        (
-            "child_launch.rs",
-            "child_workdir_rel(capsule_name)",
-            "The host path of the same child directory, for the child's `--workdir` argument. \
-             Declared through the `.murmur/children` entry.",
         ),
         (
             "trace.rs",
@@ -623,12 +509,33 @@ mod tests {
             "The session's temporary folder, `/tmp` and `$TMPDIR` to its commands. Created \
              empty at staging; the runtime writes nothing in it.",
         ),
+        (
+            "home",
+            "The session's home folder, `$HOME` to its commands. Created empty at staging; the \
+             runtime writes nothing in it.",
+        ),
+        (
+            "out",
+            "An agent's `result.txt`, `result_<task-id>.txt` and `compaction-summaries.jsonl`, \
+             written by the runtime alone.",
+        ),
+        (
+            "children",
+            "One `<capsule>-<16 hex>` work folder per delegated child, the child's `--workdir`.",
+        ),
     ];
 
     /// Writes through `records_root` whose argument is not a literal or a named constant, each
     /// with the [`RECORDS_DIR_WRITES`] entry it lies under and the reason. Matched only through
     /// `records_root`: the same argument through a workdir root resolves to nothing and fails.
     const RECORDS_DIR_DYNAMIC: &[(&str, &str, &str, &str)] = &[
+        (
+            "child_launch.rs",
+            "rel",
+            "children",
+            "One delegated child's work folder, `children/<name>-<16 hex>`, composed by \
+             `child_workdir_rel`.",
+        ),
         (
             "shell.rs",
             "&log.relative",
@@ -1042,6 +949,20 @@ mod tests {
     /// goes through [`crate::workdir_fs::WorkdirRoot`] instead, and has no row here.
     const RAW_FS_EXEMPT: &[(&str, &str, &str)] = &[
         (
+            "sandbox.rs",
+            "children_records_path",
+            "Asks whether `records_group(<records dir>/children)` under `~/.murmur/records`, outside \
+             every work folder, exists yet; the descriptor a grant is taken on is opened with no \
+             link followed by `open_directory_no_follow`.",
+        ),
+        (
+            "sandbox.rs",
+            "open_directory_no_follow",
+            "Opens `records_group(<records dir>/children)` under `~/.murmur/records`, outside every \
+             work folder, `O_PATH` with no link followed at its last component, as the descriptor \
+             a parent's read-only rule and bind on its children's records are taken on.",
+        ),
+        (
             "network_policy.rs",
             "resolve_scoped_dir",
             "Creates a declared `capabilities.filesystem.scope` beneath the root a WASI guest is \
@@ -1349,7 +1270,7 @@ mod tests {
         );
         assert_eq!(
             resolve_entry_name("CHILDREN_DIR").as_deref(),
-            Some(".murmur")
+            Some("children")
         );
         assert_eq!(resolve_entry_name("&rel"), None);
         assert_eq!(resolve_entry_name("format!(\"{}/x\", a)"), None);
@@ -1369,8 +1290,7 @@ mod tests {
         }
     }
 
-    /// Every shell log is a record in the session's records directory, so no row names `logs`,
-    /// and the accessible-scope rows left are conditioned on nothing a shell call does.
+    /// Every shell log is a record in the session's records directory, so no row names `logs`.
     #[test]
     fn no_declared_path_is_a_shell_log() {
         for write in runtime_writes() {
@@ -1379,13 +1299,33 @@ mod tests {
                 "{} is declared as a workdir write",
                 write.path
             );
-            if write.scope == RuntimeWriteScope::Accessible {
-                assert_ne!(
-                    write.condition,
-                    RuntimeWriteCondition::Shell,
-                    "{}",
-                    write.path
-                );
+        }
+    }
+
+    /// The declaration is exactly the two paths the capsule itself asks for: a redeemed peer
+    /// handle's `peer-in` and a script capsule's own `out`. Nothing the runtime keeps for itself —
+    /// a session directory, a home, an agent's results, a child's work folder — is in the work
+    /// folder.
+    #[test]
+    fn runtime_writes_are_exactly_peer_in_and_a_script_capsules_out() {
+        assert_eq!(
+            runtime_writes(),
+            vec![
+                RuntimeWriteReport {
+                    path: "peer-in".to_string(),
+                    kind: RuntimeWriteKind::Directory,
+                    condition: RuntimeWriteCondition::PeerFetch,
+                },
+                RuntimeWriteReport {
+                    path: "out".to_string(),
+                    kind: RuntimeWriteKind::Directory,
+                    condition: RuntimeWriteCondition::ScriptSession,
+                },
+            ]
+        );
+        for write in runtime_writes() {
+            for old in [".murmur", ".capsule-home", "children", "home"] {
+                assert!(!write.path.contains(old), "{}", write.path);
             }
         }
     }
@@ -1404,55 +1344,24 @@ mod tests {
         }
     }
 
-    /// Serialized rows carry exactly the four documented keys, in declaration order, with the
+    /// Serialized rows carry exactly the three documented keys, in declaration order, with the
     /// kebab-case wire values.
     ///
     /// The order is asserted off `to_string` rather than off `to_value`: `serde_json`'s `Value`
     /// holds a map that sorts its keys, so a round trip through it would prove nothing about the
     /// bytes `--explain-scope --json` and `trace.jsonl` actually carry.
     #[test]
-    fn a_serialized_row_carries_exactly_path_kind_scope_and_condition() {
+    fn a_serialized_row_carries_exactly_path_kind_and_condition() {
         for write in runtime_writes() {
             let line = serde_json::to_string(&write).unwrap();
             assert_eq!(
                 line,
                 format!(
-                    r#"{{"path":"{}","kind":"{}","scope":"{}","condition":"{}"}}"#,
+                    r#"{{"path":"{}","kind":"{}","condition":"{}"}}"#,
                     write.path,
                     write.kind.wire_name(),
-                    write.scope.wire_name(),
                     write.condition.wire_name()
                 )
-            );
-        }
-    }
-
-    /// A session-scoped entry is reported under the one prefix a consumer excludes, and an
-    /// accessible one never is.
-    #[test]
-    fn session_scoped_paths_carry_the_murmur_prefix_and_the_literal_session_id() {
-        for write in runtime_writes() {
-            match write.scope {
-                RuntimeWriteScope::Session => {
-                    let prefix = format!(".murmur/{SESSION_ID_PLACEHOLDER}/");
-                    assert!(
-                        write.path.starts_with(&prefix),
-                        "{} is session-scoped but not under {prefix}",
-                        write.path
-                    );
-                }
-                RuntimeWriteScope::Accessible => assert!(
-                    !write
-                        .path
-                        .starts_with(&format!(".murmur/{SESSION_ID_PLACEHOLDER}/")),
-                    "{} is accessible-scoped but sits inside the session directory",
-                    write.path
-                ),
-            }
-            assert!(
-                !write.path.contains("ses_"),
-                "{} carries a real session id where the placeholder belongs",
-                write.path
             );
         }
     }
@@ -1470,10 +1379,10 @@ mod tests {
     }
 
     #[test]
-    fn the_rendering_names_every_declared_path_and_the_placeholder_rule() {
+    fn the_rendering_names_every_declared_path_relative_to_the_work_folder() {
         let writes = runtime_writes();
         let rendered = render_runtime_writes(&writes);
-        assert!(rendered.contains("`<session-id>` is a literal segment"));
+        assert!(rendered.contains("paths are relative to the work folder"));
         for write in &writes {
             assert!(
                 rendered.contains(&write.path),

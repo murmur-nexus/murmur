@@ -11,7 +11,7 @@ The relevant manifest options are:
 | [inference.compaction.model](../reference/manifest.md#field-inference) | Model used for the compaction call (optional override) |
 | [inference.compaction.system_prompt](../reference/manifest.md#field-inference) | System prompt override for the compaction call (optional; hook picks its own default when unset) |
 | [inference.compaction.system_prompt_file](../reference/manifest.md#field-inference) | Same override, loaded from a file next to the manifest (optional; mutually exclusive with `system_prompt`) |
-| [inference.compaction.dump_summaries](../reference/manifest.md#field-inference) | When `true`, appends one JSON line per committed compaction to `out/compaction-summaries.jsonl` (optional; default `false`) |
+| [inference.compaction.dump_summaries](../reference/manifest.md#field-inference) | When `true`, appends one JSON line per committed compaction to `out/compaction-summaries.jsonl` in the session's records directory (optional; default `false`) |
 | [inference.compaction.max_tokens](../reference/manifest.md#field-inference) | Output cap of the compaction call (optional; default: the driver's ceiling for the model) |
 | [inference.compaction.driver_config](../reference/manifest.md#field-inference) | Driver settings laid over `inference.driver.config` for the compaction call only (optional) |
 
@@ -319,14 +319,15 @@ inference:
     dump_summaries: true
 ```
 
-Each committed compaction then appends one line to `out/compaction-summaries.jsonl`, holding
-what the hook returned and not the task message the runtime kept ahead of it:
+Each committed compaction then appends one line to `out/compaction-summaries.jsonl` in the
+session's [records directory](../reference/workdir.md#records-directory), holding what the hook
+returned and not the task message the runtime kept ahead of it:
 
 ```json
 {"turn":17,"tokens_before":81501,"tokens_after":334,"summary":"1. THE BUG: ..."}
 ```
 
-See [out/compaction-summaries.jsonl](../reference/workdir.md#compaction-summaries) for the
+See [Compaction summaries](../reference/workdir.md#compaction-summaries) for the
 full field reference. The file is only created once the first compaction actually commits, and
 a compaction the tool-call-pairing safety net rejects writes nothing.
 
@@ -407,8 +408,8 @@ call/result pair.
 **A bound hook ran and returned an error, with no refused `run-inference` call behind it.** This
 *is* treated as a failure, and it ends the
 session: there is no fallback compactor behind a declared compaction hook, so continuing would
-mean another inference turn on a context already known to be over budget. `out/result.txt`
-records the error, the session's `trace.jsonl` records `session_end` with `exit_status: "failed"`,
+mean another inference turn on a context already known to be over budget. `out/result.txt` in
+the session's records directory records the error, the session's `trace.jsonl` records `session_end` with `exit_status: "failed"`,
 OTel emits `session_end` as `"failed"` (if `observability.otel_endpoint` is configured), and — if
 the session has a `task_id` — the final SSE `status` event reports `state: "failed"`. The agent
 loop does not attempt another turn after this.
@@ -444,7 +445,7 @@ ends the session as a spend stop, not as a failure. The hook's call crossed
 | Surface | What it records |
 |---|---|
 | `trace.jsonl` | One `spend_ceiling_reached` line with `origin: "hook:<name>"`; `task_end` and `session_end` with `exit_status: "spend_ceiling_reached"` |
-| `out/result.txt` | `stopped: spend ceiling reached: …` |
+| `out/result.txt` in the records directory | `stopped: spend ceiling reached: …` |
 | OTel | `session_end` as `"spend_ceiling_reached"` |
 | SSE | A final `status` event with `state: "failed"` and the refusal text as its message |
 
@@ -462,7 +463,7 @@ compaction.
 | `murmur/hook-compact` with `runtime: hook` (or any hook bound to `on-compaction`) | Provides the compaction hook; required to enable compaction |
 | `inference.compaction.threshold: 0.85` | Compaction fires when the context reaches 85% of the context window |
 | `inference.compaction.model: claude-haiku-4-5` | Uses a different (typically cheaper) model for compaction calls |
-| `inference.compaction.dump_summaries: true` | Appends every committed compaction's summary to `out/compaction-summaries.jsonl`; default `false` |
+| `inference.compaction.dump_summaries: true` | Appends every committed compaction's summary to `out/compaction-summaries.jsonl` in the session's records directory; default `false` |
 | `inference.compaction.max_tokens: 8000` | Caps the compaction call at 8000 output tokens; above the driver's ceiling for the compaction model, the launch is refused with `E-RUN-054` |
 | `inference.compaction.driver_config: {reasoning_effort: low}` | Runs the compaction call with `reasoning_effort: low` laid over `inference.driver.config`; agent turns keep their own |
 | `capabilities.limits.deadline_seconds` on the hook's entry | That hook's call deadline, ahead of the capsule-wide value and the 30-second default |

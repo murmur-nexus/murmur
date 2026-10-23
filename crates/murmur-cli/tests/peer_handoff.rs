@@ -272,7 +272,7 @@ fn end_turn_response(text: &str) -> String {
 
 struct Capsule {
     project: PathBuf,
-    session_dir: PathBuf,
+    runtime_dir: PathBuf,
     records_dir: PathBuf,
     url: String,
     name: String,
@@ -412,7 +412,7 @@ fn launch(spec: CapsuleSpec<'_>) -> Capsule {
     )
     .expect("staging should succeed");
 
-    let session_dir = staged.workdir.clone();
+    let runtime_dir = staged.runtime_dir.clone();
     let records_dir = staged.records_dir.clone();
     let (url_tx, url_rx) = mpsc::channel::<String>();
     let handle = thread::spawn(move || {
@@ -427,7 +427,7 @@ fn launch(spec: CapsuleSpec<'_>) -> Capsule {
 
     Capsule {
         project,
-        session_dir,
+        runtime_dir,
         records_dir,
         url,
         name: spec.name.to_string(),
@@ -832,7 +832,7 @@ fn without_exports_peer_files_nothing_mints_and_the_plane_denies() {
 
     assert!(
         !capsule
-            .session_dir
+            .runtime_dir
             .join("tools")
             .join("share-file")
             .exists(),
@@ -885,7 +885,7 @@ fn without_peer_fetch_nothing_fetches_and_the_check_precedes_the_connection() {
     });
     assert!(
         !undeclared
-            .session_dir
+            .runtime_dir
             .join("tools")
             .join("fetch-peer-file")
             .exists(),
@@ -1369,7 +1369,7 @@ fn relaunch(project: &Path, manifest: &str, port: u16) -> Capsule {
     )
     .expect("the second session should stage");
 
-    let session_dir = staged.workdir.clone();
+    let runtime_dir = staged.runtime_dir.clone();
     let records_dir = staged.records_dir.clone();
     let (url_tx, url_rx) = mpsc::channel::<String>();
     let handle = thread::spawn(move || {
@@ -1384,7 +1384,7 @@ fn relaunch(project: &Path, manifest: &str, port: u16) -> Capsule {
 
     Capsule {
         project: project.to_path_buf(),
-        session_dir,
+        runtime_dir,
         records_dir,
         url,
         name: runtime_manifest.name.clone(),
