@@ -146,7 +146,7 @@ its own cap and config.
 
 | Call | `max_output_tokens` | `driver_config` |
 |---|---|---|
-| Agent-loop turn | The cap that turn sent: [`inference.max_tokens`](manifest.md#inference-max-tokens), or a value a controller set | [`inference.driver.config`](manifest.md#field-inference), the same for every driver choice |
+| Agent-loop turn | The cap that turn sent: a value a controller set, otherwise [`inference.max_tokens`](manifest.md#inference-max-tokens), otherwise the entry for the serving [driver choice](manifest.md#inference-alternates)'s model in the driver's [`models:`](manifest.md#driver-models) table | [`inference.driver.config`](manifest.md#field-inference), the same for every driver choice |
 | A hook's `run-inference` while it serves `on-compaction` | `inference.compaction.max_tokens` when set, otherwise as any other hook call | [`inference.compaction.driver_config`](manifest.md#field-inference) laid over `inference.driver.config` |
 | Any other hook `run-inference` | The driver's declared ceiling for the model called, otherwise the agent's cap | `inference.driver.config` |
 

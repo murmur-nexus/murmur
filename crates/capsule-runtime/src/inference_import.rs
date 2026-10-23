@@ -142,8 +142,9 @@ pub(crate) struct HookInferenceCtx {
     /// The session's inference gateway, so a hook's `run-inference` reaches the provider exactly
     /// as the agent loop's own turns do. Never another artifact's gateway.
     pub(crate) gateway: Option<Arc<crate::credential_gateway::CredentialGateway>>,
-    /// Every gateway the session holds, so a record's `driver_config` is redacted of every
-    /// credential value the session holds, not only the inference gateway's.
+    /// Every gateway the session holds, read only by [`Self::redact`], so a record's error text
+    /// and `driver_config` are redacted of every credential value the session holds, as the agent
+    /// loop's own records are, not only the inference gateway's.
     pub(crate) gateways: crate::credential_gateway::GatewayTable,
     /// The session's formation membership, so the driver's guest reaches the callees its
     /// environment names exactly as the agent loop's own driver does.
@@ -211,7 +212,7 @@ impl HookInferenceCtx {
         let inference_env = self.env_for(purpose);
         let settings = InferenceCallSettings {
             max_output_tokens,
-            driver_config: recorded_driver_config(inference_env, |text| self.gateways.redact(text)),
+            driver_config: recorded_driver_config(inference_env, |text| self.redact(text)),
         };
         let started = Instant::now();
         let outcome = self.dispatch(payload_json, inference_env).await;
@@ -424,16 +425,9 @@ impl HookInferenceCtx {
         Some(message)
     }
 
-    /// `text` with the context gateway's credential redacted.
+    /// `text` with every credential value the session holds redacted.
     fn redact(&self, text: &str) -> String {
-        match self
-            .gateway
-            .as_ref()
-            .and_then(|gateway| gateway.credential())
-        {
-            Some(credential) => credential.redact(text),
-            None => text.to_string(),
-        }
+        self.gateways.redact(text)
     }
 
     fn record(&self, record: HookInferenceRecord) {
