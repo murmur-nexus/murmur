@@ -3621,7 +3621,9 @@ fn launch(
                 )
                 // This capsule's own A2A door, bound just above: where a started delegation's
                 // completion is posted, and what makes `DelegationPlane::start` available at all.
-                .reporting_to(format!("http://{capsule_url}")),
+                .reporting_to(format!("http://{capsule_url}"))
+                // A child runs no longer than this session: its own session deadline is this one.
+                .bounded_by(session_deadline),
             )
         });
 
@@ -9809,6 +9811,9 @@ impl CapsuleStoreState {
             .delegation
             .as_ref()
             .and_then(|plane| plane.formation_id().cloned());
+        // The session's deadline, which every `capsule` step's child inherits as the plane's
+        // own children do.
+        let deadline = self.delegation.as_ref().and_then(|plane| plane.deadline());
         let plan_trace = self.plan_trace.clone();
         let registry = Arc::clone(&self.registry);
         let gate_tx = request_tx.clone();
@@ -9869,6 +9874,7 @@ impl CapsuleStoreState {
                 registry,
                 spawn_credential,
                 formation_id,
+                deadline,
                 trace: plan_trace.as_deref(),
                 gate_step: &gate_step,
                 invoke_tool: &invoke_tool,
@@ -12155,7 +12161,7 @@ struct TerminationSources {
     formation_closed: Option<tokio::sync::oneshot::Receiver<()>>,
     /// Fired once by the spawner lifeline's watcher thread, at EOF, for a delegated child.
     spawner_closed: Option<tokio::sync::oneshot::Receiver<()>>,
-    /// The `mur run --deadline` the session ends at.
+    /// The deadline the session ends at: the earliest of its own and the one it inherited.
     deadline: Option<crate::session_status::SessionDeadline>,
 }
 
@@ -12227,8 +12233,24 @@ enum TerminationCause {
     FormationEnded,
     /// EOF on the spawner lifeline: the process that spawned this session has ended.
     SpawnerEnded,
-    /// The `mur run --deadline` timer fired.
+    /// The session's deadline fell.
     Deadline,
+}
+
+/// The cause a termination taken at `now` is recorded as: [`TerminationCause::Deadline`] once the
+/// session's deadline has passed, whatever arrived, and `cause` otherwise. So a member whose
+/// lifeline closes because a peer ended at the formation's shared deadline ends at that deadline
+/// too.
+#[cfg(unix)]
+fn settle_termination_cause(
+    cause: TerminationCause,
+    deadline: Option<crate::session_status::SessionDeadline>,
+    now: Instant,
+) -> TerminationCause {
+    match deadline {
+        Some(deadline) if deadline.left(now).is_zero() => TerminationCause::Deadline,
+        _ => cause,
+    }
 }
 
 /// Wait until the deadline, or forever when there is none.
@@ -12262,6 +12284,7 @@ async fn lifeline_closed(closed: &mut Option<tokio::sync::oneshot::Receiver<()>>
 ///
 /// * The first `SIGTERM` begins it. A second exits with status 143 at once; lifeline EOF never
 ///   counts toward that, so a `SIGTERM` after EOF is a first `SIGTERM`, and changes nothing.
+/// * A cause taken once the deadline has passed is the deadline: [`settle_termination_cause`].
 /// * EOF on either lifeline, and the deadline, begin it only when nothing has yet:
 ///   `formation_ended`, `spawner_ended` or `deadline_reached` is then appended before any live
 ///   task is cancelled, so it precedes every record the wind-down writes. One of them after
@@ -12278,6 +12301,7 @@ async fn run_termination(
 ) {
     let mut sigterms = 0u32;
     let mut begun = false;
+    let deadline = sources.deadline;
     while sources.any() {
         let cause = tokio::select! {
             received = async {
@@ -12316,6 +12340,7 @@ async fn run_termination(
             continue;
         }
         begun = true;
+        let cause = settle_termination_cause(cause, deadline, Instant::now());
         start_termination(
             cause,
             &ends,
@@ -22452,6 +22477,48 @@ inference:
         ));
         assert!(MAX_TURNS_REACHED_REASON.contains("inference.max_turns"));
         assert!(SPEND_CEILING_REACHED_REASON.contains("spend ceiling"));
+    }
+
+    /// A lifeline's EOF or a `SIGTERM` taken once the deadline has passed is the deadline; before
+    /// it, or with no deadline, each stays what it is.
+    #[cfg(unix)]
+    #[test]
+    fn termination_cause_after_the_deadline_settles_as_the_deadline() {
+        let started = Instant::now();
+        let deadline = crate::session_status::SessionDeadline::after(
+            started,
+            std::time::SystemTime::now(),
+            30,
+        );
+        let before = started + std::time::Duration::from_secs(29);
+        let after = started + std::time::Duration::from_secs(30);
+        for cause in [
+            TerminationCause::FormationEnded,
+            TerminationCause::SpawnerEnded,
+            TerminationCause::Sigterm,
+        ] {
+            assert_eq!(
+                settle_termination_cause(cause, Some(deadline), after),
+                TerminationCause::Deadline
+            );
+            assert_eq!(
+                settle_termination_cause(
+                    cause,
+                    Some(deadline),
+                    after + std::time::Duration::from_millis(5)
+                ),
+                TerminationCause::Deadline
+            );
+            assert_eq!(
+                settle_termination_cause(cause, Some(deadline), before),
+                cause
+            );
+            assert_eq!(settle_termination_cause(cause, None, after), cause);
+        }
+        assert_eq!(
+            settle_termination_cause(TerminationCause::Deadline, Some(deadline), after),
+            TerminationCause::Deadline
+        );
     }
 
     /// A running task the formation's end cancelled ends the launch `formation_ended`, and is no

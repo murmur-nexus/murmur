@@ -71,6 +71,7 @@ use crate::formation_credentials::{
 use crate::lifeline::SPAWNER_LIFELINE_ENV;
 use crate::roster::AdmittedRoster;
 use crate::running::ProcessIdentity;
+use crate::session_status::{SessionDeadline, INHERITED_DEADLINE_FLAG};
 use serde::{Deserialize, Serialize};
 
 /// How long a member has, from its spawn, to report itself and have its door answer.
@@ -138,6 +139,10 @@ pub struct FormationLaunchOptions {
     /// How long a stopped member has after its lifeline is closed. [`MEMBER_STOP_GRACE`] in
     /// production.
     pub stop_grace: Duration,
+    /// `--deadline`: the formation's one deadline, counted from the launcher's start and passed to
+    /// every member as [`crate::session_status::INHERITED_DEADLINE_FLAG`] and its moment. It also
+    /// bounds every peer's wait to become ready. `None` bounds nothing.
+    pub deadline: Option<SessionDeadline>,
     /// Where peers' directories are made in place of `<murmur home>/formations`. `None` in
     /// production; set by tests that must not write under the developer's home.
     pub(crate) formations_dir: Option<PathBuf>,
@@ -156,6 +161,7 @@ impl FormationLaunchOptions {
             containment: None,
             ready_timeout: MEMBER_READY_TIMEOUT,
             stop_grace: MEMBER_STOP_GRACE,
+            deadline: None,
             formations_dir: None,
         }
     }
@@ -401,6 +407,9 @@ pub struct MemberLaunchFailure {
     /// The signal the launcher caught while members were coming up, when that is what ended the
     /// launch.
     pub interrupted_by: Option<i32>,
+    /// Whether the formation's deadline fell before its entry member started, and ended the
+    /// launch. A member the deadline cut off is not among [`Self::failed`].
+    pub deadline_reached: bool,
 }
 
 impl std::fmt::Display for MemberLaunchFailure {
@@ -411,6 +420,9 @@ impl std::fmt::Display for MemberLaunchFailure {
                 "the formation launch was interrupted by {} before every member was ready",
                 signal_name(signal)
             )?,
+            None if self.deadline_reached && self.failed.is_empty() => {
+                f.write_str("the formation reached its deadline before its entry member started")?
+            }
             _ => f.write_str("the formation could not be launched")?,
         }
         for failure in &self.failed {
@@ -833,7 +845,8 @@ fn member_args(member: &PlannedMember, workdir: &Path) -> Vec<String> {
     ]
 }
 
-/// The pass-through flags every member gets.
+/// The pass-through flags every member gets. The formation's deadline goes last, as one moment,
+/// so every member ends at the same instant however far apart they started.
 fn pass_through(args: &mut Vec<String>, options: &FormationLaunchOptions) {
     if options.no_env_file {
         args.push("--no-env-file".to_string());
@@ -841,6 +854,10 @@ fn pass_through(args: &mut Vec<String>, options: &FormationLaunchOptions) {
     if let Some(class) = &options.containment {
         args.push("--containment".to_string());
         args.push(class.clone());
+    }
+    if let Some(deadline) = &options.deadline {
+        args.push(INHERITED_DEADLINE_FLAG.to_string());
+        args.push(deadline.at_unix_millis().to_string());
     }
 }
 
@@ -1102,6 +1119,8 @@ enum PeerOutcome {
     Failed(MemberFailureReason),
     /// Given up on because another peer failed or the launcher was signalled.
     Abandoned,
+    /// Cut off by the formation's deadline before it was ready.
+    DeadlineReached,
 }
 
 /// A member's formation channel: the write end the launcher keeps, already holding the member's
@@ -1175,7 +1194,19 @@ fn start_peer(
     };
     let set = channel.member_env(&options.formation_id);
     let spawned_at = Instant::now();
-    let deadline = spawned_at + options.ready_timeout;
+    // The earlier of its own ready bound and the formation's deadline. Once the formation's
+    // deadline has passed, whatever ends the wait is that deadline: a member that exits then is
+    // ending itself at the deadline it was handed.
+    let deadline = options
+        .deadline
+        .map_or(spawned_at + options.ready_timeout, |formation| {
+            (spawned_at + options.ready_timeout).min(formation.instant())
+        });
+    let deadline_passed = || {
+        options
+            .deadline
+            .is_some_and(|formation| formation.left(Instant::now()).is_zero())
+    };
     let started = child_launch::start_process(&ProcessLaunch {
         binary,
         args: &args,
@@ -1238,6 +1269,9 @@ fn start_peer(
             return (Some(process), PeerOutcome::Abandoned);
         }
         let now = Instant::now();
+        if now >= deadline && deadline_passed() {
+            return (Some(process), PeerOutcome::DeadlineReached);
+        }
         if now >= deadline {
             return (
                 Some(process),
@@ -1262,6 +1296,9 @@ fn start_peer(
                     }
                     std::thread::sleep(POLL_INTERVAL);
                 };
+                if deadline_passed() {
+                    return (Some(process), PeerOutcome::DeadlineReached);
+                }
                 return (
                     Some(process),
                     PeerOutcome::Failed(MemberFailureReason::ExitedBeforeReporting {
@@ -1286,6 +1323,9 @@ fn start_peer(
             return (Some(process), PeerOutcome::Abandoned);
         }
         if let Some(status) = process.exit_status_now() {
+            if deadline_passed() {
+                return (Some(process), PeerOutcome::DeadlineReached);
+            }
             return (
                 Some(process),
                 PeerOutcome::Failed(MemberFailureReason::ExitedBeforeDoorAnswered {
@@ -1317,6 +1357,9 @@ fn start_peer(
             Err(why) => last_error = why,
         }
         let now = Instant::now();
+        if now >= deadline && deadline_passed() {
+            return (Some(process), PeerOutcome::DeadlineReached);
+        }
         if now >= deadline {
             return (
                 Some(process),
@@ -1418,6 +1461,7 @@ pub(crate) fn launch_plan(
                     .collect(),
                 stopped: Vec::new(),
                 interrupted_by: None,
+                deadline_reached: false,
             })
         }
     };
@@ -1434,6 +1478,7 @@ pub(crate) fn launch_plan(
                     .collect(),
                 stopped: Vec::new(),
                 interrupted_by: None,
+                deadline_reached: false,
             })
         }
     };
@@ -1461,6 +1506,7 @@ pub(crate) fn launch_plan(
                     .collect(),
                 stopped: Vec::new(),
                 interrupted_by: None,
+                deadline_reached: false,
             })
         }
     };
@@ -1521,7 +1567,10 @@ pub(crate) fn launch_plan(
         loop {
             match rx.recv_timeout(POLL_INTERVAL) {
                 Ok((index, outcome)) => {
-                    if matches!(outcome.1, PeerOutcome::Failed(_)) {
+                    if matches!(
+                        outcome.1,
+                        PeerOutcome::Failed(_) | PeerOutcome::DeadlineReached
+                    ) {
                         abort.store(true, Ordering::SeqCst);
                     }
                     outcomes[index] = Some(outcome);
@@ -1541,6 +1590,7 @@ pub(crate) fn launch_plan(
     let mut members = MemberSet(Vec::new());
     let mut peers = Vec::new();
     let mut failed = Vec::new();
+    let mut deadline_reached = false;
     for (member, outcome) in plan.peers.iter().zip(outcomes) {
         let Some((process, outcome)) = outcome else {
             continue;
@@ -1550,15 +1600,21 @@ pub(crate) fn launch_plan(
             PeerOutcome::Ready(peer) => peers.push(peer),
             PeerOutcome::Failed(reason) => failed.push(failure(member, reason)),
             PeerOutcome::Abandoned => {}
+            PeerOutcome::DeadlineReached => deadline_reached = true,
         }
     }
 
-    if !failed.is_empty() || interrupted_by.is_some() || peers.len() != plan.peers.len() {
+    if !failed.is_empty()
+        || interrupted_by.is_some()
+        || deadline_reached
+        || peers.len() != plan.peers.len()
+    {
         let stopped = members.stop_all();
         return Err(MemberLaunchFailure {
             failed,
             stopped,
             interrupted_by,
+            deadline_reached,
         });
     }
 
@@ -1688,6 +1744,20 @@ impl RunningFormation {
     ///
     /// On failure every peer has been stopped and reaped.
     pub fn start_entry(&mut self) -> Result<u32, MemberLaunchFailure> {
+        // A deadline that has already fallen starts nothing more.
+        if self
+            .options
+            .deadline
+            .is_some_and(|deadline| deadline.left(Instant::now()).is_zero())
+        {
+            let stopped = self.members.stop_all();
+            return Err(MemberLaunchFailure {
+                failed: Vec::new(),
+                stopped,
+                interrupted_by: None,
+                deadline_reached: true,
+            });
+        }
         let args = entry_args(&self.entry, &self.options);
         // Its whole channel is written before it starts: every address it may need is known.
         let channel = Channel::open(&self.plan.first_line(
@@ -1717,6 +1787,7 @@ impl RunningFormation {
                     failed: vec![failure(&self.entry, reason)],
                     stopped,
                     interrupted_by: None,
+                    deadline_reached: false,
                 });
             }
         };
@@ -1772,6 +1843,7 @@ impl RunningFormation {
                     )],
                     stopped,
                     interrupted_by: None,
+                    deadline_reached: false,
                 })
             }
         }
@@ -1925,6 +1997,36 @@ mod tests {
             "scoped".to_string()
         ]));
         assert!(!peer.iter().any(|arg| arg == "--task" || arg == "--verbose"));
+        assert!(
+            !peer
+                .iter()
+                .chain(&entry)
+                .any(|arg| arg == INHERITED_DEADLINE_FLAG),
+            "no deadline, no flag: {peer:?} {entry:?}"
+        );
+
+        // The formation's deadline goes to every member last, as one moment.
+        let deadline = SessionDeadline::after(
+            Instant::now(),
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(1_792_497_600_250),
+            60,
+        );
+        options.deadline = Some(deadline);
+        let flag = [
+            INHERITED_DEADLINE_FLAG.to_string(),
+            "1792497660250".to_string(),
+        ];
+        let peer = peer_args(&coder, &options, &workdir);
+        assert!(peer.ends_with(&flag), "{peer:?}");
+        let entry = entry_args(&member("planner"), &options);
+        assert!(entry.ends_with(&flag), "{entry:?}");
+        assert_eq!(
+            entry
+                .iter()
+                .filter(|arg| *arg == INHERITED_DEADLINE_FLAG)
+                .count(),
+            1
+        );
     }
 
     /// Serializes the tests that point `MURMUR_MUR_BINARY` at a stand-in; the variable is
@@ -2047,6 +2149,76 @@ mod tests {
         );
         assert!(message.contains("'coder' (coder@0.1.0)"), "{message}");
         assert_reaped(&failure);
+    }
+
+    /// A formation deadline that falls while a peer has not reported ends the launch as the
+    /// deadline, well before the peer's own ready bound: the peer is reaped, no member is failed
+    /// for it, and no entry member is started.
+    #[test]
+    fn a_formation_deadline_before_the_entry_member_ends_the_launch_at_the_deadline() {
+        let _guard = binary_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = options(Duration::from_secs(60));
+        let started = Instant::now();
+        options.deadline = Some(SessionDeadline::after(
+            started,
+            std::time::SystemTime::now(),
+            2,
+        ));
+        std::env::set_var(child_launch::MUR_BINARY_ENV, stand_in(dir.path(), None));
+        let result = launch_plan(plan_of("coder"), options);
+        std::env::remove_var(child_launch::MUR_BINARY_ENV);
+        let Err(failure) = result else {
+            panic!("the launch was expected to end at the deadline");
+        };
+        let took = started.elapsed();
+        assert!(took >= Duration::from_secs(2), "{took:?}");
+        assert!(took < Duration::from_secs(20), "{took:?}: {failure:?}");
+        assert!(failure.deadline_reached, "{failure:?}");
+        assert!(failure.failed.is_empty(), "{failure:?}");
+        assert_eq!(failure.interrupted_by, None);
+        assert_reaped(&failure);
+        assert_eq!(
+            failure.to_string(),
+            format!(
+                "the formation reached its deadline before its entry member started\n  \
+                 stopped: coder (pid {})",
+                failure.stopped[0].pid
+            )
+        );
+    }
+
+    /// `start_entry` after the formation's deadline starts nothing and reports the deadline.
+    #[test]
+    fn start_entry_after_the_formation_deadline_starts_nothing() {
+        let _guard = binary_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = options(Duration::from_secs(60));
+        let started = Instant::now();
+        options.deadline = Some(SessionDeadline::after(
+            started,
+            std::time::SystemTime::now(),
+            1,
+        ));
+        std::env::set_var(child_launch::MUR_BINARY_ENV, stand_in(dir.path(), None));
+        let plan = FormationPlan {
+            peers: Vec::new(),
+            entry: member("planner"),
+            callees: Vec::new(),
+        };
+        let launched = launch_plan(plan, options);
+        std::env::remove_var(child_launch::MUR_BINARY_ENV);
+        let mut formation = launched.expect("a formation with no peers launches at once");
+        std::thread::sleep(Duration::from_millis(1_100));
+        let failure = formation
+            .start_entry()
+            .expect_err("the deadline has fallen");
+        assert!(failure.deadline_reached, "{failure:?}");
+        assert!(
+            failure.failed.is_empty() && failure.stopped.is_empty(),
+            "{failure:?}"
+        );
+        assert_eq!(formation.entry_pid(), None);
     }
 
     /// A one-route door on `127.0.0.1`, served forever: each connection's request is read, then
@@ -2492,6 +2664,7 @@ mod tests {
                 },
             ],
             interrupted_by: None,
+            deadline_reached: false,
         };
         assert_eq!(
             failure.to_string(),

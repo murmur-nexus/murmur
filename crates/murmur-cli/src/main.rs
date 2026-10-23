@@ -309,7 +309,8 @@ enum Commands {
         /// Takes the roster's project directory or its roster.yaml; given with no value it means
         /// ./roster.yaml. Every member runs as its own `mur run` process: the peers first, each
         /// ready once its door answers, then the entry member with --task. --task, --json,
-        /// --verbose, --no-env-file and --containment are passed through.
+        /// --verbose, --no-env-file and --containment are passed through. --deadline bounds the
+        /// whole formation: counted from this launcher's start, every member ends at it.
         #[arg(
             long,
             num_args = 0..=1,
@@ -334,7 +335,7 @@ enum Commands {
                 "explain_scope",
                 "readiness_tokens",
                 "workdir_identity",
-                "deadline",
+                "inherited_deadline",
             ]
         )]
         roster: Option<PathBuf>,
@@ -367,7 +368,9 @@ enum Commands {
         /// does, records deadline_reached, and exits non-zero with E-RUN-053. The agent is told
         /// once, on a tool result, when lifecycle.deadline_notice_secs are left, and its
         /// session-status tool reports the time left. Requires an agent capsule (a manifest with
-        /// an inference: block). At most 315360000 (ten years).
+        /// an inference: block). At most 315360000 (ten years). With --roster, the formation's
+        /// one deadline. A session launched by a formation or a delegating capsule runs under the
+        /// earlier of this and the deadline it inherited.
         #[arg(
             long,
             value_name = "SECONDS",
@@ -375,6 +378,12 @@ enum Commands {
                 .range(1..=capsule_runtime::session_status::MAX_DEADLINE_SECS)
         )]
         deadline: Option<u64>,
+
+        /// The deadline this session inherits, as milliseconds since the Unix epoch. Set by
+        /// `mur run --roster` on every member and by a parent capsule's runtime on every child it
+        /// launches; the session runs under the earlier of it and --deadline.
+        #[arg(long = "inherited-deadline", value_name = "UNIX_MILLIS", hide = true)]
+        inherited_deadline: Option<u64>,
 
         /// Context id for this run's task, making its conversation record reachable by name.
         /// Two runs given the same id share one record, and a hook granted
@@ -757,6 +766,7 @@ fn main() {
             verbose,
             no_env_file,
             containment,
+            deadline,
             ..
         } => match run_roster(RosterLaunch {
             roster: &roster,
@@ -765,6 +775,7 @@ fn main() {
             verbose,
             no_env_file,
             containment: containment.as_deref(),
+            deadline,
         }) {
             // Every member has been stopped and reaped by the time a status comes back, so this
             // exit leaves nothing running.
@@ -783,6 +794,7 @@ fn main() {
             task,
             system_prompt,
             deadline,
+            inherited_deadline,
             context,
             resume,
             resume_mode,
@@ -808,6 +820,7 @@ fn main() {
             task.as_deref(),
             system_prompt.as_deref(),
             deadline,
+            inherited_deadline,
             context.as_deref(),
             resume.as_deref(),
             resume_mode.unwrap_or_default().into(),

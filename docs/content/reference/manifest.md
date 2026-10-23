@@ -1570,9 +1570,10 @@ model ends it. What bounds a task with no turn cap:
 | [`spend.machine_tokens_per_day`](config.md#spend) | Every run on the machine, once the day's tokens are spent |
 | [`mur stop`](cli.md#mur-stop), or [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) | The session, or the one task |
 | [`lifecycle.delegation_deadline_secs`](#lifecycle-delegation-deadline-secs) of the capsule that delegated the task | A delegated sub-capsule |
+| [`mur run --deadline`](cli.md#mur-run-deadline), its formation's, or its parent's | The session, and every sub-capsule it delegates to |
 | A deadline the launcher imposes, such as a CI job's timeout | Whatever the launcher kills |
 
-mur sets no wall-clock limit on a session you launch with `mur run`.
+Without a deadline, mur sets no wall-clock limit on a session you launch with `mur run`.
 
 #### Output cap: `inference.max_tokens` { #inference-max-tokens }
 
@@ -2539,6 +2540,9 @@ A capsule that does not declare it hands off work under the 600-second default. 
 bound for a whole process when it names a positive integer; the declared value applies otherwise,
 and `600` when neither is given. Getting the sub-capsule *started* is bounded separately — see
 [Bounds](roost-api.md#bounds) — so a slow host does not spend this window on staging.
+
+A sub-capsule also runs under its parent's own [deadline](cli.md#mur-run-deadline), as its session
+deadline. Whichever of the two falls first ends the sub-capsule.
 
 **Reaching the deadline ends the sub-capsule.** Under `delegate-task` the delegating task, which
 waits for every sub-capsule it started on any `lifecycle`, continues with an outcome carrying the

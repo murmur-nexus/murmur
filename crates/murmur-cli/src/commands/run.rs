@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
 };
 
+use capsule_runtime::session_status::{DeadlineSource, SessionDeadline};
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, configured_artifact_names, explain_scope,
     launch_session_handling_sigterm, preopen_reports, probe_io_max, requires_process_bounding,
@@ -152,6 +153,7 @@ pub(crate) fn run_run(
     task_arg: Option<&str>,
     system_prompt_arg: Option<&str>,
     deadline_arg: Option<u64>,
+    inherited_deadline_arg: Option<u64>,
     context_id_arg: Option<&str>,
     resume_arg: Option<&str>,
     resume_mode: capsule_runtime::ResumeMode,
@@ -169,14 +171,12 @@ pub(crate) fn run_run(
     explain_scope_only: bool,
 ) -> Result<(), CliError> {
     // Read first, so the runtime's deadline is never later than a launcher's own timeout started
-    // at the same moment.
-    let session_deadline = deadline_arg.map(|secs| {
-        capsule_runtime::session_status::SessionDeadline::after(
-            std::time::Instant::now(),
-            std::time::SystemTime::now(),
-            secs,
-        )
-    });
+    // at the same moment. Both deadlines are read against the one start, so `earliest` compares
+    // like with like.
+    let (started, started_wall) = (std::time::Instant::now(), std::time::SystemTime::now());
+    let own_deadline = deadline_arg.map(|secs| SessionDeadline::after(started, started_wall, secs));
+    let inherited_deadline = inherited_deadline_arg
+        .map(|millis| SessionDeadline::from_unix_millis(started, started_wall, millis));
     let mut session_id = "n/a".to_string();
     let mut workdir = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("/"))
@@ -653,7 +653,7 @@ pub(crate) fn run_run(
         &workdir,
         json,
     )?;
-    if session_deadline.is_some() && staged_inference.is_none() {
+    if own_deadline.is_some() && staged_inference.is_none() {
         return Err(fail(
             &session_id,
             &workdir,
@@ -665,6 +665,12 @@ pub(crate) fn run_run(
             json,
         ));
     }
+    // A script capsule has no termination routine to enforce an inherited deadline; launched as a
+    // child, it ends with its parent through its spawner lifeline instead.
+    let session_deadline = SessionDeadline::earliest(
+        own_deadline,
+        inherited_deadline.filter(|_| staged_inference.is_some()),
+    );
 
     let mut allowlisted_tools = HashSet::new();
     let mut requested_artifacts = Vec::with_capacity(runtime_manifest.artifacts.len());
@@ -1009,7 +1015,7 @@ pub(crate) fn run_run(
             }
         })
         .map_err(CliError::from)
-        .and_then(|launched| deadline_outcome(launched.ending, deadline_arg))
+        .and_then(|launched| deadline_outcome(launched.ending, session_deadline))
     } else {
         // Capture fields for the startup closure before `staged` is consumed by launch_session.
         let session_id_for_startup = session_id.clone();
@@ -1066,7 +1072,7 @@ pub(crate) fn run_run(
                     &launched.workdir,
                     run_status_for_ending(launched.ending),
                 );
-                deadline_outcome(launched.ending, deadline_arg)
+                deadline_outcome(launched.ending, session_deadline)
             }
             Err(error) => {
                 print_run_output(&session_id, &workdir, run_status_for(&error));
@@ -1108,13 +1114,30 @@ fn run_status_for_ending(ending: LaunchEnding) -> RunStatus {
     }
 }
 
-/// What `mur run` returns for a launch that ended `ending`: `E-RUN-053` for one its
-/// `--deadline` ended, success for every other.
-fn deadline_outcome(ending: LaunchEnding, deadline_secs: Option<u64>) -> Result<(), CliError> {
+/// What `mur run` returns for a launch that ended `ending` under `deadline`, the session's
+/// effective one: `E-RUN-053` for one its deadline ended, naming where that deadline came from,
+/// and success for every other.
+fn deadline_outcome(
+    ending: LaunchEnding,
+    deadline: Option<SessionDeadline>,
+) -> Result<(), CliError> {
     if ending != LaunchEnding::DeadlineReached {
         return Ok(());
     }
-    let limit = deadline_secs.map_or_else(String::new, |secs| format!(" of {secs} seconds"));
+    if let Some(deadline) = deadline.filter(|d| d.source() == DeadlineSource::Inherited) {
+        return Err(CliError::with_hint(
+            E_RUN_053,
+            format!(
+                "the session reached the deadline it inherited, at {}, from the formation or the \
+                 capsule that launched it; the runtime cancelled the running task and ended the \
+                 session",
+                deadline.at_rfc3339()
+            ),
+            "raise the --deadline the formation or the delegating capsule was launched with; \
+             `mur trace show <session>` shows where the task was when the deadline fell",
+        ));
+    }
+    let limit = deadline.map_or_else(String::new, |d| format!(" of {} seconds", d.secs()));
     Err(CliError::with_hint(
         E_RUN_053,
         format!(

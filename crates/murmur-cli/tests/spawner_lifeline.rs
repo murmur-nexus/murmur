@@ -890,3 +890,40 @@ fn a_script_capsule_child_ends_its_run_when_its_spawner_lifeline_closes() {
     assert!(common::find_file(project.path(), "done.txt").is_some());
     drop(lifeline);
 }
+
+/// A script-capsule child handed its parent's deadline takes no session deadline from it: the
+/// launch is not refused, and the run goes on to its own end as it does without one. Its parent
+/// ending at that deadline ends it through its spawner lifeline.
+#[test]
+fn a_script_capsule_child_takes_no_session_deadline_from_an_inherited_deadline() {
+    let home = driver_home();
+    let project = script_project();
+    let at = std::time::SystemTime::now() + Duration::from_secs(300);
+    let millis = at
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .to_string();
+    let mut command = command(
+        home.path(),
+        project.path(),
+        &[
+            "--task",
+            "sleep a while",
+            capsule_runtime::session_status::INHERITED_DEADLINE_FLAG,
+            &millis,
+        ],
+    );
+    command.stdout(Stdio::null()).stderr(Stdio::piped());
+    let mut lifeline = ChildLifeline::new().unwrap();
+    lifeline.hand_to(&mut command);
+    let child = command.spawn().unwrap();
+    lifeline.spawned();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{}: {stderr}", output.status);
+    assert!(!stderr.contains("E-IO-003"), "{stderr}");
+    assert!(!stderr.contains("E-RUN-053"), "{stderr}");
+    assert!(common::find_file(project.path(), "done.txt").is_some());
+    drop(lifeline);
+}

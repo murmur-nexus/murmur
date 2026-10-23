@@ -250,7 +250,8 @@ struct SessionStartEvent {
     /// `spend.machine_tokens_per_day` when this session keeps the machine ledger. Always written,
     /// `null` when the machine ceiling does not cover this session.
     machine_tokens_per_day: Option<u64>,
-    /// The `mur run --deadline` this session runs under. Always written, `null` when none was set.
+    /// The deadline this session runs under: the earliest of its own `mur run --deadline` and the
+    /// one it inherited. Always written, `null` when it has neither.
     deadline: Option<SessionStartDeadline>,
     capabilities: Vec<String>,
     tools_declared: Vec<String>,
@@ -371,11 +372,14 @@ struct SessionStartEvent {
 struct SessionStartDeadline {
     /// When the runtime ends the session, RFC 3339 UTC.
     at: String,
-    /// The `--deadline` value: seconds from `mur run`'s start.
+    /// Seconds from `mur run`'s start to `at`: the `--deadline` value, or for an inherited
+    /// deadline the whole seconds left at the start, rounded up.
     secs: u64,
     /// The notice margin in force, `lifecycle.deadline_notice_secs` or its default; `0` sends
     /// none.
     notice_secs: u64,
+    /// `SessionDeadline::source`: `"own"` or `"inherited"`.
+    source: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1655,8 +1659,8 @@ struct DeadlineNoticeEvent<'a> {
     notice_secs: u64,
 }
 
-/// The session reached its `mur run --deadline`, and is winding down because of it. Written by
-/// the termination routine before any task is cancelled.
+/// The session reached its deadline, own or inherited, and is winding down because of it. Written
+/// by the termination routine before any task is cancelled.
 #[derive(Serialize)]
 struct DeadlineReachedEvent {
     event_type: &'static str,
@@ -1666,8 +1670,10 @@ struct DeadlineReachedEvent {
     timestamp: u64,
     /// When the deadline fell, RFC 3339 UTC.
     deadline_at: String,
-    /// The `--deadline` value.
+    /// `session_start.deadline.secs`.
     deadline_secs: u64,
+    /// `SessionDeadline::source`: `"own"` or `"inherited"`.
+    source: &'static str,
 }
 
 /// A delegated child's spawner lifeline read EOF: the process that spawned this session has
@@ -2317,6 +2323,7 @@ impl TraceWriter {
                     at: deadline.at_rfc3339(),
                     secs: deadline.secs(),
                     notice_secs: status.notice_secs(),
+                    source: deadline.source().as_str(),
                 })
             }),
             capabilities: self.capabilities.clone(),
@@ -4115,6 +4122,7 @@ impl ResourceTraceAppender {
             timestamp: timestamp_ms(),
             deadline_at: deadline.at_rfc3339(),
             deadline_secs: deadline.secs(),
+            source: deadline.source().as_str(),
         };
         self.append(&event).await;
     }

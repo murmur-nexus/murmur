@@ -166,6 +166,9 @@ pub struct SchedulerContext<'a> {
     /// The session's formation, which every `capsule` step's child joins. `None` for a session
     /// nobody placed in a formation, whose children carry none either.
     pub formation_id: Option<crate::formation::FormationId>,
+    /// The session's deadline, which every `capsule` step's child inherits as its own session
+    /// deadline. `None` bounds no child.
+    pub deadline: Option<crate::session_status::SessionDeadline>,
     /// Where this run's per-step lifecycle records and its `capsule` steps' delegation records
     /// go, or `None` to record nothing.
     ///
@@ -1274,7 +1277,8 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
         std::sync::Arc::clone(&ctx.registry),
         ctx.capability_policy.env_allow.clone(),
         ctx.formation_id.clone(),
-    );
+    )
+    .bounded_by(ctx.deadline);
     // The launch notice is written where it arrives, on this thread, while the child is still
     // holding its task: `delegate` blocks until the child answers, so a notice parked for later
     // would only reach disk once there was already a terminal line to write beside it. The task
@@ -1600,6 +1604,7 @@ mod tests {
             )),
             spawn_credential: None,
             formation_id: None,
+            deadline: None,
             trace: None,
             gate_step,
             invoke_tool,

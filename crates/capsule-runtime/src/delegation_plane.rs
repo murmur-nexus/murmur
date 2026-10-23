@@ -51,6 +51,7 @@ use crate::delegation::{CompletionAddress, Spawner};
 use crate::errors::RuntimeError;
 use crate::formation::FormationId;
 use crate::http_client::http_json;
+use crate::session_status::SessionDeadline;
 use crate::spawn_credential::{SpawnApproval, SpawnCredential, SPAWN_CREDENTIAL_HEADER};
 use crate::workdir_fs::WorkdirRoot;
 
@@ -347,6 +348,9 @@ pub struct DelegationPlane {
     /// child joins it. `None` for a session nobody placed in a formation, whose children carry
     /// none either.
     formation_id: Option<FormationId>,
+    /// The delegating session's deadline, the earliest bound placed on it, handed to every child
+    /// as that child's inherited deadline. `None` until [`DelegationPlane::bounded_by`] names one.
+    deadline: Option<SessionDeadline>,
 }
 
 impl DelegationPlane {
@@ -381,7 +385,15 @@ impl DelegationPlane {
             parent_env_allow,
             own_url: String::new(),
             formation_id,
+            deadline: None,
         }
+    }
+
+    /// Bound every child this plane launches by `deadline`, the delegating session's own, so no
+    /// child runs past the moment its parent ends. `None` bounds none.
+    pub fn bounded_by(mut self, deadline: Option<SessionDeadline>) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// Name this capsule's own A2A endpoint, `http://host:port`, as where a started delegation's
@@ -399,6 +411,11 @@ impl DelegationPlane {
     /// The formation every child this plane launches joins, or `None` for a session in none.
     pub fn formation_id(&self) -> Option<&FormationId> {
         self.formation_id.as_ref()
+    }
+
+    /// The deadline every child this plane launches inherits, or `None` for an unbounded plane.
+    pub fn deadline(&self) -> Option<SessionDeadline> {
+        self.deadline
     }
 
     /// This plane's bound on the wait for a child's answer.
@@ -535,6 +552,7 @@ impl DelegationPlane {
             completion_deadline,
             // Independent of `spawner`: a launch that names no lineage still joins the formation.
             formation_id: self.formation_id.clone(),
+            deadline: self.deadline,
         })
     }
 
@@ -1690,6 +1708,32 @@ through that constructor rather than composing a second request literal."
                 vec!["B".to_string(), "C".to_string()],
                 "{named} hands on what both manifests declare, in the child's order"
             );
+        }
+    }
+
+    /// A bounded plane hands its deadline to every launch, on the started path and the plan-step
+    /// path alike; an unbounded one hands none.
+    #[test]
+    fn a_bounded_plane_hands_its_deadline_to_every_launch() {
+        let store = store_with_worker();
+        let deadline =
+            SessionDeadline::after(std::time::Instant::now(), std::time::SystemTime::now(), 60);
+        let bounded = plane_over(&store, &[]).bounded_by(Some(deadline));
+        let unbounded = plane_over(&store, &[]);
+
+        for report_to in [Some(completion_address()), None] {
+            let compose = |plane: &DelegationPlane| {
+                plane
+                    .launch_request(
+                        &request(),
+                        &origin(),
+                        SpawnApproval::new("approved".to_string()),
+                        report_to.clone(),
+                    )
+                    .expect("the store holds the child's declaration")
+            };
+            assert_eq!(compose(&bounded).deadline, Some(deadline), "{report_to:?}");
+            assert_eq!(compose(&unbounded).deadline, None, "{report_to:?}");
         }
     }
 

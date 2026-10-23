@@ -415,6 +415,7 @@ fn launch_bounded(
         spawner,
         completion_deadline,
         formation_id: None,
+        deadline: None,
     })
     .unwrap_or_else(|error| panic!("launching '{name}' failed: {error}"))
 }

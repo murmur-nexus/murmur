@@ -106,7 +106,7 @@ Seconds are whole, rounded down.
 |---|---|---|
 | `time.elapsed_secs` | Seconds since the session started | — |
 | `time.task_elapsed_secs` | Seconds since the running task's `task_start` | `"unknown"` outside a task |
-| `time.deadline.at` | When the runtime ends the session, RFC 3339 UTC: [`mur run --deadline`](cli.md#mur-run-deadline) seconds after `mur run` started | `time.deadline` is `"none"` with no `--deadline` |
+| `time.deadline.at` | When the runtime ends the session, RFC 3339 UTC: the session's effective [deadline](cli.md#mur-run-deadline), the earliest of its own `--deadline` and the one it inherited from its formation or its parent | `time.deadline` is `"none"` when the session has no deadline |
 | `time.deadline.left_secs` | Seconds until `at`; `0` once it has passed | — |
 | `turns.used` | Inference calls the running task has made, across its reopens and continuations, a hook's `run-inference` included: the count [`inference.max_turns`](manifest.md#field-inference) is checked against | — |
 | `turns.cap` | `inference.max_turns` | `"none"` with no cap |
@@ -134,7 +134,7 @@ the object returned.
 
 ### The deadline notice { #deadline-notice }
 
-With [`mur run --deadline`](cli.md#mur-run-deadline) set, the agent is told once that the session is about
+With a [deadline](cli.md#mur-run-deadline), own or inherited, the agent is told once that the session is about
 to end. The first tool result the runtime hands the model once no more than
 [`lifecycle.deadline_notice_secs`](manifest.md#field-lifecycle) are left carries one line after
 its fence:

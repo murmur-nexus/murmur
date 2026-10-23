@@ -222,7 +222,7 @@ struct SessionStartEvent {
     /// from a runtime predating the key, which reads as none.
     #[serde(default)]
     runtime_artifacts: Vec<RuntimeArtifactEntry>,
-    /// The `mur run --deadline` the session ran under; `null` or absent for none.
+    /// The deadline the session ran under, its own or inherited; `null` or absent for none.
     #[serde(default)]
     deadline: Option<SessionDeadline>,
 }
@@ -233,7 +233,14 @@ struct SessionDeadline {
     at: String,
     secs: u64,
     notice_secs: u64,
+    /// `"own"` or `"inherited"`. Absent on a trace from a runtime predating the key, whose deadline
+    /// was always its own.
+    #[serde(default)]
+    source: Option<String>,
 }
+
+/// The `source` value an inherited deadline's records carry.
+const INHERITED_SOURCE: &str = capsule_runtime::session_status::DeadlineSource::Inherited.as_str();
 
 /// One element of `session_start.runtime_artifacts`.
 #[derive(Debug, Deserialize)]
@@ -588,11 +595,20 @@ struct DeadlineNoticeEvent {
     left_secs: u64,
 }
 
-/// The session reached its `mur run --deadline`, and that began its wind-down.
+/// The session reached its deadline, own or inherited, and that began its wind-down.
 #[derive(Debug, Deserialize)]
 struct DeadlineReachedEvent {
     deadline_at: String,
     deadline_secs: u64,
+    /// As on `session_start.deadline`; absent reads as `"own"`.
+    #[serde(default)]
+    source: Option<String>,
+}
+
+impl DeadlineReachedEvent {
+    fn inherited(&self) -> bool {
+        self.source.as_deref() == Some(INHERITED_SOURCE)
+    }
 }
 
 /// A delegated child's spawner lifeline closed: the session that delegated to it ended, and that
@@ -1498,7 +1514,15 @@ fn session_deadline_line(d: &SessionDeadline) -> String {
     } else {
         format!("notice {}s before", d.notice_secs)
     };
-    format!("{}  ({}s after mur run started; {notice})", d.at, d.secs)
+    let inherited = if d.source.as_deref() == Some(INHERITED_SOURCE) {
+        "inherited; "
+    } else {
+        ""
+    };
+    format!(
+        "{}  ({inherited}{}s after mur run started; {notice})",
+        d.at, d.secs
+    )
 }
 
 /// A `session_status.status` member as a row reads it: a number with thousands separators, a
@@ -1571,6 +1595,12 @@ fn deadline_notice_row(e: &DeadlineNoticeEvent) -> String {
 
 /// The `deadline_reached` record's row.
 fn deadline_reached_row(e: &DeadlineReachedEvent) -> String {
+    if e.inherited() {
+        return format!(
+            "deadline_reached  {}  the inherited deadline fell; this session wound down",
+            e.deadline_at
+        );
+    }
     format!(
         "deadline_reached  {}  the --deadline of {}s fell; this session wound down",
         e.deadline_at, e.deadline_secs
@@ -4433,6 +4463,9 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.tool_name,
             e.left_secs
         ),
+        TraceEvent::DeadlineReached(e) if e.inherited() => {
+            format!("{}{}  inherited", kind("deadline_reached"), e.deadline_at)
+        }
         TraceEvent::DeadlineReached(e) => {
             format!("{}{}", kind("deadline_reached"), e.deadline_at)
         }
@@ -6339,16 +6372,65 @@ mod tests {
             at: "2026-10-20T14:00:00Z".to_string(),
             secs: 600,
             notice_secs: 60,
+            source: None,
         };
         assert_eq!(
             session_deadline_line(&deadline),
             "2026-10-20T14:00:00Z  (600s after mur run started; notice 60s before)"
+        );
+        let own = SessionDeadline {
+            source: Some("own".to_string()),
+            ..deadline.clone()
+        };
+        assert_eq!(
+            session_deadline_line(&own),
+            session_deadline_line(&deadline)
         );
         let silent = SessionDeadline {
             notice_secs: 0,
             ..deadline
         };
         assert!(session_deadline_line(&silent).ends_with("; no notice)"));
+    }
+
+    /// An inherited deadline says so on the Session line, the `show` row and the `steps` row; an
+    /// own one, and a record with no `source`, render as they always have.
+    #[test]
+    fn inherited_deadline_records_render_as_inherited() {
+        let start =
+            r#"{"at":"2026-10-20T14:00:00Z","secs":57,"notice_secs":5,"source":"inherited"}"#;
+        let deadline: SessionDeadline = serde_json::from_str(start).unwrap();
+        assert_eq!(
+            session_deadline_line(&deadline),
+            "2026-10-20T14:00:00Z  (inherited; 57s after mur run started; notice 5s before)"
+        );
+
+        let inherited = r#"{"event_type":"deadline_reached","event_id":"evt_11","parent_id":"evt_1","session_id":"s","timestamp":11,"deadline_at":"2026-10-20T14:00:00Z","deadline_secs":57,"source":"inherited"}"#;
+        assert_eq!(
+            row(inherited),
+            "deadline_reached 2026-10-20T14:00:00Z  inherited"
+        );
+        let TraceEvent::DeadlineReached(e) = serde_json::from_str::<TraceEvent>(inherited).unwrap()
+        else {
+            panic!("a deadline_reached line parses as DeadlineReached");
+        };
+        assert_eq!(
+            deadline_reached_row(&e),
+            "deadline_reached  2026-10-20T14:00:00Z  the inherited deadline fell; this session \
+             wound down"
+        );
+
+        let own = r#"{"event_type":"deadline_reached","event_id":"evt_11","parent_id":"evt_1","session_id":"s","timestamp":11,"deadline_at":"2026-10-20T14:00:00Z","deadline_secs":30,"source":"own"}"#;
+        assert_eq!(row(own), "deadline_reached 2026-10-20T14:00:00Z");
+        let TraceEvent::DeadlineReached(e) = serde_json::from_str::<TraceEvent>(own).unwrap()
+        else {
+            panic!("a deadline_reached line parses as DeadlineReached");
+        };
+        assert_eq!(
+            deadline_reached_row(&e),
+            "deadline_reached  2026-10-20T14:00:00Z  the --deadline of 30s fell; this session \
+             wound down"
+        );
     }
 
     /// A `spawner_ended` record's `steps` row names the spawning session, and its `show` row names
