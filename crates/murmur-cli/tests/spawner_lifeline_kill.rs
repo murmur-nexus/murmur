@@ -1185,7 +1185,7 @@ fn a_delegated_child_ends_at_its_parents_deadline() {
     let started = Instant::now();
     let mut parent = bounded_parent(&world, "bounded-parent", &body, model);
     parent.submit();
-    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
+    let delegation = await_delegation(&parent.records_dir());
     assert_bounded_by_the_parents_deadline(&mut parent, &delegation, started);
 }
 
@@ -1203,7 +1203,7 @@ fn a_plan_steps_child_ends_at_its_parents_deadline() {
     let started = Instant::now();
     let mut parent = bounded_parent(&world, "bounded-planner", &body, model);
     parent.submit();
-    let delegation = await_delegation(&world, parent.project.path(), &parent.session_id());
+    let delegation = await_delegation(&parent.records_dir());
     assert_bounded_by_the_parents_deadline(&mut parent, &delegation, started);
 }
 
