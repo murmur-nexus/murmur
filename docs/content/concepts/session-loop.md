@@ -145,11 +145,13 @@ exits with [`E-RUN-053`](../reference/diagnostics.md#e-run-053).
 
 A session runs under the **earliest** deadline placed on it:
 
-| Deadline | Placed by |
-|---|---|
-| Its own | [`mur run --deadline`](../reference/cli.md#mur-run-deadline) |
-| Its formation's | [`mur run --roster --deadline`](../reference/roster.md#launch-stop): one moment every member shares |
-| Its parent's | The capsule that launched it with `delegate-task` or a plan `capsule` step. A child runs no longer than its parent, and a grandchild inherits the same moment |
+- its own, from [`mur run --deadline`](../reference/cli.md#mur-run-deadline);
+- its formation's, from [`mur run --roster --deadline`](../reference/roster.md#launch-stop): one
+  moment every member shares;
+- its parent's, when a capsule launched it with `delegate-task` or a plan `capsule` step. A child
+  runs no longer than its parent, and a grandchild inherits the same moment.
+
+[The deadline](../reference/cli.md#mur-run-deadline) lists how each one is counted.
 
 The agent sees only the effective deadline, through
 [`session-status`](../reference/runtime-provided-tools.md#session-status) and its one

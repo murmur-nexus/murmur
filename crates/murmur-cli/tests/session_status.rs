@@ -946,7 +946,7 @@ fn an_inherited_deadline_earlier_than_its_own_ends_the_session() {
 }
 
 /// The session's own `--deadline`, when earlier than the inherited moment, is the one it runs
-/// under, and ends it with today's message.
+/// under, and ends it with the own-deadline message.
 #[test]
 fn an_own_deadline_earlier_than_the_inherited_one_ends_the_session() {
     let home = home_with_driver(common::FIXTURE_DRIVER_MODELS);

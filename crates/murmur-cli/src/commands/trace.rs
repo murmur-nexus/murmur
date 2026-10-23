@@ -240,7 +240,7 @@ struct SessionDeadline {
 }
 
 /// The `source` value an inherited deadline's records carry.
-const INHERITED_SOURCE: &str = "inherited";
+const INHERITED_SOURCE: &str = capsule_runtime::session_status::DeadlineSource::Inherited.as_str();
 
 /// One element of `session_start.runtime_artifacts`.
 #[derive(Debug, Deserialize)]

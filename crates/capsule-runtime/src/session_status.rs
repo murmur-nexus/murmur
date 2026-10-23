@@ -47,7 +47,7 @@ pub enum DeadlineSource {
 
 impl DeadlineSource {
     /// The `source` value the trace records carry.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Own => "own",
             Self::Inherited => "inherited",
