@@ -339,16 +339,30 @@ error[E-CAP-003]: declared containment class 'scoped' is not achievable on this 
 ```
 
 For `sealed` the reason names the *specific* missing piece and the command that fixes it, because
-"no mount namespace here" has several completely different causes. The runtime never falls back to
-a weaker class, whichever one it reports:
+"no composed root here" has several completely different causes. Whether `sealed` is refused is
+decided by the [namespace probe](containment.md#telling-host-conditions-apart) building the
+composed root inside the capsule's network namespace, never by the AppArmor setting. When a probe
+attempt failed, the reason has three parts: the class sentence below, the call the probe saw fail,
+and the readings line `E-CAP-005` ends with:
+
+```text
+error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): <class sentence and remedy> The probe's <call> failed with <ERRNO> (<description>). Host readings: kernel.apparmor_restrict_unprivileged_userns=<0|1>; AppArmor profile confining mur: <profile>.
+```
+
+A probe that could not run reads `The probe could not run: <the runtime's message>.` in place of
+the failed call. A non-Linux host and a host without Landlock fail no attempt, and their reason is
+the class sentence alone. The runtime never falls back to a weaker class, whichever one it reports:
 
 | Reason reported | What to do |
 |---|---|
 | This platform has no mount namespace and never will | Nothing — macOS and every other non-Linux host stay at `advisory` permanently |
-| AppArmor's unprivileged-userns restriction is active while the `mur-sealed` profile is not confining this binary | Install and load the profile shipped with `mur`: `sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`, or re-run the `mur` installer as root. Running a checkout build out of `./target`, which no shipped profile attaches to: `sudo scripts/install-dev-apparmor.sh`. Last resort, only where a profile genuinely cannot be loaded: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, which removes unprivileged-userns hardening from every program on the machine and reports [`W-SEC-013`](#w-sec-013) |
-| `unshare(CLONE_NEWUSER \| CLONE_NEWNS)` was refused — the usual answer inside a container, where `CAP_SYS_ADMIN` is absent or the container's own seccomp filter blocks `unshare(2)` | Add `--cap-add SYS_ADMIN` to the container invocation, or establish the mount namespace outside the container and run `mur` inside it |
+| AppArmor's unprivileged-userns restriction is active while the `mur-sealed` profile is not confining this binary. Reported only when the network namespace was refused at `unshare` or `writing uid_map/gid_map` with `EPERM` or `EACCES`, the setting reads `1` and `mur` is unconfined | Install and load the profile shipped with `mur`: `sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`, or re-run the `mur` installer as root. Running a checkout build out of `./target`, which no shipped profile attaches to: `sudo scripts/install-dev-apparmor.sh`. Last resort, only where a profile genuinely cannot be loaded: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, which removes unprivileged-userns hardening from every program on the machine and reports [`W-SEC-013`](#w-sec-013) |
+| A user namespace was refused — the usual answer inside a container, where `CAP_SYS_ADMIN` is absent or the container's own seccomp filter blocks `unshare(2)` | Add `--cap-add SYS_ADMIN` to the container invocation, or establish the mount namespace outside the container and run `mur` inside it |
 | The namespace was created but its identity `uid_map`/`gid_map` could not be written, so the process cannot own it | Check that `/proc/sys/user/max_user_namespaces` is non-zero, that no LSM policy blocks `uid_map` writes for this binary, and that `mur` is not already running inside an unmapped user namespace |
 | The namespace was created but `mount(2)` inside it was refused — a confinement that permits `userns_create` and then withholds `CAP_SYS_ADMIN` | Load the shipped profile with `sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`; inside a container, add `--cap-add SYS_ADMIN`, or establish the mount namespace outside it |
+| The namespace was created and mounted inside, but `pivot_root(2)` was refused | On an AppArmor host, check the loaded profile carries a `pivot_root,` rule and reload it; inside a container, `pivot_root(2)` is commonly absent from the runtime's seccomp allowlist, so establish the mount namespace outside the container |
+| `sealed` is built inside the capsule's network namespace, and this host could not create or enter it | Fix the network namespace first: [`E-CAP-005`](#e-cap-005) names the step that failed and its remedy |
+| The probe could not run, so whether this host can back `sealed` is unknown; refused rather than assumed | Re-run once the process or descriptor limit or memory is relieved, or allow the probe's syscalls |
 | The kernel provides no unprivileged user namespaces at all (`CONFIG_USER_NS=n`, or `user.max_user_namespaces=0`) | `sudo sysctl -w user.max_user_namespaces=10000` if the sysctl is merely zeroed, otherwise run on a kernel built with `CONFIG_USER_NS=y` |
 | No usable Landlock ABI, which `sealed` keeps inside the composed root as defence in depth | Run on Linux 5.13+ — a host that cannot back `scoped` cannot back `sealed` either |
 
@@ -1510,9 +1524,11 @@ different point:
 | A declared `runtime: tool` artifact ships a native implementation | At launch, once the artifacts are staged and before any component is instantiated |
 | A native tool pulled into the session by `manage.pull` or `pull-artifact` | At that tool's first call, which fails with `E-CAP-005` and the same reason |
 
-All four check points and `mur doctor` run the same probe and print the same reason. `mur doctor`
-reports its answer as the `network namespace:` line of its `AppArmor / user namespaces` block, for
-every project.
+Staging and launch read the session's one probe, the first call of a pulled native tool creates the
+namespace itself, and `mur doctor` takes its own probe; all print the same reason. `mur doctor`
+reports the answer as the `network namespace:` line of its `AppArmor / user namespaces` block, for
+every project, beside the `mount namespace:` and `sealed root:` lines. How the three lines and the
+readings tell host conditions apart: [Telling host conditions apart](containment.md#telling-host-conditions-apart).
 
 It is not part of the containment ladder — every class needs the namespace equally — so neither
 raising nor lowering a declared floor changes this answer.

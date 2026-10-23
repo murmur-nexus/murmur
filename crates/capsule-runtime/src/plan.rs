@@ -394,6 +394,7 @@ fn execute_inner(
     // steps — resolved once, up front, same cadence as `runtime::launch_session`. The `/tmp`
     // mapping is decided from the same reading, for the tier this enforcement applies.
     let probe = sandbox::HostProbe::probe();
+    let mount_namespace_usable = probe.mount_namespace_usable();
     let shell_enforcement = match sandbox::ShellEnforcement::resolve(
         &ctx.capability_policy,
         ctx.capability_policy.containment_floor,
@@ -402,7 +403,7 @@ fn execute_inner(
         Ok(enforcement) => {
             let temp_mapping = crate::temp_dir::temp_mapping(
                 enforcement.tier,
-                probe.mount_namespace_usable(),
+                mount_namespace_usable,
                 ctx.accessible_workdir.path(),
             );
             enforcement

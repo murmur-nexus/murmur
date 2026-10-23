@@ -109,7 +109,9 @@ pub const SEALED_APPARMOR_PROFILE_SHA256: &str =
 /// `sealed` result obtained on a weakened host cannot be told apart from one obtained through the
 /// profile.
 ///
-/// The grant never decides whether a run is refused — only [`Self::permits_userns`] does.
+/// The grant never decides anything: whether a namespace, a private `/tmp` or `sealed` is
+/// available is decided by [`crate::namespace_probe`] creating them. The grant only words a
+/// refusal once an attempt has failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsernsGrant {
@@ -126,8 +128,9 @@ pub enum UsernsGrant {
     /// `scripts/install-dev-apparmor.sh` generates. The grant is narrow: it applies to this binary
     /// and nothing else.
     ProfileConfining,
-    /// The restriction is on and nothing grants this binary anything. The only variant that keeps
-    /// a host below `sealed`, and the default so an unprobed host claims nothing.
+    /// The restriction is on and nothing grants this binary anything. A container whose own
+    /// profile permits user namespaces reads this too, and is not refused for it. The default, so
+    /// an unprobed host claims nothing.
     #[default]
     Withheld,
 }
@@ -141,18 +144,6 @@ impl UsernsGrant {
         UsernsGrant::ProfileConfining,
         UsernsGrant::Withheld,
     ];
-
-    /// Whether an unprivileged `unshare(CLONE_NEWUSER)` gets through on this host.
-    ///
-    /// The whole of what the `sealed` decisions read: [`sealed_blocker`] and
-    /// `sandbox::tier_from_probe` consult this and nothing else about the grant, so provenance is
-    /// reported without ever changing an outcome. Whether a capsule gets its network namespace
-    /// does not read it at all: that is decided by creating one
-    /// ([`crate::network_namespace::detect_egress_namespace_failure`]).
-    #[must_use]
-    pub fn permits_userns(self) -> bool {
-        !matches!(self, UsernsGrant::Withheld)
-    }
 
     /// Stable wire name, as it appears in `--explain-scope --json`, in `session_start` and in
     /// `mur doctor`. Distinct per variant, and not a `Debug` rendering, which is free to change.
@@ -411,6 +402,12 @@ pub enum SealedBlocker {
     /// is required to keep would be missing. `sealed` is strictly stronger than `scoped`; a host
     /// that cannot back `scoped` cannot back `sealed` either.
     LandlockUnavailable,
+    /// The composed root is built inside the capsule's network namespace, and this host created
+    /// the user namespace but could not finish the network namespace or enter it.
+    NetworkNamespaceUnavailable,
+    /// The probe itself could not run — a child could not be forked, waited for, or reported
+    /// nothing — so whether this host can back `sealed` is unknown.
+    ProbeUnavailable,
 }
 
 impl SealedBlocker {
@@ -427,6 +424,8 @@ impl SealedBlocker {
         SealedBlocker::PivotRootDenied,
         SealedBlocker::KernelUnsupported,
         SealedBlocker::LandlockUnavailable,
+        SealedBlocker::NetworkNamespaceUnavailable,
+        SealedBlocker::ProbeUnavailable,
     ];
 
     /// One sentence naming the missing mechanism, plus the exact remediation. Rendered into
@@ -458,7 +457,7 @@ impl SealedBlocker {
                 path = SEALED_APPARMOR_PROFILE_PATH,
             ),
             SealedBlocker::NamespaceCreationDenied => {
-                "sealed requires unshare(CLONE_NEWUSER | CLONE_NEWNS), which this host refused. \
+                "sealed requires an unprivileged user namespace, which this host refused to create. \
                  This is the usual answer inside a container: CAP_SYS_ADMIN is absent, or the \
                  container's own seccomp filter blocks unshare(2). Either add `--cap-add \
                  SYS_ADMIN` to the container invocation, or establish the mount namespace outside \
@@ -467,8 +466,8 @@ impl SealedBlocker {
                     .to_string()
             }
             SealedBlocker::IdMapDenied => {
-                "sealed created a user+mount namespace, but writing the identity uid_map/gid_map \
-                 into it was refused, so the process cannot own the namespace it just made. This \
+                "sealed created a user namespace, but writing the identity uid_map/gid_map into \
+                 it was refused, so the process cannot own the namespace it just made. This \
                  is an id-mapping problem, not a missing capability: check that \
                  /proc/sys/user/max_user_namespaces is non-zero, that no LSM policy blocks \
                  uid_map writes for this binary, and that mur is not already running inside an \
@@ -507,94 +506,186 @@ impl SealedBlocker {
                  cannot back scoped cannot back sealed either."
                     .to_string()
             }
-        }
-    }
-}
-
-// ---------------------------------------------------------------- host probe result
-
-/// Outcome of really rehearsing the composed root's construction in a forked child.
-///
-/// The states are not interchangeable: `Denied`, `MountDenied` and `PivotRootDenied` all mean "no
-/// sealed here" but point at completely different remediations (container capability, AppArmor
-/// profile, seccomp allowlist), which is the entire reason this is not a `bool`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum NamespaceProbe {
-    /// The child completed the whole composed-root shape in its own throwaway namespace:
-    /// `unshare`, the identity maps, private propagation, a `tmpfs` over a root base candidate,
-    /// the parking directory, `pivot_root(2)` and `umount2(MNT_DETACH)`.
-    Ok,
-    /// `unshare` itself was refused (`EPERM`).
-    Denied,
-    /// `unshare` succeeded, but writing the identity `uid_map`/`gid_map` did not — the namespace
-    /// exists and cannot be owned. Distinct from [`Denied`](Self::Denied) because the remediation
-    /// is completely different: `Denied` points at `CAP_SYS_ADMIN` and container flags, while this
-    /// points at id-mapping policy. Collapsing the two sent an operator hunting a container
-    /// problem on a host that had created the namespace perfectly well.
-    MapDenied,
-    /// `unshare` succeeded, `mount(2)` inside the namespace did not — either the
-    /// `MS_REC | MS_PRIVATE` propagation change or the new root's `tmpfs`. The two fold together
-    /// because they are the same mechanism with the same remediation.
-    MountDenied,
-    /// Every mount succeeded and the `pivot_root(2)` sequence did not. Kept apart from
-    /// [`MountDenied`](Self::MountDenied) because a host can permit `mount(2)` and refuse
-    /// `pivot_root(2)`. Folding the two together lets such a host clear the launch probe and
-    /// fail at the first subprocess with `E-RUN-014`.
-    PivotRootDenied,
-    /// The kernel does not implement it (`ENOSYS`/`EINVAL`), or the probe could not run at all.
-    #[default]
-    Unsupported,
-}
-
-/// Everything the host probe learned about `sealed`, kept separate from the decision that uses it
-/// so `sandbox::tier_from_probe` stays pure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct SealedProbe {
-    /// Where this host's permission to create an unprivileged user namespace comes from, or
-    /// [`UsernsGrant::Withheld`] when it gives none.
-    ///
-    /// Named for the question that actually matters rather than for "is the profile loaded",
-    /// because a Fedora or Arch host with no AppArmor at all needs no profile and must not be
-    /// refused for lacking one. Every decision below reads only
-    /// [`UsernsGrant::permits_userns`]; the rest of the value is provenance, reported and never
-    /// acted on.
-    pub(crate) userns_grant: UsernsGrant,
-    /// What a real rehearsal of the composed root's construction — through `pivot_root(2)` and
-    /// `umount2(MNT_DETACH)` — did in a forked child.
-    pub(crate) namespace: NamespaceProbe,
-}
-
-/// Which single mechanism to blame, given the probe. Pure; the ordering is the order an operator
-/// has to fix things in.
-///
-/// `None` means every precondition holds and this host can back `sealed`.
-pub(crate) fn sealed_blocker(
-    is_linux: bool,
-    landlock_fully_enforced: bool,
-    probe: SealedProbe,
-) -> Option<SealedBlocker> {
-    if !is_linux {
-        return Some(SealedBlocker::NotLinux);
-    }
-    // Attribute to AppArmor before the namespace outcome: when the restriction is on and the
-    // shipped profile is not loaded, the namespace failure is a *consequence*, and naming
-    // `--cap-add SYS_ADMIN` on a bare host sends the operator somewhere useless.
-    if !probe.userns_grant.permits_userns() {
-        return Some(SealedBlocker::AppArmorProfileMissing);
-    }
-    match probe.namespace {
-        NamespaceProbe::Ok => {
-            if landlock_fully_enforced {
-                None
-            } else {
-                Some(SealedBlocker::LandlockUnavailable)
+            SealedBlocker::NetworkNamespaceUnavailable => {
+                "sealed is built inside the capsule's network namespace and this host could not \
+                 create or enter it, so there is no namespace to build the composed root in. \
+                 Every capsule that can spawn a subprocess needs that namespace: see E-CAP-005 \
+                 for the step that failed and its remedy, then re-run. The runtime will not fall \
+                 back to a weaker class."
+                    .to_string()
+            }
+            SealedBlocker::ProbeUnavailable => {
+                "sealed could not be probed: the probe could not run, so whether this host can \
+                 back sealed is unknown; refused rather than assumed. A process or descriptor \
+                 limit, or memory, ran out, or a policy killed the probe's child: re-run once \
+                 the limit is relieved, or allow the probe's syscalls."
+                    .to_string()
             }
         }
-        NamespaceProbe::Denied => Some(SealedBlocker::NamespaceCreationDenied),
-        NamespaceProbe::MapDenied => Some(SealedBlocker::IdMapDenied),
-        NamespaceProbe::MountDenied => Some(SealedBlocker::MountDenied),
-        NamespaceProbe::PivotRootDenied => Some(SealedBlocker::PivotRootDenied),
-        NamespaceProbe::Unsupported => Some(SealedBlocker::KernelUnsupported),
+    }
+}
+
+/// Why this host cannot back `sealed`: the blocker, and, when a probe attempt failed, the call it
+/// saw fail and the readings the refusal is worded with.
+///
+/// [`Self::reason`] is the text under `E-CAP-003` for `sealed`, so the floor refusal,
+/// `--explain-scope` and `mur doctor` cannot explain one host two ways.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedShortfall {
+    /// Decided by the attempts and Landlock alone; the readings below never change whether there
+    /// is a shortfall.
+    pub blocker: SealedBlocker,
+    /// The probe's call that failed, in its step's words (`unshare(CLONE_NEWUSER | CLONE_NEWNET)`,
+    /// `pivot_root(2)`, …), or, for [`SealedBlocker::ProbeUnavailable`], the runtime's account of
+    /// why the probe could not run. `None` when no attempt failed: [`SealedBlocker::NotLinux`] and
+    /// [`SealedBlocker::LandlockUnavailable`].
+    pub failed_call: Option<String>,
+    /// The `errno` the failed call left. `None` when no call failed, and for
+    /// [`SealedBlocker::ProbeUnavailable`].
+    pub errno: Option<i32>,
+    /// AppArmor's unprivileged-userns restriction as read with the attempts.
+    pub userns_grant: UsernsGrant,
+    /// The profile the kernel reports as confining this process, read with the attempts.
+    pub attachment: ProfileAttachment,
+}
+
+impl SealedShortfall {
+    /// [`SealedBlocker::reason`]; then, when an attempt failed, `The probe's <call> failed with
+    /// <ERRNO> (<words>).` (or `The probe could not run: <account>.`); then, last, the same `Host
+    /// readings: …` line `E-CAP-005` ends with.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        let mut reason = self.blocker.reason();
+        let Some(call) = &self.failed_call else {
+            return reason;
+        };
+        let what = match self.errno {
+            Some(errno) => crate::namespace_probe::probe_failure_sentence(call, errno),
+            None => format!("The probe could not run: {call}."),
+        };
+        reason.push(' ');
+        reason.push_str(&what);
+        reason.push(' ');
+        reason.push_str(&crate::network_namespace::host_readings(
+            self.userns_grant,
+            &self.attachment,
+        ));
+        reason
+    }
+}
+
+/// Which single mechanism keeps this host below `sealed`, decided from the probe's attempts and
+/// Landlock. Pure; `None` means the composed root was built and Landlock is fully enforced.
+///
+/// The readings decide nothing but which words an attempt that failed with `EPERM`/`EACCES` is
+/// named in: a network namespace refused under the restriction with `mur` unconfined is
+/// [`SealedBlocker::AppArmorProfileMissing`], the same refusal under a container's profile is the
+/// container case. The `/tmp` attempt never affects `sealed`: the composed root binds `/tmp`
+/// itself.
+pub(crate) fn sealed_shortfall(
+    is_linux: bool,
+    landlock_fully_enforced: bool,
+    reading: &crate::namespace_probe::NamespaceReading,
+) -> Option<SealedShortfall> {
+    use crate::namespace_probe::{MountAttempt, MountAttemptError, MountStep};
+    use crate::network_namespace::{CreationStep, NamespaceAttemptError};
+
+    let shortfall = |blocker, failed_call: Option<String>, errno| SealedShortfall {
+        blocker,
+        failed_call,
+        errno,
+        userns_grant: reading.userns_grant,
+        attachment: reading.attachment.clone(),
+    };
+    if !is_linux {
+        return Some(shortfall(SealedBlocker::NotLinux, None, None));
+    }
+    const KERNEL_ERRNOS: [i32; 4] = [libc::ENOSPC, libc::EINVAL, libc::ENOSYS, libc::EUSERS];
+    match &reading.network {
+        Ok(()) => {}
+        Err(NamespaceAttemptError::Creator(detail)) => {
+            return Some(shortfall(
+                SealedBlocker::ProbeUnavailable,
+                Some(detail.clone()),
+                None,
+            ))
+        }
+        Err(NamespaceAttemptError::Step { step, errno }) => {
+            let errno = *errno;
+            let blocker = match step {
+                CreationStep::Unshare if KERNEL_ERRNOS.contains(&errno) => {
+                    SealedBlocker::KernelUnsupported
+                }
+                CreationStep::Unshare | CreationStep::IdentityMaps
+                    if matches!(errno, libc::EPERM | libc::EACCES)
+                        && reading.userns_grant == UsernsGrant::Withheld
+                        && reading.attachment == ProfileAttachment::Unconfined =>
+                {
+                    SealedBlocker::AppArmorProfileMissing
+                }
+                CreationStep::Unshare => SealedBlocker::NamespaceCreationDenied,
+                CreationStep::IdentityMaps => SealedBlocker::IdMapDenied,
+                CreationStep::Loopback
+                | CreationStep::LocalRoute
+                | CreationStep::TcpListener
+                | CreationStep::Resolver
+                | CreationStep::NamespaceHandles
+                | CreationStep::HandOff => SealedBlocker::NetworkNamespaceUnavailable,
+            };
+            return Some(shortfall(
+                blocker,
+                Some(step.describe().to_string()),
+                Some(errno),
+            ));
+        }
+    }
+    match &reading.sealed_root {
+        MountAttempt::Created => {}
+        // Not attempted with the network namespace created is no state the probe produces; it is
+        // refused as unknown rather than read as built.
+        MountAttempt::NotAttempted => {
+            return Some(shortfall(
+                SealedBlocker::ProbeUnavailable,
+                Some("the sealed-root rehearsal did not run".to_string()),
+                None,
+            ))
+        }
+        MountAttempt::Failed(MountAttemptError::Rehearsal(detail)) => {
+            return Some(shortfall(
+                SealedBlocker::ProbeUnavailable,
+                Some(detail.clone()),
+                None,
+            ))
+        }
+        MountAttempt::Failed(MountAttemptError::Step { step, errno }) => {
+            let errno = *errno;
+            let blocker = match step {
+                MountStep::JoinSession => SealedBlocker::NetworkNamespaceUnavailable,
+                MountStep::UnshareUserMount if KERNEL_ERRNOS.contains(&errno) => {
+                    SealedBlocker::KernelUnsupported
+                }
+                MountStep::UnshareUserMount => SealedBlocker::NamespaceCreationDenied,
+                MountStep::IdentityMaps => SealedBlocker::IdMapDenied,
+                MountStep::MakePrivateNested | MountStep::Tmpfs => SealedBlocker::MountDenied,
+                MountStep::PivotPrepare | MountStep::PivotRoot | MountStep::DetachOldRoot => {
+                    SealedBlocker::PivotRootDenied
+                }
+                // The `/tmp` rehearsal's steps; the sealed-root rehearsal never reports them.
+                MountStep::UnshareMount | MountStep::MakePrivate | MountStep::BindTmp => {
+                    SealedBlocker::MountDenied
+                }
+            };
+            return Some(shortfall(
+                blocker,
+                Some(step.describe().to_string()),
+                Some(errno),
+            ));
+        }
+    }
+    if landlock_fully_enforced {
+        None
+    } else {
+        Some(shortfall(SealedBlocker::LandlockUnavailable, None, None))
     }
 }
 
@@ -1009,9 +1100,8 @@ const OLD_ROOT_NAME: &str = ".mur-oldroot";
 
 /// [`OLD_ROOT_NAME`] relative, and rooted at `/` after the pivot, as NUL-terminated literals.
 ///
-/// Same reason [`SEALED_ROOT_BASE_CANDIDATES_C`] exists: the probe child rehearses the pivot after
-/// `fork()`, where composing a `CString` is not allowed. `old_root_names_agree` keeps the three
-/// spellings in step.
+/// The probe's sealed-root rehearsal pivots after `fork()`, where composing a `CString` is not
+/// allowed. `old_root_names_agree` keeps the three spellings in step.
 pub(crate) const OLD_ROOT_NAME_C: &std::ffi::CStr = c".mur-oldroot";
 
 /// [`OLD_ROOT_NAME`] as it is named from inside the new root, once `pivot_root(2)` has parked the
@@ -1025,16 +1115,6 @@ pub(crate) const OLD_ROOT_PIVOTED_C: &std::ffi::CStr = c"/.mur-oldroot";
 /// the session workdir (a workdir under `/tmp` is entirely normal) and must not be one of the
 /// directories the composed root goes on to bind-mount from.
 pub const SEALED_ROOT_BASE_CANDIDATES: &[&str] = &["/tmp", "/run", "/var/tmp", "/mnt", "/media"];
-
-/// [`SEALED_ROOT_BASE_CANDIDATES`] as NUL-terminated literals, in the same order.
-///
-/// The host probe's child rehearses the composed root inside a `fork()`, where composing a
-/// `CString` would touch the allocator a sibling thread of the parent may have held frozen at fork
-/// time. Static literals are the only form usable there. `probe_root_base_candidates_match_the_str_list`
-/// keeps the two lists identical, so the probe can never rehearse a base the real construction
-/// would not choose.
-pub(crate) const SEALED_ROOT_BASE_CANDIDATES_C: &[&std::ffi::CStr] =
-    &[c"/tmp", c"/run", c"/var/tmp", c"/mnt", c"/media"];
 
 /// `hidepid` spellings tried, in order, when mounting the composed root's `/proc` with
 /// `mount -t proc`. The numeric form is the legacy parser's; `invisible` is the Linux 5.8+
@@ -1587,9 +1667,7 @@ impl PlanBuilder {
 pub(crate) const SEALED_ROOT_FAILURE_PREFIX: &str = "sealed-root:";
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{
-    build_sealed_root_spec, construct_composed_root, probe_sealed_support, SealedRootSpec,
-};
+pub(crate) use linux::{build_sealed_root_spec, construct_composed_root, SealedRootSpec};
 
 /// The post-`fork()` namespace primitives [`crate::network_namespace`] reuses rather than
 /// reimplementing.
@@ -1616,26 +1694,9 @@ mod linux {
     use std::path::Path;
 
     use super::{
-        ComposedRootPlan, NamespaceProbe, RootOp, RootStep, SealedProbe, UsernsGrant,
-        OLD_ROOT_NAME, OLD_ROOT_NAME_C, OLD_ROOT_PIVOTED_C, PROC_HIDEPID_OPTIONS,
-        SEALED_ROOT_BASE_CANDIDATES_C, SEALED_ROOT_FAILURE_PREFIX,
+        ComposedRootPlan, RootOp, RootStep, UsernsGrant, OLD_ROOT_NAME, PROC_HIDEPID_OPTIONS,
+        SEALED_ROOT_FAILURE_PREFIX,
     };
-
-    // ------------------------------------------------------------ probe
-
-    /// Reads AppArmor's unprivileged-userns restriction and, if it is not in the way, really
-    /// creates a user+mount namespace in a forked child.
-    ///
-    /// Forking rather than testing in-process is required, not defensive: `unshare(CLONE_NEWUSER)`
-    /// is irreversible for the calling process, and putting the whole runtime into a user
-    /// namespace as a side effect of a capability check would be exactly the "probe that changes
-    /// the thing it measures" mistake `probe_landlock_full_access` documents avoiding.
-    pub(crate) fn probe_sealed_support() -> SealedProbe {
-        SealedProbe {
-            userns_grant: userns_grant(),
-            namespace: probe_namespace(),
-        }
-    }
 
     /// Reads the three host files [`UsernsGrant::from_readings`] decides on, which holds the
     /// whole decision.
@@ -1719,174 +1780,6 @@ mod linux {
         // SAFETY: integer-only `prctl`, in the post-fork child.
         unsafe {
             libc::prctl(libc::PR_SET_DUMPABLE, previous, 0, 0, 0);
-        }
-    }
-
-    // Exit codes the probe child reports. Kept as small distinct integers so the parent learns the
-    // *step* that failed without any IPC beyond `waitpid`.
-    const PROBE_OK: i32 = 0;
-    const PROBE_UNSHARE_DENIED: i32 = 1;
-    const PROBE_UNSHARE_UNSUPPORTED: i32 = 2;
-    const PROBE_MOUNT_DENIED: i32 = 3;
-    const PROBE_MAP_DENIED: i32 = 4;
-    /// No candidate in [`SEALED_ROOT_BASE_CANDIDATES_C`] accepted a `tmpfs` mount. Same mechanism
-    /// and same remediation as [`PROBE_MOUNT_DENIED`], so it folds into `MountDenied`.
-    const PROBE_TMPFS_DENIED: i32 = 5;
-    /// The parking directory could not be made, or the child could not `chdir` into the new root —
-    /// composed-root step 6 before the syscall itself.
-    const PROBE_PIVOT_PREPARE_DENIED: i32 = 6;
-    /// `syscall(SYS_pivot_root, ".", ".mur-oldroot")` was refused.
-    const PROBE_PIVOT_ROOT_DENIED: i32 = 7;
-    /// `pivot_root` succeeded and detaching the parked old root did not — composed-root step 7.
-    const PROBE_OLD_ROOT_DETACH_DENIED: i32 = 8;
-
-    fn probe_namespace() -> NamespaceProbe {
-        // Read before the fork, and therefore before `unshare`: inside a fresh user namespace
-        // with no mapping written yet, `getuid()`/`getgid()` report the *overflow* ids (65534),
-        // not the real ones. Writing `65534 65534 1` into `uid_map` is refused with `EPERM` on
-        // every host, so reading them after the unshare made the probe fail everywhere and
-        // report the host as the culprit. This is the one ordering in this function that is
-        // load-bearing.
-        // SAFETY: getuid/getgid take no arguments, dereference nothing and cannot fail.
-        let uid = unsafe { libc::getuid() };
-        let gid = unsafe { libc::getgid() };
-
-        // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the child
-        // touches nothing but async-signal-safe primitives. The child below calls `unshare`,
-        // `prctl`, `mount`, the `open`/`write`/`close` triples that write the identity maps,
-        // `chdir`, `mkdir`, `pivot_root` via `syscall`, `umount2`, and `_exit` — every one of them
-        // async-signal-safe, and no allocation, no locks, no stdio. Anything added to the child
-        // must hold to the same list.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            return NamespaceProbe::Unsupported;
-        }
-        if pid == 0 {
-            // SAFETY: forked-child context, syscalls only; every branch ends in `_exit`.
-            unsafe {
-                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
-                    let errno = *libc::__errno_location();
-                    libc::_exit(match errno {
-                        libc::EPERM => PROBE_UNSHARE_DENIED,
-                        _ => PROBE_UNSHARE_UNSUPPORTED,
-                    });
-                }
-                // Rehearse the identity uid/gid mapping too, rather than stopping at
-                // `unshare`. A probe that skips it is not measuring what the real construction
-                // does: a host can allow the namespace and still refuse to let the process own
-                // it, and finding that out at spawn time instead of at launch time is exactly
-                // the surprise this probe exists to prevent.
-                //
-                // `uid`/`gid` come from before the fork — see `probe_namespace`.
-                //
-                // Dumpable for the map writes only, and restored immediately: see
-                // `make_dumpable_for_map_writes` for why an inherited non-dumpable flag makes
-                // these three files root-owned.
-                let previous_dumpable = make_dumpable_for_map_writes();
-                let _ = write_decimal_map(c"/proc/self/setgroups", None, 0);
-                let mapped = write_decimal_map(c"/proc/self/uid_map", Some(uid), uid).is_ok()
-                    && write_decimal_map(c"/proc/self/gid_map", Some(gid), gid).is_ok();
-                restore_dumpable(previous_dumpable);
-                if !mapped {
-                    libc::_exit(PROBE_MAP_DENIED);
-                }
-
-                // The first mount any composed root performs, and the one AppArmor's
-                // `unprivileged_userns` profile denies: if this works, `CAP_SYS_ADMIN` is real
-                // inside the new namespace.
-                if libc::mount(
-                    std::ptr::null(),
-                    c"/".as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_REC | libc::MS_PRIVATE,
-                    std::ptr::null(),
-                ) != 0
-                {
-                    libc::_exit(PROBE_MOUNT_DENIED);
-                }
-
-                // Steps 4, 6 and 7 of `construct_composed_root`, in the same order and with the
-                // same syscalls. A probe that stops at the mount above clears a host that refuses
-                // `pivot_root(2)`, which then fails at the first subprocess after an inference
-                // call has already been paid for.
-                //
-                // Everything below happens inside this child's own mount namespace, whose
-                // propagation the mount above just made private, so the host's mount table is
-                // unchanged whatever the outcome — and the child `_exit`s a few syscalls later
-                // without ever unwinding any of it.
-                let mut based = false;
-                for base in SEALED_ROOT_BASE_CANDIDATES_C {
-                    if libc::mount(
-                        c"tmpfs".as_ptr(),
-                        base.as_ptr(),
-                        c"tmpfs".as_ptr(),
-                        libc::MS_NOSUID | libc::MS_NODEV,
-                        c"mode=0755".as_ptr() as *const libc::c_void,
-                    ) == 0
-                    {
-                        // `chdir` first, so the parking directory and `pivot_root`'s two
-                        // arguments are all relative and no path has to be composed here.
-                        if libc::chdir(base.as_ptr()) != 0 {
-                            libc::_exit(PROBE_PIVOT_PREPARE_DENIED);
-                        }
-                        based = true;
-                        break;
-                    }
-                }
-                if !based {
-                    libc::_exit(PROBE_TMPFS_DENIED);
-                }
-
-                if libc::mkdir(OLD_ROOT_NAME_C.as_ptr(), 0o700) != 0 {
-                    libc::_exit(PROBE_PIVOT_PREPARE_DENIED);
-                }
-                if libc::syscall(
-                    libc::SYS_pivot_root,
-                    c".".as_ptr(),
-                    OLD_ROOT_NAME_C.as_ptr(),
-                ) != 0
-                {
-                    libc::_exit(PROBE_PIVOT_ROOT_DENIED);
-                }
-                if libc::chdir(c"/".as_ptr()) != 0 {
-                    libc::_exit(PROBE_PIVOT_PREPARE_DENIED);
-                }
-                if libc::umount2(OLD_ROOT_PIVOTED_C.as_ptr(), libc::MNT_DETACH) != 0 {
-                    libc::_exit(PROBE_OLD_ROOT_DETACH_DENIED);
-                }
-                libc::_exit(PROBE_OK);
-            }
-        }
-
-        let mut status: libc::c_int = 0;
-        // SAFETY: `pid` is the child just forked; `status` is a live local.
-        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if waited != pid {
-            return NamespaceProbe::Unsupported;
-        }
-        if !libc::WIFEXITED(status) {
-            return NamespaceProbe::Unsupported;
-        }
-        match libc::WEXITSTATUS(status) {
-            PROBE_OK => NamespaceProbe::Ok,
-            PROBE_UNSHARE_DENIED => NamespaceProbe::Denied,
-            // Kept apart from `Denied`: the child already told us which step failed, and
-            // throwing that away made a map failure indistinguishable from the kernel refusing
-            // the namespace outright — so the reported cause, and the remediation offered with
-            // it, named the wrong thing entirely.
-            PROBE_MAP_DENIED => NamespaceProbe::MapDenied,
-            // A tmpfs the kernel would not accept over any candidate base is the same mechanism
-            // and the same remediation as the propagation mount above, so the two report as one.
-            PROBE_MOUNT_DENIED | PROBE_TMPFS_DENIED => NamespaceProbe::MountDenied,
-            // The whole of composed-root steps 6 and 7. The parking `mkdir`, the two `chdir`s and
-            // the `umount2` are the sequence `pivot_root(2)` is performed with, and a host that
-            // refuses any of them refuses the pivot; the exit codes stay distinct so the *stage*
-            // is still recoverable from a core-less child, while the blocker names the mechanism
-            // an operator has to grant.
-            PROBE_PIVOT_PREPARE_DENIED | PROBE_PIVOT_ROOT_DENIED | PROBE_OLD_ROOT_DETACH_DENIED => {
-                NamespaceProbe::PivotRootDenied
-            }
-            _ => NamespaceProbe::Unsupported,
         }
     }
 
@@ -3567,11 +3460,9 @@ mod tests {
 
     /// The wire names are what `--explain-scope --json`, `session_start` and `mur doctor` all
     /// print, so two variants sharing one would re-collapse exactly the distinction this enum
-    /// exists to make. `permits_userns` is the whole of what the runtime decisions read, and it
-    /// must be false for `Withheld` alone — any other variant denying would refuse a host the
-    /// runtime is required to keep serving.
+    /// exists to make.
     #[test]
-    fn every_grant_has_a_distinct_wire_name_and_only_withheld_denies() {
+    fn every_grant_has_a_distinct_wire_name_and_summary() {
         let names: Vec<&str> = UsernsGrant::ALL
             .iter()
             .map(|grant| grant.wire_name())
@@ -3591,11 +3482,6 @@ mod tests {
         );
 
         for grant in UsernsGrant::ALL {
-            assert_eq!(
-                grant.permits_userns(),
-                *grant != UsernsGrant::Withheld,
-                "{grant:?} must permit the namespace unless it is Withheld"
-            );
             assert_eq!(
                 serde_json::to_value(grant).unwrap(),
                 serde_json::Value::String(grant.wire_name().to_string()),
@@ -3658,71 +3544,8 @@ mod tests {
         }
     }
 
-    /// A refused `pivot_root(2)` is its own finding, with its own remediation. Without this
-    /// variant a host that permits `mount(2)` and refuses the pivot probes as `Ok` and fails at
-    /// the first subprocess with `E-RUN-014`, after an inference call has already been paid for.
-    #[test]
-    fn a_refused_pivot_root_is_its_own_blocker() {
-        let probe = SealedProbe {
-            userns_grant: UsernsGrant::ProfileConfining,
-            namespace: NamespaceProbe::PivotRootDenied,
-        };
-        assert_eq!(
-            sealed_blocker(true, true, probe),
-            Some(SealedBlocker::PivotRootDenied)
-        );
-
-        let reason = SealedBlocker::PivotRootDenied.reason();
-        assert!(reason.contains("pivot_root(2)"), "reason was: {reason}");
-        // Distinguishable from `MountDenied`'s: an operator handed the mount remediation on a
-        // host whose mounts already work has been sent somewhere useless.
-        assert_ne!(reason, SealedBlocker::MountDenied.reason());
-        assert!(reason.contains("seccomp"), "reason was: {reason}");
-    }
-
-    /// Every [`NamespaceProbe`] variant reaches a blocker decision, so a variant added later
-    /// cannot fall through to "this host can back sealed".
-    #[test]
-    fn every_namespace_probe_outcome_is_attributed() {
-        const ALL: &[NamespaceProbe] = &[
-            NamespaceProbe::Ok,
-            NamespaceProbe::Denied,
-            NamespaceProbe::MapDenied,
-            NamespaceProbe::MountDenied,
-            NamespaceProbe::PivotRootDenied,
-            NamespaceProbe::Unsupported,
-        ];
-        for namespace in ALL {
-            let probe = SealedProbe {
-                userns_grant: UsernsGrant::ProfileConfining,
-                namespace: *namespace,
-            };
-            let blocker = sealed_blocker(true, true, probe);
-            if *namespace == NamespaceProbe::Ok {
-                assert_eq!(blocker, None, "a complete rehearsal must back sealed");
-            } else {
-                let blocker = blocker.unwrap_or_else(|| panic!("{namespace:?} named no blocker"));
-                assert!(
-                    SealedBlocker::ALL.contains(&blocker),
-                    "{blocker:?} is missing from SealedBlocker::ALL"
-                );
-            }
-        }
-    }
-
-    /// The probe child cannot compose a `CString`, so it carries its own NUL-terminated copies of
-    /// the base candidates. A copy that drifted would have the probe rehearse a base the real
-    /// construction would never choose.
-    #[test]
-    fn probe_root_base_candidates_match_the_str_list() {
-        let literals: Vec<&str> = SEALED_ROOT_BASE_CANDIDATES_C
-            .iter()
-            .map(|value| value.to_str().expect("ASCII path literal"))
-            .collect();
-        assert_eq!(literals, SEALED_ROOT_BASE_CANDIDATES);
-    }
-
-    /// Same reason, for the old-root parking directory: three spellings of one name.
+    /// The probe child cannot compose a `CString`, so it carries NUL-terminated copies of the
+    /// old-root parking directory's name: three spellings of one name.
     #[test]
     fn old_root_names_agree() {
         assert_eq!(OLD_ROOT_NAME_C.to_str().unwrap(), OLD_ROOT_NAME);
@@ -3840,75 +3663,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn blocker_blames_apparmor_before_the_namespace_outcome_it_causes() {
-        let probe = SealedProbe {
-            userns_grant: UsernsGrant::Withheld,
-            namespace: NamespaceProbe::Denied,
-        };
-        assert_eq!(
-            sealed_blocker(true, true, probe),
-            Some(SealedBlocker::AppArmorProfileMissing)
-        );
-        let reason = SealedBlocker::AppArmorProfileMissing.reason();
-        assert!(reason.contains("mur-sealed"));
-        assert!(reason.contains("apparmor_parser -r"));
-    }
-
-    #[test]
-    fn blocker_names_the_container_remediation_verbatim() {
-        let probe = SealedProbe {
-            userns_grant: UsernsGrant::ProfileConfining,
-            namespace: NamespaceProbe::Denied,
-        };
-        assert_eq!(
-            sealed_blocker(true, true, probe),
-            Some(SealedBlocker::NamespaceCreationDenied)
-        );
-        let reason = SealedBlocker::NamespaceCreationDenied.reason();
-        assert!(reason.contains("--cap-add SYS_ADMIN"));
-        assert!(reason.contains("outside the container"));
-    }
-
-    #[test]
-    fn a_map_failure_is_not_reported_as_the_container_case() {
-        // `MapDenied` must stay distinct from `Denied`: a host that creates the namespace and
-        // then refuses the id mapping is not the container case, and must not be told to add
-        // `--cap-add SYS_ADMIN` to a container it is not running in.
-        let probe = SealedProbe {
-            userns_grant: UsernsGrant::ProfileConfining,
-            namespace: NamespaceProbe::MapDenied,
-        };
-        assert_eq!(
-            sealed_blocker(true, true, probe),
-            Some(SealedBlocker::IdMapDenied)
-        );
-
-        let reason = SealedBlocker::IdMapDenied.reason();
-        assert!(
-            reason.contains("uid_map"),
-            "must name the step that failed: {reason}"
-        );
-        assert!(
-            !reason.contains("CAP_SYS_ADMIN") && !reason.contains("--cap-add"),
-            "must not send the operator after a capability that isn't the problem: {reason}",
-        );
-
-        // And the container case must keep its own, different advice.
-        let denied = SealedProbe {
-            userns_grant: UsernsGrant::ProfileConfining,
-            namespace: NamespaceProbe::Denied,
-        };
-        assert_eq!(
-            sealed_blocker(true, true, denied),
-            Some(SealedBlocker::NamespaceCreationDenied)
-        );
-        assert_ne!(
-            SealedBlocker::IdMapDenied.reason(),
-            SealedBlocker::NamespaceCreationDenied.reason(),
-        );
-    }
-
     /// `SealedBlocker::ALL` is what `murmur-cli`'s containment test matches a refusal against, so a
     /// variant missing from it makes that test assert something false about the *host*. Adding a
     /// variant must break this test — loudly, here — rather than surface three crates away.
@@ -3925,7 +3679,9 @@ mod tests {
                 | SealedBlocker::MountDenied
                 | SealedBlocker::PivotRootDenied
                 | SealedBlocker::KernelUnsupported
-                | SealedBlocker::LandlockUnavailable => *blocker,
+                | SealedBlocker::LandlockUnavailable
+                | SealedBlocker::NetworkNamespaceUnavailable
+                | SealedBlocker::ProbeUnavailable => *blocker,
             };
             assert!(
                 SealedBlocker::ALL.contains(&named),
@@ -3957,45 +3713,6 @@ mod tests {
     }
 
     #[test]
-    fn blocker_is_none_only_when_every_precondition_holds() {
-        let ok = SealedProbe {
-            userns_grant: UsernsGrant::ProfileConfining,
-            namespace: NamespaceProbe::Ok,
-        };
-        assert_eq!(sealed_blocker(true, true, ok), None);
-        assert_eq!(
-            sealed_blocker(false, true, ok),
-            Some(SealedBlocker::NotLinux)
-        );
-        assert_eq!(
-            sealed_blocker(true, false, ok),
-            Some(SealedBlocker::LandlockUnavailable)
-        );
-        assert_eq!(
-            sealed_blocker(
-                true,
-                true,
-                SealedProbe {
-                    userns_grant: UsernsGrant::ProfileConfining,
-                    namespace: NamespaceProbe::MountDenied
-                }
-            ),
-            Some(SealedBlocker::MountDenied)
-        );
-        assert_eq!(
-            sealed_blocker(
-                true,
-                true,
-                SealedProbe {
-                    userns_grant: UsernsGrant::ProfileConfining,
-                    namespace: NamespaceProbe::Unsupported
-                }
-            ),
-            Some(SealedBlocker::KernelUnsupported)
-        );
-    }
-
-    #[test]
     fn the_device_set_is_exactly_the_oci_default_and_excludes_shm() {
         let names: Vec<&str> = SEALED_DEVICE_NODES.iter().map(|d| d.name).collect();
         assert_eq!(names, ["null", "zero", "full", "random", "urandom", "tty"]);
@@ -4016,5 +3733,333 @@ mod tests {
                 ("/dev/tty", 5, 0, 0o666, true),
             ]
         );
+    }
+
+    // ---- `sealed_shortfall` -----------------------------------------------------------------
+
+    mod shortfall {
+        use super::super::*;
+        use crate::namespace_probe::{
+            MountAttempt, MountAttemptError, MountStep, NamespaceReading,
+        };
+        use crate::network_namespace::{CreationStep, NamespaceAttemptError};
+
+        fn docker() -> ProfileAttachment {
+            ProfileAttachment::Other {
+                profile: "docker-default".to_string(),
+            }
+        }
+
+        fn created(grant: UsernsGrant, attachment: ProfileAttachment) -> NamespaceReading {
+            NamespaceReading {
+                network: Ok(()),
+                mount: MountAttempt::Created,
+                sealed_root: MountAttempt::Created,
+                userns_grant: grant,
+                attachment,
+            }
+        }
+
+        fn network_failed(step: CreationStep, errno: i32) -> NamespaceReading {
+            NamespaceReading {
+                network: Err(NamespaceAttemptError::Step { step, errno }),
+                mount: MountAttempt::NotAttempted,
+                sealed_root: MountAttempt::NotAttempted,
+                ..created(UsernsGrant::Withheld, ProfileAttachment::Unconfined)
+            }
+        }
+
+        fn root_failed(step: MountStep, errno: i32) -> NamespaceReading {
+            NamespaceReading {
+                sealed_root: MountAttempt::Failed(MountAttemptError::Step { step, errno }),
+                ..created(UsernsGrant::Withheld, ProfileAttachment::Unconfined)
+            }
+        }
+
+        /// Every mapping of the design, with the blocker it decides and the rendering it carries:
+        /// the class sentence, the failed call, the `errno` symbol and words, and the readings
+        /// line last.
+        #[test]
+        fn every_failed_attempt_names_its_blocker_call_errno_and_readings() {
+            use CreationStep as C;
+            use MountStep as M;
+            let docker_eperm = |step| NamespaceReading {
+                attachment: docker(),
+                ..network_failed(step, libc::EPERM)
+            };
+            let cases: Vec<(NamespaceReading, SealedBlocker, &str, i32)> = vec![
+                (
+                    network_failed(C::Unshare, libc::ENOSPC),
+                    SealedBlocker::KernelUnsupported,
+                    C::Unshare.describe(),
+                    libc::ENOSPC,
+                ),
+                (
+                    network_failed(C::Unshare, libc::EINVAL),
+                    SealedBlocker::KernelUnsupported,
+                    C::Unshare.describe(),
+                    libc::EINVAL,
+                ),
+                (
+                    network_failed(C::Unshare, libc::ENOSYS),
+                    SealedBlocker::KernelUnsupported,
+                    C::Unshare.describe(),
+                    libc::ENOSYS,
+                ),
+                (
+                    network_failed(C::Unshare, libc::EUSERS),
+                    SealedBlocker::KernelUnsupported,
+                    C::Unshare.describe(),
+                    libc::EUSERS,
+                ),
+                (
+                    network_failed(C::Unshare, libc::EPERM),
+                    SealedBlocker::AppArmorProfileMissing,
+                    C::Unshare.describe(),
+                    libc::EPERM,
+                ),
+                (
+                    network_failed(C::IdentityMaps, libc::EPERM),
+                    SealedBlocker::AppArmorProfileMissing,
+                    C::IdentityMaps.describe(),
+                    libc::EPERM,
+                ),
+                (
+                    network_failed(C::IdentityMaps, libc::EACCES),
+                    SealedBlocker::AppArmorProfileMissing,
+                    C::IdentityMaps.describe(),
+                    libc::EACCES,
+                ),
+                (
+                    docker_eperm(C::Unshare),
+                    SealedBlocker::NamespaceCreationDenied,
+                    C::Unshare.describe(),
+                    libc::EPERM,
+                ),
+                (
+                    docker_eperm(C::IdentityMaps),
+                    SealedBlocker::IdMapDenied,
+                    C::IdentityMaps.describe(),
+                    libc::EPERM,
+                ),
+                (
+                    network_failed(C::Loopback, libc::EPERM),
+                    SealedBlocker::NetworkNamespaceUnavailable,
+                    C::Loopback.describe(),
+                    libc::EPERM,
+                ),
+                (
+                    network_failed(C::LocalRoute, libc::EPERM),
+                    SealedBlocker::NetworkNamespaceUnavailable,
+                    C::LocalRoute.describe(),
+                    libc::EPERM,
+                ),
+                (
+                    network_failed(C::Resolver, libc::EADDRINUSE),
+                    SealedBlocker::NetworkNamespaceUnavailable,
+                    C::Resolver.describe(),
+                    libc::EADDRINUSE,
+                ),
+                (
+                    network_failed(C::HandOff, libc::EMFILE),
+                    SealedBlocker::NetworkNamespaceUnavailable,
+                    C::HandOff.describe(),
+                    libc::EMFILE,
+                ),
+                (
+                    root_failed(M::JoinSession, libc::EINVAL),
+                    SealedBlocker::NetworkNamespaceUnavailable,
+                    M::JoinSession.describe(),
+                    libc::EINVAL,
+                ),
+                (
+                    root_failed(M::UnshareUserMount, libc::EUSERS),
+                    SealedBlocker::KernelUnsupported,
+                    M::UnshareUserMount.describe(),
+                    libc::EUSERS,
+                ),
+                (
+                    root_failed(M::UnshareUserMount, libc::ENOSPC),
+                    SealedBlocker::KernelUnsupported,
+                    M::UnshareUserMount.describe(),
+                    libc::ENOSPC,
+                ),
+                (
+                    root_failed(M::UnshareUserMount, libc::EPERM),
+                    SealedBlocker::NamespaceCreationDenied,
+                    M::UnshareUserMount.describe(),
+                    libc::EPERM,
+                ),
+                (
+                    root_failed(M::IdentityMaps, libc::EPERM),
+                    SealedBlocker::IdMapDenied,
+                    M::IdentityMaps.describe(),
+                    libc::EPERM,
+                ),
+                (
+                    root_failed(M::MakePrivateNested, libc::EACCES),
+                    SealedBlocker::MountDenied,
+                    M::MakePrivateNested.describe(),
+                    libc::EACCES,
+                ),
+                (
+                    root_failed(M::Tmpfs, libc::EPERM),
+                    SealedBlocker::MountDenied,
+                    M::Tmpfs.describe(),
+                    libc::EPERM,
+                ),
+                (
+                    root_failed(M::PivotPrepare, libc::EACCES),
+                    SealedBlocker::PivotRootDenied,
+                    M::PivotPrepare.describe(),
+                    libc::EACCES,
+                ),
+                (
+                    root_failed(M::PivotRoot, libc::EPERM),
+                    SealedBlocker::PivotRootDenied,
+                    M::PivotRoot.describe(),
+                    libc::EPERM,
+                ),
+                (
+                    root_failed(M::DetachOldRoot, libc::EINVAL),
+                    SealedBlocker::PivotRootDenied,
+                    M::DetachOldRoot.describe(),
+                    libc::EINVAL,
+                ),
+            ];
+            for (reading, blocker, call, errno) in cases {
+                for landlock in [true, false] {
+                    let shortfall = sealed_shortfall(true, landlock, &reading)
+                        .unwrap_or_else(|| panic!("{reading:?} must be refused"));
+                    assert_eq!(shortfall.blocker, blocker, "{reading:?}");
+                    assert_eq!(shortfall.failed_call.as_deref(), Some(call));
+                    assert_eq!(shortfall.errno, Some(errno));
+                    let reason = shortfall.reason();
+                    let name = crate::network_namespace::errno_name(errno).unwrap();
+                    let words = crate::network_namespace::errno_words(errno);
+                    assert!(reason.starts_with(&blocker.reason()), "{reason}");
+                    assert!(
+                        reason
+                            .contains(&format!("The probe's {call} failed with {name} ({words}).")),
+                        "{reason}"
+                    );
+                    let readings = reason.find("Host readings:").expect("readings line");
+                    assert!(reason[readings..].ends_with('.'), "{reason}");
+                    assert!(
+                        !reason[readings..].contains("The probe's"),
+                        "the readings come last: {reason}"
+                    );
+                }
+            }
+        }
+
+        /// A probe that could not run is refused as unknown, with the runtime's own account and
+        /// no errno.
+        #[test]
+        fn a_probe_that_could_not_run_is_refused_rather_than_assumed() {
+            for reading in [
+                NamespaceReading {
+                    network: Err(NamespaceAttemptError::Creator(
+                        "fork() for the namespace creator failed: EAGAIN".to_string(),
+                    )),
+                    mount: MountAttempt::NotAttempted,
+                    sealed_root: MountAttempt::NotAttempted,
+                    ..created(UsernsGrant::Withheld, ProfileAttachment::Unconfined)
+                },
+                NamespaceReading {
+                    sealed_root: MountAttempt::Failed(MountAttemptError::Rehearsal(
+                        "fork() for the sealed-root rehearsal failed: EAGAIN".to_string(),
+                    )),
+                    ..created(UsernsGrant::Withheld, ProfileAttachment::Unconfined)
+                },
+            ] {
+                let shortfall = sealed_shortfall(true, true, &reading).unwrap();
+                assert_eq!(shortfall.blocker, SealedBlocker::ProbeUnavailable);
+                assert_eq!(shortfall.errno, None);
+                let reason = shortfall.reason();
+                assert!(
+                    reason.contains("The probe could not run: fork() for the"),
+                    "{reason}"
+                );
+                assert!(reason.contains("Host readings:"), "{reason}");
+            }
+        }
+
+        /// `AppArmorProfileMissing` comes only from a failed attempt: every grant and attachment
+        /// over a reading whose attempts all created their namespaces is no shortfall at all.
+        #[test]
+        fn the_readings_never_refuse_a_host_whose_attempts_all_succeeded() {
+            for grant in UsernsGrant::ALL {
+                for attachment in [
+                    ProfileAttachment::Unconfined,
+                    docker(),
+                    ProfileAttachment::NotReported,
+                    ProfileAttachment::Sealed {
+                        profile: "mur-sealed".to_string(),
+                    },
+                ] {
+                    let reading = created(*grant, attachment);
+                    assert_eq!(sealed_shortfall(true, true, &reading), None, "{reading:?}");
+                    assert_eq!(
+                        sealed_shortfall(true, false, &reading).map(|s| s.blocker),
+                        Some(SealedBlocker::LandlockUnavailable)
+                    );
+                    assert_eq!(
+                        sealed_shortfall(false, true, &reading).map(|s| s.blocker),
+                        Some(SealedBlocker::NotLinux)
+                    );
+                }
+            }
+        }
+
+        /// The `/tmp` attempt is the mount namespace a `scoped` command uses; the composed root
+        /// binds `/tmp` itself, so a refused `/tmp` mapping says nothing about `sealed`.
+        #[test]
+        fn the_tmp_attempt_never_affects_sealed() {
+            let reading = NamespaceReading {
+                mount: MountAttempt::Failed(MountAttemptError::Step {
+                    step: MountStep::MakePrivate,
+                    errno: libc::EACCES,
+                }),
+                ..created(UsernsGrant::Withheld, ProfileAttachment::Unconfined)
+            };
+            assert_eq!(sealed_shortfall(true, true, &reading), None);
+        }
+
+        /// No attempt failed for `NotLinux` and `LandlockUnavailable`, so their reason is the
+        /// class sentence alone, with no readings.
+        #[test]
+        fn a_shortfall_without_a_failed_attempt_carries_no_readings() {
+            let reading = created(UsernsGrant::Withheld, ProfileAttachment::Unconfined);
+            for shortfall in [
+                sealed_shortfall(false, true, &reading).unwrap(),
+                sealed_shortfall(true, false, &reading).unwrap(),
+            ] {
+                assert_eq!(shortfall.reason(), shortfall.blocker.reason());
+            }
+        }
+
+        /// The container case and the id-mapping case keep their own advice: a host that creates
+        /// the namespace and refuses its map is not told to add a capability it is not missing,
+        /// and a refused `pivot_root(2)` is not given the `mount(2)` remedy.
+        #[test]
+        fn each_blocker_keeps_its_own_remedy() {
+            let container = SealedBlocker::NamespaceCreationDenied.reason();
+            assert!(container.contains("--cap-add SYS_ADMIN"), "{container}");
+            assert!(container.contains("outside the container"), "{container}");
+            let map = SealedBlocker::IdMapDenied.reason();
+            assert!(map.contains("uid_map"), "{map}");
+            assert!(!map.contains("--cap-add"), "{map}");
+            let pivot = SealedBlocker::PivotRootDenied.reason();
+            assert!(
+                pivot.contains("pivot_root(2)") && pivot.contains("seccomp"),
+                "{pivot}"
+            );
+            assert_ne!(pivot, SealedBlocker::MountDenied.reason());
+            let network = SealedBlocker::NetworkNamespaceUnavailable.reason();
+            assert!(network.contains("E-CAP-005"), "{network}");
+            let apparmor = SealedBlocker::AppArmorProfileMissing.reason();
+            assert!(apparmor.contains("mur-sealed") && apparmor.contains("apparmor_parser -r"));
+        }
     }
 }

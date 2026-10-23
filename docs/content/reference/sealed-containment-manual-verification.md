@@ -251,7 +251,10 @@ Containment
              those two paths. LAST RESORT, only where a profile genuinely cannot be loaded:
              `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` — this removes
              unprivileged-userns hardening from every program on the machine, not just from
-             mur, and is not the configuration murmur ships.
+             mur, and is not the configuration murmur ships. The probe's writing
+             uid_map/gid_map failed with EPERM (Operation not permitted). Host readings:
+             kernel.apparmor_restrict_unprivileged_userns=1; AppArmor profile confining mur:
+             unconfined.
   mechanism: landlock+seccomp
   userns grant: withheld
 ```
@@ -265,7 +268,7 @@ mur run; echo "exit=$?"
 Expected:
 
 ```text
-error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): sealed requires an unprivileged user+mount namespace, and AppArmor's unprivileged-userns restriction is active on this host while the 'mur-sealed' profile is not confining this binary. Install and load the profile shipped with mur: `sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed` (or re-run the mur installer as root), then re-run. Building out of a checkout, where the binary sits at ./target/{debug,release}/mur and no shipped profile attaches to it: run `scripts/install-dev-apparmor.sh`, which generates and loads the same grant for those two paths. LAST RESORT, only where a profile genuinely cannot be loaded: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` — this removes unprivileged-userns hardening from every program on the machine, not just from mur, and is not the configuration murmur ships.
+error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): sealed requires an unprivileged user+mount namespace, and AppArmor's unprivileged-userns restriction is active on this host while the 'mur-sealed' profile is not confining this binary. Install and load the profile shipped with mur: `sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed` (or re-run the mur installer as root), then re-run. Building out of a checkout, where the binary sits at ./target/{debug,release}/mur and no shipped profile attaches to it: run `scripts/install-dev-apparmor.sh`, which generates and loads the same grant for those two paths. LAST RESORT, only where a profile genuinely cannot be loaded: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` — this removes unprivileged-userns hardening from every program on the machine, not just from mur, and is not the configuration murmur ships. The probe's writing uid_map/gid_map failed with EPERM (Operation not permitted). Host readings: kernel.apparmor_restrict_unprivileged_userns=1; AppArmor profile confining mur: unconfined.
   hint: lower the declared floor to 'scoped' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment), or run on a host that provides 'sealed'
 exit=1
 ```
@@ -696,13 +699,14 @@ docker run --rm -v "$PWD":/work -w /work -v "$(command -v mur)":/usr/local/bin/m
 Expected — a refusal naming both remediations, and **no session**:
 
 ```text
-error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): sealed requires unshare(CLONE_NEWUSER | CLONE_NEWNS), which this host refused. This is the usual answer inside a container: CAP_SYS_ADMIN is absent, or the container's own seccomp filter blocks unshare(2). Either add `--cap-add SYS_ADMIN` to the container invocation, or establish the mount namespace outside the container and run mur inside it. The runtime will not fall back to a weaker class.
+error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): sealed requires an unprivileged user namespace, which this host refused to create. This is the usual answer inside a container: CAP_SYS_ADMIN is absent, or the container's own seccomp filter blocks unshare(2). Either add `--cap-add SYS_ADMIN` to the container invocation, or establish the mount namespace outside the container and run mur inside it. The runtime will not fall back to a weaker class. The probe's unshare(CLONE_NEWUSER | CLONE_NEWNET) failed with EPERM (Operation not permitted). Host readings: kernel.apparmor_restrict_unprivileged_userns=<0|1>; AppArmor profile confining mur: docker-default.
   hint: lower the declared floor to 'scoped' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment), or run on a host that provides 'sealed'
 exit=1
 ```
 
-The reason string may instead be the `MountDenied` variant, if this container's runtime lets
-`unshare` through and refuses the subsequent `mount(2)`. Both are correct; record which one you got.
+The reason string may instead be the `MountDenied` variant, naming `making / MS_REC|MS_PRIVATE in
+the nested namespace`, if this container's runtime lets `unshare` through and refuses the
+subsequent `mount(2)`. Both are correct; record which one you got, with its readings line.
 
 Then confirm the stated remediation actually works:
 

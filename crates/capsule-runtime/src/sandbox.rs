@@ -57,8 +57,8 @@
 //!
 //! ## Four-tier model
 //!
-//! - `KernelSealed` (Linux, everything `KernelFull` has, plus a usable unprivileged user+mount
-//!   namespace — AppArmor out of the way, `unshare` + `mount` verified by a real probe): the
+//! - `KernelSealed` (Linux, everything `KernelFull` has, plus a composed root the namespace probe
+//!   really built inside the capsule's network namespace — see [`crate::namespace_probe`]): the
 //!   subprocess tree additionally runs inside a private mount namespace pivoted onto a composed
 //!   root, so paths outside it are *absent* rather than denied. Landlock and seccomp still install,
 //!   inside the new root, as defence in depth — see [`crate::sealed`]. Only capsules that declare
@@ -128,28 +128,23 @@ pub(crate) enum EnforcementTier {
 }
 
 /// Pure decision: given whether the host is Linux, the outcome of a Landlock
-/// ruleset-restriction probe, and what [`crate::sealed::probe_sealed_support`] found, decide the
-/// tier. No syscalls here — fully unit-testable on any OS.
+/// ruleset-restriction probe, and what [`crate::namespace_probe`] created, decide the tier. No
+/// syscalls here — fully unit-testable on any OS.
 ///
-/// `KernelSealed` requires the whole conjunction — Linux, a usable Landlock ABI, AppArmor out of
-/// the way, and a namespace probe that really created one. Any missing element falls back to the
-/// tier that element still supports; nothing here ever reports a mechanism the host did not
-/// demonstrate.
+/// `KernelSealed` requires the whole conjunction — Linux, a fully enforced Landlock ruleset, and a
+/// sealed-root rehearsal that really built the composed root inside the capsule's network
+/// namespace. Any missing element falls back to the tier that element still supports; nothing
+/// here ever reports a mechanism the host did not demonstrate, and nothing here reads AppArmor.
 pub(crate) fn tier_from_probe(
     is_linux: bool,
     landlock_fully_enforced: Option<bool>,
-    sealed: crate::sealed::SealedProbe,
+    namespaces: &crate::namespace_probe::NamespaceReading,
 ) -> EnforcementTier {
     if !is_linux {
         return EnforcementTier::EnvironmentOnly;
     }
     match landlock_fully_enforced {
-        Some(true)
-            if sealed.userns_grant.permits_userns()
-                && sealed.namespace == crate::sealed::NamespaceProbe::Ok =>
-        {
-            EnforcementTier::KernelSealed
-        }
+        Some(true) if namespaces.sealed_root_created() => EnforcementTier::KernelSealed,
         Some(true) => EnforcementTier::KernelFull,
         Some(false) | None => EnforcementTier::KernelSeccompOnly,
     }
@@ -181,16 +176,17 @@ pub(crate) fn applied_tier(
 /// The host facts the tier decision is made from, taken together as one reading.
 ///
 /// A staged session takes exactly one of these and every consumer of that session reads it — the
-/// containment-floor refusal, the `ScopeReport` written to the trace, and the tier
-/// [`ShellEnforcement::resolve`] installs. Two readings of a host that changed between them would
-/// let the trace describe a session that never ran under what it claims.
-#[derive(Debug, Clone, Copy)]
+/// containment-floor refusal, the `ScopeReport` written to the trace, the `/tmp` mapping, the
+/// `E-CAP-005` check at staging and at launch, and the tier [`ShellEnforcement::resolve`]
+/// installs. Two readings of a host that changed between them would let the trace describe a
+/// session that never ran under what it claims.
+#[derive(Debug, Clone)]
 pub struct HostProbe {
     landlock_fully_enforced: Option<bool>,
     /// The kernel's Landlock ABI, from `linux_enforce::kernel_landlock_abi`. `None` off Linux and
     /// on a Linux kernel without Landlock.
     landlock_kernel_abi: Option<u8>,
-    sealed: crate::sealed::SealedProbe,
+    namespaces: crate::namespace_probe::NamespaceReading,
 }
 
 /// Probes taken since this process started. See [`HostProbe::probes_taken`].
@@ -199,16 +195,17 @@ static PROBES_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 impl HostProbe {
     /// Reads the host as it is right now: on Linux a real Landlock ruleset restriction attempt
     /// (`RulesetStatus::FullyEnforced` → `Some(true)`, `PartiallyEnforced`/`NotEnforced` or any
-    /// construction error → `Some(false)`, no Landlock ABI → `None`) plus a real
-    /// `unshare(CLONE_NEWUSER | CLONE_NEWNS)` and `mount(2)`. Off Linux it probes nothing and
-    /// claims nothing.
+    /// construction error → `Some(false)`, no Landlock ABI → `None`) plus
+    /// [`crate::namespace_probe`]'s three attempts: the session's network namespace, a command's
+    /// private mount namespace inside it, and the composed root's nested namespace and pivot. Off
+    /// Linux it probes nothing and claims nothing.
     ///
     /// Taken once per staged session, not once per process. That is affordable because both
     /// halves do their work in a forked child and leave the calling process exactly as they found
     /// it — `linux_enforce::probe_landlock_full_access` forks so the runtime is never placed
-    /// into a Landlock domain by a capability check, and [`crate::sealed::probe_sealed_support`]
-    /// forks because `unshare(CLONE_NEWUSER)` is irreversible for the task that calls it. Neither
-    /// is idempotency-sensitive, so a reading costs no more than the syscalls it makes: two
+    /// into a Landlock domain by a capability check, and the namespace probe forks because
+    /// `unshare(CLONE_NEWUSER)` is irreversible for the task that calls it. Neither is
+    /// idempotency-sensitive, so a reading costs no more than the syscalls it makes: four
     /// `fork`/`waitpid` pairs and three small `/proc` reads.
     ///
     /// The window this leaves open is one session wide. Between `runtime::stage_session` and the
@@ -222,13 +219,13 @@ impl HostProbe {
         let probe = HostProbe {
             landlock_fully_enforced: linux_enforce::probe_landlock_full_access(),
             landlock_kernel_abi: linux_enforce::kernel_landlock_abi(),
-            sealed: crate::sealed::probe_sealed_support(),
+            namespaces: crate::namespace_probe::probe_namespaces(),
         };
         #[cfg(not(target_os = "linux"))]
         let probe = HostProbe {
             landlock_fully_enforced: None,
             landlock_kernel_abi: None,
-            sealed: crate::sealed::SealedProbe::default(),
+            namespaces: crate::namespace_probe::probe_namespaces(),
         };
         probe
     }
@@ -238,12 +235,12 @@ impl HostProbe {
     #[cfg(test)]
     pub(crate) fn from_parts(
         landlock_fully_enforced: Option<bool>,
-        sealed: crate::sealed::SealedProbe,
+        namespaces: crate::namespace_probe::NamespaceReading,
     ) -> HostProbe {
         HostProbe {
             landlock_fully_enforced,
             landlock_kernel_abi: None,
-            sealed,
+            namespaces,
         }
     }
 
@@ -262,24 +259,36 @@ impl HostProbe {
         tier_from_probe(
             cfg!(target_os = "linux"),
             self.landlock_fully_enforced,
-            self.sealed,
+            &self.namespaces,
         )
     }
 
-    /// Whether this host can give a command a private mount namespace inside the session's user
-    /// namespace: the two `sealed` conditions [`tier_from_probe`] reads, without Landlock.
-    pub(crate) fn mount_namespace_usable(&self) -> bool {
-        cfg!(target_os = "linux")
-            && self.sealed.userns_grant.permits_userns()
-            && self.sealed.namespace == crate::sealed::NamespaceProbe::Ok
+    /// What the namespace probe attempted, and the readings it took with the attempts.
+    pub fn namespaces(&self) -> &crate::namespace_probe::NamespaceReading {
+        &self.namespaces
     }
 
-    /// Which single mechanism keeps this reading below `sealed`, or `None` when nothing does.
-    pub fn sealed_blocker(&self) -> Option<crate::sealed::SealedBlocker> {
-        crate::sealed::sealed_blocker(
+    /// The `E-CAP-005` failure this reading's network attempt is, or `None` when it created the
+    /// namespace (and always off Linux).
+    pub fn egress_namespace_failure(
+        &self,
+    ) -> Option<crate::network_namespace::EgressNamespaceFailure> {
+        self.namespaces.egress_namespace_failure()
+    }
+
+    /// Whether this host can give a command a private mount namespace inside the session's user
+    /// namespace: the probe's mount attempt created one.
+    pub(crate) fn mount_namespace_usable(&self) -> bool {
+        cfg!(target_os = "linux") && self.namespaces.mount_namespace_created()
+    }
+
+    /// Why this reading cannot back `sealed`, or `None` when nothing keeps it below. `None`
+    /// exactly when [`Self::tier`] is `KernelSealed`.
+    pub fn sealed_shortfall(&self) -> Option<crate::sealed::SealedShortfall> {
+        crate::sealed::sealed_shortfall(
             cfg!(target_os = "linux"),
             self.landlock_fully_enforced == Some(true),
-            self.sealed,
+            &self.namespaces,
         )
     }
 
@@ -287,7 +296,7 @@ impl HostProbe {
     /// `None` off Linux, where the question has no answer rather than a negative one.
     pub fn userns_grant(&self) -> Option<crate::sealed::UsernsGrant> {
         if cfg!(target_os = "linux") {
-            Some(self.sealed.userns_grant)
+            Some(self.namespaces.userns_grant)
         } else {
             None
         }
@@ -319,14 +328,14 @@ pub(crate) fn detect_enforcement_tier() -> EnforcementTier {
     HostProbe::probe().tier()
 }
 
-/// Which single mechanism keeps this host below `sealed`, or `None` when nothing does, from a
-/// reading taken here.
+/// Why this host cannot back `sealed`, or `None` when nothing keeps it below, from a reading
+/// taken here.
 ///
 /// Takes its own probe, as its neighbours do. What a session needs — that the refusal an operator
 /// sees and the tier the runtime installs cannot disagree about the host — is upheld by
 /// `runtime::stage_session` passing one [`HostProbe`] to both, not by this function.
-pub fn detect_sealed_blocker() -> Option<crate::sealed::SealedBlocker> {
-    HostProbe::probe().sealed_blocker()
+pub fn detect_sealed_shortfall() -> Option<crate::sealed::SealedShortfall> {
+    HostProbe::probe().sealed_shortfall()
 }
 
 /// Where this host's unprivileged-user-namespace permission comes from, or `None` off Linux, where
@@ -5771,24 +5780,35 @@ mod tests {
         );
     }
 
-    /// A host that can back the sealed mechanism: AppArmor out of the way, and a namespace probe
-    /// that really created one.
-    fn sealed_capable() -> crate::sealed::SealedProbe {
-        crate::sealed::SealedProbe {
-            userns_grant: crate::sealed::UsernsGrant::ProfileConfining,
-            namespace: crate::sealed::NamespaceProbe::Ok,
+    /// A host whose probe created all three namespaces — read under the AppArmor restriction with
+    /// `mur` unconfined, because the readings never decide anything.
+    fn sealed_capable() -> crate::namespace_probe::NamespaceReading {
+        crate::namespace_probe::NamespaceReading {
+            network: Ok(()),
+            mount: crate::namespace_probe::MountAttempt::Created,
+            sealed_root: crate::namespace_probe::MountAttempt::Created,
+            userns_grant: crate::sealed::UsernsGrant::Withheld,
+            attachment: crate::sealed::ProfileAttachment::Unconfined,
         }
     }
 
-    /// A host that cannot: the default, which claims nothing.
-    fn sealed_incapable() -> crate::sealed::SealedProbe {
-        crate::sealed::SealedProbe::default()
+    /// A host whose probe could not run at all, which claims nothing.
+    fn sealed_incapable() -> crate::namespace_probe::NamespaceReading {
+        crate::namespace_probe::NamespaceReading {
+            network: Err(crate::network_namespace::NamespaceAttemptError::Creator(
+                "the namespace creator did not run".to_string(),
+            )),
+            mount: crate::namespace_probe::MountAttempt::NotAttempted,
+            sealed_root: crate::namespace_probe::MountAttempt::NotAttempted,
+            userns_grant: crate::sealed::UsernsGrant::Withheld,
+            attachment: crate::sealed::ProfileAttachment::NotReported,
+        }
     }
 
-    /// A probe that learned nothing: no Landlock answer and a sealed half that claims nothing.
+    /// A probe that learned nothing: no Landlock answer and a namespace probe that could not run.
     /// The reading a host gives when neither half of the probe could run.
     fn unprobed() -> HostProbe {
-        HostProbe::from_parts(None, crate::sealed::SealedProbe::default())
+        HostProbe::from_parts(None, sealed_incapable())
     }
 
     /// A probe that could not run must land on the weakest Linux tier, not on either kernel tier
@@ -5810,7 +5830,7 @@ mod tests {
     /// blocker is a refusal an operator cannot act on.
     #[test]
     fn an_unprobed_host_names_a_blocker() {
-        assert!(unprobed().sealed_blocker().is_some());
+        assert!(unprobed().sealed_shortfall().is_some());
     }
 
     /// The achieved class the trace records for an unprobed host stays strictly below `sealed`,
@@ -5830,7 +5850,7 @@ mod tests {
         let error = crate::containment::check_containment_floor(
             murmur_artifact::ContainmentClass::Sealed,
             achieved,
-            probe.sealed_blocker(),
+            probe.sealed_shortfall().as_ref(),
             false,
             None,
         )
@@ -5841,37 +5861,114 @@ mod tests {
         ));
     }
 
-    /// The tier decision reads only `UsernsGrant::permits_userns()`, so every grant that permits
-    /// the namespace has to reach the same tier — otherwise reporting provenance would have
-    /// changed an outcome, which is exactly what naming the grant set out not to do.
+    /// The probe succeeding while the AppArmor setting reads `1`: all three attempts created,
+    /// `mur` unconfined or confined by a container's profile. The host backs `sealed`, maps
+    /// `/tmp`, and is refused nothing.
     #[test]
-    fn tier_from_probe_is_identical_across_every_permitting_userns_grant() {
-        use crate::sealed::{NamespaceProbe, SealedProbe, UsernsGrant};
-
-        for grant in UsernsGrant::ALL {
-            let probe = SealedProbe {
-                userns_grant: *grant,
-                namespace: NamespaceProbe::Ok,
-            };
-            let expected = if grant.permits_userns() {
-                EnforcementTier::KernelSealed
-            } else {
-                EnforcementTier::KernelFull
-            };
+    fn a_probe_that_created_every_namespace_backs_sealed_while_the_setting_reads_one() {
+        for attachment in [
+            crate::sealed::ProfileAttachment::Unconfined,
+            crate::sealed::ProfileAttachment::Other {
+                profile: "docker-default".to_string(),
+            },
+        ] {
+            let probe = HostProbe::from_parts(
+                Some(true),
+                crate::namespace_probe::NamespaceReading {
+                    attachment,
+                    ..sealed_capable()
+                },
+            );
+            if !cfg!(target_os = "linux") {
+                assert_eq!(probe.tier(), EnforcementTier::EnvironmentOnly);
+                continue;
+            }
+            assert_eq!(probe.tier(), EnforcementTier::KernelSealed);
+            assert_eq!(probe.sealed_shortfall(), None);
+            assert!(probe.mount_namespace_usable());
+            assert_eq!(probe.egress_namespace_failure(), None);
             assert_eq!(
-                tier_from_probe(true, Some(true), probe),
-                expected,
-                "grant {grant:?} must decide the tier only through permits_userns()"
+                crate::temp_dir::temp_mapping(
+                    EnforcementTier::KernelFull,
+                    probe.mount_namespace_usable(),
+                    Path::new("/home/u/w"),
+                ),
+                crate::temp_dir::TempMapping::MountNamespace
             );
         }
+    }
+
+    /// No decision reads the grant: over every reading of the restriction, the tier, the
+    /// shortfall, the `/tmp` question and the network failure are the same — for a probe that
+    /// created everything, and for one that created only the network and mount namespaces.
+    #[test]
+    fn every_decision_is_identical_across_every_userns_grant() {
+        use crate::namespace_probe::{
+            MountAttempt, MountAttemptError, MountStep, NamespaceReading,
+        };
+        let root_refused = NamespaceReading {
+            sealed_root: MountAttempt::Failed(MountAttemptError::Step {
+                step: MountStep::PivotRoot,
+                errno: libc::EPERM,
+            }),
+            ..sealed_capable()
+        };
+        for base in [sealed_capable(), root_refused, sealed_incapable()] {
+            let decide = |grant: crate::sealed::UsernsGrant| {
+                let probe = HostProbe::from_parts(
+                    Some(true),
+                    NamespaceReading {
+                        userns_grant: grant,
+                        ..base.clone()
+                    },
+                );
+                (
+                    probe.tier(),
+                    probe.sealed_shortfall().map(|shortfall| shortfall.blocker),
+                    probe.mount_namespace_usable(),
+                    probe
+                        .egress_namespace_failure()
+                        .map(|failure| failure.blocker),
+                )
+            };
+            let expected = decide(crate::sealed::UsernsGrant::Withheld);
+            for grant in crate::sealed::UsernsGrant::ALL {
+                assert_eq!(decide(*grant), expected, "{grant:?} over {base:?}");
+            }
+        }
+    }
+
+    /// On whatever host this runs, one live reading is `KernelSealed` exactly when it names no
+    /// `sealed` shortfall, maps `/tmp` exactly when the network and mount attempts created their
+    /// namespaces, and reports `E-CAP-005` exactly when the network attempt failed.
+    #[test]
+    fn a_live_reading_answers_every_question_from_its_own_attempts() {
+        let probe = HostProbe::probe();
+        let namespaces = probe.namespaces().clone();
+        let linux = cfg!(target_os = "linux");
+        assert_eq!(
+            probe.tier() == EnforcementTier::KernelSealed,
+            probe.sealed_shortfall().is_none(),
+            "{namespaces:?}"
+        );
+        assert_eq!(
+            probe.mount_namespace_usable(),
+            linux
+                && namespaces.network.is_ok()
+                && namespaces.mount == crate::namespace_probe::MountAttempt::Created
+        );
+        assert_eq!(
+            probe.egress_namespace_failure().is_some(),
+            linux && namespaces.network.is_err()
+        );
     }
 
     #[test]
     fn tier_from_probe_non_linux_is_always_environment_only() {
         for landlock in [None, Some(true), Some(false)] {
-            for sealed in [sealed_capable(), sealed_incapable()] {
+            for namespaces in [sealed_capable(), sealed_incapable()] {
                 assert_eq!(
-                    tier_from_probe(false, landlock, sealed),
+                    tier_from_probe(false, landlock, &namespaces),
                     EnforcementTier::EnvironmentOnly
                 );
             }
@@ -5881,7 +5978,7 @@ mod tests {
     #[test]
     fn tier_from_probe_linux_fully_enforced_is_kernel_full() {
         assert_eq!(
-            tier_from_probe(true, Some(true), sealed_incapable()),
+            tier_from_probe(true, Some(true), &sealed_incapable()),
             EnforcementTier::KernelFull
         );
     }
@@ -5889,7 +5986,7 @@ mod tests {
     #[test]
     fn tier_from_probe_linux_partially_enforced_is_seccomp_only() {
         assert_eq!(
-            tier_from_probe(true, Some(false), sealed_incapable()),
+            tier_from_probe(true, Some(false), &sealed_incapable()),
             EnforcementTier::KernelSeccompOnly
         );
     }
@@ -5897,74 +5994,168 @@ mod tests {
     #[test]
     fn tier_from_probe_linux_no_probe_result_is_seccomp_only() {
         assert_eq!(
-            tier_from_probe(true, None, sealed_incapable()),
+            tier_from_probe(true, None, &sealed_incapable()),
             EnforcementTier::KernelSeccompOnly
         );
     }
 
-    /// The whole conjunction, one element removed at a time: `KernelSealed` needs Linux, a usable
-    /// Landlock ABI, AppArmor out of the way, and a namespace probe that succeeded — and drops to
-    /// exactly the tier the missing element still supports, never further.
+    /// The whole conjunction, one element removed at a time: `KernelSealed` needs Linux, a fully
+    /// enforced Landlock ruleset and a sealed-root rehearsal that built the composed root — and
+    /// drops to exactly the tier the missing element still supports, never further.
     #[test]
     fn tier_from_probe_reaches_sealed_only_when_every_precondition_holds() {
-        use crate::sealed::{NamespaceProbe, SealedProbe};
+        use crate::namespace_probe::{
+            MountAttempt, MountAttemptError, MountStep, NamespaceReading,
+        };
 
         assert_eq!(
-            tier_from_probe(true, Some(true), sealed_capable()),
+            tier_from_probe(true, Some(true), &sealed_capable()),
             EnforcementTier::KernelSealed
         );
 
-        // No AppArmor profile (and the restriction is on) → the mechanism is unavailable, but
-        // Landlock still is: `scoped`, not `advisory`.
+        // A refused network namespace attempts nothing after it: `scoped`, not `advisory`.
+        let network_refused = NamespaceReading {
+            network: Err(crate::network_namespace::NamespaceAttemptError::Step {
+                step: crate::network_namespace::CreationStep::IdentityMaps,
+                errno: libc::EPERM,
+            }),
+            mount: MountAttempt::NotAttempted,
+            sealed_root: MountAttempt::NotAttempted,
+            ..sealed_capable()
+        };
         assert_eq!(
-            tier_from_probe(
-                true,
-                Some(true),
-                SealedProbe {
-                    userns_grant: crate::sealed::UsernsGrant::Withheld,
-                    namespace: NamespaceProbe::Ok
-                }
-            ),
+            tier_from_probe(true, Some(true), &network_refused),
             EnforcementTier::KernelFull
         );
 
-        // The container case, and its three other namespace failure modes.
-        for namespace in [
-            NamespaceProbe::Denied,
-            NamespaceProbe::MapDenied,
-            NamespaceProbe::MountDenied,
-            NamespaceProbe::Unsupported,
+        // Every way the sealed-root rehearsal can fail falls back to KernelFull, never below.
+        for step in [
+            MountStep::JoinSession,
+            MountStep::UnshareUserMount,
+            MountStep::IdentityMaps,
+            MountStep::MakePrivateNested,
+            MountStep::Tmpfs,
+            MountStep::PivotPrepare,
+            MountStep::PivotRoot,
+            MountStep::DetachOldRoot,
         ] {
+            let reading = NamespaceReading {
+                sealed_root: MountAttempt::Failed(MountAttemptError::Step {
+                    step,
+                    errno: libc::EPERM,
+                }),
+                ..sealed_capable()
+            };
             assert_eq!(
-                tier_from_probe(
-                    true,
-                    Some(true),
-                    SealedProbe {
-                        userns_grant: crate::sealed::UsernsGrant::ProfileConfining,
-                        namespace
-                    }
-                ),
+                tier_from_probe(true, Some(true), &reading),
                 EnforcementTier::KernelFull,
-                "namespace probe {namespace:?} must fall back to KernelFull, never below it"
+                "a sealed root refused at {step:?} must fall back to KernelFull"
             );
         }
+
+        // The `/tmp` attempt is not the composed root's: refusing it leaves `sealed` reachable.
+        let tmp_refused = NamespaceReading {
+            mount: MountAttempt::Failed(MountAttemptError::Step {
+                step: MountStep::MakePrivate,
+                errno: libc::EACCES,
+            }),
+            ..sealed_capable()
+        };
+        assert_eq!(
+            tier_from_probe(true, Some(true), &tmp_refused),
+            EnforcementTier::KernelSealed
+        );
 
         // Landlock missing: sealed keeps Landlock inside as defence in depth, so a host without it
         // cannot reach sealed no matter how good its namespaces are.
         assert_eq!(
-            tier_from_probe(true, Some(false), sealed_capable()),
+            tier_from_probe(true, Some(false), &sealed_capable()),
             EnforcementTier::KernelSeccompOnly
         );
         assert_eq!(
-            tier_from_probe(true, None, sealed_capable()),
+            tier_from_probe(true, None, &sealed_capable()),
             EnforcementTier::KernelSeccompOnly
         );
 
         // Not Linux at all.
         assert_eq!(
-            tier_from_probe(false, Some(true), sealed_capable()),
+            tier_from_probe(false, Some(true), &sealed_capable()),
             EnforcementTier::EnvironmentOnly
         );
+    }
+
+    /// `/tmp` follows the probe's mount attempt: refused at `MS_REC|MS_PRIVATE` it is not mapped;
+    /// created with the sealed root refused it is mapped at `KernelFull`; with the network
+    /// namespace refused there is no mount namespace to map it in.
+    #[test]
+    fn the_tmp_mapping_follows_the_mount_attempt() {
+        use crate::namespace_probe::{
+            MountAttempt, MountAttemptError, MountStep, NamespaceReading,
+        };
+        use crate::temp_dir::{temp_mapping, NotMappedReason, TempMapping};
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let workdir = Path::new("/home/u/w");
+        let refused = |step, errno| MountAttempt::Failed(MountAttemptError::Step { step, errno });
+
+        let mount_refused = HostProbe::from_parts(
+            Some(true),
+            NamespaceReading {
+                mount: refused(MountStep::MakePrivate, libc::EACCES),
+                sealed_root: refused(MountStep::MakePrivateNested, libc::EACCES),
+                ..sealed_capable()
+            },
+        );
+        assert_eq!(mount_refused.tier(), EnforcementTier::KernelFull);
+        assert_eq!(
+            temp_mapping(
+                mount_refused.tier(),
+                mount_refused.mount_namespace_usable(),
+                workdir
+            ),
+            TempMapping::NotMapped(NotMappedReason::NoMountNamespace)
+        );
+
+        let root_refused = HostProbe::from_parts(
+            Some(true),
+            NamespaceReading {
+                sealed_root: refused(MountStep::PivotRoot, libc::EPERM),
+                ..sealed_capable()
+            },
+        );
+        assert_eq!(root_refused.tier(), EnforcementTier::KernelFull);
+        assert_eq!(
+            temp_mapping(
+                root_refused.tier(),
+                root_refused.mount_namespace_usable(),
+                workdir
+            ),
+            TempMapping::MountNamespace
+        );
+
+        let network_refused = HostProbe::from_parts(
+            Some(true),
+            NamespaceReading {
+                network: Err(crate::network_namespace::NamespaceAttemptError::Step {
+                    step: crate::network_namespace::CreationStep::Unshare,
+                    errno: libc::EPERM,
+                }),
+                mount: MountAttempt::NotAttempted,
+                sealed_root: MountAttempt::NotAttempted,
+                ..sealed_capable()
+            },
+        );
+        assert!(!network_refused.mount_namespace_usable());
+        assert!(matches!(
+            temp_mapping(
+                network_refused.tier(),
+                network_refused.mount_namespace_usable(),
+                workdir
+            ),
+            TempMapping::NotMapped(_)
+        ));
+        assert!(network_refused.egress_namespace_failure().is_some());
     }
 
     /// The ruleset ABI is the kernel's, capped at v3, on the two Landlock tiers only.
@@ -6012,12 +6203,12 @@ mod tests {
     /// applied tier, and an all-negative probe carries none.
     #[test]
     fn ruleset_landlock_abi_reaches_shell_enforcement_from_the_probe() {
-        let negative = HostProbe::from_parts(None, crate::sealed::SealedProbe::default());
+        let negative = unprobed();
         for abi in [None, Some(1), Some(8)] {
             let enforcement = ShellEnforcement::resolve(
                 &CapabilityPolicy::default(),
                 murmur_artifact::ContainmentClass::Advisory,
-                negative.with_landlock_kernel_abi(abi),
+                negative.clone().with_landlock_kernel_abi(abi),
             )
             .unwrap()
             .with_test_session_dirs();
@@ -6030,7 +6221,7 @@ mod tests {
             assert_eq!(enforcement.landlock_abi, None);
         }
         if cfg!(target_os = "linux") {
-            let full = HostProbe::from_parts(Some(true), crate::sealed::SealedProbe::default());
+            let full = HostProbe::from_parts(Some(true), sealed_incapable());
             let enforcement = ShellEnforcement::resolve(
                 &CapabilityPolicy::default(),
                 murmur_artifact::ContainmentClass::Scoped,
@@ -8065,9 +8256,9 @@ mod landlock_probe_isolation {
     /// in-process `restrict_self` turns the second answer into a mount denial and fails it.
     #[test]
     fn the_landlock_probe_does_not_restrict_the_calling_process() {
-        let before = crate::sealed::probe_sealed_support().namespace;
+        let before = crate::namespace_probe::probe_namespaces().sealed_root;
         let _ = super::linux_enforce::probe_landlock_full_access();
-        let after = crate::sealed::probe_sealed_support().namespace;
+        let after = crate::namespace_probe::probe_namespaces().sealed_root;
 
         assert_eq!(
             before, after,
@@ -8918,10 +9109,13 @@ mod linux_integration_tests {
             return None;
         }
         let probe = HostProbe::probe();
-        let enforcement =
-            ShellEnforcement::resolve(policy, murmur_artifact::ContainmentClass::Scoped, probe)
-                .unwrap()
-                .with_test_session_dirs();
+        let enforcement = ShellEnforcement::resolve(
+            policy,
+            murmur_artifact::ContainmentClass::Scoped,
+            probe.clone(),
+        )
+        .unwrap()
+        .with_test_session_dirs();
         if enforcement.tier != EnforcementTier::KernelFull
             || enforcement.landlock_abi < Some(min_abi)
         {
@@ -9604,14 +9798,16 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             ..CapabilityPolicy::default()
         };
         let runtime = tempfile::tempdir().unwrap();
-        let enforcement =
-            ShellEnforcement::resolve(&policy, murmur_artifact::ContainmentClass::Sealed, probe)
-                .expect("a sealed-capable host resolves sealed enforcement")
-                .with_runtime_dir(
-                    test_runtime_dir(runtime.path())
-                        .with_children_records(runtime.path().join("children")),
-                    None,
-                );
+        let enforcement = ShellEnforcement::resolve(
+            &policy,
+            murmur_artifact::ContainmentClass::Sealed,
+            probe.clone(),
+        )
+        .expect("a sealed-capable host resolves sealed enforcement")
+        .with_runtime_dir(
+            test_runtime_dir(runtime.path()).with_children_records(runtime.path().join("children")),
+            None,
+        );
         // A delegated child's result, as a child that has staged leaves it.
         let child_result = runtime
             .path()
@@ -10916,14 +11112,12 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             return None;
         }
         let probe = HostProbe::probe();
+        let mount_namespace_usable = probe.mount_namespace_usable();
         let enforcement = ShellEnforcement::resolve(policy, class, probe)
             .unwrap()
             .with_runtime_dir(test_runtime_dir(base), None);
-        let mapping = crate::temp_dir::temp_mapping(
-            enforcement.tier,
-            probe.mount_namespace_usable(),
-            workdir,
-        );
+        let mapping =
+            crate::temp_dir::temp_mapping(enforcement.tier, mount_namespace_usable, workdir);
         if mapping != crate::temp_dir::TempMapping::MountNamespace {
             crate::runtime_err!(
                 "[SKIP-HOST] {test}: this host maps no private /tmp at {class:?} ({mapping:?} on \
@@ -10957,11 +11151,18 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             );
             return None;
         }
+        let refused = crate::namespace_probe::MountAttempt::Failed(
+            crate::namespace_probe::MountAttemptError::Step {
+                step: crate::namespace_probe::MountStep::UnshareMount,
+                errno: libc::EPERM,
+            },
+        );
         let probe = HostProbe::from_parts(
             Some(true),
-            crate::sealed::SealedProbe {
-                userns_grant: live.userns_grant().expect("Linux reports a grant"),
-                namespace: crate::sealed::NamespaceProbe::Denied,
+            crate::namespace_probe::NamespaceReading {
+                mount: refused.clone(),
+                sealed_root: refused,
+                ..live.namespaces().clone()
             },
         )
         .with_landlock_kernel_abi(live.landlock_kernel_abi());
@@ -10971,11 +11172,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                 .unwrap()
                 .with_runtime_dir(test_runtime_dir(base), None);
         assert_eq!(enforcement.tier, EnforcementTier::KernelFull);
-        let mapping = crate::temp_dir::temp_mapping(
-            enforcement.tier,
-            probe.mount_namespace_usable(),
-            workdir,
-        );
+        let mapping = crate::temp_dir::temp_mapping(enforcement.tier, false, workdir);
         assert_eq!(
             mapping,
             crate::temp_dir::TempMapping::NotMapped(
