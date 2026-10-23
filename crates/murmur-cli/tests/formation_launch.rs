@@ -2450,6 +2450,156 @@ fn mur_stop_of_one_member_stops_that_member_alone() {
     );
 }
 
+/// One member stopped and one killed outright: `mur ps --json` lists the survivor as `running`
+/// and counts the two it lost in the formation's `not_listed` — the stopped one `ended`, the
+/// killed one `gone_without_ending` with its record kept and untouched. A plain `mur ps` then
+/// counts the same members, pruning the kept record, and the next `--json` counts the killed
+/// member from its trace alone.
+///
+/// This is also the check that the plain summary line and the JSON count the same members for
+/// the same records, read `--json` first and plain second.
+#[test]
+fn ps_json_counts_the_members_a_formation_lost() {
+    let _lock = launch_lock();
+    let project = Project::with_probes(
+        &[CODER, REVIEWER, PLANNER],
+        FULL_REACH,
+        &[("planner", json!({"names": []}))],
+    );
+    let mut launcher = project.launch(&[], &[]);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.await_entry_mid_task();
+    let id = formation["formation_id"].as_str().unwrap();
+    let peer = |name: &str| {
+        formation["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|peer| peer["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    let (coder, reviewer) = (peer("coder"), peer("reviewer"));
+    let coder_session = coder["session_id"].as_str().unwrap();
+    let reviewer_session = reviewer["session_id"].as_str().unwrap();
+    let planner_session = planner["session_id"].as_str().unwrap();
+
+    let stopped = project.run(&["stop", coder_session], &[]);
+    assert!(stopped.status.success(), "{}", stopped.stderr);
+    let reviewer_pid = reviewer["pid"].as_u64().unwrap() as u32;
+    signal(reviewer_pid, libc::SIGKILL);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while alive(reviewer_pid) {
+        assert!(Instant::now() < deadline, "reviewer outlived its SIGKILL");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let reviewer_record = project
+        .home
+        .path()
+        .join(".murmur")
+        .join("running")
+        .join(format!("{reviewer_session}.json"));
+    let reviewer_bytes = std::fs::read(&reviewer_record)
+        .expect("a member killed outright leaves its running record behind");
+
+    let ps_json = || {
+        let ps = project.run(&["ps", "--json"], &[]);
+        assert!(ps.status.success(), "{}", ps.stderr);
+        assert!(ps.stderr.is_empty(), "{}", ps.stderr);
+        println!("mur ps --json:\n{}", ps.stdout);
+        serde_json::from_str::<Value>(&ps.stdout).unwrap()
+    };
+    let summary_line = |ps: &str| -> Vec<String> {
+        ps.lines()
+            .filter(|line| line.starts_with("formation "))
+            .map(str::to_string)
+            .collect()
+    };
+    let not_listed = |reviewer_kept: bool| {
+        let mut members = vec![
+            json!({"session_id": coder_session, "formation_member": "coder",
+                   "reason": "ended", "record_kept": false}),
+            json!({"session_id": reviewer_session, "formation_member": "reviewer",
+                   "reason": "gone_without_ending", "record_kept": reviewer_kept}),
+        ];
+        members.sort_by(|a, b| {
+            b["session_id"]
+                .as_str()
+                .unwrap()
+                .cmp(a["session_id"].as_str().unwrap())
+        });
+        Value::Array(members)
+    };
+    let check_formations = |listing: &Value, reviewer_kept: bool| {
+        let capsules = listing["capsules"].as_array().unwrap();
+        let planner_entry = capsules
+            .iter()
+            .find(|capsule| capsule["session_id"] == planner_session)
+            .unwrap_or_else(|| panic!("planner is not listed: {listing:#}"));
+        assert_eq!(planner_entry["status"], "running", "{listing:#}");
+        for gone in [coder_session, reviewer_session] {
+            assert!(
+                !capsules.iter().any(|capsule| capsule["session_id"] == gone),
+                "{gone} is listed: {listing:#}"
+            );
+        }
+        let formations = listing["formations"].as_array().unwrap();
+        assert_eq!(formations.len(), 1, "{listing:#}");
+        let entry = &formations[0];
+        assert_eq!(entry["formation_id"], id, "{listing:#}");
+        assert_eq!(entry["listed"], 1, "{listing:#}");
+        assert_eq!(entry["ended"], 1, "{listing:#}");
+        assert_eq!(entry["gone_without_ending"], 1, "{listing:#}");
+        assert_eq!(entry["unreadable_roots"], 0, "{listing:#}");
+        assert!(
+            entry["searched_roots"].as_u64().unwrap() >= 1,
+            "{listing:#}"
+        );
+        assert_eq!(
+            entry["not_listed"],
+            not_listed(reviewer_kept),
+            "{listing:#}"
+        );
+    };
+
+    check_formations(&ps_json(), true);
+    assert_eq!(
+        std::fs::read(&reviewer_record).unwrap(),
+        reviewer_bytes,
+        "mur ps --json changed the killed member's record"
+    );
+    assert_eq!(
+        summary_line(&project.ps()),
+        [format!(
+            "formation {id}: 1 listed (1 running), 1 pruned now; not listed: 1 ended"
+        )]
+    );
+    assert!(!reviewer_record.exists(), "plain mur ps prunes the record");
+
+    check_formations(&ps_json(), false);
+    assert_eq!(
+        summary_line(&project.ps()),
+        [format!(
+            "formation {id}: 1 listed (1 running); not listed: 1 ended, 1 with no record"
+        )]
+    );
+
+    let stopped = project.run(&["stop", id], &[]);
+    assert!(
+        stopped.status.success(),
+        "{}\n{}",
+        stopped.stdout,
+        stopped.stderr
+    );
+    launcher.wait();
+    let _ = project.release.send(());
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
+}
+
 /// The entry member is killed, the launcher tears the formation down and exits, and a member
 /// started by hand in the formation is all that is left: it holds no lifeline, so `mur stop
 /// <formation id>` stops it as one session, and names no launcher.

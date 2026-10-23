@@ -1,7 +1,7 @@
 //! The capsules running on this machine.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::PathBuf,
 };
 
@@ -34,6 +34,10 @@ const OLDER_MUR_SKIPPED: &str = "a record an older mur wrote, which this mur can
 /// What a row says about the capsule it names, once the record has been verified.
 const STATUS_RUNNING: &str = "running";
 const STATUS_UNREACHABLE: &str = "unreachable";
+
+/// Why a member of a listed formation has no entry in `capsules`, read from its trace.
+const REASON_ENDED: &str = "ended";
+const REASON_GONE_WITHOUT_ENDING: &str = "gone_without_ending";
 
 /// List every capsule running on this machine, verifying each record before printing it.
 ///
@@ -134,6 +138,47 @@ pub(crate) fn run_ps(verbose: bool, json: bool) -> Result<(), CliError> {
 struct CapsuleListing {
     /// One entry per record `mur ps` would print a row for, most recent session first.
     capsules: Vec<ListedCapsule>,
+    /// One entry per formation an entry of `capsules` names, in the order of each formation's
+    /// first entry there. Empty when none names one.
+    formations: Vec<ListedFormation>,
+}
+
+/// What this read knows of one formation beyond its entries in `capsules`: the formation's
+/// [`FormationCensus`], as plain `mur ps` summarises it in one line.
+///
+/// Never a claim that the formation is complete, and there is no member total: the roster is not
+/// read, so a member that left neither a running record nor a trace under a searched root is
+/// counted nowhere.
+#[derive(Debug, serde::Serialize)]
+struct ListedFormation {
+    formation_id: String,
+    /// How many entries of `capsules` carry this formation id.
+    listed: usize,
+    /// How many of `not_listed` have the reason [`REASON_ENDED`].
+    ended: usize,
+    /// How many of `not_listed` have the reason [`REASON_GONE_WITHOUT_ENDING`].
+    gone_without_ending: usize,
+    /// Every member this read knows of that has no entry in `capsules`, by session id descending.
+    not_listed: Vec<NotListedMember>,
+    /// Session roots that were listed.
+    searched_roots: usize,
+    /// Session roots that exist and could not be listed.
+    unreadable_roots: usize,
+}
+
+/// A member of a listed formation with no entry in `capsules`.
+#[derive(Debug, serde::Serialize)]
+struct NotListedMember {
+    session_id: String,
+    /// The roster name: the running record's when one is kept and names one, else
+    /// `session_start`'s. `null` when neither names one, as for a member's delegated child.
+    formation_member: Option<String>,
+    /// [`REASON_ENDED`] when the member's trace holds a `session_end`, else
+    /// [`REASON_GONE_WITHOUT_ENDING`] — killed outright, its trace unreadable, or never recorded.
+    reason: &'static str,
+    /// `true` for a running record left on disk whose process is gone — the record plain `mur ps`
+    /// prunes and counts as `pruned now`.
+    record_kept: bool,
 }
 
 /// One running record, with the status its row would carry. The record's door token,
@@ -156,14 +201,16 @@ struct ListedCapsule {
     formation_member: Option<String>,
 }
 
-/// `mur ps --json`: the rows `mur ps` would print, as one [`CapsuleListing`].
+/// `mur ps --json`: the rows `mur ps` would print, and the formations they name, as one
+/// [`CapsuleListing`].
 ///
 /// Each record is verified by [`running::verify`] exactly as the table's rows are, and a `Gone`
-/// one is left out. Nothing is created, re-moded, unlinked or signalled: the directory is read
-/// with [`running::scan`], so a missing `~/.murmur/running` stays missing, and a record that is
-/// gone or unreadable stays where it is. A record an older `mur` wrote is named on stderr as the
-/// table names it. A directory that cannot be listed, or a `HOME` it cannot be located from,
-/// fails with `E-RUN-028` and prints nothing on stdout.
+/// one is left out of `capsules` and counted in its formation's `not_listed`. Nothing is created,
+/// re-moded, unlinked or signalled: the directory is read with [`running::scan`], so a missing
+/// `~/.murmur/running` stays missing, and a record that is gone or unreadable stays where it is.
+/// A record an older `mur` wrote is named on stderr as the table names it. A directory that cannot
+/// be listed, or a `HOME` it cannot be located from, fails with `E-RUN-028` and prints nothing on
+/// stdout. Nothing a formation's census reads can fail it.
 fn run_ps_json() -> Result<(), CliError> {
     let scan = running::running_dir_location()
         .and_then(|dir| running::scan(&dir))
@@ -171,13 +218,18 @@ fn run_ps_json() -> Result<(), CliError> {
     for path in &scan.older_mur {
         capsule_runtime::report_eprintln!("skipped: {} — {OLDER_MUR_SKIPPED}", path.display());
     }
-    let mut capsules = Vec::new();
+    let mut rows = Vec::new();
+    let mut gone = Vec::new();
     for record in scan.records {
-        let status = match running::verify(&record) {
-            Liveness::Live => STATUS_RUNNING,
-            Liveness::Unreachable(_) => STATUS_UNREACHABLE,
-            Liveness::Gone(_) => continue,
-        };
+        match running::verify(&record) {
+            Liveness::Live => rows.push((record, STATUS_RUNNING)),
+            Liveness::Unreachable(_) => rows.push((record, STATUS_UNREACHABLE)),
+            Liveness::Gone(_) => gone.push(record),
+        }
+    }
+    let formations = listed_formations(&rows, &gone);
+    let mut capsules = Vec::new();
+    for (record, status) in rows {
         capsules.push(ListedCapsule {
             status,
             url: record.url,
@@ -199,8 +251,11 @@ fn run_ps_json() -> Result<(), CliError> {
     }
     capsule_runtime::report_println!(
         "{}",
-        serde_json::to_string_pretty(&CapsuleListing { capsules })
-            .expect("a listing of strings, integers and booleans always serializes")
+        serde_json::to_string_pretty(&CapsuleListing {
+            capsules,
+            formations
+        })
+        .expect("a listing of strings, integers and booleans always serializes")
     );
     Ok(())
 }
@@ -295,6 +350,63 @@ fn formations_in_order(
     formations
 }
 
+/// One [`ListedFormation`] per formation a row names, in the order of its first row. A formation
+/// known only from `gone` records gets none, as default `mur ps` prints no line for it.
+fn listed_formations(
+    rows: &[(RunningRecord, &str)],
+    gone: &[RunningRecord],
+) -> Vec<ListedFormation> {
+    let recorded = recorded_sessions(rows, gone);
+    formations_in_order(rows, &[])
+        .into_iter()
+        .map(|formation| {
+            let listed = in_formation(&formation, rows.iter().map(|(record, _)| record));
+            let census = formation_census(
+                &formation,
+                &listed,
+                &in_formation(&formation, gone),
+                &recorded,
+            );
+            listed_formation(&formation, listed.len(), census)
+        })
+        .collect()
+}
+
+/// `formation`'s entry in `formations`, from its census.
+fn listed_formation(
+    formation: &FormationId,
+    listed: usize,
+    census: FormationCensus,
+) -> ListedFormation {
+    let not_listed: Vec<NotListedMember> = census
+        .not_listed
+        .into_iter()
+        .map(|member| NotListedMember {
+            session_id: member.session_id,
+            formation_member: member.formation_member,
+            reason: if member.ended {
+                REASON_ENDED
+            } else {
+                REASON_GONE_WITHOUT_ENDING
+            },
+            record_kept: member.record_kept,
+        })
+        .collect();
+    let ended = not_listed
+        .iter()
+        .filter(|member| member.reason == REASON_ENDED)
+        .count();
+    ListedFormation {
+        formation_id: formation.as_str().to_string(),
+        listed,
+        ended,
+        gone_without_ending: not_listed.len() - ended,
+        not_listed,
+        searched_roots: census.searched,
+        unreadable_roots: census.unreadable,
+    }
+}
+
 /// `formation <id>: <L> listed (<statuses>)[, <P> pruned now][; <not-listed clause>][; <U> session
 /// root(s) could not be read]`.
 ///
@@ -306,33 +418,135 @@ fn summary_line(
     rows: &[(RunningRecord, &str)],
     pruned: &[RunningRecord],
 ) -> String {
-    let in_formation = |record: &&RunningRecord| record.formation_id.as_ref() == Some(formation);
-    let listed: Vec<&str> = rows
+    let statuses: Vec<&str> = rows
         .iter()
-        .filter(|(record, _)| in_formation(&record))
+        .filter(|(record, _)| record.formation_id.as_ref() == Some(formation))
         .map(|(_, status)| *status)
         .collect();
-    let pruned_here: Vec<&RunningRecord> = pruned.iter().filter(in_formation).collect();
+    let census = formation_census(
+        formation,
+        &in_formation(formation, rows.iter().map(|(record, _)| record)),
+        &in_formation(formation, pruned),
+        &recorded_sessions(rows, pruned),
+    );
+    census_line(formation, &statuses, &census)
+}
 
-    let mut line = format!("formation {formation}: {} listed", listed.len());
-    if !listed.is_empty() {
+/// [`summary_line`]'s text for a formation whose listed records carry `statuses`.
+fn census_line(formation: &FormationId, statuses: &[&str], census: &FormationCensus) -> String {
+    let mut line = format!("formation {formation}: {} listed", statuses.len());
+    if !statuses.is_empty() {
         let statuses = counted(&[
-            (count_of(&listed, STATUS_RUNNING), STATUS_RUNNING),
-            (count_of(&listed, STATUS_UNREACHABLE), STATUS_UNREACHABLE),
+            (count_of(statuses, STATUS_RUNNING), STATUS_RUNNING),
+            (count_of(statuses, STATUS_UNREACHABLE), STATUS_UNREACHABLE),
         ]);
         line.push_str(&format!(" ({statuses})"));
     }
-    if !pruned_here.is_empty() {
-        line.push_str(&format!(", {} pruned now", pruned_here.len()));
+    let pruned = census.not_listed.iter().filter(|m| m.record_kept).count();
+    if pruned > 0 {
+        line.push_str(&format!(", {pruned} pruned now"));
     }
 
+    let traced_only = census.not_listed.iter().filter(|m| !m.record_kept);
+    let (ended, no_record): (Vec<_>, Vec<_>) = traced_only.partition(|m| m.ended);
+    if ended.len() + no_record.len() > 0 {
+        let not_listed = counted(&[(ended.len(), "ended"), (no_record.len(), "with no record")]);
+        line.push_str(&format!("; not listed: {not_listed}"));
+    } else {
+        line.push_str(&format!(
+            "; no other member found in {} session {}",
+            census.searched,
+            if census.searched == 1 {
+                "root"
+            } else {
+                "roots"
+            }
+        ));
+    }
+    if census.unreadable > 0 {
+        line.push_str(&format!(
+            "; {} session {} could not be read",
+            census.unreadable,
+            if census.unreadable == 1 {
+                "root"
+            } else {
+                "roots"
+            }
+        ));
+    }
+    line
+}
+
+/// The records among `records` that name `formation`.
+fn in_formation<'a>(
+    formation: &FormationId,
+    records: impl IntoIterator<Item = &'a RunningRecord>,
+) -> Vec<&'a RunningRecord> {
+    records
+        .into_iter()
+        .filter(|record| record.formation_id.as_ref() == Some(formation))
+        .collect()
+}
+
+/// Every session this read had a record for, listed or gone, in any formation.
+fn recorded_sessions<'a>(
+    rows: &'a [(RunningRecord, &str)],
+    gone: &'a [RunningRecord],
+) -> HashSet<&'a str> {
+    rows.iter()
+        .map(|(record, _)| record)
+        .chain(gone)
+        .map(|record| record.session_id.as_str())
+        .collect()
+}
+
+/// What one read knows of a formation's members beyond its listed records. Plain `mur ps`
+/// renders it as [`census_line`] and `mur ps --json` as a [`ListedFormation`], so the two count
+/// the same members.
+#[derive(Debug)]
+struct FormationCensus {
+    /// Every member with no listed record, by session id descending: each gone record of the
+    /// formation, then each member a trace under a searched root records that had no record in
+    /// this read at all.
+    not_listed: Vec<CensusMember>,
+    /// Session roots that were listed.
+    searched: usize,
+    /// Session roots that exist and could not be listed.
+    unreadable: usize,
+}
+
+/// One member in [`FormationCensus::not_listed`].
+#[derive(Debug, PartialEq, Eq)]
+struct CensusMember {
+    session_id: String,
+    /// The gone record's `formation_member`, falling back to its trace's
+    /// `session_start.formation_member`; a trace-only member's comes from its trace.
+    formation_member: Option<String>,
+    /// Whether a trace found under a searched root holds a `session_end`.
+    ended: bool,
+    /// Whether this read found the member's running record with its process gone.
+    record_kept: bool,
+}
+
+/// What the traces under `formation`'s session roots record about its `gone` records' sessions
+/// and about members `recorded` has no record of.
+///
+/// The roots searched are each `listed` or `gone` record's records group and each peer's root
+/// under `~/.murmur/formations/<frm_id>/`. `recorded` is every session this read had a record
+/// for, in any formation, so a trace is never counted beside its own record. A member found under
+/// two roots counts once. A root that cannot be listed is counted in `unreadable` and fails
+/// nothing; a gone record whose trace is under it, or nowhere, did not end.
+fn formation_census(
+    formation: &FormationId,
+    listed: &[&RunningRecord],
+    gone: &[&RunningRecord],
+    recorded: &HashSet<&str>,
+) -> FormationCensus {
     // A record's `records_dir` is its session's records directory, so its parent is the records
     // group its siblings are in.
-    let roots: BTreeSet<PathBuf> = rows
+    let roots: BTreeSet<PathBuf> = listed
         .iter()
-        .map(|(record, _)| record)
-        .filter(in_formation)
-        .chain(pruned_here.iter().copied())
+        .chain(gone)
         .filter_map(|record| record.records_dir.parent().map(PathBuf::from))
         // Each peer records under its own directory in the murmur home, whether or not a record
         // of it is left to point there.
@@ -340,15 +554,14 @@ fn summary_line(
             formation,
         ))
         .collect();
-    // Every session this read had a record for, so a trace is never counted beside its own row.
-    let recorded: HashSet<&str> = rows
+    let gone_sessions: HashSet<&str> = gone
         .iter()
-        .map(|(record, _)| record)
-        .chain(pruned)
         .map(|record| record.session_id.as_str())
         .collect();
-    let mut seen = HashSet::new();
-    let (mut ended, mut no_record, mut searched, mut unreadable) = (0, 0, 0, 0);
+
+    // Every member found, once each, with its roster name and whether it ended.
+    let mut traced: HashMap<String, (Option<String>, bool)> = HashMap::new();
+    let (mut searched, mut unreadable) = (0, 0);
     for root in &roots {
         let Ok(found) = recorded_members(root, formation) else {
             unreadable += 1;
@@ -356,33 +569,48 @@ fn summary_line(
         };
         searched += 1;
         for member in found.members {
-            if recorded.contains(member.session_id.as_str()) || !seen.insert(member.session_id) {
+            let session = member.session_id.as_str();
+            if recorded.contains(session) && !gone_sessions.contains(session) {
                 continue;
             }
-            if member.exit_status.is_some() {
-                ended += 1;
-            } else {
-                no_record += 1;
-            }
+            traced
+                .entry(member.session_id)
+                .or_insert((member.member, member.exit_status.is_some()));
         }
     }
 
-    if ended + no_record > 0 {
-        let not_listed = counted(&[(ended, "ended"), (no_record, "with no record")]);
-        line.push_str(&format!("; not listed: {not_listed}"));
-    } else {
-        line.push_str(&format!(
-            "; no other member found in {searched} session {}",
-            if searched == 1 { "root" } else { "roots" }
-        ));
+    let mut not_listed: Vec<CensusMember> = gone
+        .iter()
+        .map(|record| {
+            let trace = traced.remove(&record.session_id);
+            CensusMember {
+                session_id: record.session_id.clone(),
+                formation_member: record
+                    .formation_member
+                    .clone()
+                    .or_else(|| trace.as_ref().and_then(|(member, _)| member.clone())),
+                ended: trace.is_some_and(|(_, ended)| ended),
+                record_kept: true,
+            }
+        })
+        .collect();
+    // What is left is every member found that had no record in this read at all.
+    not_listed.extend(
+        traced
+            .into_iter()
+            .map(|(session_id, (formation_member, ended))| CensusMember {
+                session_id,
+                formation_member,
+                ended,
+                record_kept: false,
+            }),
+    );
+    not_listed.sort_by(|a, b| b.session_id.cmp(&a.session_id));
+    FormationCensus {
+        not_listed,
+        searched,
+        unreadable,
     }
-    if unreadable > 0 {
-        line.push_str(&format!(
-            "; {unreadable} session {} could not be read",
-            if unreadable == 1 { "root" } else { "roots" }
-        ));
-    }
-    line
 }
 
 fn count_of(statuses: &[&str], status: &str) -> usize {
@@ -552,6 +780,236 @@ mod tests {
             format!(
                 "formation {formation}: 2 listed (2 running); no other member found in 2 session \
                  roots"
+            )
+        );
+    }
+
+    /// A `ses_` id minted `offset_ms` after `formation`, so a census does not skip its trace.
+    fn session_after(formation: &FormationId, offset_ms: u64, tail: &str) -> String {
+        format!(
+            "ses_{:012x}{tail:0>20}",
+            formation.minted_at_ms() + offset_ms
+        )
+    }
+
+    /// A record of `formation` whose records directory is `<root>/<session_id>`.
+    fn member_at(
+        root: &std::path::Path,
+        session_id: &str,
+        formation: &FormationId,
+        member: Option<&str>,
+    ) -> RunningRecord {
+        let (mut record, _) = row(session_id, Some(formation));
+        record.records_dir = root.join(session_id);
+        record.formation_member = member.map(str::to_string);
+        record
+    }
+
+    /// Writes `<root>/<session_id>/trace.jsonl`: a `session_start` naming `formation` and
+    /// `member`, then a `session_end` when `ended`.
+    fn write_trace(
+        root: &std::path::Path,
+        session_id: &str,
+        formation: &FormationId,
+        member: Option<&str>,
+        ended: bool,
+    ) {
+        let mut start = serde_json::json!({
+            "event_type": "session_start",
+            "session_id": session_id,
+            "capsule_name": "member",
+            "capsule_version": "0.1.0",
+            "model": "m",
+            "max_turns": 3,
+            "formation_id": formation.as_str(),
+        });
+        if let Some(member) = member {
+            start["formation_member"] = member.into();
+        }
+        let mut lines = vec![start.to_string()];
+        if ended {
+            lines.push(
+                serde_json::json!({"event_type": "session_end", "exit_status": "completed"})
+                    .to_string(),
+            );
+        }
+        let dir = root.join(session_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("trace.jsonl"), lines.join("\n") + "\n").unwrap();
+    }
+
+    /// A gone record is counted with its record kept: `ended` when its trace holds a
+    /// `session_end`, with the trace's roster name when the record names none, and
+    /// `gone_without_ending` with the record's roster name when it has no trace. A member known
+    /// only from its trace has no record kept, and a `session_start` naming no member leaves its
+    /// roster name `null`. A listed member's trace, which has no `session_end` yet, is not
+    /// counted, and the plain line counts the same members.
+    #[test]
+    fn a_census_counts_gone_records_and_trace_only_members_by_their_traces() {
+        let formation = FormationId::mint();
+        let records = tempfile::tempdir().unwrap();
+        let root = records.path().join("project");
+        let listed = session_after(&formation, 50, "5");
+        let gone_ended = session_after(&formation, 40, "4");
+        let gone_untraced = session_after(&formation, 30, "3");
+        let traced_ended = session_after(&formation, 20, "2");
+        let traced_child = session_after(&formation, 10, "1");
+        write_trace(&root, &listed, &formation, Some("lead"), false);
+        write_trace(&root, &gone_ended, &formation, Some("coder"), true);
+        write_trace(&root, &traced_ended, &formation, Some("reviewer"), true);
+        write_trace(&root, &traced_child, &formation, None, false);
+
+        let rows = vec![(
+            member_at(&root, &listed, &formation, Some("lead")),
+            STATUS_RUNNING,
+        )];
+        let gone = vec![
+            member_at(&root, &gone_ended, &formation, None),
+            member_at(&root, &gone_untraced, &formation, Some("worker")),
+        ];
+        let entries = serde_json::to_value(listed_formations(&rows, &gone)).unwrap();
+        assert_eq!(
+            entries,
+            serde_json::json!([{
+                "formation_id": formation.as_str(),
+                "listed": 1,
+                "ended": 2,
+                "gone_without_ending": 2,
+                "not_listed": [
+                    {"session_id": gone_ended, "formation_member": "coder",
+                     "reason": "ended", "record_kept": true},
+                    {"session_id": gone_untraced, "formation_member": "worker",
+                     "reason": "gone_without_ending", "record_kept": true},
+                    {"session_id": traced_ended, "formation_member": "reviewer",
+                     "reason": "ended", "record_kept": false},
+                    {"session_id": traced_child, "formation_member": null,
+                     "reason": "gone_without_ending", "record_kept": false},
+                ],
+                "searched_roots": 1,
+                "unreadable_roots": 0,
+            }])
+        );
+        assert_eq!(
+            summary_line(&formation, &rows, &gone),
+            format!(
+                "formation {formation}: 1 listed (1 running), 2 pruned now; not listed: 1 ended, \
+                 1 with no record"
+            )
+        );
+    }
+
+    /// A formation known only from gone records gets no entry, and its gone record, which this
+    /// read had a record for, is never counted as a trace-only member of another formation.
+    #[test]
+    fn a_formation_known_only_from_gone_records_gets_no_entry() {
+        let listed_formation = FormationId::mint();
+        let gone_formation = FormationId::mint();
+        let records = tempfile::tempdir().unwrap();
+        let root = records.path().join("project");
+        let listed = session_after(&listed_formation, 20, "2");
+        let other = session_after(&listed_formation, 10, "1");
+        write_trace(&root, &listed, &listed_formation, None, false);
+        write_trace(&root, &other, &listed_formation, None, true);
+
+        let rows = vec![
+            (
+                member_at(&root, &listed, &listed_formation, None),
+                STATUS_RUNNING,
+            ),
+            row("ses_0", None),
+        ];
+        // A record of another formation whose session's trace names the listed one, which no
+        // real trace does, so only `recorded` keeps it out.
+        let gone = vec![member_at(&root, &other, &gone_formation, None)];
+        let entries = listed_formations(&rows, &gone);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].formation_id, listed_formation.as_str());
+        assert_eq!(entries[0].listed, 1);
+        assert!(entries[0].not_listed.is_empty());
+        assert_eq!(
+            summary_line(&listed_formation, &rows, &gone),
+            format!(
+                "formation {listed_formation}: 1 listed (1 running); no other member found in 1 \
+                 session root"
+            )
+        );
+        assert_eq!(
+            summary_line(&gone_formation, &rows, &gone),
+            format!(
+                "formation {gone_formation}: 0 listed, 1 pruned now; no other member found in 1 \
+                 session root"
+            )
+        );
+        assert!(listed_formations(&[row("ses_0", None)], &gone).is_empty());
+    }
+
+    /// A member whose trace is under two searched roots counts once.
+    #[test]
+    fn a_member_found_under_two_roots_counts_once() {
+        let formation = FormationId::mint();
+        let records = tempfile::tempdir().unwrap();
+        let (first, second) = (records.path().join("a"), records.path().join("b"));
+        let (entry, peer, ended) = (
+            session_after(&formation, 30, "3"),
+            session_after(&formation, 20, "2"),
+            session_after(&formation, 10, "1"),
+        );
+        write_trace(&first, &ended, &formation, Some("worker"), true);
+        write_trace(&second, &ended, &formation, Some("worker"), true);
+        let rows = vec![
+            (member_at(&first, &entry, &formation, None), STATUS_RUNNING),
+            (member_at(&second, &peer, &formation, None), STATUS_RUNNING),
+        ];
+        let entries = listed_formations(&rows, &[]);
+        assert_eq!(entries[0].not_listed.len(), 1);
+        assert_eq!(entries[0].ended, 1);
+        assert_eq!(entries[0].searched_roots, 2);
+        assert_eq!(
+            summary_line(&formation, &rows, &[]),
+            format!("formation {formation}: 2 listed (2 running); not listed: 1 ended")
+        );
+    }
+
+    /// A gone record whose trace is under a root that cannot be listed did not end, as far as
+    /// this read knows, and the root is counted unreadable rather than failing anything.
+    #[test]
+    fn a_gone_record_under_an_unreadable_root_is_gone_without_ending() {
+        use std::os::unix::fs::PermissionsExt;
+        let formation = FormationId::mint();
+        let records = tempfile::tempdir().unwrap();
+        let (readable, sealed) = (records.path().join("a"), records.path().join("b"));
+        let (entry, gone) = (
+            session_after(&formation, 20, "2"),
+            session_after(&formation, 10, "1"),
+        );
+        std::fs::create_dir_all(&readable).unwrap();
+        write_trace(&sealed, &gone, &formation, Some("worker"), true);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&sealed).is_ok() {
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipped: a mode-000 directory is readable here, as it is to root");
+            return;
+        }
+        let rows = vec![(
+            member_at(&readable, &entry, &formation, None),
+            STATUS_RUNNING,
+        )];
+        let gone = vec![member_at(&sealed, &gone, &formation, None)];
+        let entries = listed_formations(&rows, &gone);
+        let line = summary_line(&formation, &rows, &gone);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(entries[0].gone_without_ending, 1);
+        assert_eq!(entries[0].not_listed[0].reason, REASON_GONE_WITHOUT_ENDING);
+        assert!(entries[0].not_listed[0].record_kept);
+        assert_eq!(entries[0].not_listed[0].formation_member, None);
+        assert_eq!(entries[0].searched_roots, 1);
+        assert_eq!(entries[0].unreadable_roots, 1);
+        assert_eq!(
+            line,
+            format!(
+                "formation {formation}: 1 listed (1 running), 1 pruned now; no other member \
+                 found in 1 session root; 1 session root could not be read"
             )
         );
     }
