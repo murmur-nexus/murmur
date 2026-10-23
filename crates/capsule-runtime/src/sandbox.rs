@@ -481,7 +481,10 @@ pub(crate) fn resolve_exec_allowlist(shell_allow: &[String]) -> Vec<PathBuf> {
 /// executable `PATH` match is included (not just the first): all of them are binaries the
 /// operator's launch-time `PATH` exposes under that allowlisted name, and on merged-`/usr` distros
 /// `/bin/x` and `/usr/bin/x` canonicalize to the same entry anyway.
-fn resolve_exec_allowlist_in(shell_allow: &[String], path_dirs: &[PathBuf]) -> Vec<PathBuf> {
+pub(crate) fn resolve_exec_allowlist_in(
+    shell_allow: &[String],
+    path_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut resolved = std::collections::BTreeSet::new();
     for entry in shell_allow {
         if entry.is_empty() {
@@ -593,7 +596,7 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
 /// Covers both supported platform targets (`linux/x86_64` and `linux/aarch64`), including the
 /// Debian/Ubuntu multiarch-triplet subdirectories. Extend here for a platform this list does not
 /// cover — it is the single source of truth.
-const DEFAULT_LIBRARY_SEARCH_DIRS: &[&str] = &[
+pub(crate) const DEFAULT_LIBRARY_SEARCH_DIRS: &[&str] = &[
     "/lib",
     "/lib64",
     "/usr/lib",
@@ -781,6 +784,82 @@ pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
     })
 }
 
+/// Whether `bytes` begins an ELF64 shared object (`e_type` `ET_DYN`), in either byte order. Needs
+/// only the first 18 bytes, so a caller sorting a directory reads no more of each file than that.
+/// A position-independent executable is `ET_DYN` too and answers `true`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn elf_is_shared_object(bytes: &[u8]) -> bool {
+    if bytes.len() < 18 || &bytes[0..4] != b"\x7fELF" || bytes[4] != 2 {
+        return false;
+    }
+    let le = match bytes[5] {
+        1 => true,
+        2 => false,
+        _ => return false,
+    };
+    read_u16(bytes, 16, le) == Some(3)
+}
+
+/// The name of every entry in an ELF64 image's dynamic symbol table (`.dynsym`), defined and
+/// undefined alike, in table order. `None` for anything that is not a well-formed ELF64 image or
+/// has no `.dynsym` section.
+///
+/// Reads the section headers: the `SHT_DYNSYM` section and the string table its `sh_link` names.
+/// A symbol the binary imports from a shared library is listed here as well as one it defines, so
+/// an interpreter built against `libpython` or `libperl` names its entry symbol the same way a
+/// statically linked one does. A binary stripped of its section headers names nothing.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn elf_dynamic_symbol_names(bytes: &[u8]) -> Option<Vec<String>> {
+    if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" || bytes[4] != 2 {
+        return None;
+    }
+    let le = match bytes[5] {
+        1 => true,
+        2 => false,
+        _ => return None,
+    };
+    let e_shoff = read_u64(bytes, 40, le)? as usize;
+    let e_shentsize = read_u16(bytes, 58, le)? as usize;
+    let e_shnum = read_u16(bytes, 60, le)? as usize;
+    // Each Elf64_Shdr is 64 bytes; a smaller entsize is not this layout.
+    if e_shentsize < 64 {
+        return None;
+    }
+    // (sh_type, sh_offset, sh_size, sh_link, sh_entsize) of section `index`.
+    let section = |index: usize| -> Option<(u32, usize, usize, usize, usize)> {
+        let base = e_shoff.checked_add(index.checked_mul(e_shentsize)?)?;
+        Some((
+            read_u32(bytes, base + 4, le)?,
+            read_u64(bytes, base + 24, le)? as usize,
+            read_u64(bytes, base + 32, le)? as usize,
+            read_u32(bytes, base + 40, le)? as usize,
+            read_u64(bytes, base + 56, le)? as usize,
+        ))
+    };
+    // SHT_DYNSYM == 11.
+    let (_, sym_off, sym_size, strtab_index, sym_entsize) = (0..e_shnum)
+        .filter_map(section)
+        .find(|(sh_type, ..)| *sh_type == 11)?;
+    // Each Elf64_Sym is 24 bytes.
+    if sym_entsize < 24 {
+        return None;
+    }
+    let (_, str_off, str_size, _, _) = section(strtab_index)?;
+    let strtab = bytes.get(str_off..str_off.checked_add(str_size)?)?;
+    let symbols = bytes.get(sym_off..sym_off.checked_add(sym_size)?)?;
+    let mut names = Vec::new();
+    for symbol in symbols.chunks_exact(sym_entsize) {
+        let st_name = read_u32(symbol, 0, le)? as usize;
+        if st_name == 0 {
+            continue;
+        }
+        if let Some(region) = strtab.get(st_name..) {
+            names.push(cstr_at_start(region));
+        }
+    }
+    Some(names)
+}
+
 /// Expands a leading/embedded `$ORIGIN` (or `${ORIGIN}`) in an rpath entry to the directory of the
 /// binary that declared it — the dynamic loader's own rule for `DT_RUNPATH`/`DT_RPATH`.
 fn expand_origin(rpath: &str, origin_dir: &Path) -> PathBuf {
@@ -858,16 +937,16 @@ fn resolve_landlock_grants_in(
     exec_allow_paths: &[PathBuf],
     search_dirs: &[PathBuf],
 ) -> Vec<PathBuf> {
-    resolve_landlock_grants_outside(exec_allow_paths, search_dirs, None)
+    resolve_landlock_grants_outside(exec_allow_paths, search_dirs, &[])
 }
 
-/// [`resolve_landlock_grants_in`], skipping every path under the canonical `excluded` root: such a
-/// path is neither granted nor read for further dependencies. For a closure that must not be
-/// decided by files the capsule can write.
-fn resolve_landlock_grants_outside(
+/// [`resolve_landlock_grants_in`], skipping every path under one of the canonical `excluded`
+/// roots: such a path is neither granted nor read for further dependencies. For a closure that
+/// must not be decided by files the capsule can write.
+pub(crate) fn resolve_landlock_grants_outside(
     exec_allow_paths: &[PathBuf],
     search_dirs: &[PathBuf],
-    excluded: Option<&Path>,
+    excluded: &[PathBuf],
 ) -> Vec<PathBuf> {
     let mut grants: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     let mut visited: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
@@ -884,7 +963,7 @@ fn resolve_landlock_grants_outside(
     }
 
     while let Some(path) = queue.pop_front() {
-        if excluded.is_some_and(|root| path.starts_with(root)) {
+        if excluded.iter().any(|root| path.starts_with(root)) {
             continue;
         }
         if !visited.insert(path.clone()) {
@@ -930,12 +1009,13 @@ fn resolve_landlock_grants_outside(
 ///     no-op anyway (Landlock's `ReadDir` only has meaning on a directory inode).
 ///   - `true` → adds enumerability, which a path-based interpreter's import machinery needs on
 ///     each `sys.path` entry (CPython's `FileFinder` `listdir`-caches each one). Set by an author
-///     writing `list_dir: true` next to a specific `interpreter_runtime` directory, and by the
-///     whole-tree resolvers ([`resolve_staged_runtime_landlock_grants`],
-///     [`resolve_sealed_runtime_landlock_grants`] and, per entry, the directory half of
-///     [`resolve_sealed_etc_landlock_grants`]) where a tree is walked by definition — never
-///     inferred from anything else, and never applied to an ancestor or sibling of a granted
-///     directory.
+///     writing `list_dir: true` next to a specific `interpreter_runtime` directory, on each
+///     directory a recognised interpreter reports on its own import path
+///     ([`resolve_derived_interpreter_grants`]), and by the whole-tree resolvers
+///     ([`resolve_staged_runtime_landlock_grants`], [`resolve_sealed_runtime_landlock_grants`]
+///     and, per entry, the directory half of [`resolve_sealed_etc_landlock_grants`]) where a tree
+///     is walked by definition — never inferred from anything else, and never applied to an
+///     ancestor or sibling of a granted directory.
 ///
 /// `ReadDir` is meaningful only on a directory, and the kernel enforces that: `landlock_add_rule`
 /// returns `EINVAL` for a directory-only right on a non-directory. `open_landlock_fds` therefore
@@ -1018,7 +1098,9 @@ impl LandlockGrant {
 ///
 /// There is deliberately no path here that could widen a grant to a whole install prefix: it emits
 /// one grant per explicitly declared directory and copies the author's `list_dir` verbatim,
-/// inferring enumerability from nothing.
+/// inferring enumerability from nothing. A recognised interpreter's own import path is granted
+/// separately, by [`resolve_derived_interpreter_grants`]; this is the route for an interpreter the
+/// runtime does not recognise.
 pub(crate) fn resolve_interpreter_runtime_grants(
     grants: &[InterpreterRuntimeGrant],
 ) -> Vec<LandlockGrant> {
@@ -1037,9 +1119,40 @@ pub(crate) fn resolve_interpreter_runtime_grants(
         .collect()
 }
 
+/// One [`LandlockGrant`] per entry staging derived from a recognised interpreter (see
+/// [`crate::interpreter_runtime`]): each directory on its import path readable and listable, and
+/// each zip archive on it and each extension-module library readable only.
+///
+/// `executable: false` on every one (see [`LandlockGrant`]): the manifest asked to run the
+/// interpreter, which its own ELF closure grants, not the files it imports. A C extension module
+/// still loads, because `dlopen(3)` needs `ReadFile` alone. The derivation never names `/` or an
+/// ancestor of the interpreter's directory, so no grant here widens to an install prefix.
+pub(crate) fn resolve_derived_interpreter_grants(
+    derived: &[crate::interpreter_runtime::DerivedInterpreterRuntime],
+) -> Vec<LandlockGrant> {
+    let read_only = |path: &Path, list_dir: bool| LandlockGrant {
+        path: path.to_path_buf(),
+        list_dir,
+        executable: false,
+        pinned: None,
+    };
+    derived
+        .iter()
+        .flat_map(|runtime| {
+            runtime
+                .entries()
+                .map(|(path, is_dir)| read_only(path, is_dir))
+                .chain(runtime.libraries.iter().map(|path| read_only(path, false)))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// The host directories a composed root must carry *beyond* [`crate::sealed::SEALED_RUNTIME_PATHS`]
 /// for this capsule's `shell.allow` to keep working: the containing directory of each resolved
-/// allowlisted binary, and each declared `interpreter_runtime` directory.
+/// allowlisted binary, each declared `interpreter_runtime` directory, and each directory a
+/// recognised interpreter reported on its import path with the parent directory of each library
+/// its extension modules need.
 ///
 /// Whole directories, deduplicated, and only the ones not already inside a fixed runtime path.
 /// This is the deliberate opposite of `resolve_landlock_grants`: no ELF parsing, no `DT_NEEDED`
@@ -1066,6 +1179,24 @@ pub(crate) fn resolve_sealed_bind_dirs(
                 .shell_interpreter_runtime
                 .iter()
                 .flat_map(|grant| grant.dirs.iter().map(|dir| PathBuf::from(&dir.path))),
+        )
+        .chain(
+            policy
+                .shell_derived_interpreter_runtime
+                .iter()
+                .flat_map(|runtime| {
+                    runtime
+                        .entries()
+                        .filter(|(_, is_dir)| *is_dir)
+                        .map(|(path, _)| path.to_path_buf())
+                        .chain(
+                            runtime
+                                .libraries
+                                .iter()
+                                .filter_map(|library| library.parent().map(Path::to_path_buf)),
+                        )
+                        .collect::<Vec<_>>()
+                }),
         );
 
     for candidate in candidates {
@@ -1179,7 +1310,7 @@ impl NativeEntrypoint {
             path: path.to_path_buf(),
             pinned: pinned_identity(path),
             interpreter,
-            closure: resolve_landlock_grants_outside(&seeds, search_dirs, Some(&excluded)),
+            closure: resolve_landlock_grants_outside(&seeds, search_dirs, &[excluded]),
         }
     }
 
@@ -2070,7 +2201,7 @@ pub(crate) struct ShellEnforcement {
     pub(crate) landlock_abi: Option<u8>,
     /// Narrow read (never write) Landlock grants *outside* the workdir so the allowlisted
     /// binaries can actually exec, dynamically link, and (for a path-based interpreter) reach their
-    /// stdlib. Five origins, combined here:
+    /// stdlib. Six origins, combined here:
     ///
     ///   - the `DT_NEEDED`-closure files (`shell.allow` binaries, their ELF interpreter, their
     ///     shared-library closure), from `resolve_landlock_grants` — each wrapped `list_dir: false`
@@ -2078,6 +2209,9 @@ pub(crate) struct ShellEnforcement {
     ///   - one grant per `capabilities.shell.interpreter_runtime` directory, from
     ///     `resolve_interpreter_runtime_grants` — each carrying exactly the `list_dir` its author
     ///     declared;
+    ///   - one non-executable grant per entry a recognised interpreter reported on its import
+    ///     path at staging, and per library its extension modules need, from
+    ///     `resolve_derived_interpreter_grants` — listable for a directory;
     ///   - one listable grant per `capabilities.shell.staged_runtime` tree, from
     ///     `resolve_staged_runtime_landlock_grants`;
     ///   - on `KernelSealed` **only**, one listable but *non-executable* grant per fixed
@@ -2089,8 +2223,9 @@ pub(crate) struct ShellEnforcement {
     ///     (`list_dir` per entry, since that list mixes directories and files) — the composed
     ///     root's `/etc` allowlist, likewise granted by nothing else.
     ///
-    /// The first three carry `executable: true`; the two tier-issued ones do not, and that
-    /// asymmetry is load-bearing — see [`LandlockGrant`].
+    /// The closure, `interpreter_runtime` and `staged_runtime` grants carry `executable: true`;
+    /// the derived interpreter grants and the two tier-issued ones do not, and that asymmetry is
+    /// load-bearing — see [`LandlockGrant`].
     ///
     /// Resolved once at launch (in the parent) and threaded into the forked child's `pre_exec`,
     /// where `apply_landlock_scope` turns each into a per-path `PathBeneath` rule with an access
@@ -2187,13 +2322,18 @@ impl ShellEnforcement {
                 .map_err(|error| error.to_string())?;
         let egress_tcp_ports = crate::egress_proxy::egress_listen_ports(&network_allow_rules);
         let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
-        // The `DT_NEEDED`-closure files (individual files → non-listable) plus one grant
-        // per author-declared `interpreter_runtime` directory (each with its own `list_dir`). A
-        // directory not named in the manifest never receives a rule, regardless of what it holds.
+        // The `DT_NEEDED`-closure files (individual files → non-listable), one grant per
+        // author-declared `interpreter_runtime` directory (each with its own `list_dir`), and one
+        // read-only grant per entry a recognised interpreter reported on its own import path at
+        // staging. A directory neither the manifest names nor an allowlisted interpreter reports
+        // never receives a rule, regardless of what it holds.
         let mut landlock_grants =
             LandlockGrant::non_listable_files(resolve_landlock_grants(&exec_allow_paths));
         landlock_grants.extend(resolve_interpreter_runtime_grants(
             &policy.shell_interpreter_runtime,
+        ));
+        landlock_grants.extend(resolve_derived_interpreter_grants(
+            &policy.shell_derived_interpreter_runtime,
         ));
         // Plus one per staged runtime tree. Without this the tree is bind-mounted into the
         // composed root and then denied by the Landlock ruleset installed inside it — see
@@ -11317,5 +11457,239 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             0,
             "the link's target was written"
         );
+    }
+
+    /// A policy allowlisting `binary` with its interpreter runtime derived the way
+    /// `stage_session` derives it, `work` excluded as the capsule-writable root.
+    fn derived_interpreter_policy(binary: &str, work: &Path) -> CapabilityPolicy {
+        let mut policy = CapabilityPolicy {
+            shell_allow: vec![binary.to_string()],
+            ..CapabilityPolicy::default()
+        };
+        policy.shell_derived_interpreter_runtime =
+            crate::interpreter_runtime::derive_interpreter_runtimes(
+                &policy.shell_allow,
+                &[],
+                &[work],
+            );
+        policy
+    }
+
+    /// What `program` prints when this host's `python3` runs it outside any sandbox.
+    fn unsandboxed_python(program: &str) -> String {
+        let output = std::process::Command::new("python3")
+            .args(["-I", "-c", program])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// Asserts the derived runtime holds the directories `encodings` and `_sqlite3` load from on
+    /// this host, as the interpreter itself reports them, and returns the first: the stdlib.
+    fn assert_derives_stdlib_and_sqlite(policy: &CapabilityPolicy) -> PathBuf {
+        let stdlib = PathBuf::from(unsandboxed_python(
+            "import encodings, os; print(os.path.dirname(os.path.dirname(encodings.__file__)))",
+        ));
+        let dynload = PathBuf::from(unsandboxed_python(
+            "import _sqlite3, os; print(os.path.dirname(os.path.realpath(_sqlite3.__file__)))",
+        ));
+        let derived = &policy.shell_derived_interpreter_runtime;
+        println!("derived: {derived:#?}");
+        let dirs: Vec<&PathBuf> = derived.iter().flat_map(|runtime| &runtime.dirs).collect();
+        let canonical = |path: &Path| std::fs::canonicalize(path).unwrap();
+        assert!(
+            dirs.contains(&&canonical(&stdlib)),
+            "{stdlib:?} not in {dirs:?}"
+        );
+        assert!(
+            dirs.contains(&&canonical(&dynload)),
+            "{dynload:?} not in {dirs:?}"
+        );
+        canonical(&stdlib)
+    }
+
+    /// The program that opens `secret` and lists `parent`, each in its own `try`, printing the
+    /// exception class name or `allowed`.
+    fn python_probe_outside(secret: &Path, parent: &Path) -> String {
+        format!(
+            "import os\n\
+             for label, act in (('open', lambda: open({secret:?}).read()), \
+             ('listdir', lambda: os.listdir({parent:?}))):\n\
+             \x20   try:\n\
+             \x20       act(); print(label, 'allowed')\n\
+             \x20   except Exception as error:\n\
+             \x20       print(label, type(error).__name__)\n",
+            secret = secret.to_string_lossy(),
+            parent = parent.to_string_lossy(),
+        )
+    }
+
+    fn execute(
+        binary: &str,
+        args: &[&str],
+        accessible: &Path,
+        session: &Path,
+        policy: &CapabilityPolicy,
+        enforcement: &ShellEnforcement,
+    ) -> crate::shell::ShellResult {
+        let result = crate::shell::execute_shell(
+            binary,
+            args,
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(accessible).unwrap(),
+            &crate::workdir_fs::WorkdirRoot::open(session).unwrap(),
+            policy,
+            enforcement,
+        )
+        .unwrap();
+        println!(
+            "exit {}\n--- stdout\n{}--- stderr\n{}---",
+            result.exit_code, result.stdout, result.stderr
+        );
+        result
+    }
+
+    /// An allowlisted `python3` with no `interpreter_runtime` block imports its standard library
+    /// and a C extension needing a library outside its own closure under `scoped`, while a file
+    /// outside its runtime and the directory above its stdlib stay denied.
+    #[test]
+    fn a_scoped_python3_imports_its_stdlib_and_nothing_outside_it() {
+        let test = "a_scoped_python3_imports_its_stdlib_and_nothing_outside_it";
+        if find_on_path("python3").is_none() {
+            println!("[SKIP] {test}: no python3 on PATH");
+            return;
+        }
+        let (_base, work, outside) = work_and_outside();
+        let policy = derived_interpreter_policy("python3", &work);
+        let stdlib = assert_derives_stdlib_and_sqlite(&policy);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+
+        let imported = execute(
+            "python3",
+            &["-c", "import json, sqlite3, venv; print('imported')"],
+            &work,
+            &work,
+            &policy,
+            &enforcement,
+        );
+        assert_eq!(imported.exit_code, 0, "{}", imported.stderr);
+        assert_eq!(imported.stdout.trim(), "imported");
+
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "secret").unwrap();
+        let probe = python_probe_outside(&secret, stdlib.parent().unwrap());
+        let denied = execute(
+            "python3",
+            &["-c", &probe],
+            &work,
+            &work,
+            &policy,
+            &enforcement,
+        );
+        assert_eq!(denied.exit_code, 0, "{}", denied.stderr);
+        assert_eq!(
+            denied.stdout.lines().collect::<Vec<_>>(),
+            vec!["open PermissionError", "listdir PermissionError"]
+        );
+    }
+
+    /// The same interpreter under `sealed`: it imports what it imported under `scoped`, and the
+    /// file outside its runtime is neither readable nor present in the composed root.
+    #[test]
+    fn a_sealed_python3_imports_its_stdlib_and_nothing_outside_it() {
+        let test = "a_sealed_python3_imports_its_stdlib_and_nothing_outside_it";
+        if crate::network_namespace::skip_without_egress_namespace(test) {
+            return;
+        }
+        if find_on_path("python3").is_none() {
+            println!("[SKIP] {test}: no python3 on PATH");
+            return;
+        }
+        let probe = HostProbe::probe();
+        if probe.tier() != EnforcementTier::KernelSealed {
+            eprintln!(
+                "SKIP — PROVES NOTHING ABOUT THE SEALED ROOT ON THIS HOST: {test} needs a host \
+                 that reaches KernelSealed; detected {:?}. No composed root is built in this run.",
+                probe.tier()
+            );
+            return;
+        }
+        let (_base, work, outside) = work_and_outside();
+        let session = work.join(".murmur").join("ses_sealed_python");
+        std::fs::create_dir_all(&session).unwrap();
+        let policy = derived_interpreter_policy("python3", &work);
+        assert_derives_stdlib_and_sqlite(&policy);
+        let runtime = tempfile::tempdir().unwrap();
+        let enforcement =
+            ShellEnforcement::resolve(&policy, murmur_artifact::ContainmentClass::Sealed, probe)
+                .expect("a sealed-capable host resolves sealed enforcement")
+                .with_runtime_dir(test_runtime_dir(runtime.path()), None);
+        assert_eq!(enforcement.tier, EnforcementTier::KernelSealed);
+
+        let imported = execute(
+            "python3",
+            &["-c", "import json, sqlite3, venv; print('imported')"],
+            &work,
+            &session,
+            &policy,
+            &enforcement,
+        );
+        assert_eq!(imported.exit_code, 0, "{}", imported.stderr);
+        assert_eq!(imported.stdout.trim(), "imported");
+
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "secret").unwrap();
+        let program = format!(
+            "try:\n    open({:?}).read(); print('allowed')\nexcept Exception as error:\n    \
+             print(type(error).__name__)\n",
+            secret.to_string_lossy()
+        );
+        let denied = execute(
+            "python3",
+            &["-c", &program],
+            &work,
+            &session,
+            &policy,
+            &enforcement,
+        );
+        assert_eq!(denied.exit_code, 0, "{}", denied.stderr);
+        let outcome = denied.stdout.trim();
+        assert!(
+            outcome == "PermissionError" || outcome == "FileNotFoundError",
+            "{outcome}"
+        );
+    }
+
+    /// An allowlisted `perl` with no `interpreter_runtime` block loads `POSIX`, an XS module, out
+    /// of its own `@INC` under `scoped`.
+    #[test]
+    fn a_scoped_perl_loads_posix_from_its_inc() {
+        let test = "a_scoped_perl_loads_posix_from_its_inc";
+        if find_on_path("perl").is_none() {
+            println!("[SKIP] {test}: no perl on PATH");
+            return;
+        }
+        let (_base, work, _outside) = work_and_outside();
+        let policy = derived_interpreter_policy("perl", &work);
+        assert!(
+            !policy.shell_derived_interpreter_runtime.is_empty(),
+            "perl was not recognised or reported nothing"
+        );
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        let result = execute(
+            "perl",
+            &["-MPOSIX", "-e", "print qq{loaded\n}"],
+            &work,
+            &work,
+            &policy,
+            &enforcement,
+        );
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.stdout.trim(), "loaded");
     }
 }

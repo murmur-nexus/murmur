@@ -61,8 +61,10 @@ interpreter (dynamic loader), and the transitive closure of their shared librari
 allowlisted program can exec and dynamic-link `/usr/bin/bash` and its libraries while no directory
 is granted wholesale and the only writable paths outside the workdir are `/dev/null` (see
 [the fixed capsule device set](#capsule-device-set)), the
-[session's temporary folder](#temp-folder) and its [home folder](#home-folder). A capsule may *additionally* name specific
-host directories a path-based interpreter needs (its stdlib) via
+[session's temporary folder](#temp-folder) and its [home folder](#home-folder). An allowlisted CPython or Perl interpreter also gets
+read-only grants on the directories it reports on its own import path (see
+[Derived interpreter runtimes](#derived-interpreter-runtime)). For any other path-based
+interpreter, a capsule may name the host directories it needs via
 `capabilities.shell.interpreter_runtime`, which grants exactly the directories named, each with an
 explicit per-directory `list_dir` flag (see [`W-SEC-009`](diagnostics.md#w-sec-009)). The workdir
 grant is *not* the full Landlock right-set: character-device (`MakeChar`), block-device
@@ -155,7 +157,7 @@ Everything else the tool reads, writes, runs or connects to has to be granted by
 |---|---|
 | Runs another program, such as `git` | That program in `capabilities.shell.allow` |
 | Is a `#!/usr/bin/env python3` script | `python3` in `capabilities.shell.allow`: the `#!` grant covers `env` only |
-| Reads or writes a path outside the workdir | On Full and Sealed, keep its inputs and outputs in the workdir or the [session's temporary folder](#temp-folder). Nothing grants a write anywhere else; the only read grant outside it is a [`capabilities.shell.interpreter_runtime`](manifest.md#field-capabilities) directory, which names a `shell.allow` binary and grants execute as well |
+| Reads or writes a path outside the workdir | On Full and Sealed, keep its inputs and outputs in the workdir or the [session's temporary folder](#temp-folder). Nothing grants a write anywhere else; the read grants outside it are an allowlisted interpreter's [derived runtime](#derived-interpreter-runtime) and a [`capabilities.shell.interpreter_runtime`](manifest.md#field-capabilities) directory, which names a `shell.allow` binary and grants execute as well |
 | Reaches a host | That host in `capabilities.network.allow`; the connection leaves through the egress proxy |
 | Reaches a server an earlier shell call started on `127.0.0.1` | Nothing: the tool shares the session's loopback |
 | Opens an `AF_UNIX` socket | `capabilities.network.unix_sockets: true` |
@@ -838,6 +840,52 @@ either way, which is exactly why neither can reach `scoped`. `W-SEC-001` and `W-
 say so.
 
 ---
+
+## Derived interpreter runtimes { #derived-interpreter-runtime }
+
+An allowlisted interpreter reads its standard library from directories its binary does not name.
+When `mur` stages a session on Linux, it asks each `capabilities.shell.allow` binary it recognises
+as an interpreter where those directories are, and grants them. No manifest key turns this on or
+names a path.
+
+| Interpreter | Recognised by | Asked with |
+|---|---|---|
+| CPython | its binary lists the symbol `Py_BytesMain` | `-I -S -c` and a program printing `sys.path` and `site.getsitepackages()` |
+| Perl | its binary lists the symbol `perl_parse` | `-f -e` and a program printing `@INC` |
+
+The interpreter runs once per session, before the capsule starts, with an empty environment, `/`
+as its working directory and a 5-second limit. A binary inside the workdir root or the records
+directory is never run. A binary named by a [`staged_runtime`](#field-staged-runtime) grant is not
+asked, because its runtime is the staged tree. When the interpreter cannot answer, `mur` prints one
+line naming the binary and the reason, and the session starts with the binary's usual grants.
+
+What the interpreter reports becomes a grant:
+
+| Reported path | `scoped` and `sealed` grant | Composed-root bind on `sealed` |
+|---|---|---|
+| A directory on the import path | read and list, never execute | optional, when outside `/usr`, `/bin`, `/sbin` and `/lib*` |
+| A zip archive on the import path | read, never execute | none |
+| A library an extension module directly inside one of those directories needs, such as `libsqlite3.so.0` behind `_sqlite3` | read, never execute | its directory, on the same terms |
+
+A reported path is dropped when it is relative, does not exist, is `/`, is the interpreter's own
+directory or a directory above it, or lies inside the workdir root or the records directory.
+
+Extension modules are scanned one directory deep. A third-party package that keeps its extension
+modules in its own subdirectory, and needs a system library no derived directory holds, still
+needs that library named in `capabilities.shell.interpreter_runtime`.
+
+`mur run --explain-scope` lists the derived paths under `derived interpreter runtime`, and the
+`session_start` event records them under
+[`effective_grants.derived_interpreter_runtime`](observability-schemas.md#session-trace-tracejsonl):
+
+```text
+  derived interpreter runtime:
+    - /usr/bin/python3.12: /usr/lib/python3.12 (list_dir)
+    - /usr/bin/python3.12: /usr/lib/python3.12/lib-dynload (list_dir)
+    - /usr/bin/python3.12: /usr/lib/x86_64-linux-gnu/libsqlite3.so.0.8.6
+```
+
+On macOS nothing is derived and nothing is run.
 
 ## Staged runtime { #field-staged-runtime }
 

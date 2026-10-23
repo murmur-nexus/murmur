@@ -173,17 +173,13 @@ pub fn derive_interpreter_dirs(python: &str) -> Result<Vec<(String, bool)>, Stri
 /// process bound.
 fn tight_resources_yaml() -> &'static str {
     "  resources:\n\
-    \x20   # 128 rather than the document's 64. `apply_hard_rlimits` runs first in the child's\n\
-    \x20   # pre_exec window, so every later step in that window lives under this ceiling — and\n\
-    \x20   # the Landlock grant fds, the netns/uid_map setup and the seccomp filter all need\n\
-    \x20   # descriptors while it holds. At 16 and at 32 every spawn dies with `shell enforcement\n\
-    \x20   # setup failed before exec: There was a system failure beyond the control of\n\
-    \x20   # libseccomp`. At 64 the one Landlock grant per `SEALED_ETC_PATHS` entry puts this\n\
-    \x20   # harness's `sealed` capsule over the line, and every resource case reports\n\
-    \x20   # `egress-netns: writing uid_map/gid_map failed` instead of its ceiling: a\n\
-    \x20   # [bash, python3] sealed capsule spawns at 72 and refuses at 64. 128 is that floor with\n\
-    \x20   # room for a grant set that grows. Do not raise it toward the host default: the\n\
-    \x20   # fd-exhauster case needs a ceiling far below 1024 to grade anything.\n\
+    \x20   # 128 rather than the document's 64. The child's pre_exec window sets\n\
+    \x20   # RLIMIT_NPROC (none in a cgroup scope), joins the scope, installs the enforcement\n\
+    \x20   # (composed root, Landlock, netns, seccomp), and sets the per-process rlimits\n\
+    \x20   # RLIMIT_NOFILE among them last, right before execve, so the setup is not bound by\n\
+    \x20   # this ceiling. It bounds the exec'd program alone, whose interpreter and runtime\n\
+    \x20   # libraries hold descriptors of their own before a probe opens its first. Keep it\n\
+    \x20   # far below the host default: the fd-exhauster case grades a ceiling under 512.\n\
     \x20   max_open_files: 128\n\
     \x20   max_file_size_bytes: 10485760      # 10 MiB\n\
     \x20   # 60 rather than the document's 5: pids.max is hit in milliseconds, so a generous CPU\n\
@@ -1210,12 +1206,8 @@ mod tests {
         let yaml = manifest_yaml(case, &config(), ContainmentClass::Scoped, &log());
         assert!(yaml.contains("cgroup_pids_max: 32"));
         assert!(yaml.contains("workdir_max_bytes: 52428800"));
-        // 128, not the manual-verification document's 64: the child's pre_exec window has to
-        // install a seccomp filter, write uid_map/gid_map for the egress netns, and hold one
-        // Landlock grant fd per granted path, all under this ceiling. Below roughly 64 the
-        // seccomp install fails; at 64 a `sealed` capsule fails on uid_map once the
-        // `SEALED_ETC_PATHS` grants are counted. Pinned here so the value
-        // cannot drift back down without the reason being re-read.
+        // 128, not the manual-verification document's 64: see `tight_resources_yaml`. The
+        // fd-exhauster case grades only a ceiling far below the 1024 default.
         assert!(yaml.contains("max_open_files: 128"));
         assert!(!yaml.contains("max_processes"));
     }

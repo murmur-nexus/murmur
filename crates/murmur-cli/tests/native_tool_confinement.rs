@@ -751,6 +751,88 @@ fn a_native_tool_starts_under_a_low_max_open_files_sealed() {
     assert_low_max_open_files_holds(test, ContainmentClass::Sealed);
 }
 
+/// A capsule allowlisting `python3` with no `interpreter_runtime` block, run at `floor`: one
+/// `python3` call imports `json`, `sqlite3` and `venv`, and `session_start` names the stdlib
+/// directory the runtime derived from the interpreter.
+fn assert_allowlisted_python3_imports(test: &str, floor: ContainmentClass) {
+    if capsule_runtime::find_on_path("python3").is_none() {
+        eprintln!("[SKIP-HOST] {test}: no python3 on PATH");
+        return;
+    }
+    let capsule = Capsule {
+        shell_allow: vec!["python3".into()],
+        ..Capsule::default()
+    };
+    let calls = vec![(
+        "toolu_python3",
+        "python3",
+        json!({"command": "-c \"import json, sqlite3, venv; print('imported')\""}),
+    )];
+    let Some(ran) = run(&capsule, &[], &calls, floor) else {
+        eprintln!("[SKIP] {test}: the fixture tool could not be built");
+        return;
+    };
+
+    let text = ran.text("toolu_python3");
+    assert!(
+        text.contains("Exit code: 0") && text.contains("imported"),
+        "python3 must import its stdlib: {text}\ntrace record: {}",
+        ran.tool_call_record("toolu_python3")
+    );
+
+    let stdlib = std::process::Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            "import encodings, os; print(os.path.realpath(os.path.dirname(os.path.dirname(encodings.__file__))))",
+        ])
+        .output()
+        .unwrap();
+    let stdlib = String::from_utf8(stdlib.stdout).unwrap().trim().to_string();
+    let trace = ran
+        .trace_path()
+        .unwrap_or_else(|missing| panic!("{missing}"));
+    let session_start = common::read_whole_trace(&trace)
+        .into_iter()
+        .find(|record| record["event_type"] == "session_start")
+        .expect("the session wrote session_start");
+    let derived = session_start["effective_grants"]["derived_interpreter_runtime"]
+        .as_array()
+        .expect("derived_interpreter_runtime is an array")
+        .clone();
+    println!("derived_interpreter_runtime: {derived:?}");
+    assert!(
+        derived.iter().any(|entry| entry
+            .as_str()
+            .is_some_and(|entry| entry.contains("python3")
+                && entry.ends_with(&format!(": {stdlib} (list_dir)")))),
+        "session_start names python3's stdlib {stdlib}: {derived:?}"
+    );
+}
+
+/// Under `scoped`, an allowlisted `python3` reads its own standard library with no manifest
+/// declaration naming it.
+#[test]
+#[allow(clippy::print_stdout)]
+fn an_allowlisted_python3_imports_its_stdlib_scoped() {
+    let test = "an_allowlisted_python3_imports_its_stdlib_scoped";
+    if skip_host(test, ContainmentClass::Scoped) {
+        return;
+    }
+    assert_allowlisted_python3_imports(test, ContainmentClass::Scoped);
+}
+
+/// The same under `sealed`, inside the composed root.
+#[test]
+#[allow(clippy::print_stdout)]
+fn an_allowlisted_python3_imports_its_stdlib_sealed() {
+    let test = "an_allowlisted_python3_imports_its_stdlib_sealed";
+    if skip_host(test, ContainmentClass::Sealed) {
+        return;
+    }
+    assert_allowlisted_python3_imports(test, ContainmentClass::Sealed);
+}
+
 // ── the default-artifacts native tools ───────────────────────────────────────
 
 /// The variable naming a directory of default-artifacts native tool zips, each built by that

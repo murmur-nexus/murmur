@@ -442,7 +442,7 @@ pub(crate) fn run_run(
         capsule_runtime::runtime_err!("{line}");
     }
 
-    let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
+    let mut capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
 
     // `stage_session` refuses the same thing with the same checker; called here so
     // `--explain-scope` refuses exactly what a launch refuses, and ahead of the `W-SEC-024`
@@ -602,9 +602,10 @@ pub(crate) fn run_run(
         // `has_native_artifact` is `false` here and not read from the manifest: an entry's
         // implementation is a property of the *installed* artifact, which only a registry read
         // resolves, and this block is placed ahead of every side effect including that one. The
-        // condition evaluated is therefore `shell.allow` or `spawn.allow` alone, so a capsule that
-        // declares neither and installs a native tool reports `not-required` here while its launch
-        // does create a scope and does report the real status in `session_start`.
+        // condition evaluated is therefore `shell.allow`, `spawn.allow` or `install.tool` alone,
+        // so a capsule that declares none of them and installs a native tool reports
+        // `not-required` here while its launch does create a scope and does report the real
+        // status in `session_start`.
         //
         // The `not-required` report is built by `IoMaxReport::no_scope_required` rather than
         // spelled out here, because `session_start.effective_grants` must be the byte-for-byte
@@ -615,6 +616,17 @@ pub(crate) fn run_run(
         } else {
             IoMaxReport::no_scope_required(capability_policy.resources.cgroup_io_bytes_per_sec)
         };
+        // The interpreter runtimes `stage_session` would derive, through the same function and
+        // with the same trees excluded, so the report names the directories a launch grants.
+        let launch_workdir = workdir_root(&project_dir, workdir_arg.as_deref());
+        let placement = capsule_runtime::runtime_dir_placement(&launch_workdir)
+            .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+        capability_policy.shell_derived_interpreter_runtime =
+            capsule_runtime::derive_interpreter_runtimes(
+                &capability_policy.shell_allow,
+                &capability_policy.shell_staged_runtime,
+                &capsule_runtime::capsule_writable_roots(&placement),
+            );
         let report = explain_scope(
             &capability_policy,
             declared_containment_floor,
@@ -623,7 +635,7 @@ pub(crate) fn run_run(
             configured_artifacts,
             preopens,
             io_max,
-            &workdir_root(&project_dir, workdir_arg.as_deref()),
+            &launch_workdir,
         )
         .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
         if json {

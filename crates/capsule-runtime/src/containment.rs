@@ -960,6 +960,11 @@ pub struct ScopeReport {
     /// `<binary>: <dir>[ (list_dir)]`. These are the paths outside the workdir that stay
     /// reachable even at `scoped`.
     pub interpreter_runtime_grants: Vec<String>,
+    /// Every host path staging derived from a recognised `shell.allow` interpreter's own import
+    /// path, rendered `<binary>: <dir> (list_dir)` for a directory and `<binary>: <path>` for a zip
+    /// archive or an extension-module library. Each is readable and none is executable. Always
+    /// serialized, `[]` when no allowlisted binary is a recognised interpreter.
+    pub derived_interpreter_runtime: Vec<String>,
     /// The read-only file surface `exports.files` declares, or `null` when the capsule declares
     /// none. Always serialized (never skipped), so a consumer can tell "this runtime predates
     /// exports" from "this capsule declined to export anything" by the field's presence rather
@@ -1164,6 +1169,11 @@ impl ScopeReport {
             &mut out,
             "interpreter runtime",
             &self.interpreter_runtime_grants,
+        );
+        push_list(
+            &mut out,
+            "derived interpreter runtime",
+            &self.derived_interpreter_runtime,
         );
         push_list(&mut out, "staged runtime", &self.staged_runtime_grants);
         push_list(
@@ -1535,6 +1545,26 @@ pub(crate) fn scope_report_for_tier(
                     let listable = if dir.list_dir { " (list_dir)" } else { "" };
                     format!("{}: {}{}", grant.binary, dir.path, listable)
                 })
+            })
+            .collect(),
+        derived_interpreter_runtime: policy
+            .shell_derived_interpreter_runtime
+            .iter()
+            .flat_map(|runtime| {
+                let binary = runtime.binary.display();
+                runtime
+                    .entries()
+                    .map(|(path, is_dir)| {
+                        let listable = if is_dir { " (list_dir)" } else { "" };
+                        format!("{binary}: {}{listable}", path.display())
+                    })
+                    .chain(
+                        runtime
+                            .libraries
+                            .iter()
+                            .map(|library| format!("{binary}: {}", library.display())),
+                    )
+                    .collect::<Vec<_>>()
             })
             .collect(),
         staged_runtime_grants: policy
@@ -3465,6 +3495,10 @@ mod tests {
             ("shell_allow", "shell_allow"),
             ("spawn_allow", "spawn_allow"),
             ("shell_interpreter_runtime", "interpreter_runtime_grants"),
+            (
+                "shell_derived_interpreter_runtime",
+                "derived_interpreter_runtime",
+            ),
             ("shell_staged_runtime", "staged_runtime_grants"),
             ("env_allow", "env_allow"),
             ("plan_submit", "plan_submit"),

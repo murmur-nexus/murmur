@@ -51,6 +51,7 @@ pub(crate) mod http_client;
 pub(crate) mod identity;
 pub(crate) mod inference_import;
 pub(crate) mod install_grant;
+pub(crate) mod interpreter_runtime;
 pub mod lanes;
 pub mod lifeline;
 pub mod limits;
@@ -126,6 +127,11 @@ pub use containment::{
     ScopeReport, ShortfallCause, StateStoreReport, TempDirReport,
 };
 pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
+// `mur run --explain-scope` derives an allowlisted interpreter's runtime directories through the
+// same function `stage_session` does, so the report and the session's grants name one set.
+pub use interpreter_runtime::{
+    capsule_writable_roots, derive_interpreter_runtimes, DerivedInterpreterRuntime,
+};
 pub use murmur_home::{usable_murmur_home, HomeUnusable, HOME_UNUSABLE_HINT};
 pub use network_namespace::{
     check_egress_namespace, detect_egress_namespace_failure, skip_without_egress_namespace,
