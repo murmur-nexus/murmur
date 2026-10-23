@@ -371,6 +371,21 @@ A `max_tokens` above the driver's ceiling for the compaction model refuses the l
 reports the same. Under `transport: process` both keys are refused: the harness runs its own
 compaction.
 
+To confirm what the compaction call was sent, run [`mur trace show`](#step-5-verify-compaction-ran-using-the-trace)
+after a session that compacted and read its **Call settings** section. Each row is one caller with
+the output cap and driver config its calls carried. For the manifest above:
+
+```text
+── Call settings ────────────────────────────────
+agent  max_tokens 16000  driver_config {"reasoning_effort":"max"}  2 calls  turns 0, 1
+hook:hook-compact  max_tokens 8000  driver_config {"reasoning_effort":"low"}  1 call  turn 0
+```
+
+The `agent` row carries `inference.max_tokens` and `inference.driver.config`; the compaction hook's
+row carries `inference.compaction.max_tokens` and the merged config. Every `inference` line in
+`trace.jsonl` holds the same two values as
+[`max_output_tokens` and `driver_config`](../reference/observability-schemas.md#inference-call-settings).
+
 A slow compaction call counts against the compaction hook's own deadline, 30 seconds by default.
 To give the hook longer without changing the deadline of every other call, set it on the hook's
 entry:

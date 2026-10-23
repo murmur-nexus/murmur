@@ -582,6 +582,18 @@ fn a_controller_changes_a_declared_setting_from_the_next_inference_call() {
     let position = |id: &Value| events.iter().position(|e| e["event_id"] == *id).unwrap();
     assert!(position(&change["event_id"]) < position(&applied["event_id"]));
     assert!(position(&applied["event_id"]) < position(&third_inference["event_id"]));
+    // Each line names the cap its own request carried, the changed one from the call it applied to.
+    let inference = of_type(&events, "inference");
+    assert_eq!(
+        inference
+            .iter()
+            .map(|line| line["max_output_tokens"].clone())
+            .collect::<Vec<_>>(),
+        [json!(4096), json!(4096), json!(1234)]
+    );
+    for line in &inference {
+        assert!(line.get("driver_config").is_some(), "{line}");
+    }
 
     let show = Ran::of(
         mur(home.path())

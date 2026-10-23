@@ -111,13 +111,25 @@ fn summarizing_home() -> TempDir {
 /// compactor declared with `hook_extra` spliced into its entry and `compaction_extra` into
 /// `inference.compaction`.
 fn manifest(endpoint: &str, hook_extra: &str, compaction_extra: &str) -> String {
+    manifest_with_key(endpoint, "test-key", "", hook_extra, compaction_extra)
+}
+
+/// [`manifest`] with the driver's `gateway.api_key` set to `api_key` and `config_extra` spliced
+/// into `inference.driver.config` after `reasoning_effort`.
+fn manifest_with_key(
+    endpoint: &str,
+    api_key: &str,
+    config_extra: &str,
+    hook_extra: &str,
+    compaction_extra: &str,
+) -> String {
     format!(
         "name: compaction-call\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    version: \
          {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      \
-         api_key: test-key\n  - name: {COMPACTOR}\n    version: 0.1.0\n    runtime: hook\n\
+         api_key: {api_key}\n  - name: {COMPACTOR}\n    version: 0.1.0\n    runtime: hook\n\
          {hook_extra}capabilities:\n  network:\n    allow:\n      - {endpoint}\n{CONTEXT}\
          inference:\n  transport: http\n  model: {MODEL}\n  max_tokens: {TURN_CAP}\n  driver:\n    \
-         artifact: {DRIVER}\n    config:\n      reasoning_effort: high\n  compaction:\n    \
+         artifact: {DRIVER}\n    config:\n      reasoning_effort: high\n{config_extra}  compaction:\n    \
          threshold: 0.5\n{compaction_extra}"
     )
 }
@@ -235,6 +247,19 @@ fn is_compaction_call(request: &Value) -> bool {
 /// Runs [`compacting_script`] under `compaction_extra`, asserts it completed with one compaction,
 /// and returns the three requests the provider received, in order.
 fn run_compacting(compaction_extra: &str) -> Vec<Value> {
+    run_compacting_traced(compaction_extra).requests
+}
+
+/// One [`run_compacting_traced`] run: the requests, the run, and the scratch `HOME` holding its
+/// records.
+struct Compacted {
+    requests: Vec<Value>,
+    run: Run,
+    home: TempDir,
+}
+
+/// [`run_compacting`], keeping the run and its records.
+fn run_compacting_traced(compaction_extra: &str) -> Compacted {
     let home = summarizing_home();
     let server = common::ScriptedServer::start(compacting_script());
     let project = project(&manifest(&server.endpoint, "", compaction_extra));
@@ -257,7 +282,11 @@ fn run_compacting(compaction_extra: &str) -> Vec<Value> {
         [false, true, false],
         "turn, compaction call, turn: {requests:#?}"
     );
-    requests
+    Compacted {
+        requests,
+        run,
+        home,
+    }
 }
 
 // ── S4, S7: what the compaction call sends ────────────────────────────────────
@@ -448,5 +477,193 @@ fn a_hook_entrys_other_limits_draw_w_sec_006_by_their_full_key() {
         !warned[0].contains("declares capabilities.limits which"),
         "{}",
         warned[0]
+    );
+}
+
+// ── The trace names each call's settings ──────────────────────────────────────
+
+/// Every `inference` line's caller (`origin`, `null` for the agent), `max_output_tokens` and
+/// `driver_config`, in file order.
+fn call_settings(trace: &[Value]) -> Vec<(Value, Value, Value)> {
+    events(trace, "inference")
+        .into_iter()
+        .map(|line| {
+            (
+                line.get("origin").cloned().unwrap_or(Value::Null),
+                line.get("max_output_tokens")
+                    .cloned()
+                    .expect("max_output_tokens on every http line"),
+                line.get("driver_config")
+                    .cloned()
+                    .expect("driver_config on every http line"),
+            )
+        })
+        .collect()
+}
+
+/// `turn N` for one distinct turn, `turns a, b` for several, as the Call settings rows list them.
+fn turn_list(lines: &[&Value]) -> String {
+    let mut turns: Vec<u64> = lines
+        .iter()
+        .map(|line| line["turn"].as_u64().expect("turn"))
+        .collect();
+    turns.sort_unstable();
+    turns.dedup();
+    let list = turns
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match turns.len() {
+        1 => format!("turn {list}"),
+        _ => format!("turns {list}"),
+    }
+}
+
+#[test]
+fn the_trace_records_each_calls_cap_and_driver_config() {
+    let Compacted {
+        requests,
+        run,
+        home,
+    } = run_compacting_traced(BOTH_KEYS);
+    let trace = run.trace();
+    let settings = call_settings(&trace);
+    println!("{settings:?}");
+    assert_eq!(
+        settings,
+        [
+            (
+                Value::Null,
+                json!(TURN_CAP),
+                json!({"reasoning_effort": "high"})
+            ),
+            (
+                json!("hook:compactor"),
+                json!(2000),
+                json!({"reasoning_effort": "low"})
+            ),
+            (
+                Value::Null,
+                json!(TURN_CAP),
+                json!({"reasoning_effort": "high"})
+            ),
+        ]
+    );
+    // What each line says is what the request at the same position carried.
+    for (line, request) in settings.iter().zip(&requests) {
+        assert_eq!(
+            (line.1.clone(), line.2["reasoning_effort"].clone()),
+            cap_and_effort(request),
+            "{request:#?}"
+        );
+    }
+
+    let lines = events(&trace, "inference");
+    for line in &lines {
+        println!("{line}");
+    }
+    let agent_turns = turn_list(&[lines[0], lines[2]]);
+    let hook_turn = turn_list(&[lines[1]]);
+    let records = common::parse_records_from_stdout(&run.stdout);
+    let show = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(["trace", "show"])
+        .arg(records.join("trace.jsonl"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    println!("{stdout}");
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let section: Vec<&str> = stdout
+        .lines()
+        .skip_while(|line| !line.starts_with("── Call settings"))
+        .take_while(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        section,
+        [
+            "── Call settings ────────────────────────────────".to_string(),
+            format!(
+                r#"agent  max_tokens {TURN_CAP}  driver_config {{"reasoning_effort":"high"}}  2 calls  {agent_turns}"#
+            ),
+            format!(
+                r#"hook:compactor  max_tokens 2000  driver_config {{"reasoning_effort":"low"}}  1 call  {hook_turn}"#
+            ),
+        ]
+    );
+}
+
+#[test]
+fn the_trace_records_the_ceiling_and_the_agents_config_without_an_overlay() {
+    // `_home` holds the records the trace is read from.
+    let Compacted {
+        run, home: _home, ..
+    } = run_compacting_traced("");
+    assert_eq!(
+        call_settings(&run.trace()),
+        [
+            (
+                Value::Null,
+                json!(TURN_CAP),
+                json!({"reasoning_effort": "high"})
+            ),
+            (
+                json!("hook:compactor"),
+                json!(common::FIXTURE_MAX_OUTPUT_TOKENS),
+                json!({"reasoning_effort": "high"})
+            ),
+            (
+                Value::Null,
+                json!(TURN_CAP),
+                json!({"reasoning_effort": "high"})
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_credential_in_the_driver_config_is_redacted_in_the_trace() {
+    const CREDENTIAL: &str = "trace-test-credential-4be1";
+    let home = summarizing_home();
+    let server = common::ScriptedServer::start(compacting_script());
+    let project = project(&manifest_with_key(
+        &server.endpoint,
+        CREDENTIAL,
+        &format!("      bogus_key: {CREDENTIAL}\n"),
+        "",
+        "",
+    ));
+    let run = run(&home, &project);
+    assert_ne!(run.output.status.code(), Some(0), "{}", run.context());
+    assert!(
+        server.requests().is_empty(),
+        "the driver refused before sending: {}",
+        run.context()
+    );
+
+    let trace = run.trace();
+    let lines = events(&trace, "inference");
+    assert_eq!(lines.len(), 1, "{trace:#?}");
+    let failed = lines[0];
+    println!("{failed}");
+    assert_eq!(failed["decision"], "error");
+    assert_eq!(failed["error_code"], "driver_error");
+    assert_eq!(failed["max_output_tokens"], json!(TURN_CAP));
+    assert_eq!(
+        failed["driver_config"],
+        json!({"bogus_key": "[redacted]", "reasoning_effort": "high"})
+    );
+    let text =
+        fs::read_to_string(common::parse_records_from_stdout(&run.stdout).join("trace.jsonl"))
+            .unwrap();
+    assert!(
+        !text.contains(CREDENTIAL),
+        "the credential appears in trace.jsonl:\n{text}"
     );
 }

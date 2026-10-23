@@ -311,6 +311,15 @@ struct InferenceEvent {
     /// The HTTP status the runtime's credential gateway received for the failed call.
     #[serde(default)]
     provider_status: Option<u16>,
+    /// The output cap the request carried as `max_tokens`. Written on every `transport: http`
+    /// line; absent on a `transport: process` line and on a line from an older runtime.
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
+    /// The driver config the call's driver ran with, credentials already redacted, beside
+    /// `max_output_tokens`. `None` both when the key is absent and when it is `null`; the two
+    /// are told apart by `max_output_tokens`.
+    #[serde(default)]
+    driver_config: Option<serde_json::Value>,
 }
 
 impl InferenceEvent {
@@ -1088,6 +1097,17 @@ struct InferenceRecord {
     served_by: Option<(String, String)>,
     /// Why the call failed, on a record that says it did.
     failure: Option<FailedCall>,
+    /// How the call was sent, on a record that names it.
+    settings: Option<CallSettings>,
+}
+
+/// One call's output cap and driver config, the Call settings section's grouping key beside the
+/// caller.
+#[derive(Debug, Clone, PartialEq)]
+struct CallSettings {
+    max_output_tokens: u32,
+    /// `None` for a driver that saw no config.
+    driver_config: Option<serde_json::Value>,
 }
 
 impl InferenceRecord {
@@ -1097,6 +1117,10 @@ impl InferenceRecord {
             .clone()
             .map(|choice| (choice, e.model.clone().unwrap_or_default()));
         let failure = e.failure();
+        let settings = e.max_output_tokens.map(|max_output_tokens| CallSettings {
+            max_output_tokens,
+            driver_config: e.driver_config.clone(),
+        });
         InferenceRecord {
             turn: e.turn,
             decision: e.decision,
@@ -1107,6 +1131,7 @@ impl InferenceRecord {
             message_shas: e.message_shas,
             served_by,
             failure,
+            settings,
         }
     }
 
@@ -1533,6 +1558,58 @@ fn status_value(value: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         _ => "-".to_string(),
     }
+}
+
+/// The Call settings section's rows: one per distinct caller, output cap and driver config, in
+/// order of first appearance, over every `inference` record that names its settings, failed
+/// calls included —
+/// `<caller>  max_tokens <n>  driver_config <compact JSON | none>  <k> call[s]  turn[s] <a>[, <b>…]`.
+/// The caller is `agent` for an agent-loop record and the record's `origin` otherwise. Empty when
+/// no record names its settings: a `transport: process` session, or a trace from an older runtime.
+fn call_settings_rows(records: &[InferenceRecord]) -> Vec<String> {
+    let mut groups: Vec<(&str, &CallSettings, Vec<u32>)> = Vec::new();
+    for record in records {
+        let Some(settings) = &record.settings else {
+            continue;
+        };
+        let caller = record.origin.as_deref().unwrap_or("agent");
+        match groups
+            .iter_mut()
+            .find(|(c, s, _)| *c == caller && *s == settings)
+        {
+            Some((_, _, turns)) => turns.push(record.turn),
+            None => groups.push((caller, settings, vec![record.turn])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(caller, settings, turns)| {
+            let calls = match turns.len() {
+                1 => "1 call".to_string(),
+                n => format!("{n} calls"),
+            };
+            let mut distinct = turns;
+            distinct.sort_unstable();
+            distinct.dedup();
+            let list = distinct
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let turns = match distinct.len() {
+                1 => format!("turn {list}"),
+                _ => format!("turns {list}"),
+            };
+            let config = settings
+                .driver_config
+                .as_ref()
+                .map_or_else(|| "none".to_string(), |config| config.to_string());
+            format!(
+                "{caller}  max_tokens {}  driver_config {config}  {calls}  {turns}",
+                settings.max_output_tokens
+            )
+        })
+        .collect()
 }
 
 /// One `background_command` record's row:
@@ -3260,6 +3337,15 @@ fn print_show(m: &TraceMetrics) {
         );
     }
 
+    let call_settings = call_settings_rows(&m.inference_records);
+    if !call_settings.is_empty() {
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Call settings ────────────────────────────────");
+        for row in &call_settings {
+            capsule_runtime::report_println!("{row}");
+        }
+    }
+
     if let Some(formation) = &m.formation_ended {
         capsule_runtime::report_println!();
         capsule_runtime::report_println!("── Formation ended ──────────────────────────────");
@@ -3695,6 +3781,7 @@ impl WireIndex {
                         message_shas: e.message_shas,
                         served_by: None,
                         failure: None,
+                        settings: None,
                     };
                     note(record.system_sha.as_ref(), &mut known_hashes);
                     note(record.tools_sha.as_ref(), &mut known_hashes);
@@ -5976,6 +6063,121 @@ mod tests {
             TraceEvent::CompactionDeclined(e) => assert_eq!(e.tokens, 4321),
             other => panic!("expected a compaction_declined event, got {other:?}"),
         }
+    }
+
+    /// An `inference` line for the Call settings tests: `origin` and `settings` are spliced in
+    /// verbatim, so `settings` is `""` for a line that names none.
+    fn call_settings_line(
+        turn: u32,
+        origin: Option<&str>,
+        decision: &str,
+        settings: &str,
+    ) -> String {
+        let origin = origin.map_or(String::new(), |o| format!(r#","origin":"{o}""#));
+        let failure = if decision == "error" {
+            r#","stop_reason":"error","error_code":"driver_error","error":"HTTP 500: boom""#
+        } else {
+            ""
+        };
+        format!(
+            r#"{{"event_type":"inference","session_id":"ses_child","timestamp":1791000002000,"turn":{turn},"input_tokens":10,"output_tokens":5,"decision":"{decision}","tool_name":null{origin}{failure}{settings}}}"#
+        )
+    }
+
+    fn call_settings_of(lines: &[String]) -> Vec<String> {
+        let mut trace = format!("{UNENDED_START}\n");
+        for line in lines {
+            trace.push_str(line);
+            trace.push('\n');
+        }
+        let (_dir, path) = trace_of(&trace);
+        let (metrics, _) = load_metrics_for_show(&path).expect("the trace shows");
+        call_settings_rows(&metrics.inference_records)
+    }
+
+    const TURN_SETTINGS: &str =
+        r#","max_output_tokens":4096,"driver_config":{"reasoning_effort":"high"}"#;
+    const COMPACTION_SETTINGS: &str =
+        r#","max_output_tokens":2000,"driver_config":{"reasoning_effort":"low"}"#;
+
+    /// One row per distinct caller, cap and config, in order of first appearance, each counting
+    /// its calls and listing its distinct turns.
+    #[test]
+    fn call_settings_rows_group_by_caller_cap_and_config_in_first_seen_order() {
+        let rows = call_settings_of(&[
+            call_settings_line(0, None, "end_turn", TURN_SETTINGS),
+            call_settings_line(0, Some("hook:compactor"), "end_turn", COMPACTION_SETTINGS),
+            call_settings_line(1, None, "end_turn", TURN_SETTINGS),
+            call_settings_line(
+                2,
+                None,
+                "end_turn",
+                r#","max_output_tokens":1234,"driver_config":{"reasoning_effort":"high"}"#,
+            ),
+            call_settings_line(3, None, "end_turn", TURN_SETTINGS),
+        ]);
+        assert_eq!(
+            rows,
+            [
+                r#"agent  max_tokens 4096  driver_config {"reasoning_effort":"high"}  3 calls  turns 0, 1, 3"#,
+                r#"hook:compactor  max_tokens 2000  driver_config {"reasoning_effort":"low"}  1 call  turn 0"#,
+                r#"agent  max_tokens 1234  driver_config {"reasoning_effort":"high"}  1 call  turn 2"#,
+            ]
+        );
+    }
+
+    /// Two calls on one turn are two calls and one turn; a `null` config reads `none`, and a
+    /// config differing only in its value is a group of its own.
+    #[test]
+    fn call_settings_rows_count_calls_apart_from_turns_and_show_a_null_config_as_none() {
+        let rows = call_settings_of(&[
+            call_settings_line(
+                0,
+                Some("hook:compactor"),
+                "end_turn",
+                r#","max_output_tokens":2000,"driver_config":null"#,
+            ),
+            call_settings_line(
+                0,
+                Some("hook:compactor"),
+                "end_turn",
+                r#","max_output_tokens":2000,"driver_config":null"#,
+            ),
+            call_settings_line(1, Some("hook:compactor"), "end_turn", COMPACTION_SETTINGS),
+        ]);
+        assert_eq!(
+            rows,
+            [
+                "hook:compactor  max_tokens 2000  driver_config none  2 calls  turn 0",
+                r#"hook:compactor  max_tokens 2000  driver_config {"reasoning_effort":"low"}  1 call  turn 1"#,
+            ]
+        );
+    }
+
+    /// A failed call is one of its group's calls.
+    #[test]
+    fn call_settings_rows_count_a_failed_call() {
+        let rows = call_settings_of(&[
+            call_settings_line(0, None, "end_turn", TURN_SETTINGS),
+            call_settings_line(1, None, "error", TURN_SETTINGS),
+        ]);
+        assert_eq!(
+            rows,
+            [
+                r#"agent  max_tokens 4096  driver_config {"reasoning_effort":"high"}  2 calls  turns 0, 1"#
+            ]
+        );
+    }
+
+    /// With no line naming its settings — a `transport: process` session, or an older runtime's
+    /// trace — there are no rows and so no section.
+    #[test]
+    fn call_settings_rows_are_empty_when_no_line_names_its_settings() {
+        let rows = call_settings_of(&[
+            call_settings_line(0, None, "end_turn", ""),
+            call_settings_line(1, None, "end_turn", ""),
+        ]);
+        assert!(rows.is_empty(), "{rows:?}");
     }
 
     const UNENDED_START: &str = r#"{"event_type":"session_start","session_id":"ses_child","timestamp":1791000000000,"capsule_name":"worker","capsule_version":"0.1.0","model":"m","max_turns":5}"#;

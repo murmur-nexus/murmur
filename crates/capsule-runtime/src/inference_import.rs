@@ -25,7 +25,8 @@ use crate::{
     runtime::{invoke_tool_component, ToolA2aWiring, ToolInvokeEnv},
     spend::{SpendMeter, SpendRefusal},
     trace::{
-        InferenceOrigin, INFERENCE_ERROR_CREDENTIAL_REJECTED, INFERENCE_ERROR_DRIVER_ERROR,
+        recorded_driver_config, InferenceCallSettings, InferenceOrigin,
+        INFERENCE_ERROR_CREDENTIAL_REJECTED, INFERENCE_ERROR_DRIVER_ERROR,
         INFERENCE_ERROR_DRIVER_FAILED, INFERENCE_ERROR_MALFORMED_RESPONSE,
     },
     types::CapabilityPolicy,
@@ -61,6 +62,8 @@ pub(crate) struct HookInferenceRecord {
     pub(crate) usage: Option<DriverUsage>,
     /// Why the call failed. `Some` exactly when `decision` is `"error"`.
     pub(crate) failure: Option<HookInferenceFailure>,
+    /// The cap the payload carried and the driver config the call ran under, failed or not.
+    pub(crate) settings: InferenceCallSettings,
 }
 
 /// Why one `run-inference` call failed: what the guest is told, and what the trace records.
@@ -139,6 +142,9 @@ pub(crate) struct HookInferenceCtx {
     /// The session's inference gateway, so a hook's `run-inference` reaches the provider exactly
     /// as the agent loop's own turns do. Never another artifact's gateway.
     pub(crate) gateway: Option<Arc<crate::credential_gateway::CredentialGateway>>,
+    /// Every gateway the session holds, so a record's `driver_config` is redacted of every
+    /// credential value the session holds, not only the inference gateway's.
+    pub(crate) gateways: crate::credential_gateway::GatewayTable,
     /// The session's formation membership, so the driver's guest reaches the callees its
     /// environment names exactly as the agent loop's own driver does.
     pub(crate) formation: Option<Arc<crate::formation_credentials::FormationMember>>,
@@ -202,8 +208,13 @@ impl HookInferenceCtx {
             }
         };
 
+        let inference_env = self.env_for(purpose);
+        let settings = InferenceCallSettings {
+            max_output_tokens,
+            driver_config: recorded_driver_config(inference_env, |text| self.gateways.redact(text)),
+        };
         let started = Instant::now();
-        let outcome = self.dispatch(payload_json, self.env_for(purpose)).await;
+        let outcome = self.dispatch(payload_json, inference_env).await;
         let duration_ms = started.elapsed().as_millis() as u64;
 
         let (output_tokens, usage, failure, result) = match outcome {
@@ -254,6 +265,7 @@ impl HookInferenceCtx {
             duration_ms,
             usage,
             failure,
+            settings,
         });
 
         result
@@ -898,6 +910,7 @@ mod tests {
             network_allow_rules: Vec::new(),
             driver_grant: None,
             gateway: None,
+            gateways: Default::default(),
             formation: None,
             spend,
             records: std::sync::Mutex::new(Vec::new()),
@@ -1221,6 +1234,70 @@ mod tests {
         ctx.compaction_inference_env = compaction.clone();
         assert_eq!(ctx.env_for(LIFECYCLE), session.as_slice());
         assert_eq!(ctx.env_for(COMPACTION), compaction.as_slice());
+    }
+
+    /// Each buffered record carries the cap its payload sent and the driver config its driver ran
+    /// under: the compaction cap and environment for a compaction call, the lifecycle cap and the
+    /// session's environment otherwise, and a failed call's own.
+    #[test]
+    fn run_inference_records_each_calls_cap_and_driver_config() {
+        const COMPACTION_CAP: u32 = 2000;
+        let config_env = |config: &str| {
+            vec![(
+                "MURMUR_INFERENCE_DRIVER_CONFIG".to_string(),
+                config.to_string(),
+            )]
+        };
+        let settings = |cap: u32, effort: &str| InferenceCallSettings {
+            max_output_tokens: cap,
+            driver_config: Some(serde_json::json!({ "reasoning_effort": effort })),
+        };
+        let dir = TempDir::new().unwrap();
+        let engine = engine();
+        let with_envs = |mut ctx: HookInferenceCtx| {
+            ctx.output_caps = output_caps(Some(COMPACTION_CAP));
+            ctx.inference_env = config_env(r#"{"reasoning_effort":"high"}"#);
+            ctx.compaction_inference_env = config_env(r#"{"reasoning_effort":"low"}"#);
+            ctx
+        };
+
+        let ctx = with_envs(self::ctx(
+            &engine,
+            dir.path(),
+            driver_double(&engine, 0, CANNED),
+        ));
+        block_on(ctx.run("hook:compactor", COMPACTION, request(None))).unwrap();
+        block_on(ctx.run("hook:summary", LIFECYCLE, request(None))).unwrap();
+        let recorded: Vec<(String, InferenceCallSettings)> = ctx
+            .drain_records()
+            .into_iter()
+            .map(|record| (record.origin.source, record.settings))
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                (
+                    "hook:compactor".to_string(),
+                    settings(COMPACTION_CAP, "low")
+                ),
+                ("hook:summary".to_string(), settings(PRIMARY_CAP, "high")),
+            ]
+        );
+
+        let failing = with_envs(self::ctx(
+            &engine,
+            dir.path(),
+            driver_double(
+                &engine,
+                2,
+                r#"{"stop_reason":"error","error":"HTTP 500: boom"}"#,
+            ),
+        ));
+        block_on(failing.run("hook:compactor", COMPACTION, request(None))).expect_err("an error");
+        let records = failing.drain_records();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].failure.is_some());
+        assert_eq!(records[0].settings, settings(COMPACTION_CAP, "low"));
     }
 
     /// A spend ceiling refuses a hook's completion before dispatch — both a ceiling too small for
