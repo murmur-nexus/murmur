@@ -293,9 +293,10 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
 
     capsule_runtime::report_eprintln!("mur new: generating manifest...");
 
-    // Run the generator synchronously. The capsule reads skill.md via murmur/tool-editor,
-    // discovers artifacts via murmur/tool-registry-search, generates the manifest, and writes
-    // it to out/murmur.yaml. The session exits via after_task: exit.
+    // Run the generator synchronously. The capsule calls the skill-create-manifest skill for its
+    // guide, discovers artifacts via murmur/tool-registry-search, generates the manifest, and
+    // writes it to out/murmur.yaml with murmur/tool-editor's write_file operation. The session
+    // exits via after_task: exit.
     let launched = launch_session(staged, |_url| {});
     // The agent's result text is in the generator's records directory, read before those
     // records go.
@@ -309,8 +310,8 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     }
     launched.map_err(CliError::from)?;
 
-    // Read the manifest written by the agent via write_file("out/murmur.yaml") into its work
-    // folder. Read through the work folder's root, so a link the generator left there is refused
+    // Read the manifest the agent wrote to out/murmur.yaml in its work folder, through
+    // tool-editor's write_file operation. Read through the work folder's root, so a link the generator left there is refused
     // rather than followed.
     let manifest_yaml = match accessible_root.read_to_string("out/murmur.yaml") {
         Ok(Some(manifest_yaml)) => manifest_yaml,
@@ -604,15 +605,18 @@ fn check_artifacts_installed(
 }
 
 /// The prompt for the generator capsule. `index` is the registry-search tool's `index` input,
-/// shown in the example call.
+/// shown in the example call. Every tool it names is the tool name of a [`GENERATOR_ARTIFACTS`]
+/// entry, the name the model is offered it under.
 fn build_task_prompt(task: &str, index: &str, _inf: &InferenceConfig) -> String {
+    let [search, editor, skill] =
+        GENERATOR_ARTIFACTS.map(|a| murmur_artifact::tool_name_of(a.name));
     format!(
         r#"Step 1 — Read your manifest generation guide:
-Call read_file with path "murmur-runtime/tools/skill-create-manifest/skill.md".
-Read the full contents before proceeding.
+Call the {skill} tool. It takes no input, and its result is your manifest generation guide.
+Read the full guide before proceeding.
 
 Step 2 — Search for available artifacts:
-Call the registry search tool with a query relevant to the task.
+Call the {search} tool with a query relevant to the task.
 Example: {{"query": "git editor shell", "index": {index}}}
 Pass this index on every search call.
 Each result names an artifact by its full <scope>/<name> and lists its versions newest first.
@@ -621,13 +625,13 @@ Use each artifact's full <scope>/<name>, at the newest version the results list 
 Step 3 — Generate the manifest:
 Task: {task}
 
-Follow all guidance from the skill file. The manifest must pass `mur build` validation.
+Follow all guidance in the guide. The manifest must pass `mur build` validation.
 Prefer murmur/tool-git and murmur/tool-editor over granting bash shell access.
 Name every artifact by its full <scope>/<name>, at the newest version the registry search lists.
 Include runtime: tool at the top level.
 
 Step 4 — Write the manifest:
-Call write_file with path "out/murmur.yaml" and the YAML content.
+Call the {editor} tool with operation write_file, dest_path "out/murmur.yaml" and content set to the YAML.
 Do not include markdown fences in the file content — write raw YAML only.
 Output only the word DONE when finished.
 "#,
@@ -1315,29 +1319,42 @@ mod tests {
         }
     }
 
+    /// Every tool the prompt calls is one the generator declares, under the name it is
+    /// offered by.
     #[test]
-    fn build_task_prompt_instructs_read_file() {
+    fn build_task_prompt_calls_only_the_generator_tools() {
         let prompt = build_task_prompt("summarise a document", DEFAULT_INDEX_URL, &anthropic_inf());
-        assert!(
-            prompt.contains("read_file"),
-            "prompt must instruct agent to call read_file"
-        );
-        assert!(
-            prompt.contains("murmur-runtime/tools/skill-create-manifest/skill.md"),
-            "prompt must reference skill.md path"
-        );
+        let offered: Vec<&str> = GENERATOR_ARTIFACTS
+            .iter()
+            .map(|artifact| murmur_artifact::tool_name_of(artifact.name))
+            .collect();
+        let called: Vec<&str> = prompt
+            .split("Call the ")
+            .skip(1)
+            .map(|rest| rest.split(" tool").next().unwrap())
+            .collect();
+        assert_eq!(called.len(), 3, "prompt:\n{prompt}");
+        for name in &called {
+            assert!(offered.contains(name), "{name:?} is not a generator tool");
+        }
+        for name in &offered {
+            assert!(called.contains(name), "{name:?} is never called");
+        }
+        assert!(prompt.contains("It takes no input"), "prompt:\n{prompt}");
+        assert!(!prompt.contains("Call read_file"), "prompt:\n{prompt}");
     }
 
     #[test]
-    fn build_task_prompt_instructs_write_file() {
+    fn build_task_prompt_writes_through_tool_editor() {
         let prompt = build_task_prompt("summarise a document", DEFAULT_INDEX_URL, &anthropic_inf());
         assert!(
-            prompt.contains("write_file"),
-            "prompt must instruct agent to call write_file"
+            prompt.contains("Call the tool-editor tool with operation write_file"),
+            "prompt:\n{prompt}"
         );
-        assert!(
-            prompt.contains("out/murmur.yaml"),
-            "prompt must reference out/murmur.yaml"
-        );
+        assert!(prompt.contains("operation write_file"));
+        assert!(prompt.contains("dest_path \"out/murmur.yaml\""));
+        assert!(prompt.contains("out/murmur.yaml"));
+        assert!(!prompt.contains("Call write_file with path"));
+        assert!(!prompt.contains("Call read_file"));
     }
 }

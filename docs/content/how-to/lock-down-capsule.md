@@ -320,14 +320,16 @@ session: ses_019ed2af53da75c2aefee84ee10c34af
 status:  ok
 ```
 
-The capsule's `MURMUR.md`, which the agent reads at `$MURMUR_RUNTIME_DIR/MURMUR.md`, lists the binaries it has access to under **Running Shell Commands**:
+The capsule's `MURMUR.md`, which the agent reads at `$MURMUR_RUNTIME_DIR/MURMUR.md`, lists the binaries it has access to under **Running Shell Commands**. On a Linux host whose [tier](../reference/containment.md#subprocess-enforcement-tiers) enforces the list, it also names the programs a command can start:
 
 ```text
 ## Running Shell Commands
 
-Shell interpreter(s) available: bash. Pass a complete command string in the `command` field — the interpreter runs it via `-c`.
+Shell interpreter(s) available: bash. The `command` field is a complete command line, which the interpreter runs with `-c`.
 
-Direct binaries exposed as tools: git. Each appears as a named tool in the Installed Tools section above. Call it directly — put the arguments (not the binary name) in the `command` field.
+Direct binaries exposed as tools: git. Each is a tool of the same name, listed under Installed Tools. Its `command` field holds the binary's arguments and not the binary name; no shell runs it, so nothing in it is expanded.
+
+Programs a command can start: bash, git. The kernel refuses to start any other program, whatever starts it: the start fails with permission denied, and a shell reports exit status 126. A file in the work folder cannot be started as a program. A shell interpreter's builtins run inside it; any other program a shell command runs is started like one, so it is refused unless it is listed here.
 ```
 
 Each shell invocation the agent makes appears in the session's [`trace.jsonl`](../reference/workdir.md#records-directory) as a `shell` event:

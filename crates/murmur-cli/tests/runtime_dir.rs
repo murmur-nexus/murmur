@@ -1472,6 +1472,44 @@ fn work_folder_ceiling_stated_without_workdir_is_enforced() {
     );
 }
 
+/// MURMUR.md names the programs a command can start, in the manifest's order, and what happens
+/// to any other: `date`, which `SHELL_ALLOW` leaves out, is refused and its shell exits 126.
+#[test]
+#[allow(clippy::print_stdout)]
+fn murmur_md_states_the_allowlist_and_an_unlisted_program_exits_126() {
+    const TEST: &str = "murmur_md_states_the_allowlist_and_an_unlisted_program_exits_126";
+    if common::skip_without_host_support(TEST) {
+        return;
+    }
+    let server = common::ScriptedServer::start(vec![
+        cat_murmur_md(1),
+        tool_call(2, "toolu_date", "bash", bash("date")),
+        end_turn("done"),
+    ]);
+    let p = project(&server.endpoint, &Spec::default()).unwrap();
+    Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", p.home.path())
+        .args([
+            "run",
+            "--manifest",
+            p.manifest.to_str().unwrap(),
+            "--task",
+            TASK,
+        ])
+        .assert()
+        .success();
+    let murmur_md = result_text(&server, "toolu_md");
+    let section = md_section(&murmur_md, "Running Shell Commands");
+    let programs = format!("Programs a command can start: {}.", SHELL_ALLOW.join(", "));
+    assert!(section.contains(&programs), "{section}");
+    assert!(section.contains("exit status 126"), "{section}");
+    let date = result_text(&server, "toolu_date");
+    assert!(date.contains("Exit code: 126"), "{date}");
+    assert!(date.contains("Permission denied"), "{date}");
+    println!("{TEST}: ran; MURMUR.md states the allowlist and `date` exited 126");
+}
+
 // ── the task's way in ────────────────────────────────────────────────────────
 
 /// One session whose single call cats the runtime directory's task, with `prepare` run on the

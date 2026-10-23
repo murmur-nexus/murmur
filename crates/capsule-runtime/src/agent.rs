@@ -4991,6 +4991,28 @@ mod tests {
         );
     }
 
+    /// An http capsule with no `inference.max_turns` has no turn cap, and its `Limits:` line
+    /// names only the per-command limits.
+    #[test]
+    fn augmented_system_prompt_states_no_turn_limit_when_none_is_set() {
+        let inference = murmur_artifact::InferenceConfig {
+            max_turns: None,
+            ..crate::capsule_facts::test_http_inference()
+        };
+        let facts = CapsuleFacts::resolve(
+            &crate::types::CapabilityPolicy::default(),
+            &inference,
+            &murmur_artifact::LifecycleConfig::default(),
+            Vec::new(),
+        );
+        let prompt = build_augmented_system_prompt("my-capsule", "1.0.0", None, None, &facts, None);
+        assert!(
+            prompt.contains("\nLimits: 2 GiB memory and 3600 s CPU time per command.\n"),
+            "got:\n{prompt}"
+        );
+        assert!(!prompt.contains("turns"), "got:\n{prompt}");
+    }
+
     /// A launch with `--capsule` read no manifest file, and the runtime-files line names none.
     #[test]
     fn augmented_system_prompt_names_no_manifest_for_a_launch_that_read_none() {

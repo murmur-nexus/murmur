@@ -2925,6 +2925,13 @@ pub fn stage_session(
             work_folder_ceiling: (inference.transport != "process")
                 .then_some(request.capability_policy.resources.workdir_max_bytes),
             runtime_dir_tools,
+            // The tier `launch_session`'s `ShellEnforcement::resolve` applies from this same probe
+            // and floor, for either transport: the process bridge dispatches shell calls through
+            // the same enforcement.
+            exec: murmur_md::ExecFacts::resolve(
+                &request.capability_policy,
+                sandbox::applied_tier(enforcement_tier, request.declared_containment_floor),
+            ),
         };
         murmur_md::write_murmur_md(&runtime_root, &inputs);
         inputs
@@ -10910,10 +10917,10 @@ pub(crate) const DELEGATE_TASK_TOOL: &str = "delegate-task";
 /// the sub-capsule is told; which fields [`delegate_task_result_data`] returns and why `output`
 /// and `result_path` are absent; that once the turn ends the task waits for every sub-capsule and
 /// continues in this conversation with each outcome, naming the result file; that the delegation
-/// deadline ends a sub-capsule still running; that there is nothing to poll; and that a task that
-/// ends any other way ends its sub-capsules with it. It is the same on every lifecycle and
-/// identical on every launch for a given `spawn_allow`, because it sits in the cached prompt
-/// prefix.
+/// deadline ends a sub-capsule still running; that no tool reports on a running sub-capsule; and
+/// that a task that ends any other way ends its sub-capsules with it. It is the same on every
+/// lifecycle and identical on every launch for a given `spawn_allow`, because it sits in the
+/// cached prompt prefix.
 fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
     // The bare parts, which the manifest parser keeps unique: the model never sees a scope.
     let bare: Vec<&str> = spawn_allow
@@ -10943,8 +10950,7 @@ fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
          outcome: its `delegation_id`, its final status, and either the path of its result \
          file, which you read for its answer, or `result: none` when it wrote no file. A \
          sub-capsule still running at the delegation deadline is ended and reported as \
-         `{terminated}`. There is nothing to poll: start every delegation this task needs, then \
-         end your turn. A task that is cancelled, or that ends any other way while a sub-capsule \
+         `{terminated}`. No tool reports on a sub-capsule while it runs. A task that is cancelled, or that ends any other way while a sub-capsule \
          is still running, ends that sub-capsule with it."
     );
     native_tool_manifest_yaml(DELEGATE_TASK_TOOL, description, schema)
@@ -12971,7 +12977,7 @@ mod tests {
             "this task waits for every sub-capsule it started",
             "the path of its result file",
             "`result: none`",
-            "There is nothing to poll",
+            "No tool reports on a sub-capsule while it runs",
             "ends that sub-capsule with it",
         ] {
             assert!(
@@ -12985,6 +12991,8 @@ mod tests {
             "Returns its answer",
             "arrives later as a separate task",
             "carry on with other work",
+            concat!("nothing to ", "poll"),
+            "then end your turn",
         ] {
             assert!(
                 !description.contains(forbidden),

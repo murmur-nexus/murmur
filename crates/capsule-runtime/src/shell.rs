@@ -345,7 +345,7 @@ pub(crate) fn shell_tool_manifest_yaml(binary: &str) -> String {
     let description = if is_shell_interpreter(binary) {
         format!("Run a shell command via {binary} in the capsule workdir. The `command` field is passed to {binary} via -c.")
     } else {
-        format!("Run {binary} in the capsule workdir. The `command` field is the argument list — omit the binary name itself (pass -s http://example.com, not {binary} -s http://example.com).")
+        format!("Run {binary} in the capsule workdir. The `command` field holds {binary}'s arguments and not the binary name. It is split into arguments at whitespace; single or double quotes group words, and a backslash escapes the next character. No shell runs it, so nothing in it is expanded.")
     };
 
     format!(
@@ -1503,6 +1503,63 @@ mod tests {
         assert_eq!(result.exit_code, 0, "stderr was: {}", result.stderr);
     }
 
+    /// What MURMUR.md's `## Running Shell Commands` states on a kernel tier: a program outside
+    /// `shell.allow` has no Landlock `Execute` rule, so a shell that tries to start it gets
+    /// `EACCES` and reports exit status 126. Listing the program is what lets it start.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_program_outside_the_allowlist_is_refused_with_exit_126() {
+        const TEST: &str = "a_program_outside_the_allowlist_is_refused_with_exit_126";
+        if crate::network_namespace::skip_without_egress_namespace(TEST) {
+            return;
+        }
+        let run = |allow: &[&str]| {
+            let temp = tempdir().unwrap();
+            let policy = CapabilityPolicy {
+                shell_allow: allow.iter().map(|b| b.to_string()).collect(),
+                ..CapabilityPolicy::default()
+            };
+            let enforcement = ShellEnforcement::resolve(
+                &policy,
+                murmur_artifact::ContainmentClass::Scoped,
+                crate::sandbox::HostProbe::probe(),
+            )
+            .unwrap()
+            .with_runtime_dir(crate::sandbox::test_runtime_dir(temp.path()), None);
+            if enforcement.tier != crate::sandbox::EnforcementTier::KernelFull {
+                crate::runtime_err!(
+                    "[SKIP-HOST] {TEST}: this host resolves {:?}, the test needs KernelFull",
+                    enforcement.tier
+                );
+                return None;
+            }
+            let result = execute_shell(
+                "bash",
+                &["-c", "cat /dev/null"],
+                &[],
+                &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+                &policy,
+                &enforcement,
+            )
+            .expect("bash must start");
+            Some(result)
+        };
+
+        let Some(refused) = run(&["bash"]) else {
+            return;
+        };
+        assert_eq!(refused.exit_code, 126, "stderr was: {}", refused.stderr);
+        assert!(
+            refused.stderr.contains("Permission denied"),
+            "stderr was: {}",
+            refused.stderr
+        );
+
+        let allowed = run(&["bash", "cat"]).expect("the tier did not change between runs");
+        assert_eq!(allowed.exit_code, 0, "stderr was: {}", allowed.stderr);
+        crate::runtime_err!("{TEST}: ran on KernelFull; [bash] exited 126, [bash, cat] exited 0");
+    }
+
     /// With `RLIMIT_NPROC` left alone, `pids.max` is the only process bound on a scoped capsule,
     /// and it has to stop a fork bomb by itself and be named as what did. The children sleep
     /// rather than exit so every one of them holds a task in the scope until the loop gives up.
@@ -2375,6 +2432,33 @@ mod tests {
             Some("tool"),
             "non-interpreter manifest must have runtime: tool so inventory picks it up"
         );
+    }
+
+    /// A direct binary's description is the rule alone, a pure function of the name: it sits in
+    /// the tool array of every request, so it carries no example and no per-launch input.
+    #[test]
+    fn a_direct_binary_description_states_the_argument_rule_and_nothing_else() {
+        for binary in ["curl", "git", "jq", "python3"] {
+            let yaml = shell_tool_manifest_yaml(binary);
+            let value: serde_norway::Value = serde_norway::from_str(&yaml)
+                .unwrap_or_else(|e| panic!("{binary} manifest must be valid YAML: {e}"));
+            let description = value
+                .get("description")
+                .and_then(|v| v.as_str())
+                .expect("the manifest has a description");
+            assert_eq!(
+                description,
+                format!(
+                    "Run {binary} in the capsule workdir. The `command` field holds {binary}'s \
+                     arguments and not the binary name. It is split into arguments at whitespace; \
+                     single or double quotes group words, and a backslash escapes the next \
+                     character. No shell runs it, so nothing in it is expanded."
+                )
+            );
+            assert!(!description.contains("example.com"), "{description}");
+            assert!(!description.contains(" -s "), "{description}");
+            assert_eq!(yaml, shell_tool_manifest_yaml(binary));
+        }
     }
 
     /// A caller that stops waiting demotes its command at once, through the same path the grace

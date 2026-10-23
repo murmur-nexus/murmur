@@ -39,7 +39,8 @@ mur run
 ```
 
 Each task runs an inference loop: a sequence of LLM calls that continues until the model
-signals it is done, or the per-capsule turn limit is reached. One *turn* is one round-trip to
+signals it is done, or until it reaches the turn limit `inference.max_turns` sets, when the
+manifest sets one. One *turn* is one round-trip to
 the inference driver — the runtime sends the current conversation history, tool list, and
 system prompt; the driver returns a response. If the model requests a tool call, the runtime
 executes it, appends the result, and starts the next turn. When the model returns `end_turn`
@@ -59,7 +60,7 @@ and the installed tools. It is an inventory of the session:
 | Limits | The limits the runtime enforces, the same text the `[Capsule]` block states; `capabilities.resources.workdir_max_bytes` for every `transport: http` session, the [ceiling](../reference/workdir.md#work-folder-ceiling) on the work folder, `$HOME` and `$TMPDIR` together; the context budget |
 | Runtime Directory | The entries of the runtime directory that exist when the file is written |
 | Installed Tools, Installed Skills | Every tool in the model's tool list, under its tool name, and every skill |
-| Running Shell Commands | The binaries `capabilities.shell.allow` declares |
+| Running Shell Commands | The binaries `capabilities.shell.allow` declares and how each tool reads its `command` field; on the [tiers that enforce it](../reference/containment.md#subprocess-enforcement-tiers), which programs a command can start and that the kernel refuses any other with exit status 126 |
 
 The runtime rewrites it at launch and after every pull or removal that commits —
 [`pull-artifact`, `remove-artifact`](../reference/runtime-provided-tools.md#pull-artifact),
@@ -129,8 +130,8 @@ runtime's per-command limits.
 
 ## Turn limit (`inference.max_turns`)
 
-The turn limit caps how many inference calls a single task may make. It defaults to **10**
-and is set per-capsule in the manifest. A hook's `run-inference` call — a compaction hook's
+The turn limit caps how many inference calls a single task may make. The manifest sets it per
+capsule. A manifest that omits it sets no turn limit, and its `Limits:` line names none. A hook's `run-inference` call — a compaction hook's
 summary, say — is an inference call the task made, so it counts as well: the task's turn count,
 `task_end.turns`, includes it. When the limit is reached, the loop exits with
 `exit_status: "max_turns_reached"`, and the task's failure message names the limit, the turns the
