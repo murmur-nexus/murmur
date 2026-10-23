@@ -132,8 +132,8 @@ pub use network_namespace::{
     EgressNamespaceBlocker, EgressNamespaceFailure,
 };
 pub use records_dir::{
-    records_dir_root, records_group, records_group_under, RecordsDir, HOOKS_SUBDIR,
-    RECORDS_DIR_ENV, RECORDS_DIR_NAME,
+    records_dir_root, records_group, records_group_under, RecordsDir, HOME_SUBDIR, HOOKS_SUBDIR,
+    RECORDS_DIR_ENV, RECORDS_DIR_NAME, RESULTS_SUBDIR, RESULT_FILE,
 };
 pub use runtime_dir::{
     runtime_dir_inside_warning, runtime_dir_placement, RuntimeDirPlacement, RUNTIME_DIR_ENV,
@@ -285,9 +285,9 @@ pub use workdir_fs::{
 // The declaration `--explain-scope` prints and `trace.jsonl` carries as
 // `session_start.effective_grants.runtime_writes`. Flat, on the same terms as the other report
 // types: a consumer of a scope report reads these names off it.
+pub use runtime_dir::SESSION_ID_PLACEHOLDER;
 pub use workdir_writes::{
     render_runtime_writes, RuntimeWriteCondition, RuntimeWriteKind, RuntimeWriteReport,
-    RuntimeWriteScope, SESSION_ID_PLACEHOLDER,
 };
 // The served version of each `murmur:*` package, and the WIT levels: the committed, numbered sets
 // of those versions, the newest of which is the one this host serves.

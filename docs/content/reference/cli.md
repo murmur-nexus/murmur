@@ -33,7 +33,7 @@ Every `mur` command, its flags, and what each one does.
 | `mur trace diff` | Side-by-side metric comparison of two sessions |
 | `mur trace report` | Aggregate statistics across a set of sessions |
 | `mur trace list` | List the sessions of one workdir root, newest first |
-| `mur trace rm` | Remove one ended session's records directory, session directory and stale running record |
+| `mur trace rm` | Remove one ended session's records directory, the work folder the runtime created for it, and its stale running record |
 | `mur eval show` | Human-readable (or JSON) summary of a single `eval.jsonl` session |
 | `mur eval diff` | Side-by-side scorer comparison of two eval sessions |
 | `mur eval run` | Drive a multi-case dataset and collect `eval.jsonl` per run |
@@ -176,7 +176,7 @@ A session whose manifest declares `control:` also holds its control token beside
 [Control surface](control-surface.md#token).
 
 Each record carries the session id, the capsule address, the process id and its start time, the
-capsule name and version, the session workdir as `workdir`, the session's
+capsule name and version, the session's work folder as `workdir`, the session's
 [records directory](workdir.md#records-directory) as `records_dir`, whether the session outlives
 its launcher, and the time it started. It carries nothing from the environment: no API key, no
 granted variable.
@@ -505,7 +505,7 @@ The generator automatically infers whether the task is:
 
 **Generator behavior:**
 
-The generator reads its manifest guide, calls `murmur/tool-registry-search` to find artifacts for the task, and writes the manifest to `out/murmur.yaml` in its own session workdir. The CLI reads that file, validates the YAML, then writes it to `murmur.yaml` in the current directory through a temporary file and a rename, so an interrupted run leaves no partial manifest. A generator that writes no `out/murmur.yaml` fails with `E-NEW-001`, quoting whatever the agent did produce.
+The generator reads its manifest guide, calls `murmur/tool-registry-search` to find artifacts for the task, and writes the manifest to `out/murmur.yaml` in its own work folder. The CLI reads that file, validates the YAML, then writes it to `murmur.yaml` in the current directory through a temporary file and a rename, so an interrupted run leaves no partial manifest. A generator that writes no `out/murmur.yaml` fails with `E-NEW-001`, quoting whatever the agent did produce.
 
 If the generated YAML fails validation, nothing is written to CWD and the error is printed to stderr.
 
@@ -1342,7 +1342,7 @@ mur run --roster [<path>] [--task <path-or-text>] [--json]
 | `--resume` | `@1` when the flag is given with no value | Session whose conversation this run continues, as a [session address](#session-addresses). Resolves that session's context id and runs under it, so it is `--context` with the id looked up for you. Loads the [conversation record](workdir.md#the-conversation-record) — or, under [`transport: process`](manifest.md#transport-process), hands the harness the session id that context's [harness session map](workdir.md#harness-session-map) holds — even when the capsule declares `lifecycle.conversation: stateless`. A context with neither refuses the launch with [`E-RUN-017`](diagnostics.md#e-run-017). Passing it together with `--context` refuses the launch with [`E-RUN-015`](diagnostics.md#e-run-015). Reads the named session's `trace.jsonl` only as far as its first task, so a session whose process was killed — leaving the file ending mid-record — still resumes. [`mur trace show`](#mur-trace-show) over that same file skips the torn last line and says so |
 | `--resume-mode` | `full` | How `--resume` puts the loaded conversation in front of the model. `full` loads the record verbatim; `compact` runs the capsule's `on-compaction` hook over it first and continues from the summary, which is the answer when the conversation would not fit the context window at all. `full` is often the cheaper of the two: a verbatim reload can hit the provider's prompt cache, while compaction changes the prefix from the first altered token, guarantees a cache miss, and costs an extra inference call to produce the summary. `compact` with no hook bound to `on-compaction` refuses the launch with [`E-RUN-018`](diagnostics.md#e-run-018), and `compact` under [`transport: process`](manifest.md#transport-process) — where the harness holds the history and murmur has none to summarize — with [`E-RUN-037`](diagnostics.md#e-run-037) |
 | <span id="run-forget-session">`--forget-session`</span> | off | Drop the harness session `--context` names, then run this launch's first task as a new conversation under the same context id. The answer to [`E-RUN-036`](diagnostics.md#e-run-036), where the harness no longer holds the conversation a context names and every later task in it fails the same way. The entry is deleted from the [harness session map](workdir.md#harness-session-map) and the run's trace records a `harness_session_forgotten` event naming the context, the id that was dropped and `requested_by: "cli"`; asked for a context with no entry, it drops nothing and records nothing. Applies to the launch's first task and to no later one. Requires `--context`, and cannot be combined with `--resume`, which asks for the opposite. Only [`transport: process`](manifest.md#transport-process) has a harness session, so every other transport refuses the launch with [`E-RUN-039`](diagnostics.md#e-run-039) |
-| `--workdir` | `<manifest-dir>/workdir/<session-id>` | Directory mounted as the capsule's accessible workspace. When passed, the session workdir is created inside it under `.murmur/<session-id>`, and the session's records are kept under `~/.murmur/records/<this directory>/`. See [Session workdir](workdir.md) |
+| `--workdir` | `<manifest-dir>/workdir/<session-id>` | The capsule's [work folder](workdir.md#work-folder). The runtime creates nothing in it, and the session's records are kept under `~/.murmur/records/<this directory>/`. See [Session directories](workdir.md) |
 | `--bind` | `127.0.0.1` | Address the capsule's HTTP server binds. Use `0.0.0.0` to accept connections from other machines. An address off loopback on a capsule declaring no [`network.authentication`](manifest.md#field-network-authentication) prints [`W-SEC-032`](diagnostics.md#w-sec-032) on stderr |
 | `--json` | off | Emit launch info as a single JSON line instead of human-readable output. Takes precedence over `--verbose` |
 | `--verbose`, `-v` | off | Add `workdir:`, `records:`, `manifest:`, `driver:` and `skills:` to the startup lines, and `formation:` for a [formation member](#mur-run-formation) |
@@ -1350,7 +1350,7 @@ mur run --roster [<path>] [--task <path-or-text>] [--json]
 | `--lifecycle-after-task` | — | Override `lifecycle.after_task` (`exit`\|`sleep`). The resolved value is the one [`W-SEC-024`](diagnostics.md#w-sec-024) reports, so `--explain-scope` previews the warning this override produces; a value outside the two is refused there as on a real run |
 | `--no-env-file` | off | Skip auto-loading the workspace-root `.env` file for this invocation. Recommended default for CI/CD pipelines |
 | `--containment` | — | Require at least this containment class (`advisory`\|`scoped`\|`sealed`). Combines with the manifest's `capabilities.containment` and the workspace `containment` config by taking the strongest of the three — this flag can only raise the effective floor, never lower one another source already set. See [Containment class](containment.md#field-containment) |
-| `--explain-scope` | off | Print the effective grant set and the declared/achieved containment classes, then exit `0` without staging or launching anything — no artifact pull, no component compile, no workdir. Reports even when the declared floor is not met. The `Resource plane` block, and `io_max` under `--json`, report whether the declared [`cgroup_io_bytes_per_sec`](resource-limits.md#io-max-report) ceiling applies on this host. Also lists every path the runtime writes into the workdir, as `runtime_writes` under `--json` — see [Session workdir](workdir.md). A `Runtime directory` block after `Containment` gives the session's [runtime directory](workdir.md#runtime-directory) and whether the capsule's commands can change it, a `Records directory` block after it does the same for the [records directory](workdir.md#records-directory), and a `Temporary folder` block after that gives the [session's temporary folder](containment.md#temp-folder), the value of `TMPDIR`, and whether a literal `/tmp` reaches the folder; `--json` carries them as `runtime_dir`, `records_dir` and `temp_dir`. Refused with [`E-IO-004`](diagnostics.md#e-io-004) when `HOME` cannot hold `~/.murmur`, as the launch would be. Unless the session composes a sealed root, a `Not protected here` block prints under `Containment`, naming what its filesystem mechanism leaves unrestricted and why a `~`-based probe is not evidence of containment — see [Testing containment honestly](containment.md#testing-containment); `--json` carries the same statements as `filesystem_boundary` |
+| `--explain-scope` | off | Print the effective grant set and the declared/achieved containment classes, then exit `0` without staging or launching anything — no artifact pull, no component compile, no workdir. Reports even when the declared floor is not met. The `Resource plane` block, and `io_max` under `--json`, report whether the declared [`cgroup_io_bytes_per_sec`](resource-limits.md#io-max-report) ceiling applies on this host. Also lists every path the runtime writes into the work folder in a `Runtime writes` block — the line `paths are relative to the work folder`, then `- peer-in (directory, peer-fetch)` and `- out (directory, script-session)` — and as `runtime_writes` under `--json`; see [What the capsule changed](workdir.md#what-the-capsule-changed). A `Runtime directory` block after `Containment` gives the session's [runtime directory](workdir.md#runtime-directory) and whether the capsule's commands can change it, a `Records directory` block after it does the same for the [records directory](workdir.md#records-directory), and a `Temporary folder` block after that gives the [session's temporary folder](containment.md#temp-folder), the value of `TMPDIR`, and whether a literal `/tmp` reaches the folder; `--json` carries them as `runtime_dir`, `records_dir` and `temp_dir`. Refused with [`E-IO-004`](diagnostics.md#e-io-004) when `HOME` cannot hold `~/.murmur`, as the launch would be. Unless the session composes a sealed root, a `Not protected here` block prints under `Containment`, naming what its filesystem mechanism leaves unrestricted and why a `~`-based probe is not evidence of containment — see [Testing containment honestly](containment.md#testing-containment); `--json` carries the same statements as `filesystem_boundary` |
 | `--deadline` | — | End the session this many seconds after `mur run` started, staging included, whatever it is doing. A whole number from `1` to `315360000` (ten years). The runtime ends the session as a first [`SIGTERM`](#mur-run-sigterm) does, records `deadline_reached`, and exits with [`E-RUN-053`](diagnostics.md#e-run-053); see [The deadline](#mur-run-deadline). Requires an agent capsule: on a manifest with no `inference:` block the run fails with `error[E-IO-003]` before anything is staged. With `--roster`, the formation's one deadline, counted from the launcher's start |
 | `--system-prompt` | — | Replace the manifest's system prompt for this invocation only. Overrides `inference.system_prompt`, `inference.system_prompt_file` and `inference.system_prompt_artifact` alike, whichever the manifest used — and applies just as well when it declared none. The value is trimmed; an empty or whitespace-only value clears the prompt rather than setting one. `murmur.yaml` is not modified. Requires an agent capsule: on a manifest with no `inference:` block the run fails with `error[E-IO-003]` before anything is staged. Inert under `--explain-scope`. See [Override the prompt for a single run](../how-to/capsule-system-prompt.md#step-8-override-the-prompt-for-a-single-run) |
 
@@ -1370,7 +1370,7 @@ object the moment the capsule is addressable:
 | `pid` | always | The `mur run` process id |
 | `session_id` | always | The session id |
 | `name`, `version` | always | The capsule's name and version |
-| `workdir` | always | The accessible workdir |
+| `workdir` | always | The session's [work folder](workdir.md#work-folder) |
 | `records_dir` | always | The session's [records directory](workdir.md#records-directory), where its trace is |
 | `formation_id` | a [formation member](#mur-run-formation) | The formation id |
 | `auth` | an authenticated door | `"bearer"` |
@@ -1747,7 +1747,7 @@ mur ps --json
       "process_start": "9123456",
       "capsule_name": "planner",
       "capsule_version": "0.1.0",
-      "workdir": "/home/me/proj/.murmur/ses_019f01a9c3e47d1a9b2c3d4e5f6a7b8c",
+      "workdir": "/home/me/proj",
       "records_dir": "/home/me/.murmur/records/home/me/proj/ses_019f01a9c3e47d1a9b2c3d4e5f6a7b8c",
       "outlives_launcher": true,
       "started_at": "2026-10-20T09:12:44Z",
@@ -1792,7 +1792,7 @@ mur ps --json
 | `capsules[].process_start` | string | That process's start time, an opaque token local to this machine |
 | `capsules[].capsule_name` | string | `name:` from the manifest the session was launched from |
 | `capsules[].capsule_version` | string | `version:` from that manifest |
-| `capsules[].workdir` | string | The session workdir, as the record holds it |
+| `capsules[].workdir` | string | The session's [work folder](workdir.md#work-folder), as the record holds it |
 | `capsules[].records_dir` | string | The session's [records directory](workdir.md#records-directory) |
 | `capsules[].outlives_launcher` | boolean | Whether the capsule [survives the window that launched it](#outlives-launcher) |
 | `capsules[].started_at` | string | When the session started, RFC 3339 UTC, as the record holds it |
@@ -3365,16 +3365,19 @@ mur trace rm <session> [--workdir <dir>] [--json]
 | `--json` | off | Print one JSON object, the stable interface below, instead of one line per removal |
 
 `@N` and a suffix name a session in the root's records group, as [`mur trace list`](#mur-trace-list)
-lists it. A full `ses_` id is also accepted while only the session directory is left, so a session
-an earlier removal only half removed can be removed again.
+lists it. A full `ses_` id is also accepted while only the session's work folder is left, so a
+session an earlier removal only half removed can be removed again.
 
 What is removed, in this order:
 
 | What | Where | Removed when |
 |---|---|---|
-| Session directory | `<root>/.murmur/<session_id>` for a run given `--workdir <root>`, or else `<root>/<session_id>` for a run without `--workdir` | One of the two exists. `.murmur/<session_id>` is looked for first |
+| Work folder | `./workdir/<session_id>`, the folder the runtime created for a run without `--workdir` | `--workdir` is not passed, and the folder exists |
 | Records directory | `<records group>/<session_id>`, as `mur trace list` names it | It exists |
 | Stale running record | `~/.murmur/running/<session_id>.json` and its `.control` file | A [record](#running-capsule-records) names the session and its process is gone |
+
+With `--workdir`, only the records directory goes, with its `out/`, `home/`, `tmp/` and `children/`,
+and nothing in the operator's folder is touched.
 
 Both directories are removed without following a link. A link, or a file where a directory belongs,
 anywhere on the way is refused with [`E-RUN-050`](diagnostics.md#e-run-050), and nothing the link
@@ -3388,16 +3391,17 @@ refused with [`E-RUN-024`](diagnostics.md#e-run-024) and nothing is removed. End
 
 Nothing else is removed:
 
-- the records group, `<root>/.murmur/` and `<root>/.murmur/children/`
-- the session of any capsule this one delegated to
+- the records group
+- anything in a `--workdir` folder
+- the session of any capsule this one delegated to, apart from its work folder in `children/`
 - the [conversation record](workdir.md#the-conversation-record). A conversation spans every session
   that resumed it; [`mur conversation rm`](#mur-conversation-rm) removes one
 
 Without `--json`, it prints one line per removal:
 
 ```text
-removed session directory /home/me/proj/.murmur/ses_019f0193c7d871a5b2e30ff41a7c0ce1
-removed records /home/me/.murmur/records/home/me/proj/ses_019f0193c7d871a5b2e30ff41a7c0ce1
+removed work folder /home/me/proj/workdir/ses_019f0193c7d871a5b2e30ff41a7c0ce1
+removed records /home/me/.murmur/records/home/me/proj/workdir/ses_019f0193c7d871a5b2e30ff41a7c0ce1
 removed running record /home/me/.murmur/running/ses_019f0193c7d871a5b2e30ff41a7c0ce1.json
 ```
 
@@ -3406,8 +3410,8 @@ With `--json`, it prints one pretty-printed JSON object:
 ```json
 {
   "session_id": "ses_019f0193c7d871a5b2e30ff41a7c0ce1",
-  "records_dir": "/home/me/.murmur/records/home/me/proj/ses_019f0193c7d871a5b2e30ff41a7c0ce1",
-  "session_dir": "/home/me/proj/.murmur/ses_019f0193c7d871a5b2e30ff41a7c0ce1",
+  "records_dir": "/home/me/.murmur/records/home/me/proj/workdir/ses_019f0193c7d871a5b2e30ff41a7c0ce1",
+  "session_dir": "/home/me/proj/workdir/ses_019f0193c7d871a5b2e30ff41a7c0ce1",
   "running_record": null
 }
 ```
@@ -3416,7 +3420,7 @@ With `--json`, it prints one pretty-printed JSON object:
 |---|---|---|
 | `session_id` | string | The session that was removed |
 | `records_dir` | string or `null` | The records directory removed, absolute. `null` when there was none |
-| `session_dir` | string or `null` | The session directory removed, absolute. `null` when there was none |
+| `session_dir` | string or `null` | The work folder removed, absolute. Always `null` under `--workdir`, and `null` when there was none |
 | `running_record` | string or `null` | The stale running record removed. `null` when no record named the session |
 
 These keys are a stable interface. Each keeps its name, type and meaning. New keys may be added, and

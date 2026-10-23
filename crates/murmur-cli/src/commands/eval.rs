@@ -734,7 +734,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             }
         };
 
-        workdir = staged.workdir.clone();
+        workdir = staged.accessible_workdir.clone();
 
         if write_lock && !lock_written {
             let lock = MurmurLock {
@@ -772,7 +772,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             );
         }
 
-        let case_workdir = staged.workdir.clone();
+        let case_workdir = staged.accessible_workdir.clone();
         let case_eval = staged.records_dir.join(EVAL_RECORD_FILE);
         let case_session_id = staged.session_id.clone();
 

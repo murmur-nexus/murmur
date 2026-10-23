@@ -74,7 +74,7 @@ before the first task begins
 | `containment_declared` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the strongest class the manifest, workspace config or `--containment` asked for. Always present; `"advisory"` when none of them declared one |
 | `containment_achieved` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the class this host can enforce, capped by `workdir_exec`. Nothing in a manifest can raise it. See [Containment](containment.md) |
 | `userns_grant` | string \| null | Where this host's permission to create an unprivileged user namespace came from: `"apparmor_absent"`, `"restriction_disabled_host_wide"`, `"profile_confining"` or `"withheld"`. Always written; `null` only off Linux, where AppArmor does not exist. Two sessions can reach the same `containment_achieved` through different permissions, so read this alongside it. See [`W-SEC-013`](diagnostics.md#w-sec-013) |
-| `workdir_exec` | bool | `capabilities.filesystem.workdir_exec`, always written. `true` means the session workdir kept its `Execute` right, so `capabilities.shell.allow` was advisory inside it — and it is why `containment_achieved` can read `"advisory"` on a Landlock-capable host. See [`W-SEC-011`](diagnostics.md#w-sec-011) |
+| `workdir_exec` | bool | `capabilities.filesystem.workdir_exec`, always written. `true` means the work folder kept its `Execute` right, so `capabilities.shell.allow` was advisory inside it — and it is why `containment_achieved` can read `"advisory"` on a Landlock-capable host. See [`W-SEC-011`](diagnostics.md#w-sec-011) |
 | `resumed_from` | string \| null | The session [`mur run --resume`](cli.md#mur-run) continued, verbatim as the address resolved it. `null` on an ordinary launch. Always written, so its absence identifies a trace from a runtime predating the field |
 | `context_id` | string \| null | The context id every task of this launch runs under: the `mur run --context` value, or the id `--resume` resolved to. `null` when each task mints its own — `task_start.context_id` carries the id a task actually ran under either way. Always written, on the same terms as `resumed_from` |
 | `control` | object | What may be changed on this session: `settings` (the names `control.settings` lists), `secrets` (the names `control.secrets` lists) and `agent_settings` (the names `control.agent_settings` lists; absent when it lists none). Written only when the manifest declares [`control:`](manifest.md#field-control); absent otherwise. Never a value — see [Control surface](control-surface.md) |
@@ -92,7 +92,7 @@ before the first task begins
 | `effective_grants.runtime_dir` | object | The session's [runtime directory](workdir.md#runtime-directory) and what it is to the capsule's commands: `path` (`<home>/.murmur/sessions/<session-id>/runtime`, with the literal segment `<session-id>`), `read_only_to_commands` (boolean), `enforced_by` (`"mountns+landlock"` on the sealed tier, `"landlock"` on the Landlock tier at Landlock ABI 3 or later, `null` whenever `read_only_to_commands` is `false`) and `not_protected_because` (why a command can change it, `null` when none can). Derived from the tier this session applies, `landlock_abi` and whether the directory lies inside the workdir |
 | `effective_grants.records_dir` | object | The session's [records directory](workdir.md#records-directory), with `runtime_dir`'s four keys: `path` is `<home>/.murmur/records/<workdir root>/<session-id>`, with the literal segment `<session-id>` |
 | `effective_grants.temp_dir` | object | The [session's temporary folder](containment.md#temp-folder) and how the session's commands reach it: `path` (`<home>/.murmur/records/<workdir root>/<session-id>/tmp`, with the literal segment `<session-id>`), `tmpdir` (the value of `TMPDIR`, `TMP` and `TEMP`: `/tmp` when `tmp_mapped` is `true`, `path` when it is `false`), `tmp_mapped` (boolean: whether a literal `/tmp` is the folder), `mapped_by` (`"composed-root"`, `"mount-namespace"`, or `null` when not mapped) and `not_mapped_because` (why a literal `/tmp` is not the folder, `null` when it is). Derived from the tier this session applies, whether the host can give a command a private mount namespace, and whether the workdir is `/tmp` |
-| `effective_grants.runtime_writes` | array of object | Every path the runtime itself writes inside the accessible workdir — the files it writes for its own use are in the runtime directory and not listed — so a consumer for whom that workdir is the deliverable can subtract them and be left with what the capsule changed. One object per path, with `path`, `kind` (`"file"` \| `"directory"`), `scope` (`"accessible"` \| `"session"`) and `condition` (`"always"`, `"agent-session"`, `"script-session"`, `"shell"`, `"peer-fetch"` or `"spawn"`). Paths are relative to the accessible workdir and carry the literal segment `<session-id>`, which `session_id` on this same line supplies. The set is the same on every tier: a condition names when the path appears, never whether the row is listed. See [Session workdir](workdir.md) |
+| `effective_grants.runtime_writes` | array of object | Every path the runtime itself writes inside the work folder, so a consumer for whom that folder is the deliverable can subtract them and be left with what the capsule changed. One object per path, with `path`, `kind` (`"file"` \| `"directory"`) and `condition`, relative to the work folder. Exactly two rows: `{"path":"peer-in","kind":"directory","condition":"peer-fetch"}` and `{"path":"out","kind":"directory","condition":"script-session"}`. The set is the same on every tier: a condition names when the path appears, never whether the row is listed. See [What the capsule changed](workdir.md#what-the-capsule-changed) |
 
 **`inference`**{ #inference } — written after each driver call, including one that failed
 
@@ -827,7 +827,7 @@ terminal `task_end`
 | `task_id` | string | The task in progress. Absent for a failure recorded before any `task_start` |
 | `turn` | u32 | The turn that failed, 0-based. Absent when the failure is the task's rather than one turn's: `reopen_budget_exhausted`, `runtime_error` and `workdir_path_refused` |
 | `cause` | string | Why the attempt failed, from the table below |
-| `reason` | string | What went wrong, in words: the driver's or provider's error text, the refusal, the runtime error. A `driver_error` or `compaction_hook` reason has every credential value the session holds replaced with `[redacted]`, as `out/result.txt` does. At most 2,000 bytes; the whole text is in `out/result.txt`. For a launch that ends `failed`, this is the reason [`E-RUN-040`](diagnostics.md#e-run-040) prints |
+| `reason` | string | What went wrong, in words: the driver's or provider's error text, the refusal, the runtime error. A `driver_error` or `compaction_hook` reason has every credential value the session holds replaced with `[redacted]`, as `out/result.txt` does. At most 2,000 bytes; the whole text is in `out/result.txt` in the session's [records directory](workdir.md#records-directory). For a launch that ends `failed`, this is the reason [`E-RUN-040`](diagnostics.md#e-run-040) prints |
 
 | `cause` | Written when |
 |---|---|
@@ -847,14 +847,15 @@ Written whatever [`trace.capture`](manifest.md#field-trace) is. A task that ende
 
 **`workdir_path_refused`**{ #workdir-path-refused } — written once for each path the runtime refused
 to write, append to, read, create or remove because it met a symbolic link or the wrong kind of
-file inside the workdir. See [Links inside the workdir](workdir.md#links-inside-the-workdir).
+file inside the work folder, the records directory or the runtime directory. See
+[Links inside the work folder](workdir.md#links-inside-the-workdir).
 
 | Field | Type | Notes |
 |---|---|---|
 | `task_id` | string | The task in progress. Absent outside a task |
-| `path` | string | The path the runtime meant to touch, relative to the accessible workdir, with the real session id; beneath the [runtime directory](workdir.md#runtime-directory), its absolute path |
+| `path` | string | The path the runtime meant to touch, relative to the work folder; beneath the [runtime directory](workdir.md#runtime-directory) or the [records directory](workdir.md#records-directory), its absolute path |
 | `operation` | string | `write`, `append`, `read`, `create_dir` or `remove` |
-| `refused_at` | string | The part of `path` found to be a link or the wrong kind of file, relative to the accessible workdir |
+| `refused_at` | string | The part of `path` found to be a link or the wrong kind of file, named the way `path` is |
 | `reason` | string | `symlink`, `hard_link`, `not_a_regular_file` or `invalid_component` |
 
 Written whatever [`trace.capture`](manifest.md#field-trace) is, before the
@@ -1175,7 +1176,7 @@ refused
 |---|---|---|
 | `peer` | string | The peer address the tool was given |
 | `handle_id` | string | As above. Equal to the minting capsule's `handle_id` for the same handle |
-| `stored_path` | string \| null | Where the bytes landed, relative to the accessible workdir. `null` on any non-`ok` outcome |
+| `stored_path` | string \| null | Where the bytes landed, relative to the work folder. `null` on any non-`ok` outcome |
 | `bytes` | u64 \| null | Bytes stored. `null` on any non-`ok` outcome |
 | `sha256` | string \| null | SHA-256 (lowercase hex) of the bytes stored. `null` on any non-`ok` outcome |
 | `outcome` | string | `"ok"`, `"peer_not_allowed"`, `"peer_unreachable"`, `"etag_mismatch"`, `"io_error"`, `"path_refused"` — `peer-in/` or the stored name is a link inside the workdir, and nothing was written — or the peer's own [error code](resource-plane.md#redeem) |
@@ -1194,7 +1195,7 @@ and has reported its session id
 | `capsule` | string | The full name, `<scope>/<name>`, of the sub-capsule that was named |
 | `version` | string | The version that was named |
 | `child_session_id` | string | `ses_…`, the session the child's runtime minted for itself |
-| `child_workdir` | string | The child's directory, relative to this capsule's accessible workdir |
+| `child_workdir` | string | The child's work folder, absolute: `<this session's records directory>/children/<capsule>-<16 hex>` |
 | `child_records_dir` | string | The child's [records directory](workdir.md#records-directory), absolute, as the child reported it on its readiness line. Its own `trace.jsonl` and `completion.json` are there |
 
 Written when the child starts, so a child that then hangs, crashes or is ended is attributable

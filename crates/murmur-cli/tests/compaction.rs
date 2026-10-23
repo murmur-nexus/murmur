@@ -92,14 +92,22 @@ fn compact_not_declared_threshold_reached_warning_logged() {
     let staged = stage_compaction_session(&home, project.path(), &manifest_path);
     // Do NOT create murmur-compact tool dir → compact_tool_name = None
 
-    fs::write(staged.workdir.join("task.md"), "Run echo and summarize.").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Run echo and summarize.",
+    )
+    .unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
 
-    // out/result.txt must exist
+    // The agent's out/result.txt is in the records directory.
     assert!(
-        launched.workdir.join("out/result.txt").exists(),
-        "out/result.txt should exist"
+        launched.records_dir.join("out/result.txt").exists(),
+        "out/result.txt should exist in the records directory"
+    );
+    assert!(
+        !launched.workdir.join("out").exists(),
+        "the runtime should create no out/ in the work folder"
     );
 
     // summary.md must NOT exist (compaction was skipped)
@@ -325,7 +333,7 @@ fn run_compacting(responses: Vec<String>, window: u64, with_hook: bool, task: &s
     fs::write(&manifest, text).unwrap();
 
     let staged = stage_compaction_session(&home, project.path(), &manifest);
-    fs::write(staged.workdir.join("task.md"), task).unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), task).unwrap();
     let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
 
     let trace = fs::read_to_string(launched.records_dir.join("trace.jsonl")).unwrap();
@@ -558,7 +566,7 @@ fn the_task_survives_compaction() {
         "  - name: local/compact-hook\n    version: 0.1.0\n    runtime: hook\n",
     );
     let staged = stage_compaction_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), TASK).unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), TASK).unwrap();
     let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
 
     let trace = fs::read_to_string(launched.records_dir.join("trace.jsonl")).unwrap_or_default();

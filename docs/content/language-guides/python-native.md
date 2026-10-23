@@ -156,7 +156,7 @@ On Linux the binary also runs in the same sandbox as a shell command, with the c
 
 | The tool… | Needs |
 |---|---|
-| Reads or writes files | The files inside the session workdir, or in the session's temporary folder at `$TMPDIR`. On the Full tier nothing else outside the workdir is readable or writable |
+| Reads or writes files | The files inside the work folder, in the session's temporary folder at `$TMPDIR`, or in its home folder at `$HOME`. On the Full tier nothing outside these three is writable |
 | Runs another program | That program in `capabilities.shell.allow` |
 | Connects to a host | That host in `capabilities.network.allow` |
 

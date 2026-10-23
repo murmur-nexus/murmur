@@ -216,7 +216,7 @@ fn run_session(responses: Vec<String>, capsule: &Capsule<'_>, seed: impl FnOnce(
 
     let manifest_path = create_manifest(project.path(), &server.endpoint, capsule);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let trace_path = staged.records_dir.join("trace.jsonl");
 
     fs::create_dir_all(workdir.join("tests")).unwrap();
@@ -800,7 +800,7 @@ fn no_annotation_suppresses_a_refusal() {
 /// workdir-relative form rather than the absolute spelling the model typed.
 ///
 /// Staged with an explicit accessible workdir, because with no override the runtime mints a
-/// random session directory and the test could not name a file inside it before scripting the
+/// random work folder and the test could not name a file inside it before scripting the
 /// driver.
 #[test]
 fn an_absolute_path_resolves_to_the_same_rule() {

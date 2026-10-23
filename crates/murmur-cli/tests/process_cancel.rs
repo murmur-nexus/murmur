@@ -219,7 +219,7 @@ impl Built {
         .unwrap();
 
         let staged = stage(&home, &manifest, self.sleeps);
-        let workdir = staged.workdir.clone();
+        let workdir = staged.accessible_workdir.clone();
         let records_dir = staged.records_dir.clone();
         let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
@@ -676,7 +676,7 @@ fn s1_a_harness_that_honours_the_interrupt_stops_and_the_context_survives() {
     assert_eq!(ended["exit_status"], "canceled", "{ended}");
     // A stopped harness produced no result, and the file says so.
     assert_eq!(
-        fs::read_to_string(capsule.workdir.join("out").join("result.txt")).unwrap(),
+        fs::read_to_string(capsule.records_dir.join("out").join("result.txt")).unwrap(),
         "canceled: the task was canceled before it completed, so it has no result"
     );
 

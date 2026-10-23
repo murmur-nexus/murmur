@@ -43,7 +43,8 @@ signals it is done, or the per-capsule turn limit is reached. One *turn* is one 
 the inference driver — the runtime sends the current conversation history, tool list, and
 system prompt; the driver returns a response. If the model requests a tool call, the runtime
 executes it, appends the result, and starts the next turn. When the model returns `end_turn`
-(or `max_tokens`) the result is written to `workdir/out/result.txt` and the loop exits.
+(or `max_tokens`) the result is written to `out/result.txt` in the session's
+[records directory](../reference/workdir.md#records-directory) and the loop exits.
 
 ## `MURMUR.md` { #murmur-md }
 
@@ -55,7 +56,7 @@ and the installed tools. It is an inventory of the session:
 |---|---|
 | Identity | Capsule name and version, session id, capsule URL; for a formation member, its roster name and formation id |
 | Capsule | Model, the work folder as an absolute path, the runtime directory with the name each kind of tool opens it by, the read-only paths, `capabilities.network.allow` |
-| Limits | The limits the runtime enforces, the same text the `[Capsule]` block states; `capabilities.resources.workdir_max_bytes` for a `transport: http` session launched without `--workdir`; the context budget |
+| Limits | The limits the runtime enforces, the same text the `[Capsule]` block states; `capabilities.resources.workdir_max_bytes` for every `transport: http` session, the [ceiling](../reference/workdir.md#work-folder-ceiling) on the work folder, `$HOME` and `$TMPDIR` together; the context budget |
 | Runtime Directory | The entries of the runtime directory that exist when the file is written |
 | Installed Tools, Installed Skills | Every tool in the model's tool list, under its tool name, and every skill |
 | Running Shell Commands | The binaries `capabilities.shell.allow` declares |

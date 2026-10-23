@@ -192,7 +192,7 @@ fn a_redirected_run_writes_no_token_and_mur_token_reads_each_from_the_record() {
         assert_eq!(record["credentials"]["watcher"], watcher);
         let reader = token(home.path(), &["--credential", "reader"]).1;
         assert_eq!(record["credentials"]["reader"], reader.trim_end());
-        let session_dir = PathBuf::from(record["workdir"].as_str().unwrap());
+        let work_folder = PathBuf::from(record["workdir"].as_str().unwrap());
         let records_dir = PathBuf::from(record["records_dir"].as_str().unwrap());
 
         // `mur ps` names it and prints no token; `mur stop` ends it by address.
@@ -215,7 +215,7 @@ fn a_redirected_run_writes_no_token_and_mur_token_reads_each_from_the_record() {
             !written.contains("mdt1."),
             "json={json}: the run log holds a token:\n{written}"
         );
-        for root in [project.path(), session_dir.as_path(), records_dir.as_path()] {
+        for root in [project.path(), work_folder.as_path(), records_dir.as_path()] {
             assert_eq!(
                 files_containing(root, "mdt1."),
                 Vec::<PathBuf>::new(),

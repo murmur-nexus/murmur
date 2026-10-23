@@ -166,9 +166,8 @@ struct OpenTurn {
 /// Holds no harness knowledge: names arrive bare and are recorded as given, and the only text it
 /// ever reads is the result it writes out.
 pub(super) struct ProcessEventSink<'a> {
-    /// The internal session workdir, where `out/result.txt` goes.
-    workdir: WorkdirRoot,
-    /// The session's records directory, where every hook fault this run raises is logged.
+    /// The session's records directory, where `out/result.txt` is written and every hook fault
+    /// this run raises is logged.
     records_root: WorkdirRoot,
     /// This attempt's remaining turn budget, already net of the turns earlier attempts spent.
     /// `None` refuses no turn.
@@ -233,7 +232,6 @@ fn turn_budget_exceeded_message(turn: u32, ceiling: u32, used_before: u32) -> St
 impl<'a> ProcessEventSink<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        workdir: &WorkdirRoot,
         records_root: &WorkdirRoot,
         max_turns: Option<u32>,
         task_max_turns: Option<u32>,
@@ -244,7 +242,6 @@ impl<'a> ProcessEventSink<'a> {
         gateways: GatewayTable,
     ) -> Self {
         Self {
-            workdir: workdir.clone(),
             records_root: records_root.clone(),
             max_turns,
             task_max_turns,
@@ -265,9 +262,9 @@ impl<'a> ProcessEventSink<'a> {
         }
     }
 
-    /// The internal session workdir this run writes `out/result.txt` into.
-    pub(super) fn workdir(&self) -> &WorkdirRoot {
-        &self.workdir
+    /// The session's records directory, which this run writes `out/result.txt` into.
+    pub(super) fn records_root(&self) -> &WorkdirRoot {
+        &self.records_root
     }
 
     /// The runtime is about to interrupt the harness. Everything the harness says from here on is
@@ -573,7 +570,7 @@ impl<'a> ProcessEventSink<'a> {
                     Ok(hook_artifacts) => hook_artifacts,
                     Err(reached) => return reached,
                 };
-                match super::record_result(hooks, &self.workdir, &result) {
+                match super::record_result(hooks, &self.records_root, &result) {
                     Ok(()) => {
                         self.a2a.turn_end(&result, hook_artifacts).await;
                         SinkOutcome::Ended
@@ -1134,7 +1131,6 @@ mod tests {
             let session = RunSession::new(&self.plan, &self.policy, HARNESS, "fixture-driver");
             let mut sink = ProcessEventSink::new(
                 &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
-                &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
                 self.max_turns,
                 self.task_max_turns,
                 self.first_turn,
@@ -1157,7 +1153,6 @@ mod tests {
         async fn feed_then_go_quiet(&mut self, events: Vec<Event>) {
             let session = RunSession::new(&self.plan, &self.policy, HARNESS, "fixture-driver");
             let mut sink = ProcessEventSink::new(
-                &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
                 &crate::workdir_fs::WorkdirRoot::open(&self.workdir).unwrap(),
                 self.max_turns,
                 self.task_max_turns,

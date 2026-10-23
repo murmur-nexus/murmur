@@ -574,6 +574,7 @@ fn the_scaffolded_lead_hands_the_worker_a_task() {
     assert!(task_start < task_end, "{kinds:?}");
     assert_eq!(worker[task_start]["origin"], "peer");
     assert!(!scratch.path().join("crew/worker/.murmur").exists());
+    assert!(!worker_dir.join(".murmur").exists());
 
     // Lead's model: call-member offered with worker as its only member, and the answer fenced.
     let requests = server.requests();

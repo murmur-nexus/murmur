@@ -487,7 +487,7 @@ answered, the response carries an artifact named `residue` with one data part pe
             [
                 {"data": {"kind": "detached_shell", "work_id": "wrk_9f2a1c", "binary": "bash", "command": "sleep 30", "started_at_ms": 1757068800123},
                  "mediaType": "application/json"},
-                {"data": {"kind": "delegation", "delegation_id": "dlg_7b31de", "capsule": "my-worker", "version": "0.1.0", "child_session_id": "ses_019ed…", "child_workdir": ".murmur/children/my-worker-7b31de"},
+                {"data": {"kind": "delegation", "delegation_id": "dlg_7b31de", "capsule": "my-worker", "version": "0.1.0", "child_session_id": "ses_019ed…", "child_workdir": "/home/me/.murmur/records/home/me/proj/ses_019ed1f0…/children/my-worker-7b31de0c4a9f1e25"},
                  "mediaType": "application/json"}
             ]
         }

@@ -69,10 +69,9 @@ pub struct DeclaredExport {
 }
 
 impl DeclaredExport {
-    /// Resolves a manifest's `exports.files` block against the session's accessible workdir —
-    /// the directory the agent's own tools see at `.`, and therefore the one `out/result.txt`
-    /// means. Not `StagedSession::workdir`, which is the internal `.murmur/<session_id>`
-    /// bookkeeping directory when `--workdir` is given, and holds `trace.jsonl`.
+    /// Resolves a manifest's `exports.files` block against the session's work folder — the
+    /// directory the agent's own tools see at `.`, and therefore the one a relative export root
+    /// names.
     pub fn resolve(accessible_workdir: &Path, export: &FileExport) -> Self {
         Self {
             declared_root: export.root.clone(),
@@ -387,8 +386,8 @@ pub enum SymlinkPolicy {
 ///
 /// * `scoped` — host-path grants are possible and the filesystem's shape stays visible, so a
 ///   symlink under the export root could target a granted host path. Refuse it outright.
-/// * `sealed` — the workdir and `/tmp` are the only writable paths and there is no outside to
-///   name, so everything under the export root is capsule-authored. Follow, and check the target.
+/// * `sealed` — the workdir, `/tmp` and the home folder are the only writable paths and there is
+///   no outside to name, so everything under the export root is capsule-authored. Follow, and check the target.
 /// * `advisory` — a convention on top of a convention. Same rule as `sealed`, and every response
 ///   says `advisory` so a caller knows what it is trusting.
 pub fn symlink_policy(class: ContainmentClass) -> SymlinkPolicy {

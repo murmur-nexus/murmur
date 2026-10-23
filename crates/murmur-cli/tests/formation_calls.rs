@@ -385,6 +385,9 @@ fn two_callees_work_at_once_each_in_its_own_directory() {
     );
     assert!(!worker_dir.join("task.md").exists());
     assert!(!reviewer_dir.join("task.md").exists());
+    // A member's sessions keep their records under its records group, not in its workdir.
+    assert!(!worker_dir.join(".murmur").exists());
+    assert!(!reviewer_dir.join(".murmur").exists());
 
     release_worker.send(()).unwrap();
     release_reviewer.send(()).unwrap();
@@ -764,7 +767,7 @@ fn a_member_its_formation_ended_reports_formation_ended_and_no_stale_result() {
 
     // p's call to q timed out after p's turn ended with its interim reply, and p is continuing.
     project.await_requests("p", 3);
-    let p_session = session_dirs(&project.member_dir(&formation_id, "p").join(".murmur"))
+    let p_session = session_dirs(&project.member_records(&formation_id, "p"))
         .pop()
         .unwrap();
     let p_result = p_session.join("out").join("result.txt");
@@ -1701,7 +1704,7 @@ fn a_process_lead_gets_the_answer_in_its_resumed_session() {
     );
 
     // What the resumed harness was told, as it answered with it.
-    let lead_session = &session_dirs(&project.path().join(".murmur"))[0];
+    let lead_session = &session_dirs(&project.member_records(&formation_id, "lead"))[0];
     let result = std::fs::read_to_string(lead_session.join("out/result.txt")).unwrap();
     for said in [
         format!("[call-member] call {call_id} to worker ended completed:"),

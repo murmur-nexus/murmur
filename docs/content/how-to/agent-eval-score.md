@@ -239,7 +239,7 @@ mur eval run ./other-capsule --dataset ./other.jsonl        # both explicit
 
 `mur eval run` runs one capsule session per case, sequentially. For each case it:
 
-1. Stages the session — allocates a per-session workdir (`workdir/ses_xxx/`) and records directory, and loads artifacts
+1. Stages the session — allocates a per-session work folder (`workdir/ses_xxx/`) and records directory, and loads artifacts
 2. Copies `task_path` to `task.md` in the session's [runtime directory](../reference/workdir.md#runtime-directory)
 3. Launches the session
 4. Reads `hooks/eval.jsonl` from the session's records directory (written by the hook at session end). A case whose hook wrote none — one declared `scope: .` instead of `records: true` — reports `no_scores` and a warning naming the grant

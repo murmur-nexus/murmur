@@ -122,8 +122,8 @@ pub(crate) struct HookInferenceCtx {
     pub(crate) output_caps: crate::model_limits::HookOutputCaps,
     pub(crate) engine: Engine,
     pub(crate) accessible_workdir: PathBuf,
-    /// The session's bookkeeping directory, where a credential failure writes `out/result.txt`.
-    pub(crate) workdir: crate::workdir_fs::WorkdirRoot,
+    /// The session's records directory, where a credential failure writes `out/result.txt`.
+    pub(crate) records_root: crate::workdir_fs::WorkdirRoot,
     pub(crate) inference_env: Vec<(String, String)>,
     /// The driver's environment for a [`HookInferencePurpose::Compaction`] call:
     /// [`Self::inference_env`] with `inference.compaction.driver_config` laid over its
@@ -404,7 +404,9 @@ impl HookInferenceCtx {
             .as_ref()
             .and_then(|gateway| gateway.credential())
             .and_then(|credential| credential.report_rejection())?;
-        if let Err(err) = crate::agent::write_result(&self.workdir, &format!("error: {message}")) {
+        if let Err(err) =
+            crate::agent::write_result(&self.records_root, &format!("error: {message}"))
+        {
             crate::runtime_err!("{err}");
         }
         Some(message)
@@ -889,7 +891,7 @@ mod tests {
             output_caps: output_caps(None),
             engine: engine.clone(),
             accessible_workdir: workdir.to_path_buf(),
-            workdir: crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
+            records_root: crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             inference_env: Vec::new(),
             compaction_inference_env: Vec::new(),
             capability_policy: CapabilityPolicy::default(),

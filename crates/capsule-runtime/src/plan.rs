@@ -133,13 +133,10 @@ pub struct SchedulerContext<'a> {
     /// The directory a `shell` step runs in and a `tool` step resolves a `data_path` against —
     /// the capsule's own workdir, which under `--workdir` is the operator's directory.
     pub accessible_workdir: WorkdirRoot,
-    /// `<accessible_workdir>/.murmur/<session id>/` under `--workdir`, and the same path as
-    /// [`Self::accessible_workdir`] without it. Where a `shell` step's synthetic `$HOME` and, on
-    /// a sealed host, its `/tmp` and `/etc` staging live.
-    pub session_workdir: WorkdirRoot,
     /// The session's runtime directory and its siblings: the plan file is read from
     /// `runtime/plans/`, and every `shell` step is told the directory through
     /// `$MURMUR_RUNTIME_DIR` and may read it and not change it, as the session's own commands may.
+    /// A `shell` step's `$HOME` and `$TMPDIR` are its records directory's `home/` and `tmp/`.
     pub runtime_dir: crate::runtime_dir::RuntimeDirRoots,
     pub capability_policy: CapabilityPolicy,
     pub installed_tools: HashSet<String>,
@@ -388,6 +385,7 @@ fn execute_inner(
     let workdir_guard = Some(crate::resources::WorkdirGuard::spawn(
         &ctx.accessible_workdir,
         ctx.runtime_dir.temp.as_ref(),
+        ctx.runtime_dir.home.as_ref(),
         ctx.runtime_dir.records.as_ref(),
         ctx.capability_policy.resources.workdir_max_bytes,
     ));
@@ -1188,7 +1186,6 @@ fn dispatch_shell_step(
         &arg_refs,
         &[],
         &ctx.accessible_workdir,
-        &ctx.session_workdir,
         &ctx.capability_policy,
         enforcement,
     ) {
@@ -1268,10 +1265,17 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
     // is one delegation mechanism in this crate rather than two that drift.
     // A plan step reads no manifest of its own here, so it delegates under the default bound
     // rather than under a declared one.
+    let Some(records_root) = ctx.runtime_dir.records.clone() else {
+        return failed(
+            &step.id,
+            "this plan runs outside a session's records directory, where a capsule step's child \
+             work folder is created",
+        );
+    };
     let plane = DelegationPlane::new(
         roost_url,
         credential.clone(),
-        ctx.accessible_workdir.clone(),
+        records_root,
         ctx.current_session_id.clone().unwrap_or_default(),
         crate::delegation_plane::DELEGATION_RESULT_TIMEOUT,
         std::sync::Arc::clone(&ctx.registry),
@@ -1577,12 +1581,13 @@ mod tests {
     ) -> SchedulerContext<'a> {
         SchedulerContext {
             accessible_workdir: WorkdirRoot::open(&workdir).unwrap(),
-            session_workdir: WorkdirRoot::open(&workdir).unwrap(),
             runtime_dir: crate::runtime_dir::RuntimeDirRoots::new(
                 WorkdirRoot::open(&workdir).unwrap(),
                 WorkdirRoot::open(&workdir).unwrap(),
                 WorkdirRoot::open(&workdir).unwrap(),
-            ),
+            )
+            // Kept past the test: the context's clones may outlive it.
+            .with_home(WorkdirRoot::open(&tempfile::tempdir().unwrap().keep()).unwrap()),
             capability_policy: CapabilityPolicy {
                 shell_allow: vec!["bash".to_string()],
                 spawn_allow: vec!["worker".to_string()],
@@ -1865,7 +1870,8 @@ mod tests {
             murmur_artifact::ContainmentClass::Scoped,
             sandbox::HostProbe::probe(),
         )
-        .unwrap();
+        .unwrap()
+        .with_test_session_dirs();
         let server = execute_shell(
             "bash",
             &[
@@ -1873,7 +1879,6 @@ mod tests {
                 "(printf \"pong\\n\" | nc -N -l 127.0.0.1 8080) >/dev/null 2>&1 & echo $! > server.pid",
             ],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             &policy,
             &session,
@@ -1921,7 +1926,6 @@ mod tests {
             "bash",
             &["-c", "true"],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
             &policy,
             &session,

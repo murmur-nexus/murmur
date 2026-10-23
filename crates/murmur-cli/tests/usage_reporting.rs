@@ -105,12 +105,16 @@ fn run_session(config_mode: Option<&str>) -> Run {
 
     let manifest_path = create_manifest(project.path(), config_mode);
     let staged: StagedSession = common::stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Report your usage.").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Report your usage.",
+    )
+    .unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
 
     Run {
-        result: fs::read_to_string(launched.workdir.join("out/result.txt")).unwrap_or_default(),
+        result: fs::read_to_string(launched.records_dir.join("out/result.txt")).unwrap_or_default(),
         trace: fs::read_to_string(launched.records_dir.join("trace.jsonl")).unwrap_or_default(),
         bootstrap_log: fs::read_to_string(launched.records_dir.join("logs/bootstrap.log"))
             .unwrap_or_default(),

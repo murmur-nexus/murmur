@@ -448,9 +448,8 @@ pub struct StageRequest {
     pub lifecycle_override: Option<LifecycleOverride>,
     /// Trace config from the manifest (None = defaults apply: input captured, output not).
     pub trace: Option<murmur_artifact::TraceConfig>,
-    /// Optional user project directory to mount as the capsule's accessible workspace.
-    /// When set, session artifacts go into `<workdir>/.murmur/<session_id>/`.
-    /// When None, uses the default temp dir (existing behavior).
+    /// The operator's directory to use as the capsule's work folder, `mur run --workdir`; the
+    /// runtime creates nothing in it. `None` uses `<manifest_dir>/workdir/<session_id>`.
     pub workdir: Option<std::path::PathBuf>,
     /// Address to bind the HTTP server on. Defaults to "127.0.0.1" for local runs.
     /// Use "0.0.0.0" when deploying to a VM so the capsule is reachable externally.
@@ -551,17 +550,16 @@ pub struct StagedProcessDriver {
 
 pub struct StagedSession {
     pub session_id: String,
-    /// The session directory's host path, for display and subprocess arguments. The runtime reads
-    /// and writes beneath it only through [`Self::session_root`].
-    pub workdir: PathBuf,
-    /// User project directory (or session dir if no --workdir). WASM tools see this at ".".
-    /// The runtime reads and writes beneath it only through [`Self::accessible_root`].
+    /// The work folder: the `--workdir` directory, or `<manifest-dir>/workdir/<session-id>`
+    /// without one. Every command's current directory and every WASM tool's `"."`. The runtime
+    /// creates nothing beneath it, and reads beneath it only through [`Self::accessible_root`].
     pub accessible_workdir: std::path::PathBuf,
     /// [`Self::accessible_workdir`], held open.
     pub accessible_root: crate::workdir_fs::WorkdirRoot,
-    /// [`Self::workdir`], held open, reached from [`Self::accessible_root`] with no link followed.
-    /// The same root as `accessible_root` without `--workdir`.
-    pub session_root: crate::workdir_fs::WorkdirRoot,
+    /// `<manifest-dir>/workdir`, which holds the work folder the runtime created for a launch
+    /// without `--workdir`, and those of earlier such launches that `trace.retain` prunes. `None`
+    /// under `--workdir`, whose folder is the operator's and is never pruned.
+    pub(crate) created_workdirs: Option<PathBuf>,
     /// The session's runtime directory, `~/.murmur/sessions/<session-id>/runtime`: the value of
     /// `$MURMUR_RUNTIME_DIR`, holding `MURMUR.md`, `task.md`, `murmur.yaml`, `tools/` and
     /// `plans/`. Removed when the session ends; the runtime reads and writes beneath it only
@@ -574,8 +572,9 @@ pub struct StagedSession {
     pub(crate) runtime_dirs: crate::runtime_dir::RuntimeDirRoots,
     /// The session's records directory, `~/.murmur/records/<workdir root>/<session-id>`: the
     /// value of `$MURMUR_RECORDS_DIR`, holding `trace.jsonl`, `blobs/`, `logs/`,
-    /// `completion.json` and `hooks/`. Kept after the session ends; the runtime reads and writes
-    /// beneath it only through [`Self::records_root`].
+    /// `completion.json`, `hooks/`, `out/`, `tmp/`, `home/` and `children/`. Kept after the
+    /// session ends; the runtime reads and writes beneath it only through
+    /// [`Self::records_root`].
     pub records_dir: PathBuf,
     /// [`Self::records_dir`], held open, sharing [`Self::accessible_root`]'s refusal latch.
     pub records_root: crate::workdir_fs::WorkdirRoot,
@@ -851,6 +850,7 @@ impl StagedSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchResult {
     pub session_id: String,
+    /// The session's work folder, [`StagedSession::accessible_workdir`].
     pub workdir: PathBuf,
     /// The session's records directory, where its trace is, kept after the session.
     pub records_dir: PathBuf,

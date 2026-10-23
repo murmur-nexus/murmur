@@ -117,7 +117,7 @@ fn murmur_md_written_after_staging() {
         murmur_md_path.exists(),
         "MURMUR.md should exist in the runtime directory after staging"
     );
-    assert!(!staged.workdir.join("MURMUR.md").exists());
+    assert!(!staged.accessible_workdir.join("MURMUR.md").exists());
 
     let content = fs::read_to_string(&murmur_md_path).unwrap();
     assert!(
@@ -337,7 +337,11 @@ fn native_tool_dispatch_executes_binary_and_returns_result() {
     );
 
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Use test-native.").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Use test-native.",
+    )
+    .unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("launch should succeed");
 
@@ -346,8 +350,8 @@ fn native_tool_dispatch_executes_binary_and_returns_result() {
         "native tool should have created the marker file"
     );
     assert!(
-        launched.workdir.join("out").join("result.txt").exists(),
-        "out/result.txt should exist after agent completes"
+        launched.records_dir.join("out").join("result.txt").exists(),
+        "out/result.txt should exist in the records directory after the agent completes"
     );
 }
 

@@ -203,7 +203,7 @@ nav:
       - Containment: reference/containment.md
       - Resource Limits: reference/resource-limits.md
       - Diagnostics: reference/diagnostics.md
-      - Session Workdir: reference/workdir.md
+      - Session Directories: reference/workdir.md
       - Runtime-Provided Tools: reference/runtime-provided-tools.md
       - Plans: reference/plans.md
       - Resource Plane: reference/resource-plane.md

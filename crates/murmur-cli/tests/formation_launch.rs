@@ -366,9 +366,7 @@ impl Project {
     /// group of the project, each peer's in the records group of its own directory in the scratch
     /// `HOME`.
     fn sessions(&self) -> Vec<PathBuf> {
-        let peer_dirs = common::formation::peer_session_roots(self.home.path())
-            .into_iter()
-            .filter_map(|root| root.parent().map(Path::to_path_buf));
+        let peer_dirs = common::formation::peer_workdirs(self.home.path());
         std::iter::once(self.path().to_path_buf())
             .chain(peer_dirs)
             .flat_map(|dir| {
@@ -496,6 +494,8 @@ fn assert_formation_line(formation: &Value, entry: &str, peers: &[&str]) {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(workdir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "{peer}");
+        // The peer's session keeps its records in the records group of that directory.
+        assert!(!workdir.join(".murmur").exists(), "{peer}");
     }
     let keys: Vec<&String> = formation.as_object().unwrap().keys().collect();
     assert_eq!(

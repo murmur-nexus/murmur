@@ -995,11 +995,11 @@ The items a `murmur.StopSession` answer lists, and the data parts of a `CancelTa
 | `kind` | Names | Keys |
 |---|---|---|
 | `detached_shell` | A [demoted shell command](manifest.md#lifecycle-shell-grace-secs), which runs until it finishes or its session ends, which kills it | `work_id` (`wrk_…`), `binary`, `command`, `started_at_ms` |
-| `delegation` | A sub-capsule the cancelled task delegated to, which that task ends | `delegation_id` (`dlg_…`), `capsule`, `version`, `child_session_id`, `child_workdir` |
+| `delegation` | A sub-capsule the cancelled task delegated to, which that task ends | `delegation_id` (`dlg_…`), `capsule`, `version`, `child_session_id`, `child_workdir` (the child's work folder, absolute) |
 
 ```json
 {"kind": "delegation", "delegation_id": "dlg_7b31de", "capsule": "my-worker", "version": "0.1.0",
- "child_session_id": "ses_019ed2af76b57c42912b612f07dd4d51", "child_workdir": ".murmur/children/my-worker-7b31de"}
+ "child_session_id": "ses_019ed2af76b57c42912b612f07dd4d51", "child_workdir": "/home/me/.murmur/records/home/me/proj/ses_019ed2a0c4b17e3a8f5d6c2b1e0f9a87/children/my-worker-7b31de0c4a9f1e25"}
 ```
 
 #### `forgetSession` { #forget-session }

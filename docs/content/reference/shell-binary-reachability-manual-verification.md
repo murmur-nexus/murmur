@@ -548,16 +548,16 @@ SCRATCH_GRANT=true
 TIER: KernelSealed
 EXIT: 0
 OUT: ['', '/usr/lib/python312.zip', '/usr/lib/python3.12', '/usr/lib/python3.12/lib-dynload', '/usr/local/lib/python3.12/dist-packages', '/usr/lib/python3/dist-packages']
-/tmp/.tmp4jPtgn/.capsule-home/.local/lib/python3.12/site-packages
+<home folder>/.local/lib/python3.12/site-packages
 --- with PYTHONPATH ---
 pip 26.2 from /home/agape/.local/lib/python3.12/site-packages/pip (python 3.12)
 PIP_OK
 ```
 
-CPython derives the user-site directory from `HOME`, and a sealed session relocates `HOME` to a
-per-session `.capsule-home` inside the workdir — so `site.getusersitepackages()` computes
-`/tmp/.tmp4jPtgn/.capsule-home/.local/lib/python3.12/site-packages`, and the host's real user-site
-directory is never on `sys.path` no matter how thoroughly it is granted. Adding `PYTHONPATH`
+CPython derives the user-site directory from `HOME`, and a sealed session sets `HOME` to the
+session's [home folder](containment.md#home-folder), `home/` in its records directory — so
+`site.getusersitepackages()` computes `<home folder>/.local/lib/python3.12/site-packages`, and the
+host's real user-site directory is never on `sys.path` no matter how thoroughly it is granted. Adding `PYTHONPATH`
 resolves it, and `pip 26.2 from /home/agape/.local/lib/python3.12/site-packages/pip` proves the
 granted tree really was reachable all along.
 

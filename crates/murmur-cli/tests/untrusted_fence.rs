@@ -242,7 +242,11 @@ fn wasm_tool_result_reaches_the_model_fenced_and_named() {
         &[],
     );
     let staged = stage(&home, project.path(), &manifest);
-    fs::write(staged.workdir.join("task.md"), "Call the echo tool.").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Call the echo tool.",
+    )
+    .unwrap();
     launch_session(staged, |_| {}).expect("launch should succeed");
 
     let requests = server.requests();
@@ -312,7 +316,11 @@ fn hostile_tool_output_cannot_close_the_fence_early() {
 
     let manifest = write_manifest(project.path(), &server.endpoint, &[], &["bash"]);
     let staged = stage(&home, project.path(), &manifest);
-    fs::write(staged.workdir.join("task.md"), "Run the command.").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Run the command.",
+    )
+    .unwrap();
     launch_session(staged, |_| {}).expect("launch should succeed");
 
     let requests = server.requests();
@@ -392,7 +400,11 @@ fn wasm_and_native_tool_results_carry_the_same_fence() {
         &[],
     );
     let staged = stage(&home, project.path(), &manifest);
-    fs::write(staged.workdir.join("task.md"), "Call both tools.").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Call both tools.",
+    )
+    .unwrap();
     launch_session(staged, |_| {}).expect("launch should succeed");
 
     let requests = server.requests();
@@ -446,7 +458,7 @@ fn skill_result_reaches_the_model_unfenced() {
         &[],
     );
     let staged = stage(&home, project.path(), &manifest);
-    fs::write(staged.workdir.join("task.md"), "Read the skill.").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Read the skill.").unwrap();
     let launched = launch_session(staged, |_| {}).expect("launch should succeed");
 
     let requests = server.requests();
@@ -557,7 +569,11 @@ fn user_origin_task_payload_is_not_fenced() {
 
     let manifest = write_manifest(project.path(), &server.endpoint, &[], &[]);
     let staged = stage(&home, project.path(), &manifest);
-    fs::write(staged.workdir.join("task.md"), "Ship the release.").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Ship the release.",
+    )
+    .unwrap();
     launch_session(staged, |_| {}).expect("launch should succeed");
 
     assert_eq!(first_user_text(&server.requests()), "Ship the release.");

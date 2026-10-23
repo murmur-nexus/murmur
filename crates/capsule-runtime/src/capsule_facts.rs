@@ -134,10 +134,14 @@ impl CapsuleFacts {
     }
 }
 
-/// The work-folder ceiling as a limit part, in the form [`CapsuleFacts::limit_parts`] renders.
-/// MURMUR.md alone states it, and only where `WorkdirGuard` measures the work folder itself.
+/// The work-folder ceiling as a limit part, in the form [`CapsuleFacts::limit_parts`] renders,
+/// naming what `WorkdirGuard` measures against it: the work folder, the commands' `$HOME` and
+/// their `$TMPDIR` together. MURMUR.md alone states it.
 pub(crate) fn work_folder_ceiling_part(workdir_max_bytes: u64) -> String {
-    format!("{} in the work folder", render_bytes(workdir_max_bytes))
+    format!(
+        "{} across the work folder, $HOME and $TMPDIR",
+        render_bytes(workdir_max_bytes)
+    )
 }
 
 /// `bytes` as a whole number of GiB or MiB when it is one, else as bytes.
@@ -261,7 +265,7 @@ mod tests {
         );
         assert_eq!(
             work_folder_ceiling_part(policy.resources.workdir_max_bytes),
-            "512 MiB in the work folder"
+            "512 MiB across the work folder, $HOME and $TMPDIR"
         );
     }
 

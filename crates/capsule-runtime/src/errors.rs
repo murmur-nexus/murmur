@@ -531,7 +531,7 @@ pub enum RuntimeError {
 
     #[error(
         "tool '{tool}' returned data_path '{path}', which does not resolve to a readable file \
-         beneath the session workdir ({code}): {detail}"
+         beneath the work folder ({code}): {detail}"
     )]
     ToolDataPathRefused {
         tool: String,
@@ -550,7 +550,7 @@ pub enum RuntimeError {
     CgroupDelegationUnavailable { reason: String },
 
     #[error(
-        "session workdir and temporary folder grew to {observed_bytes} bytes, past the \
+        "work folder, $HOME and $TMPDIR together grew to {observed_bytes} bytes, past the \
          {max_bytes} byte ceiling (capabilities.resources.workdir_max_bytes)"
     )]
     WorkdirSizeExceeded { max_bytes: u64, observed_bytes: u64 },

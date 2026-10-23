@@ -5718,7 +5718,8 @@ fn print_session_listing(listing: &SessionListing) {
 
 /// `mur trace rm --json`: a stable interface. Keys keep their names, types and meanings and
 /// serialize in declaration order; a key may be added, never removed or renamed. Each path is what
-/// was removed, or `null` when nothing was there.
+/// was removed, or `null` when nothing was there. `session_dir` is the work folder the runtime
+/// created for a launch without `--workdir`, and always `null` under `--workdir`.
 #[derive(Debug, serde::Serialize)]
 struct RemovedSession {
     session_id: String,
@@ -5747,16 +5748,19 @@ impl Doomed {
 }
 
 /// Remove everything `mur` keeps for one ended session of the workdir root `workdir` (default
-/// `./workdir`): its session directory, its records directory, and a running record whose process
-/// is gone, in that order, so a partial failure leaves the session listed and removable again.
+/// `./workdir`): the work folder the runtime created for it, its records directory, and a running
+/// record whose process is gone, in that order, so a partial failure leaves the session listed and
+/// removable again.
 ///
 /// `session` is `@N`, a suffix, or a full `ses_` id, which is accepted while either directory is
 /// left. A literal path is refused, so a removal is only ever scoped to one root's own sessions.
-/// The session directory is `<root>/.murmur/<id>`, or else `<root>/<id>`: the two places staging
-/// makes it. Both directories are removed by descriptor and no link is followed; a link or a
-/// wrong file type on the way is `E-RUN-050`, and a session whose record names a live process is
-/// `E-RUN-024`. Nothing else is touched: not the records group, not `<root>/.murmur`, not a
-/// delegated child's session, not the conversation record. Every failure prints nothing on stdout.
+/// Without `--workdir` the work folder is `./workdir/<id>`, which the runtime created; with it the
+/// folder is the operator's and nothing in it is touched, so only the records directory goes —
+/// with it the session's `out/`, `home/`, `tmp/` and delegated children's `children/`. Both
+/// directories are removed by descriptor and no link is followed; a link or a wrong file type on
+/// the way is `E-RUN-050`, and a session whose record names a live process is `E-RUN-024`. Nothing
+/// else is touched: not the records group, not the conversation record. Every failure prints
+/// nothing on stdout.
 pub(crate) fn run_trace_rm(
     session: String,
     workdir: Option<PathBuf>,
@@ -5771,6 +5775,7 @@ pub(crate) fn run_trace_rm(
             ),
         ));
     }
+    let created_work_folders = workdir.is_none();
     let root = workdir.unwrap_or_else(|| PathBuf::from("workdir"));
     let group = session_address::records_group(&root)?;
     let root = std::path::absolute(&root).map_err(|e| {
@@ -5795,9 +5800,10 @@ pub(crate) fn run_trace_rm(
             .to_string_lossy()
             .into_owned()
     };
-    let session_dir = match directory_beneath(&root, &format!(".murmur/{session_id}"))? {
-        Some(dir) => Some(dir),
-        None => directory_beneath(&root, &session_id)?,
+    let session_dir = if created_work_folders {
+        directory_beneath(&root, &session_id)?
+    } else {
+        None
     };
     let records_dir = directory_beneath(&group, &session_id)?;
     if session_dir.is_none() && records_dir.is_none() {
@@ -5860,7 +5866,7 @@ pub(crate) fn run_trace_rm(
         return Ok(());
     }
     for (what, path) in [
-        ("session directory", &removed.session_dir),
+        ("work folder", &removed.session_dir),
         ("records", &removed.records_dir),
         ("running record", &removed.running_record),
     ] {

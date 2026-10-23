@@ -235,7 +235,7 @@ fn an_entry_declaring_nothing_behaves_exactly_as_before() {
 }
 
 /// Five shapes the channel cannot carry, each refused by the same code, naming the artifact and
-/// the rule — before any session workdir exists, which is what proves the refusal precedes
+/// the rule — before any work folder exists, which is what proves the refusal precedes
 /// staging rather than following it.
 #[test]
 fn a_malformed_config_refuses_the_launch_and_leaves_no_workdir() {
@@ -265,7 +265,7 @@ fn a_malformed_config_refuses_the_launch_and_leaves_no_workdir() {
 
         assert!(
             !project.path().join("workdir").exists(),
-            "'{config}' must be refused before any session workdir is created"
+            "'{config}' must be refused before any work folder is created"
         );
     }
 

@@ -239,12 +239,12 @@ fn queue_lifecycle() -> LifecycleConfig {
 struct Capsule {
     url: String,
     trace_path: PathBuf,
-    session_dir: PathBuf,
+    records_dir: PathBuf,
 }
 
 fn launch(staged: capsule_runtime::StagedSession) -> Capsule {
     let trace_path = staged.records_dir.join("trace.jsonl");
-    let session_dir = staged.workdir.clone();
+    let records_dir = staged.records_dir.clone();
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         let _ = launch_session(staged, move |url| {
@@ -257,7 +257,7 @@ fn launch(staged: capsule_runtime::StagedSession) -> Capsule {
     Capsule {
         url,
         trace_path,
-        session_dir,
+        records_dir,
     }
 }
 
@@ -357,9 +357,9 @@ fn poll_until_state(addr: &str, task_id: &str, expected: &str, timeout: Duration
 const CANCELED_RESULT: &str =
     "canceled: the task was canceled before it completed, so it has no result";
 
-/// `out/<name>` under the session's workdir, or `None` when nothing wrote it.
+/// `out/<name>` under the session's records directory, or `None` when nothing wrote it.
 fn out_file(capsule: &Capsule, name: &str) -> Option<String> {
-    fs::read_to_string(capsule.session_dir.join("out").join(name)).ok()
+    fs::read_to_string(capsule.records_dir.join("out").join(name)).ok()
 }
 
 // ── Reading the trace ─────────────────────────────────────────────────────────
@@ -1400,7 +1400,7 @@ fn the_trace_distinguishes_cancelled_from_failed() {
         !rendered.contains("status:     failed"),
         "a cancelled task must not read as failed: {rendered}"
     );
-    assert!(capsule.session_dir.exists());
+    assert!(capsule.records_dir.exists());
 }
 
 // ── The announcement follows the session frame ────────────────────────────────

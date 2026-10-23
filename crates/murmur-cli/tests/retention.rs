@@ -53,7 +53,7 @@ struct Fixture {
     _artifacts: TempDir,
     _server: common::ScriptedServer,
     manifest: PathBuf,
-    /// `--workdir` for every run: session workdirs land under `<workdir>/.murmur/`, records in
+    /// `--workdir` for every run: the work folder every run shares, whose sessions' records are in
     /// its records group.
     workdir: TempDir,
 }
@@ -94,17 +94,17 @@ impl Fixture {
         common::records_group(self.home.path(), self.workdir.path())
     }
 
-    /// The directory holding every `ses_*` session workdir of this fixture's runs.
-    fn session_workdirs(&self) -> PathBuf {
-        self.workdir.path().join(".murmur")
+    /// The entries of the shared work folder, which no run of this fixture writes into.
+    fn work_folder_entries(&self) -> Vec<String> {
+        fs::read_dir(self.workdir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
     }
 
-    /// A session whose uuid-v7 timestamp is `ms`, both halves: its records directory and its
-    /// session workdir.
+    /// The records directory of a session whose uuid-v7 timestamp is `ms`.
     fn plant(&self, ms: u64, tail: u64) -> String {
-        let name = plant_session(&self.sessions_root(), ms, tail);
-        fs::create_dir_all(self.session_workdirs().join(&name).join("out")).unwrap();
-        name
+        plant_session(&self.sessions_root(), ms, tail)
     }
 
     fn run(&self, extra: &[&str]) -> Assert {
@@ -309,13 +309,14 @@ fn max_sessions_leaves_exactly_the_newest_three_and_says_so_in_the_trace() {
     for gone in &newest_three[..3] {
         let dir = f.sessions_root().join(gone);
         assert!(!dir.exists(), "{gone} must go whole");
-        assert!(
-            !f.session_workdirs().join(gone).exists(),
-            "{gone}'s session workdir goes with its records"
-        );
         assert!(!dir.join("trace.jsonl").exists());
         assert!(!dir.join("blobs").exists());
     }
+    assert_eq!(
+        f.work_folder_entries(),
+        Vec::<String>::new(),
+        "six runs under --workdir leave nothing in the work folder"
+    );
 
     // the newest session's own trace names what it removed and why.
     let events = retention_events(&f.sessions_root().join(survivors.last().unwrap()));

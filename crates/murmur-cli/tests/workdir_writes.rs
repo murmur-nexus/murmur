@@ -1,6 +1,6 @@
-//! The property the `runtime_writes` declaration exists for: a consumer for whom the accessible
-//! workdir is the deliverable can subtract what the runtime wrote and be left with exactly what
-//! the capsule changed.
+//! The property the `runtime_writes` declaration exists for: a consumer for whom the work folder
+//! is the deliverable can subtract what the runtime wrote and be left with exactly what the
+//! capsule changed — which, the runtime writing nothing there of its own, is everything in it.
 //!
 //! The subtraction here is performed the way that consumer would perform it — from the run's own
 //! `trace.jsonl`, with no list written into this file. Anything the runtime leaves behind that the
@@ -19,7 +19,10 @@ use std::{
 use capsule_runtime::launch_session;
 use serde_json::{json, Value};
 
-use common::ScriptedServer;
+use common::{
+    hook_wat::{compaction_hook_wasm, create_hook_zip},
+    ScriptedServer,
+};
 
 const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
@@ -40,12 +43,9 @@ struct Run {
 }
 
 impl Run {
-    /// Every path in the accessible workdir, relative and slash-separated, with each declared
-    /// accessible-scope entry subtracted — a `directory` row as a prefix, a `file` row exactly,
-    /// and either one's parent directories with it.
-    ///
-    /// The literal `<session-id>` in a declared path is replaced with this run's own id, which
-    /// `session_start.session_id` carried on the same line the declaration came from.
+    /// Every path in the work folder, relative and slash-separated, with each declared entry
+    /// subtracted — a `directory` row as a prefix, a `file` row exactly, and either one's parent
+    /// directories with it.
     fn left_after_subtracting_the_declaration(&self) -> BTreeSet<String> {
         let mut remaining = BTreeSet::new();
         for entry in walk(&self.accessible, &self.accessible) {
@@ -58,19 +58,13 @@ impl Run {
 
     fn is_declared(&self, path: &str) -> bool {
         self.runtime_writes.iter().any(|write| {
-            if write["scope"] != "accessible" {
-                return false;
-            }
-            let declared = write["path"]
-                .as_str()
-                .unwrap()
-                .replace("<session-id>", &self.session_id);
+            let declared = write["path"].as_str().unwrap().to_string();
             if path == declared {
                 return true;
             }
-            // A parent of a declared path is the runtime's too: nothing created `.murmur/` for
-            // its own sake, and `git status --untracked-files=all` — the shape of subtraction
-            // this stands in for — reports files rather than the directories above them.
+            // A parent of a declared path is the runtime's too: `git status
+            // --untracked-files=all` — the shape of subtraction this stands in for — reports files
+            // rather than the directories above them.
             if declared.starts_with(&format!("{path}/")) {
                 return true;
             }
@@ -101,26 +95,21 @@ impl Run {
         }
     }
 
-    /// Every declared row that is in the accessible workdir and claims to be written by every
-    /// session must really be there.
-    fn assert_every_unconditional_declaration_exists(&self) {
-        for write in &self.runtime_writes {
-            if write["scope"] != "accessible" || write["condition"] != "always" {
-                continue;
-            }
-            let declared = write["path"]
-                .as_str()
-                .unwrap()
-                .replace("<session-id>", &self.session_id);
-            assert!(
-                self.accessible.join(&declared).exists(),
-                "`{declared}` is declared as written by every session and is not on disk"
-            );
-        }
+    /// The declaration names exactly the two paths a capsule asks for, and no row is
+    /// unconditional: a session that redeems no handle and is no script capsule leaves the work
+    /// folder as it found it.
+    fn assert_the_declaration_is_peer_in_and_a_script_capsules_out(&self) {
+        assert_eq!(
+            self.runtime_writes,
+            vec![
+                json!({"path": "peer-in", "kind": "directory", "condition": "peer-fetch"}),
+                json!({"path": "out", "kind": "directory", "condition": "script-session"}),
+            ]
+        );
     }
 }
 
-/// A capsule that answers and stops. Whatever is in the workdir afterwards came from the runtime.
+/// A capsule that answers and stops: the runtime leaves nothing in the work folder.
 #[test]
 fn a_capsule_that_wrote_nothing_leaves_nothing_the_declaration_does_not_name() {
     if common::skip_without_host_support(
@@ -130,11 +119,11 @@ fn a_capsule_that_wrote_nothing_leaves_nothing_the_declaration_does_not_name() {
     }
     let run = run_session(vec![text_response("msg_1", "done")]);
 
-    run.assert_every_unconditional_declaration_exists();
+    run.assert_the_declaration_is_peer_in_and_a_script_capsules_out();
+    assert_eq!(walk(&run.accessible, &run.accessible), Vec::<String>::new());
     assert_eq!(
-        run.left_after_subtracting_the_declaration(),
-        BTreeSet::new(),
-        "everything in the workdir was the runtime's, and the declaration must name all of it"
+        fs::read_to_string(run.records_dir.join("out/result.txt")).unwrap(),
+        "done"
     );
 }
 
@@ -162,16 +151,10 @@ fn a_capsule_that_wrote_one_file_leaves_exactly_that_file() {
         "the capsule's own file is the only thing the declaration does not account for"
     );
 
-    // The synthetic home the shell call materialised, where the declaration says it is. Spelled
-    // out beside the subtraction because the subtraction alone cannot tell a directory that moved
-    // from one that was never created.
-    assert!(run
-        .accessible
-        .join(".murmur")
-        .join(&run.session_id)
-        .join(".capsule-home")
-        .is_dir());
-    assert!(!run.accessible.join(".capsule-home").exists());
+    // The shell call's home folder is in the records directory, and nothing of the runtime's is
+    // in the work folder.
+    assert!(run.records_dir.join("home").is_dir());
+    assert!(!run.accessible.join(".murmur").exists());
 }
 
 /// A command whose output passes the 16 KiB cap: its full output goes to the records directory,
@@ -308,14 +291,372 @@ fn the_trace_carries_the_same_declaration_explain_scope_prints() {
     for write in &run.runtime_writes {
         assert!(
             !write["path"].as_str().unwrap().contains(&run.session_id),
-            "a declared path carries the literal <session-id>, never a real id: {write}"
+            "a declared path carries no session id: {write}"
         );
     }
 }
 
-/// Stage an agent session against an explicit accessible workdir — the shape `mur run --workdir`
-/// takes, and the only shape in which the two workdirs are different directories — script the
-/// driver with `responses`, and read the declaration back out of the run's own trace.
+// ── The work folder holds only what the agent changed ────────────────────────
+
+const COMPACTOR: &str = "local/compactor";
+const COMPACTION_SUMMARY: &str = "the probe, the notes and the generated folder are in place";
+const FINAL_ANSWER: &str = "All done.";
+
+/// What one [`run_agent`] left: the work folder, the run's own records directory, its trace and
+/// how the launch ended.
+struct AgentRun {
+    work_folder: PathBuf,
+    records_dir: PathBuf,
+    events: Vec<Value>,
+    launch_error: Option<String>,
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+impl AgentRun {
+    fn has_event(&self, event_type: &str) -> bool {
+        self.events
+            .iter()
+            .any(|event| event["event_type"] == event_type)
+    }
+}
+
+/// An anthropic response reporting `usage`: a call of `tool` with `input`, or the end of the turn
+/// with `text` when `tool` is `None`.
+fn scripted(id: &str, tool: Option<(&str, Value)>, text: &str, usage: (u64, u64)) -> String {
+    let (content, stop_reason) = match tool {
+        Some((name, input)) => (
+            json!([{"type": "tool_use", "id": format!("toolu_{id}"), "name": name, "input": input}]),
+            "tool_use",
+        ),
+        None => (json!([{"type": "text", "text": text}]), "end_turn"),
+    };
+    json!({
+        "id": id,
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": Value::Null,
+        "usage": {"input_tokens": usage.0, "output_tokens": usage.1}
+    })
+    .to_string()
+}
+
+/// The scripted model of the acceptance runs: `command` through `bash`, the fixture native tool's
+/// `create_dir` of `generated` with label `x`, a call whose reported usage crosses the
+/// compaction trigger (400 of a 4000-token window), and the end of the turn.
+fn acceptance_responses(command: &str) -> Vec<String> {
+    vec![
+        scripted(
+            "msg_1",
+            Some(("bash", json!({"command": command}))),
+            "",
+            (10, 5),
+        ),
+        scripted(
+            "msg_2",
+            Some((
+                common::FIXTURE_NATIVE_TOOL_NAME,
+                json!({"operation": "create_dir", "path": "generated", "label": "x"}),
+            )),
+            "",
+            (10, 5),
+        ),
+        scripted(
+            "msg_3",
+            Some(("bash", json!({"command": "true"}))),
+            "",
+            (520, 20),
+        ),
+        scripted("msg_4", None, FINAL_ANSWER, (30, 5)),
+    ]
+}
+
+/// Launch an agent session in-process with `bash` and `extra_shell` allowed, the fixture native
+/// tool installed, an `on-compaction` hook that replaces the context, compaction at 10% of a
+/// 4000-token window with `dump_summaries`, `extra_capabilities` appended under
+/// `capabilities:`, and `workdir` as its `--workdir` when given. `None` when the native tool
+/// fixture cannot be built on this host.
+fn run_agent(
+    responses: Vec<String>,
+    delay: std::time::Duration,
+    workdir: Option<&Path>,
+    extra_shell: &[&str],
+    extra_capabilities: &str,
+) -> Option<AgentRun> {
+    let binary = common::fixture_native_tool_binary()?;
+    let server = ScriptedServer::start_with_delay(responses, delay);
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let driver = common::create_driver_artifact(
+        artifact_dir.path(),
+        DRIVER_NAME,
+        DRIVER_VERSION,
+        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver).success();
+    let tool = common::create_native_tool_zip(
+        artifact_dir.path(),
+        common::FIXTURE_NATIVE_TOOL_NAME,
+        "0.1.0",
+        &fs::read(common::fixture_native_tool_manifest()).unwrap(),
+        &binary,
+    );
+    common::publish_local(&home, &tool).success();
+    let hook = create_hook_zip(
+        artifact_dir.path(),
+        COMPACTOR,
+        "on-compaction",
+        "replace-context",
+        &compaction_hook_wasm(COMPACTION_SUMMARY),
+    );
+    common::publish_local(&home, &hook).success();
+
+    let endpoint = &server.endpoint;
+    let tool_name = common::FIXTURE_NATIVE_TOOL_NAME;
+    let extra_shell_yaml: String = extra_shell
+        .iter()
+        .map(|binary| format!("      - {binary}\n"))
+        .collect();
+    let manifest_path = project.path().join("murmur.yaml");
+    fs::write(
+        &manifest_path,
+        format!(
+            "name: workdir-writes-agent\nversion: 0.1.0\ncontext:\n  max_tokens: 4000\n\
+             artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    \
+             runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n  \
+             - name: local/{tool_name}\n    version: 0.1.0\n    runtime: tool\n  \
+             - name: {COMPACTOR}\n    version: 0.1.0\n    runtime: hook\n\
+             capabilities:\n  network:\n    allow:\n      - {endpoint}\n  shell:\n    allow:\n      \
+             - bash\n{extra_shell_yaml}{extra_capabilities}inference:\n  transport: http\n  \
+             model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n  compaction:\n    \
+             threshold: 0.1\n    dump_summaries: true\nlifecycle:\n  shell_grace_secs: 30\n"
+        ),
+    )
+    .unwrap();
+
+    let staged = match workdir {
+        Some(workdir) => {
+            common::stage_agent_session_with_workdir(&home, project.path(), &manifest_path, workdir)
+        }
+        None => common::stage_agent_session(&home, project.path(), &manifest_path),
+    };
+    let work_folder = staged.accessible_workdir.clone();
+    // The run's own record of where its records are: staging decided it, and the launch reports
+    // the same directory when it returns.
+    let records_dir = staged.records_dir.clone();
+    staged
+        .write_task_input(b"Probe, write the notes and generate the folder.")
+        .unwrap();
+
+    let launch_error = match launch_session(staged, |_| {}) {
+        Ok(launched) => {
+            assert_eq!(launched.records_dir, records_dir);
+            assert_eq!(launched.workdir, work_folder);
+            None
+        }
+        Err(error) => Some(error.to_string()),
+    };
+    let events = fs::read_to_string(records_dir.join("trace.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    Some(AgentRun {
+        work_folder,
+        records_dir,
+        events,
+        launch_error,
+        _dirs: vec![home, artifact_dir, project],
+    })
+}
+
+/// `git` in `repo` with a fixed identity, its stdout.
+fn git(repo: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=murmur-test",
+            "-c",
+            "user.email=murmur-test@example.invalid",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// The records directory holds the shell command's `$HOME` file, the final answer and the one
+/// committed compaction's summary, and the trace records that compaction.
+fn assert_the_records_hold_home_results_and_summaries(run: &AgentRun) {
+    assert_eq!(run.launch_error, None, "the session completes");
+    assert_eq!(
+        fs::read_to_string(run.records_dir.join("home/probe")).unwrap(),
+        "probe\n"
+    );
+    assert_eq!(
+        fs::read_to_string(run.records_dir.join("out/result.txt")).unwrap(),
+        FINAL_ANSWER
+    );
+    let summaries =
+        fs::read_to_string(run.records_dir.join("out/compaction-summaries.jsonl")).unwrap();
+    assert_eq!(summaries.lines().count(), 1, "{summaries}");
+    assert!(summaries.contains(COMPACTION_SUMMARY), "{summaries}");
+    assert!(run.has_event("compaction"), "{:#?}", run.events);
+}
+
+/// The acceptance check: a git work folder handed to `--workdir`, a session that runs a shell
+/// command, calls a native tool and compacts, and `git status` lists only what the agent changed.
+#[test]
+fn a_git_work_folder_shows_only_what_the_agent_changed() {
+    if common::skip_without_host_support("a_git_work_folder_shows_only_what_the_agent_changed") {
+        return;
+    }
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "--quiet"]);
+    fs::write(repo.path().join("README.md"), "# repo\n").unwrap();
+    git(repo.path(), &["add", "README.md"]);
+    git(repo.path(), &["commit", "--quiet", "-m", "init"]);
+
+    let Some(run) = run_agent(
+        acceptance_responses(
+            "echo probe > \"$HOME/probe\"; echo agent > notes.txt; echo more >> README.md",
+        ),
+        std::time::Duration::ZERO,
+        Some(repo.path()),
+        &[],
+        "",
+    ) else {
+        eprintln!("SKIP: the native tool fixture could not be built on this host");
+        return;
+    };
+
+    let status = git(
+        repo.path(),
+        &["status", "--porcelain", "--untracked-files=all"],
+    );
+    let mut lines: Vec<&str> = status.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(
+        lines,
+        [" M README.md", "?? generated/label.txt", "?? notes.txt"],
+        "{status}"
+    );
+    assert!(!repo.path().join(".murmur").exists());
+    assert_the_records_hold_home_results_and_summaries(&run);
+}
+
+/// The same session without `--workdir`: the work folder the runtime created holds exactly what
+/// the agent wrote.
+#[test]
+fn a_default_work_folder_holds_only_what_the_agent_wrote() {
+    if common::skip_without_host_support("a_default_work_folder_holds_only_what_the_agent_wrote") {
+        return;
+    }
+    let Some(run) = run_agent(
+        acceptance_responses("echo probe > \"$HOME/probe\"; echo agent > notes.txt"),
+        std::time::Duration::ZERO,
+        None,
+        &[],
+        "",
+    ) else {
+        eprintln!("SKIP: the native tool fixture could not be built on this host");
+        return;
+    };
+
+    let mut files = walk(&run.work_folder, &run.work_folder);
+    files.sort_unstable();
+    assert_eq!(files, ["generated", "generated/label.txt", "notes.txt"]);
+    assert_the_records_hold_home_results_and_summaries(&run);
+}
+
+/// Under `--workdir` the ceiling covers the operator's folder: a command writing 2 MB into it
+/// past a 1 MiB `workdir_max_bytes` ends the session with `E-RUN-013`, and the breach's
+/// bootstrap log line names the work folder, `tmp/` and `home/` it measured.
+#[test]
+fn a_work_folder_past_its_ceiling_ends_the_session_under_workdir() {
+    if common::skip_without_host_support(
+        "a_work_folder_past_its_ceiling_ends_the_session_under_workdir",
+    ) {
+        return;
+    }
+    let workdir = tempfile::tempdir().unwrap();
+    // A builtin loop: on a kernel-enforcement host only the allowed binaries are executable.
+    let write_2mb = "block=$(printf '%01024d' 0); for ((i = 0; i < 2048; i++)); do \
+                     printf '%s' \"$block\"; done > big.bin";
+    let responses = vec![
+        scripted(
+            "msg_1",
+            Some(("bash", json!({"command": write_2mb}))),
+            "",
+            (10, 5),
+        ),
+        // Longer than the guard's 10 s check interval.
+        scripted(
+            "msg_2",
+            Some(("bash", json!({"command": "sleep 12"}))),
+            "",
+            (10, 5),
+        ),
+        scripted(
+            "msg_3",
+            Some(("bash", json!({"command": "true"}))),
+            "",
+            (10, 5),
+        ),
+        scripted("msg_4", None, "never reached", (10, 5)),
+    ];
+    let Some(run) = run_agent(
+        responses,
+        std::time::Duration::ZERO,
+        Some(workdir.path()),
+        &["sleep"],
+        "  resources:\n    workdir_max_bytes: 1048576\n",
+    ) else {
+        eprintln!("SKIP: the native tool fixture could not be built on this host");
+        return;
+    };
+
+    let error = run
+        .launch_error
+        .as_deref()
+        .expect("the breach ends the session");
+    assert!(
+        error.contains("past the 1048576 byte ceiling (capabilities.resources.workdir_max_bytes)"),
+        "{error}"
+    );
+    assert!(error.contains("work folder, $HOME and $TMPDIR"), "{error}");
+    let size = fs::metadata(workdir.path().join("big.bin")).unwrap().len();
+    assert_eq!(size, 2 * 1024 * 1024);
+    let log = fs::read_to_string(run.records_dir.join("logs/bootstrap.log")).unwrap();
+    let line = log
+        .lines()
+        .find(|line| line.contains("measured: "))
+        .unwrap_or_else(|| panic!("no breach line names what it measured:\n{log}"));
+    for measured in [
+        workdir.path().to_path_buf(),
+        run.records_dir.join("tmp"),
+        run.records_dir.join("home"),
+    ] {
+        assert!(line.contains(&measured.display().to_string()), "{line}");
+    }
+    assert!(!workdir.path().join(".murmur").exists());
+}
+
+/// Stage an agent session against an explicit work folder — the shape `mur run --workdir` takes —
+/// script the driver with `responses`, and read the declaration back out of the run's own trace.
 fn run_session(responses: Vec<String>) -> Run {
     run_session_with(responses, std::time::Duration::ZERO, &[], "")
 }

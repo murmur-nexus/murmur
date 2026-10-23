@@ -43,8 +43,8 @@ depends on its role:
 
 | Entry | No `filesystem.scope` declared | `filesystem.scope: cache` |
 |---|---|---|
-| `runtime: tool` | The whole accessible session workdir, read-write | `<workdir>/cache` and nothing above it |
-| `runtime: driver` | The whole accessible session workdir, read-write | `<workdir>/cache` and nothing above it |
+| `runtime: tool` | The whole work folder, read-write | `<workdir>/cache` and nothing above it |
+| `runtime: driver` | The whole work folder, read-write | `<workdir>/cache` and nothing above it |
 | `runtime: hook` | No directory of any kind | `<workdir>/cache` and nothing above it |
 
 The wide default for tools and drivers is chosen against prompt injection steering an honest

@@ -91,10 +91,10 @@ pub(crate) struct MurmurMdInputs {
     /// The manifest file the launch copied into the runtime directory, if it read one.
     pub(crate) manifest_file: Option<String>,
     pub(crate) facts: CapsuleFacts,
-    /// `capabilities.resources.workdir_max_bytes`, when `WorkdirGuard` measures the accessible
-    /// workdir itself and a breach ends the session: `transport: http` launched without
-    /// `--workdir`. Under `--workdir` the guard measures `.murmur/<session-id>` beneath it, and on
-    /// `transport: process` the harness's own writes are not refused, so neither states a ceiling.
+    /// `capabilities.resources.workdir_max_bytes`, when a breach ends the session: every
+    /// `transport: http` session, with or without `--workdir`, whose `WorkdirGuard` measures the
+    /// work folder, `$HOME` and `$TMPDIR` together. On `transport: process` the harness's own
+    /// writes are not refused, so it states no ceiling.
     pub(crate) work_folder_ceiling: Option<u64>,
     /// The installed tools whose guest is preopened at `murmur-runtime/`, sorted
     /// ([`crate::runtime_dir::runtime_dir_preopened_tools`]). The staged set at first; a committed
@@ -586,7 +586,7 @@ mod tests {
              - 50000 tokens per session\n\
              - 2 GiB memory and 3600 s CPU time per command\n\
              - a shell command still running after 10 s moves to the background\n\
-             - 10 GiB in the work folder\n\
+             - 10 GiB across the work folder, $HOME and $TMPDIR\n\
              - Context budget: 200000 tokens (compaction not configured)\n\
              \n\
              ## Runtime Directory\n"
@@ -704,10 +704,10 @@ mod tests {
          - 1 GiB memory and 120 s CPU time per command\n\
          - a shell command still running after 30 s moves to the background\n";
 
-    /// Launched without `--workdir`, the guard measures the work folder, so its ceiling follows
-    /// the block's parts.
+    /// An http session's guard measures the work folder, `$HOME` and `$TMPDIR`, so its ceiling
+    /// follows the block's parts.
     #[test]
-    fn capsule_facts_in_murmur_md_without_workdir_state_the_work_folder_ceiling() {
+    fn capsule_facts_in_murmur_md_of_an_http_session_state_the_work_folder_ceiling() {
         let tmp = TempDir::new().unwrap();
         let (policy, facts) = enforced_limits_facts();
         let content = render(&tmp, |inputs| {
@@ -715,16 +715,16 @@ mod tests {
             inputs.work_folder_ceiling = Some(policy.resources.workdir_max_bytes);
         });
         let expected = format!(
-            "{ENFORCED_LIMIT_BULLETS}- 512 MiB in the work folder\n- Context budget: not set \
+            "{ENFORCED_LIMIT_BULLETS}- 512 MiB across the work folder, $HOME and $TMPDIR\n- \
+             Context budget: not set \
              (compaction not configured)\n"
         );
         assert!(content.contains(&expected), "content: {content}");
     }
 
-    /// Launched with `--workdir`, the guard measures `.murmur/<session-id>` beneath the work
-    /// folder, so no ceiling is stated for it.
+    /// Without a ceiling — a `transport: process` session — none is stated.
     #[test]
-    fn capsule_facts_in_murmur_md_under_workdir_state_no_work_folder_ceiling() {
+    fn capsule_facts_in_murmur_md_without_a_ceiling_state_none() {
         let tmp = TempDir::new().unwrap();
         let (_, facts) = enforced_limits_facts();
         let content = render(&tmp, |inputs| {
@@ -736,7 +736,7 @@ mod tests {
         );
         assert!(content.contains(&expected), "content: {content}");
         assert!(
-            !content.contains("in the work folder"),
+            !content.contains("across the work folder"),
             "content: {content}"
         );
     }

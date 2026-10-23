@@ -258,69 +258,56 @@ fn an_unknown_manifest_containment_value_fails_at_parse_time() {
         ));
 }
 
-/// The `runtime_writes` declaration, read the way a consumer for whom the workdir is the
+/// The `runtime_writes` declaration, read the way a consumer for whom the work folder is the
 /// deliverable reads it: before anything is staged, off a command that creates nothing.
 ///
-/// The row set itself is asserted in `capsule-runtime`'s own tests, against the declaration
-/// function. What is asserted here is the part only the real binary can show — that the key
-/// reaches `--explain-scope --json` at all, that each row is the four-key object a consumer
-/// parses, and that asking the question leaves no directory behind.
+/// A capsule granted shell and spawn still declares exactly the two paths a capsule asks for —
+/// a redeemed peer handle's `peer-in` and a script capsule's own `out` — each a three-key row,
+/// in the JSON report and in the human rendering alike. Nothing the runtime keeps for itself is
+/// declared, because none of it is in the work folder, and asking the question leaves no
+/// directory behind.
 #[test]
 fn explain_scope_declares_what_the_runtime_writes_and_creates_nothing() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     write_project(
         project.path(),
-        "capabilities:\n  shell:\n    allow:\n      - bash\n",
+        "capabilities:\n  shell:\n    allow:\n      - bash\n  spawn:\n    allow:\n      - local/worker\n",
     );
 
     let report = explain_scope_report(&home, project.path(), &[]);
-    let writes = report["runtime_writes"]
-        .as_array()
-        .expect("runtime_writes is an array");
-    assert!(!writes.is_empty(), "the runtime writes something");
-
-    for write in writes {
-        let object = write.as_object().expect("each row is an object");
-        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(keys, ["condition", "kind", "path", "scope"], "{write}");
-        assert!(
-            ["file", "directory"].contains(&object["kind"].as_str().unwrap()),
-            "{write}"
-        );
-        assert!(
-            ["accessible", "session"].contains(&object["scope"].as_str().unwrap()),
-            "{write}"
-        );
-        let condition = object["condition"].as_str().unwrap();
-        assert!(
-            condition
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c == '-'),
-            "conditions are kebab-case wire names: {write}"
-        );
-    }
-
-    let declared: Vec<&str> = writes
-        .iter()
-        .map(|write| write["path"].as_str().unwrap())
-        .collect();
-    assert!(declared.contains(&".murmur/<session-id>"), "{declared:?}");
-    // The files the runtime owns are in the runtime directory, so none is a workdir write.
-    for moved in ["task.md", "murmur.yaml", "MURMUR.md", "tools", "plans"] {
-        assert!(
-            !declared.iter().any(|path| path.ends_with(moved)),
-            "{moved}: {declared:?}"
-        );
-    }
-    // Every shell log is a record in the session's records directory, shell allowed or not.
-    assert!(
-        !declared
-            .iter()
-            .any(|path| *path == "logs" || path.starts_with("logs/")),
-        "{declared:?}"
+    assert_eq!(
+        report["runtime_writes"],
+        serde_json::json!([
+            {"path": "peer-in", "kind": "directory", "condition": "peer-fetch"},
+            {"path": "out", "kind": "directory", "condition": "script-session"},
+        ])
     );
+    for write in report["runtime_writes"].as_array().unwrap() {
+        let mut keys: Vec<&str> = write
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["condition", "kind", "path"], "{write}");
+    }
+
+    let output = mur_run(&home, project.path(), &["--explain-scope"]).success();
+    let text = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        text.contains(
+            "  paths are relative to the work folder\n  runtime writes:\n    \
+             - peer-in (directory, peer-fetch)\n    - out (directory, script-session)\n"
+        ),
+        "{text}"
+    );
+    for absent in [".murmur/", ".capsule-home", "children"] {
+        let block = &text[text.find("runtime writes:").unwrap()..];
+        let block = &block[..block.find("\n\n").unwrap_or(block.len())];
+        assert!(!block.contains(absent), "{absent}: {block}");
+    }
 
     assert!(
         !project.path().join(".murmur").exists(),

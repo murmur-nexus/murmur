@@ -321,15 +321,16 @@ Because every child is a process of its own:
 
 ### The child's directory
 
-The parent's runtime composes the child's directory at
-`<parent accessible workdir>/.murmur/children/<capsule name>-<16 hex>`, creates it owner-only
-(`0700` on Unix), and passes it as the child's `--workdir`. The 16 hex characters are fresh per
-delegation, so spawning the same capsule twice yields two directories rather than one shared one.
+The parent's runtime composes the child's work folder at
+`<parent records directory>/children/<capsule name>-<16 hex>`, creates it owner-only (`0700` on
+Unix), and passes it as the child's `--workdir`. The 16 hex characters are fresh per delegation, so
+spawning the same capsule twice yields two directories rather than one shared one.
 
-**The parent retains write access to a running child's directory.** The directory sits beneath the
-parent's own accessible workdir, so a parent can place inputs in it before launch and keep writing
-to it while the child runs, without any grant saying so. The spawn envelope does not cover this
-channel. A child cannot reach out of its own directory, so nothing flows the other way.
+**The parent's commands can read a child's work folder and cannot write it.** It lies in the
+parent's [records directory](workdir.md#records-directory), outside the parent's work folder, so
+it is read-only to the parent's commands wherever the host enforces the records directory. A child
+cannot reach out of its own work folder. It is removed with the parent's records directory, by
+[`mur trace rm`](cli.md#mur-trace-rm) or [`trace.retain`](manifest.md#trace-retain).
 
 ### The child's environment { #the-childs-environment }
 
@@ -446,7 +447,7 @@ it are composed by the capsule's own runtime, so **a delegating capsule needs no
 | `session_id` | string | `ses_…`, the child's own session |
 | `capsule`, `version` | string | The artifact that was launched, `capsule` by its bare name |
 | `status` | string | `started` or `failed`. A refused call returns no object — see below |
-| `child_workdir` | string | The child's directory, relative to the delegating capsule's accessible workdir — where its result will be. Its `trace.jsonl` is in its own [records directory](workdir.md#records-directory). Present only on `started` |
+| `child_workdir` | string | The child's work folder, absolute: `<parent records directory>/children/<capsule>-<16 hex>`. Its `trace.jsonl` and an agent child's `out/result.txt` are in its own [records directory](workdir.md#records-directory). Present only on `started` |
 | `output` | string | Why there is no delegation, on `failed`. Absent on `started`, which has produced nothing yet |
 
 `started` means the sub-capsule is running **and holding its task**, not merely that a process
@@ -497,8 +498,8 @@ capsule: worker@1.0.0
 session_id: ses_0193…
 status: ok
 duration_ms: 4210
-workdir: /home/me/project/.murmur/children/worker-3f2a…
-result: .murmur/ses_0193…/out/result.txt (in that workdir)
+workdir: /home/me/.murmur/records/home/me/project/ses_0192…/children/worker-3f2a…
+result: /home/me/.murmur/records/home/me/.murmur/records/home/me/project/ses_0192…/children/worker-3f2a…/ses_0193…/out/result.txt
 
 The child's own output is in that file and is not reproduced here.
 </untrusted-content>
@@ -571,8 +572,8 @@ cannot be read refuses to launch with [`E-RUN-020`](diagnostics.md#e-run-020).
 ### What the completion carries
 
 The delegation's identity, the outcome and where the result is — never the child's output. The
-result stays in the child's own directory, which is inside the parent's accessible workdir, so a
-parent that wants it reads the file deliberately through an ordinary tool call.
+result stays in the child's own files: `out/result.txt` in the child's records directory for an
+agent child, or in its work folder for a script child, which writes its own.
 
 | Field | Meaning |
 |---|---|
@@ -580,8 +581,8 @@ parent that wants it reads the file deliberately through an ordinary tool call.
 | `capsule_name`, `capsule_version` | Which capsule ran |
 | `session_id` | The child's own session, so its trace is findable |
 | `status` | `ok`, `error`, `crashed` or `terminated`. These are the words the `delegation` trace line carries for a delegation closed from a completion — see [Which outcome vocabulary applies](observability-schemas.md#delegation-outcome) |
-| `result_path` | Workdir-relative path to the result, absent when the child wrote none |
-| `workdir` | The child's directory, absolute — the root `result_path` is relative to |
+| `result_path` | The result file's absolute path, absent when the child wrote none |
+| `workdir` | The child's work folder, absolute |
 | `duration_ms` | How long the child ran |
 | `detail` | The exit status and the child's last stderr lines, on a `crashed` or `terminated` outcome |
 

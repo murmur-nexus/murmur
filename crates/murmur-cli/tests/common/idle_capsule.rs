@@ -58,7 +58,7 @@ pub fn end_turn_server(texts: &[&str]) -> ScriptedServer {
 
 // ── capsule ────────────────────────────────────────────────────────────────────
 
-/// A launched, idle queue+sleep capsule: its address and its workdir.
+/// A launched, idle queue+sleep capsule: its address and its work folder.
 pub struct IdleCapsule {
     pub url: String,
     pub workdir: PathBuf,
@@ -113,7 +113,7 @@ pub fn launch_idle_capsule_with_input_timeout(
     .unwrap();
 
     let staged = stage_agent(&home, &manifest_path, input_timeout_secs);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let records_dir = staged.records_dir.clone();
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();

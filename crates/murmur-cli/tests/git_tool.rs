@@ -283,7 +283,7 @@ fn native_tool_dispatch_creates_directory() {
     ]);
 
     let staged = stage_fixture_tool_session(&home, project.path(), &server.endpoint);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     fs::write(workdir.join("task.md"), "Create ./made/here.").unwrap();
 
     launch_session(staged, |_| {}).expect("launch should succeed");
@@ -355,7 +355,7 @@ fn native_tool_dispatch_reports_failure_for_existing_path() {
 
     // Stage first to learn the workdir, then occupy the target path inside it.
     let staged = stage_fixture_tool_session(&home, project.path(), &server.endpoint);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let occupied = workdir.join("occupied");
     fs::create_dir_all(&occupied).unwrap();
     fs::write(occupied.join("pre-existing.txt"), "untouched\n").unwrap();
@@ -416,7 +416,7 @@ fn native_tool_dispatch_lists_entries() {
 
     // Stage first to learn the workdir path, then populate the directory inside it.
     let staged = stage_fixture_tool_session(&home, project.path(), &server.endpoint);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let listing = workdir.join("listing");
     fs::create_dir_all(&listing).unwrap();
     fs::write(listing.join("alpha.txt"), "a\n").unwrap();
@@ -470,7 +470,7 @@ fn native_tool_dispatch_lists_entries_with_repo_base() {
     ]);
 
     let staged = stage_fixture_tool_session(&home, project.path(), &server.endpoint);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let base = workdir.join("base");
     fs::create_dir_all(&base).unwrap();
     fs::write(base.join("gamma.txt"), "g\n").unwrap();
@@ -524,7 +524,7 @@ fn native_tool_dispatch_with_explicit_repo() {
     ]);
 
     let staged = stage_fixture_tool_session(&home, project.path(), &server.endpoint);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     fs::create_dir_all(workdir.join("explicit-base")).unwrap();
     fs::write(
         workdir.join("task.md"),
@@ -591,7 +591,7 @@ fn native_tool_schema_includes_repo_field() {
     let server = common::ScriptedServer::start(vec![end_turn_response("done")]);
 
     let staged = stage_fixture_tool_session(&home, project.path(), &server.endpoint);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     fs::write(workdir.join("task.md"), "no-op").unwrap();
 
     launch_session(staged, |_| {}).expect("launch should succeed");

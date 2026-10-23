@@ -75,7 +75,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
     let manifest = project.path().join("murmur.yaml");
     let staged = stage_door(&home, &manifest, None);
     let session_id = staged.session_id.clone();
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let records_dir = staged.records_dir.clone();
     fs::create_dir_all(workdir.join("out")).unwrap();
     fs::write(workdir.join("out").join("report.txt"), "exported").unwrap();

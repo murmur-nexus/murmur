@@ -41,9 +41,9 @@
 //!     `linux_enforce::WORKDIR_ACCESS_RIGHTS_NO_EXEC` and `linux_enforce::workdir_access_rights`.
 //!     Outside the workdir, alongside the derived
 //!     read+execute grants, a fixed three-device set is granted unconditionally — see
-//!     `CAPSULE_DEVICE_GRANTS`: `/dev/null` read+write (with the session's temporary folder, the
-//!     only writable paths outside the workdir), `/dev/zero` and `/dev/urandom` read-only, and no
-//!     other device at all.
+//!     `CAPSULE_DEVICE_GRANTS`: `/dev/null` read+write (with the session's temporary and home
+//!     folders, the only writable paths outside the workdir), `/dev/zero` and `/dev/urandom`
+//!     read-only, and no other device at all.
 //!
 //! Both Linux tiers additionally strip the forked child's **Linux capabilities** (bounding set,
 //! then permitted/effective/inheritable, then `no_new_privs`) before `execve()` — see
@@ -2273,6 +2273,31 @@ impl ShellEnforcement {
             .map(crate::workdir_fs::WorkdirRoot::path)
     }
 
+    /// The session's home folder, `home/` in its records directory, held. `None` for an
+    /// enforcement held outside a session, which runs no command.
+    pub(crate) fn home_root(&self) -> Option<&crate::workdir_fs::WorkdirRoot> {
+        self.runtime_dir
+            .as_ref()
+            .and_then(|roots| roots.home.as_ref())
+    }
+
+    /// The directory the session's delegated children keep their records beneath, when the
+    /// session can delegate and a child has staged there; read-only to every command. Linux only:
+    /// no other platform grants it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn children_records_path(&self) -> Option<&Path> {
+        self.runtime_dir
+            .as_ref()
+            .and_then(|roots| roots.children_records.as_deref())
+            .filter(|path| path.is_dir())
+    }
+
+    /// The home folder's absolute path, the value of `$HOME` and the synthetic passwd's home
+    /// directory on every tier. `None` for an enforcement held outside a session.
+    pub(crate) fn home_dir_path(&self) -> Option<&Path> {
+        self.home_root().map(crate::workdir_fs::WorkdirRoot::path)
+    }
+
     /// Hand in the session's [`crate::temp_dir::temp_mapping`] answer, decided for this
     /// enforcement's tier.
     pub(crate) fn with_temp_mapping(mut self, mapping: crate::temp_dir::TempMapping) -> Self {
@@ -2408,6 +2433,15 @@ impl ShellEnforcement {
         }
     }
 
+    /// This enforcement holding a session's runtime directory roots, home folder included, in a
+    /// fresh directory kept past the test: a clone may outlive the value. For a test whose
+    /// commands need only to run.
+    #[cfg(test)]
+    pub(crate) fn with_test_session_dirs(self) -> Self {
+        let base = tempfile::tempdir().unwrap().keep();
+        self.with_runtime_dir(test_runtime_dir(&base), None)
+    }
+
     /// Run this enforcement's commands in `session_netns` rather than in a namespace of its own.
     ///
     /// For a plan submitted inside a session: its shell steps are that session's commands, so
@@ -2529,7 +2563,7 @@ impl Drop for EndSessionOnDrop {
 /// addition to the workdir's own grant (which withholds device-node and unix-socket creation, see
 /// `linux_enforce::WORKDIR_ACCESS_RIGHTS`) — so allowlisted programs can actually exec and
 /// dynamically link, and the only writable paths outside the workdir are the session's temporary
-/// folder and `/dev/null`, one of the three fixed devices in `CAPSULE_DEVICE_GRANTS`. Seccomp
+/// and home folders and `/dev/null`, one of the three fixed devices in `CAPSULE_DEVICE_GRANTS`. Seccomp
 /// additionally refuses the `socket(2)` domains in `denied_socket_domains` — closing the
 /// `/var/run/docker.sock` path, which no Landlock ABI mediates for pathname sockets. The forked
 /// shell child also drops every Linux capability before `execve` (see
@@ -2540,8 +2574,8 @@ const KERNEL_ENFORCEMENT_NOTICE: &str = "capabilities.shell.allow is non-empty a
 resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now grants a narrow, \
 derived read+execute scope outside the workdir (the allowlisted binaries, their loader, and their \
 shared libraries — nothing writable, no directory granted wholesale), plus a fixed device set \
-every capsule gets unconditionally: /dev/null read+write (with the session's temporary folder, \
-the only writable paths outside the workdir), \
+every capsule gets unconditionally: /dev/null read+write (with the session's temporary and home \
+folders, the only writable paths outside the workdir), \
 /dev/zero and /dev/urandom read-only, and no other device — /dev/random, /dev/full, /dev/tty and \
 raw block devices stay denied. The workdir's own grant also \
 withholds device-node and unix-socket creation; seccomp refuses socket(AF_UNIX) outright unless \
@@ -2558,9 +2592,9 @@ denied, not absent: stat, access and readlink on an ungranted path still succeed
 /// has one. Names what `sealed` adds over `scoped` so the warning is not a louder copy of it.
 const KERNEL_SEALED_ENFORCEMENT_NOTICE: &str = "capabilities.shell.allow is non-empty and this \
 host resolved to the sealed kernel-enforcement tier: the subprocess tree runs in a private mount \
-namespace pivoted onto a composed root (host runtime bind-mounted read-only, the session workdir \
-and /tmp, the session's temporary folder, the only writable paths, a private /dev tmpfs carrying \
-the OCI default device set), with Landlock \
+namespace pivoted onto a composed root (host runtime bind-mounted read-only, the session workdir, \
+its temporary folder at /tmp and its home folder at $HOME the only writable paths, a private /dev \
+tmpfs carrying the OCI default device set), with Landlock \
 and seccomp still installed inside it as defence in depth. Paths outside that root are absent \
 rather than denied — with one documented exception: /proc is a bind of the host's, not a masked \
 private procfs, because mounting one unprivileged needs a PID namespace this tier does not create, \
@@ -2819,13 +2853,13 @@ pub(crate) fn sealed_test_enforcement() -> ShellEnforcement {
     let base = tempfile::tempdir().unwrap().keep();
     ShellEnforcement {
         tier: EnforcementTier::KernelSealed,
-        ..ShellEnforcement::environment_only()
+        ..ShellEnforcement::environment_only().with_test_session_dirs()
     }
     .with_runtime_dir(test_runtime_dir(&base), None)
 }
 
-/// `runtime/`, `sealed-etc/`, `harness/` and a records directory holding a temporary folder,
-/// created under `base`, held as a session's runtime directory roots.
+/// `runtime/`, `sealed-etc/`, `harness/` and a records directory holding a temporary folder and
+/// a home folder, created under `base`, held as a session's runtime directory roots.
 #[cfg(test)]
 pub(crate) fn test_runtime_dir(base: &Path) -> crate::runtime_dir::RuntimeDirRoots {
     let open = |sub: &str| {
@@ -2843,6 +2877,11 @@ pub(crate) fn test_runtime_dir(base: &Path) -> crate::runtime_dir::RuntimeDirRoo
         "{}/{}",
         crate::records_dir::RECORDS_DIR_NAME,
         crate::temp_dir::SESSION_TEMP_DIR_NAME
+    )))
+    .with_home(open(&format!(
+        "{}/{}",
+        crate::records_dir::RECORDS_DIR_NAME,
+        crate::records_dir::HOME_SUBDIR
     )))
 }
 
@@ -2916,7 +2955,6 @@ pub(crate) fn prepare_enforcement(
     command: &mut std::process::Command,
     enforcement: &ShellEnforcement,
     _accessible_workdir: &Path,
-    _session_workdir: &crate::workdir_fs::WorkdirRoot,
 ) -> Result<SupervisorHandle, String> {
     #[cfg(test)]
     forced_prepare_failure()?;
@@ -2941,7 +2979,6 @@ pub(crate) fn prepare_enforcement(
     command: &mut std::process::Command,
     enforcement: &ShellEnforcement,
     accessible_workdir: &Path,
-    session_workdir: &crate::workdir_fs::WorkdirRoot,
 ) -> Result<SupervisorHandle, String> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
@@ -2968,6 +3005,21 @@ pub(crate) fn prepare_enforcement(
         .map_err(|error| {
             format!("sandbox: failed to open the session's temporary folder: {error}")
         })?;
+    // The session's home folder, on exactly the temporary folder's terms: its Landlock rule's fd
+    // on both Landlock tiers and the identity its sealed bind verifies.
+    let home_dir_fd = enforcement
+        .home_root()
+        .map(|home| home.path_fd().map(Arc::new))
+        .transpose()
+        .map_err(|error| format!("sandbox: failed to open the session's home folder: {error}"))?;
+
+    // The delegated children's records, opened only once a child has staged there, with no link
+    // at the last component followed: a read-only rule on both Landlock tiers and a read-only
+    // bind on `KernelSealed`, so a parent's agent reads the result an outcome names.
+    let children_records_fd = enforcement
+        .children_records_path()
+        .map(|path| open_directory_no_follow(path).map(|fd| (Arc::new(fd), path.to_path_buf())))
+        .transpose()?;
 
     // The descriptors a rule and a bind share on `KernelSealed`: the temporary folder and the
     // runtime and records directories, each taken once, with no link followed, from a held
@@ -2976,9 +3028,10 @@ pub(crate) fn prepare_enforcement(
     // changes neither.
     let sealed_sources = if enforcement.tier == EnforcementTier::KernelSealed {
         Some(SealedSourceFds::open(
-            session_workdir,
             enforcement,
             temp_dir_fd.as_ref(),
+            home_dir_fd.as_ref(),
+            children_records_fd.clone(),
         )?)
     } else {
         None
@@ -3019,7 +3072,7 @@ pub(crate) fn prepare_enforcement(
     // The private `/tmp` of a `MountNamespace` spawn, every path and buffer of it built here.
     let tmp_map_spec = match (&temp_dir_fd, enforcement.installed_temp_mapping()) {
         (Some(folder_fd), crate::temp_dir::TempMapping::MountNamespace) => Some(
-            build_tmp_map_spec(enforcement, folder_fd, accessible_workdir, session_workdir)?,
+            build_tmp_map_spec(enforcement, folder_fd, accessible_workdir)?,
         ),
         _ => None,
     };
@@ -3043,8 +3096,10 @@ pub(crate) fn prepare_enforcement(
                 abi: enforcement.landlock_abi,
                 sealed: sealed_sources.as_ref(),
                 temp_dir_fd,
+                home_dir_fd,
                 runtime_dir_fd,
                 records_dir_fd,
+                children_records_fd: children_records_fd.map(|(fd, _)| fd),
             },
         )?)
     } else {
@@ -3217,7 +3272,7 @@ fn landlock_device_grants(tier: EnforcementTier) -> Vec<CapsuleDeviceGrant> {
 /// canonical `/tmp`, and every path beneath the host's `/tmp` the command still needs re-exposed
 /// at its own path.
 ///
-/// Those paths are the accessible and session workdirs, bound read-write, and the runtime and
+/// Those paths are the accessible workdir and the session's home folder, bound read-write, and the runtime and
 /// records directories and every Landlock grant path, which already carries the `shell.allow`
 /// closure, the interpreter and staged runtimes and a native tool's entrypoint closure, bound
 /// read-only. Landlock adds the folder's rights to everything bound beneath it, which are the
@@ -3228,7 +3283,6 @@ fn build_tmp_map_spec(
     enforcement: &ShellEnforcement,
     folder_fd: &std::os::fd::OwnedFd,
     accessible_workdir: &Path,
-    session_workdir: &crate::workdir_fs::WorkdirRoot,
 ) -> Result<crate::temp_dir::TmpMapSpec, String> {
     let folder = enforcement.temp_dir_path().ok_or_else(|| {
         format!(
@@ -3246,6 +3300,7 @@ fn build_tmp_map_spec(
     let read_only = [
         enforcement.runtime_dir_path(),
         enforcement.records_dir_path(),
+        enforcement.children_records_path(),
     ]
     .into_iter()
     .flatten()
@@ -3257,7 +3312,7 @@ fn build_tmp_map_spec(
     );
     let reexposed = crate::temp_dir::reexposed_paths(
         &canonical_tmp,
-        [accessible_workdir, session_workdir.path()],
+        std::iter::once(accessible_workdir).chain(enforcement.home_dir_path()),
         read_only,
     );
     crate::temp_dir::TmpMapSpec::new(
@@ -3269,13 +3324,26 @@ fn build_tmp_map_spec(
     )
 }
 
+/// `path`, a directory, opened `O_PATH` with no link followed at its last component: the
+/// descriptor a rule is taken on and a bind is verified against.
+#[cfg(target_os = "linux")]
+fn open_directory_no_follow(path: &Path) -> Result<std::os::fd::OwnedFd, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .map(std::os::fd::OwnedFd::from)
+        .map_err(|error| format!("sandbox: failed to open {}: {error}", path.display()))
+}
+
 /// Writes (idempotently) the synthetic `/etc/passwd`/`/etc/group` the composed root binds in place
 /// of the host's into the session's `sealed-etc/` directory, returning their host paths in
 /// [`crate::sealed::SEALED_ETC_PATHS`] order.
 ///
 /// `sealed-etc/` sits beside the runtime directory, outside every workdir, and no capsule command
-/// is granted it. The account the files name is the session workdir's owner, the identity the
-/// capsule's subprocesses run as, with the session's synthetic home as its home directory.
+/// is granted it. The account the files name is the home folder's owner, the identity the
+/// capsule's subprocesses run as, with the session's home folder as its home directory.
 ///
 /// Runs in the parent, never in `pre_exec`: composing a root is the child's job, but *producing
 /// content* is work the parent can do, and this module's rule is that the `pre_exec` window does
@@ -3287,18 +3355,18 @@ fn build_tmp_map_spec(
 #[cfg(target_os = "linux")]
 fn ensure_sealed_identity_files(
     sealed_etc_root: &crate::workdir_fs::WorkdirRoot,
-    session_workdir: &crate::workdir_fs::WorkdirRoot,
+    home_root: &crate::workdir_fs::WorkdirRoot,
 ) -> Result<Vec<PathBuf>, String> {
-    // The workdir was created by this process, so its owner is the identity the capsule's
+    // The home folder was created by this process, so its owner is the identity the capsule's
     // subprocesses run as — no `getuid(2)` FFI needed under `#![deny(unsafe_code)]`.
-    let (uid, gid) = session_workdir.owner().map_err(|error| {
-        format!("sealed: failed to stat the session workdir for the capsule's uid/gid: {error}")
+    let (uid, gid) = home_root.owner().map_err(|error| {
+        format!(
+            "sealed: failed to stat the session's home folder for the capsule's uid/gid: {error}"
+        )
     })?;
-    // The same string `build_shell_env` puts in `$HOME`, from the same constant, resolved against
-    // the same directory: the synthetic home lives in the session workdir, so a `pw_dir` composed
-    // against the accessible one would name a directory that does not exist.
-    let home = session_workdir.host_path(crate::shell::SYNTHETIC_HOME_DIR_NAME);
-    let home = home.to_string_lossy().into_owned();
+    // The same string `build_shell_env` puts in `$HOME`: the home folder's own absolute path,
+    // which the composed root binds at that same path.
+    let home = home_root.path().to_string_lossy().into_owned();
     let identity = crate::sealed::SealedAccountIdentity {
         uid,
         gid,
@@ -3339,6 +3407,9 @@ pub(crate) struct SealedSourceFds {
     tmp_store: Arc<std::os::fd::OwnedFd>,
     /// The folder's host path, which the child opens and verifies against [`Self::tmp_store`].
     tmp_store_path: PathBuf,
+    /// The session's home folder, reopened from its root's held descriptor, and its absolute
+    /// path: its rule's fd and its read-write bind at that same path.
+    home_dir: (Arc<std::os::fd::OwnedFd>, PathBuf),
     /// The runtime directory, reopened from its root's held descriptor: its rule's fd.
     runtime_dir: Arc<std::os::fd::OwnedFd>,
     /// The runtime directory's absolute path, which the bind reproduces inside the root and the
@@ -3348,6 +3419,9 @@ pub(crate) struct SealedSourceFds {
     /// its rule's fd and its read-only bind, on the runtime directory's terms. `None` for an
     /// enforcement held outside a session.
     records_dir: Option<(Arc<std::os::fd::OwnedFd>, PathBuf)>,
+    /// The delegated children's records, and its absolute path: its rule's fd and its read-only
+    /// bind. `None` until a child has staged there.
+    children_records: Option<(Arc<std::os::fd::OwnedFd>, PathBuf)>,
     /// `sealed-etc/`'s host path.
     etc_dir: PathBuf,
     /// The synthetic `/etc` files, in [`crate::sealed::SEALED_ETC_PATHS`] order.
@@ -3356,14 +3430,15 @@ pub(crate) struct SealedSourceFds {
 
 #[cfg(target_os = "linux")]
 impl SealedSourceFds {
-    /// Writes the synthetic `/etc` files and takes every descriptor, with `temp_dir_fd` the
-    /// descriptor `prepare_enforcement` took on the session's temporary folder. A sealed root
-    /// cannot be composed for an enforcement that holds no runtime directory or no temporary
-    /// folder.
+    /// Writes the synthetic `/etc` files and takes every descriptor, with `temp_dir_fd` and
+    /// `home_dir_fd` the descriptors `prepare_enforcement` took on the session's temporary and
+    /// home folders. A sealed root cannot be composed for an enforcement that holds no runtime
+    /// directory, no temporary folder or no home folder.
     fn open(
-        session_workdir: &crate::workdir_fs::WorkdirRoot,
         enforcement: &ShellEnforcement,
         temp_dir_fd: Option<&Arc<std::os::fd::OwnedFd>>,
+        home_dir_fd: Option<&Arc<std::os::fd::OwnedFd>>,
+        children_records: Option<(Arc<std::os::fd::OwnedFd>, PathBuf)>,
     ) -> Result<Self, String> {
         let roots = enforcement.runtime_dir.as_ref().ok_or_else(|| {
             "sealed: a composed root needs the session's runtime directory, and this \
@@ -3378,7 +3453,11 @@ impl SealedSourceFds {
             );
         };
         let tmp_store = Arc::clone(tmp_store);
-        let identity_files = ensure_sealed_identity_files(&roots.sealed_etc, session_workdir)?;
+        let (Some(home), Some(home_fd)) = (roots.home.as_ref(), home_dir_fd) else {
+            return Err(crate::shell::NO_HOME_FOLDER_REFUSAL.to_string());
+        };
+        let home_dir = (Arc::clone(home_fd), home.path().to_path_buf());
+        let identity_files = ensure_sealed_identity_files(&roots.sealed_etc, home)?;
         let runtime_dir = Arc::new(roots.runtime.path_fd().map_err(|error| {
             format!("sealed: failed to open the runtime directory for its bind: {error}")
         })?);
@@ -3399,9 +3478,11 @@ impl SealedSourceFds {
         Ok(Self {
             tmp_store,
             tmp_store_path: temp.path().to_path_buf(),
+            home_dir,
             runtime_dir,
             runtime_dir_path: roots.runtime.path().to_path_buf(),
             records_dir,
+            children_records,
             etc_dir: roots.sealed_etc.path().to_path_buf(),
             identity_files,
         })
@@ -3476,6 +3557,17 @@ fn build_sealed_root(
             )),
             records_dir: sources
                 .records_dir
+                .as_ref()
+                .map(|(fd, path)| {
+                    SealedSourceFds::identity_of(fd).map(|identity| (path.as_path(), identity))
+                })
+                .transpose()?,
+            home_dir: Some((
+                &sources.home_dir.1,
+                SealedSourceFds::identity_of(&sources.home_dir.0)?,
+            )),
+            children_records: sources
+                .children_records
                 .as_ref()
                 .map(|(fd, path)| {
                     SealedSourceFds::identity_of(fd).map(|identity| (path.as_path(), identity))
@@ -3561,6 +3653,11 @@ mod linux_enforce {
         /// directory or the workdir. It carries the workdir's own right-set, `Execute` axis
         /// included, so `workdir_exec: false` forbids running anything written there.
         temp_dir_fd: Option<std::sync::Arc<OwnedFd>>,
+        /// The session's home folder, `home/` in its records directory, on exactly
+        /// [`Self::temp_dir_fd`]'s terms: the workdir's rights, on both Landlock tiers, whenever the
+        /// enforcement holds one. On `KernelSealed` the same descriptor is the read-write bind's
+        /// source.
+        home_dir_fd: Option<std::sync::Arc<OwnedFd>>,
         /// The synthetic `/etc/passwd`/`/etc/group` in the session's `sealed-etc/`, opened on
         /// `KernelSealed` and empty on every other tier.
         ///
@@ -3584,6 +3681,9 @@ mod linux_enforce {
         /// none of them. `None` outside a session. On `KernelSealed` the same descriptor is the
         /// read-only bind's source.
         records_dir_fd: Option<std::sync::Arc<OwnedFd>>,
+        /// The delegated children's records, granted on [`Self::records_dir_fd`]'s terms, once a
+        /// child has staged there.
+        children_records_fd: Option<std::sync::Arc<OwnedFd>>,
         grants: Vec<OpenLandlockGrant>,
         devices: Vec<OpenDeviceGrant>,
     }
@@ -3596,6 +3696,12 @@ mod linux_enforce {
             self.temp_dir_fd.as_deref()
         }
 
+        /// The home folder's fd, for the tier-gate test, on the same terms.
+        #[cfg(test)]
+        pub(super) fn home_dir_fd(&self) -> Option<&OwnedFd> {
+            self.home_dir_fd.as_deref()
+        }
+
         /// The runtime directory's fd, for the tier-gate test, on the same terms.
         #[cfg(test)]
         pub(super) fn runtime_dir_fd(&self) -> Option<&OwnedFd> {
@@ -3606,6 +3712,12 @@ mod linux_enforce {
         #[cfg(test)]
         pub(super) fn records_dir_fd(&self) -> Option<&OwnedFd> {
             self.records_dir_fd.as_deref()
+        }
+
+        /// The delegated children's records' fd, for the tier-gate test, on the same terms.
+        #[cfg(test)]
+        pub(super) fn children_records_fd(&self) -> Option<&OwnedFd> {
+            self.children_records_fd.as_deref()
         }
 
         /// How many synthetic-`/etc` fds were opened, for the tier-gate test. A count, not the fds:
@@ -4597,6 +4709,16 @@ mod linux_enforce {
                 })?;
         }
 
+        // The session's home folder, on exactly the temporary folder's terms: the workdir's
+        // rights beneath the records directory's read-only rule.
+        if let Some(home_dir_fd) = &fds.home_dir_fd {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(home_dir_fd.as_fd(), writable_rights))
+                .map_err(|error| {
+                    format!("landlock: add_rule for the session's home folder failed: {error}")
+                })?;
+        }
+
         // The runtime directory: readable and listable, never writable or executable. A native
         // tool's entrypoint inside it runs through its own pinned `Execute` grant.
         if let Some(runtime_dir_fd) = &fds.runtime_dir_fd {
@@ -4620,6 +4742,18 @@ mod linux_enforce {
                 ))
                 .map_err(|error| {
                     format!("landlock: add_rule for the records directory failed: {error}")
+                })?;
+        }
+
+        // The delegated children's records, on the records directory's terms.
+        if let Some(children_records_fd) = &fds.children_records_fd {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(
+                    children_records_fd.as_fd(),
+                    read_list & handled,
+                ))
+                .map_err(|error| {
+                    format!("landlock: add_rule for the children's records failed: {error}")
                 })?;
         }
 
@@ -4697,10 +4831,14 @@ mod linux_enforce {
         /// `Err` naming the path, exactly like the workdir's own open, never the grant loops'
         /// shrink-not-fail `continue`.
         pub(super) temp_dir_fd: Option<std::sync::Arc<OwnedFd>>,
+        /// The session's home folder's descriptor, on the same terms as [`Self::temp_dir_fd`].
+        pub(super) home_dir_fd: Option<std::sync::Arc<OwnedFd>>,
         /// The runtime directory's descriptor, on the same terms as [`Self::temp_dir_fd`].
         pub(super) runtime_dir_fd: Option<std::sync::Arc<OwnedFd>>,
         /// The records directory's descriptor, on the same terms as [`Self::temp_dir_fd`].
         pub(super) records_dir_fd: Option<std::sync::Arc<OwnedFd>>,
+        /// The delegated children's records' descriptor, on the same terms.
+        pub(super) children_records_fd: Option<std::sync::Arc<OwnedFd>>,
     }
 
     impl<'a> LandlockFdRequest<'a> {
@@ -4716,8 +4854,10 @@ mod linux_enforce {
                 abi: None,
                 sealed: None,
                 temp_dir_fd: None,
+                home_dir_fd: None,
                 runtime_dir_fd: None,
                 records_dir_fd: None,
+                children_records_fd: None,
             }
         }
     }
@@ -4746,8 +4886,10 @@ mod linux_enforce {
             abi,
             sealed,
             temp_dir_fd,
+            home_dir_fd,
             runtime_dir_fd,
             records_dir_fd,
+            children_records_fd,
         } = request;
         let workdir_fd = open_o_path(accessible_workdir)
             .map(OwnedFd::from)
@@ -4824,9 +4966,11 @@ mod linux_enforce {
             workdir_exec,
             abi,
             temp_dir_fd,
+            home_dir_fd,
             sealed_identity_fds,
             runtime_dir_fd,
             records_dir_fd,
+            children_records_fd,
             grants,
             devices,
         })
@@ -5733,7 +5877,8 @@ mod tests {
                 murmur_artifact::ContainmentClass::Advisory,
                 negative.with_landlock_kernel_abi(abi),
             )
-            .unwrap();
+            .unwrap()
+            .with_test_session_dirs();
             assert_eq!(
                 enforcement.landlock_abi,
                 ruleset_landlock_abi(abi, enforcement.tier),
@@ -5749,7 +5894,8 @@ mod tests {
                 murmur_artifact::ContainmentClass::Scoped,
                 full.with_landlock_kernel_abi(Some(8)),
             )
-            .unwrap();
+            .unwrap()
+            .with_test_session_dirs();
             assert_eq!(enforcement.tier, EnforcementTier::KernelFull);
             assert_eq!(enforcement.landlock_abi, Some(LANDLOCK_TARGET_ABI));
         }
@@ -6010,7 +6156,8 @@ mod tests {
             murmur_artifact::ContainmentClass::Scoped,
             HostProbe::probe(),
         )
-        .expect("an empty policy resolves");
+        .expect("an empty policy resolves")
+        .with_test_session_dirs();
         assert!(
             !scoped.landlock_grants.iter().any(|grant| grant.path == usr),
             "a scoped capsule runs Landlock over the real host filesystem — /usr must stay \
@@ -6022,7 +6169,8 @@ mod tests {
             murmur_artifact::ContainmentClass::Sealed,
             HostProbe::probe(),
         )
-        .expect("an empty policy resolves");
+        .expect("an empty policy resolves")
+        .with_test_session_dirs();
         let granted: Vec<&LandlockGrant> = sealed
             .landlock_grants
             .iter()
@@ -6128,7 +6276,8 @@ mod tests {
             murmur_artifact::ContainmentClass::Scoped,
             HostProbe::probe(),
         )
-        .expect("an empty policy resolves");
+        .expect("an empty policy resolves")
+        .with_test_session_dirs();
         assert!(
             !scoped.landlock_grants.iter().any(is_etc_grant),
             "a scoped capsule runs Landlock over the real host filesystem — /etc/shadow's \
@@ -6140,7 +6289,8 @@ mod tests {
             murmur_artifact::ContainmentClass::Sealed,
             HostProbe::probe(),
         )
-        .expect("an empty policy resolves");
+        .expect("an empty policy resolves")
+        .with_test_session_dirs();
         let granted: Vec<&LandlockGrant> = sealed
             .landlock_grants
             .iter()
@@ -6253,7 +6403,10 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn nproc_bound_without_a_scope_is_headroom_over_a_live_count() {
-        match ShellEnforcement::environment_only().nproc_bound() {
+        match ShellEnforcement::environment_only()
+            .with_test_session_dirs()
+            .nproc_bound()
+        {
             crate::resources::NprocBound::Headroom { baseline } => assert!(
                 baseline > 0,
                 "the test process is owned by this uid, so the count cannot be zero"
@@ -6268,7 +6421,7 @@ mod tests {
     #[test]
     fn nproc_bound_without_a_scope_is_measured_on_each_call() {
         let _lock = crate::resources::test_support::host_threads_lock();
-        let enforcement = ShellEnforcement::environment_only();
+        let enforcement = ShellEnforcement::environment_only().with_test_session_dirs();
         let baseline = |bound| match bound {
             crate::resources::NprocBound::Headroom { baseline } => baseline,
             other => panic!("no scope must give headroom, got {other:?}"),
@@ -6301,7 +6454,9 @@ mod tests {
         let scope = crate::cgroup::prepare_scope(true, &limits, "ses_nproc_bound", temp.path())
             .expect("this host delegates a cgroup scope")
             .scope;
-        let enforcement = ShellEnforcement::environment_only().with_host_bounding(scope, None);
+        let enforcement = ShellEnforcement::environment_only()
+            .with_test_session_dirs()
+            .with_host_bounding(scope, None);
 
         assert_eq!(
             enforcement.nproc_bound(),
@@ -6348,7 +6503,7 @@ mod tests {
             resources: limits,
             ..CapabilityPolicy::default()
         };
-        let mut enforcement = ShellEnforcement::environment_only();
+        let mut enforcement = ShellEnforcement::environment_only().with_test_session_dirs();
         enforcement.resource_limits = limits;
         let enforcement = enforcement.with_host_bounding(scope, None);
 
@@ -6361,7 +6516,6 @@ mod tests {
                 "for i in $(seq 1 40); do sleep 0.2 & done; wait; ulimit -Hu; ulimit -Hn",
             ],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
@@ -6396,7 +6550,6 @@ mod tests {
                 &["-e", script],
                 &[],
                 &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-                &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
                 &policy,
                 &enforcement,
             )
@@ -6427,7 +6580,7 @@ mod tests {
             },
             ..CapabilityPolicy::default()
         };
-        let mut enforcement = ShellEnforcement::environment_only();
+        let mut enforcement = ShellEnforcement::environment_only().with_test_session_dirs();
         enforcement.resource_limits = policy.resources;
 
         let before = crate::resources::uid_task_count().expect("Linux can count the uid's tasks");
@@ -6445,7 +6598,6 @@ mod tests {
                 "bash",
                 &["-c", "ulimit -Hu"],
                 &[],
-                &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
                 &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
                 &policy,
                 &enforcement,
@@ -7005,7 +7157,7 @@ mod tests {
         let base = ShellEnforcement {
             tier: EnforcementTier::KernelFull,
             landlock_grants: vec![existing.clone()],
-            ..ShellEnforcement::environment_only()
+            ..ShellEnforcement::environment_only().with_test_session_dirs()
         };
 
         let native = base.for_native_entrypoint(&installed(&entrypoint, dir.path()));
@@ -7051,7 +7203,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sealed = ShellEnforcement {
             tier: EnforcementTier::KernelSealed,
-            ..ShellEnforcement::environment_only()
+            ..ShellEnforcement::environment_only().with_test_session_dirs()
         };
 
         let system = installed(
@@ -7074,7 +7226,7 @@ mod tests {
 
         let scoped = ShellEnforcement {
             tier: EnforcementTier::KernelFull,
-            ..ShellEnforcement::environment_only()
+            ..ShellEnforcement::environment_only().with_test_session_dirs()
         };
         assert!(scoped
             .for_native_entrypoint(&custom)
@@ -7094,7 +7246,7 @@ mod tests {
         for tier in [EnforcementTier::KernelFull, EnforcementTier::KernelSealed] {
             let base = ShellEnforcement {
                 tier,
-                ..ShellEnforcement::environment_only()
+                ..ShellEnforcement::environment_only().with_test_session_dirs()
             };
             let before = base.for_native_entrypoint(&native);
 
@@ -7179,7 +7331,7 @@ mod tests {
         let native = installed(&entrypoint, accessible.path());
         let grants = ShellEnforcement {
             tier: EnforcementTier::KernelFull,
-            ..ShellEnforcement::environment_only()
+            ..ShellEnforcement::environment_only().with_test_session_dirs()
         }
         .for_native_entrypoint(&native)
         .landlock_grants;
@@ -7724,9 +7876,8 @@ mod tests {
                 &["-c", &script],
                 &[],
                 &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-                &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
                 &policy,
-                &ShellEnforcement::environment_only(),
+                &ShellEnforcement::environment_only().with_test_session_dirs(),
             )
             .unwrap_err();
             assert!(
@@ -7746,9 +7897,8 @@ mod tests {
             &["-c", &script],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
-            &ShellEnforcement::environment_only(),
+            &ShellEnforcement::environment_only().with_test_session_dirs(),
         )
         .unwrap();
         assert_eq!(result.exit_code, 0);
@@ -7810,15 +7960,6 @@ mod linux_integration_tests {
         // without it. Kept past the test: a clone may outlive the value.
         let base = tempfile::tempdir().unwrap().keep();
         ShellEnforcement::environment_only().with_runtime_dir(test_runtime_dir(&base), None)
-    }
-
-    /// `<accessible>/.murmur/<session id>/`, the session workdir a `--workdir` launch stages
-    /// into — the shape that makes the two workdirs different paths, which is the only shape in
-    /// which putting a staging directory in the wrong one is visible.
-    fn session_workdir_under(accessible: &Path) -> PathBuf {
-        let session = accessible.join(".murmur").join("ses_sandbox_tests");
-        std::fs::create_dir_all(&session).unwrap();
-        session
     }
 
     /// Pure content check on the workdir access-right set: no kernel call, no fork, no spawn.
@@ -7940,7 +8081,7 @@ mod linux_integration_tests {
     fn sealed_with_runtime_dir(base: &Path) -> ShellEnforcement {
         ShellEnforcement {
             tier: EnforcementTier::KernelSealed,
-            ..ShellEnforcement::environment_only()
+            ..ShellEnforcement::environment_only().with_test_session_dirs()
         }
         .with_runtime_dir(test_runtime_dir(base), None)
     }
@@ -7955,6 +8096,14 @@ mod linux_integration_tests {
             .map(|temp| Arc::new(temp.path_fd().unwrap()))
     }
 
+    /// The session's home folder's descriptor, as `prepare_enforcement` takes it from the held
+    /// root.
+    fn home_dir_fd_of(enforcement: &ShellEnforcement) -> Option<Arc<std::os::fd::OwnedFd>> {
+        enforcement
+            .home_root()
+            .map(|home| Arc::new(home.path_fd().unwrap()))
+    }
+
     /// The sealed sources take the session's temporary folder from the runtime directory roots,
     /// bind it from its own path, and add nothing to either workdir; the Landlock fds carry the
     /// folder's rule whenever one is handed in. Opening an fd is an ordinary `open()` — no
@@ -7967,20 +8116,29 @@ mod linux_integration_tests {
     fn the_temp_folder_and_runtime_dir_are_opened_for_landlock_and_the_sealed_bind() {
         let accessible = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
-        let session = session_workdir_under(accessible.path());
-        let session_root = crate::workdir_fs::WorkdirRoot::open(&session).unwrap();
         let enforcement = sealed_with_runtime_dir(runtime.path());
         let temp_dir_fd = temp_dir_fd_of(&enforcement);
-        let sources = SealedSourceFds::open(&session_root, &enforcement, temp_dir_fd.as_ref())
-            .expect("a real, writable workdir must yield the sealed sources");
+        let sources = SealedSourceFds::open(
+            &enforcement,
+            temp_dir_fd.as_ref(),
+            home_dir_fd_of(&enforcement).as_ref(),
+            None,
+        )
+        .expect("a real, writable workdir must yield the sealed sources");
         assert_eq!(
             sources.tmp_store_path,
             enforcement.temp_dir_path().unwrap(),
             "the composed root binds the session's temporary folder at /tmp"
         );
+        assert_eq!(
+            sources.home_dir.1,
+            enforcement.home_dir_path().unwrap(),
+            "the composed root binds the session's home folder at its own path"
+        );
         let fds = linux_enforce::open_landlock_fds(linux_enforce::LandlockFdRequest {
             sealed: Some(&sources),
             temp_dir_fd,
+            home_dir_fd: Some(Arc::clone(&sources.home_dir.0)),
             runtime_dir_fd: Some(Arc::clone(&sources.runtime_dir)),
             records_dir_fd: sources.records_dir.as_ref().map(|(fd, _)| Arc::clone(fd)),
             ..linux_enforce::LandlockFdRequest::workdir_only(accessible.path())
@@ -7988,24 +8146,20 @@ mod linux_integration_tests {
         .expect("a real, writable workdir must yield sealed Landlock fds");
 
         assert!(fds.temp_dir_fd().is_some());
+        assert!(
+            fds.home_dir_fd().is_some(),
+            "the home folder takes the temporary folder's rule"
+        );
         assert!(fds.runtime_dir_fd().is_some());
         assert!(
             fds.records_dir_fd().is_some(),
             "the records directory takes the runtime directory's read-only rule"
         );
-        for dir in [accessible.path(), session.as_path()] {
-            assert_eq!(
-                std::fs::read_dir(dir)
-                    .unwrap()
-                    .filter_map(Result::ok)
-                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                    .filter(|name| name != ".murmur")
-                    .collect::<Vec<_>>(),
-                Vec::<String>::new(),
-                "enabling sealed must add nothing to {}",
-                dir.display()
-            );
-        }
+        assert_eq!(
+            std::fs::read_dir(accessible.path()).unwrap().count(),
+            0,
+            "enabling sealed must add nothing to the work folder"
+        );
 
         let fds = linux_enforce::open_landlock_fds(linux_enforce::LandlockFdRequest::workdir_only(
             accessible.path(),
@@ -8015,30 +8169,61 @@ mod linux_integration_tests {
             fds.temp_dir_fd().is_none(),
             "an enforcement holding no temporary folder grants none"
         );
+        assert!(fds.home_dir_fd().is_none());
+        assert!(fds.children_records_fd().is_none());
     }
 
     /// A sealed root cannot be composed without the session's temporary folder: the refusal is
     /// the parent's, names the folder, and comes before anything is spawned.
     #[test]
     fn a_sealed_root_needs_the_temp_folder() {
-        let accessible = tempfile::tempdir().unwrap();
-        let session = session_workdir_under(accessible.path());
         let runtime = tempfile::tempdir().unwrap();
         let mut roots = test_runtime_dir(runtime.path());
         roots.temp = None;
         let enforcement = ShellEnforcement {
             tier: EnforcementTier::KernelSealed,
-            ..ShellEnforcement::environment_only()
+            ..ShellEnforcement::environment_only().with_test_session_dirs()
         }
         .with_runtime_dir(roots, None);
         let error = SealedSourceFds::open(
-            &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
             &enforcement,
+            None,
+            home_dir_fd_of(&enforcement).as_ref(),
             None,
         )
         .err()
         .expect("refused");
         assert!(error.contains("temporary folder"), "{error}");
+    }
+
+    /// Nor without its home folder: the refusal names the missing home folder, and comes before
+    /// anything is spawned or written.
+    #[test]
+    fn no_home_folder_refuses_a_sealed_root() {
+        let runtime = tempfile::tempdir().unwrap();
+        let roots = crate::runtime_dir::RuntimeDirRoots {
+            home: None,
+            ..test_runtime_dir(runtime.path())
+        };
+        let enforcement = ShellEnforcement {
+            tier: EnforcementTier::KernelSealed,
+            ..ShellEnforcement::environment_only().with_test_session_dirs()
+        }
+        .with_runtime_dir(roots, None);
+        let error = SealedSourceFds::open(
+            &enforcement,
+            temp_dir_fd_of(&enforcement).as_ref(),
+            None,
+            None,
+        )
+        .err()
+        .expect("refused");
+        assert!(error.contains("no home folder"), "{error}");
+        assert!(!runtime
+            .path()
+            .join(crate::runtime_dir::SEALED_ETC_SUBDIR)
+            .join("passwd")
+            .exists());
     }
 
     /// The synthetic account databases, written into `sealed-etc/` beside the runtime directory
@@ -8052,13 +8237,12 @@ mod linux_integration_tests {
     fn the_synthetic_etc_files_are_written_into_sealed_etc_and_opened() {
         let accessible = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
-        let session = session_workdir_under(accessible.path());
-        let session_root = crate::workdir_fs::WorkdirRoot::open(&session).unwrap();
         let enforcement = sealed_with_runtime_dir(runtime.path());
         let sources = SealedSourceFds::open(
-            &session_root,
             &enforcement,
             temp_dir_fd_of(&enforcement).as_ref(),
+            home_dir_fd_of(&enforcement).as_ref(),
+            None,
         )
         .unwrap();
         let fds = linux_enforce::open_landlock_fds(linux_enforce::LandlockFdRequest {
@@ -8085,13 +8269,10 @@ mod linux_integration_tests {
                 entry.path
             );
         }
-        for dir in [accessible.path(), session.as_path()] {
-            assert!(
-                !dir.join(".mur-etc").exists(),
-                "{} gained .mur-etc",
-                dir.display()
-            );
-        }
+        assert!(
+            !accessible.path().join(".mur-etc").exists(),
+            "the work folder gained .mur-etc"
+        );
 
         let fds = linux_enforce::open_landlock_fds(linux_enforce::LandlockFdRequest::workdir_only(
             accessible.path(),
@@ -8104,46 +8285,35 @@ mod linux_integration_tests {
     /// the parent's, before anything is spawned.
     #[test]
     fn a_sealed_root_needs_the_runtime_directory() {
-        let accessible = tempfile::tempdir().unwrap();
-        let session = session_workdir_under(accessible.path());
         let enforcement = ShellEnforcement {
             tier: EnforcementTier::KernelSealed,
             ..ShellEnforcement::environment_only()
         };
-        let error = SealedSourceFds::open(
-            &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
-            &enforcement,
-            None,
-        )
-        .err()
-        .expect("refused");
+        let error = SealedSourceFds::open(&enforcement, None, None, None)
+            .err()
+            .expect("refused");
         assert!(error.contains("runtime directory"), "{error}");
     }
 
     /// The one field that has to agree across two files: the synthetic `pw_dir` and `$HOME`.
     ///
-    /// Both are derived from `shell::SYNTHETIC_HOME_DIR_NAME`, and this asserts the end result
-    /// rather than the constant — a capsule sees `pwd.getpwuid(os.getuid()).pw_dir` and
-    /// `os.environ["HOME"]`, and a disagreement between them is silent until a tool picks the
-    /// wrong one. The uid/gid are checked against the workdir's own owner, which is where
+    /// Both are the session's home folder's absolute path, `<records>/home`, and this asserts the
+    /// end result — a capsule sees `pwd.getpwuid(os.getuid()).pw_dir` and `os.environ["HOME"]`,
+    /// and a disagreement between them is silent until a tool picks the wrong one. The uid/gid
+    /// are checked against the home folder's own owner, which is where
     /// `ensure_sealed_identity_files` reads the capsule's identity from.
     #[test]
-    fn the_synthetic_passwd_entry_carries_exactly_the_home_the_subprocess_env_gets() {
+    fn home_folder_is_the_synthetic_passwd_entrys_home_and_home() {
         use std::os::unix::fs::MetadataExt;
 
-        let accessible = tempfile::tempdir().unwrap();
-        let session = session_workdir_under(accessible.path());
         let runtime = tempfile::tempdir().unwrap();
         let roots = test_runtime_dir(runtime.path());
-        let written = ensure_sealed_identity_files(
-            &roots.sealed_etc,
-            &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
-        )
-        .unwrap();
+        let home = roots.home.clone().unwrap();
+        let written = ensure_sealed_identity_files(&roots.sealed_etc, &home).unwrap();
         let env = crate::shell::build_shell_env(
             &crate::types::CapabilityPolicy::default(),
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
+            Some(home.path()),
             None,
             None,
             None,
@@ -8151,7 +8321,7 @@ mod linux_integration_tests {
         .unwrap();
 
         let passwd = std::fs::read_to_string(&written[0]).unwrap();
-        let owner = std::fs::metadata(&session).unwrap();
+        let owner = std::fs::metadata(home.path()).unwrap();
         let entry: Vec<&str> = passwd
             .lines()
             .last()
@@ -8166,6 +8336,15 @@ mod linux_integration_tests {
             env.get("HOME"),
             "pw_dir and $HOME are the same string or the entry is worse than useless",
         );
+        assert_eq!(
+            entry[5],
+            runtime
+                .path()
+                .join(crate::records_dir::RECORDS_DIR_NAME)
+                .join(crate::records_dir::HOME_SUBDIR)
+                .to_str()
+                .unwrap()
+        );
 
         let group = std::fs::read_to_string(&written[1]).unwrap();
         assert_eq!(
@@ -8175,8 +8354,7 @@ mod linux_integration_tests {
         );
     }
 
-    /// A workdir root over `accessible`'s session directory beside an `outside/` directory holding
-    /// one sentinel file.
+    /// A workdir root over `work/` beside an `outside/` directory holding one sentinel file.
     fn sealed_planted() -> (
         tempfile::TempDir,
         PathBuf,
@@ -8189,10 +8367,7 @@ mod linux_integration_tests {
         std::fs::create_dir_all(&accessible).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("sentinel.txt"), b"operator data").unwrap();
-        let root = crate::workdir_fs::WorkdirRoot::open(&accessible)
-            .unwrap()
-            .session_beneath("ses_sandbox_tests")
-            .unwrap();
+        let root = crate::workdir_fs::WorkdirRoot::open(&accessible).unwrap();
         (dir, root.path().to_path_buf(), outside, root)
     }
 
@@ -8268,14 +8443,9 @@ mod linux_integration_tests {
     #[test]
     fn prepare_enforcement_is_noop_for_environment_only_tier_even_on_linux() {
         let mut command = std::process::Command::new("true");
-        let enforcement = ShellEnforcement::environment_only();
-        let supervisor = prepare_enforcement(
-            &mut command,
-            &enforcement,
-            Path::new("/tmp"),
-            &crate::workdir_fs::WorkdirRoot::open(Path::new("/tmp")).unwrap(),
-        )
-        .expect("environment_only must never fail");
+        let enforcement = ShellEnforcement::environment_only().with_test_session_dirs();
+        let supervisor = prepare_enforcement(&mut command, &enforcement, Path::new("/tmp"))
+            .expect("environment_only must never fail");
         assert!(matches!(supervisor, SupervisorHandle::Noop));
         assert_eq!(
             enforcement.session_netns.creations(),
@@ -8324,7 +8494,6 @@ mod linux_integration_tests {
             "bash",
             &["-c", "exit 7"],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
@@ -8376,7 +8545,6 @@ mod linux_integration_tests {
             "bash",
             &["-c", "ls"],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
@@ -8438,7 +8606,6 @@ mod linux_integration_tests {
             "bash",
             &["-c", &script],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
@@ -8522,7 +8689,6 @@ mod linux_integration_tests {
             &["-c", &script],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -8582,7 +8748,6 @@ mod linux_integration_tests {
             &["-c", "cat /etc/hostname"],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -8613,7 +8778,8 @@ mod linux_integration_tests {
         let probe = HostProbe::probe();
         let enforcement =
             ShellEnforcement::resolve(policy, murmur_artifact::ContainmentClass::Scoped, probe)
-                .unwrap();
+                .unwrap()
+                .with_test_session_dirs();
         if enforcement.tier != EnforcementTier::KernelFull
             || enforcement.landlock_abi < Some(min_abi)
         {
@@ -8651,7 +8817,6 @@ mod linux_integration_tests {
             "bash",
             &["-c", script],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             policy,
             enforcement,
@@ -8715,6 +8880,118 @@ echo "mv a/d b/d: ok"
             "a move, a hard link and a directory reparent between workdir folders must all \
              succeed under Refer"
         );
+    }
+
+    /// On a Landlock tier the session's home folder is `$HOME` and carries the work folder's
+    /// rights: a command writes, renames within and removes files under it. The records directory
+    /// around it stays read-only: a command cannot write `out/result.txt`, create `children/x`, or
+    /// move the home folder itself aside. Both directories sit under the host's `/tmp` here, so
+    /// where `/tmp` is mapped this also proves the home folder is re-exposed writable over the
+    /// read-only records directory.
+    #[test]
+    fn home_folder_is_writable_like_tmp_and_the_records_around_it_are_not() {
+        let test = "home_folder_is_writable_like_tmp_and_the_records_around_it_are_not";
+        let policy = coreutils_policy(&["rm", "rmdir"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        eprintln!(
+            "{test}: tier {:?}, Landlock ruleset ABI {:?} (kernel {:?}), /tmp {:?}",
+            enforcement.tier,
+            enforcement.landlock_abi,
+            HostProbe::probe().landlock_kernel_abi(),
+            enforcement.installed_temp_mapping()
+        );
+        let records = enforcement.records_root().unwrap().clone();
+        records
+            .create_dir_all(crate::records_dir::RESULTS_SUBDIR, 0o700)
+            .unwrap();
+        let home = enforcement.home_dir_path().unwrap().to_path_buf();
+
+        let workdir = tempfile::tempdir().unwrap();
+        let result = run_bash_in(
+            workdir.path(),
+            &format!(
+                r#"[ "$HOME" = '{home}' ] && echo home-is-the-folder
+echo a > "$HOME/a" && mv "$HOME/a" "$HOME/b" && mkdir "$HOME/d" && mv "$HOME/b" "$HOME/d/c" \
+  && rm "$HOME/d/c" && rmdir "$HOME/d" && echo home-writable
+if echo x > "$MURMUR_RECORDS_DIR/out/result.txt"; then echo result-written; else echo result-refused; fi
+if mkdir -p "$MURMUR_RECORDS_DIR/children/x"; then echo child-created; else echo child-refused; fi
+if mv "$HOME" "$HOME.moved"; then echo home-moved; else echo home-move-refused; fi
+"#,
+                home = home.display()
+            ),
+            &policy,
+            &enforcement,
+        );
+
+        assert_eq!(
+            result.stdout,
+            "home-is-the-folder\nhome-writable\nresult-refused\nchild-refused\nhome-move-refused\n",
+            "stderr: {}",
+            result.stderr
+        );
+        assert!(home.is_dir());
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
+        assert!(!records.host_path("out/result.txt").exists());
+        assert!(!records.host_path("children").exists());
+        assert!(!home.with_extension("moved").exists());
+        assert_eq!(std::fs::read_dir(workdir.path()).unwrap().count(), 0);
+    }
+
+    /// A delegated child's records, beneath the session's children's records directory, are
+    /// readable by a parent's command and never writable: the result an outcome names can be read,
+    /// and nothing of the child's can be changed. Before any child has staged there is nothing to
+    /// grant, and nothing is.
+    #[test]
+    fn children_records_are_readable_and_never_writable_by_a_parents_commands() {
+        let test = "children_records_are_readable_and_never_writable_by_a_parents_commands";
+        let policy = coreutils_policy(&[]);
+        let Some(mut enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        let base = tempfile::tempdir().unwrap();
+        let children_records = base.path().join("children");
+        enforcement.runtime_dir.as_mut().unwrap().children_records = Some(children_records.clone());
+        assert_eq!(
+            enforcement.children_records_path(),
+            None,
+            "no child has staged"
+        );
+
+        let result_file = children_records.join("worker-0123456789abcdef/ses_child/out/result.txt");
+        std::fs::create_dir_all(result_file.parent().unwrap()).unwrap();
+        std::fs::write(&result_file, "the child's answer").unwrap();
+        assert_eq!(
+            enforcement.children_records_path(),
+            Some(children_records.as_path())
+        );
+
+        let workdir = tempfile::tempdir().unwrap();
+        let result = run_bash_in(
+            workdir.path(),
+            &format!(
+                r#"cat '{file}'; echo
+if echo forged > '{file}'; then echo written; else echo write-refused; fi
+if mkdir '{dir}/x'; then echo created; else echo create-refused; fi
+"#,
+                file = result_file.display(),
+                dir = children_records.display()
+            ),
+            &policy,
+            &enforcement,
+        );
+
+        assert_eq!(
+            result.stdout, "the child's answer\nwrite-refused\ncreate-refused\n",
+            "stderr: {}",
+            result.stderr
+        );
+        assert_eq!(
+            std::fs::read_to_string(&result_file).unwrap(),
+            "the child's answer"
+        );
+        assert!(!children_records.join("x").exists());
     }
 
     /// The ruleset a 5.13–5.18 kernel gets, forced through the same `landlock_abi` field the probe
@@ -9041,7 +9318,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             &["-c", "echo landlock-grant-ok | cat"],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -9109,7 +9385,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             &["-c", &script],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -9147,18 +9422,18 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         }
     }
 
-    /// A real sealed run against two different workdirs: the composed root's `/tmp` is the
-    /// session's temporary folder in its records directory, its synthetic `/etc/passwd` resolves
-    /// from the session workdir, and the capsule's own directory gains nothing from either.
+    /// A real sealed run: the composed root's `/tmp` is the session's temporary folder in its
+    /// records directory, `$HOME` and the synthetic `/etc/passwd`'s home are both its home folder,
+    /// writable inside the root (`cd ~ && touch f`), and the work folder gains nothing.
     ///
     /// This drives a composed root end to end, so it needs a host that can actually reach
     /// `KernelSealed` and skips loudly on one that cannot; the parent-side halves are covered
     /// unconditionally by the `open_landlock_fds` tests above. `mur doctor` reports the same host
     /// answer this checks.
     #[test]
-    fn a_sealed_command_finds_tmp_in_the_records_dir_and_etc_in_the_session_workdir() {
+    fn home_folder_and_tmp_in_the_records_dir_on_a_sealed_root() {
         if crate::network_namespace::skip_without_egress_namespace(
-            "a_sealed_command_finds_tmp_in_the_records_dir_and_etc_in_the_session_workdir",
+            "home_folder_and_tmp_in_the_records_dir_on_a_sealed_root",
         ) {
             return;
         }
@@ -9166,7 +9441,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         if probe.tier() != EnforcementTier::KernelSealed {
             eprintln!(
                 "SKIP — PROVES NOTHING ABOUT THE SEALED ROOT ON THIS HOST: \
-                 a_sealed_command_finds_tmp_in_the_records_dir_... needs a host that reaches \
+                 home_folder_and_tmp_in_the_records_dir_on_a_sealed_root needs a host that reaches \
                  KernelSealed (unprivileged user namespaces plus a usable Landlock ABI); detected \
                  {:?}. No composed root is built in this run.",
                 probe.tier()
@@ -9175,18 +9450,40 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         }
 
         let accessible = tempfile::tempdir().unwrap();
-        let session = accessible.path().join(".murmur").join("ses_sealed_e2e");
-        std::fs::create_dir_all(&session).unwrap();
         let policy = CapabilityPolicy {
-            shell_allow: vec!["bash".to_string(), "cat".to_string(), "id".to_string()],
+            shell_allow: vec![
+                "bash".to_string(),
+                "cat".to_string(),
+                "id".to_string(),
+                "touch".to_string(),
+                "getent".to_string(),
+                "cut".to_string(),
+            ],
             ..CapabilityPolicy::default()
         };
         let runtime = tempfile::tempdir().unwrap();
         let enforcement =
             ShellEnforcement::resolve(&policy, murmur_artifact::ContainmentClass::Sealed, probe)
                 .expect("a sealed-capable host resolves sealed enforcement")
-                .with_runtime_dir(test_runtime_dir(runtime.path()), None);
+                .with_runtime_dir(
+                    test_runtime_dir(runtime.path())
+                        .with_children_records(runtime.path().join("children")),
+                    None,
+                );
+        // A delegated child's result, as a child that has staged leaves it.
+        let child_result = runtime
+            .path()
+            .join("children/worker-0123456789abcdef/out/result.txt");
+        std::fs::create_dir_all(child_result.parent().unwrap()).unwrap();
+        std::fs::write(&child_result, "the child's answer").unwrap();
         assert_eq!(enforcement.tier, EnforcementTier::KernelSealed);
+        eprintln!(
+            "home_folder_and_tmp_in_the_records_dir_on_a_sealed_root: tier {:?}, Landlock \
+             ruleset ABI {:?} (kernel {:?})",
+            enforcement.tier,
+            enforcement.landlock_abi,
+            probe.landlock_kernel_abi()
+        );
         let probe_name = format!("sealed-probe-{}", std::process::id());
 
         let result = crate::shell::execute_shell(
@@ -9195,12 +9492,15 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                 "-c",
                 &format!(
                     "echo t > /tmp/{probe_name} && cat /tmp/{probe_name} && id -un && \
-                     printf '%s\\n' \"$TMPDIR\""
+                     printf '%s\\n' \"$TMPDIR\" && printf '%s\\n' \"$HOME\" && \
+                     getent passwd \"$(id -u)\" | cut -d: -f6 && cd ~ && touch f && echo touched && \
+                     cat '{child}' && echo && \
+                     {{ echo forged > '{child}' && echo forged || echo child-read-only; }}",
+                    child = child_result.display()
                 ),
             ],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(accessible.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
             &policy,
             &enforcement,
         )
@@ -9228,6 +9528,25 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             Some("/tmp"),
             "TMPDIR names /tmp inside the root"
         );
+        let home = enforcement.home_dir_path().unwrap().to_str().unwrap();
+        assert_eq!(lines.next(), Some(home), "$HOME is the home folder");
+        assert_eq!(lines.next(), Some(home), "passwd's home is the home folder");
+        assert_eq!(
+            lines.next(),
+            Some("touched"),
+            "~ is writable inside the root"
+        );
+        assert_eq!(
+            lines.next(),
+            Some("the child's answer"),
+            "a child's result reads"
+        );
+        assert_eq!(
+            lines.next(),
+            Some("child-read-only"),
+            "and cannot be changed"
+        );
+        assert!(Path::new(home).join("f").is_file());
 
         let folder = enforcement.temp_dir_path().unwrap();
         assert_eq!(
@@ -9244,19 +9563,11 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             .join(crate::runtime_dir::SEALED_ETC_SUBDIR)
             .join("passwd")
             .is_file());
-        for dir in [accessible.path(), session.as_path()] {
-            for name in [".mur-etc", crate::temp_dir::SESSION_TEMP_DIR_NAME] {
-                assert!(
-                    !dir.join(name).exists(),
-                    "enabling sealed must add no temp store or /etc to {}, and it added {name}",
-                    dir.display()
-                );
-            }
-        }
-        assert!(!accessible
-            .path()
-            .join(crate::shell::SYNTHETIC_HOME_DIR_NAME)
-            .exists());
+        assert_eq!(
+            std::fs::read_dir(accessible.path()).unwrap().count(),
+            0,
+            "enabling sealed must add nothing to the work folder"
+        );
     }
 
     // As above: a green run proves nothing below `KernelFull`. Both tests print a skip line and
@@ -9308,7 +9619,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             &["-c", &format!("cat '{}'", module.display())],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -9325,7 +9635,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "bash",
             &["-c", &format!("ls '{}'", stdlib.path().display())],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &policy,
             &enforcement,
@@ -9383,7 +9692,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             &["-c", &format!("ls '{}'", stdlib.display())],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &policy,
             &enforcement,
         )
@@ -9401,7 +9709,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "bash",
             &["-c", &format!("ls '{}'", parent.path().display())],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &policy,
             &enforcement,
@@ -9470,7 +9777,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                 "bash",
                 &["-c", &command],
                 &[],
-                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 &policy,
                 enforcement,
@@ -9577,7 +9883,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                 &["-c", &format!("cat '{}'", bundle.display())],
                 &[],
                 &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
-                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 &policy,
                 enforcement,
             )
@@ -9675,13 +9980,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             .arg("-c")
             .arg(format!("echo ran > '{}'", marker.display()));
 
-        let error = prepare_enforcement(
-            &mut command,
-            &kernel_full_empty_grants(),
-            &missing,
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-        )
-        .expect_err("an unresolvable workdir must fail before fork()");
+        let error = prepare_enforcement(&mut command, &kernel_full_empty_grants(), &missing)
+            .expect_err("an unresolvable workdir must fail before fork()");
         assert!(
             !marker.exists(),
             "prepare_enforcement must never spawn a subprocess: {error}"
@@ -9717,7 +10017,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "bash",
             &["-c", &script],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             enforcement,
@@ -9901,7 +10200,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             murmur_artifact::ContainmentClass::Scoped,
             HostProbe::probe(),
         )
-        .expect("the policy resolves");
+        .expect("the policy resolves")
+        .with_test_session_dirs();
         assert_eq!(
             enforcement.tier,
             EnforcementTier::KernelFull,
@@ -9937,7 +10237,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "bash",
             &["-c", script],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             policy,
             enforcement,
@@ -10038,7 +10337,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "nc",
             &["-l", "127.0.0.1", "8080"],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
@@ -10161,7 +10459,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "grep",
             &["-x", "20000", &path],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &policy,
             &enforcement,
@@ -10555,19 +10852,19 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         )
     }
 
-    /// The parent-side spec re-exposes the workdirs read-write and the runtime and records
-    /// directories and every grant path read-only, each at its exact path beneath `/tmp`.
+    /// The parent-side spec re-exposes the work folder and the home folder read-write and the
+    /// runtime and records directories and every grant path read-only, each at its exact path
+    /// beneath `/tmp`, the home folder over the records directory it lies in.
     #[test]
     fn the_tmp_map_spec_reexposes_exact_paths_beneath_tmp_read_only_but_the_workdir() {
         let base = tempfile::tempdir().unwrap();
         let workdir = tempfile::tempdir().unwrap();
-        let session = session_workdir_under(workdir.path());
         let grant_dir = tempfile::tempdir().unwrap();
         let grant = grant_dir.path().join("bin");
         std::fs::write(&grant, b"#!/bin/sh\n").unwrap();
         let mut enforcement = ShellEnforcement {
             tier: EnforcementTier::KernelFull,
-            ..ShellEnforcement::environment_only()
+            ..ShellEnforcement::environment_only().with_test_session_dirs()
         }
         .with_runtime_dir(test_runtime_dir(base.path()), None)
         .with_temp_mapping(crate::temp_dir::TempMapping::MountNamespace);
@@ -10581,13 +10878,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             .path_fd()
             .unwrap();
 
-        let spec = build_tmp_map_spec(
-            &enforcement,
-            &folder,
-            workdir.path(),
-            &crate::workdir_fs::WorkdirRoot::open(&session).unwrap(),
-        )
-        .unwrap();
+        let spec = build_tmp_map_spec(&enforcement, &folder, workdir.path()).unwrap();
 
         let canonical = |path: &Path| {
             std::fs::canonicalize(path)
@@ -10604,6 +10895,15 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             (
                 canonical(&base.path().join(crate::records_dir::RECORDS_DIR_NAME)),
                 true,
+            ),
+            (
+                canonical(
+                    &base
+                        .path()
+                        .join(crate::records_dir::RECORDS_DIR_NAME)
+                        .join(crate::records_dir::HOME_SUBDIR),
+                ),
+                false,
             ),
             (canonical(&grant), true),
         ];
@@ -10951,7 +11251,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                 &["-c", "echo ran > \"$(pwd)/marker\""],
                 &[],
                 &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
-                &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
                 &policy,
                 &enforcement,
             )
@@ -10997,7 +11296,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "bash",
             &["-c", "echo x > /tmp/swapped"],
             &[],
-            &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &crate::workdir_fs::WorkdirRoot::open(workdir.path()).unwrap(),
             &policy,
             &enforcement,

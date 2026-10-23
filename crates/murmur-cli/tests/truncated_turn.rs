@@ -67,10 +67,9 @@ fn write_project(project_dir: &Path, config_mode: Option<&str>) -> PathBuf {
 /// What one `mur run` left behind.
 struct Run {
     home: TempDir,
-    /// Held so the project directory — and the session workdir under it — outlives the assertions.
+    /// Held so the project directory — and the work folder under it — outlives the assertions.
     _project: TempDir,
     output: std::process::Output,
-    workdir: PathBuf,
     records_dir: PathBuf,
 }
 
@@ -90,7 +89,7 @@ impl Run {
     }
 
     fn result(&self) -> String {
-        fs::read_to_string(self.workdir.join("out/result.txt")).expect("a result was written")
+        fs::read_to_string(self.records_dir.join("out/result.txt")).expect("a result was written")
     }
 
     fn trace(&self) -> String {
@@ -189,16 +188,11 @@ fn run(config_mode: Option<&str>) -> Run {
     let trace = common::find_file(&common::records_root(home.path()), "trace.jsonl")
         .expect("the session wrote a trace");
     let records_dir = trace.parent().unwrap().to_path_buf();
-    let workdir = project
-        .path()
-        .join("workdir")
-        .join(records_dir.file_name().unwrap());
 
     Run {
         home,
         _project: project,
         output: assertion.get_output().clone(),
-        workdir,
         records_dir,
     }
 }

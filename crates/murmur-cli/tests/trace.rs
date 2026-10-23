@@ -168,7 +168,7 @@ fn trace_two_turn_session_all_event_types() {
 
     let manifest_path = create_manifest(project.path(), &server.endpoint);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let records = staged.records_dir.clone();
     fs::write(workdir.join("task.md"), "Run echo and report.").unwrap();
 
@@ -468,7 +468,7 @@ fn trace_written_without_hook_artifacts() {
 
     let manifest_path = create_manifest(project.path(), &server.endpoint);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let records = staged.records_dir.clone();
     fs::write(workdir.join("task.md"), "Just say done.").unwrap();
 
@@ -514,7 +514,7 @@ fn trace_session_end_written_on_failed_exit() {
 
     let manifest_path = create_manifest(project.path(), &server.endpoint);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let records = staged.records_dir.clone();
     fs::write(workdir.join("task.md"), "Echo something.").unwrap();
 
@@ -593,7 +593,7 @@ fn trace_session_id_matches_staged_session() {
 
     let manifest_path = create_manifest(project.path(), &server.endpoint);
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let records = staged.records_dir.clone();
     let expected_session_id = staged.session_id.clone();
     fs::write(workdir.join("task.md"), "done").unwrap();
@@ -705,7 +705,7 @@ fn session_start_effective_grants_match_explain_scope_json() {
     let explain_report: Value =
         serde_json::from_str(String::from_utf8(explain_stdout).unwrap().trim()).unwrap();
 
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let records = staged.records_dir.clone();
     fs::write(workdir.join("task.md"), "Report and stop.").unwrap();
 
@@ -795,7 +795,7 @@ fn effective_grants_network_allow_tracks_the_manifest_across_two_runs() {
         fs::write(&manifest_path, manifest).unwrap();
 
         let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-        let workdir = staged.workdir.clone();
+        let workdir = staged.accessible_workdir.clone();
         let records = staged.records_dir.clone();
         fs::write(workdir.join("task.md"), "Report and stop.").unwrap();
         launch_session(staged, |_| {}).expect("agent launch should succeed");

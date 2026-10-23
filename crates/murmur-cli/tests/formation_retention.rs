@@ -212,16 +212,16 @@ impl Project {
         launched.finished(&launcher)
     }
 
-    /// An owned-looking formation directory minted two days ago, holding one peer session — its
-    /// session workdir and its records directory — with `marker` as its `formation.json` when
-    /// given.
+    /// An owned-looking formation directory minted two days ago, holding one peer's workdir and
+    /// the records directory of a session that ran in it, with `marker` as its `formation.json`
+    /// when given.
     fn fabricate(&self, tail: u64, marker: Option<&str>) -> String {
         let minted = now_ms() - 2 * DAY_MS;
         let id = format!("frm_{minted:012x}{tail:020x}");
         let dir = self.formation_dir(&id);
         let session_id = format!("ses_{minted:012x}{tail:020x}");
         let worker = dir.join("worker");
-        std::fs::create_dir_all(worker.join(".murmur").join(&session_id)).unwrap();
+        std::fs::create_dir_all(&worker).unwrap();
         let records = common::session_records_dir(self.home.path(), &worker, &session_id);
         std::fs::create_dir_all(&records).unwrap();
         std::fs::write(records.join("trace.jsonl"), "{}\n").unwrap();

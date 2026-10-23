@@ -406,7 +406,7 @@ fn launch_bounded(
         .to_string();
 
     launch_child_capsule(ChildLaunchRequest {
-        parent_accessible_root: capsule_runtime::WorkdirRoot::open(parent_dir).unwrap(),
+        parent_records_root: capsule_runtime::WorkdirRoot::open(parent_dir).unwrap(),
         capsule_name: name.to_string(),
         capsule_version: "0.1.0".to_string(),
         grant: SpawnApproval::new(approval),
@@ -655,7 +655,21 @@ fn a_finished_childs_completion_is_refused_by_a_parent_with_no_task_waiting_for_
     assert_eq!(completion["status"], DelegationStatus::Ok.as_str());
     assert_eq!(completion["reported_by"], Reporter::Child.as_str());
     assert_refused_as_unwaited(&completion, &delegation_id);
-    assert_eq!(completion["result_path"], "out/result.txt");
+    // A script child writes its own `out/result.txt` into its work folder, and the completion
+    // names it absolutely.
+    assert_eq!(
+        completion["result_path"],
+        child
+            .workdir
+            .join("out")
+            .join("result.txt")
+            .display()
+            .to_string()
+    );
+    assert!(child
+        .workdir
+        .starts_with(parent_dir.path().join("children")));
+    assert!(!parent_dir.path().join(".murmur").exists());
     assert_eq!(completion["delegation_id"], delegation_id);
     assert_eq!(completion["capsule_name"], "local/worker");
     assert_eq!(completion["session_id"], child.session_id);
@@ -822,7 +836,7 @@ fn a_completion_with_no_parent_left_is_recorded_rather_than_dropped() {
     let mut parent = RunningParent::start();
     let parent_dir = TempDir::new().unwrap();
     let spawner = parent.spawner();
-    let children_dir = parent_dir.path().join(".murmur").join("children");
+    let children_dir = parent_dir.path().join("children");
     let before = dirs_under(&children_dir);
 
     // The child waits for `targets.txt` before it finishes, so the parent can be killed while it

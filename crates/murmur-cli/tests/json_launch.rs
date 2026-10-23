@@ -207,7 +207,7 @@ fn json_launch_emits_parseable_json() {
 
     let expected_session_id = staged.session_id.clone();
     let expected_pid = std::process::id();
-    let expected_workdir = staged.workdir.clone();
+    let expected_workdir = staged.accessible_workdir.clone();
     let expected_records_dir = staged.records_dir.clone();
 
     let (json_tx, json_rx) = std::sync::mpsc::channel::<String>();
@@ -295,11 +295,11 @@ fn json_launch_url_is_reachable() {
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path);
 
-    fs::write(staged.workdir.join("task.md"), "agent card test").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "agent card test").unwrap();
 
     let expected_session_id = staged.session_id.clone();
     let expected_pid = std::process::id();
-    let expected_workdir = staged.workdir.clone();
+    let expected_workdir = staged.accessible_workdir.clone();
     let expected_records_dir = staged.records_dir.clone();
 
     let (json_tx, json_rx) = std::sync::mpsc::channel::<String>();
@@ -356,11 +356,11 @@ fn json_launch_session_id_matches_trace() {
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path);
 
-    fs::write(staged.workdir.join("task.md"), "trace test").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "trace test").unwrap();
 
     let expected_session_id = staged.session_id.clone();
     let expected_pid = std::process::id();
-    let expected_workdir = staged.workdir.clone();
+    let expected_workdir = staged.accessible_workdir.clone();
     let records_dir = staged.records_dir.clone();
     let expected_records_dir = records_dir.clone();
 
@@ -484,7 +484,8 @@ fn no_json_flag_human_readable_output_unchanged() {
     );
 }
 
-/// Test 5: --workdir sets the workdir field in JSON output and creates .murmur/ inside it.
+/// Test 5: --workdir sets the workdir field in JSON output, the run creates nothing inside it, and
+/// the agent's answer is in the records directory.
 #[test]
 fn json_launch_workdir_flag_is_reflected() {
     let server = end_turn_server("workdir flag test done");
@@ -551,12 +552,20 @@ fn json_launch_workdir_flag_is_reflected() {
         "records_dir in JSON should be the session's records directory under --workdir's group"
     );
 
-    // .murmur/ directory should have been created inside the workdir
-    let murmur_dir = user_workdir.path().join(".murmur");
+    // The work folder gains nothing; the agent's answer is in the records directory.
+    let entries: Vec<_> = fs::read_dir(user_workdir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
     assert!(
-        murmur_dir.exists() && murmur_dir.is_dir(),
-        ".murmur/ directory should exist inside --workdir; checked: {}",
-        murmur_dir.display()
+        entries.is_empty(),
+        "the run created {entries:?} inside --workdir"
+    );
+    let records_dir = std::path::PathBuf::from(parsed["records_dir"].as_str().unwrap());
+    assert!(
+        records_dir.join("out").join("result.txt").is_file(),
+        "the agent's answer should be in {}",
+        records_dir.display()
     );
 }
 
@@ -1072,8 +1081,8 @@ fn door_tokens_are_absent_from_a_public_capsule_readiness_line() {
 
 // ── Formation membership ──────────────────────────────────────────────────────
 
-/// The `ses_*` directories `mur run --manifest <project>/murmur.yaml` has left under
-/// `<project>/workdir/`, where a launch without `--workdir` stages its sessions.
+/// The `ses_*` work folders `mur run --manifest <project>/murmur.yaml` has left under
+/// `<project>/workdir/`, where a launch without `--workdir` creates its work folder.
 fn session_dirs(project: &Path) -> Vec<String> {
     fs::read_dir(project.join("workdir"))
         .into_iter()
@@ -1117,7 +1126,7 @@ fn formation_members_report_the_id_they_were_launched_with() {
     assert!(standalone.startup["session_id"].as_str().is_some());
 }
 
-/// A value that is not a formation id refuses the launch before a session directory exists, and
+/// A value that is not a formation id refuses the launch before a work folder exists, and
 /// the refusal does not print the value back.
 #[test]
 fn a_malformed_formation_id_refuses_the_launch_with_e_run_044() {
@@ -1143,11 +1152,7 @@ fn a_malformed_formation_id_refuses_the_launch_with_e_run_044() {
             !String::from_utf8_lossy(&output.stdout).contains(value),
             "{value} was echoed on stdout"
         );
-        assert_eq!(
-            session_dirs(project),
-            before,
-            "{value} left a session directory"
-        );
+        assert_eq!(session_dirs(project), before, "{value} left a work folder");
     }
 }
 

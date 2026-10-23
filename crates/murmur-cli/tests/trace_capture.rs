@@ -132,12 +132,16 @@ fn run_session(trace_block: &str) -> Run {
 
     let manifest_path = create_manifest(project.path(), trace_block);
     let staged: StagedSession = common::stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Digest the wire.").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "Digest the wire.",
+    )
+    .unwrap();
 
     let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
 
     Run {
-        result: fs::read_to_string(launched.workdir.join("out/result.txt")).unwrap_or_default(),
+        result: fs::read_to_string(launched.records_dir.join("out/result.txt")).unwrap_or_default(),
         trace: fs::read_to_string(launched.records_dir.join("trace.jsonl")).unwrap_or_default(),
         records_dir: launched.records_dir.clone(),
         _project: project,
@@ -465,8 +469,8 @@ fn stderr_of(assert: &assert_cmd::assert::Assert) -> String {
     String::from_utf8(assert.get_output().stderr.clone()).unwrap()
 }
 
-/// The session directories a run minted. `mur run` stages into `<project>/workdir/<session_id>`,
-/// so a manifest refused while parsing leaves this empty.
+/// The work folders a run minted. `mur run` without `--workdir` creates
+/// `<project>/workdir/<session_id>`, so a manifest refused while parsing leaves this empty.
 fn session_dirs(project: &tempfile::TempDir) -> Vec<String> {
     fs::read_dir(project.path().join("workdir"))
         .map(|entries| {

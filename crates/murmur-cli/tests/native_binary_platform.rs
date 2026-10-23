@@ -213,8 +213,8 @@ fn stage_request(project_dir: &Path, manifest: &RuntimeManifest) -> StageRequest
 
 /// Whether any `tools/<TOOL_NAME>/<TOOL_NAME>` exists anywhere under `root`.
 ///
-/// The session workdir is created under the project directory with a generated session id, so a
-/// refusal leaves no path the test can name directly — the whole tree is swept instead.
+/// The session's directories are named for a generated session id, so a refusal leaves no path
+/// the test can name directly — the whole tree is swept instead.
 fn staged_binary_exists_under(root: &Path) -> bool {
     let Ok(entries) = fs::read_dir(root) else {
         return false;
@@ -299,7 +299,7 @@ fn staging_refuses_a_native_binary_built_for_another_platform() {
 
     assert!(
         !staged_binary_exists_under(project.path()),
-        "a refused native binary must not be written to the session workdir"
+        "a refused native binary must not be written to the work folder"
     );
 }
 

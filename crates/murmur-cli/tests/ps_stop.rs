@@ -2202,8 +2202,8 @@ fn start_member(home: &Arc<TempDir>, project: &Arc<TempDir>, formation: &str) ->
     )
 }
 
-/// The session root a capsule's session directory sits in: the workdir root whose records group
-/// holds its records directory.
+/// The workdir root a capsule's work folder sits in: the root whose records group holds its
+/// records directory.
 fn session_root(capsule: &Capsule) -> PathBuf {
     PathBuf::from(capsule.startup["workdir"].as_str().unwrap())
         .parent()
@@ -2243,8 +2243,8 @@ fn formation_cell(row: &str) -> &str {
     row.split_whitespace().rev().nth(1).unwrap()
 }
 
-/// A record the runtime would write for a member, naming a session directory under `root` and a
-/// records directory in `root`'s records group.
+/// A record the runtime would write for a member, naming a work folder under `root` and a records
+/// directory in `root`'s records group.
 fn write_member_record(
     home: &Path,
     session_id: &str,

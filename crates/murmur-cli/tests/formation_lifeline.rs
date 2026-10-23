@@ -164,10 +164,6 @@ impl Member {
         self.child.id()
     }
 
-    fn session_dir(&self) -> PathBuf {
-        PathBuf::from(self.startup["workdir"].as_str().unwrap())
-    }
-
     fn records_dir(&self) -> PathBuf {
         PathBuf::from(self.startup["records_dir"].as_str().unwrap())
     }
@@ -244,9 +240,9 @@ impl Member {
             .to_string()
     }
 
-    /// The session's `out/result.txt`, or `None` when nothing wrote it.
+    /// `out/result.txt` in the session's records directory, or `None` when nothing wrote it.
     fn result_text(&self) -> Option<String> {
-        std::fs::read_to_string(self.session_dir().join("out").join("result.txt")).ok()
+        std::fs::read_to_string(self.records_dir().join("out").join("result.txt")).ok()
     }
 }
 
@@ -801,7 +797,8 @@ fn sigterm_then_eof_writes_no_formation_ended() {
     assert_eq!(stderr.matches("error[").count(), 1, "{stderr}");
     assert!(
         stderr.contains(
-            "the task was canceled before it completed, so out/result.txt holds no result"
+            "the task was canceled before it completed, so out/result.txt in the session's \
+             records directory holds no result"
         ),
         "{stderr}"
     );

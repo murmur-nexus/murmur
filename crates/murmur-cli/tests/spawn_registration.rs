@@ -311,9 +311,13 @@ fn an_installed_capsule_runs_by_name_and_version() {
         .assert()
         .success();
 
-    // Staged from the artifact bytes into the workdir, with no murmur.yaml and no lockfile written
-    // beside them.
-    assert!(workdir.path().join(".murmur").is_dir());
+    // Staged from the artifact bytes outside the work folder: the only entry in it is the script
+    // capsule's own `out/`, with no `.murmur`, no murmur.yaml and no lockfile.
+    let entries: Vec<_> = fs::read_dir(workdir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, ["out"], "{entries:?}");
     assert!(!workdir.path().join("murmur.yaml").exists());
     assert!(!workdir.path().join("murmur.lock").exists());
     assert_eq!(roost.connections(), 0);

@@ -52,14 +52,19 @@ fn ctx_gated<'a>(
     invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
     gate_step: &'a (dyn Fn(&PlannedCall<'_>) -> Option<String> + Sync),
 ) -> SchedulerContext<'a> {
+    // A stand-in records directory, `records/` in the test's directory, holding the home folder
+    // every shell step needs and the `children/` a capsule step creates its child's work folder in.
+    let records = records_of(&workdir);
+    std::fs::create_dir_all(records.join("home")).unwrap();
     SchedulerContext {
         accessible_workdir: WorkdirRoot::open(&workdir).unwrap(),
-        session_workdir: WorkdirRoot::open(&workdir).unwrap(),
         runtime_dir: capsule_runtime::runtime_dir::RuntimeDirRoots::new(
             WorkdirRoot::open(&workdir).unwrap(),
             WorkdirRoot::open(&workdir).unwrap(),
             WorkdirRoot::open(&workdir).unwrap(),
-        ),
+        )
+        .with_records(WorkdirRoot::open(&records).unwrap())
+        .with_home(WorkdirRoot::open(&records.join("home")).unwrap()),
         capability_policy: CapabilityPolicy {
             shell_allow: vec!["bash".to_string(), "printf".to_string()],
             spawn_allow: vec!["local/worker".to_string()],
@@ -83,6 +88,11 @@ fn ctx_gated<'a>(
         invoke_tool,
         task: None,
     }
+}
+
+/// The stand-in records directory of the context built over `workdir`.
+fn records_of(workdir: &Path) -> PathBuf {
+    workdir.join("records")
 }
 
 /// A store holding the `local/worker` artifact every capsule step here delegates to, by its
@@ -713,7 +723,7 @@ fn test_capsule_step_asks_permission_then_launches_the_child_itself() {
 
     // The child was started by this runtime, on the argument vector the launcher builds.
     let argv = _stub.recorded("argv.txt");
-    let child_dir = dir.path().join(".murmur").join("children");
+    let child_dir = records_of(dir.path()).join("children");
     assert!(
         argv.starts_with("run --capsule local/worker --capsule-version 0.1.0 --workdir "),
         "{argv}"
@@ -739,6 +749,24 @@ fn test_capsule_step_asks_permission_then_launches_the_child_itself() {
         let meta = std::fs::metadata(&child_workdir).unwrap();
         format!("{}:{}", meta.dev(), meta.ino())
     };
+    // The child's work folder is `<records>/children/worker-<16 hex>/`, owner-only, and the plan's
+    // work folder gains nothing for it.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let child_workdir = Path::new(&child_workdir);
+        assert_eq!(child_workdir.parent(), Some(child_dir.as_path()));
+        let name = child_workdir.file_name().unwrap().to_string_lossy();
+        assert_eq!(name.len(), "worker-".len() + 16, "{name}");
+        assert_eq!(
+            std::fs::metadata(child_workdir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(!dir.path().join(".murmur").exists());
+    }
     assert!(
         argv.contains(&format!(" --workdir-identity {identity} --json")),
         "{argv}"
@@ -2342,7 +2370,7 @@ fn test_a_cancelled_task_ends_its_capsule_steps_sub_capsule() {
 
     let pid = stub.recorded("pid.txt");
     assert!(!process_exists(&pid), "the stub child {pid} is still there");
-    let children: Vec<PathBuf> = fs::read_dir(dir.path().join(".murmur").join("children"))
+    let children: Vec<PathBuf> = fs::read_dir(records_of(dir.path()).join("children"))
         .unwrap()
         .flatten()
         .map(|entry| entry.path())

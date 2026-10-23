@@ -456,7 +456,11 @@ fn streaming_agent_card_has_streaming_capability() {
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path);
 
-    fs::write(staged.workdir.join("task.md"), "agent card streaming check").unwrap();
+    fs::write(
+        staged.accessible_workdir.join("task.md"),
+        "agent card streaming check",
+    )
+    .unwrap();
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let handle = std::thread::spawn(move || {

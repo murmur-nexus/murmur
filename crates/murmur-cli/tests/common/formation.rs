@@ -123,23 +123,24 @@ pub fn session_dirs(root: &Path) -> Vec<std::path::PathBuf> {
     sessions
 }
 
-/// Every session root the formations launched under the scratch `home` gave their peers:
-/// `<home>/.murmur/formations/<frm_id>/<member>/.murmur`, sorted.
-pub fn peer_session_roots(home: &Path) -> Vec<std::path::PathBuf> {
-    let mut roots = Vec::new();
+/// Every workdir the formations launched under the scratch `home` gave their peers:
+/// `<home>/.murmur/formations/<frm_id>/<member>`, sorted. A peer's sessions keep their records
+/// in the records group of its workdir.
+pub fn peer_workdirs(home: &Path) -> Vec<std::path::PathBuf> {
+    let mut workdirs = Vec::new();
     let Ok(formations) = std::fs::read_dir(home.join(".murmur").join("formations")) else {
-        return roots;
+        return workdirs;
     };
     for formation in formations.flatten() {
         let Ok(members) = std::fs::read_dir(formation.path()) else {
             continue;
         };
         for member in members.flatten() {
-            roots.push(member.path().join(".murmur"));
+            workdirs.push(member.path());
         }
     }
-    roots.sort();
-    roots
+    workdirs.sort();
+    workdirs
 }
 
 /// Send `signal` to `pid`, a process this test started.

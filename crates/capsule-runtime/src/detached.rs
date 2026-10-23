@@ -1017,7 +1017,6 @@ mod tests {
             &["-c", script],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
             &bash_policy(),
             enforcement,
             Some(DetachPolicy {
@@ -1286,10 +1285,17 @@ mod tests {
     #[test]
     fn with_no_records_directory_a_slow_command_is_not_demoted() {
         let workdir = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
         let started = Instant::now();
         let (outcome, registry, mut receiver) = detached_run_with(
             workdir.path(),
-            &ShellEnforcement::environment_only(),
+            &ShellEnforcement::environment_only().with_runtime_dir(
+                crate::runtime_dir::RuntimeDirRoots {
+                    records: None,
+                    ..crate::sandbox::test_runtime_dir(base.path())
+                },
+                None,
+            ),
             "sleep 2; echo done",
             Duration::from_millis(200),
         );

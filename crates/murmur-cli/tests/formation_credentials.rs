@@ -51,7 +51,7 @@ fn door(
         &format!("{QUEUE_SLEEP_YAML}{exports}{AUTHENTICATED}"),
     );
     let staged = stage_door(home, &project.path().join("murmur.yaml"), member);
-    let workdir = staged.workdir.clone();
+    let workdir = staged.accessible_workdir.clone();
     let records_dir = staged.records_dir.clone();
     let operator = staged.door_tokens()[0].1.expose().to_string();
     Door {

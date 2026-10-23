@@ -904,7 +904,8 @@ pub struct SealedDevice {
 /// `/dev/console` is omitted (the OCI spec creates it only for a terminal-attached container, and
 /// a capsule subprocess has pipes, not a controlling terminal). `/dev/ptmx` and `/dev/pts` come
 /// from a `devpts` mount rather than from this list, and `/dev/shm` is omitted deliberately: it is
-/// writable, and the session workdir and `/tmp` are the only writable paths in a composed root.
+/// writable, and the session workdir, `/tmp` and the home folder are the only writable paths in a
+/// composed root.
 pub const SEALED_DEVICE_NODES: &[SealedDevice] = &[
     SealedDevice {
         name: "null",
@@ -992,6 +993,14 @@ pub(crate) struct SealedBindSources<'a> {
     /// The session's records directory and the identity of the records root's own descriptor,
     /// bound read-only and required at its own absolute path, on [`Self::runtime_dir`]'s terms.
     pub(crate) records_dir: Option<(&'a Path, (u64, u64))>,
+    /// The session's home folder, `home/` in its records directory, and the identity of the
+    /// descriptor its home root holds on it, bound read-write and required at its own absolute
+    /// path, after [`Self::records_dir`], so `$HOME` names it inside the root.
+    pub(crate) home_dir: Option<(&'a Path, (u64, u64))>,
+    /// The directory the session's delegated children keep their records beneath, and the
+    /// identity of the descriptor taken on it, bound read-only at its own absolute path once a
+    /// child has staged there.
+    pub(crate) children_records: Option<(&'a Path, (u64, u64))>,
 }
 
 /// Directory the old root is parked in between `pivot_root(2)` and `umount2(MNT_DETACH)`.
@@ -1322,8 +1331,8 @@ pub(crate) fn plan_composed_root(
     );
 
     // 6. The capsule's workdir — the accessible one, which is also the subprocess cwd — at its
-    //    own absolute path, read-write. With /tmp above, the only writable paths in the composed
-    //    root.
+    //    own absolute path, read-write. With /tmp above and the home folder below, the only
+    //    writable paths in the composed root.
     let workdir_target = rebase(base, accessible_workdir);
     builder.mkdir_p(&workdir_target);
     builder.push(
@@ -1361,6 +1370,40 @@ pub(crate) fn plan_composed_root(
     //    lies beneath the other. A records directory that cannot be bound ends the session rather than leaving
     //    it writable, or absent from a root whose commands are told where it is.
     if let Some((path, identity)) = sources.records_dir {
+        let target = rebase(base, path);
+        builder.mkdir_p(&target);
+        builder.push(
+            RootOp::BindVerified {
+                source: path.to_path_buf(),
+                target,
+                read_only: true,
+                identity,
+            },
+            true,
+        );
+    }
+
+    // 9. The session's home folder, read-write and REQUIRED, at its own absolute path, so `$HOME`
+    //    and the synthetic passwd's home directory name it inside the root. After the records
+    //    directory it lies in, so this deeper, writable bind is the one that survives on top of
+    //    that read-only one. Verified like `/tmp`: a link swapped onto its path moves nothing.
+    if let Some((path, identity)) = sources.home_dir {
+        let target = rebase(base, path);
+        builder.mkdir_p(&target);
+        builder.push(
+            RootOp::BindVerified {
+                source: path.to_path_buf(),
+                target,
+                read_only: false,
+                identity,
+            },
+            true,
+        );
+    }
+
+    // 10. The delegated children's records, read-only and REQUIRED once they exist, at their own
+    //    absolute path, so the result an outcome names reads the same inside the root.
+    if let Some((path, identity)) = sources.children_records {
         let target = rebase(base, path);
         builder.mkdir_p(&target);
         builder.push(
@@ -2657,6 +2700,8 @@ mod tests {
             etc_dir: Path::new(TEST_ETC_DIR),
             runtime_dir: None,
             records_dir: None,
+            home_dir: None,
+            children_records: None,
         }
     }
 
@@ -2830,14 +2875,14 @@ mod tests {
         let identity = SealedAccountIdentity {
             uid: 1000,
             gid: 1000,
-            home: "/w/.capsule-home",
+            home: "/r/ses/home",
         };
 
         let passwd = SyntheticEtcFile::Passwd.render(&identity).unwrap();
         assert_eq!(
             passwd,
             "root:x:0:0:root:/root:/bin/sh\n\
-             capsule:x:1000:1000:Murmur capsule:/w/.capsule-home:/bin/sh\n"
+             capsule:x:1000:1000:Murmur capsule:/r/ses/home:/bin/sh\n"
         );
         let group = SyntheticEtcFile::Group.render(&identity).unwrap();
         assert_eq!(group, "root:x:0:\ncapsule:x:1000:\n");
@@ -2865,12 +2910,12 @@ mod tests {
         let identity = SealedAccountIdentity {
             uid: 0,
             gid: 0,
-            home: "/w/.capsule-home",
+            home: "/r/ses/home",
         };
 
         assert_eq!(
             SyntheticEtcFile::Passwd.render(&identity).unwrap(),
-            "root:x:0:0:root:/w/.capsule-home:/bin/sh\n"
+            "root:x:0:0:root:/r/ses/home:/bin/sh\n"
         );
         assert_eq!(
             SyntheticEtcFile::Group.render(&identity).unwrap(),
@@ -2985,6 +3030,101 @@ mod tests {
                 identity: TEST_RECORDS_IDENTITY,
             }
         );
+    }
+
+    /// The home folder is bound read-write, verified and required at its own path, after the
+    /// records directory's read-only bind it lies beneath, so the deeper, writable bind survives.
+    #[test]
+    fn home_folder_is_bound_read_write_and_verified_after_the_records_directory() {
+        const TEST_RECORDS_DIR: &str = "/home/u/.murmur/records/home/u/w/ses_x";
+        const TEST_RECORDS_IDENTITY: (u64, u64) = (7, 77);
+        const TEST_HOME_DIR: &str = "/home/u/.murmur/records/home/u/w/ses_x/home";
+        const TEST_HOME_IDENTITY: (u64, u64) = (7, 78);
+        let plan = plan_composed_root(
+            Path::new("/home/u/w"),
+            &SealedBindSources {
+                runtime_dir: Some((Path::new(TEST_RUNTIME_DIR), TEST_RUNTIME_IDENTITY)),
+                records_dir: Some((Path::new(TEST_RECORDS_DIR), TEST_RECORDS_IDENTITY)),
+                home_dir: Some((Path::new(TEST_HOME_DIR), TEST_HOME_IDENTITY)),
+                ..test_sources()
+            },
+            Path::new("/tmp"),
+            &[],
+            &[],
+            &FakeHost::usrmerge(),
+        );
+        let position = |source: &str| {
+            plan.steps
+                .iter()
+                .position(|step| {
+                    matches!(&step.op, RootOp::BindVerified { source: s, .. } if s == Path::new(source))
+                })
+                .unwrap_or_else(|| panic!("{source} is bound"))
+        };
+        let records = position(TEST_RECORDS_DIR);
+        let home = position(TEST_HOME_DIR);
+        assert!(records < home, "the home bind comes after the records bind");
+        assert!(
+            plan.steps[home].required,
+            "a missing home folder ends the session"
+        );
+        assert_eq!(
+            plan.steps[home].op,
+            RootOp::BindVerified {
+                source: PathBuf::from(TEST_HOME_DIR),
+                target: PathBuf::from("/tmp").join(TEST_HOME_DIR.trim_start_matches('/')),
+                read_only: false,
+                identity: TEST_HOME_IDENTITY,
+            }
+        );
+        assert!(matches!(
+            plan.steps[records].op,
+            RootOp::BindVerified {
+                read_only: true,
+                ..
+            }
+        ));
+    }
+
+    /// The delegated children's records, once a child has staged, are bound read-only, verified
+    /// and required at their own path.
+    #[test]
+    fn the_childrens_records_are_bound_read_only_and_verified() {
+        const TEST_CHILDREN_RECORDS: &str =
+            "/home/u/.murmur/records/home/u/.murmur/records/home/u/w/ses_x/children";
+        const TEST_CHILDREN_IDENTITY: (u64, u64) = (7, 79);
+        let plan = plan_composed_root(
+            Path::new("/home/u/w"),
+            &SealedBindSources {
+                children_records: Some((Path::new(TEST_CHILDREN_RECORDS), TEST_CHILDREN_IDENTITY)),
+                ..test_sources()
+            },
+            Path::new("/tmp"),
+            &[],
+            &[],
+            &FakeHost::usrmerge(),
+        );
+        let step = plan
+            .steps
+            .iter()
+            .find(|step| {
+                matches!(&step.op, RootOp::BindVerified { source, .. } if source == Path::new(TEST_CHILDREN_RECORDS))
+            })
+            .expect("the children's records are bound");
+        assert!(step.required);
+        assert_eq!(
+            step.op,
+            RootOp::BindVerified {
+                source: PathBuf::from(TEST_CHILDREN_RECORDS),
+                target: PathBuf::from("/tmp").join(TEST_CHILDREN_RECORDS.trim_start_matches('/')),
+                read_only: true,
+                identity: TEST_CHILDREN_IDENTITY,
+            }
+        );
+        assert!(plan_for("/home/u/w").steps.iter().all(|step| !matches!(
+            &step.op,
+            RootOp::BindVerified { source, .. } if source == Path::new(TEST_CHILDREN_RECORDS)
+        )));
     }
 
     /// The remount keeps every flag a user namespace locks on the source mount.

@@ -57,7 +57,7 @@ pub const E_RUN_009: &str = "E-RUN-009"; // system prompt file could not be read
 pub const E_RUN_010: &str = "E-RUN-010"; // network.internal_port already in use
 pub const E_RUN_011: &str = "E-RUN-011"; // subprocess killed for exceeding a capabilities.resources limit
 pub const E_RUN_012: &str = "E-RUN-012"; // no cgroup v2 scope could be delegated on Linux
-pub const E_RUN_013: &str = "E-RUN-013"; // session workdir grew past capabilities.resources.workdir_max_bytes
+pub const E_RUN_013: &str = "E-RUN-013"; // work folder, $HOME and $TMPDIR grew past capabilities.resources.workdir_max_bytes
 pub const E_RUN_014: &str = "E-RUN-014"; // a sealed session's composed root could not be built after the host probe had cleared it
 pub const E_RUN_015: &str = "E-RUN-015"; // --resume and --context both given
 pub const E_RUN_016: &str = "E-RUN-016"; // the resumed session's trace holds no task_start carrying a context id
@@ -336,8 +336,8 @@ impl From<RuntimeError> for CliError {
                 E_RUN_001,
                 error.to_string(),
                 "a tool answered with a file the host may not read — data_path is resolved beneath \
-                 the session workdir and symlinks out of it are refused; have the tool write its \
-                 output under that workdir",
+                 the work folder and symlinks out of it are refused; have the tool write its \
+                 output under that folder",
             ),
             error @ RuntimeError::CgroupDelegationUnavailable { .. } => CliError::with_hint(
                 E_RUN_012,
@@ -442,7 +442,7 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::WorkdirIdentityMismatch { .. } => CliError::with_hint(
                 E_RUN_051,
                 error.to_string(),
-                "the delegating capsule's workdir changed under .murmur/children between the \
+                "the delegating capsule's child work folder in children/ changed between the \
                  directory's creation and this launch; nothing was written"
                     .to_string(),
             ),
@@ -924,14 +924,15 @@ impl From<RuntimeError> for CliError {
             } => CliError::with_hint(
                 E_RUN_040,
                 error.to_string(),
-                "the task was canceled before it completed, so out/result.txt holds no result; \
-                 `mur trace show <session>` shows the turn it was canceled on and why",
+                "the task was canceled before it completed, so out/result.txt in the session's \
+                 records directory holds no result; `mur trace show <session>` shows the turn it \
+                 was canceled on and why",
             ),
             error @ RuntimeError::TaskDidNotComplete { .. } => CliError::with_hint(
                 E_RUN_040,
                 error.to_string(),
-                "the task's result text is in out/result.txt under the workdir, and `mur trace \
-                 show <session>` shows the turn it ended on and why",
+                "the task's result text is in out/result.txt in the session's records directory, \
+                 and `mur trace show <session>` shows the turn it ended on and why",
             ),
             error @ RuntimeError::SpawnRegistrationFailed { .. } => CliError::with_hint(
                 E_RUN_019,

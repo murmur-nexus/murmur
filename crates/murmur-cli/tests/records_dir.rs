@@ -318,7 +318,6 @@ fn commands_cannot_change_the_records(test: &str, floor: ContainmentClass) {
     );
     let records = staged.records_dir.clone();
     let session_id = staged.session_id.clone();
-    let session_workdir = staged.workdir.clone();
     let home = common::process_home();
     assert_eq!(
         records,
@@ -478,14 +477,21 @@ fn commands_cannot_change_the_records(test: &str, floor: ContainmentClass) {
     assert!(!records.join("completion.json").exists());
     for name in ["blobs", "logs"] {
         assert!(
-            !session_workdir.join(name).exists(),
-            "the session workdir gained {name}"
+            !workdir.path().join(name).exists(),
+            "the work folder gained {name}"
         );
     }
     assert_eq!(
-        fs::read_to_string(session_workdir.join("trace.jsonl")).unwrap(),
+        fs::read_to_string(
+            workdir
+                .path()
+                .join(".murmur")
+                .join(&session_id)
+                .join("trace.jsonl")
+        )
+        .unwrap(),
         "planted",
-        "the runtime wrote nothing into the session workdir's trace.jsonl"
+        "the runtime wrote nothing into the planted trace.jsonl"
     );
 
     // Every reader reads the records directory, never the plants.
@@ -545,9 +551,9 @@ fn sealed_commands_cannot_change_the_records() {
 
 // ── a records-granted hook writes beneath hooks/, a scope stays in the workdir ──
 
-/// One advisory session with the `records-hook` fixture declared `capabilities`, its workdir
-/// root, its records directory and its session workdir.
-fn hook_run(capabilities: &str) -> (TempDir, PathBuf, PathBuf) {
+/// One advisory session with the `records-hook` fixture declared `capabilities`: its work folder
+/// and its records directory.
+fn hook_run(capabilities: &str) -> (TempDir, PathBuf) {
     let server = common::ScriptedServer::start(vec![end_turn("done")]);
     let p = project(&server.endpoint, Some(capabilities), false);
     let workdir = TempDir::new().unwrap();
@@ -559,10 +565,9 @@ fn hook_run(capabilities: &str) -> (TempDir, PathBuf, PathBuf) {
         Some(workdir.path()),
     );
     let records = staged.records_dir.clone();
-    let session = staged.workdir.clone();
     fs::write(workdir.path().join("task.md"), TASK).unwrap();
     launch_session(staged, |_| {}).expect("the session runs");
-    (workdir, records, session)
+    (workdir, records)
 }
 
 #[test]
@@ -570,22 +575,21 @@ fn a_hook_granted_the_records_dir_writes_beneath_hooks() {
     if common::skip_without_host_support("a_hook_granted_the_records_dir_writes_beneath_hooks") {
         return;
     }
-    let (workdir, records, session) = hook_run(RECORDS_GRANT);
+    let (workdir, records) = hook_run(RECORDS_GRANT);
     let eval = fs::read_to_string(records.join("hooks/eval.jsonl")).unwrap();
     assert!(eval.contains("\"records-hook\":0.75"), "{eval}");
     assert!(records.join("hooks/logs/hook-records-hook.log").is_file());
-    for dir in [workdir.path(), session.as_path()] {
-        assert!(!dir.join("eval.jsonl").exists(), "{}", dir.display());
-        assert!(
-            !dir.join("logs/hook-records-hook.log").exists(),
-            "{}",
-            dir.display()
-        );
-    }
+    let dir = workdir.path();
+    assert!(!dir.join("eval.jsonl").exists(), "{}", dir.display());
+    assert!(
+        !dir.join("logs/hook-records-hook.log").exists(),
+        "{}",
+        dir.display()
+    );
 
     // The same hook declared `scope: .` writes into the workdir exactly as before, and its
     // records directory holds no `hooks/`.
-    let (workdir, records, _) = hook_run(SCOPE_GRANT);
+    let (workdir, records) = hook_run(SCOPE_GRANT);
     let eval = fs::read_to_string(workdir.path().join("eval.jsonl")).unwrap();
     assert!(eval.contains("\"records-hook\":0.75"), "{eval}");
     assert!(!records.join("hooks").exists());

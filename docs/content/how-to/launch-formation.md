@@ -272,9 +272,9 @@ The launcher starts `worker` first, waits for its door, and only then starts `le
 |---|---|
 | `formation: frm_…` | The formation id minted for this launch. Every member carries it, and its trace is addressed by it |
 | `peer   worker …` | `worker` is ready: its process id, its session id, and the door that answered as that session |
-| `workdir …` | `worker`'s own directory, under `~/.murmur/formations/<frm_id>/worker`. Its sessions are under it |
+| `workdir …` | `worker`'s work folder, under `~/.murmur/formations/<frm_id>/worker`. Its sessions' records are under the same path mirrored in `~/.murmur/records` |
 | `entry  lead    starting` | Every peer is ready, and `lead` is starting with the task |
-| `murmur: url`, `murmur: auth`, `session:` | `lead`'s own startup lines: its door, that the door requires a token, and its session id. `lead` works in `crew`, and its sessions are under `crew/.murmur` |
+| `murmur: url`, `murmur: auth`, `session:` | `lead`'s own startup lines: its door, that the door requires a token, and its session id. `lead` works in `crew`, and its sessions' records are under `~/.murmur/records/<crew's path>/` |
 | `status:  ok` | `lead`'s task ended `ok` |
 | `[worker] … formation lifeline closed …` | `worker` saw the formation end and wound down |
 
@@ -309,9 +309,9 @@ mur trace show frm_01a1100295f47ea3b227ddf4612759f3
 ```text
 ── Formation ────────────────────────────────────
 formation:  frm_01a1100295f47ea3b227ddf4612759f3
-searched:   /tmp/crew-run-d078/work/crew/workdir
-searched:   /tmp/crew-run-d078/work/crew/.murmur
-searched:   /tmp/crew-run-d078/home/.murmur/formations/frm_01a1100295f47ea3b227ddf4612759f3/worker/.murmur
+searched:   /tmp/crew-run-d078/home/.murmur/records/tmp/crew-run-d078/work/crew/workdir
+searched:   /tmp/crew-run-d078/home/.murmur/records/tmp/crew-run-d078/work/crew
+searched:   /tmp/crew-run-d078/home/.murmur/records/tmp/crew-run-d078/home/.murmur/formations/frm_01a1100295f47ea3b227ddf4612759f3/worker
 ses_01a11002968476428a785ab0b3ae4fbb  worker  crew-worker@0.1.0  ok
 ses_01a11002984c7bd0ad3a7b1927d94d5d  lead    crew-lead@0.1.0    ok  may call worker
 calls:      1
@@ -358,10 +358,12 @@ In `worker`'s trace, the task arrives named for the member that sent it:
 [`call-member`](../reference/runtime-provided-tools.md#call-member) and the
 [`member_call`](../reference/observability-schemas.md#member-call) record.
 
-`lead`'s answer, and so the formation's, is in its session's `out/result.txt`:
+`lead`'s answer, and so the formation's, is in `out/result.txt` in its session's
+[records directory](../reference/workdir.md#records-directory). `lead` works in the project
+directory, so that is `~/.murmur/records/<project directory>/<session_id>/`:
 
 ```bash
-cat .murmur/ses_01a11002984c7bd0ad3a7b1927d94d5d/out/result.txt
+cat ~/.murmur/records$PWD/ses_01a11002984c7bd0ad3a7b1927d94d5d/out/result.txt
 ```
 
 ```text
@@ -375,10 +377,10 @@ Guiding lost sails toward the light.
 
 ## Step 7 — read each member's own trace
 
-Show `lead`'s session from its root, `.murmur`:
+Show `lead`'s session from its root, `crew` itself:
 
 ```bash
-mur trace show ses_01a11002984c7bd0ad3a7b1927d94d5d --workdir .murmur
+mur trace show ses_01a11002984c7bd0ad3a7b1927d94d5d --workdir .
 ```
 
 ```text
@@ -403,8 +405,8 @@ mcl_01a11002a5d57021b9017e9e2e31a465  worker  tsk_01a11002a5db7fe0a98b4e4e743aa4
 
 ── Formation ────────────────────────────────────
 formation:  frm_01a1100295f47ea3b227ddf4612759f3
-searched:   .murmur
-searched:   /tmp/crew-run-d078/home/.murmur/formations/frm_01a1100295f47ea3b227ddf4612759f3/worker/.murmur
+searched:   /tmp/crew-run-d078/home/.murmur/records/tmp/crew-run-d078/work/crew
+searched:   /tmp/crew-run-d078/home/.murmur/records/tmp/crew-run-d078/home/.murmur/formations/frm_01a1100295f47ea3b227ddf4612759f3/worker
 ses_01a11002968476428a785ab0b3ae4fbb  worker  crew-worker@0.1.0  ok
 ses_01a11002984c7bd0ad3a7b1927d94d5d  lead    crew-lead@0.1.0    ok  may call worker
 calls:      1
@@ -418,7 +420,7 @@ section lists each call this session made with the member, its task id, and how 
 Show `worker`'s session from its own directory:
 
 ```bash
-mur trace show ses_01a11002968476428a785ab0b3ae4fbb --workdir ~/.murmur/formations/frm_01a1100295f47ea3b227ddf4612759f3/worker/.murmur
+mur trace show ses_01a11002968476428a785ab0b3ae4fbb --workdir ~/.murmur/formations/frm_01a1100295f47ea3b227ddf4612759f3/worker
 ```
 
 ```text
@@ -439,7 +441,7 @@ sent:       0 messages
 
 ── Formation ────────────────────────────────────
 formation:  frm_01a1100295f47ea3b227ddf4612759f3
-searched:   /tmp/crew-run-d078/home/.murmur/formations/frm_01a1100295f47ea3b227ddf4612759f3/worker/.murmur
+searched:   /tmp/crew-run-d078/home/.murmur/records/tmp/crew-run-d078/home/.murmur/formations/frm_01a1100295f47ea3b227ddf4612759f3/worker
 ses_01a11002968476428a785ab0b3ae4fbb  worker  crew-worker@0.1.0  ok
 calls:      1
 mcl_01a11002a5d57021b9017e9e2e31a465  lead → worker  unknown  -    lead's trace not found; worker's task ended ok
