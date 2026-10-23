@@ -32,12 +32,16 @@ fn build_commit(manifest_dir: &Path) -> Option<String> {
     Some(commit)
 }
 
-/// The files a commit, checkout or reset rewrites: `HEAD`, the branch it names and
+/// The files a commit, checkout or reset rewrites: `HEAD`, its reflog, the branch it names and
 /// `packed-refs`. `--git-path` resolves them in a linked worktree, where `.git` is a file.
 /// Only existing ones are returned: cargo counts a missing `rerun-if-changed` path as changed
 /// on every build, which would recompile `murmur-cli` each time.
+///
+/// The reflog is what catches a commit on a branch that lives only in `packed-refs`, as
+/// `git gc` leaves every branch: the commit creates the loose ref file, which did not exist to
+/// be watched, and rewrites neither `HEAD` nor `packed-refs`.
 fn head_files(manifest_dir: &Path) -> Vec<PathBuf> {
-    let mut names = vec!["HEAD".to_string()];
+    let mut names = vec!["HEAD".to_string(), "logs/HEAD".to_string()];
     if let Some(branch) = git(manifest_dir, &["symbolic-ref", "-q", "HEAD"]) {
         names.push(branch.trim().to_string());
     }
