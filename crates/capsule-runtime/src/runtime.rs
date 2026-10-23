@@ -879,7 +879,7 @@ async fn end_task(
         }
     };
     if ending.state == TaskState::Canceled {
-        write_canceled_result(mode, Some(task_id), &state.records_root);
+        write_canceled_result(mode, task_id, &state.records_root);
     }
     let reported = reported.or_else(|| {
         let context_id = context_id?;
@@ -920,7 +920,7 @@ fn unregistered_ending(
 }
 
 /// Write [`crate::cancel::CANCELED_RESULT_TEXT`] to the session's `out/result.txt`, and, under
-/// `lifecycle.conversation: threaded` with an A2A task id, to `out/result_<task_id>.txt`.
+/// `lifecycle.conversation: threaded`, to `out/result_<task_id>.txt`.
 ///
 /// Through [`agent::write_result`] rather than the task-output funnel: the cancelled attempt's
 /// task-io output was cleared when the attempt began, and stays unset. A failed write is reported
@@ -928,17 +928,13 @@ fn unregistered_ending(
 ///
 /// `records_root` is the session's records directory, where the marker is written and that report
 /// is logged.
-fn write_canceled_result(
-    mode: &ConversationMode,
-    task_id: Option<&str>,
-    records_root: &WorkdirRoot,
-) {
+fn write_canceled_result(mode: &ConversationMode, task_id: &str, records_root: &WorkdirRoot) {
     let text = crate::cancel::CANCELED_RESULT_TEXT;
     let mut failures = Vec::new();
     if let Err(error) = agent::write_result(records_root, text) {
         failures.push(error);
     }
-    if let (ConversationMode::Threaded, Some(task_id)) = (mode, task_id) {
+    if matches!(mode, ConversationMode::Threaded) {
         if let Err(error) = agent::write_result_for_task(records_root, task_id, text) {
             failures.push(error);
         }
@@ -22723,7 +22719,7 @@ inference:
     }
 
     /// The cancelled-task marker replaces whatever `out/result.txt` held, and under a threaded
-    /// conversation the per-task file of an A2A task as well.
+    /// conversation the per-task file as well.
     #[test]
     fn a_cancelled_task_writes_the_marker_to_its_result_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -22734,7 +22730,7 @@ inference:
 
         write_canceled_result(
             &ConversationMode::Threaded,
-            Some("tsk_a"),
+            "tsk_a",
             &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
         );
         let read = |name: &str| std::fs::read_to_string(out.join(name)).unwrap();
@@ -22748,16 +22744,11 @@ inference:
             "canceled: the task was canceled before it completed, so it has no result"
         );
 
-        // A stateless conversation keeps no per-task file, and a task.md task has no task id.
+        // A stateless conversation keeps no per-task file.
         let dir = tempfile::tempdir().unwrap();
         write_canceled_result(
             &ConversationMode::Stateless,
-            Some("tsk_b"),
-            &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
-        );
-        write_canceled_result(
-            &ConversationMode::Threaded,
-            None,
+            "tsk_b",
             &crate::workdir_fs::WorkdirRoot::open(dir.path()).unwrap(),
         );
         let out = dir.path().join("out");

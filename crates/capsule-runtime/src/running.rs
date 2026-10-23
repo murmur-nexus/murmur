@@ -65,11 +65,11 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Every field but `door_token`, `credentials`, `formation_id`, `formation_member`,
 /// `formation_entry`, `formation_lifeline`, `formation_launcher` and `spawned_by` is required, and
-/// each of those eight is omitted when it does not apply, so a standalone session's record carries the ten required
-/// keys alone. There is no version field: a record that does not deserialize names no process that
-/// could be checked, and is pruned, which is what "the record is a hint" already means — except one
-/// an older `mur` wrote, which [`scan`] recognises by its missing `records_dir` and no reader
-/// removes.
+/// each of those eight is omitted when it does not apply, so a standalone session's record carries
+/// the ten required keys alone. There is no version field: a record that does not deserialize
+/// names no process that could be checked, and is pruned, which is what "the record is a hint"
+/// already means — except one an older `mur` wrote, which [`scan`] recognises by its missing
+/// `records_dir` and no reader removes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningRecord {
     /// The session this door answers for, compared against the agent card by layer 3.

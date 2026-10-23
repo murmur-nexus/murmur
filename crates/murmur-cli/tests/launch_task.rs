@@ -53,13 +53,7 @@ impl Held {
 /// A provider whose first request is held until [`Held::release`], or until the [`Held`] is
 /// dropped, and is then answered with an `end_turn` saying `done`.
 fn held_provider() -> (common::ScriptedServer, Held) {
-    let (release, released) = mpsc::channel::<()>();
-    let (arrive, arrived) = mpsc::channel::<()>();
-    let server = common::ScriptedServer::start_answering(1, move |_| {
-        let _ = arrive.send(());
-        let _ = released.recv_timeout(Duration::from_secs(120));
-        end_turn(1, "done")
-    });
+    let (server, arrived, release) = common::held_provider(end_turn(1, "done"));
     (server, Held { release, arrived })
 }
 

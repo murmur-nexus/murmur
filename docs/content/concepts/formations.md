@@ -2,9 +2,9 @@
 
 ## What a formation is { #what }
 
-A formation is a group of capsules on one machine that work on one task together. Its members are
+A formation is a group of capsules on one machine that work on tasks together. Its members are
 declared in a `roster.yaml` in the project directory: each is a capsule at an exact version, one
-of them is the **entry member** that receives the formation's task, and the roster says which
+of them is the **entry member** that receives the formation's tasks, and the roster says which
 members may call which. [`mur doctor`](../reference/cli.md#doctor-roster) checks a roster against
 the installed capsules. See the [Roster Schema](../reference/roster.md).
 
@@ -20,7 +20,8 @@ the installed capsules. See the [Roster Schema](../reference/roster.md).
    signal or its deadline.
 
 Either way, the entry member's task is a task on its door, which `ListTasks` lists while it runs.
-One launch is one formation. Launching the same roster again makes a new formation with a new id. See [Launching a formation](../reference/roster.md#launch) and the
+One launch is one formation. Launching the same roster again makes a new formation with a new id.
+See [Launching a formation](../reference/roster.md#launch) and the
 [`mur run --roster` flags and output](../reference/cli.md#mur-run-roster).
 [How to launch a formation of capsules](../how-to/launch-formation.md) scaffolds a two-member
 formation, launches it, and follows one member handing the other its task.
@@ -67,8 +68,8 @@ A call from one member to another succeeds only when all three layers allow it:
 | The caller's egress | The caller's `murmur.yaml` | The caller's own [`capabilities.network.allow`](../reference/roster.md#member-calls) lists `localhost` |
 
 The entry member is never called by a peer: its tasks come from the launch or from a client at its
-door, and no member holds a credential for it. A rule that lists it in `to` is refused at admission with
-[`E-ROS-008`](../reference/diagnostics.md#e-ros-008). To have a member report to the entry member,
+door, and no member holds a credential for it. A rule that lists it in `to` is refused at
+admission with [`E-ROS-008`](../reference/diagnostics.md#e-ros-008). To have a member report to the entry member,
 let the entry member call it; the answer comes back into the entry member's own task. See
 [The entry member](../reference/roster.md#entry-member).
 

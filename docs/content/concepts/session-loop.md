@@ -301,8 +301,8 @@ it accepts over its lifetime:
 
 | `task_acceptance` | `after_task` | Behaviour |
 |---|---|---|
-| `none` | `exit` | Runs from `task.md` if present, then exits. The door starts no task — see [`lifecycle.task_acceptance`](../reference/manifest.md#lifecycle-task-acceptance). |
-| `single` (default) | `exit` (default) | Accepts one [A2A task](formations.md), runs it, exits. Classic ephemeral capsule. |
+| `none` | `exit` | Runs the launch's own task — `--task`, or a `task.md` in the workdir — if it has one, then exits. The door starts no task — see [`lifecycle.task_acceptance`](../reference/manifest.md#lifecycle-task-acceptance). |
+| `single` (default) | `exit` (default) | Runs one task — the launch's own, or else the first [A2A task](formations.md) — then exits. Classic ephemeral capsule. |
 | `queue` | `sleep` | Accepts a queue of tasks, processes them serially, sleeps between tasks; the host decides when to shut it down on idle. |
 
 `queue+sleep` is the canonical mode for persistent capsules — it parks between tasks rather

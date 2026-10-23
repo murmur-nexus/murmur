@@ -789,26 +789,14 @@ fn list_tasks(door: &str, token: &str) -> Vec<Value> {
     listed.json()["result"]["tasks"].as_array().unwrap().clone()
 }
 
-/// Whether a process with `pid` exists.
-fn pid_exists(pid: u64) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
-
 /// The scaffold, launched with `--task`: while lead's first model request is held, lead's door
 /// lists the formation's task as working and a stream on it ends completed, and `mur ps --json`
 /// marks lead as the formation's entry member. The launcher then exits 0 and nothing remains.
 #[test]
 fn the_entry_members_launch_task_is_on_its_door_while_it_runs() {
     let scratch = Scratch::new();
-    // Lead's first model request is held until the test releases it. The server records a
-    // request only once it is answered, so the request says it arrived on its own channel.
-    let (release, released) = mpsc::channel::<()>();
-    let (arrive, arrived) = mpsc::channel::<()>();
-    let server = ScriptedServer::start_answering(1, move |_| {
-        let _ = arrive.send(());
-        let _ = released.recv_timeout(LAUNCH_LIMIT);
-        end_turn(1, "hello back")
-    });
+    // Lead's first model request is held until the test releases it.
+    let (server, arrived, release) = common::held_provider(end_turn(1, "hello back"));
     scratch.write_config(&format!(
         "inference:\n  provider: anthropic\n  model: test-model\n  endpoint: {}\n",
         server.endpoint
@@ -904,12 +892,12 @@ fn a_formation_launched_without_a_task_stays_up_until_stopped() {
     let readiness = run.line(1);
     let door = readiness["url"].as_str().unwrap().to_string();
     let session = readiness["session_id"].as_str().unwrap().to_string();
-    let lead_pid = readiness["pid"].as_u64().unwrap();
-    let worker_pid = formation["peers"][0]["pid"].as_u64().unwrap();
+    let lead_pid = readiness["pid"].as_u64().unwrap() as u32;
+    let worker_pid = formation["peers"][0]["pid"].as_u64().unwrap() as u32;
 
     thread::sleep(Duration::from_secs(8));
     assert!(run.running(), "the launcher ended with no task to run");
-    assert!(pid_exists(lead_pid) && pid_exists(worker_pid));
+    assert!(common::formation::alive(lead_pid) && common::formation::alive(worker_pid));
     let listing = ps_json(&scratch);
     assert_eq!(
         listed_formation(&listing, &formation_id)["entry_member"],
@@ -941,7 +929,10 @@ fn a_formation_launched_without_a_task_stays_up_until_stopped() {
         );
         thread::sleep(Duration::from_millis(500));
         assert!(run.running(), "the formation ended after task {index}");
-        assert!(pid_exists(lead_pid), "lead ended after task {index}");
+        assert!(
+            common::formation::alive(lead_pid),
+            "lead ended after task {index}"
+        );
     }
     assert_eq!(server.requests().len(), 2);
 
@@ -953,7 +944,7 @@ fn a_formation_launched_without_a_task_stays_up_until_stopped() {
     assert!(!stderr.contains("E-RUN-052"), "{stderr}");
     assert_no_member_remains(
         scratch.path(),
-        &[lead_pid as u32, worker_pid as u32],
+        &[lead_pid, worker_pid],
         Duration::from_secs(30),
     );
 }

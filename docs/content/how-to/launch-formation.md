@@ -490,8 +490,10 @@ Launched without `--task`, the formation stays up and `lead` takes tasks at its 
 another, from the operator or from a client such as `nexus`. `mur ps --json` names `lead` as the
 formation's `entry_member`, `mur token <lead's session>` prints the token its door takes, and
 `mur stop frm_<id>` ends the formation; the launcher then exits `143`. See
-[Launching a formation](../reference/cli.md#mur-run-roster). `mur run --roster` refuses `--resume`, and a member's
-session resumed by hand belongs to no formation. See
+[Launching a formation](../reference/cli.md#mur-run-roster).
+
+`mur run --roster` refuses `--resume`, and a member's session resumed by hand belongs to no
+formation. See
 [How a formation ends](../reference/roster.md#launch-stop) and
 [Resuming a member's session](../reference/roster.md#launch-resume).
 

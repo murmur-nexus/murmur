@@ -30,7 +30,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 - [Tools](/concepts/tools.md): How murmur defines tool artifacts — both WASM and native — and how the runtime invokes them during a session.
 - [Access Control](/concepts/access-control.md): The `capabilities` block: what a capsule and its artifacts are allowed to reach — filesystem, network, and subprocesses.
 - [Context](/concepts/context.md): Context compaction — how the runtime condenses message history automatically so a long-running session avoids hitting a hard token limit.
-- [Formations](/concepts/formations.md): A group of capsules on one machine, declared in `roster.yaml` and launched with `mur run --roster` for one task, whose members hand each other work with `call-member`.
+- [Formations](/concepts/formations.md): A group of capsules on one machine, declared in `roster.yaml` and launched with `mur run --roster` for one task or until it is stopped, whose members hand each other work with `call-member`.
 - [Observability](/concepts/observability.md): The structured trace every session writes to `~/.murmur/records/<workdir root>/<session_id>/trace.jsonl`, regardless of whether any hooks are declared.
 - [Sources and stores](/concepts/registry.md): Where `mur` gets artifacts: the project and global stores on disk and the GitHub sources in `~/.murmur/config.yaml`, and the order each command checks them.
 

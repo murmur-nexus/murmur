@@ -1534,26 +1534,6 @@ const REJECTED_SESSION_ENDED_MESSAGE: &str =
 /// A body the fixture driver fails the task on: another provider's response shape.
 const CHAT_COMPLETIONS_BODY: &str = r#"{"id":"x","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"hi"}}]}"#;
 
-/// A provider answering its one request with `body`, and only once the test releases it. The
-/// first receiver fires when the request arrives, so the test knows the `task.md` task is running
-/// and not yet finished.
-fn held_provider(
-    body: String,
-) -> (
-    common::ScriptedServer,
-    std::sync::mpsc::Receiver<()>,
-    std::sync::mpsc::Sender<()>,
-) {
-    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<()>();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let server = common::ScriptedServer::start_answering(1, move |_| {
-        let _ = arrived_tx.send(());
-        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(60));
-        body.clone()
-    });
-    (server, arrived_rx, release_tx)
-}
-
 /// `launch_session` on a thread, and the capsule URL it announced.
 fn launch_in_background(
     staged: capsule_runtime::StagedSession,
@@ -1690,7 +1670,7 @@ fn assert_sole_rejection<'a>(events: &'a [Value], task_id: &str, cause: &str) ->
 /// outcome is the `task.md` task's.
 #[test]
 fn lifecycle_a_task_queued_behind_an_exit_task_is_rejected_when_the_session_closes() {
-    let (server, arrived, release) = held_provider(end_turn_response("msg_1", "done"));
+    let (server, arrived, release) = common::held_provider(end_turn_response("msg_1", "done"));
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     // Before staging, so the session's records land under the home `mur trace show` reads below.
     let process_home = common::process_home();
@@ -1774,7 +1754,7 @@ fn lifecycle_a_task_queued_behind_an_exit_task_is_rejected_when_the_session_clos
 /// open after the refusal.
 #[test]
 fn lifecycle_a_rejected_task_reads_rejected_over_tasks_get() {
-    let (server, arrived, release) = held_provider(end_turn_response("msg_1", "done"));
+    let (server, arrived, release) = common::held_provider(end_turn_response("msg_1", "done"));
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let artifacts = tempfile::tempdir().unwrap();
     let hook = common::hook_wat::create_hook_zip(
@@ -1875,7 +1855,7 @@ fn lifecycle_a_rejected_task_reads_rejected_over_tasks_get() {
 /// nothing is left for the session to refuse when it closes.
 #[test]
 fn lifecycle_single_exit_refuses_a_task_while_its_launch_task_runs() {
-    let (server, arrived, release) = held_provider(end_turn_response("msg_1", "done"));
+    let (server, arrived, release) = common::held_provider(end_turn_response("msg_1", "done"));
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path, None, None);
     fs::write(staged.accessible_workdir.join("task.md"), "Say done.").unwrap();
@@ -1910,7 +1890,7 @@ fn lifecycle_single_exit_refuses_a_task_while_its_launch_task_runs() {
 /// rather than run or folded into that failure.
 #[test]
 fn lifecycle_a_failed_exit_task_still_rejects_what_queued_behind_it() {
-    let (server, arrived, release) = held_provider(CHAT_COMPLETIONS_BODY.to_string());
+    let (server, arrived, release) = common::held_provider(CHAT_COMPLETIONS_BODY.to_string());
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path, Some(queue_exit_lifecycle()), None);
     fs::write(staged.accessible_workdir.join("task.md"), "Say done.").unwrap();
