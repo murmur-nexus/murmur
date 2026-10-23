@@ -16,9 +16,9 @@
 //!   declaration raises a class" property stays a property of one small, pure function.
 //!
 //! [`ContainmentClass::Sealed`] is reachable exactly when [`EnforcementTier::KernelSealed`] is:
-//! a Linux host with a usable Landlock ABI, AppArmor out of the way of unprivileged user
-//! namespaces, and a namespace probe that really created one. See [`crate::sealed`] for the
-//! mechanism and for the [`SealedBlocker`] taxonomy that turns "not sealed here" into a specific
+//! a Linux host with a usable Landlock ABI and a namespace probe that really built the composed
+//! root inside the capsule's network namespace. See [`crate::sealed`] for the mechanism and for
+//! the [`crate::sealed::SealedBlocker`] taxonomy that turns "not sealed here" into a specific
 //! command an operator can run.
 //!
 //! The shortfall reason for `sealed` is therefore *mechanism-specific*, not a fixed string: a
@@ -34,11 +34,11 @@ use crate::{
     errors::RuntimeError,
     runtime_dir::RuntimeDirPlacement,
     sandbox::{detect_enforcement_tier, EnforcementTier},
-    sealed::{SealedBlocker, UsernsGrant},
+    sealed::{SealedShortfall, UsernsGrant},
     types::CapabilityPolicy,
 };
 
-pub use crate::sandbox::{detect_sealed_blocker, detect_userns_grant};
+pub use crate::sandbox::{detect_sealed_shortfall, detect_userns_grant};
 
 /// The class a host in `tier` can actually back, and nothing stronger.
 ///
@@ -111,9 +111,9 @@ pub fn detect_achieved_containment() -> ContainmentClass {
 /// missing class. `None` when the floor is met.
 ///
 /// Pure and host-independent: the caller supplies both classes *and* — for the `sealed` arm — the
-/// already-probed [`SealedBlocker`], so this function still probes nothing and stays testable
-/// without a kernel. `sealed_blocker` is `None` when the caller has not probed (or cannot: a
-/// non-Linux host), in which case the arm falls back to naming the mechanism generically.
+/// already-probed [`SealedShortfall`], so this function still probes nothing and stays testable
+/// without a kernel. `sealed_shortfall` is `None` when the caller has not probed, in which case
+/// the arm falls back to naming the mechanism generically.
 ///
 /// `workdir_exec` is the capsule's own `capabilities.filesystem.workdir_exec`. It is checked before
 /// every host arm below, because it is the one shortfall an operator cannot fix by changing hosts:
@@ -127,14 +127,14 @@ pub fn detect_achieved_containment() -> ContainmentClass {
 pub fn containment_shortfall_reason(
     declared: ContainmentClass,
     achieved: ContainmentClass,
-    sealed_blocker: Option<SealedBlocker>,
+    sealed_shortfall: Option<&SealedShortfall>,
     workdir_exec: bool,
     runtime_dir_inside: Option<&RuntimeDirPlacement>,
 ) -> Option<String> {
     containment_shortfall(
         declared,
         achieved,
-        sealed_blocker,
+        sealed_shortfall,
         workdir_exec,
         runtime_dir_inside,
     )
@@ -158,7 +158,7 @@ pub enum ShortfallCause {
 fn containment_shortfall(
     declared: ContainmentClass,
     achieved: ContainmentClass,
-    sealed_blocker: Option<SealedBlocker>,
+    sealed_shortfall: Option<&SealedShortfall>,
     workdir_exec: bool,
     runtime_dir_inside: Option<&RuntimeDirPlacement>,
 ) -> Option<(String, ShortfallCause)> {
@@ -192,8 +192,8 @@ fn containment_shortfall(
         }
         // The mechanism exists now, so the reason names *which part of it* this host is missing
         // and how to fix that part — never the old blanket "no host can provide it today".
-        ContainmentClass::Sealed => match sealed_blocker {
-            Some(blocker) => blocker.reason(),
+        ContainmentClass::Sealed => match sealed_shortfall {
+            Some(shortfall) => shortfall.reason(),
             None => "sealed requires a private mount namespace pivoted onto a composed root \
                      (unshare(CLONE_NEWUSER|CLONE_NEWNS) + pivot_root), which this host did not \
                      provide"
@@ -224,14 +224,14 @@ const WORKDIR_EXEC_SHORTFALL: &str =
 pub fn check_containment_floor(
     declared: ContainmentClass,
     achieved: ContainmentClass,
-    sealed_blocker: Option<SealedBlocker>,
+    sealed_shortfall: Option<&SealedShortfall>,
     workdir_exec: bool,
     runtime_dir_inside: Option<&RuntimeDirPlacement>,
 ) -> Result<(), RuntimeError> {
     match containment_shortfall(
         declared,
         achieved,
-        sealed_blocker,
+        sealed_shortfall,
         workdir_exec,
         runtime_dir_inside,
     ) {
@@ -1365,7 +1365,7 @@ fn push_list(out: &mut String, label: &str, values: &[String]) {
 }
 
 /// Builds a [`ScopeReport`] for `policy` against this host, with `declared` as the already-
-/// combined floor. Takes one [`crate::sandbox::HostProbe`], so the tier, the blocker and the
+/// combined floor. Takes one [`crate::sandbox::HostProbe`], so the tier, the shortfall and the
 /// grant it reports all describe one host at one moment.
 ///
 /// `state_stores`, `configured_artifacts` and `preopens` are resolved by the caller (from the
@@ -1401,7 +1401,7 @@ pub fn explain_scope(
         policy,
         declared,
         probe.tier(),
-        probe.sealed_blocker(),
+        probe.sealed_shortfall().as_ref(),
         probe.userns_grant(),
         probe.landlock_kernel_abi(),
         exports,
@@ -1445,14 +1445,14 @@ pub struct DoctorDirReports {
     pub placement: RuntimeDirPlacement,
 }
 
-/// [`explain_scope`] with the tier and the sealed blocker injected — the seam every test uses so
+/// [`explain_scope`] with the tier and the sealed shortfall injected — the seam every test uses so
 /// no test depends on the host it happens to run on.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scope_report_for_tier(
     policy: &CapabilityPolicy,
     declared: ContainmentClass,
     tier: EnforcementTier,
-    sealed_blocker: Option<SealedBlocker>,
+    sealed_shortfall: Option<&SealedShortfall>,
     userns_grant: Option<UsernsGrant>,
     landlock_kernel_abi: Option<u8>,
     exports: Option<&Exports>,
@@ -1476,7 +1476,7 @@ pub(crate) fn scope_report_for_tier(
     let shortfall_reason = containment_shortfall_reason(
         declared,
         achieved,
-        sealed_blocker,
+        sealed_shortfall,
         policy.workdir_exec_allowed,
         runtime_dir_placement.inside(),
     );
@@ -1637,6 +1637,18 @@ fn enforcement_tier_name(tier: EnforcementTier) -> &'static str {
 #[allow(clippy::print_stdout, clippy::print_stderr)]
 mod tests {
     use super::*;
+    use crate::sealed::SealedBlocker;
+
+    /// A shortfall of `blocker` with no failed attempt, whose reason is the class sentence alone.
+    fn blocked(blocker: SealedBlocker) -> SealedShortfall {
+        SealedShortfall {
+            blocker,
+            failed_call: None,
+            errno: None,
+            userns_grant: UsernsGrant::Withheld,
+            attachment: crate::sealed::ProfileAttachment::NotReported,
+        }
+    }
     use murmur_artifact::{InterpreterRuntimeDir, InterpreterRuntimeGrant, StagedRuntimeGrant};
 
     /// Every tier, so a new variant cannot quietly escape a test that iterates "all of them".
@@ -1770,7 +1782,7 @@ mod tests {
         let reason = containment_shortfall_reason(
             ContainmentClass::Sealed,
             ContainmentClass::Advisory,
-            Some(SealedBlocker::AppArmorProfileMissing),
+            Some(&blocked(SealedBlocker::AppArmorProfileMissing)),
             true,
             None,
         )
@@ -1886,7 +1898,7 @@ mod tests {
             let error = check_containment_floor(
                 ContainmentClass::Sealed,
                 achieved,
-                Some(SealedBlocker::NamespaceCreationDenied),
+                Some(&blocked(SealedBlocker::NamespaceCreationDenied)),
                 false,
                 None,
             )
@@ -1915,7 +1927,7 @@ mod tests {
         let apparmor = containment_shortfall_reason(
             ContainmentClass::Sealed,
             achieved,
-            Some(SealedBlocker::AppArmorProfileMissing),
+            Some(&blocked(SealedBlocker::AppArmorProfileMissing)),
             false,
             None,
         )
@@ -1927,7 +1939,7 @@ mod tests {
         let container = containment_shortfall_reason(
             ContainmentClass::Sealed,
             achieved,
-            Some(SealedBlocker::NamespaceCreationDenied),
+            Some(&blocked(SealedBlocker::NamespaceCreationDenied)),
             false,
             None,
         )
@@ -1941,7 +1953,7 @@ mod tests {
         let pivot = containment_shortfall_reason(
             ContainmentClass::Sealed,
             ContainmentClass::Advisory,
-            Some(SealedBlocker::PivotRootDenied),
+            Some(&blocked(SealedBlocker::PivotRootDenied)),
             false,
             None,
         )
@@ -1952,7 +1964,7 @@ mod tests {
             containment_shortfall_reason(
                 ContainmentClass::Sealed,
                 ContainmentClass::Advisory,
-                Some(SealedBlocker::MountDenied),
+                Some(&blocked(SealedBlocker::MountDenied)),
                 false,
                 None,
             )
@@ -1972,7 +1984,7 @@ mod tests {
             let reason = containment_shortfall_reason(
                 ContainmentClass::Sealed,
                 achieved,
-                Some(blocker),
+                Some(&blocked(blocker)),
                 false,
                 None,
             )
@@ -2026,7 +2038,7 @@ mod tests {
             containment_shortfall_reason(
                 ContainmentClass::Sealed,
                 ContainmentClass::Sealed,
-                Some(SealedBlocker::NamespaceCreationDenied),
+                Some(&blocked(SealedBlocker::NamespaceCreationDenied)),
                 false,
                 None
             ),
@@ -2283,7 +2295,7 @@ mod tests {
                 &policy,
                 ContainmentClass::Sealed,
                 *tier,
-                Some(SealedBlocker::NamespaceCreationDenied),
+                Some(&blocked(SealedBlocker::NamespaceCreationDenied)),
                 None,
                 None,
                 None,
@@ -2347,7 +2359,7 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Sealed,
             EnforcementTier::KernelFull,
-            Some(SealedBlocker::NamespaceCreationDenied),
+            Some(&blocked(SealedBlocker::NamespaceCreationDenied)),
             None,
             None,
             None,
@@ -2371,7 +2383,7 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Sealed,
             EnforcementTier::EnvironmentOnly,
-            Some(SealedBlocker::NotLinux),
+            Some(&blocked(SealedBlocker::NotLinux)),
             None,
             None,
             None,
@@ -2577,7 +2589,7 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Sealed,
             EnforcementTier::KernelFull,
-            Some(SealedBlocker::AppArmorProfileMissing),
+            Some(&blocked(SealedBlocker::AppArmorProfileMissing)),
             None,
             None,
             None,
@@ -4066,6 +4078,7 @@ mod tests {
                 ..CapabilityPolicy::default()
             };
             let probe = crate::sandbox::HostProbe::probe();
+            let host_tier = probe.tier();
             let runtime = tempfile::tempdir().unwrap();
             let enforcement = crate::sandbox::ShellEnforcement::resolve(&policy, declared, probe)
                 .unwrap()
@@ -4073,7 +4086,7 @@ mod tests {
             let report = scope_report_for_tier(
                 &policy,
                 declared,
-                probe.tier(),
+                host_tier,
                 None,
                 None,
                 None,
@@ -4083,8 +4096,7 @@ mod tests {
                 Vec::new(),
                 &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
                 crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
-                    probe.tier(),
-                    declared,
+                    host_tier, declared,
                 )),
                 IoMaxReport::default(),
             );

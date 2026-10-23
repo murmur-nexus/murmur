@@ -27,12 +27,13 @@
 //!
 //! ## Whether a host can create one
 //!
-//! Answered by creating one: [`detect_egress_namespace_failure`] runs the same creator a session
-//! does, with an empty allowlist, and drops what it hands over. Staging, launch and `mur doctor`
-//! read that one cached answer, and a session's first command gets the same refusal from its own
-//! creation ([`SessionNetns::establish`]). AppArmor's unprivileged-userns restriction and the
-//! profile confining `mur` are read only to explain a failure: a container whose own profile
-//! permits the namespace is not refused because the host's restriction reads `1`.
+//! Answered by creating one: [`crate::namespace_probe`] runs the same creator a session does, with
+//! an empty allowlist, and drops what it hands over. A staged session's staging and launch read
+//! the answer off that session's one [`crate::sandbox::HostProbe`], and a session's first command
+//! gets the same refusal from its own creation ([`SessionNetns::establish`]). AppArmor's
+//! unprivileged-userns restriction and the profile confining `mur` are read only to explain a
+//! failure: a container whose own profile permits the namespace is not refused because the host's
+//! restriction reads `1`.
 //!
 //! ## The syscall sequence
 //!
@@ -119,7 +120,7 @@ pub(crate) const MAX_SESSION_NETNS_FDS: usize = MAX_NAMESPACE_SOCKETS + 2;
 /// Defined outside the Linux module so [`egress_namespace_failure`], the decision over a failed
 /// step, compiles and is tested on every OS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CreationStep {
+pub enum CreationStep {
     Unshare = 1,
     IdentityMaps = 2,
     Loopback = 3,
@@ -148,7 +149,8 @@ impl CreationStep {
     }
 
     /// The call or operation, as a refusal names it.
-    pub(crate) fn describe(self) -> &'static str {
+    #[must_use]
+    pub fn describe(self) -> &'static str {
         match self {
             Self::Unshare => "unshare(CLONE_NEWUSER | CLONE_NEWNET)",
             Self::IdentityMaps => "writing uid_map/gid_map",
@@ -164,7 +166,7 @@ impl CreationStep {
 
 /// Why an attempt to create a session's network namespace produced no namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NamespaceAttemptError {
+pub enum NamespaceAttemptError {
     /// The creator ran, and `step` failed with `errno`.
     Step { step: CreationStep, errno: i32 },
     /// The creator could not run, or exited without handing anything over; the runtime's own
@@ -280,28 +282,36 @@ impl EgressNamespaceFailure {
         }
     }
 
-    /// The readings line. AppArmor's restriction knob reads `1` for both grants decided with it
-    /// on, and `0` for the one decided with it off.
     fn readings(&self) -> String {
-        use crate::sealed::{ProfileAttachment, UsernsGrant};
-        let restriction = match self.userns_grant {
-            UsernsGrant::ApparmorAbsent => "AppArmor not enabled",
-            UsernsGrant::RestrictionDisabledHostWide => {
-                "kernel.apparmor_restrict_unprivileged_userns=0"
-            }
-            UsernsGrant::ProfileConfining | UsernsGrant::Withheld => {
-                "kernel.apparmor_restrict_unprivileged_userns=1"
-            }
-        };
-        let profile = match &self.attachment {
-            ProfileAttachment::Sealed { profile } | ProfileAttachment::Other { profile } => {
-                profile.as_str()
-            }
-            ProfileAttachment::Unconfined => "unconfined",
-            ProfileAttachment::NotReported => "not reported",
-        };
-        format!("Host readings: {restriction}; AppArmor profile confining mur: {profile}.")
+        host_readings(self.userns_grant, &self.attachment)
     }
+}
+
+/// The readings line every namespace refusal ends with — `E-CAP-005`'s, and `E-CAP-003`'s for
+/// `sealed`. AppArmor's restriction knob reads `1` for both grants decided with it on, and `0` for
+/// the one decided with it off.
+pub(crate) fn host_readings(
+    userns_grant: crate::sealed::UsernsGrant,
+    attachment: &crate::sealed::ProfileAttachment,
+) -> String {
+    use crate::sealed::{ProfileAttachment, UsernsGrant};
+    let restriction = match userns_grant {
+        UsernsGrant::ApparmorAbsent => "AppArmor not enabled",
+        UsernsGrant::RestrictionDisabledHostWide => {
+            "kernel.apparmor_restrict_unprivileged_userns=0"
+        }
+        UsernsGrant::ProfileConfining | UsernsGrant::Withheld => {
+            "kernel.apparmor_restrict_unprivileged_userns=1"
+        }
+    };
+    let profile = match attachment {
+        ProfileAttachment::Sealed { profile } | ProfileAttachment::Other { profile } => {
+            profile.as_str()
+        }
+        ProfileAttachment::Unconfined => "unconfined",
+        ProfileAttachment::NotReported => "not reported",
+    };
+    format!("Host readings: {restriction}; AppArmor profile confining mur: {profile}.")
 }
 
 /// What a step after `unshare` failing says about the namespace, ahead of the cause.
@@ -428,12 +438,12 @@ pub(crate) fn errno_name(errno: i32) -> Option<&'static str> {
 }
 
 /// [`errno_name`], or `errno <n>` for a value outside it.
-fn errno_label(errno: i32) -> String {
+pub(crate) fn errno_label(errno: i32) -> String {
     errno_name(errno).map_or_else(|| format!("errno {errno}"), str::to_string)
 }
 
 /// The C library's description of `errno`, without the `(os error <n>)` suffix `std` appends.
-fn errno_words(errno: i32) -> String {
+pub(crate) fn errno_words(errno: i32) -> String {
     let rendered = std::io::Error::from_raw_os_error(errno).to_string();
     rendered
         .strip_suffix(&format!(" (os error {errno})"))
@@ -495,33 +505,14 @@ fn failure_of(
 
 /// Whether this host can give a capsule its own network namespace, answered by creating one.
 ///
-/// The probe is the launch's own construction — [`linux::create_session_netns`] with an empty
-/// allowlist, the namespace it hands over dropped at once — so it cannot pass where a launch
-/// would fail, or fail where a launch would pass. The AppArmor readings are taken only to explain
-/// a failure. Process-cached, so staging, launch and `mur doctor` read one answer.
-#[cfg(target_os = "linux")]
+/// A fresh [`crate::sandbox::HostProbe`] each call, so it re-reads the host: the attempt is the
+/// launch's own construction ([`linux::create_session_netns`] with an empty allowlist, the
+/// namespace it hands over dropped at once), and it cannot pass where a launch would fail, or fail
+/// where a launch would pass. A session does not call this: it reads the failure off its own
+/// `HostProbe`, so staging and launch judge one reading.
 #[must_use]
 pub fn detect_egress_namespace_failure() -> Option<EgressNamespaceFailure> {
-    static FAILURE: std::sync::OnceLock<Option<EgressNamespaceFailure>> =
-        std::sync::OnceLock::new();
-    FAILURE
-        .get_or_init(|| {
-            let attempt =
-                linux::create_session_netns(&CapsuleNetnsPlan::resolve(Vec::new())).map(drop);
-            egress_namespace_failure(
-                true,
-                attempt,
-                crate::sealed::userns_grant(),
-                crate::sealed::inspect_profile_attachment(),
-            )
-        })
-        .clone()
-}
-
-#[cfg(not(target_os = "linux"))]
-#[must_use]
-pub fn detect_egress_namespace_failure() -> Option<EgressNamespaceFailure> {
-    None
+    crate::sandbox::HostProbe::probe().egress_namespace_failure()
 }
 
 /// Whether a test that needs a capsule network namespace must stand down on this host, printing
@@ -612,7 +603,7 @@ pub(crate) struct CapsuleNetnsPlan {
     pub(crate) tcp_ports: Vec<u16>,
     /// The real uid/gid, read in the parent.
     ///
-    /// Load-bearing ordering, exactly as in `sealed::probe_namespace`: inside a fresh user
+    /// Load-bearing ordering, exactly as in `namespace_probe`'s rehearsals: inside a fresh user
     /// namespace with no map written yet, `getuid()` reports the overflow id (65534), and writing
     /// that into `uid_map` is refused on every host.
     pub(crate) uid: u32,
@@ -785,8 +776,28 @@ impl Drop for SessionNetns {
     }
 }
 
+/// Bytes in a forked child's step report: a `u32` step code, then the `errno` as an `i32`, both
+/// native-endian. The namespace creator and the namespace probe's rehearsals both report this way.
+pub(crate) const STEP_RECORD_LEN: usize = 8;
+
+/// A child's step report. Integers only, so a forked child builds it without allocating.
+pub(crate) fn encode_step_record(code: u32, errno: i32) -> [u8; STEP_RECORD_LEN] {
+    let mut record = [0u8; STEP_RECORD_LEN];
+    record[..4].copy_from_slice(&code.to_ne_bytes());
+    record[4..].copy_from_slice(&errno.to_ne_bytes());
+    record
+}
+
+/// `(code, errno)` from a child's step report.
+pub(crate) fn decode_step_record(record: &[u8; STEP_RECORD_LEN]) -> (u32, i32) {
+    (
+        u32::from_ne_bytes([record[0], record[1], record[2], record[3]]),
+        i32::from_ne_bytes([record[4], record[5], record[6], record[7]]),
+    )
+}
+
 #[cfg(target_os = "linux")]
-pub(crate) use linux::join_session_netns;
+pub(crate) use linux::{create_session_netns, join_session_netns, reap_child};
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
@@ -796,8 +807,9 @@ mod linux {
     use std::sync::Arc;
 
     use super::{
-        CapsuleNetnsPlan, CreationStep, NamespaceAttemptError, SessionNetnsJoin,
-        MAX_NAMESPACE_SOCKETS, MAX_SESSION_NETNS_FDS,
+        decode_step_record, encode_step_record, CapsuleNetnsPlan, CreationStep,
+        NamespaceAttemptError, SessionNetnsJoin, MAX_NAMESPACE_SOCKETS, MAX_SESSION_NETNS_FDS,
+        STEP_RECORD_LEN,
     };
 
     // ------------------------------------------------------------ netlink constants
@@ -839,9 +851,6 @@ mod linux {
         errno: i32,
     }
 
-    /// Bytes in an encoded [`CreationFailure`]: the step's code, then the `errno`.
-    const FAILURE_RECORD_LEN: usize = 8;
-
     impl CreationFailure {
         /// The failure of `step`, with the `errno` the failing call just left.
         ///
@@ -854,18 +863,13 @@ mod linux {
             Self { step, errno }
         }
 
-        fn encode(self) -> [u8; FAILURE_RECORD_LEN] {
-            let mut record = [0u8; FAILURE_RECORD_LEN];
-            record[..4].copy_from_slice(&(self.step as u32).to_ne_bytes());
-            record[4..].copy_from_slice(&self.errno.to_ne_bytes());
-            record
+        fn encode(self) -> [u8; STEP_RECORD_LEN] {
+            encode_step_record(self.step as u32, self.errno)
         }
 
-        fn decode(record: &[u8; FAILURE_RECORD_LEN]) -> Option<Self> {
-            let step = CreationStep::from_code(u32::from_ne_bytes([
-                record[0], record[1], record[2], record[3],
-            ]))?;
-            let errno = i32::from_ne_bytes([record[4], record[5], record[6], record[7]]);
+        fn decode(record: &[u8; STEP_RECORD_LEN]) -> Option<Self> {
+            let (code, errno) = decode_step_record(record);
+            let step = CreationStep::from_code(code)?;
             Some(Self { step, errno })
         }
     }
@@ -985,13 +989,18 @@ mod linux {
 
     /// What the creator handed over: the namespace sockets, ready for the egress proxy, and the
     /// two namespace handles.
-    pub(super) struct CreatedNetns {
+    pub(crate) struct CreatedNetns {
         sockets: Vec<OwnedFd>,
         user_ns: OwnedFd,
         net_ns: OwnedFd,
     }
 
     impl CreatedNetns {
+        /// `(user_ns, net_ns)`, for [`join_session_netns`] in a child forked while this is held.
+        pub(crate) fn namespace_handles(&self) -> (RawFd, RawFd) {
+            (self.user_ns.as_raw_fd(), self.net_ns.as_raw_fd())
+        }
+
         /// Starts the session's egress proxy on the namespace sockets.
         ///
         /// On failure the sockets and the namespace handles close here, which leaves no process
@@ -1042,7 +1051,7 @@ mod linux {
     /// A failed step is [`NamespaceAttemptError::Step`] with the step and the `errno` the creator
     /// reported; every way the creator itself could not run or report is
     /// [`NamespaceAttemptError::Creator`].
-    pub(super) fn create_session_netns(
+    pub(crate) fn create_session_netns(
         plan: &CapsuleNetnsPlan,
     ) -> Result<CreatedNetns, NamespaceAttemptError> {
         // Checked here because the creator indexes a fixed buffer of this size and must not be the
@@ -1105,7 +1114,14 @@ mod linux {
         }
         drop(creator_end);
 
-        let status = wait_for_creator(pid).map_err(NamespaceAttemptError::Creator)?;
+        // The hand-off is read only after the creator is reaped: a `SOCK_DGRAM` pair reports no
+        // end-of-file when its peer closes, so reading first would block forever on a creator that
+        // died before sending, while the message a creator did send stays queued after it exits.
+        let status = reap_child(pid).map_err(|error| {
+            NamespaceAttemptError::Creator(format!(
+                "waiting for the namespace creator failed: {error}"
+            ))
+        })?;
         match receive_session_netns(parent_end.as_raw_fd(), plan.socket_count())
             .map_err(NamespaceAttemptError::Creator)?
         {
@@ -1125,20 +1141,18 @@ mod linux {
         }
     }
 
-    /// Reaps the creator. The hand-off is read only afterwards: a `SOCK_DGRAM` pair reports no
-    /// end-of-file when its peer closes, so reading first would block forever on a creator that
-    /// died before sending, while the message a creator did send stays queued after it exits.
-    fn wait_for_creator(pid: libc::pid_t) -> Result<String, String> {
+    /// Reaps the child `pid`, retrying on `EINTR`, and renders how it ended.
+    pub(crate) fn reap_child(pid: libc::pid_t) -> io::Result<String> {
         let mut status: libc::c_int = 0;
         loop {
-            // SAFETY: `pid` is the creator just forked; `status` is a live local.
+            // SAFETY: `pid` is a child this process forked; `status` is a live local.
             let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
             if waited == pid {
                 break;
             }
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
-                return Err(format!("waiting for the namespace creator failed: {error}"));
+                return Err(error);
             }
         }
         Ok(if libc::WIFEXITED(status) {
@@ -1154,9 +1168,7 @@ mod linux {
     /// parent returns for it.
     #[cfg(test)]
     pub(super) fn decode_failure_record(step: u32, errno: i32) -> Option<NamespaceAttemptError> {
-        let mut record = [0u8; FAILURE_RECORD_LEN];
-        record[..4].copy_from_slice(&step.to_ne_bytes());
-        record[4..].copy_from_slice(&errno.to_ne_bytes());
+        let record = encode_step_record(step, errno);
         CreationFailure::decode(&record).map(|failure| {
             assert_eq!(failure.encode(), record);
             failure.into()
@@ -1504,7 +1516,7 @@ mod linux {
         // SAFETY: `sock_fd` is a valid unix socket; all buffers are live locals sized for the
         // largest message the creator can send, and the control buffer is 8-byte aligned.
         unsafe {
-            let mut payload = [0u8; FAILURE_RECORD_LEN];
+            let mut payload = [0u8; STEP_RECORD_LEN];
             let mut iov = libc::iovec {
                 iov_base: payload.as_mut_ptr().cast(),
                 iov_len: payload.len(),
@@ -1531,7 +1543,7 @@ mod linux {
 
             let cmsg = libc::CMSG_FIRSTHDR(&msg);
             if cmsg.is_null() {
-                if received as usize == FAILURE_RECORD_LEN {
+                if received as usize == STEP_RECORD_LEN {
                     if let Some(failure) = CreationFailure::decode(&payload) {
                         return Ok(Received::Failure(failure));
                     }

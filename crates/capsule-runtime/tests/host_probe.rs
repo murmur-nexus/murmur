@@ -9,7 +9,8 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use capsule_runtime::{
-    detect_achieved_containment, detect_sealed_blocker, detect_userns_grant, HostProbe,
+    detect_achieved_containment, detect_sealed_shortfall, detect_userns_grant, HostProbe,
+    MountAttempt,
 };
 
 /// `HostProbe::probes_taken` counts the whole process, so the two tests that assert on deltas
@@ -45,10 +46,10 @@ fn each_standalone_host_question_takes_its_own_reading() {
 
     assert_eq!(
         probes_during(|| {
-            detect_sealed_blocker();
+            detect_sealed_shortfall();
         }),
         1,
-        "detect_sealed_blocker must read the host once per call",
+        "detect_sealed_shortfall must read the host once per call",
     );
     assert_eq!(
         probes_during(|| {
@@ -66,6 +67,31 @@ fn each_standalone_host_question_takes_its_own_reading() {
     );
 }
 
+/// One reading answers every namespace question from its attempts, on whatever host this runs:
+/// `E-CAP-005` is reported exactly when the network attempt failed, a failed network attempt
+/// attempts nothing after it, and `sealed` is backed only when the sealed root was built. Whether
+/// `/tmp` is mappable is crate-private; `sandbox`'s live-reading test checks it.
+#[test]
+fn one_reading_answers_every_namespace_question_from_its_attempts() {
+    let probe = HostProbe::probe();
+    let namespaces = probe.namespaces();
+    println!("namespace reading: {namespaces:?}");
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            probe.egress_namespace_failure().is_some(),
+            namespaces.network.is_err(),
+            "E-CAP-005 must follow the network attempt"
+        );
+    }
+    if namespaces.network.is_err() {
+        assert_eq!(namespaces.mount, MountAttempt::NotAttempted);
+        assert_eq!(namespaces.sealed_root, MountAttempt::NotAttempted);
+    }
+    if probe.sealed_shortfall().is_none() {
+        assert!(namespaces.sealed_root_created());
+    }
+}
+
 /// Hand-run, on a bare Linux host where an unprivileged user can create a user namespace:
 ///
 /// ```text
@@ -81,28 +107,35 @@ fn each_standalone_host_question_takes_its_own_reading() {
 #[ignore = "mutates /proc/sys/user/max_user_namespaces; hand-run under `unshare --user --map-root-user`"]
 #[cfg(target_os = "linux")]
 fn reprobe_observes_a_change_in_userns_availability() {
-    use capsule_runtime::SealedBlocker;
+    use capsule_runtime::{SealedBlocker, SealedShortfall};
 
     const SYSCTL: &str = "/proc/sys/user/max_user_namespaces";
     const INVOCATION: &str = "unshare --user --map-root-user cargo test -p capsule-runtime \
                               --test host_probe -- --ignored \
                               reprobe_observes_a_change_in_userns_availability";
 
-    // A blocker of `None` or `LandlockUnavailable` is exactly the set in which the namespace half
-    // of the probe reported `Ok`: every other variant names a namespace step that failed, or a
-    // grant that was withheld before the namespace was ever attempted.
-    fn namespace_ok(blocker: Option<SealedBlocker>) -> bool {
-        matches!(blocker, None | Some(SealedBlocker::LandlockUnavailable))
+    // A shortfall of `None` or `LandlockUnavailable` is exactly the set in which every namespace
+    // attempt of the probe created its namespace: every other blocker names an attempt that
+    // failed.
+    fn namespace_ok(shortfall: &Option<SealedShortfall>) -> bool {
+        matches!(
+            shortfall.as_ref().map(|shortfall| shortfall.blocker),
+            None | Some(SealedBlocker::LandlockUnavailable)
+        )
     }
 
-    let first = HostProbe::probe().sealed_blocker();
-    println!("probe #1: sealed_blocker {first:?}");
-    if !namespace_ok(first) {
+    let first = HostProbe::probe();
+    let first_shortfall = first.sealed_shortfall();
+    println!(
+        "probe #1: sealed_shortfall {first_shortfall:?}, network {:?}",
+        first.namespaces().network
+    );
+    if !namespace_ok(&first_shortfall) || first.egress_namespace_failure().is_some() {
         // The recorded waiver: this host cannot create an unprivileged user namespace at all, so
         // there is no capability present to take away.
         panic!(
-            "this host reports {first:?} before any change, so it has no user-namespace \
-             capability to withdraw. Run on a bare Linux host as: {INVOCATION}"
+            "this host reports {first_shortfall:?} before any change, so it has no \
+             user-namespace capability to withdraw. Run on a bare Linux host as: {INVOCATION}"
         );
     }
 
@@ -112,14 +145,23 @@ fn reprobe_observes_a_change_in_userns_availability() {
         .unwrap_or_else(|error| panic!("cannot write {SYSCTL}: {error}. Run as: {INVOCATION}"));
 
     let second = HostProbe::probe();
-    let withdrawn = second.sealed_blocker();
-    println!("probe #2 (max_user_namespaces=0): sealed_blocker {withdrawn:?}");
+    let withdrawn = second.sealed_shortfall();
+    let egress = second.egress_namespace_failure();
+    println!("probe #2 (max_user_namespaces=0): sealed_shortfall {withdrawn:?}, egress {egress:?}");
     let restore = || std::fs::write(SYSCTL, original.trim());
 
-    if namespace_ok(withdrawn) {
+    if namespace_ok(&withdrawn) || egress.is_none() || second.namespaces().network.is_ok() {
         let _ = restore();
-        panic!("probe #2 still reports {withdrawn:?} after {SYSCTL} was zeroed");
+        panic!("probe #2 still reports a namespace after {SYSCTL} was zeroed: {withdrawn:?}");
     }
+    assert_eq!(
+        withdrawn.as_ref().map(|shortfall| shortfall.blocker),
+        Some(SealedBlocker::KernelUnsupported)
+    );
+    assert_eq!(
+        egress.as_ref().and_then(|failure| failure.errno),
+        Some(libc::ENOSPC)
+    );
     assert_ne!(
         detect_achieved_containment(),
         murmur_artifact::ContainmentClass::Sealed,
@@ -129,12 +171,19 @@ fn reprobe_observes_a_change_in_userns_availability() {
     restore().unwrap_or_else(|error| {
         panic!("the kernel refused to restore {SYSCTL} to {original:?}: {error}")
     });
-    let third = HostProbe::probe().sealed_blocker();
-    println!("probe #3 (restored): sealed_blocker {third:?}");
+    let third = HostProbe::probe();
+    println!(
+        "probe #3 (restored): sealed_shortfall {:?}, network {:?}",
+        third.sealed_shortfall(),
+        third.namespaces().network
+    );
     assert_eq!(
-        third, first,
+        third.sealed_shortfall(),
+        first_shortfall,
         "a condition that has cleared must stop being reported without restarting the process",
     );
+    assert!(third.namespaces().network.is_ok());
+    assert_eq!(third.egress_namespace_failure(), None);
 }
 
 /// Hand-run:
@@ -143,7 +192,7 @@ fn reprobe_observes_a_change_in_userns_availability() {
 /// cargo test -p capsule-runtime --test host_probe -- --ignored --nocapture probe_cost
 /// ```
 ///
-/// The ceiling is far above any plausible cost for two `fork`/`waitpid` pairs and three small
+/// The ceiling is far above any plausible cost for four `fork`/`waitpid` pairs and three small
 /// `/proc` reads, so a failure here means something pathological rather than merely slow.
 #[test]
 #[ignore = "measures host syscall cost; hand-run with --nocapture"]

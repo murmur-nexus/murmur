@@ -1859,15 +1859,16 @@ pub fn stage_session(
     // `containment::achieved_containment_class`).
     let workdir_exec = request.capability_policy.workdir_exec_allowed;
     // The host is probed exactly once per session, right here, and every later consumer — the
-    // refusal below, the `ScopeReport` recorded in the trace, and the tier `launch_session`
-    // installs — reads this one value. A second probe could read differently from the first (an
-    // AppArmor profile loaded, a container's capabilities changed), and the trace would then
-    // describe a session that never ran under what it claims.
+    // refusal below, the `ScopeReport` recorded in the trace, the `/tmp` mapping, the `E-CAP-005`
+    // check here and in `launch`, and the tier `launch_session` installs — reads this one value.
+    // A second probe could read differently from the first (an AppArmor profile loaded, a
+    // container's capabilities changed), and the trace would then describe a session that never
+    // ran under what it claims.
     let host_probe = sandbox::HostProbe::probe();
     let enforcement_tier = host_probe.tier();
-    // Derived only so the refusal can name *which* part of the sealed mechanism is missing —
-    // the AppArmor profile, `CAP_SYS_ADMIN` inside a container, or the kernel itself.
-    let sealed_blocker = host_probe.sealed_blocker();
+    // Derived only so the refusal can name *which* part of the sealed mechanism is missing — the
+    // call the probe saw fail, its `errno`, and the readings it is worded with.
+    let sealed_shortfall = host_probe.sealed_shortfall();
     // The second input that caps the achieved class: a runtime or records directory inside the
     // workdir the capsule's commands write is one they can change. Decided from the paths alone,
     // before anything is created, and refused here when `HOME` cannot hold `~/.murmur` at all.
@@ -1885,7 +1886,7 @@ pub fn stage_session(
     check_containment_floor(
         request.declared_containment_floor,
         achieved_containment,
-        sealed_blocker,
+        sealed_shortfall.as_ref(),
         workdir_exec,
         runtime_dir_placement.inside(),
     )?;
@@ -1995,7 +1996,7 @@ pub fn stage_session(
         &request.capability_policy,
         request.declared_containment_floor,
         enforcement_tier,
-        sealed_blocker,
+        sealed_shortfall.as_ref(),
         host_probe.userns_grant(),
         host_probe.landlock_kernel_abi(),
         request.exports.as_ref(),
@@ -2056,7 +2057,7 @@ pub fn stage_session(
     // instead (`check_native_artifact_egress_namespace`), still before anything is instantiated.
     crate::network_namespace::check_egress_namespace(
         has_subprocess_route_at_staging(&request.capability_policy),
-        crate::network_namespace::detect_egress_namespace_failure().as_ref(),
+        host_probe.egress_namespace_failure().as_ref(),
     )?;
     // Lowered here, in the same pre-registry-pull seam and for the same reason a state store name
     // is: an entry that cannot be a workdir subtree refuses the launch before anything is pulled,
@@ -3218,7 +3219,7 @@ fn launch(
     check_native_artifact_egress_namespace(
         &staged.capability_policy,
         has_native_artifact,
-        crate::network_namespace::detect_egress_namespace_failure().as_ref(),
+        staged.host_probe.egress_namespace_failure().as_ref(),
     )?;
     let requires_process_bounding =
         cgroup::requires_process_bounding(&staged.capability_policy, has_native_artifact);
@@ -3248,7 +3249,7 @@ fn launch(
     let shell_enforcement = sandbox::ShellEnforcement::resolve(
         &staged.capability_policy,
         staged.declared_containment_floor,
-        staged.host_probe,
+        staged.host_probe.clone(),
     )
     .map_err(RuntimeError::Runtime)?
     .with_host_bounding(cgroup_scope, workdir_guard)

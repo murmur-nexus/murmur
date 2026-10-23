@@ -2104,7 +2104,7 @@ pub fn io_max_device_available(path: &Path) -> bool {
 /// printing the blocker when it must.
 ///
 /// Both blockers are asked through the same calls a launch makes -- `delegated_base` for the
-/// cgroup scope, `detect_egress_namespace_failure` for the network namespace -- so the gate and
+/// cgroup scope, a fresh `HostProbe`'s network attempt for the network namespace -- so the gate and
 /// the launch cannot reach different conclusions about the host. A containerised CI runner
 /// typically clears the first and fails the second.
 pub fn skip_without_host_support(test_name: &str) -> bool {

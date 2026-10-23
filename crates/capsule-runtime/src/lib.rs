@@ -60,6 +60,7 @@ pub(crate) mod member_call;
 pub mod model_limits;
 pub mod murmur_home;
 pub(crate) mod murmur_md;
+pub mod namespace_probe;
 pub mod network_namespace;
 pub(crate) mod network_policy;
 pub mod origin;
@@ -119,7 +120,7 @@ pub use artifact_config::{
 pub use artifact_supply::{SourceSupply, SourcedArtifact};
 pub use containment::{
     applied_mechanism, check_containment_floor, containment_shortfall_reason,
-    detect_achieved_containment, detect_sealed_blocker, detect_userns_grant, doctor_runtime_dir,
+    detect_achieved_containment, detect_sealed_shortfall, detect_userns_grant, doctor_runtime_dir,
     explain_scope, install_from_places, read_only_advisory_for, render_install, render_read_only,
     render_records_dir, render_runtime_dir, render_temp_dir, resolve_runtime_dir_reach,
     resolve_runtime_dir_reaches, DoctorDirReports, ExportsFilesReport, FilesystemBoundaryReport,
@@ -133,9 +134,10 @@ pub use interpreter_runtime::{
     capsule_writable_roots, derive_interpreter_runtimes, DerivedInterpreterRuntime,
 };
 pub use murmur_home::{usable_murmur_home, HomeUnusable, HOME_UNUSABLE_HINT};
+pub use namespace_probe::{MountAttempt, MountAttemptError, MountStep, NamespaceReading};
 pub use network_namespace::{
     check_egress_namespace, detect_egress_namespace_failure, skip_without_egress_namespace,
-    EgressNamespaceBlocker, EgressNamespaceFailure,
+    CreationStep, EgressNamespaceBlocker, EgressNamespaceFailure, NamespaceAttemptError,
 };
 pub use records_dir::{
     records_dir_root, records_group, records_group_under, RecordsDir, HOME_SUBDIR, HOOKS_SUBDIR,
@@ -157,7 +159,7 @@ pub use sandbox::{detect_landlock_abi, find_on_path, landlock_doctor_lines, Host
 pub use sealed::{
     classify_installed_profile, classify_profile_attachment, inspect_installed_profile,
     inspect_profile_attachment, InstalledProfileState, ProfileAttachment, SealedBlocker,
-    UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH,
+    SealedShortfall, UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH,
     SEALED_APPARMOR_PROFILE_SHA256,
 };
 pub use streaming::STREAM_EXTENSION_URI;

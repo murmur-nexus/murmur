@@ -6,18 +6,18 @@ use capsule_runtime::{
     applied_mechanism, caller_overflow_fix, caller_overflow_warning,
     capability_policy_from_runtime_manifest, check_egress_namespace,
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
-    detect_egress_namespace_failure, detect_landlock_abi, detect_userns_grant, doctor_runtime_dir,
-    find_on_path, has_subprocess_route_at_staging, inspect_installed_profile,
-    inspect_profile_attachment, install_from_places, landlock_doctor_lines, preopen_reports,
+    detect_landlock_abi, doctor_runtime_dir, find_on_path, has_subprocess_route_at_staging,
+    inspect_installed_profile, install_from_places, landlock_doctor_lines, preopen_reports,
     read_only_advisory_for, render_install, render_read_only, render_records_dir,
     render_runtime_dir, render_temp_dir, runtime_dir_inside_warning, served_wit_level,
     undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
     warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
     warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
     warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
-    warn_on_workdir_exec, wit_levels, ArtifactRequest, EgressNamespaceFailure,
-    InstalledProfileState, ProfileAttachment, UsernsGrant, HOME_UNUSABLE_HINT,
-    SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
+    warn_on_workdir_exec, wit_levels, ArtifactRequest, EgressNamespaceFailure, HostProbe,
+    InstalledProfileState, MountAttempt, NamespaceReading, ProfileAttachment, UsernsGrant,
+    HOME_UNUSABLE_HINT, SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH,
+    SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, native_binary_verdict, newest_fitting_level,
@@ -157,6 +157,65 @@ fn network_namespace_line(is_linux: bool, failure: Option<&EgressNamespaceFailur
     }
 }
 
+/// The `mount namespace:` line: whether the probe's private mount namespace, inside the network
+/// namespace, was created — which decides whether a command's literal `/tmp` is mapped.
+fn mount_namespace_line(is_linux: bool, reading: &NamespaceReading) -> String {
+    attempt_line(
+        is_linux,
+        &reading.mount,
+        "a private mount namespace inside the session's user namespace was created, so /tmp can \
+         be mapped",
+        "a private mount namespace",
+    )
+}
+
+/// The `sealed root:` line: whether the probe's composed root — a nested user+mount namespace
+/// inside the network namespace, entered with `pivot_root(2)` — was built.
+fn sealed_root_line(is_linux: bool, reading: &NamespaceReading) -> String {
+    attempt_line(
+        is_linux,
+        &reading.sealed_root,
+        "a nested user+mount namespace inside the session's was created and pivot_root(2) entered \
+         a composed root, so sealed can be backed",
+        "a composed root",
+    )
+}
+
+/// One mount attempt's line, in the four shapes the two lines share.
+fn attempt_line(is_linux: bool, attempt: &MountAttempt, created: &str, mechanism: &str) -> String {
+    match attempt {
+        _ if !is_linux => format!("n/a ({mechanism} is a Linux mechanism)"),
+        MountAttempt::Created => format!("created ({created})"),
+        MountAttempt::NotAttempted => {
+            "not attempted (no network namespace to create it in)".to_string()
+        }
+        MountAttempt::Failed(_) => format!(
+            "refused \u{2014} {}",
+            attempt.failure_summary().unwrap_or_default()
+        ),
+    }
+}
+
+/// Whether the install-the-profile advice applies: an attempt failed, the grant is withheld and
+/// `mur` is unconfined. Under any other profile — a container's — the profile `mur` ships cannot
+/// attach, and the refusal itself names the container's remedy.
+fn profile_advice_applies(
+    grant: Option<UsernsGrant>,
+    attachment: &ProfileAttachment,
+    attempt_failed: bool,
+) -> bool {
+    attempt_failed
+        && grant == Some(UsernsGrant::Withheld)
+        && *attachment == ProfileAttachment::Unconfined
+}
+
+/// Whether the probe saw an attempt `sealed` depends on fail — the network namespace or the
+/// composed root. The install-the-profile advice is printed only then: a withheld grant over
+/// attempts that all succeeded explains nothing.
+fn an_attempt_failed(reading: &NamespaceReading) -> bool {
+    reading.network.is_err() || matches!(reading.sealed_root, MountAttempt::Failed(_))
+}
+
 /// The verdict for one installed artifact when `murmur.lock` is present. Mirrors the
 /// three ways `mur run` rejects a locked artifact (`stage_session`'s lock enforcement),
 /// so a green doctor line means a session would accept the same artifact.
@@ -252,7 +311,11 @@ fn check_lock_entry(
 /// platform will not report it.
 ///
 /// Reaches no `fixes` entry and changes no exit code, exactly as the rest of this block does not.
-fn report_binary_attachment(grant: Option<UsernsGrant>) {
+fn report_binary_attachment(
+    grant: Option<UsernsGrant>,
+    attachment: &ProfileAttachment,
+    attempt_failed: bool,
+) {
     match std::env::current_exe() {
         Ok(path) => {
             let resolved = std::fs::canonicalize(&path).unwrap_or(path);
@@ -268,7 +331,7 @@ fn report_binary_attachment(grant: Option<UsernsGrant>) {
         }
     }
 
-    match inspect_profile_attachment() {
+    match attachment {
         ProfileAttachment::Sealed { profile } => {
             capsule_runtime::report_println!("  profile attached: {profile}");
             capsule_runtime::report_println!(
@@ -299,7 +362,12 @@ fn report_binary_attachment(grant: Option<UsernsGrant>) {
         }
     }
 
-    if grant == Some(UsernsGrant::Withheld) {
+    if grant == Some(UsernsGrant::Withheld) && !attempt_failed {
+        capsule_runtime::report_println!(
+            "    The grant below reads withheld, and the namespaces below were created regardless: \
+             the reading explains a refusal when an attempt fails, and caused none here."
+        );
+    } else if profile_advice_applies(grant, attachment, attempt_failed) {
         capsule_runtime::report_println!(
             "    This path is why the grant below is withheld: AppArmor attaches profiles by \
              executable path, and no mur-sealed profile attaches to this one."
@@ -349,10 +417,12 @@ fn report_landlock_abi() {
 /// installed and does not attach here". The attachment is read from `/proc/self/attr/current`,
 /// never inferred by matching the running path against
 /// [`SEALED_APPARMOR_ATTACHMENT_PATHS`], which is remediation text only.
-fn report_userns_grant() {
-    let grant = detect_userns_grant();
+fn report_userns_grant(probe: &HostProbe) {
+    let grant = probe.userns_grant();
+    let reading = probe.namespaces();
+    let is_linux = cfg!(target_os = "linux");
     capsule_runtime::report_println!("AppArmor / user namespaces");
-    report_binary_attachment(grant);
+    report_binary_attachment(grant, &reading.attachment, an_attempt_failed(reading));
     match grant {
         Some(grant) => {
             capsule_runtime::report_println!("  userns grant: {}", grant.wire_name());
@@ -364,11 +434,13 @@ fn report_userns_grant() {
     }
     capsule_runtime::report_println!(
         "  network namespace: {}",
-        network_namespace_line(
-            cfg!(target_os = "linux"),
-            detect_egress_namespace_failure().as_ref()
-        )
+        network_namespace_line(is_linux, probe.egress_namespace_failure().as_ref())
     );
+    capsule_runtime::report_println!(
+        "  mount namespace: {}",
+        mount_namespace_line(is_linux, reading)
+    );
+    capsule_runtime::report_println!("  sealed root: {}", sealed_root_line(is_linux, reading));
 
     match inspect_installed_profile() {
         InstalledProfileState::Matches => {
@@ -1783,10 +1855,11 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         .and_then(|caps| caps.spawn.as_ref())
         .is_some_and(|spawn| !spawn.allow.is_empty());
     let can_spawn_subprocess = has_subprocess_route_at_staging(&capability_policy);
-    if let Some(warning) = egress_namespace_warning(
-        can_spawn_subprocess,
-        detect_egress_namespace_failure().as_ref(),
-    ) {
+    // One reading of the host's namespaces for the whole checklist: the `E-CAP-005` warnings and
+    // the `AppArmor / user namespaces` block below cannot describe two different hosts.
+    let host_probe = HostProbe::probe();
+    let egress_failure = host_probe.egress_namespace_failure();
+    if let Some(warning) = egress_namespace_warning(can_spawn_subprocess, egress_failure.as_ref()) {
         capsule_runtime::report_eprintln!("{warning}");
     }
 
@@ -1802,7 +1875,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // questions with no manifest input, printed for every project — an operator reading `achieved:
     // sealed` needs to know whether that came from the profile murmur ships or from the host's
     // unprivileged-userns hardening being switched off for every binary on the machine.
-    report_userns_grant();
+    report_userns_grant(&host_probe);
 
     // Which Landlock ABI the kernel offers and which the runtime builds a capsule's ruleset at. A
     // host question too, printed for every project: below ABI v2 a capsule cannot move a file
@@ -2144,9 +2217,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         // The half of the E-CAP-005 check above that needed this loop: a capsule whose only
         // subprocess route is a native tool.
         if !can_spawn_subprocess {
-            if let Some(warning) =
-                egress_namespace_warning(true, detect_egress_namespace_failure().as_ref())
-            {
+            if let Some(warning) = egress_namespace_warning(true, egress_failure.as_ref()) {
                 capsule_runtime::report_eprintln!("{warning}");
             }
         }
@@ -2289,6 +2360,130 @@ mod tests {
         );
         assert!(network_namespace_line(false, None).starts_with("n/a"));
         assert!(network_namespace_line(false, Some(&kernel_support_missing())).starts_with("n/a"));
+    }
+
+    fn reading(
+        network_ok: bool,
+        mount: MountAttempt,
+        sealed_root: MountAttempt,
+    ) -> NamespaceReading {
+        NamespaceReading {
+            network: if network_ok {
+                Ok(())
+            } else {
+                Err(capsule_runtime::NamespaceAttemptError::Step {
+                    step: capsule_runtime::CreationStep::Unshare,
+                    errno: libc::EPERM,
+                })
+            },
+            mount,
+            sealed_root,
+            userns_grant: UsernsGrant::Withheld,
+            attachment: ProfileAttachment::Unconfined,
+        }
+    }
+
+    fn refused(step: capsule_runtime::MountStep, errno: i32) -> MountAttempt {
+        MountAttempt::Failed(capsule_runtime::MountAttemptError::Step { step, errno })
+    }
+
+    /// The `mount namespace:` and `sealed root:` lines report each attempt in four shapes:
+    /// created, refused with the call and its `errno`, not attempted, and n/a off Linux.
+    #[test]
+    fn the_mount_and_sealed_root_lines_report_each_attempt() {
+        use capsule_runtime::MountStep;
+        let created = reading(true, MountAttempt::Created, MountAttempt::Created);
+        assert_eq!(
+            mount_namespace_line(true, &created),
+            "created (a private mount namespace inside the session's user namespace was created, \
+             so /tmp can be mapped)"
+        );
+        assert!(sealed_root_line(true, &created).starts_with("created ("));
+
+        let refusing = reading(
+            true,
+            refused(MountStep::MakePrivate, libc::EACCES),
+            refused(MountStep::PivotRoot, libc::EPERM),
+        );
+        assert_eq!(
+            mount_namespace_line(true, &refusing),
+            "refused \u{2014} making / MS_REC|MS_PRIVATE failed with EACCES"
+        );
+        assert_eq!(
+            sealed_root_line(true, &refusing),
+            "refused \u{2014} pivot_root(2) failed with EPERM"
+        );
+
+        let no_network = reading(
+            false,
+            MountAttempt::NotAttempted,
+            MountAttempt::NotAttempted,
+        );
+        for line in [
+            mount_namespace_line(true, &no_network),
+            sealed_root_line(true, &no_network),
+        ] {
+            assert_eq!(line, "not attempted (no network namespace to create it in)");
+        }
+
+        for reading in [created, refusing, no_network] {
+            assert!(mount_namespace_line(false, &reading).starts_with("n/a ("));
+            assert!(sealed_root_line(false, &reading).starts_with("n/a ("));
+        }
+    }
+
+    /// The install-the-profile advice follows a failed network or sealed-root attempt, never the
+    /// grant alone; a refused `/tmp` mapping does not call for it.
+    #[test]
+    fn the_profile_advice_follows_a_failed_attempt_not_the_reading() {
+        use capsule_runtime::MountStep;
+        assert!(!an_attempt_failed(&reading(
+            true,
+            MountAttempt::Created,
+            MountAttempt::Created
+        )));
+        assert!(!an_attempt_failed(&reading(
+            true,
+            refused(MountStep::MakePrivate, libc::EACCES),
+            MountAttempt::Created
+        )));
+        assert!(an_attempt_failed(&reading(
+            true,
+            MountAttempt::Created,
+            refused(MountStep::Tmpfs, libc::EPERM)
+        )));
+        assert!(an_attempt_failed(&reading(
+            false,
+            MountAttempt::NotAttempted,
+            MountAttempt::NotAttempted
+        )));
+    }
+
+    /// The install-the-profile advice is for an unconfined `mur` whose attempt failed under a
+    /// withheld grant; a container's profile, a created set of namespaces or another grant never
+    /// prints it.
+    #[test]
+    fn the_profile_advice_is_for_an_unconfined_binary_only() {
+        let docker = ProfileAttachment::Other {
+            profile: "docker-default".to_string(),
+        };
+        let withheld = Some(UsernsGrant::Withheld);
+        assert!(profile_advice_applies(
+            withheld,
+            &ProfileAttachment::Unconfined,
+            true
+        ));
+        assert!(!profile_advice_applies(withheld, &docker, true));
+        assert!(!profile_advice_applies(
+            withheld,
+            &ProfileAttachment::Unconfined,
+            false
+        ));
+        assert!(!profile_advice_applies(
+            Some(UsernsGrant::RestrictionDisabledHostWide),
+            &ProfileAttachment::Unconfined,
+            true
+        ));
     }
 
     #[test]

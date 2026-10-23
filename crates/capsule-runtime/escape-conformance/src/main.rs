@@ -294,17 +294,20 @@ fn list_cases() {
 fn gate(options: &Options, facts: &host::HostFacts, class: ContainmentClass) -> Result<(), String> {
     let achieved = capsule_runtime::detect_achieved_containment();
     // The third argument is what turns "sealed is unavailable here" into a specific, actionable
-    // sentence — the missing AppArmor profile, a container without CAP_SYS_ADMIN, a kernel
-    // without user namespaces. It probes the same cached host facts `detect_achieved_containment`
-    // above does.
-    let sealed_blocker = capsule_runtime::detect_sealed_blocker();
+    // sentence — the call the namespace probe saw fail, its errno, and the host readings. It takes
+    // its own probe, as `detect_achieved_containment` above does.
+    let sealed_shortfall = capsule_runtime::detect_sealed_shortfall();
     // `workdir_exec: false` — the fourth argument is a *capsule* declaration
     // (`capabilities.filesystem.workdir_exec`), and this gate asks a host question: can this
     // machine back the class under test? The suite's own probe capsules never declare it, and one
     // that did would be asserting a boundary it had opted out of.
-    if let Some(reason) =
-        capsule_runtime::containment_shortfall_reason(class, achieved, sealed_blocker, false, None)
-    {
+    if let Some(reason) = capsule_runtime::containment_shortfall_reason(
+        class,
+        achieved,
+        sealed_shortfall.as_ref(),
+        false,
+        None,
+    ) {
         return Err(format!(
             "REFUSED — this host cannot back the class under test.\n\
              \x20 declared: {class}\n\

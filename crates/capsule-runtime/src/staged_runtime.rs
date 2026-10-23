@@ -421,19 +421,24 @@ mod tests {
 
         // The inner run needs a user namespace to get `CAP_SYS_ADMIN` for `mount(2)`. Where the
         // host forbids that, say so loudly and name what went unproven rather than passing quietly.
-        if !unprivileged_userns_available() {
+        let namespaces = crate::sandbox::HostProbe::probe().namespaces().clone();
+        if !namespaces.user_mount_namespace_usable() {
+            let failed = namespaces
+                .first_failure()
+                .unwrap_or_else(|| "no attempt reported a failure".to_string());
             eprintln!(
                 "\n\
                  ==================== SKIPPED: staged-runtime bind mount ====================\n\
-                 This host does not permit an unprivileged user namespace, so this test could\n\
-                 NOT prove any of the following on this machine:\n\
+                 This host does not permit an unprivileged user+mount namespace, so this test\n\
+                 could NOT prove any of the following on this machine:\n\
                    - that bind_mount_staged_runtimes() establishes a real bind mount\n\
                    - that the staged tree is READ-ONLY through the target root\n\
                    - that the source tree's contents are readable through the target root\n\
-                 The pure re-basing and floor-check tests above still ran. Re-run this suite on\n\
-                 a Linux host that permits the unshare -- `unshare -Ur true` succeeding is the\n\
-                 whole test -- before treating the mount behaviour as verified. Where AppArmor\n\
-                 refuses it, `kernel.apparmor_restrict_unprivileged_userns` is the sysctl.\n\
+                 The pure re-basing and floor-check tests above still ran. The namespace probe\n\
+                 reported: {failed}\n\
+                 Re-run this suite on a Linux host where `mur doctor` reports the sealed root\n\
+                 created, or refused no earlier than its tmpfs, before treating the mount\n\
+                 behaviour as verified.\n\
                  ============================================================================\n"
             );
             return;
@@ -464,24 +469,6 @@ mod tests {
             stdout.contains("1 passed"),
             "inner run did not execute the mount test\n--- stdout ---\n{stdout}"
         );
-    }
-
-    /// True when this host lets an unprivileged process create a user namespace.
-    ///
-    /// Answered by `detect_egress_namespace_failure`, which forks and creates a namespace for real
-    /// rather than reading a knob. Reading knobs gets this wrong on Ubuntu 23.10 and later:
-    /// `/proc/sys/kernel/unprivileged_userns_clone` no longer exists there, and the fallback
-    /// question -- whether `/proc/self/ns/user` exists -- is yes on every kernel built with
-    /// `CONFIG_USER_NS` regardless of whether the `unshare` is permitted. AppArmor's
-    /// `kernel.apparmor_restrict_unprivileged_userns` is what actually refuses it, so the knobs
-    /// report available on precisely the hosts where the inner run then dies at step 10.
-    ///
-    /// The probe unshares `CLONE_NEWUSER | CLONE_NEWNET` where the inner run wants
-    /// `CLONE_NEWUSER | CLONE_NEWNS`. `CLONE_NEWUSER` is the half that gets refused and is common
-    /// to both, so the probe answers the question this guard is asking.
-    #[cfg(target_os = "linux")]
-    fn unprivileged_userns_available() -> bool {
-        crate::network_namespace::detect_egress_namespace_failure().is_none()
     }
 
     /// What the forked child reports back through its exit status. `Ok` is 0; every other value

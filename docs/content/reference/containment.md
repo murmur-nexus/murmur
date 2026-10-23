@@ -36,7 +36,7 @@ capsule on a sealed-capable host runs on Full.
 
 | Tier | Host | `mechanism:` | Filesystem | Exec | Network |
 |---|---|---|---|---|---|
-| Sealed | Linux, kernel ≥5.13, with a usable unprivileged user + mount namespace | `mountns+pivot_root+landlock+seccomp` | kernel-enforced, inside a composed root | kernel-enforced | kernel-enforced |
+| Sealed | Linux, kernel ≥5.13, where the namespace probe builds the composed root ([how the host is probed](#telling-host-conditions-apart)) | `mountns+pivot_root+landlock+seccomp` | kernel-enforced, inside a composed root | kernel-enforced | kernel-enforced |
 | Full | Linux, kernel ≥5.13 (Landlock available) | `landlock+seccomp` | kernel-enforced | kernel-enforced | kernel-enforced |
 | Seccomp-only | Linux, kernel <5.13 (no Landlock) | `seccomp-only` | **not** enforced | **not** enforced¹ | kernel-enforced |
 | Environment-only | macOS, Windows, any non-Linux host | `none` | **not** enforced | **not** enforced | **not** enforced |
@@ -201,7 +201,7 @@ Containment
 | `apparmor_absent` | AppArmor is not enabled on this host | nothing was ever restricted; no profile is needed |
 | `profile_confining` | the shipped `mur-sealed` AppArmor profile is confining this binary | `mur` alone — the configuration murmur ships |
 | `restriction_disabled_host_wide` | `kernel.apparmor_restrict_unprivileged_userns` is `0` | every program on the machine; reported as [`W-SEC-013`](diagnostics.md#w-sec-013) |
-| `withheld` | nothing murmur ships: the restriction is on and no `mur-sealed` profile confines `mur` | `sealed` is refused with `E-CAP-003`. Whether a capsule that spawns a subprocess gets its network namespace is decided by creating one, so it is refused with [`E-CAP-005`](diagnostics.md#e-cap-005) only when that creation fails |
+| `withheld` | nothing murmur ships: the restriction is on and no `mur-sealed` profile confines `mur` | Nothing is refused for this reading. The network namespace, the private `/tmp` and `sealed` are each decided by creating the namespaces, so a capsule is refused with [`E-CAP-005`](diagnostics.md#e-cap-005) or [`E-CAP-003`](diagnostics.md#e-cap-003) only when a creation fails; see [Telling host conditions apart](#telling-host-conditions-apart) |
 
 The line is `n/a` off Linux, where AppArmor does not exist. The same value is written to
 `session_start.userns_grant` in
@@ -241,6 +241,56 @@ Landlock
 ```
 
 ---
+
+## Telling host conditions apart { #telling-host-conditions-apart }
+
+Whether a capsule gets its network namespace, a mapped `/tmp` and `sealed` is decided by one
+namespace probe, taken once per capsule run. It creates, in short-lived child processes, exactly
+the namespaces a session needs, in the order a session needs them:
+
+| Attempt | What the child does | Decides |
+|---|---|---|
+| Network | `unshare(CLONE_NEWUSER \| CLONE_NEWNET)`, the identity `uid_map`/`gid_map`, `lo` up, the local default route, the namespace's sockets, the hand-off to the runtime | [`E-CAP-005`](diagnostics.md#e-cap-005) for a capsule that can spawn a subprocess |
+| Mount | Joins that network namespace as every command does, then `unshare(CLONE_NEWNS)`, `/` made `MS_REC\|MS_PRIVATE`, a bind over `/tmp` | Whether a literal `/tmp` is mapped by a mount namespace ([temporary folder](#temp-folder)) |
+| Sealed root | Joins that network namespace, then `unshare(CLONE_NEWUSER \| CLONE_NEWNS)` nested inside it, the identity maps, `/` made `MS_REC\|MS_PRIVATE`, a `tmpfs`, `pivot_root(2)`, the old root detached | The Sealed tier, and [`E-CAP-003`](diagnostics.md#e-cap-003) for a `sealed` capsule |
+
+Each attempt is created, refused at a named call with its `errno`, or not attempted because the
+network namespace it nests in could not be created. A refused network attempt therefore leaves
+`/tmp` unmapped and the host at most on `landlock+seccomp`.
+
+AppArmor's `kernel.apparmor_restrict_unprivileged_userns` and the profile confining `mur` are read
+with the attempts and only word a refusal: **the setting is never the reason for a refusal.** A
+refusal ends with the readings line, `Host readings: kernel.apparmor_restrict_unprivileged_userns=<0|1>;
+AppArmor profile confining mur: <profile>.`, and `mur doctor` prints one line per attempt in its
+`AppArmor / user namespaces` block. Inside a container whose profile permits the namespaces, with
+the setting reading `1`:
+
+```text
+AppArmor / user namespaces
+  this binary:  /usr/local/bin/mur
+  profile attached: docker-default
+    Some other profile confines this binary. It is not the profile mur ships and grants nothing mur asked for; it may also be narrower than unconfined.
+    The grant below reads withheld, and the namespaces below were created regardless: the reading explains a refusal when an attempt fails, and caused none here.
+  userns grant: withheld
+    the restriction is on and no mur-sealed AppArmor profile is confining this binary, so nothing murmur ships grants it a user namespace
+  network namespace: created (a real probe created one; the readings above explain a refusal, they never cause one)
+  mount namespace: created (a private mount namespace inside the session's user namespace was created, so /tmp can be mapped)
+  sealed root: created (a nested user+mount namespace inside the session's was created and pivot_root(2) entered a composed root, so sealed can be backed)
+```
+
+A refused attempt reads `refused — <call> failed with <ERRNO>`, and an attempt after a refused
+network namespace reads `not attempted (no network namespace to create it in)`. The failed call,
+its `errno` and the readings identify the host condition:
+
+| Host condition | Network | Mount, sealed root | Readings line | Outcome and remedy |
+|---|---|---|---|---|
+| Bare Ubuntu, setting `1`, `mur` unconfined | refused at `writing uid_map/gid_map`, `EPERM` | not attempted | `=1; … unconfined` | `E-CAP-005`; `sealed` refused with the `mur-sealed` profile sentence. Load the `mur-sealed` profile |
+| `mur-sealed` loaded | created | created | `=1; … mur-sealed` | Nothing refused |
+| A container whose profile and seccomp policy permit the namespace | created | created | `=1; … <container profile>` | Nothing refused |
+| A container profile that denies `mount` | created | refused at `making / MS_REC\|MS_PRIVATE` | `=1; … <container profile>` | `/tmp` not mapped; `sealed` refused as `mount(2)` refused. Run the container with a profile that permits `mount` |
+| A container runtime that refuses `unshare` | refused at `unshare(CLONE_NEWUSER \| CLONE_NEWNET)`, `EPERM` | not attempted | names the container profile | `E-CAP-005`; `sealed` refused as the namespace refused. Permit `unshare(CLONE_NEWUSER)` in the container's seccomp policy, or `--cap-add SYS_ADMIN` |
+| `user.max_user_namespaces=0` | refused at `unshare(…)`, `ENOSPC` | not attempted | any | `E-CAP-005`; `sealed` refused as unsupported by the kernel. Raise `user.max_user_namespaces` |
+| `mur` running inside a `chroot` | refused at `unshare(…)`, `EPERM` | not attempted | any | `E-CAP-005`. The kernel refuses a user namespace to a chrooted process; run `mur` outside the `chroot` |
 
 ## Containment class { #field-containment }
 
@@ -577,9 +627,11 @@ where it is not:
 | `none` (macOS, any non-Linux host) | — | Not mapped; the host's own `/tmp` | The folder's absolute path | `null` |
 | Any tier but `mountns+pivot_root+landlock+seccomp`, with the workdir **being** `/tmp` | — | Not mapped, since binding `/tmp` would hide the workdir | The folder's absolute path | `null` |
 
-**Mount namespace usable** is the host reading that also decides `sealed`: unprivileged user
-namespaces are permitted and a real namespace probe succeeded. On a sealed-capable host, a capsule
-declaring `advisory` or `scoped` runs on `landlock+seccomp` and maps `/tmp` through a mount
+**Mount namespace usable** is the namespace probe's mount attempt: inside the network namespace
+it created, a child joined it the way every command does and built the private mount namespace a
+command's mapping builds. It is decided by that attempt alone, never by the AppArmor setting; see
+[Telling host conditions apart](#telling-host-conditions-apart). On a sealed-capable host, a
+capsule declaring `advisory` or `scoped` runs on `landlock+seccomp` and maps `/tmp` through a mount
 namespace.
 
 On a `mount-namespace` tier each command enters a private mount namespace inside the session's
