@@ -11531,7 +11531,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         binary: &str,
         args: &[&str],
         accessible: &Path,
-        session: &Path,
         policy: &CapabilityPolicy,
         enforcement: &ShellEnforcement,
     ) -> crate::shell::ShellResult {
@@ -11540,7 +11539,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             args,
             &[],
             &crate::workdir_fs::WorkdirRoot::open(accessible).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(session).unwrap(),
             policy,
             enforcement,
         )
@@ -11573,7 +11571,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "python3",
             &["-c", "import json, sqlite3, venv; print('imported')"],
             &work,
-            &work,
             &policy,
             &enforcement,
         );
@@ -11583,14 +11580,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         let secret = outside.join("secret.txt");
         std::fs::write(&secret, "secret").unwrap();
         let probe = python_probe_outside(&secret, stdlib.parent().unwrap());
-        let denied = execute(
-            "python3",
-            &["-c", &probe],
-            &work,
-            &work,
-            &policy,
-            &enforcement,
-        );
+        let denied = execute("python3", &["-c", &probe], &work, &policy, &enforcement);
         assert_eq!(denied.exit_code, 0, "{}", denied.stderr);
         assert_eq!(
             denied.stdout.lines().collect::<Vec<_>>(),
@@ -11620,8 +11610,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             return;
         }
         let (_base, work, outside) = work_and_outside();
-        let session = work.join(".murmur").join("ses_sealed_python");
-        std::fs::create_dir_all(&session).unwrap();
         let policy = derived_interpreter_policy("python3", &work);
         assert_derives_stdlib_and_sqlite(&policy);
         let runtime = tempfile::tempdir().unwrap();
@@ -11635,7 +11623,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             "python3",
             &["-c", "import json, sqlite3, venv; print('imported')"],
             &work,
-            &session,
             &policy,
             &enforcement,
         );
@@ -11649,14 +11636,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
              print(type(error).__name__)\n",
             secret.to_string_lossy()
         );
-        let denied = execute(
-            "python3",
-            &["-c", &program],
-            &work,
-            &session,
-            &policy,
-            &enforcement,
-        );
+        let denied = execute("python3", &["-c", &program], &work, &policy, &enforcement);
         assert_eq!(denied.exit_code, 0, "{}", denied.stderr);
         let outcome = denied.stdout.trim();
         assert!(
@@ -11686,7 +11666,6 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         let result = execute(
             "perl",
             &["-MPOSIX", "-e", "print qq{loaded\n}"],
-            &work,
             &work,
             &policy,
             &enforcement,

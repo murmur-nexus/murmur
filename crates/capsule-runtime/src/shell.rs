@@ -1603,7 +1603,6 @@ mod tests {
             ],
             &[],
             &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
-            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
             &policy,
             &enforcement,
         )
