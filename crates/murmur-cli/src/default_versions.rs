@@ -100,7 +100,7 @@ impl DefaultVersions {
         })
     }
 
-    /// How messages name the index: `github:murmur-nexus/default-artifacts v0.27.0`, or the
+    /// How messages name the index: `github:murmur-nexus/default-artifacts <release tag>`, or the
     /// `--index` value as given.
     pub(crate) fn label(&self) -> &str {
         &self.label

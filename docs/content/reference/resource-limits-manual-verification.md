@@ -144,7 +144,9 @@ Start it before the `mur run` it is meant to observe. The scenarios below use it
 ## The test capsule
 
 Every scenario below uses this manifest. Save it as `murmur.yaml` in an empty directory, and run
-every command on this page from that directory.
+every command on this page from that directory. Replace each `<VERSION>` with the version
+`mur search <name>` lists for that artifact in its `VERSION` column: `driver-openai` and
+`tool-git`.
 
 ```yaml
 name: resource-limit-probe
@@ -156,13 +158,13 @@ context:
 artifacts:
   - name: murmur/driver-openai
     runtime: driver
-    version: "{{ v.murmur_driver_openai }}"
+    version: "<VERSION>"
     gateway:
       endpoint: https://api.openai.com/v1
       api_key: ${OPENAI_API_KEY}
   - name: murmur/tool-git
     runtime: tool
-    version: "{{ v.murmur_tool_git }}"
+    version: "<VERSION>"
 
 capabilities:
   env:
