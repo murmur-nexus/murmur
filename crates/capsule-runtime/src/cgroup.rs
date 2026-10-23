@@ -516,6 +516,10 @@ pub(crate) fn prepare_scope(
     }
     #[cfg(target_os = "linux")]
     {
+        #[cfg(test)]
+        if FORCE_DELEGATION_FAILURE.with(std::cell::Cell::get) {
+            return Err("forced: delegation refused by the test seam".to_string());
+        }
         let (scope, io_max) = CgroupScope::create(limits, session_id, workdir)?;
         Ok(PreparedScope {
             scope: Some(Arc::new(scope)),
@@ -585,14 +589,17 @@ pub fn probe_io_max(limits: &HostResourceLimits, workdir: &Path) -> IoMaxReport 
 
 /// Does this policy give the capsule any way to run a native subprocess at all?
 ///
-/// The exact condition the Linux fail-closed launch refusal keys on: `capabilities.shell.allow`,
-/// `capabilities.spawn.allow`, or a declared artifact whose implementation is native (passed in
-/// by the caller, which is the only place the installed-artifact list is in hand).
+/// The exact condition the Linux fail-closed launch refusal keys on: every route
+/// [`crate::runtime::has_subprocess_route_at_staging`] counts (`capabilities.shell.allow`,
+/// `capabilities.spawn.allow`, and `capabilities.install.tool`, whose pattern can match a native
+/// tool a pull installs), or a declared artifact whose implementation is native (passed in by the
+/// caller, which is the only place the installed-artifact list is in hand). The same routes the
+/// `E-CAP-005` egress refusal counts, from the same function.
 pub fn requires_process_bounding(
     policy: &crate::types::CapabilityPolicy,
     has_native_artifact: bool,
 ) -> bool {
-    !policy.shell_allow.is_empty() || !policy.spawn_allow.is_empty() || has_native_artifact
+    crate::runtime::has_subprocess_route_at_staging(policy) || has_native_artifact
 }
 
 impl CgroupScope {
@@ -793,6 +800,14 @@ fn write_existing(path: &Path, value: &str) -> std::io::Result<()> {
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
     pub(crate) static FORCE_KILL_FALLBACK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+// Makes a required `prepare_scope` fail as on a host that cannot delegate a scope. Read on the
+// calling thread, so it reaches a `prepare_scope` the test calls itself.
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    pub(crate) static FORCE_DELEGATION_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
@@ -2348,10 +2363,33 @@ mod tests {
             spawn_allow: vec!["child".to_string()],
             ..CapabilityPolicy::default()
         };
+        let install_tool = CapabilityPolicy {
+            install_tool: vec!["local/tool-*".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let install_skill = CapabilityPolicy {
+            install_skill: vec!["local/skill-*".to_string()],
+            ..CapabilityPolicy::default()
+        };
         let bare = CapabilityPolicy::default();
 
         assert!(requires_process_bounding(&shell, false));
         assert!(requires_process_bounding(&spawn, false));
+        assert!(
+            requires_process_bounding(&install_tool, false),
+            "a tool the capsule may pull can be native"
+        );
+        assert!(
+            !requires_process_bounding(&install_skill, false),
+            "a pulled skill gains no grant and runs no subprocess"
+        );
+        for policy in [&shell, &spawn, &install_tool, &install_skill, &bare] {
+            assert_eq!(
+                requires_process_bounding(policy, false),
+                crate::runtime::has_subprocess_route_at_staging(policy),
+                "{policy:?}"
+            );
+        }
         assert!(
             requires_process_bounding(&bare, true),
             "a native artifact alone is enough"

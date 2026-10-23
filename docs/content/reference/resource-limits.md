@@ -92,7 +92,8 @@ session do not use up the capsule's headroom.
 ### Platform behavior { #platform-behavior }
 
 **Linux.** A capsule that can spawn any native subprocess — through `capabilities.shell.allow`,
-`capabilities.spawn.allow`, or a native-implementation artifact — refuses to launch with
+`capabilities.spawn.allow`, `capabilities.install.tool` (a tool it may pull can be native), or a
+native-implementation artifact — refuses to launch with
 `E-RUN-012` when the host cannot delegate a cgroup, rather than running that tree with no aggregate
 ceiling. On launch, `mur` asks the systemd user session for a fresh delegated scope of its own —
 the same mechanism rootless Podman and Docker use — so it works from an ordinary shell without any

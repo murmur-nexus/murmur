@@ -66,9 +66,6 @@ pub struct RunnerConfig {
     /// `E-RUN-012` and no case can report anything — see the install requirement in
     /// `resource-limits-manual-verification.md`.
     pub systemd_scope: bool,
-    /// `capabilities.shell.interpreter_runtime` dirs for `python3`, derived from the host's own
-    /// interpreter at preflight rather than hardcoded.
-    pub interpreter_dirs: Vec<(String, bool)>,
 }
 
 /// One case's result.
@@ -103,87 +100,19 @@ pub enum RunReach {
     },
 }
 
-/// Derives the host directories `python3` needs outside the workdir, by asking the interpreter.
-///
-/// Hardcoding `/usr/lib/python3.11` (as `containment.md`'s example does) would break on the
-/// next point release, and `W-SEC-009` exists precisely to warn that such a grant couples a
-/// capsule to one host layout. Asking the interpreter keeps the harness portable across distros.
-///
-/// **This grant is not part of the boundary under test and does not weaken any case.** It opens
-/// the Python standard library and the system library directory for read+execute. Every boundary
-/// case targets something else entirely — `/etc`, `/tmp`, `/proc`, a device node, a socket, a
-/// syscall number — so no case's verdict can be produced by this grant. It is stated here, and in
-/// the reference document, so no reader has to work that out for themselves.
-pub fn derive_interpreter_dirs(python: &str) -> Result<Vec<(String, bool)>, String> {
-    let script = "import sysconfig,sys;\
-                  p=sysconfig.get_paths();\
-                  print(p['stdlib']);\
-                  print(p.get('platstdlib', p['stdlib']));\
-                  print(sysconfig.get_config_var('MULTIARCH') or '')";
-    let output = Command::new(python)
-        .args(["-c", script])
-        .output()
-        .map_err(|err| format!("could not run `{python} -c ...`: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "`{python}` could not report its own paths: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut lines = text.lines();
-    let stdlib = lines.next().unwrap_or_default().trim().to_string();
-    let platstdlib = lines.next().unwrap_or_default().trim().to_string();
-    let multiarch = lines.next().unwrap_or_default().trim().to_string();
-    if stdlib.is_empty() {
-        return Err(format!("`{python}` reported no stdlib path"));
-    }
-
-    let mut dirs = vec![(stdlib.clone(), true)];
-    if !platstdlib.is_empty() && platstdlib != stdlib {
-        dirs.push((platstdlib.clone(), true));
-    }
-    // `lib-dynload` holds the C extension modules (`_ctypes`, `fcntl`, `_socket`) the probes
-    // import; it is a subdirectory, but naming it explicitly keeps the grant legible.
-    for base in [&stdlib, &platstdlib] {
-        let dynload = format!("{base}/lib-dynload");
-        if !base.is_empty()
-            && Path::new(&dynload).is_dir()
-            && !dirs.iter().any(|(p, _)| p == &dynload)
-        {
-            dirs.push((dynload, false));
-        }
-    }
-    // libffi, which `_ctypes` dlopens, is a dependency of the extension module rather than of the
-    // `python3` binary, so it is not in the library closure the runtime derives from `shell.allow`
-    // and has to be granted explicitly. Without it the six dangerous-syscall cases cannot import
-    // `ctypes` and would all report INCONCLUSIVE.
-    if !multiarch.is_empty() {
-        let libdir = format!("/usr/lib/{multiarch}");
-        if Path::new(&libdir).is_dir() {
-            dirs.push((libdir, false));
-        }
-    }
-    Ok(dirs)
-}
-
 /// The tight `capabilities.resources` block from `resource-limits-manual-verification.md`'s test
 /// capsule, with the divergences noted inline. `max_processes` is left out: every case here runs
 /// in a cgroup scope, where the runtime sets no `RLIMIT_NPROC` and `cgroup_pids_max` is the only
 /// process bound.
 fn tight_resources_yaml() -> &'static str {
     "  resources:\n\
-    \x20   # 128 rather than the document's 64. `apply_hard_rlimits` runs first in the child's\n\
-    \x20   # pre_exec window, so every later step in that window lives under this ceiling — and\n\
-    \x20   # the Landlock grant fds, the netns/uid_map setup and the seccomp filter all need\n\
-    \x20   # descriptors while it holds. At 16 and at 32 every spawn dies with `shell enforcement\n\
-    \x20   # setup failed before exec: There was a system failure beyond the control of\n\
-    \x20   # libseccomp`. At 64 the one Landlock grant per `SEALED_ETC_PATHS` entry puts this\n\
-    \x20   # harness's `sealed` capsule over the line, and every resource case reports\n\
-    \x20   # `egress-netns: writing uid_map/gid_map failed` instead of its ceiling: a\n\
-    \x20   # [bash, python3] sealed capsule spawns at 72 and refuses at 64. 128 is that floor with\n\
-    \x20   # room for a grant set that grows. Do not raise it toward the host default: the\n\
-    \x20   # fd-exhauster case needs a ceiling far below 1024 to grade anything.\n\
+    \x20   # 128 rather than the document's 64. The child's pre_exec window sets\n\
+    \x20   # RLIMIT_NPROC (none in a cgroup scope), joins the scope, installs the enforcement\n\
+    \x20   # (composed root, Landlock, netns, seccomp), and sets the per-process rlimits\n\
+    \x20   # RLIMIT_NOFILE among them last, right before execve, so the setup is not bound by\n\
+    \x20   # this ceiling. It bounds the exec'd program alone, whose interpreter and runtime\n\
+    \x20   # libraries hold descriptors of their own before a probe opens its first. Keep it\n\
+    \x20   # far below the host default: the fd-exhauster case grades a ceiling under 512.\n\
     \x20   max_open_files: 128\n\
     \x20   max_file_size_bytes: 10485760      # 10 MiB\n\
     \x20   # 60 rather than the document's 5: pids.max is hit in milliseconds, so a generous CPU\n\
@@ -253,13 +182,6 @@ pub fn manifest_yaml(
     // `bash` is allowlisted so `exec-renamed-disallowed-binary` has an allowlisted basename to
     // wear; `python3` is what every probe actually runs as.
     yaml.push_str("    allow:\n      - bash\n      - python3\n");
-    if !config.interpreter_dirs.is_empty() {
-        yaml.push_str("    interpreter_runtime:\n      - binary: python3\n        dirs:\n");
-        for (path, list_dir) in &config.interpreter_dirs {
-            yaml.push_str(&format!("          - path: {}\n", yaml_str(path)));
-            yaml.push_str(&format!("            list_dir: {list_dir}\n"));
-        }
-    }
     if case.profile == Profile::TightResources {
         yaml.push_str(tight_resources_yaml());
     }
@@ -969,7 +891,6 @@ mod tests {
             work_root: PathBuf::from("/tmp/escape-conformance-test"),
             timeout: Duration::from_secs(1),
             systemd_scope: false,
-            interpreter_dirs: vec![("/usr/lib/python3".to_string(), true)],
         }
     }
 
@@ -1210,12 +1131,8 @@ mod tests {
         let yaml = manifest_yaml(case, &config(), ContainmentClass::Scoped, &log());
         assert!(yaml.contains("cgroup_pids_max: 32"));
         assert!(yaml.contains("workdir_max_bytes: 52428800"));
-        // 128, not the manual-verification document's 64: the child's pre_exec window has to
-        // install a seccomp filter, write uid_map/gid_map for the egress netns, and hold one
-        // Landlock grant fd per granted path, all under this ceiling. Below roughly 64 the
-        // seccomp install fails; at 64 a `sealed` capsule fails on uid_map once the
-        // `SEALED_ETC_PATHS` grants are counted. Pinned here so the value
-        // cannot drift back down without the reason being re-read.
+        // 128, not the manual-verification document's 64: see `tight_resources_yaml`. The
+        // fd-exhauster case grades only a ceiling far below the 1024 default.
         assert!(yaml.contains("max_open_files: 128"));
         assert!(!yaml.contains("max_processes"));
     }
@@ -1274,11 +1191,10 @@ mod tests {
     #[test]
     fn every_generated_manifest_parses_as_mur_run_parses_it() {
         let mut config = config();
-        // A work root with a space and a colon in it, and an interpreter dir with a `#`: every
-        // path is a quoted scalar, or one of these would end the value early.
+        // A work root and a probe driver path with a space and a colon in them: every path is a
+        // quoted scalar, or one of these would end the value early.
         config.work_root = PathBuf::from("/tmp/escape conformance: work");
         config.probe_driver = PathBuf::from("/opt/a build: tree/probe-driver");
-        config.interpreter_dirs = vec![("/usr/lib/python3 #1".to_string(), true)];
 
         let mut profiles_seen = (false, false);
         let cases = std::iter::once(&cases::PREFLIGHT).chain(cases::all_cases());

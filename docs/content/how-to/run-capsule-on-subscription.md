@@ -274,13 +274,6 @@ capabilities:
       - rm
       - mkdir
       - python3
-    interpreter_runtime:
-      - binary: python3
-        dirs:
-          - path: /usr/lib/python3.12
-            list_dir: true
-          - path: /usr/lib/python3.12/lib-dynload
-            list_dir: false
 
 inference:
   transport: process

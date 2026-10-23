@@ -1981,6 +1981,16 @@ pub fn stage_session(
         host_probe.mount_namespace_usable(),
         &runtime_dir_placement.workdir,
     );
+    // Filled here, once, because this is where the trees the capsule's commands can write are
+    // known, and before the report below so `session_start` names what `launch_session`'s
+    // enforcement then grants. Plans, delegated children and formation members stage through here
+    // or reuse this policy.
+    request.capability_policy.shell_derived_interpreter_runtime =
+        crate::interpreter_runtime::derive_interpreter_runtimes(
+            &request.capability_policy.shell_allow,
+            &request.capability_policy.shell_staged_runtime,
+            &crate::interpreter_runtime::capsule_writable_roots(&runtime_dir_placement),
+        );
     let mut scope_report = crate::containment::scope_report_for_tier(
         &request.capability_policy,
         request.declared_containment_floor,
@@ -3190,11 +3200,12 @@ fn launch(
     // --- Host-process bounding, before any WASM is instantiated ------------------------------
     //
     // A capsule that can reach a native subprocess by any route (`shell.allow`, `spawn.allow`,
-    // or a native-implementation artifact) needs a cgroup scope around that process tree. On
-    // Linux, failing to get one is fatal here — refusing the launch is strictly better than
-    // running the tree with no aggregate memory/pids/cpu ceiling, and it must happen before
-    // instantiation so no subprocess is ever spawned unbounded. Off Linux there is no cgroup to
-    // get, so `prepare_scope` returns `None` and the gap is reported as `W-SEC-010` instead.
+    // `install.tool`, or a native-implementation artifact) needs a cgroup scope around that
+    // process tree. On Linux, failing to get one is fatal here — refusing the launch is strictly
+    // better than running the tree with no aggregate memory/pids/cpu ceiling, and it must happen
+    // before instantiation so no subprocess is ever spawned unbounded. Off Linux there is no
+    // cgroup to get, so `prepare_scope` returns `None` and the gap is reported as `W-SEC-010`
+    // instead.
     let has_native_artifact = staged.installed_artifacts.iter().any(|artifact| {
         matches!(
             artifact.implementation,
@@ -3211,13 +3222,12 @@ fn launch(
     )?;
     let requires_process_bounding =
         cgroup::requires_process_bounding(&staged.capability_policy, has_native_artifact);
-    let prepared_scope = cgroup::prepare_scope(
-        requires_process_bounding,
-        &staged.capability_policy.resources,
+    let prepared_scope = prepare_launch_scope(
+        &staged.capability_policy,
+        has_native_artifact,
         &staged.session_id,
         &staged.accessible_workdir,
-    )
-    .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })?;
+    )?;
     // Written into the staged report here, immediately after the write that decided it and ahead
     // of every `staged.scope_report.clone()` that feeds a `session_start` event — the agent path
     // and the script path both clone it later in this function. `stage_session` could not fill it:
@@ -5767,6 +5777,26 @@ fn warn_on_runtime_dir_inside_workdir(placement: &crate::runtime_dir::RuntimeDir
             crate::runtime_dir::runtime_dir_inside_warning(placement)
         );
     }
+}
+
+/// The session's cgroup scope, decided and created: none when `policy` and `has_native_artifact`
+/// give the capsule no route to a native subprocess
+/// ([`cgroup::requires_process_bounding`]), and
+/// [`RuntimeError::CgroupDelegationUnavailable`] on a Linux host that cannot delegate one when
+/// they do. `launch_session` calls this once, before any WASM is instantiated.
+pub(crate) fn prepare_launch_scope(
+    policy: &CapabilityPolicy,
+    has_native_artifact: bool,
+    session_id: &str,
+    workdir: &Path,
+) -> Result<cgroup::PreparedScope, RuntimeError> {
+    cgroup::prepare_scope(
+        cgroup::requires_process_bounding(policy, has_native_artifact),
+        &policy.resources,
+        session_id,
+        workdir,
+    )
+    .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })
 }
 
 /// Whether `stage_session` can already tell the capsule may start a native subprocess: a
@@ -11410,9 +11440,9 @@ fn write_shell_tool_manifests(
 /// Refuses with `E-CAP-005` a capsule whose only subprocess route is a native tool, on a host
 /// that cannot give it a network namespace.
 ///
-/// A capsule declaring `shell.allow` or `spawn.allow` was already asked by `stage_session`, before
-/// any registry pull; `has_native_artifact` exists only after staging, so this is the half that
-/// check cannot make. Pure, with the host answer passed in.
+/// A capsule declaring `shell.allow`, `spawn.allow` or `install.tool` was already asked by
+/// `stage_session`, before any registry pull; `has_native_artifact` exists only after staging, so
+/// this is the half that check cannot make. Pure, with the host answer passed in.
 fn check_native_artifact_egress_namespace(
     policy: &CapabilityPolicy,
     has_native_artifact: bool,
@@ -19813,6 +19843,48 @@ inference:
             check_native_artifact_egress_namespace(&skill_grant, true, failed),
             Err(RuntimeError::EgressNamespaceUnavailable { .. })
         ));
+    }
+
+    /// A capsule whose only native route is a tool it may pull is bounded like one declaring a
+    /// native tool: on a Linux host that cannot delegate a scope, both are refused with the error
+    /// `E-RUN-012` reports, and a capsule with no route is launched with no scope.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_tool_alone_needs_a_cgroup_scope() {
+        struct ClearOnDrop;
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                cgroup::FORCE_DELEGATION_FAILURE.with(|flag| flag.set(false));
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let tool_grant = CapabilityPolicy {
+            install_tool: vec!["local/tool-*".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let skill_grant = CapabilityPolicy {
+            install_skill: vec!["local/skill-*".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let bare = CapabilityPolicy::default();
+
+        cgroup::FORCE_DELEGATION_FAILURE.with(|flag| flag.set(true));
+        let _clear = ClearOnDrop;
+        let launch = |policy: &CapabilityPolicy, has_native_artifact| {
+            prepare_launch_scope(policy, has_native_artifact, "ses_test", temp.path())
+        };
+        for (policy, has_native_artifact) in [(&tool_grant, false), (&bare, true)] {
+            match launch(policy, has_native_artifact) {
+                Err(RuntimeError::CgroupDelegationUnavailable { reason }) => {
+                    assert!(reason.starts_with("forced:"), "{reason}");
+                }
+                other => panic!("{policy:?} / native {has_native_artifact}: {other:?}"),
+            }
+        }
+        for policy in [&skill_grant, &bare] {
+            let prepared = launch(policy, false).expect("no route needs no scope");
+            assert!(prepared.scope.is_none(), "{policy:?}");
+        }
     }
 
     /// The accessible workdir a delegated child opened is the directory its parent created, or

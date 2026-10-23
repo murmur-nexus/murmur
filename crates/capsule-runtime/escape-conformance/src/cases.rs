@@ -1476,17 +1476,12 @@ def main():
                       from its own RLIMIT_NOFILE rather than against a constant — it must land at \
                       or under that ceiling, and the ceiling itself must be far below the 1024 \
                       default. Asserted at `advisory` too, since setrlimit applies on every \
-                      Unix platform. Lifted from scenario 1, but with the declared ceiling raised \
-                      from that document's 64 to 128: see the comment on the tight resources block \
-                      in runner.rs, where 16 is shown to make every spawn fail outright rather \
-                      than bound anything, and where 64 is shown to be too few for this \
-                      harness's `sealed` capsule once the `SEALED_ETC_PATHS` grant fds are held. \
-                      Measured CONTAINED at `sealed`: EMFILE after 125 descriptors against a \
-                      declared max_open_files of 128, read back from the child's own \
-                      RLIMIT_NOFILE. Both halves of the grading held — at or under the declared \
-                      ceiling, and that ceiling far below the 1024 default — and the small gap \
-                      between 125 and 128 is the composed root's own grant fds, which is exactly \
-                      the effect that forced the ceiling from 64 to 128.",
+                      Unix platform. Lifted from scenario 1, with the declared ceiling at 128 \
+                      rather than that document's 64: see the comment on the tight resources \
+                      block in runner.rs. RLIMIT_NOFILE is set last in the child's pre_exec \
+                      window, after the cgroup join and the enforcement setup, so it bounds the \
+                      exec'd interpreter alone, and the descriptors that interpreter already \
+                      holds count against it before the loop opens its first.",
         advisory: Must(Contained),
         scoped: Must(Contained),
         sealed: Must(Contained),
@@ -1508,12 +1503,11 @@ def main():
                 os.close(fd)
             except OSError:
                 pass
-        # Graded against the ceiling the capsule actually declared, read back from the child's
-        # own RLIMIT_NOFILE, rather than against a magic number calibrated for one manifest:
-        # `max_open_files` has had to move twice already (16 -> 64 -> 128, see the tight
-        # resources block in runner.rs), and each move silently invalidated a fixed threshold.
-        # Two conditions, and both matter: EMFILE arrived at or under the declared ceiling, and
-        # that ceiling is itself well below the 1024 default this case exists to rule out.
+        # Graded against the ceiling the capsule declared, read back from the child's own
+        # RLIMIT_NOFILE, so a change to `max_open_files` in the tight resources block in
+        # runner.rs needs no change here. Two conditions, and both matter: EMFILE arrived at or
+        # under the declared ceiling, and that ceiling is itself well below the 1024 default
+        # this case exists to rule out.
         if count <= ceiling and ceiling < 512:
             verdict("CONTAINED", "open() failed with %s after %d descriptors, at or under the "
                                  "declared max_open_files ceiling of %d -- not the 1024 default"

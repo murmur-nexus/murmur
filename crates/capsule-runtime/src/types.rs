@@ -242,6 +242,15 @@ pub struct CapabilityPolicy {
     /// section of `--explain-scope`. Per-binary mutually exclusive with
     /// [`Self::shell_interpreter_runtime`], which the manifest parser already guarantees.
     pub shell_staged_runtime: Vec<murmur_artifact::StagedRuntimeGrant>,
+    /// The runtime directories of each `shell_allow` binary the runtime recognises as an
+    /// interpreter, as that interpreter reported them (see [`crate::interpreter_runtime`]). Not a
+    /// manifest field: empty from [`capability_policy_from_runtime_manifest`], filled once by
+    /// `stage_session` and by `mur run --explain-scope` through
+    /// [`crate::interpreter_runtime::derive_interpreter_runtimes`]. Each becomes a readable,
+    /// non-executable Landlock grant (`sandbox::resolve_derived_interpreter_grants`) and, on
+    /// `sealed`, an optional composed-root bind.
+    pub shell_derived_interpreter_runtime:
+        Vec<crate::interpreter_runtime::DerivedInterpreterRuntime>,
     /// Host env var names a WASM guest may observe, from `capabilities.env.allow`. Empty by
     /// default: a guest sees only the runtime's own `MURMUR_*` injection unless the manifest
     /// names a variable here. `shell_strip_env` and the credential patterns still apply on
@@ -984,6 +993,7 @@ pub fn capability_policy_from_runtime_manifest(
         shell_baseline_env,
         shell_interpreter_runtime,
         shell_staged_runtime,
+        shell_derived_interpreter_runtime: Vec::new(),
         env_allow,
         limits,
         resources,
@@ -1125,6 +1135,8 @@ capabilities:
         // The two mechanisms stay separate all the way down: lowering one must not populate the
         // other.
         assert!(policy.shell_interpreter_runtime.is_empty());
+        // Derived at staging, never lowered from the manifest.
+        assert!(policy.shell_derived_interpreter_runtime.is_empty());
     }
 
     /// A shell block that declares no staged runtime lowers to an empty list, not to a default

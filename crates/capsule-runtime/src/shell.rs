@@ -1560,6 +1560,64 @@ mod tests {
         crate::runtime_err!("{TEST}: ran on KernelFull; [bash] exited 126, [bash, cat] exited 0");
     }
 
+    /// The CPU ceiling's two slots reach a program a kernel tier starts: soft `cpu_seconds`, hard
+    /// one second above it, set by `apply_per_process_rlimits` last before `execve`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn a_kernel_tier_command_gets_the_cpu_slots() {
+        const TEST: &str = "a_kernel_tier_command_gets_the_cpu_slots";
+        if crate::network_namespace::skip_without_egress_namespace(TEST) {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            resources: crate::resources::HostResourceLimits {
+                cpu_seconds: 5,
+                max_open_files: 64,
+                ..crate::resources::HostResourceLimits::default()
+            },
+            ..CapabilityPolicy::default()
+        };
+        let enforcement = ShellEnforcement::resolve(
+            &policy,
+            murmur_artifact::ContainmentClass::Scoped,
+            crate::sandbox::HostProbe::probe(),
+        )
+        .unwrap()
+        .with_runtime_dir(crate::sandbox::test_runtime_dir(temp.path()), None);
+        if enforcement.tier != crate::sandbox::EnforcementTier::KernelFull {
+            crate::runtime_err!(
+                "[SKIP-HOST] {TEST}: this host resolves {:?}, the test needs KernelFull",
+                enforcement.tier
+            );
+            return;
+        }
+
+        let result = execute_shell(
+            "bash",
+            &[
+                "-c",
+                r#"echo "$(ulimit -St) $(ulimit -Ht) $(ulimit -Sn) $(ulimit -Hn)""#,
+            ],
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &policy,
+            &enforcement,
+        )
+        .expect("bash must start under the limits");
+        println!("{}", result.stdout.trim());
+
+        assert_eq!(
+            result.stdout.trim(),
+            "5 6 64 64",
+            "stderr was: {}",
+            result.stderr
+        );
+        assert_eq!(result.exit_code, 0, "stderr was: {}", result.stderr);
+    }
+
     /// With `RLIMIT_NPROC` left alone, `pids.max` is the only process bound on a scoped capsule,
     /// and it has to stop a fork bomb by itself and be named as what did. The children sleep
     /// rather than exit so every one of them holds a task in the scope until the loop gives up.

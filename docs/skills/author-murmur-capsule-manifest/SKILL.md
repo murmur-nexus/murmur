@@ -343,7 +343,9 @@ Prefer a structured Murmur tool over a raw binary when both accomplish the same 
 
 Use `strip_env` to remove sensitive/unnecessary subprocess environment variables. Keep only the baseline environment genuinely required by allowed commands.
 
-If an allowlisted interpreter needs host runtime directories outside the workdir, use one of:
+An allowlisted CPython or Perl interpreter needs no declaration for its own standard library and installed packages: on Linux, `mur` asks the interpreter for its import path and grants those directories read-only (`mur run --explain-scope` lists them under `derived interpreter runtime`). Do not add `interpreter_runtime` for them.
+
+If another interpreter, or a directory a recognised one does not report (such as a virtual environment's `site-packages`), needs host runtime directories outside the workdir, use one of:
 
 - `interpreter_runtime` — explicitly grants the required host runtime directories;
 - `staged_runtime` — mounts an already-pinned runtime tree into a `sealed` capsule.

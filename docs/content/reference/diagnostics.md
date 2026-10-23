@@ -3023,7 +3023,9 @@ more grants. Fires once per grant, from both `mur run` (at staging) and `mur doc
 
 **Why it matters:** an `interpreter_runtime` grant widens an already-allowlisted binary's Landlock
 scope to specific host directories *outside* the workdir so a path-based interpreter (e.g. CPython)
-can reach its standard library. That makes the grant necessary to run such an interpreter, and it
+can reach its standard library. A CPython or Perl interpreter needs no grant for its own import
+path: `mur` [derives those directories](containment.md#derived-interpreter-runtime) from the
+interpreter itself. For any other interpreter the grant is what lets it run, and it
 **couples the capsule to a specific host distro/interpreter-version layout**: a grant naming
 `/usr/lib/python3.11` stops resolving the moment the host ships Python 3.12, and a capsule that
 runs on Debian may not run on Alpine. The durable fix is
@@ -3043,7 +3045,10 @@ There is no field that accepts a prefix and expands it, and `ReadDir` is never i
 granted only where an author wrote `list_dir: true`, and only on that one directory, never on its
 parent or siblings. A directory not named in the manifest receives no rule at all.
 
-**What to do:** name the narrowest set of directories that actually works — measure the real
+**What to do:** for an allowlisted CPython or Perl interpreter, delete the grant unless it names a
+directory the interpreter does not report on its own import path, such as a virtual environment's
+`site-packages`; `mur run --explain-scope` lists what is derived under `derived interpreter
+runtime`. Otherwise, name the narrowest set of directories that actually works — measure the real
 requirement with `strace -f -e trace=openat,getdents64 <interpreter> -c "import ..."` rather than
 guessing, and set `list_dir: false` on any directory you only open known files inside. Accept
 that the capsule is now pinned to this host's interpreter layout, or switch to
