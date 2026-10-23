@@ -4,6 +4,10 @@
 
 mod allocator;
 mod beta;
+// `build.rs` compiles the same file to fix the commit `mur version` reports.
+#[cfg(test)]
+#[path = "../build/commit.rs"]
+mod build_commit;
 mod commands;
 mod config;
 mod env_requirements;
@@ -179,9 +183,10 @@ enum Commands {
         #[arg(short, long, value_name = "FILE", default_value = murmur_artifact::ARTIFACT_INDEX_FILE_NAME)]
         output: PathBuf,
     },
-    /// Print this mur's version, the WIT level it serves and that level's package versions
+    /// Print this mur's version and commit, the WIT level it serves, that level's package
+    /// versions and the machine-readable commands it serves
     Version {
-        /// Print one JSON object: mur_version, wit_level and packages
+        /// Print one JSON object: mur_version, commit, wit_level, packages and commands
         #[arg(long)]
         json: bool,
     },

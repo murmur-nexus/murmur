@@ -58,6 +58,50 @@ had with its output open.
 
 ---
 
+## Driving mur from another program { #machine-interface }
+
+A program that runs `mur` and parses its output asks [`mur version --json`](#mur-version) once what
+this `mur` serves, and looks its command up in `commands`:
+
+| What `commands` holds for the command | What the program does |
+|---|---|
+| A number the program was written for | Run the command and parse its output |
+| A number the program does not know | Refuse with a message: the command's output changed shape |
+| No key | Refuse with a message: this `mur` does not serve the command |
+
+Compare `commands`, not `mur_version`. A release reports `X.Y.Z`. A build from `main` reports
+`X.Y.Z-dev`, where `X.Y.Z` is the next release, and its `commit` names the build, or is `null` for
+a build made outside a git checkout.
+
+A command's number moves only when its output breaks for an existing consumer:
+
+- a key removed or renamed;
+- a key's type or meaning changed;
+- a different number of lines or objects.
+
+A new key does not move it, and a consumer ignores keys it does not know. A command that is removed
+loses its key.
+
+`mur --version` prints `murmur-cli <version>`, for people and installers.
+
+| Key | Number | Output |
+|---|---:|---|
+| `control show --json` | 1 | [`mur control`](#mur-control) |
+| `conversation ls --json` | 1 | [`mur conversation ls`](#mur-conversation-ls) |
+| `conversation show --json` | 1 | [`mur conversation show`](#mur-conversation-show) |
+| `eval show --json` | 1 | [`mur eval show`](#mur-eval-show) |
+| `precompile --json` | 1 | [`mur precompile`](#mur-precompile) |
+| `ps --json` | 1 | [`mur ps --json`](#mur-ps-json) |
+| `run --explain-scope --json` | 1 | The `--explain-scope` row of [`mur run`](#mur-run) |
+| `run --json` | 1 | [Readiness line](#mur-run-json) |
+| `run --roster --json` | 1 | [Launching a formation](#mur-run-roster) |
+| `token` | 1 | [`mur token`](#mur-token): standard output is the token |
+| `trace list --json` | 1 | [`mur trace list`](#mur-trace-list) |
+| `trace rm --json` | 1 | [`mur trace rm`](#mur-trace-rm) |
+| `version --json` | 1 | [`mur version`](#mur-version) |
+
+---
+
 ## Session addresses { #session-addresses }
 
 Every command that names a session spells the address the same way.
@@ -3697,8 +3741,8 @@ mur index release --repo ana/my-artifacts --release v1.1.0 --merge previous/arti
 
 ## `mur version` { #mur-version }
 
-Print this `mur`'s version, the [WIT level](wit-levels.md) it serves, and that level's package
-versions.
+Print this `mur`'s version, the commit it was built from, the [WIT level](wit-levels.md) it serves,
+that level's package versions, and the machine-readable commands it serves.
 
 ```bash
 mur version [--json]
@@ -3706,12 +3750,13 @@ mur version [--json]
 
 | Flag | Default | Description |
 |---|---|---|
-| `--json` | off | Print one JSON object instead of text |
+| `--json` | off | Print one JSON object instead of text: `mur_version`, `commit`, `wit_level`, `packages` and `commands` |
 
 **Output:**
 
 ```text
-mur 1.0.0
+mur 1.1.0-dev
+commit 0123456789abcdef0123456789abcdef01234567
 WIT level 1
 
 PACKAGE                  VERSION
@@ -3721,31 +3766,41 @@ murmur:capsule           0.1.0
 murmur:tool-registry     0.1.0
 ```
 
-One row per package of the served level, in ascending order, each column padded to its widest cell
-plus two spaces.
+The second line is `commit unknown` for a build made without a git checkout or a
+`.cargo_vcs_info.json`. One row per package of the served level, in ascending order, each column
+padded to its widest cell plus two spaces.
 
 **Output (`--json`):** one pretty-printed object and a newline.
 
 ```json
 {
-  "mur_version": "1.0.0",
+  "mur_version": "1.1.0-dev",
+  "commit": "0123456789abcdef0123456789abcdef01234567",
   "wit_level": 1,
   "packages": [
     {
       "package": "murmur:artifact-manager",
       "version": "0.1.0"
     }
-  ]
+  ],
+  "commands": {
+    "control show --json": 1,
+    "conversation ls --json": 1,
+    ...
+    "version --json": 1
+  }
 }
 ```
 
 | Key | Type | Holds |
 |---|---|---|
-| `mur_version` | string | This `mur`'s version, as `mur --version` prints it |
+| `mur_version` | string | This `mur`'s version, as `mur --version` prints it: `X.Y.Z` for a release, `X.Y.Z-dev` for a build from `main`, where `X.Y.Z` is the next release |
+| `commit` | string or `null` | The 40-character lowercase hex git commit this `mur` was built from. `null` when the build had neither a git checkout nor a `.cargo_vcs_info.json` |
 | `wit_level` | integer | The WIT level this `mur` serves |
 | `packages` | array | Every package of that level, ascending, each `{"package", "version"}` |
+| `commands` | object | One key per machine-readable command, as it is typed after `mur`, in ascending order. Each value is the positive schema number of that command's output. See [Driving mur from another program](#machine-interface) |
 
-`mur --version` prints `murmur-cli <version>` only.
+The keys print in this order. `mur --version` prints `murmur-cli <version>` only.
 
 ---
 

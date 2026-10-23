@@ -27,7 +27,7 @@ Ask for or inspect what is available; do not demand everything before starting:
 
 1. The exact command and complete stdout/stderr, including warnings and hints.
 2. The relevant `murmur.yaml` sections and `murmur.lock`; redact secret values but keep key names and structure.
-3. Murmur version and the WIT level it serves (`mur version --json` prints both), OS, kernel, container/VM context, and whether the run is local or remote.
+3. Murmur version, the commit it was built from and the WIT level it serves (`mur version --json` prints all three; a build from `main` reports an `X.Y.Z-dev` version, so the commit is what identifies it), OS, kernel, container/VM context, and whether the run is local or remote.
 4. Whether a workdir, a session records directory (`~/.murmur/records/<workdir root>/<session-id>/`, holding `trace.jsonl` and the bootstrap and hook logs), or a tool log exists. `mur trace list --workdir <dir> --json` prints every session of a workdir root with its records directory.
 5. For a behavioral complaint: expected behavior, observed behavior, and one concrete example.
 

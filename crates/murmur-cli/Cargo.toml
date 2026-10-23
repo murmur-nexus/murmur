@@ -78,6 +78,10 @@ mimalloc = ["dep:mimalloc"]
 # Builds the `mur-alloc-bench` measurement binary and the runtime module it times.
 alloc-bench = ["capsule-runtime/alloc-bench"]
 
+# `build.rs` reads the commit out of a source package's `.cargo_vcs_info.json`.
+[build-dependencies]
+serde_json = "1"
+
 [dev-dependencies]
 mur-roost = { path = "../mur-roost" }
 assert_cmd = "2"
