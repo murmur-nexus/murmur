@@ -2282,7 +2282,9 @@ impl ShellEnforcement {
     }
 
     /// The directory the session's delegated children keep their records beneath, when the
-    /// session can delegate and a child has staged there; read-only to every command.
+    /// session can delegate and a child has staged there; read-only to every command. Linux only:
+    /// no other platform grants it.
+    #[cfg(target_os = "linux")]
     pub(crate) fn children_records_path(&self) -> Option<&Path> {
         self.runtime_dir
             .as_ref()
