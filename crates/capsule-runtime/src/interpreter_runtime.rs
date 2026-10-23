@@ -161,7 +161,7 @@ pub(crate) fn derive_in(
 
     let mut derived = Vec::new();
     for binary in resolve_exec_allowlist_in(&queried, path_dirs) {
-        if staged_binaries.contains(&binary) || is_under_any(&binary, &roots) {
+        if staged_binaries.contains(&binary) || crate::reachability::under_any(&binary, &roots) {
             continue;
         }
         let Ok(image) = std::fs::read(&binary) else {
@@ -199,11 +199,6 @@ fn report_not_derived(binary: &Path, kind: InterpreterKind<'_>, reason: &str) {
         kind.name,
         binary.display()
     );
-}
-
-#[cfg(target_os = "linux")]
-fn is_under_any(path: &Path, roots: &[PathBuf]) -> bool {
-    roots.iter().any(|root| path.starts_with(root))
 }
 
 /// The first kind whose marker symbol `image`'s `.dynsym` lists. `None` for an ELF that lists
@@ -327,7 +322,7 @@ pub(crate) fn keep_entries(binary: &Path, reported: &[String], roots: &[PathBuf]
         if !(metadata.is_dir() || metadata.is_file()) {
             continue;
         }
-        if own_dir.starts_with(&canonical) || is_under_any(&canonical, roots) {
+        if own_dir.starts_with(&canonical) || crate::reachability::under_any(&canonical, roots) {
             continue;
         }
         if !kept.contains(&canonical) {
@@ -633,13 +628,29 @@ mod tests {
         assert!(binds.contains(&PathBuf::from("/opt/test/lib")), "{binds:?}");
     }
 
-    /// The derivation for this host's `python3` and `perl`, timed, for the staging cost it adds.
+    /// The derivation for this host's `python3` and `perl`: each one on `PATH` is derived, none of
+    /// its entries is its own directory or an ancestor of it, and the time taken is printed for the
+    /// staging cost it adds.
     #[test]
     fn this_hosts_interpreters_derive_their_runtimes() {
         let allow = vec!["python3".to_string(), "perl".to_string()];
         let started = std::time::Instant::now();
         let derived = derive_interpreter_runtimes(&allow, &[], &[]);
         let elapsed = started.elapsed();
+        for name in &allow {
+            let Some(found) = crate::sandbox::find_on_path(name) else {
+                println!("[SKIP] no {name} on PATH");
+                continue;
+            };
+            let binary = std::fs::canonicalize(found).unwrap();
+            assert!(
+                derived
+                    .iter()
+                    .any(|runtime| runtime.binary == binary && !runtime.dirs.is_empty()),
+                "{name} ({}) derived nothing: {derived:?}",
+                binary.display()
+            );
+        }
         for runtime in &derived {
             println!("{}", runtime.binary.display());
             for dir in &runtime.dirs {

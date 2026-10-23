@@ -853,11 +853,14 @@ names a path.
 | CPython | its binary lists the symbol `Py_BytesMain` | `-I -S -c` and a program printing `sys.path` and `site.getsitepackages()` |
 | Perl | its binary lists the symbol `perl_parse` | `-f -e` and a program printing `@INC` |
 
-The interpreter runs once per session, before the capsule starts, with an empty environment, `/`
-as its working directory and a 5-second limit. A binary inside the workdir root or the records
-directory is never run. A binary named by a [`staged_runtime`](#field-staged-runtime) grant is not
-asked, because its runtime is the staged tree. When the interpreter cannot answer, `mur` prints one
-line naming the binary and the reason, and the session starts with the binary's usual grants.
+The interpreter runs outside the sandbox, with an empty environment, `/` as its working directory
+and a 5-second limit: once each time `mur` stages a session, before the capsule starts, and once for
+each `mur run --explain-scope`. A binary the capsule's commands could have written is never run:
+one inside the workdir root, or inside `~/.murmur/records/<workdir root>/`, which holds every
+session's [temporary folder](#temp-folder). A binary named by a
+[`staged_runtime`](#field-staged-runtime) grant is not asked, because its runtime is the staged
+tree. When the interpreter cannot answer, `mur` prints one line naming the binary and the reason,
+and the session starts with the binary's usual grants.
 
 What the interpreter reports becomes a grant:
 
@@ -868,7 +871,7 @@ What the interpreter reports becomes a grant:
 | A library an extension module directly inside one of those directories needs, such as `libsqlite3.so.0` behind `_sqlite3` | read, never execute | its directory, on the same terms |
 
 A reported path is dropped when it is relative, does not exist, is `/`, is the interpreter's own
-directory or a directory above it, or lies inside the workdir root or the records directory.
+directory or a directory above it, or lies inside one of those two capsule-writable trees.
 
 Extension modules are scanned one directory deep. A third-party package that keeps its extension
 modules in its own subdirectory, and needs a system library no derived directory holds, still

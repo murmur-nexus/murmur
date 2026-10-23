@@ -787,7 +787,7 @@ pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
 /// Whether `bytes` begins an ELF64 shared object (`e_type` `ET_DYN`), in either byte order. Needs
 /// only the first 18 bytes, so a caller sorting a directory reads no more of each file than that.
 /// A position-independent executable is `ET_DYN` too and answers `true`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 pub(crate) fn elf_is_shared_object(bytes: &[u8]) -> bool {
     if bytes.len() < 18 || &bytes[0..4] != b"\x7fELF" || bytes[4] != 2 {
         return false;
@@ -808,7 +808,7 @@ pub(crate) fn elf_is_shared_object(bytes: &[u8]) -> bool {
 /// A symbol the binary imports from a shared library is listed here as well as one it defines, so
 /// an interpreter built against `libpython` or `libperl` names its entry symbol the same way a
 /// statically linked one does. A binary stripped of its section headers names nothing.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 pub(crate) fn elf_dynamic_symbol_names(bytes: &[u8]) -> Option<Vec<String>> {
     if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" || bytes[4] != 2 {
         return None;
@@ -2713,7 +2713,9 @@ impl Drop for EndSessionOnDrop {
 const KERNEL_ENFORCEMENT_NOTICE: &str = "capabilities.shell.allow is non-empty and this host \
 resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now grants a narrow, \
 derived read+execute scope outside the workdir (the allowlisted binaries, their loader, and their \
-shared libraries — nothing writable, no directory granted wholesale), plus a fixed device set \
+shared libraries — nothing writable), read-only access to the directories an allowlisted \
+CPython or Perl interpreter reports on its own import path, and no other directory granted \
+wholesale, plus a fixed device set \
 every capsule gets unconditionally: /dev/null read+write (with the session's temporary and home \
 folders, the only writable paths outside the workdir), \
 /dev/zero and /dev/urandom read-only, and no other device — /dev/random, /dev/full, /dev/tty and \

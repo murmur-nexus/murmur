@@ -58,7 +58,6 @@ OPTIONS:
     --mur <PATH>           The built `mur` binary. Default: $MUR_BIN, then this repository's
                            target/release/mur and target/debug/mur, then PATH.
     --probe-driver <PATH>  This package's probe-driver harness. Default: next to this binary.
-    --python <NAME>        Interpreter the probes run as. Default: python3.
     --timeout-secs <N>     Wall-clock ceiling per case. Default: 300.
     --systemd-scope        Wrap each `mur run` in
                            `systemd-run --user --scope --property=Delegate=yes`.
@@ -88,7 +87,6 @@ struct Options {
     work_root: Option<PathBuf>,
     mur: Option<PathBuf>,
     probe_driver: Option<PathBuf>,
-    python: String,
     timeout: Duration,
     systemd_scope: Option<bool>,
     allow_container: bool,
@@ -104,7 +102,6 @@ impl Default for Options {
             work_root: None,
             mur: None,
             probe_driver: None,
-            python: "python3".to_string(),
             timeout: Duration::from_secs(300),
             systemd_scope: None,
             allow_container: false,
@@ -138,7 +135,6 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
             "--probe-driver" => {
                 options.probe_driver = Some(PathBuf::from(value("--probe-driver")?))
             }
-            "--python" => options.python = value("--python")?,
             "--timeout-secs" => {
                 let raw = value("--timeout-secs")?;
                 let secs: u64 = raw
@@ -378,16 +374,6 @@ fn run() -> Result<u8, String> {
     };
     let mur = absolute(resolve_mur(options.mur.clone())?)?;
     let probe_driver = absolute(resolve_probe_driver(options.probe_driver.clone())?)?;
-    let interpreter_dirs = runner::derive_interpreter_dirs(&options.python).map_err(|err| {
-        format!(
-            "REFUSED — {err}\n\n\
-             Every probe runs as `{}`, because under the full enforcement tier a capsule may only \
-             exec the binaries named in capabilities.shell.allow. Without a working interpreter \
-             no case can report anything, and a suite that ran anyway would report INCONCLUSIVE \
-             for everything. No record file was written.",
-            options.python
-        )
-    })?;
 
     let systemd_scope = options
         .systemd_scope
@@ -439,15 +425,6 @@ fn run() -> Result<u8, String> {
     );
     println!("  harness:   {}", probe_driver.display());
     println!("  scratch:   {}", work_root.display());
-    println!(
-        "  python:    {} (interpreter_runtime grants: {})",
-        options.python,
-        interpreter_dirs
-            .iter()
-            .map(|(p, _)| p.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
     if !facts.is_root() {
         println!(
             "  note:      non-root run (euid {}). `mknod`, `bpf` and `open_by_handle_at` refuse \
@@ -464,7 +441,6 @@ fn run() -> Result<u8, String> {
         work_root,
         timeout: options.timeout,
         systemd_scope,
-        interpreter_dirs,
     };
 
     // Last gate before the first case. A host where no probe can start is refused, not run with

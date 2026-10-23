@@ -66,9 +66,6 @@ pub struct RunnerConfig {
     /// `E-RUN-012` and no case can report anything — see the install requirement in
     /// `resource-limits-manual-verification.md`.
     pub systemd_scope: bool,
-    /// `capabilities.shell.interpreter_runtime` dirs for `python3`, derived from the host's own
-    /// interpreter at preflight rather than hardcoded.
-    pub interpreter_dirs: Vec<(String, bool)>,
 }
 
 /// One case's result.
@@ -101,70 +98,6 @@ pub enum RunReach {
         /// The probe driver's summary line, `None` when it left none.
         tool_result: Option<String>,
     },
-}
-
-/// Derives the host directories `python3` needs outside the workdir, by asking the interpreter.
-///
-/// Hardcoding `/usr/lib/python3.11` (as `containment.md`'s example does) would break on the
-/// next point release, and `W-SEC-009` exists precisely to warn that such a grant couples a
-/// capsule to one host layout. Asking the interpreter keeps the harness portable across distros.
-///
-/// **This grant is not part of the boundary under test and does not weaken any case.** It opens
-/// the Python standard library and the system library directory for read+execute. Every boundary
-/// case targets something else entirely — `/etc`, `/tmp`, `/proc`, a device node, a socket, a
-/// syscall number — so no case's verdict can be produced by this grant. It is stated here, and in
-/// the reference document, so no reader has to work that out for themselves.
-pub fn derive_interpreter_dirs(python: &str) -> Result<Vec<(String, bool)>, String> {
-    let script = "import sysconfig,sys;\
-                  p=sysconfig.get_paths();\
-                  print(p['stdlib']);\
-                  print(p.get('platstdlib', p['stdlib']));\
-                  print(sysconfig.get_config_var('MULTIARCH') or '')";
-    let output = Command::new(python)
-        .args(["-c", script])
-        .output()
-        .map_err(|err| format!("could not run `{python} -c ...`: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "`{python}` could not report its own paths: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut lines = text.lines();
-    let stdlib = lines.next().unwrap_or_default().trim().to_string();
-    let platstdlib = lines.next().unwrap_or_default().trim().to_string();
-    let multiarch = lines.next().unwrap_or_default().trim().to_string();
-    if stdlib.is_empty() {
-        return Err(format!("`{python}` reported no stdlib path"));
-    }
-
-    let mut dirs = vec![(stdlib.clone(), true)];
-    if !platstdlib.is_empty() && platstdlib != stdlib {
-        dirs.push((platstdlib.clone(), true));
-    }
-    // `lib-dynload` holds the C extension modules (`_ctypes`, `fcntl`, `_socket`) the probes
-    // import; it is a subdirectory, but naming it explicitly keeps the grant legible.
-    for base in [&stdlib, &platstdlib] {
-        let dynload = format!("{base}/lib-dynload");
-        if !base.is_empty()
-            && Path::new(&dynload).is_dir()
-            && !dirs.iter().any(|(p, _)| p == &dynload)
-        {
-            dirs.push((dynload, false));
-        }
-    }
-    // libffi, which `_ctypes` dlopens, is a dependency of the extension module rather than of the
-    // `python3` binary, so it is not in the library closure the runtime derives from `shell.allow`
-    // and has to be granted explicitly. Without it the six dangerous-syscall cases cannot import
-    // `ctypes` and would all report INCONCLUSIVE.
-    if !multiarch.is_empty() {
-        let libdir = format!("/usr/lib/{multiarch}");
-        if Path::new(&libdir).is_dir() {
-            dirs.push((libdir, false));
-        }
-    }
-    Ok(dirs)
 }
 
 /// The tight `capabilities.resources` block from `resource-limits-manual-verification.md`'s test
@@ -249,13 +182,6 @@ pub fn manifest_yaml(
     // `bash` is allowlisted so `exec-renamed-disallowed-binary` has an allowlisted basename to
     // wear; `python3` is what every probe actually runs as.
     yaml.push_str("    allow:\n      - bash\n      - python3\n");
-    if !config.interpreter_dirs.is_empty() {
-        yaml.push_str("    interpreter_runtime:\n      - binary: python3\n        dirs:\n");
-        for (path, list_dir) in &config.interpreter_dirs {
-            yaml.push_str(&format!("          - path: {}\n", yaml_str(path)));
-            yaml.push_str(&format!("            list_dir: {list_dir}\n"));
-        }
-    }
     if case.profile == Profile::TightResources {
         yaml.push_str(tight_resources_yaml());
     }
@@ -965,7 +891,6 @@ mod tests {
             work_root: PathBuf::from("/tmp/escape-conformance-test"),
             timeout: Duration::from_secs(1),
             systemd_scope: false,
-            interpreter_dirs: vec![("/usr/lib/python3".to_string(), true)],
         }
     }
 
@@ -1266,11 +1191,10 @@ mod tests {
     #[test]
     fn every_generated_manifest_parses_as_mur_run_parses_it() {
         let mut config = config();
-        // A work root with a space and a colon in it, and an interpreter dir with a `#`: every
-        // path is a quoted scalar, or one of these would end the value early.
+        // A work root and a probe driver path with a space and a colon in them: every path is a
+        // quoted scalar, or one of these would end the value early.
         config.work_root = PathBuf::from("/tmp/escape conformance: work");
         config.probe_driver = PathBuf::from("/opt/a build: tree/probe-driver");
-        config.interpreter_dirs = vec![("/usr/lib/python3 #1".to_string(), true)];
 
         let mut profiles_seen = (false, false);
         let cases = std::iter::once(&cases::PREFLIGHT).chain(cases::all_cases());

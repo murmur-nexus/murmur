@@ -644,7 +644,7 @@ fn declared_grant_binaries(policy: &CapabilityPolicy) -> impl Iterator<Item = &s
 ///
 /// `Path::starts_with` is component-wise, not textual, so `/usrlocal/bin/pip` is correctly *not*
 /// under `/usr` — the trap a `str::starts_with` would fall into.
-fn under_any(path: &Path, roots: &[PathBuf]) -> bool {
+pub(crate) fn under_any(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 

@@ -1481,9 +1481,7 @@ def main():
                       block in runner.rs. RLIMIT_NOFILE is set last in the child's pre_exec \
                       window, after the cgroup join and the enforcement setup, so it bounds the \
                       exec'd interpreter alone, and the descriptors that interpreter already \
-                      holds count against it before the loop opens its first. Measured \
-                      CONTAINED at `sealed`: EMFILE after 125 descriptors against a declared \
-                      max_open_files of 128, read back from the child's own RLIMIT_NOFILE.",
+                      holds count against it before the loop opens its first.",
         advisory: Must(Contained),
         scoped: Must(Contained),
         sealed: Must(Contained),
