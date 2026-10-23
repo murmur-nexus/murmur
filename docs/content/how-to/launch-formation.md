@@ -124,15 +124,16 @@ network:
 
 ### `crew/lead/murmur.yaml`
 
-`lead` is told to hand its task on, takes the formation's one task, and may reach other members'
-doors:
+`lead` is told to hand its task on, declares no lifecycle, and may reach other members' doors:
 
 ```yaml
   system_prompt: "You are 'lead', the entry member of the formation 'crew'. You do not do the task yourself: worker does it. Your first reply is a call-member tool call that hands worker the task you are given, stated in full. Then end your turn while worker works. When worker's answer arrives in this conversation, answer with it. If the runtime says worker gave no answer, say so in your reply and do not answer the task yourself."
-…
-lifecycle:
-  task_acceptance: single           # one task: the formation's
-  after_task: exit                  # exit when it ends, which stops the formation
+
+# How the capsule takes tasks is not declared here: mur run --roster sets the entry member's
+# lifecycle on every launch. With --task it runs that one task and exits, which ends the
+# formation; without, it takes tasks at its door one after another until the formation is
+# stopped.
+# https://docs.murmur.nexus/reference/cli/#mur-run-roster
 …
 capabilities:
   network:                          # IP destinations the capsule may reach
@@ -146,8 +147,9 @@ network:
 
 - **System prompt.** `lead` does not do the task itself: it hands the task to `worker` with
   `call-member`, ends its turn, and answers with what comes back.
-- **Lifecycle.** `single` and `exit` make `lead` take the formation's task and exit when it ends.
-  Its exit ends the formation.
+- **Lifecycle.** `lead` declares none: `mur run --roster` sets the entry member's lifecycle on
+  every launch. With `--task`, `lead` takes that one task and exits when it ends, and its exit ends
+  the formation. Without `--task`, it takes tasks at its door until the formation is stopped.
 - **Egress.** The roster grants `lead` a name and a credential, not network access. A member's
   door is served on loopback at a port chosen at launch, so `lead` allows the bare host
   `localhost`. Without it every call fails, and the launch prints
@@ -457,8 +459,8 @@ from `crew` as in Step 6, finds both sides.
 
 ## Step 8 — see how the formation ends
 
-`lead` takes one task and exits when it ends. When `lead`'s process ends, the launcher closes every
-other member's lifeline, and the formation is over:
+Launched with `--task`, `lead` takes that one task and exits when it ends. When `lead`'s process
+ends, the launcher closes every other member's lifeline, and the formation is over:
 
 1. `worker` appends `formation_ended` to its trace, before anything else its wind-down writes:
 
@@ -481,8 +483,14 @@ mur ps
 no running capsules
 ```
 
-The formation lives for this one task. To run it again, launch it again with a new task: the new
-launch is a new formation with a new id. `mur run --roster` refuses `--resume`, and a member's
+Launched with `--task`, the formation lives for that one task. To run it again, launch it again
+with a new task: the new launch is a new formation with a new id.
+
+Launched without `--task`, the formation stays up and `lead` takes tasks at its door one after
+another, from the operator or from a client such as `nexus`. `mur ps --json` names `lead` as the
+formation's `entry_member`, `mur token <lead's session>` prints the token its door takes, and
+`mur stop frm_<id>` ends the formation; the launcher then exits `143`. See
+[Launching a formation](../reference/cli.md#mur-run-roster). `mur run --roster` refuses `--resume`, and a member's
 session resumed by hand belongs to no formation. See
 [How a formation ends](../reference/roster.md#launch-stop) and
 [Resuming a member's session](../reference/roster.md#launch-resume).
@@ -494,7 +502,7 @@ session resumed by hand belongs to no formation. See
 | Feature / setting | How it works |
 |---|---|
 | Scaffold | `mur new --roster crew` writes `roster.yaml` and one `murmur.yaml` per member, with the provider from `~/.murmur/config.yaml`, and prints the `Next:` steps |
-| Entry member | `entry: true` in `roster.yaml`. It receives the task and is never called; when its task ends, the formation ends |
+| Entry member | `entry: true` in `roster.yaml`. It receives the formation's tasks and is never called by a peer. With `--task` the formation ends when that task ends; without, it takes tasks at its door until `mur stop` |
 | Edge | A `reachability` rule. It gives the caller `call-member` and a credential for the callee's door |
 | Consent | `exports.peer_tasks.accept: true` on every member a rule calls |
 | Authentication | `network.authentication` on every member once the roster has any edge |
@@ -503,4 +511,4 @@ session resumed by hand belongs to no formation. See
 | Launch | `mur run --roster crew --task "…"` starts the peers, waits for each door, then starts the entry member |
 | Hand-off | `call-member` returns at once: started when the callee holds the task, or busy when it has no room, and the runtime keeps offering a busy callee the task. The answer, or word that none came, comes back into the caller's same task. A member with nothing to give ends its task with `end-without-answer`, and its caller's call ends `no_answer` |
 | Trace | `mur trace show frm_<id>` from the roster's directory lists every member by roster name and every call: who called whom, how it ended, whether the answer was delivered, and how many offers a busy callee turned away. Behind each call row, `member_call` in the caller's trace and `a2a_task_received` with `caller_member` in the callee's |
-| End | The entry member exits after its task; every other member records `formation_ended` and exits; the launcher exits with the entry member's status |
+| End | With `--task`, the entry member exits after its task; every other member records `formation_ended` and exits; the launcher exits with the entry member's status. Without, `mur stop frm_<id>` ends every member and the launcher exits `143` |

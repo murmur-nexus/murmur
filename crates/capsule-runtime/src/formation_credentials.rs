@@ -236,6 +236,7 @@ impl FormationAuthority {
             formation_id: self.formation_id.clone(),
             member: member.to_string(),
             launcher: None,
+            entry: false,
             verify_key: self.verify_key(),
             calls: callees
                 .iter()
@@ -376,6 +377,10 @@ pub struct FormationBundle {
     /// `mur stop` can find the launcher from it. `None` when the launcher could not read its own
     /// start time, and the line then carries no `launcher` key.
     pub launcher: Option<crate::running::ProcessIdentity>,
+    /// Whether this member is the formation's entry member, which the member writes into its
+    /// running record so `mur ps` can say which member runs the formation's task. The line
+    /// carries `"entry":true` only when it is; a line without the key is a peer's.
+    pub entry: bool,
     pub verify_key: FormationVerifyKey,
     /// One token per callee, in roster order.
     pub calls: Vec<(String, FormationToken)>,
@@ -387,6 +392,7 @@ impl std::fmt::Debug for FormationBundle {
             .field("formation_id", &self.formation_id.as_str())
             .field("member", &self.member)
             .field("launcher", &self.launcher)
+            .field("entry", &self.entry)
             .field(
                 "calls",
                 &self
@@ -436,8 +442,9 @@ impl FormationBundle {
                 )
             })
             .unwrap_or_default();
+        let entry = if self.entry { ",\"entry\":true" } else { "" };
         format!(
-            "{{\"formation_id\":{},\"member\":{}{launcher},\"verify_key\":{},\"calls\":[{}]}}",
+            "{{\"formation_id\":{},\"member\":{}{launcher}{entry},\"verify_key\":{},\"calls\":[{}]}}",
             json_string(self.formation_id.as_str()),
             json_string(&self.member),
             json_string(&self.verify_key.render()),
@@ -476,6 +483,15 @@ impl FormationBundle {
             )));
         }
         let launcher = object.get("launcher").map(parse_launcher).transpose()?;
+        let entry = match object.get("entry") {
+            None => false,
+            Some(Value::Bool(entry)) => *entry,
+            Some(_) => {
+                return Err(channel_unreadable(
+                    "its first line's entry is not a boolean",
+                ))
+            }
+        };
         let verify_key = FormationVerifyKey::parse(string("verify_key")?).map_err(|why| {
             channel_unreadable(format!(
                 "its first line's verify_key is not a formation key: {why}"
@@ -524,6 +540,7 @@ impl FormationBundle {
             formation_id,
             member,
             launcher,
+            entry,
             verify_key,
             calls,
         })
@@ -647,6 +664,8 @@ pub struct FormationMember {
     verifier: FormationVerifier,
     /// The launcher its first line named, if it named one.
     launcher: Option<crate::running::ProcessIdentity>,
+    /// Whether its first line named it the formation's entry member.
+    entry: bool,
     /// Roster order.
     calls: Vec<(String, FormationToken)>,
     book: Mutex<AddressBook>,
@@ -671,6 +690,7 @@ impl FormationMember {
         Self {
             verifier: FormationVerifier::new(bundle.formation_id, bundle.member, bundle.verify_key),
             launcher: bundle.launcher,
+            entry: bundle.entry,
             calls: bundle.calls,
             book: Mutex::new(AddressBook::default()),
             arrived: Condvar::new(),
@@ -787,6 +807,12 @@ impl FormationMember {
     /// line that named none.
     pub fn launcher(&self) -> Option<&crate::running::ProcessIdentity> {
         self.launcher.as_ref()
+    }
+
+    /// Whether this member is its formation's entry member, as its first line said. A child this
+    /// member delegates to is not a formation member at all, so it is never the entry member.
+    pub fn is_entry(&self) -> bool {
+        self.entry
     }
 
     /// What this member's door checks a formation token with.
@@ -1179,6 +1205,53 @@ mod tests {
         let back = FormationBundle::parse_line(&without).unwrap();
         assert_eq!(back.launcher, None);
         assert_eq!(FormationMember::from_bundle(back).launcher(), None);
+    }
+
+    /// The entry flag is written after `launcher` only when it is set and read back whole; a line
+    /// without it, which is every peer's, reads as not the entry member, and anything but a
+    /// boolean is refused.
+    #[test]
+    fn a_first_line_names_the_entry_member_and_no_other() {
+        let (authority, _) = chain_roster();
+        let launcher = crate::running::ProcessIdentity {
+            pid: 4242,
+            process_start: "987654".to_string(),
+        };
+        let mut bundle = authority.member_bundle("planner", &["coder"]);
+        assert!(!bundle.entry);
+        bundle.launcher = Some(launcher);
+        bundle.entry = true;
+        let line = bundle.render_line();
+        assert!(
+            line.contains("\"process_start\":\"987654\"},\"entry\":true,\"verify_key\":\""),
+            "{line}"
+        );
+        let back = FormationBundle::parse_line(&line).unwrap();
+        assert!(back.entry);
+        assert_eq!(back.calls, bundle.calls);
+        assert!(FormationMember::from_bundle(back).is_entry());
+
+        let peer = authority
+            .member_bundle("coder", &["reviewer"])
+            .render_line();
+        assert!(!peer.contains("entry"), "{peer}");
+        let back = FormationBundle::parse_line(&peer).unwrap();
+        assert!(!back.entry);
+        assert!(!FormationMember::from_bundle(back).is_entry());
+
+        let mut value: Value = serde_json::from_str(&peer).unwrap();
+        value["entry"] = Value::Bool(false);
+        assert!(
+            !FormationBundle::parse_line(&value.to_string())
+                .unwrap()
+                .entry
+        );
+        value["entry"] = Value::String("true".to_string());
+        let error = FormationBundle::parse_line(&value.to_string()).unwrap_err();
+        assert!(
+            error.to_string().contains("entry is not a boolean"),
+            "{error}"
+        );
     }
 
     #[test]

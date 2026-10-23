@@ -450,6 +450,7 @@ fn max_age_removes_an_ended_formation_and_keeps_a_live_one() {
         credentials: Default::default(),
         formation_id: Some(FormationId::parse(&old_record).unwrap()),
         formation_member: None,
+        formation_entry: false,
         formation_lifeline: false,
         formation_launcher: None,
         spawned_by: None,

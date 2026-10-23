@@ -188,8 +188,13 @@ The rule governs [`GetTask`](#tasks-get), [`ListTasks`](#list-tasks), `CancelTas
 [`SubscribeToTask`](#subscribe-to-task), a message's [`taskId`](#task-id) and its
 [`referenceTaskIds`](#reference-task-ids). A task the caller does not see is answered exactly as an
 id the session never held: [`-32001`](#errors) with `metadata.taskId`, and
-`not a task this capsule holds` in a reference block. A task the runtime starts itself, such as a
-detached command's result, belongs to the session.
+`not a task this capsule holds` in a reference block. A task the runtime starts itself belongs to
+the session:
+
+| Task | On the door |
+|---|---|
+| The launch's own task: `mur run --task`, or a `task.md` or `input.txt` in the workdir | From the moment the door is announced, so the first `ListTasks` lists it. `SubscribeToTask` follows it and `CancelTask` reaches it like any task a client sent |
+| A detached command's result, or a resumed launch's report of commands it lost | From the moment the command's result arrives, or the launch starts |
 
 `murmur.WatchSession` and `murmur.StopSession` are the session's own methods. A credential holding either
 reaches every task through it, whatever that credential started: `murmur.WatchSession` carries every

@@ -134,8 +134,8 @@ pub enum RosterRefusal {
     /// `from` is the offending rule's own `from`; `entry` is the entry member's name.
     #[error(
         "{ROSTER_FILENAME}: the reachability rule from '{from}' lists the entry member '{entry}' \
-         in `to`, but the entry member is never called: it runs the formation's own task from \
-         launch until the formation ends"
+         in `to`, but the entry member is never called by a peer: it takes the formation's tasks \
+         from the launch or from a client at its door"
     )]
     RuleCallsEntryMember { from: String, entry: String },
     /// `coordinate` is `capsule@version`.

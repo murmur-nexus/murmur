@@ -67,11 +67,18 @@ changes `murmur.lock`.
 
 ## The entry member { #entry-member }
 
-The entry member receives the formation's task, splits it up and hands the parts to the members
-it may call. Its task outcome is the formation's outcome.
+The entry member receives the formation's tasks, splits each one up and hands the parts to the
+members it may call. What it takes depends on the launch:
 
-The entry member is never called. It runs the formation's one task from launch until the
-formation ends, and accepts no other, so there is no task slot for a peer's call to fill. A rule
+| Launch | The entry member |
+|---|---|
+| `mur run --roster --task "…"` | Runs that one task, and its outcome is the formation's outcome. The formation ends with it |
+| `mur run --roster` | Takes tasks at its door, from the operator or a client, one after another, until the formation is stopped |
+
+Either way the task is a task on its door: [`ListTasks`](agent-card.md#list-tasks) lists it,
+`SubscribeToTask` follows it, and `CancelTask` reaches it.
+
+The entry member is never called by a peer: no member holds a credential for its door. A rule
 that lists it in `to` is refused with [`E-ROS-008`](diagnostics.md#e-ros-008).
 
 | Reachability | The entry member calls | The entry member is called by |
@@ -140,7 +147,7 @@ call a member than it holds tasks at once, [`W-ROS-001`](diagnostics.md#w-ros-00
 
 ## Launching a formation { #launch }
 
-[`mur run --roster`](cli.md#mur-run-roster) launches the admitted roster for one task:
+[`mur run --roster`](cli.md#mur-run-roster) launches the admitted roster:
 
 1. **Admit.** The roster is admitted as above. A refusal starts nothing.
 2. **Mint.** One formation id and one signing key are minted for this launch. The key exists only
@@ -154,11 +161,16 @@ call a member than it holds tasks at once, [`W-ROS-001`](diagnostics.md#w-ros-00
    serves an agent card naming the session id that line reported.
 5. **Hand out addresses.** Each peer that may call other peers is sent their door URLs on its
    channel.
-6. **Start the entry member.** The entry member starts last, with
-   `--lifecycle-task-acceptance single --lifecycle-after-task exit`. Its channel holds its
-   credentials and its callees' door URLs before it starts.
+6. **Start the entry member.** The entry member starts last, with the lifecycle the launch sets
+   in place of its manifest's, shown below. Its channel holds its credentials, its callees' door
+   URLs and its role as the entry member before it starts.
 7. **End.** When the entry member's process ends, for any reason, the formation ends: every peer
    is stopped and the signing key is dropped. See [How a formation ends](#launch-stop).
+
+| Launch | The entry member's lifecycle | The formation ends |
+|---|---|---|
+| With `--task` | `--lifecycle-task-acceptance single --lifecycle-after-task exit`, and `--task` | When that task ends |
+| Without `--task` | `--lifecycle-task-acceptance queue --lifecycle-after-task sleep`, with no [idle timeout](manifest.md#idle-timeout) | On [`mur stop <formation-id>`](cli.md#mur-stop-formation), a signal to the launcher, or `--deadline` |
 
 `mur run --roster --deadline <SECONDS>` fixes one moment, counted from the launcher's start, and
 passes it to every member as that member's deadline. Every member ends at the same instant however
@@ -353,8 +365,8 @@ own environment places it in one, so a session resumed by hand never re-adopts a
 | Lifeline | None: nothing winds it down, and its trace has no `formation_ended` |
 | [`W-RUN-007`](diagnostics.md#w-run-007) | Not printed |
 
-`mur run --roster` refuses `--resume` with exit status 2. A formation lives for one task, so to run
-it again, launch it again with a new task.
+`mur run --roster` refuses `--resume` with exit status 2. To run a formation again, launch it
+again: the new launch is a new formation.
 
 ## How reachability is enforced { #enforcement }
 
@@ -525,7 +537,7 @@ each `a2a_task_received` a formation token let in — see the
 ### Why a formation credential never expires { #enforcement-lifetime }
 
 A formation credential has no expiry, no rotation and no revocation list, because it cannot outlive
-the one task it was issued for. The signing key exists only in the launcher's memory and is dropped
+the formation it was issued for. The signing key exists only in the launcher's memory and is dropped
 when the formation is torn down; a new launch of the same roster has a new formation id and a new
 key, so a token from an earlier launch is `401` at every door of the new one. Rotation would solve
 a problem that cannot occur.

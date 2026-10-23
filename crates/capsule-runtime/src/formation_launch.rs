@@ -7,6 +7,11 @@
 //! The launcher waits on the entry member's process, so the peers are stopped however the entry
 //! member ends — its task finishing, its own `exit(143)`, or a `SIGKILL` of its process.
 //!
+//! **The launch decides what the entry member does** ([`entry_args`]). Launched with a task, it
+//! runs that one task and exits, which ends the formation. Launched without one, it takes tasks
+//! at its door one after another, with no idle timeout, until the formation is stopped: `mur stop`,
+//! a signal to the launcher, or the deadline.
+//!
 //! **Every member holds a lifeline.** Each member is handed the read end of a pipe of its own
 //! ([`crate::lifeline`]), whose write end only the launcher holds and never writes to. A member
 //! that reads EOF winds down as a first `SIGTERM` would wind it down. The launcher ends a
@@ -31,8 +36,8 @@
 //! Once every peer's door answers, each peer that calls other peers is written one address line
 //! naming their doors; the entry member's first line and address line are both written before it is
 //! spawned. Nothing here writes a token to stdout, stderr, a file, argv or an environment
-//! variable. Callees never include the entry member: it runs the formation's own task from launch
-//! until the formation ends and serves no peer, and admission never admits an edge into it. The
+//! variable. Callees never include the entry member: it takes the formation's tasks at its door
+//! from the operator or a client and serves no peer, and admission never admits an edge into it. The
 //! key and the write ends are dropped once every member is reaped.
 //!
 //! **Teardown.**
@@ -229,8 +234,8 @@ impl FormationPlan {
             .unwrap_or_default()
     }
 
-    /// `member`'s channel first line, signed by `authority` and naming `launcher` as the process
-    /// that started it.
+    /// `member`'s channel first line, signed by `authority`, naming `launcher` as the process
+    /// that started it, and saying whether `member` is the plan's entry member.
     fn first_line(
         &self,
         authority: &FormationAuthority,
@@ -240,6 +245,7 @@ impl FormationPlan {
         let callees: Vec<&str> = self.callees_of(member).iter().map(String::as_str).collect();
         let mut bundle = authority.member_bundle(member, &callees);
         bundle.launcher = launcher.cloned();
+        bundle.entry = member == self.entry.name;
         bundle.render_line()
     }
 }
@@ -885,13 +891,22 @@ pub(crate) fn peer_args(
 /// The entry member's arguments after the binary. It runs in the project directory, where its
 /// `--task` is written. Never [`child_launch::READINESS_TOKENS_FLAG`]: the entry's output is the
 /// operator's.
+///
+/// The launch decides the entry member's lifecycle, whatever its manifest declares. Given a task,
+/// it runs that one task and exits (`single` + `exit`), which ends the formation. Given none, it
+/// takes tasks at its door one after another with no idle timeout (`queue` + `sleep`), until the
+/// formation is stopped.
 pub(crate) fn entry_args(member: &PlannedMember, options: &FormationLaunchOptions) -> Vec<String> {
     let mut args = member_args(member, &options.project_dir);
+    let (task_acceptance, after_task) = match options.task {
+        Some(_) => ("single", "exit"),
+        None => ("queue", "sleep"),
+    };
     args.extend([
         "--lifecycle-task-acceptance".to_string(),
-        "single".to_string(),
+        task_acceptance.to_string(),
         "--lifecycle-after-task".to_string(),
-        "exit".to_string(),
+        after_task.to_string(),
     ]);
     if let Some(task) = &options.task {
         args.push("--task".to_string());
@@ -2005,6 +2020,27 @@ mod tests {
             "no deadline, no flag: {peer:?} {entry:?}"
         );
 
+        // Without a task the entry member takes tasks at its door until the formation is
+        // stopped, and is handed no `--task`; the peers' argv does not change.
+        options.task = None;
+        let untasked = entry_args(&member("planner"), &options);
+        assert_eq!(
+            &untasked[9..],
+            [
+                "--lifecycle-task-acceptance",
+                "queue",
+                "--lifecycle-after-task",
+                "sleep",
+                "--json",
+                "--verbose",
+                "--no-env-file",
+                "--containment",
+                "scoped",
+            ]
+        );
+        assert_eq!(peer_args(&coder, &options, &workdir), peer);
+        options.task = Some("probe".to_string());
+
         // The formation's deadline goes to every member last, as one moment.
         let deadline = SessionDeadline::after(
             Instant::now(),
@@ -2581,6 +2617,14 @@ mod tests {
             assert_eq!(bundle.verify_key, coder_bundle.verify_key);
             assert_eq!(bundle.launcher, launcher, "{}", bundle.member);
         }
+        // Only the entry member is told it is the entry member; a peer's line has no key at all.
+        assert!(planner_bundle.entry);
+        assert!(!coder_bundle.entry && !reviewer_bundle.entry);
+        assert!(planner[0].contains("\"entry\":true"), "{planner:?}");
+        assert!(
+            !coder[0].contains("\"entry\"") && !reviewer[0].contains("\"entry\""),
+            "{coder:?} {reviewer:?}"
+        );
         assert!(!planner.join("\n").contains("reviewer"), "{planner:?}");
         let addresses = |line: &str| -> Vec<(String, String)> {
             parse_address_line(line)
@@ -2912,6 +2956,7 @@ mod tests {
             credentials: Default::default(),
             formation_id: formation.cloned(),
             formation_member: None,
+            formation_entry: false,
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,

@@ -81,26 +81,25 @@ pub(crate) fn run_ps(verbose: bool, json: bool) -> Result<(), CliError> {
     let mut rows = Vec::new();
     let mut pruned = Vec::new();
     for record in listing.records {
-        match running::verify(&record) {
-            Liveness::Live => rows.push((record, STATUS_RUNNING)),
-            Liveness::Unreachable(_) => rows.push((record, STATUS_UNREACHABLE)),
-            Liveness::Gone(reason) => {
-                running::prune(&record);
-                if verbose {
-                    match &record.formation_id {
-                        Some(formation) => capsule_runtime::report_eprintln!(
-                            "pruned: {} — {reason} (formation {formation})",
-                            record.session_id
-                        ),
-                        None => capsule_runtime::report_eprintln!(
-                            "pruned: {} — {reason}",
-                            record.session_id
-                        ),
-                    }
+        let liveness = running::verify(&record);
+        if liveness.is_running() {
+            rows.push((record, row_status(&liveness)));
+            continue;
+        }
+        running::prune(&record);
+        if verbose {
+            let reason = liveness.reason();
+            match &record.formation_id {
+                Some(formation) => capsule_runtime::report_eprintln!(
+                    "pruned: {} — {reason} (formation {formation})",
+                    record.session_id
+                ),
+                None => {
+                    capsule_runtime::report_eprintln!("pruned: {} — {reason}", record.session_id)
                 }
-                pruned.push(record);
             }
         }
+        pruned.push(record);
     }
     if verbose {
         for path in &listing.removed_unreadable {
@@ -152,6 +151,10 @@ struct CapsuleListing {
 #[derive(Debug, serde::Serialize)]
 struct ListedFormation {
     formation_id: String,
+    /// The entry member's roster name: from the record in this read that says it is the entry
+    /// member, a listed one first, else a gone one kept on disk. `null` when no record in this
+    /// read says so.
+    entry_member: Option<String>,
     /// How many entries of `capsules` carry this formation id.
     listed: usize,
     /// How many of `not_listed` have the reason [`REASON_ENDED`].
@@ -199,6 +202,8 @@ struct ListedCapsule {
     started_at: String,
     formation_id: Option<String>,
     formation_member: Option<String>,
+    /// `true` for the entry member of a formation, `false` for every other session.
+    formation_entry: bool,
 }
 
 /// `mur ps --json`: the rows `mur ps` would print, and the formations they name, as one
@@ -221,34 +226,18 @@ fn run_ps_json() -> Result<(), CliError> {
     let mut rows = Vec::new();
     let mut gone = Vec::new();
     for record in scan.records {
-        match running::verify(&record) {
-            Liveness::Live => rows.push((record, STATUS_RUNNING)),
-            Liveness::Unreachable(_) => rows.push((record, STATUS_UNREACHABLE)),
-            Liveness::Gone(_) => gone.push(record),
+        let liveness = running::verify(&record);
+        if liveness.is_running() {
+            rows.push((record, row_status(&liveness)));
+        } else {
+            gone.push(record);
         }
     }
     let formations = listed_formations(&rows, &gone);
-    let mut capsules = Vec::new();
-    for (record, status) in rows {
-        capsules.push(ListedCapsule {
-            status,
-            url: record.url,
-            pid: record.pid,
-            process_start: record.process_start,
-            capsule_name: record.capsule_name,
-            capsule_version: record.capsule_version,
-            workdir: record.workdir.display().to_string(),
-            records_dir: record.records_dir.display().to_string(),
-            outlives_launcher: record.outlives_launcher,
-            started_at: record.started_at,
-            formation_id: record
-                .formation_id
-                .as_ref()
-                .map(|id| id.as_str().to_string()),
-            formation_member: record.formation_member,
-            session_id: record.session_id,
-        });
-    }
+    let capsules = rows
+        .into_iter()
+        .map(|(record, status)| listed_capsule(record, status))
+        .collect();
     capsule_runtime::report_println!(
         "{}",
         serde_json::to_string_pretty(&CapsuleListing {
@@ -258,6 +247,39 @@ fn run_ps_json() -> Result<(), CliError> {
         .expect("a listing of strings, integers and booleans always serializes")
     );
     Ok(())
+}
+
+/// `record`'s entry in `capsules`, with the status its row carries.
+fn listed_capsule(record: RunningRecord, status: &'static str) -> ListedCapsule {
+    ListedCapsule {
+        status,
+        url: record.url,
+        pid: record.pid,
+        process_start: record.process_start,
+        capsule_name: record.capsule_name,
+        capsule_version: record.capsule_version,
+        workdir: record.workdir.display().to_string(),
+        records_dir: record.records_dir.display().to_string(),
+        outlives_launcher: record.outlives_launcher,
+        started_at: record.started_at,
+        formation_id: record
+            .formation_id
+            .as_ref()
+            .map(|id| id.as_str().to_string()),
+        formation_member: record.formation_member,
+        formation_entry: record.formation_entry,
+        session_id: record.session_id,
+    }
+}
+
+/// The status a running record's row carries: [`STATUS_RUNNING`] when its door answered for it,
+/// else [`STATUS_UNREACHABLE`].
+fn row_status(liveness: &Liveness) -> &'static str {
+    if *liveness == Liveness::Live {
+        STATUS_RUNNING
+    } else {
+        STATUS_UNREACHABLE
+    }
 }
 
 /// The one stderr line a default `mur ps` prints for `removed` records, or `None` for none.
@@ -361,13 +383,14 @@ fn listed_formations(
         .into_iter()
         .map(|formation| {
             let listed = in_formation(&formation, rows.iter().map(|(record, _)| record));
-            let census = formation_census(
-                &formation,
-                &listed,
-                &in_formation(&formation, gone),
-                &recorded,
-            );
-            listed_formation(&formation, listed.len(), census)
+            let kept = in_formation(&formation, gone);
+            let entry_member = listed
+                .iter()
+                .chain(&kept)
+                .find(|record| record.formation_entry)
+                .and_then(|record| record.formation_member.clone());
+            let census = formation_census(&formation, &listed, &kept, &recorded);
+            listed_formation(&formation, entry_member, listed.len(), census)
         })
         .collect()
 }
@@ -375,6 +398,7 @@ fn listed_formations(
 /// `formation`'s entry in `formations`, from its census.
 fn listed_formation(
     formation: &FormationId,
+    entry_member: Option<String>,
     listed: usize,
     census: FormationCensus,
 ) -> ListedFormation {
@@ -398,6 +422,7 @@ fn listed_formation(
         .count();
     ListedFormation {
         formation_id: formation.as_str().to_string(),
+        entry_member,
         listed,
         ended,
         gone_without_ending: not_listed.len() - ended,
@@ -696,6 +721,7 @@ mod tests {
             credentials: Default::default(),
             formation_id: formation.cloned(),
             formation_member: None,
+            formation_entry: false,
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,
@@ -872,6 +898,7 @@ mod tests {
             entries,
             serde_json::json!([{
                 "formation_id": formation.as_str(),
+                "entry_member": null,
                 "listed": 1,
                 "ended": 2,
                 "gone_without_ending": 2,
@@ -895,6 +922,69 @@ mod tests {
                 "formation {formation}: 1 listed (1 running), 2 pruned now; not listed: 1 ended, \
                  1 with no record"
             )
+        );
+    }
+
+    /// Every capsule entry carries `formation_entry`, `false` for a standalone session, right
+    /// after `formation_member`.
+    #[test]
+    fn every_listed_capsule_says_whether_it_is_a_formation_entry() {
+        let (standalone, status) = row("ses_1", None);
+        let capsule = listed_capsule(standalone, status);
+        assert_eq!(
+            serde_json::to_value(&capsule).unwrap()["formation_entry"],
+            false
+        );
+        let text = serde_json::to_string(&capsule).unwrap();
+        assert!(
+            text.ends_with(r#""formation_member":null,"formation_entry":false}"#),
+            "{text}"
+        );
+
+        let formation = FormationId::mint();
+        let (mut entry, status) = row("ses_2", Some(&formation));
+        entry.formation_member = Some("lead".to_string());
+        entry.formation_entry = true;
+        let value = serde_json::to_value(listed_capsule(entry, status)).unwrap();
+        assert_eq!(value["formation_member"], "lead");
+        assert_eq!(value["formation_entry"], true);
+    }
+
+    /// A formation's `entry_member` is the roster name of the record that says it is the entry
+    /// member — a listed one before a gone one kept on disk — and `null` when no record in the
+    /// read says so.
+    #[test]
+    fn a_formations_entry_member_comes_from_the_record_marked_entry() {
+        let formation = FormationId::mint();
+        let records = tempfile::tempdir().unwrap();
+        let root = records.path().join("project");
+        let (lead, worker, old_lead) = (
+            session_after(&formation, 30, "3"),
+            session_after(&formation, 20, "2"),
+            session_after(&formation, 10, "1"),
+        );
+        let mut lead_record = member_at(&root, &lead, &formation, Some("lead"));
+        lead_record.formation_entry = true;
+        let worker_record = member_at(&root, &worker, &formation, Some("worker"));
+        let mut gone_lead = member_at(&root, &old_lead, &formation, Some("planner"));
+        gone_lead.formation_entry = true;
+
+        let rows = vec![
+            (lead_record.clone(), STATUS_RUNNING),
+            (worker_record.clone(), STATUS_RUNNING),
+        ];
+        let entries = listed_formations(&rows, std::slice::from_ref(&gone_lead));
+        assert_eq!(entries[0].entry_member.as_deref(), Some("lead"));
+
+        let peers_only = vec![(worker_record.clone(), STATUS_RUNNING)];
+        let entries = listed_formations(&peers_only, std::slice::from_ref(&gone_lead));
+        assert_eq!(entries[0].entry_member.as_deref(), Some("planner"));
+
+        let entries = listed_formations(&peers_only, &[]);
+        assert_eq!(entries[0].entry_member, None);
+        assert_eq!(
+            serde_json::to_value(&entries[0]).unwrap()["entry_member"],
+            serde_json::Value::Null
         );
     }
 

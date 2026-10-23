@@ -64,8 +64,8 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Where one running session's door is, and which process holds it.
 ///
 /// Every field but `door_token`, `credentials`, `formation_id`, `formation_member`,
-/// `formation_lifeline`, `formation_launcher` and `spawned_by` is required, and each of those seven
-/// is omitted when it does not apply, so a standalone session's record carries the ten required
+/// `formation_entry`, `formation_lifeline`, `formation_launcher` and `spawned_by` is required, and
+/// each of those eight is omitted when it does not apply, so a standalone session's record carries the ten required
 /// keys alone. There is no version field: a record that does not deserialize names no process that
 /// could be checked, and is pruned, which is what "the record is a hint" already means — except one
 /// an older `mur` wrote, which [`scan`] recognises by its missing `records_dir` and no reader
@@ -133,6 +133,12 @@ pub struct RunningRecord {
         deserialize_with = "member_name_field::deserialize"
     )]
     pub formation_member: Option<String>,
+    /// The session is its formation's entry member: the member `mur run --roster` hands the
+    /// formation's task, or whose door takes the formation's tasks. Set from the member's
+    /// formation channel. Absent when `false`: for every other member, every session in no
+    /// formation, a member's delegated child, and in a record an older runtime wrote.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub formation_entry: bool,
     /// The session holds a formation lifeline: its launcher ends it by closing that lifeline, and
     /// nothing else needs to. Absent when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -473,6 +479,26 @@ pub enum Liveness {
     Unreachable(String),
     /// The process that wrote the record is gone. The record is stale and can be pruned.
     Gone(String),
+}
+
+impl Liveness {
+    /// Whether the record still names a running capsule: false exactly for `Gone`.
+    ///
+    /// The same rule as [`ProcessState::is_running`], reached through [`verify`]: `Alive` becomes
+    /// `Live` or `Unreachable` after the probe, `Unverified` becomes `Unreachable`, and `Gone`
+    /// stays `Gone`. The probe decides whether the door answers, never whether the capsule runs.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        !matches!(self, Liveness::Gone(_))
+    }
+
+    /// Why the record is not `Live`, or the empty string when it is.
+    pub fn reason(&self) -> &str {
+        match self {
+            Liveness::Live => "",
+            Liveness::Unreachable(reason) | Liveness::Gone(reason) => reason,
+        }
+    }
 }
 
 /// All three layers, door probe included.
@@ -948,6 +974,7 @@ mod tests {
             credentials: BTreeMap::new(),
             formation_id: None,
             formation_member: None,
+            formation_entry: false,
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,
@@ -994,6 +1021,7 @@ mod tests {
             credentials: BTreeMap::new(),
             formation_id: None,
             formation_member: None,
+            formation_entry: false,
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,
@@ -1281,8 +1309,10 @@ mod tests {
 
     #[test]
     fn a_launched_members_record_round_trips_its_launcher_and_lineage() {
-        let member = launched_member();
+        let mut member = launched_member();
+        member.formation_entry = true;
         let value = serde_json::to_value(&member).unwrap();
+        assert_eq!(value["formation_entry"], true);
         assert_eq!(value["formation_lifeline"], true);
         assert_eq!(
             value["formation_launcher"],
@@ -1293,22 +1323,55 @@ mod tests {
         assert_eq!(back, member);
     }
 
-    /// The three keys are written only when they apply, so a record without them is byte for
+    /// The four keys are written only when they apply, so a record without them is byte for
     /// byte the record a standalone session always wrote.
     #[test]
-    fn a_record_holding_no_lifeline_launcher_or_spawner_omits_all_three_keys() {
+    fn a_record_holding_no_entry_lifeline_launcher_or_spawner_omits_all_four_keys() {
         let mut member = launched_member();
+        member.formation_entry = false;
         member.formation_lifeline = false;
         member.formation_launcher = None;
         member.spawned_by = None;
         let body = serde_json::to_string_pretty(&member).unwrap();
-        for key in ["formation_lifeline", "formation_launcher", "spawned_by"] {
+        for key in [
+            "formation_entry",
+            "formation_lifeline",
+            "formation_launcher",
+            "spawned_by",
+        ] {
             assert!(!body.contains(key), "{key} in {body}");
         }
         assert_eq!(
             serde_json::from_str::<RunningRecord>(&body).unwrap(),
             member
         );
+    }
+
+    /// `Liveness::is_running` and `ProcessState::is_running` are one rule: for every process
+    /// state, every `Liveness` `verify` can reach from it is running exactly when the state is.
+    #[test]
+    fn liveness_is_running_exactly_when_its_process_state_is() {
+        for state in [
+            ProcessState::Alive,
+            ProcessState::Unverified("unreadable start time".to_string()),
+            ProcessState::Gone("no such process".to_string()),
+        ] {
+            let reachable = match liveness_without_probe(state.clone()) {
+                Some(liveness) => vec![liveness],
+                // What the door probe can make of a live process.
+                None => vec![
+                    Liveness::Live,
+                    Liveness::Unreachable("the door did not answer".to_string()),
+                ],
+            };
+            for liveness in reachable {
+                assert_eq!(
+                    liveness.is_running(),
+                    state.is_running(),
+                    "{state:?} → {liveness:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1713,6 +1776,7 @@ mod home_tests {
             credentials: BTreeMap::new(),
             formation_id: None,
             formation_member: None,
+            formation_entry: false,
             formation_lifeline: false,
             formation_launcher: None,
             spawned_by: None,

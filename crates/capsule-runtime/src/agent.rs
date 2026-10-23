@@ -688,8 +688,8 @@ pub(crate) async fn run_agent_loop(
     mode: ConversationMode,
     context_id: Option<String>,
     seed: Option<HookSeed>,
-    // This task's cancel flag, or `None` where no task can be cancelled: the `task.md` paths,
-    // which run no A2A task.
+    // This task's cancel flag; `None` only where a unit test drives an attempt with no task to
+    // cancel.
     cancel: Option<CancelSignal>,
     thread: &mut TaskThread,
     continuation: Option<Continuation>,

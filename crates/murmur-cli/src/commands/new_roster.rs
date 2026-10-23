@@ -105,38 +105,43 @@ struct MemberTemplate {
     /// Declares `exports.peer_tasks.accept: true`. True for exactly the members a
     /// [`REACHABILITY`] rule names in its `to`, which admission requires.
     serves_peers: bool,
+    /// The sentence after the capsule name in the file's header comment.
+    role: &'static str,
+    /// The `lifecycle:` block the member declares. `None` for the entry member, whose lifecycle
+    /// `mur run --roster` sets on every launch.
+    lifecycle: Option<LifecycleTemplate>,
+}
+
+/// A member's declared `lifecycle:` block, each value with its trailing comment.
+struct LifecycleTemplate {
     task_acceptance: &'static str,
     task_acceptance_note: &'static str,
     after_task: &'static str,
     after_task_note: &'static str,
-    /// The sentence after the capsule name in the file's header comment.
-    role: &'static str,
-    lifecycle_note: &'static str,
+    /// What the block's header comment says after "How the capsule takes tasks: ".
+    note: &'static str,
 }
 
 const LEAD: MemberTemplate = MemberTemplate {
     name: "lead",
     entry: true,
     serves_peers: false,
-    task_acceptance: "single",
-    task_acceptance_note: "one task: the formation's",
-    after_task: "exit",
-    after_task_note: "exit when it ends, which stops the formation",
     role: "the entry member, which receives the formation's task",
-    lifecycle_note: "the entry member takes the formation's one task and exits, which ends the \
-                     formation",
+    lifecycle: None,
 };
 
 const WORKER: MemberTemplate = MemberTemplate {
     name: "worker",
     entry: false,
     serves_peers: true,
-    task_acceptance: "queue",
-    task_acceptance_note: "take tasks one after another",
-    after_task: "sleep",
-    after_task_note: "wait at the door for the next one",
     role: "the member lead may call, which serves tasks at its door",
-    lifecycle_note: "worker waits at its door for as long as the formation runs",
+    lifecycle: Some(LifecycleTemplate {
+        task_acceptance: "queue",
+        task_acceptance_note: "take tasks one after another",
+        after_task: "sleep",
+        after_task_note: "wait at the door for the next one",
+        note: "worker waits at its door for as long as the formation runs",
+    }),
 };
 
 /// The formation's members, in the order `roster.yaml` lists them.
@@ -774,24 +779,39 @@ fn render_member(name: &str, member: &MemberTemplate, choice: &ProviderChoice) -
         2,
         &format!("system_prompt: {}", quoted(&system_prompt(name, member))),
     )
-    .blank()
-    .comment(
-        0,
-        &format!("How the capsule takes tasks: {}.", member.lifecycle_note),
-    )
-    .see(0, "manifest/#field-lifecycle")
-    .bare(0, "lifecycle:")
-    .line(
-        2,
-        &format!("task_acceptance: {}", member.task_acceptance),
-        member.task_acceptance_note,
-    )
-    .line(
-        2,
-        &format!("after_task: {}", member.after_task),
-        member.after_task_note,
-    )
     .blank();
+    match &member.lifecycle {
+        Some(lifecycle) => {
+            yaml.comment(
+                0,
+                &format!("How the capsule takes tasks: {}.", lifecycle.note),
+            )
+            .see(0, "manifest/#field-lifecycle")
+            .bare(0, "lifecycle:")
+            .line(
+                2,
+                &format!("task_acceptance: {}", lifecycle.task_acceptance),
+                lifecycle.task_acceptance_note,
+            )
+            .line(
+                2,
+                &format!("after_task: {}", lifecycle.after_task),
+                lifecycle.after_task_note,
+            )
+            .blank();
+        }
+        None => {
+            yaml.comment(
+                0,
+                "How the capsule takes tasks is not declared here: mur run --roster sets the
+                 entry member's lifecycle on every launch. With --task it runs that one task and
+                 exits, which ends the formation; without, it takes tasks at its door one after
+                 another until the formation is stopped.",
+            )
+            .see(0, "cli/#mur-run-roster")
+            .blank();
+        }
+    }
     let callees = callees_of(member.name);
     if !callees.is_empty() {
         yaml.comment(
@@ -1093,18 +1113,30 @@ mod tests {
         }
     }
 
+    /// Worker declares the lifecycle it runs with. Lead declares none, because `mur run
+    /// --roster` sets the entry member's lifecycle on every launch, and says so where the block
+    /// would be.
     #[test]
     fn lifecycles_are_stated() {
         let (_, lead, worker, scaffold) = files(&default_choice());
-        let lead_lifecycle = lead.lifecycle.unwrap();
-        assert_eq!(lead_lifecycle.task_acceptance, TaskAcceptance::Single);
-        assert_eq!(lead_lifecycle.after_task, AfterTask::Exit);
+        assert!(lead.lifecycle.is_none());
         let worker_lifecycle = worker.lifecycle.unwrap();
         assert_eq!(worker_lifecycle.task_acceptance, TaskAcceptance::Queue);
         assert_eq!(worker_lifecycle.after_task, AfterTask::Sleep);
         let lead_text = scaffold.file(Path::new("lead/murmur.yaml")).unwrap();
-        assert!(lead_text.contains("task_acceptance: single"));
-        assert!(lead_text.contains("after_task: exit"));
+        assert!(!lead_text.contains("lifecycle:\n"), "{lead_text}");
+        assert!(!lead_text.contains("task_acceptance"), "{lead_text}");
+        // The comment's wrapped lines, read as one.
+        let unwrapped = lead_text.replace("\n# ", " ");
+        assert!(
+            unwrapped
+                .contains("mur run --roster sets the entry member's lifecycle on every launch"),
+            "{lead_text}"
+        );
+        assert!(lead_text.contains(&format!("# {DOCS}/cli/#mur-run-roster\n")));
+        let worker_text = scaffold.file(Path::new("worker/murmur.yaml")).unwrap();
+        assert!(worker_text.contains("task_acceptance: queue"));
+        assert!(worker_text.contains("after_task: sleep"));
     }
 
     /// The mur release a deploy installs is the deployer's choice, so no scaffold pins it.

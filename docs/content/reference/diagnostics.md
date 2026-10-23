@@ -2626,13 +2626,13 @@ with `mur install <capsule>@<version>`, or change the member's `version` to one 
 ### E-ROS-008 — a rule calls the entry member { #e-ros-008 }
 
 ```text
-error[E-ROS-008]: roster.yaml: the reachability rule from 'coder' lists the entry member 'planner' in `to`, but the entry member is never called: it runs the formation's own task from launch until the formation ends
+error[E-ROS-008]: roster.yaml: the reachability rule from 'coder' lists the entry member 'planner' in `to`, but the entry member is never called by a peer: it takes the formation's tasks from the launch or from a client at its door
   hint: remove 'planner' from that rule's `to` in roster.yaml. For 'coder' to report to 'planner', write the edge the other way — `- from: planner` with `to: [coder]` — so 'planner' hands 'coder' its work with call-member and 'coder''s answer comes back into 'planner''s own task; 'coder' then needs exports.peer_tasks.accept: true in its murmur.yaml
 ```
 
-The message names the rule's `from` and the entry member. The entry member is never called: it
-runs the formation's own task from launch until the formation ends and accepts no other, so a call
-into it has nothing to run in. See [The entry member](roster.md#entry-member).
+The message names the rule's `from` and the entry member. The entry member is never called by a
+peer: its tasks come from the launch's `--task` or from a client at its door, and no member is
+issued a credential for it. See [The entry member](roster.md#entry-member).
 
 Turn the edge around: remove the entry member from the rule's `to`, and write a rule `from:` the
 entry member with the caller in `to`. The entry member then hands the caller its work with

@@ -1870,10 +1870,11 @@ fn lifecycle_a_rejected_task_reads_rejected_over_tasks_get() {
     assert_eq!(events_named(&events, "task_rejected").len(), 1);
 }
 
-/// Under the default lifecycle (`single` + `exit`) the door takes one task while the `task.md`
-/// task runs and refuses the next as busy. The one it took is refused when the session closes.
+/// Under the default lifecycle (`single` + `exit`) the launch's own task holds the door's one
+/// slot from the moment the door is announced, so a task sent while it runs is refused as busy and
+/// nothing is left for the session to refuse when it closes.
 #[test]
-fn lifecycle_single_exit_rejects_the_task_it_accepted_during_its_task_md_task() {
+fn lifecycle_single_exit_refuses_a_task_while_its_launch_task_runs() {
     let (server, arrived, release) = held_provider(end_turn_response("msg_1", "done"));
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path, None, None);
@@ -1884,12 +1885,10 @@ fn lifecycle_single_exit_rejects_the_task_it_accepted_during_its_task_md_task() 
     arrived
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("the task.md task reached the provider");
-    let (task_b, state) = send_task(&capsule_url, "m-b", "taken while the launch task runs");
-    assert_eq!(state, "TASK_STATE_SUBMITTED");
-    let (busy_task, busy_state) = send_task(&capsule_url, "m-c", "one too many");
+    let (busy_task, busy_state) = send_task(&capsule_url, "m-b", "sent while the launch task runs");
     assert_eq!(
         busy_state, "TASK_STATE_REJECTED",
-        "a single capsule holds one task"
+        "the launch task holds a single capsule's one slot"
     );
     release.send(()).unwrap();
 
@@ -1897,12 +1896,12 @@ fn lifecycle_single_exit_rejects_the_task_it_accepted_during_its_task_md_task() 
     assert!(result.is_ok(), "the launch task completed: {result:?}");
 
     let events = read_trace(&trace_path);
-    assert_sole_rejection(&events, &task_b, "session_ended");
     assert!(
         events_naming(&events, &busy_task).is_empty(),
         "a busy refusal is not recorded"
     );
-    assert_eq!(events_named(&events, "task_rejected").len(), 1);
+    assert!(events_named(&events, "task_rejected").is_empty());
+    assert_eq!(events_named(&events, "task_start").len(), 1);
     assert_eq!(server.requests().len(), 1);
     assert_eq!(events_named(&events, "session_end")[0]["exit_status"], "ok");
 }

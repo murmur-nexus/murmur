@@ -640,8 +640,8 @@ pub(crate) async fn run_process_inference_loop(
     _name: &str,
     _version: &str,
     session_policy: HarnessSessionPolicy,
-    // This task's cancel flag, or `None` for a run with no task to stop — `mur run`, a `task.md`
-    // launch. Without one the harness is never interrupted.
+    // This task's cancel flag, or `None` for a run with no task to stop. Without one the harness
+    // is never interrupted.
     cancel: Option<CancelSignal>,
     // What this attempt continues `session_policy.reopen_session` with — a reopen's feedback or
     // member answers — sent as the harness's prompt in place of `task.md`. `None` on an attempt

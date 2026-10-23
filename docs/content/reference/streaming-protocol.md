@@ -208,6 +208,10 @@ does not end a subscription. The reply comes on a `SendMessage` or `SendStreamin
 task, and the subscription then carries the task's `TASK_STATE_WORKING` status with message
 `resumed`.
 
+The launch's own task — `mur run --task`, or a `task.md` in the workdir — is a live task from the
+moment the door is announced, so a subscription to it, found with
+[`ListTasks`](agent-card.md#list-tasks), carries its events to its terminal status like any other.
+
 ### What `murmur.WatchSession` writes, in order { #watch-order }
 
 1. The response headers.

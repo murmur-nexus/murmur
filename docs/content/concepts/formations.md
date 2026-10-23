@@ -8,16 +8,19 @@ of them is the **entry member** that receives the formation's task, and the rost
 members may call which. [`mur doctor`](../reference/cli.md#doctor-roster) checks a roster against
 the installed capsules. See the [Roster Schema](../reference/roster.md).
 
-`mur run --roster` launches a roster for one task:
+`mur run --roster` launches a roster:
 
 1. Every member runs as its own `mur run` process, and every member carries the same
    `formation_id`, minted for this launch. Each member's trace names it.
 2. The other members, the peers, start first, each counted ready only once its door answers as the
-   session it reported. The entry member starts last, with the formation's task.
-3. When the entry member's task ends, the formation ends.
+   session it reported. The entry member starts last.
+3. Launched with `--task`, the entry member runs that one task, and when it ends the formation
+   ends. Launched without one, the entry member takes tasks at its door, from the operator or a
+   client such as `nexus`, one after another, until the formation is stopped with `mur stop`, a
+   signal or its deadline.
 
-One launch is one formation, for one task. Launching the same roster again makes a new formation
-with a new id. See [Launching a formation](../reference/roster.md#launch) and the
+Either way, the entry member's task is a task on its door, which `ListTasks` lists while it runs.
+One launch is one formation. Launching the same roster again makes a new formation with a new id. See [Launching a formation](../reference/roster.md#launch) and the
 [`mur run --roster` flags and output](../reference/cli.md#mur-run-roster).
 [How to launch a formation of capsules](../how-to/launch-formation.md) scaffolds a two-member
 formation, launches it, and follows one member handing the other its task.
@@ -63,8 +66,8 @@ A call from one member to another succeeds only when all three layers allow it:
 | The callee's consent | The callee's `murmur.yaml` | The callee declares [`exports.peer_tasks.accept: true`](../reference/manifest.md#field-exports-peer-tasks), and its door [lets in only a credential issued for it](../reference/roster.md#enforcement-door) |
 | The caller's egress | The caller's `murmur.yaml` | The caller's own [`capabilities.network.allow`](../reference/roster.md#member-calls) lists `localhost` |
 
-The entry member is never called: it runs the formation's one task from launch until the formation
-ends, and accepts no other. A rule that lists it in `to` is refused at admission with
+The entry member is never called by a peer: its tasks come from the launch or from a client at its
+door, and no member holds a credential for it. A rule that lists it in `to` is refused at admission with
 [`E-ROS-008`](../reference/diagnostics.md#e-ros-008). To have a member report to the entry member,
 let the entry member call it; the answer comes back into the entry member's own task. See
 [The entry member](../reference/roster.md#entry-member).
@@ -115,7 +118,7 @@ wire two capsules together by hand, with a pinned port and `curl`, see
   it through its loopback tool server; the answer reaches it when the runtime resumes the
   harness's session — see [How the answer arrives](../reference/runtime-provided-tools.md#call-member-answer).
 - **Credential rotation.** A formation credential has no expiry, rotation or revocation; the
-  credentials end with the formation's one task — see
+  credentials end with the formation — see
   [Why a formation credential never expires](../reference/roster.md#enforcement-lifetime).
 - **Cancelling a member's task.** A formation credential reaches `CancelTask` only for the tasks
   its member started, and the runtime sends it only for a task a member took just after the
