@@ -59,7 +59,9 @@ section that explains it.
 | `E-NEW-002` | The name given to `mur new --roster`, or a capsule name derived from it, is not an artifact name | [`mur new --roster`](cli.md#mur-new-roster) |
 | `E-NEW-003` | The directory `mur new --roster` would write already exists | [`mur new --roster`](cli.md#mur-new-roster-writing) |
 | `E-NEW-004` | `inference.provider` in `~/.murmur/config.yaml` names a provider `mur new --roster` has no driver for | [`mur new --roster`](cli.md#mur-new-roster-provider) |
-| `E-NEW-005` | `mur new <task>` was given `--index local`, the global store the generator capsule cannot read | [`mur new`](cli.md#mur-new-task) |
+| `E-NEW-005` | `mur new` was given `--index local`, the global store, which is not a published artifact index | [`mur new`](cli.md#mur-new) |
+| `E-NEW-006` | `mur new` could not read the artifact index it takes default-artifact versions from | [E-NEW-006](#e-new-006) |
+| `E-NEW-007` | The artifact index `mur new` read lists no version of a default artifact that fits this `mur` | [E-NEW-007](#e-new-007) |
 | `E-REG-001` | The scope's index lists no such name, no such version, or no payload of it for the host platform, or no version that fits this `mur`; or a `local/` artifact is not in the store, and no source serves the `local` scope | [E-REG-001](#e-reg-001) |
 | `E-REG-002` | Artifact bytes do not match the sha256 recorded for them or listed in the source's index, or an artifact's packed `name:` or `version:` is not the one it is installed as | [E-REG-002](#e-reg-002) |
 | `E-REG-003` | An artifact of that name and version is already published | [`mur publish`](cli.md#mur-publish) |
@@ -2138,6 +2140,39 @@ error[E-CFG-003]: /home/ana/.murmur/config.yaml sets registry.default, which thi
 
 `mur index` writes an [artifact index](artifact-index.md) and `mur search` reads one. A refused
 `mur index` writes nothing and leaves an existing output file as it was.
+
+### E-NEW-006 — `mur new` could not read the artifact index { #e-new-006 }
+
+`mur new` writes each default artifact at the newest version that fits this `mur` in a published
+artifact index — see [`mur new`](cli.md#mur-new). With no index to read it refuses and writes
+nothing. The message names the index and why it was not read:
+
+```text
+error[E-NEW-006]: could not read the artifact index of github:murmur-nexus/default-artifacts: request failed: io: Connection refused
+  hint: pass --index <PATH|URL> to take versions from an artifact index file or http(s) URL instead
+```
+
+| Index | Message names |
+|---|---|
+| Omitted `--index`: the latest default-artifacts release | `the artifact index of github:murmur-nexus/default-artifacts` and what the source answered. A rate limit adds the token advice `mur install` gives to the hint |
+| An `--index` URL | `the artifact index at <URL>` and the request's failure or HTTP status |
+| An `--index` file | `the artifact index file <PATH>` and the read error |
+
+Restore the network or the source, or pass `--index` naming a copy of an index you hold.
+
+### E-NEW-007 — no fitting version of a default artifact { #e-new-007 }
+
+The artifact index `mur new` read is of another scope, does not list a default artifact it writes,
+or lists only versions that do not fit this `mur`. The message names the artifact and the index,
+and for versions that do not fit, the newest one and why:
+
+```text
+error[E-NEW-007]: the artifact index github:murmur-nexus/default-artifacts v1.0.0 lists no version of murmur/driver-anthropic that fits this mur; the newest it lists, 1.1.0, needs murmur:driver/process@9.9.9, this mur serves murmur:driver@0.3.0
+  hint: upgrade mur, or pass --index <PATH|URL> naming an artifact index that lists a version of murmur/driver-anthropic this mur fits
+```
+
+A version fits when this `mur` serves its WIT level and one of its payloads runs on this platform
+— see [WIT levels](wit-levels.md).
 
 ### E-IDX-001 — a file cannot be indexed { #e-idx-001 }
 

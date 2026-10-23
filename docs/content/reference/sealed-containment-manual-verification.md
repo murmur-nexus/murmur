@@ -159,7 +159,8 @@ and a `bash` shell allowlist are what this procedure needs; `inference.transport
 the agent loop through a locally installed harness CLI rather than a hosted API key, the same
 pattern as the [quickstart](../getting-started/quickstart.md#want-to-use-a-subscription). The
 [process driver](manifest.md#process-driver) is what knows how to drive that CLI — swap it for
-whichever driver matches the harness the host has installed:
+whichever driver matches the harness the host has installed. Replace `<VERSION>` with the version
+`mur search driver-claude-code` lists in its `VERSION` column:
 
 ```yaml
 name: sealed-check
@@ -167,7 +168,7 @@ version: 0.1.0
 
 artifacts:
   - name: murmur/driver-claude-code
-    version: "0.1.0"
+    version: "<VERSION>"
     runtime: driver
 
 capabilities:

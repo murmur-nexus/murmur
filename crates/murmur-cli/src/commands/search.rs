@@ -148,31 +148,27 @@ pub(crate) fn read_index_file_verbatim(path: &str) -> Result<(ArtifactIndex, Str
 }
 
 fn fetch_remote(url: &str) -> Result<ArtifactIndex, CliError> {
-    let client = crate::http::blocking_agent(Duration::from_secs(30));
-    let mut response = client.get(url).call().map_err(|e| {
+    let raw = fetch_index_text(url, Duration::from_secs(30)).map_err(|reason| {
         CliError::new(
             E_IO_003,
-            format!("failed to fetch artifact index from {url}: {e}"),
-        )
-    })?;
-
-    if !response.status().is_success() {
-        return Err(CliError::new(
-            E_IO_003,
-            format!(
-                "failed to fetch artifact index from {url}: HTTP {}",
-                response.status()
-            ),
-        ));
-    }
-
-    let raw = response.body_mut().read_to_string().map_err(|e| {
-        CliError::new(
-            E_IO_003,
-            format!("failed to fetch artifact index from {url}: {e}"),
+            format!("failed to fetch artifact index from {url}: {reason}"),
         )
     })?;
     ArtifactIndex::from_json(&raw).map_err(|error| index_error(url, error))
+}
+
+/// The body of a GET of `url` within `timeout`, or why there is none: the request failed, the
+/// status is not 2xx, or the body is not text.
+pub(crate) fn fetch_index_text(url: &str, timeout: Duration) -> Result<String, String> {
+    let client = crate::http::blocking_agent(timeout);
+    let mut response = client.get(url).call().map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| e.to_string())
 }
 
 fn index_entries(index: ArtifactIndex, platform: &str) -> Vec<SearchEntry> {

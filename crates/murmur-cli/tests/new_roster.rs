@@ -2,7 +2,9 @@
 //! `mur run --roster` exactly as written, and every refusal leaves the directory as it found it.
 //!
 //! Every case runs the real `mur` binary in an empty scratch directory, under a scratch `HOME`,
-//! with no provider key in its environment.
+//! with no provider key in its environment. Each scaffold takes its driver version from the
+//! committed copy of a default-artifacts release's index, named with `--index`, unless the case
+//! is about where that version comes from.
 
 mod common;
 
@@ -16,8 +18,12 @@ use std::time::{Duration, Instant};
 
 use common::door_capsule::end_turn;
 use common::formation::{assert_no_member_remains, launch_lock};
+use common::github_release::MockGitHub;
 use common::ScriptedServer;
-use murmur_artifact::{ApiKeyReference, RuntimeManifest};
+use murmur_artifact::{
+    current_platform, version_fit, ApiKeyReference, ArtifactIndex, FitSubject, RuntimeManifest,
+    VersionFit,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -82,6 +88,11 @@ impl Scratch {
 
     fn run(&self, args: &[&str]) -> Finished {
         self.run_in(self.path(), args)
+    }
+
+    /// `mur new --roster <name> --index <the committed index>`.
+    fn new_roster(&self, name: &str) -> Finished {
+        self.run(&["new", "--roster", name, "--index", &committed_index()])
     }
 
     /// `mur <args>` as [`Scratch::command`] runs it, from `dir`.
@@ -199,19 +210,44 @@ fn store_key(scratch: &Scratch, step: &str, key_var: &str) {
     assert!(!set.stdout.contains(TEST_KEY) && !set.stderr.contains(TEST_KEY));
 }
 
-/// The `extra.v.<key>` value in `docs/mkdocs.yml`: the driver version a scaffolded member pins.
-fn docs_version(key: &str) -> String {
-    let mkdocs = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/mkdocs.yml"),
-    )
-    .unwrap();
-    let prefix = format!("{key}:");
-    let line = mkdocs
+/// The committed verbatim copy of a default-artifacts release's index.
+fn committed_index() -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/published-index/artifacts-index.json")
+        .display()
+        .to_string()
+}
+
+/// The version of `murmur/<name>` a scaffold over [`committed_index`] pins: the newest the index
+/// lists, which fits this mur.
+fn committed_version(name: &str) -> String {
+    let index =
+        ArtifactIndex::from_json(&std::fs::read_to_string(committed_index()).unwrap()).unwrap();
+    let newest = &index
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.name == name)
+        .unwrap_or_else(|| panic!("the committed index lists no {name}"))
+        .versions[0];
+    assert_eq!(
+        version_fit(
+            &FitSubject::indexed(newest),
+            capsule_runtime::served_wit_level(),
+            current_platform()
+        ),
+        VersionFit::Fits,
+        "{name}@{} fits this mur",
+        newest.version
+    );
+    newest.version.clone()
+}
+
+/// The summary line naming the driver version and the index it came from.
+fn driver_line(stdout: &str) -> &str {
+    stdout
         .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with(&prefix))
-        .unwrap_or_else(|| panic!("no {key} in docs/mkdocs.yml"));
-    line[prefix.len()..].trim().trim_matches('"').to_string()
+        .find(|line| line.starts_with("  Driver: "))
+        .unwrap_or_else(|| panic!("no Driver: line in\n{stdout}"))
 }
 
 /// Run the printed key, driver and build-and-install steps, `steps[0..4]`, as printed. The driver
@@ -226,7 +262,7 @@ fn install_as_printed(scratch: &Scratch, steps: &[String]) {
         .split_once('@')
         .unwrap();
     assert_eq!(driver_name, "murmur/driver-anthropic");
-    assert_eq!(driver_version, docs_version("murmur_driver_anthropic"));
+    assert_eq!(driver_version, committed_version("driver-anthropic"));
     let artifacts = tempfile::tempdir().unwrap();
     let driver_zip = common::create_driver_artifact(
         artifacts.path(),
@@ -271,7 +307,7 @@ fn the_scaffold_installs_and_launches_as_printed() {
         server.endpoint
     ));
 
-    let new = scratch.run(&["new", "--roster", "crew"]);
+    let new = scratch.new_roster("crew");
     new.assert_code(0);
     let steps = next_steps(&new.stdout);
     let hashes: Vec<String> = CREW_FILES
@@ -467,7 +503,7 @@ fn the_scaffolded_lead_hands_the_worker_a_task() {
         "inference:\n  provider: anthropic\n  model: test-model\n  endpoint: {}\n",
         server.endpoint
     ));
-    let new = scratch.run(&["new", "--roster", "crew"]);
+    let new = scratch.new_roster("crew");
     new.assert_code(0);
     let steps = next_steps(&new.stdout);
     let hashes: Vec<String> = CREW_FILES
@@ -644,7 +680,7 @@ fn error_line(stderr: &str) -> &str {
 #[test]
 fn doctor_in_the_scaffolded_formation_checks_its_roster() {
     let scratch = Scratch::new();
-    let new = scratch.run(&["new", "--roster", "crew"]);
+    let new = scratch.new_roster("crew");
     new.assert_code(0);
     let steps = next_steps(&new.stdout);
     let crew = scratch.path().join("crew").canonicalize().unwrap();
@@ -709,7 +745,7 @@ fn a_hand_resume_of_a_members_session_joins_no_formation() {
         "inference:\n  provider: anthropic\n  model: test-model\n  endpoint: {}\n",
         server.endpoint
     ));
-    let new = scratch.run(&["new", "--roster", "crew"]);
+    let new = scratch.new_roster("crew");
     new.assert_code(0);
     install_as_printed(&scratch, &next_steps(&new.stdout));
 
@@ -796,13 +832,14 @@ fn a_hand_resume_of_a_members_session_joins_no_formation() {
 #[test]
 fn with_no_config_the_members_name_anthropic() {
     let scratch = Scratch::new();
-    let new = scratch.run(&["new", "--roster", "crew"]);
+    let new = scratch.new_roster("crew");
     new.assert_code(0);
     for member in ["lead", "worker"] {
         let manifest = scratch.manifest(member);
         let driver = &manifest.artifacts[0];
         assert_eq!(driver.name, "murmur/driver-anthropic");
-        assert_eq!(driver.version, docs_version("murmur_driver_anthropic"));
+        assert_eq!(driver.version, committed_version("driver-anthropic"));
+        assert_eq!(driver.version, "0.10.0");
         let gateway = driver.gateway.as_ref().unwrap();
         assert_eq!(gateway.endpoint, "https://api.anthropic.com");
         assert_eq!(
@@ -819,6 +856,17 @@ fn with_no_config_the_members_name_anthropic() {
     assert!(new
         .stdout
         .contains("mur config set -g credentials.ANTHROPIC_API_KEY <your key>"));
+    assert_eq!(
+        driver_line(&new.stdout),
+        format!(
+            "  Driver: murmur/driver-anthropic@0.10.0, the newest that fits this mur in {}",
+            committed_index()
+        )
+    );
+    assert_eq!(
+        next_steps(&new.stdout)[1],
+        "mur install -g murmur/driver-anthropic@0.10.0"
+    );
     assert!(
         !scratch.config_path().exists(),
         "mur new --roster wrote a config"
@@ -835,7 +883,7 @@ fn with_no_config_the_members_name_anthropic() {
 /// artifacts.
 fn the_key_step_comes_first_and_writes_no_registry_source() {
     let scratch = Scratch::new();
-    let new = scratch.run(&["new", "--roster", "crew"]);
+    let new = scratch.new_roster("crew");
     new.assert_code(0);
     let steps = next_steps(&new.stdout);
     assert!(steps[1].starts_with("mur install -g "), "{steps:?}");
@@ -860,13 +908,14 @@ fn an_openai_config_names_the_openai_driver_and_key() {
         fake_key()
     );
     scratch.write_config(&config);
-    let new = scratch.run(&["new", "--roster", "crew"]);
+    let new = scratch.new_roster("crew");
     new.assert_code(0);
     for member in ["lead", "worker"] {
         let manifest = scratch.manifest(member);
         let driver = &manifest.artifacts[0];
         assert_eq!(driver.name, "murmur/driver-openai");
-        assert_eq!(driver.version, docs_version("murmur_driver_openai"));
+        assert_eq!(driver.version, committed_version("driver-openai"));
+        assert_eq!(driver.version, "0.9.0");
         let gateway = driver.gateway.as_ref().unwrap();
         assert_eq!(gateway.endpoint, "https://api.openai.com/v1");
         assert_eq!(
@@ -876,11 +925,12 @@ fn an_openai_config_names_the_openai_driver_and_key() {
         assert_eq!(manifest.inference.unwrap().model, "gpt-5.6-luna");
     }
     let steps = next_steps(&new.stdout);
+    assert_eq!(steps[1], "mur install -g murmur/driver-openai@0.9.0");
     assert_eq!(
-        steps[1],
+        driver_line(&new.stdout),
         format!(
-            "mur install -g murmur/driver-openai@{}",
-            docs_version("murmur_driver_openai")
+            "  Driver: murmur/driver-openai@0.9.0, the newest that fits this mur in {}",
+            committed_index()
         )
     );
     assert!(steps.contains(&"mur config set -g credentials.OPENAI_API_KEY <your key>".to_string()));
@@ -900,7 +950,7 @@ fn a_configured_endpoint_and_model_are_written_and_the_key_is_not() {
         fake_key()
     );
     scratch.write_config(&config);
-    let new = scratch.run(&["new", "--roster", "crew"]);
+    let new = scratch.new_roster("crew");
     new.assert_code(0);
     let manifest = scratch.manifest("lead");
     assert_eq!(
@@ -920,7 +970,7 @@ fn an_unknown_provider_is_refused_and_nothing_is_written() {
     let scratch = Scratch::new();
     let config = "inference:\n  provider: mistral\n";
     scratch.write_config(config);
-    let new = scratch.run(&["new", "--roster", "crew"]);
+    let new = scratch.new_roster("crew");
     new.assert_code(1);
     assert!(new.stderr.contains("error[E-NEW-004]"), "{}", new.stderr);
     assert!(new.stderr.contains("'mistral'"), "{}", new.stderr);
@@ -940,7 +990,7 @@ fn an_unknown_provider_is_refused_and_nothing_is_written() {
 fn an_endpoint_the_manifest_refuses_is_blamed_on_the_config() {
     let scratch = Scratch::new();
     scratch.write_config("inference:\n  endpoint: http://example.com\n");
-    let new = scratch.run(&["new", "--roster", "crew"]);
+    let new = scratch.new_roster("crew");
     new.assert_code(1);
     assert!(new.stderr.contains("error[E-MAN-003]"), "{}", new.stderr);
     assert!(new.stderr.contains("inference.endpoint"), "{}", new.stderr);
@@ -956,7 +1006,7 @@ fn an_existing_directory_is_never_written_into() {
     std::fs::create_dir(scratch.path().join("crew")).unwrap();
     std::fs::write(scratch.path().join("crew/keep.txt"), "mine").unwrap();
     let before = scratch.tree();
-    let new = scratch.run(&["new", "--roster", "crew"]);
+    let new = scratch.new_roster("crew");
     new.assert_code(1);
     assert!(new.stderr.contains("error[E-NEW-003]"), "{}", new.stderr);
     assert!(new.stderr.contains("./crew"), "{}", new.stderr);
@@ -968,7 +1018,7 @@ fn an_existing_file_is_never_replaced() {
     let scratch = Scratch::new();
     std::fs::write(scratch.path().join("crew"), "mine").unwrap();
     let before = scratch.tree();
-    let new = scratch.run(&["new", "--roster", "crew"]);
+    let new = scratch.new_roster("crew");
     new.assert_code(1);
     assert!(new.stderr.contains("error[E-NEW-003]"), "{}", new.stderr);
     assert!(new.stderr.contains("./crew"), "{}", new.stderr);
@@ -978,9 +1028,9 @@ fn an_existing_file_is_never_replaced() {
 #[test]
 fn a_second_scaffold_of_the_same_name_is_refused() {
     let scratch = Scratch::new();
-    scratch.run(&["new", "--roster", "crew"]).assert_code(0);
+    scratch.new_roster("crew").assert_code(0);
     let before = scratch.tree();
-    let again = scratch.run(&["new", "--roster", "crew"]);
+    let again = scratch.new_roster("crew");
     again.assert_code(1);
     assert!(
         again.stderr.contains("error[E-NEW-003]"),
@@ -1011,7 +1061,12 @@ fn a_name_that_is_not_an_artifact_name_is_refused() {
     ];
     for (name, reason) in cases {
         let scratch = Scratch::new();
-        let new = scratch.run(&["new", &format!("--roster={name}")]);
+        let new = scratch.run(&[
+            "new",
+            &format!("--roster={name}"),
+            "--index",
+            &committed_index(),
+        ]);
         new.assert_code(1);
         assert!(
             new.stderr.contains("error[E-NEW-002]"),
@@ -1029,6 +1084,247 @@ fn a_name_that_is_not_an_artifact_name_is_refused() {
     }
 }
 
+// ── Where the driver version comes from ──────────────────────────────────────
+
+/// The default-artifacts repository and its owner's GitHub id, as the built-in source checks.
+const DEFAULT_REPO: &str = "murmur-nexus/default-artifacts";
+const MURMUR_OWNER_ID: u64 = 190_196_424;
+
+/// An interface list naming a package version this mur does not serve, sorted.
+const UNSERVED: &str =
+    r#"["murmur:driver/process@9.9.9", "murmur:stream/events@0.1.0", "murmur:tool/run@0.1.0"]"#;
+
+/// Interfaces this mur serves.
+const SERVED: &str = r#"["murmur:stream/events@0.1.0", "murmur:tool/run@0.1.0"]"#;
+
+/// A schema 2 index of `scope` listing `name` at each `(version, interfaces)`, newest first.
+fn index_json(scope: &str, name: &str, versions: &[(&str, &str)]) -> String {
+    let versions: Vec<String> = versions
+        .iter()
+        .map(|(version, interfaces)| {
+            format!(
+                r#"{{"version": "{version}", "release": "v0.99.0", "interfaces": {interfaces},
+                    "assets": [{{"file": "{name}-{version}.mur.zip", "sha256": "{}"}}]}}"#,
+                "ab".repeat(32)
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"schema_version": 2, "scope": "{scope}", "artifacts": [
+            {{"name": "{name}", "runtime": "driver", "tags": [], "versions": [{}]}}]}}"#,
+        versions.join(", ")
+    )
+}
+
+/// With no `--index`, the version is the newest that fits this mur in the index on the latest
+/// default-artifacts release, read through the built-in source: a newer version needing an
+/// interface this mur does not serve is passed over, and no payload is downloaded.
+#[test]
+fn the_default_source_decides_the_driver_version_by_fit() {
+    let scratch = Scratch::new();
+    let stub = MockGitHub::start();
+    stub.repository(DEFAULT_REPO, MURMUR_OWNER_ID);
+    let index = index_json(
+        "murmur",
+        "driver-anthropic",
+        &[("0.12.0", UNSERVED), ("0.11.0", SERVED)],
+    );
+    stub.release(
+        DEFAULT_REPO,
+        "v0.99.0",
+        vec![("artifacts-index.json".to_string(), index.into_bytes())],
+    );
+    let output = scratch
+        .command(&["new", "--roster", "crew"])
+        .env("MUR_GITHUB_API_BASE", &stub.api_base)
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for member in ["lead", "worker"] {
+        let manifest = scratch.manifest(member);
+        assert_eq!(manifest.artifacts[0].name, "murmur/driver-anthropic");
+        assert_eq!(manifest.artifacts[0].version, "0.11.0", "{member}");
+    }
+    assert_eq!(
+        next_steps(&stdout)[1],
+        "mur install -g murmur/driver-anthropic@0.11.0"
+    );
+    assert_eq!(
+        driver_line(&stdout),
+        "  Driver: murmur/driver-anthropic@0.11.0, the newest that fits this mur in \
+         github:murmur-nexus/default-artifacts v0.99.0"
+    );
+    let paths = stub.paths();
+    assert!(
+        !paths.is_empty()
+            && paths
+                .iter()
+                .all(|path| path.starts_with("/repos/murmur-nexus/default-artifacts")),
+        "{paths:?}"
+    );
+    assert!(!stub.downloaded_a_payload(), "{paths:?}");
+    assert!(
+        !scratch.config_path().exists(),
+        "mur new --roster wrote a config"
+    );
+}
+
+/// A loopback address nothing listens on.
+fn closed_address() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    drop(listener);
+    address
+}
+
+/// Fail unless `finished` refused with `code`, said each of `said`, and left the scratch
+/// directory empty.
+fn assert_refused(scratch: &Scratch, finished: &Finished, code: &str, said: &[&str]) {
+    finished.assert_code(1);
+    let refusal = error_line(&finished.stderr);
+    assert!(
+        refusal.starts_with(&format!("error[{code}]")),
+        "{}",
+        finished.stderr
+    );
+    for said in said {
+        assert!(
+            finished.stderr.contains(said),
+            "{said}: {}",
+            finished.stderr
+        );
+    }
+    assert!(scratch.tree().is_empty(), "{:?}", scratch.tree());
+}
+
+/// No index to read, whether the default source, an `--index` URL or an `--index` file: refused
+/// `E-NEW-006`, naming what was not read and `--index`, with nothing written.
+#[test]
+fn no_index_reachable_is_refused_naming_index() {
+    let scratch = Scratch::new();
+    let api_base = format!("http://{}", closed_address());
+    let output = scratch
+        .command(&["new", "--roster", "crew"])
+        .env("MUR_GITHUB_API_BASE", &api_base)
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .unwrap();
+    let source = Finished {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    };
+    assert_refused(
+        &scratch,
+        &source,
+        "E-NEW-006",
+        &[
+            "could not read the artifact index of github:murmur-nexus/default-artifacts:",
+            "hint: pass --index <PATH|URL>",
+        ],
+    );
+
+    let url = format!("http://{}/artifacts-index.json", closed_address());
+    let fetched = scratch.run(&["new", "--roster", "crew", "--index", &url]);
+    assert_refused(
+        &scratch,
+        &fetched,
+        "E-NEW-006",
+        &[
+            &format!("could not read the artifact index at {url}:"),
+            "hint: pass --index <PATH|URL>",
+        ],
+    );
+
+    let missing = scratch.run(&["new", "--roster", "crew", "--index", "./missing.json"]);
+    assert_refused(
+        &scratch,
+        &missing,
+        "E-NEW-006",
+        &[
+            "could not read the artifact index file ./missing.json:",
+            "hint: pass --index <PATH|URL>",
+        ],
+    );
+}
+
+/// An index with no fitting version of the driver: refused `E-NEW-007` naming the driver and the
+/// index, and for versions that do not fit, the newest and why. Nothing is written.
+#[test]
+fn an_index_with_no_fitting_driver_is_refused() {
+    let scratch = Scratch::new();
+    let files = tempfile::tempdir().unwrap();
+    let write = |file: &str, text: &str| {
+        let path = files.path().join(file);
+        std::fs::write(&path, text).unwrap();
+        path.display().to_string()
+    };
+    let unlisted = write(
+        "unlisted.json",
+        &index_json("murmur", "driver-openai", &[("0.9.0", SERVED)]),
+    );
+    let unfit = write(
+        "unfit.json",
+        &index_json("murmur", "driver-anthropic", &[("0.12.0", UNSERVED)]),
+    );
+    let foreign = write(
+        "foreign.json",
+        &index_json("ana", "driver-anthropic", &[("0.10.0", SERVED)]),
+    );
+    for (index, said) in [
+        (&unlisted, vec!["lists no murmur/driver-anthropic"]),
+        (
+            &unfit,
+            vec![
+                "lists no version of murmur/driver-anthropic that fits this mur",
+                "the newest it lists, 0.12.0, needs",
+                "murmur:driver/process@9.9.9",
+            ],
+        ),
+        (&foreign, vec!["'ana' scope", "murmur/driver-anthropic"]),
+    ] {
+        let refused = scratch.run(&["new", "--roster", "crew", "--index", index]);
+        let mut said = said;
+        said.push(index.as_str());
+        said.push("hint: upgrade mur, or pass --index <PATH|URL>");
+        assert_refused(&scratch, &refused, "E-NEW-007", &said);
+    }
+
+    let old = write("old.json", r#"{"schema_version":"1","artifacts":[]}"#);
+    let refused = scratch.run(&["new", "--roster", "crew", "--index", &old]);
+    assert_refused(&scratch, &refused, "E-IDX-002", &[old.as_str()]);
+}
+
+/// `--index local` is refused before the config is read: a malformed config is never reached.
+#[test]
+fn a_local_index_is_refused_before_the_config_is_read() {
+    let scratch = Scratch::new();
+    let config = "inference: [this is not a mapping\n";
+    scratch.write_config(config);
+    let refused = scratch.run(&["new", "--roster", "crew", "--index", "local"]);
+    assert_refused(
+        &scratch,
+        &refused,
+        "E-NEW-005",
+        &[
+            "--index local",
+            "hint: pass an index file or an http(s) URL",
+        ],
+    );
+    assert!(!refused.stderr.contains("E-CFG"), "{}", refused.stderr);
+    assert_eq!(
+        std::fs::read_to_string(scratch.config_path()).unwrap(),
+        config
+    );
+}
+
 // ── S6: gating ───────────────────────────────────────────────────────────────
 
 #[cfg(not(feature = "beta-mur-new"))]
@@ -1040,25 +1336,26 @@ fn the_default_build_has_only_the_roster_form() {
     assert!(help.stdout.contains("--roster <NAME>"), "{}", help.stdout);
     assert!(!help.stdout.contains("<TASK>"), "{}", help.stdout);
     assert!(!help.stdout.contains("--registry"), "{}", help.stdout);
-    assert!(!help.stdout.contains("--index"), "{}", help.stdout);
+    assert!(
+        help.stdout.contains("--index <PATH|URL>"),
+        "{}",
+        help.stdout
+    );
 
     let task = scratch.run(&["new", "summarise a doc"]);
     task.assert_code(2);
     assert!(scratch.tree().is_empty(), "{:?}", scratch.tree());
 
-    scratch.run(&["new", "--roster", "crew"]).assert_code(0);
+    scratch.new_roster("crew").assert_code(0);
 }
 
 #[cfg(feature = "beta-mur-new")]
 #[test]
 fn the_roster_form_conflicts_with_the_task_form() {
     let scratch = Scratch::new();
-    scratch
-        .run(&["new", "--roster", "crew", "summarise a doc"])
-        .assert_code(2);
-    let conflict = scratch.run(&["new", "--roster", "crew", "--index", "local"]);
+    let conflict = scratch.run(&["new", "--roster", "crew", "summarise a doc"]);
     conflict.assert_code(2);
-    assert!(conflict.stderr.contains("--index"), "{}", conflict.stderr);
+    assert!(conflict.stderr.contains("--roster"), "{}", conflict.stderr);
     assert!(scratch.tree().is_empty(), "{:?}", scratch.tree());
 }
 
@@ -1135,7 +1432,7 @@ fn the_task_form_checks_an_index_file_on_the_host_first() {
     ]);
     missing.assert_code(1);
     assert!(
-        missing.stderr.contains("E-IO-003") && missing.stderr.contains("./missing.json"),
+        missing.stderr.contains("error[E-NEW-006]") && missing.stderr.contains("./missing.json"),
         "{}",
         missing.stderr
     );
@@ -1164,7 +1461,12 @@ fn the_task_form_checks_an_index_file_on_the_host_first() {
 fn the_task_form_names_a_global_install_for_a_missing_generator_artifact() {
     let scratch = beta_task_scratch();
     let output = scratch
-        .command(&["new", "a capsule that greps logs"])
+        .command(&[
+            "new",
+            "a capsule that greps logs",
+            "--index",
+            &committed_index(),
+        ])
         .env("OPENAI_API_KEY", ["sk-", "test"].concat())
         .output()
         .unwrap();
@@ -1172,7 +1474,10 @@ fn the_task_form_names_a_global_install_for_a_missing_generator_artifact() {
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("error[E-RUN-008]"), "{stderr}");
     assert!(
-        stderr.contains("hint: run `mur install -g murmur/driver-openai@"),
+        stderr.contains(&format!(
+            "hint: run `mur install -g murmur/driver-openai@{}`",
+            committed_version("driver-openai")
+        )),
         "{stderr}"
     );
     assert!(scratch.tree().is_empty(), "{:?}", scratch.tree());
@@ -1201,5 +1506,50 @@ fn with_the_beta_flag_off_the_task_form_names_the_flag_and_the_roster_form_works
     assert!(!help.stdout.contains("<TASK>"), "{}", help.stdout);
     assert!(!help.stdout.contains("task description"), "{}", help.stdout);
 
-    scratch.run(&["new", "--roster", "crew"]).assert_code(0);
+    scratch.new_roster("crew").assert_code(0);
+}
+
+/// The generator's tools take their versions from the same index: one that lists no
+/// `murmur/tool-editor` is refused `E-NEW-007` before anything is staged.
+#[cfg(feature = "beta-mur-new")]
+#[test]
+fn the_task_form_refuses_an_index_with_no_fitting_generator_tool() {
+    let scratch = beta_task_scratch();
+    let mut index: Value =
+        serde_json::from_str(&std::fs::read_to_string(committed_index()).unwrap()).unwrap();
+    index["artifacts"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|artifact| artifact["name"] != "tool-editor");
+    let path = scratch.home.path().join("no-editor-index.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&index).unwrap()).unwrap();
+    // The whole config: the beta flag `beta_task_scratch` set, and a complete inference block.
+    scratch.write_config(&format!(
+        "beta:\n  enabled:\n  - mur-new\ninference:\n  provider: openai\n  model: gpt-5.6-luna\n  \
+         api_key: {}\n",
+        fake_key()
+    ));
+    let refused = scratch.run(&[
+        "new",
+        "a capsule that greps logs",
+        "--index",
+        path.to_str().unwrap(),
+    ]);
+    refused.assert_code(1);
+    assert!(
+        refused.stderr.contains("error[E-NEW-007]"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        refused.stderr.contains("murmur/tool-editor")
+            && refused.stderr.contains(path.to_str().unwrap()),
+        "{}",
+        refused.stderr
+    );
+    assert!(scratch.tree().is_empty(), "{:?}", scratch.tree());
+    assert!(
+        !scratch.home.path().join(".murmur/artifacts").exists(),
+        "nothing is staged"
+    );
 }

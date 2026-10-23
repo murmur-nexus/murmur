@@ -10,13 +10,12 @@ mod beta;
 mod build_commit;
 mod commands;
 mod config;
+mod default_versions;
 mod env_requirements;
 mod error;
 mod formation_trace;
 mod http;
 mod live_address;
-#[cfg(test)]
-mod published_pins;
 mod residue;
 mod session_address;
 mod source;
@@ -70,6 +69,11 @@ use commands::{
     watch::run_watch,
 };
 
+/// `mur new --index` as `mur new --roster` reads it.
+const ROSTER_INDEX_HELP: &str = "Artifact index whose newest version that fits this mur the \
+     members' driver is pinned at: an http:// or https:// URL is fetched; any other value is an \
+     index file. \"local\" is refused. Omitted, the index on the latest default-artifacts release";
+
 /// `--resume-mode`'s value vocabulary. Separate from [`ResumeMode`] so the runtime enum carries
 /// no clap derive and the CLI owns the spelling of its own values.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -120,6 +124,9 @@ enum Commands {
         /// artifact name, and prefixes each member's capsule name
         #[arg(long, value_name = "NAME")]
         roster: String,
+
+        #[arg(long, value_name = "PATH|URL", help = ROSTER_INDEX_HELP)]
+        index: Option<String>,
     },
     #[cfg(feature = "beta-mur-new")]
     /// Scaffold a formation with --roster, or generate a murmur.yaml from a plain-language task
@@ -130,7 +137,7 @@ enum Commands {
         #[arg(
             long,
             value_name = "NAME",
-            conflicts_with_all = ["task", "index"],
+            conflicts_with_all = ["task"],
             required_unless_present = "task"
         )]
         roster: Option<String>,
@@ -138,10 +145,12 @@ enum Commands {
         /// Plain-language task description for the capsule to generate (beta: mur-new)
         task: Option<String>,
 
-        /// Artifact index the generator searches: an http:// or https:// URL is fetched by its
-        /// search tool; any other value is an index file, which the generator reads from a copy
-        /// in its work folder. "local" is refused. Omitted, the generator searches the index on
-        /// the latest default-artifacts release
+        /// Artifact index to take default-artifact versions from: with --roster, the members'
+        /// driver is pinned at its newest version that fits this mur; with a task, so are the
+        /// generator's driver, tools and skill, and the generator searches it. An http:// or
+        /// https:// URL is fetched; any other value is an index file, which the generator reads
+        /// from a copy in its work folder. "local" is refused. Omitted, the index on the latest
+        /// default-artifacts release
         #[arg(long, value_name = "PATH|URL")]
         index: Option<String>,
     },
@@ -666,7 +675,7 @@ fn main() {
                 "Scaffold a formation: ./<NAME>/ holding a roster.yaml and one capsule per member",
             )
             .mut_arg("task", |arg| arg.hide(true))
-            .mut_arg("index", |arg| arg.hide(true))
+            .mut_arg("index", |arg| arg.help(ROSTER_INDEX_HELP))
         });
     }
     #[cfg(feature = "beta-mur-deploy")]
@@ -686,12 +695,13 @@ fn main() {
 
     let result = match cli.command {
         #[cfg(not(feature = "beta-mur-new"))]
-        Commands::New { roster } => run_new_roster(&roster),
+        Commands::New { roster, index } => run_new_roster(&roster, index.as_deref()),
         #[cfg(feature = "beta-mur-new")]
         Commands::New {
             roster: Some(roster),
+            index,
             ..
-        } => run_new_roster(&roster),
+        } => run_new_roster(&roster, index.as_deref()),
         #[cfg(feature = "beta-mur-new")]
         Commands::New {
             roster: None,
@@ -1042,7 +1052,6 @@ fn registry_flag_hint(subcommand: &str) -> Option<&'static str> {
         ),
         "publish" => Some("`mur publish` writes into the global store ~/.murmur/artifacts/"),
         "search" => Some("to choose the artifact index, pass --index <PATH|URL|local>"),
-        #[cfg(feature = "beta-mur-new")]
         "new" => Some("to choose the artifact index, pass --index <PATH|URL>"),
         _ => None,
     }

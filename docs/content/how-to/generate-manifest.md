@@ -104,8 +104,10 @@ mur new "review this PR for security issues" \
 ```
 
 The generator capsule fetches that URL itself, and `mur new` adds its host to the generator's
-network allow list. To search an index file on disk, pass its path instead; `mur new` checks it
-and copies it into the generator's work folder:
+network allow list. The same index decides the versions of the generator's driver, tools and
+skill: the newest of each that fits your `mur`, which is what to have installed. To search an
+index file on disk, pass its path instead; `mur new` checks it and copies it into the generator's
+work folder:
 
 ```bash
 mur new "review this PR for security issues" --index ./artifacts-index.json

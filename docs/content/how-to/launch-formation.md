@@ -51,10 +51,11 @@ Scaffolded formation 'crew' in ./crew
   crew/roster.yaml          lead is the entry member; lead may call worker
   crew/lead/murmur.yaml     capsule local/crew-lead@0.1.0
   crew/worker/murmur.yaml   capsule local/crew-worker@0.1.0, serves peers
+  Driver: murmur/driver-openai@{{ v.murmur_driver_openai }}, the newest that fits this mur in github:murmur-nexus/default-artifacts <release>
 
 Next:
   mur config set -g credentials.OPENAI_API_KEY <your key>
-  mur install -g murmur/driver-openai@0.9.0
+  mur install -g murmur/driver-openai@{{ v.murmur_driver_openai }}
   mur build crew/lead && mur install -g crew/lead/crew-lead-0.1.0.mur.zip
   mur build crew/worker && mur install -g crew/worker/crew-worker-0.1.0.mur.zip
   mur run --roster crew --task "<your task>"
@@ -196,7 +197,7 @@ Install the driver both members declare:
     ```
 
 ```text
-Installed murmur/driver-openai@0.9.0 from github:murmur-nexus/default-artifacts
+Installed murmur/driver-openai@{{ v.murmur_driver_openai }} from github:murmur-nexus/default-artifacts
 ```
 
 --8<-- "includes/mur-pull-info.md"

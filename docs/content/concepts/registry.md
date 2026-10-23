@@ -19,9 +19,9 @@ on this `mur`. [`mur index`](../reference/cli.md#mur-index) writes the index fro
 see [Publish your own artifact source](../how-to/publish-artifact-source.md).
 
 `mur install <scope>/<name>@<version>` asks each source for the bare `<name>` and stores what it
-finds under the full name you gave. The releases `murmur-nexus/default-artifacts` publishes name
-their assets with a `murmur-` prefix, so `murmur/murmur-tool-git@0.2.0` resolves from it and
-`murmur/tool-git@0.2.0` does not.
+finds under the full name you gave. The releases `murmur-nexus/default-artifacts` publishes list
+their artifacts by bare name, `tool-git`, so `murmur/tool-git@{{ v.murmur_tool_git }}` resolves
+from it.
 
 ## Artifact names { #artifact-names }
 
