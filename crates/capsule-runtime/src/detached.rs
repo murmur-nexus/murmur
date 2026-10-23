@@ -29,6 +29,7 @@ use tokio::sync::{
 
 use crate::{
     bindings::host::murmur::tool::run::{Status, ToolResult},
+    cancel::CancelSignal,
     origin::{TaskOrigin, TaskProvenance},
 };
 
@@ -680,6 +681,11 @@ pub(crate) struct DetachPolicy {
     /// then demoted at once, exactly as if it had outrun `grace`. `None` for every caller that
     /// cannot go away mid-call; the process-transport tool bridge is the one that can.
     pub abandoned: Option<AbandonSignal>,
+    /// The cancel of the task whose turn made the call. Raised before the spawn, the command is
+    /// not run; raised while it runs in the foreground, it is demoted at once, as `abandoned`
+    /// demotes it, and the cancel is claimed for [`crate::cancel::PHASE_SHELL`]. `None` for a
+    /// caller whose own wait answers the cancel: a plan step, and the process-transport bridge.
+    pub canceled: Option<CancelSignal>,
 }
 
 /// Set once by a caller that stopped waiting for a call's result.
@@ -1027,6 +1033,7 @@ mod tests {
                 context_id: "ctx_detached_tests".to_string(),
                 provenance: Some(TaskProvenance::derive(TaskOrigin::User, None)),
                 abandoned: None,
+                canceled: None,
             }),
         )
         .expect("a declared binary runs");

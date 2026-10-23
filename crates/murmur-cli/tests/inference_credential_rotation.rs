@@ -1136,13 +1136,13 @@ fn a_provider_error_echoing_the_key_is_recorded_redacted() {
     assert!(error.contains("HTTP 429"), "{error}");
     let task_failed = &run.of_type("task_failed")[0];
     assert_eq!(task_failed["cause"], "driver_error");
-    assert!(
-        task_failed["reason"]
-            .as_str()
-            .unwrap()
-            .contains("[redacted]"),
-        "{task_failed}"
-    );
+    // The driver's `error` text, not the JSON payload it arrived in.
+    let reason = task_failed["reason"].as_str().unwrap();
+    assert!(reason.contains("[redacted]"), "{task_failed}");
+    assert!(!reason.starts_with('{'), "{task_failed}");
+    let result = run.result();
+    assert!(result.contains("[redacted]"), "{result}");
+    assert!(!result.starts_with('{'), "{result}");
     assert_eq!(run.of_type("task_end")[0]["turns"], 0);
 
     let show = capsule.trace_show();

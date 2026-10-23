@@ -1560,6 +1560,7 @@ started.
 | Aspect | Behaviour |
 |---|---|
 | Reached | The session ends as a first [`SIGTERM`](#mur-run-sigterm) ends it, under the same 20-second bound: every live task is cancelled and ends `canceled`, and the teardown runs |
+| A foreground shell command running, on `transport: http` | Stops being waited for at once: it is moved to the background, the task ends `canceled` with `task_canceled.phase` `"shell"`, and the session's end kills the command |
 | Trace | `deadline_reached` before the wind-down's records, then `session_end` with `exit_status: "deadline_reached"`; `session_start.deadline` names it from the start. See [`trace.jsonl`](observability-schemas.md#deadline-reached) |
 | Exit | `status:  deadline_reached`, exit code `1`, [`E-RUN-053`](diagnostics.md#e-run-053) — unless an earlier task already failed, which keeps its own status |
 | Already past at launch | The session ends before any task runs |
@@ -2207,7 +2208,9 @@ Output format:
 A status line is `[<state>]  <message>`; a task's terminal status is `[<state>]` alone, and a
 completed task's answer follows it, wrapped and indented. `<state>` is murmur's word for the
 [`TASK_STATE_*` name](agent-card.md#task-states) the door writes, so `TASK_STATE_INPUT_REQUIRED`
-prints as `[input-required]`. On a capsule declaring `lifecycle.conversation: threaded`, the
+prints as `[input-required]`. Streamed model text is printed as it arrives, with nothing between
+two pieces; a status or artifact line after text that did not end its line starts on a new line.
+On a capsule declaring `lifecycle.conversation: threaded`, the
 bracket is `[<context id> / turn <n> / <state>]`. The context id is shortened to `ctx_` and its
 next 8 characters, then `...`; an id without the `ctx_` prefix shows its first 12 characters, then
 `...`.

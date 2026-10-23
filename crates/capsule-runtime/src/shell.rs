@@ -368,6 +368,10 @@ pub(crate) enum ShellOutcome {
 /// non-blocking syscalls rather than a busy loop.
 const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// The tool error a shell call gets when its task was cancelled before the command was spawned.
+pub(crate) const CANCELED_BEFORE_SPAWN: &str =
+    "the task was canceled before this command started, so it was not run";
+
 /// Run a shell command, demoting it to the background if it outruns `detach`'s grace period.
 ///
 /// The command starts as the leader of a new process group, with `/dev/null` as its stdin. Once
@@ -381,8 +385,9 @@ const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// the path `plan.rs` and the script-capsule store state take, because neither runs a task loop
 /// and so neither has anywhere to deliver a completion.
 ///
-/// With `detach: Some`, the child is polled until it exits or the deadline passes. On the
-/// deadline the child, its two pipe readers and the metadata needed to describe it all move to
+/// With `detach: Some`, the child is polled until it exits, the deadline passes, or the policy's
+/// abandon or cancel signal is raised; a cancel already raised refuses the call before the spawn.
+/// On demotion the child, its two pipe readers and the metadata needed to describe it all move to
 /// one plain OS thread — not a `spawn_blocking` task — so runtime teardown never waits on it. The
 /// session's end kills it with every other process the session started.
 ///
@@ -392,7 +397,7 @@ const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Every command runs in the session's one network namespace, so a server one call starts — in
 /// the background, or demoted — is reachable from the next call of the same session.
 ///
-/// Everything before the spawn is identical on both paths, including the whole spawn-failure
+/// Everything else before the spawn is identical on both paths, including the whole spawn-failure
 /// arm: a spawn failure happens inside the grace window and stays a foreground error.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_shell(
@@ -410,6 +415,16 @@ pub(crate) fn run_shell(
         return Err(ShellExecError::Failed(format!(
             "binary '{binary}' is not in capabilities.shell.allow"
         )));
+    }
+
+    // A call the task's tool loop reaches after its cancel starts nothing: the task is ending,
+    // and a command it started now would only be demoted at its first poll.
+    if detach
+        .as_ref()
+        .and_then(|detach| detach.canceled.as_ref())
+        .is_some_and(crate::cancel::CancelSignal::is_canceled)
+    {
+        return Err(ShellExecError::Failed(CANCELED_BEFORE_SPAWN.to_string()));
     }
 
     // Refuse before spawning, not after: once the workdir ceiling is crossed, the cheapest way
@@ -510,7 +525,16 @@ pub(crate) fn run_shell(
                             .abandoned
                             .as_ref()
                             .is_some_and(crate::detached::AbandonSignal::is_raised);
-                        if remaining.is_zero() || abandoned {
+                        // A cancelled task stops waiting the same way, and the session's end
+                        // kills the command it leaves running.
+                        let canceled = policy
+                            .canceled
+                            .as_ref()
+                            .filter(|signal| signal.is_canceled());
+                        if let Some(signal) = canceled {
+                            signal.note_phase(crate::cancel::PHASE_SHELL);
+                        }
+                        if remaining.is_zero() || abandoned || canceled.is_some() {
                             // A zero grace demotes here, at the first poll after the spawn.
                             return Ok(ShellOutcome::Detached(demote(
                                 child,
@@ -2565,6 +2589,7 @@ mod tests {
                 context_id: "ctx_abandon_test".to_string(),
                 provenance: Some(TaskProvenance::derive(TaskOrigin::User, None)),
                 abandoned: Some(abandon),
+                canceled: None,
             }),
         )
         .expect("a declared binary runs");
@@ -2585,6 +2610,165 @@ mod tests {
                 .any(|work| work.work_id == info.work_id),
             "the demoted command is registered like one that outran its grace"
         );
+    }
+
+    /// A detach policy for a cancel test, with a grace no test outlasts.
+    fn cancel_test_policy(
+        registry: &std::sync::Arc<crate::detached::DetachedRegistry>,
+        command: &str,
+        canceled: crate::cancel::CancelSignal,
+    ) -> crate::detached::DetachPolicy {
+        use crate::origin::{TaskOrigin, TaskProvenance};
+        crate::detached::DetachPolicy {
+            grace: Duration::from_secs(60),
+            delivered: true,
+            registry: std::sync::Arc::clone(registry),
+            command: command.to_string(),
+            context_id: "ctx_cancel_test".to_string(),
+            provenance: Some(TaskProvenance::derive(TaskOrigin::User, None)),
+            abandoned: None,
+            canceled: Some(canceled),
+        }
+    }
+
+    /// A task cancelled while its foreground command runs stops waiting on it at the next poll:
+    /// the command is demoted and registered, and the cancel is claimed for the shell.
+    #[test]
+    fn a_canceled_task_demotes_its_foreground_command() {
+        use crate::{
+            cancel::{CancelSignal, PHASE_SHELL},
+            detached::{DetachedRegistry, KillRunningOnDrop},
+        };
+
+        let temp = tempdir().unwrap();
+        let runtime = tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let (registry, _reports) = DetachedRegistry::new();
+        let _kill = KillRunningOnDrop(std::sync::Arc::clone(&registry));
+        let cancel = CancelSignal::new();
+        let raiser = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                cancel.cancel();
+            })
+        };
+
+        let started = Instant::now();
+        let outcome = run_shell(
+            "bash",
+            &["-c", "sleep 30"],
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &policy,
+            &ShellEnforcement::environment_only()
+                .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None),
+            Some(cancel_test_policy(&registry, "sleep 30", cancel.clone())),
+        )
+        .expect("a declared binary runs");
+        let elapsed = started.elapsed();
+        raiser.join().unwrap();
+
+        let ShellOutcome::Detached(info) = outcome else {
+            panic!("a canceled task's command must demote, got {outcome:?}");
+        };
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "demotion waited {elapsed:?}, as if the 60 s grace still applied"
+        );
+        assert!(
+            registry
+                .outstanding()
+                .iter()
+                .any(|work| work.work_id == info.work_id),
+            "the demoted command is registered, so the cancel residue names it"
+        );
+        assert_eq!(cancel.phase(), PHASE_SHELL);
+    }
+
+    /// The shell's claim is a first claim like any other: a wait that saw the cancel earlier
+    /// keeps the phase.
+    #[test]
+    fn an_earlier_claim_keeps_the_phase_over_the_shell() {
+        use crate::{
+            cancel::{CancelSignal, PHASE_INFERENCE},
+            detached::{DetachedRegistry, KillRunningOnDrop},
+        };
+
+        let temp = tempdir().unwrap();
+        let runtime = tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let (registry, _reports) = DetachedRegistry::new();
+        let _kill = KillRunningOnDrop(std::sync::Arc::clone(&registry));
+        let cancel = CancelSignal::new();
+        cancel.note_phase(PHASE_INFERENCE);
+        let raiser = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                cancel.cancel();
+            })
+        };
+
+        let outcome = run_shell(
+            "bash",
+            &["-c", "sleep 30"],
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &policy,
+            &ShellEnforcement::environment_only()
+                .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None),
+            Some(cancel_test_policy(&registry, "sleep 30", cancel.clone())),
+        )
+        .expect("a declared binary runs");
+        raiser.join().unwrap();
+
+        assert!(matches!(outcome, ShellOutcome::Detached(_)), "{outcome:?}");
+        assert_eq!(cancel.phase(), PHASE_INFERENCE);
+    }
+
+    /// A shell call reached after the task's cancel is refused before anything is spawned.
+    #[test]
+    fn a_canceled_task_starts_no_command() {
+        use crate::{cancel::CancelSignal, detached::DetachedRegistry};
+
+        let temp = tempdir().unwrap();
+        let runtime = tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let (registry, _reports) = DetachedRegistry::new();
+        let cancel = CancelSignal::new();
+        cancel.cancel();
+
+        let result = run_shell(
+            "bash",
+            &["-c", "touch started"],
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(temp.path()).unwrap(),
+            &policy,
+            &ShellEnforcement::environment_only()
+                .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None),
+            Some(cancel_test_policy(
+                &registry,
+                "touch started",
+                cancel.clone(),
+            )),
+        );
+
+        match result {
+            Err(ShellExecError::Failed(message)) => assert_eq!(message, CANCELED_BEFORE_SPAWN),
+            other => panic!("a canceled task's call must be refused, got {other:?}"),
+        }
+        assert!(!temp.path().join("started").exists(), "nothing was spawned");
+        assert!(registry.outstanding().is_empty(), "nothing was registered");
     }
 
     /// `run` on a thread of its own, failing the test after 30 s instead of hanging it.
@@ -2638,6 +2822,7 @@ mod tests {
                     context_id: "ctx_holder_test".to_string(),
                     provenance: Some(TaskProvenance::derive(TaskOrigin::User, None)),
                     abandoned: None,
+                    canceled: None,
                 }),
             )
             .expect("a declared binary runs")
@@ -2734,6 +2919,7 @@ mod tests {
                 context_id: "ctx_late_output_test".to_string(),
                 provenance: Some(TaskProvenance::derive(TaskOrigin::User, None)),
                 abandoned: None,
+                canceled: None,
             }),
         )
         .expect("a declared binary runs");
@@ -2789,6 +2975,7 @@ mod tests {
                     context_id: "ctx_escaped_test".to_string(),
                     provenance: Some(TaskProvenance::derive(TaskOrigin::User, None)),
                     abandoned: None,
+                    canceled: None,
                 }),
             )
             .expect("a declared binary runs")

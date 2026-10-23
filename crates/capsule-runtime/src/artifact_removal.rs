@@ -255,7 +255,7 @@ mod tests {
 
     async fn dispatch(state: &CapsuleStoreState, name: &str) -> Result<String, String> {
         state
-            .dispatch_agent_tool_async(name, input(), None)
+            .dispatch_agent_tool_async(name, input(), None, None)
             .await
             .map(|outcome| outcome.result.data.unwrap_or_default())
     }

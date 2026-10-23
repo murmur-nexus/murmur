@@ -10490,6 +10490,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                 context_id: "ctx_demoted_server".to_string(),
                 provenance: None,
                 abandoned: None,
+                canceled: None,
             }),
         )
         .expect("the server command runs");

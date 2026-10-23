@@ -1333,7 +1333,19 @@ error[E-RUN-050]: refused to remove ses_019f0193c7d871a5b2e30ff41a7c0ce1: ses_01
   hint: the runtime never follows a link inside the workdir; replace /home/me/proj/workdir/ses_019f0193c7d871a5b2e30ff41a7c0ce1 with a regular file or directory, or remove it, and run again
 ```
 
-Remove the link, or replace it with the regular file or directory it stands in for. A refusal during
+The hint names where the path is:
+
+| Path | Hint |
+|---|---|
+| In the workdir | `the runtime never follows a link inside the workdir; replace <path> with a regular file or directory, or remove it, and run again` |
+| Under `~/.murmur/records`, mur's [records directory](workdir.md#records-directory) — `mur trace rm`'s session records directory, or one a run writes to | `<path> is in mur's records directory, where mur never follows a link; remove it, or replace it with the directory it stands in for, and run again` |
+
+```text
+error[E-RUN-050]: refused to remove ses_019f0193c7d871a5b2e30ff41a7c0ce1: ses_019f0193c7d871a5b2e30ff41a7c0ce1 is a symbolic link (in /home/me/.murmur/records/home/me/proj/workdir)
+  hint: /home/me/.murmur/records/home/me/proj/workdir/ses_019f0193c7d871a5b2e30ff41a7c0ce1 is in mur's records directory, where mur never follows a link; remove it, or replace it with the directory it stands in for, and run again
+```
+
+Remove the link, or replace it with the file or directory it stands in for. A refusal during
 a task also writes a [`workdir_path_refused`](observability-schemas.md#workdir-path-refused) trace
 line naming the path, and an A2A task that meets one ends `failed` with the refusal as its status
 message; see [Links inside the work folder](workdir.md#links-inside-the-workdir).

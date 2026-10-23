@@ -46,7 +46,8 @@ use crate::{
         INFERENCE_ERROR_DRIVER_FAILED, INFERENCE_ERROR_MALFORMED_RESPONSE,
         MAX_TASK_FAILURE_REASON_BYTES, TASK_FAILED_COMPACTION_HOOK,
         TASK_FAILED_CREDENTIAL_REJECTED, TASK_FAILED_DRIVER_ERROR, TASK_FAILED_INPUT_TIMEOUT,
-        TASK_FAILED_MALFORMED_RESPONSE, TASK_FAILED_WORKDIR_PATH_REFUSED,
+        TASK_FAILED_MALFORMED_RESPONSE, TASK_FAILED_RUNTIME_ERROR,
+        TASK_FAILED_WORKDIR_PATH_REFUSED,
     },
     types::ResumeMode,
     workdir_fs::{EntryKind, WorkdirRoot, DEFAULT_FILE_MODE},
@@ -1049,7 +1050,8 @@ pub(crate) async fn run_agent_loop(
 
         // The turn boundary. A cancel that landed while the previous turn's tools were running is
         // honoured here rather than by another request to the provider: an ordinary tool call
-        // runs to its own bound, and this is the first place after it that can stop.
+        // runs to its own bound, a foreground shell command is demoted to the background at once,
+        // and this is the first place after either that can stop.
         if let Some(signal) = cancel.as_ref().filter(|signal| signal.is_canceled()) {
             let producer = has_alternates.then(|| run_config.selected_driver_choice().producer());
             return Ok(finish_canceled_turn(
@@ -1375,15 +1377,13 @@ pub(crate) async fn run_agent_loop(
             Ok(r) => r,
             Err(e) => {
                 // Driver dispatch failed (e.g. WASM instantiation error, import mismatch).
-                let msg = format!("driver invocation failed: {e}");
-                failed_call(
-                    INFERENCE_ERROR_DRIVER_FAILED,
-                    store_state.gateways.redact(&msg),
-                )
-                .write(trace, None, message_ids)
-                .await;
-                *ending = Some(AttemptEnding::failed(msg.clone()));
-                return Err(RuntimeError::AgentLoopFailed(msg));
+                let failure =
+                    DriverDispatchFailure::new(&e, |text| store_state.gateways.redact(text));
+                failed_call(INFERENCE_ERROR_DRIVER_FAILED, failure.text.clone())
+                    .write(trace, None, message_ids)
+                    .await;
+                *ending = Some(failure.ending());
+                return Err(failure.into_error());
             }
         };
         let inference_duration_ms = inference_started.elapsed().as_millis() as u64;
@@ -1409,7 +1409,7 @@ pub(crate) async fn run_agent_loop(
                     TASK_FAILED_DRIVER_ERROR,
                     store_state
                         .gateways
-                        .redact(data.as_deref().unwrap_or("driver returned error")),
+                        .redact(&driver_error_text(data.as_deref())),
                 ),
             };
             // A failed call's payload is read only for a `usage` block the provider reported.
@@ -1540,7 +1540,7 @@ pub(crate) async fn run_agent_loop(
                         response
                             .get("error")
                             .and_then(Value::as_str)
-                            .unwrap_or("driver returned error"),
+                            .unwrap_or(DRIVER_RETURNED_ERROR),
                     );
                     crate::runtime_err!("inference error from driver: {error}");
                     (TASK_FAILED_DRIVER_ERROR, error)
@@ -1818,6 +1818,7 @@ pub(crate) async fn run_agent_loop(
                                         log_path: None,
                                     },
                                     Some(&mut gate),
+                                    cancel.as_ref(),
                                 )
                                 .await
                         }
@@ -2351,6 +2352,47 @@ impl FailedTurnCall<'_> {
                 settings: Some(self.settings),
             })
             .await;
+    }
+}
+
+/// What a failed driver call is reported by when its payload says nothing more.
+pub(crate) const DRIVER_RETURNED_ERROR: &str = "driver returned error";
+
+/// The error text of a driver call that answered other than `Passed`, from its `data` (or
+/// `summary`): a JSON object's string `error` member when it has one, the payload as given
+/// otherwise, and [`DRIVER_RETURNED_ERROR`] when there is none. Not yet redacted.
+fn driver_error_text(data: Option<&str>) -> String {
+    let Some(data) = data else {
+        return DRIVER_RETURNED_ERROR.to_string();
+    };
+    serde_json::from_str::<Value>(data)
+        .ok()
+        .and_then(|payload| payload.get("error")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| data.to_string())
+}
+
+/// A driver that could not be run at all — instantiation failed, an import did not match, it
+/// trapped. The text is redacted once, here, so the inference record, the attempt's status and
+/// the error the runtime names in its `task_failed` all carry the same redacted words.
+struct DriverDispatchFailure {
+    /// `driver invocation failed: <error>`, redacted.
+    text: String,
+}
+
+impl DriverDispatchFailure {
+    fn new(error: &dyn std::fmt::Display, redact: impl FnOnce(&str) -> String) -> Self {
+        Self {
+            text: redact(&format!("driver invocation failed: {error}")),
+        }
+    }
+
+    /// `task failed (runtime_error): driver invocation failed: …`.
+    fn ending(&self) -> AttemptEnding {
+        AttemptEnding::failed(failed_status_message(TASK_FAILED_RUNTIME_ERROR, &self.text))
+    }
+
+    fn into_error(self) -> RuntimeError {
+        RuntimeError::AgentLoopFailed(self.text)
     }
 }
 
@@ -4863,6 +4905,67 @@ mod tests {
     }
 
     #[test]
+    fn driver_failure_text_is_the_error_member_of_an_object() {
+        assert_eq!(
+            driver_error_text(Some(
+                r#"{"error":"driver: Anthropic stream ended with no stop_reason","stop_reason":"error"}"#
+            )),
+            "driver: Anthropic stream ended with no stop_reason"
+        );
+    }
+
+    #[test]
+    fn driver_failure_text_is_the_whole_payload_without_a_string_error() {
+        for payload in [
+            r#"{"stop_reason":"error"}"#,
+            r#"{"error":{"type":"overloaded"}}"#,
+            r#"["error"]"#,
+            "upstream closed the connection",
+        ] {
+            assert_eq!(driver_error_text(Some(payload)), payload);
+        }
+    }
+
+    #[test]
+    fn driver_failure_text_without_a_payload_says_the_driver_returned_error() {
+        assert_eq!(driver_error_text(None), "driver returned error");
+    }
+
+    #[test]
+    fn dispatch_failure_text_is_redacted_everywhere_it_goes() {
+        let held = "sk-held-credential";
+        let redact = |text: &str| text.replace(held, "[redacted]");
+        let failure =
+            DriverDispatchFailure::new(&format!("wasm trap echoing the key {held}"), redact);
+
+        assert_eq!(
+            failure.text,
+            "driver invocation failed: wasm trap echoing the key [redacted]"
+        );
+        let ending = failure.ending();
+        assert_eq!(ending.state, TaskState::Failed);
+        assert_eq!(
+            ending.message,
+            "task failed (runtime_error): driver invocation failed: wasm trap echoing the key \
+             [redacted]"
+        );
+        let error = failure.into_error().to_string();
+        assert!(!error.contains(held), "{error}");
+        assert!(error.contains("[redacted]"), "{error}");
+    }
+
+    #[test]
+    fn dispatch_failure_status_is_capped_as_the_trace_caps_it() {
+        let long = "x".repeat(MAX_TASK_FAILURE_REASON_BYTES * 2);
+        let ending = DriverDispatchFailure::new(&long, str::to_string).ending();
+        let reason = ending
+            .message
+            .strip_prefix("task failed (runtime_error): ")
+            .expect("the cause prefix");
+        assert_eq!(reason.len(), MAX_TASK_FAILURE_REASON_BYTES);
+    }
+
+    #[test]
     fn compaction_failure_without_refusals_is_a_hook_failure() {
         assert_eq!(
             classify_compaction_failure("summarizer unreachable".into(), Vec::new()),
@@ -5997,6 +6100,72 @@ mod tests {
             occupancy_fixture(&tools, system).count(&messages),
             "occupancy is a function of the messages, the system prompt and the tools only"
         );
+    }
+
+    /// The two `usage` tables on the WIT reference page say what the drivers send: `input_tokens`
+    /// without the cache counts, which [`parse_driver_usage`]'s request sum adds back. A page
+    /// that says otherwise tells a driver author to fold the cache in, and the runtime would
+    /// count it twice.
+    #[test]
+    fn usage_tables_state_input_without_the_cache() {
+        let page = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/content/reference/wit-interfaces.md"),
+        )
+        .expect("the WIT reference page");
+        let cells = |line: &str| -> Vec<String> {
+            line.trim_matches('|')
+                .split(" | ")
+                .map(|cell| cell.trim().to_string())
+                .collect()
+        };
+        let table = |header: &str| {
+            let start = page.find(header).unwrap_or_else(|| panic!("no {header:?}"));
+            &page[start..]
+        };
+        let row = |member: &str, header: &str| -> Vec<String> {
+            cells(
+                table(header)
+                    .lines()
+                    .find(|line| line.starts_with(&format!("| `{member}` |")))
+                    .unwrap_or_else(|| panic!("no `{member}` row after {header:?}")),
+            )
+        };
+
+        let member = row("input_tokens", "| Member | Value |");
+        assert!(!member[1].contains("billed for the request"), "{member:?}");
+
+        const SURFACES: &str = "| Member | Anthropic Messages";
+        let header = cells(table(SURFACES).lines().next().unwrap());
+        let column = |name: &str| {
+            header
+                .iter()
+                .position(|cell| cell.contains(name))
+                .unwrap_or_else(|| panic!("no {name} column in {header:?}"))
+        };
+        let (chat, responses) = (column("Chat Completions"), column("Responses"));
+        column("DeepSeek");
+
+        let input = row("input_tokens", SURFACES);
+        for (surface, bare) in [
+            (chat, "`usage.prompt_tokens`"),
+            (responses, "`usage.input_tokens`"),
+        ] {
+            let cell = &input[surface];
+            assert!(
+                cell != bare && cell.contains(" minus "),
+                "{} maps input_tokens without subtracting the cache: {cell}",
+                header[surface]
+            );
+        }
+        let cache_write = row("cache_write_tokens", SURFACES);
+        for surface in [chat, responses] {
+            assert_ne!(
+                cache_write[surface], "Not reported",
+                "{} reads cache_write_tokens when sent",
+                header[surface]
+            );
+        }
     }
 
     #[test]

@@ -469,8 +469,12 @@ held is answered `-32001`, `Task not found`. Both errors are listed under
 ### What the cancel names { #what-the-cancel-left-running }
 
 A detached shell command is not ended by the cancel: it runs until it finishes or its session
-ends, which kills it. A sub-capsule the task delegated to is ended by
-the cancelled task before its `task_end`, whether `delegate-task` started it or a
+ends, which kills it. A shell command still running in the foreground is moved to the background
+at once and kept the same way, and the task ends `canceled` without waiting for it. The response
+is read at the moment of the cancel, before that move, so it may leave such a command out; the
+task's [`task_canceled`](../reference/observability-schemas.md#task-canceled) record names it.
+A sub-capsule the task delegated to is ended by the cancelled task before its `task_end`, whether
+`delegate-task` started it or a
 [plan's `capsule` step](../reference/plans.md#when-the-task-is-cancelled) did; a plan stops with
 its task and runs none of its remaining steps. When either was in flight at the moment the cancel was
 answered, the response carries an artifact named `residue` with one data part per item, each part's

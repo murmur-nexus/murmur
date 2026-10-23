@@ -485,3 +485,41 @@ fn rm_refuses_paths_unknown_ids_and_links() {
     assert!(!second.exists());
     assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
 }
+
+/// A link where a session's records directory belongs under `~/.murmur/records` is refused with a
+/// hint naming mur's records directory, not the workdir; the link's target is untouched and
+/// nothing is removed.
+#[cfg(unix)]
+#[test]
+fn rm_refuses_a_link_in_the_records_directory_naming_that_directory() {
+    let f = fixture(vec![end_turn("one")]);
+    let root = f.root("R");
+    let records = f.run("t1", Some(&root));
+    let id = name_of(&records);
+
+    let elsewhere = f.project.path().join("elsewhere");
+    fs::rename(&records, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &records).unwrap();
+    let stderr = rm_refused(f.home.path(), &[&id], &root, "E-RUN-050");
+    let hint = stderr
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("hint: "))
+        .unwrap_or_else(|| panic!("no hint in:\n{stderr}"));
+    assert_eq!(
+        hint,
+        format!(
+            "{} is in mur's records directory, where mur never follows a link; remove it, or \
+             replace it with the directory it stands in for, and run again",
+            records.display()
+        ),
+        "{stderr}"
+    );
+    for wrong in ["the runtime", "inside the workdir", "regular file"] {
+        assert!(!hint.contains(wrong), "{hint}");
+    }
+    assert!(
+        elsewhere.join("trace.jsonl").is_file(),
+        "the link's target is untouched"
+    );
+    assert!(records.is_symlink(), "the link itself is not removed");
+}

@@ -859,6 +859,71 @@ fn the_deadline_ends_an_http_session_in_flight() {
     assert_ended_by_the_deadline(&run);
 }
 
+/// Whether any process on this host is still running `sleep 119`, a duration no other test
+/// sleeps for.
+fn the_foreground_sleep_is_running() -> bool {
+    std::process::Command::new("ps")
+        .args(["-eo", "args"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains("sleep 119"))
+        .unwrap_or(false)
+}
+
+/// A deadline that falls while a foreground shell command runs stops the wait at once: the
+/// command is demoted, the task ends `canceled` in the shell, and the session ends with
+/// `E-RUN-053` rather than the teardown watchdog's exit 143. The session's end kills the command.
+#[test]
+fn the_deadline_ends_a_session_in_a_foreground_command() {
+    if common::skip_without_host_support("the_deadline_ends_a_session_in_a_foreground_command") {
+        return;
+    }
+    let home = home_with_driver(common::FIXTURE_DRIVER_MODELS);
+    let server = common::ScriptedServer::start(vec![
+        tool_turn("toolu_1", "sleep", json!({"command": "119"})),
+        end_turn(),
+    ]);
+    let project = project(&http_manifest(
+        &server.endpoint,
+        &Http {
+            sleep: true,
+            ..Http::default()
+        },
+    ));
+    let begun = Instant::now();
+    let run = run(&home, &project, &["--deadline", &DEADLINE_SECS.to_string()]);
+    let took = begun.elapsed();
+    assert!(
+        took < Duration::from_secs(60),
+        "{took:?}\n{}",
+        run.context()
+    );
+    assert_ne!(run.output.status.code(), Some(143), "{}", run.context());
+    assert_ended_by_the_deadline(&run);
+
+    let trace = run.trace();
+    if events(&trace, "task_start").is_empty() {
+        return;
+    }
+    let canceled = first(&trace, "task_canceled");
+    assert_eq!(canceled["phase"], "shell", "{trace:#?}");
+    // The teardown watchdog would have killed the command 20 s after the deadline; the wind-down
+    // that stops waiting on it takes nowhere near that.
+    let wind_down = ms(first(&trace, "session_end")) - ms(first(&trace, "deadline_reached"));
+    assert!(wind_down < 10_000, "{wind_down} ms\n{trace:#?}");
+    assert!(
+        position(&trace, "shell_detached") < position(&trace, "task_canceled"),
+        "{trace:#?}"
+    );
+    let gone_by = Instant::now() + Duration::from_secs(5);
+    while the_foreground_sleep_is_running() && Instant::now() < gone_by {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !the_foreground_sleep_is_running(),
+        "the session's end kills the demoted command"
+    );
+}
+
 /// A harness that never answers is ended by the deadline, and is gone afterwards.
 #[cfg(unix)]
 #[test]

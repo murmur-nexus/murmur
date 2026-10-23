@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, path::Path};
 
 use capsule_runtime::{
     process_driver::PROCESS_DRIVER_IFACE, RosterRefusal, RuntimeError, MAX_ARTIFACT_CONFIG_BYTES,
@@ -244,12 +244,38 @@ fn containment_floor_hint(
     }
 }
 
-/// The `E-RUN-050` hint for a link or wrong file type found at `refused_at`.
-pub(crate) fn workdir_refused_hint(refused_at: &str) -> String {
-    format!(
-        "the runtime never follows a link inside the workdir; replace {refused_at} with a regular \
-         file or directory, or remove it, and run again"
-    )
+/// Where an `E-RUN-050` refusal was met, which decides what its hint tells the user to fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusedPlace {
+    /// The workdir, where the user's files and a session's work folder are.
+    Workdir,
+    /// mur's records directory, `~/.murmur/records`, where every entry is a directory mur made.
+    Records,
+}
+
+impl RefusedPlace {
+    /// [`Self::Records`] for a path under [`capsule_runtime::records_dir_root`] — the absolute
+    /// path a run's records-directory refusal names — and [`Self::Workdir`] for any other.
+    pub(crate) fn of(refused_at: &str) -> Self {
+        match capsule_runtime::records_dir_root() {
+            Ok(root) if Path::new(refused_at).starts_with(&root) => Self::Records,
+            _ => Self::Workdir,
+        }
+    }
+}
+
+/// The `E-RUN-050` hint for a link or wrong file type found at `refused_at`, in `place`.
+pub(crate) fn path_refused_hint(place: RefusedPlace, refused_at: &str) -> String {
+    match place {
+        RefusedPlace::Workdir => format!(
+            "the runtime never follows a link inside the workdir; replace {refused_at} with a \
+             regular file or directory, or remove it, and run again"
+        ),
+        RefusedPlace::Records => format!(
+            "{refused_at} is in mur's records directory, where mur never follows a link; remove \
+             it, or replace it with the directory it stands in for, and run again"
+        ),
+    }
 }
 
 /// `E-IO-004` for a `HOME` that cannot hold `~/.murmur`: the cause, and what to set.
@@ -439,7 +465,7 @@ impl From<RuntimeError> for CliError {
             RuntimeError::WorkdirPathRefused { refusal } => CliError::with_hint(
                 E_RUN_050,
                 refusal.to_string(),
-                workdir_refused_hint(&refusal.refused_at),
+                path_refused_hint(RefusedPlace::of(&refusal.refused_at), &refusal.refused_at),
             ),
             error @ RuntimeError::WorkdirIdentityMismatch { .. } => CliError::with_hint(
                 E_RUN_051,
@@ -1435,6 +1461,47 @@ mod tests {
                 .contains(".murmur/ses_a/plans"),
             "{:?}",
             cli.hint
+        );
+    }
+
+    #[test]
+    fn a_workdir_path_refusal_hint_names_the_place_it_was_met() {
+        let refusal = |refused_at: String| {
+            CliError::from(RuntimeError::WorkdirPathRefused {
+                refusal: capsule_runtime::WorkdirRefusal {
+                    path: format!("{refused_at}/trace.jsonl"),
+                    refused_at,
+                    operation: capsule_runtime::WorkdirOperation::Write,
+                    reason: capsule_runtime::RefusalReason::Symlink,
+                },
+            })
+        };
+
+        let in_workdir = refusal(".murmur/ses_a".to_string());
+        assert_eq!(in_workdir.code, E_RUN_050);
+        assert_eq!(
+            in_workdir.hint.as_deref(),
+            Some(
+                "the runtime never follows a link inside the workdir; replace .murmur/ses_a with \
+                 a regular file or directory, or remove it, and run again"
+            )
+        );
+
+        let records = capsule_runtime::records_dir_root()
+            .expect("the test HOME holds ~/.murmur")
+            .join("home/u/project/workdir/ses_a");
+        let records = records.display().to_string();
+        let in_records = refusal(records.clone());
+        assert_eq!(in_records.code, E_RUN_050);
+        assert_eq!(
+            in_records.hint.as_deref(),
+            Some(
+                format!(
+                    "{records} is in mur's records directory, where mur never follows a link; \
+                     remove it, or replace it with the directory it stands in for, and run again"
+                )
+                .as_str()
+            )
         );
     }
 
