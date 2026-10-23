@@ -40,9 +40,8 @@ mur run
 
 Each task runs an inference loop: a sequence of LLM calls that continues until the model
 signals it is done, or until it reaches the turn limit `inference.max_turns` sets, when the
-manifest sets one. One *turn* is one round-trip to
-the inference driver — the runtime sends the current conversation history, tool list, and
-system prompt; the driver returns a response. If the model requests a tool call, the runtime
+manifest sets one. One *turn* is one round-trip to the inference driver — the runtime sends the
+current conversation history, tool list, and system prompt; the driver returns a response. If the model requests a tool call, the runtime
 executes it, appends the result, and starts the next turn. When the model returns `end_turn`
 (or `max_tokens`) the result is written to `out/result.txt` in the session's
 [records directory](../reference/workdir.md#records-directory) and the loop exits.
@@ -131,9 +130,9 @@ runtime's per-command limits.
 ## Turn limit (`inference.max_turns`)
 
 The turn limit caps how many inference calls a single task may make. The manifest sets it per
-capsule. A manifest that omits it sets no turn limit, and its `Limits:` line names none. A hook's `run-inference` call — a compaction hook's
-summary, say — is an inference call the task made, so it counts as well: the task's turn count,
-`task_end.turns`, includes it. When the limit is reached, the loop exits with
+capsule. A manifest that omits it sets no turn limit, and the `Limits:` line states no turn count.
+A hook's `run-inference` call — a compaction hook's summary, say — is an inference call the task
+made, so it counts as well: the task's turn count, `task_end.turns`, includes it. When the limit is reached, the loop exits with
 `exit_status: "max_turns_reached"`, and the task's failure message names the limit, the turns the
 task used by the numbers `mur trace show` prints, and how many of the calls were a hook's. The
 task did not complete: `GetTask` reads `TASK_STATE_FAILED`, and

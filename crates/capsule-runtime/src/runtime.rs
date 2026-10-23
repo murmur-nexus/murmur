@@ -10950,8 +10950,9 @@ fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
          outcome: its `delegation_id`, its final status, and either the path of its result \
          file, which you read for its answer, or `result: none` when it wrote no file. A \
          sub-capsule still running at the delegation deadline is ended and reported as \
-         `{terminated}`. No tool reports on a sub-capsule while it runs. A task that is cancelled, or that ends any other way while a sub-capsule \
-         is still running, ends that sub-capsule with it."
+         `{terminated}`. No tool reports on a sub-capsule while it runs. A task that is \
+         cancelled, or that ends any other way while a sub-capsule is still running, ends that \
+         sub-capsule with it."
     );
     native_tool_manifest_yaml(DELEGATE_TASK_TOOL, description, schema)
 }

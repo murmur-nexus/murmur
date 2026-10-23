@@ -77,7 +77,8 @@ pub(crate) struct ExecFacts {
     /// The `executable` directory grants, as strings: every `shell.interpreter_runtime` dir in
     /// declaration order, then `sandbox::resolve_staged_runtime_dirs`, duplicates dropped.
     pub(crate) runtime_dirs: Vec<String>,
-    /// `capabilities.filesystem.workdir_exec`.
+    /// `capabilities.filesystem.workdir_exec`. The session's `$HOME` and `$TMPDIR` carry the work
+    /// folder's rights, `Execute` included, so the section names all three together.
     pub(crate) workdir_exec: bool,
 }
 
@@ -555,14 +556,16 @@ fn build_shell_section(shell_allow: &[String], exec: &ExecFacts) -> String {
             ));
         }
         if exec.workdir_exec {
-            out.push_str("; any file in the work folder");
+            out.push_str("; any file in the work folder, $HOME or $TMPDIR");
         }
         out.push_str(
             ". The kernel refuses to start any other program, whatever starts it: the start fails \
              with permission denied, and a shell reports exit status 126.",
         );
         if !exec.workdir_exec {
-            out.push_str(" A file in the work folder cannot be started as a program.");
+            out.push_str(
+                " A file in the work folder, $HOME or $TMPDIR cannot be started as a program.",
+            );
         }
         if !interpreters.is_empty() {
             out.push_str(
@@ -1173,9 +1176,10 @@ mod tests {
              \n\
              Programs a command can start: bash, git. The kernel refuses to start any other \
              program, whatever starts it: the start fails with permission denied, and a shell \
-             reports exit status 126. A file in the work folder cannot be started as a program. A \
-             shell interpreter's builtins run inside it; any other program a shell command runs \
-             is started like one, so it is refused unless it is listed here.\n\
+             reports exit status 126. A file in the work folder, $HOME or $TMPDIR cannot be \
+             started as a program. A shell interpreter's builtins run inside it; any other program \
+             a shell command runs is started like one, so it is refused unless it is listed \
+             here.\n\
              \n"
         );
     }
@@ -1241,8 +1245,8 @@ mod tests {
         assert!(
             section.contains(
                 "Programs a command can start: python3; anything under /usr/lib/python3.12, \
-                 /usr/lib/python3.12/lib-dynload, /opt/tool; any file in the work folder. The \
-                 kernel refuses"
+                 /usr/lib/python3.12/lib-dynload, /opt/tool; any file in the work folder, $HOME \
+                 or $TMPDIR. The kernel refuses"
             ),
             "{section}"
         );

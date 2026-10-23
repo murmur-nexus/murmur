@@ -329,7 +329,7 @@ Shell interpreter(s) available: bash. The `command` field is a complete command 
 
 Direct binaries exposed as tools: git. Each is a tool of the same name, listed under Installed Tools. Its `command` field holds the binary's arguments and not the binary name; no shell runs it, so nothing in it is expanded.
 
-Programs a command can start: bash, git. The kernel refuses to start any other program, whatever starts it: the start fails with permission denied, and a shell reports exit status 126. A file in the work folder cannot be started as a program. A shell interpreter's builtins run inside it; any other program a shell command runs is started like one, so it is refused unless it is listed here.
+Programs a command can start: bash, git. The kernel refuses to start any other program, whatever starts it: the start fails with permission denied, and a shell reports exit status 126. A file in the work folder, $HOME or $TMPDIR cannot be started as a program. A shell interpreter's builtins run inside it; any other program a shell command runs is started like one, so it is refused unless it is listed here.
 ```
 
 Each shell invocation the agent makes appears in the session's [`trace.jsonl`](../reference/workdir.md#records-directory) as a `shell` event:

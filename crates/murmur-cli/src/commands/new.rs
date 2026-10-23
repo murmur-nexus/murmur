@@ -311,8 +311,8 @@ pub(crate) fn run_new(task: &str, index: Option<&str>) -> Result<(), CliError> {
     launched.map_err(CliError::from)?;
 
     // Read the manifest the agent wrote to out/murmur.yaml in its work folder, through
-    // tool-editor's write_file operation. Read through the work folder's root, so a link the generator left there is refused
-    // rather than followed.
+    // tool-editor's write_file operation. Read through the work folder's root, so a link the
+    // generator left there is refused rather than followed.
     let manifest_yaml = match accessible_root.read_to_string("out/murmur.yaml") {
         Ok(Some(manifest_yaml)) => manifest_yaml,
         Ok(None) => {
@@ -1351,7 +1351,6 @@ mod tests {
             prompt.contains("Call the tool-editor tool with operation write_file"),
             "prompt:\n{prompt}"
         );
-        assert!(prompt.contains("operation write_file"));
         assert!(prompt.contains("dest_path \"out/murmur.yaml\""));
         assert!(prompt.contains("out/murmur.yaml"));
         assert!(!prompt.contains("Call write_file with path"));
