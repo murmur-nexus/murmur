@@ -1799,6 +1799,30 @@ mod tests {
         }
     }
 
+    /// A process capsule with neither `max_turns` nor `max_session_tokens` states that it has no
+    /// limit, never an empty sentence or a turn cap.
+    #[test]
+    fn process_system_prompt_states_no_limit_when_none_is_set() {
+        let inference = InferenceConfig {
+            max_turns: None,
+            max_session_tokens: None,
+            ..process_inference("m", None)
+        };
+        let facts = CapsuleFacts::resolve(
+            &CapabilityPolicy::default(),
+            &inference,
+            &murmur_artifact::LifecycleConfig::default(),
+            Vec::new(),
+        );
+        let prompt = build_process_system_prompt(None, &facts, Some("murmur.yaml"));
+        assert!(
+            prompt.lines().any(|line| line == "Limits: none"),
+            "got:\n{prompt}"
+        );
+        assert!(!prompt.contains("Limits: ."), "got:\n{prompt}");
+        assert!(!prompt.contains("turns"), "got:\n{prompt}");
+    }
+
     #[test]
     fn process_system_prompt_puts_the_manifest_prompt_after_a_blank_line() {
         let prompt = build_process_system_prompt(

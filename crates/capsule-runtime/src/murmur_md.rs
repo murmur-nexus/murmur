@@ -9,6 +9,7 @@ use crate::{
     identity::CapsuleIdentity,
     runtime_dir::{RUNTIME_DIR_ENV, RUNTIME_DIR_GUEST_PATH},
     shell::is_shell_interpreter,
+    types::CapabilityPolicy,
     workdir_fs::{EntryKind, WorkdirRoot, DEFAULT_FILE_MODE},
 };
 
@@ -63,6 +64,57 @@ pub(crate) fn sanitize_description(raw: &str) -> String {
     }
 }
 
+/// What the kernel lets this session's commands start, as `## Running Shell Commands` states it.
+///
+/// Kept out of [`CapsuleFacts`]: it depends on the host's tier, and the `[Capsule]` block those
+/// facts feed must be the same on every host. Every directory here must be one
+/// [`crate::sandbox::ShellEnforcement::resolve`] grants `executable`, so a new executable grant
+/// there belongs here too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecFacts {
+    /// The applied tier installs Landlock `Execute` rules: `KernelFull` or `KernelSealed`.
+    pub(crate) enforced: bool,
+    /// The `executable` directory grants, as strings: every `shell.interpreter_runtime` dir in
+    /// declaration order, then `sandbox::resolve_staged_runtime_dirs`, duplicates dropped.
+    pub(crate) runtime_dirs: Vec<String>,
+    /// `capabilities.filesystem.workdir_exec`. The session's `$HOME` and `$TMPDIR` carry the work
+    /// folder's rights, `Execute` included, so the section names all three together.
+    pub(crate) workdir_exec: bool,
+}
+
+impl ExecFacts {
+    /// The facts for `policy` on `applied_tier`, the tier
+    /// [`crate::sandbox::applied_tier`] gives the session.
+    pub(crate) fn resolve(
+        policy: &CapabilityPolicy,
+        applied_tier: crate::sandbox::EnforcementTier,
+    ) -> Self {
+        use crate::sandbox::EnforcementTier;
+
+        let enforced = match applied_tier {
+            EnforcementTier::KernelSealed | EnforcementTier::KernelFull => true,
+            EnforcementTier::KernelSeccompOnly | EnforcementTier::EnvironmentOnly => false,
+        };
+        let mut runtime_dirs: Vec<String> = Vec::new();
+        let interpreter_dirs =
+            crate::sandbox::resolve_interpreter_runtime_grants(&policy.shell_interpreter_runtime)
+                .into_iter()
+                .map(|grant| grant.path);
+        let staged_dirs = crate::sandbox::resolve_staged_runtime_dirs(policy).into_iter();
+        for dir in interpreter_dirs.chain(staged_dirs) {
+            let dir = dir.display().to_string();
+            if !runtime_dirs.contains(&dir) {
+                runtime_dirs.push(dir);
+            }
+        }
+        Self {
+            enforced,
+            runtime_dirs,
+            workdir_exec: policy.workdir_exec_allowed,
+        }
+    }
+}
+
 /// Everything MURMUR.md is rendered from besides the runtime directory's own contents.
 ///
 /// Built once at staging for an agent session, completed at launch with the capsule URL, and held
@@ -100,6 +152,8 @@ pub(crate) struct MurmurMdInputs {
     /// ([`crate::runtime_dir::runtime_dir_preopened_tools`]). The staged set at first; a committed
     /// pull or removal replaces it before the rewrite.
     pub(crate) runtime_dir_tools: Vec<String>,
+    /// What the session's commands can start, on the tier its `ShellEnforcement` applies.
+    pub(crate) exec: ExecFacts,
 }
 
 /// Write MURMUR.md to the session's runtime directory, `runtime_root`, which the capsule's
@@ -196,7 +250,7 @@ fn generate_murmur_md(runtime_root: &WorkdirRoot, inputs: &MurmurMdInputs) -> St
     let system_prompt_artifact = inputs.system_prompt_artifact.as_deref();
     let tools_section = build_tools_section(runtime_root, system_prompt_artifact);
     let skills_section = build_skills_section(runtime_root, system_prompt_artifact);
-    let shell_section = build_shell_section(&inputs.shell_allow);
+    let shell_section = build_shell_section(&inputs.shell_allow, &inputs.exec);
     let workdir = inputs.accessible_workdir.display();
     let runtime_dir_entry = runtime_dir_entry(
         &runtime_root.path().display().to_string(),
@@ -458,7 +512,10 @@ fn build_skills_section(
     out
 }
 
-fn build_shell_section(shell_allow: &[String]) -> String {
+/// `## Running Shell Commands`: how each tool reads its `command` field, then what a command can
+/// start. On a tier without Landlock nothing limits that, and the section says so rather than
+/// naming a refusal the kernel would not make.
+fn build_shell_section(shell_allow: &[String], exec: &ExecFacts) -> String {
     if shell_allow.is_empty() {
         return "Shell execution is not enabled in this capsule's manifest.\n\n".to_string();
     }
@@ -472,19 +529,57 @@ fn build_shell_section(shell_allow: &[String]) -> String {
 
     if !interpreters.is_empty() {
         out.push_str(&format!(
-            "Shell interpreter(s) available: {}. \
-             Pass a complete command string in the `command` field — the interpreter runs it via `-c`.\n\n",
+            "Shell interpreter(s) available: {}. The `command` field is a complete command line, \
+             which the interpreter runs with `-c`.\n\n",
             interpreters.join(", ")
         ));
     }
 
     if !tools.is_empty() {
         out.push_str(&format!(
-            "Direct binaries exposed as tools: {}. \
-             Each appears as a named tool in the Installed Tools section above. \
-             Call it directly — put the arguments (not the binary name) in the `command` field.\n\n",
+            "Direct binaries exposed as tools: {}. Each is a tool of the same name, listed under \
+             Installed Tools. Its `command` field holds the binary's arguments and not the binary \
+             name; no shell runs it, so nothing in it is expanded.\n\n",
             tools.join(", ")
         ));
+    }
+
+    if exec.enforced {
+        out.push_str(&format!(
+            "Programs a command can start: {}",
+            shell_allow.join(", ")
+        ));
+        if !exec.runtime_dirs.is_empty() {
+            out.push_str(&format!(
+                "; anything under {}",
+                exec.runtime_dirs.join(", ")
+            ));
+        }
+        if exec.workdir_exec {
+            out.push_str("; any file in the work folder, $HOME or $TMPDIR");
+        }
+        out.push_str(
+            ". The kernel refuses to start any other program, whatever starts it: the start fails \
+             with permission denied, and a shell reports exit status 126.",
+        );
+        if !exec.workdir_exec {
+            out.push_str(
+                " A file in the work folder, $HOME or $TMPDIR cannot be started as a program.",
+            );
+        }
+        if !interpreters.is_empty() {
+            out.push_str(
+                " A shell interpreter's builtins run inside it; any other program a shell command \
+                 runs is started like one, so it is refused unless it is listed here.",
+            );
+        }
+        out.push_str("\n\n");
+    } else {
+        out.push_str(
+            "On this host the runtime does not restrict which programs a command starts: a \
+             command can start any program it finds. The list above decides only which tools \
+             exist.\n\n",
+        );
     }
 
     out
@@ -512,6 +607,11 @@ pub(crate) fn test_inputs() -> MurmurMdInputs {
         facts: crate::capsule_facts::test_default_facts(),
         work_folder_ceiling: Some(crate::resources::DEFAULT_WORKDIR_MAX_BYTES),
         runtime_dir_tools: Vec::new(),
+        exec: ExecFacts {
+            enforced: true,
+            runtime_dirs: Vec::new(),
+            workdir_exec: false,
+        },
     }
 }
 
@@ -952,25 +1052,34 @@ mod tests {
         assert!(content.contains("No tool artifacts declared"));
     }
 
-    #[test]
-    fn shell_section_interpreter_only() {
+    /// MURMUR.md's `## Running Shell Commands` section for `shell_allow` and `exec`, to the end
+    /// of the file.
+    fn shell_section_of(shell_allow: &[&str], exec: ExecFacts) -> String {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
-        let policy = CapabilityPolicy {
-            shell_allow: vec!["bash".to_string()],
-            ..Default::default()
-        };
         let content = render(&tmp, |inputs| {
-            inputs.shell_allow = policy.shell_allow.clone();
+            inputs.shell_allow = shell_allow.iter().map(|b| b.to_string()).collect();
+            inputs.exec = exec;
         });
+        let start = content
+            .find("## Running Shell Commands")
+            .expect("the section is always written");
+        content[start..].to_string()
+    }
+
+    fn enforced() -> ExecFacts {
+        test_inputs().exec
+    }
+
+    #[test]
+    fn shell_section_interpreter_only() {
+        let section = shell_section_of(&["bash"], enforced());
         assert!(
-            content.contains("Shell interpreter(s) available: bash"),
-            "interpreter section should list bash"
+            section.contains("Shell interpreter(s) available: bash. The `command` field"),
+            "{section}"
         );
-        assert!(
-            !content.contains("Direct binaries"),
-            "should not show non-interpreter section when only bash is listed"
-        );
+        assert!(!section.contains("Direct binaries"), "{section}");
+        assert!(!section.contains("Call it directly"), "{section}");
     }
 
     #[test]
@@ -985,60 +1094,260 @@ mod tests {
              input_schema: '{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}'\n",
         )
         .unwrap();
-        let policy = CapabilityPolicy {
-            shell_allow: vec!["curl".to_string()],
-            ..Default::default()
-        };
         let content = render(&tmp, |inputs| {
-            inputs.shell_allow = policy.shell_allow.clone();
+            inputs.shell_allow = vec!["curl".to_string()];
         });
         assert!(
-            content.contains("Direct binaries exposed as tools: curl"),
-            "should surface curl as a direct tool"
+            content.contains(
+                "Direct binaries exposed as tools: curl. Each is a tool of the same name"
+            ),
+            "{content}"
         );
-        assert!(
-            !content.contains("Shell interpreter(s)"),
-            "should not show interpreter section when no interpreter is listed"
-        );
+        assert!(!content.contains("Shell interpreter(s)"), "{content}");
         assert!(
             content.contains("**curl**"),
-            "curl should appear in Installed Tools section"
+            "curl is listed under Installed Tools"
         );
         assert!(
-            !content.contains("or directly from bash"),
-            "should not mention bash when bash is absent"
+            content.contains("Programs a command can start: curl."),
+            "{content}"
         );
+        assert!(!content.contains("builtins"), "{content}");
+        assert!(!content.contains("Call it directly"), "{content}");
     }
 
     #[test]
     fn shell_section_mixed_interpreter_and_direct_tools() {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir_all(tmp.path().join("tools")).unwrap();
-        let policy = CapabilityPolicy {
-            shell_allow: vec!["bash".to_string(), "curl".to_string(), "git".to_string()],
-            ..Default::default()
-        };
-        let content = render(&tmp, |inputs| {
-            inputs.shell_allow = policy.shell_allow.clone();
-        });
+        let section = shell_section_of(&["bash", "curl", "git"], enforced());
         assert!(
-            content.contains("Shell interpreter(s) available: bash"),
-            "interpreter section should list bash"
+            section.contains("Shell interpreter(s) available: bash."),
+            "{section}"
         );
         assert!(
-            content.contains("Direct binaries exposed as tools:"),
-            "should show direct tools section"
+            section.contains("Direct binaries exposed as tools: curl, git."),
+            "{section}"
         );
-        assert!(content.contains("curl"), "curl should be mentioned");
-        assert!(content.contains("git"), "git should be mentioned");
+        assert!(
+            section.contains("Programs a command can start: bash, curl, git."),
+            "{section}"
+        );
+        assert!(!section.contains("Call it directly"), "{section}");
     }
 
     #[test]
     fn shell_section_says_not_enabled_when_empty() {
+        for exec in [
+            enforced(),
+            ExecFacts {
+                enforced: false,
+                ..enforced()
+            },
+        ] {
+            let section = shell_section_of(&[], exec);
+            assert!(
+                section.starts_with(
+                    "## Running Shell Commands\n\nShell execution is not enabled in this \
+                     capsule's manifest.\n\n"
+                ),
+                "{section}"
+            );
+            assert!(
+                !section.contains("Programs a command can start"),
+                "{section}"
+            );
+            assert!(!section.contains("126"), "{section}");
+        }
+    }
+
+    /// An interpreter and a direct binary on an enforcing tier: every paragraph, in order.
+    #[test]
+    fn shell_section_states_the_allowlist_for_an_interpreter_and_a_direct_binary() {
+        let section = shell_section_of(&["bash", "git"], enforced());
+        assert_eq!(
+            section,
+            "## Running Shell Commands\n\
+             \n\
+             Shell interpreter(s) available: bash. The `command` field is a complete command \
+             line, which the interpreter runs with `-c`.\n\
+             \n\
+             Direct binaries exposed as tools: git. Each is a tool of the same name, listed under \
+             Installed Tools. Its `command` field holds the binary's arguments and not the binary \
+             name; no shell runs it, so nothing in it is expanded.\n\
+             \n\
+             Programs a command can start: bash, git. The kernel refuses to start any other \
+             program, whatever starts it: the start fails with permission denied, and a shell \
+             reports exit status 126. A file in the work folder, $HOME or $TMPDIR cannot be \
+             started as a program. A shell interpreter's builtins run inside it; any other program \
+             a shell command runs is started like one, so it is refused unless it is listed \
+             here.\n\
+             \n"
+        );
+    }
+
+    /// `[bash]` reads as: bash can start bash, and nothing else.
+    #[test]
+    fn shell_section_for_an_interpreter_alone_names_only_it() {
+        let section = shell_section_of(&["bash"], enforced());
+        assert!(!section.contains("Direct binaries"), "{section}");
+        assert!(
+            section.contains(
+                "Programs a command can start: bash. The kernel refuses to start any other program"
+            ),
+            "{section}"
+        );
+        assert!(
+            section.contains(
+                " A shell interpreter's builtins run inside it; any other program a shell command \
+                 runs is started like one, so it is refused unless it is listed here.\n\n"
+            ),
+            "{section}"
+        );
+    }
+
+    /// The runtime directories come from the grants `ShellEnforcement` installs, in declaration
+    /// order, and an executable work folder is named instead of denied.
+    #[test]
+    fn shell_section_names_runtime_dirs_and_an_executable_work_folder() {
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["python3".to_string()],
+            shell_interpreter_runtime: vec![murmur_artifact::InterpreterRuntimeGrant {
+                binary: "python3".to_string(),
+                dirs: ["/usr/lib/python3.12", "/usr/lib/python3.12/lib-dynload"]
+                    .into_iter()
+                    .map(|path| murmur_artifact::InterpreterRuntimeDir {
+                        path: path.to_string(),
+                        list_dir: true,
+                    })
+                    .collect(),
+            }],
+            shell_staged_runtime: vec![murmur_artifact::StagedRuntimeGrant {
+                binary: "python3".to_string(),
+                source_path: "/opt/tool".to_string(),
+                pin: "pin-1".to_string(),
+            }],
+            workdir_exec_allowed: true,
+            ..CapabilityPolicy::default()
+        };
+        let exec = ExecFacts::resolve(&policy, crate::sandbox::EnforcementTier::KernelFull);
+        assert_eq!(
+            exec,
+            ExecFacts {
+                enforced: true,
+                runtime_dirs: vec![
+                    "/usr/lib/python3.12".to_string(),
+                    "/usr/lib/python3.12/lib-dynload".to_string(),
+                    "/opt/tool".to_string(),
+                ],
+                workdir_exec: true,
+            }
+        );
+        let section = shell_section_of(&["python3"], exec);
+        assert!(
+            section.contains(
+                "Programs a command can start: python3; anything under /usr/lib/python3.12, \
+                 /usr/lib/python3.12/lib-dynload, /opt/tool; any file in the work folder, $HOME \
+                 or $TMPDIR. The kernel refuses"
+            ),
+            "{section}"
+        );
+        assert!(!section.contains("cannot be started"), "{section}");
+        assert!(!section.contains("builtins"), "{section}");
+    }
+
+    /// A directory named both as an interpreter runtime and as a staged tree is stated once.
+    #[test]
+    fn exec_facts_drop_a_repeated_runtime_dir() {
+        let policy = CapabilityPolicy {
+            shell_interpreter_runtime: vec![murmur_artifact::InterpreterRuntimeGrant {
+                binary: "python3".to_string(),
+                dirs: vec![murmur_artifact::InterpreterRuntimeDir {
+                    path: "/opt/tool".to_string(),
+                    list_dir: false,
+                }],
+            }],
+            shell_staged_runtime: vec![murmur_artifact::StagedRuntimeGrant {
+                binary: "python3".to_string(),
+                source_path: "/opt/tool".to_string(),
+                pin: "pin-1".to_string(),
+            }],
+            ..CapabilityPolicy::default()
+        };
+        let exec = ExecFacts::resolve(&policy, crate::sandbox::EnforcementTier::KernelFull);
+        assert_eq!(exec.runtime_dirs, vec!["/opt/tool".to_string()]);
+    }
+
+    /// Only the Landlock tiers restrict execution, and a tier that does not is never credited
+    /// with a refusal.
+    #[test]
+    fn exec_facts_follow_the_applied_tier() {
+        use crate::sandbox::EnforcementTier;
+
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        for (tier, enforced) in [
+            (EnforcementTier::KernelFull, true),
+            (EnforcementTier::KernelSealed, true),
+            (EnforcementTier::KernelSeccompOnly, false),
+            (EnforcementTier::EnvironmentOnly, false),
+        ] {
+            let exec = ExecFacts::resolve(&policy, tier);
+            assert_eq!(exec.enforced, enforced, "{tier:?}");
+            let section = shell_section_of(&["bash"], exec);
+            if enforced {
+                assert!(section.contains("exit status 126"), "{tier:?}: {section}");
+            } else {
+                assert!(
+                    section.contains(
+                        "On this host the runtime does not restrict which programs a command \
+                         starts: a command can start any program it finds. The list above \
+                         decides only which tools exist.\n\n"
+                    ),
+                    "{tier:?}: {section}"
+                );
+                assert!(!section.contains("126"), "{tier:?}: {section}");
+                assert!(
+                    !section.contains("Programs a command can start"),
+                    "{tier:?}: {section}"
+                );
+            }
+        }
+    }
+
+    /// A `transport: process` capsule declaring neither a turn nor a token limit has no limit
+    /// bullet but the context budget.
+    #[test]
+    fn murmur_md_of_a_process_capsule_without_limits_states_no_turn_limit() {
         let tmp = TempDir::new().unwrap();
-        fs::create_dir_all(tmp.path().join("tools")).unwrap();
-        let content = render(&tmp, |_| {});
-        assert!(content.contains("Shell execution is not enabled"));
+        let inference = murmur_artifact::InferenceConfig {
+            transport: "process".into(),
+            max_turns: None,
+            max_session_tokens: None,
+            ..crate::capsule_facts::test_http_inference()
+        };
+        let content = render(&tmp, |inputs| {
+            inputs.facts = CapsuleFacts::resolve(
+                &CapabilityPolicy::default(),
+                &inference,
+                &murmur_artifact::LifecycleConfig::default(),
+                Vec::new(),
+            );
+            inputs.work_folder_ceiling = None;
+        });
+        let start =
+            content.find("## Limits\n\n").expect("a Limits section") + "## Limits\n\n".len();
+        let end = start + content[start..].find("\n\n").unwrap();
+        let limits = &content[start..end];
+        assert_eq!(
+            limits, "- Context budget: not set (compaction not configured)",
+            "content: {content}"
+        );
+        assert!(!content.contains("turns per task"), "content: {content}");
+        assert!(
+            !content.lines().any(|line| line.trim_end() == "-"),
+            "content: {content}"
+        );
     }
 
     #[test]
