@@ -155,7 +155,7 @@ for that call:
 
 | Member | Value |
 |---|---|
-| `input_tokens` | Tokens the provider billed for the request |
+| `input_tokens` | Request tokens neither read from nor written to the provider's prompt cache |
 | `output_tokens` | Tokens the provider billed for the completion |
 | `cached_tokens` | Request tokens served from the provider's prompt cache |
 | `cache_write_tokens` | Request tokens written into the provider's prompt cache |
@@ -166,15 +166,17 @@ members its provider returned; a provider with no prompt cache reports no cache 
 member the provider did not report rather than sending `0` — the runtime keeps the two apart, and
 a `0` reads as a genuine cache miss on the trace.
 
-Where the two provider shapes carry each number:
+Where each default-artifacts HTTP driver reads each number, by the provider surface it calls:
 
-| Member | Anthropic Messages API | OpenAI Chat and Responses APIs |
-|---|---|---|
-| `input_tokens` | `usage.input_tokens` | `usage.prompt_tokens` |
-| `output_tokens` | `usage.output_tokens` | `usage.completion_tokens` |
-| `cached_tokens` | `usage.cache_read_input_tokens` | `usage.prompt_tokens_details.cached_tokens` |
-| `cache_write_tokens` | `usage.cache_creation_input_tokens` | Not reported |
-| `thinking_tokens` | `usage.output_tokens_details.thinking_tokens` | `usage.completion_tokens_details.reasoning_tokens` |
+| Member | Anthropic Messages (`driver-anthropic`) | OpenAI Chat Completions (`driver-openai` for o-series models and models before gpt-5, `driver-moonshotai`, `driver-zai`) | OpenAI Responses (`driver-openai`, gpt-5 and later) | DeepSeek (`driver-deepseek`) |
+|---|---|---|---|---|
+| `input_tokens` | `usage.input_tokens` | `usage.prompt_tokens` minus `prompt_tokens_details.cached_tokens` and `prompt_tokens_details.cache_write_tokens`; `driver-zai` subtracts `cached_tokens` alone | `usage.input_tokens` minus `input_tokens_details.cached_tokens` and `input_tokens_details.cache_write_tokens` | `usage.prompt_cache_miss_tokens` |
+| `output_tokens` | `usage.output_tokens` | `usage.completion_tokens` | `usage.output_tokens` | `usage.completion_tokens` |
+| `cached_tokens` | `usage.cache_read_input_tokens` | `usage.prompt_tokens_details.cached_tokens` | `usage.input_tokens_details.cached_tokens` | `usage.prompt_cache_hit_tokens` |
+| `cache_write_tokens` | `usage.cache_creation_input_tokens` | `usage.prompt_tokens_details.cache_write_tokens` when sent; never from `driver-zai` | `usage.input_tokens_details.cache_write_tokens` when sent | Not reported |
+| `thinking_tokens` | Not reported | `usage.completion_tokens_details.reasoning_tokens` from `driver-zai` only | Not reported | Not reported |
+
+A subtraction that would go below zero leaves `input_tokens` out.
 
 The runtime records the reported numbers on the call's `inference` trace event and its
 `capsule.inference` span. A report that carries both `input_tokens` and `output_tokens` is also

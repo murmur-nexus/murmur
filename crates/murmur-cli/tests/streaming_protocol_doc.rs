@@ -874,6 +874,7 @@ fn watch_prints_the_same_lines() {
 const WATCH_TRANSCRIPT: &str = "[working]  inference turn 1
 [artifact] tool: no-such-tool [error, Nms] | tool 'no-such-tool' is not declared in manifest allowlist
 [working]  inference turn 2
-done[completed]
+done
+[completed]
   done
 ";

@@ -8724,13 +8724,19 @@ impl CapsuleStoreState {
     /// than at either of the two callers that turn a [`DispatchOutcome`] into model-facing text.
     /// The reduction from `data`/`summary` to one string happens here too, so no unfenced tool
     /// text is left on the outcome for a caller to reach for.
+    ///
+    /// `cancel` is the attempt's own cancel — the A2A task's, or on the `task.md` path the
+    /// session's termination signal. A foreground shell command is demoted the moment it is
+    /// raised, and a shell call made after it starts nothing.
     pub(crate) async fn dispatch_agent_tool_async(
         &self,
         name: &str,
         input: murmur::tool::run::ToolInput,
         gate: Option<&mut crate::agent::CallGate<'_>>,
+        cancel: Option<&crate::cancel::CancelSignal>,
     ) -> Result<DispatchOutcome, String> {
-        self.dispatch_fenced(name, input, gate, None).await
+        self.dispatch_fenced(name, input, gate, None, cancel.cloned())
+            .await
     }
 
     /// [`Self::dispatch_agent_tool_async`] for a call the process-transport tool bridge serves,
@@ -8747,7 +8753,8 @@ impl CapsuleStoreState {
         input: murmur::tool::run::ToolInput,
         abandon: crate::detached::AbandonSignal,
     ) -> Result<DispatchOutcome, String> {
-        self.dispatch_fenced(name, input, None, Some(abandon)).await
+        self.dispatch_fenced(name, input, None, Some(abandon), None)
+            .await
     }
 
     async fn dispatch_fenced(
@@ -8756,9 +8763,10 @@ impl CapsuleStoreState {
         input: murmur::tool::run::ToolInput,
         gate: Option<&mut crate::agent::CallGate<'_>>,
         abandon: Option<crate::detached::AbandonSignal>,
+        canceled: Option<crate::cancel::CancelSignal>,
     ) -> Result<DispatchOutcome, String> {
         let mut outcome = self
-            .dispatch_agent_tool_unfenced(name, input, gate, abandon)
+            .dispatch_agent_tool_unfenced(name, input, gate, abandon, canceled)
             .await?;
         fence_and_label(name, &self.artifact_origin(name), &mut outcome);
         self.deliver_deadline_notice(name, &mut outcome).await;
@@ -8807,12 +8815,18 @@ impl CapsuleStoreState {
     /// `abandon` reaches the shell branch only, as the [`DetachPolicy`]'s abandon signal. `None`
     /// for every caller that cannot stop waiting mid-call; see
     /// [`Self::dispatch_bridged_tool_async`] for the one that can.
+    ///
+    /// `canceled` reaches the shell branch only too, as the [`DetachPolicy`]'s cancel: the http
+    /// agent loop passes its attempt's cancel, so a cancel demotes a running foreground command
+    /// rather than waiting on it. A plan step and the bridge pass `None`: the plan's and the
+    /// harness's own waits answer the cancel there.
     async fn dispatch_agent_tool_unfenced(
         &self,
         name: &str,
         input: murmur::tool::run::ToolInput,
         gate: Option<&mut crate::agent::CallGate<'_>>,
         abandon: Option<crate::detached::AbandonSignal>,
+        canceled: Option<crate::cancel::CancelSignal>,
     ) -> Result<DispatchOutcome, String> {
         // The two runtime-provided peer-handoff tools, intercepted ahead of every other path.
         // They have no artifact, no binary and no component: the manifests under
@@ -8936,6 +8950,7 @@ impl CapsuleStoreState {
                     context_id: context_id.clone(),
                     provenance: self.current_task_provenance,
                     abandoned: abandon,
+                    canceled,
                 }),
                 _ => None,
             };
@@ -10048,9 +10063,10 @@ impl CapsuleStoreState {
                 // futures are mutually recursive and one of them has to be behind a pointer for
                 // either to have a size. `validate_plan` refuses a `submit-plan` step, so the
                 // recursion is one level deep in practice.
-                let outcome = Box::pin(self.dispatch_agent_tool_unfenced(&name, input, gate, None))
-                    .await
-                    .map(|outcome| outcome.result);
+                let outcome =
+                    Box::pin(self.dispatch_agent_tool_unfenced(&name, input, gate, None, None))
+                        .await
+                        .map(|outcome| outcome.result);
                 let _ = reply.send(outcome);
             }
         }
@@ -13362,6 +13378,7 @@ mod tests {
                     log_path: None,
                 },
                 None,
+                None,
             )
             .await
     }
@@ -15968,7 +15985,7 @@ inference:
         };
         tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(state.dispatch_agent_tool_async(name, input, None))
+            .block_on(state.dispatch_agent_tool_async(name, input, None, None))
             .unwrap()
     }
 
@@ -16805,6 +16822,7 @@ inference:
                     data: Some("{}".to_string()),
                     log_path: None,
                 },
+                None,
                 None,
             )
             .await
@@ -18982,6 +19000,7 @@ inference:
                         None,
                     )),
                     abandoned: None,
+                    canceled: None,
                 }),
             );
             let _ = sender.send((outcome, enforcement, policy));
@@ -20301,6 +20320,7 @@ inference:
                             log_path: None,
                         },
                         None,
+                        None,
                     )
                     .await;
                 native_done.store(true, Ordering::SeqCst);
@@ -20317,6 +20337,7 @@ inference:
                             data: None,
                             log_path: None,
                         },
+                        None,
                         None,
                     )
                     .await;
@@ -25434,7 +25455,7 @@ mod member_call_tests {
         )
         .await;
         let Err(refused) = state
-            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("critic", "review"), None)
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("critic", "review"), None, None)
             .await
         else {
             panic!("a call to a non-callee was dispatched");
@@ -25466,7 +25487,7 @@ mod member_call_tests {
         drop(calls.scope_task("tsk_done", None, None));
         assert_eq!(calls.task_id(), None);
         let Err(refused) = state
-            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "work"), None)
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "work"), None, None)
             .await
         else {
             panic!("a call with no task in scope was dispatched");
@@ -25525,7 +25546,12 @@ mod member_call_tests {
             )
             .await;
             let outcome = state
-                .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "add 2 and 2"), None)
+                .dispatch_agent_tool_async(
+                    MEMBER_CALL_TOOL,
+                    call("worker", "add 2 and 2"),
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
             let result = &outcome.result;
@@ -25683,7 +25709,7 @@ mod member_call_tests {
         )
         .await;
         let outcome = state
-            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "x"), None)
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "x"), None, None)
             .await
             .unwrap();
         let data = outcome.result.data.unwrap();
@@ -26109,7 +26135,7 @@ mod member_call_tests {
         .await;
         let began = std::time::Instant::now();
         let outcome = state
-            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "add 2 and 2"), None)
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "add 2 and 2"), None, None)
             .await
             .unwrap();
         assert!(
@@ -26147,7 +26173,7 @@ mod member_call_tests {
             vec![(call_id.clone(), "worker".to_string())]
         );
         let Err(refused) = state
-            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "again"), None)
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "again"), None, None)
             .await
         else {
             panic!("a second call to a member waiting for room was dispatched");
@@ -26597,7 +26623,7 @@ mod member_call_tests {
         )
         .await;
         let outcome = state
-            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "add 2 and 2"), None)
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "add 2 and 2"), None, None)
             .await
             .unwrap();
         let call_id = events(dir.path(), "member_call_start")[0]["call_id"]
@@ -26647,7 +26673,7 @@ mod member_call_tests {
         )
         .await;
         let failed = state
-            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "x"), None)
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "x"), None, None)
             .await
             .unwrap();
         assert_eq!(failed.result.status, murmur::tool::run::Status::Failed);
@@ -26664,7 +26690,7 @@ mod member_call_tests {
         assert!(!data.contains("is now working on call"), "{data}");
 
         let Err(refused) = state
-            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("critic", "x"), None)
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("critic", "x"), None, None)
             .await
         else {
             panic!("a call to a non-callee was dispatched");
@@ -26841,7 +26867,7 @@ mod member_call_tests {
             .await
             .unwrap();
         let Err(refused) = state
-            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "again"), None)
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "again"), None, None)
             .await
         else {
             panic!("a second call to a pending member was dispatched");
@@ -26960,7 +26986,7 @@ mod member_call_tests {
         assert_eq!(
             refused(
                 plain
-                    .dispatch_agent_tool_async(END_WITHOUT_ANSWER_TOOL, reason("none"), None)
+                    .dispatch_agent_tool_async(END_WITHOUT_ANSWER_TOOL, reason("none"), None, None)
                     .await
             ),
             "'end-without-answer' is answered only for a formation member that roster.yaml lets \
@@ -26976,7 +27002,7 @@ mod member_call_tests {
         .await;
         let calls = Arc::clone(state.member_calls.as_ref().unwrap());
         let dispatch =
-            |input| state.dispatch_agent_tool_async(END_WITHOUT_ANSWER_TOOL, input, None);
+            |input| state.dispatch_agent_tool_async(END_WITHOUT_ANSWER_TOOL, input, None, None);
         drop(calls.scope_task("tsk_done", None, None));
         assert_eq!(
             refused(dispatch(reason("none")).await),
@@ -26991,7 +27017,7 @@ mod member_call_tests {
         drop(scope);
         let _scope = calls.scope_task("tsk_caller", None, Some("lead".to_string()));
         state
-            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "x"), None)
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "x"), None, None)
             .await
             .unwrap();
         let call_id = events(dir.path(), "member_call_start")[0]["call_id"]
@@ -27049,7 +27075,7 @@ mod member_call_tests {
         assert_eq!(
             refused(
                 state
-                    .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "y"), None)
+                    .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "y"), None, None)
                     .await
             ),
             "'call-member' makes no call from a task that is ending without an answer."
@@ -27061,7 +27087,7 @@ mod member_call_tests {
         calls.clear_decline();
         // Sent, and ended within its tool call: the door took only the first task.
         state
-            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "z"), None)
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "z"), None, None)
             .await
             .unwrap();
     }

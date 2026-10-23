@@ -14,7 +14,9 @@ use capsule_runtime::running::{self, RecordScan};
 use capsule_runtime::{formation::FORMATION_ID_PREFIX, FormationId};
 use capsule_runtime::{EntryKind, RunningRecord, WorkdirError, WorkdirRoot};
 
-use crate::error::{workdir_refused_hint, CliError, E_IO_001, E_IO_003, E_RUN_024, E_RUN_050};
+use crate::error::{
+    path_refused_hint, CliError, RefusedPlace, E_IO_001, E_IO_003, E_RUN_024, E_RUN_050,
+};
 use crate::formation_trace::{
     fold_member_call, fold_member_call_busy, fold_member_call_start, formation_calls,
     no_answer_below_note, search_formation, CallEnding, FormationCall, FormationSearch,
@@ -5820,6 +5822,7 @@ struct RemovedSession {
 struct Doomed {
     base: WorkdirRoot,
     rel: String,
+    place: RefusedPlace,
 }
 
 impl Doomed {
@@ -5830,7 +5833,7 @@ impl Doomed {
     fn remove(&self) -> Result<(), CliError> {
         self.base
             .remove_dir_all(&self.rel)
-            .map_err(|error| removal_error(self.base.path(), error))
+            .map_err(|error| removal_error(self.base.path(), error, self.place))
     }
 }
 
@@ -5888,11 +5891,11 @@ pub(crate) fn run_trace_rm(
             .into_owned()
     };
     let session_dir = if created_work_folders {
-        directory_beneath(&root, &session_id)?
+        directory_beneath(&root, &session_id, RefusedPlace::Workdir)?
     } else {
         None
     };
-    let records_dir = directory_beneath(&group, &session_id)?;
+    let records_dir = directory_beneath(&group, &session_id, RefusedPlace::Records)?;
     if session_dir.is_none() && records_dir.is_none() {
         return Err(CliError::new(
             E_TRC_002,
@@ -5966,45 +5969,55 @@ pub(crate) fn run_trace_rm(
 
 /// The directory `rel` beneath `base`, reached with no link followed, or `None` when `base` or
 /// `rel` is absent. A link or a file that is not a directory anywhere on the way is `E-RUN-050`,
-/// so a refusal is never read as absence.
-fn directory_beneath(base: &Path, rel: &str) -> Result<Option<Doomed>, CliError> {
+/// so a refusal is never read as absence; `place` is where `base` is, for its hint.
+fn directory_beneath(
+    base: &Path,
+    rel: &str,
+    place: RefusedPlace,
+) -> Result<Option<Doomed>, CliError> {
     let held = match WorkdirRoot::open(base) {
         Ok(held) => held,
         Err(error) if error.is_not_found() => return Ok(None),
-        Err(error) => return Err(removal_error(base, error)),
+        Err(error) => return Err(removal_error(base, error, place)),
     };
     match held
         .entry_kind(rel)
-        .map_err(|error| removal_error(base, error))?
+        .map_err(|error| removal_error(base, error, place))?
     {
         None => Ok(None),
         Some(EntryKind::Directory) => Ok(Some(Doomed {
             base: held,
             rel: rel.to_string(),
+            place,
         })),
         Some(EntryKind::Symlink) => Err(refused(
             base,
             rel,
             format!("refused to remove {rel}: {rel} is a symbolic link"),
+            place,
         )),
         Some(EntryKind::File | EntryKind::Other) => Err(refused(
             base,
             rel,
             format!("refused to remove {rel}: {rel} is not a directory"),
+            place,
         )),
     }
 }
 
 /// A [`WorkdirError`] met beneath `base`: a refusal, or a segment that is not a directory, is
 /// `E-RUN-050`; any other I/O failure is `E-IO-003`.
-fn removal_error(base: &Path, error: WorkdirError) -> CliError {
+fn removal_error(base: &Path, error: WorkdirError, place: RefusedPlace) -> CliError {
     match error {
-        WorkdirError::Refused(refusal) => refused(base, &refusal.refused_at, refusal.to_string()),
+        WorkdirError::Refused(refusal) => {
+            refused(base, &refusal.refused_at, refusal.to_string(), place)
+        }
         WorkdirError::Io { path, source } if source.kind() == std::io::ErrorKind::NotADirectory => {
             refused(
                 base,
                 &path,
                 format!("refused to remove beneath {path}: it is not a directory"),
+                place,
             )
         }
         error => CliError::new(
@@ -6014,12 +6027,12 @@ fn removal_error(base: &Path, error: WorkdirError) -> CliError {
     }
 }
 
-/// `E-RUN-050` for `refused_at`, a path relative to `base`.
-fn refused(base: &Path, refused_at: &str, message: String) -> CliError {
+/// `E-RUN-050` for `refused_at`, a path relative to `base`, which is in `place`.
+fn refused(base: &Path, refused_at: &str, message: String, place: RefusedPlace) -> CliError {
     CliError::with_hint(
         E_RUN_050,
         format!("{message} (in {})", base.display()),
-        workdir_refused_hint(&base.join(refused_at).display().to_string()),
+        path_refused_hint(place, &base.join(refused_at).display().to_string()),
     )
 }
 

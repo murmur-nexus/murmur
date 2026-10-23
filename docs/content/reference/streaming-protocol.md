@@ -763,7 +763,7 @@ follows them.
 | `statusUpdate` | Printed to stdout as `[<state>]  <message>`, the state in murmur's word; a task's terminal status as `[<state>]` alone |
 | `artifactUpdate` `response` | Held, and printed wrapped under its task's `[completed]` line |
 | `task` | Ignored |
-| `text`, `artifact` | Printed to stdout |
+| `text`, `artifact` | Printed to stdout; text is printed as it arrives, and the next status or artifact line after text that did not end its line starts on a new line |
 | `thinking` | Not shown |
 | `tool-call-started`, `tool-call-progress` | Not shown |
 | `connection-ack` | Read for `conversationMode`, which sets how status lines are labelled |

@@ -874,6 +874,98 @@ fn cancel_names_a_detached_shell_still_running() {
     );
 }
 
+/// Whether any process on this host is still running `sleep 33`, a duration no other test sleeps
+/// for.
+fn the_foreground_sleep_is_running() -> bool {
+    std::process::Command::new("ps")
+        .args(["-eo", "args"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains("sleep 33"))
+        .unwrap_or(false)
+}
+
+/// A cancel that lands while a foreground shell command runs ends the task at once rather than
+/// at the command's exit: the command is demoted, the task's `task_canceled` names it with phase
+/// `shell`, the command keeps running, and the door goes on serving the next task.
+#[test]
+fn cancel_demotes_a_running_foreground_command() {
+    if common::skip_without_host_support("cancel_demotes_a_running_foreground_command") {
+        return;
+    }
+    let server = common::ScriptedServer::start(vec![
+        tool_call_response("msg_1", "toolu_1", "sleep", json!({"command": "33"})),
+        end_turn_response("msg_2", "the next task is done"),
+    ]);
+    let (home, manifest_path) = setup_project(
+        &server.endpoint,
+        "cancel-foreground",
+        &format!(
+            "capabilities:\n  network:\n    allow:\n      - {}\n  shell:\n    allow:\n      - sleep\n",
+            server.endpoint
+        ),
+    );
+    let capsule = launch(stage_agent(
+        &home,
+        &manifest_path,
+        LifecycleConfig {
+            shell_grace_secs: 120,
+            ..queue_lifecycle()
+        },
+    ));
+
+    let submitted = send_message(&capsule.url, "msg-1", "run the long command", None);
+    let task_id = submitted["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let running_by = Instant::now() + Duration::from_secs(120);
+    while !the_foreground_sleep_is_running() {
+        assert!(Instant::now() < running_by, "the command never started");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let asked = Instant::now();
+    let canceled = tasks_cancel(&capsule.url, &task_id);
+    assert_eq!(
+        canceled["result"]["status"]["state"], "TASK_STATE_CANCELED",
+        "{canceled}"
+    );
+    let events = wait_for_trace(
+        &capsule.trace_path,
+        Duration::from_secs(10),
+        "the cancelled task to end",
+        |events| !events_named(events, "task_canceled").is_empty(),
+    );
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "the task waited {:?} on its foreground command",
+        asked.elapsed()
+    );
+    let detached = events_named(&events, "shell_detached");
+    assert_eq!(detached.len(), 1, "{events:?}");
+    assert_eq!(detached[0]["command"], "33", "{events:?}");
+    let task_canceled = events_named(&events, "task_canceled")[0];
+    assert_eq!(task_canceled["phase"], "shell", "{task_canceled}");
+    assert_eq!(
+        task_canceled["detached_work_ids"],
+        json!([detached[0]["work_id"]]),
+        "the residue names the demoted command: {task_canceled}"
+    );
+    assert!(
+        the_foreground_sleep_is_running(),
+        "a cancel stops the runtime waiting, not the command"
+    );
+
+    let next = send_message(&capsule.url, "msg-2", "the next task", None);
+    let next_id = next["result"]["task"]["id"].as_str().unwrap().to_string();
+    poll_until_state(
+        &capsule.url,
+        &next_id,
+        "TASK_STATE_COMPLETED",
+        Duration::from_secs(60),
+    );
+}
+
 /// `mur cancel` is a thin caller: it names the task, the state, and one line per residue item.
 #[test]
 fn mur_cancel_reports_the_state_and_the_residue() {

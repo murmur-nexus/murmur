@@ -478,10 +478,10 @@ fn a_task_answers_with_its_outcome_to_its_own_caller_only() {
     );
     assert!(failed["result"].get("artifacts").is_none(), "{failed}");
     // The final status a task whose driver response could not be read ends with: the
-    // `task_failed` cause, and the driver's error data as the trace records it.
+    // `task_failed` cause, and the driver's `error` text as the trace records it.
     assert_eq!(
         message_of(&failed)["parts"][0]["text"],
-        r#"task failed (driver_error): {"error":"driver: Anthropic stream ended with no stop_reason","stop_reason":"error"}"#,
+        "task failed (driver_error): driver: Anthropic stream ended with no stop_reason",
         "{failed}"
     );
 

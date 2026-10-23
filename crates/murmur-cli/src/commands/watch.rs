@@ -204,6 +204,9 @@ struct WatchView {
     context_turns: HashMap<String, u32>,
     /// Each task's answer, held from its `response` artifact until its `completed` line prints it.
     responses: HashMap<String, String>,
+    /// Whether streamed text left the cursor mid-line. The next status or artifact line ends that
+    /// line first, so it never joins the text it follows.
+    mid_line: bool,
 }
 
 impl Default for WatchView {
@@ -212,6 +215,7 @@ impl Default for WatchView {
             conversation_mode: String::from("stateless"),
             context_turns: HashMap::new(),
             responses: HashMap::new(),
+            mid_line: false,
         }
     }
 }
@@ -281,10 +285,12 @@ impl WatchView {
                     if !text.is_empty() {
                         write!(out, "{text}")?;
                         out.flush()?;
+                        self.mid_line = !text.ends_with('\n');
                     }
                 }
             }
             "artifact" => {
+                self.end_text_line(out)?;
                 let header = artifact_header(frame);
                 let content = frame.get("content").and_then(Value::as_str).unwrap_or("");
                 let mut content_lines = content.lines();
@@ -306,6 +312,7 @@ impl WatchView {
     /// followed by the wrapped answer of a `completed` one. Threaded mode prefixes the context
     /// and its turn, which a task's end advances.
     fn status_line(&mut self, out: &mut impl Write, update: &Value) -> std::io::Result<()> {
+        self.end_text_line(out)?;
         let task_id = update["taskId"].as_str().unwrap_or("").to_string();
         let status = &update["status"];
         let state = status["state"]
@@ -347,6 +354,14 @@ impl WatchView {
             for line in wrap_text(&response.unwrap_or_default(), col_width) {
                 writeln!(out, "  {line}")?;
             }
+            writeln!(out)?;
+        }
+        Ok(())
+    }
+
+    /// End the line streamed text left open, if it did.
+    fn end_text_line(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        if std::mem::take(&mut self.mid_line) {
             writeln!(out)?;
         }
         Ok(())
@@ -615,6 +630,51 @@ mod tests {
 
     fn lagged() -> String {
         message_frame(json!({"frame": "lagged", "missed": 3}))
+    }
+
+    fn text(id: u64, text: &str) -> String {
+        task_frame(id, json!({"frame": "text", "text": text, "final": false}))
+    }
+
+    #[test]
+    fn a_status_after_unfinished_text_starts_its_own_line() {
+        let body = format!("{}{}{}", ack(), text(1, "4"), completed(2, "4"));
+        assert!(
+            read(&body).1.starts_with("4\n[completed]\n"),
+            "{:?}",
+            read(&body).1
+        );
+    }
+
+    #[test]
+    fn an_artifact_after_unfinished_text_starts_its_own_line() {
+        let artifact = task_frame(
+            2,
+            json!({"frame": "artifact", "toolName": "bash", "content": "out"}),
+        );
+        let body = format!("{}{}{artifact}", ack(), text(1, "running"));
+        assert_eq!(read(&body).1, "running\n[artifact] tool: bash | out\n");
+    }
+
+    #[test]
+    fn text_that_ends_its_line_gets_no_blank_line_before_a_status() {
+        let working = status(Some(2), "TASK_STATE_WORKING", Some("inference turn 2"));
+        let body = format!("{}{}{working}", ack(), text(1, "done\n"));
+        assert_eq!(read(&body).1, "done\n[working]  inference turn 2\n");
+    }
+
+    #[test]
+    fn consecutive_text_frames_join() {
+        let working = status(Some(3), "TASK_STATE_WORKING", Some("inference turn 2"));
+        let body = format!("{}{}{}{working}", ack(), text(1, "do"), text(2, "ne"));
+        assert_eq!(read(&body).1, "done\n[working]  inference turn 2\n");
+    }
+
+    #[test]
+    fn an_empty_text_frame_leaves_the_line_as_it_was() {
+        let working = status(Some(3), "TASK_STATE_WORKING", Some("inference turn 2"));
+        let body = format!("{}{}{}{working}", ack(), text(1, "done\n"), text(2, ""));
+        assert_eq!(read(&body).1, "done\n[working]  inference turn 2\n");
     }
 
     #[test]

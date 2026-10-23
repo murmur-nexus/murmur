@@ -58,6 +58,9 @@ pub(crate) const PHASE_PLAN: &str = "plan";
 /// Cancelled while a `background-command` call was waiting for a background shell command. The
 /// wait ends; the command keeps running.
 pub(crate) const PHASE_BACKGROUND_WAIT: &str = "background_wait";
+/// Cancelled while a foreground shell command was running. The command is demoted to the
+/// background and keeps its own lifecycle.
+pub(crate) const PHASE_SHELL: &str = "shell";
 
 /// What the terminal `TASK_STATE_CANCELED` status says. One constant for every transport: a client
 /// cannot tell from the status which one ran the task.

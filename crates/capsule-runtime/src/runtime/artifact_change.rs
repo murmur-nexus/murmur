@@ -955,16 +955,23 @@ impl CapsuleStoreState {
     ///
     /// Both tools run inline on the calling task: they hold the session exclusively, and the turn
     /// waits on them in any case. A pull that reads a source blocks that task for the requests.
+    ///
+    /// `cancel` is the attempt's own cancel, handed on to [`Self::dispatch_agent_tool_async`].
     pub(crate) async fn dispatch_agent_tool_exclusive(
         &mut self,
         name: &str,
         input: murmur::tool::run::ToolInput,
         gate: Option<&mut crate::agent::CallGate<'_>>,
+        cancel: Option<&crate::cancel::CancelSignal>,
     ) -> Result<DispatchOutcome, String> {
         let mut outcome = match name {
             PULL_ARTIFACT_TOOL => self.call_pull_artifact(&input)?,
             REMOVE_ARTIFACT_TOOL => self.call_remove_artifact(&input)?,
-            _ => return self.dispatch_agent_tool_async(name, input, gate).await,
+            _ => {
+                return self
+                    .dispatch_agent_tool_async(name, input, gate, cancel)
+                    .await
+            }
         };
         fence_and_label(name, &self.artifact_origin(name), &mut outcome);
         self.deliver_deadline_notice(name, &mut outcome).await;
@@ -1264,7 +1271,7 @@ mod tests {
             ),
         ] {
             let err = state
-                .dispatch_agent_tool_async(name, input(json), None)
+                .dispatch_agent_tool_async(name, input(json), None, None)
                 .await
                 .err()
                 .expect("the shared dispatch cannot run either tool");
@@ -1294,6 +1301,7 @@ mod tests {
                 PULL_ARTIFACT_TOOL,
                 input(serde_json::json!({"artifact": EDITOR})),
                 None,
+                None,
             )
             .await
             .expect("a granted tool pulls");
@@ -1317,6 +1325,7 @@ mod tests {
                 EDITOR_TOOL,
                 input(serde_json::json!({"text": "hello"})),
                 None,
+                None,
             )
             .await
             .expect("the pulled tool is dispatchable");
@@ -1326,6 +1335,7 @@ mod tests {
             .dispatch_agent_tool_exclusive(
                 REMOVE_ARTIFACT_TOOL,
                 input(serde_json::json!({"artifact": EDITOR_TOOL})),
+                None,
                 None,
             )
             .await
@@ -1343,7 +1353,7 @@ mod tests {
         assert!(!project.locked(EDITOR));
 
         let err = state
-            .dispatch_agent_tool_exclusive(EDITOR_TOOL, input(serde_json::json!({})), None)
+            .dispatch_agent_tool_exclusive(EDITOR_TOOL, input(serde_json::json!({})), None, None)
             .await
             .err()
             .expect("a removed tool is refused");
@@ -1356,6 +1366,7 @@ mod tests {
             .dispatch_agent_tool_exclusive(
                 REMOVE_ARTIFACT_TOOL,
                 input(serde_json::json!({"artifact": EDITOR_TOOL})),
+                None,
                 None,
             )
             .await
