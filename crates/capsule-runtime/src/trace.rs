@@ -1135,6 +1135,27 @@ struct TaskEndEvent {
     /// How `lifecycle.keep_working` went for this task. Absent when the capsule does not set it.
     #[serde(skip_serializing_if = "Option::is_none")]
     keep_working: Option<KeepWorkingSummary>,
+    /// How `lifecycle.done_check` went for this task. Absent when the capsule does not set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    done_check: Option<DoneCheckSummary>,
+}
+
+/// `task_end.done_check`: the runs of `lifecycle.done_check`'s command for this task, the reopens
+/// they caused and whether the last run passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct DoneCheckSummary {
+    /// Runs, across reopens.
+    pub(crate) runs: u32,
+    /// Reopens the failing runs caused.
+    pub(crate) reopens: u32,
+    /// `lifecycle.done_check.limit`.
+    pub(crate) limit: u32,
+    /// Whether the last run passed: `null` when the check never ran, `false` after a run a cancel
+    /// or the session deadline stopped.
+    pub(crate) met: Option<bool>,
+    /// What ended the task with the check unmet: `limit`, `max_turns`, `spend_ceiling` or
+    /// `deadline`. `null` otherwise.
+    pub(crate) stopped_by: Option<&'static str>,
 }
 
 /// `task_end.keep_working`: the continuations `lifecycle.keep_working` sent this task and what
@@ -1454,6 +1475,47 @@ struct KeepWorkingEvent {
     turns_remaining: Option<u32>,
     /// The byte length of the message sent.
     message_bytes: u64,
+}
+
+/// One run of `lifecycle.done_check`'s command at a turn end. Written after that turn's
+/// `inference` and any `keep_working` record, before the next attempt's first `inference` or the
+/// task's `task_end`.
+#[derive(Serialize)]
+struct DoneCheckEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    #[serde(flatten)]
+    run: &'a DoneCheckRun<'a>,
+}
+
+/// The fields of one `done_check` record that describe the run.
+#[derive(Debug, Serialize)]
+pub(crate) struct DoneCheckRun<'a> {
+    pub(crate) task_id: &'a str,
+    /// 1-based ordinal of this run within the task, counted across reopens.
+    pub(crate) number: u32,
+    /// `lifecycle.done_check.command` as declared.
+    pub(crate) command: &'a str,
+    /// `passed`, `failed`, `timed_out`, `stopped` or `not_started`.
+    pub(crate) outcome: &'static str,
+    /// `null` for `timed_out`, `stopped` and `not_started`.
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) duration_ms: u64,
+    /// Bytes returned after the 16 KiB-per-stream cap.
+    pub(crate) stdout_bytes: u64,
+    pub(crate) stderr_bytes: u64,
+    pub(crate) truncated: bool,
+    /// The `capabilities.resources` field whose limit killed the command.
+    pub(crate) resource_limit: Option<&'a str>,
+    /// Whether this run reopened the task.
+    pub(crate) reopened: bool,
+    /// The reopens the check may still cause in this task, after this run.
+    pub(crate) reopens_left: u32,
+    /// `inference.max_turns` less every turn the task has spent. `null` with no cap.
+    pub(crate) turns_remaining: Option<u32>,
 }
 
 /// A driver call failed transiently and is about to be made again. The call's one `inference`
@@ -3202,6 +3264,7 @@ impl TraceWriter {
         reopen_count: u32,
         running_commands: Vec<String>,
         keep_working: Option<KeepWorkingSummary>,
+        done_check: Option<DoneCheckSummary>,
     ) -> std::io::Result<()> {
         let duration_ms = self
             .task_start_instant
@@ -3226,6 +3289,7 @@ impl TraceWriter {
             reopen_count,
             running_commands,
             keep_working,
+            done_check,
         };
         self.active_task_id = None;
         self.task_event_id = None;
@@ -3433,6 +3497,29 @@ impl TraceWriter {
         };
         if let Some(status) = &self.session_status {
             status.keep_working_sent(number);
+        }
+        self.write_event(&event).await
+    }
+
+    /// Record one run of `lifecycle.done_check`'s command. A run that reopened the task feeds the
+    /// session status the task's reopens so far, `reopens`.
+    pub(crate) async fn write_done_check(
+        &mut self,
+        run: &DoneCheckRun<'_>,
+        reopens: u32,
+    ) -> std::io::Result<()> {
+        let event = DoneCheckEvent {
+            event_type: "done_check",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            run,
+        };
+        if run.reopened {
+            if let Some(status) = &self.session_status {
+                status.done_check_reopened(reopens);
+            }
         }
         self.write_event(&event).await
     }
@@ -7250,7 +7337,7 @@ mod tests {
         w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
             .await
             .unwrap();
-        w.write_task_end("tsk_1", "ok", 2, Vec::new(), None)
+        w.write_task_end("tsk_1", "ok", 2, Vec::new(), None, None)
             .await
             .unwrap();
         w.flush().await.unwrap();
@@ -7293,7 +7380,7 @@ mod tests {
             w.write_task_start(task_id, "ctx_1", "a2a", event_provenance(), 3, &[], &[])
                 .await
                 .unwrap();
-            w.write_task_end(task_id, "ok", 0, Vec::new(), keep_working)
+            w.write_task_end(task_id, "ok", 0, Vec::new(), keep_working, None)
                 .await
                 .unwrap();
         }
@@ -7328,6 +7415,7 @@ mod tests {
             None,
             0,
             Some(3),
+            None,
         ));
         w.set_session_status(std::sync::Arc::clone(&status));
         w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
@@ -7372,6 +7460,164 @@ mod tests {
         );
     }
 
+    /// `task_end.done_check` is the summary the runtime passes and is absent with the option off.
+    #[tokio::test]
+    async fn task_end_carries_done_check_only_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        for (task_id, done_check) in [
+            (
+                "tsk_1",
+                Some(DoneCheckSummary {
+                    runs: 3,
+                    reopens: 2,
+                    limit: 2,
+                    met: Some(false),
+                    stopped_by: Some("limit"),
+                }),
+            ),
+            (
+                "tsk_2",
+                Some(DoneCheckSummary {
+                    runs: 0,
+                    reopens: 0,
+                    limit: 1,
+                    met: None,
+                    stopped_by: None,
+                }),
+            ),
+            ("tsk_3", None),
+        ] {
+            w.write_task_start(task_id, "ctx_1", "a2a", event_provenance(), 3, &[], &[])
+                .await
+                .unwrap();
+            w.write_task_end(task_id, "ok", 0, Vec::new(), None, done_check)
+                .await
+                .unwrap();
+        }
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let ends: Vec<_> = events
+            .iter()
+            .filter(|e| e["event_type"] == "task_end")
+            .collect();
+        assert_eq!(
+            ends[0]["done_check"],
+            serde_json::json!({"runs": 3, "reopens": 2, "limit": 2, "met": false,
+                               "stopped_by": "limit"})
+        );
+        assert_eq!(
+            ends[1]["done_check"],
+            serde_json::json!({"runs": 0, "reopens": 0, "limit": 1, "met": null,
+                               "stopped_by": null})
+        );
+        assert!(ends[2].get("done_check").is_none(), "{}", ends[2]);
+    }
+
+    /// One `done_check` record per run, parented on the task, with its fields in the documented
+    /// order; a reopening run feeds the session-status count and a non-reopening one does not.
+    #[tokio::test]
+    async fn done_check_record_carries_its_fields_and_feeds_session_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        let status = std::sync::Arc::new(crate::session_status::SessionStatus::new(
+            std::time::Instant::now(),
+            false,
+            None,
+            None,
+            0,
+            None,
+            Some(3),
+        ));
+        w.set_session_status(std::sync::Arc::clone(&status));
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
+            .await
+            .unwrap();
+        let mut run = DoneCheckRun {
+            task_id: "tsk_1",
+            number: 1,
+            command: "bash -c 'exit 1'",
+            outcome: "failed",
+            exit_code: Some(1),
+            duration_ms: 12,
+            stdout_bytes: 5,
+            stderr_bytes: 0,
+            truncated: false,
+            resource_limit: None,
+            reopened: true,
+            reopens_left: 2,
+            turns_remaining: Some(4),
+        };
+        w.write_done_check(&run, 1).await.unwrap();
+        run.number = 2;
+        run.outcome = "timed_out";
+        run.exit_code = None;
+        run.reopened = false;
+        run.turns_remaining = None;
+        w.write_done_check(&run, 1).await.unwrap();
+        w.flush().await.unwrap();
+
+        let text = std::fs::read_to_string(dir.path().join("trace.jsonl")).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.contains("\"done_check\""))
+            .unwrap();
+        let order: Vec<usize> = [
+            "event_type",
+            "event_id",
+            "parent_id",
+            "session_id",
+            "timestamp",
+            "task_id",
+            "number",
+            "command",
+            "outcome",
+            "exit_code",
+            "duration_ms",
+            "stdout_bytes",
+            "stderr_bytes",
+            "truncated",
+            "resource_limit",
+            "reopened",
+            "reopens_left",
+            "turns_remaining",
+        ]
+        .iter()
+        .map(|key| line.find(&format!("\"{key}\":")).unwrap())
+        .collect();
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{line}");
+
+        let events = read_events(dir.path());
+        let start = events
+            .iter()
+            .find(|e| e["event_type"] == "task_start")
+            .unwrap();
+        let records: Vec<_> = events
+            .iter()
+            .filter(|e| e["event_type"] == "done_check")
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["parent_id"], start["event_id"]);
+        assert_eq!(records[0]["command"], "bash -c 'exit 1'");
+        assert_eq!(records[0]["exit_code"], 1);
+        assert_eq!(records[0]["reopened"], true);
+        assert_eq!(records[0]["turns_remaining"], 4);
+        assert_eq!(records[1]["outcome"], "timed_out");
+        assert_eq!(records[1]["exit_code"], serde_json::Value::Null);
+        assert_eq!(records[1]["resource_limit"], serde_json::Value::Null);
+        assert_eq!(records[1]["turns_remaining"], serde_json::Value::Null);
+        let spend = crate::session_status::SpendReading {
+            used: 0,
+            ceiling: None,
+            machine: None,
+        };
+        assert_eq!(
+            serde_json::to_value(status.snapshot(spend)).unwrap()["done_check"],
+            serde_json::json!({"used": 1, "left": 2})
+        );
+    }
+
     /// `task_end` names the background commands still running, and has no such field when there
     /// were none.
     #[tokio::test]
@@ -7385,7 +7631,7 @@ mod tests {
             w.write_task_start(task_id, "ctx_1", "a2a", event_provenance(), 3, &[], &[])
                 .await
                 .unwrap();
-            w.write_task_end(task_id, "ok", 0, running, None)
+            w.write_task_end(task_id, "ok", 0, running, None, None)
                 .await
                 .unwrap();
         }
@@ -7616,7 +7862,7 @@ mod tests {
         assert_eq!(w.task_agent_turns(), 2);
         assert_eq!(w.task_turns(), 3);
         assert_eq!(w.task_hook_inferences(), 1);
-        w.write_task_end("tsk_1", "completed", 0, Vec::new(), None)
+        w.write_task_end("tsk_1", "completed", 0, Vec::new(), None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -7710,7 +7956,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        w.write_task_end("tsk_1", "ok", 0, Vec::new(), None)
+        w.write_task_end("tsk_1", "ok", 0, Vec::new(), None, None)
             .await
             .unwrap();
         w.write_session_end("ok").await.unwrap();
@@ -8026,7 +8272,7 @@ mod tests {
         w.write_task_start("tsk_ran", "ctx_ran", "a2a", event_provenance(), 3, &[], &[])
             .await
             .unwrap();
-        w.write_task_end("tsk_ran", "ok", 0, Vec::new(), None)
+        w.write_task_end("tsk_ran", "ok", 0, Vec::new(), None, None)
             .await
             .unwrap();
         w.write_task_rejected(
@@ -8086,7 +8332,7 @@ mod tests {
         w.write_task_failed(Some(2), TASK_FAILED_DRIVER_ERROR, &long)
             .await
             .unwrap();
-        w.write_task_end("tsk_1", "failed", 0, Vec::new(), None)
+        w.write_task_end("tsk_1", "failed", 0, Vec::new(), None, None)
             .await
             .unwrap();
         w.flush().await.unwrap();
@@ -8161,7 +8407,7 @@ mod tests {
         w.write_compaction(0, 100, OccupancyBasis::Estimate, 40)
             .await
             .unwrap();
-        w.write_task_end("tsk_1", "ok", 0, Vec::new(), None)
+        w.write_task_end("tsk_1", "ok", 0, Vec::new(), None, None)
             .await
             .unwrap();
         w.write_inference(

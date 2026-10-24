@@ -76,6 +76,12 @@ pub(crate) fn delegation_source(capsule: &str) -> String {
     format!("delegation:{capsule}")
 }
 
+/// The source name for the output of `lifecycle.done_check`'s command: `done-check`. The command
+/// is the operator's, but what it prints comes from the work the agent left.
+pub(crate) fn done_check_source() -> &'static str {
+    "done-check"
+}
+
 /// The source name for a task payload: `task:<origin>`, e.g. `task:event`.
 pub(crate) fn task_source(origin: TaskOrigin) -> String {
     format!("task:{}", origin.as_str())

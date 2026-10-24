@@ -243,6 +243,9 @@ struct Fed {
     /// The active task's `lifecycle.keep_working` continuations, as of its last `keep_working`
     /// record.
     keep_working_used: u32,
+    /// The active task's `lifecycle.done_check` reopens, as of its last reopening `done_check`
+    /// record.
+    done_check_reopens: u32,
     input: Option<u64>,
     output: Option<u64>,
     cached: Option<u64>,
@@ -265,6 +268,8 @@ pub(crate) struct SessionStatus {
     notice_secs: u64,
     /// `lifecycle.keep_working.limit`; `None` when the option is off.
     keep_working_limit: Option<u32>,
+    /// `lifecycle.done_check.limit`; `None` when the option is off.
+    done_check_limit: Option<u32>,
     notice_taken: AtomicBool,
     fed: Mutex<Fed>,
 }
@@ -272,7 +277,8 @@ pub(crate) struct SessionStatus {
 impl SessionStatus {
     /// A session that started at `started`. `notice_secs` is [`notice_secs`]'s answer, and is
     /// read only when there is a deadline. `keep_working_limit` is `lifecycle.keep_working.limit`,
-    /// `None` when the capsule does not set the option.
+    /// `None` when the capsule does not set the option, and `done_check_limit` is
+    /// `lifecycle.done_check.limit` on the same terms.
     pub(crate) fn new(
         started: Instant,
         harness_transport: bool,
@@ -280,6 +286,7 @@ impl SessionStatus {
         deadline: Option<SessionDeadline>,
         notice_secs: u64,
         keep_working_limit: Option<u32>,
+        done_check_limit: Option<u32>,
     ) -> Self {
         Self {
             started,
@@ -288,6 +295,7 @@ impl SessionStatus {
             deadline,
             notice_secs,
             keep_working_limit,
+            done_check_limit,
             notice_taken: AtomicBool::new(false),
             fed: Mutex::new(Fed::default()),
         }
@@ -316,11 +324,18 @@ impl SessionStatus {
         fed.task = Some((task_id.to_string(), at));
         fed.task_turns = 0;
         fed.keep_working_used = 0;
+        fed.done_check_reopens = 0;
     }
 
     /// Fed by `TraceWriter::write_keep_working` with the continuation's 1-based `number`.
     pub(crate) fn keep_working_sent(&self, number: u32) {
         self.fed().keep_working_used = number;
+    }
+
+    /// Fed by `TraceWriter::write_done_check` with the task's reopens so far, when a run reopened
+    /// it.
+    pub(crate) fn done_check_reopened(&self, reopens: u32) {
+        self.fed().done_check_reopens = reopens;
     }
 
     /// Fed by `TraceWriter::write_task_end`.
@@ -448,6 +463,15 @@ impl SessionStatus {
                     })
                 },
             ),
+            done_check: self.done_check_limit.map_or_else(
+                || Value::from(NONE),
+                |limit| {
+                    serde_json::json!({
+                        "used": fed.done_check_reopens,
+                        "left": limit.saturating_sub(fed.done_check_reopens),
+                    })
+                },
+            ),
             context,
             tokens: TokensReport {
                 input: or_unknown(fed.input),
@@ -506,6 +530,8 @@ pub(crate) struct StatusReport {
     turns: TurnsReport,
     /// `{used, left}` under `lifecycle.keep_working`; `"none"` without it.
     keep_working: Value,
+    /// `{used, left}` under `lifecycle.done_check`; `"none"` without it.
+    done_check: Value,
     /// An object under `transport: http`; `"unknown"` under `transport: process`.
     context: Value,
     tokens: TokensReport,
@@ -547,7 +573,8 @@ const FIELDS: &str = "`time`: `elapsed_secs` since the session started, `task_el
      the session, and `left_secs` until then. `turns`: `used`, the inference calls this task has \
      made, and `cap`, the most it may make. `keep_working`: `used`, the messages \
      lifecycle.keep_working has sent this task to keep it working past a turn end, and `left`, \
-     how many more it may send.";
+     how many more it may send. `done_check`: `used`, the times lifecycle.done_check has \
+     reopened this task because its command failed, and `left`, how many more it may.";
 
 /// The `spend` and closing sentences every description shares.
 const SPEND_AND_VALUES: &str = "`spend`: `tokens`, what the spend ceilings count for this \
@@ -625,7 +652,7 @@ mod tests {
         let started = Instant::now();
         let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_792_497_600);
         let deadline = SessionDeadline::after(started, wall, 7_200);
-        let status = SessionStatus::new(started, false, Some(20), Some(deadline), 300, None);
+        let status = SessionStatus::new(started, false, Some(20), Some(deadline), 300, None, None);
         status.task_started("tsk_1", started + Duration::from_secs(44));
         status.record_inference(
             1,
@@ -661,6 +688,7 @@ mod tests {
                          "deadline": {"at": "2026-10-20T14:00:00Z", "left_secs": 5365}},
                 "turns": {"used": 2, "cap": 20},
                 "keep_working": "none",
+                "done_check": "none",
                 "context": {"used_tokens": 61234, "window_tokens": 200000,
                             "budget_tokens": 191808,
                             "budget_basis": "context_window_less_output_cap",
@@ -677,6 +705,7 @@ mod tests {
             "\"time\"",
             "\"turns\"",
             "\"keep_working\"",
+            "\"done_check\"",
             "\"context\"",
             "\"tokens\"",
             "\"spend\"",
@@ -690,13 +719,14 @@ mod tests {
     #[test]
     fn session_status_says_none_for_unset_limits_and_unknown_for_missing_counts() {
         let started = Instant::now();
-        let status = SessionStatus::new(started, false, None, None, 0, None);
+        let status = SessionStatus::new(started, false, None, None, 0, None, None);
         assert_eq!(
             report(&status, started, no_spend()),
             json!({
                 "time": {"elapsed_secs": 0, "task_elapsed_secs": "unknown", "deadline": "none"},
                 "turns": {"used": 0, "cap": "none"},
                 "keep_working": "none",
+                "done_check": "none",
                 "context": "unknown",
                 "tokens": {"input": "unknown", "output": "unknown", "cached": "unknown",
                            "cache_write": "unknown", "unreported_calls": 0},
@@ -741,7 +771,7 @@ mod tests {
     #[test]
     fn session_status_under_process_reads_the_harness_counts_and_no_context() {
         let started = Instant::now();
-        let status = SessionStatus::new(started, true, Some(10), None, 0, None);
+        let status = SessionStatus::new(started, true, Some(10), None, 0, None, None);
         status.task_started("tsk_1", started);
         status.record_inference(
             1,
@@ -765,7 +795,7 @@ mod tests {
     #[test]
     fn session_status_restarts_the_task_clock_and_turns_at_each_task() {
         let started = Instant::now();
-        let status = SessionStatus::new(started, false, None, None, 0, None);
+        let status = SessionStatus::new(started, false, None, None, 0, None, None);
         status.task_started("tsk_1", started);
         status.record_inference(1, None, None, None);
         status.task_ended();
@@ -785,7 +815,7 @@ mod tests {
     #[test]
     fn session_status_counts_keep_working_per_task_against_the_limit() {
         let started = Instant::now();
-        let status = SessionStatus::new(started, false, None, None, 0, Some(3));
+        let status = SessionStatus::new(started, false, None, None, 0, Some(3), None);
         assert_eq!(
             report(&status, started, no_spend())["keep_working"],
             json!({"used": 0, "left": 3})
@@ -824,7 +854,7 @@ mod tests {
     fn session_status_take_due_notice_fires_once_inside_the_margin() {
         let started = Instant::now();
         let deadline = SessionDeadline::after(started, SystemTime::now(), 30);
-        let status = SessionStatus::new(started, false, None, Some(deadline), 20, None);
+        let status = SessionStatus::new(started, false, None, Some(deadline), 20, None, None);
         assert_eq!(
             status.take_due_notice(started + Duration::from_secs(9)),
             None
@@ -855,15 +885,15 @@ mod tests {
     fn session_status_take_due_notice_never_fires_at_zero_or_without_a_deadline() {
         let started = Instant::now();
         let deadline = SessionDeadline::after(started, SystemTime::now(), 30);
-        let silent = SessionStatus::new(started, false, None, Some(deadline), 0, None);
+        let silent = SessionStatus::new(started, false, None, Some(deadline), 0, None, None);
         assert_eq!(
             silent.take_due_notice(started + Duration::from_secs(29)),
             None
         );
-        let unbounded = SessionStatus::new(started, false, None, None, 300, None);
+        let unbounded = SessionStatus::new(started, false, None, None, 300, None, None);
         assert_eq!(unbounded.take_due_notice(started), None);
         // A deadline already past still gives its one notice, saying no time is left.
-        let past = SessionStatus::new(started, false, None, Some(deadline), 5, None);
+        let past = SessionStatus::new(started, false, None, Some(deadline), 5, None, None);
         let notice = past
             .take_due_notice(started + Duration::from_secs(31))
             .unwrap();
@@ -985,6 +1015,32 @@ mod tests {
         assert_eq!(DeadlineSource::Inherited.as_str(), "inherited");
     }
 
+    /// `done_check` counts the active task's reopens by `lifecycle.done_check` against the limit,
+    /// from zero at each task's start.
+    #[test]
+    fn session_status_counts_done_check_reopens_per_task_against_the_limit() {
+        let started = Instant::now();
+        let status = SessionStatus::new(started, false, None, None, 0, None, Some(3));
+        assert_eq!(
+            report(&status, started, no_spend())["done_check"],
+            json!({"used": 0, "left": 3})
+        );
+        assert_eq!(report(&status, started, no_spend())["keep_working"], "none");
+        status.task_started("tsk_1", started);
+        status.done_check_reopened(1);
+        status.done_check_reopened(2);
+        assert_eq!(
+            report(&status, started, no_spend())["done_check"],
+            json!({"used": 2, "left": 1})
+        );
+        status.task_ended();
+        status.task_started("tsk_2", started);
+        assert_eq!(
+            report(&status, started, no_spend())["done_check"],
+            json!({"used": 0, "left": 3})
+        );
+    }
+
     #[test]
     fn session_status_descriptions_name_every_field_and_no_timing_advice() {
         for description in [description_http(), description_process()] {
@@ -996,6 +1052,7 @@ mod tests {
                 "`turns`",
                 "`cap`",
                 "`keep_working`",
+                "`done_check`",
                 "`used`",
                 "`left`",
                 "`context`",

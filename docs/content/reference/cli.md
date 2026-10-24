@@ -1563,7 +1563,7 @@ started.
 
 | Aspect | Behaviour |
 |---|---|
-| Reached | The session ends as a first [`SIGTERM`](#mur-run-sigterm) ends it, under the same 20-second bound: every live task is cancelled and ends `canceled`, and the teardown runs. A task [kept working](../concepts/session-loop.md#keep-working) by `lifecycle.keep_working` ends `ok` with its last turn end's answer instead |
+| Reached | The session ends as a first [`SIGTERM`](#mur-run-sigterm) ends it, under the same 20-second bound: every live task is cancelled and ends `canceled`, and the teardown runs. A task [kept working](../concepts/session-loop.md#keep-working) by `lifecycle.keep_working` ends `ok` with its last turn end's answer instead, and so does a task whose [done check](../concepts/session-loop.md#done-check) is running or has reopened it |
 | A foreground shell command running, on `transport: http` | Stops being waited for at once: it is moved to the background, the task ends `canceled` with `task_canceled.phase` `"shell"`, and the session's end kills the command |
 | Trace | `deadline_reached` before the wind-down's records, then `session_end` with `exit_status: "deadline_reached"`; `session_start.deadline` names it from the start. See [`trace.jsonl`](observability-schemas.md#deadline-reached) |
 | Exit | `status:  deadline_reached`, exit code `1`, [`E-RUN-053`](diagnostics.md#e-run-053) — unless an earlier task already failed, which keeps its own status |

@@ -26,6 +26,7 @@ pub mod runtime_manifest;
 pub mod runtime_warnings;
 pub mod secrets;
 pub mod security_warnings;
+pub mod shell_words;
 pub mod trace_capture;
 pub mod unknown_manifest_keys;
 pub mod wit_contract;
@@ -107,11 +108,11 @@ pub use runtime_manifest::{
     referenced_env_variables, tool_name_of, AfterTask, ApiKeyReference, ArtifactGateway,
     ArtifactImplementation, ArtifactRuntime, AuthenticationScheme, Capabilities, CompactionConfig,
     ContainmentClass, ContextConfig, ContextRetainConfig, ControlConfig, ControllableSetting,
-    ConversationCapabilities, ConversationMode, DeployConfig, DoorCredential, EnvCapabilities,
-    EvalConfig, ExportMode, Exports, FileExport, FilesystemCapabilities, HookBinding,
-    HookCommitPolicy, HookConfig, HookExecutionMode, HookOverflowPolicy, InferenceAlternate,
-    InferenceConfig, InferenceDriver, InferenceRetry, InstallCapabilities, InstallFrom,
-    InterpreterRuntimeDir, InterpreterRuntimeGrant, KeepWorking, LifecycleConfig,
+    ConversationCapabilities, ConversationMode, DeployConfig, DoneCheck, DoorCredential,
+    EnvCapabilities, EvalConfig, ExportMode, Exports, FileExport, FilesystemCapabilities,
+    HookBinding, HookCommitPolicy, HookConfig, HookExecutionMode, HookOverflowPolicy,
+    InferenceAlternate, InferenceConfig, InferenceDriver, InferenceRetry, InstallCapabilities,
+    InstallFrom, InterpreterRuntimeDir, InterpreterRuntimeGrant, KeepWorking, LifecycleConfig,
     LifecycleOverride, NetworkAuthentication, NetworkCapabilities, NetworkConfig,
     ObservabilityConfig, ParseContainmentClassError, PeerFetchCapabilities, PeerFilesExport,
     PeerTasksExport, PlanCapabilities, ReferencedEnvVariable, ResourceCapabilities, ResourceLimits,
@@ -136,6 +137,7 @@ pub use security_warnings::{
     W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_021, W_SEC_023, W_SEC_024,
     W_SEC_025, W_SEC_027, W_SEC_028, W_SEC_029, W_SEC_030, W_SEC_031, W_SEC_032, W_SEC_033,
 };
+pub use shell_words::split_shell_words;
 pub use trace_capture::{
     resolve_trace_capture, ParseTraceCaptureError, TraceCapture, TRACE_CAPTURE_ACCEPTED_VALUES,
 };

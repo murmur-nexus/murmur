@@ -138,7 +138,8 @@ task used by the numbers `mur trace show` prints, and how many of the calls were
 task did not complete: `GetTask` reads `TASK_STATE_FAILED`, and
 [`mur run`](../reference/cli.md#mur-run-status) exits `1`. A task
 [kept working](#keep-working) that spends the limit ends `ok` instead, with the answer of its last
-turn end.
+turn end, and so does a task a failing [done check](#done-check) reopened, with the answer that
+preceded the reopen.
 
 ## Deadlines { #deadlines }
 
@@ -164,7 +165,9 @@ is a separate bound: whichever falls first ends the child.
 
 A task [kept working](#keep-working) past a turn end is the exception to the cancel: the deadline
 ends it `ok` with its last turn end's answer, while the session still ends `deadline_reached` and
-`mur run` still exits with `E-RUN-053`.
+`mur run` still exits with `E-RUN-053`. So is a task whose [done check](#done-check) is running or
+has reopened it: the deadline kills a running check and ends the task `ok` with the answer it was
+checking.
 
 ## Keeping a task working { #keep-working }
 
@@ -213,6 +216,90 @@ before it, and a task's cost grows with every continuation. To measure what the 
 the capsule through [`mur eval run`](../reference/cli.md#mur-eval-run), run a copy of the capsule
 directory whose manifest omits `lifecycle.keep_working` the same way, and compare the two sessions
 with [`mur eval diff`](../reference/cli.md#mur-eval-diff).
+
+## Done check { #done-check }
+
+By default a task ends when the model stops, whether or not the work passes. With
+[`lifecycle.done_check`](../reference/manifest.md#lifecycle-done-check) set, the operator's
+`command` decides: it runs each time the agent stops, and exit `0` is the only result that lets the
+task end with the check met.
+
+At a stop the runtime takes these steps in order:
+
+1. Handed-off work: outstanding [`call-member`](../reference/runtime-provided-tools.md#call-member)
+   answers and delegation outcomes continue the task first.
+2. [`lifecycle.keep_working`](#keep-working) sends its message until it stops.
+3. The done check runs.
+4. `on-task-end` hooks run, on an attempt that passed the check or exhausted it.
+
+| Result | What happens |
+|---|---|
+| Exit `0` | The check is met, and the task ends as it would without the option |
+| Any other result while reopens remain | The task reopens and continues its own conversation, with the run's facts as the next user message |
+| A failing run once `limit` reopens are spent | The task ends `ok` with its last answer, and `task_end.done_check.met` is `false` |
+
+A run that exits non-zero fails, and so does one a resource limit kills, one still running at
+`timeout_secs`, and one that could not start. The task ends `ok` at the limit rather than `failed`:
+the status says whether the session ran to an end. A caller that wants to know whether the work
+passed reads `task_end.done_check.met`.
+
+What ends a task with its check unmet:
+
+| Stop | `stopped_by` | How the task ends |
+|---|---|---|
+| `limit` reopens were spent and the next run failed too | `limit` | `ok`, with the last answer |
+| [`inference.max_turns`](#turn-limit-inferencemax_turns) is spent, at the stop or inside a reopened attempt | `max_turns` | `ok`, with the answer that preceded the reopen when a reopened attempt ran out |
+| A [spend ceiling](../reference/manifest.md#inference-max-session-tokens) refuses the next driver call of a reopened attempt | `spend_ceiling` | `ok`, with the answer that preceded the reopen |
+| The [session deadline](#deadlines) falls while the check runs or a reopened attempt works | `deadline` | `ok`, with the answer being checked; a running check is killed. The session still ends `deadline_reached`, and `mur run` exits with [`E-RUN-053`](../reference/diagnostics.md#e-run-053) |
+
+A person's `CancelTask`, `mur stop` and `SIGTERM` still end the task `canceled`; a check they
+interrupt is killed and `task_canceled.phase` is `"done_check"`.
+
+A check reopen happens inside one task:
+
+- `on-task-end` hooks are not dispatched for an attempt the check reopens: it is not an end. A hook
+  that [reopens](#task-reopening-commit_policy-reopen-task) a task that passed the check sends it
+  through the check again at its next stop.
+- `limit` is the check's own budget, per task and across hook reopens.
+  [`lifecycle.max_task_reopens`](../reference/manifest.md#field-lifecycle) is the hooks' budget: a
+  check reopen does not spend it, writes no `task_reopened` record and does not count in
+  `task_end.reopen_count`, and `max_task_reopens: 0` does not turn the check off.
+- Each run writes one [`done_check`](../reference/observability-schemas.md#done-check) trace
+  record, and a reopen sends one `working` status, `done check failed, reopened <n> of <limit>`, on
+  the [stream](../reference/streaming-protocol.md#working-messages). `task_end.done_check` records
+  `runs`, `reopens`, `limit`, `met` and `stopped_by`, and `mur trace show` prints
+  `done check: not met  reopens 2 of 2 (stopped by limit)`.
+- The agent reads the reopens used and left in the `done_check` field of
+  [`session-status`](../reference/runtime-provided-tools.md#session-status).
+
+The command runs the way the agent's shell tool runs one: in the work folder, under the capsule's
+containment, environment and [resource limits](../reference/manifest.md#field-capabilities), with
+each output stream capped at 16 KiB. It is not a tool call: it writes no `shell` record, dispatches
+no hook event, and counts in neither `tool_calls` nor `shell_calls`.
+
+The message a reopened attempt receives is the run's facts and nothing else. The output comes from
+the work the agent left, so it is fenced as untrusted content:
+
+```text
+Done check
+<untrusted-content source=done-check>
+$ cargo test --quiet
+Exit code: 101
+Stdout:
+<stdout>
+Stderr:
+<stderr>
+</untrusted-content>
+```
+
+`Exit code` reads `none` for a run killed at `timeout_secs`. A run that could not start shows
+`Did not start: <error>` in place of the exit code and streams. Output cut at the cap ends with
+`Output truncated.` inside the fence, followed by the path of the full output when it was kept in
+the records directory. Two lines may follow the closing marker:
+`Resource limit: capabilities.resources.<field>` when a limit killed the command, and
+`Stopped after <n> s by lifecycle.done_check.timeout_secs.` for a run the timeout killed. The
+runtime adds no wording about what to do next, and nothing about the option enters the system
+prompt, `MURMUR.md` or the `[Capsule]` block.
 
 ## Task reopening (`commit_policy: reopen-task`) { #task-reopening-commit_policy-reopen-task }
 

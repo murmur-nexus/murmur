@@ -519,7 +519,8 @@ Rules:
 - `after_task: sleep` is for a capsule intended to remain available;
 - use `conversation: threaded` only when tasks sharing a context should accumulate conversational history;
 - add `input_timeout_secs` only when tools can request human/input replies and indefinite waiting is unacceptable;
-- add [`keep_working`](https://docs.murmur.nexus/reference/manifest/#lifecycle-keep-working) (`message` and `limit`, both required, `limit` at least `1`) only when the operator wants the agent kept working past its turn ends until a budget is spent; every continuation resends the whole context, so pair it with `inference.max_turns`, a spend ceiling or `mur run --deadline`. Omit it to keep the default, where a task ends at its first turn end.
+- add [`keep_working`](https://docs.murmur.nexus/reference/manifest/#lifecycle-keep-working) (`message` and `limit`, both required, `limit` at least `1`) only when the operator wants the agent kept working past its turn ends until a budget is spent; every continuation resends the whole context, so pair it with `inference.max_turns`, a spend ceiling or `mur run --deadline`. Omit it to keep the default, where a task ends at its first turn end;
+- add [`done_check`](https://docs.murmur.nexus/reference/manifest/#lifecycle-done-check) (`command` and `limit` required, `timeout_secs` default `600`) only when a command can say whether the work is done, such as `cargo test --quiet`; its program must be in `capabilities.shell.allow`, a failing run reopens the task up to `limit` times, and a task at the limit still ends `ok` with `task_end.done_check.met: false`. Omit it to end a task when the model stops.
 
 ### 9. Add observability deliberately
 

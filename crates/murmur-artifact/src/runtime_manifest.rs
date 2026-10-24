@@ -9,6 +9,7 @@ use crate::{
     build::artifact_name_format_error,
     manifest::{REGISTRY_BLOCK_KEY, REGISTRY_BLOCK_MESSAGE},
     manifest_path::MANIFEST_FILENAME,
+    shell_words::split_shell_words,
     trace_capture::{resolve_trace_capture, TraceCapture},
     unknown_manifest_keys::{nearest_known_key, UnknownManifestKey},
 };
@@ -88,6 +89,11 @@ pub struct LifecycleConfig {
     /// conversation, up to [`KeepWorking::limit`] times per task. `None` (the default, and what a
     /// manifest without `lifecycle.keep_working` gets) ends a task at its first turn end.
     pub keep_working: Option<KeepWorking>,
+    /// What "done" means for a task: each time an attempt stops at a turn end, the runtime runs
+    /// [`DoneCheck::command`] in the work folder and, while it fails, reopens the task with its
+    /// output, up to [`DoneCheck::limit`] times per task. `None` (the default, and what a manifest
+    /// without `lifecycle.done_check` gets) ends a task when the model stops.
+    pub done_check: Option<DoneCheck>,
 }
 
 /// `lifecycle.keep_working`: what the runtime sends when a task's attempt ends at a turn end, and
@@ -99,6 +105,30 @@ pub struct KeepWorking {
     pub message: String,
     /// How many continuations one task may receive. At least 1.
     pub limit: u32,
+}
+
+/// `lifecycle.done_check`: the command whose exit status says whether a task's work is done, and
+/// how many times per task a failing run may reopen the task; see [`LifecycleConfig::done_check`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoneCheck {
+    /// As declared. Split with [`split_shell_words`]; its first word is a
+    /// `capabilities.shell.allow` entry.
+    pub command: String,
+    /// How many times one task may be reopened by a failing run, counted across hook reopens and
+    /// separately from `max_task_reopens`. `0` runs and records the check without reopening.
+    pub limit: u32,
+    /// How long one run may take before the runtime kills it. At least 1.
+    pub timeout_secs: u64,
+}
+
+impl DoneCheck {
+    /// The default [`DoneCheck::timeout_secs`].
+    pub const DEFAULT_TIMEOUT_SECS: u64 = 600;
+
+    /// [`DoneCheck::command`] as the program and its arguments.
+    pub fn argv(&self) -> Vec<String> {
+        split_shell_words(&self.command)
+    }
 }
 
 impl LifecycleConfig {
@@ -154,6 +184,7 @@ impl Default for LifecycleConfig {
             delegation_deadline_secs: 600,
             deadline_notice_secs: None,
             keep_working: None,
+            done_check: None,
         }
     }
 }
@@ -2190,6 +2221,20 @@ struct RawLifecycleConfig {
     deadline_notice_secs: Option<u64>,
     #[serde(default)]
     keep_working: Option<RawKeepWorking>,
+    #[serde(default)]
+    done_check: Option<RawDoneCheck>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDoneCheck {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2864,6 +2909,48 @@ fn parse_keep_working(raw: RawKeepWorking) -> Result<KeepWorking, RuntimeManifes
     Ok(KeepWorking { message, limit })
 }
 
+/// Resolves `lifecycle.done_check`, refusing a missing, blank or wordless `command`, a command
+/// whose program `shell_allow` (`capabilities.shell.allow`) does not list, a missing `limit` and a
+/// zero `timeout_secs`. The command keeps the operator's bytes as written.
+fn parse_done_check(
+    raw: RawDoneCheck,
+    shell_allow: &[String],
+) -> Result<DoneCheck, RuntimeManifestError> {
+    let invalid = |field: &str, message: String| RuntimeManifestError::InvalidLifecycleConfig {
+        field: format!("lifecycle.done_check.{field}"),
+        message,
+    };
+    let command = match raw.command {
+        None => return Err(invalid("command", "is required".into())),
+        Some(command) if command.trim().is_empty() => {
+            return Err(invalid("command", "must not be blank".into()))
+        }
+        Some(command) => command,
+    };
+    let Some(program) = split_shell_words(&command).into_iter().next() else {
+        return Err(invalid("command", "must name a program".into()));
+    };
+    if !shell_allow.contains(&program) {
+        return Err(invalid(
+            "command",
+            format!("runs '{program}', which is not in capabilities.shell.allow"),
+        ));
+    }
+    let Some(limit) = raw.limit else {
+        return Err(invalid("limit", "is required".into()));
+    };
+    let timeout_secs = match raw.timeout_secs {
+        None => DoneCheck::DEFAULT_TIMEOUT_SECS,
+        Some(0) => return Err(invalid("timeout_secs", "must be at least 1".into())),
+        Some(secs) => secs,
+    };
+    Ok(DoneCheck {
+        command,
+        limit,
+        timeout_secs,
+    })
+}
+
 impl RawBlock for RawLifecycleConfig {
     const KNOWN_KEYS: &'static [&'static str] = &[
         "task_acceptance",
@@ -2876,6 +2963,7 @@ impl RawBlock for RawLifecycleConfig {
         "delegation_deadline_secs",
         "deadline_notice_secs",
         "keep_working",
+        "done_check",
     ];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
@@ -2885,6 +2973,16 @@ impl RawBlock for RawLifecycleConfig {
         if let Some(keep_working) = &self.keep_working {
             collect_block(keep_working, &child_path(path, "keep_working"), out);
         }
+        if let Some(done_check) = &self.done_check {
+            collect_block(done_check, &child_path(path, "done_check"), out);
+        }
+    }
+}
+
+impl RawBlock for RawDoneCheck {
+    const KNOWN_KEYS: &'static [&'static str] = &["command", "limit", "timeout_secs"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
     }
 }
 
@@ -3931,6 +4029,16 @@ impl RuntimeManifest {
                         .unwrap_or(defaults.delegation_deadline_secs),
                     deadline_notice_secs: raw_lc.deadline_notice_secs,
                     keep_working: raw_lc.keep_working.map(parse_keep_working).transpose()?,
+                    done_check: raw_lc
+                        .done_check
+                        .map(|raw| {
+                            let shell_allow = capabilities
+                                .as_ref()
+                                .and_then(|capabilities| capabilities.shell.as_ref())
+                                .map_or(&[][..], |shell| shell.allow.as_slice());
+                            parse_done_check(raw, shell_allow)
+                        })
+                        .transpose()?,
                 };
                 if lifecycle.queue_has_room() {
                     Ok(lifecycle)
@@ -11655,6 +11763,142 @@ context:
         assert_eq!(
             reported,
             vec![("lmit".to_string(), "lifecycle.keep_working".to_string())]
+        );
+    }
+
+    fn lifecycle_with_done_check(
+        allow: &str,
+        block: &str,
+    ) -> Result<RuntimeManifest, RuntimeManifestError> {
+        RuntimeManifest::from_yaml_str(&format!(
+            "name: cap\nversion: 0.0.1\nartifacts: []\n{allow}lifecycle:\n  done_check:\n{block}"
+        ))
+    }
+
+    const ALLOW_BASH: &str = "capabilities:\n  shell:\n    allow: [bash]\n";
+
+    fn refused_done_check_field(allow: &str, block: &str) -> (String, String) {
+        match lifecycle_with_done_check(allow, block) {
+            Err(RuntimeManifestError::InvalidLifecycleConfig { field, message }) => {
+                (field, message)
+            }
+            other => panic!("expected InvalidLifecycleConfig for {block:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lifecycle_done_check_is_off_when_absent() {
+        let without_block =
+            RuntimeManifest::from_yaml_str("name: cap\nversion: 0.0.1\nartifacts: []\n").unwrap();
+        assert_eq!(without_block.effective_lifecycle().done_check, None);
+        let without_key = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  queue_depth: 3\n",
+        )
+        .unwrap();
+        assert_eq!(without_key.lifecycle.unwrap().done_check, None);
+    }
+
+    #[test]
+    fn lifecycle_done_check_takes_the_command_and_limit_with_the_default_timeout() {
+        let manifest = lifecycle_with_done_check(
+            ALLOW_BASH,
+            "    command: \"bash -c 'true'\"\n    limit: 2\n",
+        )
+        .unwrap();
+        assert!(
+            manifest.unknown_keys.is_empty(),
+            "{:?}",
+            manifest.unknown_keys
+        );
+        let done_check = manifest.lifecycle.unwrap().done_check.unwrap();
+        assert_eq!(
+            done_check,
+            DoneCheck {
+                command: "bash -c 'true'".into(),
+                limit: 2,
+                timeout_secs: 600,
+            }
+        );
+        assert_eq!(done_check.argv(), ["bash", "-c", "true"]);
+    }
+
+    /// `0` observes without reopening; an explicit timeout is kept.
+    #[test]
+    fn lifecycle_done_check_accepts_a_zero_limit_and_an_explicit_timeout() {
+        let manifest = lifecycle_with_done_check(
+            ALLOW_BASH,
+            "    command: bash -c 'exit 1'\n    limit: 0\n    timeout_secs: 5\n",
+        )
+        .unwrap();
+        let done_check = manifest.lifecycle.unwrap().done_check.unwrap();
+        assert_eq!((done_check.limit, done_check.timeout_secs), (0, 5));
+    }
+
+    #[test]
+    fn lifecycle_done_check_refuses_each_invalid_field() {
+        for (allow, block, field, message) in [
+            (ALLOW_BASH, "    limit: 1\n", "command", "is required"),
+            (
+                ALLOW_BASH,
+                "    command: \"  \"\n    limit: 1\n",
+                "command",
+                "must not be blank",
+            ),
+            (
+                ALLOW_BASH,
+                "    command: \"''\"\n    limit: 1\n",
+                "command",
+                "must name a program",
+            ),
+            (
+                ALLOW_BASH,
+                "    command: cargo test\n    limit: 1\n",
+                "command",
+                "runs 'cargo', which is not in capabilities.shell.allow",
+            ),
+            (
+                "",
+                "    command: bash -c true\n    limit: 1\n",
+                "command",
+                "runs 'bash', which is not in capabilities.shell.allow",
+            ),
+            (
+                ALLOW_BASH,
+                "    command: bash -c true\n",
+                "limit",
+                "is required",
+            ),
+            (
+                ALLOW_BASH,
+                "    command: bash -c true\n    limit: 1\n    timeout_secs: 0\n",
+                "timeout_secs",
+                "must be at least 1",
+            ),
+        ] {
+            assert_eq!(
+                refused_done_check_field(allow, block),
+                (format!("lifecycle.done_check.{field}"), message.to_string()),
+                "{block:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_done_check_reports_an_unknown_key_inside_the_block() {
+        assert!(RawLifecycleConfig::KNOWN_KEYS.contains(&"done_check"));
+        let manifest = lifecycle_with_done_check(
+            ALLOW_BASH,
+            "    command: bash -c true\n    limit: 2\n    limt: 3\n",
+        )
+        .unwrap();
+        let reported: Vec<(String, String)> = manifest
+            .unknown_keys
+            .iter()
+            .map(|key| (key.key.clone(), key.block_path.clone()))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![("limt".to_string(), "lifecycle.done_check".to_string())]
         );
     }
 
