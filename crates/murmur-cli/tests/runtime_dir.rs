@@ -1019,7 +1019,9 @@ fn runtime_dir_murmur_md_and_the_capsule_block_name_the_runtime_dir() {
             murmur_md.contains(&workdir.path().display().to_string()),
             "{murmur_md}"
         );
-        assert!(murmur_md.contains("\n  - a shell command: `$MURMUR_RUNTIME_DIR`\n"));
+        assert!(murmur_md.contains(
+            "\n  - a command line a shell interpreter runs with `-c`: `$MURMUR_RUNTIME_DIR`\n"
+        ));
         // No tool of this capsule is preopened there.
         assert!(!murmur_md.contains("murmur-runtime/"), "{murmur_md}");
         fs::write(workdir.path().join("task.md"), TASK).unwrap();
@@ -1227,9 +1229,10 @@ fn murmur_runtime_tools(entry: &str) -> Vec<String> {
 }
 
 /// MURMUR.md gives the runtime directory's absolute path and the name each kind of tool opens it
-/// by: `$MURMUR_RUNTIME_DIR` for a shell command, `murmur-runtime/` for exactly the tools preopened
-/// there, the absolute path for any other. A tool pulled mid-session joins the `murmur-runtime/`
-/// list once the pull commits.
+/// by: `$MURMUR_RUNTIME_DIR` for a command line a shell interpreter runs with `-c`,
+/// `murmur-runtime/` for exactly the tools preopened there, the absolute path for a program run
+/// directly and any other tool. A tool pulled mid-session joins the `murmur-runtime/` list once
+/// the pull commits.
 #[test]
 #[allow(clippy::print_stdout)]
 fn murmur_md_runtime_directory_names() {
@@ -1304,8 +1307,12 @@ fn murmur_md_runtime_directory_names() {
     );
     // Checked before the launch, which removes the runtime directory when it ends.
     assert!(runtime_dir.is_dir());
-    assert!(entry.contains("\n  - a shell command: `$MURMUR_RUNTIME_DIR`\n"));
-    assert!(entry.ends_with(&format!("\n  - any other tool given a path: `{absolute}`")));
+    assert!(entry.contains(
+        "\n  - a command line a shell interpreter runs with `-c`: `$MURMUR_RUNTIME_DIR`\n"
+    ));
+    assert!(entry.ends_with(&format!(
+        "\n  - a program run directly, or any other tool given a path: `{absolute}`"
+    )));
     assert_eq!(murmur_runtime_tools(&entry), [PROBE_TOOL], "{entry}");
     // Every tool named there is preopened there.
     for tool in murmur_runtime_tools(&entry) {

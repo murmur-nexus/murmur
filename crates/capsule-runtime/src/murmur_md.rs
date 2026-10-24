@@ -201,8 +201,9 @@ pub(crate) fn write_murmur_md(runtime_root: &WorkdirRoot, inputs: &MurmurMdInput
 
 /// The `- Runtime directory:` entry of `## Capsule`: the directory's absolute path, then the name
 /// each kind of tool opens it by. `$MURMUR_RUNTIME_DIR` is given only when `shell_interpreter`,
-/// and `murmur-runtime/` only for `runtime_dir_tools`, the tools preopened there. A native tool
-/// does not expand the variable in a path argument, so it, like every other tool, takes the
+/// for a command line a shell interpreter runs with `-c`, because only that expands it.
+/// `murmur-runtime/` is given only for `runtime_dir_tools`, the tools preopened there. A program
+/// run directly is handed its arguments unexpanded, so it, like every other tool, takes the
 /// absolute path.
 fn runtime_dir_entry(
     runtime_dir: &str,
@@ -214,7 +215,9 @@ fn runtime_dir_entry(
          it:\n"
     );
     if shell_interpreter {
-        out.push_str(&format!("  - a shell command: `${RUNTIME_DIR_ENV}`\n"));
+        out.push_str(&format!(
+            "  - a command line a shell interpreter runs with `-c`: `${RUNTIME_DIR_ENV}`\n"
+        ));
     }
     if !runtime_dir_tools.is_empty() {
         out.push_str(&format!(
@@ -223,7 +226,7 @@ fn runtime_dir_entry(
         ));
     }
     out.push_str(&format!(
-        "  - any other tool given a path: `{runtime_dir}`\n"
+        "  - a program run directly, or any other tool given a path: `{runtime_dir}`\n"
     ));
     out
 }
@@ -717,8 +720,8 @@ mod tests {
              - Work folder: /work  (`./`)\n\
              - Runtime directory: {runtime_dir} (read-only). The name to use depends on what \
              opens it:\n\
-             \x20 - a shell command: `$MURMUR_RUNTIME_DIR`\n\
-             \x20 - any other tool given a path: `{runtime_dir}`\n\
+             \x20 - a command line a shell interpreter runs with `-c`: `$MURMUR_RUNTIME_DIR`\n\
+             \x20 - a program run directly, or any other tool given a path: `{runtime_dir}`\n\
              - Writable: the work folder, except tests, Cargo.lock (read-only)\n\
              - Network allowlist: api.openai.com, pypi.org\n\
              \n\
@@ -784,11 +787,12 @@ mod tests {
             format!(
                 "- Runtime directory: {dir} (read-only). The name to use depends on what opens \
                  it:\n\
-                 \x20 - a shell command: `$MURMUR_RUNTIME_DIR`\n\
+                 \x20 - a command line a shell interpreter runs with `-c`: `$MURMUR_RUNTIME_DIR`\n\
                  \x20 - runtime-dir-probe, tool-editor: `murmur-runtime/`\n\
-                 \x20 - any other tool given a path: `{dir}`\n"
+                 \x20 - a program run directly, or any other tool given a path: `{dir}`\n"
             )
         );
+        assert!(!entry.contains("a shell command"), "{entry}");
     }
 
     #[test]
@@ -799,10 +803,11 @@ mod tests {
             format!(
                 "- Runtime directory: {dir} (read-only). The name to use depends on what opens \
                  it:\n\
-                 \x20 - a shell command: `$MURMUR_RUNTIME_DIR`\n\
-                 \x20 - any other tool given a path: `{dir}`\n"
+                 \x20 - a command line a shell interpreter runs with `-c`: `$MURMUR_RUNTIME_DIR`\n\
+                 \x20 - a program run directly, or any other tool given a path: `{dir}`\n"
             )
         );
+        assert!(!entry.contains("a shell command"), "{entry}");
     }
 
     #[test]
@@ -814,9 +819,12 @@ mod tests {
                 "- Runtime directory: {dir} (read-only). The name to use depends on what opens \
                  it:\n\
                  \x20 - tool-editor: `murmur-runtime/`\n\
-                 \x20 - any other tool given a path: `{dir}`\n"
+                 \x20 - a program run directly, or any other tool given a path: `{dir}`\n"
             )
         );
+        assert!(!entry.contains("a shell command"), "{entry}");
+        assert!(!entry.contains("MURMUR_RUNTIME_DIR"), "{entry}");
+        assert!(!entry.contains("shell interpreter"), "{entry}");
     }
 
     /// A binary allowed on its own and every other tool take the absolute path.
@@ -828,10 +836,12 @@ mod tests {
             format!(
                 "- Runtime directory: {dir} (read-only). The name to use depends on what opens \
                  it:\n\
-                 \x20 - any other tool given a path: `{dir}`\n"
+                 \x20 - a program run directly, or any other tool given a path: `{dir}`\n"
             )
         );
-        assert!(!entry.contains("MURMUR_RUNTIME_DIR"));
+        assert!(!entry.contains("a shell command"), "{entry}");
+        assert!(!entry.contains("MURMUR_RUNTIME_DIR"), "{entry}");
+        assert!(!entry.contains("shell interpreter"), "{entry}");
     }
 
     /// The facts of the capsule whose limits `capsule_facts_equal_the_enforced_values` pins.
