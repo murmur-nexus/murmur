@@ -290,6 +290,15 @@ fn models_malformed_tables_fail_the_build_naming_the_field() {
         ),
         (
             "driver",
+            entry(
+                "    max_output_tokens: 128000\n    context_window: 1050000\n    \
+                 max_input_tokens: 1050001\n",
+            ),
+            "'models.glm-5.3.max_input_tokens' is 1050001, above this entry's context_window of \
+             1050000",
+        ),
+        (
+            "driver",
             "models:\n  \"\":\n    max_output_tokens: 1\n    context_window: 2\n".to_string(),
             "'models' has an empty model id",
         ),
@@ -311,7 +320,8 @@ fn models_malformed_tables_fail_the_build_naming_the_field() {
                 .and(predicate::str::contains(field))
                 .and(predicate::str::contains(
                     "hint: models: is a driver's table",
-                )),
+                ))
+                .and(predicate::str::contains("optionally max_input_tokens")),
         );
         assert!(!dir.path().join("out.mur.zip").exists(), "{models}");
     }
@@ -324,7 +334,8 @@ fn models_a_good_table_builds_and_is_packed_byte_for_byte() {
     let manifest = models_driver_manifest(
         "driver",
         "# limits for each model this driver serves\nmodels:\n  glm-5.3:\n    \
-         max_output_tokens: 131072\n    context_window: 200000\n",
+         max_output_tokens: 131072\n    context_window: 200000\n  gpt-5.6:\n    \
+         max_output_tokens: 128000\n    context_window: 1050000\n    max_input_tokens: 922000\n",
     );
     fs::write(dir.path().join("murmur.yaml"), &manifest).unwrap();
     fs::write(dir.path().join("driver.wasm"), b"\0asm").unwrap();

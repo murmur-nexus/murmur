@@ -548,7 +548,7 @@ reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task)
 `seed-context` is honored at `on-task-start` alone: the first bound blocking hook to return it
 wins, and its messages are placed at the head of the task's context, ahead of any loaded history
 and ahead of the task message. The list is chronological, oldest first. The host measures it
-against `task-start-event.budget-tokens` — the context window × `context.seed_budget` — and
+against `task-start-event.budget-tokens` — the input budget × `context.seed_budget` — and
 commits it whole, drops its oldest messages, summarizes the overflowing front through the
 compaction hook, or refuses it; every outcome is recorded as a
 [`context_seed`](observability-schemas.md#context-seed) event, and a refusal never fails the task.
@@ -570,7 +570,8 @@ fail-closed rule that governs a policy hook's failures.
   `inference.compaction.threshold`: the provider's count of the call that crossed it when the
   driver reported [usage](#driver-usage), the runtime's estimate otherwise. The trace's
   [`compaction`](observability-schemas.md#session-trace-tracejsonl) line records which in
-  `tokens_before_source`. `compaction-event.threshold` is `session-tokens` over the context window.
+  `tokens_before_source`. `compaction-event.threshold` is `session-tokens` over the turn's
+  [input budget](manifest.md#inference-max-tokens), the number the threshold is a fraction of.
 - `compaction-event.model` and `compaction-event.system-prompt` carry
   `inference.compaction.model` and `inference.compaction.system_prompt` verbatim, so a compaction
   hook knows which model and which prompt to use for its own summarization call. Setting
@@ -608,8 +609,11 @@ fail-closed rule that governs a policy hook's failures.
   one. It is precomputed so a hook sizing its work against the window never has to know which
   model the session runs.
 - `task-start-event.budget-tokens` is the ceiling a `seed-context` returned from this event is
-  enforced against: that context window × [`context.seed_budget`](manifest.md#field-context),
-  rounded down.
+  enforced against: the primary choice's [input budget](manifest.md#inference-max-tokens) at
+  launch × [`context.seed_budget`](manifest.md#field-context), rounded down. The input budget is
+  the input ceiling, or the window less the output cap, whichever is smaller, so
+  `budget-tokens` is a fraction of a number below `context-window`, which still carries the
+  window.
   `task-start-event.prior-tokens` is the token count of the conversation history the task will
   load under [`lifecycle.conversation: threaded`](manifest.md#lifecycle-conversation), and `0`
   under every other conversation mode. Read `0` as "the runtime has not computed this" and

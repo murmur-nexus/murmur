@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use common::{
-    hook_wat::{compaction_hook_wasm, create_hook_zip},
+    hook_wat::{compaction_hook_wasm, compaction_hook_wasm_expecting, create_hook_zip},
     ScriptedServer,
 };
 
@@ -189,9 +189,10 @@ fn compact_not_declared_threshold_reached_warning_logged() {
         .stdout(predicates::str::contains("no_hook_replacement"));
 }
 
-/// Create a test project manifest for compaction tests: context.max_tokens=200 and
-/// compaction.threshold=0.01, so compaction fires on the very first turn, bash allowed, and
-/// `hooks` (YAML `artifacts:` entries) declared beside the driver.
+/// Create a test project manifest for compaction tests: context.max_tokens=200,
+/// inference.max_tokens=100 (an input budget of 100) and compaction.threshold=0.01, so compaction
+/// fires on the very first turn, bash allowed, and `hooks` (YAML `artifacts:` entries) declared
+/// beside the driver.
 fn create_compaction_manifest(
     project_dir: &Path,
     endpoint: &str,
@@ -224,6 +225,7 @@ fn create_compaction_manifest(
             "inference:\n",
             "  transport: http\n",
             "  model: test-model\n",
+            "  max_tokens: 100\n",
             "  driver:\n",
             "    artifact: {driver_name}\n",
             "  compaction:\n",
@@ -244,13 +246,15 @@ fn create_compaction_manifest(
 
 const COMPACTOR: &str = "local/compactor";
 const SUMMARY: &str = "everything so far, in one line";
-/// `context.max_tokens` and `inference.compaction.threshold` for the cases below: compaction
-/// fires at 400 tokens, which the runtime's estimate of any request crosses on its own.
+/// `context.max_tokens`, `inference.max_tokens` and `inference.compaction.threshold` for the
+/// cases below: the input budget is 3000, so compaction fires at 300 tokens, which the runtime's
+/// estimate of any request crosses on its own.
 const WINDOW: u64 = 4_000;
+const CAP: u64 = 1_000;
 const THRESHOLD: f64 = 0.1;
 
 fn threshold_tokens() -> u64 {
-    (WINDOW as f64 * THRESHOLD) as u64
+    ((WINDOW - CAP) as f64 * THRESHOLD) as u64
 }
 
 /// An anthropic response: a `bash` call running `command`, or the end of the turn when `command`
@@ -288,9 +292,9 @@ fn response(command: Option<&str>, usage: Option<Value>) -> String {
 
 const TASK: &str = "Run the command and summarize.";
 
-/// A capsule over `responses` with `context.max_tokens: window`, `compaction.threshold:
-/// THRESHOLD`, `bash` allowed and, `with_hook`, [`compaction_hook_wasm`] bound to
-/// `on-compaction`, run over `task` to its end. Returns every trace line.
+/// A capsule over `responses` with `context.max_tokens: window`, `inference.max_tokens: CAP`,
+/// `compaction.threshold: THRESHOLD`, `bash` allowed and, `with_hook`, [`compaction_hook_wasm`]
+/// bound to `on-compaction`, run over `task` to its end. Returns every trace line.
 fn run_compacting(responses: Vec<String>, window: u64, with_hook: bool, task: &str) -> Vec<Value> {
     let server = ScriptedServer::start(responses);
     let home = tempfile::tempdir().unwrap();
@@ -326,6 +330,7 @@ fn run_compacting(responses: Vec<String>, window: u64, with_hook: bool, task: &s
     let text = fs::read_to_string(&manifest)
         .unwrap()
         .replace("  max_tokens: 200\n", &format!("  max_tokens: {window}\n"))
+        .replace("  max_tokens: 100\n", &format!("  max_tokens: {CAP}\n"))
         .replace(
             "    threshold: 0.01\n",
             &format!("    threshold: {THRESHOLD}\n"),
@@ -439,7 +444,7 @@ fn compaction_counts_each_cache_member_once() {
     );
 
     // Neither cache member alone carries the turn over: 50 + 200 + 10 and 50 + 160 + 10 are
-    // both under 400.
+    // both under 300.
     assert!(50 + 200 + 10 < threshold_tokens() && 50 + 160 + 10 < threshold_tokens());
     let compactions = of_type(&events, "compaction");
     assert_eq!(compactions.len(), 1, "{events:#?}");
@@ -490,8 +495,8 @@ fn compaction_measures_messages_added_after_the_report() {
             ),
             response(None, None),
         ],
-        // Compaction fires at 200 tokens: turn 0's report (15) stays under it, turn 1's estimate
-        // (at least 315) crosses it.
+        // The input budget is 2000 − CAP, so compaction fires at 100 tokens: turn 0's report
+        // (15) stays under it, turn 1's estimate (at least 315) crosses it.
         2_000,
         true,
         // Long enough that the whole first request outweighs what turn 0 adds. The report covers
@@ -611,4 +616,157 @@ fn the_task_survives_compaction() {
         .collect();
     assert_eq!(tasks.len(), 1, "{record:?}");
     assert_eq!(tasks[0].get("inserted_by"), None, "{record:?}");
+}
+
+// ── The input budget ─────────────────────────────────────────────────────────
+
+/// A capsule on a driver whose `models:` table is `models`, with no `context.max_tokens`,
+/// `inference_extra` spliced into `inference:`, `compaction.threshold: 0.5` and a compaction hook
+/// bound to `on-compaction` that replaces the context only when its event carries `fires_at` as
+/// `session-tokens` and `0.5` as `threshold`, run over `responses` to its end. Returns every trace
+/// line.
+fn run_budgeted(
+    models: &str,
+    inference_extra: &str,
+    fires_at: u64,
+    responses: Vec<String>,
+) -> Vec<Value> {
+    let server = ScriptedServer::start(responses);
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let driver_artifact = common::create_driver_artifact_with_auth(
+        artifact_dir.path(),
+        DRIVER_ANTHROPIC_NAME,
+        DRIVER_VERSION,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+        &format!("{}{models}", common::FIXTURE_DRIVER_AUTH),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+    let hook = create_hook_zip(
+        artifact_dir.path(),
+        COMPACTOR,
+        "on-compaction",
+        "replace-context",
+        &compaction_hook_wasm_expecting(SUMMARY, fires_at, 0.5),
+    );
+    common::publish_local(&home, &hook).success();
+
+    let manifest = create_compaction_manifest(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        &format!("  - name: {COMPACTOR}\n    version: 0.1.0\n    runtime: hook\n"),
+    );
+    let text = fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("context:\n  max_tokens: 200\n", "")
+        .replace("  max_tokens: 100\n", inference_extra)
+        .replace("    threshold: 0.01\n", "    threshold: 0.5\n");
+    fs::write(&manifest, text).unwrap();
+
+    let staged = stage_compaction_session(&home, project.path(), &manifest);
+    fs::write(staged.accessible_workdir.join("task.md"), TASK).unwrap();
+    let launched = launch_session(staged, |_| {}).expect("agent launch should succeed");
+    let trace = fs::read_to_string(launched.records_dir.join("trace.jsonl")).unwrap();
+    trace
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("every trace line must be valid JSON"))
+        .collect()
+}
+
+/// Two `bash` turns reporting `before` and then `at` tokens in all, then the end of the task.
+fn budget_responses(before: u64, at: u64) -> Vec<String> {
+    vec![
+        response(
+            Some("echo one"),
+            Some(json!({"input_tokens": before - 1000, "output_tokens": 1000})),
+        ),
+        response(
+            Some("echo two"),
+            Some(json!({"input_tokens": at - 1000, "output_tokens": 1000})),
+        ),
+        response(None, Some(json!({"input_tokens": 30, "output_tokens": 5}))),
+    ]
+}
+
+/// Asserts one compaction, on turn 1 at `tokens` reported, none declined, and every agent-loop
+/// `inference` line carrying `cap` and `budget`.
+fn assert_compacted_once_at(events: &[Value], tokens: u64, cap: u64, budget: u64) {
+    assert!(
+        of_type(events, "compaction_declined").is_empty(),
+        "{events:#?}"
+    );
+    let compactions = of_type(events, "compaction");
+    assert_eq!(compactions.len(), 1, "{events:#?}");
+    assert_eq!(compactions[0]["turn"], 1);
+    assert_eq!(compactions[0]["tokens_before"], tokens);
+    assert_eq!(compactions[0]["tokens_before_source"], "actual");
+    let turns: Vec<&Value> = of_type(events, "inference")
+        .into_iter()
+        .filter(|line| line.get("origin").is_none())
+        .collect();
+    assert_eq!(turns.len(), 3, "{events:#?}");
+    for line in turns {
+        assert_eq!(line["max_output_tokens"], cap, "{line}");
+        assert_eq!(line["input_budget"], budget, "{line}");
+    }
+}
+
+/// The input ceiling of 922000 is below 1050000 less the 128000 cap, so the budget is the
+/// ceiling: threshold 0.5 fires at 461000 and not one token below, and the hook's event carries
+/// 461000 ÷ 922000.
+#[test]
+fn input_budget_from_the_ceiling_moves_the_trigger() {
+    if common::skip_without_host_support("input_budget_from_the_ceiling_moves_the_trigger") {
+        return;
+    }
+    let events = run_budgeted(
+        "models:\n  test-model:\n    max_output_tokens: 128000\n    context_window: 1050000\n    \
+         max_input_tokens: 922000\n",
+        "",
+        461_000,
+        budget_responses(460_999, 461_000),
+    );
+    assert_compacted_once_at(&events, 461_000, 128_000, 922_000);
+    assert_eq!(
+        of_type(&events, "session_start")[0]["model_limits"],
+        json!({
+            "max_output_tokens": 128000,
+            "max_output_tokens_source": "driver",
+            "context_window": 1050000,
+            "context_window_source": "driver",
+            "max_input_tokens": 922000,
+            "max_input_tokens_source": "driver",
+            "input_budget": 922000,
+            "input_budget_basis": "max_input_tokens",
+        })
+    );
+}
+
+/// With no ceiling, the budget is the window less the manifest's cap: 1050000 − 6000.
+#[test]
+fn input_budget_from_the_window_less_the_cap_moves_the_trigger() {
+    if common::skip_without_host_support(
+        "input_budget_from_the_window_less_the_cap_moves_the_trigger",
+    ) {
+        return;
+    }
+    let events = run_budgeted(
+        "models:\n  test-model:\n    max_output_tokens: 128000\n    context_window: 1050000\n",
+        "  max_tokens: 6000\n",
+        522_000,
+        budget_responses(521_999, 522_000),
+    );
+    assert_compacted_once_at(&events, 522_000, 6000, 1_044_000);
+    let limits = &of_type(&events, "session_start")[0]["model_limits"];
+    assert_eq!(limits["input_budget"], 1_044_000, "{limits}");
+    assert_eq!(
+        limits["input_budget_basis"], "context_window_less_output_cap",
+        "{limits}"
+    );
+    assert_eq!(limits["max_input_tokens"], Value::Null, "{limits}");
+    assert_eq!(limits["max_input_tokens_source"], "none", "{limits}");
 }

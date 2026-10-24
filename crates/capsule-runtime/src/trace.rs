@@ -157,6 +157,9 @@ pub(crate) struct InferenceCallSettings {
     /// The output cap the request carried as `max_tokens`, and the amount the spend meter
     /// reserved for it.
     pub(crate) max_output_tokens: u32,
+    /// The input budget the call was measured against, `min(input ceiling, context window −
+    /// max_output_tokens)`; `None` when its model has no window.
+    pub(crate) input_budget: Option<u32>,
     /// The `MURMUR_INFERENCE_DRIVER_CONFIG` the call's driver ran with, from
     /// [`recorded_driver_config`]. `None` when the driver saw none.
     pub(crate) driver_config: Option<Value>,
@@ -513,6 +516,11 @@ struct InferenceEvent {
     /// harness runs the model and the runtime sets no cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
+    /// The call's input budget, `min(input ceiling, context window − max_output_tokens)`.
+    /// Present exactly when `max_output_tokens` is; `null` there means the model has no window.
+    /// The outer `Option` is the key, the inner one its value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_budget: Option<Option<u32>>,
     /// The `MURMUR_INFERENCE_DRIVER_CONFIG` this call's driver ran with, every credential value
     /// the session holds replaced with `[redacted]`. Present exactly when `max_output_tokens` is;
     /// `null` there means the driver saw no config. The outer `Option` is the key, the inner one
@@ -2608,6 +2616,7 @@ impl TraceWriter {
                 .map(|o| o.model.clone())
                 .or_else(|| choice.map(|choice| choice.model.clone())),
             max_output_tokens: settings.map(|settings| settings.max_output_tokens),
+            input_budget: settings.map(|settings| settings.input_budget),
             driver_config: settings.map(|settings| settings.driver_config.clone()),
             message_ids,
             system_sha,
@@ -5303,6 +5312,10 @@ mod tests {
             max_output_tokens_source: crate::model_limits::LimitSource::Driver,
             context_window: None,
             context_window_source: crate::model_limits::LimitSource::None,
+            max_input_tokens: None,
+            max_input_tokens_source: crate::model_limits::LimitSource::None,
+            input_budget: None,
+            input_budget_basis: crate::model_limits::BudgetBasis::None,
         };
         w.write_session_start(None, Some(limits), Vec::new())
             .await
@@ -5318,6 +5331,10 @@ mod tests {
                 "max_output_tokens_source": "driver",
                 "context_window": null,
                 "context_window_source": "none",
+                "max_input_tokens": null,
+                "max_input_tokens_source": "none",
+                "input_budget": null,
+                "input_budget_basis": "none",
             })
         );
     }
@@ -6097,22 +6114,26 @@ mod tests {
         assert!(hook.get("output_tokens").is_none());
     }
 
-    /// Every `http` line names how its call was sent: the cap and the driver config, both keys
-    /// present, `driver_config` written as `null` when the driver saw none.
+    /// Every `http` line names how its call was sent: the cap, the input budget and the driver
+    /// config, every key present, `input_budget` written as `null` with no window and
+    /// `driver_config` as `null` when the driver saw none.
     #[tokio::test]
     async fn inference_call_settings_are_written_on_every_kind_of_http_line() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
         let turn = InferenceCallSettings {
             max_output_tokens: 4096,
+            input_budget: Some(195_904),
             driver_config: Some(serde_json::json!({"reasoning_effort": "high"})),
         };
         let unconfigured = InferenceCallSettings {
             max_output_tokens: 1024,
+            input_budget: None,
             driver_config: None,
         };
         let hook = InferenceCallSettings {
             max_output_tokens: 2000,
+            input_budget: Some(198_000),
             driver_config: Some(serde_json::json!({"reasoning_effort": "low"})),
         };
         let origin = InferenceOrigin {
@@ -6182,13 +6203,16 @@ mod tests {
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
-        let settings: Vec<(Value, Value, Value)> = events
+        let settings: Vec<(Value, Value, Value, Value)> = events
             .iter()
             .filter(|e| e["event_type"] == "inference")
             .map(|e| {
                 (
                     e["decision"].clone(),
                     e["max_output_tokens"].clone(),
+                    e.get("input_budget")
+                        .cloned()
+                        .expect("input_budget is written, null or not"),
                     e.get("driver_config")
                         .cloned()
                         .expect("driver_config is written, null or not"),
@@ -6201,28 +6225,32 @@ mod tests {
                 (
                     serde_json::json!("end_turn"),
                     serde_json::json!(4096),
+                    serde_json::json!(195_904),
                     serde_json::json!({"reasoning_effort": "high"})
                 ),
                 (
                     serde_json::json!("end_turn"),
                     serde_json::json!(1024),
+                    Value::Null,
                     Value::Null
                 ),
                 (
                     serde_json::json!("end_turn"),
                     serde_json::json!(2000),
+                    serde_json::json!(198_000),
                     serde_json::json!({"reasoning_effort": "low"})
                 ),
                 (
                     serde_json::json!("error"),
                     serde_json::json!(4096),
+                    serde_json::json!(195_904),
                     serde_json::json!({"reasoning_effort": "high"})
                 ),
             ]
         );
     }
 
-    /// A line written without settings — every `process` line — carries neither key.
+    /// A line written without settings — every `process` line — carries none of the keys.
     #[tokio::test]
     async fn an_inference_line_without_call_settings_writes_neither_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -6267,6 +6295,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         for line in lines {
             assert!(line.get("max_output_tokens").is_none(), "{line}");
+            assert!(line.get("input_budget").is_none(), "{line}");
             assert!(line.get("driver_config").is_none(), "{line}");
         }
     }

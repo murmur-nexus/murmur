@@ -297,22 +297,43 @@ fn parse_setting_value(
     choices: &DriverChoices,
 ) -> Result<SettingValue, ChangeRefused> {
     match setting {
-        ControllableSetting::InferenceMaxTokens => value
-            .as_u64()
-            .and_then(|count| u32::try_from(count).ok())
-            .filter(|count| *count >= 1)
-            .map(SettingValue::Tokens)
-            .ok_or_else(|| {
-                ChangeRefused::new(
+        ControllableSetting::InferenceMaxTokens => {
+            let tokens = value
+                .as_u64()
+                .and_then(|count| u32::try_from(count).ok())
+                .filter(|count| *count >= 1)
+                .ok_or_else(|| {
+                    ChangeRefused::new(
+                        422,
+                        "invalid_value",
+                        format!(
+                            "{} takes an integer from 1 to {}",
+                            setting.wire_name(),
+                            u32::MAX
+                        ),
+                    )
+                })?;
+            // The cap applies to every choice's calls, so it must leave each choice's window an
+            // input budget: a call never runs without one.
+            if let Some((name, window)) = choices.iter().find_map(|choice| {
+                choice
+                    .limits
+                    .and_then(|limits| limits.context_window)
+                    .filter(|window| *window <= tokens)
+                    .map(|window| (choice.name.as_str(), window))
+            }) {
+                return Err(ChangeRefused::new(
                     422,
-                    "invalid_value",
+                    "no_input_budget",
                     format!(
-                        "{} takes an integer from 1 to {}",
-                        setting.wire_name(),
-                        u32::MAX
+                        "{} of {tokens} leaves driver choice '{name}' no input budget: its \
+                         context window is {window}",
+                        setting.wire_name()
                     ),
-                )
-            }),
+                ));
+            }
+            Ok(SettingValue::Tokens(tokens))
+        }
         ControllableSetting::InferenceDriver => value
             .as_str()
             .and_then(|name| choices.index_of(name))
@@ -1200,21 +1221,42 @@ mod tests {
     const DRIVER_CAP: u32 = 65536;
 
     /// `choices` with the output cap `caps[i]` recorded on choice `i`, as staging resolves them.
-    fn with_caps(mut choices: DriverChoices, caps: &[u32]) -> DriverChoices {
+    fn with_caps(choices: DriverChoices, caps: &[u32]) -> DriverChoices {
+        with_limits(
+            choices,
+            &caps.iter().map(|cap| (*cap, None)).collect::<Vec<_>>(),
+        )
+    }
+
+    /// `choices` with the output cap and context window `limits[i]` recorded on choice `i`.
+    fn with_limits(mut choices: DriverChoices, limits: &[(u32, Option<u32>)]) -> DriverChoices {
+        use crate::model_limits::{BudgetBasis, LimitSource, ResolvedModelLimits};
         let resolved: Vec<crate::model_limits::ChoiceModelLimits> = choices
             .iter()
-            .zip(caps)
-            .map(|(choice, cap)| crate::model_limits::ChoiceModelLimits {
-                choice: choice.name.clone(),
-                model: choice.model.clone(),
-                driver: choice.artifact.clone(),
-                limits: crate::model_limits::ResolvedModelLimits {
+            .zip(limits)
+            .map(|(choice, (cap, window))| {
+                let mut limits = ResolvedModelLimits {
                     max_output_tokens: *cap,
-                    max_output_tokens_source: crate::model_limits::LimitSource::Driver,
-                    context_window: None,
-                    context_window_source: crate::model_limits::LimitSource::None,
-                },
-                warning: None,
+                    max_output_tokens_source: LimitSource::Driver,
+                    context_window: *window,
+                    context_window_source: window
+                        .map_or(LimitSource::None, |_| LimitSource::Driver),
+                    max_input_tokens: None,
+                    max_input_tokens_source: LimitSource::None,
+                    input_budget: None,
+                    input_budget_basis: BudgetBasis::None,
+                };
+                if let Some(budget) = limits.input_budget_for(*cap) {
+                    limits.input_budget = Some(budget.tokens);
+                    limits.input_budget_basis = budget.basis;
+                }
+                crate::model_limits::ChoiceModelLimits {
+                    choice: choice.name.clone(),
+                    model: choice.model.clone(),
+                    driver: choice.artifact.clone(),
+                    limits,
+                    warning: None,
+                }
             })
             .collect();
         choices.record_limits(&resolved);
@@ -1496,6 +1538,52 @@ mod tests {
 
         set(2048);
         assert_eq!(state.for_call(setting).unwrap().applies_change, None);
+    }
+
+    /// A cap at or above any choice's context window is refused, naming the first such choice,
+    /// and leaves the value as it was; one token less is accepted.
+    #[test]
+    fn a_cap_that_leaves_a_choice_no_input_budget_is_refused() {
+        let mut inference = inference(None);
+        for (name, model) in [("cheap", "cheap-m"), ("bare", "bare-m")] {
+            inference
+                .alternates
+                .push(murmur_artifact::InferenceAlternate {
+                    name: name.to_string(),
+                    model: model.to_string(),
+                    driver: "d".to_string(),
+                });
+        }
+        let config = config();
+        let state = ControlState::new(
+            &config,
+            with_limits(
+                DriverChoices::declared(&inference, &std::collections::HashMap::new()),
+                &[(128_000, Some(1_050_000)), (1000, Some(2000)), (1000, None)],
+            ),
+            Arc::new(InjectedSecrets::new(&config.secrets)),
+        );
+        let setting = ControllableSetting::InferenceMaxTokens;
+        for value in [2000, 1_050_000] {
+            let refused = state
+                .request_change(Principal::Controller, setting, &json!(value))
+                .unwrap_err();
+            assert_eq!((refused.status, refused.reason), (422, "no_input_budget"));
+            assert_eq!(
+                refused.message,
+                format!(
+                    "inference.max_tokens of {value} leaves driver choice '{}' no input budget: \
+                     its context window is {}",
+                    if value == 2000 { "cheap" } else { "primary" },
+                    if value == 2000 { 2000 } else { 1_050_000 },
+                )
+            );
+        }
+        assert_eq!(state.selected(setting), Some(SettingValue::Tokens(128_000)));
+        state
+            .request_change(Principal::Controller, setting, &json!(1999))
+            .unwrap();
+        assert_eq!(state.selected(setting), Some(SettingValue::Tokens(1999)));
     }
 
     /// Until a controller sets `inference.max_tokens`, it is the cap of the driver choice selected

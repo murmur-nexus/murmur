@@ -263,7 +263,7 @@ Two manifest keys govern how much a seed may occupy:
 
 | Key | Controls |
 |---|---|
-| [`context.seed_budget`](../reference/manifest.md#field-context) | Fraction of the [context window](../reference/manifest.md#field-context) the seed may occupy. The product, rounded down, is the seed's ceiling and is sent to the hook as `task-start-event.budget-tokens` |
+| [`context.seed_budget`](../reference/manifest.md#field-context) | Fraction of the primary choice's [input budget](../reference/manifest.md#inference-max-tokens) the seed may occupy. The product, rounded down, is the seed's ceiling and is sent to the hook as `task-start-event.budget-tokens`; `task-start-event.context-window` carries the window itself |
 | [`context.seed_overflow_margin`](../reference/manifest.md#field-context) | How far over that ceiling a seed may go before the runtime spends an inference call summarizing it instead of simply dropping its oldest messages |
 
 What the runtime does with a proposal, checked in this order:

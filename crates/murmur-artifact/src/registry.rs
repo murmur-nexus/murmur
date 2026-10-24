@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    artifact::{declared_runtime_from_artifact_bytes, load_manifest_from_artifact_bytes},
+    artifact::{
+        declared_runtime_from_artifact_bytes, load_manifest_from_artifact_bytes,
+        load_manifest_yaml_from_artifact_bytes,
+    },
     artifact_index::{asset_file_name, metadata_file_name, payload_stem, sha256_file_name},
     artifact_name::ArtifactName,
     build::artifact_name_format_error,
@@ -305,7 +308,7 @@ impl LocalRegistry {
     ) -> Result<(), RegistryError> {
         // The bare part a payload is filed under is its tool name in every session that stages
         // it, so it must be the name the artifact declares. A payload with no readable manifest
-        // declares nothing to compare.
+        // declares nothing to compare, and no models: table to check.
         if let Ok(packed) = load_manifest_from_artifact_bytes(bytes) {
             if packed.name != meta.name.name() {
                 return Err(RegistryError::PackedNameMismatch {
@@ -313,6 +316,17 @@ impl LocalRegistry {
                     version: meta.version.clone(),
                     packed: packed.name,
                 });
+            }
+            // The launch refuses the same table with E-RUN-052, so a payload carrying one is
+            // never stored.
+            if let Ok(yaml) = load_manifest_yaml_from_artifact_bytes(bytes) {
+                crate::manifest::parse_model_limits(&yaml).map_err(|error| {
+                    RegistryError::MalformedModelsTable {
+                        name: meta.name.to_string(),
+                        version: meta.version.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
             }
         }
         // Read before anything is written, so a malformed label leaves the store untouched.
@@ -713,6 +727,17 @@ pub enum RegistryError {
         name: String,
         version: String,
         packed: String,
+    },
+    /// The payload's packed `murmur.yaml` ships a `models:` table that
+    /// [`crate::parse_model_limits`] refuses. `reason` names the dotted field at fault.
+    #[error(
+        "{name}@{version} cannot be stored: its murmur.yaml ships a malformed models: table: \
+         {reason}"
+    )]
+    MalformedModelsTable {
+        name: String,
+        version: String,
+        reason: String,
     },
     #[error("reserved artifact version '{0}' is not allowed")]
     ReservedVersion(String),
@@ -1950,6 +1975,39 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(error, RegistryError::PackedNameMismatch { .. }),
+            "{error:?}"
+        );
+        assert!(files_in(dir.path()).is_empty(), "the store was written to");
+    }
+
+    #[test]
+    fn registry_refuses_a_payload_with_a_malformed_models_table_and_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let bytes = zip_with(&[
+            (
+                "murmur.yaml",
+                b"name: tool-x\nversion: 1.0.0\nruntime: driver\nmodels:\n  m:\n    \
+                  max_output_tokens: 128000\n    context_window: 1050000\n    \
+                  max_input_tokens: 1050001\n",
+            ),
+            ("tool.wasm", b"\0asm"),
+        ]);
+
+        let error = registry
+            .publish(test_meta("tool-x", "1.0.0"), &bytes)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "ana/tool-x@1.0.0 cannot be stored: its murmur.yaml ships a malformed models: table: \
+             murmur.yaml: field 'models.m.max_input_tokens' is 1050001, above this entry's context_window of \
+             1050000; an input ceiling is at most the window"
+        );
+        let error = registry
+            .store_installed_overwrite(test_meta("tool-x", "1.0.0"), &bytes, &sha256_hex(&bytes))
+            .unwrap_err();
+        assert!(
+            matches!(error, RegistryError::MalformedModelsTable { .. }),
             "{error:?}"
         );
         assert!(files_in(dir.path()).is_empty(), "the store was written to");

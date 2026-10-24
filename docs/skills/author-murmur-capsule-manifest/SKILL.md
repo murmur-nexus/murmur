@@ -137,7 +137,7 @@ Examples of defaults you often do **not** need to restate:
 - `lifecycle.after_task: exit`;
 - `trace.capture: meta`.
 
-Model limits follow the same rule. `inference.max_turns` omitted means no turn cap; set it only when a task must stop after a fixed number of turns. `inference.max_tokens` and `context.max_tokens` default to the `max_output_tokens` and `context_window` the driver's `models:` table declares for the model. Set `inference.max_tokens` when the driver does not list the model, which otherwise refuses the launch with `E-RUN-052`, or to send a smaller cap. Run `mur doctor` to see the cap and window each driver choice resolves to.
+Model limits follow the same rule. `inference.max_turns` omitted means no turn cap; set it only when a task must stop after a fixed number of turns. `inference.max_tokens` and `context.max_tokens` default to the `max_output_tokens` and `context_window` the driver's `models:` table declares for the model. Set `inference.max_tokens` when the driver does not list the model, which otherwise refuses the launch with `E-RUN-052`, or to send a smaller cap. Run `mur doctor` to see the cap, window, input ceiling and input budget each driver choice resolves to.
 
 When omission and an explicit empty collection mean different things, preserve that distinction. For example, a tool/driver `network.allow: []` is a deliberate narrowing to zero, while omitting that per-artifact network block means it inherits the capsule ceiling.
 
@@ -473,7 +473,7 @@ The runtime validates the shape of these config blocks, not their semantics. Do 
 
 ### 7. Add context only for a reason
 
-`context.max_tokens` is the context window compaction measures against and is distinct from `inference.max_tokens`, which is the per-turn model output cap. Omitted, the window is the `context_window` the driver's `models:` table declares for the model; set it only to override that, or for a model the driver does not list.
+`context.max_tokens` is the context window and is distinct from `inference.max_tokens`, which is the per-turn model output cap. Omitted, the window is the `context_window` the driver's `models:` table declares for the model; set it only to override that, or for a model the driver does not list. Compaction's threshold and `context.seed_budget` are fractions of the input budget: the driver's `max_input_tokens` for the model, or the window less the output cap, whichever is smaller. A window at or below the output cap leaves no input budget and refuses the launch with `E-RUN-055`, so a smaller window needs a smaller `inference.max_tokens`.
 
 For HTTP inference, context compaction requires a context window. The compaction settings refine that mechanism; do not add them to a process-inference capsule where they are inert.
 
@@ -485,6 +485,7 @@ context:
 
 inference:
   # ...HTTP inference...
+  max_tokens: 16000
   compaction:
     threshold: 0.85
 ```

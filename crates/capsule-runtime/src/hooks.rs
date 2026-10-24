@@ -410,9 +410,10 @@ pub(crate) enum HookEvent {
         source: String,
         input_bytes: u64,
         /// Token ceiling a `seed-context` returned from this event is enforced
-        /// against: `floor(context_window * context.seed_budget)`. `0` when the
-        /// primary choice has no window, which the WIT contract reads as "not
-        /// computed" rather than "unbounded".
+        /// against: `floor(input budget * context.seed_budget)`, the primary
+        /// choice's input budget at launch. `0` when the primary choice has no
+        /// window, which the WIT contract reads as "not computed" rather than
+        /// "unbounded".
         budget_tokens: u64,
         /// The primary driver choice's context window: `context.max_tokens`, else
         /// its driver's `models:` entry for the model, or `0` when neither gives one.
@@ -3603,7 +3604,12 @@ mod tests {
             driver_name: "mock-driver".to_string(),
             driver_component: driver,
             model: "manifest-model".to_string(),
-            output_caps: crate::model_limits::HookOutputCaps::new(Default::default(), 1024, None),
+            output_caps: crate::model_limits::HookOutputCaps::new(
+                Default::default(),
+                1024,
+                None,
+                None,
+            ),
             engine: engine.clone(),
             accessible_workdir: accessible.path().to_path_buf(),
             records_root: WorkdirRoot::open(accessible.path()).unwrap(),
@@ -3682,6 +3688,7 @@ mod tests {
                 Default::default(),
                 1024,
                 compaction_cap,
+                None,
             ),
             engine: engine.clone(),
             accessible_workdir: accessible.to_path_buf(),

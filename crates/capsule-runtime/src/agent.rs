@@ -56,11 +56,13 @@ use murmur_artifact::PACKED_MANIFEST_ENTRY;
 
 #[derive(Clone)]
 pub(crate) struct AgentRunConfig {
-    /// The primary driver choice's context window, which `on-task-start` and the seed budget
-    /// measure against. 0 means the primary has none, and compaction is disabled on it. An
-    /// agent-loop call measures against its own choice's window.
-    pub context_window: u32,
-    /// Fraction of context_window at which compaction fires (0.0–1.0).
+    /// The primary driver choice's input budget at launch
+    /// ([`crate::model_limits::ResolvedModelLimits::input_budget`]), which the seed budget and
+    /// `--resume-mode compact` measure against. 0 means the primary has no window, and compaction
+    /// is disabled on it. An agent-loop call measures against its own budget,
+    /// [`Self::input_budget_for`].
+    pub primary_input_budget: u32,
+    /// Fraction of the input budget at which compaction fires (0.0–1.0).
     pub compaction_threshold: f32,
     /// Model override for compaction calls. None = use primary inference model.
     pub compaction_model: Option<String>,
@@ -76,13 +78,13 @@ pub(crate) struct AgentRunConfig {
     pub max_output_tokens: u32,
     /// The session's driver choices as staging resolved them, each with its own limits. A choice
     /// with none recorded measures against [`Self::max_output_tokens`] and
-    /// [`Self::context_window`].
+    /// [`Self::primary_input_budget`].
     pub choices: DriverChoices,
     /// What a controller has changed on this session, or `None` for a capsule with no
     /// `control:` block.
     pub control: Option<Arc<crate::control_plane::ControlState>>,
-    /// Fraction of `context_window` an `on-task-start` `seed-context` may occupy, from
-    /// `context.seed_budget`. A window of 0 leaves no budget to enforce, so a seed is
+    /// Fraction of `primary_input_budget` an `on-task-start` `seed-context` may occupy, from
+    /// `context.seed_budget`. A budget of 0 leaves no budget to enforce, so a seed is
     /// rejected rather than committed unbounded — see [`seed_budget_tokens`].
     pub seed_budget: f32,
     /// Slack above the seed budget, as a fraction of it, within which an over-budget seed
@@ -141,12 +143,27 @@ impl AgentRunConfig {
         }
     }
 
-    /// The context window an agent-loop call under `choice` measures compaction against; 0 when
-    /// the choice has none.
-    fn context_window_for(&self, choice: &DriverChoice) -> u32 {
-        choice.limits.map_or(self.context_window, |limits| {
-            limits.context_window.unwrap_or(0)
-        })
+    /// The input budget an agent-loop call under `choice` that sends `max_output_tokens`
+    /// ([`Self::output_cap_for_call`]'s cap) measures compaction against; 0 when the choice has
+    /// no window.
+    pub(crate) fn input_budget_for(&self, choice: &DriverChoice, max_output_tokens: u32) -> u32 {
+        self.call_input_budget(choice, max_output_tokens)
+            .map_or(0, |budget| budget.tokens)
+    }
+
+    /// [`Self::input_budget_for`] with its basis; `None` when the choice has no window.
+    fn call_input_budget(
+        &self,
+        choice: &DriverChoice,
+        max_output_tokens: u32,
+    ) -> Option<crate::model_limits::InputBudget> {
+        match choice.limits {
+            Some(limits) => limits.input_budget_for(max_output_tokens),
+            None => (self.primary_input_budget > 0).then_some(crate::model_limits::InputBudget {
+                tokens: self.primary_input_budget,
+                basis: crate::model_limits::BudgetBasis::ContextWindow,
+            }),
+        }
     }
 
     /// The driver choice one agent-loop inference call is served by, read once so the call's
@@ -740,7 +757,7 @@ pub(crate) async fn run_agent_loop(
                 &records_root,
                 &seed.hook_name,
                 proposed_tokens,
-                seed_budget_tokens(run_config.context_window, run_config.seed_budget),
+                seed_budget_tokens(run_config.primary_input_budget, run_config.seed_budget),
                 crate::trace::SEED_REJECTED_UNSUPPORTED_TRANSPORT,
             )
             .await;
@@ -966,7 +983,7 @@ pub(crate) async fn run_agent_loop(
                     &occupancy,
                     store_state,
                     first_turn as usize,
-                    run_config.context_window,
+                    run_config.primary_input_budget,
                     &records_root,
                     hooks,
                     trace,
@@ -1122,10 +1139,13 @@ pub(crate) async fn run_agent_loop(
         // Read once for this call, so its payload, occupancy count, spend admission and
         // truncation warning never mix a cap a controller changed partway through.
         let (max_output_tokens, applies_change) = run_config.output_cap_for_call(&choice);
+        // The budget the compaction check measures this call against, from the same cap.
+        let call_input_budget = run_config.call_input_budget(&choice, max_output_tokens);
         // Every choice's driver runs under the session's `MURMUR_INFERENCE_DRIVER_CONFIG`
         // (`driver_choice_env` replaces only the endpoint, model and driver name).
         let call_settings = InferenceCallSettings {
             max_output_tokens,
+            input_budget: call_input_budget.map(|budget| budget.tokens),
             driver_config: recorded_driver_config(&store_state.inference_env, |text| {
                 store_state.gateways.redact(text)
             }),
@@ -1637,10 +1657,11 @@ pub(crate) async fn run_agent_loop(
             &choice.name,
         );
 
-        // Check compaction after receiving response, before processing the turn, against the
-        // window of the choice that served it.
-        let context_window = run_config.context_window_for(&choice);
-        if session_tokens.crosses(context_window, run_config.compaction_threshold) {
+        // Check compaction after receiving response, before processing the turn, against this
+        // call's input budget: the window of the choice that served it less the cap it sent, or
+        // the driver's input ceiling when that is smaller.
+        let input_budget = run_config.input_budget_for(&choice, max_output_tokens);
+        if session_tokens.crosses(input_budget, run_config.compaction_threshold) {
             let compacted = try_compact_via_hooks(
                 messages,
                 reported,
@@ -1649,7 +1670,7 @@ pub(crate) async fn run_agent_loop(
                 &occupancy,
                 store_state,
                 turn,
-                context_window,
+                input_budget,
                 &records_root,
                 hooks,
                 trace,
@@ -1700,11 +1721,13 @@ pub(crate) async fn run_agent_loop(
             }
         }
         // What `session-status` reports as `context`: the count this check compared, after any
-        // replacement it committed, against the window it compared it with.
+        // replacement it committed, against the budget it compared it with and that budget's
+        // window.
         if let Some(status) = &store_state.session_status {
             status.set_context(
                 session_tokens.tokens,
-                (context_window > 0).then_some(context_window),
+                choice.limits.and_then(|limits| limits.context_window),
+                call_input_budget,
                 session_tokens.basis,
             );
         }
@@ -3321,7 +3344,7 @@ pub(crate) async fn try_compact_via_hooks(
     occupancy: &ContextOccupancy<'_>,
     store_state: &mut CapsuleStoreState,
     turn: usize,
-    context_window: u32,
+    input_budget: u32,
     records_root: &WorkdirRoot,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
@@ -3334,7 +3357,7 @@ pub(crate) async fn try_compact_via_hooks(
     let wit_messages = to_wit_messages(messages);
 
     let tokens_before = *session_tokens;
-    let threshold = f64::from(tokens_before.tokens) / f64::from(context_window).max(1.0);
+    let threshold = f64::from(tokens_before.tokens) / f64::from(input_budget).max(1.0);
 
     let dispatched = hooks
         .dispatch_compaction(
@@ -3645,17 +3668,18 @@ fn fit_suffix(per_message_tokens: &[u64], budget: u64) -> usize {
 }
 
 /// The token ceiling a `seed-context` returned at this task is enforced against:
-/// `floor(context.max_tokens * context.seed_budget)`.
+/// `floor(input_budget * context.seed_budget)`, `input_budget` being the primary choice's
+/// [`AgentRunConfig::primary_input_budget`].
 ///
-/// `0` when the capsule declares no `context.max_tokens` — a fraction of no ceiling is no
+/// `0` when the primary has no window, so no input budget — a fraction of no ceiling is no
 /// ceiling, and the runtime refuses an unbounded seed rather than committing one. Sent to the
 /// hook as `task-start-event.budget-tokens` so a hook never has to know the model or the
 /// window.
-pub(crate) fn seed_budget_tokens(context_window: u32, seed_budget: f32) -> u64 {
-    if context_window == 0 || seed_budget <= 0.0 {
+pub(crate) fn seed_budget_tokens(input_budget: u32, seed_budget: f32) -> u64 {
+    if input_budget == 0 || seed_budget <= 0.0 {
         return 0;
     }
-    (f64::from(context_window) * f64::from(seed_budget)).floor() as u64
+    (f64::from(input_budget) * f64::from(seed_budget)).floor() as u64
 }
 
 /// The conversation this task continues, or an empty list when nothing asks for it or the
@@ -3800,7 +3824,7 @@ pub(crate) async fn apply_seed_context(
         hook_name,
         messages: wit_messages,
     } = seed;
-    let budget = seed_budget_tokens(run_config.context_window, run_config.seed_budget);
+    let budget = seed_budget_tokens(run_config.primary_input_budget, run_config.seed_budget);
 
     let proposed = reconstruct_hook_messages(wit_messages, ContextInsertion::SeedContext, &[]);
     let per_message_tokens: Vec<u64> = proposed.iter().map(message_tokens).collect();
@@ -4432,10 +4456,10 @@ impl SessionOccupancy {
         }
     }
 
-    /// Whether this occupancy reaches `threshold` of `context_window`. A window of `0` is no
-    /// window, and never crosses.
-    pub(crate) fn crosses(self, context_window: u32, threshold: f32) -> bool {
-        context_window > 0 && self.tokens as f32 / context_window as f32 >= threshold
+    /// Whether this occupancy reaches `threshold` of `input_budget`, the call's
+    /// [`AgentRunConfig::input_budget_for`]. A budget of `0` is no window, and never crosses.
+    pub(crate) fn crosses(self, input_budget: u32, threshold: f32) -> bool {
+        input_budget > 0 && self.tokens as f32 / input_budget as f32 >= threshold
     }
 }
 
@@ -5965,6 +5989,7 @@ mod tests {
             }),
             settings: crate::trace::InferenceCallSettings {
                 max_output_tokens: 2000,
+                input_budget: Some(198_000),
                 driver_config: Some(json!({"reasoning_effort": "low"})),
             },
         };
@@ -5985,6 +6010,7 @@ mod tests {
         assert_eq!(event["input_tokens"], 42);
         assert!(event.get("output_tokens").is_none());
         assert_eq!(event["max_output_tokens"], 2000);
+        assert_eq!(event["input_budget"], 198_000);
         assert_eq!(event["driver_config"], json!({"reasoning_effort": "low"}));
     }
 

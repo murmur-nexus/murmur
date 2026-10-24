@@ -4,18 +4,24 @@ Long-running agent sessions accumulate tokens with every message. Context compac
 automatically condenses the message history so the session can continue without hitting a
 hard limit:
 
-1. After each driver response, the runtime measures how much of the context window the call
-   used, its `session_tokens`:
+1. After each driver response, the runtime measures how much context the call used, its
+   `session_tokens`:
 
     | The response | `session_tokens` |
     |---|---|
     | Reported [usage](../reference/wit-interfaces.md#driver-usage) with both `input_tokens` and `output_tokens` | The provider's count: `input_tokens + cached_tokens + cache_write_tokens + output_tokens` |
     | Reported nothing | The runtime's estimate of the request plus its count of the response |
 
-2. It checks whether `session_tokens` over the context window of the driver choice that served the
-   call has crossed `inference.compaction.threshold`. The window is
-   [`context.max_tokens`](../reference/manifest.md#field-context), or the `context_window` the
-   driver's [`models:`](../reference/manifest.md#driver-models) table declares for the model.
+2. It checks whether `session_tokens` over the call's
+   [input budget](../reference/manifest.md#inference-max-tokens) has crossed
+   `inference.compaction.threshold`. The input budget is the most input the provider accepts for
+   the model, or the context window less the output cap the call sent, whichever is smaller.
+
+    A provider whose input limit is below its window less the output cap — 922000 input tokens of
+    a 1050000-token window with a 128000 cap — declares that limit as `max_input_tokens`, and a
+    session on it compacts at `threshold` × 922000, before a request would exceed what the
+    provider accepts. A launch whose output cap leaves no input budget is refused with
+    [`E-RUN-055`](../reference/diagnostics.md#e-run-055).
 3. Once crossed, the runtime fires the `on-compaction` lifecycle event with the full message
    history. The runtime picks the compaction hook by binding, so you configure no artifact name
    anywhere — any hook bound to `on-compaction` receives the event. `murmur/hook-compact` is the
@@ -85,8 +91,9 @@ above or below the provider's own count. Where each number comes from:
 | Spend reserved before a call | The estimate, plus the call's output cap |
 
 A switch to another choice measures its first request whole. Each choice has its own
-[output cap and context window](../reference/manifest.md#inference-max-tokens), resolved at
-launch, and the compaction trigger measures against the window of the choice that served the turn.
+[output cap, context window and input ceiling](../reference/manifest.md#inference-max-tokens),
+resolved at launch, and the compaction trigger measures against the input budget of the choice that
+served the turn.
 Each turn's `inference` line in `trace.jsonl` names the choice that served it, beside the
 provider's own counts in `input_tokens_actual` and `output_tokens_actual`, so the gap between the
 estimate and each model's own count is visible per model.

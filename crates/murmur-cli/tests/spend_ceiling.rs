@@ -981,10 +981,11 @@ fn home_with_compactor() -> TempDir {
 }
 
 /// [`http_manifest`] with the `compactor` hook bound, and — when `context_budget` is set — a
-/// `context.max_tokens` and threshold the first agent turn already crosses.
+/// `context.max_tokens` and threshold the first agent turn already crosses: a window of 1200
+/// less the [`MAX_OUTPUT`] cap leaves an input budget of 200.
 fn compaction_manifest(endpoint: &str, inference_extra: &str, context_budget: bool) -> String {
     let context = if context_budget {
-        "context:\n  max_tokens: 200\n"
+        "context:\n  max_tokens: 1200\n"
     } else {
         ""
     };

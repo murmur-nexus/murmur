@@ -13,7 +13,9 @@ use std::{
 };
 
 use capsule_runtime::launch_session;
-use common::hook_wat::{compaction_hook_wasm, create_hook_zip, seed_hook_wasm};
+use common::hook_wat::{
+    compaction_hook_wasm, create_hook_zip, seed_hook_wasm, seed_hook_wasm_expecting,
+};
 use serde_json::{json, Value};
 
 const DRIVER_NAME: &str = "local/murmur-driver-anthropic";
@@ -43,13 +45,22 @@ fn one_turn_responses() -> Vec<String> {
     .to_string()]
 }
 
-/// A capsule manifest declaring the driver, the given hooks, and a `context:` block.
+/// `context.max_tokens` for the cases below: 200000 above the fixture driver's 8192 output cap,
+/// so the input budget the seed budget is a fraction of is 200000, and wide enough that the
+/// compaction threshold is never crossed during the run, so any `compaction` line in the trace
+/// can only have come from the seed path.
+const WINDOW: u32 = 208_192;
+
+/// A capsule manifest declaring the driver, the given hooks, and a `context:` block with
+/// `context.max_tokens: window` when given.
 fn create_manifest(
     project_dir: &Path,
     endpoint: &str,
+    window: Option<u32>,
     seed_budget: &str,
     hook_names: &[&str],
 ) -> PathBuf {
+    let window = window.map_or_else(String::new, |window| format!("  max_tokens: {window}\n"));
     let hooks: String = hook_names
         .iter()
         .map(|name| format!("  - name: local/{name}\n    version: 0.1.0\n    runtime: hook\n"))
@@ -60,9 +71,7 @@ fn create_manifest(
             "name: seed-capsule\n",
             "version: 0.1.0\n",
             "context:\n",
-            // Wide enough that the compaction threshold is never crossed during the run, so
-            // any `compaction` line in the trace can only have come from the seed path.
-            "  max_tokens: 200000\n",
+            "{window}",
             "  seed_budget: {seed_budget}\n",
             "  seed_overflow_margin: 0.10\n",
             "artifacts:\n",
@@ -83,6 +92,7 @@ fn create_manifest(
             "  driver:\n",
             "    artifact: {driver_name}\n",
         ),
+        window = window,
         seed_budget = seed_budget,
         driver_name = DRIVER_NAME,
         driver_version = DRIVER_VERSION,
@@ -157,18 +167,36 @@ impl Session {
     }
 }
 
-/// Publish the driver and every hook, stage the capsule, run it, and collect what it left.
+/// Publish the driver and every hook, stage the capsule with `context.max_tokens: WINDOW`, run
+/// it, and collect what it left.
 fn run_session(seed_budget: &str, hooks: &[(&str, &str, &str, Vec<u8>)]) -> Session {
+    run_session_on(
+        common::FIXTURE_DRIVER_MODELS,
+        Some(WINDOW),
+        seed_budget,
+        hooks,
+    )
+}
+
+/// [`run_session`] on a driver whose `models:` table is `models`, with `context.max_tokens:
+/// window` when given.
+fn run_session_on(
+    models: &str,
+    window: Option<u32>,
+    seed_budget: &str,
+    hooks: &[(&str, &str, &str, Vec<u8>)],
+) -> Session {
     let server = common::ScriptedServer::start(one_turn_responses());
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
-    let driver_artifact = common::create_driver_artifact(
+    let driver_artifact = common::create_driver_artifact_with_auth(
         artifact_dir.path(),
         DRIVER_NAME,
         DRIVER_VERSION,
         &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+        &format!("{}{models}", common::FIXTURE_DRIVER_AUTH),
     );
     common::publish_local(&home, &driver_artifact).success();
 
@@ -179,7 +207,13 @@ fn run_session(seed_budget: &str, hooks: &[(&str, &str, &str, Vec<u8>)]) -> Sess
         hook_names.push(*name);
     }
 
-    let manifest_path = create_manifest(project.path(), &server.endpoint, seed_budget, &hook_names);
+    let manifest_path = create_manifest(
+        project.path(),
+        &server.endpoint,
+        window,
+        seed_budget,
+        &hook_names,
+    );
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
     let records_dir = staged.records_dir.clone();
     fs::write(staged.accessible_workdir.join("task.md"), TASK_TEXT).unwrap();
@@ -281,6 +315,7 @@ fn seeds_the_first_inference_request() {
         "a committed seed carries its token count: {seed}"
     );
     assert_eq!(seed["proposed_tokens"], seed["tokens"]);
+    // 0.10 of the 200000-token input budget.
     assert_eq!(seed["budget_tokens"], 20_000);
     let ids = seed["message_ids"].as_array().unwrap();
     assert_eq!(ids.len(), 1);
@@ -667,4 +702,31 @@ fn trace_show_renders_the_context_section_for_a_seeded_session() {
         "{stdout}"
     );
     assert!(stdout.contains(&seeded_id), "{stdout}");
+}
+
+/// The seed budget is a fraction of the primary's input budget, not of its window: on a driver
+/// declaring 1050000 / 128000 / 922000, 0.10 is 92200 tokens. The hook sees that number as
+/// `budget-tokens` and the window as `context-window`, or it traps and seeds nothing.
+#[test]
+fn the_seed_budget_is_a_fraction_of_the_input_budget() {
+    if common::skip_without_host_support("the_seed_budget_is_a_fraction_of_the_input_budget") {
+        return;
+    }
+    let known = "REMEMBER-THIS the input budget, not the window.";
+    let session = run_session_on(
+        "models:\n  test-model:\n    max_output_tokens: 128000\n    context_window: 1050000\n    \
+         max_input_tokens: 922000\n",
+        None,
+        "0.10",
+        &[(
+            "seed-hook",
+            "on-task-start",
+            "seed-context",
+            seed_hook_wasm_expecting(&[("user", known)], 92_200, 1_050_000),
+        )],
+    );
+    let seed = session.context_seed();
+    assert_eq!(seed["outcome"], "seeded", "{}", session.trace_raw);
+    assert_eq!(seed["budget_tokens"], 92_200, "{seed}");
+    assert_eq!(text_of(&session.first_messages()[0]), known);
 }

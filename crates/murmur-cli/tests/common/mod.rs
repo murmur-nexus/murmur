@@ -221,6 +221,23 @@ pub fn publish_local(home: &TempDir, artifact_path: &Path) -> Assert {
         .assert()
 }
 
+/// Replaces the payload and `.sha256` that `home`'s global store holds for `name@version` with
+/// `artifact_path`'s bytes, bypassing the store's own checks: how a test stages a payload
+/// `mur install` and `mur publish` refuse, to see what the launch makes of it.
+pub fn overwrite_stored_payload(home: &TempDir, name: &str, version: &str, artifact_path: &Path) {
+    let registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
+    let name = murmur_artifact::ArtifactName::parse(name).unwrap();
+    let payload = registry.artifact_path_for(&name, version);
+    assert!(payload.is_file(), "{} is not stored", payload.display());
+    let bytes = fs::read(artifact_path).unwrap();
+    fs::write(&payload, &bytes).unwrap();
+    fs::write(
+        registry.sha256_path_for(&name, version),
+        murmur_artifact::sha256_hex(&bytes),
+    )
+    .unwrap();
+}
+
 /// Install an artifact into the project store of `project_dir` via `mur install <path>`.
 /// The project directory must already contain murmur.yaml so that
 /// `find_project_root()` can locate it.

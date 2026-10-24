@@ -394,6 +394,9 @@ fn session_status_fields_match_the_trace() {
         json!({
             "used_tokens": provider_count(before.last().unwrap()),
             "window_tokens": 50000,
+            // The window less the fixture driver's 8192 output cap.
+            "budget_tokens": 41808,
+            "budget_basis": "context_window_less_output_cap",
             "measured_by": "actual",
         })
     );
@@ -467,6 +470,8 @@ fn unset_limits_say_none_and_unreported_counts_say_unknown() {
     assert_eq!(status["turns"]["cap"], "none");
     assert_eq!(status["turns"]["used"], 1);
     assert_eq!(status["context"]["window_tokens"], "none");
+    assert_eq!(status["context"]["budget_tokens"], "none");
+    assert_eq!(status["context"]["budget_basis"], "none");
     assert_eq!(status["context"]["measured_by"], "estimate");
     assert_eq!(
         status["tokens"],

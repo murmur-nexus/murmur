@@ -594,6 +594,15 @@ fn a_controller_changes_a_declared_setting_from_the_next_inference_call() {
     for line in &inference {
         assert!(line.get("driver_config").is_some(), "{line}");
     }
+    // The input budget is recomputed from the cap each call sent: the fixture driver's
+    // 1000000-token window less it.
+    assert_eq!(
+        inference
+            .iter()
+            .map(|line| line["input_budget"].clone())
+            .collect::<Vec<_>>(),
+        [json!(995_904), json!(995_904), json!(998_766)]
+    );
 
     let show = Ran::of(
         mur(home.path())
@@ -962,6 +971,15 @@ fn a_controller_is_refused_what_is_not_declared() {
             Some("inference.max_tokens"),
         );
     }
+    // A cap at the fixture driver's 1000000-token window leaves the choice no input budget.
+    let no_budget = put_setting(&addr, &token, "1000000");
+    assert_eq!(
+        no_budget.json()["error"],
+        "inference.max_tokens of 1000000 leaves driver choice 'primary' no input budget: its \
+         context window is 1000000",
+        "{no_budget:?}"
+    );
+    check(no_budget, 422, Some("inference.max_tokens"));
     check(
         http(
             &addr,

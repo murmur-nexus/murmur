@@ -8,7 +8,7 @@ The relevant manifest options are:
 |---|---|
 | [context.record](../reference/manifest.md#field-context) | Whether the runtime keeps a durable conversation record for this capsule |
 | [context.record_store](../reference/manifest.md#field-context) | Directory under `~/.murmur/conversations/` the record lives in |
-| [context.seed_budget](../reference/manifest.md#field-context) | Fraction of the context window an `on-task-start` hook's seed may occupy |
+| [context.seed_budget](../reference/manifest.md#field-context) | Fraction of the input budget an `on-task-start` hook's seed may occupy |
 | [context.seed_overflow_margin](../reference/manifest.md#field-context) | Slack above the seed budget before the runtime trims or summarizes instead of seeding it whole |
 | [capabilities.conversation.read](../reference/manifest.md#hook-capabilities) | Grants a hook read access to the conversation record |
 | [capabilities.state](../reference/manifest.md#field-capabilities) | Durable store an artifact's own file tools cannot reach |
@@ -111,7 +111,7 @@ Create a `murmur.yaml` file:
         artifact: murmur/driver-deepseek
     ```
 
-`capabilities.conversation.read: true` on the hook's own entry is required, not inferred — a `murmur/hook-memory` declared without it fails every read and seeds nothing. A context window is required too: it is what `context.seed_budget` is a fraction of, and without one a seed the hook returns is refused. It is `context.max_tokens`, or the window the driver's `models:` table declares for the model.
+`capabilities.conversation.read: true` on the hook's own entry is required, not inferred — a `murmur/hook-memory` declared without it fails every read and seeds nothing. A context window is required too: the [input budget](../reference/manifest.md#inference-max-tokens) `context.seed_budget` is a fraction of is cut from it, and without one a seed the hook returns is refused. It is `context.max_tokens`, or the window the driver's `models:` table declares for the model. The input budget is the driver's input ceiling for the model, or the window less the output cap, whichever is smaller; the hook still sees the window itself as `task-start-event.context-window`.
 
 ---
 
@@ -127,7 +127,7 @@ mur install
 
 ## Step 3 — bound what the hook may seed
 
-`context.seed_budget` and `context.seed_overflow_margin` both default to `0.10` — a seed may use up to 10% of the context window, with another 10% of *that* as slack before the runtime intervenes. Raise the budget for a capsule that leans on its history more than on the current task:
+`context.seed_budget` and `context.seed_overflow_margin` both default to `0.10` — a seed may use up to 10% of the input budget, with another 10% of *that* as slack before the runtime intervenes. Raise the budget for a capsule that leans on its history more than on the current task:
 
 ```yaml
 context:
@@ -257,7 +257,7 @@ mur run --explain-scope
 | `context.record: off` | Nothing is written; a hook granted `capabilities.conversation.read` reads an empty page |
 | `context.record_store: <name>` | Names the record's directory explicitly; default is the capsule name |
 | `murmur/hook-memory` with `capabilities.conversation.read: true` on its own entry | Seeds each task with the relevant slice of prior conversation; the capsule-wide `capabilities` block cannot grant this |
-| `context.seed_budget` (default `0.10`) | Fraction of the context window a seed may occupy |
+| `context.seed_budget` (default `0.10`) | Fraction of the input budget a seed may occupy |
 | `context.seed_overflow_margin` (default `0.10`) | Slack before an over-budget seed is trimmed or summarized instead of seeded whole |
 | `mur run --context <id>` | Two runs with the same id share one conversation record |
 | `capabilities.state: {}` on an artifact entry | Grants that artifact a durable directory outside the workdir, keyed by capsule |

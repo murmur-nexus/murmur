@@ -97,6 +97,7 @@ Every refusal has the body `{"error": "<one sentence>"}`. A secret's value never
 | 422 | `missing_body` | A `PUT` with no body, or `content-length: 0` |
 | 415 | `unsupported_media_type` | A setting `PUT` without `content-type: application/json` |
 | 422 | `invalid_value` | An `inference.max_tokens` value outside its range or not an integer, or a secret that is empty or holds any byte other than visible ASCII and space |
+| 422 | `no_input_budget` | An `inference.max_tokens` value at or above the context window of any declared driver choice, which would leave that choice's calls no [input budget](manifest.md#inference-max-tokens). The message names the first such choice in declaration order and its window: `inference.max_tokens of 2000 leaves driver choice 'cheap' no input budget: its context window is 2000` |
 | 422 | `undeclared_driver` | An `inference.driver` value that is not a string naming a declared choice. The message lists the declared names |
 | 409 | `credential_unresolvable` | An `inference.driver` choice whose credential cannot produce a value now. The message names the credential |
 | 409 | `in_use` | A secret `DELETE` while the secret keys the driver choice in use |

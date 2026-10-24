@@ -12,7 +12,7 @@ section that explains it.
 | `E-BLD-002` | `requires_files:` entry is unsafe (absolute, `..`, symlink) or collides inside the archive | [E-BLD-002](#e-bld-002) |
 | `E-BLD-003` | Packed entry set is not a launchable wasm payload | [E-BLD-003](#e-bld-003) |
 | `E-BLD-004` | Artifact manifest declares `inference_auth:`, the former name of `upstream_auth:` | [E-BLD-004](#e-bld-004) |
-| `E-BLD-005` | A driver's `models:` table is malformed, or `models:` is declared on an artifact that is not a driver | [E-BLD-005](#e-bld-005) |
+| `E-BLD-005` | A driver's `models:` table is malformed — a `max_input_tokens` above its `context_window` included — or `models:` is declared on an artifact that is not a driver | [E-BLD-005](#e-bld-005) |
 | `E-CAP-001` | A `capabilities.network.allow` entry could not be parsed | [E-CAP-001](#e-cap-001) |
 | `E-CAP-002` | A `filesystem.scope` is not relative to the workdir, or escapes it via `..` | [E-CAP-002](#e-cap-002) |
 | `E-CAP-003` | Declared containment floor (`advisory`\|`scoped`\|`sealed`) is not achievable on this host | [E-CAP-003](#e-cap-003) |
@@ -72,6 +72,7 @@ section that explains it.
 | `E-REG-008` | No source serves the artifact's scope | [E-REG-008](#e-reg-008) |
 | `E-REG-009` | A source's index states a scope the source does not own | [E-REG-009](#e-reg-009) |
 | `E-REG-010` | A scope's GitHub owner id is not the one recorded for it in `murmur.lock`, in the stored payload, or compiled in for `murmur` | [E-REG-010](#e-reg-010) |
+| `E-REG-011` | `mur install` or `mur publish` was handed a payload whose packed `murmur.yaml` ships a malformed `models:` table | [E-REG-011](#e-reg-011) |
 | `E-ROS-001` | `roster.yaml` is missing, unreadable, or does not have the roster shape, or names a member's capsule by a bare name | [E-ROS-001](#e-ros-001) |
 | `E-ROS-002` | A roster marks no member `entry: true`, or more than one | [E-ROS-002](#e-ros-002) |
 | `E-ROS-003` | Two roster members share one `name` | [E-ROS-003](#e-ros-003) |
@@ -130,9 +131,10 @@ section that explains it.
 | `E-RUN-049` | `mur token --credential` named a credential the session did not mint | [E-RUN-049](#e-run-049) |
 | `E-RUN-050` | The runtime met a symbolic link, or the wrong kind of file, inside the workdir — while staging the session, or during the task `mur run` ran — or `mur trace rm` met one on the way to a directory it removes | [E-RUN-050](#e-run-050) |
 | `E-RUN-051` | A delegated child's `--workdir` is not the directory its parent created; nothing was written | [E-RUN-051](#e-run-051) |
-| `E-RUN-052` | A driver choice has no output cap — its driver lists no limits for its model and the manifest sets no `inference.max_tokens` — or its driver ships a malformed `models:` table | [E-RUN-052](#e-run-052) |
+| `E-RUN-052` | A driver choice has no output cap — its driver lists no limits for its model and the manifest sets no `inference.max_tokens` — or its driver ships a malformed `models:` table, a `max_input_tokens` above its `context_window` included | [E-RUN-052](#e-run-052) |
 | `E-RUN-053` | The session reached its deadline, own or inherited, and was ended; a formation's `--deadline` fell before its entry member started; or a launch was handed a deadline it cannot enforce | [E-RUN-053](#e-run-053) |
 | `E-RUN-054` | `inference.compaction.max_tokens` is above the output ceiling the primary driver's `models:` table declares for the compaction model | [E-RUN-054](#e-run-054) |
+| `E-RUN-055` | A driver choice's output cap, or `inference.compaction.max_tokens`, is at or above its context window, leaving its calls no input budget | [E-RUN-055](#e-run-055) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -1398,12 +1400,15 @@ in the capsule's manifest, or install a release of the driver that lists the mod
 [`mur doctor`](cli.md#mur-doctor) reports the same condition as a fix.
 
 A driver whose own `models:` table is malformed refuses the launch under the same code, naming the
-driver and the field:
+driver and the field. An entry's `max_input_tokens` above its `context_window` is one such table:
 
 ```text
 error[E-RUN-052]: driver local/driver-glm@0.1.0 ships a malformed models: table: murmur.yaml: field 'models.glm-5.3.max_output_tokens' must be an integer from 1 to 4294967295
   hint: the driver's own murmur.yaml is at fault; use a release of the driver whose models: table is well formed
 ```
+
+`mur install` and `mur publish` refuse such a payload with [`E-REG-011`](#e-reg-011), so the launch
+meets one only in a store written some other way.
 
 ### E-RUN-053 — the session reached its deadline { #e-run-053 }
 
@@ -1457,6 +1462,35 @@ error[E-RUN-054]: inference.compaction.max_tokens (9000) is above the output cei
 A value equal to the ceiling is accepted. A compaction model the table does not list has no ceiling
 to check against, and the value is used as written. [`mur doctor`](cli.md#mur-doctor) reports the
 same condition as a fix.
+
+### E-RUN-055 — a driver choice has no input budget { #e-run-055 }
+
+Every inference call's [input budget](manifest.md#inference-max-tokens) is the input ceiling, or
+the context window less the output cap the call sends, whichever is smaller. An output cap at or
+above the window leaves no input tokens, and the launch is refused before any request leaves:
+
+```text
+error[E-RUN-055]: driver choice 'primary' has no input budget: its context window of 200000 (manifest) less its output cap of 200000 (manifest) leaves no input tokens; input ceiling none (model 'test-model', driver local/murmur-driver-anthropic@0.1.0)
+  hint: lower inference.max_tokens below the context window, or raise context.max_tokens above the output cap
+```
+
+| Field | Value |
+|---|---|
+| Choice | `primary` or an `inference.alternates` entry's `name`. Each choice is checked on its own window |
+| Window, cap | Each followed by its source: `manifest` or `driver` |
+| Input ceiling | The driver's `max_input_tokens` for the model, or `none` |
+
+The same code refuses an [`inference.compaction.max_tokens`](manifest.md#field-inference) at or
+above the compaction model's window — `context.max_tokens`, else the `context_window` the primary
+driver's [`models:`](manifest.md#driver-models) table declares for that model:
+
+```text
+error[E-RUN-055]: compaction calls have no input budget: the context window of 100000 (manifest) for compaction model 'gpt-5.6' less inference.compaction.max_tokens of 100000 leaves no input tokens; input ceiling 922000 (driver local/driver-openai@0.1.0)
+  hint: lower inference.compaction.max_tokens below 100000
+```
+
+A compaction model with neither window is not checked. [`mur doctor`](cli.md#mur-doctor) reports
+both conditions as a fix.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
@@ -2046,7 +2080,7 @@ unchanged.
 
 ```text
 error[E-BLD-005]: murmur.yaml: field 'models.glm-5.3.max_output_tokens' must be an integer from 1 to 4294967295
-  hint: models: is a driver's table of model id to max_output_tokens and context_window, each an integer from 1 to 4294967295; a driver shipped with a malformed table is refused at launch with E-RUN-052
+  hint: models: is a driver's table of model id to max_output_tokens and context_window, and optionally max_input_tokens (at most context_window), each an integer from 1 to 4294967295; a driver shipped with a malformed table is refused at launch with E-RUN-052
 ```
 
 `mur build` refuses before writing the `.mur.zip`, naming the field:
@@ -2059,6 +2093,7 @@ error[E-BLD-005]: murmur.yaml: field 'models.glm-5.3.max_output_tokens' must be 
 | An entry that is not a mapping | `models.<id>` |
 | An entry missing `max_output_tokens` or `context_window` | `models.<id>.<key>` |
 | A value that is not an integer from `1` to `4294967295` | `models.<id>.<key>` |
+| A `max_input_tokens` above the entry's `context_window` | `models.<id>.max_input_tokens` |
 | An entry holding any other key | `models.<id>.<key>` |
 
 The block's shape is in [`models:` block](manifest.md#driver-models).
@@ -2468,6 +2503,20 @@ error[E-REG-010]: could not resolve ana/tool-git@1.0.0: the owner of scope 'ana'
 To trust the new owner, delete the scope's entries from `murmur.lock` and install again. The
 `murmur` scope's id cannot be changed: a different one means the request did not reach GitHub's own
 `murmur-nexus/default-artifacts`, for example through `MUR_GITHUB_API_BASE`.
+
+### E-REG-011 — a payload ships a malformed `models:` table { #e-reg-011 }
+
+`mur install` — from a file, GitHub, the global store or a manifest's dependencies — and
+`mur publish` read the payload's packed `murmur.yaml` before anything is stored. A
+[`models:`](manifest.md#driver-models) table [`E-BLD-005`](#e-bld-005) would refuse is refused here
+too, and neither the store nor `murmur.lock` is written:
+
+```text
+error[E-REG-011]: local/murmur-driver-anthropic@0.1.0 cannot be stored: its murmur.yaml ships a malformed models: table: murmur.yaml: field 'models.test-model.max_input_tokens' is 1050001, above this entry's context_window of 1050000; an input ceiling is at most the window
+  hint: the driver's own murmur.yaml is at fault; use a release of the driver whose models: table is well formed — mur build refuses the same table with E-BLD-005
+```
+
+A payload with no readable `murmur.yaml` declares no table, and is stored.
 
 ---
 

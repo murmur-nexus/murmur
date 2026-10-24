@@ -24,6 +24,7 @@ pub const E_REG_007: &str = "E-REG-007"; // an artifact name on the command line
 pub const E_REG_008: &str = "E-REG-008"; // no source serves the artifact's scope
 pub const E_REG_009: &str = "E-REG-009"; // a source's index states a scope the source does not own
 pub const E_REG_010: &str = "E-REG-010"; // a scope's GitHub owner id is not the one recorded for it (murmur.lock, a stored payload, or compiled in for murmur)
+pub const E_REG_011: &str = "E-REG-011"; // a payload's packed murmur.yaml ships a malformed models: table, so the store refuses it
 
 // WIT levels
 pub const E_WIT_LEVEL_001: &str = "E-WIT-LEVEL-001"; // an artifact a launch stages does not fit the WIT level this mur serves
@@ -100,9 +101,10 @@ pub const E_RUN_048: &str = "E-RUN-048"; // `mur token` named a session whose do
 pub const E_RUN_049: &str = "E-RUN-049"; // `mur token --credential` named a credential the session did not mint
 pub const E_RUN_050: &str = "E-RUN-050"; // a runtime write, read, create or removal inside the workdir met a symbolic link or the wrong kind of file
 pub const E_RUN_051: &str = "E-RUN-051"; // a delegated child's --workdir is not the directory its parent created
-pub const E_RUN_052: &str = "E-RUN-052"; // a driver choice has no output cap, or its driver ships a malformed models: table
+pub const E_RUN_052: &str = "E-RUN-052"; // a driver choice has no output cap, or its driver ships a malformed models: table (an input ceiling above its window included)
 pub const E_RUN_053: &str = "E-RUN-053"; // the session reached its mur run --deadline, or a launch cannot enforce the deadline it was staged with
 pub const E_RUN_054: &str = "E-RUN-054"; // inference.compaction.max_tokens is above the primary driver's output ceiling for the compaction model
+pub const E_RUN_055: &str = "E-RUN-055"; // a driver choice's output cap, or inference.compaction.max_tokens, leaves no input budget in its context window
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -318,6 +320,16 @@ pub(crate) fn model_limits_error(
                 "lower inference.compaction.max_tokens to at most {ceiling}, or remove it to use \
                  the driver's ceiling"
             ),
+        ),
+        ModelLimitsError::NoInputBudget { .. } => (
+            E_RUN_055,
+            "lower inference.max_tokens below the context window, or raise context.max_tokens \
+             above the output cap"
+                .to_string(),
+        ),
+        ModelLimitsError::CompactionNoInputBudget { window, .. } => (
+            E_RUN_055,
+            format!("lower inference.compaction.max_tokens below {window}"),
         ),
     };
     CliError::with_hint(code, error.to_string(), hint)
@@ -1089,6 +1101,12 @@ impl From<RegistryError> for CliError {
                 .to_string();
                 CliError::with_hint(E_REG_002, message, hint)
             }
+            error @ RegistryError::MalformedModelsTable { .. } => CliError::with_hint(
+                E_REG_011,
+                error.to_string(),
+                "the driver's own murmur.yaml is at fault; use a release of the driver whose \
+                 models: table is well formed — mur build refuses the same table with E-BLD-005",
+            ),
             RegistryError::IntegrityMismatch { name, version, .. } => CliError::with_hint(
                 E_REG_002,
                 format!("artifact integrity check failed for {name}@{version}"),
@@ -1227,8 +1245,9 @@ impl From<BuildError> for CliError {
                 E_BLD_005,
                 error.to_string(),
                 "models: is a driver's table of model id to max_output_tokens and \
-                 context_window, each an integer from 1 to 4294967295; a driver shipped with a \
-                 malformed table is refused at launch with E-RUN-052",
+                 context_window, and optionally max_input_tokens (at most context_window), each \
+                 an integer from 1 to 4294967295; a driver shipped with a malformed table is \
+                 refused at launch with E-RUN-052",
             ),
         }
     }

@@ -21,7 +21,7 @@ The manifest that ships inside a `.mur.zip`, read by `mur build` and `mur publis
 | `requires_files` | list<string> | no | Companion files that must sit beside `murmur.yaml` — and the complete list of what `mur build` packages besides the manifest itself. Paths are relative to the source directory and may be nested (`assets/logo.png`). Default: `["skill.md"]` for `runtime: skill`, empty for every other role; an explicit value, including `[]`, always overrides that default. A missing file fails the build with `E-IO-003`, naming the first missing entry. Entries must be plain relative paths to real files: absolute paths, `..` components and symlinks are rejected with [`E-BLD-002`](diagnostics.md#e-bld-002). An artifact with a compiled payload must declare it here, or the built `.mur.zip` contains nothing but `murmur.yaml` — for a wasm artifact that is [`E-BLD-003`](diagnostics.md#e-bld-003). |
 | `input_schema` | string (JSON) or map | no | A `runtime: tool` artifact's parameters, as a JSON Schema object. Offered to the model as the tool's input; every name in its top-level `required` must be present in a call's input or the call is refused before the tool runs. Default: an object with no properties, and no field required. `input` is an accepted older spelling. See [`input_schema`](#input-schema). |
 | `upstream_auth` | map | no | How the artifact's upstream takes its key: `header` and a `value` template with `{key}` exactly once. Read only when the capsule's entry for this artifact declares [`gateway:`](#artifact-gateway); absent or malformed then refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025). See [`upstream_auth:` block](#upstream-auth). |
-| `models` | map | no | `runtime: driver` only. Each model id the driver serves, with its `max_output_tokens` and `context_window`. Default: empty. A capsule on the driver takes its output cap and context window from here. See [`models:` block](#driver-models). |
+| `models` | map | no | `runtime: driver` only. Each model id the driver serves, with its `max_output_tokens`, `context_window` and optionally `max_input_tokens`. Default: empty. A capsule on the driver takes its output cap, context window and input ceiling from here. See [`models:` block](#driver-models). |
 
 A hook artifact's own manifest carries three more fields — see
 [Hook contract fields](#hook-contract-fields).
@@ -74,7 +74,7 @@ When the block is read and refused:
 The limits of each model a driver serves, declared in the driver's own `murmur.yaml` beside
 `upstream_auth:`. A `transport: http` capsule on the driver takes each driver choice's
 [output cap](#inference-max-tokens) and context window from the entry for its model, unless the
-capsule's manifest sets them.
+capsule's manifest sets them, and its input ceiling from the entry alone.
 
 ```yaml
 name: driver-glm
@@ -86,18 +86,24 @@ models:
   glm-5.3:
     max_output_tokens: 131072
     context_window: 200000
+  gpt-5.6:
+    max_output_tokens: 128000
+    context_window: 1050000
+    max_input_tokens: 922000
 ```
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `models.<id>` | map | — | One entry per model id. The id is matched by exact string equality with `inference.model` or an alternate's `model`: no prefix, alias or case folding, so a driver that accepts a dated id and an alias lists both. Must not be empty. No key besides the two below |
+| `models.<id>` | map | — | One entry per model id. The id is matched by exact string equality with `inference.model` or an alternate's `model`: no prefix, alias or case folding, so a driver that accepts a dated id and an alias lists both. Must not be empty. No key besides the three below |
 | `models.<id>.max_output_tokens` | integer | yes | The most output tokens the model produces in one completion. `1` to `4294967295` |
 | `models.<id>.context_window` | integer | yes | The model's context window in tokens. `1` to `4294967295` |
+| `models.<id>.max_input_tokens` | integer | no | The most input tokens the provider accepts in one request for the model. `1` to `4294967295`, and at most `context_window`. With it, every call's [input budget](#inference-max-tokens) is at most this number |
 
 | Case | Result |
 |---|---|
-| `models:` malformed, or declared on an artifact whose `runtime` is not `driver` | `mur build` refuses with [`E-BLD-005`](diagnostics.md#e-bld-005), naming the field |
-| An installed driver whose `models:` is malformed | `mur run` refuses with [`E-RUN-052`](diagnostics.md#e-run-052), naming the driver and the field |
+| `models:` malformed — a `max_input_tokens` above its `context_window` included — or declared on an artifact whose `runtime` is not `driver` | `mur build` refuses with [`E-BLD-005`](diagnostics.md#e-bld-005), naming the field |
+| A packed `murmur.yaml` whose `models:` is malformed | `mur install` and `mur publish` refuse with [`E-REG-011`](diagnostics.md#e-reg-011), naming `name@version` and the field, and write nothing to the store or `murmur.lock` |
+| A stored driver whose `models:` is malformed | `mur run` refuses with [`E-RUN-052`](diagnostics.md#e-run-052), naming the driver and the field |
 | The table lists no entry for a choice's model | The capsule's own `inference.max_tokens` and `context.max_tokens` apply; see [Output cap](#inference-max-tokens) |
 
 ### `input_schema` { #input-schema }
@@ -236,7 +242,7 @@ network:
         scopes: [GetTask, murmur.WatchSession]
 
 context:
-  max_tokens: 200000   # enables context compaction; omit to disable
+  max_tokens: 200000   # optional; overrides the context_window the driver declares for the model
   record: on           # on (default) | off — the durable conversation record
   record_store: shey   # optional; directory under ~/.murmur/conversations/, default: capsule name
   retain:              # optional; omit to keep every record whole and forever
@@ -1121,7 +1127,7 @@ These fields are read under `transport: http`. Setting any of them except `infer
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `inference.model` | string | yes | Model identifier passed to the driver. |
-| `inference.max_tokens` | integer | no | Maximum output tokens the model may generate **per turn**, for every driver choice. Default: the `max_output_tokens` the driver's [`models:`](#driver-models) table declares for the choice's model; a choice with neither refuses the launch with [`E-RUN-052`](diagnostics.md#e-run-052). Must be > 0; not clamped at the top end. Distinct from [`context.max_tokens`](#field-context) — see [Output cap](#inference-max-tokens). |
+| `inference.max_tokens` | integer | no | Maximum output tokens the model may generate **per turn**, for every driver choice. Default: the `max_output_tokens` the driver's [`models:`](#driver-models) table declares for the choice's model; a choice with neither refuses the launch with [`E-RUN-052`](diagnostics.md#e-run-052). Must be > 0; not clamped at the top end. A value at or above a choice's context window leaves it no input budget and refuses the launch with [`E-RUN-055`](diagnostics.md#e-run-055). Distinct from [`context.max_tokens`](#field-context) — see [Output cap](#inference-max-tokens). |
 | `inference.tool_refresh` | `compaction \| immediate` | no | When an artifact installed mid-session, other than by the model's own `pull-artifact`, reaches the tool list the model is offered. Default: `compaction`. See [Tool refresh](#inference-tool-refresh). |
 | `inference.alternates` | list | no | Default: empty. Other driver choices the agent loop may be switched to while the capsule runs. Requires `inference.driver` in `control.settings` or `control.agent_settings`. See [Driver alternates](#inference-alternates). |
 
@@ -1245,20 +1251,20 @@ has no compaction step. Under `transport: process`, `threshold`, `model`, `syste
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `inference.compaction.threshold` | float (0.0–1.0] | no | Fraction of the context window at which compaction fires. Default: `0.98`. Checked after each response against the provider's count of the call when the driver reports usage, and the runtime's estimate otherwise — see [Context compaction](../concepts/context.md). |
+| `inference.compaction.threshold` | float (0.0–1.0] | no | Fraction of the call's [input budget](#inference-max-tokens) at which compaction fires. Default: `0.98`. Checked after each response against the provider's count of the call when the driver reports usage, and the runtime's estimate otherwise — see [Context compaction](../concepts/context.md). |
 | `inference.compaction.model` | string | no | Model override for compaction calls. Defaults to the primary inference model. |
 | `inference.compaction.system_prompt` | string | no | System prompt override for compaction calls, passed verbatim to the compaction hook. No trimming, length limit or format check. Omitted, the compaction hook picks its own default prompt. Mutually exclusive with `inference.compaction.system_prompt_file`. |
 | `inference.compaction.system_prompt_file` | string | no | Path to a file whose content is passed verbatim as the compaction system prompt. Relative to the manifest directory; read when the session launches. Mutually exclusive with `inference.compaction.system_prompt`. |
 | `inference.compaction.dump_summaries` | bool | no | Default: `false`. When `true`, every committed compaction appends one JSON line to `out/compaction-summaries.jsonl` in the session's [records directory](workdir.md#compaction-summaries), recording the verbatim summary text plus token counts. |
-| `inference.compaction.max_tokens` | integer | no | Output cap of every `run-inference` call a hook makes while it serves `on-compaction` — the threshold trigger, [`mur run --resume … --resume-mode compact`](cli.md#mur-run) and a seed's overflow summary — and the amount a [spend ceiling](#inference-max-session-tokens) reserves for each. Default: the cap any other hook call sends, under [Output cap sent](#inference-max-tokens). Must be > 0. A value above the `max_output_tokens` the primary driver's [`models:`](#driver-models) table declares for the compaction model (`inference.compaction.model`, else `inference.model`) refuses the launch with [`E-RUN-054`](diagnostics.md#e-run-054); a model the table does not list takes any value. Invalid for `transport: process`. |
+| `inference.compaction.max_tokens` | integer | no | Output cap of every `run-inference` call a hook makes while it serves `on-compaction` — the threshold trigger, [`mur run --resume … --resume-mode compact`](cli.md#mur-run) and a seed's overflow summary — and the amount a [spend ceiling](#inference-max-session-tokens) reserves for each. Default: the cap any other hook call sends, under [Output cap sent](#inference-max-tokens). Must be > 0. A value above the `max_output_tokens` the primary driver's [`models:`](#driver-models) table declares for the compaction model (`inference.compaction.model`, else `inference.model`) refuses the launch with [`E-RUN-054`](diagnostics.md#e-run-054); a model the table does not list takes any value. A value at or above the compaction model's window (`context.max_tokens`, else that table entry's `context_window`) leaves compaction calls no input budget and refuses the launch with [`E-RUN-055`](diagnostics.md#e-run-055). Invalid for `transport: process`. |
 | `inference.compaction.driver_config` | mapping | no | Laid over [`inference.driver.config`](#inference-config) for the same calls `inference.compaction.max_tokens` caps, and no others. Shallow: each top-level key replaces the same-named key of `inference.driver.config` or is added beside it, and every other key is kept; a nested mapping replaces the whole value. With no `inference.driver.config`, the mapping alone is sent. The driver validates the merged object as it validates `inference.driver.config`, and names it `inference.driver.config` in its refusal. Default: none, so compaction calls get `inference.driver.config` unchanged. A non-mapping value is refused. Invalid for `transport: process`. |
 
 #### `context` { #field-context }
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `context.max_tokens` | integer | no | The context window compaction and the seed budget measure against, for every driver choice. Default: the `context_window` the driver's [`models:`](#driver-models) table declares for the choice's model; with neither, the choice has no window, and compaction does not run on it. Must be > 0. Read only under `transport: http`, like the [`inference.compaction`](#field-inference) block it drives. Distinct from [`inference.max_tokens`](#field-inference), the per-turn output cap. |
-| `context.seed_budget` | float (0.0–1.0) | no | Default: `0.10`. Fraction of the primary choice's context window an `on-task-start` hook's `seed-context` may occupy. The product, rounded down, is sent to the hook as `task-start-event.budget-tokens`. Requires a window: with none there is no ceiling, and a returned seed is refused with `reason: "no_budget"`. Inert under `transport: process`, where a seed is refused with `reason: "unsupported_transport"`. |
+| `context.max_tokens` | integer | no | The context window every driver choice's [input budget](#inference-max-tokens) is cut from: compaction and the seed budget measure against that budget. Default: the `context_window` the driver's [`models:`](#driver-models) table declares for the choice's model; with neither, the choice has no window, and compaction does not run on it. Must be > 0. A value at or below a choice's output cap leaves it no input budget and refuses the launch with [`E-RUN-055`](diagnostics.md#e-run-055). Read only under `transport: http`, like the [`inference.compaction`](#field-inference) block it drives. Distinct from [`inference.max_tokens`](#field-inference), the per-turn output cap. |
+| `context.seed_budget` | float (0.0–1.0) | no | Default: `0.10`. Fraction of the primary choice's [input budget](#inference-max-tokens) at launch an `on-task-start` hook's `seed-context` may occupy. The product, rounded down, is sent to the hook as `task-start-event.budget-tokens`; `task-start-event.context-window` carries the window. Requires a window: with none there is no ceiling, and a returned seed is refused with `reason: "no_budget"`. Inert under `transport: process`, where a seed is refused with `reason: "unsupported_transport"`. |
 | `context.seed_overflow_margin` | float (0.0–1.0) | no | Default: `0.10`. Slack above `context.seed_budget`, as a fraction of it, within which an over-budget seed has its oldest messages dropped rather than being handed to the compaction hook. Requires a window and is inert under `transport: process`, exactly like `context.seed_budget`. |
 | `context.record` { #context-record } | `on \| off` | no | Default: `on`. Whether the runtime keeps a [durable conversation record](workdir.md#the-conversation-record) for this capsule. `off` turns the mechanism off: nothing is created under `~/.murmur/conversations/`, and a hook granted `capabilities.conversation.read` reads an empty page. Under `transport: process` no record is written either way, and `off` additionally turns off the [harness session map](workdir.md#harness-session-map). |
 | `context.record_store` | string | no | Default: the capsule name. Directory under `~/.murmur/conversations/` this capsule's records live in. One path segment: no `/`, no `.` or `..`, not absolute, not starting with a dot — anything else refuses the launch with [`E-CAP-011`](diagnostics.md#e-cap-011). Accepted and inert alongside `record: off`. |
@@ -1582,22 +1588,49 @@ runtime hands the driver, which every driver forwards verbatim to its provider A
 provider-agnostic and reaches every driver through the same wire field, so no `driver.config` entry
 is needed for it.
 
-[`context.max_tokens`](#field-context) is the context window compaction and the seed budget measure
-against; `inference.max_tokens` bounds a single response.
+[`context.max_tokens`](#field-context) is the context window; `inference.max_tokens` bounds a
+single response.
 
 At launch, each driver choice — the primary and every [alternate](#inference-alternates) — resolves
-both numbers once, from the manifest or else from the [`models:`](#driver-models) entry its driver
+its limits once, from the manifest or else from the [`models:`](#driver-models) entry its driver
 declares for its model:
 
 | Limit | Manifest sets it | Else the driver's table lists the model | Else |
 |---|---|---|---|
 | Output cap | `inference.max_tokens`, for every choice | `max_output_tokens` | The launch is refused with [`E-RUN-052`](diagnostics.md#e-run-052), naming the choice, the model, the driver and `inference.max_tokens` |
 | Context window | `context.max_tokens`, for every choice | `context_window` | No window: compaction does not run for that choice, and no seed budget applies |
+| Input ceiling | — | `max_input_tokens`, when the entry declares it | None |
+
+Every inference call has one **input budget**: the input ceiling, or the context window less the
+output cap that call sends, whichever is smaller. Compaction's
+[`threshold`](#field-inference) and the [`context.seed_budget`](#field-context) are fractions of it.
+
+| Term | Value |
+|---|---|
+| Window | `context.max_tokens`, else the serving driver's `context_window` for the model |
+| Output cap | The cap the call sends, from the table below |
+| Ceiling | The serving driver's `max_input_tokens` for the model, when declared |
+| Budget | `min(ceiling, window − output cap)`; a tie goes to the ceiling |
+
+| Driver entry (window / cap / ceiling) | Manifest | Budget | Basis | Fires at threshold `0.5` |
+|---|---|---|---|---|
+| 1050000 / 128000 / 922000 | — | 922000 | `max_input_tokens` | 461000 |
+| 1050000 / 128000 / — | `inference.max_tokens: 6000` | 1044000 | `context_window_less_output_cap` | 522000 |
+| 1050000 / 128000 / 922000 | `context.max_tokens: 200000`, `inference.max_tokens: 8192` | 191808 | `context_window_less_output_cap` | 95904 |
+| 1000000 / 8192 / — | `context.max_tokens: 200000`, `inference.max_tokens: 200000` | — | refused, [`E-RUN-055`](diagnostics.md#e-run-055) | — |
+
+| Case | Result |
+|---|---|
+| No window | No budget: compaction does not run and no seed budget applies |
+| A choice's output cap at or above its window | The launch is refused with [`E-RUN-055`](diagnostics.md#e-run-055), naming the window, the cap and the ceiling |
+| `inference.compaction.max_tokens` at or above the compaction model's window | The launch is refused with [`E-RUN-055`](diagnostics.md#e-run-055) |
+| A controller sets `inference.max_tokens` at or above any choice's window | Refused `422 no_input_budget` on the [control surface](control-surface.md#refusals); the cap in force is unchanged |
 
 A choice whose model the table does not list draws [`W-RUN-009`](diagnostics.md#w-run-009) once at
-launch, unless the manifest sets both keys. `session_start` records each choice's numbers and where
-each came from in [`model_limits`](observability-schemas.md#session-trace-tracejsonl), and
-[`mur doctor`](cli.md#mur-doctor) prints them.
+launch, unless the manifest sets both keys. `session_start` records each choice's numbers, its input
+budget and where each came from in
+[`model_limits`](observability-schemas.md#session-trace-tracejsonl), every `inference` line records
+its call's `input_budget`, and [`mur doctor`](cli.md#mur-doctor) prints them.
 
 Validation is one-sided: `0` is rejected at parse time, but a value larger than a given model's
 documented maximum is neither rejected nor clamped — an over-large cap surfaces as the provider's

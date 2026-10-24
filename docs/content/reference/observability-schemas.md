@@ -63,7 +63,7 @@ before the first task begins
 | `capsule_version` | string | Manifest `version` |
 | `model` | string | `inference.model` |
 | `max_turns` | u32 \| null | [`inference.max_turns`](manifest.md#inference-max-turns) — the turn ceiling each task of this launch runs under. Always present; `null` when no cap applies |
-| `model_limits` | object \| null | The primary driver choice's [output cap and context window](manifest.md#inference-max-tokens): `max_output_tokens` (u32), `max_output_tokens_source` (`"manifest"` \| `"driver"`), `context_window` (u32 \| null; `null` when the choice has none) and `context_window_source` (`"manifest"` \| `"driver"` \| `"none"`). `"manifest"` is `inference.max_tokens` or `context.max_tokens`; `"driver"` is the driver's [`models:`](manifest.md#driver-models) entry. Always present; `null` under `transport: process` |
+| `model_limits` | object \| null | The primary driver choice's [output cap, context window, input ceiling and input budget](manifest.md#inference-max-tokens), keys below. Always present; `null` under `transport: process` |
 | `max_session_tokens` | u64 \| null | [`inference.max_session_tokens`](manifest.md#inference-max-session-tokens). Always present; `null` when no session ceiling applies |
 | `machine_tokens_per_day` | u64 \| null | [`spend.machine_tokens_per_day`](config.md#spend) when this session is counted against it. Always present; `null` when no machine ceiling was in effect, and under `transport: process` |
 | `deadline` | object \| null | The [deadline](cli.md#mur-run-deadline) this session runs under, the earliest placed on it: `at` (string, RFC 3339 UTC, when the runtime ends the session), `secs` (u64, seconds from `mur run`'s start to `at`: the `--deadline` value, or for an inherited deadline the seconds left at the start, rounded up, `0` once passed), `notice_secs` (u64, the [notice](runtime-provided-tools.md#deadline-notice) margin in force; `0` sends none) and `source` (string, `"own"` for the session's own `--deadline`, `"inherited"` for the formation's or its parent's). Every key is always present; `null` when the session has no deadline |
@@ -94,6 +94,20 @@ before the first task begins
 | `effective_grants.temp_dir` | object | The [session's temporary folder](containment.md#temp-folder) and how the session's commands reach it: `path` (`<home>/.murmur/records/<workdir root>/<session-id>/tmp`, with the literal segment `<session-id>`), `tmpdir` (the value of `TMPDIR`, `TMP` and `TEMP`: `/tmp` when `tmp_mapped` is `true`, `path` when it is `false`), `tmp_mapped` (boolean: whether a literal `/tmp` is the folder), `mapped_by` (`"composed-root"`, `"mount-namespace"`, or `null` when not mapped) and `not_mapped_because` (why a literal `/tmp` is not the folder, `null` when it is). Derived from the tier this session applies, whether the host can give a command a private mount namespace, and whether the workdir is `/tmp` |
 | `effective_grants.runtime_writes` | array of object | Every path the runtime itself writes inside the work folder, so a consumer for whom that folder is the deliverable can subtract them and be left with what the capsule changed. One object per path, with `path`, `kind` (`"file"` \| `"directory"`) and `condition`, relative to the work folder. Exactly two rows: `{"path":"peer-in","kind":"directory","condition":"peer-fetch"}` and `{"path":"out","kind":"directory","condition":"script-session"}`. The set is the same on every tier: a condition names when the path appears, never whether the row is listed. See [What the capsule changed](workdir.md#what-the-capsule-changed) |
 
+The `model_limits` object, on `session_start` and on each `inference_choices` element, in this
+order:
+
+| Key | Type | Notes |
+|---|---|---|
+| `max_output_tokens` | u32 | The choice's output cap |
+| `max_output_tokens_source` | string | `"manifest"` (`inference.max_tokens`) \| `"driver"` (the driver's [`models:`](manifest.md#driver-models) entry) |
+| `context_window` | u32 \| null | The choice's context window; `null` when it has none |
+| `context_window_source` | string | `"manifest"` (`context.max_tokens`) \| `"driver"` \| `"none"` |
+| `max_input_tokens` | u32 \| null | The input ceiling the driver's entry declares; `null` when it declares none |
+| `max_input_tokens_source` | string | `"driver"` \| `"none"`. The manifest has no ceiling key |
+| `input_budget` | u32 \| null | The [input budget](manifest.md#inference-max-tokens) of a call sending `max_output_tokens`; `null` with no window |
+| `input_budget_basis` | string | Which limit sets `input_budget`: `"max_input_tokens"` (the ceiling, at most the window less the cap; a tie goes here) \| `"context_window_less_output_cap"` \| `"none"` (no window) |
+
 **`inference`**{ #inference } — written after each driver call, including one that failed
 
 | Field | Type | Notes |
@@ -114,6 +128,7 @@ before the first task begins
 | `driver_choice` | string | The [driver choice](manifest.md#inference-alternates) that served an agent-loop turn, by name. Written only when `inference.alternates` is declared |
 | `model` | string | The model this call was sent to. Written alongside `origin`, and alongside `driver_choice` |
 | `max_output_tokens` | u32 | The output cap the request carried as `max_tokens`, and the amount the spend meter reserved for the call. Written on every `transport: http` record — agent-loop turn, hook `run-inference` and failed call alike — and never under `transport: process`. See [Call settings](#inference-call-settings) |
+| `input_budget` | u32 \| null | The call's [input budget](manifest.md#inference-max-tokens): the input ceiling, or the context window less `max_output_tokens`, whichever is smaller. An agent-loop turn's compaction check measures against it. `null` when the call's model has no window. Written exactly when `max_output_tokens` is. See [Call settings](#inference-call-settings) |
 | `driver_config` | object \| null | The driver config the call's driver ran with, as `MURMUR_INFERENCE_DRIVER_CONFIG` handed it over, with every credential value the session holds replaced by `[redacted]`. `null` when the driver was handed none. Written exactly when `max_output_tokens` is. See [Call settings](#inference-call-settings) |
 | `message_ids` | array of string | Ids of the messages this request embedded, in the order they sat in it. Under an active [driver continuation](wit-interfaces.md#stateful-driver-continuation) only the tail the driver has not seen is sent, and this names exactly that tail. Absent when the list is empty: a hook's own completion and the `process` transport both send a message list the runtime never minted |
 | `system_sha` | string | SHA-256 (lowercase hex) of this request's `system` string — the resolved prompt with the `[Capsule]` identity block already prepended |
@@ -138,24 +153,24 @@ of measurements:
 
 #### Call settings { #inference-call-settings }
 
-`max_output_tokens` and `driver_config` say how one call was sent. Each record carries both values
-in full: `session_start` holds no baseline for them, and one session can send calls under several
+`max_output_tokens`, `input_budget` and `driver_config` say how one call was sent. Each record
+carries all three in full: `session_start` holds no baseline for them, and one session can send calls under several
 settings, because a [controller](manifest.md#field-control) can change `inference.max_tokens` from
 the next call, a driver switch changes the cap to that choice's own, and the compaction call has
 its own cap and config.
 
-| Call | `max_output_tokens` | `driver_config` |
-|---|---|---|
-| Agent-loop turn | The cap that turn sent: a value a controller set, otherwise [`inference.max_tokens`](manifest.md#inference-max-tokens), otherwise the entry for the serving [driver choice](manifest.md#inference-alternates)'s model in the driver's [`models:`](manifest.md#driver-models) table | [`inference.driver.config`](manifest.md#field-inference), the same for every driver choice |
-| A hook's `run-inference` while it serves `on-compaction` | `inference.compaction.max_tokens` when set, otherwise as any other hook call | [`inference.compaction.driver_config`](manifest.md#field-inference) laid over `inference.driver.config` |
-| Any other hook `run-inference` | The driver's declared ceiling for the model called, otherwise the agent's cap | `inference.driver.config` |
+| Call | `max_output_tokens` | `input_budget` | `driver_config` |
+|---|---|---|---|
+| Agent-loop turn | The cap that turn sent: a value a controller set, otherwise [`inference.max_tokens`](manifest.md#inference-max-tokens), otherwise the entry for the serving [driver choice](manifest.md#inference-alternates)'s model in the driver's [`models:`](manifest.md#driver-models) table | Cut from the serving choice's window and ceiling with that cap | [`inference.driver.config`](manifest.md#field-inference), the same for every driver choice |
+| A hook's `run-inference` while it serves `on-compaction` | `inference.compaction.max_tokens` when set, otherwise as any other hook call | Cut with that cap from `context.max_tokens`, else the primary driver's table entry for the model called | [`inference.compaction.driver_config`](manifest.md#field-inference) laid over `inference.driver.config` |
+| Any other hook `run-inference` | The driver's declared ceiling for the model called, otherwise the agent's cap | As for a compaction call. `0` when that cap fills a window the launch did not check | `inference.driver.config` |
 
 Every credential value the session holds is replaced with `[redacted]` wherever it appears in an
 object key or a string, and a number whose digits contain one is written as the string
 `"[redacted]"`. The driver artifact's own [`artifacts[].config`](manifest.md#artifact-config)
 is not recorded here.
 
-A record with neither key is a `transport: process` call, where the harness runs the model and the
+A record with none of the three keys is a `transport: process` call, where the harness runs the model and the
 runtime sets no cap, or a record from a Murmur version that did not write them.
 
 #### Failed calls { #inference-failed }
@@ -495,7 +510,7 @@ nothing to report about it.
 |---|---|---|
 | `turn` | u32 | |
 | `task_id` | string \| null | The task this compaction belongs to. `null` when no task is in scope |
-| `tokens_before` | u64 | Context occupancy the trigger compared against the threshold |
+| `tokens_before` | u64 | Context occupancy the trigger compared against the threshold × the turn's `input_budget`. The `on-compaction` event's `threshold` is `tokens_before` ÷ that budget |
 | `tokens_before_source` | string | Which number `tokens_before` is. Always written |
 | `tokens_after` | u64 | The runtime's estimate of the committed context: the tiktoken count of the whole serialized driver payload, system prompt, tool inventory and `messages` array. Always the estimate; the next `inference` line carries the provider's first count of it |
 
@@ -511,7 +526,7 @@ left as it was
 |---|---|---|
 | `turn` | u32 | The turn that crossed the threshold |
 | `task_id` | string \| null | The task this turn belongs to. `null` when no task is in scope |
-| `tokens` | u64 | Context occupancy at the moment of the decline — the same measurement `compaction` records as `tokens_before`, and the budget the session went on running over |
+| `tokens` | u64 | Context occupancy at the moment of the decline — the same measurement `compaction` records as `tokens_before`, compared against the threshold × the turn's `input_budget`, and the budget the session went on running over. The `on-compaction` event the hooks declined carried `threshold` = `tokens` ÷ that budget |
 | `tokens_source` | string | `"actual"` \| `"estimate"`: which number `tokens` is, on the terms of `compaction`'s `tokens_before_source`. Always written |
 | `reason` | string | `"no_hook_replacement"` when no bound hook returned `replace-context`; `"unresolved_tool_call"` when a hook's replacement was discarded because its tool calls and tool results did not pair up |
 
@@ -528,7 +543,7 @@ one turn does not stop a later turn from compacting successfully.
 | `hook_name` | string | Manifest name of the hook that returned the `seed-context` |
 | `tokens` | u64 | Tokens actually committed to the head of the context. `0` on a rejection |
 | `proposed_tokens` | u64 | Tokens the hook returned, before any trim or summarization |
-| `budget_tokens` | u64 | The ceiling in force: the primary choice's [context window](manifest.md#field-context) × `context.seed_budget`, rounded down. `0` when it has no window |
+| `budget_tokens` | u64 | The ceiling in force: the primary choice's [input budget](manifest.md#inference-max-tokens) at launch × `context.seed_budget`, rounded down. `0` when it has no window |
 | `outcome` | string | What the runtime did — see below |
 | `reason` | string | Why nothing was committed. Present on `"rejected"` only; absent otherwise |
 | `message_ids` | list of string | The `msg_`-prefixed id of every committed message, in the order they were placed. Empty on a rejection. The same ids appear on the `inference` line of each request that carried these messages, and on their lines in the [conversation record](workdir.md#the-conversation-record); none of them ever reaches the driver |

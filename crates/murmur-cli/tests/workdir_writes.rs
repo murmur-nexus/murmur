@@ -345,7 +345,7 @@ fn scripted(id: &str, tool: Option<(&str, Value)>, text: &str, usage: (u64, u64)
 
 /// The scripted model of the acceptance runs: `command` through `bash`, the fixture native tool's
 /// `create_dir` of `generated` with label `x`, a call whose reported usage crosses the
-/// compaction trigger (400 of a 4000-token window), and the end of the turn.
+/// compaction trigger (400 of a 4000-token input budget), and the end of the turn.
 fn acceptance_responses(command: &str) -> Vec<String> {
     vec![
         scripted(
@@ -375,7 +375,8 @@ fn acceptance_responses(command: &str) -> Vec<String> {
 
 /// Launch an agent session in-process with `bash` and `extra_shell` allowed, the fixture native
 /// tool installed, an `on-compaction` hook that replaces the context, compaction at 10% of a
-/// 4000-token window with `dump_summaries`, `extra_capabilities` appended under
+/// 4000-token input budget (a 12192-token window less the fixture driver's 8192 output cap) with
+/// `dump_summaries`, `extra_capabilities` appended under
 /// `capabilities:`, and `workdir` as its `--workdir` when given. `None` when the native tool
 /// fixture cannot be built on this host.
 fn run_agent(
@@ -425,7 +426,7 @@ fn run_agent(
     fs::write(
         &manifest_path,
         format!(
-            "name: workdir-writes-agent\nversion: 0.1.0\ncontext:\n  max_tokens: 4000\n\
+            "name: workdir-writes-agent\nversion: 0.1.0\ncontext:\n  max_tokens: 12192\n\
              artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    \
              runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n  \
              - name: local/{tool_name}\n    version: 0.1.0\n    runtime: tool\n  \

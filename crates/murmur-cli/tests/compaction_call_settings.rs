@@ -25,9 +25,24 @@ const BEARER_AUTH: &str = "upstream_auth:\n  header: Authorization\n  value: \"B
 const TASK: &str = "Call the tool, then finish.";
 /// `inference.max_tokens` here: every agent turn's cap.
 const TURN_CAP: u64 = 4096;
-/// `context.max_tokens` and the threshold: compaction fires at 50 000 tokens, which only the first
-/// turn's reported usage reaches.
+/// `context.max_tokens` and the threshold: an agent turn's input budget is 100 000 less
+/// [`TURN_CAP`], so compaction fires at 47 952 tokens, which only the first turn's reported usage
+/// reaches.
 const CONTEXT: &str = "context:\n  max_tokens: 100000\n";
+/// Every agent turn's input budget: `context.max_tokens` less [`TURN_CAP`].
+const TURN_BUDGET: u64 = 100_000 - TURN_CAP;
+
+/// The `input_budget` of every `inference` line, in order.
+fn input_budgets(trace: &[Value]) -> Vec<Value> {
+    events(trace, "inference")
+        .iter()
+        .map(|line| {
+            line.get("input_budget")
+                .cloned()
+                .expect("input_budget is written")
+        })
+        .collect()
+}
 const SUMMARY: &str = "the conversation so far, in one line";
 
 // ── Scripted provider responses ───────────────────────────────────────────────
@@ -550,6 +565,11 @@ fn the_trace_records_each_calls_cap_and_driver_config() {
             ),
         ]
     );
+    // The compaction call's budget is cut from its own cap: 100 000 less 2000.
+    assert_eq!(
+        input_budgets(&trace),
+        [json!(TURN_BUDGET), json!(98_000), json!(TURN_BUDGET)]
+    );
     // What each line says is what the request at the same position carried.
     for (line, request) in settings.iter().zip(&requests) {
         assert_eq!(
@@ -606,6 +626,14 @@ fn the_trace_records_the_ceiling_and_the_agents_config_without_an_overlay() {
         run, home: _home, ..
     } = run_compacting_traced("");
     assert_eq!(
+        input_budgets(&run.trace()),
+        [
+            json!(TURN_BUDGET),
+            json!(100_000 - u64::from(common::FIXTURE_MAX_OUTPUT_TOKENS)),
+            json!(TURN_BUDGET)
+        ]
+    );
+    assert_eq!(
         call_settings(&run.trace()),
         [
             (
@@ -655,6 +683,7 @@ fn a_credential_in_the_driver_config_is_redacted_in_the_trace() {
     assert_eq!(failed["decision"], "error");
     assert_eq!(failed["error_code"], "driver_error");
     assert_eq!(failed["max_output_tokens"], json!(TURN_CAP));
+    assert_eq!(failed["input_budget"], json!(TURN_BUDGET));
     assert_eq!(
         failed["driver_config"],
         json!({"bogus_key": "[redacted]", "reasoning_effort": "high"})

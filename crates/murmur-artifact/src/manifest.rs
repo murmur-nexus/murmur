@@ -445,9 +445,10 @@ fn prefix_field(err: ManifestError, block: &str) -> ManifestError {
 ///
 /// ```yaml
 /// models:
-///   glm-5.3:
-///     max_output_tokens: 131072
-///     context_window: 200000
+///   gpt-5.6:
+///     max_output_tokens: 128000
+///     context_window: 1050000
+///     max_input_tokens: 922000
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelLimits {
@@ -455,19 +456,22 @@ pub struct ModelLimits {
     pub max_output_tokens: u32,
     /// The model's context window in tokens.
     pub context_window: u32,
+    /// The most input tokens the provider accepts in one request, at most `context_window`;
+    /// `None` when the entry declares no input ceiling.
+    pub max_input_tokens: Option<u32>,
 }
 
-/// The keys one `models:` entry holds, both required.
-const MODEL_LIMITS_KEYS: [&str; 2] = ["max_output_tokens", "context_window"];
+/// The keys one `models:` entry may hold: the first two required, `max_input_tokens` optional.
+const MODEL_LIMITS_KEYS: [&str; 3] = ["max_output_tokens", "context_window", "max_input_tokens"];
 
 /// Reads the top-level `models:` table from an artifact's bundled manifest text, keyed by the
 /// exact model id each entry names.
 ///
 /// An absent key is an empty table. `Err` names the dotted field at fault: `models` that is not a
 /// mapping, declared on an artifact whose `runtime` is not `driver`, or holding a non-string or
-/// empty model id; an entry that is not a mapping, lacks a key, holds a key other than
-/// `max_output_tokens` and `context_window`, or a value that is not an integer in
-/// `1..=u32::MAX`.
+/// empty model id; an entry that is not a mapping, lacks a required key, holds a key other than
+/// `max_output_tokens`, `context_window` and `max_input_tokens`, a value that is not an integer
+/// in `1..=u32::MAX`, or a `max_input_tokens` above its `context_window`.
 pub fn parse_model_limits(
     manifest_yaml: &str,
 ) -> Result<BTreeMap<String, ModelLimits>, ManifestError> {
@@ -530,17 +534,15 @@ pub fn parse_model_limits(
                         .map_or_else(|| yaml_type_name(extra), str::to_string)
                 ),
                 message: "is not a model limit; an entry holds max_output_tokens and \
-                          context_window"
+                          context_window, and optionally max_input_tokens"
                     .to_string(),
             });
         }
-        let limit = |name: &str| -> Result<u32, ManifestError> {
+        let optional_limit = |name: &str| -> Result<Option<u32>, ManifestError> {
             let field = format!("{entry_field}.{name}");
-            let value = entry.get(Value::String(name.to_string())).ok_or_else(|| {
-                ManifestError::MissingField {
-                    field: field.clone(),
-                }
-            })?;
+            let Some(value) = entry.get(Value::String(name.to_string())) else {
+                return Ok(None);
+            };
             let count = value.as_u64().ok_or_else(|| ManifestError::InvalidType {
                 field: field.clone(),
                 expected: "integer".to_string(),
@@ -549,18 +551,36 @@ pub fn parse_model_limits(
             u32::try_from(count)
                 .ok()
                 .filter(|count| *count >= 1)
+                .map(Some)
                 .ok_or_else(|| ManifestError::InvalidValue {
                     field,
                     message: format!("must be an integer from 1 to {}", u32::MAX),
                 })
         };
-        table.insert(
-            id.to_string(),
-            ModelLimits {
-                max_output_tokens: limit(MODEL_LIMITS_KEYS[0])?,
-                context_window: limit(MODEL_LIMITS_KEYS[1])?,
-            },
-        );
+        let limit = |name: &str| -> Result<u32, ManifestError> {
+            optional_limit(name)?.ok_or_else(|| ManifestError::MissingField {
+                field: format!("{entry_field}.{name}"),
+            })
+        };
+        let limits = ModelLimits {
+            max_output_tokens: limit(MODEL_LIMITS_KEYS[0])?,
+            context_window: limit(MODEL_LIMITS_KEYS[1])?,
+            max_input_tokens: optional_limit(MODEL_LIMITS_KEYS[2])?,
+        };
+        if let Some(ceiling) = limits
+            .max_input_tokens
+            .filter(|ceiling| *ceiling > limits.context_window)
+        {
+            return Err(ManifestError::InvalidValue {
+                field: format!("{entry_field}.{}", MODEL_LIMITS_KEYS[2]),
+                message: format!(
+                    "is {ceiling}, above this entry's context_window of {}; an input ceiling is \
+                     at most the window",
+                    limits.context_window
+                ),
+            });
+        }
+        table.insert(id.to_string(), limits);
     }
     Ok(table)
 }
@@ -591,10 +611,32 @@ mod model_limits_tests {
             Some(&ModelLimits {
                 max_output_tokens: 131_072,
                 context_window: 200_000,
+                max_input_tokens: None,
             })
         );
         assert_eq!(table["GLM-5.3-2026"].context_window, u32::MAX);
         assert_eq!(table.get("glm-5"), None);
+    }
+
+    #[test]
+    fn an_entry_may_declare_an_input_ceiling_up_to_its_window() {
+        let table = parse_model_limits(&driver(
+            "models:\n  gpt-5.6:\n    max_output_tokens: 128000\n    context_window: 1050000\n    \
+             max_input_tokens: 922000\n  at-window:\n    max_output_tokens: 10\n    \
+             context_window: 400000\n    max_input_tokens: 400000\n  none:\n    \
+             max_output_tokens: 10\n    context_window: 20\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            table["gpt-5.6"],
+            ModelLimits {
+                max_output_tokens: 128_000,
+                context_window: 1_050_000,
+                max_input_tokens: Some(922_000),
+            }
+        );
+        assert_eq!(table["at-window"].max_input_tokens, Some(400_000));
+        assert_eq!(table["none"].max_input_tokens, None);
     }
 
     #[test]
@@ -635,8 +677,30 @@ mod model_limits_tests {
             ),
             (
                 "models:\n  m:\n    max_output_tokens: 10\n    context_window: 10\n    \
-                 max_input_tokens: 5\n",
-                "field 'models.m.max_input_tokens' is not a model limit",
+                 max_tokens: 5\n",
+                "field 'models.m.max_tokens' is not a model limit; an entry holds \
+                 max_output_tokens and context_window, and optionally max_input_tokens",
+            ),
+            (
+                "models:\n  m:\n    max_output_tokens: 10\n    context_window: 1050000\n    \
+                 max_input_tokens: 1050001\n",
+                "field 'models.m.max_input_tokens' is 1050001, above this entry's \
+                 context_window of 1050000; an input ceiling is at most the window",
+            ),
+            (
+                "models:\n  m:\n    max_output_tokens: 10\n    context_window: 10\n    \
+                 max_input_tokens: 0\n",
+                "field 'models.m.max_input_tokens' must be an integer from 1 to 4294967295",
+            ),
+            (
+                "models:\n  m:\n    max_output_tokens: 10\n    context_window: 10\n    \
+                 max_input_tokens: 4294967296\n",
+                "field 'models.m.max_input_tokens' must be an integer from 1 to 4294967295",
+            ),
+            (
+                "models:\n  m:\n    max_output_tokens: 10\n    context_window: 10\n    \
+                 max_input_tokens: \"5\"\n",
+                "field 'models.m.max_input_tokens' has invalid type (expected integer, got string)",
             ),
             (
                 "models:\n  \"\":\n    max_output_tokens: 10\n    context_window: 10\n",

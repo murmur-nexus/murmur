@@ -96,6 +96,31 @@ pub fn hook_component(
     messages: &[(&str, &str)],
     inserted_by: Option<u8>,
 ) -> Vec<u8> {
+    hook_component_guarded(
+        fn_name,
+        core_params,
+        event_type,
+        event_type_name,
+        arm_disc,
+        messages,
+        inserted_by,
+        "",
+    )
+}
+
+/// [`hook_component`] whose handler runs `guard`, core instructions over its parameters, before
+/// it returns: a guard that traps makes the dispatch fail.
+#[allow(clippy::too_many_arguments)]
+fn hook_component_guarded(
+    fn_name: &str,
+    core_params: &str,
+    event_type: &str,
+    event_type_name: &str,
+    arm_disc: u32,
+    messages: &[(&str, &str)],
+    inserted_by: Option<u8>,
+    guard: &str,
+) -> Vec<u8> {
     let (records, pool) = message_list(messages, inserted_by);
     let mut ret = Vec::new();
     le(0, &mut ret); // result: ok
@@ -119,7 +144,7 @@ pub fn hook_component(
       (local.set $p (global.get $bump))
       (global.set $bump (i32.add (local.get $p) (local.get $newsz)))
       (local.get $p))
-    (func (export "handler") {core_params} (result i32) (i32.const {RETURN_AREA}))
+    (func (export "handler") {core_params} (result i32) {guard} (i32.const {RETURN_AREA}))
     (func (export "noop"))
   )
   (core instance $i (instantiate $m))
@@ -139,6 +164,27 @@ pub fn hook_component(
 /// An `on-task-start` hook returning `seed-context(messages)`, or `none` when `messages` is
 /// empty.
 pub fn seed_hook_wasm(messages: &[(&str, &str)]) -> Vec<u8> {
+    seed_hook(messages, "")
+}
+
+/// [`seed_hook_wasm`] that traps unless its event carries `budget_tokens` as `budget-tokens` and
+/// `context_window` as `context-window`, so a committed seed proves the hook saw both.
+pub fn seed_hook_wasm_expecting(
+    messages: &[(&str, &str)],
+    budget_tokens: u64,
+    context_window: u64,
+) -> Vec<u8> {
+    // The flat lowering puts `budget-tokens` at core parameter 7 and `context-window` at 8.
+    seed_hook(
+        messages,
+        &format!(
+            "(if (i64.ne (local.get 7) (i64.const {budget_tokens})) (then unreachable)) \
+             (if (i64.ne (local.get 8) (i64.const {context_window})) (then unreachable))"
+        ),
+    )
+}
+
+fn seed_hook(messages: &[(&str, &str)], guard: &str) -> Vec<u8> {
     let task_start_event = r#"  (type $event (record
     (field "task-id" string)
     (field "context-id" string)
@@ -147,7 +193,7 @@ pub fn seed_hook_wasm(messages: &[(&str, &str)]) -> Vec<u8> {
     (field "budget-tokens" u64)
     (field "context-window" u64)
     (field "prior-tokens" u64)))"#;
-    hook_component(
+    hook_component_guarded(
         "on-task-start",
         "(param i32 i32 i32 i32 i32 i32 i64 i64 i64 i64)",
         task_start_event,
@@ -155,6 +201,7 @@ pub fn seed_hook_wasm(messages: &[(&str, &str)]) -> Vec<u8> {
         if messages.is_empty() { 0 } else { 5 },
         messages,
         None,
+        guard,
     )
 }
 
@@ -166,13 +213,37 @@ pub fn compaction_hook_wasm(summary: &str) -> Vec<u8> {
 /// An `on-compaction` hook returning `replace-context([summary])` with the summary under `role`,
 /// claiming the `inserted_by` mark [`message_list`] describes.
 pub fn compaction_hook_wasm_as(role: &str, summary: &str, inserted_by: Option<u8>) -> Vec<u8> {
+    compaction_hook(role, summary, inserted_by, "")
+}
+
+/// [`compaction_hook_wasm`] that traps unless its event carries `session_tokens` as
+/// `session-tokens` and `threshold` as `threshold`, so a committed replacement proves the hook saw
+/// both.
+pub fn compaction_hook_wasm_expecting(
+    summary: &str,
+    session_tokens: u64,
+    threshold: f64,
+) -> Vec<u8> {
+    // The flat lowering puts `session-tokens` at core parameter 2 and `threshold` at 3.
+    compaction_hook(
+        "user",
+        summary,
+        None,
+        &format!(
+            "(if (i64.ne (local.get 2) (i64.const {session_tokens})) (then unreachable)) \
+             (if (f64.ne (local.get 3) (f64.const {threshold:?})) (then unreachable))"
+        ),
+    )
+}
+
+fn compaction_hook(role: &str, summary: &str, inserted_by: Option<u8>, guard: &str) -> Vec<u8> {
     let compaction_event = r#"  (type $event (record
     (field "messages" (list $message))
     (field "session-tokens" u64)
     (field "threshold" f64)
     (field "model" (option string))
     (field "system-prompt" (option string))))"#;
-    hook_component(
+    hook_component_guarded(
         "on-compaction",
         "(param i32 i32 i64 f64 i32 i32 i32 i32 i32 i32)",
         compaction_event,
@@ -180,6 +251,7 @@ pub fn compaction_hook_wasm_as(role: &str, summary: &str, inserted_by: Option<u8
         1,
         &[(role, summary)],
         inserted_by,
+        guard,
     )
 }
 

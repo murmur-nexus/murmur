@@ -215,6 +215,7 @@ impl HookInferenceCtx {
         let inference_env = self.env_for(purpose);
         let settings = InferenceCallSettings {
             max_output_tokens,
+            input_budget: self.output_caps.input_budget(&model, max_output_tokens),
             driver_config: recorded_driver_config(inference_env, |text| self.redact(text)),
         };
         let started = Instant::now();
@@ -862,6 +863,8 @@ mod tests {
     /// The one model the primary driver's `models:` table lists in these tests, and its ceiling.
     const DECLARED_MODEL: &str = "declared-model";
     const DECLARED_CAP: u32 = 1_048_576;
+    const DECLARED_WINDOW: u32 = 2_000_000;
+    const DECLARED_CEILING: u32 = 1_000_000;
     /// The primary choice's resolved cap, what a model the table does not list gets.
     const PRIMARY_CAP: u32 = 4096;
     const LIFECYCLE: HookInferencePurpose = HookInferencePurpose::Lifecycle;
@@ -875,11 +878,13 @@ mod tests {
                 DECLARED_MODEL.to_string(),
                 murmur_artifact::ModelLimits {
                     max_output_tokens: DECLARED_CAP,
-                    context_window: 2_000_000,
+                    context_window: DECLARED_WINDOW,
+                    max_input_tokens: Some(DECLARED_CEILING),
                 },
             )]),
             PRIMARY_CAP,
             compaction,
+            None,
         )
     }
 
@@ -1245,8 +1250,9 @@ mod tests {
                 config.to_string(),
             )]
         };
-        let settings = |cap: u32, effort: &str| InferenceCallSettings {
+        let settings = |cap: u32, budget: Option<u32>, effort: &str| InferenceCallSettings {
             max_output_tokens: cap,
+            input_budget: budget,
             driver_config: Some(serde_json::json!({ "reasoning_effort": effort })),
         };
         let dir = TempDir::new().unwrap();
@@ -1265,19 +1271,34 @@ mod tests {
         ));
         block_on(ctx.run("hook:compactor", COMPACTION, request(None))).unwrap();
         block_on(ctx.run("hook:summary", LIFECYCLE, request(None))).unwrap();
+        block_on(ctx.run("hook:compactor", COMPACTION, request(Some(DECLARED_MODEL)))).unwrap();
+        block_on(ctx.run("hook:summary", LIFECYCLE, request(Some(DECLARED_MODEL)))).unwrap();
         let recorded: Vec<(String, InferenceCallSettings)> = ctx
             .drain_records()
             .into_iter()
             .map(|record| (record.origin.source, record.settings))
             .collect();
+        // The manifest's model has no table entry and no `context.max_tokens`, so no window;
+        // the declared model's budget is `min(ceiling, window − the cap the call sent)`.
         assert_eq!(
             recorded,
             [
                 (
                     "hook:compactor".to_string(),
-                    settings(COMPACTION_CAP, "low")
+                    settings(COMPACTION_CAP, None, "low")
                 ),
-                ("hook:summary".to_string(), settings(PRIMARY_CAP, "high")),
+                (
+                    "hook:summary".to_string(),
+                    settings(PRIMARY_CAP, None, "high")
+                ),
+                (
+                    "hook:compactor".to_string(),
+                    settings(COMPACTION_CAP, Some(DECLARED_CEILING), "low")
+                ),
+                (
+                    "hook:summary".to_string(),
+                    settings(DECLARED_CAP, Some(DECLARED_WINDOW - DECLARED_CAP), "high")
+                ),
             ]
         );
 
@@ -1294,7 +1315,7 @@ mod tests {
         let records = failing.drain_records();
         assert_eq!(records.len(), 1);
         assert!(records[0].failure.is_some());
-        assert_eq!(records[0].settings, settings(COMPACTION_CAP, "low"));
+        assert_eq!(records[0].settings, settings(COMPACTION_CAP, None, "low"));
     }
 
     /// A spend ceiling refuses a hook's completion before dispatch — both a ceiling too small for

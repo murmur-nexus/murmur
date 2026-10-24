@@ -133,8 +133,9 @@ pub(crate) struct MurmurMdInputs {
     pub(crate) system_prompt_artifact: Option<String>,
     /// The accessible workdir's host path, the agent's `./`.
     pub(crate) accessible_workdir: PathBuf,
-    /// The primary driver choice's context window, else `context.max_tokens`.
-    pub(crate) context_window: Option<u32>,
+    /// The primary driver choice's window, cap, ceiling and launch input budget, else
+    /// `context.max_tokens` alone under `transport: process`; `None` with no window.
+    pub(crate) context_budget: Option<ContextBudget>,
     /// Whether a hook is bound to `on-compaction`: with a context window, the two conditions
     /// compaction runs on.
     pub(crate) compaction_hook_registered: bool,
@@ -154,6 +155,35 @@ pub(crate) struct MurmurMdInputs {
     pub(crate) runtime_dir_tools: Vec<String>,
     /// What the session's commands can start, on the tier its `ShellEnforcement` applies.
     pub(crate) exec: ExecFacts,
+}
+
+/// The primary driver choice's limits as the `- Context budget:` line states them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContextBudget {
+    pub(crate) window: u32,
+    /// `None` under `transport: process`, where the harness owns its output.
+    pub(crate) output_cap: Option<u32>,
+    pub(crate) input_ceiling: Option<u32>,
+    pub(crate) budget: crate::model_limits::InputBudget,
+}
+
+impl ContextBudget {
+    /// `budget` with `window`, `cap` and `ceiling`, as the `- Context budget:` line states it.
+    fn line(&self) -> String {
+        use crate::model_limits::{limit_or_none, BudgetBasis};
+        let basis = match self.budget.basis {
+            BudgetBasis::MaxInputTokens => "the input ceiling",
+            BudgetBasis::ContextWindowLessOutputCap => "the context window less the output cap",
+            BudgetBasis::ContextWindow | BudgetBasis::None => "the context window",
+        };
+        format!(
+            "{} input tokens, {basis} (context window {}, output cap {}, input ceiling {})",
+            self.budget.tokens,
+            self.window,
+            limit_or_none(self.output_cap),
+            limit_or_none(self.input_ceiling)
+        )
+    }
 }
 
 /// Write MURMUR.md to the session's runtime directory, `runtime_root`, which the capsule's
@@ -232,15 +262,15 @@ fn generate_murmur_md(runtime_root: &WorkdirRoot, inputs: &MurmurMdInputs) -> St
     let facts = &inputs.facts;
 
     let max_tokens_display = inputs
-        .context_window
-        .map(|n| format!("{n} tokens"))
+        .context_budget
+        .map(|budget| budget.line())
         .unwrap_or_else(|| "not set".to_string());
 
     // Compaction is dispatched by lifecycle binding, not by artifact name: it fires when the
     // primary choice has a context window AND at least one hook is bound to `on-compaction`.
     // Report the same two conditions the runtime actually gates on rather than probing for a tool
     // directory.
-    let compaction_status = if inputs.context_window.is_some() && inputs.compaction_hook_registered
+    let compaction_status = if inputs.context_budget.is_some() && inputs.compaction_hook_registered
     {
         "compaction configured"
     } else {
@@ -600,7 +630,7 @@ pub(crate) fn test_inputs() -> MurmurMdInputs {
         model: "test-model".to_string(),
         system_prompt_artifact: None,
         accessible_workdir: PathBuf::from("/work"),
-        context_window: None,
+        context_budget: None,
         compaction_hook_registered: false,
         shell_allow: Vec::new(),
         manifest_file: Some("murmur.yaml".to_string()),
@@ -621,6 +651,18 @@ mod tests {
     use crate::types::CapabilityPolicy;
     use std::fs;
     use tempfile::TempDir;
+
+    use crate::model_limits::{BudgetBasis, InputBudget};
+
+    /// An http primary's limits: `window`, `cap` and `ceiling`, with the budget they cut.
+    fn budget(window: u32, cap: Option<u32>, ceiling: Option<u32>) -> ContextBudget {
+        ContextBudget {
+            window,
+            output_cap: cap,
+            input_ceiling: ceiling,
+            budget: InputBudget::of(window, cap.unwrap_or(0), ceiling),
+        }
+    }
 
     /// MURMUR.md for the runtime directory `tmp`, from [`test_inputs`] as `edit` leaves them.
     fn render(tmp: &TempDir, edit: impl FnOnce(&mut MurmurMdInputs)) -> String {
@@ -663,7 +705,7 @@ mod tests {
         );
         let content = render(&tmp, |inputs| {
             inputs.model = inference.model.clone();
-            inputs.context_window = Some(200_000);
+            inputs.context_budget = Some(budget(200_000, Some(8192), None));
             inputs.facts = facts.clone();
             inputs.work_folder_ceiling = Some(policy.resources.workdir_max_bytes);
         });
@@ -687,7 +729,9 @@ mod tests {
              - 2 GiB memory and 3600 s CPU time per command\n\
              - a shell command still running after 10 s moves to the background\n\
              - 10 GiB across the work folder, $HOME and $TMPDIR\n\
-             - Context budget: 200000 tokens (compaction not configured)\n\
+             - Context budget: 191808 input tokens, the context window less the output cap \
+             (context window 200000, output cap 8192, input ceiling none) (compaction not \
+             configured)\n\
              \n\
              ## Runtime Directory\n"
         );
@@ -998,10 +1042,38 @@ mod tests {
     fn shows_context_budget_when_set() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
-        let content = render(&tmp, |inputs| {
-            inputs.context_window = Some(200_000);
-        });
-        assert!(content.contains("200000 tokens"));
+        for (context_budget, line) in [
+            (
+                budget(1_050_000, Some(128_000), Some(922_000)),
+                "- Context budget: 922000 input tokens, the input ceiling (context window \
+                 1050000, output cap 128000, input ceiling 922000) (compaction configured)\n",
+            ),
+            (
+                budget(1_050_000, Some(6000), None),
+                "- Context budget: 1044000 input tokens, the context window less the output cap \
+                 (context window 1050000, output cap 6000, input ceiling none) (compaction \
+                 configured)\n",
+            ),
+            (
+                ContextBudget {
+                    window: 200_000,
+                    output_cap: None,
+                    input_ceiling: None,
+                    budget: InputBudget {
+                        tokens: 200_000,
+                        basis: BudgetBasis::ContextWindow,
+                    },
+                },
+                "- Context budget: 200000 input tokens, the context window (context window \
+                 200000, output cap none, input ceiling none) (compaction configured)\n",
+            ),
+        ] {
+            let content = render(&tmp, |inputs| {
+                inputs.context_budget = Some(context_budget);
+                inputs.compaction_hook_registered = true;
+            });
+            assert!(content.contains(line), "{line}: {content}");
+        }
     }
 
     #[test]
@@ -1009,7 +1081,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
         let content = render(&tmp, |inputs| {
-            inputs.context_window = Some(100_000);
+            inputs.context_budget = Some(budget(100_000, Some(8192), None));
             inputs.compaction_hook_registered = true;
         });
         assert!(content.contains("compaction configured"));
@@ -1020,7 +1092,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
         let content = render(&tmp, |inputs| {
-            inputs.context_window = Some(100_000);
+            inputs.context_budget = Some(budget(100_000, Some(8192), None));
         });
         assert!(content.contains("compaction not configured"));
     }
