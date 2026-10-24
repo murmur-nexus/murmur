@@ -1779,8 +1779,8 @@ The runtime stops retrying, and the call fails as it would have without retries,
 | The wait would end at or after the session's [deadline](cli.md#mur-run-deadline) | `deadline` |
 | The [spend ceiling](#inference-max-session-tokens) refuses the next attempt | None: the ordinary `spend_ceiling_reached` line and ending are written |
 
-A call that failed after more than one attempt, or whose retrying one of the first three cases
-stopped, fails the task with a reason that ends by naming it. The reason is what
+When a failed call was retried, or one of the first three cases stopped its retrying, the task's
+failure reason ends with the number of attempts and the stop. The reason is what
 [`task_failed`](observability-schemas.md#task-failed) records, `out/result.txt` holds and
 [`E-RUN-040`](diagnostics.md#e-run-040) prints:
 
