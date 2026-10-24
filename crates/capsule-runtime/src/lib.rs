@@ -120,12 +120,13 @@ pub use artifact_config::{
 pub use artifact_supply::{SourceSupply, SourcedArtifact};
 pub use containment::{
     applied_mechanism, check_containment_floor, containment_shortfall_reason,
-    detect_achieved_containment, detect_sealed_shortfall, detect_userns_grant, doctor_runtime_dir,
+    detect_containment_decision, detect_sealed_shortfall, detect_userns_grant, doctor_runtime_dir,
     explain_scope, install_from_places, read_only_advisory_for, render_install, render_read_only,
     render_records_dir, render_runtime_dir, render_temp_dir, resolve_runtime_dir_reach,
-    resolve_runtime_dir_reaches, DoctorDirReports, ExportsFilesReport, FilesystemBoundaryReport,
-    FilesystemRestriction, PreopenReport, PreopenSurface, RuntimeDirReach, RuntimeDirReport,
-    ScopeReport, ShortfallCause, StateStoreReport, TempDirReport,
+    resolve_runtime_dir_reaches, ContainmentDecision, DoctorDirReports, ExportsFilesReport,
+    FilesystemBoundaryReport, FilesystemRestriction, PreopenReport, PreopenSurface,
+    RuntimeDirReach, RuntimeDirReport, ScopeReport, ShortfallCause, StateStoreReport,
+    TempDirReport,
 };
 pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
 // `mur run --explain-scope` derives an allowlisted interpreter's runtime directories through the

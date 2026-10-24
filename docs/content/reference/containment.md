@@ -44,10 +44,11 @@ capsule on a sealed-capable host runs on Full.
 ¹ Exec is a Landlock right, so a host without Landlock has no kernel-level exec mediation at all.
 Treat `capabilities.shell.allow` as advisory on a host below kernel 5.13.
 
-The `mechanism:` column is what `mur run --explain-scope` prints, and it always reports what the
-*host* can back — never what the session installed. The `covers:` line under it names the
-subprocess routes that mechanism confines, and `--explain-scope --json` carries them as
-`mechanism_covers`:
+The `mechanism:` column is what `mur run --explain-scope` prints for a session on that tier, and
+`--explain-scope --json` carries it as `enforcement_tier`. It names the tier the session's
+commands run on, which [Declared class and host tier](#declared-class-and-host-tier) gives for every
+declared class. The `covers:` line under it names the subprocess routes that mechanism confines,
+and `--explain-scope --json` carries them as `mechanism_covers`:
 
 | `mechanism_covers` value | Route |
 |---|---|
@@ -189,6 +190,7 @@ in effect on the line below `mechanism:`, and `--explain-scope --json` carries t
 Containment
   declared:  sealed
   achieved:  sealed
+  host can back: sealed
   floor met: yes
   mechanism: mountns+pivot_root+landlock+seccomp
   covers:    shell commands, plan shell steps, native tools
@@ -333,19 +335,40 @@ Any source left undeclared contributes nothing; if all three are undeclared, the
 `advisory`. A CLI flag or workspace default can only *raise* the floor a manifest already set —
 never lower it.
 
-**Achieved class.** `mur run` derives the class the host can *actually* provide by probing the
-kernel directly (never by trusting the manifest). The probe is a conjunction, and every element has
-to hold for the next class up: a Landlock-capable Linux 5.13+ host achieves `scoped`; a host that
-also completes the whole composed-root construction — verified by really doing it in a forked
-child, not by reading a version string — achieves `sealed`; every other host (older Linux without
-Landlock, or macOS) achieves `advisory`. Granting a `scoped` capsule access to host
-paths outside the workdir via `capabilities.shell.interpreter_runtime` never changes the achieved
-class.
+**Achieved class.** The achieved class is the class of the tier the session's commands run on.
+`mur run` probes the kernel directly (never by trusting the manifest) for the strongest tier the
+host can back, and the session runs on that tier capped by its declared floor:
+
+* a Landlock-capable Linux 5.13+ host backs the Full tier, `scoped`;
+* a host that also completes the whole composed-root construction — verified by really doing it in
+  a forked child, not by reading a version string — backs the Sealed tier, `sealed`, which only a
+  capsule declaring `sealed` runs on;
+* every other host (older Linux without Landlock, or macOS) backs `advisory`.
+
+Granting a `scoped` capsule access to host paths outside the workdir via
+`capabilities.shell.interpreter_runtime` never changes the achieved class.
+
+### Declared class and host tier { #declared-class-and-host-tier }
+
+Each cell gives the tier the session's commands run on, by its `mechanism:` name, and the class
+`achieved:` reports:
+
+| Declared | Sealed host | Full host | Seccomp-only host | Environment-only host |
+|---|---|---|---|---|
+| `advisory` | `landlock+seccomp`, `scoped` | `landlock+seccomp`, `scoped` | `seccomp-only`, `advisory` | `none`, `advisory` |
+| `scoped` | `landlock+seccomp`, `scoped` | `landlock+seccomp`, `scoped` | refused, `E-CAP-003` | refused, `E-CAP-003` |
+| `sealed` | `mountns+pivot_root+landlock+seccomp`, `sealed` | refused, `E-CAP-003` | refused, `E-CAP-003` | refused, `E-CAP-003` |
+
+`capabilities.filesystem.workdir_exec: true` and a runtime directory inside the work folder each
+cap the reported class at `advisory` without changing the tier. What the host could provide to a
+capsule declaring `sealed` is reported separately, as `host can back:` under `achieved:` and
+`host_containment` in `--explain-scope --json` and `session_start.effective_grants`.
 
 **One manifest property does lower it, and only lower it.**
 `capabilities.filesystem.workdir_exec: true` caps the achieved class at `advisory` on every host,
-including a `sealed`-capable one. The host probe still reports what the machine can do, and
-`mechanism:` in `--explain-scope` still names the full tier. It is the capsule giving up the claim
+including a `sealed`-capable one. `mechanism:` in `--explain-scope` still names the tier the
+commands run on, and `host can back:` still names what the machine can do. It is the capsule giving
+up the claim
 `scoped` makes: with an executable workdir, `shell.allow` is no longer something the kernel can hold
 the capsule to. Nothing in a manifest can ever *raise* an achieved class. See
 [Executable workdirs](#field-workdir-exec).
@@ -358,11 +381,11 @@ tools in its [runtime directory](workdir.md#runtime-directory), and the achieved
 [`W-SEC-033`](diagnostics.md#w-sec-033).
 
 **A weaker declaration is never silently upgraded.** On a `sealed`-capable host, a capsule
-declaring `scoped` still runs with `scoped`'s mechanism — Landlock and seccomp over the host
-filesystem, no composed root. Installing one anyway would delete the host paths its
+declaring `scoped` (or `advisory`, or nothing) runs with `scoped`'s mechanism — Landlock and seccomp
+over the host filesystem, no composed root — and reports `achieved: scoped` and
+`mechanism: landlock+seccomp`. Installing a composed root anyway would delete the host paths its
 `interpreter_runtime` grants legitimately name, weakening the capsule rather than strengthening it.
-The achieved class reported in the trace still says what the *host* can back; the mechanism
-installed follows what the capsule *asked for*.
+`host can back: sealed` is the only line that names what the host could have provided.
 
 **What the `sealed` probe performs.** The probe child rehearses the composed root's construction
 end to end, in its own throwaway namespace, and reports the stage that failed:
@@ -455,6 +478,9 @@ every response reports in `x-murmur-containment`:
 | `scoped` | Refuse any symlink on the resolved path with `symlink_refused`, and omit symlinked entries from a listing | Host-path grants are possible and the filesystem's shape stays visible, so a symlink under the export root could target a granted host path |
 | `sealed` | Follow, and serve only when the fully-resolved target is still beneath the export root | The workdir, the session's temporary folder and its home folder are the only writable paths and there is no outside to name, so everything under the root is capsule-authored |
 | `advisory` | Same rule as `sealed` | A convention on top of a convention; every response carries `advisory` so a reader knows what it is trusting |
+
+A capsule declaring less than `sealed` on a sealed-capable host achieves `scoped`, so the `scoped`
+rule applies to it.
 
 A symlink whose target leaves the root is refused at every class: `symlink_refused` under `scoped`,
 `outside_root` under the other two.
@@ -1013,13 +1039,15 @@ cat: /home/you/.ssh/id_rsa: Permission denied
 | `enforced` | `Permission denied` — Landlock refuses the open, and `stat` on the same path still succeeds |
 | `absent` | `No such file or directory` — the path is not in the composed root |
 
-Read `filesystem_boundary.restriction` rather than `achieved_containment`. The achieved class is
-what this **host** can back; the restriction is the mechanism this **session** installs, and the two
-part company on a sealed-capable host running a capsule that declared less than `sealed`. A composed
-root is built only for a session that asked for one — through
-[`capabilities.containment: sealed`](#field-containment) or `mur run --containment sealed` — so a
-capsule that declares nothing reads `achieved: sealed` and `restriction: enforced`, and its probe
-gets `Permission denied` rather than `No such file or directory`.
+The restriction follows from the tier `enforcement_tier` reports: `absent` on
+`mountns+pivot_root+landlock+seccomp`, `enforced` on `landlock+seccomp`, `advisory` below. A
+composed root is built only for a session that asked for one — through
+[`capabilities.containment: sealed`](#field-containment) or `mur run --containment sealed` — so on
+a sealed-capable host a capsule that declares nothing reads `achieved: scoped`,
+`mechanism: landlock+seccomp` and `restriction: enforced`, and its probe gets `Permission denied`
+rather than `No such file or directory`. Read `filesystem_boundary.restriction` rather than
+`achieved_containment` when `workdir_exec` is declared: it caps the class at `advisory` while
+Landlock still enforces.
 
 **The `~` form returns a false pass.** `cat ~/.ssh/id_rsa` answers `No such file or directory` on
 every tier, including a host that denies nothing. The tilde resolves through `HOME`, which the

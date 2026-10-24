@@ -361,8 +361,9 @@ fn a_creatable_namespace_is_not_refused_while_the_restriction_reads_one() {
 }
 
 /// With the restriction reading `1` and every namespace creatable, `--explain-scope` reports a
-/// `sealed` capsule as backed, its `/tmp` mapped by the composed root, and a `scoped` capsule's
-/// `/tmp` mapped by a mount namespace.
+/// `sealed` capsule as backed on the composed root with its `/tmp` mapped by it, and a `scoped`
+/// capsule as `scoped` on `landlock+seccomp` with its `/tmp` mapped by a mount namespace. Both
+/// report the host can back `sealed`.
 #[test]
 fn sealed_is_backed_and_tmp_mapped_while_the_restriction_reads_one() {
     let test = "sealed_is_backed_and_tmp_mapped_while_the_restriction_reads_one";
@@ -372,11 +373,20 @@ fn sealed_is_backed_and_tmp_mapped_while_the_restriction_reads_one() {
         return;
     }
     let home = tempfile::tempdir().unwrap();
-    for (class, mapped_by) in [("sealed", "composed-root"), ("scoped", "mount-namespace")] {
+    for (class, tier, mapped_by) in [
+        (
+            "sealed",
+            "mountns+pivot_root+landlock+seccomp",
+            "composed-root",
+        ),
+        ("scoped", "landlock+seccomp", "mount-namespace"),
+    ] {
         let project = driver_project("http://127.0.0.1:9", class);
         let report = explain_scope(construction, &scratch, home.path(), project.path());
         assert_eq!(report["declared_containment"], class, "{report}");
-        assert_eq!(report["achieved_containment"], "sealed", "{report}");
+        assert_eq!(report["achieved_containment"], class, "{report}");
+        assert_eq!(report["enforcement_tier"], tier, "{report}");
+        assert_eq!(report["host_containment"], "sealed", "{report}");
         assert_eq!(report["floor_met"], true, "{report}");
         assert_eq!(report["temp_dir"]["mapped_by"], mapped_by, "{report}");
     }
@@ -509,7 +519,12 @@ fn a_session_under_the_reading(test: &str, class: &str, mapped_by: &str) {
         .expect("trace carries session_start");
     let grants = &session_start["effective_grants"];
     assert_eq!(grants["temp_dir"]["mapped_by"], mapped_by, "{grants}");
-    assert_eq!(grants["achieved_containment"], "sealed", "{grants}");
+    assert_eq!(grants["achieved_containment"], class, "{grants}");
+    assert_eq!(
+        session_start["containment_achieved"], class,
+        "{session_start}"
+    );
+    assert_eq!(grants["host_containment"], "sealed", "{grants}");
 }
 
 /// Where the namespace really cannot be created and the restriction reads `1`, `mur run` refuses

@@ -395,33 +395,39 @@ fn execute_inner(
     // mapping is decided from the same reading, for the tier this enforcement applies.
     let probe = sandbox::HostProbe::probe();
     let mount_namespace_usable = probe.mount_namespace_usable();
-    let shell_enforcement = match sandbox::ShellEnforcement::resolve(
-        &ctx.capability_policy,
+    // The runtime directory's placement caps the class and never the tier, and only the tier is
+    // installed here, so `false` stands in for a placement the plan context does not carry.
+    let decision = crate::containment::ContainmentDecision::decide(
+        probe.tier(),
         ctx.capability_policy.containment_floor,
-        probe,
-    ) {
-        Ok(enforcement) => {
-            let temp_mapping = crate::temp_dir::temp_mapping(
-                enforcement.tier,
-                mount_namespace_usable,
-                ctx.accessible_workdir.path(),
-            );
-            enforcement
-                .with_host_bounding(cgroup_scope, workdir_guard)
-                .with_runtime_dir(ctx.runtime_dir.clone(), None)
-                .with_temp_mapping(temp_mapping)
-        }
-        Err(error) => {
-            let error = format!("failed to resolve shell subprocess sandbox enforcement: {error}");
-            return Ok(refused_before_any_step(
-                &plan,
-                ctx,
-                plan_node.as_deref(),
-                started,
-                error,
-            ));
-        }
-    };
+        ctx.capability_policy.workdir_exec_allowed,
+        false,
+    );
+    let shell_enforcement =
+        match sandbox::ShellEnforcement::resolve(&ctx.capability_policy, &decision, probe) {
+            Ok(enforcement) => {
+                let temp_mapping = crate::temp_dir::temp_mapping(
+                    enforcement.tier,
+                    mount_namespace_usable,
+                    ctx.accessible_workdir.path(),
+                );
+                enforcement
+                    .with_host_bounding(cgroup_scope, workdir_guard)
+                    .with_runtime_dir(ctx.runtime_dir.clone(), None)
+                    .with_temp_mapping(temp_mapping)
+            }
+            Err(error) => {
+                let error =
+                    format!("failed to resolve shell subprocess sandbox enforcement: {error}");
+                return Ok(refused_before_any_step(
+                    &plan,
+                    ctx,
+                    plan_node.as_deref(),
+                    started,
+                    error,
+                ));
+            }
+        };
     let owns_netns = session_netns.is_none();
     let shell_enforcement = match session_netns {
         Some(session_netns) => shell_enforcement.with_session_netns(session_netns),
@@ -1866,7 +1872,7 @@ mod tests {
             shell_allow: vec!["bash".to_string(), "nc".to_string(), "sleep".to_string()],
             ..CapabilityPolicy::default()
         };
-        let session = sandbox::ShellEnforcement::resolve(
+        let session = sandbox::ShellEnforcement::resolve_declared(
             &policy,
             murmur_artifact::ContainmentClass::Scoped,
             sandbox::HostProbe::probe(),

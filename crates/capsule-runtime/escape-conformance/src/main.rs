@@ -292,15 +292,15 @@ fn list_cases() {
 /// Everything that must hold before the first case runs. Any failure here is a refusal (exit 2),
 /// never a skipped case.
 fn gate(options: &Options, facts: &host::HostFacts, class: ContainmentClass) -> Result<(), String> {
-    let achieved = capsule_runtime::detect_achieved_containment();
-    // The third argument is what turns "sealed is unavailable here" into a specific, actionable
-    // sentence — the call the namespace probe saw fail, its errno, and the host readings. It takes
-    // its own probe, as `detect_achieved_containment` above does.
-    let sealed_shortfall = capsule_runtime::detect_sealed_shortfall();
+    // One probe for the class and the shortfall: the shortfall is what turns "sealed is
+    // unavailable here" into a specific, actionable sentence — the call the namespace probe saw
+    // fail, its errno, and the host readings.
+    let (decision, sealed_shortfall) = capsule_runtime::detect_containment_decision(class);
+    let achieved = decision.achieved();
     // `workdir_exec: false` — the fourth argument is a *capsule* declaration
-    // (`capabilities.filesystem.workdir_exec`), and this gate asks a host question: can this
-    // machine back the class under test? The suite's own probe capsules never declare it, and one
-    // that did would be asserting a boundary it had opted out of.
+    // (`capabilities.filesystem.workdir_exec`), and this gate asks whether a session declaring the
+    // class under test can achieve it here. The suite's own probe capsules never declare it, and
+    // one that did would be asserting a boundary it had opted out of.
     if let Some(reason) = capsule_runtime::containment_shortfall_reason(
         class,
         achieved,
@@ -350,7 +350,10 @@ fn run() -> Result<u8, String> {
     };
 
     let facts = host::probe();
-    let achieved = capsule_runtime::detect_achieved_containment();
+    // Each case's capsule declares `class`, so its sessions decide exactly as this does: the
+    // banner and the record name the class and tier the cases run under.
+    let (decision, _) = capsule_runtime::detect_containment_decision(class);
+    let achieved = decision.achieved();
 
     println!("escape-conformance — hand-run containment gate");
     println!(
@@ -360,6 +363,7 @@ fn run() -> Result<u8, String> {
     println!("  container: {}", facts.container);
     println!("  declared:  {class}");
     println!("  achieved:  {achieved}");
+    println!("  mechanism: {}", decision.enforcement_tier());
 
     if let Err(refusal) = gate(&options, &facts, class) {
         eprintln!("\n{refusal}");
@@ -505,6 +509,7 @@ fn run() -> Result<u8, String> {
         stamp,
         declared: class,
         achieved,
+        enforcement_tier: decision.enforcement_tier(),
         host: &facts,
         mur_binary: mur.display().to_string(),
         mur_version: mur_version(&mur),

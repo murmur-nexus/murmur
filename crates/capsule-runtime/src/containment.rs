@@ -1,25 +1,29 @@
-//! Containment classes: what an operator *declares* versus what a host actually *achieves*.
+//! Containment classes: what an operator *declares* versus what a session actually *achieves*.
 //!
 //! The two directions are deliberately kept apart:
 //!
 //! * The **declared floor** ([`murmur_artifact::ContainmentClass`]) is a requirement, combined
 //!   from the manifest, the workspace config and `--containment` by taking the strongest (see
 //!   [`murmur_artifact::effective_containment_floor`]).
-//! * The **achieved class** starts from [`EnforcementTier`], which is host-probed at launch time.
-//!   [`achieved_class_for_tier`] takes nothing else — not the manifest, not the grant set — so no
-//!   declaration can ever talk a host into reporting a class it cannot back. Exactly one manifest
-//!   property may then talk a *capsule* down from that ceiling, and only downwards:
-//!   `capabilities.filesystem.workdir_exec: true` caps the result at
-//!   [`ContainmentClass::Advisory`] (see [`achieved_containment_class`]), because a capsule whose
-//!   own workdir is executable has given up the claim `scoped` makes. The cap is applied in a
-//!   separate wrapper rather than inside [`achieved_class_for_tier`] precisely so the "no
-//!   declaration raises a class" property stays a property of one small, pure function.
+//! * The **achieved class** is the class of the tier the session's commands run on. That tier,
+//!   and the class read off it, are one [`ContainmentDecision`], made once per session from one
+//!   [`HostProbe`] reading and the declared floor. The host's tier is a ceiling the declaration
+//!   can only lower: a capsule declaring less than `sealed` on a sealed-capable host runs on
+//!   [`EnforcementTier::KernelFull`] and achieves `scoped`, and no declaration raises a tier
+//!   above what the host backs. [`achieved_class_for_tier`] takes nothing but a tier, so no
+//!   declaration can talk a tier into reporting a class it does not back. Two capsule-side facts
+//!   then cap the class at [`ContainmentClass::Advisory`] without changing the tier:
+//!   `capabilities.filesystem.workdir_exec: true` and a runtime directory inside the workdir (see
+//!   [`achieved_containment_class`]).
 //!
-//! [`ContainmentClass::Sealed`] is reachable exactly when [`EnforcementTier::KernelSealed`] is:
-//! a Linux host with a usable Landlock ABI and a namespace probe that really built the composed
-//! root inside the capsule's network namespace. See [`crate::sealed`] for the mechanism and for
-//! the [`crate::sealed::SealedBlocker`] taxonomy that turns "not sealed here" into a specific
-//! command an operator can run.
+//! What the host could back for a capsule declaring `sealed` is reported separately, as
+//! [`ContainmentDecision::host_containment`], and decides nothing.
+//!
+//! [`ContainmentClass::Sealed`] is reachable exactly when [`EnforcementTier::KernelSealed`] is
+//! applied: a Linux host with a usable Landlock ABI and a namespace probe that really built the
+//! composed root inside the capsule's network namespace, and a capsule declaring `sealed`. See
+//! [`crate::sealed`] for the mechanism and for the [`crate::sealed::SealedBlocker`] taxonomy that
+//! turns "not sealed here" into a specific command an operator can run.
 //!
 //! The shortfall reason for `sealed` is therefore *mechanism-specific*, not a fixed string: a
 //! host missing the AppArmor profile and a container missing `CAP_SYS_ADMIN` both fail to reach
@@ -33,18 +37,17 @@ use crate::{
     cgroup::{IoMaxReport, IoMaxStatus},
     errors::RuntimeError,
     runtime_dir::RuntimeDirPlacement,
-    sandbox::{detect_enforcement_tier, EnforcementTier},
+    sandbox::{EnforcementTier, HostProbe},
     sealed::{SealedShortfall, UsernsGrant},
     types::CapabilityPolicy,
 };
 
 pub use crate::sandbox::{detect_sealed_shortfall, detect_userns_grant};
 
-/// The class a host in `tier` can actually back, and nothing stronger.
+/// The class a session whose commands run on `tier` achieves, before any capsule-side cap.
 ///
-/// Pure — the host probe lives in [`detect_enforcement_tier`], mirroring the
-/// `tier_from_probe`/`detect_enforcement_tier` split in `sandbox.rs` so this mapping stays
-/// unit-testable on any OS.
+/// Pure and tier-only, so this mapping stays unit-testable on any OS and no declaration can make a
+/// tier report a class it does not back.
 pub(crate) fn achieved_class_for_tier(tier: EnforcementTier) -> ContainmentClass {
     match tier {
         // A private mount namespace pivoted onto a composed root: paths outside it are absent,
@@ -64,47 +67,119 @@ pub(crate) fn achieved_class_for_tier(tier: EnforcementTier) -> ContainmentClass
     }
 }
 
-/// The class a session actually achieves: the host's ceiling from [`achieved_class_for_tier`],
-/// capped by what the capsule's own `capabilities.filesystem.workdir_exec` leaves standing and by
-/// where its runtime directory lies.
+/// The class a session achieves: the class of the tier its commands run on, from
+/// [`achieved_class_for_tier`], capped by what the capsule's own
+/// `capabilities.filesystem.workdir_exec` leaves standing and by where its runtime directory lies.
 ///
-/// These are the only inputs besides the tier that lower an achieved class, and they do so by
-/// capping rather than by deciding: [`achieved_class_for_tier`] above stays pure and tier-only,
-/// so no declaration can talk a host up, and this wrapper can only ever talk a capsule *down*.
+/// Both caps lower the class without changing the tier: the commands still run under the same
+/// mechanism, which no longer backs the claim the higher class makes.
 ///
 /// Why `workdir_exec` caps at [`ContainmentClass::Advisory`]: `scoped` (and `sealed` above it) both
 /// claim that what runs inside the capsule is bounded by what the operator declared. With the
 /// workdir's `Execute` right granted, a binary the agent compiles, downloads or renames inside its
 /// own workdir runs whatever `capabilities.shell.allow` says — the allowlist stops being an
-/// enforceable property. A host that could back `scoped` still cannot back a claim the capsule
-/// itself has given up, so the honest report is `advisory`, on every tier.
+/// enforceable property. A tier that backs `scoped` still cannot back a claim the capsule itself
+/// has given up, so the honest report is `advisory`, on every tier.
 ///
 /// Why `runtime_dir_inside_workdir` caps at [`ContainmentClass::Advisory`] too: with
 /// `~/.murmur/sessions` inside the workdir the capsule's commands write, they can rewrite the
 /// task, `MURMUR.md`, a submitted plan or an installed tool's entrypoint, which every class above
 /// `advisory` claims they cannot.
-pub(crate) fn achieved_containment_class(
+fn achieved_containment_class(
     tier: EnforcementTier,
     workdir_exec: bool,
     runtime_dir_inside_workdir: bool,
 ) -> ContainmentClass {
-    let host_ceiling = achieved_class_for_tier(tier);
+    let class = achieved_class_for_tier(tier);
     if workdir_exec || runtime_dir_inside_workdir {
-        host_ceiling.min(ContainmentClass::Advisory)
+        class.min(ContainmentClass::Advisory)
     } else {
-        host_ceiling
+        class
     }
 }
 
-/// Probes this host and reports the strongest class it can actually provide.
+/// A session's containment, decided once: the tier its commands run on and the class that tier
+/// achieves for this capsule.
 ///
-/// Host-only, and deliberately still takes no capsule input: it answers "what can this machine
-/// back?", which is what `mur doctor` and the escape-conformance harness ask. A *session* asks the
-/// narrower question and must use [`achieved_containment_class`] with its own probed tier instead
-/// — see `runtime::stage_session`, which probes the tier once and passes it to both that call and
-/// [`scope_report_for_tier`].
-pub fn detect_achieved_containment() -> ContainmentClass {
-    achieved_class_for_tier(detect_enforcement_tier())
+/// Every reader of a session's class or tier takes it from here — the floor refusal, the
+/// [`ScopeReport`] (and so `--explain-scope` and `session_start`), the `/tmp` mapping, the
+/// `MURMUR.md` exec facts, the tier `ShellEnforcement` installs, the resource plane's and peer
+/// handoff's symlink rule, `mur doctor` and the escape-conformance harness — so no report can name
+/// a class or tier the session's commands do not run under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainmentDecision {
+    declared: ContainmentClass,
+    host_tier: EnforcementTier,
+    applied_tier: EnforcementTier,
+    achieved: ContainmentClass,
+}
+
+impl ContainmentDecision {
+    /// Decides from one host tier reading, the combined declared floor, the capsule's
+    /// `capabilities.filesystem.workdir_exec` and whether its runtime directory lies inside the
+    /// workdir. The last two cap the class and never change the tier.
+    pub(crate) fn decide(
+        host_tier: EnforcementTier,
+        declared: ContainmentClass,
+        workdir_exec: bool,
+        runtime_dir_inside_workdir: bool,
+    ) -> Self {
+        let applied_tier = crate::sandbox::applied_tier(host_tier, declared);
+        Self {
+            declared,
+            host_tier,
+            applied_tier,
+            achieved: achieved_containment_class(
+                applied_tier,
+                workdir_exec,
+                runtime_dir_inside_workdir,
+            ),
+        }
+    }
+
+    /// The combined declared floor the decision was made for.
+    pub fn declared(&self) -> ContainmentClass {
+        self.declared
+    }
+
+    /// The class this session's commands run under.
+    pub fn achieved(&self) -> ContainmentClass {
+        self.achieved
+    }
+
+    /// The class the host could back for a capsule declaring `sealed`, with no capsule-side cap.
+    /// Reported only; nothing decides from it.
+    pub fn host_containment(&self) -> ContainmentClass {
+        achieved_class_for_tier(self.host_tier)
+    }
+
+    /// The wire name of the tier this session installs, as [`ScopeReport::enforcement_tier`]
+    /// spells it.
+    pub fn enforcement_tier(&self) -> &'static str {
+        enforcement_tier_name(self.applied_tier)
+    }
+
+    /// The tier this session installs. `pub(crate)` because [`EnforcementTier`] is.
+    pub(crate) fn applied_tier(&self) -> EnforcementTier {
+        self.applied_tier
+    }
+}
+
+/// Probes this host once and decides for a capsule declaring `declared`, with neither capsule-side
+/// cap, returning the probe's sealed shortfall beside it.
+///
+/// What `mur doctor`'s callers and the escape-conformance harness ask: the class and tier a
+/// session declaring `declared` would run under here, and why `sealed` is out of reach when it is.
+/// A *session* takes its own [`HostProbe`] in `runtime::stage_session` and decides with its real
+/// `workdir_exec` and runtime-directory placement instead.
+pub fn detect_containment_decision(
+    declared: ContainmentClass,
+) -> (ContainmentDecision, Option<SealedShortfall>) {
+    let probe = HostProbe::probe();
+    (
+        ContainmentDecision::decide(probe.tier(), declared, false, false),
+        probe.sealed_shortfall(),
+    )
 }
 
 /// Why `achieved` falls short of `declared`, naming the missing *mechanism* rather than the
@@ -216,8 +291,9 @@ const WORKDIR_EXEC_SHORTFALL: &str =
      then enforced by the kernel on the resolved path) or lower the declared containment floor to \
      advisory";
 
-/// The refusal gate: `Ok(())` when the host's `achieved` class meets or exceeds the `declared`
-/// floor, [`RuntimeError::ContainmentFloorUnmet`] otherwise.
+/// The refusal gate: `Ok(())` when the session's `achieved` class
+/// ([`ContainmentDecision::achieved`]) meets or exceeds the `declared` floor,
+/// [`RuntimeError::ContainmentFloorUnmet`] otherwise.
 ///
 /// Pure — takes every input as an argument and probes nothing, so the whole decision is
 /// testable without a kernel.
@@ -477,11 +553,11 @@ impl PreopenReport {
 
 /// What the filesystem mechanism this session installs restricts, as a stable wire name.
 ///
-/// Keyed on [`crate::sandbox::applied_tier`] — the host tier capped by the declared containment
-/// floor, which is the same value [`crate::sandbox::ShellEnforcement::resolve`] installs the
-/// session's mechanisms from. The achieved containment class answers a different question ("what
-/// can this host back"), and a capsule declaring less than `sealed` on a sealed-capable host is
-/// where the two part company: it is reported `achieved: sealed` and runs Landlock-scoped.
+/// Keyed on [`ContainmentDecision::applied_tier`], the tier
+/// [`crate::sandbox::ShellEnforcement::resolve`] installs the session's mechanisms from and the
+/// one [`ScopeReport::enforcement_tier`] names. Not on the achieved class, which `workdir_exec`
+/// and the runtime directory's placement can cap at `advisory` without changing what the
+/// mechanism restricts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FilesystemRestriction {
@@ -835,21 +911,28 @@ pub fn render_temp_dir(report: &TempDirReport) -> String {
 
 /// Read-only answer to "what would this capsule actually be allowed to do on this host?".
 ///
-/// Built from the already-parsed [`CapabilityPolicy`] plus one host tier probe. Nothing here
-/// stages artifacts, touches a registry, creates a workdir or resolves DNS — it is a diagnostic,
-/// so it reports even when [`Self::floor_met`] is `false`.
+/// Built from the already-parsed [`CapabilityPolicy`] plus one [`ContainmentDecision`]. Nothing
+/// here stages artifacts, touches a registry, creates a workdir or resolves DNS — it is a
+/// diagnostic, so it reports even when [`Self::floor_met`] is `false`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ScopeReport {
     /// Strongest class any source asked for (manifest / workspace config / `--containment`).
     pub declared_containment: ContainmentClass,
-    /// Strongest class this host can actually back, derived from the tier probe alone.
+    /// The class this session's commands run under: the class of [`Self::enforcement_tier`],
+    /// capped at `advisory` by `workdir_exec` or a runtime directory inside the workdir. From
+    /// [`ContainmentDecision::achieved`].
     pub achieved_containment: ContainmentClass,
+    /// The class this host could back for a capsule declaring `sealed`, never what this session
+    /// runs on: a capsule declaring less runs on a weaker tier, and [`Self::achieved_containment`]
+    /// says which. From [`ContainmentDecision::host_containment`]. Always serialized.
+    pub host_containment: ContainmentClass,
     /// `achieved_containment >= declared_containment`. `false` means `mur run` would refuse.
     pub floor_met: bool,
     /// The missing mechanism when `floor_met` is `false`; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shortfall_reason: Option<String>,
-    /// The probed host tier, as a stable wire name.
+    /// The tier this session installs, as a stable wire name: the host's tier capped by the
+    /// declared floor, from [`ContainmentDecision::enforcement_tier`].
     pub enforcement_tier: &'static str,
     /// What [`Self::enforcement_tier`] confines, as stable wire names: always `shell`,
     /// `plan-shell-steps` and `native-tools`, since all three are spawned through one enforcement
@@ -872,7 +955,7 @@ pub struct ScopeReport {
     /// [`crate::sandbox::LANDLOCK_TARGET_ABI`], or `null` when no Landlock domain is installed —
     /// a tier below `landlock+seccomp`, or a kernel without Landlock.
     ///
-    /// Keyed on [`crate::sandbox::applied_tier`], like [`Self::filesystem_boundary`], and computed
+    /// Keyed on the session's applied tier, like [`Self::filesystem_boundary`], and computed
     /// by the same [`crate::sandbox::ruleset_landlock_abi`] the shell child builds at, so the
     /// trace records the ruleset that was installed. Always serialized, on the same terms as
     /// [`Self::userns_grant`]. Below 2 a file cannot be moved or hard-linked between two folders
@@ -1041,11 +1124,8 @@ pub struct ScopeReport {
     /// silently falls behind every time the set changes — enabling `sealed` being exactly that
     /// case.
     ///
-    /// Keyed on the tier this session would install: [`Self::enforcement_tier`] capped by
-    /// [`Self::declared_containment`], which is what decides whether a composed root is built at
-    /// all. Reading `enforcement_tier: mountns+pivot_root+landlock+seccomp` next to a report with
-    /// no `sealed` rows is that cap, not a disagreement — the host could seal and the capsule did
-    /// not ask. See [`crate::workdir_writes`].
+    /// The same set whatever [`Self::enforcement_tier`] and [`Self::achieved_containment`] say:
+    /// no row turns on the tier. See [`crate::workdir_writes`].
     pub runtime_writes: Vec<crate::workdir_writes::RuntimeWriteReport>,
     /// The declared `capabilities.resources.cgroup_io_bytes_per_sec` ceiling, and whether it is
     /// actually on this session's cgroup scope.
@@ -1070,12 +1150,10 @@ pub struct ScopeReport {
     /// key identifies a runtime that predates the field, and an empty
     /// [`FilesystemBoundaryReport::not_protected`] identifies a session with nothing to disclaim.
     ///
-    /// Derived in [`filesystem_boundary`] from [`crate::sandbox::applied_tier`] — the same value
-    /// [`Self::runtime_writes`] is keyed on — and from no [`CapabilityPolicy`] field. Not from
-    /// [`Self::achieved_containment`], which reports the class this *host* can back: a capsule
-    /// declaring less than `sealed` on a sealed-capable host reads `achieved: sealed` and composes
-    /// no root, so a boundary keyed on the class would report an absence the capsule does not have.
-    /// It stands beside the grants rather than among them because it qualifies every one at once.
+    /// Derived in [`filesystem_boundary`] from the tier [`Self::enforcement_tier`] names, and
+    /// from no [`CapabilityPolicy`] field: `workdir_exec` caps [`Self::achieved_containment`]
+    /// without changing what the mechanism restricts. It stands beside the grants rather than
+    /// among them because it qualifies every one at once.
     pub filesystem_boundary: FilesystemBoundaryReport,
     /// What the session's runtime directory is to its commands, from [`runtime_dir_report`] on
     /// the applied tier, [`Self::landlock_abi`] and where the directory lies. Always serialized.
@@ -1099,6 +1177,7 @@ impl ScopeReport {
         out.push_str("Containment\n");
         out.push_str(&format!("  declared:  {}\n", self.declared_containment));
         out.push_str(&format!("  achieved:  {}\n", self.achieved_containment));
+        out.push_str(&format!("  host can back: {}\n", self.host_containment));
         out.push_str(&format!(
             "  floor met: {}\n",
             if self.floor_met { "yes" } else { "no" }
@@ -1391,16 +1470,21 @@ pub fn explain_scope(
     workdir: &std::path::Path,
 ) -> Result<ScopeReport, crate::murmur_home::HomeUnusable> {
     let placement = crate::runtime_dir::runtime_dir_placement(workdir)?;
-    let probe = crate::sandbox::HostProbe::probe();
+    let probe = HostProbe::probe();
+    let decision = ContainmentDecision::decide(
+        probe.tier(),
+        declared,
+        policy.workdir_exec_allowed,
+        placement.inside_workdir(),
+    );
     let temp_mapping = crate::temp_dir::temp_mapping(
-        crate::sandbox::applied_tier(probe.tier(), declared),
+        decision.applied_tier(),
         probe.mount_namespace_usable(),
         &placement.workdir,
     );
     Ok(scope_report_for_tier(
         policy,
-        declared,
-        probe.tier(),
+        &decision,
         probe.sealed_shortfall().as_ref(),
         probe.userns_grant(),
         probe.landlock_kernel_abi(),
@@ -1416,15 +1500,19 @@ pub fn explain_scope(
 
 /// `mur doctor`'s `Runtime directory`, `Records directory` and `Temporary folder` sections for a
 /// capsule declaring `declared`, run from `workdir`: the same [`runtime_dir_report`],
-/// [`records_dir_report`] and [`temp_dir_report`] on this host's applied tier, ruleset ABI and
-/// mount namespace, or why `HOME` cannot hold them.
+/// [`records_dir_report`] and [`temp_dir_report`] on the tier `probe`'s [`ContainmentDecision`]
+/// applies, its ruleset ABI and mount namespace, or why `HOME` cannot hold them.
+///
+/// `probe` is the reading the rest of the doctor run reports from, so every section describes one
+/// host at one moment.
 pub fn doctor_runtime_dir(
+    probe: &HostProbe,
     declared: ContainmentClass,
     workdir: &std::path::Path,
 ) -> Result<DoctorDirReports, crate::murmur_home::HomeUnusable> {
     let placement = crate::runtime_dir::runtime_dir_placement(workdir)?;
-    let probe = crate::sandbox::HostProbe::probe();
-    let applied = crate::sandbox::applied_tier(probe.tier(), declared);
+    // `workdir_exec` and the placement cap the class, never the tier, and only the tier is read.
+    let applied = ContainmentDecision::decide(probe.tier(), declared, false, false).applied_tier();
     let abi = crate::sandbox::ruleset_landlock_abi(probe.landlock_kernel_abi(), applied);
     let temp_mapping =
         crate::temp_dir::temp_mapping(applied, probe.mount_namespace_usable(), &placement.workdir);
@@ -1445,13 +1533,16 @@ pub struct DoctorDirReports {
     pub placement: RuntimeDirPlacement,
 }
 
-/// [`explain_scope`] with the tier and the sealed shortfall injected — the seam every test uses so
-/// no test depends on the host it happens to run on.
+/// [`explain_scope`] with the [`ContainmentDecision`] and the sealed shortfall injected — the
+/// seam `runtime::stage_session` builds the session's report through, and every test, through
+/// [`report_for`], so no test depends on the host it happens to run on.
+///
+/// `decision` must have been decided with `policy.workdir_exec_allowed` and
+/// `runtime_dir_placement.inside_workdir()`: the report states both beside the class they cap.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scope_report_for_tier(
     policy: &CapabilityPolicy,
-    declared: ContainmentClass,
-    tier: EnforcementTier,
+    decision: &ContainmentDecision,
     sealed_shortfall: Option<&SealedShortfall>,
     userns_grant: Option<UsernsGrant>,
     landlock_kernel_abi: Option<u8>,
@@ -1463,16 +1554,22 @@ pub(crate) fn scope_report_for_tier(
     temp_mapping: crate::temp_dir::TempMapping,
     io_max: IoMaxReport,
 ) -> ScopeReport {
-    let achieved = achieved_containment_class(
-        tier,
-        policy.workdir_exec_allowed,
-        runtime_dir_placement.inside_workdir(),
+    debug_assert_eq!(
+        *decision,
+        ContainmentDecision::decide(
+            decision.host_tier,
+            decision.declared,
+            policy.workdir_exec_allowed,
+            runtime_dir_placement.inside_workdir(),
+        ),
+        "the decision must be made from the policy and placement this report states"
     );
-    // The tier this session would actually install: the host reading `enforcement_tier`
-    // reports, capped by the declared floor, which is the same `sandbox::applied_tier`
-    // `ShellEnforcement::resolve` runs. Three fields below are keyed on it rather than on
-    // `achieved`, because all three describe mechanisms rather than the class this host can back.
-    let applied = crate::sandbox::applied_tier(tier, declared);
+    let declared = decision.declared();
+    let achieved = decision.achieved();
+    // The tier `ShellEnforcement::resolve` installs from the same decision. The mechanism fields
+    // below are keyed on it rather than on `achieved`, which `workdir_exec` and the placement can
+    // cap without changing what the mechanism restricts.
+    let applied = decision.applied_tier();
     let shortfall_reason = containment_shortfall_reason(
         declared,
         achieved,
@@ -1493,9 +1590,10 @@ pub(crate) fn scope_report_for_tier(
     ScopeReport {
         declared_containment: declared,
         achieved_containment: achieved,
+        host_containment: decision.host_containment(),
         floor_met: shortfall_reason.is_none(),
         shortfall_reason,
-        enforcement_tier: enforcement_tier_name(tier),
+        enforcement_tier: decision.enforcement_tier(),
         mechanism_covers: MECHANISM_COVERS.to_vec(),
         userns_grant,
         landlock_abi,
@@ -1511,11 +1609,11 @@ pub(crate) fn scope_report_for_tier(
         peer_fetch_allow: policy.peer_fetch_allow.clone(),
         // Resolved by `state_store::state_store_reports` before this call and copied through on
         // the same terms as the export reports above: a grant that opens a path outside the
-        // workdir still gets no say in what class this host is reported to back.
+        // workdir still gets no say in what class the session is reported to achieve.
         state_stores,
         // Resolved by `artifact_config::configured_artifact_names` before this call and copied
         // through on the same terms: one environment variable delivered to one guest gets no say
-        // in what class this host is reported to back.
+        // in what class the session is reported to achieve.
         configured_artifacts,
         filesystem_scope: policy.filesystem_scope.clone(),
         workdir_exec: policy.workdir_exec_allowed,
@@ -1526,7 +1624,7 @@ pub(crate) fn scope_report_for_tier(
         ),
         // Resolved by `network_policy::preopen_reports` before this call and copied through on the
         // same terms as the reports above: what one guest is preopened into gets no say in what
-        // class this host is reported to back.
+        // class the session is reported to achieve.
         preopens,
         network_allow: policy.network_allow.clone(),
         unix_sockets: policy.unix_sockets_allowed,
@@ -1595,6 +1693,47 @@ pub(crate) fn scope_report_for_tier(
     }
 }
 
+/// [`scope_report_for_tier`] for a capsule declaring `declared` on a host whose tier is `tier`,
+/// deciding from `policy` and `runtime_dir_placement` as `runtime::stage_session` does.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn report_for(
+    policy: &CapabilityPolicy,
+    declared: ContainmentClass,
+    tier: EnforcementTier,
+    sealed_shortfall: Option<&SealedShortfall>,
+    userns_grant: Option<UsernsGrant>,
+    landlock_kernel_abi: Option<u8>,
+    exports: Option<&Exports>,
+    state_stores: Vec<StateStoreReport>,
+    configured_artifacts: Vec<String>,
+    preopens: Vec<PreopenReport>,
+    runtime_dir_placement: &RuntimeDirPlacement,
+    temp_mapping: crate::temp_dir::TempMapping,
+    io_max: IoMaxReport,
+) -> ScopeReport {
+    let decision = ContainmentDecision::decide(
+        tier,
+        declared,
+        policy.workdir_exec_allowed,
+        runtime_dir_placement.inside_workdir(),
+    );
+    scope_report_for_tier(
+        policy,
+        &decision,
+        sealed_shortfall,
+        userns_grant,
+        landlock_kernel_abi,
+        exports,
+        state_stores,
+        configured_artifacts,
+        preopens,
+        runtime_dir_placement,
+        temp_mapping,
+        io_max,
+    )
+}
+
 /// The subprocess routes the session's enforcement tier confines, as
 /// [`ScopeReport::mechanism_covers`] reports them.
 pub(crate) const MECHANISM_COVERS: &[&str] = &["shell", "plan-shell-steps", "native-tools"];
@@ -1613,13 +1752,13 @@ fn render_mechanism_covers(covers: &[&str]) -> String {
         .join(", ")
 }
 
-/// The wire name of the tier a native tool of a capsule declaring `declared` runs under on this
-/// host: the probed tier capped by the declared floor, which is what
+/// The wire name of the tier a native tool of a capsule declaring `declared` runs under on the
+/// host `probe` read: [`ContainmentDecision::enforcement_tier`], which is what
 /// `ShellEnforcement::resolve` installs for every subprocess. Spelled as
 /// [`ScopeReport::enforcement_tier`] spells a tier.
-pub fn applied_mechanism(declared: ContainmentClass) -> &'static str {
-    let probe = crate::sandbox::HostProbe::probe();
-    enforcement_tier_name(crate::sandbox::applied_tier(probe.tier(), declared))
+pub fn applied_mechanism(probe: &HostProbe, declared: ContainmentClass) -> &'static str {
+    // `workdir_exec` and the placement cap the class, never the tier, and only the tier is read.
+    ContainmentDecision::decide(probe.tier(), declared, false, false).enforcement_tier()
 }
 
 /// Stable wire name for a tier, so `--explain-scope --json` consumers see the mechanism rather
@@ -1857,26 +1996,187 @@ mod tests {
         }
     }
 
-    /// The edge case the new tier makes possible: a capsule declaring the *weaker* class on a
-    /// sealed-capable host. The floor is met (a stronger host satisfies a weaker requirement),
-    /// and the applied mechanism is the declared one — asserted next door in
-    /// `sandbox::applied_tier`'s tests, since a careless `match` here could force sealed-only
-    /// behaviour onto a `scoped` declaration.
+    /// The edge case the sealed tier makes possible: a capsule declaring a *weaker* class on a
+    /// sealed-capable host. It runs on `landlock+seccomp` and achieves `scoped` — never the
+    /// `sealed` the host could back — and that still meets its floor.
     #[test]
     fn a_weaker_declaration_is_satisfied_by_a_sealed_host_without_being_upgraded() {
-        let achieved = achieved_class_for_tier(EnforcementTier::KernelSealed);
-        assert_eq!(achieved, ContainmentClass::Sealed);
-        assert!(
-            check_containment_floor(ContainmentClass::Advisory, achieved, None, false, None)
-                .is_ok()
-        );
-        assert!(
-            check_containment_floor(ContainmentClass::Scoped, achieved, None, false, None).is_ok()
-        );
+        for declared in [ContainmentClass::Advisory, ContainmentClass::Scoped] {
+            let decision =
+                ContainmentDecision::decide(EnforcementTier::KernelSealed, declared, false, false);
+            assert_eq!(decision.applied_tier(), EnforcementTier::KernelFull);
+            assert_eq!(decision.achieved(), ContainmentClass::Scoped);
+            assert_eq!(decision.enforcement_tier(), "landlock+seccomp");
+            assert_eq!(decision.host_containment(), ContainmentClass::Sealed);
+            assert!(
+                check_containment_floor(declared, decision.achieved(), None, false, None).is_ok()
+            );
+            assert_eq!(
+                containment_shortfall_reason(declared, decision.achieved(), None, false, None),
+                None
+            );
+        }
+    }
+
+    const ALL_CLASSES: &[ContainmentClass] = &[
+        ContainmentClass::Advisory,
+        ContainmentClass::Scoped,
+        ContainmentClass::Sealed,
+    ];
+
+    /// Every host tier × declared class × `workdir_exec` × runtime directory inside the workdir:
+    /// the tier the session installs, the class read off it, the host's ceiling and the wire name
+    /// of the installed tier, from a table written out here rather than recomputed.
+    #[test]
+    fn the_decision_reads_the_class_off_the_tier_the_session_installs() {
+        use ContainmentClass::{Advisory, Scoped, Sealed};
+        use EnforcementTier::{EnvironmentOnly, KernelFull, KernelSealed, KernelSeccompOnly};
+        // (host tier, declared) → (applied tier, uncapped class, wire name)
+        let table = [
+            (
+                (KernelSealed, Advisory),
+                (KernelFull, Scoped, "landlock+seccomp"),
+            ),
+            (
+                (KernelSealed, Scoped),
+                (KernelFull, Scoped, "landlock+seccomp"),
+            ),
+            (
+                (KernelSealed, Sealed),
+                (KernelSealed, Sealed, "mountns+pivot_root+landlock+seccomp"),
+            ),
+            (
+                (KernelFull, Advisory),
+                (KernelFull, Scoped, "landlock+seccomp"),
+            ),
+            (
+                (KernelFull, Scoped),
+                (KernelFull, Scoped, "landlock+seccomp"),
+            ),
+            (
+                (KernelFull, Sealed),
+                (KernelFull, Scoped, "landlock+seccomp"),
+            ),
+            (
+                (KernelSeccompOnly, Advisory),
+                (KernelSeccompOnly, Advisory, "seccomp-only"),
+            ),
+            (
+                (KernelSeccompOnly, Scoped),
+                (KernelSeccompOnly, Advisory, "seccomp-only"),
+            ),
+            (
+                (KernelSeccompOnly, Sealed),
+                (KernelSeccompOnly, Advisory, "seccomp-only"),
+            ),
+            (
+                (EnvironmentOnly, Advisory),
+                (EnvironmentOnly, Advisory, "none"),
+            ),
+            (
+                (EnvironmentOnly, Scoped),
+                (EnvironmentOnly, Advisory, "none"),
+            ),
+            (
+                (EnvironmentOnly, Sealed),
+                (EnvironmentOnly, Advisory, "none"),
+            ),
+        ];
+        assert_eq!(table.len(), ALL_TIERS.len() * ALL_CLASSES.len());
+        for ((host_tier, declared), (applied, class, wire)) in table {
+            let host_class = match host_tier {
+                KernelSealed => Sealed,
+                KernelFull => Scoped,
+                KernelSeccompOnly | EnvironmentOnly => Advisory,
+            };
+            for workdir_exec in [false, true] {
+                for inside in [false, true] {
+                    let decision =
+                        ContainmentDecision::decide(host_tier, declared, workdir_exec, inside);
+                    let what = format!("{host_tier:?} {declared} exec={workdir_exec} in={inside}");
+                    assert_eq!(decision.declared(), declared, "{what}");
+                    assert_eq!(decision.applied_tier(), applied, "{what}");
+                    assert_eq!(decision.enforcement_tier(), wire, "{what}");
+                    assert_eq!(decision.host_containment(), host_class, "{what}");
+                    let expected = if workdir_exec || inside {
+                        Advisory
+                    } else {
+                        class
+                    };
+                    assert_eq!(decision.achieved(), expected, "{what}");
+                    // No declaration raises a class above the host's, and only a `sealed`
+                    // declaration is ever reported `sealed`.
+                    assert!(decision.achieved() <= decision.host_containment(), "{what}");
+                    assert!(
+                        decision.achieved() != Sealed || declared == Sealed,
+                        "{what}"
+                    );
+                }
+            }
+        }
+
+        // The three rows a sealed-capable host turns on, by name.
+        let scoped = ContainmentDecision::decide(KernelSealed, Scoped, false, false);
         assert_eq!(
-            containment_shortfall_reason(ContainmentClass::Scoped, achieved, None, false, None),
-            None
+            (
+                scoped.achieved(),
+                scoped.enforcement_tier(),
+                scoped.host_containment()
+            ),
+            (Scoped, "landlock+seccomp", Sealed)
         );
+        let sealed = ContainmentDecision::decide(KernelSealed, Sealed, false, false);
+        assert_eq!(
+            (sealed.achieved(), sealed.enforcement_tier()),
+            (Sealed, "mountns+pivot_root+landlock+seccomp")
+        );
+        let advisory = ContainmentDecision::decide(KernelSealed, Advisory, false, false);
+        assert_eq!(
+            (advisory.achieved(), advisory.enforcement_tier()),
+            (Scoped, "landlock+seccomp")
+        );
+    }
+
+    /// The floor refusal decides from the decision's class exactly as it did from the host tier's
+    /// class: the two differ only where the host is sealed-capable and the declaration is below
+    /// `sealed`, and there both meet the floor (or, capped, both refuse with the same words).
+    #[test]
+    fn the_floor_verdict_and_wording_are_those_of_the_host_tier_class() {
+        for &host_tier in ALL_TIERS {
+            for &declared in ALL_CLASSES {
+                for workdir_exec in [false, true] {
+                    for inside in [None, Some(inside_placement())] {
+                        let in_workdir = inside.is_some();
+                        let decision = ContainmentDecision::decide(
+                            host_tier,
+                            declared,
+                            workdir_exec,
+                            in_workdir,
+                        );
+                        let host_class =
+                            achieved_containment_class(host_tier, workdir_exec, in_workdir);
+                        let shortfall = blocked(SealedBlocker::NamespaceCreationDenied);
+                        assert_eq!(
+                            containment_shortfall_reason(
+                                declared,
+                                decision.achieved(),
+                                Some(&shortfall),
+                                workdir_exec,
+                                inside.as_ref(),
+                            ),
+                            containment_shortfall_reason(
+                                declared,
+                                host_class,
+                                Some(&shortfall),
+                                workdir_exec,
+                                inside.as_ref(),
+                            ),
+                            "{host_tier:?} {declared} exec={workdir_exec} in={in_workdir}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2068,7 +2368,7 @@ mod tests {
 
     #[test]
     fn scope_report_mirrors_the_policy_and_the_probed_tier() {
-        let report = scope_report_for_tier(
+        let report = report_for(
             &sample_policy(),
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
@@ -2116,7 +2416,7 @@ mod tests {
             ..CapabilityPolicy::default()
         };
 
-        let report = scope_report_for_tier(
+        let report = report_for(
             &policy,
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
@@ -2160,7 +2460,7 @@ mod tests {
     /// asked. "Not asked" is a value — `not-probed` — inside the object.
     #[test]
     fn scope_report_json_always_carries_io_max() {
-        let unprobed: serde_json::Value = serde_json::to_value(scope_report_for_tier(
+        let unprobed: serde_json::Value = serde_json::to_value(report_for(
             &sample_policy(),
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
@@ -2183,7 +2483,7 @@ mod tests {
         assert_eq!(unprobed["io_max"]["declared_bytes_per_sec"], 0);
         assert!(unprobed["io_max"].get("reason").is_none());
 
-        let enforced: serde_json::Value = serde_json::to_value(scope_report_for_tier(
+        let enforced: serde_json::Value = serde_json::to_value(report_for(
             &sample_policy(),
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
@@ -2215,7 +2515,7 @@ mod tests {
     /// uncontradicted.
     #[test]
     fn the_rendered_resource_plane_states_what_became_of_the_io_ceiling() {
-        let rendered = scope_report_for_tier(
+        let rendered = report_for(
             &sample_policy(),
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
@@ -2253,7 +2553,7 @@ mod tests {
     /// declared nothing" from "this runtime does not know the key".
     #[test]
     fn scope_report_json_always_carries_workdir_exec() {
-        let value: serde_json::Value = serde_json::to_value(scope_report_for_tier(
+        let value: serde_json::Value = serde_json::to_value(report_for(
             &sample_policy(),
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
@@ -2291,7 +2591,7 @@ mod tests {
         };
 
         for tier in ALL_TIERS {
-            let report = scope_report_for_tier(
+            let report = report_for(
                 &policy,
                 ContainmentClass::Sealed,
                 *tier,
@@ -2328,7 +2628,7 @@ mod tests {
     /// inventing one, and `render` still names it as `<none>` like every other empty list.
     #[test]
     fn absent_staged_runtime_reports_nothing() {
-        let report = scope_report_for_tier(
+        let report = report_for(
             &sample_policy(),
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
@@ -2355,7 +2655,7 @@ mod tests {
     /// the achieved class.
     #[test]
     fn grant_set_never_raises_the_achieved_class() {
-        let report = scope_report_for_tier(
+        let report = report_for(
             &sample_policy(),
             ContainmentClass::Sealed,
             EnforcementTier::KernelFull,
@@ -2379,7 +2679,7 @@ mod tests {
 
     #[test]
     fn scope_report_still_reports_when_the_floor_is_unmet() {
-        let report = scope_report_for_tier(
+        let report = report_for(
             &sample_policy(),
             ContainmentClass::Sealed,
             EnforcementTier::EnvironmentOnly,
@@ -2407,7 +2707,7 @@ mod tests {
 
     #[test]
     fn scope_report_names_the_sealed_mechanism_on_a_sealed_host() {
-        let report = scope_report_for_tier(
+        let report = report_for(
             &sample_policy(),
             ContainmentClass::Sealed,
             EnforcementTier::KernelSealed,
@@ -2426,16 +2726,123 @@ mod tests {
             IoMaxReport::default(),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Sealed);
+        assert_eq!(report.host_containment, ContainmentClass::Sealed);
         assert!(report.floor_met);
         assert_eq!(
             report.enforcement_tier,
             "mountns+pivot_root+landlock+seccomp"
         );
+        assert_eq!(
+            report.filesystem_boundary.restriction,
+            FilesystemRestriction::Absent
+        );
+    }
+
+    /// Every host tier × declared class: the class, the tier, the filesystem boundary, the ruleset
+    /// ABI and the host's ceiling a report names all follow the one decision, so no report can
+    /// pair `mountns+pivot_root+landlock+seccomp` with `restriction: enforced`.
+    #[test]
+    fn every_report_field_follows_the_decision() {
+        for &host_tier in ALL_TIERS {
+            for &declared in ALL_CLASSES {
+                let decision = ContainmentDecision::decide(host_tier, declared, false, false);
+                let report = scope_report_for_tier(
+                    &sample_policy(),
+                    &decision,
+                    None,
+                    None,
+                    Some(6),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                    crate::temp_dir::tier_temp_mapping(decision.applied_tier()),
+                    IoMaxReport::default(),
+                );
+                let what = format!("{host_tier:?} {declared}");
+                assert_eq!(report.declared_containment, declared, "{what}");
+                assert_eq!(report.achieved_containment, decision.achieved(), "{what}");
+                assert_eq!(
+                    report.enforcement_tier,
+                    decision.enforcement_tier(),
+                    "{what}"
+                );
+                assert_eq!(
+                    report.host_containment,
+                    decision.host_containment(),
+                    "{what}"
+                );
+                assert_eq!(
+                    report.landlock_abi,
+                    crate::sandbox::ruleset_landlock_abi(Some(6), decision.applied_tier()),
+                    "{what}"
+                );
+                let restriction = filesystem_boundary(decision.applied_tier()).restriction;
+                assert_eq!(
+                    report.filesystem_boundary.restriction, restriction,
+                    "{what}"
+                );
+                assert_eq!(
+                    restriction,
+                    match report.enforcement_tier {
+                        "mountns+pivot_root+landlock+seccomp" => FilesystemRestriction::Absent,
+                        "landlock+seccomp" => FilesystemRestriction::Enforced,
+                        _ => FilesystemRestriction::Advisory,
+                    },
+                    "{what}"
+                );
+                assert_eq!(
+                    report.temp_dir,
+                    temp_dir_report(
+                        crate::temp_dir::tier_temp_mapping(decision.applied_tier()),
+                        &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                    ),
+                    "{what}"
+                );
+            }
+        }
+    }
+
+    /// The host's ceiling is its own field and its own line, directly under the session's class,
+    /// so a reader sees both and cannot take one for the other.
+    #[test]
+    fn host_containment_is_reported_beside_the_achieved_class() {
+        let report = report_for(
+            &sample_policy(),
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelSealed,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+            crate::temp_dir::tier_temp_mapping(EnforcementTier::KernelFull),
+            IoMaxReport::default(),
+        );
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["achieved_containment"], "scoped");
+        assert_eq!(value["host_containment"], "sealed");
+        assert_eq!(value["enforcement_tier"], "landlock+seccomp");
+        assert_eq!(value["filesystem_boundary"]["restriction"], "enforced");
+
+        let rendered = report.render();
+        assert!(
+            rendered.contains("  achieved:  scoped\n  host can back: sealed\n  floor met: yes\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  mechanism: landlock+seccomp\n"),
+            "{rendered}"
+        );
     }
 
     #[test]
     fn scope_report_json_uses_wire_names() {
-        let report = scope_report_for_tier(
+        let report = report_for(
             &CapabilityPolicy::default(),
             ContainmentClass::Advisory,
             EnforcementTier::KernelSeccompOnly,
@@ -2457,6 +2864,7 @@ mod tests {
 
         assert_eq!(value["declared_containment"], "advisory");
         assert_eq!(value["achieved_containment"], "advisory");
+        assert_eq!(value["host_containment"], "advisory");
         assert_eq!(value["floor_met"], true);
         assert_eq!(value["enforcement_tier"], "seccomp-only");
         // Absent rather than null when the floor is met.
@@ -2468,7 +2876,7 @@ mod tests {
     #[test]
     fn scope_report_names_the_landlock_abi_the_ruleset_is_built_at() {
         let report = |tier, kernel| {
-            scope_report_for_tier(
+            report_for(
                 &sample_policy(),
                 ContainmentClass::Scoped,
                 tier,
@@ -2526,7 +2934,7 @@ mod tests {
     /// with four different grants produces four reports that differ in exactly one field.
     #[test]
     fn the_userns_grant_is_reported_without_changing_any_verdict() {
-        let baseline = scope_report_for_tier(
+        let baseline = report_for(
             &sample_policy(),
             ContainmentClass::Advisory,
             EnforcementTier::KernelSealed,
@@ -2546,7 +2954,7 @@ mod tests {
         );
 
         for grant in UsernsGrant::ALL {
-            let report = scope_report_for_tier(
+            let report = report_for(
                 &sample_policy(),
                 ContainmentClass::Advisory,
                 EnforcementTier::KernelSealed,
@@ -2585,7 +2993,7 @@ mod tests {
 
     #[test]
     fn rendered_report_names_both_classes_and_the_refusal() {
-        let rendered = scope_report_for_tier(
+        let rendered = report_for(
             &sample_policy(),
             ContainmentClass::Sealed,
             EnforcementTier::KernelFull,
@@ -2628,7 +3036,7 @@ mod tests {
                     workdir_exec_allowed: workdir_exec,
                     ..sample_policy()
                 };
-                let without = scope_report_for_tier(
+                let without = report_for(
                     &policy,
                     ContainmentClass::Scoped,
                     *tier,
@@ -2646,7 +3054,7 @@ mod tests {
                     )),
                     IoMaxReport::default(),
                 );
-                let with = scope_report_for_tier(
+                let with = report_for(
                     &policy,
                     ContainmentClass::Scoped,
                     *tier,
@@ -2716,7 +3124,7 @@ mod tests {
                     peer_fetch_allow: vec!["localhost:41234".to_string()],
                     ..without_policy.clone()
                 };
-                let without = scope_report_for_tier(
+                let without = report_for(
                     &without_policy,
                     ContainmentClass::Scoped,
                     *tier,
@@ -2734,7 +3142,7 @@ mod tests {
                     )),
                     IoMaxReport::default(),
                 );
-                let with = scope_report_for_tier(
+                let with = report_for(
                     &with_policy,
                     ContainmentClass::Scoped,
                     *tier,
@@ -2793,7 +3201,7 @@ mod tests {
     /// capsule that declined.
     #[test]
     fn the_peer_fields_are_always_serialized() {
-        let undeclared: serde_json::Value = serde_json::to_value(scope_report_for_tier(
+        let undeclared: serde_json::Value = serde_json::to_value(report_for(
             &sample_policy(),
             ContainmentClass::Advisory,
             EnforcementTier::KernelSealed,
@@ -2815,7 +3223,7 @@ mod tests {
         assert_eq!(undeclared["peer_files"], serde_json::Value::Null);
         assert_eq!(undeclared["peer_fetch_allow"], serde_json::json!([]));
 
-        let declared: serde_json::Value = serde_json::to_value(scope_report_for_tier(
+        let declared: serde_json::Value = serde_json::to_value(report_for(
             &CapabilityPolicy {
                 peer_fetch_allow: vec!["localhost:41234".to_string()],
                 ..sample_policy()
@@ -2857,7 +3265,7 @@ mod tests {
 
     #[test]
     fn render_names_peer_handoff_in_both_directions() {
-        let undeclared = scope_report_for_tier(
+        let undeclared = report_for(
             &sample_policy(),
             ContainmentClass::Advisory,
             EnforcementTier::KernelSealed,
@@ -2880,7 +3288,7 @@ mod tests {
         assert!(undeclared.contains("exports.peer_files: <none>"));
         assert!(undeclared.contains("peer_fetch allow: <none>"));
 
-        let declared = scope_report_for_tier(
+        let declared = report_for(
             &CapabilityPolicy {
                 peer_fetch_allow: vec!["localhost:41234".to_string()],
                 ..sample_policy()
@@ -2917,7 +3325,7 @@ mod tests {
     }
 
     fn report_with_peer_tasks(tier: EnforcementTier, peer_tasks: Option<bool>) -> ScopeReport {
-        scope_report_for_tier(
+        report_for(
             &sample_policy(),
             ContainmentClass::Scoped,
             tier,
@@ -3011,7 +3419,7 @@ mod tests {
             host_path: "/home/dev/.murmur/state/shey".to_string(),
         }];
 
-        let without = scope_report_for_tier(
+        let without = report_for(
             &policy,
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
@@ -3029,7 +3437,7 @@ mod tests {
             )),
             IoMaxReport::default(),
         );
-        let with = scope_report_for_tier(
+        let with = report_for(
             &policy,
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
@@ -3114,7 +3522,7 @@ mod tests {
             },
         ];
 
-        let without = scope_report_for_tier(
+        let without = report_for(
             &policy,
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
@@ -3132,7 +3540,7 @@ mod tests {
             )),
             IoMaxReport::default(),
         );
-        let with = scope_report_for_tier(
+        let with = report_for(
             &policy,
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
@@ -3215,7 +3623,7 @@ mod tests {
     /// exported nothing.
     #[test]
     fn exports_files_is_always_serialized() {
-        let undeclared = serde_json::to_value(scope_report_for_tier(
+        let undeclared = serde_json::to_value(report_for(
             &sample_policy(),
             ContainmentClass::Advisory,
             EnforcementTier::KernelFull,
@@ -3236,7 +3644,7 @@ mod tests {
         .unwrap();
         assert_eq!(undeclared["exports_files"], serde_json::Value::Null);
 
-        let declared = serde_json::to_value(scope_report_for_tier(
+        let declared = serde_json::to_value(report_for(
             &sample_policy(),
             ContainmentClass::Advisory,
             EnforcementTier::KernelFull,
@@ -3271,7 +3679,7 @@ mod tests {
 
     #[test]
     fn render_names_the_resource_plane_in_both_directions() {
-        let undeclared = scope_report_for_tier(
+        let undeclared = report_for(
             &sample_policy(),
             ContainmentClass::Advisory,
             EnforcementTier::KernelFull,
@@ -3295,7 +3703,7 @@ mod tests {
             "{undeclared}"
         );
 
-        let declared = scope_report_for_tier(
+        let declared = report_for(
             &sample_policy(),
             ContainmentClass::Advisory,
             EnforcementTier::KernelFull,
@@ -3335,13 +3743,13 @@ mod tests {
 
     // ── read_only reporting ───────────────────────────────────────────────────
 
-    fn report_for(read_only: &[&str], shell_allow: &[&str]) -> ScopeReport {
+    fn read_only_report(read_only: &[&str], shell_allow: &[&str]) -> ScopeReport {
         let policy = CapabilityPolicy {
             read_only_paths: read_only.iter().map(|p| (*p).to_string()).collect(),
             shell_allow: shell_allow.iter().map(|b| (*b).to_string()).collect(),
             ..CapabilityPolicy::default()
         };
-        scope_report_for_tier(
+        report_for(
             &policy,
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
@@ -3365,7 +3773,7 @@ mod tests {
     /// the report says exactly that and nothing stronger.
     #[test]
     fn declared_read_only_with_no_interpreter_reports_as_enforced() {
-        let report = report_for(&["tests", "bench/fixtures"], &["git"]);
+        let report = read_only_report(&["tests", "bench/fixtures"], &["git"]);
         assert_eq!(
             report.read_only_paths,
             vec!["tests".to_string(), "bench/fixtures".to_string()]
@@ -3385,7 +3793,7 @@ mod tests {
     /// must never claim more than `W-SEC-017` already withdraws.
     #[test]
     fn an_allowlisted_interpreter_is_named_as_advisory() {
-        let report = report_for(&["tests"], &["git", "python3"]);
+        let report = read_only_report(&["tests"], &["git", "python3"]);
         assert_eq!(report.read_only_advisory_for, vec!["python3".to_string()]);
 
         let rendered = report.render();
@@ -3405,7 +3813,7 @@ mod tests {
             .collect();
         let declared = vec!["tests".to_string()];
         assert_eq!(
-            report_for(&["tests"], &["git", "python3", "node", "make", "bash"])
+            read_only_report(&["tests"], &["git", "python3", "node", "make", "bash"])
                 .read_only_advisory_for,
             read_only_advisory_for(&declared, &shell_allow)
         );
@@ -3418,11 +3826,11 @@ mod tests {
     /// capsule that declared nothing.
     #[test]
     fn both_read_only_keys_are_always_serialized_arrays() {
-        let json = serde_json::to_value(report_for(&[], &["python3"])).unwrap();
+        let json = serde_json::to_value(read_only_report(&[], &["python3"])).unwrap();
         assert_eq!(json["read_only_paths"], serde_json::json!([]));
         assert_eq!(json["read_only_advisory_for"], serde_json::json!([]));
 
-        let json = serde_json::to_value(report_for(&["tests"], &["python3"])).unwrap();
+        let json = serde_json::to_value(read_only_report(&["tests"], &["python3"])).unwrap();
         assert_eq!(json["read_only_paths"], serde_json::json!(["tests"]));
         assert_eq!(
             json["read_only_advisory_for"],
@@ -3434,7 +3842,7 @@ mod tests {
     /// because there is no protection to qualify.
     #[test]
     fn an_undeclared_read_only_renders_none_and_no_enforcement_line() {
-        let rendered = report_for(&[], &["python3"]).render();
+        let rendered = read_only_report(&[], &["python3"]).render();
         assert!(rendered.contains("  read_only: <none>\n"));
         assert!(!rendered.contains("read_only enforcement:"));
     }
@@ -3551,7 +3959,7 @@ mod tests {
 
         // The other direction: a report key the table claims must really be in the JSON, so no
         // row can cover a field with a key that does not exist.
-        let json = serde_json::to_value(scope_report_for_tier(
+        let json = serde_json::to_value(report_for(
             &sample_policy(),
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
@@ -3583,7 +3991,7 @@ mod tests {
     /// A report off [`sample_policy`] at a chosen host tier and declared floor, so the mechanism
     /// this session would install is the only thing that varies between the cases below.
     fn boundary_report(declared: ContainmentClass, tier: EnforcementTier) -> ScopeReport {
-        scope_report_for_tier(
+        report_for(
             &sample_policy(),
             declared,
             tier,
@@ -3805,7 +4213,7 @@ mod tests {
         )
         .is_ok());
 
-        let report = scope_report_for_tier(
+        let report = report_for(
             &sample_policy(),
             ContainmentClass::Advisory,
             EnforcementTier::KernelFull,
@@ -3885,17 +4293,18 @@ mod tests {
     }
 
     /// A capsule that declares less than `sealed` composes no root on a sealed-capable host: it
-    /// runs Landlock-scoped, and the block must say so rather than claim the paths outside its
-    /// grants are absent. This is the configuration `achieved_containment` cannot distinguish —
-    /// it reads `sealed` on both sides of this test.
+    /// runs Landlock-scoped, is reported `scoped` on `landlock+seccomp`, and the block says so
+    /// rather than claim the paths outside its grants are absent.
     #[test]
     fn a_sealed_capable_host_still_discloses_landlock_for_a_capsule_that_declared_less() {
         let report = boundary_report(ContainmentClass::Advisory, EnforcementTier::KernelSealed);
 
+        assert_eq!(report.achieved_containment, ContainmentClass::Scoped);
+        assert_eq!(report.enforcement_tier, "landlock+seccomp");
         assert_eq!(
-            report.achieved_containment,
+            report.host_containment,
             ContainmentClass::Sealed,
-            "the host can back sealed, which is what `achieved` answers"
+            "the host can back sealed, which only `host_containment` says"
         );
         assert_eq!(
             report.filesystem_boundary.restriction,
@@ -3968,7 +4377,7 @@ mod tests {
             ..CapabilityPolicy::default()
         };
 
-        let report = scope_report_for_tier(
+        let report = report_for(
             &policy,
             ContainmentClass::Advisory,
             EnforcementTier::KernelSealed,
@@ -3987,10 +4396,7 @@ mod tests {
             IoMaxReport::default(),
         );
 
-        assert_eq!(
-            report.enforcement_tier,
-            "mountns+pivot_root+landlock+seccomp"
-        );
+        assert_eq!(report.enforcement_tier, "landlock+seccomp");
         assert_eq!(report.achieved_containment, ContainmentClass::Advisory);
         assert_eq!(
             report.filesystem_boundary.restriction,
@@ -4080,10 +4486,11 @@ mod tests {
             let probe = crate::sandbox::HostProbe::probe();
             let host_tier = probe.tier();
             let runtime = tempfile::tempdir().unwrap();
-            let enforcement = crate::sandbox::ShellEnforcement::resolve(&policy, declared, probe)
-                .unwrap()
-                .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None);
-            let report = scope_report_for_tier(
+            let enforcement =
+                crate::sandbox::ShellEnforcement::resolve_declared(&policy, declared, probe)
+                    .unwrap()
+                    .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime.path()), None);
+            let report = report_for(
                 &policy,
                 declared,
                 host_tier,
@@ -4268,7 +4675,7 @@ mod tests {
                 "{row}"
             );
 
-            let scope = scope_report_for_tier(
+            let scope = report_for(
                 &CapabilityPolicy::default(),
                 declared,
                 tier,
@@ -4338,7 +4745,7 @@ mod tests {
             })
         );
 
-        let scope = scope_report_for_tier(
+        let scope = report_for(
             &CapabilityPolicy::default(),
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,

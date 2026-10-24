@@ -2411,7 +2411,10 @@ fn doctor_names_each_native_tool_and_the_mechanism_it_runs_under() {
     println!("{stdout}");
 
     // No floor is declared, so the tier is this host's capped at `advisory`'s.
-    let mechanism = capsule_runtime::applied_mechanism(murmur_artifact::ContainmentClass::Advisory);
+    let mechanism = capsule_runtime::applied_mechanism(
+        &capsule_runtime::HostProbe::probe(),
+        murmur_artifact::ContainmentClass::Advisory,
+    );
     let line = if mechanism == "none" {
         "  - local/tool-fixture@0.1.0: runs with no kernel confinement on this host (rlimits only)"
             .to_string()

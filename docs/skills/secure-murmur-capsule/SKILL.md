@@ -162,8 +162,9 @@ Consult the current containment reference and set a containment floor appropriat
 Keep these facts separate in the assessment:
 
 - **declared floor:** minimum enforcement requested by manifest, CLI, or workspace policy;
-- **achieved class:** what probing shows the host can support;
-- **installed mechanism:** what the capsule actually requested and ran under.
+- **achieved class:** the class the capsule's commands ran under (`achieved:` / `achieved_containment`);
+- **installed mechanism:** the enforcement tier those commands ran on (`mechanism:` / `enforcement_tier`);
+- **host ceiling:** what probing shows the host could support for a capsule declaring `sealed` (`host can back:` / `host_containment`).
 
 A stronger-capable host does not silently upgrade a weaker requested mechanism. A missing floor permits launch at the weakest class. Test on the production host class, outside any extra container boundary when determining what Murmur itself enforces.
 
@@ -188,7 +189,7 @@ Do not stop after editing YAML.
 1. Run the capsule on the target host type and capture stderr from staging onward.
 2. Inspect `MURMUR.md` for the inventory of model-visible shell commands and effective session context. It lives in the session's runtime directory (`$MURMUR_RUNTIME_DIR` in a shell command), which is removed when the session ends, so read it during the run; `mur run --explain-scope` prints a `Runtime directory` block saying whether the capsule's commands can change it on this host.
 3. Inspect behavior with `mur trace show` and `mur trace steps --verbose`; use `mur trace diff` when comparing pre- and post-hardening runs.
-4. Verify the achieved containment class and the mechanism actually installed, not only the class the host could support.
+4. Verify the achieved containment class and the mechanism actually installed, not the host ceiling: a capsule declaring less than `sealed` runs on the Landlock tier even on a host that could seal it.
 5. Exercise safe negative tests against each intended boundary: an unallowed host, a path outside scope, an unlisted binary, a stripped environment variable, and controlled resource-limit cases. A positive task succeeding proves functionality, not containment.
 6. Re-run the real workload and confirm that no removed capability is required. Add back only the narrowest capability supported by a concrete failure.
 

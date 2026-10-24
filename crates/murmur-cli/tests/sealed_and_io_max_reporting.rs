@@ -25,8 +25,13 @@ use common::ScriptedServer;
 const DRIVER_ANTHROPIC_NAME: &str = "local/murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
-/// A capsule that talks to `endpoint`, may run `echo`, and declares `containment`.
-fn write_agent_project(project_dir: &Path, endpoint: &str, containment: &str) -> PathBuf {
+/// A capsule that talks to `endpoint`, may run `binary`, and declares `containment`.
+fn write_agent_project(
+    project_dir: &Path,
+    endpoint: &str,
+    containment: &str,
+    binary: &str,
+) -> PathBuf {
     let manifest = project_dir.join("murmur.yaml");
     fs::write(
         &manifest,
@@ -35,7 +40,7 @@ fn write_agent_project(project_dir: &Path, endpoint: &str, containment: &str) ->
              artifacts:\n  - name: {DRIVER_ANTHROPIC_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
              \x20   gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
              capabilities:\n  containment: {containment}\n  network:\n    allow:\n      - {endpoint}\n\
-             \x20 shell:\n    allow:\n      - echo\n\
+             \x20 shell:\n    allow:\n      - {binary}\n\
              inference:\n  transport: http\n  model: test-model\n  \
              driver:\n    artifact: {DRIVER_ANTHROPIC_NAME}\n"
         ),
@@ -56,13 +61,13 @@ fn publish_driver(home: &TempDir) {
     common::publish_local(home, &artifact).success();
 }
 
-/// One scripted `tool_use` calling the `echo` tool with `command`, then a plain answer.
+/// One scripted `tool_use` calling the `binary` tool with `command`, then a plain answer.
 ///
-/// The tool name has to be `echo`: a capsule declaring `shell.allow: [echo]` is offered exactly
-/// that tool, and any other name is refused by the dispatcher without a subprocess ever being
-/// spawned — which would leave the scenario below asserting nothing about the composed root.
+/// The tool name has to be the allowlisted binary: a capsule declaring `shell.allow: [echo]` is
+/// offered exactly that tool, and any other name is refused by the dispatcher without a subprocess
+/// ever being spawned — which would leave a scenario asserting nothing about the mechanism.
 /// `command` is the argument list alone, without the binary name.
-fn echo_then_answer(command: &str) -> Vec<String> {
+fn call_then_answer(binary: &str, command: &str) -> Vec<String> {
     vec![
         json!({
             "id": "msg_1",
@@ -71,8 +76,8 @@ fn echo_then_answer(command: &str) -> Vec<String> {
             "model": "test-model",
             "content": [{
                 "type": "tool_use",
-                "id": "toolu_echo",
-                "name": "echo",
+                "id": "toolu_call",
+                "name": binary,
                 "input": {"command": command}
             }],
             "stop_reason": "tool_use",
@@ -130,6 +135,128 @@ fn session_start_grants(home: &TempDir, project_dir: &Path) -> Value {
 
 // ── Scenario A: a sealed verdict survives the first subprocess ────────────────
 
+/// One session of a capsule declaring `containment` that runs `ls /usr/lib` once: its
+/// `--explain-scope --json`, the tool result the provider received, and its `session_start`.
+#[cfg(target_os = "linux")]
+fn ls_usr_lib_under(containment: &str) -> (Value, String, Value) {
+    let server = ScriptedServer::start(call_then_answer("ls", "/usr/lib"));
+    let home = TempDir::new().unwrap();
+    publish_driver(&home);
+    let project = TempDir::new().unwrap();
+    let manifest = write_agent_project(project.path(), &server.endpoint, containment, "ls");
+
+    let report = common::explain_scope_json(&home, &manifest);
+    mur_run(&home, &manifest, "List /usr/lib.").success();
+    let tool_result = common::tool_result_text(&server.requests(), "toolu_call")
+        .expect("the provider received the ls call's result");
+
+    let trace_path = common::newest_session_records(home.path(), &project.path().join("workdir"))
+        .expect("the session wrote a records directory")
+        .join("trace.jsonl");
+    let session_start = fs::read_to_string(trace_path)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["event_type"] == "session_start")
+        .expect("every session writes a session_start");
+    (report, tool_result, session_start)
+}
+
+/// The exit code a shell tool result reports, from its `Exit code: N` line.
+#[cfg(target_os = "linux")]
+fn exit_code(tool_result: &str) -> i64 {
+    tool_result
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Exit code: "))
+        .and_then(|code| code.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no `Exit code:` line in {tool_result}"))
+}
+
+/// On a host that can back `sealed`, a capsule declaring `scoped` reports the class and tier its
+/// commands run on — `scoped` on `landlock+seccomp` — in `--explain-scope --json` and in
+/// `session_start`, and its `ls /usr/lib` is denied by Landlock. A capsule declaring `sealed` on
+/// the same host reports `sealed` on the composed root, where `/usr/lib` is bound and listable.
+/// Both report the host can back `sealed`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_scoped_capsule_on_a_sealed_host_reports_and_runs_on_landlock() {
+    let test = "a_scoped_capsule_on_a_sealed_host_reports_and_runs_on_landlock";
+    if common::skip_without_host_support(test) {
+        return;
+    }
+    let host =
+        capsule_runtime::detect_containment_decision(murmur_artifact::ContainmentClass::Sealed);
+    if host.0.achieved() != murmur_artifact::ContainmentClass::Sealed {
+        eprintln!(
+            "[SKIP-HOST] {test}: this host cannot back sealed ({})",
+            host.1
+                .map(|shortfall| shortfall.reason())
+                .unwrap_or_else(|| format!("it reaches {}", host.0.achieved()))
+        );
+        return;
+    }
+
+    let (report, tool_result, session_start) = ls_usr_lib_under("scoped");
+    assert_eq!(report["achieved_containment"], "scoped", "{report}");
+    assert_eq!(report["enforcement_tier"], "landlock+seccomp", "{report}");
+    assert_eq!(report["host_containment"], "sealed", "{report}");
+    assert_eq!(
+        report["filesystem_boundary"]["restriction"], "enforced",
+        "{report}"
+    );
+    assert_ne!(exit_code(&tool_result), 0, "{tool_result}");
+    assert!(
+        tool_result.contains("Permission denied"),
+        "Landlock denies listing /usr/lib to a scoped capsule: {tool_result}"
+    );
+    assert_eq!(
+        session_start["containment_achieved"], "scoped",
+        "{session_start}"
+    );
+    let grants = &session_start["effective_grants"];
+    for key in [
+        "achieved_containment",
+        "enforcement_tier",
+        "host_containment",
+    ] {
+        assert_eq!(grants[key], report[key], "{key}: {grants}");
+    }
+
+    let (report, tool_result, session_start) = ls_usr_lib_under("sealed");
+    assert_eq!(report["achieved_containment"], "sealed", "{report}");
+    assert_eq!(
+        report["enforcement_tier"], "mountns+pivot_root+landlock+seccomp",
+        "{report}"
+    );
+    assert_eq!(report["host_containment"], "sealed", "{report}");
+    assert_eq!(
+        report["filesystem_boundary"]["restriction"], "absent",
+        "{report}"
+    );
+    assert_eq!(exit_code(&tool_result), 0, "{tool_result}");
+    let listing = tool_result
+        .split_once("Stdout:")
+        .and_then(|(_, rest)| rest.split_once("Stderr:"))
+        .map(|(stdout, _)| stdout.trim())
+        .unwrap_or_default();
+    assert!(
+        !listing.is_empty(),
+        "the composed root binds /usr and lists it: {tool_result}"
+    );
+    assert_eq!(
+        session_start["containment_achieved"], "sealed",
+        "{session_start}"
+    );
+    let grants = &session_start["effective_grants"];
+    for key in [
+        "achieved_containment",
+        "enforcement_tier",
+        "host_containment",
+    ] {
+        assert_eq!(grants[key], report[key], "{key}: {grants}");
+    }
+}
+
 /// The probe rehearses the whole composed-root shape through `pivot_root(2)`, so the launch
 /// verdict and the first subprocess cannot disagree.
 ///
@@ -142,12 +269,12 @@ fn a_sealed_verdict_survives_the_first_subprocess() {
     if common::skip_without_host_support("a_sealed_verdict_survives_the_first_subprocess") {
         return;
     }
-    let server = ScriptedServer::start(echo_then_answer("sealed-subprocess-ran"));
+    let server = ScriptedServer::start(call_then_answer("echo", "sealed-subprocess-ran"));
     let home = TempDir::new().unwrap();
     publish_driver(&home);
 
     let project = TempDir::new().unwrap();
-    let manifest = write_agent_project(project.path(), &server.endpoint, "sealed");
+    let manifest = write_agent_project(project.path(), &server.endpoint, "sealed", "echo");
 
     let report = common::explain_scope_json(&home, &manifest);
     let achieved = report["achieved_containment"].as_str().unwrap().to_string();
@@ -210,7 +337,7 @@ fn run_and_observe(
     home: &TempDir,
     server: &ScriptedServer,
 ) -> IoMaxObservation {
-    let manifest = write_agent_project(project_dir, &server.endpoint, "advisory");
+    let manifest = write_agent_project(project_dir, &server.endpoint, "advisory", "echo");
     let explained = common::explain_scope_json(home, &manifest)["io_max"].clone();
     let assertion = mur_run(home, &manifest, "Say something.").success();
     IoMaxObservation {

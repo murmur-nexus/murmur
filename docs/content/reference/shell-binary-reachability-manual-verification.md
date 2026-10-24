@@ -70,7 +70,7 @@ as `Execute` coverage. None of them touches a kernel boundary.
 
 * Linux, kernel ≥ 5.13, with a usable Landlock ABI, unprivileged user namespaces, and the shipped
   `mur-sealed` AppArmor profile installed — i.e. a host that actually reports
-  `achieved_containment: sealed`. Containers routinely mask this.
+  `host_containment: sealed`. Containers routinely mask this.
 * A real `gcc`/`cc` install, and a real Python with a **user-site** `pip` at `~/.local/bin/pip`
   (not a `/usr` one — the whole point of step 1 is a script outside `SEALED_RUNTIME_PATHS`).
 * A checkout of this repository and a working `cargo` (plus `libseccomp-dev`).
@@ -109,8 +109,9 @@ $ mur run --manifest murmur.yaml --explain-scope --json
 {"declared_containment":"advisory","achieved_containment":"sealed","floor_met":true,"enforcement_tier":"mountns+pivot_root+landlock+seccomp","filesystem_scope":null,"workdir_exec":false,"network_allow":[],"unix_sockets":false,"shell_allow":[],"spawn_allow":[],"env_allow":[],"interpreter_runtime_grants":[],"staged_runtime_grants":[]}
 ```
 
-`"achieved_containment":"sealed"` is the gate. Anything else and **steps 3–4 prove nothing** on
-this machine; stop and find another host.
+`"host_containment":"sealed"` is the gate. The recorded output above predates that field and
+carries the host's class in `achieved_containment`; a current `mur` reports this `advisory` capsule
+as `achieved_containment: scoped`, `enforcement_tier: landlock+seccomp`. Anything else and **steps 3–4 prove nothing** on this machine; stop and find another host.
 
 Build the CLI once, for steps 1 and 2:
 

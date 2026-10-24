@@ -150,17 +150,17 @@ pub(crate) fn tier_from_probe(
     }
 }
 
-/// The tier this *session* actually applies, which is never stronger than the host can back and
-/// never stronger than the capsule asked for.
+/// The tier a session applies on a host whose tier is `host_tier`: never stronger than the host
+/// can back and never stronger than the capsule asked for.
 ///
-/// A capsule declaring `scoped` on a sealed-capable host keeps running exactly as it does today:
-/// the composed root would otherwise silently delete host paths its `interpreter_runtime` grants
-/// legitimately point at — a narrowing of `scoped`'s behaviour, not added security. The
-/// declared floor is honoured, not merely met.
+/// A capsule declaring less than `sealed` on a sealed-capable host runs on
+/// [`EnforcementTier::KernelFull`]: the composed root would otherwise delete host paths its
+/// `interpreter_runtime` grants legitimately point at — a narrowing of `scoped`'s behaviour, not
+/// added security. The declared floor is honoured, not merely met.
 ///
-/// It is deliberately *not* symmetric with the achieved class recorded in the trace: `achieved`
-/// answers "what can this host back" (a host fact) and is probed independently, while this answers
-/// "what did this session install" (a session fact).
+/// Called only by [`crate::containment::ContainmentDecision::decide`], which reads the session's
+/// achieved class off the tier this returns, so the class a report names and the tier the
+/// session's commands run on are one decision.
 pub(crate) fn applied_tier(
     host_tier: EnforcementTier,
     declared: murmur_artifact::ContainmentClass,
@@ -319,11 +319,9 @@ impl HostProbe {
     }
 }
 
-/// The tier this host can back, from a reading taken here.
-///
-/// Answers a standalone host question — `mur doctor` and the escape-conformance harness ask it.
-/// A *session* must not: it reads its own [`HostProbe`] so its refusal, its trace and the
-/// mechanisms it installs describe one host at one moment.
+/// The tier this host can back, from a reading taken here. The seam the kernel tests resolve the
+/// host they run on through; a session reads its own [`HostProbe`].
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn detect_enforcement_tier() -> EnforcementTier {
     HostProbe::probe().tier()
 }
@@ -2313,18 +2311,20 @@ impl ShellEnforcement {
     /// policy), while the cgroup scope and workdir guard are session-scoped live handles the
     /// caller creates and attaches with [`Self::with_host_bounding`].
     ///
-    /// `declared` is the already-combined containment floor for the session. It is what decides
-    /// whether a sealed-capable host actually installs a composed root — see [`applied_tier`].
+    /// `decision` is the session's [`crate::containment::ContainmentDecision`], and its applied
+    /// tier is the one installed: whether a sealed-capable host builds a composed root is decided
+    /// there, from the declared floor, so the tier installed here is the one the session's trace
+    /// names.
     ///
-    /// `probe` is the session's own [`HostProbe`], taken by `runtime::stage_session` and carried
-    /// on the `StagedSession`. Passed in rather than taken here so the mechanisms this installs
-    /// are the ones the session's trace already claims.
+    /// `probe` is the reading `decision` was made from — for a session, the [`HostProbe`]
+    /// `runtime::stage_session` took and carried on the `StagedSession` — and supplies the
+    /// kernel's Landlock ABI.
     pub(crate) fn resolve(
         policy: &CapabilityPolicy,
-        declared: murmur_artifact::ContainmentClass,
+        decision: &crate::containment::ContainmentDecision,
         probe: HostProbe,
     ) -> Result<Self, String> {
-        let tier = applied_tier(probe.tier(), declared);
+        let tier = decision.applied_tier();
         let network_allow_ips = resolve_network_allowlist_ips(&policy.network_allow)?;
         let network_allow_rules =
             crate::network_policy::parse_network_allow_rules(&policy.network_allow)
@@ -2380,6 +2380,23 @@ impl ShellEnforcement {
             runtime_dir_owner: None,
             temp_mapping: crate::temp_dir::tier_temp_mapping(tier),
         })
+    }
+
+    /// [`Self::resolve`] for a capsule declaring `declared`, decided from `probe` with the
+    /// runtime directory outside the workdir: the seam tests resolve an enforcement through.
+    #[cfg(test)]
+    pub(crate) fn resolve_declared(
+        policy: &CapabilityPolicy,
+        declared: murmur_artifact::ContainmentClass,
+        probe: HostProbe,
+    ) -> Result<Self, String> {
+        let decision = crate::containment::ContainmentDecision::decide(
+            probe.tier(),
+            declared,
+            policy.workdir_exec_allowed,
+            false,
+        );
+        Self::resolve(policy, &decision, probe)
     }
 
     /// Attach the session's runtime directory, and with `owner` the directory itself, so a
@@ -5805,6 +5822,32 @@ mod tests {
         }
     }
 
+    /// `mur doctor`'s native-tool mechanism is read from the decision on the reading it is handed:
+    /// on a sealed-capable reading a capsule declaring `scoped` runs its native tools on
+    /// `landlock+seccomp` and one declaring `sealed` on the composed root.
+    #[test]
+    fn doctor_reads_the_decision_from_the_probe_it_is_handed() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let sealed_host = HostProbe::from_parts(Some(true), sealed_capable());
+        assert_eq!(sealed_host.tier(), EnforcementTier::KernelSealed);
+        assert_eq!(
+            crate::containment::applied_mechanism(
+                &sealed_host,
+                murmur_artifact::ContainmentClass::Scoped
+            ),
+            "landlock+seccomp"
+        );
+        assert_eq!(
+            crate::containment::applied_mechanism(
+                &sealed_host,
+                murmur_artifact::ContainmentClass::Sealed
+            ),
+            "mountns+pivot_root+landlock+seccomp"
+        );
+    }
+
     /// A probe that learned nothing: no Landlock answer and a namespace probe that could not run.
     /// The reading a host gives when neither half of the probe could run.
     fn unprobed() -> HostProbe {
@@ -6205,7 +6248,7 @@ mod tests {
     fn ruleset_landlock_abi_reaches_shell_enforcement_from_the_probe() {
         let negative = unprobed();
         for abi in [None, Some(1), Some(8)] {
-            let enforcement = ShellEnforcement::resolve(
+            let enforcement = ShellEnforcement::resolve_declared(
                 &CapabilityPolicy::default(),
                 murmur_artifact::ContainmentClass::Advisory,
                 negative.clone().with_landlock_kernel_abi(abi),
@@ -6222,7 +6265,7 @@ mod tests {
         }
         if cfg!(target_os = "linux") {
             let full = HostProbe::from_parts(Some(true), sealed_incapable());
-            let enforcement = ShellEnforcement::resolve(
+            let enforcement = ShellEnforcement::resolve_declared(
                 &CapabilityPolicy::default(),
                 murmur_artifact::ContainmentClass::Scoped,
                 full.with_landlock_kernel_abi(Some(8)),
@@ -6484,7 +6527,7 @@ mod tests {
         let policy = CapabilityPolicy::default();
         let usr = PathBuf::from("/usr");
 
-        let scoped = ShellEnforcement::resolve(
+        let scoped = ShellEnforcement::resolve_declared(
             &policy,
             murmur_artifact::ContainmentClass::Scoped,
             HostProbe::probe(),
@@ -6497,7 +6540,7 @@ mod tests {
              unenumerable there",
         );
 
-        let sealed = ShellEnforcement::resolve(
+        let sealed = ShellEnforcement::resolve_declared(
             &policy,
             murmur_artifact::ContainmentClass::Sealed,
             HostProbe::probe(),
@@ -6604,7 +6647,7 @@ mod tests {
                 .any(|entry| Path::new(entry.path) == grant.path)
         };
 
-        let scoped = ShellEnforcement::resolve(
+        let scoped = ShellEnforcement::resolve_declared(
             &policy,
             murmur_artifact::ContainmentClass::Scoped,
             HostProbe::probe(),
@@ -6617,7 +6660,7 @@ mod tests {
              neighbours must not become readable there",
         );
 
-        let sealed = ShellEnforcement::resolve(
+        let sealed = ShellEnforcement::resolve_declared(
             &policy,
             murmur_artifact::ContainmentClass::Sealed,
             HostProbe::probe(),
@@ -9109,7 +9152,7 @@ mod linux_integration_tests {
             return None;
         }
         let probe = HostProbe::probe();
-        let enforcement = ShellEnforcement::resolve(
+        let enforcement = ShellEnforcement::resolve_declared(
             policy,
             murmur_artifact::ContainmentClass::Scoped,
             probe.clone(),
@@ -9798,7 +9841,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             ..CapabilityPolicy::default()
         };
         let runtime = tempfile::tempdir().unwrap();
-        let enforcement = ShellEnforcement::resolve(
+        let enforcement = ShellEnforcement::resolve_declared(
             &policy,
             murmur_artifact::ContainmentClass::Sealed,
             probe.clone(),
@@ -10533,7 +10576,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
 
     /// A session's enforcement, resolved as `stage_session` resolves a `scoped` capsule's.
     fn session_enforcement(policy: &CapabilityPolicy) -> ShellEnforcement {
-        let enforcement = ShellEnforcement::resolve(
+        let enforcement = ShellEnforcement::resolve_declared(
             policy,
             murmur_artifact::ContainmentClass::Scoped,
             HostProbe::probe(),
@@ -10752,7 +10795,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             shell_allow: vec!["bash".to_string(), "grep".to_string()],
             ..CapabilityPolicy::default()
         };
-        let enforcement = ShellEnforcement::resolve(
+        let enforcement = ShellEnforcement::resolve_declared(
             &policy,
             murmur_artifact::ContainmentClass::Scoped,
             HostProbe::probe(),
@@ -11113,7 +11156,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         }
         let probe = HostProbe::probe();
         let mount_namespace_usable = probe.mount_namespace_usable();
-        let enforcement = ShellEnforcement::resolve(policy, class, probe)
+        let enforcement = ShellEnforcement::resolve_declared(policy, class, probe)
             .unwrap()
             .with_runtime_dir(test_runtime_dir(base), None);
         let mapping =
@@ -11167,10 +11210,13 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         )
         .with_landlock_kernel_abi(live.landlock_kernel_abi());
         assert!(!probe.mount_namespace_usable());
-        let enforcement =
-            ShellEnforcement::resolve(policy, murmur_artifact::ContainmentClass::Scoped, probe)
-                .unwrap()
-                .with_runtime_dir(test_runtime_dir(base), None);
+        let enforcement = ShellEnforcement::resolve_declared(
+            policy,
+            murmur_artifact::ContainmentClass::Scoped,
+            probe,
+        )
+        .unwrap()
+        .with_runtime_dir(test_runtime_dir(base), None);
         assert_eq!(enforcement.tier, EnforcementTier::KernelFull);
         let mapping = crate::temp_dir::temp_mapping(enforcement.tier, false, workdir);
         assert_eq!(
@@ -11811,10 +11857,13 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         let policy = derived_interpreter_policy("python3", &work);
         assert_derives_stdlib_and_sqlite(&policy);
         let runtime = tempfile::tempdir().unwrap();
-        let enforcement =
-            ShellEnforcement::resolve(&policy, murmur_artifact::ContainmentClass::Sealed, probe)
-                .expect("a sealed-capable host resolves sealed enforcement")
-                .with_runtime_dir(test_runtime_dir(runtime.path()), None);
+        let enforcement = ShellEnforcement::resolve_declared(
+            &policy,
+            murmur_artifact::ContainmentClass::Sealed,
+            probe,
+        )
+        .expect("a sealed-capable host resolves sealed enforcement")
+        .with_runtime_dir(test_runtime_dir(runtime.path()), None);
         assert_eq!(enforcement.tier, EnforcementTier::KernelSealed);
 
         let imported = execute(

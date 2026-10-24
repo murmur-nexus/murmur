@@ -917,7 +917,10 @@ fn a_registration_failure_names_the_daemon_and_the_reason() {
 fn a_sealed_child_either_achieves_its_floor_or_is_refused() {
     let parent = Parent::new();
     let host_reaches_sealed =
-        capsule_runtime::detect_achieved_containment() == murmur_artifact::ContainmentClass::Sealed;
+        capsule_runtime::detect_containment_decision(murmur_artifact::ContainmentClass::Sealed)
+            .0
+            .achieved()
+            == murmur_artifact::ContainmentClass::Sealed;
 
     match parent.try_launch("local/child-sealed", &[]) {
         Ok(mut child) => {
@@ -942,6 +945,11 @@ fn a_sealed_child_either_achieves_its_floor_or_is_refused() {
                 session_start["effective_grants"]["achieved_containment"], "sealed",
                 "{session_start}"
             );
+            assert_eq!(
+                session_start["effective_grants"]["enforcement_tier"],
+                "mountns+pivot_root+landlock+seccomp",
+                "{session_start}"
+            );
             child.shutdown().unwrap();
         }
         Err(error) => {
@@ -960,6 +968,56 @@ fn a_sealed_child_either_achieves_its_floor_or_is_refused() {
             );
         }
     }
+}
+
+/// A child declaring no floor stages through `mur run` like any session, so its trace names the
+/// class and tier its own decision reached — on a sealed-capable host `scoped` on
+/// `landlock+seccomp`, never the `sealed` the host could back for a capsule asking for it.
+#[test]
+fn an_undeclared_child_reports_the_tier_its_commands_run_on() {
+    let parent = Parent::new();
+    let (expected, _) =
+        capsule_runtime::detect_containment_decision(murmur_artifact::ContainmentClass::Advisory);
+
+    let mut child = parent
+        .try_launch("local/child-agent", &[])
+        .expect("an advisory child launches on every host");
+    let trace = trace_of(&child);
+    wait_for("the child's trace", Duration::from_secs(30), || {
+        trace.is_file()
+            && std::fs::read_to_string(&trace)
+                .unwrap()
+                .contains("session_start")
+    });
+    let session_start: Value = std::fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["event_type"] == "session_start")
+        .expect("the child's trace records a session_start");
+    let grants = &session_start["effective_grants"];
+    assert_eq!(
+        session_start["containment_achieved"],
+        expected.achieved().to_string(),
+        "{session_start}"
+    );
+    assert_eq!(
+        grants["achieved_containment"],
+        expected.achieved().to_string(),
+        "{session_start}"
+    );
+    assert_eq!(
+        grants["enforcement_tier"],
+        expected.enforcement_tier(),
+        "{session_start}"
+    );
+    assert_eq!(
+        grants["host_containment"],
+        expected.host_containment().to_string(),
+        "{session_start}"
+    );
+    assert_ne!(grants["achieved_containment"], "sealed", "{session_start}");
+    child.shutdown().unwrap();
 }
 
 // ── 7. The naming rule ────────────────────────────────────────────────────────

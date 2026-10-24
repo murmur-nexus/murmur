@@ -643,12 +643,14 @@ fn report_home_unusable(error: &capsule_runtime::HomeUnusable) {
 fn report_preopens(
     runtime_manifest: &murmur_artifact::RuntimeManifest,
     project_root: &Path,
+    host_probe: &HostProbe,
     declared_floor: murmur_artifact::ContainmentClass,
 ) {
     capsule_runtime::report_println!("Filesystem preopens");
     let lock = read_optional_lockfile(project_root).ok().flatten();
-    let runtime_dir_protected = doctor_runtime_dir(declared_floor, &project_root.join("workdir"))
-        .is_ok_and(|reports| reports.runtime_dir.read_only_to_commands);
+    let runtime_dir_protected =
+        doctor_runtime_dir(host_probe, declared_floor, &project_root.join("workdir"))
+            .is_ok_and(|reports| reports.runtime_dir.read_only_to_commands);
     match preopen_reports(runtime_manifest.artifacts.iter().map(|artifact| {
         (
             artifact.name.as_str(),
@@ -1859,8 +1861,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         .and_then(|caps| caps.spawn.as_ref())
         .is_some_and(|spawn| !spawn.allow.is_empty());
     let can_spawn_subprocess = has_subprocess_route_at_staging(&capability_policy);
-    // One reading of the host's namespaces for the whole checklist: the `E-CAP-005` warnings and
-    // the `AppArmor / user namespaces` block below cannot describe two different hosts.
+    // One reading of the host for the whole checklist: the `E-CAP-005` warnings, the `AppArmor /
+    // user namespaces` block, the native tools' mechanism and the runtime directory sections below
+    // cannot describe two different hosts.
     let host_probe = HostProbe::probe();
     let egress_failure = host_probe.egress_namespace_failure();
     if let Some(warning) = egress_namespace_warning(can_spawn_subprocess, egress_failure.as_ref()) {
@@ -1895,7 +1898,12 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // the same reason the block above is: it is a property of the manifest, not of any one
     // artifact's presence in a store, and it is the question `capabilities.filesystem.scope` at
     // the capsule level does not answer.
-    report_preopens(&runtime_manifest, &project_root, declared_floor);
+    report_preopens(
+        &runtime_manifest,
+        &project_root,
+        &host_probe,
+        declared_floor,
+    );
 
     // The `read_only` declaration and whether it is enforced or advisory, through the renderer
     // `--explain-scope` prints from, for the reason `report_preopens` shares `PreopenReport::render`.
@@ -2216,7 +2224,10 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         capsule_runtime::report_println!();
         capsule_runtime::report_print!(
             "{}",
-            render_native_tools(&native_tools, applied_mechanism(declared_floor))
+            render_native_tools(
+                &native_tools,
+                applied_mechanism(&host_probe, declared_floor)
+            )
         );
         // The half of the E-CAP-005 check above that needed this loop: a capsule whose only
         // subprocess route is a native tool.
@@ -2232,7 +2243,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // `<manifest dir>/workdir`. A `HOME` that cannot hold them is a failed check: no launch here
     // would start.
     capsule_runtime::report_println!();
-    match doctor_runtime_dir(declared_floor, &project_root.join("workdir")) {
+    match doctor_runtime_dir(&host_probe, declared_floor, &project_root.join("workdir")) {
         Ok(reports) => {
             capsule_runtime::report_print!("{}", render_runtime_dir(&reports.runtime_dir));
             capsule_runtime::report_println!();
@@ -2296,6 +2307,30 @@ mod tests {
             ),
             "{unconfined}"
         );
+    }
+
+    /// The mechanism the block names is the tier the declared class runs on, read from one probe:
+    /// a capsule declaring `scoped` never runs its native tools inside a composed root, and on a
+    /// sealed-capable host one declaring `sealed` does while one declaring `scoped` runs on
+    /// `landlock+seccomp`.
+    #[test]
+    fn the_native_tools_block_names_the_tier_the_declared_class_runs_on() {
+        let probe = HostProbe::probe();
+        let tools = vec!["local/tool-fixture@0.1.0".to_string()];
+        let scoped_mechanism = applied_mechanism(&probe, murmur_artifact::ContainmentClass::Scoped);
+        let sealed_mechanism = applied_mechanism(&probe, murmur_artifact::ContainmentClass::Sealed);
+        let scoped = render_native_tools(&tools, scoped_mechanism);
+        let sealed = render_native_tools(&tools, sealed_mechanism);
+        assert!(!scoped.contains("mountns+pivot_root"), "{scoped}");
+        if sealed_mechanism == "mountns+pivot_root+landlock+seccomp" {
+            assert!(
+                sealed.contains("runs under mountns+pivot_root+landlock+seccomp"),
+                "{sealed}"
+            );
+            assert!(scoped.contains("runs under landlock+seccomp"), "{scoped}");
+        } else {
+            assert_eq!(scoped, sealed);
+        }
     }
 
     /// A namespace creation refused because the kernel has no user namespaces left to give.

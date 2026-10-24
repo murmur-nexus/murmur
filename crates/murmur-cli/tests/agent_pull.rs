@@ -1453,7 +1453,9 @@ fn s11_a_pulled_native_tool_is_confined_like_a_declared_one() {
         return;
     }
     let floor = murmur_artifact::ContainmentClass::Scoped;
-    let achieved = capsule_runtime::detect_achieved_containment();
+    let achieved = capsule_runtime::detect_containment_decision(floor)
+        .0
+        .achieved();
     if achieved < floor {
         eprintln!("[SKIP-HOST] {test}: this host reaches {achieved}, the test needs {floor}");
         return;

@@ -232,6 +232,7 @@ mur run --explain-scope
 Containment
   declared:  advisory
   achieved:  scoped
+  host can back: sealed
   floor met: yes
   mechanism: landlock+seccomp
   covers:    shell commands, plan shell steps, native tools
@@ -279,9 +280,12 @@ from, and is `n/a` off Linux. See
 domain is installed. Below 2, moving a file between two folders of the workdir fails with `EXDEV`.
 See [Which Landlock ABI the ruleset is built at](../reference/containment.md#landlock-abi).
 
-`mechanism:` is a stable name for the kernel enforcement the host actually provides:
+`mechanism:` is a stable name for the kernel enforcement this capsule's commands run under: the
+strongest the host provides, capped by the declared class. Only a capsule declaring `sealed` runs on
+the composed root; on the same host every other capsule runs on `landlock+seccomp`, as above.
+`host can back:` names the class the host could provide to a capsule declaring `sealed`.
 
-| `mechanism` | Achieved class | What the host provides |
+| `mechanism` | Achieved class | What the capsule's commands run under |
 |---|---|---|
 | `mountns+pivot_root+landlock+seccomp` | `sealed` | Private mount namespace pivoted onto a composed root, with Landlock and seccomp inside it |
 | `landlock+seccomp` | `scoped` | Landlock filesystem mediation plus the seccomp syscall allowlist over the host filesystem |

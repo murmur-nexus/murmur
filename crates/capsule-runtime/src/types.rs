@@ -690,24 +690,26 @@ pub struct StagedSession {
     pub(crate) bind_addr: String,
     /// Internal port from the manifest (copied from StageRequest::internal_port).
     pub(crate) internal_port: Option<u16>,
-    /// Floor this session was staged against (copied from
-    /// StageRequest::declared_containment_floor).
-    pub(crate) declared_containment_floor: murmur_artifact::ContainmentClass,
+    /// This session's containment, decided once by `stage_session` from [`Self::host_probe`],
+    /// `StageRequest::declared_containment_floor`, `workdir_exec` and where the runtime directory
+    /// lies. The floor refusal, [`Self::scope_report`], [`Self::temp_mapping`], `MURMUR.md`'s exec
+    /// facts and the tier `launch_session`'s `sandbox::ShellEnforcement::resolve` installs all
+    /// read it, so the class and tier the session reports are the ones its commands run on.
+    pub(crate) containment: crate::containment::ContainmentDecision,
     /// The complete effective grant set this session was staged with — the same report
     /// `mur run --explain-scope --json` prints, built by `containment::scope_report_for_tier`
-    /// from this session's own policy, declared floor and single host probe. Written verbatim to
+    /// from this session's own policy and [`Self::containment`]. Written verbatim to
     /// `trace.jsonl`'s `session_start` as `effective_grants`, and the source of the
     /// `containment_declared`/`containment_achieved`/`workdir_exec` fields alongside it, so the
     /// summary and the full report cannot disagree.
     ///
-    /// Replaces a former separate `achieved_containment` field: what the host actually provided
-    /// is `scope_report.achieved_containment`, and keeping a second copy beside it only created a
-    /// way for the two to drift.
+    /// The session's class here, `scope_report.achieved_containment`, is copied from
+    /// [`Self::containment`] when the report is built, so the two cannot drift.
     pub(crate) scope_report: crate::containment::ScopeReport,
     /// The single host reading this session was staged against, taken at the top of
-    /// `runtime::stage_session`. `launch_session` passes it to `sandbox::ShellEnforcement::resolve`
-    /// rather than taking a new one, so the mechanisms installed at launch are the ones
-    /// [`Self::scope_report`] already claims.
+    /// `runtime::stage_session`, which [`Self::containment`] was decided from. `launch_session`
+    /// passes both to `sandbox::ShellEnforcement::resolve` rather than taking a new reading, so the
+    /// mechanisms installed at launch are the ones [`Self::scope_report`] already claims.
     pub(crate) host_probe: crate::sandbox::HostProbe,
     /// Whether a literal `/tmp` reaches the session's temporary folder, decided once by
     /// `stage_session` from [`Self::host_probe`]: [`Self::scope_report`]'s `temp_dir` says it and
