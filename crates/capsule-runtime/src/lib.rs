@@ -50,6 +50,7 @@ pub mod host_warnings;
 pub(crate) mod http_client;
 pub(crate) mod identity;
 pub(crate) mod inference_import;
+pub(crate) mod inference_retry;
 pub(crate) mod install_grant;
 pub(crate) mod interpreter_runtime;
 pub mod lanes;

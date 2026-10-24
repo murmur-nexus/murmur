@@ -322,6 +322,12 @@ struct InferenceEvent {
     /// are told apart by `max_output_tokens`.
     #[serde(default)]
     driver_config: Option<serde_json::Value>,
+    /// How many attempts the call took, written only when it took more than one.
+    #[serde(default)]
+    attempts: Option<u32>,
+    /// Why a call whose last attempt failed transiently was not made again.
+    #[serde(default)]
+    retry_stopped: Option<String>,
 }
 
 impl InferenceEvent {
@@ -331,7 +337,20 @@ impl InferenceEvent {
             error_code: code.clone(),
             error: self.error.clone().unwrap_or_default(),
             provider_status: self.provider_status,
+            retry: self.retry_suffix(),
         })
+    }
+
+    /// `  attempts N` and `  retry stopped: <reason>`, each when the record carries it.
+    fn retry_suffix(&self) -> String {
+        let mut suffix = String::new();
+        if let Some(attempts) = self.attempts {
+            suffix.push_str(&format!("  attempts {attempts}"));
+        }
+        if let Some(stopped) = &self.retry_stopped {
+            suffix.push_str(&format!("  retry stopped: {stopped}"));
+        }
+        suffix
     }
 
     /// A failed call of the agent loop's own: recorded on its turn, never counted as one.
@@ -351,6 +370,8 @@ struct FailedCall {
     error_code: String,
     error: String,
     provider_status: Option<u16>,
+    /// [`InferenceEvent::retry_suffix`] of the record.
+    retry: String,
 }
 
 impl FailedCall {
@@ -745,6 +766,46 @@ struct ToolInputRefusedEvent {
     missing: Vec<String>,
 }
 
+/// A driver call failed transiently and was made again. The call's one `inference` line follows
+/// its last attempt.
+#[derive(Debug, Deserialize)]
+struct InferenceRetryEvent {
+    #[serde(default)]
+    turn: u32,
+    /// The attempt that failed, 1-based.
+    attempt: u32,
+    max_retries: u32,
+    /// `"status"`, `"connection"` or `"driver"`.
+    reason: String,
+    #[serde(default)]
+    provider_status: Option<u16>,
+    delay_ms: u64,
+    /// `hook:<name>` for a hook's `run-inference` call; absent for an agent-loop turn.
+    #[serde(default)]
+    origin: Option<String>,
+}
+
+impl InferenceRetryEvent {
+    /// `inference_retry  attempt 1 of 7  HTTP 429  wait 1.2s`: the attempt out of every attempt
+    /// the call may make, the status or else the reason, the wait, and a hook's origin.
+    fn row(&self) -> String {
+        let cause = match self.provider_status {
+            Some(status) => format!("HTTP {status}"),
+            None => self.reason.clone(),
+        };
+        format!(
+            "inference_retry  attempt {} of {}  {cause}  wait {}{}",
+            self.attempt,
+            self.max_retries.saturating_add(1),
+            fmt_dur(self.delay_ms),
+            self.origin
+                .as_deref()
+                .map(|origin| format!("  {origin}"))
+                .unwrap_or_default()
+        )
+    }
+}
+
 /// A spend ceiling refused a driver call before it was sent. There is no `inference` line for a
 /// refused call.
 #[derive(Debug, Deserialize)]
@@ -1046,6 +1107,7 @@ enum TraceEvent {
     PlanStep(PlanStepEvent),
     PlanEnd(PlanEndEvent),
     SpendCeilingReached(SpendCeilingReachedEvent),
+    InferenceRetry(InferenceRetryEvent),
     HarnessWarning(HarnessWarningEvent),
     HarnessFailed(HarnessFailedEvent),
     HarnessInterrupt(HarnessInterruptEvent),
@@ -1333,6 +1395,8 @@ struct TraceMetrics {
     tool_call_records: Vec<ToolCallRecord>,
     redundant_calls: Vec<RedundantCallRecord>,
     inference_records: Vec<InferenceRecord>,
+    /// Every retry, as its row reads, beside the turn it was made on.
+    retries: Vec<(u32, String)>,
     provider_tokens: Option<ProviderTokens>,
     total_shell_calls: u32,
     shell_exit_codes: HashMap<i32, u32>,
@@ -2191,6 +2255,7 @@ fn compute_metrics(
     // plan-driven run and an ad-hoc run are measured on one efficiency axis, not two.
     let mut resource_last_access: HashMap<String, CallSite> = HashMap::new();
     let mut inference_records: Vec<InferenceRecord> = Vec::new();
+    let mut retries: Vec<(u32, String)> = Vec::new();
     let mut provider_tokens: Option<ProviderTokens> = None;
     let mut shell_exit_codes: HashMap<i32, u32> = HashMap::new();
     let mut shell_latencies: Vec<u64> = Vec::new();
@@ -2570,6 +2635,7 @@ fn compute_metrics(
             }
             // Rendered in the step list; the summary has no spend section.
             TraceEvent::SpendCeilingReached(_) => {}
+            TraceEvent::InferenceRetry(e) => retries.push((e.turn, e.row())),
             TraceEvent::ControlChange(change) => control_changes.push(ControlChangeRecord {
                 change,
                 applied_turn: None,
@@ -2661,6 +2727,7 @@ fn compute_metrics(
             tool_call_records,
             redundant_calls,
             inference_records,
+            retries,
             provider_tokens,
             total_shell_calls: se.total_shell_calls,
             shell_exit_codes,
@@ -3117,6 +3184,9 @@ fn print_show(m: &TraceMetrics) {
     );
     if let Some(line) = continued_line(&m.continuations) {
         capsule_runtime::report_println!("{line}");
+    }
+    for (turn, row) in &m.retries {
+        capsule_runtime::report_println!("retry:      turn {turn}  {row}");
     }
     for line in failed_call_lines(&m.inference_records) {
         capsule_runtime::report_println!("{line}");
@@ -4376,17 +4446,29 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             // ran inside.
             Some(origin) => match e.failure() {
                 Some(failure) => format!(
-                    "{}{}  {}  {}",
+                    "{}{}  {}  {}{}",
                     kind("inference"),
                     origin,
                     e.decision,
-                    failure.label()
+                    failure.label(),
+                    failure.retry
                 ),
-                None => format!("{}{}  {}", kind("inference"), origin, e.decision),
+                None => format!(
+                    "{}{}  {}{}",
+                    kind("inference"),
+                    origin,
+                    e.decision,
+                    e.retry_suffix()
+                ),
             },
             None => {
                 if let Some(failure) = e.failure() {
-                    return Some(format!("turn {}  error  {}", e.turn, failure.label()));
+                    return Some(format!(
+                        "turn {}  error  {}{}",
+                        e.turn,
+                        failure.label(),
+                        failure.retry
+                    ));
                 }
                 // A turn the provider cut off at the output cap, named on the line rather than
                 // left to be read out of the raw event.
@@ -4401,12 +4483,16 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
                     (Some(choice), None) => format!("  on {choice}"),
                     _ => String::new(),
                 };
+                let retried = e.retry_suffix();
                 match &e.tool_name {
                     Some(tool) => format!(
-                        "turn {}  {}  {}{}{}",
-                        e.turn, e.decision, tool, capped, served
+                        "turn {}  {}  {}{}{}{}",
+                        e.turn, e.decision, tool, capped, served, retried
                     ),
-                    None => format!("turn {}  {}{}{}", e.turn, e.decision, capped, served),
+                    None => format!(
+                        "turn {}  {}{}{}{}",
+                        e.turn, e.decision, capped, served, retried
+                    ),
                 }
             }
         },
@@ -4606,6 +4692,7 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.tool_name,
             e.missing.join(", ")
         ),
+        TraceEvent::InferenceRetry(e) => e.row(),
         TraceEvent::SpendCeilingReached(e) => format!(
             "{}{}  used {} of {}  needs {}{}",
             kind("spend_ceiling_reached"),
@@ -5169,9 +5256,10 @@ fn failed_call_lines(records: &[InferenceRecord]) -> Vec<String> {
             .map(|origin| format!("{origin}  "))
             .unwrap_or_default();
         lines.push(format!(
-            "failed:     turn {}  {origin}{}",
+            "failed:     turn {}  {origin}{}{}",
             rec.turn,
-            failure.label()
+            failure.label(),
+            failure.retry
         ));
         let mut error: String = failure
             .error
@@ -6454,6 +6542,53 @@ mod tests {
             !rendered.contains("exit"),
             "a lost command asserts no exit code: {rendered}"
         );
+    }
+
+    /// A retry row names the attempt out of every attempt the call may make, the status, and the
+    /// wait; a retry with no status names its reason instead.
+    #[test]
+    fn inference_retry_row_names_the_attempt_the_status_and_the_wait() {
+        let line = r#"{"event_type":"inference_retry","event_id":"evt_5","parent_id":"evt_1","session_id":"s","timestamp":5,"turn":0,"task_id":"tsk_1","attempt":1,"max_retries":6,"reason":"status","provider_status":429,"error":"HTTP 429: slow down","delay_ms":1200,"retry_after_ms":1200,"charged_tokens":0}"#;
+        assert_eq!(
+            row(line),
+            "inference_retry  attempt 1 of 7  HTTP 429  wait 1.2s"
+        );
+        let dropped = r#"{"event_type":"inference_retry","turn":2,"attempt":2,"max_retries":2,"reason":"connection","error":"request failed","delay_ms":15,"charged_tokens":0}"#;
+        assert_eq!(
+            row(dropped),
+            "inference_retry  attempt 2 of 3  connection  wait 15ms"
+        );
+    }
+
+    /// A hook's retry row ends on the hook's origin.
+    #[test]
+    fn inference_retry_row_of_a_hook_ends_on_its_origin() {
+        let line = r#"{"event_type":"inference_retry","turn":0,"attempt":1,"max_retries":6,"reason":"driver","error":"stream broke","delay_ms":8,"charged_tokens":120,"origin":"hook:compact"}"#;
+        assert_eq!(
+            row(line),
+            "inference_retry  attempt 1 of 7  driver  wait 8ms  hook:compact"
+        );
+    }
+
+    /// An `inference` row names the attempts a retried call took and why a failed one stopped
+    /// retrying; a record that carries neither renders as before.
+    #[test]
+    fn inference_retry_fields_render_on_the_inference_row() {
+        let retried = r#"{"event_type":"inference","event_id":"evt_2","session_id":"s","timestamp":1,"turn":0,"task_id":"tsk_1","input_tokens":40,"output_tokens":5,"decision":"end_turn","stop_reason":"end_turn","tool_name":null,"attempts":2}"#;
+        assert_eq!(row(retried), "turn 0  end_turn  attempts 2");
+        let failed = r#"{"event_type":"inference","event_id":"evt_3","session_id":"s","timestamp":1,"turn":0,"task_id":"tsk_1","decision":"error","stop_reason":"error","tool_name":null,"error_code":"driver_error","error":"HTTP 503","provider_status":503,"attempts":3,"retry_stopped":"max_retries"}"#;
+        assert_eq!(
+            row(failed),
+            "turn 0  error  driver_error  HTTP 503  attempts 3  retry stopped: max_retries"
+        );
+        let hook = r#"{"event_type":"inference","turn":0,"input_tokens":40,"output_tokens":5,"decision":"end_turn","tool_name":null,"origin":"hook:summarize","model":"m","attempts":2}"#;
+        assert!(
+            row(hook).ends_with("hook:summarize  end_turn  attempts 2"),
+            "{}",
+            row(hook)
+        );
+        let plain = r#"{"event_type":"inference","turn":1,"decision":"end_turn","stop_reason":"end_turn","tool_name":null}"#;
+        assert_eq!(row(plain), "turn 1  end_turn");
     }
 
     /// A spend refusal names the limit, what was used of the ceiling and what the refused call

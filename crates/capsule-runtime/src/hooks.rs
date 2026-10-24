@@ -1027,6 +1027,17 @@ impl HookRuntime {
             .unwrap_or_default()
     }
 
+    /// Take every `run-inference` retry made since the last drain, in the order they were made.
+    /// Drained by the agent loop beside [`Self::drain_inference_records`].
+    pub(crate) fn drain_inference_retries(
+        &self,
+    ) -> Vec<crate::inference_retry::InferenceRetryRecord> {
+        self.inference
+            .as_ref()
+            .map(|ctx| ctx.drain_retries())
+            .unwrap_or_default()
+    }
+
     /// Put a task in scope for one attempt of the agent loop, with the two input forms the
     /// `murmur:task-io/read` import distinguishes: `original` is the task before any reopen
     /// feedback was appended, `as_given` is exactly what this attempt's loop is handed.
@@ -3624,6 +3635,9 @@ mod tests {
             spend: Arc::new(crate::spend::SpendMeter::unlimited()),
             records: std::sync::Mutex::new(Vec::new()),
             spend_refusals: std::sync::Mutex::new(Vec::new()),
+            retries: std::sync::Mutex::new(Vec::new()),
+            retry: Default::default(),
+            deadline: None,
         });
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3704,6 +3718,9 @@ mod tests {
             spend: Arc::new(crate::spend::SpendMeter::unlimited()),
             records: std::sync::Mutex::new(Vec::new()),
             spend_refusals: std::sync::Mutex::new(Vec::new()),
+            retries: std::sync::Mutex::new(Vec::new()),
+            retry: Default::default(),
+            deadline: None,
         })
     }
 

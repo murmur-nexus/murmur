@@ -24,8 +24,14 @@ use crate::{
         hook::murmur::runtime::inference::{InferenceRequest, InferenceResponse},
         host::murmur::tool::run::{Status, ToolInput},
     },
+    credential_gateway::UpstreamOutcome,
+    inference_retry::{
+        millis, AttemptFailure, InferenceRetryRecord, RetryDecision, RetryNote, RetryPolicy,
+        RetryReason,
+    },
     network_policy::{NetworkAllowRule, ToolCapabilityGrant},
     runtime::{invoke_tool_component, ToolA2aWiring, ToolInvokeEnv},
+    session_status::SessionDeadline,
     spend::{SpendMeter, SpendRefusal},
     trace::{
         recorded_driver_config, InferenceCallSettings, InferenceOrigin,
@@ -67,6 +73,9 @@ pub(crate) struct HookInferenceRecord {
     pub(crate) failure: Option<HookInferenceFailure>,
     /// The cap the payload carried and the driver config the call ran under, failed or not.
     pub(crate) settings: InferenceCallSettings,
+    /// The attempts the call took and why its retrying stopped. Every attempt before the last
+    /// has its own [`InferenceRetryRecord`].
+    pub(crate) retry: RetryNote,
 }
 
 /// Why one `run-inference` call failed: what the guest is told, and what the trace records.
@@ -83,6 +92,29 @@ pub(crate) struct HookInferenceFailure {
     pub(crate) provider_status: Option<u16>,
     /// A `usage` block the driver's error payload carried.
     pub(crate) usage: Option<DriverUsage>,
+}
+
+/// One failed attempt, with what the retry loop classifies it by.
+struct FailedAttempt {
+    failure: HookInferenceFailure,
+    /// `None` for a failure that is never retried: a malformed response.
+    shape: Option<AttemptFailure>,
+    /// The driver's reserved `transient` metadata.
+    transient: Option<bool>,
+    /// What the gateway recorded for the attempt.
+    outcome: Option<UpstreamOutcome>,
+}
+
+/// A driver call that failed, before the gateway's record is joined to it.
+struct DriverFailure {
+    /// One of the `INFERENCE_ERROR_*` constants.
+    code: &'static str,
+    /// The guest message.
+    message: String,
+    /// A `usage` block the failed payload carried.
+    usage: Option<DriverUsage>,
+    shape: Option<AttemptFailure>,
+    transient: Option<bool>,
 }
 
 /// One `run-inference` call a spend ceiling refused before dispatch, buffered for the agent loop
@@ -159,6 +191,12 @@ pub(crate) struct HookInferenceCtx {
     pub(crate) records: std::sync::Mutex<Vec<HookInferenceRecord>>,
     /// Calls refused by a spend ceiling, drained beside [`Self::records`].
     pub(crate) spend_refusals: std::sync::Mutex<Vec<SpendRefusalRecord>>,
+    /// Retries made, drained beside [`Self::records`].
+    pub(crate) retries: std::sync::Mutex<Vec<InferenceRetryRecord>>,
+    /// `inference.retry`, applied to every call as to the agent loop's own.
+    pub(crate) retry: RetryPolicy,
+    /// The session deadline, past which no retry's wait may run.
+    pub(crate) deadline: Option<SessionDeadline>,
 }
 
 impl HookInferenceCtx {
@@ -196,84 +234,158 @@ impl HookInferenceCtx {
             .map_err(|e| format!("failed to encode driver payload: {e}"))?;
         let input_tokens = u64::from(count_tokens(&payload_json));
 
-        // Refused before dispatch: the guest gets the refusal text as `err`, and the trace gets a
-        // refusal line rather than an `inference` record for a call that never happened.
-        let admission = match self.spend.admit(input_tokens, u64::from(max_output_tokens)) {
-            Ok(admission) => admission,
-            Err(refusal) => {
-                let text = refusal.to_string();
-                if let Ok(mut refusals) = self.spend_refusals.lock() {
-                    refusals.push(SpendRefusalRecord {
-                        origin: origin.to_string(),
-                        refusal,
-                    });
-                }
-                return Err(text);
-            }
-        };
-
         let inference_env = self.env_for(purpose);
         let settings = InferenceCallSettings {
             max_output_tokens,
             input_budget: self.output_caps.input_budget(&model, max_output_tokens),
             driver_config: recorded_driver_config(inference_env, |text| self.redact(text)),
         };
-        let started = Instant::now();
-        let outcome = self.dispatch(payload_json, inference_env).await;
-        let duration_ms = started.elapsed().as_millis() as u64;
 
-        let (output_tokens, usage, failure, result) = match outcome {
-            Ok((raw, text, usage)) => {
-                // `input-tokens`/`output-tokens` on the WIT response are documented as the
-                // runtime's own tiktoken counts, so a driver-reported `usage` never lands
-                // there. It goes to the trace record below, and its counts are what the spend
-                // meter is charged when they make a report.
-                let output_tokens = u64::from(count_tokens(&raw));
-                match usage.as_ref().and_then(provider_counts) {
-                    Some(counts) => admission.settle(counts.request, counts.completion),
-                    None => admission.settle(input_tokens, output_tokens),
+        // One attempt per pass; a transient failure the policy allows is waited out and sent
+        // again with the same payload. Only the call's last attempt is recorded as an
+        // `inference` record and reaches the guest.
+        let mut retries_made = 0u32;
+        loop {
+            // Refused before dispatch: the guest gets the refusal text as `err`, and the trace
+            // gets a refusal line rather than an `inference` record for a call that never
+            // happened. A retry's admission is refused the same way.
+            let admission = match self.spend.admit(input_tokens, u64::from(max_output_tokens)) {
+                Ok(admission) => admission,
+                Err(refusal) => {
+                    let text = refusal.to_string();
+                    if let Ok(mut refusals) = self.spend_refusals.lock() {
+                        refusals.push(SpendRefusalRecord {
+                            origin: origin.to_string(),
+                            refusal,
+                        });
+                    }
+                    return Err(text);
                 }
-                (
-                    Some(output_tokens),
-                    usage,
-                    None,
-                    Ok(InferenceResponse {
-                        text,
-                        // Echoed, not driver-confirmed — the response never
-                        // names the model back.
-                        model_used: model.clone(),
-                        input_tokens,
-                        output_tokens,
-                    }),
-                )
-            }
-            Err(failure) => {
-                // A failed call is charged what the provider reported for it, and its input
-                // estimate alone when it reported nothing.
-                match failure.usage.as_ref().and_then(provider_counts) {
-                    Some(counts) => admission.settle(counts.request, counts.completion),
-                    None => drop(admission),
+            };
+
+            let started = Instant::now();
+            let outcome = self.dispatch(payload_json.clone(), inference_env).await;
+            let duration_ms = started.elapsed().as_millis() as u64;
+
+            let (output_tokens, usage, failure, result, stopped) = match outcome {
+                Ok((raw, text, usage)) => {
+                    // `input-tokens`/`output-tokens` on the WIT response are documented as the
+                    // runtime's own tiktoken counts, so a driver-reported `usage` never lands
+                    // there. It goes to the trace record below, and its counts are what the
+                    // spend meter is charged when they make a report.
+                    let output_tokens = u64::from(count_tokens(&raw));
+                    match usage.as_ref().and_then(provider_counts) {
+                        Some(counts) => admission.settle(counts.request, counts.completion),
+                        None => admission.settle(input_tokens, output_tokens),
+                    }
+                    (
+                        Some(output_tokens),
+                        usage,
+                        None,
+                        Ok(InferenceResponse {
+                            text,
+                            // Echoed, not driver-confirmed — the response never
+                            // names the model back.
+                            model_used: model.clone(),
+                            input_tokens,
+                            output_tokens,
+                        }),
+                        None,
+                    )
                 }
-                let message = failure.message.clone();
-                (None, failure.usage.clone(), Some(*failure), Err(message))
-            }
-        };
+                Err(failed) => {
+                    let FailedAttempt {
+                        failure,
+                        shape,
+                        transient,
+                        outcome,
+                    } = *failed;
+                    let retryable = shape.is_some_and(|shape| {
+                        crate::inference_retry::classify(
+                            shape,
+                            transient,
+                            failure.code == INFERENCE_ERROR_CREDENTIAL_REJECTED,
+                            outcome,
+                        )
+                    });
+                    let decision = retryable.then(|| {
+                        self.retry.decide(
+                            retries_made,
+                            outcome.and_then(UpstreamOutcome::retry_after),
+                            crate::inference_retry::random_draw(),
+                            self.deadline.map(|deadline| deadline.instant()),
+                            Instant::now(),
+                        )
+                    });
+                    let stopped = match decision {
+                        Some(RetryDecision::Retry { wait }) => {
+                            let reason = RetryReason::of(outcome);
+                            let charged_tokens = crate::inference_retry::charge_retried_attempt(
+                                admission,
+                                reason,
+                                failure.usage.as_ref().and_then(provider_counts),
+                                input_tokens,
+                            );
+                            retries_made += 1;
+                            self.record_retry(InferenceRetryRecord {
+                                origin: Some(origin.to_string()),
+                                attempt: retries_made,
+                                max_retries: self.retry.max_retries,
+                                reason,
+                                provider_status: reason.provider_status(outcome),
+                                error: failure.error,
+                                delay_ms: millis(wait),
+                                retry_after_ms: outcome
+                                    .and_then(UpstreamOutcome::retry_after)
+                                    .map(millis),
+                                charged_tokens,
+                            });
+                            // The hook's own call deadline is not consulted: a wait that
+                            // outlasts it ends the hook as a slow provider call would.
+                            tokio::time::sleep(wait).await;
+                            continue;
+                        }
+                        Some(RetryDecision::Stop(stop)) => Some(stop),
+                        None => None,
+                    };
+                    Self::charge_failed(admission, failure.usage.as_ref());
+                    let message = failure.message.clone();
+                    (
+                        None,
+                        failure.usage.clone(),
+                        Some(failure),
+                        Err(message),
+                        stopped,
+                    )
+                }
+            };
 
-        self.record(HookInferenceRecord {
-            origin: InferenceOrigin {
-                source: origin.to_string(),
-                model,
-            },
-            input_tokens,
-            output_tokens,
-            decision: if result.is_ok() { "end_turn" } else { "error" }.to_string(),
-            duration_ms,
-            usage,
-            failure,
-            settings,
-        });
+            self.record(HookInferenceRecord {
+                origin: InferenceOrigin {
+                    source: origin.to_string(),
+                    model,
+                },
+                input_tokens,
+                output_tokens,
+                decision: if result.is_ok() { "end_turn" } else { "error" }.to_string(),
+                duration_ms,
+                usage,
+                failure,
+                settings,
+                retry: RetryNote::new(retries_made + 1, stopped),
+            });
 
-        result
+            return result;
+        }
+    }
+
+    /// Charge a failed call that is not retried what the provider reported for it, and its input
+    /// estimate alone when it reported nothing.
+    fn charge_failed(admission: crate::spend::SpendAdmission, usage: Option<&DriverUsage>) {
+        match usage.and_then(provider_counts) {
+            Some(counts) => admission.settle(counts.request, counts.completion),
+            None => drop(admission),
+        }
     }
 
     /// The driver environment a call made for `purpose` runs under.
@@ -292,38 +404,48 @@ impl HookInferenceCtx {
         &self,
         payload_json: String,
         inference_env: &[(String, String)],
-    ) -> Result<(String, String, Option<DriverUsage>), Box<HookInferenceFailure>> {
-        // The status the gateway receives during this dispatch belongs to this call.
+    ) -> Result<(String, String, Option<DriverUsage>), Box<FailedAttempt>> {
+        // What the gateway records during this dispatch belongs to this attempt.
         if let Some(gateway) = &self.gateway {
-            gateway.take_upstream_status();
+            gateway.take_upstream_outcome();
         }
-        let outcome = self.dispatch_driver(payload_json, inference_env).await;
-        let provider_status = self
+        let result = self.dispatch_driver(payload_json, inference_env).await;
+        let outcome = self
             .gateway
             .as_ref()
-            .and_then(|gateway| gateway.take_upstream_status());
-        outcome.map_err(|(code, message, usage)| {
-            Box::new(HookInferenceFailure {
+            .and_then(|gateway| gateway.take_upstream_outcome());
+        result.map_err(|failed| {
+            let DriverFailure {
                 code,
-                error: match code {
-                    INFERENCE_ERROR_CREDENTIAL_REJECTED => message.clone(),
-                    _ => self.redact(&message),
-                },
                 message,
-                provider_status,
                 usage,
+                shape,
+                transient,
+            } = failed;
+            Box::new(FailedAttempt {
+                failure: HookInferenceFailure {
+                    code,
+                    error: match code {
+                        INFERENCE_ERROR_CREDENTIAL_REJECTED => message.clone(),
+                        _ => self.redact(&message),
+                    },
+                    message,
+                    provider_status: outcome.and_then(UpstreamOutcome::status),
+                    usage,
+                },
+                shape,
+                transient,
+                outcome,
             })
         })
     }
 
-    /// [`Self::dispatch`] without the status bookkeeping. `Err` is `(error_code, guest message,
-    /// usage the failed payload carried)`.
+    /// [`Self::dispatch`] without the gateway bookkeeping.
     async fn dispatch_driver(
         &self,
         payload_json: String,
         inference_env: &[(String, String)],
-    ) -> Result<(String, String, Option<DriverUsage>), (&'static str, String, Option<DriverUsage>)>
-    {
+    ) -> Result<(String, String, Option<DriverUsage>), DriverFailure> {
         let result = invoke_tool_component(
             ToolInvokeEnv {
                 engine: &self.engine,
@@ -351,61 +473,81 @@ impl HookInferenceCtx {
             },
         )
         .await
-        .map_err(|e| {
-            (
-                INFERENCE_ERROR_DRIVER_FAILED,
-                format!("inference driver '{}' failed: {e}", self.driver_name),
-                None,
-            )
+        .map_err(|e| DriverFailure {
+            code: INFERENCE_ERROR_DRIVER_FAILED,
+            message: format!("inference driver '{}' failed: {e}", self.driver_name),
+            usage: None,
+            shape: Some(AttemptFailure::Dispatch),
+            transient: None,
         })?;
 
         let passed = matches!(result.status, Status::Passed);
-        let raw = result.data.or(result.summary).ok_or_else(|| {
-            (
-                if passed {
+        let transient = crate::inference_retry::transient_metadata(&result.metadata);
+        let raw = result
+            .data
+            .or(result.summary)
+            .ok_or_else(|| DriverFailure {
+                code: if passed {
                     INFERENCE_ERROR_MALFORMED_RESPONSE
                 } else {
                     INFERENCE_ERROR_DRIVER_ERROR
                 },
-                "inference driver returned no data".to_string(),
-                None,
-            )
-        })?;
+                message: "inference driver returned no data".to_string(),
+                usage: None,
+                shape: (!passed).then_some(AttemptFailure::Status),
+                transient,
+            })?;
         if !passed {
             if let Some(message) = self.credential_failure() {
-                return Err((INFERENCE_ERROR_CREDENTIAL_REJECTED, message, None));
+                return Err(DriverFailure {
+                    code: INFERENCE_ERROR_CREDENTIAL_REJECTED,
+                    message,
+                    usage: None,
+                    shape: Some(AttemptFailure::Status),
+                    transient,
+                });
             }
             let usage = serde_json::from_str::<Value>(&raw)
                 .ok()
                 .and_then(|response| parse_driver_usage(&response));
-            return Err((
-                INFERENCE_ERROR_DRIVER_ERROR,
-                format!("inference driver returned an error: {raw}"),
+            return Err(DriverFailure {
+                code: INFERENCE_ERROR_DRIVER_ERROR,
+                message: format!("inference driver returned an error: {raw}"),
                 usage,
-            ));
+                shape: Some(AttemptFailure::Status),
+                transient,
+            });
         }
 
-        let response: Value = serde_json::from_str(&raw).map_err(|e| {
-            (
-                INFERENCE_ERROR_MALFORMED_RESPONSE,
-                format!("failed to parse inference driver response: {e}"),
-                None,
-            )
+        let response: Value = serde_json::from_str(&raw).map_err(|e| DriverFailure {
+            code: INFERENCE_ERROR_MALFORMED_RESPONSE,
+            message: format!("failed to parse inference driver response: {e}"),
+            usage: None,
+            shape: None,
+            transient: None,
         })?;
         if response.get("stop_reason").and_then(Value::as_str) == Some("error") {
             let usage = parse_driver_usage(&response);
             if let Some(message) = self.credential_failure() {
-                return Err((INFERENCE_ERROR_CREDENTIAL_REJECTED, message, usage));
+                return Err(DriverFailure {
+                    code: INFERENCE_ERROR_CREDENTIAL_REJECTED,
+                    message,
+                    usage,
+                    shape: Some(AttemptFailure::StopReasonError),
+                    transient,
+                });
             }
             let err = response
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or(DRIVER_RETURNED_ERROR);
-            return Err((
-                INFERENCE_ERROR_DRIVER_ERROR,
-                format!("inference driver returned an error: {err}"),
+            return Err(DriverFailure {
+                code: INFERENCE_ERROR_DRIVER_ERROR,
+                message: format!("inference driver returned an error: {err}"),
                 usage,
-            ));
+                shape: Some(AttemptFailure::StopReasonError),
+                transient,
+            });
         }
 
         let text = response_text(&response);
@@ -443,6 +585,20 @@ impl HookInferenceCtx {
     /// Take every record buffered since the last drain.
     pub(crate) fn drain_records(&self) -> Vec<HookInferenceRecord> {
         self.records
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
+    }
+
+    fn record_retry(&self, retry: InferenceRetryRecord) {
+        if let Ok(mut guard) = self.retries.lock() {
+            guard.push(retry);
+        }
+    }
+
+    /// Take every retry buffered since the last drain.
+    pub(crate) fn drain_retries(&self) -> Vec<InferenceRetryRecord> {
+        self.retries
             .lock()
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default()
@@ -917,6 +1073,9 @@ mod tests {
             spend,
             records: std::sync::Mutex::new(Vec::new()),
             spend_refusals: std::sync::Mutex::new(Vec::new()),
+            retries: std::sync::Mutex::new(Vec::new()),
+            retry: Default::default(),
+            deadline: None,
         }
     }
 

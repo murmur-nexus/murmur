@@ -4070,6 +4070,9 @@ fn launch(
                                     spend: Arc::clone(&state.spend),
                                     records: std::sync::Mutex::new(Vec::new()),
                                     spend_refusals: std::sync::Mutex::new(Vec::new()),
+                                    retries: std::sync::Mutex::new(Vec::new()),
+                                    retry: inference.retry.into(),
+                                    deadline: session_status.deadline(),
                                 })
                             })
                             .ok_or(InferenceUnavailable::NotConfigured)
@@ -13054,6 +13057,7 @@ mod tests {
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
             alternates: Vec::new(),
+            retry: murmur_artifact::InferenceRetry::default(),
         };
         inference
             .alternates
@@ -14378,6 +14382,7 @@ inference:
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
             alternates: Vec::new(),
+            retry: murmur_artifact::InferenceRetry::default(),
         }
     }
 
@@ -15388,6 +15393,7 @@ inference:
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
             alternates: Vec::new(),
+            retry: murmur_artifact::InferenceRetry::default(),
         };
 
         StageRequest {
@@ -20699,6 +20705,7 @@ inference:
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
             alternates: Vec::new(),
+            retry: murmur_artifact::InferenceRetry::default(),
         }
     }
 
@@ -21934,6 +21941,7 @@ inference:
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
             alternates: Vec::new(),
+            retry: murmur_artifact::InferenceRetry::default(),
         };
 
         let mut state = build_test_state(
@@ -22325,6 +22333,7 @@ inference:
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
             alternates: Vec::new(),
+            retry: murmur_artifact::InferenceRetry::default(),
         }
     }
 
@@ -22939,6 +22948,9 @@ inference:
             spend: Arc::clone(&state.spend),
             records: std::sync::Mutex::new(Vec::new()),
             spend_refusals: std::sync::Mutex::new(Vec::new()),
+            retries: std::sync::Mutex::new(Vec::new()),
+            retry: Default::default(),
+            deadline: None,
         });
         let mut hooks =
             crate::hooks::test_support::inference_calling_hooks(&state.engine, &workdir, ctx).await;

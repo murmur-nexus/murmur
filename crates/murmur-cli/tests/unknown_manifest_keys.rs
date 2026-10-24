@@ -160,6 +160,34 @@ fn a_key_with_no_near_neighbour_is_not_called_a_typo() {
     assert!(!lines[0].contains("spelling"));
 }
 
+/// A typo under `inference.retry` is named at `inference.retry`, with the key it should have been.
+#[test]
+fn a_typo_under_inference_retry_is_named_at_its_block() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    project(
+        dir.path(),
+        "name: retry-capsule\nversion: 0.1.0\nartifacts:\n  - name: local/drv\n    version: 0.1.0\n    \
+         runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: \
+         sk-test\ninference:\n  transport: http\n  model: m\n  driver:\n    artifact: local/drv\n  \
+         retry:\n    max_retrys: 2\n",
+    );
+
+    let stderr = explain_scope_stderr(&home, dir.path());
+    let lines = warning_lines(&stderr);
+    assert_eq!(lines.len(), 1, "{stderr}");
+    assert!(
+        lines[0].contains("unrecognized key 'max_retrys' in inference.retry"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("did you mean 'max_retries'?"),
+        "{}",
+        lines[0]
+    );
+}
+
 /// A top-level `mur_version` is refused before anything is staged, on every surface that loads the
 /// project manifest, and both the message and the hint name `deploy.mur_version`.
 #[test]

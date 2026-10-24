@@ -1247,6 +1247,42 @@ pub struct InferenceConfig {
     /// manifest order. Empty under `transport: process`, where the key is refused at parse time,
     /// and for every capsule that declares none.
     pub alternates: Vec<InferenceAlternate>,
+    /// `inference.retry`: how a driver call that failed transiently is made again. Always
+    /// [`InferenceRetry::default`] under `transport: process`, where the key is refused at parse
+    /// time and the harness retries its own provider calls.
+    pub retry: InferenceRetry,
+}
+
+/// `inference.retry`: the bounds on making a `transport: http` driver call again after a
+/// transient failure. Every key is optional and takes its default when omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InferenceRetry {
+    /// The most retries one call makes after its first attempt, 0–20. 0 disables retrying.
+    pub max_retries: u32,
+    /// The backoff before the first retry, in milliseconds, 1–60000. Each later retry doubles it.
+    pub initial_delay_ms: u32,
+    /// The longest backoff, and the longest provider-requested wait the runtime honours, in
+    /// milliseconds: 1–3600000, and at least `initial_delay_ms`.
+    pub max_delay_ms: u32,
+}
+
+impl InferenceRetry {
+    /// The most `max_retries` may be.
+    pub const MAX_RETRIES: u32 = 20;
+    /// The most `initial_delay_ms` may be.
+    pub const MAX_INITIAL_DELAY_MS: u32 = 60_000;
+    /// The most `max_delay_ms` may be.
+    pub const MAX_DELAY_MS: u32 = 3_600_000;
+}
+
+impl Default for InferenceRetry {
+    fn default() -> Self {
+        Self {
+            max_retries: 6,
+            initial_delay_ms: 1_000,
+            max_delay_ms: 60_000,
+        }
+    }
 }
 
 /// `inference.tool_refresh`: the turn boundary at which the http agent loop rebuilds the tool
@@ -2561,6 +2597,20 @@ struct RawInferenceConfig {
     tool_refresh: Option<String>,
     #[serde(default)]
     alternates: Option<Vec<RawInferenceAlternate>>,
+    #[serde(default)]
+    retry: Option<RawInferenceRetry>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawInferenceRetry {
+    #[serde(default)]
+    max_retries: Option<u32>,
+    #[serde(default)]
+    initial_delay_ms: Option<u32>,
+    #[serde(default)]
+    max_delay_ms: Option<u32>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -3129,6 +3179,7 @@ impl RawBlock for RawInferenceConfig {
         "max_session_tokens",
         "tool_refresh",
         "alternates",
+        "retry",
     ];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
@@ -3141,12 +3192,23 @@ impl RawBlock for RawInferenceConfig {
         if let Some(compaction) = &self.compaction {
             collect_block(compaction, &child_path(path, "compaction"), out);
         }
+        if let Some(retry) = &self.retry {
+            collect_block(retry, &child_path(path, "retry"), out);
+        }
         if let Some(alternates) = &self.alternates {
             let alternates_path = child_path(path, "alternates");
             for (index, alternate) in alternates.iter().enumerate() {
                 collect_block(alternate, &format!("{alternates_path}[{index}]"), out);
             }
         }
+    }
+}
+
+impl RawBlock for RawInferenceRetry {
+    const KNOWN_KEYS: &'static [&'static str] =
+        &["max_retries", "initial_delay_ms", "max_delay_ms"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
     }
 }
 
@@ -5290,6 +5352,7 @@ fn parse_inference(
             }
             let tool_refresh = parse_tool_refresh(raw.tool_refresh.as_deref())?;
             let alternates = parse_alternates(raw.alternates, &driver.artifact, &model)?;
+            let retry = parse_inference_retry(raw.retry)?;
 
             Ok(Some(InferenceConfig {
                 transport,
@@ -5305,6 +5368,7 @@ fn parse_inference(
                 max_session_tokens: raw.max_session_tokens,
                 tool_refresh,
                 alternates,
+                retry,
             }))
         }
         "process" => {
@@ -5355,6 +5419,14 @@ fn parse_inference(
                         .to_string(),
                 });
             }
+            if raw.retry.is_some() {
+                return Err(RuntimeManifestError::InvalidInferenceConfig {
+                    field: "inference.retry".to_string(),
+                    message: "is not valid with transport: process; the harness retries its own \
+                              provider calls"
+                        .to_string(),
+                });
+            }
 
             // Valid here: the harness's own reported token counts are what this transport's
             // turns are metered against, and a driver that reports none is refused at load
@@ -5396,6 +5468,7 @@ fn parse_inference(
                 max_session_tokens: raw.max_session_tokens,
                 tool_refresh: ToolRefresh::default(),
                 alternates: Vec::new(),
+                retry: InferenceRetry::default(),
             }))
         }
         other => Err(RuntimeManifestError::InvalidInferenceConfig {
@@ -5403,6 +5476,58 @@ fn parse_inference(
             message: format!("unknown value '{other}'"),
         }),
     }
+}
+
+/// Lowers `inference.retry` under `transport: http`: each omitted key takes its default, and each
+/// value is checked against its bounds. `max_delay_ms` below `initial_delay_ms` is refused on
+/// `max_delay_ms`.
+fn parse_inference_retry(
+    raw: Option<RawInferenceRetry>,
+) -> Result<InferenceRetry, RuntimeManifestError> {
+    let defaults = InferenceRetry::default();
+    let Some(raw) = raw else {
+        return Ok(defaults);
+    };
+    let refuse = |key: &str, message: String| RuntimeManifestError::InvalidInferenceConfig {
+        field: format!("inference.retry.{key}"),
+        message,
+    };
+    let retry = InferenceRetry {
+        max_retries: raw.max_retries.unwrap_or(defaults.max_retries),
+        initial_delay_ms: raw.initial_delay_ms.unwrap_or(defaults.initial_delay_ms),
+        max_delay_ms: raw.max_delay_ms.unwrap_or(defaults.max_delay_ms),
+    };
+    if retry.max_retries > InferenceRetry::MAX_RETRIES {
+        return Err(refuse(
+            "max_retries",
+            format!("must be at most {}", InferenceRetry::MAX_RETRIES),
+        ));
+    }
+    if !(1..=InferenceRetry::MAX_INITIAL_DELAY_MS).contains(&retry.initial_delay_ms) {
+        return Err(refuse(
+            "initial_delay_ms",
+            format!(
+                "must be between 1 and {}",
+                InferenceRetry::MAX_INITIAL_DELAY_MS
+            ),
+        ));
+    }
+    if !(1..=InferenceRetry::MAX_DELAY_MS).contains(&retry.max_delay_ms) {
+        return Err(refuse(
+            "max_delay_ms",
+            format!("must be between 1 and {}", InferenceRetry::MAX_DELAY_MS),
+        ));
+    }
+    if retry.max_delay_ms < retry.initial_delay_ms {
+        return Err(refuse(
+            "max_delay_ms",
+            format!(
+                "must be at least inference.retry.initial_delay_ms ({})",
+                retry.initial_delay_ms
+            ),
+        ));
+    }
+    Ok(retry)
 }
 
 /// Whether `name` is an alternate's name: a lowercase letter, then up to 62 lowercase letters,
@@ -13393,10 +13518,14 @@ control:
             .split_once(&header)
             .unwrap_or_else(|| panic!("{name} has no `impl RawBlock` block"))
             .1;
+        // rustfmt moves an array too long for the declaration's line onto the next one.
         let array = body
-            .split_once("KNOWN_KEYS: &'static [&'static str] = &[")
+            .split_once("KNOWN_KEYS: &'static [&'static str] =")
             .unwrap_or_else(|| panic!("{name}'s RawBlock impl declares no KNOWN_KEYS"))
             .1
+            .trim_start()
+            .strip_prefix("&[")
+            .unwrap_or_else(|| panic!("{name}'s KNOWN_KEYS is not an array literal"))
             .split_once("];")
             .expect("KNOWN_KEYS array is unterminated")
             .0;
@@ -14379,5 +14508,126 @@ mod scoped_name_tests {
             ),
             "{message}"
         );
+    }
+}
+
+#[cfg(test)]
+mod inference_retry_tests {
+    use super::*;
+
+    const HTTP: &str = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/drv\n    \
+                        version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: \
+                        http://127.0.0.1:8080\n      api_key: sk-test\ninference:\n  transport: \
+                        http\n  model: m\n  driver:\n    artifact: local/drv\n";
+    const PROCESS: &str = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: local/drv\n    \
+                           version: 0.1.0\n    runtime: driver\ninference:\n  transport: \
+                           process\n  driver:\n    artifact: local/drv\n";
+
+    fn retry(yaml: &str) -> InferenceRetry {
+        RuntimeManifest::from_yaml_str(yaml)
+            .unwrap()
+            .inference
+            .unwrap()
+            .retry
+    }
+
+    fn refusal(yaml: &str) -> (String, String) {
+        match RuntimeManifest::from_yaml_str(yaml) {
+            Err(RuntimeManifestError::InvalidInferenceConfig { field, message }) => {
+                (field, message)
+            }
+            other => panic!("expected InvalidInferenceConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inference_retry_defaults_when_absent_and_per_key_when_partial() {
+        assert_eq!(retry(HTTP), InferenceRetry::default());
+        assert_eq!(
+            InferenceRetry::default(),
+            InferenceRetry {
+                max_retries: 6,
+                initial_delay_ms: 1_000,
+                max_delay_ms: 60_000,
+            }
+        );
+        assert_eq!(
+            retry(&format!("{HTTP}  retry:\n    max_retries: 2\n")),
+            InferenceRetry {
+                max_retries: 2,
+                ..InferenceRetry::default()
+            }
+        );
+        assert_eq!(
+            retry(&format!(
+                "{HTTP}  retry:\n    initial_delay_ms: 10\n    max_delay_ms: 2000\n"
+            )),
+            InferenceRetry {
+                max_retries: 6,
+                initial_delay_ms: 10,
+                max_delay_ms: 2000,
+            }
+        );
+        assert_eq!(
+            retry(&format!(
+                "{HTTP}  retry:\n    max_retries: 0\n    initial_delay_ms: 60000\n    \
+                 max_delay_ms: 3600000\n"
+            )),
+            InferenceRetry {
+                max_retries: 0,
+                initial_delay_ms: 60_000,
+                max_delay_ms: 3_600_000,
+            }
+        );
+        assert_eq!(retry(PROCESS), InferenceRetry::default());
+    }
+
+    #[test]
+    fn inference_retry_bounds_are_refused_naming_the_field() {
+        for (block, field) in [
+            ("max_retries: 21", "inference.retry.max_retries"),
+            ("initial_delay_ms: 0", "inference.retry.initial_delay_ms"),
+            (
+                "initial_delay_ms: 60001",
+                "inference.retry.initial_delay_ms",
+            ),
+            ("max_delay_ms: 0", "inference.retry.max_delay_ms"),
+            ("max_delay_ms: 3600001", "inference.retry.max_delay_ms"),
+            (
+                "initial_delay_ms: 5000\n    max_delay_ms: 1000",
+                "inference.retry.max_delay_ms",
+            ),
+        ] {
+            let (got, message) = refusal(&format!("{HTTP}  retry:\n    {block}\n"));
+            assert_eq!(got, field, "{block}: {message}");
+        }
+        let (_, message) = refusal(&format!(
+            "{HTTP}  retry:\n    initial_delay_ms: 5000\n    max_delay_ms: 1000\n"
+        ));
+        assert!(message.contains("initial_delay_ms"), "{message}");
+    }
+
+    #[test]
+    fn inference_retry_is_refused_under_transport_process() {
+        let (field, message) = refusal(&format!("{PROCESS}  retry:\n    max_retries: 2\n"));
+        assert_eq!(field, "inference.retry");
+        assert_eq!(
+            message,
+            "is not valid with transport: process; the harness retries its own provider calls"
+        );
+    }
+
+    #[test]
+    fn inference_retry_unknown_key_is_reported_at_its_block() {
+        let manifest = RuntimeManifest::from_yaml_str(&format!(
+            "{HTTP}  retry:\n    max_retries: 2\n    jitter: full\n"
+        ))
+        .unwrap();
+        let keys: Vec<(&str, &str)> = manifest
+            .unknown_keys
+            .iter()
+            .map(|key| (key.key.as_str(), key.block_path.as_str()))
+            .collect();
+        assert_eq!(keys, vec![("jitter", "inference.retry")]);
     }
 }

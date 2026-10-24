@@ -66,6 +66,19 @@ interface run {
     /// name. If the list carries more than one `resource_id` tuple, the host
     /// uses the first in list order. A tool that never sets this key (every
     /// tool shipped today) sees no behavior change.
+    ///
+    /// Reserved key `"transient"`: whether an inference driver's failed call
+    /// may succeed if the host makes it again. `"true"` marks the failure
+    /// transient: a stream that broke after the provider answered `200`, or a
+    /// provider error event mid-stream. The host then sends the same payload
+    /// again after a backoff, within the capsule's `inference.retry` bounds.
+    /// `"false"` vetoes a retry of a status the host would otherwise retry,
+    /// such as a `429` the provider reports as a permanent quota failure.
+    /// Any other value, or omitting the key, leaves the decision to what the
+    /// host's credential gateway saw: a `408`, `429` or retryable `5xx`, or a
+    /// connection that broke before a response arrived. Read only on a
+    /// failed inference call; if the list carries more than one `transient`
+    /// tuple, the host uses the first in list order.
     metadata: list<tuple<string, string>>,
   }
 

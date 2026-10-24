@@ -55,6 +55,7 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
                 max_session_tokens: None,
                 tool_refresh: murmur_artifact::ToolRefresh::Compaction,
                 alternates: Vec::new(),
+                retry: murmur_artifact::InferenceRetry::default(),
             }),
             system_prompt_overridden: false,
             context: None,
