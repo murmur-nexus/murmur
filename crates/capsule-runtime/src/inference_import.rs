@@ -421,7 +421,7 @@ impl HookInferenceCtx {
                 usage,
                 shape,
                 transient,
-            } = failed;
+            } = *failed;
             Box::new(FailedAttempt {
                 failure: HookInferenceFailure {
                     code,
@@ -440,12 +440,13 @@ impl HookInferenceCtx {
         })
     }
 
-    /// [`Self::dispatch`] without the gateway bookkeeping.
+    /// [`Self::dispatch`] without the gateway bookkeeping. The failure is boxed for the same
+    /// reason.
     async fn dispatch_driver(
         &self,
         payload_json: String,
         inference_env: &[(String, String)],
-    ) -> Result<(String, String, Option<DriverUsage>), DriverFailure> {
+    ) -> Result<(String, String, Option<DriverUsage>), Box<DriverFailure>> {
         let result = invoke_tool_component(
             ToolInvokeEnv {
                 engine: &self.engine,
@@ -473,20 +474,20 @@ impl HookInferenceCtx {
             },
         )
         .await
-        .map_err(|e| DriverFailure {
-            code: INFERENCE_ERROR_DRIVER_FAILED,
-            message: format!("inference driver '{}' failed: {e}", self.driver_name),
-            usage: None,
-            shape: Some(AttemptFailure::Dispatch),
-            transient: None,
+        .map_err(|e| {
+            Box::new(DriverFailure {
+                code: INFERENCE_ERROR_DRIVER_FAILED,
+                message: format!("inference driver '{}' failed: {e}", self.driver_name),
+                usage: None,
+                shape: Some(AttemptFailure::Dispatch),
+                transient: None,
+            })
         })?;
 
         let passed = matches!(result.status, Status::Passed);
         let transient = crate::inference_retry::transient_metadata(&result.metadata);
-        let raw = result
-            .data
-            .or(result.summary)
-            .ok_or_else(|| DriverFailure {
+        let raw = result.data.or(result.summary).ok_or_else(|| {
+            Box::new(DriverFailure {
                 code: if passed {
                     INFERENCE_ERROR_MALFORMED_RESPONSE
                 } else {
@@ -496,58 +497,61 @@ impl HookInferenceCtx {
                 usage: None,
                 shape: (!passed).then_some(AttemptFailure::Status),
                 transient,
-            })?;
+            })
+        })?;
         if !passed {
             if let Some(message) = self.credential_failure() {
-                return Err(DriverFailure {
+                return Err(Box::new(DriverFailure {
                     code: INFERENCE_ERROR_CREDENTIAL_REJECTED,
                     message,
                     usage: None,
                     shape: Some(AttemptFailure::Status),
                     transient,
-                });
+                }));
             }
             let usage = serde_json::from_str::<Value>(&raw)
                 .ok()
                 .and_then(|response| parse_driver_usage(&response));
-            return Err(DriverFailure {
+            return Err(Box::new(DriverFailure {
                 code: INFERENCE_ERROR_DRIVER_ERROR,
                 message: format!("inference driver returned an error: {raw}"),
                 usage,
                 shape: Some(AttemptFailure::Status),
                 transient,
-            });
+            }));
         }
 
-        let response: Value = serde_json::from_str(&raw).map_err(|e| DriverFailure {
-            code: INFERENCE_ERROR_MALFORMED_RESPONSE,
-            message: format!("failed to parse inference driver response: {e}"),
-            usage: None,
-            shape: None,
-            transient: None,
+        let response: Value = serde_json::from_str(&raw).map_err(|e| {
+            Box::new(DriverFailure {
+                code: INFERENCE_ERROR_MALFORMED_RESPONSE,
+                message: format!("failed to parse inference driver response: {e}"),
+                usage: None,
+                shape: None,
+                transient: None,
+            })
         })?;
         if response.get("stop_reason").and_then(Value::as_str) == Some("error") {
             let usage = parse_driver_usage(&response);
             if let Some(message) = self.credential_failure() {
-                return Err(DriverFailure {
+                return Err(Box::new(DriverFailure {
                     code: INFERENCE_ERROR_CREDENTIAL_REJECTED,
                     message,
                     usage,
                     shape: Some(AttemptFailure::StopReasonError),
                     transient,
-                });
+                }));
             }
             let err = response
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or(DRIVER_RETURNED_ERROR);
-            return Err(DriverFailure {
+            return Err(Box::new(DriverFailure {
                 code: INFERENCE_ERROR_DRIVER_ERROR,
                 message: format!("inference driver returned an error: {err}"),
                 usage,
                 shape: Some(AttemptFailure::StopReasonError),
                 transient,
-            });
+            }));
         }
 
         let text = response_text(&response);
