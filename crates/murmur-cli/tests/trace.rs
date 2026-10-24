@@ -734,7 +734,7 @@ fn session_start_effective_grants_match_explain_scope_json() {
     assert_eq!(grants["declared_containment"], json!("advisory"));
     assert!(
         grants["enforcement_tier"].is_string(),
-        "the probed tier must be recorded as a wire name"
+        "the tier the session installs must be recorded as a wire name"
     );
 
     // The pre-existing summary fields are untouched by the new object sitting next to them, and

@@ -5052,8 +5052,8 @@ impl PlanTraceAppender {
 mod tests {
     use super::*;
     use crate::{
-        containment::scope_report_for_tier, sandbox::EnforcementTier, sealed::UsernsGrant,
-        trace_blobs::BLOB_DIR_NAME, types::CapabilityPolicy,
+        sandbox::EnforcementTier, sealed::UsernsGrant, trace_blobs::BLOB_DIR_NAME,
+        types::CapabilityPolicy,
     };
     use murmur_artifact::{ArtifactRuntime, InterpreterRuntimeDir, InterpreterRuntimeGrant};
     use serde_json::Value;
@@ -5067,14 +5067,14 @@ mod tests {
     }
 
     /// A [`ScopeReport`] built the way production builds one — through
-    /// `containment::scope_report_for_tier` with an *explicit* tier, never a live probe, so these
+    /// `containment::report_for` with an *explicit* tier, never a live probe, so these
     /// tests assert the same values on a Landlock-capable host and a laptop that has none.
     fn report_for(
         declared: ContainmentClass,
         tier: EnforcementTier,
         workdir_exec: bool,
     ) -> ScopeReport {
-        scope_report_for_tier(
+        crate::containment::report_for(
             &CapabilityPolicy {
                 workdir_exec_allowed: workdir_exec,
                 ..CapabilityPolicy::default()
@@ -5646,7 +5646,7 @@ mod tests {
     #[tokio::test]
     async fn session_start_distinguishes_two_hosts_with_the_same_achieved_class() {
         async fn event_for(grant: UsernsGrant) -> Value {
-            let report = scope_report_for_tier(
+            let report = crate::containment::report_for(
                 &CapabilityPolicy::default(),
                 ContainmentClass::Sealed,
                 EnforcementTier::KernelSealed,
@@ -5709,7 +5709,7 @@ mod tests {
 
         // Written for every Linux host, never skipped — its absence identifies a runtime that
         // predates the key rather than a host that was not asked.
-        let unprobed = scope_report_for_tier(
+        let unprobed = crate::containment::report_for(
             &CapabilityPolicy::default(),
             ContainmentClass::Advisory,
             EnforcementTier::EnvironmentOnly,
@@ -5758,7 +5758,7 @@ mod tests {
             }],
             ..CapabilityPolicy::default()
         };
-        let expected = scope_report_for_tier(
+        let expected = crate::containment::report_for(
             &policy,
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,

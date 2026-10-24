@@ -3001,7 +3001,11 @@ fn a_child_cannot_forge_its_completion() {
     if common::skip_without_host_support("a_child_cannot_forge_its_completion") {
         return;
     }
-    if capsule_runtime::detect_achieved_containment() < murmur_artifact::ContainmentClass::Scoped {
+    if capsule_runtime::detect_containment_decision(murmur_artifact::ContainmentClass::Scoped)
+        .0
+        .achieved()
+        < murmur_artifact::ContainmentClass::Scoped
+    {
         eprintln!("[SKIP-HOST] a_child_cannot_forge_its_completion: the child declares scoped");
         return;
     }

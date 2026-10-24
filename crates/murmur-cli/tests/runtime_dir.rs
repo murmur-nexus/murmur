@@ -92,7 +92,9 @@ fn skip_host(test: &str, floor: ContainmentClass) -> bool {
     if common::skip_without_host_support(test) {
         return true;
     }
-    let achieved = capsule_runtime::detect_achieved_containment();
+    let achieved = capsule_runtime::detect_containment_decision(floor)
+        .0
+        .achieved();
     if achieved < floor {
         eprintln!("[SKIP-HOST] {test}: this host reaches {achieved}, the test needs {floor}");
         return true;

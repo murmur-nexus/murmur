@@ -1494,7 +1494,7 @@ mod tests {
             },
             ..CapabilityPolicy::default()
         };
-        let enforcement = ShellEnforcement::resolve(
+        let enforcement = ShellEnforcement::resolve_declared(
             &policy,
             murmur_artifact::ContainmentClass::Scoped,
             crate::sandbox::HostProbe::probe(),
@@ -1543,7 +1543,7 @@ mod tests {
                 shell_allow: allow.iter().map(|b| b.to_string()).collect(),
                 ..CapabilityPolicy::default()
             };
-            let enforcement = ShellEnforcement::resolve(
+            let enforcement = ShellEnforcement::resolve_declared(
                 &policy,
                 murmur_artifact::ContainmentClass::Scoped,
                 crate::sandbox::HostProbe::probe(),
@@ -1604,7 +1604,7 @@ mod tests {
             },
             ..CapabilityPolicy::default()
         };
-        let enforcement = ShellEnforcement::resolve(
+        let enforcement = ShellEnforcement::resolve_declared(
             &policy,
             murmur_artifact::ContainmentClass::Scoped,
             crate::sandbox::HostProbe::probe(),

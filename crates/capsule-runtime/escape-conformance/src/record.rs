@@ -98,6 +98,9 @@ pub struct Record<'a> {
     pub stamp: Stamp,
     pub declared: ContainmentClass,
     pub achieved: ContainmentClass,
+    /// The tier the run's sessions installed, as `--explain-scope`'s `mechanism:` names it: what
+    /// [`Self::achieved`] was read off.
+    pub enforcement_tier: &'static str,
     pub host: &'a HostFacts,
     pub mur_binary: String,
     pub mur_version: String,
@@ -255,6 +258,7 @@ impl Record<'_> {
             "| achieved containment class | **{}** |",
             self.achieved
         );
+        let _ = writeln!(out, "| enforcement tier | `{}` |", self.enforcement_tier);
         let _ = writeln!(out, "| `mur` binary | `{}` |", self.mur_binary);
         let _ = writeln!(out, "| `mur` version | `{}` |", self.mur_version);
         let _ = writeln!(out, "| invocation | `{}` |\n", self.invocation);
@@ -329,9 +333,10 @@ impl Record<'_> {
             out,
             "Recorded here so this file is self-contained: a reader can see what the suite would \
              have asserted at a different class without the repository in hand. All three columns \
-             are reachable: `achieved_class_for_tier` maps `EnforcementTier::KernelSealed` to \
-             `sealed`, and a host with a usable Landlock ABI, unprivileged user namespaces and \
-             (where the host restricts them) the shipped `mur-sealed` AppArmor profile reaches it. \
+             are reachable: a capsule declaring `sealed` runs on \
+             `mountns+pivot_root+landlock+seccomp` and achieves `sealed` on a host with a usable \
+             Landlock ABI, unprivileged user namespaces and (where the host restricts them) the \
+             shipped `mur-sealed` AppArmor profile. \
              The `sealed` column is graded rather than merely recorded: every entry is the verdict \
              a real composed root produced on 2026-08-09, except `hardlink-escape` and \
              `rename-across-boundary`, which assert nothing there because `sealed`'s independent \
@@ -423,6 +428,45 @@ mod tests {
             filename(ContainmentClass::Scoped, &stamp),
             "escape-conformance-scoped-20010909T014640Z.md"
         );
+    }
+
+    /// The header table names the class the run achieved and the tier it was read off, side by
+    /// side, so a `scoped` record from a sealed-capable host says `landlock+seccomp`.
+    #[test]
+    fn the_record_names_the_achieved_class_and_its_enforcement_tier() {
+        let host = HostFacts {
+            kernel_release: "7.0.0".to_string(),
+            kernel_system: "Linux x86_64".to_string(),
+            arch: "x86_64",
+            os: "linux",
+            euid: "1000".to_string(),
+            container: crate::host::ContainerDetection {
+                detected: false,
+                signals: Vec::new(),
+            },
+            cgroup_v2: Some(true),
+        };
+        let record = Record {
+            stamp: Stamp::from_unix(1_000_000_000),
+            declared: ContainmentClass::Scoped,
+            achieved: ContainmentClass::Scoped,
+            enforcement_tier: "landlock+seccomp",
+            host: &host,
+            mur_binary: "/usr/bin/mur".to_string(),
+            mur_version: "mur 0.0.0".to_string(),
+            outcomes: &[],
+            partial: true,
+            container_override: false,
+            invocation: "escape-conformance --class scoped".to_string(),
+        };
+        let rendered = record.render();
+        let achieved = rendered
+            .find("| achieved containment class | **scoped** |\n")
+            .expect("the achieved class row");
+        let tier = rendered
+            .find("| enforcement tier | `landlock+seccomp` |\n")
+            .expect("the enforcement tier row");
+        assert!(achieved < tier, "{rendered}");
     }
 
     #[test]

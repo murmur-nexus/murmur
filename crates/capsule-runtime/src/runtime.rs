@@ -53,7 +53,7 @@ use crate::{
     },
     cgroup,
     compiled_forms::CompiledForms,
-    containment::{achieved_containment_class, check_containment_floor},
+    containment::{check_containment_floor, ContainmentDecision},
     credential_gateway::{
         send_direct, ConnectionIo, CredentialGateway, GatewayMetering, GatewayTable,
     },
@@ -1822,14 +1822,12 @@ pub fn stage_session(
     mut request: StageRequest,
 ) -> Result<StagedSession, RuntimeError> {
     validate_capability_policy(&request.capability_policy)?;
-    // Before any registry pull, component compile or workdir creation: if this host cannot
-    // back the declared floor, refuse rather than launch something weaker than was asked for.
-    // `achieved` comes from a live kernel probe only — the manifest never gets a vote in what
-    // the host is reported to provide.
-    // `achieved` is the host's live kernel probe, capped by the one manifest property that can
-    // lower it: `capabilities.filesystem.workdir_exec`. The manifest still gets no vote in what the
-    // host is *reported* to provide — the cap can only ever subtract (see
-    // `containment::achieved_containment_class`).
+    // Before any registry pull, component compile or workdir creation: if this session cannot
+    // achieve the declared floor, refuse rather than launch something weaker than was asked for.
+    // The achieved class is the class of the tier the session's commands run on — the live
+    // kernel probe's tier, capped by the declared floor — lowered further by
+    // `capabilities.filesystem.workdir_exec` or a runtime directory inside the workdir. No
+    // declaration raises it (see `containment::ContainmentDecision`).
     let workdir_exec = request.capability_policy.workdir_exec_allowed;
     // The host is probed exactly once per session, right here, and every later consumer — the
     // refusal below, the `ScopeReport` recorded in the trace, the `/tmp` mapping, the `E-CAP-005`
@@ -1838,7 +1836,6 @@ pub fn stage_session(
     // container's capabilities changed), and the trace would then describe a session that never
     // ran under what it claims.
     let host_probe = sandbox::HostProbe::probe();
-    let enforcement_tier = host_probe.tier();
     // Derived only so the refusal can name *which* part of the sealed mechanism is missing — the
     // call the probe saw fail, its `errno`, and the readings it is worded with.
     let sealed_shortfall = host_probe.sealed_shortfall();
@@ -1851,14 +1848,18 @@ pub fn stage_session(
             .clone()
             .unwrap_or_else(|| request.manifest_dir.join("workdir")),
     )?;
-    let achieved_containment = achieved_containment_class(
-        enforcement_tier,
+    // The session's one containment decision. Every reader of its class or tier below and in
+    // `launch_session` takes this value, so the class the trace names is the class of the tier
+    // its commands run on.
+    let containment = ContainmentDecision::decide(
+        host_probe.tier(),
+        request.declared_containment_floor,
         workdir_exec,
         runtime_dir_placement.inside_workdir(),
     );
     check_containment_floor(
-        request.declared_containment_floor,
-        achieved_containment,
+        containment.declared(),
+        containment.achieved(),
         sealed_shortfall.as_ref(),
         workdir_exec,
         runtime_dir_placement.inside(),
@@ -1951,7 +1952,7 @@ pub fn stage_session(
     // Whether a literal `/tmp` reaches the session's temporary folder, decided once: the report
     // below says it and `launch_session` hands it to the enforcement that installs it.
     let temp_mapping = crate::temp_dir::temp_mapping(
-        sandbox::applied_tier(enforcement_tier, request.declared_containment_floor),
+        containment.applied_tier(),
         host_probe.mount_namespace_usable(),
         &runtime_dir_placement.workdir,
     );
@@ -1967,8 +1968,7 @@ pub fn stage_session(
         );
     let mut scope_report = crate::containment::scope_report_for_tier(
         &request.capability_policy,
-        request.declared_containment_floor,
-        enforcement_tier,
+        &containment,
         sealed_shortfall.as_ref(),
         host_probe.userns_grant(),
         host_probe.landlock_kernel_abi(),
@@ -2909,12 +2909,12 @@ pub fn stage_session(
             work_folder_ceiling: (inference.transport != "process")
                 .then_some(request.capability_policy.resources.workdir_max_bytes),
             runtime_dir_tools,
-            // The tier `launch_session`'s `ShellEnforcement::resolve` applies from this same probe
-            // and floor, for either transport: the process bridge dispatches shell calls through
+            // The tier `launch_session`'s `ShellEnforcement::resolve` installs from this same
+            // decision, for either transport: the process bridge dispatches shell calls through
             // the same enforcement.
             exec: murmur_md::ExecFacts::resolve(
                 &request.capability_policy,
-                sandbox::applied_tier(enforcement_tier, request.declared_containment_floor),
+                containment.applied_tier(),
             ),
         };
         murmur_md::write_murmur_md(&runtime_root, &inputs);
@@ -3002,7 +3002,7 @@ pub fn stage_session(
         tool_annotations,
         bind_addr: request.bind_addr,
         internal_port: request.internal_port,
-        declared_containment_floor: request.declared_containment_floor,
+        containment,
         scope_report,
         exports_files,
         exports_peer_files,
@@ -3221,7 +3221,7 @@ fn launch(
 
     let shell_enforcement = sandbox::ShellEnforcement::resolve(
         &staged.capability_policy,
-        staged.declared_containment_floor,
+        &staged.containment,
         staged.host_probe.clone(),
     )
     .map_err(RuntimeError::Runtime)?
@@ -3592,7 +3592,8 @@ fn launch(
         // leaves behind. That is what a later reader-only launch mode over an existing workdir
         // would need, and no more.
         let exports_files = staged.exports_files.clone();
-        let resource_containment = staged.scope_report.achieved_containment;
+        // The session's achieved class, which decides the symlink rule both planes apply.
+        let resource_containment = staged.containment.achieved();
         let resource_accessible_workdir = accessible_workdir.clone();
 
         // The peer plane's minting key: 32 random bytes, generated here and only when
@@ -16070,7 +16071,7 @@ inference:
         let mut state = project.session();
         pull_skill(&mut state).unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let report = crate::containment::scope_report_for_tier(
+        let report = crate::containment::report_for(
             &CapabilityPolicy::default(),
             murmur_artifact::ContainmentClass::Advisory,
             sandbox::EnforcementTier::EnvironmentOnly,
@@ -17091,7 +17092,7 @@ inference:
             "0.1.0".to_string(),
             "test-model".to_string(),
             Vec::new(),
-            crate::containment::scope_report_for_tier(
+            crate::containment::report_for(
                 &CapabilityPolicy::default(),
                 murmur_artifact::ContainmentClass::Advisory,
                 sandbox::EnforcementTier::EnvironmentOnly,
@@ -20189,7 +20190,7 @@ inference:
                 "0.1.0".to_string(),
                 "test-model".to_string(),
                 Vec::new(),
-                crate::containment::scope_report_for_tier(
+                crate::containment::report_for(
                     &policy,
                     murmur_artifact::ContainmentClass::Advisory,
                     sandbox::EnforcementTier::EnvironmentOnly,
@@ -21711,7 +21712,7 @@ inference:
             "0.1.0".to_string(),
             "test-model".to_string(),
             Vec::new(),
-            crate::containment::scope_report_for_tier(
+            crate::containment::report_for(
                 &CapabilityPolicy::default(),
                 murmur_artifact::ContainmentClass::Advisory,
                 sandbox::EnforcementTier::EnvironmentOnly,
@@ -22165,7 +22166,7 @@ inference:
             "0.1.0".to_string(),
             "test-model".to_string(),
             Vec::new(),
-            crate::containment::scope_report_for_tier(
+            crate::containment::report_for(
                 &CapabilityPolicy::default(),
                 murmur_artifact::ContainmentClass::Advisory,
                 sandbox::EnforcementTier::EnvironmentOnly,

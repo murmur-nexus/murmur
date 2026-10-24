@@ -9,9 +9,10 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use capsule_runtime::{
-    detect_achieved_containment, detect_sealed_shortfall, detect_userns_grant, HostProbe,
+    detect_containment_decision, detect_sealed_shortfall, detect_userns_grant, HostProbe,
     MountAttempt,
 };
+use murmur_artifact::ContainmentClass;
 
 /// `HostProbe::probes_taken` counts the whole process, so the two tests that assert on deltas
 /// must not overlap: without this they see each other's probes and read a correct implementation
@@ -32,8 +33,7 @@ fn two_probes_are_two_readings() {
 }
 
 /// `detect_enforcement_tier` is crate-private, so the tier question is asked here through
-/// `detect_achieved_containment`, the public wrapper `mur doctor` and the escape-conformance
-/// harness call.
+/// `detect_containment_decision`, the public wrapper the escape-conformance harness calls.
 #[test]
 fn each_standalone_host_question_takes_its_own_reading() {
     let _serial = COUNTER.lock().expect("counter lock");
@@ -60,11 +60,49 @@ fn each_standalone_host_question_takes_its_own_reading() {
     );
     assert_eq!(
         probes_during(|| {
-            detect_achieved_containment();
+            detect_containment_decision(ContainmentClass::Sealed);
         }),
         1,
-        "detect_achieved_containment must read the host once per call",
+        "detect_containment_decision must read the host once per call",
     );
+}
+
+/// The class and tier a decision names are the session's, not the host's: on whatever host this
+/// runs, only a capsule declaring `sealed` is reported `sealed` on
+/// `mountns+pivot_root+landlock+seccomp`, and every declaration reads the same host ceiling.
+#[test]
+fn only_a_sealed_declaration_is_reported_sealed() {
+    const SEALED_TIER: &str = "mountns+pivot_root+landlock+seccomp";
+    let host = detect_containment_decision(ContainmentClass::Sealed).0;
+    println!(
+        "host can back: {}, sealed declaration runs on {}",
+        host.host_containment(),
+        host.enforcement_tier()
+    );
+    for declared in [
+        ContainmentClass::Advisory,
+        ContainmentClass::Scoped,
+        ContainmentClass::Sealed,
+    ] {
+        let (decision, _) = detect_containment_decision(declared);
+        assert_eq!(decision.declared(), declared);
+        assert_eq!(
+            decision.achieved() == ContainmentClass::Sealed,
+            declared == ContainmentClass::Sealed
+                && host.host_containment() == ContainmentClass::Sealed,
+            "{declared}: {decision:?}",
+        );
+        assert_eq!(
+            decision.enforcement_tier() == SEALED_TIER,
+            decision.achieved() == ContainmentClass::Sealed,
+            "{declared}: {decision:?}",
+        );
+        assert!(
+            decision.achieved() <= decision.host_containment(),
+            "{decision:?}"
+        );
+        assert_eq!(decision.host_containment(), host.host_containment());
+    }
 }
 
 /// One reading answers every namespace question from its attempts, on whatever host this runs:
@@ -163,8 +201,10 @@ fn reprobe_observes_a_change_in_userns_availability() {
         Some(libc::ENOSPC)
     );
     assert_ne!(
-        detect_achieved_containment(),
-        murmur_artifact::ContainmentClass::Sealed,
+        detect_containment_decision(ContainmentClass::Sealed)
+            .0
+            .host_containment(),
+        ContainmentClass::Sealed,
         "a host that cannot create a user namespace must not report a sealed ceiling",
     );
 

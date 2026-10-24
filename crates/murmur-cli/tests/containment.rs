@@ -47,11 +47,12 @@ fn mur_run(home: &TempDir, project_dir: &Path, args: &[&str]) -> assert_cmd::ass
         .assert()
 }
 
-/// What this host reports it can back, read from `--explain-scope --json` rather than assumed.
+/// What this host reports it can back, read from `--explain-scope --json`'s `host_containment`
+/// rather than assumed.
 ///
 /// Uses a throwaway project so the caller's fixture is untouched, and a declared floor of
-/// `advisory` so the probe answer is the only thing that varies.
-fn host_achieved_containment() -> String {
+/// `advisory`, which nothing refuses, so the probe answer is the only thing that varies.
+fn host_containment() -> String {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     write_project(project.path(), "capabilities:\n  containment: advisory\n");
@@ -63,7 +64,7 @@ fn host_achieved_containment() -> String {
         .clone();
     let report: serde_json::Value =
         serde_json::from_str(String::from_utf8(output).unwrap().trim()).unwrap();
-    report["achieved_containment"].as_str().unwrap().to_string()
+    report["host_containment"].as_str().unwrap().to_string()
 }
 
 /// On a host that cannot back `sealed`, the refusal is `E-CAP-003` and it names the *specific*
@@ -76,7 +77,7 @@ fn sealed_refuses_with_an_actionable_reason_unless_the_host_can_back_it() {
     let project = TempDir::new().unwrap();
     write_project(project.path(), "capabilities:\n  containment: sealed\n");
 
-    if host_achieved_containment() == "sealed" {
+    if host_containment() == "sealed" {
         // The gate let it through: it fails later, at the invalid component. Asserting the
         // *absence* of E-CAP-003 is the point — a sealed-capable host must not refuse.
         mur_run(&home, project.path(), &[])
@@ -120,7 +121,7 @@ fn explain_scope_reports_an_unmet_floor_and_still_exits_zero() {
     let project = TempDir::new().unwrap();
     write_project(project.path(), "capabilities:\n  containment: sealed\n");
 
-    let met = if host_achieved_containment() == "sealed" {
+    let met = if host_containment() == "sealed" {
         "floor met: yes"
     } else {
         "floor met: no"
@@ -201,7 +202,7 @@ fn the_cli_flag_can_raise_a_floor_the_manifest_never_declared() {
     );
 
     let assertion = mur_run(&home, project.path(), &["--containment", "sealed"]).failure();
-    if host_achieved_containment() != "sealed" {
+    if host_containment() != "sealed" {
         assertion.stderr(predicate::str::contains("E-CAP-003"));
     }
 }
@@ -343,11 +344,9 @@ fn asking_for_sealed_adds_nothing_to_the_workdir_declaration() {
 
 /// The `Not protected here` block, read off the real binary on whatever host runs the suite.
 ///
-/// The expectation is derived from `enforcement_tier` and `declared_containment` — the host
-/// mechanism and the floor the manifest asked for — rather than from `achieved_containment`, which
-/// answers a different question and cannot tell a Landlock-scoped session on a sealed-capable host
-/// apart from one running inside a composed root. Deriving it from the field under test would make
-/// the assertion hold under any derivation at all.
+/// The expectation is derived from `enforcement_tier`, the mechanism this session installs, rather
+/// than from the field under test, which would make the assertion hold under any derivation at
+/// all.
 ///
 /// The strings themselves are asserted in `capsule-runtime`'s own tests, against the function that
 /// derives them and against what a subprocess in a real session actually reaches. What is asserted
@@ -370,15 +369,17 @@ fn explain_scope_discloses_what_this_host_does_not_protect() {
             .as_array()
             .expect("filesystem_boundary.not_protected is always an array");
 
-        // The mechanism this session installs: the host's, dropped to Landlock whenever the
-        // manifest asked for less than a composed root.
-        let composes_a_root = report["enforcement_tier"] == "mountns+pivot_root+landlock+seccomp"
-            && report["declared_containment"] == "sealed";
+        let composes_a_root = report["enforcement_tier"] == "mountns+pivot_root+landlock+seccomp";
         let expected_restriction = match report["enforcement_tier"].as_str().unwrap() {
-            "mountns+pivot_root+landlock+seccomp" if composes_a_root => "absent",
-            "mountns+pivot_root+landlock+seccomp" | "landlock+seccomp" => "enforced",
+            "mountns+pivot_root+landlock+seccomp" => "absent",
+            "landlock+seccomp" => "enforced",
             _ => "advisory",
         };
+        // Only a capsule declaring `sealed` composes a root.
+        assert!(
+            !composes_a_root || report["declared_containment"] == "sealed",
+            "{report}"
+        );
         assert_eq!(boundary["restriction"], expected_restriction, "{report}");
 
         let rendered = String::from_utf8(

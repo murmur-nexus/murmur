@@ -52,7 +52,7 @@ relative to the export root, `/`-separated. `size_bytes`, `mtime_ms` and `sha256
 single open of that file.
 
 ```json
-{"root":"out/","mode":"read-only","max_bytes":10485760,"generation":0,"containment_achieved":"sealed","entries":[{"path":"report.md","size_bytes":32,"mtime_ms":1787577327015,"sha256":"868db1c52a946cae0278871d41b60fcdef206b933946bf8668a42ac1ea443412"}]}
+{"root":"out/","mode":"read-only","max_bytes":10485760,"generation":0,"containment_achieved":"scoped","entries":[{"path":"report.md","size_bytes":32,"mtime_ms":1787577327015,"sha256":"868db1c52a946cae0278871d41b60fcdef206b933946bf8668a42ac1ea443412"}]}
 ```
 
 A file larger than `max_bytes` is listed with its real size and refused on read. A root that does

@@ -1054,7 +1054,7 @@ mod tests {
                 "0.1.0".to_string(),
                 "test-model".to_string(),
                 Vec::new(),
-                crate::containment::scope_report_for_tier(
+                crate::containment::report_for(
                     &crate::CapabilityPolicy::default(),
                     murmur_artifact::ContainmentClass::Advisory,
                     crate::sandbox::EnforcementTier::EnvironmentOnly,
