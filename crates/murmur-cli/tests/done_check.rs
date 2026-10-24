@@ -254,6 +254,9 @@ fn assert_runs(trace: &[Value], expected: &[(&str, Value, bool, u32)]) {
 /// With no `lifecycle.done_check` nothing runs: the task ends at its first turn end.
 #[test]
 fn without_the_block_nothing_runs() {
+    if common::skip_without_host_support("without_the_block_nothing_runs") {
+        return;
+    }
     let home = home_with_driver();
     let server = common::ScriptedServer::start(vec![end_turn("first")]);
     let project = project(&http_manifest(&server.endpoint, "", ""));
@@ -275,6 +278,9 @@ fn without_the_block_nothing_runs() {
 /// and the task ends `ok` with the check met. Nothing else changes in what the provider is sent.
 #[test]
 fn a_check_that_fails_once_reopens_once_and_is_met() {
+    if common::skip_without_host_support("a_check_that_fails_once_reopens_once_and_is_met") {
+        return;
+    }
     let home = home_with_driver();
     let server = common::ScriptedServer::start(vec![end_turn("one"), end_turn("two")]);
     let project = project(&http_manifest(
@@ -365,6 +371,9 @@ fn run_control(home: &TempDir, project: &Project) -> Run {
 /// answer and the check unmet.
 #[test]
 fn a_check_that_always_fails_ends_ok_at_the_limit() {
+    if common::skip_without_host_support("a_check_that_always_fails_ends_ok_at_the_limit") {
+        return;
+    }
     let home = home_with_driver();
     let server = common::ScriptedServer::start(vec![end_turn("a"), end_turn("b"), end_turn("c")]);
     let project = project(&http_manifest(
@@ -397,6 +406,9 @@ fn a_check_that_always_fails_ends_ok_at_the_limit() {
 /// `limit: 0` runs and records the check at the stop and never reopens.
 #[test]
 fn limit_zero_runs_the_check_and_never_reopens() {
+    if common::skip_without_host_support("limit_zero_runs_the_check_and_never_reopens") {
+        return;
+    }
     let home = home_with_driver();
     let server = common::ScriptedServer::start(vec![end_turn("a")]);
     let project = project(&http_manifest(
@@ -423,6 +435,9 @@ fn limit_zero_runs_the_check_and_never_reopens() {
 /// which ends the task `ok` with the answer that preceded the reopen.
 #[test]
 fn max_turns_stops_the_done_check() {
+    if common::skip_without_host_support("max_turns_stops_the_done_check") {
+        return;
+    }
     let home = home_with_driver();
 
     // (a) At the turn end that spends the last turn.
@@ -480,6 +495,9 @@ const MAX_OUTPUT: u64 = 1_000;
 /// answer that preceded the reopen.
 #[test]
 fn a_spend_ceiling_ends_a_reopened_attempt_ok() {
+    if common::skip_without_host_support("a_spend_ceiling_ends_a_reopened_attempt_ok") {
+        return;
+    }
     let home = home_with_driver();
     let control_server = common::ScriptedServer::start(vec![end_turn("a")]);
     let control_project = project(&http_manifest(
@@ -533,6 +551,9 @@ const DEADLINE_SECS: u64 = 45;
 /// the session still ends `deadline_reached`.
 #[test]
 fn a_deadline_stops_a_running_check() {
+    if common::skip_without_host_support("a_deadline_stops_a_running_check") {
+        return;
+    }
     let home = home_with_driver();
     let server = common::ScriptedServer::start(vec![end_turn("answer")]);
     let project = project(&http_manifest(
@@ -595,6 +616,9 @@ fn a_deadline_stops_a_running_check() {
 /// what it printed, `Exit code: none`, and that the timeout stopped it.
 #[test]
 fn timeout_secs_kills_a_hung_check() {
+    if common::skip_without_host_support("timeout_secs_kills_a_hung_check") {
+        return;
+    }
     let home = home_with_driver();
     let server = common::ScriptedServer::start(vec![end_turn("a"), end_turn("b")]);
     let project = project(&http_manifest(
@@ -787,6 +811,9 @@ fn wait_for_trace(
 /// cancel claimed for the done check; `GetTask` and `task_end` agree.
 #[test]
 fn a_cancel_during_the_check_cancels_the_task() {
+    if common::skip_without_host_support("a_cancel_during_the_check_cancels_the_task") {
+        return;
+    }
     scratch_home();
     let server = common::ScriptedServer::start(vec![end_turn("an answer")]);
     let home = TempDir::new().unwrap();
@@ -887,6 +914,9 @@ fn a_cancel_during_the_check_cancels_the_task() {
 /// outside the work folder than the agent's shell can, and its `HOME` is the session's.
 #[test]
 fn the_check_runs_in_the_capsule_s_containment() {
+    if common::skip_without_host_support("the_check_runs_in_the_capsule_s_containment") {
+        return;
+    }
     let outside = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("done-check-outside-{}", std::process::id()));
     fs::create_dir_all(&outside).unwrap();
