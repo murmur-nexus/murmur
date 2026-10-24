@@ -37,6 +37,7 @@ pub(crate) mod driver_choice;
 pub(crate) mod credential_gateway;
 pub mod diagnostic;
 pub(crate) mod dns_resolver;
+pub(crate) mod done_check;
 pub(crate) mod egress_proxy;
 pub mod errors;
 pub(crate) mod fence;
@@ -226,7 +227,7 @@ pub use lifeline::{ChildLifeline, FormationLifeline, MemberLifeline, SpawnerLife
 pub use lifeline::{FORMATION_LIFELINE_ENV, SPAWNER_LIFELINE_ENV};
 pub use limits::ExecutionLimits;
 pub use murmur_artifact::{
-    AfterTask, KeepWorking, LifecycleConfig, LifecycleOverride, TaskAcceptance,
+    AfterTask, DoneCheck, KeepWorking, LifecycleConfig, LifecycleOverride, TaskAcceptance,
 };
 // The types and header names are flat; `origin::from_wire` and `origin::stamp_for_peer` stay
 // module-qualified, because their bare names say nothing about tasks.

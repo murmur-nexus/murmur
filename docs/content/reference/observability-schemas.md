@@ -33,7 +33,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 |---|---|
 | `session_start` | Nothing — its `event_id` is the session node |
 | `task_start` | The session node. Its `event_id` is the task node |
-| `task_end`, `task_reopened`, `task_continued`, `keep_working`, `task_canceled`, `task_failed`, `context_seed` | The task node, or the session node for a `task_failed` written outside any task |
+| `task_end`, `task_reopened`, `task_continued`, `keep_working`, `done_check`, `task_canceled`, `task_failed`, `context_seed` | The task node, or the session node for a `task_failed` written outside any task |
 | `workdir_path_refused` | The task node, or the session node outside any task |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
@@ -659,6 +659,7 @@ for every task, on every exit path
 | `reopen_count` | u32 | Times an `on-task-end` hook reopened this task before it ended. `0` for a task that ran once (the common case). A reader that finds no `reopen_count` field should default it to `0` |
 | `running_commands` | array of string | The `work_id`s of the shell commands moved to the background and still running when the task ended, oldest first — the same commands the task's A2A result names in [`metadata.murmur.runningCommands`](agent-card.md#no-answer-metadata). Absent when there were none |
 | `keep_working` | object | Present only when the capsule sets [`lifecycle.keep_working`](manifest.md#lifecycle-keep-working): `used` (u32), the continuations sent across reopens; `limit` (u32), `lifecycle.keep_working.limit`; `stopped_by` (string \| null), what stopped the task being kept working — `"limit"`, `"max_turns"`, `"spend_ceiling"`, `"deadline"` or `"no_session"` (see [Keeping a task working](../concepts/session-loop.md#keep-working)) — and `null` when it ended any other way. A stopped task's `exit_status` is `"ok"` |
+| `done_check` | object | Present only when the capsule sets [`lifecycle.done_check`](manifest.md#lifecycle-done-check): `runs` (u32), the check's runs across reopens; `reopens` (u32), the reopens failing runs caused; `limit` (u32), `lifecycle.done_check.limit`; `met` (bool \| null), whether the last run passed — `null` when the check never ran, `false` after a run a cancel or the deadline stopped; `stopped_by` (string \| null), what ended the task with the check unmet — `"limit"`, `"max_turns"`, `"spend_ceiling"` or `"deadline"` (see [Done check](../concepts/session-loop.md#done-check)) — and `null` otherwise. A task ended at the limit has `exit_status` `"ok"` |
 
 **`task_canceled`**{ #task-canceled } — written where the agent loop stopped because a person
 called [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task)
@@ -974,6 +975,36 @@ Written after the `inference` of the turn end it answers and before the continue
 `inference`. `mur trace show` lists each under **Turns** as
 `keep working: <number> of <limit>  turns remaining <n>  message <bytes> bytes`, followed by one
 `kept working: <used> of <limit> (stopped by <stop>)` line per task from `task_end.keep_working`.
+
+**`done_check`**{ #done-check } — written once per run of
+[`lifecycle.done_check`](manifest.md#lifecycle-done-check)'s command, at a stop of the task's agent
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The task checked |
+| `number` | u32 | 1-based ordinal of this run within the task, counted across reopens |
+| `command` | string | `lifecycle.done_check.command` as declared |
+| `outcome` | string | `"passed"` (exit `0`), `"failed"` (any other exit, a resource-limit kill included), `"timed_out"` (killed at `timeout_secs`), `"stopped"` (killed by a cancel or the session deadline) or `"not_started"` |
+| `exit_code` | i32 \| null | `null` for `timed_out`, `stopped` and `not_started` |
+| `duration_ms` | u64 | How long the run took |
+| `stdout_bytes` | u64 | Bytes of stdout kept, after the 16 KiB cap |
+| `stderr_bytes` | u64 | Bytes of stderr kept, after the 16 KiB cap |
+| `truncated` | bool | Whether either stream was cut at the cap |
+| `resource_limit` | string \| null | The `capabilities.resources` limit that killed the command |
+| `reopened` | bool | Whether this run reopened the task |
+| `reopens_left` | u32 | Reopens the check may still cause in this task, after this run |
+| `turns_remaining` | u32 \| null | `inference.max_turns` less every turn the task has spent. `null` when `inference.max_turns` sets no cap |
+
+```json
+{"event_type":"done_check","event_id":"evt_0193…","parent_id":"evt_0192…","session_id":"ses_0192…","timestamp":1791273600000,"task_id":"tsk_0192…","number":1,"command":"cargo test --quiet","outcome":"failed","exit_code":101,"duration_ms":8412,"stdout_bytes":2210,"stderr_bytes":96,"truncated":false,"resource_limit":null,"reopened":true,"reopens_left":2,"turns_remaining":null}
+```
+
+Written after the stop's `inference` and any `keep_working` record, and before the reopened
+attempt's first `inference` or the task's `task_end`. A run the session deadline stops follows the
+`deadline_reached` record. The check writes no `shell` record. `mur trace show` lists each run
+under **Turns** as `done check <number>: <outcome> exit <code|->  <ms> ms  reopened|not reopened`,
+followed by one `done check: met|not met|not run  reopens <r> of <limit>` line per task from
+`task_end.done_check`, with ` (stopped by <stop>)` when set.
 
 **`call_denied`**{ #call-denied } — written when a [policy hook](../concepts/hooks.md#policy-hooks)
 refuses a shell command or tool call before it runs

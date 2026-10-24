@@ -1321,6 +1321,10 @@ verbatim and unredacted — bodies can be large, and a blob holds the wire paylo
 | `lifecycle.keep_working` | object | no | Absent: a task ends at its first turn end. Sends `message` after each turn end, up to `limit` times per task — see [`lifecycle.keep_working`](#lifecycle-keep-working). |
 | `lifecycle.keep_working.message` | string | yes, in the block | The text sent as the next user message, verbatim. Must not be blank. |
 | `lifecycle.keep_working.limit` | integer | yes, in the block | Most continuations one task receives. Must be ≥ 1. |
+| `lifecycle.done_check` | object | no | Absent: a task ends when the model stops. Runs `command` each time the agent stops, and reopens the task while it fails, up to `limit` times per task — see [`lifecycle.done_check`](#lifecycle-done-check). |
+| `lifecycle.done_check.command` | string | yes, in the block | The command to run in the work folder, split into words as the shell tool splits a command. Its first word must be listed in `capabilities.shell.allow`. |
+| `lifecycle.done_check.limit` | integer | yes, in the block | Most reopens a failing check causes in one task. `0` runs and records the check without reopening. |
+| `lifecycle.done_check.timeout_secs` | integer | no | Default: `600`. Seconds one run may take before the runtime kills it. Must be ≥ 1. |
 
 #### `exports` { #field-exports }
 
@@ -2439,6 +2443,7 @@ lifecycle:
   shell_grace_secs: 10
   delegation_deadline_secs: 600
   # keep_working: absent, so a task ends at its first turn end — see lifecycle.keep_working
+  # done_check: absent, so a task ends when the model stops
 ```
 
 ### `lifecycle.task_acceptance` { #lifecycle-task-acceptance }
@@ -2709,6 +2714,46 @@ The model is told nothing about the option beyond `message` itself and the `keep
 own. Every continuation resends the whole context, so cost rises with each one. What stops the
 task, what it ends with, and how the deadline treats it are in
 [Keeping a task working](../concepts/session-loop.md#keep-working).
+
+### `lifecycle.done_check` { #lifecycle-done-check }
+
+Says what "done" means for a task. Each time the agent stops — the model ended its turn with no
+tool call, nothing it handed off is outstanding, and
+[`lifecycle.keep_working`](#lifecycle-keep-working) has stopped — the runtime runs `command` in the
+work folder. Exit `0` ends the task. Any other result reopens the task with the command's output,
+until `limit` reopens are spent. Absent, a task ends when the model stops.
+
+```yaml
+capabilities:
+  shell:
+    allow: [bash, cargo]
+lifecycle:
+  done_check:
+    command: "cargo test --quiet"
+    limit: 3
+    timeout_secs: 600
+```
+
+| Field | Rule |
+|---|---|
+| `command` | Required. Must not be blank. Split into words as the shell tool splits a command: whitespace separates words, quotes group them, a backslash escapes the next character, and nothing is expanded. The first word is the program, and must be listed in `capabilities.shell.allow`. Write `bash -c '…'` for pipelines and `&&` |
+| `limit` | Required. How many times one task may be reopened by a failing run, counted across hook reopens. `0` runs and records the check at each stop without reopening |
+| `timeout_secs` | Default `600`, at least `1`. A run still going then is killed with its process group and counts as a failed run |
+
+Each of these is refused with [`E-MAN-003`](diagnostics.md#e-man-003), naming the field:
+
+| Field | Message |
+|---|---|
+| `lifecycle.done_check.command` | `is required`, `must not be blank`, `must name a program`, or `runs '<program>', which is not in capabilities.shell.allow` |
+| `lifecycle.done_check.limit` | `is required` |
+| `lifecycle.done_check.timeout_secs` | `must be at least 1` |
+
+`limit` is separate from [`lifecycle.max_task_reopens`](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task): a check
+reopen does not spend a hook's budget, and `max_task_reopens: 0` does not turn the check off. A task
+that reaches `limit` with the check still failing ends `ok` with its last answer, and
+`task_end.done_check.met` is `false`. The order at a stop, what each budget does to the check, and
+the feedback a reopened attempt receives are in
+[Done check](../concepts/session-loop.md#done-check).
 
 ### `lifecycle.conversation` { #lifecycle-conversation }
 

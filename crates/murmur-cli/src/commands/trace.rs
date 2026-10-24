@@ -581,6 +581,82 @@ struct TaskEndEvent {
     /// How `lifecycle.keep_working` went for this task; absent when the capsule does not set it.
     #[serde(default)]
     keep_working: Option<KeepWorkingEnd>,
+    /// How `lifecycle.done_check` went for this task; absent when the capsule does not set it.
+    #[serde(default)]
+    done_check: Option<DoneCheckEnd>,
+}
+
+/// `task_end.done_check`. Every field defaults, so a partial object still parses.
+#[derive(Debug, Deserialize)]
+struct DoneCheckEnd {
+    #[serde(default)]
+    reopens: u32,
+    #[serde(default)]
+    limit: u32,
+    /// The last run's verdict; `null` when the check never ran.
+    #[serde(default)]
+    met: Option<bool>,
+    /// `limit`, `max_turns`, `spend_ceiling` or `deadline`; `null` otherwise.
+    #[serde(default)]
+    stopped_by: Option<String>,
+}
+
+impl DoneCheckEnd {
+    /// The Turns section's `done check:` line for one task.
+    fn line(&self) -> String {
+        let verdict = match self.met {
+            Some(true) => "met",
+            Some(false) => "not met",
+            None => "not run",
+        };
+        let line = format!(
+            "done check: {verdict}  reopens {} of {}",
+            self.reopens, self.limit
+        );
+        match &self.stopped_by {
+            Some(stop) => format!("{line} (stopped by {stop})"),
+            None => line,
+        }
+    }
+}
+
+/// One run of `lifecycle.done_check`'s command. Every field defaults, so a line missing one still
+/// parses.
+#[derive(Debug, Deserialize)]
+struct DoneCheckEvent {
+    /// 1-based ordinal of this run within its task.
+    #[serde(default)]
+    number: u32,
+    /// `passed`, `failed`, `timed_out`, `stopped` or `not_started`.
+    #[serde(default)]
+    outcome: String,
+    /// `null` for a run that did not exit on its own or did not start.
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    duration_ms: u64,
+    #[serde(default)]
+    reopened: bool,
+}
+
+impl DoneCheckEvent {
+    /// `<number>: <outcome> exit <code|->  <ms> ms  reopened|not reopened`, the part `show` and
+    /// `steps` render alike.
+    fn detail(&self) -> String {
+        format!(
+            "{}: {} exit {}  {} ms  {}",
+            self.number,
+            self.outcome,
+            self.exit_code
+                .map_or_else(|| "-".to_string(), |code| code.to_string()),
+            self.duration_ms,
+            if self.reopened {
+                "reopened"
+            } else {
+                "not reopened"
+            }
+        )
+    }
 }
 
 /// `task_end.keep_working`. Every field defaults, so a partial object still parses.
@@ -1136,6 +1212,7 @@ enum TraceEvent {
     TaskReopened(TaskReopenedEvent),
     TaskContinued(TaskContinuedEvent),
     KeepWorking(KeepWorkingEvent),
+    DoneCheck(DoneCheckEvent),
     TaskCanceled(TaskCanceledEvent),
     TaskRejected(TaskRejectedEvent),
     TaskFailed(TaskFailedEvent),
@@ -1496,6 +1573,10 @@ struct TraceMetrics {
     keep_working_rows: Vec<String>,
     /// One `kept working:` line per `task_end` carrying `keep_working`, in file order.
     kept_working: Vec<String>,
+    /// One row per `done_check` record, in file order.
+    done_check_rows: Vec<String>,
+    /// One `done check:` line per `task_end` carrying `done_check`, in file order.
+    done_checked: Vec<String>,
     /// Every `context_seed` record, in file order — one per seeded task.
     context_seeds: Vec<ContextSeedRecord>,
     /// Every `call_denied` record, in file order — one per call a policy hook refused.
@@ -1780,6 +1861,17 @@ fn session_status_row(status: &serde_json::Value) -> String {
     } else {
         status_value(context)
     };
+    // Only a session under `lifecycle.done_check` reports an object here.
+    let done_check = &status["done_check"];
+    let done_check = if done_check.is_object() {
+        format!(
+            "  done_check {} used {} left",
+            status_value(&done_check["used"]),
+            status_value(&done_check["left"])
+        )
+    } else {
+        String::new()
+    };
     // Only a session under `lifecycle.keep_working` reports an object here.
     let keep_working = &status["keep_working"];
     let keep_working = if keep_working.is_object() {
@@ -1793,7 +1885,7 @@ fn session_status_row(status: &serde_json::Value) -> String {
     };
     format!(
         "session_status  elapsed {}s  left {left}  turns {}/{}  context {context}  tokens in {} \
-         out {}  spend {}/{}{keep_working}",
+         out {}  spend {}/{}{keep_working}{done_check}",
         status_value(&status["time"]["elapsed_secs"]),
         status_value(&status["turns"]["used"]),
         status_value(&status["turns"]["cap"]),
@@ -2357,6 +2449,8 @@ fn compute_metrics(
     let mut continuations: Vec<TaskContinuedEvent> = Vec::new();
     let mut keep_working_rows: Vec<String> = Vec::new();
     let mut kept_working: Vec<String> = Vec::new();
+    let mut done_check_rows: Vec<String> = Vec::new();
+    let mut done_checked: Vec<String> = Vec::new();
     let mut context_seeds: Vec<ContextSeedRecord> = Vec::new();
     let mut denials: Vec<DenialRecord> = Vec::new();
     let mut protected_path_denials: Vec<ProtectedPathDenialRecord> = Vec::new();
@@ -2496,6 +2590,9 @@ fn compute_metrics(
                 if let Some(keep_working) = &e.keep_working {
                     kept_working.push(keep_working.line());
                 }
+                if let Some(done_check) = &e.done_check {
+                    done_checked.push(done_check.line());
+                }
                 if task_starts.remove(&e.task_id) {
                     task_metrics.push(TaskMetrics {
                         task_id: e.task_id,
@@ -2534,6 +2631,9 @@ fn compute_metrics(
             TraceEvent::TaskContinued(e) => continuations.push(e),
             TraceEvent::KeepWorking(e) => {
                 keep_working_rows.push(format!("keep working: {}", e.detail()));
+            }
+            TraceEvent::DoneCheck(e) => {
+                done_check_rows.push(format!("done check {}", e.detail()));
             }
             TraceEvent::ContextSeed(e) => {
                 context_seeds.push(ContextSeedRecord {
@@ -2835,6 +2935,8 @@ fn compute_metrics(
             continuations,
             keep_working_rows,
             kept_working,
+            done_check_rows,
+            done_checked,
             context_seeds,
             denials,
             protected_path_denials,
@@ -3307,6 +3409,9 @@ fn print_show(m: &TraceMetrics) {
         capsule_runtime::report_println!("{line}");
     }
     for line in m.keep_working_rows.iter().chain(&m.kept_working) {
+        capsule_runtime::report_println!("{line}");
+    }
+    for line in m.done_check_rows.iter().chain(&m.done_checked) {
         capsule_runtime::report_println!("{line}");
     }
     for (turn, row) in &m.retries {
@@ -4738,6 +4843,7 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             fmt_dur(e.waited_ms)
         ),
         TraceEvent::KeepWorking(e) => format!("{}{}", kind("keep_working"), e.detail()),
+        TraceEvent::DoneCheck(e) => format!("{}{}", kind("done_check"), e.detail()),
         TraceEvent::TaskCanceled(e) => format!(
             "{}{}  {}",
             kind("task_canceled"),
@@ -7145,6 +7251,113 @@ mod tests {
         assert_eq!(
             session_status_row(&status),
             format!("{without}  keep_working 1 used 1 left")
+        );
+    }
+
+    const DONE_CHECK_1: &str = r#"{"event_type":"done_check","event_id":"evt_d1","parent_id":"evt_2","session_id":"s","timestamp":7,"task_id":"tsk_1","number":1,"command":"bash -c 'exit 3'","outcome":"failed","exit_code":3,"duration_ms":41,"stdout_bytes":14,"stderr_bytes":0,"truncated":false,"resource_limit":null,"reopened":true,"reopens_left":0,"turns_remaining":null}"#;
+    const DONE_CHECK_2: &str = r#"{"event_type":"done_check","event_id":"evt_d2","parent_id":"evt_2","session_id":"s","timestamp":8,"task_id":"tsk_1","number":2,"command":"bash -c 'sleep 9'","outcome":"timed_out","exit_code":null,"duration_ms":2004,"stdout_bytes":0,"stderr_bytes":0,"truncated":false,"resource_limit":null,"reopened":false,"reopens_left":0,"turns_remaining":3}"#;
+
+    /// A `done_check` line parses into its own variant and its steps row gives the run's number,
+    /// outcome, exit code, duration and whether it reopened the task. A line missing every field
+    /// still parses.
+    #[test]
+    fn done_check_renders_a_steps_row() {
+        assert_eq!(
+            row(DONE_CHECK_1),
+            "done_check 1: failed exit 3  41 ms  reopened"
+        );
+        assert_eq!(
+            row(DONE_CHECK_2),
+            "done_check 2: timed_out exit -  2004 ms  not reopened"
+        );
+        let bare =
+            r#"{"event_type":"done_check","event_id":"evt_d3","session_id":"s","timestamp":9}"#;
+        let TraceEvent::DoneCheck(e) = serde_json::from_str::<TraceEvent>(bare).unwrap() else {
+            panic!("a done_check line parses as DoneCheck");
+        };
+        assert_eq!(
+            (
+                e.number,
+                e.outcome.as_str(),
+                e.exit_code,
+                e.duration_ms,
+                e.reopened
+            ),
+            (0, "", None, 0, false)
+        );
+    }
+
+    fn done_check_task_lines(task_end: &str) -> String {
+        format!(
+            "{UNENDED_START}\n\
+             {{\"event_type\":\"task_start\",\"event_id\":\"evt_2\",\"session_id\":\"s\",\"timestamp\":2,\"task_id\":\"tsk_1\",\"context_id\":\"ctx\",\"source\":\"task.md\",\"input_bytes\":4}}\n\
+             {DONE_CHECK_1}\n{DONE_CHECK_2}\n\
+             {{\"event_type\":\"task_end\",\"event_id\":\"evt_9\",\"session_id\":\"s\",\"timestamp\":9,\"task_id\":\"tsk_1\",\"exit_status\":\"ok\",\"duration_ms\":10,\"turns\":3,\"input_tokens\":1,\"output_tokens\":1,\"tool_calls\":0,\"shell_calls\":0,\"reopen_count\":0{task_end}}}\n"
+        )
+    }
+
+    /// `show` gives one Turns-section line per `done_check` record and one `done check:` line per
+    /// task that carries `task_end.done_check`, naming what stopped it.
+    #[test]
+    fn show_renders_done_check_records_and_the_task_s_summary() {
+        let (_dir, path) = trace_of(&done_check_task_lines(
+            r#","done_check":{"runs":2,"reopens":1,"limit":1,"met":false,"stopped_by":"limit"}"#,
+        ));
+        let (metrics, _) = load_metrics_for_show(&path).expect("the trace shows");
+        assert_eq!(
+            metrics.done_check_rows,
+            [
+                "done check 1: failed exit 3  41 ms  reopened",
+                "done check 2: timed_out exit -  2004 ms  not reopened",
+            ]
+        );
+        assert_eq!(
+            metrics.done_checked,
+            ["done check: not met  reopens 1 of 1 (stopped by limit)"]
+        );
+
+        for (end, line) in [
+            (
+                r#","done_check":{"runs":2,"reopens":1,"limit":3,"met":true,"stopped_by":null}"#,
+                "done check: met  reopens 1 of 3",
+            ),
+            (
+                r#","done_check":{"runs":0,"reopens":0,"limit":3,"met":null,"stopped_by":"deadline"}"#,
+                "done check: not run  reopens 0 of 3 (stopped by deadline)",
+            ),
+        ] {
+            let (_dir, path) = trace_of(&done_check_task_lines(end));
+            let (metrics, _) = load_metrics_for_show(&path).expect("the trace shows");
+            assert_eq!(metrics.done_checked, [line]);
+        }
+    }
+
+    /// A trace with no `done_check` records and no `task_end.done_check` adds nothing.
+    #[test]
+    fn show_without_done_check_adds_no_line() {
+        let (_dir, path) = trace_of(&format!("{UNENDED_START}\n"));
+        let (metrics, _) = load_metrics_for_show(&path).expect("the trace shows");
+        assert!(metrics.done_check_rows.is_empty());
+        assert!(metrics.done_checked.is_empty());
+    }
+
+    /// A `session_status` row names `done_check` only when the session reported an object.
+    #[test]
+    fn session_status_row_names_done_check_only_when_set() {
+        let mut status = serde_json::json!({
+            "time": {"elapsed_secs": 3, "task_elapsed_secs": 2, "deadline": "none"},
+            "turns": {"used": 1, "cap": "none"},
+            "context": "unknown",
+            "tokens": {"input": 1, "output": 2},
+            "spend": {"tokens": 3, "ceiling": "none"},
+        });
+        let without = session_status_row(&status);
+        status["done_check"] = serde_json::json!("none");
+        assert_eq!(session_status_row(&status), without);
+        status["done_check"] = serde_json::json!({"used": 1, "left": 2});
+        assert_eq!(
+            session_status_row(&status),
+            format!("{without}  done_check 1 used 2 left")
         );
     }
 

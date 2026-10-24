@@ -61,6 +61,9 @@ pub(crate) const PHASE_BACKGROUND_WAIT: &str = "background_wait";
 /// Cancelled while a foreground shell command was running. The command is demoted to the
 /// background and keeps its own lifecycle.
 pub(crate) const PHASE_SHELL: &str = "shell";
+/// Cancelled while `lifecycle.done_check`'s command was running. The command's process group is
+/// killed.
+pub(crate) const PHASE_DONE_CHECK: &str = "done_check";
 
 /// What the terminal `TASK_STATE_CANCELED` status says. One constant for every transport: a client
 /// cannot tell from the status which one ran the task.

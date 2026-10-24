@@ -307,39 +307,7 @@ pub(crate) fn is_shell_interpreter(binary: &str) -> bool {
     SHELL_INTERPRETERS.contains(&binary)
 }
 
-pub(crate) fn split_shell_words(command: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut escaped = false;
-
-    for ch in command.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        match (ch, quote) {
-            ('"' | '\'', None) => quote = Some(ch),
-            (q, Some(open)) if q == open => quote = None,
-            (c, None) if c.is_whitespace() => {
-                if !current.is_empty() {
-                    words.push(std::mem::take(&mut current));
-                }
-            }
-            _ => current.push(ch),
-        }
-    }
-
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
-}
+pub(crate) use murmur_artifact::split_shell_words;
 
 pub(crate) fn shell_tool_manifest_yaml(binary: &str) -> String {
     let description = if is_shell_interpreter(binary) {
@@ -422,6 +390,100 @@ pub(crate) fn run_shell(
     enforcement: &crate::sandbox::ShellEnforcement,
     detach: Option<DetachPolicy>,
 ) -> Result<ShellOutcome, ShellExecError> {
+    let wait = detach.map_or(Wait::Blocking, Wait::Detach);
+    spawn_and_wait(
+        binary,
+        args,
+        env_overrides,
+        accessible_workdir,
+        policy,
+        enforcement,
+        wait,
+    )
+    .map(|(outcome, _)| outcome)
+}
+
+/// When [`run_shell_until_stopped`] stops a command before it exits on its own.
+pub(crate) struct ForegroundStop {
+    /// Raised by a person's cancel or the session deadline.
+    pub canceled: crate::cancel::CancelSignal,
+    /// How long the command may run from its spawn.
+    pub timeout: Duration,
+}
+
+/// Why [`run_shell_until_stopped`] killed a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForegroundStopReason {
+    /// [`ForegroundStop::canceled`] was raised while it ran.
+    Canceled,
+    /// It was still running at [`ForegroundStop::timeout`].
+    TimedOut,
+}
+
+/// A command [`run_shell_until_stopped`] ran: its result, partial when `stopped` is set.
+#[derive(Debug)]
+pub(crate) struct ForegroundRun {
+    pub result: ShellResult,
+    pub stopped: Option<ForegroundStopReason>,
+}
+
+/// Run a command in the foreground under the same containment, environment, resource limits and
+/// output cap as [`run_shell`], killing it when `stop`'s cancel is raised or its timeout passes.
+///
+/// The kill is `SIGKILL` to the command's whole process group, then the command is reaped and
+/// its output drained as [`finish_output`] drains any call's. The result keeps what it printed
+/// before the kill, its `exit_code` is the kill's, and no resource limit is attributed to it. A
+/// stopped command is never demoted and never registered as detached work.
+pub(crate) fn run_shell_until_stopped(
+    binary: &str,
+    args: &[&str],
+    env_overrides: &[(String, String)],
+    accessible_workdir: &WorkdirRoot,
+    policy: &CapabilityPolicy,
+    enforcement: &crate::sandbox::ShellEnforcement,
+    stop: ForegroundStop,
+) -> Result<ForegroundRun, ShellExecError> {
+    match spawn_and_wait(
+        binary,
+        args,
+        env_overrides,
+        accessible_workdir,
+        policy,
+        enforcement,
+        Wait::Stop(stop),
+    )? {
+        (ShellOutcome::Finished(result), stopped) => Ok(ForegroundRun { result, stopped }),
+        // Unreachable: only `Wait::Detach` demotes.
+        (ShellOutcome::Detached(info), _) => Err(ShellExecError::Failed(format!(
+            "a foreground command was demoted to the background as {}",
+            info.work_id
+        ))),
+    }
+}
+
+/// How [`spawn_and_wait`] waits for the command it started.
+enum Wait {
+    /// A plain blocking wait.
+    Blocking,
+    /// Polled, and demoted to the background past the policy's grace; see [`run_shell`].
+    Detach(DetachPolicy),
+    /// Polled, and killed when the stop's cancel is raised or its timeout passes; see
+    /// [`run_shell_until_stopped`].
+    Stop(ForegroundStop),
+}
+
+/// The one place a shell command is checked, contained, spawned and waited for: [`run_shell`]
+/// and [`run_shell_until_stopped`] differ only in `wait`. The second value is set when a
+/// [`Wait::Stop`] killed the command.
+fn spawn_and_wait(
+    binary: &str,
+    args: &[&str],
+    env_overrides: &[(String, String)],
+    accessible_workdir: &WorkdirRoot,
+    policy: &CapabilityPolicy,
+    enforcement: &crate::sandbox::ShellEnforcement,
+    wait: Wait,
+) -> Result<(ShellOutcome, Option<ForegroundStopReason>), ShellExecError> {
     use std::os::unix::process::CommandExt as _;
 
     if !policy.shell_allow.iter().any(|allowed| allowed == binary) {
@@ -432,12 +494,14 @@ pub(crate) fn run_shell(
 
     // A call the task's tool loop reaches after its cancel starts nothing: the task is ending,
     // and a command it started now would only be demoted at its first poll.
-    if detach
-        .as_ref()
-        .and_then(|detach| detach.canceled.as_ref())
-        .is_some_and(crate::cancel::CancelSignal::is_canceled)
+    if let Wait::Detach(DetachPolicy {
+        canceled: Some(canceled),
+        ..
+    }) = &wait
     {
-        return Err(ShellExecError::Failed(CANCELED_BEFORE_SPAWN.to_string()));
+        if canceled.is_canceled() {
+            return Err(ShellExecError::Failed(CANCELED_BEFORE_SPAWN.to_string()));
+        }
     }
 
     // Refuse before spawning, not after: once the workdir ceiling is crossed, the cheapest way
@@ -518,47 +582,77 @@ pub(crate) fn run_shell(
     // Demotion keeps the output in the records directory and points the agent at it. With no
     // records directory there is nowhere to keep it, so the command runs in the foreground.
     let records_root = enforcement.records_root();
-    let detach = detach.filter(|_| records_root.is_some());
+    let wait = match wait {
+        Wait::Detach(_) if records_root.is_none() => Wait::Blocking,
+        wait => wait,
+    };
 
-    let (status, drain_deadline) = match &detach {
-        None => {
-            let status = child.wait().map_err(|error| error.to_string())?;
-            (status, Instant::now() + PIPE_DRAIN_AFTER_EXIT)
-        }
-        Some(policy) => {
-            let deadline = started + policy.grace;
-            loop {
-                match child.try_wait().map_err(|error| error.to_string())? {
-                    Some(status) => {
-                        break (
-                            status,
-                            (Instant::now() + PIPE_DRAIN_AFTER_EXIT).min(deadline),
-                        )
+    let mut stopped = None;
+    let (status, drain_deadline) =
+        match wait {
+            Wait::Blocking => {
+                let status = child.wait().map_err(|error| error.to_string())?;
+                (status, Instant::now() + PIPE_DRAIN_AFTER_EXIT)
+            }
+            Wait::Stop(stop) => {
+                let deadline = started + stop.timeout;
+                loop {
+                    if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+                        break (status, Instant::now() + PIPE_DRAIN_AFTER_EXIT);
                     }
-                    None => {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        // A caller that stopped waiting gets the same demotion the deadline
-                        // gives, at the next poll: nobody is left to read a foreground result.
-                        let abandoned = policy
-                            .abandoned
-                            .as_ref()
-                            .is_some_and(crate::detached::AbandonSignal::is_raised);
-                        // A cancelled task stops waiting the same way, and the session's end
-                        // kills the command it leaves running.
-                        let canceled = policy
-                            .canceled
-                            .as_ref()
-                            .filter(|signal| signal.is_canceled());
-                        if let Some(signal) = canceled {
-                            signal.note_phase(crate::cancel::PHASE_SHELL);
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let reason = if stop.canceled.is_canceled() {
+                        Some(ForegroundStopReason::Canceled)
+                    } else if remaining.is_zero() {
+                        Some(ForegroundStopReason::TimedOut)
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = reason {
+                        // The leader is not reaped yet, so `pgid` still names this command's group.
+                        crate::formation_launch::signal_group(i64::from(pgid), libc::SIGKILL);
+                        let status = child.wait().map_err(|error| error.to_string())?;
+                        stopped = Some(reason);
+                        break (status, Instant::now() + PIPE_DRAIN_AFTER_EXIT);
+                    }
+                    std::thread::sleep(remaining.min(DETACH_POLL_INTERVAL));
+                }
+            }
+            Wait::Detach(policy) => {
+                let deadline = started + policy.grace;
+                loop {
+                    match child.try_wait().map_err(|error| error.to_string())? {
+                        Some(status) => {
+                            break (
+                                status,
+                                (Instant::now() + PIPE_DRAIN_AFTER_EXIT).min(deadline),
+                            )
                         }
-                        if remaining.is_zero() || abandoned || canceled.is_some() {
-                            // A zero grace demotes here, at the first poll after the spawn.
-                            return Ok(ShellOutcome::Detached(demote(
+                        None => {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            // A caller that stopped waiting gets the same demotion the deadline
+                            // gives, at the next poll: nobody is left to read a foreground result.
+                            let abandoned = policy
+                                .abandoned
+                                .as_ref()
+                                .is_some_and(crate::detached::AbandonSignal::is_raised);
+                            // A cancelled task stops waiting the same way, and the session's end
+                            // kills the command it leaves running.
+                            let canceled = policy
+                                .canceled
+                                .as_ref()
+                                .filter(|signal| signal.is_canceled());
+                            if let Some(signal) = canceled {
+                                signal.note_phase(crate::cancel::PHASE_SHELL);
+                            }
+                            if remaining.is_zero() || abandoned || canceled.is_some() {
+                                // A zero grace demotes here, at the first poll after the spawn.
+                                return Ok((
+                                ShellOutcome::Detached(demote(
                                 child,
                                 readers,
                                 DemotionContext {
-                                    policy: detach.expect("the detach policy was matched above"),
+                                    policy,
                                     records_root: records_root
                                         .expect("a detach policy is kept only with a records root")
                                         .clone(),
@@ -571,25 +665,28 @@ pub(crate) fn run_shell(
                                     cgroup_counters_before,
                                     cgroup_occupancy,
                                 },
-                            )));
+                            )),
+                                None,
+                            ));
+                            }
+                            std::thread::sleep(remaining.min(DETACH_POLL_INTERVAL));
                         }
-                        std::thread::sleep(remaining.min(DETACH_POLL_INTERVAL));
                     }
                 }
             }
-        }
-    };
+        };
     let (stdout_bytes, stderr_bytes, output_holders) = finish_output(readers, pgid, drain_deadline);
     let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
     // After `finish_output`, so forks refused while the holders were still running are in the
-    // delta.
+    // delta. A command this call killed hit no limit.
     let resource_limit_hit = classify_resource_limit(
         &status,
         enforcement.cgroup_scope.as_deref(),
         cgroup_counters_before,
         cgroup_occupancy.as_ref(),
-    );
+    )
+    .filter(|_| stopped.is_none());
     drop(cgroup_occupancy);
     let exit_code = exit_code_of(&status);
 
@@ -623,17 +720,20 @@ pub(crate) fn run_shell(
         }
     }
 
-    Ok(ShellOutcome::Finished(ShellResult {
-        binary: resolved_binary,
-        exit_code,
-        stdout,
-        stderr,
-        duration_ms,
-        truncated,
-        full_output_path,
-        resource_limit_hit,
-        output_holders,
-    }))
+    Ok((
+        ShellOutcome::Finished(ShellResult {
+            binary: resolved_binary,
+            exit_code,
+            stdout,
+            stderr,
+            duration_ms,
+            truncated,
+            full_output_path,
+            resource_limit_hit,
+            output_holders,
+        }),
+        stopped,
+    ))
 }
 
 /// [`run_shell`] with no demotion: the command runs to completion in the foreground.
@@ -2787,6 +2887,131 @@ mod tests {
         }
         assert!(!temp.path().join("started").exists(), "nothing was spawned");
         assert!(registry.outstanding().is_empty(), "nothing was registered");
+    }
+
+    /// [`run_shell_until_stopped`] on `script`, with a background `sleep` writing its pid to
+    /// `sleeper.pid` so the test can check the whole group was killed.
+    fn run_until_stopped(
+        workdir: &std::path::Path,
+        runtime: &std::path::Path,
+        script: &str,
+        stop: ForegroundStop,
+    ) -> ForegroundRun {
+        run_shell_until_stopped(
+            "bash",
+            &["-c", script],
+            &[],
+            &crate::workdir_fs::WorkdirRoot::open(workdir).unwrap(),
+            &CapabilityPolicy {
+                shell_allow: vec!["bash".to_string()],
+                ..CapabilityPolicy::default()
+            },
+            &ShellEnforcement::environment_only()
+                .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime), None),
+            stop,
+        )
+        .expect("a declared binary runs")
+    }
+
+    const STOPPABLE_SCRIPT: &str = "sleep 300 & echo $! > sleeper.pid; echo started; sleep 300";
+
+    /// A cancel raised while the command runs kills its whole process group within a second and
+    /// returns what it printed, marked stopped.
+    #[test]
+    fn a_foreground_stop_kills_the_group_on_cancel() {
+        let temp = tempdir().unwrap();
+        let runtime = tempdir().unwrap();
+        let _sleeper = KillPidFileOnDrop(temp.path().join("sleeper.pid"));
+        let cancel = crate::cancel::CancelSignal::new();
+        let raiser = {
+            let cancel = cancel.clone();
+            let pid_file = temp.path().join("sleeper.pid");
+            std::thread::spawn(move || {
+                while !pid_file.exists() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                cancel.cancel();
+                Instant::now()
+            })
+        };
+
+        let run = run_until_stopped(
+            temp.path(),
+            runtime.path(),
+            STOPPABLE_SCRIPT,
+            ForegroundStop {
+                canceled: cancel,
+                timeout: Duration::from_secs(60),
+            },
+        );
+        let raised = raiser.join().unwrap();
+
+        assert!(
+            raised.elapsed() < Duration::from_secs(1),
+            "the call returned {:?} after the cancel",
+            raised.elapsed()
+        );
+        assert_eq!(run.stopped, Some(ForegroundStopReason::Canceled));
+        assert!(run.result.stdout.contains("started"), "{:?}", run.result);
+        assert_eq!(run.result.resource_limit_hit, None);
+        let sleeper = read_pid(&temp.path().join("sleeper.pid"));
+        assert!(
+            process_dead_within(sleeper, Duration::from_secs(1)),
+            "the background sleeper {sleeper} outlived the stop"
+        );
+    }
+
+    /// A command still running at the timeout is killed with its group within a second of it.
+    #[test]
+    fn a_foreground_stop_kills_the_group_at_the_timeout() {
+        let temp = tempdir().unwrap();
+        let runtime = tempdir().unwrap();
+        let _sleeper = KillPidFileOnDrop(temp.path().join("sleeper.pid"));
+
+        let started = Instant::now();
+        let run = run_until_stopped(
+            temp.path(),
+            runtime.path(),
+            STOPPABLE_SCRIPT,
+            ForegroundStop {
+                canceled: crate::cancel::CancelSignal::new(),
+                timeout: Duration::from_secs(1),
+            },
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(2),
+            "the call returned after {elapsed:?} for a 1 s timeout"
+        );
+        assert_eq!(run.stopped, Some(ForegroundStopReason::TimedOut));
+        assert!(run.result.stdout.contains("started"), "{:?}", run.result);
+        let sleeper = read_pid(&temp.path().join("sleeper.pid"));
+        assert!(
+            process_dead_within(sleeper, Duration::from_secs(1)),
+            "the background sleeper {sleeper} outlived the timeout"
+        );
+    }
+
+    /// A command that exits on its own is not marked stopped and keeps its exit code.
+    #[test]
+    fn a_foreground_stop_leaves_a_finished_command_alone() {
+        let temp = tempdir().unwrap();
+        let runtime = tempdir().unwrap();
+        let run = run_until_stopped(
+            temp.path(),
+            runtime.path(),
+            "echo out; echo err >&2; exit 3",
+            ForegroundStop {
+                canceled: crate::cancel::CancelSignal::new(),
+                timeout: Duration::from_secs(60),
+            },
+        );
+        assert_eq!(run.stopped, None);
+        assert_eq!(run.result.exit_code, 3);
+        assert_eq!(run.result.stdout, "out\n");
+        assert_eq!(run.result.stderr, "err\n");
     }
 
     /// `run` on a thread of its own, failing the test after 30 s instead of hanging it.

@@ -646,6 +646,10 @@ pub(crate) enum Continuation {
     /// `lifecycle.keep_working.message`, the operator's text: sent verbatim, never fenced on the
     /// task's provenance and never otherwise wrapped.
     KeepWorking(String),
+    /// A failing `lifecycle.done_check` run, as [`crate::done_check::feedback`] wrote it: the
+    /// command's output already fenced under `done-check`, then the runtime's own fact lines. Sent
+    /// as written, never fenced again on the task's provenance.
+    DoneCheck(String),
 }
 
 impl Continuation {
@@ -658,7 +662,7 @@ impl Continuation {
         match self {
             Self::ReopenFeedback(feedback) => fence_task_payload(provenance, feedback),
             Self::Outcomes(outcomes) => (outcomes, None),
-            Self::KeepWorking(message) => (message, None),
+            Self::KeepWorking(message) | Self::DoneCheck(message) => (message, None),
         }
     }
 }

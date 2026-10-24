@@ -167,6 +167,7 @@ A `TASK_STATE_WORKING` status says what the task is doing:
 | `continuing with <n> member answer(s)` | The task continues with the member answers that arrived |
 | `continuing with <n> delegation outcome(s)` | The task continues with the delegation outcomes that arrived |
 | `keep working <n> of <limit>` | [`lifecycle.keep_working`](manifest.md#lifecycle-keep-working) sends its message after a turn end |
+| `done check failed, reopened <n> of <limit>` | [`lifecycle.done_check`](manifest.md#lifecycle-done-check)'s command failed and the task reopens |
 
 When both kinds are outstanding, or both kinds arrived, the two messages are joined with `; ` in
 one status.

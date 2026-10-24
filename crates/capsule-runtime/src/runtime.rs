@@ -15,12 +15,12 @@ use murmur_artifact::{
     parse_hook_config_from_yaml, parse_tool_implementation_from_yaml, read_lockfile,
     runtime_warning_link, security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask,
     ApiKeyReference, ArtifactImplementation, ArtifactName, ArtifactRuntime, ContextConfig,
-    ConversationMode, HookBinding, InferenceConfig, InterpreterRuntimeGrant, KeepWorking,
-    LifecycleConfig, LockOrigin, LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict,
-    Registry, RegistryError, RuntimeArtifact, RuntimeType, TaskAcceptance, LOCK_VERSION,
-    PACKED_MANIFEST_ENTRY, W_RUN_003, W_RUN_008, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
-    W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018,
-    W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
+    ConversationMode, DoneCheck, HookBinding, InferenceConfig, InterpreterRuntimeGrant,
+    KeepWorking, LifecycleConfig, LockOrigin, LockedSha256, LockfileError, MurmurLock,
+    NativeBinaryVerdict, Registry, RegistryError, RuntimeArtifact, RuntimeType, TaskAcceptance,
+    LOCK_VERSION, PACKED_MANIFEST_ENTRY, W_RUN_003, W_RUN_008, W_SEC_003, W_SEC_006, W_SEC_007,
+    W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017,
+    W_SEC_018, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
 };
 use serde_norway::Value;
 use wasmtime::{
@@ -63,6 +63,7 @@ use crate::{
         DetachedRegistry, DetachedReport,
     },
     diagnostic,
+    done_check::{DoneCheckOutcome, DoneCheckStop, DoneCheckTally, DoneCheckVerdict},
     errors::RuntimeError,
     formation::{FormationId, FormationPeers},
     formation_credentials::{is_formation_host, virtual_member, FormationMember, FormationToken},
@@ -316,6 +317,14 @@ fn check_workdir_identity(
 /// `working` status per continuation. The last turn end's answer stands: a continued attempt
 /// that ends on a budget (turns, spend, the session deadline) ends the task `ok` with it.
 ///
+/// `done_check` is the capsule's `lifecycle.done_check`. With it set, every attempt that stops at a
+/// turn end — after handed-off work and `keep_working` — runs the operator's command in the work
+/// folder under the capsule's containment. A failing run reopens the task with the run's facts,
+/// up to its own limit and without an `on-task-end` dispatch, a `task_reopened` record or a
+/// `reopen_count` increment; a passing run, or one at its limit, falls through to `on-task-end`
+/// as the attempt's end. One `done_check` record per run. A reopened attempt that ends on a
+/// budget ends the task `ok` with the answer that preceded the reopen, as `keep_working` does.
+///
 /// `task_id` is the door task's id: the registry entry this function finishes, the task `sse`
 /// carries frames for, and the id on the `task_start`/`task_reopened`/`task_end` records and the
 /// `on-task-end` hook event. Every task runs as a door task, the launch's own included, so
@@ -327,6 +336,7 @@ async fn run_task_with_reopens(
     inference: &InferenceConfig,
     max_task_reopens: u32,
     keep_working: Option<KeepWorking>,
+    done_check: Option<DoneCheck>,
     system_prompt: Option<String>,
     run_config: agent::AgentRunConfig,
     hooks: &mut HookRuntime,
@@ -357,6 +367,7 @@ async fn run_task_with_reopens(
             "failed",
             0,
             keep_working_summary(keep_working.as_ref(), 0, None),
+            done_check_summary(done_check.as_ref(), &DoneCheckTally::default()),
             context_id,
             &sse,
             agent::AttemptEnding::failed(reason),
@@ -393,6 +404,12 @@ async fn run_task_with_reopens(
     let mut keep_working_used: u32 = 0;
     let mut standing: Option<agent::AttemptEnding> = None;
     let mut stopped_by: Option<KeepWorkingStop> = None;
+    // `lifecycle.done_check`: its runs, reopens, last verdict and stop across the task's
+    // attempts, every feedback that reopened the task, and whether `standing` is the answer a
+    // check reopen kept — which decides whose `stopped_by` a later budget stop sets.
+    let mut done_check_tally = DoneCheckTally::default();
+    let mut done_check_results: Vec<String> = Vec::new();
+    let mut standing_from_done_check = false;
     // The formation member that sent the task, which `end-without-answer` reports to; `None` for
     // a task no formation token started. The registry lock is released here, before `scope_task`
     // takes the member-calls lock.
@@ -601,6 +618,7 @@ async fn run_task_with_reopens(
                             &feedback,
                             &member_answers,
                             &delegation_outcomes,
+                            &done_check_results,
                         );
                         if !thread.can_continue(&inference.transport) {
                             rewrite_task_input(
@@ -667,8 +685,21 @@ async fn run_task_with_reopens(
         if let Some(answer) = &standing {
             let at_deadline = matches!(result, Ok(AgentLoopExit::Canceled))
                 && registry_stopped_at_deadline(state, task_id);
-            if let Some(stop) = crate::keep_working::budget_stop(&result, at_deadline) {
-                stopped_by = Some(stop);
+            // A reopen by the done check kept the answer, so the stop is the check's.
+            let converted = if standing_from_done_check {
+                let stop = crate::done_check::budget_stop(&result, at_deadline);
+                if stop.is_some() {
+                    done_check_tally.stopped_by = stop;
+                }
+                stop.is_some()
+            } else {
+                let stop = crate::keep_working::budget_stop(&result, at_deadline);
+                if stop.is_some() {
+                    stopped_by = stop;
+                }
+                stop.is_some()
+            };
+            if converted {
                 result = Ok(AgentLoopExit::Ok);
                 thread.ending = Some(answer.clone());
                 if let Some(text) = &answer.response {
@@ -719,6 +750,7 @@ async fn run_task_with_reopens(
                 KeepWorkingDecision::End => {}
                 KeepWorkingDecision::Continue => {
                     keep_working_used += 1;
+                    standing_from_done_check = false;
                     standing =
                         Some(
                             thread
@@ -748,6 +780,176 @@ async fn run_task_with_reopens(
                     );
                     continuation = Some(agent::Continuation::KeepWorking(setting.message.clone()));
                     continue;
+                }
+            }
+        }
+
+        // `lifecycle.done_check`, at a turn end keep-working did not continue. Never after a
+        // failure, a cancel, an attempt that ended without an answer or one a budget cut short.
+        if let Some(check) = done_check.as_ref().filter(|_| turn_end) {
+            let turns = turns_left(inference.max_turns, trace.task_turns());
+            // Decided and marked under the lock the session deadline cancels under, as
+            // keep-working's turn-end decision is: a deadline either finds this attempt's answer
+            // marked as standing, so it only stops the check, or has already stopped the task.
+            let decision = match state.a2a_task_registry.as_ref() {
+                Some(registry) => {
+                    let mut registry = registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let decision = done_check_decision(
+                        registry.stopped_at_deadline(task_id),
+                        cancel.is_canceled(),
+                    );
+                    if decision == DoneCheckDecision::Run {
+                        registry.mark_standing_answer(task_id);
+                    }
+                    decision
+                }
+                None => done_check_decision(false, cancel.is_canceled()),
+            };
+            match decision {
+                DoneCheckDecision::Deadline => {
+                    done_check_tally.stopped_by = Some(DoneCheckStop::Deadline);
+                }
+                DoneCheckDecision::End => {}
+                DoneCheckDecision::Run => {
+                    let attempt_ending =
+                        thread
+                            .ending
+                            .clone()
+                            .unwrap_or_else(|| agent::AttemptEnding {
+                                state: TaskState::Completed,
+                                message: AgentLoopExit::Ok.as_str().to_string(),
+                                response: None,
+                                no_answer: false,
+                            });
+                    match run_done_check(state, check, cancel.clone()).await {
+                        // The shell tool's session-fatal failure ends the task the same way.
+                        Err(error) => {
+                            let _ = trace
+                                .write_task_failed(
+                                    None,
+                                    crate::trace::TASK_FAILED_RUNTIME_ERROR,
+                                    &error.to_string(),
+                                )
+                                .await;
+                            thread.ending = None;
+                            result = Err(error);
+                        }
+                        Ok(report) => {
+                            done_check_tally.runs += 1;
+                            done_check_tally.met = Some(report.outcome == DoneCheckOutcome::Passed);
+                            let verdict = if report.outcome == DoneCheckOutcome::Stopped {
+                                None
+                            } else {
+                                Some(crate::done_check::decide(
+                                    report.outcome,
+                                    done_check_tally.reopens,
+                                    check.limit,
+                                    turns,
+                                ))
+                            };
+                            let reopen = verdict == Some(DoneCheckVerdict::Reopen);
+                            if reopen {
+                                done_check_tally.reopens += 1;
+                            }
+                            let _ = trace
+                                .write_done_check(
+                                    &crate::trace::DoneCheckRun {
+                                        task_id,
+                                        number: done_check_tally.runs,
+                                        command: &check.command,
+                                        outcome: report.outcome.as_str(),
+                                        exit_code: report.exit_code,
+                                        duration_ms: report.duration_ms,
+                                        stdout_bytes: report.stdout.len() as u64,
+                                        stderr_bytes: report.stderr.len() as u64,
+                                        truncated: report.truncated,
+                                        resource_limit: report.resource_limit.as_deref(),
+                                        reopened: reopen,
+                                        reopens_left: check
+                                            .limit
+                                            .saturating_sub(done_check_tally.reopens),
+                                        turns_remaining: turns,
+                                    },
+                                    done_check_tally.reopens,
+                                )
+                                .await;
+                            match verdict {
+                                // Stopped by the session deadline: the task ends `ok` with this
+                                // attempt's answer.
+                                None if registry_stopped_at_deadline(state, task_id) => {
+                                    done_check_tally.stopped_by = Some(DoneCheckStop::Deadline);
+                                }
+                                // Stopped by a person's cancel, `SIGTERM` or the formation's end.
+                                None => {
+                                    cancel.note_phase(crate::cancel::PHASE_DONE_CHECK);
+                                    let residue = crate::cancel::Residue::snapshot(
+                                        state.detached.as_ref(),
+                                        &state.live_delegations,
+                                    );
+                                    let _ = trace
+                                        .write_task_canceled(
+                                            task_id,
+                                            None,
+                                            cancel.phase(),
+                                            residue.detached_work_ids(),
+                                            residue.delegation_ids(),
+                                        )
+                                        .await;
+                                    result = Ok(AgentLoopExit::Canceled);
+                                    thread.ending = Some(agent::AttemptEnding {
+                                        state: TaskState::Canceled,
+                                        message: crate::cancel::CANCELED_STATUS_MESSAGE.to_string(),
+                                        response: None,
+                                        no_answer: false,
+                                    });
+                                }
+                                Some(DoneCheckVerdict::Met) => {}
+                                Some(DoneCheckVerdict::Unmet(stop)) => {
+                                    done_check_tally.stopped_by = Some(stop);
+                                }
+                                // Not an end: no `on-task-end`, no `task_reopened`, and the
+                                // hooks' `reopen_count` is untouched.
+                                Some(DoneCheckVerdict::Reopen) => {
+                                    standing = Some(attempt_ending);
+                                    standing_from_done_check = true;
+                                    stopped_by = None;
+                                    if let Some(calls) = &calls {
+                                        calls.clear_decline();
+                                    }
+                                    emit_task_working(
+                                        &sse,
+                                        Some(task_id),
+                                        context_id.as_ref(),
+                                        format!(
+                                            "done check failed, reopened {} of {}",
+                                            done_check_tally.reopens, check.limit
+                                        ),
+                                    );
+                                    let message = crate::done_check::feedback(
+                                        &fence_done_check_output(
+                                            report.fenced_body(&check.command),
+                                        ),
+                                        &report,
+                                        check.timeout_secs,
+                                    );
+                                    done_check_results.push(message.clone());
+                                    let rewritten = build_continued_task_md(
+                                        &original_task,
+                                        &feedback,
+                                        &member_answers,
+                                        &delegation_outcomes,
+                                        &done_check_results,
+                                    );
+                                    rewrite_task_input(&runtime_root, &rewritten, "done check");
+                                    as_given = rewritten;
+                                    continuation = Some(agent::Continuation::DoneCheck(message));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -782,7 +984,8 @@ async fn run_task_with_reopens(
         let canceled = matches!(result, Ok(AgentLoopExit::Canceled));
         // Nor is a refused one: the refused operation is never retried. Nor one the session
         // deadline stopped while it was kept working: the session is ending.
-        let at_deadline = stopped_by == Some(KeepWorkingStop::Deadline);
+        let at_deadline = stopped_by == Some(KeepWorkingStop::Deadline)
+            || done_check_tally.stopped_by == Some(DoneCheckStop::Deadline);
         match reopen.filter(|_| !canceled && !refused && !at_deadline) {
             Some(TaskReopen { hook_name, reason }) => {
                 // A hook wants more. Honor it only if a reopen remains in the budget AND
@@ -794,7 +997,8 @@ async fn run_task_with_reopens(
                     reopens_used += 1;
                     // The reopened attempt has no answer of its own yet; the continuation count
                     // is the task's, so it carries over.
-                    if standing.take().is_some() {
+                    // The done check marks the answer it runs on even when it keeps none.
+                    if standing.take().is_some() || done_check_tally.runs > 0 {
                         if let Some(registry) = state.a2a_task_registry.as_ref() {
                             registry
                                 .lock()
@@ -802,7 +1006,9 @@ async fn run_task_with_reopens(
                                 .clear_standing_answer(task_id);
                         }
                     }
+                    standing_from_done_check = false;
                     stopped_by = None;
+                    done_check_tally.stopped_by = None;
                     // The reopened attempt may answer after all.
                     if let Some(calls) = &calls {
                         calls.clear_decline();
@@ -844,6 +1050,7 @@ async fn run_task_with_reopens(
                         &feedback,
                         &member_answers,
                         &delegation_outcomes,
+                        &done_check_results,
                     );
                     rewrite_task_input(&runtime_root, &rewritten, "reopen feedback");
                     as_given = rewritten;
@@ -874,6 +1081,7 @@ async fn run_task_with_reopens(
                     "reopen_budget_exhausted",
                     reopens_used,
                     keep_working_summary(keep_working.as_ref(), keep_working_used, stopped_by),
+                    done_check_summary(done_check.as_ref(), &done_check_tally),
                     context_id,
                     &sse,
                     agent::AttemptEnding::failed(refusal.clone()),
@@ -892,6 +1100,7 @@ async fn run_task_with_reopens(
                     exit_str,
                     reopens_used,
                     keep_working_summary(keep_working.as_ref(), keep_working_used, stopped_by),
+                    done_check_summary(done_check.as_ref(), &done_check_tally),
                     context_id,
                     &sse,
                     ending,
@@ -955,6 +1164,94 @@ fn keep_working_summary(
     })
 }
 
+/// What [`run_task_with_reopens`] does at a turn end under `lifecycle.done_check`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoneCheckDecision {
+    /// Mark this attempt's answer as standing and run the command.
+    Run,
+    /// End the task without running: the session deadline has stopped it.
+    Deadline,
+    /// End the task without running: a cancel is already ending it.
+    End,
+}
+
+/// The decision before a run: the session deadline having stopped the task wins, then a raised
+/// cancel; otherwise the command runs.
+fn done_check_decision(stopped_at_deadline: bool, canceled: bool) -> DoneCheckDecision {
+    if stopped_at_deadline {
+        DoneCheckDecision::Deadline
+    } else if canceled {
+        DoneCheckDecision::End
+    } else {
+        DoneCheckDecision::Run
+    }
+}
+
+/// Run `lifecycle.done_check`'s command once in the work folder, the way the agent's shell tool
+/// runs a command — the session's capability policy, shell enforcement and environment — killing
+/// it when `cancel` is raised or `timeout_secs` passes. The `Err` is a session-fatal failure.
+async fn run_done_check(
+    state: &CapsuleStoreState,
+    check: &DoneCheck,
+    cancel: crate::cancel::CancelSignal,
+) -> Result<crate::done_check::DoneCheckReport, RuntimeError> {
+    let argv = check.argv();
+    let accessible_workdir = state.accessible_root.clone();
+    let env_overrides = native_env(&state.inference_env);
+    let policy = state.capability_policy.clone();
+    let enforcement = state.shell_enforcement.clone();
+    let stop = crate::shell::ForegroundStop {
+        canceled: cancel,
+        timeout: std::time::Duration::from_secs(check.timeout_secs),
+    };
+    let started = std::time::Instant::now();
+    let run = tokio::task::spawn_blocking(move || {
+        let Some((binary, args)) = argv.split_first() else {
+            return Err(ShellExecError::Failed(
+                "lifecycle.done_check.command names no program".to_string(),
+            ));
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        crate::shell::run_shell_until_stopped(
+            binary,
+            &args,
+            &env_overrides,
+            &accessible_workdir,
+            &policy,
+            &enforcement,
+            stop,
+        )
+    })
+    .await
+    .unwrap_or_else(|error| Err(ShellExecError::Failed(error.to_string())));
+    crate::done_check::DoneCheckReport::from_run(
+        run,
+        started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+    )
+}
+
+/// `body` fenced under `done-check`, through the tool-result boundary's [`fence_result`].
+fn fence_done_check_output(body: String) -> String {
+    let mut result = murmur::tool::run::ToolResult {
+        status: murmur::tool::run::Status::Passed,
+        summary: None,
+        data: Some(body),
+        data_path: None,
+        truncated: false,
+        metadata: Vec::new(),
+    };
+    fence_result(crate::fence::done_check_source(), &mut result);
+    result.data.unwrap_or_default()
+}
+
+/// `task_end.done_check`: `None` when the capsule does not set `lifecycle.done_check`.
+fn done_check_summary(
+    setting: Option<&DoneCheck>,
+    tally: &DoneCheckTally,
+) -> Option<crate::trace::DoneCheckSummary> {
+    setting.map(|setting| tally.summary(setting.limit))
+}
+
 /// End a task [`run_task_with_reopens`] ran, in the order its readers rely on: `task_end` with
 /// `exit_status`, the hooks' task scope closed, the trace flushed, then the registry slot
 /// finished and the task's one terminal status written from `GetTask`'s view of it, after its
@@ -977,6 +1274,7 @@ async fn end_task(
     exit_status: &str,
     reopens_used: u32,
     keep_working: Option<crate::trace::KeepWorkingSummary>,
+    done_check: Option<crate::trace::DoneCheckSummary>,
     context_id: Option<String>,
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
     ending: agent::AttemptEnding,
@@ -1006,6 +1304,7 @@ async fn end_task(
                 .map(|running| running.work_id.clone())
                 .collect(),
             keep_working,
+            done_check,
         )
         .await;
     hooks.end_task();
@@ -1193,14 +1492,16 @@ fn build_reopen_task_md(original: &str, feedback: &[(String, String)]) -> String
     out
 }
 
-/// [`build_reopen_task_md`]'s `task.md`, followed by every batch of member answers and then every
-/// batch of delegation outcomes delivered so far, each under a section of its own. With neither it
-/// is exactly the reopened task; with no feedback it is the original task and the outcomes.
+/// [`build_reopen_task_md`]'s `task.md`, followed by every batch of member answers, then every
+/// batch of delegation outcomes delivered so far, then every `lifecycle.done_check` feedback that
+/// reopened the task, each under a section of its own. With none of them it is exactly the
+/// reopened task; with no feedback it is the original task and the rest.
 fn build_continued_task_md(
     original: &str,
     feedback: &[(String, String)],
     member_answers: &[String],
     delegation_outcomes: &[String],
+    done_check_results: &[String],
 ) -> String {
     let mut out = if feedback.is_empty() {
         original.to_string()
@@ -1210,6 +1511,7 @@ fn build_continued_task_md(
     for (heading, batches) in [
         ("Member answers", member_answers),
         ("Delegation outcomes", delegation_outcomes),
+        ("Done check", done_check_results),
     ] {
         if batches.is_empty() {
             continue;
@@ -3914,6 +4216,10 @@ fn launch(
                     .keep_working
                     .as_ref()
                     .map(|keep_working| keep_working.limit),
+                effective_lifecycle
+                    .done_check
+                    .as_ref()
+                    .map(|done_check| done_check.limit),
             ));
             trace.set_session_status(Arc::clone(&session_status));
 
@@ -4698,6 +5004,7 @@ fn launch(
                             inference,
                             effective_lifecycle.max_task_reopens,
                             effective_lifecycle.keep_working.clone(),
+                            effective_lifecycle.done_check.clone(),
                             system_prompt.clone(),
                             run_config.clone(),
                             &mut hooks,
@@ -17584,6 +17891,7 @@ inference:
                 0,
                 None,
                 None,
+                None,
                 run_config,
                 &mut self.hooks,
                 &mut self.trace,
@@ -21857,6 +22165,7 @@ inference:
             forget: None,
             streamed: false,
             counting_harness: false,
+            lifecycle: (None, None),
         })
         .await;
         (run.result, run.events)
@@ -21877,6 +22186,9 @@ inference:
         /// Whether the harness answers `RESULT-<n>` on its n-th spawn rather than `done` on every
         /// one.
         counting_harness: bool,
+        /// `lifecycle.keep_working` and `lifecycle.done_check`. A done check runs under a policy
+        /// whose `shell_allow` is `["bash"]`.
+        lifecycle: (Option<KeepWorking>, Option<DoneCheck>),
     }
 
     /// What a reopen scenario left behind.
@@ -22071,6 +22383,7 @@ inference:
         mode: ConversationMode,
         seed: Option<HookSeed>,
         streamed: bool,
+        lifecycle: (Option<KeepWorking>, Option<DoneCheck>),
     ) -> ReopenRun {
         let conversation_root = run_config.conversation_root.clone();
         // A real broadcast and buffer: the buffer records every frame whether or not a receiver
@@ -22107,7 +22420,8 @@ inference:
             state,
             inference,
             max_task_reopens,
-            None,
+            lifecycle.0,
+            lifecycle.1,
             None,
             run_config,
             hooks,
@@ -22195,6 +22509,9 @@ inference:
         );
         state.process_driver = Some(staged_fixture_driver(&state.engine, &harness));
         state.current_forget_harness_session = scenario.forget;
+        if scenario.lifecycle.1.is_some() {
+            state.capability_policy.shell_allow = vec!["bash".to_string()];
+        }
 
         let mut hooks = reopen_scenario_hooks(&state, &workdir, scenario.reopen_limit).await;
         let run_config = reopen_scenario_run_config(&inference, 0, None, scenario.harness_sessions);
@@ -22208,6 +22525,7 @@ inference:
             scenario.mode,
             None,
             scenario.streamed,
+            scenario.lifecycle,
         )
         .await
     }
@@ -22311,6 +22629,7 @@ inference:
             scenario.mode,
             scenario.seed,
             scenario.streamed,
+            (None, None),
         )
         .await
     }
@@ -22534,6 +22853,7 @@ inference:
             &mut state,
             &inference,
             max_task_reopens,
+            None,
             None,
             None,
             run_config,
@@ -23218,6 +23538,7 @@ inference:
             ConversationMode::Stateless,
             None,
             false,
+            (None, None),
         )
         .await;
         let hook_records = run
@@ -23460,6 +23781,264 @@ inference:
         assert_eq!(end[0]["reopen_count"], 1);
     }
 
+    // ── lifecycle.done_check in the attempt loop ─────────────────────────────────────────────
+
+    /// Fails its first run in the work folder and passes every later one, with builtins only.
+    const DONE_CHECK_FAILS_ONCE: &str = "bash -c 'if [ -f .dc-ran ]; then echo green; exit 0; \
+                                         fi; : > .dc-ran; echo \"1 test failed\"; exit 1'";
+
+    fn done_check_of(command: &str, limit: u32) -> DoneCheck {
+        DoneCheck {
+            command: command.to_string(),
+            limit,
+            timeout_secs: 60,
+        }
+    }
+
+    fn done_check_scenario(
+        reopen_limit: u32,
+        max_task_reopens: u32,
+        lifecycle: (Option<KeepWorking>, Option<DoneCheck>),
+    ) -> ProcessReopen {
+        ProcessReopen {
+            reopen_limit,
+            max_task_reopens,
+            max_turns: 10,
+            mode: ConversationMode::Stateless,
+            harness_sessions: None,
+            forget: None,
+            streamed: true,
+            counting_harness: false,
+            lifecycle,
+        }
+    }
+
+    /// The `(outcome, reopened)` of every `done_check` record.
+    fn done_check_runs(events: &[serde_json::Value]) -> Vec<(String, bool)> {
+        of_type(events, "done_check")
+            .iter()
+            .map(|record| {
+                (
+                    record["outcome"].as_str().unwrap().to_string(),
+                    record["reopened"].as_bool().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// A failing run reopens the task without an attempt boundary of the hooks' kind: one
+    /// `working` status naming the check and its count, no `reopen` metadata, no `task_reopened`,
+    /// and one final `completed` once the check passes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn done_check_reopen_is_one_working_status_and_not_a_hook_reopen() {
+        let run = run_process_reopen(done_check_scenario(
+            0,
+            1,
+            (None, Some(done_check_of(DONE_CHECK_FAILS_ONCE, 3))),
+        ))
+        .await;
+        assert!(run.result.is_ok(), "{:?}", run.result);
+        assert_eq!(
+            done_check_runs(&run.events),
+            [("failed".to_string(), true), ("passed".to_string(), false)]
+        );
+        assert!(of_type(&run.events, "task_reopened").is_empty());
+        let working: Vec<_> = run
+            .frames
+            .iter()
+            .map(|frame| &frame["statusUpdate"])
+            .filter(|status| {
+                status["status"]["message"]["parts"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("done check"))
+            })
+            .collect();
+        assert_eq!(working.len(), 1, "{:#?}", run.frames);
+        assert_eq!(
+            working[0]["status"]["message"]["parts"][0]["text"],
+            "done check failed, reopened 1 of 3"
+        );
+        assert!(run.boundary_statuses().is_empty(), "{:#?}", run.frames);
+        let finals = run.final_statuses();
+        assert_eq!(finals.len(), 1, "{:#?}", run.frames);
+        assert_eq!(
+            finals[0]["status"]["state"]
+                .as_str()
+                .and_then(crate::a2a::murmur_state_name),
+            Some("completed")
+        );
+        let end = &of_type(&run.events, "task_end")[0];
+        assert_eq!(end["reopen_count"], 0);
+        assert_eq!(
+            end["done_check"],
+            serde_json::json!({"runs": 2, "reopens": 1, "limit": 3, "met": true,
+                               "stopped_by": null})
+        );
+    }
+
+    /// `on-task-end` sees only an attempt that passed the check: a gatekeeper that reopens on its
+    /// first dispatch reopens after the passing run, never after the failing one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn done_check_dispatches_on_task_end_only_after_the_check_passes() {
+        let run = run_process_reopen(done_check_scenario(
+            1,
+            1,
+            (None, Some(done_check_of(DONE_CHECK_FAILS_ONCE, 3))),
+        ))
+        .await;
+        assert!(run.result.is_ok(), "{:?}", run.result);
+        assert_eq!(
+            done_check_runs(&run.events),
+            [
+                ("failed".to_string(), true),
+                ("passed".to_string(), false),
+                ("passed".to_string(), false),
+            ]
+        );
+        let order: Vec<&str> = run
+            .events
+            .iter()
+            .filter_map(|event| event["event_type"].as_str())
+            .filter(|kind| ["done_check", "task_reopened", "task_end"].contains(kind))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "done_check",
+                "done_check",
+                "task_reopened",
+                "done_check",
+                "task_end"
+            ]
+        );
+        let end = &of_type(&run.events, "task_end")[0];
+        assert_eq!(end["reopen_count"], 1);
+        assert_eq!(end["done_check"]["runs"], 3);
+        assert_eq!(end["done_check"]["reopens"], 1);
+    }
+
+    /// A passing check does not spare the hooks' budget: an always-reopening gatekeeper past
+    /// `max_task_reopens` still ends the task `reopen_budget_exhausted`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn done_check_leaves_the_hooks_reopen_budget_as_it_is() {
+        let run = run_process_reopen(done_check_scenario(
+            100,
+            1,
+            (None, Some(done_check_of("bash -c 'exit 0'", 2))),
+        ))
+        .await;
+        assert!(run.result.is_err(), "{:?}", run.result);
+        assert_eq!(
+            done_check_runs(&run.events),
+            [("passed".to_string(), false), ("passed".to_string(), false)]
+        );
+        assert_eq!(
+            of_type(&run.events, "task_end")[0]["exit_status"],
+            "reopen_budget_exhausted"
+        );
+    }
+
+    /// Over the process transport a check reopen resumes the harness session the task began, and
+    /// the prompt is the check's feedback alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_done_check_reopen_resumes_the_harness_session() {
+        let run = run_process_reopen(done_check_scenario(
+            0,
+            1,
+            (None, Some(done_check_of(DONE_CHECK_FAILS_ONCE, 3))),
+        ))
+        .await;
+        assert!(run.result.is_ok(), "{:?}", run.result);
+        let starts = of_type(&run.events, "harness_start");
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0]["session_mode"], "new");
+        assert_eq!(starts[1]["session_mode"], "resume");
+        assert_eq!(
+            starts[1]["harness_session_id"],
+            starts[0]["harness_session_id"]
+        );
+        let feedback = format!(
+            "Done check\n<untrusted-content source=done-check>\n$ {DONE_CHECK_FAILS_ONCE}\n\
+             Exit code: 1\nStdout:\n1 test failed\n\nStderr:\n\n</untrusted-content>"
+        );
+        // The fixture driver writes the prompt and a newline.
+        assert_eq!(starts[1]["stdin_bytes"], feedback.len() + 1);
+        assert!(
+            run.task_md
+                .ends_with(&format!("# Done check\n\n{feedback}\n")),
+            "{}",
+            run.task_md
+        );
+    }
+
+    /// Keep-working goes first at a stop and the check after it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keep_working_runs_before_the_done_check() {
+        let run = run_process_reopen(done_check_scenario(
+            0,
+            1,
+            (
+                Some(KeepWorking {
+                    message: "go on".to_string(),
+                    limit: 1,
+                }),
+                Some(done_check_of("bash -c 'echo no; exit 1'", 1)),
+            ),
+        ))
+        .await;
+        assert!(run.result.is_ok(), "{:?}", run.result);
+        let order: Vec<&str> = run
+            .events
+            .iter()
+            .filter_map(|event| event["event_type"].as_str())
+            .filter(|kind| ["keep_working", "done_check", "task_end"].contains(kind))
+            .collect();
+        assert_eq!(
+            order,
+            ["keep_working", "done_check", "done_check", "task_end"]
+        );
+        assert_eq!(
+            done_check_runs(&run.events),
+            [("failed".to_string(), true), ("failed".to_string(), false)]
+        );
+        let end = &of_type(&run.events, "task_end")[0];
+        assert_eq!(end["done_check"]["stopped_by"], "limit");
+        assert_eq!(end["keep_working"]["stopped_by"], "limit");
+    }
+
+    /// The decision before a run: the deadline wins, then a cancel; otherwise the command runs.
+    #[test]
+    fn done_check_decision_puts_the_deadline_then_a_cancel_before_a_run() {
+        use super::{done_check_decision, DoneCheckDecision};
+        assert_eq!(done_check_decision(true, true), DoneCheckDecision::Deadline);
+        assert_eq!(
+            done_check_decision(true, false),
+            DoneCheckDecision::Deadline
+        );
+        assert_eq!(done_check_decision(false, true), DoneCheckDecision::End);
+        assert_eq!(done_check_decision(false, false), DoneCheckDecision::Run);
+    }
+
+    /// `task_end.done_check` is absent with the option off.
+    #[test]
+    fn done_check_summary_is_absent_with_the_option_off() {
+        use super::{done_check_summary, DoneCheckTally};
+        assert_eq!(done_check_summary(None, &DoneCheckTally::default()), None);
+        assert_eq!(
+            done_check_summary(
+                Some(&done_check_of("bash -c true", 4)),
+                &DoneCheckTally::default()
+            ),
+            Some(crate::trace::DoneCheckSummary {
+                runs: 0,
+                reopens: 0,
+                limit: 4,
+                met: None,
+                stopped_by: None,
+            })
+        );
+    }
+
     /// Over the process transport the reopened attempt resumes the harness session the first
     /// attempt ran under, and its prompt is the feedback alone rather than the rewritten task.
     #[tokio::test(flavor = "multi_thread")]
@@ -23473,6 +24052,7 @@ inference:
             forget: None,
             streamed: false,
             counting_harness: false,
+            lifecycle: (None, None),
         })
         .await;
         assert!(run.result.is_ok(), "{:?}", run.result);
@@ -23798,6 +24378,7 @@ inference:
             forget: None,
             streamed: true,
             counting_harness: true,
+            lifecycle: (None, None),
         })
         .await;
         assert!(run.result.is_ok(), "{:?}", run.result);
@@ -23844,6 +24425,7 @@ inference:
             forget: None,
             streamed: true,
             counting_harness: true,
+            lifecycle: (None, None),
         })
         .await;
         assert!(run.result.is_err(), "{:?}", run.result);
@@ -23937,6 +24519,7 @@ inference:
             forget: Some(crate::harness_session::FORGET_BY_CLI),
             streamed: false,
             counting_harness: false,
+            lifecycle: (None, None),
         })
         .await;
         assert!(run.result.is_ok(), "{:?}", run.result);
@@ -24829,6 +25412,7 @@ inference:
             ConversationMode::Stateless,
             None,
             false,
+            (None, None),
         )
         .await
     }
@@ -24874,6 +25458,7 @@ inference:
             ConversationMode::Stateless,
             None,
             false,
+            (None, None),
         )
         .await
     }
@@ -26050,13 +26635,16 @@ mod member_call_tests {
     fn a_restarted_continuation_reads_the_task_feedback_and_outcomes() {
         let feedback = vec![("check".to_string(), "be brief".to_string())];
         assert_eq!(
-            build_continued_task_md("do it\n", &feedback, &[], &[]),
+            build_continued_task_md("do it\n", &feedback, &[], &[], &[]),
             build_reopen_task_md("do it\n", &feedback)
         );
-        assert_eq!(build_continued_task_md("do it", &[], &[], &[]), "do it");
-        let answered = build_continued_task_md("do it", &[], &["ANSWERS".to_string()], &[]);
+        assert_eq!(
+            build_continued_task_md("do it", &[], &[], &[], &[]),
+            "do it"
+        );
+        let answered = build_continued_task_md("do it", &[], &["ANSWERS".to_string()], &[], &[]);
         assert_eq!(answered, "do it\n\n---\n\n# Member answers\n\nANSWERS\n");
-        let delegated = build_continued_task_md("do it", &[], &[], &["OUTCOMES".to_string()]);
+        let delegated = build_continued_task_md("do it", &[], &[], &["OUTCOMES".to_string()], &[]);
         assert_eq!(
             delegated,
             "do it\n\n---\n\n# Delegation outcomes\n\nOUTCOMES\n"
@@ -26066,11 +26654,24 @@ mod member_call_tests {
             &[],
             &["ANSWERS".to_string()],
             &["OUTCOMES".to_string()],
+            &[],
         );
         assert_eq!(
             both,
             "do it\n\n---\n\n# Member answers\n\nANSWERS\n\n---\n\n# Delegation outcomes\n\n\
              OUTCOMES\n"
+        );
+        let checked = build_continued_task_md(
+            "do it",
+            &[],
+            &["ANSWERS".to_string()],
+            &[],
+            &["CHECK 1".to_string(), "CHECK 2".to_string()],
+        );
+        assert_eq!(
+            checked,
+            "do it\n\n---\n\n# Member answers\n\nANSWERS\n\n---\n\n# Done check\n\nCHECK 1\n\n\
+             CHECK 2\n"
         );
     }
 
@@ -26092,7 +26693,7 @@ mod member_call_tests {
             &[],
             None,
         );
-        let rewritten = build_continued_task_md("do it", &[], &[message], &[]);
+        let rewritten = build_continued_task_md("do it", &[], &[message], &[], &[]);
         assert!(
             rewritten.contains(
                 "# Member answers\n\n[call-member] call mcl_1 to worker ended completed:\n"
