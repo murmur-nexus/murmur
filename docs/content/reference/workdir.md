@@ -231,11 +231,12 @@ session ends:
 ```
 ~/.murmur/records/                                0700
 └── <workdir root without its leading />/         0700, each level
+    ├── evr_<32 hex>.json                         0600, one per mur eval run whose baseline ran here
     └── <session-id>/                             0700, created at staging, kept after the session
         ├── trace.jsonl
         ├── blobs/<sha256>
         ├── logs/bootstrap.log | otel.log | hook-<hook-name>.log
-        ├── logs/shell-<timestamp>.log | <work-id>.log
+        ├── logs/shell-<timestamp>.log | <work-id>.log | check.log
         ├── completion.json
         ├── hooks/
         ├── out/result.txt | result_<task-id>.txt | compaction-summaries.jsonl
@@ -266,6 +267,7 @@ stays under the old path.
 | `logs/hook-<hook-name>.log` | Errors from one hook, one per line. `<hook-name>` is the bare name: `hook-grafana` for `murmur/hook-grafana` | The runtime |
 | `logs/shell-<timestamp>.log` | Full stdout and stderr of one shell command, written when either stream exceeds 16 KiB. The tool result names it by its absolute path | The runtime |
 | `logs/<work-id>.log` | Output of a command [moved to the background](manifest.md#lifecycle-shell-grace-secs), written as the command runs, with an `Exit code:` line appended at its exit. [`background-command`](runtime-provided-tools.md#background-command) and its completion name it by its absolute path | The runtime |
+| `logs/check.log` | Stdout then stderr of the case's check, written by [`mur eval run`](cli.md#mur-eval-run-check) after the session ended, `0600` | `mur eval run` |
 | `completion.json` | How a delegated child ended. Read by the launcher that started it | The child at the end of its session, and that launcher |
 | `hooks/` | The current directory of every hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities). `murmur/hook-eval` writes `hooks/eval.jsonl` and `hooks/logs/hook-hook-eval.log` here. Created only when such a hook is declared | Those hooks |
 | `out/result.txt` | The agent's final output. Written on every terminal outcome of a task that ran; a failure writes `error: <message>`, a turn stopped at [`inference.max_tokens`](manifest.md#inference-max-tokens) writes the model's partial text followed by a truncation marker naming that field and the cap, and a task that ends `canceled` writes `canceled: the task was canceled before it completed, so it has no result`. A task canceled before it started writes nothing | The runtime |
@@ -277,6 +279,11 @@ stays under the old path.
 
 `tmp/` and `home/` count with the work folder against
 [`capabilities.resources.workdir_max_bytes`](#work-folder-ceiling).
+
+Beside the session directories, a group holds one [eval-run record](observability-schemas.md#eval-run-record),
+`evr_<32 hex>.json`, for each `mur eval run` whose baseline capsule's workdir root it is.
+[`trace.retain`](manifest.md#trace-retain) and [`mur trace rm`](cli.md#mur-trace-rm) remove only
+`ses_` directories, so a record outlives the sessions it names and still reads the same.
 
 ### How the capsule reaches it
 

@@ -1552,6 +1552,100 @@ Example:
 | `tool_sequence` | `expected` list is a subsequence of observed tool calls |
 | `llm_judge` | unimplemented: it logs a warning and emits no score |
 
+## Eval-run record { #eval-run-record }
+
+Every [`mur eval run`](cli.md#mur-eval-run) writes one JSON file in the records group of the
+baseline's workdir root, beside the session directories, at `0600`:
+
+```
+~/.murmur/records/<baseline capsule dir without its leading />/workdir/evr_<32 hex>.json
+```
+
+The 32 hex characters are a uuid v7, so the names sort by when the runs started. The file is
+replaced in one rename after every run with `complete: false`, and a last time with
+`complete: true`, so an interrupted run leaves a record of the runs it finished.
+[`mur eval diff --run`](cli.md#mur-eval-diff-run) reads it and nothing else: the record holds
+every measure it prints, copied from the sessions' traces when they ran. The runtime never writes
+it; `mur eval run` does.
+
+| Field | Type | Notes |
+|---|---|---|
+| `record_version` | u32 | `1` |
+| `run_id` | string | `evr_<32 hex>`, the file name without `.json` |
+| `started_at_ms` | u64 | Unix milliseconds |
+| `ended_at_ms` | u64 \| null | Unix milliseconds; `null` until `complete` |
+| `complete` | bool | `true` once every run is recorded |
+| `dataset` | string | The dataset file, absolute |
+| `repeat` | u32 | `--repeat` |
+| `arms` | array | One object per manifest, `baseline` first: `name` (`baseline` \| `variant`), `manifest` (absolute path), `manifest_sha256` (hex, of the manifest file's bytes), `model` (`inference.model`, or `null`) |
+| `cases` | array | One object per dataset line, in file order |
+
+Each `cases[]` entry:
+
+| Field | Type | Notes |
+|---|---|---|
+| `case_id` | string | |
+| `task_path` | string | As written in the dataset |
+| `start` | string \| null | The `start` directory, absolute |
+| `start_sha256` | string \| null | The source's [start digest](#start-digest), taken before any run |
+| `check` | object \| null | `command` (string), `files` (absolute path or `null`), `timeout_secs` (u64) |
+| `runs` | array | One object per run, in the order they ran |
+
+Each `runs[]` entry:
+
+| Field | Type | Notes |
+|---|---|---|
+| `arm` | string | `baseline` \| `variant` |
+| `repeat` | u32 | 0-based |
+| `order` | u32 | `0` when this arm ran first in its repeat, `1` when second |
+| `session_id` | string \| null | `null` when staging failed |
+| `records_dir` | string \| null | The session's [records directory](workdir.md#records-directory) |
+| `workdir` | string \| null | The session's work folder |
+| `start_sha256` | string \| null | The digest of the start as copied into this run's work folder |
+| `outcome` | string | `completed`, `launch_failed` (the launch returned an error), `stage_failed` or `start_mismatch` (not launched) |
+| `exit_status` | string \| null | The trace's `session_end.exit_status` |
+| `check_result` | string \| null | `pass`, `fail`, `timed_out`, `error`, `not_run`; `null` for a case with no check |
+| `check` | object \| null | The [check outcome](#check-outcome); `null` when the check did not run |
+| `turns` | u32 \| null | From the trace; `null` when it could not be read |
+| `input_tokens` | u64 \| null | The provider's count summed over the session's inference records, or the session's total where no driver reported one |
+| `output_tokens` | u64 \| null | The same, for output |
+| `cached_tokens` | u64 \| null | The provider's cache-read count, beside `input_tokens`; `null` when no driver reported it |
+| `cache_write_tokens` | u64 \| null | The provider's cache-write count, on the same terms |
+| `agent_ms` | u64 \| null | The sum of the trace's `task_end.duration_ms` |
+| `scores_overall` | string \| null | `overall` of the session's `hooks/eval.jsonl` [`dataset_run`](#structured-evaluation-evaljsonl) record, or `null` |
+
+### Check outcome { #check-outcome }
+
+| Field | Type | Notes |
+|---|---|---|
+| `result` | string | `pass`, `fail`, `timed_out` or `error` |
+| `exit_code` | i32 \| null | `null` when the command timed out or never ran |
+| `duration_ms` | u64 | From the command's start to its exit or kill; `0` when it never started |
+| `resource_limit` | string \| null | The host resource limit that killed the command |
+| `output_tail` | string | The last 4096 bytes of stdout followed by stderr |
+| `output_log` | string \| null | `logs/check.log` in the session's records directory, `0600`, holding stdout then stderr |
+| `error` | string \| null | Why the result is `error`, naming the path a refused copy stopped at |
+| `containment` | string | The class the session's `session_start.containment_achieved` recorded, which the check ran under |
+
+### Start digest { #start-digest }
+
+The digest of a `start` directory, and of its copy in a work folder: sha256, in lowercase hex,
+over every entry beneath the directory, in byte-wise order of its relative path. Each entry adds:
+
+| Part | Value |
+|---|---|
+| Kind | `d` for a directory, `f` for a regular file |
+| A space | |
+| Mode | The permission bits, `mode & 0o7777`, in octal: `644`, `755` |
+| A space | |
+| Path | Relative to the directory, `/`-separated |
+| `\0` | |
+| For a file only | Its length in decimal, `\0`, then its bytes |
+
+The directory itself contributes nothing, and a symbolic link or special file anywhere beneath it
+refuses the run before it starts. Two copies digest equal exactly when they hold the same names,
+modes and bytes.
+
 ---
 
 ## OTel span emission

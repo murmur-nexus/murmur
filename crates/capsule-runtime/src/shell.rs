@@ -353,6 +353,19 @@ pub(crate) fn shell_tool_manifest_yaml(binary: &str) -> String {
     )
 }
 
+thread_local! {
+    /// Where [`run_shell`] reports the process group of a command it starts on this thread, for a
+    /// caller that kills the command from another thread. Set only by [`crate::session_check`].
+    static SPAWNED_GROUP: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicI32>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Has every later [`run_shell`] on this thread store the process group of the command it starts
+/// in `sink`.
+pub(crate) fn report_spawned_group_to(sink: std::sync::Arc<std::sync::atomic::AtomicI32>) {
+    SPAWNED_GROUP.with(|slot| *slot.borrow_mut() = Some(sink));
+}
+
 /// Whether a shell command finished inside its grace period or was demoted to the background.
 #[derive(Debug)]
 pub(crate) enum ShellOutcome {
@@ -491,6 +504,11 @@ pub(crate) fn run_shell(
     };
     // The child is its group's leader, so its pid names the group.
     let pgid = child.id() as i32;
+    SPAWNED_GROUP.with(|slot| {
+        if let Some(sink) = slot.borrow().as_ref() {
+            sink.store(pgid, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
 
     // `wait_with_output` reads both pipes and waits in one uninterruptible step, so it cannot be
     // given a deadline. Draining each pipe on its own thread separates reading from waiting,
