@@ -321,7 +321,7 @@ impl HostProbe {
 
 /// The tier this host can back, from a reading taken here. The seam the kernel tests resolve the
 /// host they run on through; a session reads its own [`HostProbe`].
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn detect_enforcement_tier() -> EnforcementTier {
     HostProbe::probe().tier()
 }
