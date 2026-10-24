@@ -2791,6 +2791,41 @@ fn load_metrics(path: &Path) -> Result<(TraceMetrics, Vec<TaskMetrics>), CliErro
     compute_metrics(path, events, None)
 }
 
+/// What `mur eval run` keeps of one session's trace in its eval-run record.
+pub(super) struct EvalTraceSummary {
+    pub(super) turns: u32,
+    /// The provider's own counts where every turn's driver reported them, the session's totals
+    /// otherwise.
+    pub(super) input_tokens: u64,
+    pub(super) output_tokens: u64,
+    /// `None` when no turn's driver reported the count.
+    pub(super) cached_tokens: Option<u64>,
+    pub(super) cache_write_tokens: Option<u64>,
+    /// The sum of every `task_end.duration_ms`: the agent's own time, without staging or teardown.
+    pub(super) agent_ms: u64,
+    pub(super) exit_status: String,
+}
+
+/// [`EvalTraceSummary`] of the trace at `path`, read as `mur trace show` reads it, so a session
+/// killed before its `session_end` still reports what it did.
+pub(super) fn eval_trace_summary(path: &Path) -> Result<EvalTraceSummary, CliError> {
+    let (metrics, tasks) = load_metrics_for_show(path)?;
+    let provider = metrics.provider_tokens.as_ref();
+    Ok(EvalTraceSummary {
+        turns: metrics.total_turns,
+        input_tokens: provider
+            .and_then(|tokens| tokens.input)
+            .unwrap_or(metrics.total_input_tokens),
+        output_tokens: provider
+            .and_then(|tokens| tokens.output)
+            .unwrap_or(metrics.total_output_tokens),
+        cached_tokens: provider.and_then(|tokens| tokens.cached),
+        cache_write_tokens: provider.and_then(|tokens| tokens.cache_write),
+        agent_ms: tasks.iter().map(|task| task.duration_ms).sum(),
+        exit_status: metrics.exit_status,
+    })
+}
+
 /// [`load_metrics`] for `mur trace show`, which also reads a trace no `session_end` closed and
 /// one whose final line is torn: a session killed outright leaves its trace that way, and it is
 /// the one trace that says what that session was doing. `mur trace diff` and the multi-session

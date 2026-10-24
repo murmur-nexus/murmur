@@ -44,7 +44,9 @@ section that explains it.
 | `E-DEPLOY-004` | Capsule did not emit usable startup JSON within 120s | [`mur deploy run`](cli.md#mur-deploy-run) |
 | `E-DEPLOY-006` | The pinned `mur` release could not be fetched from GitHub | [`mur deploy run`](cli.md#mur-deploy-run) |
 | `E-EVAL-001` | Eval file parse error (malformed JSON, unknown `record_type`, missing required field); message includes `:line:` number | [`eval.jsonl` schema](observability-schemas.md#structured-evaluation-evaljsonl) |
-| `E-EVAL-002` | No eval file found for the session named on the command line | [`mur eval`](cli.md#mur-eval) |
+| `E-EVAL-002` | No eval file found for the session named on the command line, or no eval-run record for the run `mur eval diff --run` names | [`mur eval`](cli.md#mur-eval) |
+| `E-EVAL-003` | A dataset case's `start` or `check.files` is missing, is not a directory, or holds a symbolic link or special file; its `check.command` is empty; or its `check.timeout_secs` is 0. Names the case and the path or field | [`mur eval run`](cli.md#mur-eval-run) |
+| `E-EVAL-004` | A case's check binary is not in an arm's `capabilities.shell.allow` (names the case, the arm and the binary), or the baseline's and the variant's `inference.model` differ (names both) | [`mur eval run`](cli.md#mur-eval-run) |
 | `E-IDX-001` | A file in the directory given to `mur index` cannot be indexed, or the directory holds no `.mur.zip` | [E-IDX-001](#e-idx-001) |
 | `E-IDX-002` | An artifact index is not a schema 2 index this `mur` reads: schema 1, another schema, not JSON, or invalid; or a source's latest release has no index | [E-IDX-002](#e-idx-002) |
 | `E-IDX-003` | `mur index` was not given a usable source: `--repo` or `--release` is unusable, or `--merge` names an index of another scope | [E-IDX-003](#e-idx-003) |

@@ -55,7 +55,9 @@ tikv-jemallocator = { version = "0.7", default-features = false, optional = true
 # `default-features = false` for the same reason: an explicit, empty feature list rather than
 # whatever the crate defaults to.
 mimalloc = { version = "0.1", default-features = false, optional = true }
-uuid = { version = "1", features = ["v4"] }
+# The start digest `mur eval run` compares each copied start against.
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "v7"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [features]

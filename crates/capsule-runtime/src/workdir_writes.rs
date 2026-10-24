@@ -224,6 +224,7 @@ mod tests {
         ("sandbox.rs", include_str!("sandbox.rs")),
         ("sealed.rs", include_str!("sealed.rs")),
         ("shell.rs", include_str!("shell.rs")),
+        ("session_check.rs", include_str!("session_check.rs")),
         ("tool_annotations.rs", include_str!("tool_annotations.rs")),
         ("trace.rs", include_str!("trace.rs")),
         ("trace_blobs.rs", include_str!("trace_blobs.rs")),
@@ -248,6 +249,7 @@ mod tests {
         ("CHILDREN_DIR", crate::child_launch::CHILDREN_DIR),
         ("HOOKS_SUBDIR", crate::records_dir::HOOKS_SUBDIR),
         ("HOME_SUBDIR", crate::records_dir::HOME_SUBDIR),
+        ("CHECK_LOG_FILE", crate::session_check::CHECK_LOG_FILE),
         ("RESULTS_SUBDIR", crate::records_dir::RESULTS_SUBDIR),
         ("RESULT_FILE", crate::records_dir::RESULT_FILE),
         (
@@ -311,6 +313,15 @@ mod tests {
             "rel",
             "`write_staged_file`'s path, `tools/<name>/<file>` in the runtime directory, composed \
              by each of its callers. Declared through RUNTIME_DIR_WRITES' `tools` entry.",
+        ),
+        (
+            "session_check.rs",
+            "rel.as_ref()",
+            "A file or directory of an eval case's `start` or `check.files`, copied into the work \
+             folder by `copy_tree_into`: `start` by `mur eval run` into a freshly staged work \
+             folder before launch, as an input it stages for the capsule; `check.files` by \
+             `CheckRunner::run` after the session has ended and before the check's command runs. \
+             No session writes either.",
         ),
         (
             "types.rs",
@@ -410,13 +421,15 @@ mod tests {
         found
     }
 
-    /// The [`crate::workdir_fs::WorkdirRoot`] methods that create something beneath a root.
+    /// The [`crate::workdir_fs::WorkdirRoot`] methods that create or change something beneath a
+    /// root.
     const HELPER_WRITES: &[&str] = &[
         ".write_file(",
         ".write_file_exact_mode(",
         ".overwrite_in_place(",
         ".open_append(",
         ".create_dir_all(",
+        ".set_dir_mode(",
     ];
 
     /// The relative-path argument of every [`HELPER_WRITES`] call in `source`, as source text.
@@ -493,7 +506,8 @@ mod tests {
             "logs",
             "`bootstrap.log`, `otel.log`, one `hook-<name>.log` per failing hook, and a shell \
              command's full output: `shell-<ms>.log` for a truncated foreground command and \
-             `<work-id>.log` for a demoted one.",
+             `<work-id>.log` for a demoted one, and `check.log`, an eval check's output, written \
+             after the session ended.",
         ),
         (
             "completion.json",
@@ -948,6 +962,14 @@ mod tests {
     /// A row covers every listed call in that function. Anything a capsule's commands can reach
     /// goes through [`crate::workdir_fs::WorkdirRoot`] instead, and has no row here.
     const RAW_FS_EXEMPT: &[(&str, &str, &str)] = &[
+        (
+            "session_check.rs",
+            "copy_tree_into",
+            "Reads the files of an eval case's `start` or `check.files`, a directory of the \
+             operator's outside every work folder, walked by `walk_tree` with no link followed: a \
+             link or special file in it refuses the copy. What it reads is written into the work \
+             folder through `WorkdirRoot`.",
+        ),
         (
             "sandbox.rs",
             "children_records_path",

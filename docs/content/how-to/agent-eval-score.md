@@ -271,6 +271,8 @@ pass: 4/4
   tool-check    pass  response_size=1.00 success_check=1.00 tool_order=1.00 turn_limit=1.00  (/path/to/workdir/ses_ab25...)
 ```
 
+It then prints the run's comparison table, the one [Step 8](#step-8-compare-a-harness-change-by-whether-the-work-passes) reads, and the run's id, `run: evr_…`.
+
 All four cases pass every scorer. Reading MURMUR.md takes one inference turn (the tool call) and answering takes a second, so `turn_limit` sees two turns. The tool result injects MURMUR.md's content into the second turn's context, which pushes total tokens to around 2450 — that's why `max_tokens` is set to 3000 rather than something tighter.
 
 ---
@@ -380,6 +382,88 @@ mur trace show
 
 ---
 
+## Step 8 — compare a harness change by whether the work passes
+
+Scorers judge how a session behaved. To judge whether a change to the harness — a skill, a hook,
+the system prompt — makes the agent's *work* pass, give each case a `start` folder and a `check`
+command, and run the changed manifest as a variant against the same starts.
+
+Copy the capsule directory and make the change in the copy:
+
+```bash
+cp -r . ../variant
+$EDITOR ../variant/murmur.yaml
+```
+
+Both manifests must name the same `inference.model`, and the check's binary must be in both
+manifests' [`capabilities.shell.allow`](../reference/manifest.md): the check runs under the
+session's own containment.
+
+Give a case a `start`, a folder copied into each session's work folder before it starts, and a
+`check`, a command run in that work folder after the session ends:
+
+`eval.jsonl`:
+```json
+{ "case_id": "fix-parser", "task_path": "tasks/fix-parser.md", "start": "cases/parser", "check": "make test" }
+{ "case_id": "fix-config", "task_path": "tasks/fix-config.md", "start": "cases/config", "check": { "command": "bash check.sh", "files": "checks/config", "timeout_secs": 120 } }
+```
+
+`check.files` is copied into the work folder just before the command runs, so a test the agent
+must not see stays out of the session. The command, its files and its output never reach the
+agent, the provider or the trace. Exit `0` is `pass`.
+
+Run every case three times on each manifest:
+
+```bash
+mur eval run --variant ../variant --repeat 3
+```
+
+Each run starts from a fresh copy of the case's `start`, checked against the source's digest
+before launch, with the same task. Repeats alternate which manifest goes first. The run ends with
+the comparison and the run's id:
+
+```text
+run: evr_01a16d24d4d073c1bed590ba1bf056d3
+  hint: mur eval diff --run evr_01a16d24d4d073c1bed590ba1bf056d3
+```
+
+Read the comparison again at any time; `--run` alone reads the most recent run:
+
+```bash
+mur eval diff --run
+```
+
+```text
+── case: fix-parser ────────────────────────
+                       baseline                 variant                  delta (variant − baseline)
+  check                1/3 pass                 3/3 pass                 +2
+  turns                4 (3–6)                  3 (3–4)                  -1
+  input tokens         21840 (18210–30117)      15022 (14873–16540)      -6818
+  cached tokens        9120 (0–11002)           8890 (7310–9020)         -230
+  cache write tokens   4102 (3980–4570)         4022 (3870–4190)         -80
+  output tokens        812 (640–1210)           590 (512–700)            -222
+  time                 21.4s (18.0s–33.9s)      15.2s (14.1s–17.3s)      -6.2s
+  mur trace diff /home/dev/.murmur/records/…/ses_01a1…/trace.jsonl /home/dev/.murmur/records/…/ses_01a2…/trace.jsonl
+```
+
+The `check` row says which manifest's work passes: here the variant fixed the parser in all three
+runs and the baseline in one. Each measure is the median over the repeats with the min–max
+spread, and the delta is the variant's median minus the baseline's. Run the printed
+`mur trace diff` line to see where a pair of sessions diverged. A total block after the cases sums
+every run.
+
+The comparison is kept as a `0600` record beside the session directories:
+
+```bash
+ls -l ~/.murmur/records$(pwd)/workdir/evr_*.json
+```
+
+For a program deciding whether to keep a change, `mur eval diff --run --json` prints the same
+comparison as one JSON object. See [`mur eval diff --run`](../reference/cli.md#mur-eval-diff-run)
+and the [eval-run record](../reference/observability-schemas.md#eval-run-record).
+
+---
+
 ## Summary
 
 | Step | What you do |
@@ -392,3 +476,6 @@ mur trace show
 | `mur eval run` | Runs all cases against `eval.jsonl` and prints a pass/fail summary |
 | `mur eval show` | Shows which scorers passed, which failed, and why, for the most recent session |
 | `mur eval diff` | Compares the two most recent runs to check for regressions |
+| Give cases a `start` and a `check` | Judges each session by whether its work passes, under the session's own containment |
+| `mur eval run --variant ../variant --repeat 3` | Runs every case on both manifests from the same start |
+| `mur eval diff --run` | Prints, per case and in total, check passes, turns, tokens and time for both manifests |

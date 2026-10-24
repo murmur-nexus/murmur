@@ -615,6 +615,25 @@ impl WorkdirRoot {
             .map(|_| ())
     }
 
+    /// Sets the mode of the existing directory `rel` to exactly `mode & 0o7777`. A link at `rel`
+    /// or at any parent is refused, so the mode lands only on a directory inside the root.
+    pub fn set_dir_mode(&self, rel: impl AsRef<Path>, mode: u32) -> Result<(), WorkdirError> {
+        let rel = rel.as_ref().to_string_lossy();
+        let op = WorkdirOperation::CreateDir;
+        let (parent, name) = self.parent_of(&rel, op, false)?;
+        let Some(parent) = parent else {
+            return Err(self.io(&rel, std::io::ErrorKind::NotFound.into()));
+        };
+        match self.leaf_type(&parent, name, &rel)? {
+            None => Err(self.io(&rel, std::io::ErrorKind::NotFound.into())),
+            Some(FileType::Symlink) => Err(self.refuse(&rel, &rel, op, RefusalReason::Symlink)),
+            Some(FileType::Directory) => {
+                self.chmod_dir(&parent, name, &rel, |_| (mode & 0o7777) as RawMode)
+            }
+            Some(_) => Err(self.io(&rel, std::io::ErrorKind::NotADirectory.into())),
+        }
+    }
+
     /// What `fstatat(AT_SYMLINK_NOFOLLOW)` finds at `rel`, or `None` when it or a parent is
     /// absent. A link at a parent is refused; a link at `rel` itself is reported as
     /// [`EntryKind::Symlink`] for the caller to refuse.
@@ -745,6 +764,18 @@ impl WorkdirRoot {
         rel: &str,
     ) -> Result<(), WorkdirError> {
         const OWNER_RWX: RawMode = 0o700;
+        self.chmod_dir(parent, name, rel, |mode| mode | OWNER_RWX)
+    }
+
+    /// Sets the mode of the directory `name` in `parent`, reached with no link followed, to what
+    /// `new_mode` makes of its current `mode & 0o7777`; left as it is when that is unchanged.
+    fn chmod_dir(
+        &self,
+        parent: &impl AsFd,
+        name: &OsStr,
+        rel: &str,
+        new_mode: impl FnOnce(RawMode) -> RawMode,
+    ) -> Result<(), WorkdirError> {
         // `O_PATH | O_DIRECTORY | O_NOFOLLOW` needs no permission on the directory itself and
         // fails on a link; the mode is changed through the descriptor's `/proc/self/fd` entry,
         // since `fchmod` refuses an `O_PATH` descriptor.
@@ -760,12 +791,13 @@ impl WorkdirRoot {
             .map_err(|errno| self.io(rel, errno.into()))?;
             let stat = rustix::fs::fstat(&fd).map_err(|errno| self.io(rel, errno.into()))?;
             let mode = stat.st_mode as RawMode & 0o7777;
-            if mode & OWNER_RWX == OWNER_RWX {
+            let wanted = new_mode(mode);
+            if wanted == mode {
                 return Ok(());
             }
             rustix::fs::chmod(
                 format!("/proc/self/fd/{}", fd.as_raw_fd()),
-                Mode::from_raw_mode(mode | OWNER_RWX),
+                Mode::from_raw_mode(wanted),
             )
             .map_err(|errno| self.io(rel, errno.into()))
         }
@@ -777,13 +809,14 @@ impl WorkdirRoot {
                 return Err(self.io(rel, std::io::ErrorKind::NotADirectory.into()));
             }
             let mode = stat.st_mode as RawMode & 0o7777;
-            if mode & OWNER_RWX == OWNER_RWX {
+            let wanted = new_mode(mode);
+            if wanted == mode {
                 return Ok(());
             }
             rustix::fs::chmodat(
                 parent,
                 name,
-                Mode::from_raw_mode(mode | OWNER_RWX),
+                Mode::from_raw_mode(wanted),
                 AtFlags::SYMLINK_NOFOLLOW,
             )
             .map_err(|errno| self.io(rel, errno.into()))

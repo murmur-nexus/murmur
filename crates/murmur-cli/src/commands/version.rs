@@ -20,6 +20,7 @@ pub(crate) const MACHINE_COMMANDS: &[(&str, u32)] = &[
     ("control show --json", 1),
     ("conversation ls --json", 1),
     ("conversation show --json", 1),
+    ("eval diff --run --json", 1),
     ("eval show --json", 1),
     ("precompile --json", 1),
     ("ps --json", 1),
@@ -173,9 +174,16 @@ mod tests {
 
         for (path, longs) in &paths {
             if longs.contains("json") {
-                let key = format!("{} --json", path.join(" "));
+                // A `--json` that another flag must select is covered by the key naming both,
+                // as `eval diff --run --json`.
+                let words = path.join(" ");
+                let key = format!("{words} --json");
+                let selected = format!("{words} --");
                 assert!(
-                    keys.contains(key.as_str()),
+                    keys.contains(key.as_str())
+                        || keys
+                            .iter()
+                            .any(|k| k.starts_with(&selected) && k.ends_with(" --json")),
                     "`mur {key}` has no entry in MACHINE_COMMANDS"
                 );
             }

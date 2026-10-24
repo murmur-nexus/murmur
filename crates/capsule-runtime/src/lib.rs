@@ -90,6 +90,7 @@ pub mod runtime_dir;
 pub(crate) mod sandbox;
 pub mod sealed;
 pub mod security;
+pub mod session_check;
 pub mod session_status;
 pub(crate) mod shell;
 #[cfg(test)]
@@ -148,6 +149,9 @@ pub use records_dir::{
 pub use runtime_dir::{
     runtime_dir_inside_warning, runtime_dir_placement, RuntimeDirPlacement, RUNTIME_DIR_ENV,
     RUNTIME_DIR_GUEST_PATH,
+};
+pub use session_check::{
+    copy_tree_into, walk_tree, CheckOutcome, CheckResult, CheckRunner, SessionCheck, TreeEntry,
 };
 // `network_policy` is a private module; `preopen_reports` is re-exported because `mur run
 // --explain-scope` and `mur doctor` both resolve the preopen set the same way `stage_session`

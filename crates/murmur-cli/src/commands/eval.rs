@@ -2,26 +2,16 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
-use capsule_runtime::{
-    capability_policy_from_runtime_manifest, launch_session, stage_session, ArtifactRequest,
-    LockExpectation, RuntimeError, StageRequest,
-};
 use clap::Subcommand;
-use murmur_artifact::{
-    current_platform, load_dotenv_non_override, load_runtime_manifest, read_lockfile,
-    resolve_manifest_path, write_lockfile_atomic, ArtifactRuntime, LocalRegistry, LockOrigin,
-    LockedArtifact, LockfileError, MurmurLock, Registry, LOCK_VERSION,
-};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CliError, E_IO_001, E_IO_003};
 use crate::session_address::{self, SessionQuery};
-use crate::stores::FallbackRegistry;
 
-use super::{fail_run, lockfile_error_to_cli, runtime_manifest_error_to_cli};
+mod compare;
+mod run;
 
 const E_EVAL_001: &str = "E-EVAL-001";
 const E_EVAL_002: &str = "E-EVAL-002";
@@ -58,14 +48,35 @@ pub(crate) enum EvalCommand {
         /// records are read from ~/.murmur/records (default: ./workdir)
         #[arg(long)]
         workdir: Option<PathBuf>,
+        /// Compare the arms of one `mur eval run` instead of two sessions: its evr_ id, a suffix
+        /// (4+ chars), an @N ordinal (@1 = most recent), or a literal path to its record.
+        /// Without a value, the most recent run.
+        #[arg(
+            long,
+            value_name = "RUN",
+            num_args = 0..=1,
+            default_missing_value = compare::LATEST_RUN,
+            conflicts_with_all = ["a", "b"]
+        )]
+        run: Option<String>,
+        /// With --run, print the comparison as JSON
+        #[arg(long, requires = "run")]
+        json: bool,
     },
     /// Run a capsule against each case in a dataset and collect eval scores
     Run {
         /// Path to capsule directory (containing murmur.yaml). Defaults to current directory.
         capsule: Option<PathBuf>,
-        /// Path to dataset JSONL file. Defaults to workdir/eval.jsonl.
+        /// Path to dataset JSONL file. Defaults to ./eval.jsonl in the current directory.
         #[arg(long)]
         dataset: Option<PathBuf>,
+        /// A second capsule directory or manifest file to run every case against, from the same
+        /// start, with the same task and the same inference.model
+        #[arg(long)]
+        variant: Option<PathBuf>,
+        /// How many times to run each case on each manifest, alternating which goes first
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repeat: u32,
     },
 }
 
@@ -73,6 +84,7 @@ pub(crate) enum EvalCommand {
 
 #[derive(Debug, Deserialize)]
 struct EventScoreRecord {
+    /// Unread, but a record without it does not parse.
     #[allow(dead_code)]
     ts: u64,
     turn: u32,
@@ -80,13 +92,10 @@ struct EventScoreRecord {
     scorer: String,
     result: String,
     score: Option<f64>,
-    #[allow(dead_code)]
-    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct DatasetRunRecord {
-    #[allow(dead_code)]
     ts: u64,
     dataset_id: Option<String>,
     case_id: Option<String>,
@@ -438,416 +447,5 @@ fn print_diff(a: &EvalMetrics, b: &EvalMetrics) {
 
 // ── Run ───────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-struct DatasetCase {
-    case_id: String,
-    task_path: String,
-    #[allow(dead_code)]
-    expected: Option<serde_json::Value>,
-}
-
-pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Result<(), CliError> {
-    let session_id = "n/a".to_string();
-    let mut workdir = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("/"))
-        .join("workdir");
-
-    let capsule = capsule.unwrap_or_else(|| Path::new("."));
-
-    let manifest_path = if capsule.is_absolute() {
-        resolve_manifest_path(capsule)
-    } else {
-        let cwd = std::env::current_dir().map_err(|source| {
-            fail_run(
-                &session_id,
-                &workdir,
-                CliError::new(E_IO_003, format!("failed to determine cwd: {source}")),
-            )
-        })?;
-        resolve_manifest_path(&cwd.join(capsule))
-    };
-
-    let project_dir = manifest_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .ok_or_else(|| {
-            fail_run(
-                &session_id,
-                &workdir,
-                CliError::new(E_IO_003, "failed to determine manifest directory"),
-            )
-        })?;
-
-    workdir = project_dir.join("workdir");
-
-    // Resolve dataset — default to ./eval.jsonl (project root / cwd) if not specified
-    let (resolved_dataset, dataset_explicit) = match dataset {
-        Some(p) => (p.to_path_buf(), true),
-        None => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-            (cwd.join("eval.jsonl"), false)
-        }
-    };
-
-    load_dotenv_non_override(&project_dir).map_err(|source| {
-        fail_run(
-            &session_id,
-            &workdir,
-            CliError::new(E_IO_003, source.to_string()),
-        )
-    })?;
-
-    let runtime_manifest = load_runtime_manifest(&manifest_path)
-        .map_err(|err| fail_run(&session_id, &workdir, runtime_manifest_error_to_cli(err)))?;
-
-    // Parse dataset
-    let dataset_content = fs::read_to_string(&resolved_dataset).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => fail_run(
-            &session_id,
-            &workdir,
-            CliError::new(
-                E_IO_001,
-                if dataset_explicit {
-                    format!("dataset not found at {}", resolved_dataset.display())
-                } else {
-                    "no dataset found. Expected ./eval.jsonl or specify with --dataset <path>"
-                        .to_string()
-                },
-            ),
-        ),
-        _ => fail_run(
-            &session_id,
-            &workdir,
-            CliError::new(
-                E_IO_003,
-                format!("failed to read dataset {}: {e}", resolved_dataset.display()),
-            ),
-        ),
-    })?;
-
-    let mut cases: Vec<DatasetCase> = Vec::new();
-    for (i, line) in dataset_content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let case: DatasetCase = serde_json::from_str(line).map_err(|err| {
-            fail_run(
-                &session_id,
-                &workdir,
-                CliError::new(
-                    E_EVAL_001,
-                    format!("{}:{}: {err}", resolved_dataset.display(), i + 1),
-                ),
-            )
-        })?;
-        cases.push(case);
-    }
-
-    if cases.is_empty() {
-        return Err(fail_run(
-            &session_id,
-            &workdir,
-            CliError::new(
-                E_IO_003,
-                format!("dataset is empty: {}", resolved_dataset.display()),
-            ),
-        ));
-    }
-
-    // Build common fields
-    let eval_config_json = runtime_manifest
-        .observability
-        .as_ref()
-        .and_then(|o| o.eval.as_ref())
-        .and_then(|e| serde_json::to_string(e).ok());
-
-    let dataset_id = runtime_manifest
-        .observability
-        .as_ref()
-        .and_then(|o| o.eval.as_ref())
-        .and_then(|e| e.dataset_id.clone());
-
-    let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
-    let source_supply = crate::source::supply::CliSourceSupply::for_policy(&capability_policy)?;
-
-    let mut allowlisted_tools = HashSet::new();
-    let mut requested_artifacts: Vec<ArtifactRequest> = Vec::new();
-    for artifact in &runtime_manifest.artifacts {
-        if matches!(artifact.runtime, ArtifactRuntime::Tool) {
-            allowlisted_tools.insert(artifact.name.clone());
-        }
-        requested_artifacts.push(ArtifactRequest {
-            name: artifact.name.clone(),
-            version: artifact.version.clone(),
-            runtime: artifact.runtime.clone(),
-            source: artifact.source.clone(),
-            on_overflow: artifact.on_overflow,
-            config: artifact.config.clone(),
-            gateway: artifact.gateway.clone(),
-            capabilities: artifact.capabilities.clone(),
-        });
-    }
-
-    // Lockfile — required for eval runs (must already exist)
-    let lock_path = project_dir.join("murmur.lock");
-    let (pinned_artifacts, lock_expectations, write_lock) = match read_lockfile(&lock_path) {
-        Ok(lock) => {
-            let mut pinned = Vec::with_capacity(requested_artifacts.len());
-            let mut expectations = Vec::with_capacity(requested_artifacts.len());
-            for artifact in &requested_artifacts {
-                if let Some(entry) = lock.artifact_for(&artifact.name) {
-                    pinned.push(ArtifactRequest {
-                        name: artifact.name.clone(),
-                        version: entry.resolved_version.clone(),
-                        runtime: artifact.runtime.clone(),
-                        source: None,
-                        on_overflow: artifact.on_overflow,
-                        config: artifact.config.clone(),
-                        gateway: artifact.gateway.clone(),
-                        capabilities: artifact.capabilities.clone(),
-                    });
-                    // This host's hash, never another platform's — the same selection
-                    // `mur run` makes, so an eval enforces exactly what a session would.
-                    let host_platform = current_platform();
-                    let sha256 = entry.sha256.for_platform(host_platform).ok_or_else(|| {
-                        CliError::with_hint(
-                            E_IO_003,
-                            format!(
-                                "murmur.lock has no sha256 for '{}' on platform {host_platform} \u{2014} it pins {}",
-                                artifact.name,
-                                entry.sha256.platform_tags().join(", ")
-                            ),
-                            "run `mur install` on this host to add this platform's hash to murmur.lock",
-                        )
-                    })?;
-                    expectations.push(LockExpectation {
-                        name: artifact.name.clone(),
-                        resolved_version: entry.resolved_version.clone(),
-                        sha256: sha256.to_string(),
-                        origin: entry.origin.clone(),
-                    });
-                } else {
-                    pinned.push(artifact.clone());
-                }
-            }
-            (pinned, Some(expectations), false)
-        }
-        Err(LockfileError::NotFound(_)) => (requested_artifacts.clone(), None, true),
-        Err(error) => {
-            return Err(fail_run(
-                &session_id,
-                &workdir,
-                lockfile_error_to_cli(error),
-            ));
-        }
-    };
-
-    let project_registry = LocalRegistry::new(project_dir.join(".murmur").join("artifacts"));
-    let global_registry = LocalRegistry::from_default_home()
-        .map_err(|error| fail_run(&session_id, &workdir, CliError::from(error)))?;
-    let local_registry: Arc<dyn Registry> = Arc::new(FallbackRegistry {
-        primary: project_registry,
-        secondary: global_registry,
-    });
-
-    capsule_runtime::report_println!("Running {} case(s) …", cases.len());
-
-    let mut case_results: Vec<(String, String, PathBuf, Option<DatasetRunRecord>)> = Vec::new();
-    let mut lock_written = false;
-
-    for case in &cases {
-        capsule_runtime::report_println!("  case: {}", case.case_id);
-
-        let stage_request = StageRequest {
-            credentials_file: crate::config::mur_config_path().ok(),
-            manifest_dir: project_dir.clone(),
-            capsule_name: runtime_manifest.name.clone(),
-            capsule_version: runtime_manifest.version.clone(),
-            capsule_artifact: None,
-            capsule_component_bytes: Vec::new(),
-            artifacts: pinned_artifacts.clone(),
-            allowlisted_tools: allowlisted_tools.clone(),
-            lock_expectations: lock_expectations.clone(),
-            capability_policy: capability_policy.clone(),
-            inference: runtime_manifest.inference.clone(),
-            system_prompt_overridden: false,
-            context: runtime_manifest.context.clone(),
-            context_id: None,
-            resume: None,
-            forget_session: false,
-            otel_endpoint: runtime_manifest
-                .observability
-                .as_ref()
-                .and_then(|o| o.otel_endpoint.clone()),
-            eval_config_json: eval_config_json.clone(),
-            case_id: Some(case.case_id.clone()),
-            dataset_id: dataset_id.clone(),
-            lifecycle: runtime_manifest.lifecycle.clone(),
-            lifecycle_override: None,
-            trace: runtime_manifest.trace,
-            workdir: None,
-            bind_addr: "127.0.0.1".to_string(),
-            internal_port: runtime_manifest
-                .network
-                .as_ref()
-                .and_then(|n| n.internal_port),
-            // `mur eval` has no --containment flag and reads no workspace config, so the
-            // manifest is the only source of a floor here.
-            declared_containment_floor: runtime_manifest
-                .capabilities
-                .as_ref()
-                .and_then(|capabilities| capabilities.containment)
-                .unwrap_or_default(),
-            exports: runtime_manifest.exports.clone(),
-            control: None,
-            door_authentication: None,
-            spawn_grant: None,
-            machine_tokens_per_day: None,
-            formation_id: None,
-            formation_member: None,
-            source_supply: source_supply.clone(),
-            expected_workdir_identity: None,
-            session_deadline: None,
-            manifest_file: Some(manifest_path.clone()),
-        };
-
-        let staged = match stage_session(Arc::clone(&local_registry), stage_request) {
-            Ok(s) => s,
-            Err(error) => {
-                let error = crate::wit_level::staging_error(error);
-                capsule_runtime::report_eprintln!(
-                    "    stage failed: error[{}]: {}",
-                    error.code,
-                    error.message
-                );
-                if let Some(hint) = &error.hint {
-                    capsule_runtime::report_eprintln!("      hint: {hint}");
-                }
-                case_results.push((
-                    case.case_id.clone(),
-                    "stage_failed".to_string(),
-                    workdir.clone(),
-                    None,
-                ));
-                continue;
-            }
-        };
-
-        workdir = staged.accessible_workdir.clone();
-
-        if write_lock && !lock_written {
-            let lock = MurmurLock {
-                lock_version: LOCK_VERSION,
-                artifacts: staged
-                    .resolved_lock_artifacts
-                    .iter()
-                    .map(|entry| LockedArtifact {
-                        name: entry.name.clone(),
-                        resolved_version: entry.resolved_version.clone(),
-                        sha256: super::locked_sha256(entry),
-                        origin: LockOrigin::Operator,
-                        owner_id: None,
-                    })
-                    .collect(),
-            };
-            if write_lockfile_atomic(&lock_path, &lock).is_ok() {
-                lock_written = true;
-            }
-        }
-
-        // Copy the case task into the runtime directory's task.md
-        let task_path = Path::new(&case.task_path);
-        if task_path.exists() {
-            let copied = fs::read(task_path)
-                .map_err(|e| e.to_string())
-                .and_then(|bytes| staged.write_task_input(&bytes).map_err(|e| e.to_string()));
-            if let Err(e) = copied {
-                capsule_runtime::report_eprintln!("    warning: failed to copy task file: {e}");
-            }
-        } else if !case.task_path.is_empty() {
-            capsule_runtime::report_eprintln!(
-                "    warning: task_path '{}' not found",
-                case.task_path
-            );
-        }
-
-        let case_workdir = staged.accessible_workdir.clone();
-        let case_eval = staged.records_dir.join(EVAL_RECORD_FILE);
-        let case_session_id = staged.session_id.clone();
-
-        match launch_session(staged, |_| {}) {
-            Ok(_) => {}
-            Err(RuntimeError::CapsuleTrap(msg)) => {
-                capsule_runtime::report_eprintln!("    session trapped: {msg}");
-            }
-            Err(error) => {
-                capsule_runtime::report_eprintln!("    session failed: {error}");
-            }
-        }
-
-        // The scoring hook's `eval.jsonl`, from this session's records directory, never from the
-        // case's workdir, which its commands write.
-        let eval_path = case_eval;
-        let run_record = if eval_path.exists() {
-            match parse_eval_file(&eval_path) {
-                Ok(metrics) => metrics.dataset_run,
-                Err(e) => {
-                    capsule_runtime::report_eprintln!(
-                        "    warning: failed to read eval.jsonl: {e}"
-                    );
-                    None
-                }
-            }
-        } else {
-            capsule_runtime::report_eprintln!(
-                "    warning: no {EVAL_RECORD_FILE} in {} — the scoring hook writes it there only \
-                 when its entry declares capabilities.filesystem.records: true",
-                staged_records_display(&eval_path)
-            );
-            None
-        };
-
-        let overall = run_record
-            .as_ref()
-            .map(|r| r.overall.clone())
-            .unwrap_or_else(|| "no_scores".to_string());
-
-        capsule_runtime::report_println!("    result: {overall}  session: {case_session_id}");
-        case_results.push((case.case_id.clone(), overall, case_workdir, run_record));
-    }
-
-    capsule_runtime::report_println!();
-    capsule_runtime::report_println!("── Summary ──────────────────────────────────────");
-    let pass_count = case_results
-        .iter()
-        .filter(|(_, r, _, _)| r == "pass")
-        .count();
-    let total = case_results.len();
-    capsule_runtime::report_println!("pass: {pass_count}/{total}");
-    capsule_runtime::report_println!();
-
-    for (case_id, result, case_workdir, run) in &case_results {
-        let scores_str = run
-            .as_ref()
-            .map(|r| {
-                let mut parts: Vec<String> = r
-                    .scores
-                    .iter()
-                    .map(|(k, v)| format!("{k}={:.2}", v))
-                    .collect();
-                parts.sort();
-                parts.join(" ")
-            })
-            .unwrap_or_default();
-        capsule_runtime::report_println!(
-            "  {:<24} {}  {}  ({})",
-            case_id,
-            result,
-            scores_str,
-            case_workdir.display()
-        );
-    }
-
-    Ok(())
-}
+pub(crate) use compare::run_eval_diff_run;
+pub(crate) use run::{run_eval_run, EvalRunArgs};

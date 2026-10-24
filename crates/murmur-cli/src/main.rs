@@ -48,7 +48,9 @@ use commands::{
         ConversationCommand,
     },
     doctor::run_doctor,
-    eval::{run_eval_diff, run_eval_run, run_eval_show, EvalCommand},
+    eval::{
+        run_eval_diff, run_eval_diff_run, run_eval_run, run_eval_show, EvalCommand, EvalRunArgs,
+    },
     index::run_index,
     install::run_install,
     list::run_list,
@@ -905,10 +907,27 @@ fn main() {
                 workdir,
                 json,
             } => run_eval_show(session, workdir, json),
-            EvalCommand::Diff { a, b, workdir } => run_eval_diff(a, b, workdir),
-            EvalCommand::Run { capsule, dataset } => {
-                run_eval_run(capsule.as_deref(), dataset.as_deref())
-            }
+            EvalCommand::Diff {
+                a,
+                b,
+                workdir,
+                run,
+                json,
+            } => match run {
+                Some(run) => run_eval_diff_run(&run, workdir, json),
+                None => run_eval_diff(a, b, workdir),
+            },
+            EvalCommand::Run {
+                capsule,
+                dataset,
+                variant,
+                repeat,
+            } => run_eval_run(EvalRunArgs {
+                capsule: capsule.as_deref(),
+                dataset: dataset.as_deref(),
+                variant: variant.as_deref(),
+                repeat,
+            }),
         },
         #[cfg(feature = "beta-mur-topology")]
         Commands::Topology(args) => {

@@ -96,6 +96,7 @@ fn version_json_is_one_object_naming_the_same_level_and_packages() {
         "    \"control show --json\": 1,\n",
         "    \"conversation ls --json\": 1,\n",
         "    \"conversation show --json\": 1,\n",
+        "    \"eval diff --run --json\": 1,\n",
         "    \"eval show --json\": 1,\n",
         "    \"precompile --json\": 1,\n",
         "    \"ps --json\": 1,\n",

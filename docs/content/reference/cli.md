@@ -35,8 +35,8 @@ Every `mur` command, its flags, and what each one does.
 | `mur trace list` | List the sessions of one workdir root, newest first |
 | `mur trace rm` | Remove one ended session's records directory, the work folder the runtime created for it, and its stale running record |
 | `mur eval show` | Human-readable (or JSON) summary of a single `eval.jsonl` session |
-| `mur eval diff` | Side-by-side scorer comparison of two eval sessions |
-| `mur eval run` | Drive a multi-case dataset and collect `eval.jsonl` per run |
+| `mur eval diff` | Side-by-side scorer comparison of two eval sessions, or with `--run` the arms of one `mur eval run` |
+| `mur eval run` | Drive a multi-case dataset against a capsule, and optionally a variant, and judge each run by the case's check |
 | `mur search` | Search an artifact index for artifacts matching a keyword |
 | `mur index` | Write the artifact index for one release's `.mur.zip` assets |
 | `mur topology` | Render capsule sessions as a DAG from Grafana Tempo OTel data |
@@ -89,6 +89,7 @@ loses its key.
 | `control show --json` | 1 | [`mur control`](#mur-control) |
 | `conversation ls --json` | 1 | [`mur conversation ls`](#mur-conversation-ls) |
 | `conversation show --json` | 1 | [`mur conversation show`](#mur-conversation-show) |
+| `eval diff --run --json` | 1 | [`mur eval diff --run`](#mur-eval-diff-run) |
 | `eval show --json` | 1 | [`mur eval show`](#mur-eval-show) |
 | `precompile --json` | 1 | [`mur precompile`](#mur-precompile) |
 | `ps --json` | 1 | [`mur ps --json`](#mur-ps-json) |
@@ -144,6 +145,7 @@ Omitting the address selects a default:
 | `mur trace report` | every session in the workdir |
 | `mur eval show` | `@1` |
 | `mur eval diff` | `@2 @1` |
+| `mur eval diff --run` | `@1`, the most recent [eval run](#mur-eval-diff-run) |
 | `mur watch` | `@1` |
 | `mur token` | `@1` |
 
@@ -3538,7 +3540,7 @@ A failure prints nothing on stdout.
 
 ## `mur eval`
 
-Read and analyze `eval.jsonl` files produced by `murmur/hook-eval`, or drive a capsule against a dataset. These commands are read-only except for `mur eval run`, which launches real capsule sessions.
+Read and analyze `eval.jsonl` files produced by `murmur/hook-eval`, drive a capsule against a dataset, or compare a capsule with a variant of it on the same cases. These commands are read-only except for `mur eval run`, which launches real capsule sessions.
 
 See [Structured evaluation (`eval.jsonl`)](observability-schemas.md#structured-evaluation-evaljsonl) for the file format.
 
@@ -3612,36 +3614,160 @@ overall                  fail           pass
 - Scorers present in only one file are shown as `(A only)` or `(B only)`.
 - An equal pass rate shows `=`.
 
-### `mur eval run`
-
-Run a capsule once per case in a dataset, collect `eval.jsonl` from each run, and print a per-case summary.
+#### Comparing the arms of an eval run { #mur-eval-diff-run }
 
 ```bash
-mur eval run <capsule-dir> --dataset <dataset.jsonl>
+mur eval diff --run [<run>] [--workdir <dir>] [--json]
 ```
+
+With `--run`, `mur eval diff` reads one [eval-run record](observability-schemas.md#eval-run-record)
+instead of two sessions and prints how the baseline and the variant of that
+[`mur eval run`](#mur-eval-run) compare. It reads nothing but the record, so a session that
+[`trace.retain`](manifest.md#trace-retain) has pruned since leaves the comparison unchanged.
+
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<run>` | `@1`, the most recent run | `@N` counting back from the newest run, the full `evr_` id, its last 4 or more characters (any case), or a path to the record file: anything containing `/` or ending `.json` |
+| `--workdir` | `./workdir` | The baseline's workdir root, `<baseline capsule dir>/workdir`, whose records group holds the run's record |
+| `--json` | off | Print the comparison as one JSON object |
+
+`--run` and the two session arguments cannot be given together. A run that names nothing, an
+ordinal out of range and a group with no run are refused with [`E-EVAL-002`](diagnostics.md).
+
+The output has a header, one block per case and a total block:
+
+```text
+── Eval run: evr_01a16d24d4d073c1bed590ba1bf056d3 ─────────────────────────────
+  dataset:  /home/dev/proj/eval.jsonl
+  repeat:   3
+  status:   complete
+  baseline: /home/dev/proj/base/murmur.yaml
+  variant:  /home/dev/proj/variant/murmur.yaml
+  model:    claude-haiku-5-5
+
+── case: fix_parser ────────────────────────
+                       baseline                 variant                  delta (variant − baseline)
+  check                1/3 pass                 3/3 pass                 +2
+  turns                4 (3–6)                  3 (3–4)                  -1
+  input tokens         21840 (18210–30117)      15022 (14873–16540)      -6818
+  cached tokens        9120 (0–11002)           8890 (7310–9020)         -230
+  cache write tokens   4102 (3980–4570)         4022 (3870–4190)         -80
+  output tokens        812 (640–1210)           590 (512–700)            -222
+  time                 21.4s (18.0s–33.9s)      15.2s (14.1s–17.3s)      -6.2s
+  mur trace diff /home/dev/.murmur/records/…/ses_01a1…/trace.jsonl /home/dev/.murmur/records/…/ses_01a2…/trace.jsonl
+```
+
+| Row | Each column | Delta |
+|---|---|---|
+| `check` | `k/n pass` over the arm's runs, plus `(j not run)` when a run never reached its check; `—` for a case with no check | Variant passes minus baseline passes |
+| `turns`, `input tokens`, `cached tokens`, `cache write tokens`, `output tokens`, `time` | The median with the min–max spread when the arm has more than one run, the value itself for one, `—` when no run reported it | Variant median minus baseline median |
+| `scorers` | `k/n pass` of the runs' `murmur/hook-eval` overall; printed only when some run has one | Variant passes minus baseline passes |
+
+`time` is the agent's own time, the sum of the session's `task_end.duration_ms`. Tokens are the
+provider's counts as the trace records them; `cached tokens` and `cache write tokens` are counted
+beside `input tokens`, never inside them. Each repeat ends with the `mur trace diff` line pairing
+its two sessions. The total block sums every run of each arm, and its delta is the difference of
+the sums. A run with no variant prints one column and no delta; an interrupted run's header reads
+`incomplete: k of m runs recorded`.
+
+With `--json`:
+
+```json
+{
+  "run_id": "evr_01a16d24d4d073c1bed590ba1bf056d3",
+  "complete": true,
+  "repeat": 3,
+  "runs_recorded": 6,
+  "runs_expected": 6,
+  "arms": [{"name": "baseline", "manifest": "…", "manifest_sha256": "…", "model": "…"}, …],
+  "cases": [{
+    "case_id": "fix_parser",
+    "arms": {
+      "baseline": {
+        "runs": 3, "check_pass": 1, "check_runs": 3, "check_not_run": 0,
+        "turns": {"median": 4.0, "min": 3, "max": 6},
+        "input_tokens": {…}, "cached_tokens": {…}, "cache_write_tokens": {…},
+        "output_tokens": {…}, "agent_ms": {…},
+        "scores_pass": null, "scores_runs": 0
+      },
+      "variant": {…}
+    },
+    "trace_diffs": [["<baseline trace.jsonl>", "<variant trace.jsonl>"], …]
+  }],
+  "total": {"baseline": {"runs": 3, "check_pass": 1, "check_runs": 3, "check_not_run": 0, "turns": 13, …}, "variant": {…}}
+}
+```
+
+| Key | Value |
+|---|---|
+| `cases[].arms.<arm>.<measure>` | `{median, min, max}` over the runs that reported the measure, or `null` when none did. `median` is a number that may be fractional: the mean of the middle two for an even count |
+| `cases[].arms.<arm>.check_pass`, `check_runs`, `check_not_run` | The `check` row's counts. `check_runs` is 0 for a case with no check |
+| `cases[].arms.<arm>.scores_pass` | Runs whose hook-eval overall is `pass`, or `null` when no run has one |
+| `total.<arm>` | The same counts, and each measure summed over every run of the arm, `null` when no run reported it |
+
+An outer capsule that edits a harness reads `cases[].arms.variant.check_pass` against
+`check_runs` to decide whether the change helped, and the measures to weigh what it cost.
+
+### `mur eval run`
+
+Run a capsule once per case in a dataset, collect `eval.jsonl` from each run, judge each run's work by the case's check, and print a per-case summary and the comparison.
+
+```bash
+mur eval run [<capsule-dir>] [--dataset <dataset.jsonl>] [--variant <capsule-dir | manifest>] [--repeat <n>]
+```
+
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<capsule-dir>` | `.` | The baseline capsule: `<capsule-dir>/murmur.yaml` |
+| `--dataset` | `./eval.jsonl` | The dataset file |
+| `--variant` | none | A second manifest every case also runs against: a capsule directory, read as its `murmur.yaml`, or a manifest file. Its project directory is the manifest's directory |
+| `--repeat` | `1` | How many times each case runs on each manifest. `0` is refused |
 
 **Dataset format** — one JSON object per line:
 
 ```json
 { "case_id": "case_001", "task_path": "/path/to/task.md" }
-{ "case_id": "case_002", "task_path": "/path/to/task2.md", "expected": "optional" }
+{ "case_id": "case_002", "task_path": "tasks/fix.md", "start": "cases/repo", "check": "make test" }
+{ "case_id": "case_003", "task_path": "tasks/fix.md", "start": "cases/repo", "check": { "command": "grep -q fixed main.txt", "files": "cases/checks", "timeout_secs": 120 } }
 ```
 
 | Field | Required | Description |
 |---|---|---|
 | `case_id` | yes | Identifier passed as `MURMUR_CASE_ID` to hooks; appears in `dataset_run` records |
 | `task_path` | yes | File to copy into the session's `task.md` before launch |
-| `expected` | no | Scorer-defined; ignored by current deterministic scorers; reserved for future `llm_judge` |
+| `expected` | no | Any JSON value. `mur eval run` reads nothing from it and passes it to no hook or scorer |
+| `start` | no | A directory copied into the session's [work folder](workdir.md#work-folder) before launch |
+| `check` | no | A command run in the work folder after the session ends: a string, or an object |
+| `check.command` | yes, in the object form | The command, split into a binary and its arguments the way the shell tool splits one: quotes group words, a backslash escapes one character, and nothing is expanded |
+| `check.files` | no | A directory copied into the work folder's root just before the check's command runs. An existing file of the same name is overwritten |
+| `check.timeout_secs` | no, `600` | How long the command may run before it is killed and the check reads `timed_out` |
 
-**What happens per case:**
+Relative paths in `task_path`, `start` and `check.files` are resolved against the current
+directory. `start` and `check.files` may hold only directories and regular files.
 
-1. Stages the capsule session with `case_id` and `dataset_id` injected into the hook environment.
-2. Copies `task_path` to `task.md` in the session's [runtime directory](workdir.md#runtime-directory). If the file does not exist, a warning is printed and the session runs without it.
-3. Launches the session.
-4. Reads `hooks/eval.jsonl` from the session's [records directory](workdir.md#records-directory), where a scoring hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities) writes it. A case with no such file reports `no_scores` and a warning naming that grant.
-5. Prints a result line: `result: pass|fail|no_scores  session: <id>`.
+**Before anything runs**, every case is checked against every manifest. Nothing is staged and no
+provider is called when one is refused:
 
-After all cases, prints a summary table:
+| Refusal | Code |
+|---|---|
+| A `start` or `check.files` that is missing, is not a directory, or holds a symbolic link or special file; a `check.command` with no words; `check.timeout_secs: 0` | [`E-EVAL-003`](diagnostics.md) |
+| A check whose binary is not in a manifest's [`capabilities.shell.allow`](manifest.md); a variant whose `inference.model` differs from the baseline's | [`E-EVAL-004`](diagnostics.md) |
+
+**Order.** Cases run one after another. Within a case, repeat 1 runs the baseline then the
+variant, repeat 2 the variant then the baseline, and so on alternately.
+
+**What happens per run:**
+
+1. Stages the session with `case_id` and `dataset_id` injected into the hook environment. Its work folder is `<manifest-dir>/workdir/<session-id>`, fresh and empty.
+2. With `start`, copies it into the work folder, keeping every entry's permission bits, and compares the copy's [start digest](observability-schemas.md#start-digest) with the source's. A different digest is recorded as `start_mismatch`, and that run is not launched.
+3. Copies `task_path` to `task.md` in the session's [runtime directory](workdir.md#runtime-directory). If the file does not exist, a warning is printed and the session runs without it.
+4. Launches the session.
+5. With `check`, once the launch has returned and every process the session started is dead: copies `check.files` into the work folder, keeping every entry's permission bits as for `start`, and runs the command there, then writes its output to `logs/check.log` in the session's records directory. See [The check](#mur-eval-run-check).
+6. Reads the session's trace for its turns, tokens, agent time and ending, and `hooks/eval.jsonl` from its [records directory](workdir.md#records-directory), where a scoring hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities) writes it. A run with no such file reports `no_scores` and a warning naming that grant.
+7. Prints a result line, `result: pass|fail|no_scores  session: <id>`, and `check: <result>` for a case with a check. With `--variant` or `--repeat`, each run's lines start with `arm: baseline|variant  repeat: <n>`.
+8. Rewrites the [eval-run record](observability-schemas.md#eval-run-record).
+
+After all runs it prints the summary table, then the comparison [`mur eval diff --run`](#mur-eval-diff-run) prints, then the run's id:
 
 ```text
 ── Summary ──────────────────────────────────────
@@ -3649,13 +3775,50 @@ pass: 2/2
 
   case_001                 pass  success_check=1.00 turn_limit=1.00  (/path/to/workdir/...)
   case_002                 pass  success_check=1.00 turn_limit=1.00  (/path/to/workdir/...)
+
+── Eval run: evr_01a16d24d4d073c1bed590ba1bf056d3 ─────────────────────────────
+…
+
+run: evr_01a16d24d4d073c1bed590ba1bf056d3
+  hint: mur eval diff --run evr_01a16d24d4d073c1bed590ba1bf056d3
 ```
+
+The hint adds `--workdir <baseline capsule dir>/workdir` when that is not `./workdir`, the
+directory `mur eval diff --run` reads by default. `mur eval run` exits `0` when the run completes,
+whatever the checks and scores say.
+
+#### The check { #mur-eval-run-check }
+
+The check runs under the containment the session's own shell commands had, rebuilt from the same
+policy, declared floor and host reading:
+
+| Applies to the check | As for the session |
+|---|---|
+| Its binary | Must be in `capabilities.shell.allow` |
+| Landlock, seccomp, the composed root under `sealed` | The session's scope |
+| Network | The session's `capabilities.network.allow`, in a network namespace of the check's own |
+| Resource limits | The session's rlimits, in a cgroup scope of the check's own |
+| `$HOME`, `$TMPDIR` | The session's `home/` and `tmp/` in its records directory |
+
+The check is killed with everything it started at its timeout, and whatever it left running is
+killed when it exits. It is not part of the session: its command, its files and its output appear
+in no `task.md`, `MURMUR.md`, provider request, session environment or `trace.jsonl` line, and its
+files reach the work folder only after the session's last process is dead. A symbolic link the
+agent left where a check file goes is not followed: the check reads `error`, naming the path.
+
+| Result | When |
+|---|---|
+| `pass` | The command exited `0` |
+| `fail` | The command exited non-zero, or was killed for a resource limit, which the record names |
+| `timed_out` | The command outran `check.timeout_secs` |
+| `error` | `check.files` could not be copied, the containment could not be built, or the command could not start |
+| `not_run` | The run never reached its check: staging failed or its start did not match |
 
 **Non-obvious behaviour:**
 
-- `mur eval run` reads `murmur.yaml` from `<capsule-dir>/murmur.yaml`. The capsule must declare `murmur/hook-eval` in its `artifacts:` block — the CLI does not inject the hook automatically.
-- The lockfile (`murmur.lock`) is read from `<capsule-dir>/murmur.lock`. If absent, one is created on the first case run and reused for subsequent cases.
-- A case that fails to stage (e.g. missing artifact) is recorded as `stage_failed` and does not count toward `pass`.
+- `mur eval run` reads `murmur.yaml` from `<capsule-dir>/murmur.yaml`. The capsule must declare `murmur/hook-eval` in its `artifacts:` block for a `result:` other than `no_scores` — the CLI does not inject the hook automatically.
+- Each manifest reads its own `murmur.lock` and `.env` from its own directory, and resolves artifacts from its own `.murmur/artifacts` before the global store. If the baseline has no lockfile, one is created on its first staged run and reused; a variant's missing lockfile is never written. `.env` values load into one process, so a variable both files set takes the baseline's value.
+- A run that fails to stage (e.g. missing artifact) is recorded as `stage_failed` and does not count toward `pass`; the run goes on with the next.
 - `MURMUR_DATASET_ID` is taken from `observability.eval.dataset_id` in the manifest, not from the dataset file.
 
 ---
