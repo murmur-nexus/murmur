@@ -317,9 +317,10 @@ struct SessionStartEvent {
     tools_declared: Vec<String>,
     /// Strongest containment class any source asked for. A *requirement*, not an observation.
     containment_declared: ContainmentClass,
-    /// What this session actually ran under: the probed enforcement tier's ceiling, capped by
-    /// `workdir_exec` below. Reading these two together is how a session's trace shows whether the
-    /// capsule ran under the containment its operator asked for.
+    /// What this session's commands actually ran under: the class of the tier it installed (the
+    /// probed host tier capped by the declared floor), capped at `advisory` by `workdir_exec` below
+    /// or a runtime directory inside the workdir. Reading these two together is how a session's
+    /// trace shows whether the capsule ran under the containment its operator asked for.
     containment_achieved: ContainmentClass,
     /// `capabilities.filesystem.workdir_exec`. Always written, including `false`, so its absence
     /// identifies a trace from a runtime that predates the key rather than a capsule that declined
@@ -342,7 +343,7 @@ struct SessionStartEvent {
     /// runtime that predates the key.
     userns_grant: Option<crate::sealed::UsernsGrant>,
     /// The complete grant set this session ran under — every destination, binary, path and
-    /// environment variable the policy actually opened, plus the probed enforcement tier — in the
+    /// environment variable the policy actually opened, plus the enforcement tier installed — in the
     /// exact shape `mur run --explain-scope --json` prints for the same policy on the same host.
     ///
     /// `capabilities` above stays what it always was: a list of category *names*. It answers "did

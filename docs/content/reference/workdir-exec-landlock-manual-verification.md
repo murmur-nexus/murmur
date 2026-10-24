@@ -319,15 +319,17 @@ First the default:
 "$BIN" run --manifest /tmp/we-default/murmur.yaml --explain-scope
 ```
 
-Expected — `workdir exec: false`, and the host's real class (`sealed` on a sealed-capable host,
-`scoped` on a Landlock-only one, `advisory` elsewhere):
+Expected — `workdir exec: false`, and the class of the tier the capsule's commands run on
+(`scoped` on any Landlock-capable host, `advisory` elsewhere). `host can back:` names the host's
+own ceiling: `sealed` on a sealed-capable host, as below, `scoped` on a Landlock-only one:
 
 ```
 Containment
   declared:  advisory
-  achieved:  sealed
+  achieved:  scoped
+  host can back: sealed
   floor met: yes
-  mechanism: mountns+pivot_root+landlock+seccomp
+  mechanism: landlock+seccomp
 
 Effective grants
   filesystem scope: <none>
@@ -358,8 +360,9 @@ Expected — `workdir exec: true`, `achieved: advisory`, and `mechanism:` **unch
 Containment
   declared:  advisory
   achieved:  advisory
+  host can back: sealed
   floor met: yes
-  mechanism: mountns+pivot_root+landlock+seccomp
+  mechanism: landlock+seccomp
 
 Effective grants
   filesystem scope: <none>
@@ -378,8 +381,8 @@ Effective grants
   staged runtime: <none>
 ```
 
-The pairing is the check. `mechanism:` still names the full tier, because the *host* did not get
-weaker — the capsule did. An `achieved: advisory` next to `mechanism: none` would be a different
+The pairing is the check. `mechanism:` still names the same tier, because the commands still run
+under the same mechanism — the capsule gave up the claim `scoped` makes. An `achieved: advisory` next to `mechanism: none` would be a different
 finding (a host with no Landlock), which is why both lines are reproduced above.
 
 `--json` emits the same facts on one line; `workdir_exec` is always present, including when false:
@@ -394,8 +397,9 @@ Expected (excerpt):
 {
     "declared_containment": "advisory",
     "achieved_containment": "advisory",
+    "host_containment": "sealed",
     "floor_met": true,
-    "enforcement_tier": "mountns+pivot_root+landlock+seccomp",
+    "enforcement_tier": "landlock+seccomp",
     "workdir_exec": true
 }
 ```
@@ -450,8 +454,8 @@ Expected — `workdir_exec` present on `session_start`, next to the class it for
 }
 ```
 
-The same capsule with `workdir_exec` removed must show `"workdir_exec": false` and the host's real
-class. Record `PENDING` for this half if no runnable capsule was available.
+The same capsule with `workdir_exec` removed must show `"workdir_exec": false` and the class of
+the tier its commands ran on (`scoped` on a Landlock-capable host). Record `PENDING` for this half if no runnable capsule was available.
 
 ## Step 6 — `workdir_exec: true` + `containment: scoped` refuses with `E-CAP-003`
 

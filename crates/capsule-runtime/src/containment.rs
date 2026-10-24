@@ -292,7 +292,8 @@ const WORKDIR_EXEC_SHORTFALL: &str =
      advisory";
 
 /// The refusal gate: `Ok(())` when the session's `achieved` class
-/// ([`ContainmentDecision::achieved`]) meets or exceeds the `declared` floor, [`RuntimeError::ContainmentFloorUnmet`] otherwise.
+/// ([`ContainmentDecision::achieved`]) meets or exceeds the `declared` floor,
+/// [`RuntimeError::ContainmentFloorUnmet`] otherwise.
 ///
 /// Pure — takes every input as an argument and probes nothing, so the whole decision is
 /// testable without a kernel.
@@ -910,9 +911,9 @@ pub fn render_temp_dir(report: &TempDirReport) -> String {
 
 /// Read-only answer to "what would this capsule actually be allowed to do on this host?".
 ///
-/// Built from the already-parsed [`CapabilityPolicy`] plus one [`ContainmentDecision`]. Nothing here
-/// stages artifacts, touches a registry, creates a workdir or resolves DNS — it is a diagnostic,
-/// so it reports even when [`Self::floor_met`] is `false`.
+/// Built from the already-parsed [`CapabilityPolicy`] plus one [`ContainmentDecision`]. Nothing
+/// here stages artifacts, touches a registry, creates a workdir or resolves DNS — it is a
+/// diagnostic, so it reports even when [`Self::floor_met`] is `false`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ScopeReport {
     /// Strongest class any source asked for (manifest / workspace config / `--containment`).
@@ -1151,7 +1152,8 @@ pub struct ScopeReport {
     ///
     /// Derived in [`filesystem_boundary`] from the tier [`Self::enforcement_tier`] names, and
     /// from no [`CapabilityPolicy`] field: `workdir_exec` caps [`Self::achieved_containment`]
-    /// without changing what the mechanism restricts. It stands beside the grants rather than among them because it qualifies every one at once.
+    /// without changing what the mechanism restricts. It stands beside the grants rather than
+    /// among them because it qualifies every one at once.
     pub filesystem_boundary: FilesystemBoundaryReport,
     /// What the session's runtime directory is to its commands, from [`runtime_dir_report`] on
     /// the applied tier, [`Self::landlock_abi`] and where the directory lies. Always serialized.

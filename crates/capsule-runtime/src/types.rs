@@ -703,8 +703,8 @@ pub struct StagedSession {
     /// `containment_declared`/`containment_achieved`/`workdir_exec` fields alongside it, so the
     /// summary and the full report cannot disagree.
     ///
-    /// The session's class is `scope_report.achieved_containment`, and keeping a second copy
-    /// beside it would only create a way for the two to drift.
+    /// The session's class here, `scope_report.achieved_containment`, is copied from
+    /// [`Self::containment`] when the report is built, so the two cannot drift.
     pub(crate) scope_report: crate::containment::ScopeReport,
     /// The single host reading this session was staged against, taken at the top of
     /// `runtime::stage_session`, which [`Self::containment`] was decided from. `launch_session`

@@ -109,9 +109,9 @@ $ mur run --manifest murmur.yaml --explain-scope --json
 {"declared_containment":"advisory","achieved_containment":"sealed","floor_met":true,"enforcement_tier":"mountns+pivot_root+landlock+seccomp","filesystem_scope":null,"workdir_exec":false,"network_allow":[],"unix_sockets":false,"shell_allow":[],"spawn_allow":[],"env_allow":[],"interpreter_runtime_grants":[],"staged_runtime_grants":[]}
 ```
 
-`"host_containment":"sealed"` is the gate (the recorded run above was made by a `mur` that reported
-the host's class as `achieved_containment`; a capsule declaring `advisory` now achieves `scoped`).
-Anything else and **steps 3–4 prove nothing** on this machine; stop and find another host.
+`"host_containment":"sealed"` is the gate. The recorded output above predates that field and
+carries the host's class in `achieved_containment`; a current `mur` reports this `advisory` capsule
+as `achieved_containment: scoped`, `enforcement_tier: landlock+seccomp`. Anything else and **steps 3–4 prove nothing** on this machine; stop and find another host.
 
 Build the CLI once, for steps 1 and 2:
 
