@@ -874,7 +874,7 @@ terminal `task_end`
 | `task_id` | string | The task in progress. Absent for a failure recorded before any `task_start` |
 | `turn` | u32 | The turn that failed, 0-based. Absent when the failure is the task's rather than one turn's: `reopen_budget_exhausted`, `runtime_error` and `workdir_path_refused` |
 | `cause` | string | Why the attempt failed, from the table below |
-| `reason` | string | What went wrong, in words: the driver's or provider's error text, the refusal, the runtime error. A `driver_error` or `compaction_hook` reason has every credential value the session holds replaced with `[redacted]`, as `out/result.txt` does. At most 2,000 bytes; the whole text is in `out/result.txt` in the session's [records directory](workdir.md#records-directory). For a launch that ends `failed`, this is the reason [`E-RUN-040`](diagnostics.md#e-run-040) prints |
+| `reason` | string | What went wrong, in words: the driver's or provider's error text, the refusal, the runtime error. A `driver_error` or `compaction_hook` reason has every credential value the session holds replaced with `[redacted]`, as `out/result.txt` does. A failed driver call that was [retried](manifest.md#inference-retry), or whose retrying was stopped, ends with ` (<n> attempts; retry stopped: <reason>)`, or the part of it that applies, kept whole within the cap. At most 2,000 bytes; the whole text is in `out/result.txt` in the session's [records directory](workdir.md#records-directory). For a launch that ends `failed`, this is the reason [`E-RUN-040`](diagnostics.md#e-run-040) prints |
 
 | `cause` | Written when |
 |---|---|

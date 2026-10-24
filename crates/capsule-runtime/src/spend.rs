@@ -332,6 +332,11 @@ impl SpendMeter {
 
     fn finish(&self, reserved: u64, input_tokens: u64, output_tokens: u64) {
         self.record(input_tokens, output_tokens);
+        self.release(reserved);
+    }
+
+    /// Return one admission's reservation and close it, charging nothing.
+    fn release(&self, reserved: u64) {
         let mut state = self.lock();
         state.reserved = state.reserved.saturating_sub(reserved);
         state.open = state.open.saturating_sub(1);
@@ -389,9 +394,7 @@ impl SpendAdmission {
     /// answered, which it does not bill.
     pub(crate) fn release(mut self) {
         self.finished = true;
-        let mut state = self.meter.lock();
-        state.reserved = state.reserved.saturating_sub(self.reserved);
-        state.open = state.open.saturating_sub(1);
+        self.meter.release(self.reserved);
     }
 }
 

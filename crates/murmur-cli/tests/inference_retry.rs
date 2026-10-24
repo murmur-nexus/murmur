@@ -58,6 +58,9 @@ enum Reply {
     },
     /// The connection closed after the request was read, with nothing written.
     Drop,
+    /// A `200` head promising more body than is written, this much of it, then the connection
+    /// closed: a stream that broke after the head.
+    Partial(String),
 }
 
 fn answer(status: u16, body: &str) -> Reply {
@@ -112,6 +115,7 @@ impl Upstream {
                 };
                 match respond(index) {
                     Reply::Drop => drop(stream),
+                    Reply::Partial(body) => write_partial(&mut stream, &body),
                     Reply::Answer {
                         status,
                         headers,
@@ -143,6 +147,16 @@ fn write_response(
         "HTTP/1.1 {status} Scripted\r\ncontent-type: application/json\r\n{extra}\
          content-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
+    );
+    let _ = stream.flush();
+}
+
+fn write_partial(stream: &mut TcpStream, body: &str) {
+    let _ = write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+         connection: close\r\n\r\n{body}",
+        body.len() + 4096
     );
     let _ = stream.flush();
 }
@@ -357,10 +371,14 @@ impl Run {
         self.of_type("session_end")[0]["exit_status"].clone()
     }
 
-    fn task_failed_cause(&self) -> Value {
+    fn task_failed(&self) -> Value {
         let failed = self.of_type("task_failed");
         assert_eq!(failed.len(), 1, "{}", self.context());
-        failed[0]["cause"].clone()
+        failed[0].clone()
+    }
+
+    fn task_failed_cause(&self) -> Value {
+        self.task_failed()["cause"].clone()
     }
 
     fn context(&self) -> String {
@@ -381,7 +399,7 @@ fn assert_no_retry_fields(record: &Value) {
     assert!(record.get("retry_stopped").is_none(), "{record}");
 }
 
-/// S1: a `429` and then an answer completes the task. The retry is one line, the call one record
+/// A `429` and then an answer completes the task. The retry is one line, the call one record
 /// carrying `attempts: 2`, and both requests carry the same bytes.
 #[test]
 fn a_rate_limit_is_retried_and_the_task_completes() {
@@ -436,7 +454,7 @@ fn a_rate_limit_is_retried_and_the_task_completes() {
     );
 }
 
-/// S2: each of several server errors in a row is retried, the backoff doubling between them.
+/// Each of several server errors in a row is retried, the backoff doubling between them.
 #[test]
 fn consecutive_server_errors_are_each_retried() {
     let home = Home::new();
@@ -461,7 +479,7 @@ fn consecutive_server_errors_are_each_retried() {
     assert_eq!(run.the_turn_record()["attempts"], 3);
 }
 
-/// S3: a `retry-after` replaces the backoff, exactly.
+/// A `retry-after` replaces the backoff, exactly.
 #[test]
 fn retry_after_is_honoured() {
     let home = Home::new();
@@ -482,7 +500,7 @@ fn retry_after_is_honoured() {
     assert_eq!(retry["delay_ms"], 2000, "{retry}");
 }
 
-/// S4: a call that keeps failing stops after `max_retries` and fails the task, naming why; with
+/// A call that keeps failing stops after `max_retries` and fails the task, naming why; with
 /// `max_retries: 0` it is not retried at all.
 #[test]
 fn exhausted_retries_fail_the_task_naming_why() {
@@ -502,6 +520,21 @@ fn exhausted_retries_fail_the_task_naming_why() {
     assert_eq!(run.task_failed_cause(), "driver_error");
     assert_eq!(run.exit_status(), "failed");
     assert_ne!(run.output.status.code(), Some(0));
+    let reason = run.task_failed()["reason"].as_str().unwrap().to_string();
+    println!("{reason}");
+    assert!(
+        reason.ends_with(" (3 attempts; retry stopped: max_retries)"),
+        "{reason}"
+    );
+    assert!(reason.starts_with("HTTP 503"), "{reason}");
+    assert!(run.stderr.contains("3 attempts"), "{}", run.context());
+    assert_eq!(
+        record["error"]
+            .as_str()
+            .map(|error| error.contains("attempt")),
+        Some(false),
+        "the record's error is the provider's alone: {record}"
+    );
 
     let once = Upstream::start(|_| answer(503, OVERLOADED));
     let capsule = home.capsule(ANTHROPIC, &once.endpoint, "", &retry_block(0, 10, 2000));
@@ -511,9 +544,19 @@ fn exhausted_retries_fail_the_task_naming_why() {
     let record = run.the_turn_record();
     assert_eq!(record["retry_stopped"], "max_retries", "{record}");
     assert!(record.get("attempts").is_none(), "{record}");
+    let reason = run.task_failed()["reason"].as_str().unwrap().to_string();
+    assert!(
+        reason.ends_with(" (1 attempt; retry stopped: max_retries)"),
+        "{reason}"
+    );
+    assert!(
+        run.stderr.contains("1 attempt; retry stopped"),
+        "{}",
+        run.context()
+    );
 }
 
-/// S5: a failure that is not transient is not retried, and fails the task as it always has.
+/// A failure that is not transient is not retried, and fails the task with its ordinary cause.
 #[test]
 fn non_transient_failures_are_not_retried() {
     let home = Home::new();
@@ -556,10 +599,12 @@ fn non_transient_failures_are_not_retried() {
         assert_no_retry_fields(&record);
         assert_eq!(record["provider_status"], *status, "{record}");
         assert_eq!(run.task_failed_cause(), *cause, "{status}");
+        let reason = run.task_failed()["reason"].to_string();
+        assert!(!reason.contains("attempt"), "{status}: {reason}");
     }
 }
 
-/// S6: a connection that closes before a response is retried; a refused connection is not.
+/// A connection that closes before a response is retried; a refused connection is not.
 #[test]
 fn a_dropped_connection_is_retried_and_a_refused_one_is_not() {
     let home = Home::new();
@@ -587,7 +632,7 @@ fn a_dropped_connection_is_retried_and_a_refused_one_is_not() {
     assert!(record.get("retry_stopped").is_none(), "{record}");
 }
 
-/// S7: a failure the driver marks transient is retried and charged as a failed call; one it marks
+/// A failure the driver marks transient is retried and charged as a failed call; one it marks
 /// not transient, or does not mark, is not retried.
 #[test]
 fn a_driver_marked_transient_failure_is_retried() {
@@ -603,6 +648,7 @@ fn a_driver_marked_transient_failure_is_retried() {
     let run = home.run(&capsule);
 
     assert_eq!(run.output.status.code(), Some(0), "{}", run.context());
+    assert_eq!(run.result(), "done");
     let requests = upstream.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].body, requests[1].body);
@@ -633,7 +679,41 @@ fn a_driver_marked_transient_failure_is_retried() {
     }
 }
 
-/// S8: a driver's `transient: "false"` vetoes a retry of a status that would otherwise be retried.
+/// A response that breaks off mid-body after its `200` head is retried when the driver marks the
+/// break transient, and the turn commits only the retry's answer.
+#[test]
+fn a_stream_dropped_mid_body_is_retried_and_only_the_retry_is_committed() {
+    let home = Home::new();
+    let upstream = Upstream::start(|n| match n {
+        0 => Reply::Partial(
+            r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"partial-first-attempt"#
+                .to_string(),
+        ),
+        _ => answer(200, HOST_END_TURN),
+    });
+    let capsule = home.capsule(RETRY_DRIVER, &upstream.endpoint, "", FAST_RETRY);
+    let run = home.run(&capsule);
+
+    assert_eq!(run.output.status.code(), Some(0), "{}", run.context());
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 2, "{}", run.context());
+    assert_eq!(requests[0].body, requests[1].body);
+    let retries = run.retries();
+    assert_eq!(retries.len(), 1, "{}", run.context());
+    println!("{}", retries[0]);
+    assert_eq!(retries[0]["reason"], "driver");
+    assert!(
+        retries[0].get("provider_status").is_none(),
+        "{}",
+        retries[0]
+    );
+    assert_eq!(run.the_turn_record()["attempts"], 2);
+    let result = run.result();
+    assert_eq!(result, "done");
+    assert!(!result.contains("partial-first-attempt"));
+}
+
+/// A driver's `transient: "false"` vetoes a retry of a status that would otherwise be retried.
 #[test]
 fn a_driver_can_veto_a_retryable_status() {
     let home = Home::new();
@@ -648,7 +728,7 @@ fn a_driver_can_veto_a_retryable_status() {
     assert_no_retry_fields(&record);
 }
 
-/// S9: a wait that would end past the session deadline is not taken; the call fails at once.
+/// A wait that would end past the session deadline is not taken; the call fails at once.
 #[test]
 fn a_wait_never_runs_past_the_deadline() {
     let home = Home::new();
@@ -670,7 +750,7 @@ fn a_wait_never_runs_past_the_deadline() {
     assert!(run.of_type("deadline_reached").is_empty());
 }
 
-/// S10: a provider asking for a wait longer than `max_delay_ms` stops the retrying.
+/// A provider asking for a wait longer than `max_delay_ms` stops the retrying.
 #[test]
 fn a_retry_after_beyond_the_cap_stops_retrying() {
     let home = Home::new();
@@ -684,7 +764,7 @@ fn a_retry_after_beyond_the_cap_stops_retrying() {
     assert_eq!(run.the_turn_record()["retry_stopped"], "retry_after");
 }
 
-/// S11: every attempt is admitted against the spend ceiling. A charged failed attempt can leave
+/// Every attempt is admitted against the spend ceiling. A charged failed attempt can leave
 /// too little for the next, which then ends the session as any refused call does.
 #[test]
 fn every_attempt_is_admitted_by_the_spend_ceiling() {
@@ -719,7 +799,7 @@ fn every_attempt_is_admitted_by_the_spend_ceiling() {
     assert_eq!(run.exit_status(), "spend_ceiling_reached");
 }
 
-/// S12: a cancel during the wait ends the task as canceled, in phase `inference`.
+/// A cancel during the wait ends the task as canceled, in phase `inference`.
 #[test]
 fn a_cancel_during_the_wait_ends_the_task() {
     let home = Home::new();
@@ -752,7 +832,7 @@ fn a_cancel_during_the_wait_ends_the_task() {
     assert_eq!(canceled[0]["phase"], "inference", "{}", canceled[0]);
 }
 
-/// S13: a hook's `run-inference` is retried like an agent-loop call, its retry tagged with the
+/// A hook's `run-inference` is retried like an agent-loop call, its retry tagged with the
 /// hook's origin and its record carrying the attempts.
 #[test]
 fn a_hook_run_inference_is_retried() {

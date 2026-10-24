@@ -1113,6 +1113,7 @@ pub(crate) async fn run_agent_loop(
                 turn_u32,
                 TASK_FAILED_INPUT_TIMEOUT,
                 &reason,
+                RetryNote::default(),
             )
             .await;
         }
@@ -1522,11 +1523,12 @@ pub(crate) async fn run_agent_loop(
             Ok(r) => r,
             Err(e) => {
                 // Driver dispatch failed (e.g. WASM instantiation error, import mismatch).
-                let failure =
+                let mut failure =
                     DriverDispatchFailure::new(&e, |text| store_state.gateways.redact(text));
                 failed_call(INFERENCE_ERROR_DRIVER_FAILED, failure.text.clone())
                     .write(trace, None, message_ids)
                     .await;
+                failure.text = task_failure_reason(&failure.text, retry_note);
                 *ending = Some(failure.ending());
                 return Err(failure.into_error());
             }
@@ -1577,6 +1579,7 @@ pub(crate) async fn run_agent_loop(
                 turn_u32,
                 cause,
                 &error_text,
+                retry_note,
             )
             .await;
         }
@@ -1715,6 +1718,7 @@ pub(crate) async fn run_agent_loop(
                 turn_u32,
                 cause,
                 &error,
+                retry_note,
             )
             .await;
         }
@@ -1842,6 +1846,7 @@ pub(crate) async fn run_agent_loop(
                     turn_u32,
                     TASK_FAILED_COMPACTION_HOOK,
                     &error,
+                    RetryNote::default(),
                 )
                 .await;
             }
@@ -1881,6 +1886,7 @@ pub(crate) async fn run_agent_loop(
                         turn_u32,
                         TASK_FAILED_MALFORMED_RESPONSE,
                         "response stop_reason=tool_call but no tool_call blocks were present",
+                        RetryNote::default(),
                     )
                     .await;
                 }
@@ -2321,6 +2327,7 @@ pub(crate) async fn run_agent_loop(
                     turn_u32,
                     TASK_FAILED_MALFORMED_RESPONSE,
                     &error,
+                    RetryNote::default(),
                 )
                 .await;
             }
@@ -2421,6 +2428,9 @@ pub(crate) async fn fail_on_workdir_refusals(
 /// * a `failed` [`AttemptEnding`] carrying [`failed_status_message`] of `cause` and `reason`, in
 ///   `ending`.
 ///
+/// A driver call's `retry` note, when it has one, follows `reason` in all three, kept whole where
+/// the reason is capped (see [`task_failure_reason`]); every other failure passes the default.
+///
 /// `Err` only when the result text cannot be written; the `task_failed` line is already in the
 /// trace by then.
 #[allow(clippy::too_many_arguments)]
@@ -2433,13 +2443,19 @@ async fn finish_failed_turn(
     turn: u32,
     cause: &str,
     reason: &str,
+    retry: RetryNote,
 ) -> Result<AgentLoopExit, RuntimeError> {
-    let _ = trace.write_task_failed(Some(turn), cause, reason).await;
-    record_result(hooks, records_root, &format!("error: {reason}"))
+    let capped = task_failure_reason(reason, retry);
+    let _ = trace.write_task_failed(Some(turn), cause, &capped).await;
+    let note = retry
+        .describe()
+        .map(|note| format!(" ({note})"))
+        .unwrap_or_default();
+    record_result(hooks, records_root, &format!("error: {reason}{note}"))
         .map_err(RuntimeError::AgentLoopFailed)?;
     flush_hook_dispatch_faults(hooks, trace).await;
     otel.emit_session_end(AgentLoopExit::Failed.as_str()).await;
-    *ending = Some(AttemptEnding::failed(failed_status_message(cause, reason)));
+    *ending = Some(AttemptEnding::failed(failed_status_message(cause, &capped)));
     Ok(AgentLoopExit::Failed)
 }
 
@@ -2460,6 +2476,20 @@ async fn finish_no_answer_turn(
         .await;
     *ending = Some(AttemptEnding::no_answer(reason));
     Ok(AgentLoopExit::NoAnswer)
+}
+
+/// A failed driver call's `error` as the task's failure reason: followed by ` (<n> attempts;
+/// retry stopped: <reason>)` when the call was retried or stopped retrying, `error` cut so the
+/// whole fits [`MAX_TASK_FAILURE_REASON_BYTES`] and the cap never takes the note.
+fn task_failure_reason(error: &str, retry: RetryNote) -> String {
+    match retry.describe() {
+        None => error.to_string(),
+        Some(note) => {
+            let note = format!(" ({note})");
+            let room = MAX_TASK_FAILURE_REASON_BYTES.saturating_sub(note.len());
+            format!("{}{note}", truncate_on_char_boundary(error, room))
+        }
+    }
 }
 
 /// An agent-loop driver call that failed, as its `inference` record names it.
@@ -5117,6 +5147,32 @@ mod tests {
             failed_status_message(TASK_FAILED_INPUT_TIMEOUT, "x"),
             "input-timeout"
         );
+    }
+
+    #[test]
+    fn inference_retry_task_failure_reason_names_the_attempts_within_the_cap() {
+        assert_eq!(
+            task_failure_reason("HTTP 400: bad", RetryNote::new(1, None)),
+            "HTTP 400: bad"
+        );
+        assert_eq!(
+            task_failure_reason(
+                "HTTP 503: overloaded",
+                RetryNote::new(3, Some(inference_retry::RetryStop::MaxRetries))
+            ),
+            "HTTP 503: overloaded (3 attempts; retry stopped: max_retries)"
+        );
+        let long = "é".repeat(MAX_TASK_FAILURE_REASON_BYTES);
+        let reason = task_failure_reason(
+            &long,
+            RetryNote::new(1, Some(inference_retry::RetryStop::Deadline)),
+        );
+        assert!(
+            reason.len() <= MAX_TASK_FAILURE_REASON_BYTES,
+            "{}",
+            reason.len()
+        );
+        assert!(reason.ends_with(" (1 attempt; retry stopped: deadline)"));
     }
 
     #[test]

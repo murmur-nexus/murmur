@@ -2996,6 +2996,29 @@ failed:     turn 0  credential_rejected  HTTP 401
             the provider rejected the inference credential credentials.OPENAI_API_KEY in /home/me/.murmur/config.yaml (HTTP 401)
 ```
 
+A model call that failed transiently and was made again under
+[`inference.retry`](manifest.md#inference-retry) adds one `retry:` line per retry, ahead of the
+`failed:` lines. Each names:
+
+1. the turn;
+2. the attempt that failed, out of the most the call may make (`max_retries` + 1);
+3. the provider's HTTP status, or, when there was none, the reason: `connection` or `driver`;
+4. the wait before the next attempt;
+5. the hook's origin, for a hook's `run-inference`.
+
+A failed call that took more than one attempt ends its `failed:` line with `attempts N`, and with
+`retry stopped: <reason>` when its last failure was transient but was not retried. The reason is
+the `inference` record's [`retry_stopped`](observability-schemas.md#inference).
+
+```text
+── Turns ────────────────────────────────────────
+count:      0  (max: no cap)
+retry:      turn 0  inference_retry  attempt 1 of 3  HTTP 503  wait 5ms
+retry:      turn 0  inference_retry  attempt 2 of 3  HTTP 503  wait 10ms
+failed:     turn 0  driver_error  HTTP 503  attempts 3  retry stopped: max_retries
+            HTTP 503: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+```
+
 Below the **Tool calls** summary line, each turn that made at least one tool call gets its own row: tool name, duration, a `✓`/`✗` status icon, and — when the call carried an `input` — its compact-JSON input, truncated to 120 characters with a trailing `…` if longer. A call with no recorded input shows no input segment at all.
 
 Example (single-task session — no Tasks section):
@@ -3197,6 +3220,15 @@ plan_start release  3 steps
   plan_step_start ship  capsule  after build
   plan_step  ship  capsule  failed  900ms
   plan_end   failed  failed at ship
+```
+
+A model call made again under [`inference.retry`](manifest.md#inference-retry) renders one
+`inference_retry` row per retry, ahead of the call's own row, which ends with `attempts N`:
+
+```text
+task tsk_01a16d19…  ctx_01a16d19…  (task_md, user/trusted, lane user)
+  inference_retry  attempt 1 of 4  HTTP 429  wait 1.0s
+  turn 0  end_turn  attempts 2
 ```
 
 A trace whose lines carry no `event_id` renders one row per turn: turn number, decision, tool

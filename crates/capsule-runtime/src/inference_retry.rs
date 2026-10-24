@@ -159,6 +159,22 @@ impl RetryNote {
             stopped,
         }
     }
+
+    /// `<n> attempts; retry stopped: <reason>`, or the half of it that applies, naming what a
+    /// failed call's retrying came to; `None` for a call that made one attempt and was not stopped.
+    pub(crate) fn describe(self) -> Option<String> {
+        if self.attempts.is_none() && self.stopped.is_none() {
+            return None;
+        }
+        let attempts = match self.attempts.unwrap_or(1) {
+            1 => "1 attempt".to_string(),
+            n => format!("{n} attempts"),
+        };
+        Some(match self.stopped {
+            Some(stop) => format!("{attempts}; retry stopped: {}", stop.wire_name()),
+            None => attempts,
+        })
+    }
 }
 
 /// One retry, as its `inference_retry` trace line records it. A hook's `run-inference` buffers it
@@ -417,6 +433,27 @@ mod tests {
             max_delay_ms,
         }
         .into()
+    }
+
+    #[test]
+    fn inference_retry_note_describes_the_attempts_and_the_stop() {
+        assert_eq!(RetryNote::new(1, None).describe(), None);
+        assert_eq!(
+            RetryNote::new(3, Some(RetryStop::MaxRetries))
+                .describe()
+                .as_deref(),
+            Some("3 attempts; retry stopped: max_retries")
+        );
+        assert_eq!(
+            RetryNote::new(1, Some(RetryStop::Deadline))
+                .describe()
+                .as_deref(),
+            Some("1 attempt; retry stopped: deadline")
+        );
+        assert_eq!(
+            RetryNote::new(2, None).describe().as_deref(),
+            Some("2 attempts")
+        );
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {

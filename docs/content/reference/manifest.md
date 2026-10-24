@@ -1779,6 +1779,20 @@ The runtime stops retrying, and the call fails as it would have without retries,
 | The wait would end at or after the session's [deadline](cli.md#mur-run-deadline) | `deadline` |
 | The [spend ceiling](#inference-max-session-tokens) refuses the next attempt | None: the ordinary `spend_ceiling_reached` line and ending are written |
 
+A call that failed after more than one attempt, or whose retrying one of the first three cases
+stopped, fails the task with a reason that ends by naming it. The reason is what
+[`task_failed`](observability-schemas.md#task-failed) records, `out/result.txt` holds and
+[`E-RUN-040`](diagnostics.md#e-run-040) prints:
+
+| The call | Reason |
+|---|---|
+| Took 3 attempts, then stopped at `max_retries` | `HTTP 503: … (3 attempts; retry stopped: max_retries)` |
+| Was not retried, because the wait would pass the deadline | `HTTP 429: … (1 attempt; retry stopped: deadline)` |
+| Was retried once, then failed on a failure that is not transient | `HTTP 400: … (2 attempts)` |
+
+The failed call's `inference` record keeps the provider's error text alone in `error`, and names the
+same facts in `attempts` and `retry_stopped`.
+
 Every attempt is admitted against the spend ceilings before it is sent, and no admission is held
 during a wait. What a failed attempt that is retried costs:
 

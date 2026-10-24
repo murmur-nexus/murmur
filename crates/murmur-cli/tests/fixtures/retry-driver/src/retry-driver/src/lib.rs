@@ -9,6 +9,8 @@
 //     host's own driver response shape;
 //   * a non-2xx status — `status: error`, data `{"error":"HTTP <status>: <body>"}`, plus metadata
 //     `transient` from the body's `fixture_transient` string when present;
+//   * a response body that breaks off after the head — `status: error`, data
+//     `{"error":"response broke: <error>"}`, metadata `[("transient", "true")]`;
 //   * an outgoing-handler error — `status: error`, data `{"error":"request failed: <error>"}`.
 
 wit_bindgen::generate!({
@@ -41,8 +43,28 @@ fn split_endpoint(endpoint: &str) -> Result<(String, String), String> {
     ))
 }
 
-/// POSTs `body` and returns the response status and body. `Err` is the outgoing handler's error.
-fn post(endpoint: &str, body: &[u8]) -> Result<(u16, String), String> {
+/// Why [`post`] got no whole response.
+enum PostError {
+    /// The request was not made, or no response head came back.
+    Request(String),
+    /// The response head came back and its body broke off.
+    Body(String),
+}
+
+impl From<String> for PostError {
+    fn from(error: String) -> Self {
+        Self::Request(error)
+    }
+}
+
+impl From<&str> for PostError {
+    fn from(error: &str) -> Self {
+        Self::Request(error.to_string())
+    }
+}
+
+/// POSTs `body` and returns the response status and body.
+fn post(endpoint: &str, body: &[u8]) -> Result<(u16, String), PostError> {
     let (authority, path) = split_endpoint(endpoint)?;
     let fields = Fields::new();
     for (name, value) in [
@@ -81,8 +103,8 @@ fn post(endpoint: &str, body: &[u8]) -> Result<(u16, String), String> {
     let response = loop {
         match future.get() {
             Some(Ok(Ok(response))) => break response,
-            Some(Ok(Err(e))) => return Err(format!("{e:?}")),
-            Some(Err(())) => return Err("response future consumed".to_string()),
+            Some(Ok(Err(e))) => return Err(format!("{e:?}").into()),
+            Some(Err(())) => return Err("response future consumed".into()),
             None => future.subscribe().block(),
         }
     };
@@ -94,7 +116,7 @@ fn post(endpoint: &str, body: &[u8]) -> Result<(u16, String), String> {
         match stream.blocking_read(64 * 1024) {
             Ok(chunk) => bytes.extend_from_slice(&chunk),
             Err(StreamError::Closed) => break,
-            Err(e) => return Err(format!("read: {e:?}")),
+            Err(e) => return Err(PostError::Body(format!("{e:?}"))),
         }
     }
     Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
@@ -125,11 +147,18 @@ impl Guest for RetryDriver {
         let endpoint = std::env::var(INFERENCE_ENDPOINT).unwrap_or_default();
         let (status, body) = match post(&endpoint, payload.as_bytes()) {
             Ok(answer) => answer,
-            Err(error) => {
+            Err(PostError::Request(error)) => {
                 return result(
                     Status::Error,
                     json!({"error": format!("request failed: {error}")}).to_string(),
                     Vec::new(),
+                )
+            }
+            Err(PostError::Body(error)) => {
+                return result(
+                    Status::Error,
+                    json!({"error": format!("response broke: {error}")}).to_string(),
+                    vec![(TRANSIENT.to_string(), "true".to_string())],
                 )
             }
         };

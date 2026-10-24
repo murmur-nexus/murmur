@@ -1418,8 +1418,8 @@ struct TaskContinuedEvent<'a> {
     turns_remaining: Option<u32>,
 }
 
-/// A spend ceiling refused a driver call before it was sent. No `inference` line accompanies it,
-/// because no call was made.
+/// A driver call failed transiently and is about to be made again. The call's one `inference`
+/// line follows its last attempt.
 #[derive(Serialize)]
 struct InferenceRetryEvent<'a> {
     event_type: &'static str,
@@ -1443,6 +1443,8 @@ struct InferenceRetryEvent<'a> {
     origin: Option<&'a str>,
 }
 
+/// A spend ceiling refused a driver call before it was sent. No `inference` line accompanies it,
+/// because no call was made.
 #[derive(Serialize)]
 struct SpendCeilingReachedEvent<'a> {
     event_type: &'static str,
