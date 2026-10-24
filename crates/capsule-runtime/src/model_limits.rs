@@ -123,8 +123,9 @@ impl InputBudget {
     }
 }
 
-/// `n`, or `none` for an absent limit, as the refusals print it.
-fn or_none(limit: Option<u32>) -> String {
+/// `n`, or `none` for an absent limit, as the refusals, `mur doctor` and `MURMUR.md` print it.
+#[must_use]
+pub fn limit_or_none(limit: Option<u32>) -> String {
     limit.map_or_else(|| "none".to_string(), |limit| limit.to_string())
 }
 
@@ -222,7 +223,7 @@ pub enum ModelLimitsError {
         "driver choice '{choice}' has no input budget: its context window of {window} \
          ({window_source}) less its output cap of {cap} ({cap_source}) leaves no input tokens; \
          input ceiling {ceiling_text} (model '{model}', driver {driver})",
-        ceiling_text = or_none(*.ceiling)
+        ceiling_text = limit_or_none(*.ceiling)
     )]
     NoInputBudget {
         choice: String,
@@ -240,7 +241,7 @@ pub enum ModelLimitsError {
         "compaction calls have no input budget: the context window of {window} \
          ({window_source}) for compaction model '{model}' less inference.compaction.max_tokens \
          of {cap} leaves no input tokens; input ceiling {ceiling_text} (driver {driver})",
-        ceiling_text = or_none(*.ceiling)
+        ceiling_text = limit_or_none(*.ceiling)
     )]
     CompactionNoInputBudget {
         model: String,

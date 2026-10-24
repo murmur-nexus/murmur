@@ -15,13 +15,7 @@ hard limit:
 2. It checks whether `session_tokens` over the call's
    [input budget](../reference/manifest.md#inference-max-tokens) has crossed
    `inference.compaction.threshold`. The input budget is the most input the provider accepts for
-   the model, or the context window less the output cap the call sent, whichever is smaller:
-
-    | Term | Value |
-    |---|---|
-    | Context window | [`context.max_tokens`](../reference/manifest.md#field-context), or the `context_window` the serving driver's [`models:`](../reference/manifest.md#driver-models) table declares for the model |
-    | Output cap | The `max_tokens` the call sent |
-    | Input ceiling | The `max_input_tokens` the serving driver's table declares for the model, when it declares one |
+   the model, or the context window less the output cap the call sent, whichever is smaller.
 
     A provider whose input limit is below its window less the output cap — 922000 input tokens of
     a 1050000-token window with a 128000 cap — declares that limit as `max_input_tokens`, and a

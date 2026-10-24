@@ -242,7 +242,7 @@ network:
         scopes: [GetTask, murmur.WatchSession]
 
 context:
-  max_tokens: 200000   # enables context compaction; omit to disable
+  max_tokens: 200000   # optional; overrides the context_window the driver declares for the model
   record: on           # on (default) | off — the durable conversation record
   record_store: shey   # optional; directory under ~/.murmur/conversations/, default: capsule name
   retain:              # optional; omit to keep every record whole and forever

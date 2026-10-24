@@ -2516,7 +2516,7 @@ error[E-REG-011]: local/murmur-driver-anthropic@0.1.0 cannot be stored: its murm
   hint: the driver's own murmur.yaml is at fault; use a release of the driver whose models: table is well formed — mur build refuses the same table with E-BLD-005
 ```
 
-A payload with no readable `murmur.yaml` declares no table, and is stored as before.
+A payload with no readable `murmur.yaml` declares no table, and is stored.
 
 ---
 

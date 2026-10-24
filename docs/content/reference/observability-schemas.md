@@ -153,8 +153,8 @@ of measurements:
 
 #### Call settings { #inference-call-settings }
 
-`max_output_tokens`, `input_budget` and `driver_config` say how one call was sent. Each record carries both values
-in full: `session_start` holds no baseline for them, and one session can send calls under several
+`max_output_tokens`, `input_budget` and `driver_config` say how one call was sent. Each record
+carries all three in full: `session_start` holds no baseline for them, and one session can send calls under several
 settings, because a [controller](manifest.md#field-control) can change `inference.max_tokens` from
 the next call, a driver switch changes the cap to that choice's own, and the compaction call has
 its own cap and config.

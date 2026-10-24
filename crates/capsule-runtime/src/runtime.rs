@@ -7738,8 +7738,9 @@ fn stage_driver_choices(
 }
 
 /// Resolves every driver choice's output cap, context window, input ceiling and input budget from
-/// the `models:` table of the driver just staged for it, and records them on `choices`. Returns the `W-RUN-009` texts to
-/// print once the bootstrap log exists, and the caps a hook's `run-inference` sends.
+/// the `models:` table of the driver just staged for it, and records them on `choices`. Returns
+/// the `W-RUN-009` texts to print once the bootstrap log exists, and the caps a hook's
+/// `run-inference` sends.
 ///
 /// Refused with [`RuntimeError::ModelLimits`] for a choice with no output cap or no input budget,
 /// or a driver whose table is malformed. Under `transport: process` nothing is resolved.

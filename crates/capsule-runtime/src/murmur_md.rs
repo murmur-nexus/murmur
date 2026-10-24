@@ -170,20 +170,18 @@ pub(crate) struct ContextBudget {
 impl ContextBudget {
     /// `budget` with `window`, `cap` and `ceiling`, as the `- Context budget:` line states it.
     fn line(&self) -> String {
-        use crate::model_limits::BudgetBasis;
+        use crate::model_limits::{limit_or_none, BudgetBasis};
         let basis = match self.budget.basis {
             BudgetBasis::MaxInputTokens => "the input ceiling",
             BudgetBasis::ContextWindowLessOutputCap => "the context window less the output cap",
             BudgetBasis::ContextWindow | BudgetBasis::None => "the context window",
         };
-        let or_none =
-            |limit: Option<u32>| limit.map_or_else(|| "none".to_string(), |n| n.to_string());
         format!(
             "{} input tokens, {basis} (context window {}, output cap {}, input ceiling {})",
             self.budget.tokens,
             self.window,
-            or_none(self.output_cap),
-            or_none(self.input_ceiling)
+            limit_or_none(self.output_cap),
+            limit_or_none(self.input_ceiling)
         )
     }
 }

@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use common::{
-    hook_wat::{compaction_hook_wasm, create_hook_zip},
+    hook_wat::{compaction_hook_wasm, compaction_hook_wasm_expecting, create_hook_zip},
     ScriptedServer,
 };
 
@@ -621,10 +621,16 @@ fn the_task_survives_compaction() {
 // ── The input budget ─────────────────────────────────────────────────────────
 
 /// A capsule on a driver whose `models:` table is `models`, with no `context.max_tokens`,
-/// `inference_extra` spliced into `inference:`, `compaction.threshold: 0.5` and
-/// [`compaction_hook_wasm`] bound to `on-compaction`, run over `responses` to its end. Returns
-/// every trace line.
-fn run_budgeted(models: &str, inference_extra: &str, responses: Vec<String>) -> Vec<Value> {
+/// `inference_extra` spliced into `inference:`, `compaction.threshold: 0.5` and a compaction hook
+/// bound to `on-compaction` that replaces the context only when its event carries `fires_at` as
+/// `session-tokens` and `0.5` as `threshold`, run over `responses` to its end. Returns every trace
+/// line.
+fn run_budgeted(
+    models: &str,
+    inference_extra: &str,
+    fires_at: u64,
+    responses: Vec<String>,
+) -> Vec<Value> {
     let server = ScriptedServer::start(responses);
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
@@ -643,7 +649,7 @@ fn run_budgeted(models: &str, inference_extra: &str, responses: Vec<String>) -> 
         COMPACTOR,
         "on-compaction",
         "replace-context",
-        &compaction_hook_wasm(SUMMARY),
+        &compaction_hook_wasm_expecting(SUMMARY, fires_at, 0.5),
     );
     common::publish_local(&home, &hook).success();
 
@@ -686,9 +692,13 @@ fn budget_responses(before: u64, at: u64) -> Vec<String> {
     ]
 }
 
-/// Asserts one compaction, on turn 1 at `tokens` reported, with `threshold` its ratio to the
-/// budget, and every agent-loop `inference` line carrying `budget`.
-fn assert_compacted_once_at(events: &[Value], tokens: u64, budget: u64) {
+/// Asserts one compaction, on turn 1 at `tokens` reported, none declined, and every agent-loop
+/// `inference` line carrying `cap` and `budget`.
+fn assert_compacted_once_at(events: &[Value], tokens: u64, cap: u64, budget: u64) {
+    assert!(
+        of_type(events, "compaction_declined").is_empty(),
+        "{events:#?}"
+    );
     let compactions = of_type(events, "compaction");
     assert_eq!(compactions.len(), 1, "{events:#?}");
     assert_eq!(compactions[0]["turn"], 1);
@@ -700,12 +710,14 @@ fn assert_compacted_once_at(events: &[Value], tokens: u64, budget: u64) {
         .collect();
     assert_eq!(turns.len(), 3, "{events:#?}");
     for line in turns {
+        assert_eq!(line["max_output_tokens"], cap, "{line}");
         assert_eq!(line["input_budget"], budget, "{line}");
     }
 }
 
 /// The input ceiling of 922000 is below 1050000 less the 128000 cap, so the budget is the
-/// ceiling: threshold 0.5 fires at 461000 and not one token below.
+/// ceiling: threshold 0.5 fires at 461000 and not one token below, and the hook's event carries
+/// 461000 ÷ 922000.
 #[test]
 fn input_budget_from_the_ceiling_moves_the_trigger() {
     if common::skip_without_host_support("input_budget_from_the_ceiling_moves_the_trigger") {
@@ -715,9 +727,10 @@ fn input_budget_from_the_ceiling_moves_the_trigger() {
         "models:\n  test-model:\n    max_output_tokens: 128000\n    context_window: 1050000\n    \
          max_input_tokens: 922000\n",
         "",
+        461_000,
         budget_responses(460_999, 461_000),
     );
-    assert_compacted_once_at(&events, 461_000, 922_000);
+    assert_compacted_once_at(&events, 461_000, 128_000, 922_000);
     assert_eq!(
         of_type(&events, "session_start")[0]["model_limits"],
         json!({
@@ -744,9 +757,10 @@ fn input_budget_from_the_window_less_the_cap_moves_the_trigger() {
     let events = run_budgeted(
         "models:\n  test-model:\n    max_output_tokens: 128000\n    context_window: 1050000\n",
         "  max_tokens: 6000\n",
+        522_000,
         budget_responses(521_999, 522_000),
     );
-    assert_compacted_once_at(&events, 522_000, 1_044_000);
+    assert_compacted_once_at(&events, 522_000, 6000, 1_044_000);
     let limits = &of_type(&events, "session_start")[0]["model_limits"];
     assert_eq!(limits["input_budget"], 1_044_000, "{limits}");
     assert_eq!(

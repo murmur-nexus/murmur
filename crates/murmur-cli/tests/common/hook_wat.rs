@@ -213,13 +213,37 @@ pub fn compaction_hook_wasm(summary: &str) -> Vec<u8> {
 /// An `on-compaction` hook returning `replace-context([summary])` with the summary under `role`,
 /// claiming the `inserted_by` mark [`message_list`] describes.
 pub fn compaction_hook_wasm_as(role: &str, summary: &str, inserted_by: Option<u8>) -> Vec<u8> {
+    compaction_hook(role, summary, inserted_by, "")
+}
+
+/// [`compaction_hook_wasm`] that traps unless its event carries `session_tokens` as
+/// `session-tokens` and `threshold` as `threshold`, so a committed replacement proves the hook saw
+/// both.
+pub fn compaction_hook_wasm_expecting(
+    summary: &str,
+    session_tokens: u64,
+    threshold: f64,
+) -> Vec<u8> {
+    // The flat lowering puts `session-tokens` at core parameter 2 and `threshold` at 3.
+    compaction_hook(
+        "user",
+        summary,
+        None,
+        &format!(
+            "(if (i64.ne (local.get 2) (i64.const {session_tokens})) (then unreachable)) \
+             (if (f64.ne (local.get 3) (f64.const {threshold:?})) (then unreachable))"
+        ),
+    )
+}
+
+fn compaction_hook(role: &str, summary: &str, inserted_by: Option<u8>, guard: &str) -> Vec<u8> {
     let compaction_event = r#"  (type $event (record
     (field "messages" (list $message))
     (field "session-tokens" u64)
     (field "threshold" f64)
     (field "model" (option string))
     (field "system-prompt" (option string))))"#;
-    hook_component(
+    hook_component_guarded(
         "on-compaction",
         "(param i32 i32 i64 f64 i32 i32 i32 i32 i32 i32)",
         compaction_event,
@@ -227,6 +251,7 @@ pub fn compaction_hook_wasm_as(role: &str, summary: &str, inserted_by: Option<u8
         1,
         &[(role, summary)],
         inserted_by,
+        guard,
     )
 }
 

@@ -1575,11 +1575,9 @@ fn report_model_limits(
     capsule_runtime::report_println!("Model limits:");
     match resolved {
         Ok(choices) => {
+            use capsule_runtime::model_limits::limit_or_none;
             for choice in &choices {
                 let limits = choice.limits;
-                let or_none = |limit: Option<u32>| {
-                    limit.map_or_else(|| "none".to_string(), |n| n.to_string())
-                };
                 capsule_runtime::report_println!(
                     "  \u{2713}  {} ({}, model {}): output cap {} ({}), context window {} ({}), \
                      input ceiling {} ({}), input budget {} ({})",
@@ -1588,11 +1586,11 @@ fn report_model_limits(
                     choice.model,
                     limits.max_output_tokens,
                     limits.max_output_tokens_source.wire_name(),
-                    or_none(limits.context_window),
+                    limit_or_none(limits.context_window),
                     limits.context_window_source.wire_name(),
-                    or_none(limits.max_input_tokens),
+                    limit_or_none(limits.max_input_tokens),
                     limits.max_input_tokens_source.wire_name(),
-                    or_none(limits.input_budget),
+                    limit_or_none(limits.input_budget),
                     limits.input_budget_basis.wire_name()
                 );
             }

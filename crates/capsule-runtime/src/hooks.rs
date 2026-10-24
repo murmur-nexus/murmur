@@ -410,9 +410,10 @@ pub(crate) enum HookEvent {
         source: String,
         input_bytes: u64,
         /// Token ceiling a `seed-context` returned from this event is enforced
-        /// against: `floor(context_window * context.seed_budget)`. `0` when the
-        /// primary choice has no window, which the WIT contract reads as "not
-        /// computed" rather than "unbounded".
+        /// against: `floor(input budget * context.seed_budget)`, the primary
+        /// choice's input budget at launch. `0` when the primary choice has no
+        /// window, which the WIT contract reads as "not computed" rather than
+        /// "unbounded".
         budget_tokens: u64,
         /// The primary driver choice's context window: `context.max_tokens`, else
         /// its driver's `models:` entry for the model, or `0` when neither gives one.
