@@ -89,7 +89,8 @@ fn assert_dir_mode(path: &Path, expected: u32) {
 }
 
 /// One Anthropic response that ends the turn. The responses here report no `usage`, so the
-/// runtime's estimate is what crosses a small `context.max_tokens` and fires compaction.
+/// runtime's estimate is what crosses a small input budget and fires compaction: the cases set
+/// `context.max_tokens: 8292`, 100 tokens above the fixture driver's 8192 output cap.
 fn end_turn(text: &str) -> String {
     json!({
         "id": "msg_1",
@@ -439,9 +440,9 @@ fn an_explicit_record_store_is_the_only_directory_created() {
 fn every_recorded_message_carries_a_unique_well_formed_id() {
     let f = fixture(
         vec![tool_call(), end_turn("done")],
-        // Small enough that the first turn's occupancy is over the threshold, so compaction
-        // fires on turn 1 and the summary joins the record.
-        "context:\n  max_tokens: 100\n",
+        // An input budget of 8292 − 8192, small enough that the first turn's occupancy is over
+        // the threshold, so compaction fires on turn 1 and the summary joins the record.
+        "context:\n  max_tokens: 8292\n",
         &[(
             "compactor",
             "on-compaction",
@@ -495,9 +496,9 @@ fn inserted_by_of(message: &Value) -> Option<&str> {
 fn compacted_run(summary: &str, hook: Vec<u8>) -> (Vec<Value>, Vec<Value>) {
     let f = fixture(
         vec![tool_call(), end_turn("done")],
-        // Small enough that the first turn's occupancy is over the threshold, so compaction
-        // fires on turn 1 and the summary joins the record.
-        "context:\n  max_tokens: 100\n",
+        // An input budget of 8292 − 8192, small enough that the first turn's occupancy is over
+        // the threshold, so compaction fires on turn 1 and the summary joins the record.
+        "context:\n  max_tokens: 8292\n",
         &[("compactor", "on-compaction", "replace-context", hook)],
     );
 
@@ -648,7 +649,7 @@ fn a_reader_tells_a_real_compaction_summary_from_a_persons_turn() {
     for role in ["user", "assistant"] {
         let f = fixture(
             vec![tool_call(), end_turn("done"), end_turn("reopened")],
-            "context:\n  max_tokens: 100\n",
+            "context:\n  max_tokens: 8292\n",
             &[
                 (
                     "compactor",
@@ -709,7 +710,7 @@ fn the_mark_survives_a_threaded_reload_and_a_resume() {
             end_turn("resumed"),
             end_turn("resumed and reopened"),
         ],
-        "context:\n  max_tokens: 100\n",
+        "context:\n  max_tokens: 8292\n",
         &[(
             "compactor",
             "on-compaction",
@@ -738,14 +739,14 @@ fn the_mark_survives_a_threaded_reload_and_a_resume() {
         f.project.path(),
         "threaded.yaml",
         &f.server.endpoint,
-        "context:\n  max_tokens: 100\nlifecycle:\n  conversation: threaded\n",
+        "context:\n  max_tokens: 8292\nlifecycle:\n  conversation: threaded\n",
         &["reporter"],
     );
     let resumed = create_manifest_named(
         f.project.path(),
         "resumed.yaml",
         &f.server.endpoint,
-        "context:\n  max_tokens: 100\n",
+        "context:\n  max_tokens: 8292\n",
         &["reporter", "reader"],
     );
     grant_conversation_read(&resumed, "reader");

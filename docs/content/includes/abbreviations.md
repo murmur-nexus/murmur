@@ -22,7 +22,7 @@
 
 *[capabilities.shell.baseline_env]: env var patterns to keep after strip_env runs
 
-*[context.max_tokens]: context window compaction measures against · default: the driver's models: entry for the model · no window, no compaction
+*[context.max_tokens]: context window the input budget is cut from · default: the driver's models: entry for the model · no window, no compaction
 
 *[inference.max_tokens]: per-turn output cap · sent to the driver as max_tokens · default: the driver's models: entry for the model · http transport only · not the context window
 
@@ -30,7 +30,7 @@
 
 *[inference.driver.artifact]: inference driver artifact name · must use runtime: driver
 
-*[inference.compaction.threshold]: float 0.0–1.0 · fraction of the context window that triggers compaction · default 0.98
+*[inference.compaction.threshold]: float 0.0–1.0 · fraction of the input budget that triggers compaction · default 0.98
 
 *[inference.compaction.model]: model override for compaction calls · defaults to primary inference model
 
@@ -72,7 +72,7 @@
 
 *[context.record_store]: directory under ~/.murmur/conversations/ · default: capsule name
 
-*[context.seed_budget]: float 0.0–1.0 · fraction of the context window a task-start seed may occupy · default 0.10
+*[context.seed_budget]: float 0.0–1.0 · fraction of the input budget a task-start seed may occupy · default 0.10
 
 *[context.seed_overflow_margin]: float 0.0–1.0 · slack above seed_budget before trimming or summarizing · default 0.10
 

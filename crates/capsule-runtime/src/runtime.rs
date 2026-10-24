@@ -2892,7 +2892,7 @@ pub fn stage_session(
             model: inference.model.clone(),
             system_prompt_artifact: inference.system_prompt_artifact.clone(),
             accessible_workdir: accessible_workdir.clone(),
-            context_window: primary_context_window(
+            context_budget: primary_context_budget(
                 driver_choices.as_ref(),
                 request.context.as_ref(),
             ),
@@ -3267,17 +3267,20 @@ fn launch(
         let context_window =
             primary_context_window(staged.driver_choices.as_ref(), staged.context.as_ref())
                 .unwrap_or(0);
+        let primary_input_budget =
+            primary_context_budget(staged.driver_choices.as_ref(), staged.context.as_ref())
+                .map_or(0, |budget| budget.budget.tokens);
         let seed_budget = staged
             .context
             .as_ref()
             .map(|c| c.seed_budget)
             .unwrap_or(murmur_artifact::DEFAULT_SEED_BUDGET);
-        // Computed once for the whole launch: the ceiling depends only on the primary's window,
-        // and every `on-task-start` in the session is measured against the same number.
-        let seed_budget_tokens = agent::seed_budget_tokens(context_window, seed_budget);
+        // Computed once for the whole launch: the ceiling depends only on the primary's input
+        // budget, and every `on-task-start` in the session is measured against the same number.
+        let seed_budget_tokens = agent::seed_budget_tokens(primary_input_budget, seed_budget);
 
         let run_config = agent::AgentRunConfig {
-            context_window,
+            primary_input_budget,
             compaction_threshold: inference
                 .compaction
                 .as_ref()
@@ -7734,12 +7737,12 @@ fn stage_driver_choices(
     choices
 }
 
-/// Resolves every driver choice's output cap and context window from the `models:` table of the
-/// driver just staged for it, and records them on `choices`. Returns the `W-RUN-009` texts to
+/// Resolves every driver choice's output cap, context window, input ceiling and input budget from
+/// the `models:` table of the driver just staged for it, and records them on `choices`. Returns the `W-RUN-009` texts to
 /// print once the bootstrap log exists, and the caps a hook's `run-inference` sends.
 ///
-/// Refused with [`RuntimeError::ModelLimits`] for a choice with no output cap, or a driver whose
-/// table is malformed. Under `transport: process` nothing is resolved.
+/// Refused with [`RuntimeError::ModelLimits`] for a choice with no output cap or no input budget,
+/// or a driver whose table is malformed. Under `transport: process` nothing is resolved.
 fn stage_model_limits(
     inference: &InferenceConfig,
     context: Option<&ContextConfig>,
@@ -7803,6 +7806,7 @@ fn stage_model_limits(
                     .compaction
                     .as_ref()
                     .and_then(|compaction| compaction.max_tokens),
+                context.and_then(|context| context.max_tokens),
             )
         })
         .unwrap_or_default();
@@ -11940,8 +11944,8 @@ async fn apply_retention(
     }
 }
 
-/// The primary driver choice's context window, which `on-task-start`, the seed budget and
-/// `MURMUR.md` read; `None` when it has none. Under `transport: process`, which resolves no model
+/// The primary driver choice's context window, which `on-task-start` carries as
+/// `context-window`; `None` when it has none. Under `transport: process`, which resolves no model
 /// limits, it is `context.max_tokens`.
 fn primary_context_window(
     choices: Option<&crate::driver_choice::DriverChoices>,
@@ -11950,6 +11954,37 @@ fn primary_context_window(
     match choices.and_then(|choices| choices.primary().limits) {
         Some(limits) => limits.context_window,
         None => context.and_then(|context| context.max_tokens),
+    }
+}
+
+/// The primary driver choice's window, cap, ceiling and launch input budget, which the seed
+/// budget, resume-compact and `MURMUR.md` read; `None` when it has no window. Under
+/// `transport: process`, which knows no output cap, the budget is `context.max_tokens` itself.
+fn primary_context_budget(
+    choices: Option<&crate::driver_choice::DriverChoices>,
+    context: Option<&ContextConfig>,
+) -> Option<murmur_md::ContextBudget> {
+    match choices.and_then(|choices| choices.primary().limits) {
+        Some(limits) => Some(murmur_md::ContextBudget {
+            window: limits.context_window?,
+            output_cap: Some(limits.max_output_tokens),
+            input_ceiling: limits.max_input_tokens,
+            budget: crate::model_limits::InputBudget {
+                tokens: limits.input_budget?,
+                basis: limits.input_budget_basis,
+            },
+        }),
+        None => context
+            .and_then(|context| context.max_tokens)
+            .map(|window| murmur_md::ContextBudget {
+                window,
+                output_cap: None,
+                input_ceiling: None,
+                budget: crate::model_limits::InputBudget {
+                    tokens: window,
+                    basis: crate::model_limits::BudgetBasis::ContextWindow,
+                },
+            }),
     }
 }
 
@@ -13896,11 +13931,68 @@ inference:
             max_output_tokens_source: crate::model_limits::LimitSource::Manifest,
             context_window: Some(400_000),
             context_window_source: crate::model_limits::LimitSource::Driver,
+            max_input_tokens: Some(272_000),
+            max_input_tokens_source: crate::model_limits::LimitSource::Driver,
+            input_budget: Some(272_000),
+            input_budget_basis: crate::model_limits::BudgetBasis::MaxInputTokens,
         };
         assert_eq!(
             dispatched_context_window(CONTEXT_WINDOW_MANIFEST, Some(limits)),
-            400_000
+            400_000,
+            "on-task-start carries the window, not the budget"
         );
+    }
+
+    /// The primary's launch budget is the one resolution stored; under `transport: process`,
+    /// with no output cap known, it is `context.max_tokens` itself.
+    #[test]
+    fn the_primary_context_budget_reads_the_resolved_limits() {
+        use crate::model_limits::{BudgetBasis, InputBudget, LimitSource, ResolvedModelLimits};
+        let manifest =
+            murmur_artifact::RuntimeManifest::from_yaml_str(CONTEXT_WINDOW_MANIFEST).unwrap();
+        let inference = manifest.inference.as_ref().unwrap();
+        let mut choices = crate::driver_choice::DriverChoices::declared(inference, &HashMap::new());
+        let limits = ResolvedModelLimits {
+            max_output_tokens: 128_000,
+            max_output_tokens_source: LimitSource::Driver,
+            context_window: Some(1_050_000),
+            context_window_source: LimitSource::Driver,
+            max_input_tokens: Some(922_000),
+            max_input_tokens_source: LimitSource::Driver,
+            input_budget: Some(922_000),
+            input_budget_basis: BudgetBasis::MaxInputTokens,
+        };
+        choices.record_limits(&[crate::model_limits::ChoiceModelLimits {
+            choice: murmur_artifact::PRIMARY_DRIVER_CHOICE.to_string(),
+            model: inference.model.clone(),
+            driver: String::new(),
+            limits,
+            warning: None,
+        }]);
+        assert_eq!(
+            primary_context_budget(Some(&choices), None),
+            Some(murmur_md::ContextBudget {
+                window: 1_050_000,
+                output_cap: Some(128_000),
+                input_ceiling: Some(922_000),
+                budget: InputBudget {
+                    tokens: 922_000,
+                    basis: BudgetBasis::MaxInputTokens,
+                },
+            })
+        );
+        let process = murmur_artifact::RuntimeManifest::from_yaml_str(&format!(
+            "{CONTEXT_WINDOW_MANIFEST}context:\n  max_tokens: 200000\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            primary_context_budget(None, process.context.as_ref()).map(|budget| budget.budget),
+            Some(InputBudget {
+                tokens: 200_000,
+                basis: BudgetBasis::ContextWindow,
+            })
+        );
+        assert_eq!(primary_context_budget(None, None), None);
     }
 
     /// A capsule declaring `context.max_tokens` puts that number on every
@@ -17204,7 +17296,7 @@ inference:
         /// Runs `task_id` over `task.md` as one attempt, reopening never.
         async fn run_task(&mut self, state: &mut CapsuleStoreState, task_id: &str) {
             let run_config = agent::AgentRunConfig {
-                context_window: 0,
+                primary_input_budget: 0,
                 compaction_threshold: 0.98,
                 compaction_model: None,
                 compaction_system_prompt: None,
@@ -17410,7 +17502,7 @@ inference:
         let run_config = agent::AgentRunConfig {
             // Any context at all is over this fraction of the window: the first response
             // compacts.
-            context_window: 100_000,
+            primary_input_budget: 100_000,
             compaction_threshold: 0.000_01,
             compaction_model: Some("SUMMARY".to_string()),
             compaction_system_prompt: None,
@@ -21698,7 +21790,7 @@ inference:
         harness_sessions: Option<Arc<crate::harness_session::HarnessSessionMap>>,
     ) -> agent::AgentRunConfig {
         agent::AgentRunConfig {
-            context_window,
+            primary_input_budget: context_window,
             compaction_threshold: 0.98,
             compaction_model: None,
             compaction_system_prompt: None,
@@ -22155,7 +22247,7 @@ inference:
         .unwrap();
 
         let run_config = agent::AgentRunConfig {
-            context_window: 0,
+            primary_input_budget: 0,
             compaction_threshold: 0.98,
             compaction_model: None,
             compaction_system_prompt: None,
@@ -22826,7 +22918,12 @@ inference:
             driver_name: "mock-driver".to_string(),
             driver_component: driver,
             model: "test-model".to_string(),
-            output_caps: crate::model_limits::HookOutputCaps::new(Default::default(), 1024, None),
+            output_caps: crate::model_limits::HookOutputCaps::new(
+                Default::default(),
+                1024,
+                None,
+                None,
+            ),
             engine: state.engine.clone(),
             accessible_workdir: workdir.clone(),
             records_root: crate::workdir_fs::WorkdirRoot::open(&workdir.clone()).unwrap(),

@@ -1,6 +1,9 @@
-//! An agent capsule's turn cap, per-turn output cap and context window: no turn cap unless the
-//! manifest sets `inference.max_turns`, and the output cap and window from the driver's own
-//! `models:` table unless the manifest sets `inference.max_tokens` and `context.max_tokens`.
+//! An agent capsule's turn cap, per-turn output cap, context window, input ceiling and input
+//! budget: no turn cap unless the manifest sets `inference.max_turns`, the output cap and window
+//! from the driver's own `models:` table unless the manifest sets `inference.max_tokens` and
+//! `context.max_tokens`, the ceiling from the table alone, and the budget
+//! `min(ceiling, window − cap)`. A malformed table is refused by `mur install`, `mur publish` and
+//! the launch.
 //!
 //! Driven through the real `mur` binary and the real anthropic driver fixture against a scripted
 //! provider, because the properties are what reaches the provider, what `session_start` records,
@@ -22,6 +25,12 @@ const TASK: &str = "Say hello.";
 /// A driver table listing `test-model` with limits unlike any default.
 const TABLE: &str = "models:\n  test-model:\n    max_output_tokens: 65536\n    context_window: \
                      400000\n";
+/// A driver table listing `test-model` with the input ceiling the OpenAI 1050000 window carries.
+const CEILED_TABLE: &str = "models:\n  test-model:\n    max_output_tokens: 128000\n    \
+                            context_window: 1050000\n    max_input_tokens: 922000\n";
+/// A driver table whose `test-model` entry declares a ceiling above its window.
+const CEILING_ABOVE_WINDOW: &str = "models:\n  test-model:\n    max_output_tokens: 128000\n    \
+                                    context_window: 1050000\n    max_input_tokens: 1050001\n";
 /// A driver table that lists a model, but not `test-model`.
 const OTHER_TABLE: &str = "models:\n  other-model:\n    max_output_tokens: 1000\n    \
                            context_window: 2000\n";
@@ -56,19 +65,38 @@ fn script(tool_calls: usize) -> Vec<String> {
 
 // ── Homes, projects and `mur run` ─────────────────────────────────────────────
 
+/// The anthropic driver fixture packed into `dir`, its manifest declaring `models` as its
+/// `models:` table (empty for none).
+fn driver_zip(dir: &TempDir, models: &str) -> PathBuf {
+    common::create_driver_artifact_with_auth(
+        dir.path(),
+        DRIVER,
+        DRIVER_VERSION,
+        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+        &format!("{}{models}", common::FIXTURE_DRIVER_AUTH),
+    )
+}
+
 /// A scratch `HOME` with the driver published into it, its manifest declaring `models` as its
 /// `models:` table (empty for none).
 fn home_with_driver(models: &str) -> TempDir {
     let home = TempDir::new().unwrap();
     let artifacts = TempDir::new().unwrap();
-    let artifact = common::create_driver_artifact_with_auth(
-        artifacts.path(),
+    common::publish_local(&home, &driver_zip(&artifacts, models)).success();
+    home
+}
+
+/// A scratch `HOME` whose store holds a driver shipping `models`, a table `mur publish` refuses:
+/// a well-formed driver is published, then its stored payload replaced.
+fn home_with_stored_driver(models: &str) -> TempDir {
+    let home = home_with_driver(TABLE);
+    let artifacts = TempDir::new().unwrap();
+    common::overwrite_stored_payload(
+        &home,
         DRIVER,
         DRIVER_VERSION,
-        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-        &format!("{}{models}", common::FIXTURE_DRIVER_AUTH),
+        &driver_zip(&artifacts, models),
     );
-    common::publish_local(&home, &artifact).success();
     home
 }
 
@@ -196,12 +224,22 @@ fn sent_caps(requests: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+/// `session_start.model_limits` for a driver entry with no input ceiling: the budget is the
+/// window less the cap, or none with no window.
 fn limits(cap: u32, cap_source: &str, window: Option<u32>, window_source: &str) -> Value {
     json!({
         "max_output_tokens": cap,
         "max_output_tokens_source": cap_source,
         "context_window": window,
         "context_window_source": window_source,
+        "max_input_tokens": null,
+        "max_input_tokens_source": "none",
+        "input_budget": window.map(|window| window - cap),
+        "input_budget_basis": if window.is_some() {
+            "context_window_less_output_cap"
+        } else {
+            "none"
+        },
     })
 }
 
@@ -394,26 +432,217 @@ fn unknown_model_without_cap_is_refused() {
     }
 }
 
-/// A driver shipping a malformed table refuses the launch, naming the driver and the field.
+/// A stored driver shipping a malformed table refuses the launch, naming the driver and the
+/// field, before any request leaves: an out-of-range limit, and a ceiling above the window.
 #[test]
 fn malformed_table_is_refused() {
-    let home = home_with_driver(
-        "models:\n  test-model:\n    max_output_tokens: 0\n    context_window: 1\n",
+    for (models, field) in [
+        (
+            "models:\n  test-model:\n    max_output_tokens: 0\n    context_window: 1\n",
+            "models.test-model.max_output_tokens",
+        ),
+        (CEILING_ABOVE_WINDOW, "models.test-model.max_input_tokens"),
+    ] {
+        let home = home_with_stored_driver(models);
+        let server = common::ScriptedServer::start(script(0));
+        let project = project(&manifest(&server.endpoint, "  max_tokens: 4096\n", ""));
+        let run = run(&home, &project);
+        assert_ne!(run.output.status.code(), Some(0), "{}", run.context());
+        let refusal = run.lines("error[E-RUN-052]");
+        assert_eq!(refusal.len(), 1, "{}", run.context());
+        assert!(
+            refusal[0].contains(
+                "driver local/murmur-driver-anthropic@0.1.0 ships a malformed models: table"
+            ) && refusal[0].contains(field),
+            "{}",
+            run.context()
+        );
+        assert!(server.requests().is_empty(), "{}", run.context());
+    }
+}
+
+// ── The store refuses a malformed table ───────────────────────────────────────
+
+/// The `E-REG-011` line `mur install` and `mur publish` print for [`CEILING_ABOVE_WINDOW`].
+const STORE_REFUSAL: &str = "error[E-REG-011]: local/murmur-driver-anthropic@0.1.0 cannot be \
+                             stored: its murmur.yaml ships a malformed models: table: murmur.yaml: \
+                             field 'models.test-model.max_input_tokens' is 1050001, above this \
+                             entry's context_window of 1050000; an input ceiling is at most the \
+                             window";
+
+/// Whether `home`'s global store, or `project`'s, holds any file for the driver.
+fn stored(store_root: &std::path::Path) -> bool {
+    let registry =
+        murmur_artifact::LocalRegistry::new(store_root.join(".murmur").join("artifacts"));
+    let name = murmur_artifact::ArtifactName::parse(DRIVER).unwrap();
+    registry.artifact_path_for(&name, DRIVER_VERSION).exists()
+        || registry.sha256_path_for(&name, DRIVER_VERSION).exists()
+}
+
+/// `mur install <zip>` of a driver whose ceiling is above its window is refused, `E-REG-011`, and
+/// neither the store nor `murmur.lock` is written.
+#[test]
+fn install_refuses_a_ceiling_above_the_window() {
+    let home = TempDir::new().unwrap();
+    let artifacts = TempDir::new().unwrap();
+    let zip = driver_zip(&artifacts, CEILING_ABOVE_WINDOW);
+    let project = project("name: p\nversion: 0.1.0\nartifacts: []\n");
+    let output = common::install_artifact_to_project_with_home(
+        project.dir.path(),
+        &home,
+        &zip,
+        &["--no-precompile"],
+    )
+    .failure()
+    .get_output()
+    .clone();
+    let refused = Run::of(output);
+    assert_eq!(
+        refused.lines("error[E-REG-011]"),
+        [STORE_REFUSAL],
+        "{}",
+        refused.context()
     );
+    assert!(
+        refused
+            .stderr
+            .contains("hint: the driver's own murmur.yaml is at fault"),
+        "{}",
+        refused.context()
+    );
+    assert!(!stored(project.dir.path()), "{}", refused.context());
+    assert!(!stored(home.path()), "{}", refused.context());
+    assert!(
+        !project.dir.path().join("murmur.lock").exists()
+            || !fs::read_to_string(project.dir.path().join("murmur.lock"))
+                .unwrap()
+                .contains("murmur-driver-anthropic"),
+        "{}",
+        refused.context()
+    );
+}
+
+/// `mur publish` refuses the same payload the same way, and writes nothing.
+#[test]
+fn install_by_publish_refuses_a_ceiling_above_the_window() {
+    let home = TempDir::new().unwrap();
+    let artifacts = TempDir::new().unwrap();
+    let output = common::publish_local(&home, &driver_zip(&artifacts, CEILING_ABOVE_WINDOW))
+        .failure()
+        .get_output()
+        .clone();
+    let refused = Run::of(output);
+    assert_eq!(
+        refused.lines("error[E-REG-011]"),
+        [STORE_REFUSAL],
+        "{}",
+        refused.context()
+    );
+    assert!(!stored(home.path()), "{}", refused.context());
+}
+
+/// A well-formed driver declaring a ceiling installs and publishes.
+#[test]
+fn install_accepts_a_well_formed_ceiling() {
+    let home = TempDir::new().unwrap();
+    let artifacts = TempDir::new().unwrap();
+    let zip = driver_zip(&artifacts, CEILED_TABLE);
+    let project = project("name: p\nversion: 0.1.0\nartifacts: []\n");
+    common::install_artifact_to_project_with_home(
+        project.dir.path(),
+        &home,
+        &zip,
+        &["--no-precompile"],
+    )
+    .success();
+    assert!(stored(project.dir.path()));
+    common::publish_local(&home, &zip).success();
+    assert!(stored(home.path()));
+}
+
+// ── The input budget ──────────────────────────────────────────────────────────
+
+/// The input ceiling bounds the budget when it is the smaller term, and `session_start` and
+/// every agent-loop `inference` line carry it.
+#[test]
+fn budget_from_the_input_ceiling() {
+    let home = home_with_driver(CEILED_TABLE);
+    let server = common::ScriptedServer::start(script(1));
+    let project = project(&manifest(&server.endpoint, "", ""));
+    let run = run(&home, &project);
+    assert_eq!(run.output.status.code(), Some(0), "{}", run.context());
+    let trace = run.trace();
+    assert_eq!(
+        session_start(&trace)["model_limits"],
+        json!({
+            "max_output_tokens": 128000,
+            "max_output_tokens_source": "driver",
+            "context_window": 1050000,
+            "context_window_source": "driver",
+            "max_input_tokens": 922000,
+            "max_input_tokens_source": "driver",
+            "input_budget": 922000,
+            "input_budget_basis": "max_input_tokens",
+        })
+    );
+    let lines = events(&trace, "inference");
+    assert_eq!(lines.len(), 2, "{trace:?}");
+    for line in lines {
+        assert_eq!(line["max_output_tokens"], 128000, "{line}");
+        assert_eq!(line["input_budget"], 922000, "{line}");
+    }
+}
+
+/// An output cap that fills the window is refused before any request leaves, `E-RUN-055`, with
+/// every number and its source; `mur doctor` reports the same refusal as a fix and exits 1.
+#[test]
+fn budget_refused_when_the_cap_fills_the_window() {
+    let home = home_with_driver(common::FIXTURE_DRIVER_MODELS);
     let server = common::ScriptedServer::start(script(0));
-    let project = project(&manifest(&server.endpoint, "  max_tokens: 4096\n", ""));
+    let inference_extra = "  max_tokens: 200000\n";
+    let top_extra = "context:\n  max_tokens: 200000\n";
+    let project = project(&manifest(&server.endpoint, inference_extra, top_extra));
     let run = run(&home, &project);
     assert_ne!(run.output.status.code(), Some(0), "{}", run.context());
-    let refusal = run.lines("error[E-RUN-052]");
-    assert_eq!(refusal.len(), 1, "{}", run.context());
+    let expected = "error[E-RUN-055]: driver choice 'primary' has no input budget: its context \
+                    window of 200000 (manifest) less its output cap of 200000 (manifest) leaves \
+                    no input tokens; input ceiling none (model 'test-model', driver \
+                    local/murmur-driver-anthropic@0.1.0)";
+    assert_eq!(
+        run.lines("error[E-RUN-055]"),
+        [expected],
+        "{}",
+        run.context()
+    );
     assert!(
-        refusal[0]
-            .contains("driver local/murmur-driver-anthropic@0.1.0 ships a malformed models: table")
-            && refusal[0].contains("models.test-model.max_output_tokens"),
+        run.stderr.contains(
+            "hint: lower inference.max_tokens below the context window, or raise \
+             context.max_tokens above the output cap"
+        ),
         "{}",
         run.context()
     );
     assert!(server.requests().is_empty(), "{}", run.context());
+
+    let doctor_project = self::project(&manifest("http://127.0.0.1:9", inference_extra, top_extra));
+    let doctor = doctor(&home, &doctor_project);
+    assert_eq!(doctor.output.status.code(), Some(1), "{}", doctor.context());
+    assert!(
+        doctor
+            .stdout
+            .lines()
+            .any(|line| line == format!("  \u{2717}  {expected}").as_str()),
+        "{}",
+        doctor.context()
+    );
+    assert!(
+        doctor
+            .stdout
+            .lines()
+            .any(|line| line.contains("Fix:") && line.contains("lower inference.max_tokens")),
+        "{}",
+        doctor.context()
+    );
 }
 
 // ── mur doctor ────────────────────────────────────────────────────────────────
@@ -430,7 +659,8 @@ fn doctor_prints_the_limits_a_known_model_resolves_to() {
     assert!(
         run.stdout.contains(
             "primary (local/murmur-driver-anthropic@0.1.0, model test-model): output cap 65536 \
-             (driver), context window 400000 (driver)"
+             (driver), context window 400000 (driver), input ceiling none (none), input budget \
+             334464 (context_window_less_output_cap)"
         ),
         "{}",
         run.context()
@@ -448,7 +678,8 @@ fn doctor_warns_for_an_unknown_model_with_a_cap() {
     assert!(
         doctor.stdout.contains(
             "primary (local/murmur-driver-anthropic@0.1.0, model test-model): output cap 4096 \
-             (manifest), context window none (none)"
+             (manifest), context window none (none), input ceiling none (none), input budget \
+             none (none)"
         ),
         "{}",
         doctor.context()
@@ -504,6 +735,21 @@ fn doctor_fixes_an_unknown_model_without_a_cap() {
         run.stdout
             .lines()
             .any(|line| line.contains("Fix:") && line.contains("set inference.max_tokens")),
+        "{}",
+        run.context()
+    );
+}
+
+/// The line for a driver declaring an input ceiling, exactly.
+#[test]
+fn doctor_prints_the_input_ceiling_and_budget() {
+    let home = home_with_driver(CEILED_TABLE);
+    let run = doctor(&home, &doctor_project(""));
+    assert!(
+        run.stdout.lines().any(|line| line
+            == "  \u{2713}  primary (local/murmur-driver-anthropic@0.1.0, model test-model): \
+                output cap 128000 (driver), context window 1050000 (driver), input ceiling 922000 \
+                (driver), input budget 922000 (max_input_tokens)"),
         "{}",
         run.context()
     );

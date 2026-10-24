@@ -883,8 +883,8 @@ fn s3_an_alternate_whose_credential_is_missing_at_launch_is_staged_unavailable()
     assert_eq!(
         of_type(&events, "session_start")[0]["inference_choices"],
         json!([
-            {"name": "primary", "driver": ANTHROPIC, "model": SONNET, "credential_source": "manifest", "available": true, "model_limits": {"max_output_tokens": 4096, "max_output_tokens_source": "manifest", "context_window": 1_000_000, "context_window_source": "driver"}},
-            {"name": "gpt", "driver": OPENAI, "model": GPT, "credential_source": "none", "available": false, "model_limits": {"max_output_tokens": 4096, "max_output_tokens_source": "manifest", "context_window": 1_000_000, "context_window_source": "driver"}},
+            {"name": "primary", "driver": ANTHROPIC, "model": SONNET, "credential_source": "manifest", "available": true, "model_limits": {"max_output_tokens": 4096, "max_output_tokens_source": "manifest", "context_window": 1_000_000, "context_window_source": "driver", "max_input_tokens": null, "max_input_tokens_source": "none", "input_budget": 995_904, "input_budget_basis": "context_window_less_output_cap"}},
+            {"name": "gpt", "driver": OPENAI, "model": GPT, "credential_source": "none", "available": false, "model_limits": {"max_output_tokens": 4096, "max_output_tokens_source": "manifest", "context_window": 1_000_000, "context_window_source": "driver", "max_input_tokens": null, "max_input_tokens_source": "none", "input_budget": 995_904, "input_budget_basis": "context_window_less_output_cap"}},
         ])
     );
     let show = mur_control(home.path(), &["show"], None);
@@ -1085,6 +1085,10 @@ fn limits_follow_the_choice() {
             "max_output_tokens_source": "driver",
             "context_window": window,
             "context_window_source": "driver",
+            "max_input_tokens": null,
+            "max_input_tokens_source": "none",
+            "input_budget": window - cap,
+            "input_budget_basis": "context_window_less_output_cap",
         })
     };
     assert_eq!(
@@ -1428,8 +1432,8 @@ fn s8_an_alternates_gateway_is_metered_and_admitted_against_the_ceiling() {
     assert_eq!(
         start["inference_choices"],
         json!([
-            {"name": "primary", "driver": ANTHROPIC, "model": SONNET, "credential_source": "manifest", "available": true, "model_limits": {"max_output_tokens": 4096, "max_output_tokens_source": "manifest", "context_window": 1_000_000, "context_window_source": "driver"}},
-            {"name": "gpt", "driver": OPENAI, "model": GPT, "credential_source": "manifest", "available": true, "model_limits": {"max_output_tokens": 4096, "max_output_tokens_source": "manifest", "context_window": 1_000_000, "context_window_source": "driver"}},
+            {"name": "primary", "driver": ANTHROPIC, "model": SONNET, "credential_source": "manifest", "available": true, "model_limits": {"max_output_tokens": 4096, "max_output_tokens_source": "manifest", "context_window": 1_000_000, "context_window_source": "driver", "max_input_tokens": null, "max_input_tokens_source": "none", "input_budget": 995_904, "input_budget_basis": "context_window_less_output_cap"}},
+            {"name": "gpt", "driver": OPENAI, "model": GPT, "credential_source": "manifest", "available": true, "model_limits": {"max_output_tokens": 4096, "max_output_tokens_source": "manifest", "context_window": 1_000_000, "context_window_source": "driver", "max_input_tokens": null, "max_input_tokens_source": "none", "input_budget": 995_904, "input_budget_basis": "context_window_less_output_cap"}},
         ])
     );
     assert_eq!(of_type(&events, "spend_ceiling_reached").len(), 1);

@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::agent::{DriverUsage, OccupancyBasis};
+use crate::model_limits::{BudgetBasis, InputBudget};
 use crate::spend::SpendMeter;
 
 /// The runtime-provided tool every agent capsule has, on both transports, with no grant.
@@ -227,6 +228,8 @@ impl SpendReading {
 struct ContextReading {
     used_tokens: u32,
     window_tokens: Option<u32>,
+    budget_tokens: Option<u32>,
+    budget_basis: BudgetBasis,
     measured_by: OccupancyBasis,
 }
 
@@ -362,17 +365,21 @@ impl SessionStatus {
     }
 
     /// Fed by the http agent loop right after its compaction check: the occupancy that check
-    /// compared, the window it compared it against (`None` when the choice has none) and how the
-    /// count was made.
+    /// compared, the window of the choice that served the call (`None` when it has none), the
+    /// input budget the check compared against (`None` with no window) and how the count was
+    /// made.
     pub(crate) fn set_context(
         &self,
         used_tokens: u32,
         window_tokens: Option<u32>,
+        budget: Option<InputBudget>,
         measured_by: OccupancyBasis,
     ) {
         self.fed().context = Some(ContextReading {
             used_tokens,
             window_tokens,
+            budget_tokens: budget.map(|budget| budget.tokens),
+            budget_basis: budget.map_or(BudgetBasis::None, |budget| budget.basis),
             measured_by,
         });
     }
@@ -406,6 +413,8 @@ impl SessionStatus {
             (false, Some(reading)) => serde_json::json!({
                 "used_tokens": reading.used_tokens,
                 "window_tokens": or_none(reading.window_tokens),
+                "budget_tokens": or_none(reading.budget_tokens),
+                "budget_basis": reading.budget_basis.wire_name(),
                 "measured_by": reading.measured_by,
             }),
             _ => Value::from(UNKNOWN),
@@ -526,8 +535,11 @@ pub fn description_http() -> String {
     format!(
         "Report where this session stands, measured at the moment of the call. Takes no input and \
          returns one JSON object. {FIELDS} `context`: `used_tokens`, the conversation's size as \
-         the runtime last counted it, `window_tokens`, the model's context window, and \
-         `measured_by`, how the count was made (\"actual\": the provider's own count of the last \
+         the runtime last counted it, `window_tokens`, the model's context window, \
+         `budget_tokens`, the most input tokens a call may carry, which compaction measures \
+         against, `budget_basis`, the limit that sets it (\"max_input_tokens\": the provider's \
+         input ceiling; \"context_window_less_output_cap\": the window less the call's output \
+         cap), and `measured_by`, how the count was made (\"actual\": the provider's own count of the last \
          call; \"estimate\": the runtime's own count). `tokens`: \
          the `input`, `output`, `cached` and `cache_write` tokens the provider reported for this \
          session's inference calls, and `unreported_calls`, the calls it reported none for. \
@@ -600,7 +612,15 @@ mod tests {
             Some(30),
             Some(&usage(Some(1_200), Some(70), Some(0), Some(10))),
         );
-        status.set_context(61_234, Some(200_000), OccupancyBasis::Estimate);
+        status.set_context(
+            61_234,
+            Some(200_000),
+            Some(InputBudget {
+                tokens: 191_808,
+                basis: BudgetBasis::ContextWindowLessOutputCap,
+            }),
+            OccupancyBasis::Estimate,
+        );
         let now = started + Duration::from_millis(1_834_900);
         let spend = SpendReading {
             used: 1_920,
@@ -614,6 +634,8 @@ mod tests {
                          "deadline": {"at": "2026-10-20T14:00:00Z", "left_secs": 5365}},
                 "turns": {"used": 2, "cap": 20},
                 "context": {"used_tokens": 61234, "window_tokens": 200000,
+                            "budget_tokens": 191808,
+                            "budget_basis": "context_window_less_output_cap",
                             "measured_by": "estimate"},
                 "tokens": {"input": 2200, "output": 120, "cached": 600, "cache_write": 110,
                            "unreported_calls": 0},
@@ -662,7 +684,7 @@ mod tests {
             Some(40),
             Some(&usage(Some(7), None, None, None)),
         );
-        status.set_context(940, None, OccupancyBasis::Estimate);
+        status.set_context(940, None, None, OccupancyBasis::Estimate);
         let value = report(&status, started + Duration::from_secs(3), no_spend());
         assert_eq!(
             value["tokens"],
@@ -671,16 +693,18 @@ mod tests {
         );
         assert_eq!(
             value["context"],
-            json!({"used_tokens": 940, "window_tokens": "none", "measured_by": "estimate"})
+            json!({"used_tokens": 940, "window_tokens": "none", "budget_tokens": "none",
+                   "budget_basis": "none", "measured_by": "estimate"})
         );
         assert_eq!(value["turns"]["used"], 2);
         assert_eq!(value["time"]["task_elapsed_secs"], 3);
 
         // The provider's count of the last call, when it reported one, is named as such.
-        status.set_context(1_010, None, OccupancyBasis::Actual);
+        status.set_context(1_010, None, None, OccupancyBasis::Actual);
         assert_eq!(
             report(&status, started, no_spend())["context"],
-            json!({"used_tokens": 1010, "window_tokens": "none", "measured_by": "actual"})
+            json!({"used_tokens": 1010, "window_tokens": "none", "budget_tokens": "none",
+                   "budget_basis": "none", "measured_by": "actual"})
         );
     }
 
@@ -697,7 +721,7 @@ mod tests {
         );
         status.record_inference(2, None, None, None);
         // A process session is never fed a context reading, and one fed anyway is not reported.
-        status.set_context(1, Some(2), OccupancyBasis::Estimate);
+        status.set_context(1, Some(2), None, OccupancyBasis::Estimate);
         let value = report(&status, started, no_spend());
         assert_eq!(value["context"], json!("unknown"));
         assert_eq!(
@@ -936,6 +960,8 @@ mod tests {
             }
         }
         assert!(description_http().contains("measured_by"));
+        assert!(description_http().contains("budget_tokens"));
+        assert!(description_http().contains("budget_basis"));
         assert!(description_http().contains("\"actual\""));
         assert!(description_process().contains("the harness keeps its own context"));
     }

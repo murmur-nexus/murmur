@@ -92,7 +92,8 @@ measured at the moment of the call:
   "time":    {"elapsed_secs": 1834, "task_elapsed_secs": 1790,
               "deadline": {"at": "2026-10-20T14:00:00Z", "left_secs": 5366}},
   "turns":   {"used": 42, "cap": "none"},
-  "context": {"used_tokens": 61234, "window_tokens": 200000, "measured_by": "estimate"},
+  "context": {"used_tokens": 61234, "window_tokens": 200000, "budget_tokens": 191808,
+              "budget_basis": "context_window_less_output_cap", "measured_by": "estimate"},
   "tokens":  {"input": 812345, "output": 23456, "cached": 600000, "cache_write": 10000,
               "unreported_calls": 0},
   "spend":   {"tokens": 835801, "ceiling": "none", "machine": "none"}
@@ -111,7 +112,9 @@ Seconds are whole, rounded down.
 | `turns.used` | Inference calls the running task has made, across its reopens and continuations, a hook's `run-inference` included: the count [`inference.max_turns`](manifest.md#field-inference) is checked against | — |
 | `turns.cap` | `inference.max_turns` | `"none"` with no cap |
 | `context.used_tokens` | The conversation's size as the compaction check last counted it | `context` is `"unknown"` before the first turn, and always under `transport: process` |
-| `context.window_tokens` | The context window that check compared it with, the serving driver choice's | `"none"` when the choice has none |
+| `context.window_tokens` | The context window of the driver choice that served the last call | `"none"` when the choice has none |
+| `context.budget_tokens` | The [input budget](manifest.md#inference-max-tokens) that check compared it with: the input ceiling, or the window less the output cap the last call sent, whichever is smaller. Compaction fires at `inference.compaction.threshold` of it | `"none"` when the choice has no window |
+| `context.budget_basis` | Which limit set `budget_tokens`: `"max_input_tokens"` (the driver's input ceiling) or `"context_window_less_output_cap"` | `"none"` when the choice has no window |
 | `context.measured_by` | `"actual"`: the provider's own count of the last call, its request plus its completion. `"estimate"`: the runtime's own count, when that call reported none. The same values as the [`compaction`](observability-schemas.md) record's `tokens_before_source` | — |
 | `tokens.input`, `tokens.output`, `tokens.cached`, `tokens.cache_write` | Sums of what the provider reported over the session's `inference` records so far | `"unknown"` for a member no record carried |
 | `tokens.unreported_calls` | `inference` records that carried no count | — |

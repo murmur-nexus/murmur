@@ -1516,9 +1516,10 @@ fn run_formation_doctor(formation_dir: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Each driver choice's output cap and context window under `transport: http`, and where each
-/// comes from, through the resolver `mur run` stages with: `W-RUN-009` in the words a launch
-/// prints, counted as a warning, and the `E-RUN-052` or `E-RUN-054` refusal as a fix.
+/// Each driver choice's output cap, context window, input ceiling and input budget under
+/// `transport: http`, and where each comes from, through the resolver `mur run` stages with:
+/// `W-RUN-009` in the words a launch prints, counted as a warning, and the `E-RUN-052`,
+/// `E-RUN-054` or `E-RUN-055` refusal as a fix.
 /// `installed` is each installed artifact's declared name, `name@version` and bundled
 /// `murmur.yaml`; a choice whose driver is not installed is left to the missing line the
 /// checklist already printed.
@@ -1576,18 +1577,23 @@ fn report_model_limits(
         Ok(choices) => {
             for choice in &choices {
                 let limits = choice.limits;
-                let window = limits
-                    .context_window
-                    .map_or_else(|| "none".to_string(), |window| window.to_string());
+                let or_none = |limit: Option<u32>| {
+                    limit.map_or_else(|| "none".to_string(), |n| n.to_string())
+                };
                 capsule_runtime::report_println!(
-                    "  \u{2713}  {} ({}, model {}): output cap {} ({}), context window {} ({})",
+                    "  \u{2713}  {} ({}, model {}): output cap {} ({}), context window {} ({}), \
+                     input ceiling {} ({}), input budget {} ({})",
                     choice.choice,
                     choice.driver,
                     choice.model,
                     limits.max_output_tokens,
                     limits.max_output_tokens_source.wire_name(),
-                    window,
-                    limits.context_window_source.wire_name()
+                    or_none(limits.context_window),
+                    limits.context_window_source.wire_name(),
+                    or_none(limits.max_input_tokens),
+                    limits.max_input_tokens_source.wire_name(),
+                    or_none(limits.input_budget),
+                    limits.input_budget_basis.wire_name()
                 );
             }
             for choice in &choices {

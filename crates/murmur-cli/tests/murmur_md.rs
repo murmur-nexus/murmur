@@ -176,8 +176,12 @@ fn murmur_md_reflects_capsule_config() {
         "MURMUR.md should include the model name; content:\n{content}"
     );
     assert!(
-        content.contains("100000 tokens"),
-        "MURMUR.md should include context.max_tokens"
+        content.contains(
+            "- Context budget: 91808 input tokens, the context window less the output cap \
+             (context window 100000, output cap 8192, input ceiling none) (compaction not \
+             configured)\n"
+        ),
+        "MURMUR.md should state the input budget cut from context.max_tokens; content:\n{content}"
     );
     assert!(
         content.contains("bash"),

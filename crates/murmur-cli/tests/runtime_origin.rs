@@ -438,10 +438,10 @@ fn the_disclosure_survives_a_compaction() {
     ]);
     let p = project(
         &server.endpoint,
-        // Small enough that the first turn's occupancy is over the threshold, so the hook
-        // replaces the context before the second call.
+        // An input budget of 100 − 50, small enough that the first turn's occupancy is over the
+        // threshold, so the hook replaces the context before the second call.
         "context:\n  max_tokens: 100\n",
-        "",
+        "  max_tokens: 50\n",
         &[("compactor", compaction_hook_wasm(SUMMARY))],
     );
 

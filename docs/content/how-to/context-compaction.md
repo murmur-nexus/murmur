@@ -6,8 +6,8 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [context.max_tokens](../reference/manifest.md#field-context) | The context window compaction measures against; default: the window the driver's `models:` table declares for the model |
-| [inference.compaction.threshold](../reference/manifest.md#field-inference) | Fraction of the context window that triggers compaction |
+| [context.max_tokens](../reference/manifest.md#field-context) | The context window the input budget is cut from; default: the window the driver's `models:` table declares for the model |
+| [inference.compaction.threshold](../reference/manifest.md#field-inference) | Fraction of the input budget that triggers compaction |
 | [inference.compaction.model](../reference/manifest.md#field-inference) | Model used for the compaction call (optional override) |
 | [inference.compaction.system_prompt](../reference/manifest.md#field-inference) | System prompt override for the compaction call (optional; hook picks its own default when unset) |
 | [inference.compaction.system_prompt_file](../reference/manifest.md#field-inference) | Same override, loaded from a file next to the manifest (optional; mutually exclusive with `system_prompt`) |
@@ -130,7 +130,13 @@ Compaction is not built into the Murmur runtime — it is externalized as an art
 
 ## Step 3 — set the compaction threshold
 
-The threshold controls when compaction fires. It is a fraction of the context window. The default is `0.98` — compaction fires when the context reaches 98% of the context window.
+The threshold controls when compaction fires. It is a fraction of the call's [input budget](../reference/manifest.md#inference-max-tokens): the most input the provider accepts for the model (the driver's `max_input_tokens`), or the context window less the output cap the call sends, whichever is smaller. The default is `0.98` — compaction fires when the context reaches 98% of the input budget, so a session compacts before a request would exceed what the provider accepts.
+
+| Driver entry (window / cap / input ceiling) | Manifest | Input budget | `threshold: 0.98` fires at |
+|---|---|---|---|
+| 1050000 / 128000 / 922000 | — | 922000, the input ceiling | 903560 |
+| 1050000 / 128000 / — | `inference.max_tokens: 6000` | 1044000, the window less the cap | 1023120 |
+| 400000 / 128000 / 272000 | — | 272000, the input ceiling | 266560 |
 
 The runtime checks it after each response, against the provider's own count of the call when the driver reports [usage](../reference/wit-interfaces.md#driver-usage), and against its own estimate when it does not. The estimate can be several percent above or below the provider's count, so a driver that reports nothing compacts somewhat earlier or later than one that does. The trace's `compaction` line says which number fired it in `tokens_before_source`: `"actual"` or `"estimate"`.
 
@@ -172,7 +178,7 @@ For long-running tasks where you want compaction to kick in earlier and leave he
         threshold: 0.85
     ```
 
-With `threshold: 0.85`, compaction fires when the session has consumed 85% of the context window.
+With `threshold: 0.85`, compaction fires when the session has consumed 85% of the input budget.
 
 To use a smaller, faster model for compaction calls (saving cost while keeping your primary model for inference):
 
@@ -241,17 +247,20 @@ At startup the runtime writes a generated `MURMUR.md` into the session's [runtim
 grep "Context budget" ~/.murmur/sessions/<session_id>/runtime/MURMUR.md
 ```
 
-When the primary choice has a context window and a hook bound to `on-compaction` is staged, the status reads `compaction configured`:
+The line states the primary choice's input budget at launch, which limit set it, and the three numbers it was cut from. When the primary choice has a context window and a hook bound to `on-compaction` is staged, the status reads `compaction configured`:
 
 ```text
-- Context budget: 1000000 tokens (compaction configured)
+- Context budget: 922000 input tokens, the input ceiling (context window 1050000, output cap 128000, input ceiling 922000) (compaction configured)
 ```
 
-If either is missing — no window, or no `on-compaction` hook staged — it reads `compaction not configured`:
+If the `on-compaction` hook is missing it reads `compaction not configured`, and with no window there is no budget:
 
 ```text
-- Context budget: 1000000 tokens (compaction not configured)
+- Context budget: 1044000 input tokens, the context window less the output cap (context window 1050000, output cap 6000, input ceiling none) (compaction not configured)
+- Context budget: not set (compaction not configured)
 ```
+
+[`mur doctor`](../reference/cli.md#mur-doctor) prints the same numbers for every driver choice before a launch.
 
 The runtime selects the compaction hook by its `on-compaction` binding, not by name, so there is no artifact-name setting to get wrong: any staged hook with that binding satisfies the check.
 
@@ -474,12 +483,12 @@ compaction.
 
 | Manifest setting | Effect |
 |---|---|
-| `context.max_tokens: N` | Sets the context window, over the driver's `models:` entry |
+| `context.max_tokens: N` | Sets the context window, over the driver's `models:` entry; at or below the output cap, the launch is refused with `E-RUN-055` |
 | `murmur/hook-compact` with `runtime: hook` (or any hook bound to `on-compaction`) | Provides the compaction hook; required to enable compaction |
-| `inference.compaction.threshold: 0.85` | Compaction fires when the context reaches 85% of the context window |
+| `inference.compaction.threshold: 0.85` | Compaction fires when the context reaches 85% of the input budget: the driver's `max_input_tokens`, or the window less the output cap, whichever is smaller |
 | `inference.compaction.model: claude-haiku-4-5` | Uses a different (typically cheaper) model for compaction calls |
 | `inference.compaction.dump_summaries: true` | Appends every committed compaction's summary to `out/compaction-summaries.jsonl` in the session's records directory; default `false` |
-| `inference.compaction.max_tokens: 8000` | Caps the compaction call at 8000 output tokens; above the driver's ceiling for the compaction model, the launch is refused with `E-RUN-054` |
+| `inference.compaction.max_tokens: 8000` | Caps the compaction call at 8000 output tokens; above the driver's ceiling for the compaction model, the launch is refused with `E-RUN-054`, and at or above the compaction model's window with `E-RUN-055` |
 | `inference.compaction.driver_config: {reasoning_effort: low}` | Runs the compaction call with `reasoning_effort: low` laid over `inference.driver.config`; agent turns keep their own |
 | `capabilities.limits.deadline_seconds` on the hook's entry | That hook's call deadline, ahead of the capsule-wide value and the 30-second default |
 | No hook bound to `on-compaction` | Non-fatal — session continues with the uncompacted history; `compaction_declined` written to the trace |
