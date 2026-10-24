@@ -2,10 +2,11 @@
 //!
 //! `mur trace show`, `mur trace steps`, `mur trace diff`, `mur trace report`, `mur eval show`,
 //! `mur eval diff` and `mur run --resume` all name a session the same four ways, and all read
-//! the same way when an address names nothing. That holds because [`resolve`] is the only body
-//! any of them reaches to parse an ordinal, match a suffix, recognise a full `ses_` id or pass a
+//! the same way when an address names nothing. That holds because [`resolve_kind`] is the only
+//! body any of them reaches to parse an ordinal, match a suffix, recognise a full id or pass a
 //! literal path through; every command reaches it through a [`SessionQuery`] carrying the three
-//! things the vocabulary itself cannot know. `mur trace list` prints the candidates in the order
+//! things the vocabulary itself cannot know. `mur eval diff --run` names an eval-run record
+//! (`evr_<id>.json`, beside the sessions) the same way, through [`EVAL_RUN`]. `mur trace list` prints the candidates in the order
 //! ordinals count them, through [`sessions_newest_first`]. `mur trace rm` speaks the vocabulary
 //! less the literal path, which it refuses by [`is_literal_path`], and accepts a full id by
 //! [`is_full_session_id`] while either half of that session is left.
@@ -29,10 +30,60 @@ use crate::error::{CliError, E_IO_003};
 /// The address an omitted argument means: the most recent session.
 const LATEST: &str = "@1";
 
+/// What an address names: the candidates of one records group and how messages call them.
+pub(crate) struct RecordKind {
+    /// The name prefix every candidate carries, which a full id starts with and 32 characters
+    /// follow.
+    prefix: &'static str,
+    /// `None` when a candidate is a directory; else the extension of a candidate file, which its
+    /// id leaves off.
+    file_extension: Option<&'static str>,
+    /// The suffix that makes an address a literal path even without a `/`.
+    literal_suffix: &'static str,
+    noun: &'static str,
+    nouns: &'static str,
+    /// The fewest characters a suffix address may have.
+    min_suffix: usize,
+}
+
+/// A session: a `ses_` records directory.
+pub(crate) const SESSION: RecordKind = RecordKind {
+    prefix: "ses_",
+    file_extension: None,
+    literal_suffix: ".jsonl",
+    noun: "session",
+    nouns: "sessions",
+    min_suffix: 0,
+};
+
+/// An eval run: an `evr_<id>.json` record `mur eval run` writes.
+pub(crate) const EVAL_RUN: RecordKind = RecordKind {
+    prefix: "evr_",
+    file_extension: Some(".json"),
+    literal_suffix: ".json",
+    noun: "eval run",
+    nouns: "eval runs",
+    min_suffix: 4,
+};
+
+impl RecordKind {
+    /// The file the candidate `id` resolves to in `group`.
+    fn record_path(&self, group: &Path, id: &str, record_file: &str) -> PathBuf {
+        match self.file_extension {
+            None => group.join(id).join(record_file),
+            Some(extension) => group.join(format!("{id}{extension}")),
+        }
+    }
+
+    fn is_full_id(&self, address: &str) -> bool {
+        address.starts_with(self.prefix) && address.len() == self.prefix.len() + 32
+    }
+}
+
 /// What a command supplies that the address vocabulary cannot know.
 pub(crate) struct SessionQuery<'a> {
     /// The file an address resolves to beneath a session's records directory, `trace.jsonl` or
-    /// `hooks/eval.jsonl`.
+    /// `hooks/eval.jsonl`. Unread for a kind whose candidates are files.
     pub(crate) record_file: &'a str,
     /// The diagnostic code every addressing failure carries.
     pub(crate) code: &'static str,
@@ -61,6 +112,11 @@ pub(crate) fn records_group(workdir: &Path) -> Result<PathBuf, CliError> {
 /// A group that does not exist yet holds no sessions rather than being an error, so the
 /// callers that go on to report "no sessions found" get to phrase that themselves.
 pub(crate) fn ses_entries(group: &Path) -> Result<Vec<String>, CliError> {
+    entries(group, &SESSION)
+}
+
+/// The ids of every candidate of `kind` in `group`, unsorted; none when `group` does not exist.
+fn entries(group: &Path, kind: &RecordKind) -> Result<Vec<String>, CliError> {
     if !group.exists() || !group.is_dir() {
         return Ok(Vec::new());
     }
@@ -75,8 +131,18 @@ pub(crate) fn ses_entries(group: &Path) -> Result<Vec<String>, CliError> {
             )
         })?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("ses_") && entry.path().is_dir() {
-            entries.push(name);
+        if !name.starts_with(kind.prefix) {
+            continue;
+        }
+        let path = entry.path();
+        match kind.file_extension {
+            None if path.is_dir() => entries.push(name),
+            Some(extension) if path.is_file() => {
+                if let Some(id) = name.strip_suffix(extension) {
+                    entries.push(id.to_string());
+                }
+            }
+            _ => {}
         }
     }
     Ok(entries)
@@ -86,7 +152,12 @@ pub(crate) fn ses_entries(group: &Path) -> Result<Vec<String>, CliError> {
 /// so entry `i` is the session `@(i+1)` names. Session ids are uuid v7 and sort chronologically,
 /// which makes the order a plain sort of the names.
 pub(crate) fn sessions_newest_first(group: &Path) -> Result<Vec<String>, CliError> {
-    let mut entries = ses_entries(group)?;
+    newest_first(group, &SESSION)
+}
+
+/// The ids of `kind` in `group`, most recent first. Every kind's ids are uuid v7.
+fn newest_first(group: &Path, kind: &RecordKind) -> Result<Vec<String>, CliError> {
+    let mut entries = entries(group, kind)?;
     entries.sort();
     entries.reverse();
     Ok(entries)
@@ -95,13 +166,17 @@ pub(crate) fn sessions_newest_first(group: &Path) -> Result<Vec<String>, CliErro
 /// Whether `address` is spelled as a literal path rather than as a session address: anything
 /// that is not an ordinal and contains `/` or ends in `.jsonl`.
 pub(crate) fn is_literal_path(address: &str) -> bool {
-    !address.starts_with('@') && (address.contains('/') || address.ends_with(".jsonl"))
+    is_literal_path_of(address, &SESSION)
+}
+
+fn is_literal_path_of(address: &str, kind: &RecordKind) -> bool {
+    !address.starts_with('@') && (address.contains('/') || address.ends_with(kind.literal_suffix))
 }
 
 /// Whether `address` is spelled as a full session id: `ses_` and 32 more characters, 36 in all.
 /// The characters themselves are not checked.
 pub(crate) fn is_full_session_id(address: &str) -> bool {
-    address.starts_with("ses_") && address.len() == 36
+    SESSION.is_full_id(address)
 }
 
 /// The record file a session address names, among the sessions of the workdir root `workdir`.
@@ -117,15 +192,38 @@ pub(crate) fn resolve(
     workdir: &Path,
     query: &SessionQuery<'_>,
 ) -> Result<PathBuf, CliError> {
+    resolve_kind(address, workdir, &SESSION, query)
+}
+
+/// The record file an address names among the candidates of `kind` in the workdir root
+/// `workdir`'s records group: [`resolve`] for any kind. A file kind also refuses a suffix
+/// shorter than its `min_suffix`.
+pub(crate) fn resolve_kind(
+    address: Option<&str>,
+    workdir: &Path,
+    kind: &RecordKind,
+    query: &SessionQuery<'_>,
+) -> Result<PathBuf, CliError> {
     let address = address.unwrap_or(LATEST);
 
     // A literal path is taken verbatim; the records group is not consulted.
-    if is_literal_path(address) {
+    if is_literal_path_of(address, kind) {
         return Ok(PathBuf::from(address));
     }
-    let root = workdir;
-    let workdir = records_group(root)?;
-    let workdir = workdir.as_path();
+    let group = records_group(workdir)?;
+    resolve_in_group(address, workdir, &group, kind, query)
+}
+
+/// The non-literal arms of [`resolve_kind`], against `group`, the records group of the workdir
+/// root `root`.
+fn resolve_in_group(
+    address: &str,
+    root: &Path,
+    group: &Path,
+    kind: &RecordKind,
+    query: &SessionQuery<'_>,
+) -> Result<PathBuf, CliError> {
+    let workdir = group;
 
     if let Some(n_str) = address.strip_prefix('@') {
         let n: usize = n_str.parse().map_err(|_| {
@@ -136,13 +234,14 @@ pub(crate) fn resolve(
         if n == 0 {
             return Err(query.err("ordinal must be @1 or higher"));
         }
-        let entries = sessions_newest_first(workdir)?;
+        let entries = newest_first(workdir, kind)?;
         if entries.is_empty() {
             // Unlabelled: an empty workdir is not a fault of the argument that named it.
             return Err(CliError::new(
                 query.code,
                 format!(
-                    "no sessions found in workdir at {} (records in {})",
+                    "no {} found in workdir at {} (records in {})",
+                    kind.nouns,
                     root.display(),
                     workdir.display()
                 ),
@@ -150,19 +249,24 @@ pub(crate) fn resolve(
         }
         if n > entries.len() {
             return Err(query.err(format!(
-                "@{n} is out of range — workdir has {} session{}",
+                "@{n} is out of range — workdir has {} {}",
                 entries.len(),
-                if entries.len() == 1 { "" } else { "s" }
+                if entries.len() == 1 {
+                    kind.noun
+                } else {
+                    kind.nouns
+                }
             )));
         }
-        return Ok(workdir.join(&entries[n - 1]).join(query.record_file));
+        return Ok(kind.record_path(workdir, &entries[n - 1], query.record_file));
     }
 
-    if is_full_session_id(address) {
-        let path = workdir.join(address).join(query.record_file);
+    if kind.is_full_id(address) {
+        let path = kind.record_path(workdir, address, query.record_file);
         if !path.exists() {
             return Err(query.err(format!(
-                "session {} not found in {}",
+                "{} {} not found in {}",
+                kind.noun,
                 address,
                 workdir.display()
             )));
@@ -170,26 +274,35 @@ pub(crate) fn resolve(
         return Ok(path);
     }
 
+    if address.chars().count() < kind.min_suffix {
+        return Err(query.err(format!(
+            "'{address}' is too short a suffix — give {} or more characters",
+            kind.min_suffix
+        )));
+    }
+
     // Suffix matching (case-insensitive).
     let suffix_lower = address.to_lowercase();
-    let entries = ses_entries(workdir)?;
+    let entries = entries(workdir, kind)?;
     let mut matches: Vec<String> = entries
         .into_iter()
         .filter(|e| e.to_lowercase().ends_with(&suffix_lower))
         .collect();
     match matches.len() {
         0 => Err(query.err(format!(
-            "no session found matching suffix '{}' in {}",
+            "no {} found matching suffix '{}' in {}",
+            kind.noun,
             address,
             workdir.display()
         ))),
-        1 => Ok(workdir.join(&matches[0]).join(query.record_file)),
+        1 => Ok(kind.record_path(workdir, &matches[0], query.record_file)),
         n => {
             matches.sort();
             Err(query.err(format!(
-                "ambiguous: '{}' matches {} sessions — provide more characters\n{}",
+                "ambiguous: '{}' matches {} {} — provide more characters\n{}",
                 address,
                 n,
+                kind.nouns,
                 matches
                     .iter()
                     .map(|m| format!("  {m}"))
@@ -197,5 +310,101 @@ pub(crate) fn resolve(
                     .join("\n")
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const QUERY: SessionQuery<'static> = SessionQuery {
+        record_file: "",
+        code: "E-TEST",
+        label: Some("--run"),
+    };
+
+    /// A records group holding two eval runs, a session and a stray file; the runs newest first.
+    fn group() -> (tempfile::TempDir, [&'static str; 2]) {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = [
+            "evr_0192bbbb0000700080000000beef1234",
+            "evr_0192aaaa0000700080000000cafe1234",
+        ];
+        for run in runs {
+            fs::write(dir.path().join(format!("{run}.json")), "{}").unwrap();
+        }
+        fs::create_dir(dir.path().join("ses_0192cccc0000700080000000beef1234")).unwrap();
+        fs::write(dir.path().join("evr_notes.txt"), "").unwrap();
+        (dir, runs)
+    }
+
+    fn resolve_run(address: &str, group: &Path) -> Result<PathBuf, String> {
+        resolve_in_group(address, Path::new("/w"), group, &EVAL_RUN, &QUERY)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn an_ordinal_counts_back_from_the_newest() {
+        let (dir, runs) = group();
+        let path = |run: &str| dir.path().join(format!("{run}.json"));
+        assert_eq!(resolve_run("@1", dir.path()).unwrap(), path(runs[0]));
+        assert_eq!(resolve_run("@2", dir.path()).unwrap(), path(runs[1]));
+        let out_of_range = resolve_run("@3", dir.path()).unwrap_err();
+        assert!(
+            out_of_range.contains("--run: @3 is out of range — workdir has 2 eval runs"),
+            "{out_of_range}"
+        );
+        assert!(resolve_run("@0", dir.path()).is_err());
+        let empty = tempfile::tempdir().unwrap();
+        let none = resolve_run("@1", empty.path()).unwrap_err();
+        assert!(none.contains("no eval runs found in workdir"), "{none}");
+    }
+
+    #[test]
+    fn a_suffix_and_a_full_id_name_one_run() {
+        let (dir, runs) = group();
+        let path = |run: &str| dir.path().join(format!("{run}.json"));
+        assert_eq!(resolve_run("CAFE1234", dir.path()).unwrap(), path(runs[1]));
+        assert_eq!(resolve_run(runs[0], dir.path()).unwrap(), path(runs[0]));
+        let ambiguous = resolve_run("1234", dir.path()).unwrap_err();
+        assert!(ambiguous.contains("matches 2 eval runs"), "{ambiguous}");
+        let short = resolve_run("afe", dir.path()).unwrap_err();
+        assert!(short.contains("too short"), "{short}");
+        let missing = resolve_run("evr_0192aaaa0000700080000000dead1234", dir.path()).unwrap_err();
+        assert!(missing.contains("eval run evr_"), "{missing}");
+        assert!(missing.contains("not found"), "{missing}");
+    }
+
+    #[test]
+    fn a_session_suffix_has_no_minimum_and_names_sessions_only() {
+        let (dir, _) = group();
+        let found = resolve_in_group(
+            "234",
+            Path::new("/w"),
+            dir.path(),
+            &SESSION,
+            &SessionQuery {
+                record_file: "trace.jsonl",
+                code: "E-TEST",
+                label: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            found,
+            dir.path()
+                .join("ses_0192cccc0000700080000000beef1234")
+                .join("trace.jsonl")
+        );
+    }
+
+    #[test]
+    fn a_path_is_literal() {
+        assert!(is_literal_path_of("./x/evr_1.json", &EVAL_RUN));
+        assert!(is_literal_path_of("evr_1.json", &EVAL_RUN));
+        assert!(!is_literal_path_of("@1", &EVAL_RUN));
+        assert!(!is_literal_path_of("beef", &EVAL_RUN));
+        assert!(is_literal_path("trace.jsonl"));
+        assert!(!is_literal_path("evr_1.json"));
     }
 }

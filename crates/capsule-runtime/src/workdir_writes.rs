@@ -317,9 +317,11 @@ mod tests {
         (
             "session_check.rs",
             "rel.as_ref()",
-            "A file or directory of an eval case's `check.files`, copied into the work folder by \
+            "A file or directory of an eval case's `start` or `check.files`, copied into the work \
+             folder by `copy_tree_into`: `start` by `mur eval run` into a freshly staged work \
+             folder before launch, as an input it stages for the capsule; `check.files` by \
              `CheckRunner::run` after the session has ended and before the check's command runs. \
-             No session writes it: the check is `mur eval run`'s, not the capsule's.",
+             No session writes either.",
         ),
         (
             "types.rs",
@@ -419,13 +421,15 @@ mod tests {
         found
     }
 
-    /// The [`crate::workdir_fs::WorkdirRoot`] methods that create something beneath a root.
+    /// The [`crate::workdir_fs::WorkdirRoot`] methods that create or change something beneath a
+    /// root.
     const HELPER_WRITES: &[&str] = &[
         ".write_file(",
         ".write_file_exact_mode(",
         ".overwrite_in_place(",
         ".open_append(",
         ".create_dir_all(",
+        ".set_dir_mode(",
     ];
 
     /// The relative-path argument of every [`HELPER_WRITES`] call in `source`, as source text.
@@ -960,10 +964,11 @@ mod tests {
     const RAW_FS_EXEMPT: &[(&str, &str, &str)] = &[
         (
             "session_check.rs",
-            "collect_check_files",
-            "Reads an eval case's `check.files`, a directory of the operator's outside every work \
-             folder, with no link followed: a link or special file in it refuses the check. What \
-             it reads is written into the work folder through `WorkdirRoot`.",
+            "copy_tree_into",
+            "Reads the files of an eval case's `start` or `check.files`, a directory of the \
+             operator's outside every work folder, walked by `walk_tree` with no link followed: a \
+             link or special file in it refuses the copy. What it reads is written into the work \
+             folder through `WorkdirRoot`.",
         ),
         (
             "sandbox.rs",

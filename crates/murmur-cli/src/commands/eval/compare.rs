@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use crate::error::{CliError, E_IO_001, E_IO_003};
 use crate::session_address;
 
-use super::run::{EvalRunRecord, RunCheckResult, RunRecord, BASELINE, RUN_ID_PREFIX, VARIANT};
+use super::run::{EvalRunRecord, RunCheckResult, RunRecord, BASELINE, VARIANT};
 use super::E_EVAL_002;
 
 /// The address an omitted `--run` value means: the most recent eval run.
@@ -21,122 +21,19 @@ pub(super) const LATEST_RUN: &str = "@1";
 
 // ── Resolution ────────────────────────────────────────────────────────────────
 
-/// The `evr_` ids in `group`, newest first: uuid v7 sorts by its timestamp, so the order is a
-/// plain sort of the names.
-fn runs_newest_first(group: &Path) -> Result<Vec<String>, CliError> {
-    if !group.is_dir() {
-        return Ok(Vec::new());
-    }
-    let entries = fs::read_dir(group)
-        .map_err(|e| CliError::new(E_IO_003, format!("failed to read {}: {e}", group.display())))?;
-    let mut ids = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            CliError::new(
-                E_IO_003,
-                format!("failed to read entry in {}: {e}", group.display()),
-            )
-        })?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(id) = name.strip_suffix(".json") {
-            if id.starts_with(RUN_ID_PREFIX) && entry.path().is_file() {
-                ids.push(id.to_string());
-            }
-        }
-    }
-    ids.sort();
-    ids.reverse();
-    Ok(ids)
-}
-
-/// Whether `address` is spelled as a literal path: anything that is not an ordinal and contains
-/// `/` or ends in `.json`.
-fn is_literal_path(address: &str) -> bool {
-    !address.starts_with('@') && (address.contains('/') || address.ends_with(".json"))
-}
-
-/// The record file an eval-run address names among the runs of the workdir root `workdir`: an
-/// `@N` ordinal counting back from the newest, a literal path, a full `evr_` id, or a
-/// case-insensitive suffix of 4 or more characters. Every failure is `E-EVAL-002`.
+/// The record file an eval-run address names among the runs of the workdir root `workdir`, as
+/// [`session_address`] resolves every address. Every failure is `E-EVAL-002`.
 pub(super) fn resolve_run(address: &str, workdir: &Path) -> Result<PathBuf, CliError> {
-    if is_literal_path(address) {
-        return Ok(PathBuf::from(address));
-    }
-    let group = session_address::records_group(workdir)?;
-    let err = |message: String| CliError::new(E_EVAL_002, message);
-    let ids = runs_newest_first(&group)?;
-    resolve_among(address, &ids)
-        .map(|id| group.join(format!("{id}.json")))
-        .map_err(|reason| match reason {
-            Unresolved::Empty => err(format!(
-                "no eval runs found in workdir at {} (records in {})",
-                workdir.display(),
-                group.display()
-            )),
-            Unresolved::Message(message) => err(format!("--run: {message} in {}", group.display())),
-        })
-}
-
-/// Why an address named no run.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum Unresolved {
-    /// The group holds no run at all.
-    Empty,
-    Message(String),
-}
-
-/// The id `address` names among `ids`, newest first.
-pub(super) fn resolve_among(address: &str, ids: &[String]) -> Result<String, Unresolved> {
-    if let Some(n) = address.strip_prefix('@') {
-        let n: usize = n.parse().map_err(|_| {
-            Unresolved::Message(format!(
-                "invalid ordinal '{address}' — expected @1, @2, ..."
-            ))
-        })?;
-        if n == 0 {
-            return Err(Unresolved::Message(
-                "ordinal must be @1 or higher".to_string(),
-            ));
-        }
-        if ids.is_empty() {
-            return Err(Unresolved::Empty);
-        }
-        return ids.get(n - 1).cloned().ok_or_else(|| {
-            Unresolved::Message(format!(
-                "@{n} is out of range — there {} {} eval run{}",
-                if ids.len() == 1 { "is" } else { "are" },
-                ids.len(),
-                if ids.len() == 1 { "" } else { "s" }
-            ))
-        });
-    }
-    if address.starts_with(RUN_ID_PREFIX) && address.len() == RUN_ID_PREFIX.len() + 32 {
-        return ids
-            .iter()
-            .find(|id| *id == address)
-            .cloned()
-            .ok_or_else(|| Unresolved::Message(format!("eval run {address} not found")));
-    }
-    if address.chars().count() < 4 {
-        return Err(Unresolved::Message(format!(
-            "'{address}' is too short a suffix — give 4 or more characters"
-        )));
-    }
-    let suffix = address.to_lowercase();
-    let matches: Vec<&String> = ids
-        .iter()
-        .filter(|id| id.to_lowercase().ends_with(&suffix))
-        .collect();
-    match matches.as_slice() {
-        [] => Err(Unresolved::Message(format!(
-            "no eval run found matching suffix '{address}'"
-        ))),
-        [one] => Ok((*one).clone()),
-        many => Err(Unresolved::Message(format!(
-            "ambiguous: '{address}' matches {} eval runs — provide more characters",
-            many.len()
-        ))),
-    }
+    session_address::resolve_kind(
+        Some(address),
+        workdir,
+        &session_address::EVAL_RUN,
+        &session_address::SessionQuery {
+            record_file: "",
+            code: E_EVAL_002,
+            label: Some("--run"),
+        },
+    )
 }
 
 pub(super) fn read_record(path: &Path) -> Result<EvalRunRecord, CliError> {
@@ -674,54 +571,5 @@ mod tests {
         assert_eq!(Measure::CachedTokens.cell(&summary), "—");
         assert_eq!(Measure::InputTokens.delta(-50.0), "-50");
         assert_eq!(Measure::InputTokens.delta(50.0), "+50");
-    }
-
-    fn ids() -> Vec<String> {
-        // Newest first.
-        vec![
-            "evr_0192aaaa0000700080000000beef1234".to_string(),
-            "evr_0192aaaa0000700080000000cafe1234".to_string(),
-        ]
-    }
-
-    #[test]
-    fn an_ordinal_counts_back_from_the_newest() {
-        assert_eq!(resolve_among("@1", &ids()).unwrap(), ids()[0]);
-        assert_eq!(resolve_among("@2", &ids()).unwrap(), ids()[1]);
-        assert!(matches!(
-            resolve_among("@3", &ids()),
-            Err(Unresolved::Message(m)) if m.contains("out of range")
-        ));
-        assert!(matches!(
-            resolve_among("@0", &ids()),
-            Err(Unresolved::Message(_))
-        ));
-        assert_eq!(resolve_among("@1", &[]), Err(Unresolved::Empty));
-    }
-
-    #[test]
-    fn a_suffix_and_a_full_id_name_one_run() {
-        assert_eq!(resolve_among("CAFE1234", &ids()).unwrap(), ids()[1]);
-        assert_eq!(resolve_among(&ids()[0], &ids()).unwrap(), ids()[0]);
-        assert!(matches!(
-            resolve_among("1234", &ids()),
-            Err(Unresolved::Message(m)) if m.contains("ambiguous")
-        ));
-        assert!(matches!(
-            resolve_among("afe", &ids()),
-            Err(Unresolved::Message(m)) if m.contains("too short")
-        ));
-        assert!(matches!(
-            resolve_among("evr_0192aaaa0000700080000000dead1234", &ids()),
-            Err(Unresolved::Message(m)) if m.contains("not found")
-        ));
-    }
-
-    #[test]
-    fn a_path_is_literal() {
-        assert!(is_literal_path("./x/evr_1.json"));
-        assert!(is_literal_path("evr_1.json"));
-        assert!(!is_literal_path("@1"));
-        assert!(!is_literal_path("beef"));
     }
 }

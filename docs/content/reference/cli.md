@@ -3540,7 +3540,7 @@ A failure prints nothing on stdout.
 
 ## `mur eval`
 
-Read and analyze `eval.jsonl` files produced by `murmur/hook-eval`, or drive a capsule against a dataset. These commands are read-only except for `mur eval run`, which launches real capsule sessions.
+Read and analyze `eval.jsonl` files produced by `murmur/hook-eval`, drive a capsule against a dataset, or compare a capsule with a variant of it on the same cases. These commands are read-only except for `mur eval run`, which launches real capsule sessions.
 
 See [Structured evaluation (`eval.jsonl`)](observability-schemas.md#structured-evaluation-evaljsonl) for the file format.
 
@@ -3735,7 +3735,7 @@ mur eval run [<capsule-dir>] [--dataset <dataset.jsonl>] [--variant <capsule-dir
 |---|---|---|
 | `case_id` | yes | Identifier passed as `MURMUR_CASE_ID` to hooks; appears in `dataset_run` records |
 | `task_path` | yes | File to copy into the session's `task.md` before launch |
-| `expected` | no | Scorer-defined; ignored by current deterministic scorers; reserved for future `llm_judge` |
+| `expected` | no | Any JSON value. `mur eval run` reads nothing from it and passes it to no hook or scorer |
 | `start` | no | A directory copied into the session's [work folder](workdir.md#work-folder) before launch |
 | `check` | no | A command run in the work folder after the session ends: a string, or an object |
 | `check.command` | yes, in the object form | The command, split into a binary and its arguments the way the shell tool splits one: quotes group words, a backslash escapes one character, and nothing is expanded |
@@ -3762,7 +3762,7 @@ variant, repeat 2 the variant then the baseline, and so on alternately.
 2. With `start`, copies it into the work folder, keeping every entry's permission bits, and compares the copy's [start digest](observability-schemas.md#start-digest) with the source's. A different digest is recorded as `start_mismatch`, and that run is not launched.
 3. Copies `task_path` to `task.md` in the session's [runtime directory](workdir.md#runtime-directory). If the file does not exist, a warning is printed and the session runs without it.
 4. Launches the session.
-5. With `check`, once the launch has returned and every process the session started is dead: copies `check.files` into the work folder and runs the command there, then writes its output to `logs/check.log` in the session's records directory. See [The check](#mur-eval-run-check).
+5. With `check`, once the launch has returned and every process the session started is dead: copies `check.files` into the work folder, keeping every entry's permission bits as for `start`, and runs the command there, then writes its output to `logs/check.log` in the session's records directory. See [The check](#mur-eval-run-check).
 6. Reads the session's trace for its turns, tokens, agent time and ending, and `hooks/eval.jsonl` from its [records directory](workdir.md#records-directory), where a scoring hook declared [`capabilities.filesystem.records: true`](manifest.md#hook-capabilities) writes it. A run with no such file reports `no_scores` and a warning naming that grant.
 7. Prints a result line, `result: pass|fail|no_scores  session: <id>`, and `check: <result>` for a case with a check. With `--variant` or `--repeat`, each run's lines start with `arm: baseline|variant  repeat: <n>`.
 8. Rewrites the [eval-run record](observability-schemas.md#eval-run-record).

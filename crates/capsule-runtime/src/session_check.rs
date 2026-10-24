@@ -211,8 +211,8 @@ impl CheckRunner {
         };
 
         if let Some(files) = check.files() {
-            if let Err(refusal) = copy_check_files(files, &self.accessible_root) {
-                return error(refusal);
+            if let Err(refusal) = copy_tree_into(files, &self.accessible_root) {
+                return error(format!("could not copy the check's files: {refusal}"));
             }
         }
 
@@ -414,73 +414,99 @@ fn run_with_timeout(
     }
 }
 
-/// Copies the directory tree at `source` into `workdir`'s root: directories and regular files,
-/// each file's permission bits kept, an existing file overwritten.
-///
-/// `source` is the operator's and is walked without following a link: a symbolic link or a
-/// special file anywhere in it refuses the copy before anything is written. Every write goes
-/// through `workdir`, so nothing the agent left in the work folder — a link where a directory
-/// of the tree goes, notably — is followed; such a refusal names the path.
-fn copy_check_files(source: &Path, workdir: &WorkdirRoot) -> Result<(), String> {
-    let mut entries = Vec::new();
-    collect_check_files(source, Path::new(""), &mut entries)?;
-    for (relative, entry) in entries {
-        let rel = relative.to_string_lossy();
-        match entry {
-            CheckEntry::Dir(mode) => workdir.create_dir_all(rel.as_ref(), mode),
-            CheckEntry::File(mode, bytes) => {
-                workdir.write_file_exact_mode(rel.as_ref(), &bytes, mode)
+/// One entry beneath an operator's directory tree: an eval case's `start` or `check.files`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntry {
+    /// Relative to the tree's root.
+    pub relative: PathBuf,
+    pub is_dir: bool,
+    /// `mode & 0o7777`.
+    pub mode: u32,
+}
+
+/// Every entry beneath `root`, in byte-wise order of the relative path, so a parent comes before
+/// what it holds. Read with no link followed: a symbolic link or a special file anywhere in the
+/// tree is refused, naming it.
+pub fn walk_tree(root: &Path) -> Result<Vec<TreeEntry>, String> {
+    use std::os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _};
+
+    fn walk(dir: &Path, relative: &Path, out: &mut Vec<TreeEntry>) -> Result<(), String> {
+        let read = |path: &Path, error: std::io::Error| format!("{}: {error}", path.display());
+        for entry in std::fs::read_dir(dir).map_err(|error| read(dir, error))? {
+            let entry = entry.map_err(|error| read(dir, error))?;
+            let path = entry.path();
+            let rel = relative.join(entry.file_name());
+            let meta = std::fs::symlink_metadata(&path).map_err(|error| read(&path, error))?;
+            let mode = meta.permissions().mode() & 0o7777;
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                return Err(format!("{} is a symbolic link", path.display()));
+            }
+            if file_type.is_dir() {
+                out.push(TreeEntry {
+                    relative: rel.clone(),
+                    is_dir: true,
+                    mode,
+                });
+                walk(&path, &rel, out)?;
+            } else if file_type.is_file() {
+                out.push(TreeEntry {
+                    relative: rel,
+                    is_dir: false,
+                    mode,
+                });
+            } else {
+                return Err(format!("{} is a special file", path.display()));
             }
         }
-        .map_err(|error| format!("could not copy the check's files: {error}"))?;
+        Ok(())
     }
-    Ok(())
+
+    let mut entries = Vec::new();
+    walk(root, Path::new(""), &mut entries)?;
+    entries.sort_by(|a, b| {
+        a.relative
+            .as_os_str()
+            .as_bytes()
+            .cmp(b.relative.as_os_str().as_bytes())
+    });
+    Ok(entries)
 }
 
-/// One entry of a check's files, read from the operator's directory.
-enum CheckEntry {
-    Dir(u32),
-    File(u32, Vec<u8>),
-}
+/// Copies the tree at `source` into `workdir`'s root: directories and regular files, each
+/// entry's permission bits kept, an existing file overwritten.
+///
+/// The whole of `source` is walked by [`walk_tree`] before anything is written, so a link or
+/// special file in it refuses the copy with the work folder untouched. Every write goes through
+/// `workdir`, so nothing already in the work folder — a link where a directory of the tree goes,
+/// notably — is followed; such a refusal names the path. Each directory is held at owner `rwx`
+/// while it is filled and given its own mode last, deepest first, so a read-only directory is
+/// filled before it is closed.
+pub fn copy_tree_into(source: &Path, workdir: &WorkdirRoot) -> Result<(), String> {
+    const FILLING_DIR_MODE: u32 = 0o700;
 
-/// Every entry beneath `dir`, parents before children, relative to the tree's root.
-fn collect_check_files(
-    dir: &Path,
-    relative: &Path,
-    entries: &mut Vec<(PathBuf, CheckEntry)>,
-) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let read = |path: &Path, error: std::io::Error| format!("{}: {error}", path.display());
-    let mut children = std::fs::read_dir(dir)
-        .map_err(|error| read(dir, error))?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| read(dir, error))?;
-    children.sort();
-    for name in children {
-        let path = dir.join(&name);
-        let rel = relative.join(&name);
-        let metadata = std::fs::symlink_metadata(&path).map_err(|error| read(&path, error))?;
-        let mode = metadata.permissions().mode() & 0o7777;
-        if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "{} is a symbolic link; a check's files may hold only directories and regular files",
-                path.display()
-            ));
-        }
-        if metadata.is_dir() {
-            entries.push((rel.clone(), CheckEntry::Dir(mode)));
-            collect_check_files(&path, &rel, entries)?;
-        } else if metadata.is_file() {
-            let bytes = std::fs::read(&path).map_err(|error| read(&path, error))?;
-            entries.push((rel, CheckEntry::File(mode, bytes)));
+    let entries = walk_tree(source)?;
+    for entry in &entries {
+        let rel = entry.relative.to_string_lossy();
+        if entry.is_dir {
+            workdir
+                .create_dir_all(rel.as_ref(), FILLING_DIR_MODE)
+                .and_then(|()| workdir.set_dir_mode(rel.as_ref(), FILLING_DIR_MODE))
+                .map_err(|error| error.to_string())?;
         } else {
-            return Err(format!(
-                "{} is a special file; a check's files may hold only directories and regular files",
-                path.display()
-            ));
+            let path = source.join(&entry.relative);
+            let bytes =
+                std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            workdir
+                .write_file_exact_mode(rel.as_ref(), &bytes, entry.mode)
+                .map_err(|error| error.to_string())?;
         }
+    }
+    for entry in entries.iter().rev().filter(|entry| entry.is_dir) {
+        let rel = entry.relative.to_string_lossy();
+        workdir
+            .set_dir_mode(rel.as_ref(), entry.mode)
+            .map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -541,7 +567,7 @@ mod tests {
         std::os::unix::fs::symlink("/etc/passwd", source.path().join("z-link")).unwrap();
         let workdir = tempfile::tempdir().unwrap();
         let root = WorkdirRoot::open(workdir.path()).unwrap();
-        let refused = copy_check_files(source.path(), &root).unwrap_err();
+        let refused = copy_tree_into(source.path(), &root).unwrap_err();
         assert!(refused.contains("z-link"), "{refused}");
         assert!(!workdir.path().join("a.txt").exists());
     }
@@ -561,13 +587,41 @@ mod tests {
         std::fs::create_dir(workdir.path().join("sub")).unwrap();
         std::fs::write(workdir.path().join("sub/run.sh"), "old").unwrap();
         let root = WorkdirRoot::open(workdir.path()).unwrap();
-        copy_check_files(source.path(), &root).unwrap();
+        copy_tree_into(source.path(), &root).unwrap();
         let copied = workdir.path().join("sub/run.sh");
         assert_eq!(std::fs::read_to_string(&copied).unwrap(), "new");
         assert_eq!(
             std::fs::metadata(&copied).unwrap().permissions().mode() & 0o7777,
             0o751
         );
+    }
+
+    #[test]
+    fn a_read_only_directory_in_check_files_is_filled_then_closed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir(source.path().join("ro")).unwrap();
+        std::fs::write(source.path().join("ro/t.txt"), "t").unwrap();
+        std::fs::set_permissions(
+            source.path().join("ro"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let root = WorkdirRoot::open(workdir.path()).unwrap();
+        copy_tree_into(source.path(), &root).unwrap();
+        let copied = workdir.path().join("ro");
+        assert_eq!(std::fs::read_to_string(copied.join("t.txt")).unwrap(), "t");
+        assert_eq!(
+            std::fs::metadata(&copied).unwrap().permissions().mode() & 0o7777,
+            0o555
+        );
+        // Copied again over the read-only directory now in the work folder, as a second check
+        // into the same folder would.
+        copy_tree_into(source.path(), &root).unwrap();
+        for dir in [source.path().join("ro"), copied] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     #[test]
@@ -579,7 +633,7 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), workdir.path().join("hidden")).unwrap();
         let root = WorkdirRoot::open(workdir.path()).unwrap();
-        let refused = copy_check_files(source.path(), &root).unwrap_err();
+        let refused = copy_tree_into(source.path(), &root).unwrap_err();
         assert!(refused.contains("hidden"), "{refused}");
         assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
     }

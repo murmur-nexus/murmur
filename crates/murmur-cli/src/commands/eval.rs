@@ -67,7 +67,7 @@ pub(crate) enum EvalCommand {
     Run {
         /// Path to capsule directory (containing murmur.yaml). Defaults to current directory.
         capsule: Option<PathBuf>,
-        /// Path to dataset JSONL file. Defaults to workdir/eval.jsonl.
+        /// Path to dataset JSONL file. Defaults to ./eval.jsonl in the current directory.
         #[arg(long)]
         dataset: Option<PathBuf>,
         /// A second capsule directory or manifest file to run every case against, from the same
@@ -84,6 +84,7 @@ pub(crate) enum EvalCommand {
 
 #[derive(Debug, Deserialize)]
 struct EventScoreRecord {
+    /// Unread, but a record without it does not parse.
     #[allow(dead_code)]
     ts: u64,
     turn: u32,
@@ -91,13 +92,10 @@ struct EventScoreRecord {
     scorer: String,
     result: String,
     score: Option<f64>,
-    #[allow(dead_code)]
-    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct DatasetRunRecord {
-    #[allow(dead_code)]
     ts: u64,
     dataset_id: Option<String>,
     case_id: Option<String>,

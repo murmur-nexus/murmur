@@ -10,16 +10,16 @@ use std::{
     collections::HashSet,
     fs,
     io::Read as _,
-    os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _},
+    os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
 use capsule_runtime::{
-    capability_policy_from_runtime_manifest, launch_session, stage_session, ArtifactRequest,
-    CapabilityPolicy, CheckOutcome, CheckResult, LockExpectation, RuntimeError, SessionCheck,
-    StageRequest,
+    capability_policy_from_runtime_manifest, copy_tree_into, launch_session, stage_session,
+    walk_tree, ArtifactRequest, CapabilityPolicy, CheckOutcome, CheckResult, LockExpectation,
+    RuntimeError, SessionCheck, StageRequest,
 };
 use murmur_artifact::{
     current_platform, load_dotenv_non_override, load_runtime_manifest, read_lockfile,
@@ -48,7 +48,7 @@ const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 600;
 const RECORD_VERSION: u32 = 1;
 
 /// The file-name prefix of an eval-run record, before its uuid v7 in simple hex.
-pub(super) const RUN_ID_PREFIX: &str = "evr_";
+const RUN_ID_PREFIX: &str = "evr_";
 
 pub(super) const BASELINE: &str = "baseline";
 pub(super) const VARIANT: &str = "variant";
@@ -60,8 +60,6 @@ pub(super) const VARIANT: &str = "variant";
 pub(super) struct DatasetCase {
     pub(super) case_id: String,
     pub(super) task_path: String,
-    #[allow(dead_code)]
-    pub(super) expected: Option<serde_json::Value>,
     /// A directory copied into the work folder before the session.
     #[serde(default)]
     pub(super) start: Option<String>,
@@ -129,63 +127,6 @@ pub(super) fn parse_dataset(path: &Path, content: &str) -> Result<Vec<DatasetCas
 
 // ── Start trees ───────────────────────────────────────────────────────────────
 
-/// One entry beneath a `start` or `check.files` directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct TreeEntry {
-    /// Relative to the tree's root, `/`-separated.
-    pub(super) relative: PathBuf,
-    pub(super) is_dir: bool,
-    /// `mode & 0o7777`.
-    pub(super) mode: u32,
-}
-
-/// Every entry beneath `root`, in byte-wise order of the relative path, read with no link
-/// followed. A symbolic link or a special file anywhere in the tree is refused, naming it.
-pub(super) fn walk_tree(root: &Path) -> Result<Vec<TreeEntry>, String> {
-    fn walk(dir: &Path, relative: &Path, out: &mut Vec<TreeEntry>) -> Result<(), String> {
-        let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
-            let path = entry.path();
-            let rel = relative.join(entry.file_name());
-            let meta =
-                fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let mode = meta.permissions().mode() & 0o7777;
-            let file_type = meta.file_type();
-            if file_type.is_symlink() {
-                return Err(format!("{} is a symbolic link", path.display()));
-            }
-            if file_type.is_dir() {
-                out.push(TreeEntry {
-                    relative: rel.clone(),
-                    is_dir: true,
-                    mode,
-                });
-                walk(&path, &rel, out)?;
-            } else if file_type.is_file() {
-                out.push(TreeEntry {
-                    relative: rel,
-                    is_dir: false,
-                    mode,
-                });
-            } else {
-                return Err(format!("{} is a special file", path.display()));
-            }
-        }
-        Ok(())
-    }
-
-    let mut entries = Vec::new();
-    walk(root, Path::new(""), &mut entries)?;
-    entries.sort_by(|a, b| {
-        a.relative
-            .as_os_str()
-            .as_bytes()
-            .cmp(b.relative.as_os_str().as_bytes())
-    });
-    Ok(entries)
-}
-
 /// The start digest of the tree at `root`: sha256, in lowercase hex, over every entry in
 /// byte-wise order of its relative path — `d` or `f`, a space, `mode & 0o7777` in octal, a space,
 /// the relative path, a NUL, and for a file its length in decimal, a NUL and its bytes.
@@ -216,42 +157,11 @@ pub(super) fn tree_digest(root: &Path) -> Result<String, String> {
             }
         }
     }
-    Ok(hex(&hasher.finalize()))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// Copies the tree at `source` into a session's freshly staged work folder, keeping every
-/// entry's permission bits. Files go through the work folder's root, which follows no link;
-/// each directory's own mode is set last, deepest first, so a read-only directory is filled
-/// before it is closed. Nothing has run in the folder yet.
-fn copy_start(
-    source: &Path,
-    workdir: &capsule_runtime::workdir_fs::WorkdirRoot,
-) -> Result<(), String> {
-    let entries = walk_tree(source)?;
-    for entry in &entries {
-        let rel = entry.relative.to_string_lossy();
-        if entry.is_dir {
-            workdir
-                .create_dir_all(rel.as_ref(), 0o700)
-                .map_err(|e| e.to_string())?;
-        } else {
-            let path = source.join(&entry.relative);
-            let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            workdir
-                .write_file_exact_mode(rel.as_ref(), &bytes, entry.mode)
-                .map_err(|e| e.to_string())?;
-        }
-    }
-    for entry in entries.iter().rev().filter(|entry| entry.is_dir) {
-        let path = workdir.path().join(&entry.relative);
-        fs::set_permissions(&path, fs::Permissions::from_mode(entry.mode))
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-    }
-    Ok(())
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 // ── The eval-run record ───────────────────────────────────────────────────────
@@ -462,6 +372,9 @@ fn manifest_of(path: &Path, as_directory: bool) -> Result<(PathBuf, PathBuf), Cl
             })?
             .join(path)
     };
+    // Rebuilt from its components, which leave out every `.`: `./variant` is recorded and
+    // printed as `<cwd>/variant`.
+    let path: PathBuf = path.components().collect();
     let manifest_path = if as_directory || path.is_dir() {
         resolve_manifest_path(&path)
     } else {
@@ -667,7 +580,7 @@ impl Arm {
         Ok(ArmRecord {
             name: self.name.to_string(),
             manifest: self.manifest_path.display().to_string(),
-            manifest_sha256: hex(&Sha256::digest(&bytes)),
+            manifest_sha256: murmur_artifact::sha256_hex(&bytes),
             model: self.model().map(str::to_string),
         })
     }
@@ -961,8 +874,8 @@ pub(crate) fn run_eval_run(args: EvalRunArgs<'_>) -> Result<(), CliError> {
     };
     write_record(&record_path, &record)?;
 
-    // A run with one arm and one repeat prints exactly what `mur eval run` always has; a matched
-    // run also says which arm and repeat each case line belongs to.
+    // A run with one arm and one repeat prints only the per-case lines; a matched run also says
+    // which arm and repeat each line belongs to.
     let matched = arms.len() > 1 || args.repeat > 1;
 
     capsule_runtime::report_println!("Running {} case(s) …", cases.len());
@@ -1118,8 +1031,8 @@ fn run_one(
     run.workdir = Some(case_workdir.display().to_string());
 
     if let (Some(start), Some(expected)) = (&case.start, &case.start_sha256) {
-        let copied =
-            copy_start(start, &staged.accessible_root).and_then(|()| tree_digest(&case_workdir));
+        let copied = copy_tree_into(start, &staged.accessible_root)
+            .and_then(|()| tree_digest(&case_workdir));
         let matches = match &copied {
             Ok(digest) => digest == expected,
             Err(_) => false,
@@ -1233,6 +1146,8 @@ fn run_one(
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
 
     #[test]
@@ -1307,12 +1222,13 @@ mod tests {
     #[test]
     fn the_digest_follows_the_documented_algorithm() {
         let dir = tree();
-        let mut expected = Sha256::new();
         // "a.txt" < "src" < "src/lib.rs", byte-wise.
-        expected.update(b"f 644 a.txt\x001\x00a");
-        expected.update(b"d 755 src\x00");
-        expected.update(b"f 644 src/lib.rs\x0013\x00fn main() {}\n");
-        assert_eq!(tree_digest(dir.path()).unwrap(), hex(&expected.finalize()));
+        let stream: &[u8] =
+            b"f 644 a.txt\x001\x00ad 755 src\x00f 644 src/lib.rs\x0013\x00fn main() {}\n";
+        assert_eq!(
+            tree_digest(dir.path()).unwrap(),
+            murmur_artifact::sha256_hex(stream)
+        );
         assert_eq!(
             tree_digest(dir.path()).unwrap(),
             tree_digest(dir.path()).unwrap()
@@ -1352,7 +1268,7 @@ mod tests {
         fs::set_permissions(dir.path().join("src"), fs::Permissions::from_mode(0o555)).unwrap();
         let target = tempfile::tempdir().unwrap();
         let root = capsule_runtime::workdir_fs::WorkdirRoot::open(target.path()).unwrap();
-        copy_start(dir.path(), &root).unwrap();
+        copy_tree_into(dir.path(), &root).unwrap();
         assert_eq!(
             tree_digest(target.path()).unwrap(),
             tree_digest(dir.path()).unwrap()
