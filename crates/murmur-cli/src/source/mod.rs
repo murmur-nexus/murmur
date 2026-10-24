@@ -627,6 +627,7 @@ pub(crate) enum ExplicitVersion {
     /// host.
     FitChecked,
     /// Fetched as asked: a deploy, for a target `mur` whose level this one cannot know.
+    #[cfg(feature = "beta-mur-deploy")]
     AsAsked,
 }
 
@@ -1700,16 +1701,19 @@ mod tests {
             )
         );
         // A deploy fetches it as asked.
-        let resolved = resolve(
-            &source,
-            &name("ana/tool-x"),
-            Some("0.3.0"),
-            ExplicitVersion::AsAsked,
-            current_platform(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(resolved.version, "0.3.0");
+        #[cfg(feature = "beta-mur-deploy")]
+        {
+            let resolved = resolve(
+                &source,
+                &name("ana/tool-x"),
+                Some("0.3.0"),
+                ExplicitVersion::AsAsked,
+                current_platform(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(resolved.version, "0.3.0");
+        }
     }
 
     #[test]

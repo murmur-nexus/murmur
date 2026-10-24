@@ -10955,8 +10955,8 @@ const END_WITHOUT_ANSWER_DESCRIPTION: &str = "End the task you are working on wi
 ///
 /// The description tells the model what the schema cannot: that the task text is all the callee
 /// is told, because members share no files; that the call returns once the callee holds the task;
-/// that the answer arrives in this conversation later, so the turn should end rather than wait;
-/// and that a second call to a member before its answer has arrived is refused.
+/// that the answer arrives in this conversation, naming the call id, after the turn ends; and
+/// that a second call to a member before its answer has arrived is refused.
 fn member_call_tool_manifest(callees: &[&str]) -> String {
     let allowed = serde_json::to_string(callees).unwrap_or_else(|_| "[]".to_string());
     let schema = format!(
@@ -10974,8 +10974,7 @@ fn member_call_tool_manifest(callees: &[&str]) -> String {
          the task, or busy when the member has no room for it, in which case the runtime keeps \
          offering it the task until it takes it or the call's deadline passes. \
          The member's answer arrives in this conversation, naming that call id, after you end \
-         your turn, so do not wait or poll for it. A second call to a member before its answer \
-         has arrived is refused.\"\n\
+         your turn. A second call to a member before its answer has arrived is refused.\"\n\
          input_schema: '{schema}'\n",
     )
 }
@@ -25410,12 +25409,14 @@ mod member_call_tests {
             "started when the member holds the task",
             "busy when the member has no room for it",
             "keeps offering it the task until it takes it or the call's deadline passes",
-            "after you end your turn",
-            "do not wait or poll",
+            "The member's answer arrives in this conversation, naming that call id, after you end \
+             your turn.",
             "A second call to a member before its answer has arrived is refused.",
         ] {
             assert!(description.contains(said), "{said}: {description}");
         }
+        assert!(!description.contains("poll"), "{description}");
+        assert!(!description.contains("wait"), "{description}");
         assert!(tools_declared(with.path()).contains(&MEMBER_CALL_TOOL.to_string()));
 
         let authority = FormationAuthority::generate(&FormationId::mint()).unwrap();

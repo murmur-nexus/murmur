@@ -70,15 +70,15 @@ session has, each with the name that tool opens the directory by:
 
 | Tool | Name | Listed when |
 |---|---|---|
-| A shell command | `$MURMUR_RUNTIME_DIR` | `capabilities.shell.allow` names a shell interpreter, such as `bash` |
+| A command line a shell interpreter runs with `-c` | `$MURMUR_RUNTIME_DIR` | `capabilities.shell.allow` names a shell interpreter, such as `bash` |
 | A WASM `runtime: tool` with no `capabilities.filesystem.scope`, listed by tool name | `murmur-runtime/` | The session has such a tool installed. A pull or removal updates the list |
-| Any other tool given a path, a native tool included | The absolute path | Always |
+| A program run directly, or any other tool given a path, a native tool included | The absolute path | Always |
 
 ```text
 - Runtime directory: /home/ana/.murmur/sessions/ses_01a1…/runtime (read-only). The name to use depends on what opens it:
-  - a shell command: `$MURMUR_RUNTIME_DIR`
+  - a command line a shell interpreter runs with `-c`: `$MURMUR_RUNTIME_DIR`
   - tool-editor: `murmur-runtime/`
-  - any other tool given a path: `/home/ana/.murmur/sessions/ses_01a1…/runtime`
+  - a program run directly, or any other tool given a path: `/home/ana/.murmur/sessions/ses_01a1…/runtime`
 ```
 
 Where the host can enforce it, the agent's commands can read the directory and cannot change it —
