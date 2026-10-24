@@ -332,6 +332,11 @@ impl SpendMeter {
 
     fn finish(&self, reserved: u64, input_tokens: u64, output_tokens: u64) {
         self.record(input_tokens, output_tokens);
+        self.release(reserved);
+    }
+
+    /// Return one admission's reservation and close it, charging nothing.
+    fn release(&self, reserved: u64) {
         let mut state = self.lock();
         state.reserved = state.reserved.saturating_sub(reserved);
         state.open = state.open.saturating_sub(1);
@@ -382,6 +387,14 @@ impl SpendAdmission {
         self.finished = true;
         self.meter
             .finish(self.reserved, input_tokens, output_tokens);
+    }
+
+    /// Release the reservation and charge nothing: neither this session's total nor the machine
+    /// ledger records the call. For an attempt the provider refused with a status or never
+    /// answered, which it does not bill.
+    pub(crate) fn release(mut self) {
+        self.finished = true;
+        self.meter.release(self.reserved);
     }
 }
 
@@ -672,6 +685,33 @@ mod tests {
         drop(admission);
         assert_eq!(meter.used(), 100);
         assert!(!meter.has_open_admission());
+    }
+
+    #[test]
+    fn admission_release_returns_the_reservation_and_charges_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let meter = Arc::new(SpendMeter::new(
+            Some(1_000),
+            Some(ledger(dir.path(), "ses_a", 100_000, fixed_clock)),
+        ));
+        meter.admit(100, 100).unwrap().settle(100, 50);
+        let ledger_lines = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+                .map(|text| text.lines().count())
+                .sum::<usize>()
+        };
+        assert_eq!(ledger_lines(), 1);
+
+        let admission = meter.admit(400, 400).unwrap();
+        assert!(meter.has_open_admission());
+        admission.release();
+        assert!(!meter.has_open_admission());
+        assert_eq!(meter.used(), 150, "a released admission charges nothing");
+        assert_eq!(ledger_lines(), 1, "and appends no ledger line");
+        // The whole reservation came back: 150 used + 850 requested fits the 1000 ceiling.
+        meter.admit(425, 425).unwrap().release();
     }
 
     #[test]

@@ -278,6 +278,7 @@ mod tests {
                     driver: "driver-openai".to_string(),
                 },
             ],
+            retry: murmur_artifact::InferenceRetry::default(),
         }
     }
 

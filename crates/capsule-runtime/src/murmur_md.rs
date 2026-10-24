@@ -1040,6 +1040,7 @@ mod tests {
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
             alternates: Vec::new(),
+            retry: murmur_artifact::InferenceRetry::default(),
         };
         let content = render(&tmp, |inputs| {
             inputs.model = inference.model.clone();
@@ -1541,6 +1542,7 @@ mod tests {
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
             alternates: Vec::new(),
+            retry: murmur_artifact::InferenceRetry::default(),
         };
         let content = render(&tmp, |inputs| {
             inputs.model = inference.model.clone();

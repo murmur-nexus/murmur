@@ -1122,11 +1122,25 @@ fn a_provider_error_echoing_the_key_is_recorded_redacted() {
         );
         (429, Box::leak(body.into_boxed_str()))
     });
+    // A `429` is retried; the trace's retry lines carry the same redacted text.
     let capsule = Capsule::new(&upstream, ApiKey::Reference, "trace:\n  capture: content\n");
+    fs::write(
+        &capsule.manifest,
+        fs::read_to_string(&capsule.manifest).unwrap()
+            + "  retry:\n    max_retries: 2\n    initial_delay_ms: 10\n    max_delay_ms: 50\n",
+    )
+    .unwrap();
     capsule.set_credential(OLD);
     let run = capsule.run(None);
 
-    assert_eq!(upstream.requests().len(), 1, "{}", run.context());
+    assert_eq!(upstream.requests().len(), 3, "{}", run.context());
+    let retries = run.of_type("inference_retry");
+    assert_eq!(retries.len(), 2, "{}", run.context());
+    for retry in &retries {
+        let error = retry["error"].as_str().unwrap();
+        assert!(error.contains("[redacted]"), "{retry}");
+        assert!(!error.contains(OLD), "{retry}");
+    }
     let record = run.the_failed_call();
     println!("{record}");
     assert_eq!(record["error_code"], "driver_error", "{record}");

@@ -359,6 +359,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
         max_session_tokens: None,
         tool_refresh: murmur_artifact::ToolRefresh::Compaction,
         alternates: Vec::new(),
+        retry: murmur_artifact::InferenceRetry::default(),
     });
 
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);

@@ -19,15 +19,20 @@ use serde_json::{json, Value};
 use crate::{
     a2a::TaskState,
     agent::inventory::HeldInventory,
-    bindings::host::murmur::tool::run::{Status, ToolInput},
+    bindings::host::murmur::tool::run::{Status, ToolInput, ToolResult},
     cancel::{CancelSignal, Residue, PHASE_INFERENCE},
     capsule_facts::CapsuleFacts,
+    credential_gateway::UpstreamOutcome,
     detached::DetachedDispatchInfo,
     driver_choice::{DriverChoice, DriverChoices},
     errors::{RuntimeError, E_RUN_033, E_RUN_034, E_RUN_035, E_RUN_036},
     hooks::{
         CallDecision, DispatchFault, HookArtifact, HookEvent, HookRuntime, HookSeed, ResolvedCall,
         FAULT_ARM_SEED_REJECTED,
+    },
+    inference_retry::{
+        self, AttemptFailure, InferenceRetryRecord, RetryDecision, RetryNote, RetryPolicy,
+        RetryReason,
     },
     murmur_md::{self, MURMUR_MD_TRUST_NOTICE},
     origin::{TaskProvenance, TrustClass},
@@ -1108,6 +1113,7 @@ pub(crate) async fn run_agent_loop(
                 turn_u32,
                 TASK_FAILED_INPUT_TIMEOUT,
                 &reason,
+                RetryNote::default(),
             )
             .await;
         }
@@ -1281,110 +1287,229 @@ pub(crate) async fn run_agent_loop(
             );
         }
 
-        // Reset per-turn streaming flag before each driver dispatch.
-        store_state
-            .a2a_chunks_emitted
-            .store(false, Ordering::Relaxed);
-        // A call only this dispatch can start, report on or settle. Settled ids stay settled for
-        // the attempt.
-        store_state
-            .a2a_tool_calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear_writing();
+        // The status the gateway receives during each attempt belongs to that attempt; whatever
+        // an earlier request left behind is discarded before it is sent.
+        let gateway = store_state.gateways.inference_for(&choice.driver).cloned();
+        let retry_policy = RetryPolicy::from(inference.retry);
+        let session_deadline = store_state
+            .session_status
+            .as_ref()
+            .and_then(|status| status.deadline());
+        // One attempt per pass, each sending the same payload through the same choice. An attempt
+        // that failed transiently, when the policy allows another, is accounted for, recorded as
+        // an `inference_retry` line and waited out; nothing else of it is applied. Every other
+        // attempt leaves the loop and is handled below as the call's only one.
+        let mut retries_made = 0u32;
+        let (admission, dispatched, inference_started, started_calls, outcome, retry_note) = loop {
+            // Reset per-turn streaming flag before each driver dispatch.
+            store_state
+                .a2a_chunks_emitted
+                .store(false, Ordering::Relaxed);
+            // A call only this dispatch can start, report on or settle. Settled ids stay settled
+            // for the attempt.
+            store_state
+                .a2a_tool_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear_writing();
 
-        // Admitted after the call is measured and before anything is sent. The guard is settled
-        // once the response is parsed, with the provider's counts when it reported them; a
-        // failed call that reported them settles with them too. Every other way out of this turn
-        // drops it, which charges the input estimate alone.
-        let admission = match store_state
-            .spend
-            .admit(u64::from(input_tokens), u64::from(max_output_tokens))
-        {
-            Ok(admission) => admission,
-            Err(refusal) => {
-                return finish_spend_refused_turn(
-                    hooks,
+            // Admitted after the call is measured and before anything is sent. The guard is
+            // settled once the response is parsed, with the provider's counts when it reported
+            // them; a failed call that reported them settles with them too. Every other way out
+            // of this turn drops it, which charges the input estimate alone.
+            let admission = match store_state
+                .spend
+                .admit(u64::from(input_tokens), u64::from(max_output_tokens))
+            {
+                Ok(admission) => admission,
+                Err(refusal) => {
+                    return finish_spend_refused_turn(
+                        hooks,
+                        trace,
+                        otel,
+                        &records_root,
+                        ending,
+                        turn_u32,
+                        &refusal,
+                        RefusalLine::Write,
+                    )
+                    .await;
+                }
+            };
+
+            if let Some(gateway) = &gateway {
+                gateway.take_upstream_outcome();
+            }
+            let inference_started = Instant::now();
+            // Raced rather than awaited: a cancel must stop the provider call in flight rather
+            // than wait it out. Losing the race drops the `call_async` future, which disposes the
+            // guest fiber and takes the pending outbound request down with it.
+            let dispatched = match cancel.as_ref() {
+                Some(signal) => {
+                    tokio::select! {
+                        biased;
+                        () = signal.canceled() => {
+                            signal.note_phase(PHASE_INFERENCE);
+                            None
+                        }
+                        dispatched = store_state.dispatch_driver_async(
+                            &choice,
+                            ToolInput {
+                                data: Some(payload_json.clone()),
+                                log_path: None,
+                            },
+                        ) => Some(dispatched),
+                    }
+                }
+                None => Some(
+                    store_state
+                        .dispatch_driver_async(
+                            &choice,
+                            ToolInput {
+                                data: Some(payload_json.clone()),
+                                log_path: None,
+                            },
+                        )
+                        .await,
+                ),
+            };
+            let Some(dispatched) = dispatched else {
+                // Nothing from this turn is applied: no continuation id is adopted, no result
+                // file is written and no usage is recorded, because the call never returned one.
+                // The calls it started are not settled either: no progress frame is flushed for
+                // a canceled turn.
+                return Ok(finish_canceled_turn(
+                    store_state,
                     trace,
                     otel,
-                    &records_root,
+                    hooks,
+                    record.as_mut(),
                     ending,
+                    &task_id_str,
                     turn_u32,
-                    &refusal,
-                    RefusalLine::Write,
+                    PHASE_INFERENCE,
+                    producer.as_ref(),
                 )
-                .await;
-            }
-        };
+                .await);
+            };
+            // The driver is done writing every call it started, whatever it returned: write the
+            // size still held for each, ahead of the cursor removal and of anything else this
+            // turn writes.
+            let started_calls = settle_started_calls(
+                &sse,
+                stream_task.as_ref(),
+                &store_state.a2a_tool_calls,
+                Instant::now(),
+            );
+            let outcome = gateway
+                .as_ref()
+                .and_then(|gateway| gateway.take_upstream_outcome());
 
-        // The status the gateway receives during this dispatch belongs to this call; whatever an
-        // earlier request left behind is discarded first.
-        let gateway = store_state.gateways.inference_for(&choice.driver).cloned();
-        if let Some(gateway) = &gateway {
-            gateway.take_upstream_status();
-        }
-        let inference_started = Instant::now();
-        // Raced rather than awaited: a cancel must stop the provider call in flight rather than
-        // wait it out. Losing the race drops the `call_async` future, which disposes the guest
-        // fiber and takes the pending outbound request down with it.
-        let dispatched = match cancel.as_ref() {
-            Some(signal) => {
-                tokio::select! {
-                    biased;
-                    () = signal.canceled() => {
-                        signal.note_phase(PHASE_INFERENCE);
-                        None
-                    }
-                    dispatched = store_state.dispatch_driver_async(
-                        &choice,
-                        ToolInput {
-                            data: Some(payload_json),
-                            log_path: None,
-                        },
-                    ) => Some(dispatched),
+            let Some(failed) = FailedAttempt::of(&dispatched) else {
+                break (
+                    admission,
+                    dispatched,
+                    inference_started,
+                    started_calls,
+                    outcome,
+                    RetryNote::new(retries_made + 1, None),
+                );
+            };
+            let credential_rejected = gateway
+                .as_ref()
+                .and_then(|gateway| gateway.credential())
+                .is_some_and(|credential| credential.rejection_pending());
+            if !inference_retry::classify(
+                failed.shape,
+                failed.transient,
+                credential_rejected,
+                outcome,
+            ) {
+                break (
+                    admission,
+                    dispatched,
+                    inference_started,
+                    started_calls,
+                    outcome,
+                    RetryNote::new(retries_made + 1, None),
+                );
+            }
+            let retry_after = outcome.and_then(UpstreamOutcome::retry_after);
+            let wait = match retry_policy.decide(
+                retries_made,
+                retry_after,
+                inference_retry::random_draw(),
+                session_deadline.map(|deadline| deadline.instant()),
+                Instant::now(),
+            ) {
+                RetryDecision::Retry { wait } => wait,
+                RetryDecision::Stop(stop) => {
+                    break (
+                        admission,
+                        dispatched,
+                        inference_started,
+                        started_calls,
+                        outcome,
+                        RetryNote::new(retries_made + 1, Some(stop)),
+                    );
+                }
+            };
+
+            let reason = RetryReason::of(outcome);
+            let charged_tokens = inference_retry::charge_retried_attempt(
+                admission,
+                reason,
+                failed.usage.as_ref().and_then(provider_counts),
+                u64::from(input_tokens),
+            );
+            // Text the failed attempt streamed stays on the stream; the cursor is closed so the
+            // retry's text starts a fresh run.
+            if let Some(task) = &stream_task {
+                if store_state.a2a_chunks_emitted.load(Ordering::Relaxed) {
+                    emit_text(&sse, task, "", true);
                 }
             }
-            None => Some(
-                store_state
-                    .dispatch_driver_async(
-                        &choice,
-                        ToolInput {
-                            data: Some(payload_json),
-                            log_path: None,
-                        },
-                    )
-                    .await,
-            ),
+            retries_made += 1;
+            trace
+                .write_inference_retry(
+                    turn_u32,
+                    &InferenceRetryRecord {
+                        origin: None,
+                        attempt: retries_made,
+                        max_retries: retry_policy.max_retries,
+                        reason,
+                        provider_status: reason.provider_status(outcome),
+                        error: failed
+                            .error_text(&dispatched, |text| store_state.gateways.redact(text)),
+                        delay_ms: inference_retry::millis(wait),
+                        retry_after_ms: retry_after.map(inference_retry::millis),
+                        charged_tokens,
+                    },
+                )
+                .await
+                .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+            drop(dispatched);
+            let cancel_wait = cancel.as_ref().map(|signal| signal.canceled());
+            if !inference_retry::wait(wait, cancel_wait).await {
+                if let Some(signal) = cancel.as_ref() {
+                    signal.note_phase(PHASE_INFERENCE);
+                }
+                return Ok(finish_canceled_turn(
+                    store_state,
+                    trace,
+                    otel,
+                    hooks,
+                    record.as_mut(),
+                    ending,
+                    &task_id_str,
+                    turn_u32,
+                    PHASE_INFERENCE,
+                    producer.as_ref(),
+                )
+                .await);
+            }
         };
-        let Some(dispatched) = dispatched else {
-            // Nothing from this turn is applied: no continuation id is adopted, no result file is
-            // written and no usage is recorded, because the call never returned one. The calls it
-            // started are not settled either: no progress frame is flushed for a canceled turn.
-            return Ok(finish_canceled_turn(
-                store_state,
-                trace,
-                otel,
-                hooks,
-                record.as_mut(),
-                ending,
-                &task_id_str,
-                turn_u32,
-                PHASE_INFERENCE,
-                producer.as_ref(),
-            )
-            .await);
-        };
-        // The driver is done writing every call it started, whatever it returned: write the size
-        // still held for each, ahead of the cursor removal and of anything else this turn writes.
-        let started_calls = settle_started_calls(
-            &sse,
-            stream_task.as_ref(),
-            &store_state.a2a_tool_calls,
-            Instant::now(),
-        );
-        let provider_status = gateway
-            .as_ref()
-            .and_then(|gateway| gateway.take_upstream_status());
+        let provider_status = outcome.and_then(UpstreamOutcome::status);
         let failed_call = |error_code: &'static str, error: String| FailedTurnCall {
             turn: turn_u32,
             error_code,
@@ -1392,16 +1517,18 @@ pub(crate) async fn run_agent_loop(
             provider_status,
             choice: has_alternates.then_some(&choice),
             settings: &call_settings,
+            retry: retry_note,
         };
         let driver_result = match dispatched {
             Ok(r) => r,
             Err(e) => {
                 // Driver dispatch failed (e.g. WASM instantiation error, import mismatch).
-                let failure =
+                let mut failure =
                     DriverDispatchFailure::new(&e, |text| store_state.gateways.redact(text));
                 failed_call(INFERENCE_ERROR_DRIVER_FAILED, failure.text.clone())
                     .write(trace, None, message_ids)
                     .await;
+                failure.text = task_failure_reason(&failure.text, retry_note);
                 *ending = Some(failure.ending());
                 return Err(failure.into_error());
             }
@@ -1452,6 +1579,7 @@ pub(crate) async fn run_agent_loop(
                 turn_u32,
                 cause,
                 &error_text,
+                retry_note,
             )
             .await;
         }
@@ -1590,6 +1718,7 @@ pub(crate) async fn run_agent_loop(
                 turn_u32,
                 cause,
                 &error,
+                retry_note,
             )
             .await;
         }
@@ -1615,6 +1744,7 @@ pub(crate) async fn run_agent_loop(
                 wire.as_ref(),
                 has_alternates.then_some(&choice),
                 Some(&call_settings),
+                retry_note,
             )
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
@@ -1716,6 +1846,7 @@ pub(crate) async fn run_agent_loop(
                     turn_u32,
                     TASK_FAILED_COMPACTION_HOOK,
                     &error,
+                    RetryNote::default(),
                 )
                 .await;
             }
@@ -1755,6 +1886,7 @@ pub(crate) async fn run_agent_loop(
                         turn_u32,
                         TASK_FAILED_MALFORMED_RESPONSE,
                         "response stop_reason=tool_call but no tool_call blocks were present",
+                        RetryNote::default(),
                     )
                     .await;
                 }
@@ -2195,6 +2327,7 @@ pub(crate) async fn run_agent_loop(
                     turn_u32,
                     TASK_FAILED_MALFORMED_RESPONSE,
                     &error,
+                    RetryNote::default(),
                 )
                 .await;
             }
@@ -2295,6 +2428,9 @@ pub(crate) async fn fail_on_workdir_refusals(
 /// * a `failed` [`AttemptEnding`] carrying [`failed_status_message`] of `cause` and `reason`, in
 ///   `ending`.
 ///
+/// A driver call's `retry` note, when it has one, follows `reason` in all three, kept whole where
+/// the reason is capped (see [`task_failure_reason`]); every other failure passes the default.
+///
 /// `Err` only when the result text cannot be written; the `task_failed` line is already in the
 /// trace by then.
 #[allow(clippy::too_many_arguments)]
@@ -2307,13 +2443,19 @@ async fn finish_failed_turn(
     turn: u32,
     cause: &str,
     reason: &str,
+    retry: RetryNote,
 ) -> Result<AgentLoopExit, RuntimeError> {
-    let _ = trace.write_task_failed(Some(turn), cause, reason).await;
-    record_result(hooks, records_root, &format!("error: {reason}"))
+    let capped = task_failure_reason(reason, retry);
+    let _ = trace.write_task_failed(Some(turn), cause, &capped).await;
+    let note = retry
+        .describe()
+        .map(|note| format!(" ({note})"))
+        .unwrap_or_default();
+    record_result(hooks, records_root, &format!("error: {reason}{note}"))
         .map_err(RuntimeError::AgentLoopFailed)?;
     flush_hook_dispatch_faults(hooks, trace).await;
     otel.emit_session_end(AgentLoopExit::Failed.as_str()).await;
-    *ending = Some(AttemptEnding::failed(failed_status_message(cause, reason)));
+    *ending = Some(AttemptEnding::failed(failed_status_message(cause, &capped)));
     Ok(AgentLoopExit::Failed)
 }
 
@@ -2336,6 +2478,20 @@ async fn finish_no_answer_turn(
     Ok(AgentLoopExit::NoAnswer)
 }
 
+/// A failed driver call's `error` as the task's failure reason: followed by ` (<n> attempts;
+/// retry stopped: <reason>)` when the call was retried or stopped retrying, `error` cut so the
+/// whole fits [`MAX_TASK_FAILURE_REASON_BYTES`] and the cap never takes the note.
+fn task_failure_reason(error: &str, retry: RetryNote) -> String {
+    match retry.describe() {
+        None => error.to_string(),
+        Some(note) => {
+            let note = format!(" ({note})");
+            let room = MAX_TASK_FAILURE_REASON_BYTES.saturating_sub(note.len());
+            format!("{}{note}", truncate_on_char_boundary(error, room))
+        }
+    }
+}
+
 /// An agent-loop driver call that failed, as its `inference` record names it.
 struct FailedTurnCall<'a> {
     turn: u32,
@@ -2346,6 +2502,7 @@ struct FailedTurnCall<'a> {
     provider_status: Option<u16>,
     choice: Option<&'a DriverChoice>,
     settings: &'a InferenceCallSettings,
+    retry: RetryNote,
 }
 
 impl FailedTurnCall<'_> {
@@ -2373,8 +2530,85 @@ impl FailedTurnCall<'_> {
                 tool_name: None,
                 spent: None,
                 settings: Some(self.settings),
+                retry: self.retry,
             })
             .await;
+    }
+}
+
+/// What the retry loop reads of an agent-loop attempt that failed in one of the shapes it
+/// classifies. A passed result that does not say `stop_reason: "error"`, and one the loop cannot
+/// parse, are not among them: neither is retried.
+struct FailedAttempt {
+    shape: AttemptFailure,
+    /// The driver's reserved `transient` metadata; `None` for a dispatch error, which has none.
+    transient: Option<bool>,
+    /// A `usage` block the failed payload carried.
+    usage: Option<DriverUsage>,
+    /// The parsed payload of a [`AttemptFailure::StopReasonError`].
+    response: Option<Value>,
+}
+
+impl FailedAttempt {
+    fn of(dispatched: &Result<ToolResult, String>) -> Option<Self> {
+        let result = match dispatched {
+            Err(_) => {
+                return Some(Self {
+                    shape: AttemptFailure::Dispatch,
+                    transient: None,
+                    usage: None,
+                    response: None,
+                })
+            }
+            Ok(result) => result,
+        };
+        let transient = inference_retry::transient_metadata(&result.metadata);
+        let data = result.data.as_deref().or(result.summary.as_deref());
+        if !matches!(result.status, Status::Passed) {
+            return Some(Self {
+                shape: AttemptFailure::Status,
+                transient,
+                usage: data
+                    .and_then(|data| serde_json::from_str::<Value>(data).ok())
+                    .as_ref()
+                    .and_then(parse_driver_usage),
+                response: None,
+            });
+        }
+        // A passed answer is parsed here only when it could say `"error"`, so an ordinary turn's
+        // response is parsed once, below.
+        let response = data
+            .filter(|data| data.contains("error"))
+            .and_then(|data| serde_json::from_str::<Value>(data).ok())
+            .filter(|response| {
+                response.get("stop_reason").and_then(Value::as_str) == Some("error")
+            })?;
+        Some(Self {
+            shape: AttemptFailure::StopReasonError,
+            transient,
+            usage: parse_driver_usage(&response),
+            response: Some(response),
+        })
+    }
+
+    /// The attempt's error text, redacted, as the call's failed record would carry it.
+    fn error_text(
+        &self,
+        dispatched: &Result<ToolResult, String>,
+        redact: impl Fn(&str) -> String,
+    ) -> String {
+        match (dispatched, &self.response) {
+            (Err(e), _) => DriverDispatchFailure::new(e, redact).text,
+            (Ok(_), Some(response)) => redact(
+                response
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DRIVER_RETURNED_ERROR),
+            ),
+            (Ok(result), None) => redact(&driver_error_text(
+                result.data.as_deref().or(result.summary.as_deref()),
+            )),
+        }
     }
 }
 
@@ -2734,15 +2968,19 @@ async fn finish_completed_turn(
 /// point a hook may have run — `hooks.rs` can't write these itself, since it
 /// has no access to `trace`/`otel` (see `HookInferenceCtx::records`).
 ///
-/// A hook call a spend ceiling refused made no call and has no `inference` record; its
-/// `spend_ceiling_reached` line is written here too, tagged with the hook's origin. Returns those
-/// refusals, in the order they were made.
+/// A hook call's retries are written first, as their `inference_retry` lines. A hook call a spend
+/// ceiling refused made no call and has no `inference` record; its `spend_ceiling_reached` line is
+/// written here too, tagged with the hook's origin. Returns those refusals, in the order they were
+/// made.
 async fn flush_hook_inference_records(
     hooks: &HookRuntime,
     trace: &mut TraceWriter,
     otel: &OtelEmitter,
     turn: u32,
 ) -> Vec<SpendRefusal> {
+    for retry in hooks.drain_inference_retries() {
+        let _ = trace.write_inference_retry(turn, &retry).await;
+    }
     let mut refusals = Vec::new();
     for refused in hooks.drain_spend_refusals() {
         let _ = trace
@@ -2791,28 +3029,25 @@ async fn write_hook_inference_record(
                     tool_name: None,
                     spent: Some((Some(record.input_tokens), None)),
                     settings: Some(&record.settings),
+                    retry: record.retry,
                 })
                 .await
         }
+        // A hook names its own `decision` from its own completion and never saw a provider stop
+        // reason, so there is none to record. Its completion sent a message list the runtime
+        // never held, so there are no runtime message ids to name — and, for the same reason, no
+        // payload the runtime built and could hash.
         None => {
             trace
-                .write_inference(
+                .write_hook_inference(
                     turn,
                     Some(record.input_tokens),
                     record.output_tokens,
                     record.decision.clone(),
-                    // A hook names its own `decision` from its own completion and never saw a
-                    // provider stop reason, so there is none to record.
-                    None,
-                    None,
-                    Some(&record.origin),
+                    &record.origin,
                     record.usage.as_ref(),
-                    // A hook's own completion sent a message list the runtime never held, so
-                    // there are no runtime message ids to name — and, for the same reason, no
-                    // payload the runtime built and could hash.
-                    Vec::new(),
-                    None,
                     Some(&record.settings),
+                    record.retry,
                 )
                 .await
         }
@@ -4915,6 +5150,32 @@ mod tests {
     }
 
     #[test]
+    fn inference_retry_task_failure_reason_names_the_attempts_within_the_cap() {
+        assert_eq!(
+            task_failure_reason("HTTP 400: bad", RetryNote::new(1, None)),
+            "HTTP 400: bad"
+        );
+        assert_eq!(
+            task_failure_reason(
+                "HTTP 503: overloaded",
+                RetryNote::new(3, Some(inference_retry::RetryStop::MaxRetries))
+            ),
+            "HTTP 503: overloaded (3 attempts; retry stopped: max_retries)"
+        );
+        let long = "é".repeat(MAX_TASK_FAILURE_REASON_BYTES);
+        let reason = task_failure_reason(
+            &long,
+            RetryNote::new(1, Some(inference_retry::RetryStop::Deadline)),
+        );
+        assert!(
+            reason.len() <= MAX_TASK_FAILURE_REASON_BYTES,
+            "{}",
+            reason.len()
+        );
+        assert!(reason.ends_with(" (1 attempt; retry stopped: deadline)"));
+    }
+
+    #[test]
     fn failed_status_message_caps_the_reason_as_the_trace_does() {
         let long = "é".repeat(MAX_TASK_FAILURE_REASON_BYTES);
         let message = failed_status_message(TASK_FAILED_DRIVER_ERROR, &long);
@@ -5992,6 +6253,7 @@ mod tests {
                 input_budget: Some(198_000),
                 driver_config: Some(json!({"reasoning_effort": "low"})),
             },
+            retry: Default::default(),
         };
         write_hook_inference_record(&mut trace, 2, &record)
             .await

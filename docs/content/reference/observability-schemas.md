@@ -37,7 +37,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `workdir_path_refused` | The task node, or the session node outside any task |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
-| `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
+| `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached`, `inference_retry` | The turn node, falling back to the task node and then the session node |
 | `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended`, `session_status`, `background_command`, `deadline_notice`, `deadline_reached` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
@@ -138,6 +138,8 @@ order:
 | `error_code` | string | Why the call failed — one of the [`error_code` values](#inference-error-code). Present exactly when `decision` is `"error"` |
 | `error` | string | The failure in words, present exactly when `error_code` is. Every credential value the session holds is replaced with `[redacted]`, and the text is capped at 2,000 bytes. For `credential_rejected` it is the runtime's own `E-RUN-027` message, never the provider's reply |
 | `provider_status` | u16 | The HTTP status the runtime's credential gateway received for the failed call. Absent when the request reached no provider, on the `process` transport, and for a driver with no `gateway:` |
+| `attempts` | u32 | How many attempts the call took under [`inference.retry`](manifest.md#inference-retry). Written only when it took more than one; each earlier attempt has an [`inference_retry`](#inference-retry) line |
+| `retry_stopped` | string | Why a call whose last attempt failed transiently was not made again: `"max_retries"` \| `"retry_after"` \| `"deadline"`. Written only on such a failed call |
 
 The five provider-reported fields are written only when the driver reported that member, and are
 absent otherwise — never `0`. See [Reported token usage](wit-interfaces.md#driver-usage) for what a
@@ -872,7 +874,7 @@ terminal `task_end`
 | `task_id` | string | The task in progress. Absent for a failure recorded before any `task_start` |
 | `turn` | u32 | The turn that failed, 0-based. Absent when the failure is the task's rather than one turn's: `reopen_budget_exhausted`, `runtime_error` and `workdir_path_refused` |
 | `cause` | string | Why the attempt failed, from the table below |
-| `reason` | string | What went wrong, in words: the driver's or provider's error text, the refusal, the runtime error. A `driver_error` or `compaction_hook` reason has every credential value the session holds replaced with `[redacted]`, as `out/result.txt` does. At most 2,000 bytes; the whole text is in `out/result.txt` in the session's [records directory](workdir.md#records-directory). For a launch that ends `failed`, this is the reason [`E-RUN-040`](diagnostics.md#e-run-040) prints |
+| `reason` | string | What went wrong, in words: the driver's or provider's error text, the refusal, the runtime error. A `driver_error` or `compaction_hook` reason has every credential value the session holds replaced with `[redacted]`, as `out/result.txt` does. A failed driver call that was [retried](manifest.md#inference-retry), or whose retrying was stopped, ends with ` (<n> attempts; retry stopped: <reason>)`, or the part of it that applies, kept whole within the cap. At most 2,000 bytes; the whole text is in `out/result.txt` in the session's [records directory](workdir.md#records-directory). For a launch that ends `failed`, this is the reason [`E-RUN-040`](diagnostics.md#e-run-040) prints |
 
 | `cause` | Written when |
 |---|---|
@@ -1025,6 +1027,27 @@ Under `transport: http` no `inference` line accompanies it: nothing was sent. Un
 `transport: process` it follows the `inference` line of the turn whose spend reached the ceiling,
 which is the turn its `turn` names. A `"session"` refusal latches, so every later driver call in
 the session writes one of these too; a `"machine"` refusal is checked again on every call.
+
+**`inference_retry`**{ #inference-retry } — written when a driver call failed transiently and is
+about to be made again under [`inference.retry`](manifest.md#inference-retry). Written before the
+wait; the call's one `inference` record follows its last attempt
+
+| Field | Type | Notes |
+|---|---|---|
+| `turn` | u32 | The turn the call belongs to |
+| `task_id` | string \| null | The task in scope, `null` between tasks |
+| `attempt` | u32 | The attempt that failed, counting from 1 |
+| `max_retries` | u32 | `inference.retry.max_retries` in force |
+| `reason` | string | `"status"` — the provider answered a retryable status \| `"connection"` — the connection broke before a response arrived \| `"driver"` — the driver marked its failure [`transient`](wit-interfaces.md#murmurtoolrun) |
+| `provider_status` | u16 | The status the credential gateway received for the failed attempt, on a `"status"` retry. Absent on any other |
+| `error` | string | The failed attempt's error text, every credential value the session holds replaced with `[redacted]`, capped at 2,000 bytes |
+| `delay_ms` | u64 | The wait before the next attempt |
+| `retry_after_ms` | u64 | The wait the provider asked for through `retry-after-ms` or `retry-after`, equal to `delay_ms`. Absent when it asked for none |
+| `charged_tokens` | u64 | What the spend meter was charged for the failed attempt: `0` for `"status"` and `"connection"`, the provider's reported counts or the request's estimate for `"driver"` |
+| `origin` | string | `"hook:<hook name>"` for a hook's `run-inference` call. Absent for an agent turn |
+
+A retry is not a turn: it adds nothing to `task_end.turns`, `session_end.total_turns` or the token
+totals.
 
 **`hook_dispatch_error`** — written when a hook call fails in a way the session survives
 

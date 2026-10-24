@@ -54,10 +54,18 @@ These keys are reserved:
 | `continuation_id` | Opaque id string | Tells the runtime the driver is holding conversation state provider-side. See [Stateful driver continuation](#stateful-driver-continuation). |
 | `state_effect` | `"read"` or `"mutate"` | How this call affected the resource it addressed. Recorded on the call's `tool_call` trace event. |
 | `resource_id` | Opaque, tool-defined string | Which resource this call addressed. Recorded verbatim on the `tool_call` trace event. |
+| `transient` | `"true"` or `"false"` | Read on an inference driver's failed call. `"true"` marks the failure transient, so the runtime makes the call again; `"false"` vetoes a retry of a status the runtime would otherwise retry. Any other value counts as absent. See [Retrying transient failures](manifest.md#inference-retry). |
 
 `state_effect` and `resource_id` together let `mur trace` spot redundant calls without knowing
 anything about your tool. Omit either and the call counts as "unknown": it is never credited as a
 redundant read.
+
+A driver sets `transient: "true"` on a failure the provider's status cannot show: a stream that
+ended without a stop reason or with a provider error event after the `200`. It sets
+`transient: "false"` on a status that is retryable in general but permanent here, such as a `429`
+the provider reports as an exhausted quota. With neither, the runtime decides from what its
+credential gateway saw: the status, or a connection that broke before a response arrived. If the
+list carries more than one `transient` tuple, the first in list order counts.
 
 For `resource_id`, scope the value by addressing scheme (for example `"sym:Foo::bar"`) so it
 cannot collide with an unrelated resource of the same name. Two calls address the same resource
@@ -683,6 +691,14 @@ Every call that reaches the driver, success or failure, writes one `inference` r
 `trace.jsonl` and one `capsule.inference` OTel span carrying `origin: "hook:<hook name>"` and
 `model`. A call from an `on-inference` hook is recorded on that hook's turn, ahead of the turn's
 own `inference` line.
+
+A call that fails transiently is made again under the capsule's
+[`inference.retry`](manifest.md#inference-retry), as an agent turn is, before `run-inference`
+returns. The hook sees only the last attempt's result. Each retry writes an
+[`inference_retry`](observability-schemas.md#inference-retry) line carrying the hook's `origin`,
+and the call's one `inference` record carries `attempts` when it took more than one. The decision
+to wait does not consult the hook's own `limits.deadline_seconds`: a wait that outlasts it ends the
+hook as a slow provider call would.
 
 ---
 

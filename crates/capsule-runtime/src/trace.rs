@@ -13,6 +13,7 @@ use crate::{
     containment::ScopeReport,
     formation::FormationId,
     gateway_credential::CredentialChange,
+    inference_retry::{InferenceRetryRecord, RetryNote, RetryStop},
     lanes::TaskLane,
     origin::{TaskProvenance, TrustClass},
     trace_blobs::BlobStore,
@@ -575,6 +576,14 @@ struct InferenceEvent {
     /// gateway the runtime does not own.
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_status: Option<u16>,
+    /// How many attempts the call took, written only when it took more than one. Each retry
+    /// before the last attempt has its own `inference_retry` line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempts: Option<u32>,
+    /// Why a call whose last attempt failed transiently was not made again:
+    /// [`crate::inference_retry::RetryStop::wire_name`]. Absent on every other record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_stopped: Option<&'static str>,
 }
 
 /// The bodies one driver request put on the wire, split into the pieces an `inference` event
@@ -1270,6 +1279,8 @@ pub(crate) struct FailedInference<'a> {
     pub(crate) spent: Option<(Option<u64>, Option<u64>)>,
     /// How the call was sent; `None` on the `process` transport.
     pub(crate) settings: Option<&'a InferenceCallSettings>,
+    /// The call's attempts and why its retrying stopped, as its retry loop ended.
+    pub(crate) retry: RetryNote,
 }
 
 /// One `inference` line, as the writers that share [`TraceWriter::write_inference_event`] hand
@@ -1292,6 +1303,7 @@ struct InferenceLine<'a> {
     counted: bool,
     /// How the call was sent; `None` on the `process` transport, which writes neither key.
     settings: Option<&'a InferenceCallSettings>,
+    retry: RetryNote,
 }
 
 /// The most `task_failed.reason` carries, in bytes. A driver's error text is provider-supplied
@@ -1404,6 +1416,31 @@ struct TaskContinuedEvent<'a> {
     /// task's attempts have spent so far. `null` when
     /// `inference.max_turns` sets no cap.
     turns_remaining: Option<u32>,
+}
+
+/// A driver call failed transiently and is about to be made again. The call's one `inference`
+/// line follows its last attempt.
+#[derive(Serialize)]
+struct InferenceRetryEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    turn: u32,
+    task_id: Option<String>,
+    attempt: u32,
+    max_retries: u32,
+    reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_status: Option<u16>,
+    error: &'a str,
+    delay_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_ms: Option<u64>,
+    charged_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<&'a str>,
 }
 
 /// A spend ceiling refused a driver call before it was sent. No `inference` line accompanies it,
@@ -2481,6 +2518,41 @@ impl TraceWriter {
             failure: None,
             counted: true,
             settings,
+            retry: RetryNote::default(),
+        })
+        .await
+    }
+
+    /// [`Self::write_inference`] for a hook's `run-inference` that succeeded, with the attempts
+    /// its retry loop took.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_hook_inference(
+        &mut self,
+        turn: u32,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        decision: String,
+        origin: &InferenceOrigin,
+        usage: Option<&DriverUsage>,
+        settings: Option<&InferenceCallSettings>,
+        retry: RetryNote,
+    ) -> std::io::Result<()> {
+        self.write_inference_event(InferenceLine {
+            turn,
+            input_tokens,
+            output_tokens,
+            decision,
+            stop_reason: None,
+            tool_name: None,
+            origin: Some(origin),
+            usage,
+            message_ids: Vec::new(),
+            wire: None,
+            choice: None,
+            failure: None,
+            counted: true,
+            settings,
+            retry,
         })
         .await
     }
@@ -2502,6 +2574,7 @@ impl TraceWriter {
         wire: Option<&WireCapture>,
         choice: Option<&crate::driver_choice::DriverChoice>,
         settings: Option<&InferenceCallSettings>,
+        retry: RetryNote,
     ) -> std::io::Result<()> {
         self.write_inference_event(InferenceLine {
             turn,
@@ -2518,6 +2591,7 @@ impl TraceWriter {
             failure: None,
             counted: true,
             settings,
+            retry,
         })
         .await
     }
@@ -2552,6 +2626,7 @@ impl TraceWriter {
             failure: Some((failed.error_code, error, failed.provider_status)),
             counted: failed.spent.is_some(),
             settings: failed.settings,
+            retry: failed.retry,
         })
         .await
     }
@@ -2572,6 +2647,7 @@ impl TraceWriter {
             failure,
             counted,
             settings,
+            retry,
         } = line;
         let (error_code, error, provider_status) = match failure {
             Some((code, error, status)) => (Some(code.to_string()), Some(error), status),
@@ -2627,6 +2703,8 @@ impl TraceWriter {
             error_code,
             error,
             provider_status,
+            attempts: retry.attempts,
+            retry_stopped: retry.stopped.map(RetryStop::wire_name),
         };
         self.write_event(&event).await?;
         if origin.is_none() {
@@ -3476,6 +3554,39 @@ impl TraceWriter {
             tool_call_id: tool_call_id.filter(|id| !id.is_empty()).map(str::to_string),
             missing: missing.to_vec(),
             reason: reason.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record that a driver call failed transiently and is about to be made again after
+    /// `retry.delay_ms`. `retry.origin` is the `hook:<name>` of a hook's `run-inference` call,
+    /// `None` for an agent-loop turn. The error text is capped at
+    /// [`MAX_TASK_FAILURE_REASON_BYTES`].
+    pub(crate) async fn write_inference_retry(
+        &mut self,
+        turn: u32,
+        retry: &InferenceRetryRecord,
+    ) -> std::io::Result<()> {
+        let event = InferenceRetryEvent {
+            event_type: "inference_retry",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            turn,
+            task_id: self.active_task_id.clone(),
+            attempt: retry.attempt,
+            max_retries: retry.max_retries,
+            reason: retry.reason.wire_name(),
+            provider_status: retry.provider_status,
+            error: crate::agent::truncate_on_char_boundary(
+                &retry.error,
+                MAX_TASK_FAILURE_REASON_BYTES,
+            ),
+            delay_ms: retry.delay_ms,
+            retry_after_ms: retry.retry_after_ms,
+            charged_tokens: retry.charged_tokens,
+            origin: retry.origin.as_deref(),
         };
         self.write_event(&event).await
     }
@@ -5979,6 +6090,7 @@ mod tests {
             tool_name: None,
             spent: None,
             settings: None,
+            retry: RetryNote::default(),
         })
         .await
         .unwrap();
@@ -5998,6 +6110,7 @@ mod tests {
             tool_name: None,
             spent: Some((Some(10), Some(5))),
             settings: None,
+            retry: RetryNote::default(),
         })
         .await
         .unwrap();
@@ -6098,6 +6211,7 @@ mod tests {
             tool_name: None,
             spent: Some((Some(40), None)),
             settings: None,
+            retry: RetryNote::default(),
         })
         .await
         .unwrap();
@@ -6153,6 +6267,7 @@ mod tests {
             None,
             None,
             Some(&turn),
+            RetryNote::default(),
         )
         .await
         .unwrap();
@@ -6168,6 +6283,7 @@ mod tests {
             None,
             None,
             Some(&unconfigured),
+            RetryNote::default(),
         )
         .await
         .unwrap();
@@ -6198,6 +6314,7 @@ mod tests {
             tool_name: None,
             spent: None,
             settings: Some(&turn),
+            retry: RetryNote::default(),
         })
         .await
         .unwrap();
@@ -6283,6 +6400,7 @@ mod tests {
             tool_name: None,
             spent: None,
             settings: None,
+            retry: RetryNote::default(),
         })
         .await
         .unwrap();

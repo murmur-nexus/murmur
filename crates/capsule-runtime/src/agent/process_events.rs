@@ -712,6 +712,7 @@ impl<'a> ProcessEventSink<'a> {
                     tool_name: None,
                     spent: None,
                     settings: None,
+                    retry: crate::inference_retry::RetryNote::default(),
                 })
                 .await;
             return Ok(Vec::new());
@@ -765,6 +766,7 @@ impl<'a> ProcessEventSink<'a> {
                         tool_name: open.first_tool.clone(),
                         spent: Some((spent.input, spent.output)),
                         settings: None,
+                        retry: crate::inference_retry::RetryNote::default(),
                     })
                     .await
             }

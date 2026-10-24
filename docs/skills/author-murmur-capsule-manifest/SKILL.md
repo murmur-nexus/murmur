@@ -467,7 +467,7 @@ artifacts:
         max: 100
 ```
 
-Use `inference.driver.config` for provider-agnostic driver-role behavior such as generic timeout/retry policy **only when the selected driver actually documents and supports those keys**.
+Under `transport: http` the runtime retries a rate limit, a provider `5xx` or a dropped connection itself; tune it with `inference.retry` (`max_retries`, `initial_delay_ms`, `max_delay_ms`), not with driver config. `inference.retry` is refused under `transport: process`. Use `inference.driver.config` for other driver-role behavior, such as a timeout, **only when the selected driver actually documents and supports those keys**.
 
 The runtime validates the shape of these config blocks, not their semantics. Do not invent config keys.
 

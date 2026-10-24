@@ -19,7 +19,7 @@
 //!
 //! No error this module returns carries the key or the rendered header.
 
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use http::{
@@ -44,6 +44,42 @@ pub(crate) async fn send_direct(
 ) -> Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError> {
     let (response, io) = wasmtime_wasi_http::default_send_request(request, options).await?;
     Ok((response.map(BodyExt::boxed_unsync), Box::new(io)))
+}
+
+/// What the upstream did with the last request a gateway sent, as [`CredentialGateway::send`]
+/// records it for the retry loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamOutcome {
+    /// A response head arrived.
+    Response {
+        status: u16,
+        /// The wait the response asked for through `retry-after-ms` or `retry-after`, parsed by
+        /// [`crate::inference_retry::retry_after`] when the head arrived.
+        retry_after: Option<Duration>,
+    },
+    /// The connection failed before a response head arrived.
+    ConnectionFailed {
+        /// [`crate::inference_retry::transient_connection_error`] of the failure.
+        transient: bool,
+    },
+}
+
+impl UpstreamOutcome {
+    /// The response's status, when a response arrived.
+    pub(crate) fn status(self) -> Option<u16> {
+        match self {
+            Self::Response { status, .. } => Some(status),
+            Self::ConnectionFailed { .. } => None,
+        }
+    }
+
+    /// The response's requested wait, when a response arrived and asked for one.
+    pub(crate) fn retry_after(self) -> Option<Duration> {
+        match self {
+            Self::Response { retry_after, .. } => retry_after,
+            Self::ConnectionFailed { .. } => None,
+        }
+    }
 }
 
 /// The authority `MURMUR_GATEWAY_ENDPOINT` names.
@@ -77,9 +113,9 @@ pub(crate) struct CredentialGateway {
     /// `gateway.api_key`, resolved at staging. `None` attaches nothing.
     credential: Option<Arc<GatewayCredential>>,
     pub(crate) metering: GatewayMetering,
-    /// The status of the last response [`Self::send`] returned, until
-    /// [`Self::take_upstream_status`] takes it.
-    last_status: std::sync::Mutex<Option<u16>>,
+    /// What became of the last request [`Self::send`] sent upstream, until
+    /// [`Self::take_upstream_outcome`] takes it.
+    last_outcome: std::sync::Mutex<Option<UpstreamOutcome>>,
 }
 
 impl std::fmt::Debug for CredentialGateway {
@@ -243,7 +279,7 @@ impl CredentialGateway {
             auth,
             credential,
             metering,
-            last_status: std::sync::Mutex::new(None),
+            last_outcome: std::sync::Mutex::new(None),
         })
     }
 
@@ -252,24 +288,51 @@ impl CredentialGateway {
         self.credential.as_ref()
     }
 
-    /// Takes the status of the last response this gateway returned to a guest — the resend's,
-    /// when it resent — leaving `None`. `None` when no request reached the upstream since the
-    /// last take.
+    /// Takes what became of the last request this gateway sent upstream — the resend's, when it
+    /// resent — leaving `None`: the response's status and requested wait, or the connection
+    /// failure that came instead of a response. `None` when nothing was sent upstream since the
+    /// last take, including a request refused before it was sent.
     ///
-    /// A caller takes (and discards) it immediately before dispatching a call and takes it again
-    /// after, so the value belongs to that call. The gateway is shared, so a request another call
-    /// sends in between — an async hook's `run-inference` on the inference gateway — can replace
-    /// it: the last response wins, as it does for a pending credential rejection.
-    pub(crate) fn take_upstream_status(&self) -> Option<u16> {
-        self.last_status
+    /// A caller takes (and discards) it immediately before dispatching an attempt and takes it
+    /// again after, so the value belongs to that attempt. The gateway is shared, so a request
+    /// another call sends in between — an async hook's `run-inference` on the inference gateway —
+    /// can replace it: the last request wins, as it does for a pending credential rejection.
+    pub(crate) fn take_upstream_outcome(&self) -> Option<UpstreamOutcome> {
+        self.last_outcome
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
     }
 
-    fn note_status(&self, response: &http::Response<WasiBody>) {
-        *self.last_status.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(response.status().as_u16());
+    /// [`Self::take_upstream_outcome`]'s status alone: `None` for a connection failure as for
+    /// nothing recorded.
+    #[cfg(test)]
+    pub(crate) fn take_upstream_status(&self) -> Option<u16> {
+        self.take_upstream_outcome()
+            .and_then(UpstreamOutcome::status)
+    }
+
+    /// [`send_direct`], recording what became of the request.
+    async fn send_recorded(
+        &self,
+        request: http::Request<WasiBody>,
+        options: Option<RequestOptions>,
+    ) -> Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError> {
+        let sent = send_direct(request, options).await;
+        let outcome = match &sent {
+            Ok((response, _)) => UpstreamOutcome::Response {
+                status: response.status().as_u16(),
+                retry_after: crate::inference_retry::retry_after(
+                    response.headers(),
+                    std::time::SystemTime::now(),
+                ),
+            },
+            Err(error) => UpstreamOutcome::ConnectionFailed {
+                transient: crate::inference_retry::transient_connection_error(error),
+            },
+        };
+        *self.last_outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+        sent
     }
 
     /// Whether this is the inference gateway, admitted against the spend meter.
@@ -312,9 +375,9 @@ impl CredentialGateway {
         options: Option<RequestOptions>,
     ) -> Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError> {
         let Some(credential) = self.credential.clone() else {
-            let response = send_direct(self.rewrite(request, None)?, options).await?;
-            self.note_status(&response.0);
-            return Ok(response);
+            return self
+                .send_recorded(self.rewrite(request, None)?, options)
+                .await;
         };
 
         let (parts, body) = request.into_parts();
@@ -333,12 +396,12 @@ impl CredentialGateway {
                 credential.not_injected_message(),
             )));
         };
-        let response = send_direct(
-            self.rewrite(head.request(body.clone()), Some(&sent))?,
-            options,
-        )
-        .await?;
-        self.note_status(&response.0);
+        let response = self
+            .send_recorded(
+                self.rewrite(head.request(body.clone()), Some(&sent))?,
+                options,
+            )
+            .await?;
         if response.0.status() != StatusCode::UNAUTHORIZED {
             credential.clear_rejection();
             return Ok(response);
@@ -353,8 +416,9 @@ impl CredentialGateway {
         };
         drop(response);
 
-        let resent = send_direct(self.rewrite(head.request(body), Some(&reread))?, options).await?;
-        self.note_status(&resent.0);
+        let resent = self
+            .send_recorded(self.rewrite(head.request(body), Some(&reread))?, options)
+            .await?;
         if resent.0.status() == StatusCode::UNAUTHORIZED {
             credential
                 .record_rejection(StatusCode::UNAUTHORIZED.as_u16(), true)
@@ -418,8 +482,6 @@ pub(crate) fn readdress(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use http_body_util::Empty;
     use murmur_artifact::ApiKeyReference;
 
@@ -726,6 +788,85 @@ mod tests {
         assert_eq!(gateway.take_upstream_status(), None);
         std::thread::sleep(Duration::from_millis(100));
         assert!(upstream.accept().is_err(), "nothing reached the upstream");
+    }
+
+    /// A `429`'s `retry-after` is recorded with its status, and taking the outcome leaves
+    /// nothing.
+    #[test]
+    fn gateway_records_a_status_with_its_retry_after() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", upstream.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+                head.push(byte[0]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let gateway = Arc::new(gateway(&endpoint, auth("x-api-key", "{key}"), Some(KEY)));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let status = rt.block_on(async {
+            let (response, _io) = Arc::clone(&gateway)
+                .send(request("http://127.0.0.1:9/v1/messages", &[]), None)
+                .await
+                .unwrap();
+            response.status()
+        });
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        server.join().unwrap();
+        assert_eq!(
+            gateway.take_upstream_outcome(),
+            Some(UpstreamOutcome::Response {
+                status: 429,
+                retry_after: Some(Duration::from_secs(7)),
+            })
+        );
+        assert_eq!(gateway.take_upstream_outcome(), None);
+    }
+
+    /// A refused connection is recorded as a connection failure that is not transient, on the
+    /// keyless branch as on the keyed one, and carries no status.
+    #[test]
+    fn gateway_records_a_refused_connection_as_not_transient() {
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for key in [Some(KEY), None] {
+            let gateway = Arc::new(gateway(&endpoint, auth("x-api-key", "{key}"), key));
+            let sent = rt.block_on(async {
+                Arc::clone(&gateway)
+                    .send(request("http://127.0.0.1:9/v1/messages", &[]), None)
+                    .await
+            });
+            assert!(sent.is_err());
+            assert_eq!(
+                gateway.take_upstream_outcome(),
+                Some(UpstreamOutcome::ConnectionFailed { transient: false }),
+                "key {key:?}"
+            );
+            let _ = rt.block_on(async {
+                Arc::clone(&gateway)
+                    .send(request("http://127.0.0.1:9/v1/messages", &[]), None)
+                    .await
+            });
+            assert_eq!(gateway.take_upstream_status(), None);
+        }
     }
 
     #[test]

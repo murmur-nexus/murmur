@@ -1130,6 +1130,7 @@ These fields are read under `transport: http`. Setting any of them except `infer
 | `inference.max_tokens` | integer | no | Maximum output tokens the model may generate **per turn**, for every driver choice. Default: the `max_output_tokens` the driver's [`models:`](#driver-models) table declares for the choice's model; a choice with neither refuses the launch with [`E-RUN-052`](diagnostics.md#e-run-052). Must be > 0; not clamped at the top end. A value at or above a choice's context window leaves it no input budget and refuses the launch with [`E-RUN-055`](diagnostics.md#e-run-055). Distinct from [`context.max_tokens`](#field-context) — see [Output cap](#inference-max-tokens). |
 | `inference.tool_refresh` | `compaction \| immediate` | no | When an artifact installed mid-session, other than by the model's own `pull-artifact`, reaches the tool list the model is offered. Default: `compaction`. See [Tool refresh](#inference-tool-refresh). |
 | `inference.alternates` | list | no | Default: empty. Other driver choices the agent loop may be switched to while the capsule runs. Requires `inference.driver` in `control.settings` or `control.agent_settings`. See [Driver alternates](#inference-alternates). |
+| `inference.retry` | map | no | How a driver call that failed transiently is made again: `max_retries` (0–20, default `6`), `initial_delay_ms` (1–60000, default `1000`) and `max_delay_ms` (1–3600000 and at least `initial_delay_ms`, default `60000`), each an optional integer. Refused under `transport: process`, where the harness retries its own provider calls. See [Retrying transient failures](#inference-retry). |
 
 This field is read under both transports, against a different measurement on each:
 
@@ -1728,6 +1729,92 @@ against a process driver whose `describe()` reports no usage is refused at launc
 
 A delegated child is bounded by its own `inference.max_session_tokens` and by the machine ceiling,
 not by its parent's session ceiling.
+
+#### Retrying transient failures: `inference.retry` { #inference-retry }
+
+A driver call that fails transiently is made again: the same request, through the same driver
+choice, after a wait. This covers every agent turn and every hook's
+[`run-inference`](wit-interfaces.md#murmurruntimeinference), which is how compaction calls the
+model. The model never sees the failed attempt, no hook fires for it, and nothing from it is
+committed to the conversation, the continuation or `out/result.txt`.
+
+```yaml
+inference:
+  retry:
+    max_retries: 6          # 0–20; 0 disables retrying
+    initial_delay_ms: 1000  # 1–60000
+    max_delay_ms: 60000     # 1–3600000, and >= initial_delay_ms
+```
+
+| Key | Type | Default | Bounds |
+|---|---|---:|---|
+| `max_retries` | integer | `6` | 0–20. The most retries one call makes after its first attempt; `0` disables retrying |
+| `initial_delay_ms` | integer | `1000` | 1–60000. The backoff before the first retry |
+| `max_delay_ms` | integer | `60000` | 1–3600000, and at least `initial_delay_ms`. The longest backoff, and the longest wait a provider may ask for |
+
+A value outside its bounds fails the manifest parse with `E-MAN-003` naming the key, as
+`inference.retry.<key>`; a `max_delay_ms` below `initial_delay_ms` names `inference.retry.max_delay_ms`.
+
+A failure is transient when one of these holds, checked in order:
+
+| Rule | Retried |
+|---|---|
+| The provider rejected the credential | Never |
+| The driver's result carries [`transient: "false"`](wit-interfaces.md#murmurtoolrun) | No |
+| The driver's result carries `transient: "true"`, as a driver reports a stream that broke after the provider answered `200` | Yes |
+| The connection broke before a response arrived: reset, terminated, timed out, or the response was incomplete | Yes |
+| The provider answered `408`, `429`, or a `5xx` other than `501` and `505` | Yes |
+| Anything else, including a refused connection, a DNS or TLS failure, and every other `4xx` | No |
+
+The wait before retry *k* (counting from 0) is drawn uniformly from `[d/2, d]`, where
+`d = min(max_delay_ms, initial_delay_ms × 2^k)`. When the provider's response carried
+`retry-after-ms` or `retry-after` (seconds, or an HTTP date), the wait is exactly that value.
+
+The runtime stops retrying, and the call fails as it would have without retries, in four cases:
+
+| Case | `retry_stopped` on the call's `inference` record |
+|---|---|
+| `max_retries` retries were already made | `max_retries` |
+| The provider asked for a wait longer than `max_delay_ms` | `retry_after` |
+| The wait would end at or after the session's [deadline](cli.md#mur-run-deadline) | `deadline` |
+| The [spend ceiling](#inference-max-session-tokens) refuses the next attempt | None: the ordinary `spend_ceiling_reached` line and ending are written |
+
+When a failed call was retried, or one of the first three cases stopped its retrying, the task's
+failure reason ends with the number of attempts and the stop. The reason is what
+[`task_failed`](observability-schemas.md#task-failed) records, `out/result.txt` holds and
+[`E-RUN-040`](diagnostics.md#e-run-040) prints:
+
+| The call | Reason |
+|---|---|
+| Took 3 attempts, then stopped at `max_retries` | `HTTP 503: … (3 attempts; retry stopped: max_retries)` |
+| Was not retried, because the wait would pass the deadline | `HTTP 429: … (1 attempt; retry stopped: deadline)` |
+| Was retried once, then failed on a failure that is not transient | `HTTP 400: … (2 attempts)` |
+
+The failed call's `inference` record keeps the provider's error text alone in `error`, and names the
+same facts in `attempts` and `retry_stopped`.
+
+Every attempt is admitted against the spend ceilings before it is sent, and no admission is held
+during a wait. What a failed attempt that is retried costs:
+
+| The attempt failed on | Charged |
+|---|---|
+| A provider status, or a connection that broke before a response | Nothing |
+| A failure the driver marked transient | What any [failed call](observability-schemas.md#inference-failed) is charged: the provider's report from its error payload, otherwise the request's estimate |
+
+A cancel during a wait ends the task as canceled, in phase `inference`. A hook's call has no cancel
+of its own and does not consult the hook's `limits.deadline_seconds`: a wait that outlasts it ends
+the hook as a slow provider call would.
+
+Text a failed attempt already streamed to an A2A client stays on the stream, followed by a final
+empty text frame; the answer the task commits is the retry's.
+
+Each retry writes one [`inference_retry`](observability-schemas.md#inference-retry) line to
+`trace.jsonl`. The call keeps one `inference` record, which carries `attempts` when it took more
+than one. Retries do not count as turns, against `inference.max_turns`, or in the turn and token
+totals.
+
+Refused under `transport: process` with `E-MAN-003`: `is not valid with transport: process; the
+harness retries its own provider calls`.
 
 #### Tool refresh: `inference.tool_refresh` { #inference-tool-refresh }
 

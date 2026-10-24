@@ -435,6 +435,15 @@ impl GatewayCredential {
             .pending_rejection = None;
     }
 
+    /// Whether a rejection is waiting to be reported, without taking it.
+    pub(crate) fn rejection_pending(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending_rejection
+            .is_some()
+    }
+
     pub(crate) fn take_rejection(&self) -> Option<CredentialRejection> {
         self.state
             .lock()
