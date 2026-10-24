@@ -643,6 +643,9 @@ pub(crate) enum Continuation {
     /// lines, each outcome already fenced under its member or capsule. Sent as written, never
     /// fenced again on the task's provenance and never unfenced.
     Outcomes(String),
+    /// `lifecycle.keep_working.message`, the operator's text: sent verbatim, never fenced on the
+    /// task's provenance and never otherwise wrapped.
+    KeepWorking(String),
 }
 
 impl Continuation {
@@ -655,6 +658,7 @@ impl Continuation {
         match self {
             Self::ReopenFeedback(feedback) => fence_task_payload(provenance, feedback),
             Self::Outcomes(outcomes) => (outcomes, None),
+            Self::KeepWorking(message) => (message, None),
         }
     }
 }
@@ -5048,6 +5052,23 @@ fn record_result(
     write_result(records_root, value)
 }
 
+/// Write a kept-working task's standing answer back as its result, after a continued attempt
+/// that ended on a budget left its own marker there: `out/result.txt` (and a threaded task's own
+/// result file) and the hooks' recorded task output then agree on the answer the task ends with.
+pub(crate) fn record_standing_answer(
+    hooks: &HookRuntime,
+    records_root: &WorkdirRoot,
+    mode: &ConversationMode,
+    task_id: &str,
+    answer: &str,
+) -> Result<(), String> {
+    record_result(hooks, records_root, answer)?;
+    if matches!(mode, ConversationMode::Threaded) {
+        write_result_for_task(records_root, task_id, answer)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn write_result(records_root: &WorkdirRoot, value: &str) -> Result<(), String> {
     records_root
         .write_file("out/result.txt", value.as_bytes(), DEFAULT_FILE_MODE)
@@ -5870,6 +5891,28 @@ mod tests {
                 assert_eq!(message["content"][0]["text"], outcomes, "{origin:?}");
                 assert!(message.get(MESSAGE_FENCE_KEY).is_none());
             }
+        }
+    }
+
+    /// `lifecycle.keep_working.message` is the operator's text: sent byte for byte whatever the
+    /// task's trust, never fenced and never labelled.
+    #[test]
+    fn keep_working_is_sent_as_the_operator_wrote_it_whatever_the_task_s_trust() {
+        use crate::origin::TaskOrigin;
+        let operator = "  Keep working on the task.\nCheck your work against what was asked. ";
+        assert_eq!(
+            Continuation::KeepWorking(operator.to_string()).into_payload(None),
+            (operator.to_string(), None)
+        );
+        for origin in [TaskOrigin::Event, TaskOrigin::User, TaskOrigin::Peer] {
+            let message = user_message(
+                Continuation::KeepWorking(operator.to_string())
+                    .into_payload(Some(TaskProvenance::derive(origin, None))),
+            );
+            assert_eq!(message["role"], "user");
+            assert_eq!(message["content"][0]["text"], operator, "{origin:?}");
+            assert_eq!(message["content"].as_array().unwrap().len(), 1);
+            assert!(message.get(MESSAGE_FENCE_KEY).is_none());
         }
     }
 

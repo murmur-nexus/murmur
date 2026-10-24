@@ -518,7 +518,8 @@ Rules:
 - a queue capsule holds one running task plus `queue_depth` waiting ones; for a roster member that several members may call, `mur doctor` reports [`W-ROS-001`](https://docs.murmur.nexus/reference/diagnostics/#w-ros-001) with the `queue_depth` that holds every caller;
 - `after_task: sleep` is for a capsule intended to remain available;
 - use `conversation: threaded` only when tasks sharing a context should accumulate conversational history;
-- add `input_timeout_secs` only when tools can request human/input replies and indefinite waiting is unacceptable.
+- add `input_timeout_secs` only when tools can request human/input replies and indefinite waiting is unacceptable;
+- add [`keep_working`](https://docs.murmur.nexus/reference/manifest/#lifecycle-keep-working) (`message` and `limit`, both required, `limit` at least `1`) only when the operator wants the agent kept working past its turn ends until a budget is spent; every continuation resends the whole context, so pair it with `inference.max_turns`, a spend ceiling or `mur run --deadline`. Omit it to keep the default, where a task ends at its first turn end.
 
 ### 9. Add observability deliberately
 

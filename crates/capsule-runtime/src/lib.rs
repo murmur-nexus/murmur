@@ -53,6 +53,7 @@ pub(crate) mod inference_import;
 pub(crate) mod inference_retry;
 pub(crate) mod install_grant;
 pub(crate) mod interpreter_runtime;
+pub(crate) mod keep_working;
 pub mod lanes;
 pub mod lifeline;
 pub mod limits;
@@ -224,7 +225,9 @@ pub use lanes::TaskLane;
 pub use lifeline::{ChildLifeline, FormationLifeline, MemberLifeline, SpawnerLifeline};
 pub use lifeline::{FORMATION_LIFELINE_ENV, SPAWNER_LIFELINE_ENV};
 pub use limits::ExecutionLimits;
-pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};
+pub use murmur_artifact::{
+    AfterTask, KeepWorking, LifecycleConfig, LifecycleOverride, TaskAcceptance,
+};
 // The types and header names are flat; `origin::from_wire` and `origin::stamp_for_peer` stay
 // module-qualified, because their bare names say nothing about tasks.
 pub use origin::{TaskOrigin, TaskProvenance, TrustClass, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER};

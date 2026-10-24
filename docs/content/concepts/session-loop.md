@@ -136,7 +136,9 @@ made, so it counts as well: the task's turn count, `task_end.turns`, includes it
 `exit_status: "max_turns_reached"`, and the task's failure message names the limit, the turns the
 task used by the numbers `mur trace show` prints, and how many of the calls were a hook's. The
 task did not complete: `GetTask` reads `TASK_STATE_FAILED`, and
-[`mur run`](../reference/cli.md#mur-run-status) exits `1`.
+[`mur run`](../reference/cli.md#mur-run-status) exits `1`. A task
+[kept working](#keep-working) that spends the limit ends `ok` instead, with the answer of its last
+turn end.
 
 ## Deadlines { #deadlines }
 
@@ -159,6 +161,58 @@ The agent sees only the effective deadline, through
 [deadline notice](../reference/runtime-provided-tools.md#deadline-notice). The parent's wait for a
 child, [`lifecycle.delegation_deadline_secs`](../reference/manifest.md#lifecycle-delegation-deadline-secs),
 is a separate bound: whichever falls first ends the child.
+
+A task [kept working](#keep-working) past a turn end is the exception to the cancel: the deadline
+ends it `ok` with its last turn end's answer, while the session still ends `deadline_reached` and
+`mur run` still exits with `E-RUN-053`.
+
+## Keeping a task working { #keep-working }
+
+By default a task ends the first time the model ends its turn. With
+[`lifecycle.keep_working`](../reference/manifest.md#lifecycle-keep-working) set, the runtime
+answers each turn end — the model ended its turn with no tool call and nothing it handed off is
+outstanding — by sending the operator's `message` as the next user message in the same
+conversation, and the task goes on. Handed-off work comes first: a turn end with
+[`call-member`](../reference/runtime-provided-tools.md#call-member) answers or delegation outcomes
+outstanding continues with those, and the message waits for the next turn end.
+
+The runtime keeps sending the message until the first of these stops it:
+
+| Stop | `stopped_by` | How the task ends |
+|---|---|---|
+| `limit` continuations were sent and the next turn ends | `limit` | `ok`, with that last turn's answer |
+| [`inference.max_turns`](#turn-limit-inferencemax_turns) is spent, at a turn end or inside a continued attempt | `max_turns` | `ok`, with the last turn end's answer |
+| A [spend ceiling](../reference/manifest.md#inference-max-session-tokens) refuses the next driver call of a continued attempt | `spend_ceiling` | `ok`, with the last turn end's answer. The refused call is not retried |
+| The [session deadline](#deadlines) falls while the task is being kept working | `deadline` | `ok`, with the last turn end's answer. The session still ends `deadline_reached`, and `mur run` exits with [`E-RUN-053`](../reference/diagnostics.md#e-run-053) |
+| `transport: process` left no harness session to resume | `no_session` | `ok`, with the last turn end's answer |
+
+"The last turn end's answer" is the text `out/result.txt`, `GetTask` and the stream's final status
+all carry. Anything else ends the task as it would without the option: a driver failure, an
+`end-without-answer`, a person's `CancelTask`,
+`mur stop` or `SIGTERM` and the formation's end are reported as they are, and `stopped_by` is
+`null`.
+
+Continuations happen inside one task:
+
+- `on-task-end` hooks run once, when the task ends, never per continuation. A hook that
+  [reopens](#task-reopening-commit_policy-reopen-task) the task starts it again with its feedback,
+  and the continuation count carries over: `limit` is per task, across reopens.
+- Each continuation writes one [`keep_working`](../reference/observability-schemas.md#keep-working)
+  trace record and one `working` status, `keep working <n> of <limit>`, on the
+  [stream](../reference/streaming-protocol.md#working-messages); `task_end.keep_working` records `used`, `limit` and
+  `stopped_by`, and `mur trace show` prints `kept working: 2 of 2 (stopped by limit)`.
+- The agent reads how many continuations are used and left in the `keep_working` field of
+  [`session-status`](../reference/runtime-provided-tools.md#session-status).
+
+The runtime never judges whether the work is done, and adds no wording of its own: the message is
+the operator's, and nothing about the option enters the system prompt, `MURMUR.md` or the
+`[Capsule]` block.
+
+Every continuation resends the whole context, so each one costs at least the input of the turn
+before it, and a task's cost grows with every continuation. To measure what the option buys, run
+the capsule through [`mur eval run`](../reference/cli.md#mur-eval-run), run a copy of the capsule
+directory whose manifest omits `lifecycle.keep_working` the same way, and compare the two sessions
+with [`mur eval diff`](../reference/cli.md#mur-eval-diff).
 
 ## Task reopening (`commit_policy: reopen-task`) { #task-reopening-commit_policy-reopen-task }
 

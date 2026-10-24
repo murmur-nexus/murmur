@@ -56,7 +56,7 @@ section that explains it.
 | `E-IO-004` | `HOME` is unset, relative, or names a directory in which `~/.murmur` cannot be created, so there is nowhere to keep a session's runtime and records directories | [E-IO-004](#e-io-004) |
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
-| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication), a credential scope that names a retired door method, a `network.authentication` declared beside a non-empty `capabilities.spawn.allow`, a `lifecycle.queue_depth: 0` under `task_acceptance: queue`, a top-level `mur_version`, which is pinned as [`deploy.mur_version`](manifest.md#field-deploy), a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds, an artifact name that is not `<scope>/<name>` where a full name is required, a scope on a `source:` entry, two `capabilities.spawn.allow` entries with one bare part, or a top-level `registry:` key | [E-MAN-003](#e-man-003) |
+| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication), a credential scope that names a retired door method, a `network.authentication` declared beside a non-empty `capabilities.spawn.allow`, a `lifecycle.queue_depth: 0` under `task_acceptance: queue`, a [`lifecycle.keep_working`](manifest.md#lifecycle-keep-working) block with a missing or blank `message` or a missing or zero `limit`, a top-level `mur_version`, which is pinned as [`deploy.mur_version`](manifest.md#field-deploy), a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds, an artifact name that is not `<scope>/<name>` where a full name is required, a scope on a `source:` entry, two `capabilities.spawn.allow` entries with one bare part, or a top-level `registry:` key | [E-MAN-003](#e-man-003) |
 | `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new-task) |
 | `E-NEW-002` | The name given to `mur new --roster`, or a capsule name derived from it, is not an artifact name | [`mur new --roster`](cli.md#mur-new-roster) |
 | `E-NEW-003` | The directory `mur new --roster` would write already exists | [`mur new --roster`](cli.md#mur-new-roster-writing) |
@@ -1415,12 +1415,13 @@ meets one only in a store written some other way.
 ### E-RUN-053 — the session reached its deadline { #e-run-053 }
 
 [`mur run --deadline <SECONDS>`](cli.md#mur-run-deadline) ends the session that many seconds after
-`mur run` started. Reached, the running task is cancelled, the session's teardown runs, and the run
-exits `1`:
+`mur run` started. Reached, the running task is cancelled — or, when
+[`lifecycle.keep_working`](manifest.md#lifecycle-keep-working) is keeping it working, ends `ok` with
+its last turn end's answer — the session's teardown runs, and the run exits `1`:
 
 ```text
 status:  deadline_reached
-error[E-RUN-053]: the session reached its --deadline of 600 seconds; the runtime cancelled the running task and ended the session
+error[E-RUN-053]: the session reached its --deadline of 600 seconds; the runtime stopped the running task and ended the session
   hint: raise --deadline, or set lifecycle.deadline_notice_secs so the agent is told sooner; `mur trace show <session>` shows where the task was when the deadline fell
 ```
 
@@ -1431,7 +1432,7 @@ the one it inherited, from its formation's `--deadline` or from the capsule that
 the message names the moment instead:
 
 ```text
-error[E-RUN-053]: the session reached the deadline it inherited, at 2026-10-20T14:00:00Z, from the formation or the capsule that launched it; the runtime cancelled the running task and ended the session
+error[E-RUN-053]: the session reached the deadline it inherited, at 2026-10-20T14:00:00Z, from the formation or the capsule that launched it; the runtime stopped the running task and ended the session
   hint: raise the --deadline the formation or the delegating capsule was launched with; `mur trace show <session>` shows where the task was when the deadline fell
 ```
 

@@ -1364,6 +1364,12 @@ pub(crate) struct TaskRegistry {
     /// The instant of each task's last change, stamped beside its revision: its status's
     /// `timestamp`, and what `ListTasks`' `statusTimestampAfter` compares against.
     status_times: HashMap<String, DateTime<Utc>>,
+    /// Tasks kept working under `lifecycle.keep_working` that hold an answer from an earlier turn
+    /// end, which the session deadline ends `completed` with that answer rather than `canceled`.
+    standing_answers: HashSet<String>,
+    /// Tasks holding a standing answer whose signal the session deadline raised without
+    /// recording `Canceled`; read by [`Self::stopped_at_deadline`].
+    stopped_at_deadline: HashSet<String>,
 }
 
 /// The `status.message` of a task refused because the session ended before it started.
@@ -1399,6 +1405,8 @@ impl TaskRegistry {
             revision: 0,
             revisions: HashMap::new(),
             status_times: HashMap::new(),
+            standing_answers: HashSet::new(),
+            stopped_at_deadline: HashSet::new(),
         }
     }
 
@@ -1552,6 +1560,8 @@ impl TaskRegistry {
         self.input_waiters.remove(&tid);
         self.input_timeouts.remove(&tid);
         self.cancels.remove(&tid);
+        self.standing_answers.remove(&tid);
+        self.stopped_at_deadline.remove(&tid);
         // An accepted cancel is final. A turn a person stopped must never later read as one
         // that ran to completion, so the outcome the loop reports loses to the one already
         // recorded.
@@ -1670,18 +1680,48 @@ impl TaskRegistry {
         CancelOutcome::Accepted
     }
 
+    /// Mark `task_id` as holding a standing answer: an earlier turn end's answer, which the task
+    /// keeps while `lifecycle.keep_working` sends it on.
+    pub(crate) fn mark_standing_answer(&mut self, task_id: &str) {
+        self.standing_answers.insert(task_id.to_string());
+    }
+
+    /// Drop `task_id`'s standing-answer mark, as a reopen does: the reopened attempt has no
+    /// answer of its own yet.
+    pub(crate) fn clear_standing_answer(&mut self, task_id: &str) {
+        self.standing_answers.remove(task_id);
+    }
+
+    /// Whether the session deadline stopped `task_id` while it held a standing answer, leaving
+    /// its state for the task loop to record.
+    pub(crate) fn stopped_at_deadline(&self, task_id: &str) -> bool {
+        self.stopped_at_deadline.contains(task_id)
+    }
+
     /// Cancel every task that is not yet terminal, and return the ids that were cancelled, sorted.
     ///
     /// Each goes through [`Self::request_cancel`], so a running task's signal is raised and a
     /// `submitted` task's queue slot is given back. A second call returns nothing: every task the
     /// first one touched is `Canceled`, which is terminal.
-    pub(crate) fn cancel_every_live(&mut self) -> Vec<String> {
+    ///
+    /// With `spare_standing_answers`, which the session deadline passes, a task holding a standing
+    /// answer ([`Self::mark_standing_answer`]) only has its signal raised and is marked
+    /// [`Self::stopped_at_deadline`]: its history is left as it is, it is not in the returned ids,
+    /// and the task loop ends it with that answer.
+    pub(crate) fn cancel_every_live(&mut self, spare_standing_answers: bool) -> Vec<String> {
         let live: Vec<String> = self
             .history
             .iter()
             .filter(|(_, (state, _))| !state.is_terminal())
             .map(|(task_id, _)| task_id.clone())
             .collect();
+        let (spared, live): (Vec<String>, Vec<String>) = live
+            .into_iter()
+            .partition(|task_id| spare_standing_answers && self.standing_answers.contains(task_id));
+        for task_id in spared {
+            self.cancel_watch(&task_id).cancel();
+            self.stopped_at_deadline.insert(task_id);
+        }
         let mut canceled: Vec<String> = live
             .into_iter()
             .filter(|task_id| matches!(self.request_cancel(task_id), CancelOutcome::Accepted))
@@ -2618,14 +2658,74 @@ mod tests {
         r.start_task("tsk_a".to_string(), "ctx_001".to_string(), TaskLane::Bg);
         let running = r.cancel_watch("tsk_a");
 
-        assert_eq!(r.cancel_every_live(), vec!["tsk_a", "tsk_c"]);
+        assert_eq!(r.cancel_every_live(false), vec!["tsk_a", "tsk_c"]);
         assert!(running.is_canceled());
         assert!(r.is_canceled("tsk_c"));
         assert_eq!(
             r.get_task("tsk_done").unwrap().status.state,
             TaskState::Completed
         );
-        assert!(r.cancel_every_live().is_empty());
+        assert!(r.cancel_every_live(false).is_empty());
+    }
+
+    /// The deadline spares a running task holding a standing answer: its signal is raised, its
+    /// history stays non-terminal, and the state the task loop then reports is the one recorded.
+    #[test]
+    fn cancel_every_live_at_the_deadline_spares_a_task_holding_a_standing_answer() {
+        let mut r = TaskRegistry::new(8, TaskAcceptance::Queue);
+        r.enqueue("tsk_a", "ctx_001");
+        r.enqueue("tsk_b", "ctx_001");
+        r.start_task("tsk_a".to_string(), "ctx_001".to_string(), TaskLane::Bg);
+        let running = r.cancel_watch("tsk_a");
+        r.mark_standing_answer("tsk_a");
+
+        assert_eq!(r.cancel_every_live(true), vec!["tsk_b"]);
+        assert!(running.is_canceled());
+        assert!(!r.is_canceled("tsk_a"));
+        assert!(!r.get_task("tsk_a").unwrap().status.state.is_terminal());
+        assert!(r.stopped_at_deadline("tsk_a"));
+        assert!(
+            r.is_canceled("tsk_b"),
+            "an unmarked task is cancelled at once"
+        );
+
+        assert_eq!(
+            r.finish_task(TaskState::Completed),
+            Some(TaskState::Completed)
+        );
+        assert_eq!(
+            r.get_task("tsk_a").unwrap().status.state,
+            TaskState::Completed
+        );
+        assert!(
+            !r.stopped_at_deadline("tsk_a"),
+            "finish_task clears the mark"
+        );
+    }
+
+    /// Only the deadline spares: every other termination cancels a marked task at once.
+    #[test]
+    fn cancel_every_live_without_sparing_cancels_a_task_holding_a_standing_answer() {
+        let mut r = running_registry("tsk_001");
+        r.mark_standing_answer("tsk_001");
+        assert_eq!(r.cancel_every_live(false), vec!["tsk_001"]);
+        assert!(r.is_canceled("tsk_001"));
+        assert!(!r.stopped_at_deadline("tsk_001"));
+        assert_eq!(
+            r.finish_task(TaskState::Completed),
+            Some(TaskState::Canceled)
+        );
+    }
+
+    /// A cleared mark is not spared.
+    #[test]
+    fn cancel_every_live_at_the_deadline_cancels_a_task_whose_mark_was_cleared() {
+        let mut r = running_registry("tsk_001");
+        r.mark_standing_answer("tsk_001");
+        r.clear_standing_answer("tsk_001");
+        assert_eq!(r.cancel_every_live(true), vec!["tsk_001"]);
+        assert!(r.is_canceled("tsk_001"));
+        assert!(!r.stopped_at_deadline("tsk_001"));
     }
 
     #[test]

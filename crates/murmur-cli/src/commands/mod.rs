@@ -166,6 +166,10 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
             E_MAN_003,
             format!("{MANIFEST_FILENAME}: invalid trace config for '{field}': {message}"),
         ),
+        RuntimeManifestError::InvalidLifecycleConfig { field, message } => CliError::new(
+            E_MAN_003,
+            format!("{MANIFEST_FILENAME}: invalid lifecycle config for '{field}': {message}"),
+        ),
         error @ RuntimeManifestError::GatewayWithoutCredential { .. } => CliError::with_hint(
             E_CAP_018,
             error.to_string(),

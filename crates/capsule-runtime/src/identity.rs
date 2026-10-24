@@ -2706,7 +2706,7 @@ fn handle_stop_session(
     live_delegations: &LiveDelegations,
     session_id: &str,
 ) -> String {
-    let canceled = task_registry.lock().unwrap().cancel_every_live();
+    let canceled = task_registry.lock().unwrap().cancel_every_live(false);
 
     // Read after every cancellation is recorded, so nothing this snapshot names can have been
     // started by a task afterwards.

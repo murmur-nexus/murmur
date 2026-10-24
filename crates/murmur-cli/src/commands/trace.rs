@@ -578,6 +578,66 @@ struct TaskEndEvent {
     /// pre-slice traces, so it defaults to 0.
     #[serde(default)]
     reopen_count: u32,
+    /// How `lifecycle.keep_working` went for this task; absent when the capsule does not set it.
+    #[serde(default)]
+    keep_working: Option<KeepWorkingEnd>,
+}
+
+/// `task_end.keep_working`. Every field defaults, so a partial object still parses.
+#[derive(Debug, Deserialize)]
+struct KeepWorkingEnd {
+    #[serde(default)]
+    used: u32,
+    #[serde(default)]
+    limit: u32,
+    /// `limit`, `max_turns`, `spend_ceiling`, `deadline` or `no_session`; `null` when the task
+    /// ended on anything else.
+    #[serde(default)]
+    stopped_by: Option<String>,
+}
+
+impl KeepWorkingEnd {
+    /// The Turns section's `kept working:` line for one task.
+    fn line(&self) -> String {
+        match &self.stopped_by {
+            Some(stop) => format!(
+                "kept working: {} of {} (stopped by {stop})",
+                self.used, self.limit
+            ),
+            None => format!("kept working: {} of {}", self.used, self.limit),
+        }
+    }
+}
+
+/// `lifecycle.keep_working` sent its message after a turn end. Every field defaults, so a line
+/// missing one still parses.
+#[derive(Debug, Deserialize)]
+struct KeepWorkingEvent {
+    /// 1-based ordinal of this continuation within its task.
+    #[serde(default)]
+    number: u32,
+    #[serde(default)]
+    limit: u32,
+    /// `null` when `inference.max_turns` sets no cap.
+    #[serde(default)]
+    turns_remaining: Option<u32>,
+    #[serde(default)]
+    message_bytes: u64,
+}
+
+impl KeepWorkingEvent {
+    /// `<number> of <limit>  turns remaining <n>  message <bytes> bytes`, the part `show` and
+    /// `steps` render alike.
+    fn detail(&self) -> String {
+        format!(
+            "{} of {}  turns remaining {}  message {} bytes",
+            self.number,
+            self.limit,
+            self.turns_remaining
+                .map_or_else(|| "no cap".to_string(), |turns| turns.to_string()),
+            self.message_bytes
+        )
+    }
 }
 
 /// A person stopped this task, and what the runtime left running when it stopped.
@@ -1075,6 +1135,7 @@ enum TraceEvent {
     TaskEnd(TaskEndEvent),
     TaskReopened(TaskReopenedEvent),
     TaskContinued(TaskContinuedEvent),
+    KeepWorking(KeepWorkingEvent),
     TaskCanceled(TaskCanceledEvent),
     TaskRejected(TaskRejectedEvent),
     TaskFailed(TaskFailedEvent),
@@ -1431,6 +1492,10 @@ struct TraceMetrics {
     reopens: Vec<ReopenRecord>,
     /// Every `task_continued` record, in file order — one per round of handed-off work.
     continuations: Vec<TaskContinuedEvent>,
+    /// One row per `keep_working` record, in file order.
+    keep_working_rows: Vec<String>,
+    /// One `kept working:` line per `task_end` carrying `keep_working`, in file order.
+    kept_working: Vec<String>,
     /// Every `context_seed` record, in file order — one per seeded task.
     context_seeds: Vec<ContextSeedRecord>,
     /// Every `call_denied` record, in file order — one per call a policy hook refused.
@@ -1715,9 +1780,20 @@ fn session_status_row(status: &serde_json::Value) -> String {
     } else {
         status_value(context)
     };
+    // Only a session under `lifecycle.keep_working` reports an object here.
+    let keep_working = &status["keep_working"];
+    let keep_working = if keep_working.is_object() {
+        format!(
+            "  keep_working {} used {} left",
+            status_value(&keep_working["used"]),
+            status_value(&keep_working["left"])
+        )
+    } else {
+        String::new()
+    };
     format!(
         "session_status  elapsed {}s  left {left}  turns {}/{}  context {context}  tokens in {} \
-         out {}  spend {}/{}",
+         out {}  spend {}/{}{keep_working}",
         status_value(&status["time"]["elapsed_secs"]),
         status_value(&status["turns"]["used"]),
         status_value(&status["turns"]["cap"]),
@@ -2279,6 +2355,8 @@ fn compute_metrics(
     let mut failures: Vec<TaskFailedEvent> = Vec::new();
     let mut reopens: Vec<ReopenRecord> = Vec::new();
     let mut continuations: Vec<TaskContinuedEvent> = Vec::new();
+    let mut keep_working_rows: Vec<String> = Vec::new();
+    let mut kept_working: Vec<String> = Vec::new();
     let mut context_seeds: Vec<ContextSeedRecord> = Vec::new();
     let mut denials: Vec<DenialRecord> = Vec::new();
     let mut protected_path_denials: Vec<ProtectedPathDenialRecord> = Vec::new();
@@ -2415,6 +2493,9 @@ fn compute_metrics(
                 task_starts.insert(e.task_id.clone());
             }
             TraceEvent::TaskEnd(e) => {
+                if let Some(keep_working) = &e.keep_working {
+                    kept_working.push(keep_working.line());
+                }
                 if task_starts.remove(&e.task_id) {
                     task_metrics.push(TaskMetrics {
                         task_id: e.task_id,
@@ -2451,6 +2532,9 @@ fn compute_metrics(
                 });
             }
             TraceEvent::TaskContinued(e) => continuations.push(e),
+            TraceEvent::KeepWorking(e) => {
+                keep_working_rows.push(format!("keep working: {}", e.detail()));
+            }
             TraceEvent::ContextSeed(e) => {
                 context_seeds.push(ContextSeedRecord {
                     hook_name: e.hook_name,
@@ -2749,6 +2833,8 @@ fn compute_metrics(
             failures,
             reopens,
             continuations,
+            keep_working_rows,
+            kept_working,
             context_seeds,
             denials,
             protected_path_denials,
@@ -3218,6 +3304,9 @@ fn print_show(m: &TraceMetrics) {
             .map_or_else(|| "no cap".to_string(), |max| max.to_string())
     );
     if let Some(line) = continued_line(&m.continuations) {
+        capsule_runtime::report_println!("{line}");
+    }
+    for line in m.keep_working_rows.iter().chain(&m.kept_working) {
         capsule_runtime::report_println!("{line}");
     }
     for (turn, row) in &m.retries {
@@ -4648,6 +4737,7 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.delegations.len(),
             fmt_dur(e.waited_ms)
         ),
+        TraceEvent::KeepWorking(e) => format!("{}{}", kind("keep_working"), e.detail()),
         TraceEvent::TaskCanceled(e) => format!(
             "{}{}  {}",
             kind("task_canceled"),
@@ -6964,6 +7054,98 @@ mod tests {
         };
         assert!(e.member_calls.is_empty() && e.delegations.is_empty());
         assert_eq!(e.waited_ms, 0);
+    }
+
+    const KEEP_WORKING_1: &str = r#"{"event_type":"keep_working","event_id":"evt_k1","parent_id":"evt_2","session_id":"s","timestamp":7,"task_id":"tsk_1","number":1,"limit":2,"turns_remaining":null,"message_bytes":66}"#;
+    const KEEP_WORKING_2: &str = r#"{"event_type":"keep_working","event_id":"evt_k2","parent_id":"evt_2","session_id":"s","timestamp":8,"task_id":"tsk_1","number":2,"limit":2,"turns_remaining":5,"message_bytes":66}"#;
+
+    /// A `keep_working` line parses into its own variant and its steps row gives the
+    /// continuation's number, the limit, the turns left and the message's size. A line missing
+    /// every field still parses.
+    #[test]
+    fn keep_working_renders_a_steps_row() {
+        assert_eq!(
+            row(KEEP_WORKING_1),
+            "keep_working 1 of 2  turns remaining no cap  message 66 bytes"
+        );
+        assert_eq!(
+            row(KEEP_WORKING_2),
+            "keep_working 2 of 2  turns remaining 5  message 66 bytes"
+        );
+        let bare =
+            r#"{"event_type":"keep_working","event_id":"evt_k3","session_id":"s","timestamp":9}"#;
+        let TraceEvent::KeepWorking(e) = serde_json::from_str::<TraceEvent>(bare).unwrap() else {
+            panic!("a keep_working line parses as KeepWorking");
+        };
+        assert_eq!(
+            (e.number, e.limit, e.turns_remaining, e.message_bytes),
+            (0, 0, None, 0)
+        );
+    }
+
+    fn task_lines(task_end: &str) -> String {
+        format!(
+            "{UNENDED_START}\n\
+             {{\"event_type\":\"task_start\",\"event_id\":\"evt_2\",\"session_id\":\"s\",\"timestamp\":2,\"task_id\":\"tsk_1\",\"context_id\":\"ctx\",\"source\":\"task.md\",\"input_bytes\":4}}\n\
+             {KEEP_WORKING_1}\n{KEEP_WORKING_2}\n\
+             {{\"event_type\":\"task_end\",\"event_id\":\"evt_9\",\"session_id\":\"s\",\"timestamp\":9,\"task_id\":\"tsk_1\",\"exit_status\":\"ok\",\"duration_ms\":10,\"turns\":3,\"input_tokens\":1,\"output_tokens\":1,\"tool_calls\":0,\"shell_calls\":0,\"reopen_count\":0{task_end}}}\n"
+        )
+    }
+
+    /// `show` gives one Turns-section row per `keep_working` record and one `kept working:` line
+    /// per task that carries `task_end.keep_working`, naming what stopped it.
+    #[test]
+    fn show_renders_keep_working_records_and_the_task_s_summary() {
+        let (_dir, path) = trace_of(&task_lines(
+            r#","keep_working":{"used":2,"limit":2,"stopped_by":"limit"}"#,
+        ));
+        let (metrics, _) = load_metrics_for_show(&path).expect("the trace shows");
+        assert_eq!(
+            metrics.keep_working_rows,
+            [
+                "keep working: 1 of 2  turns remaining no cap  message 66 bytes",
+                "keep working: 2 of 2  turns remaining 5  message 66 bytes",
+            ]
+        );
+        assert_eq!(
+            metrics.kept_working,
+            ["kept working: 2 of 2 (stopped by limit)"]
+        );
+
+        let (_dir, path) = trace_of(&task_lines(
+            r#","keep_working":{"used":1,"limit":1000,"stopped_by":null}"#,
+        ));
+        let (metrics, _) = load_metrics_for_show(&path).expect("the trace shows");
+        assert_eq!(metrics.kept_working, ["kept working: 1 of 1000"]);
+    }
+
+    /// A trace with no `keep_working` records and no `task_end.keep_working` adds nothing.
+    #[test]
+    fn show_without_keep_working_adds_no_line() {
+        let (_dir, path) = trace_of(&format!("{UNENDED_START}\n"));
+        let (metrics, _) = load_metrics_for_show(&path).expect("the trace shows");
+        assert!(metrics.keep_working_rows.is_empty());
+        assert!(metrics.kept_working.is_empty());
+    }
+
+    /// A `session_status` row names `keep_working` only when the session reported an object.
+    #[test]
+    fn session_status_row_names_keep_working_only_when_set() {
+        let mut status = serde_json::json!({
+            "time": {"elapsed_secs": 3, "task_elapsed_secs": 2, "deadline": "none"},
+            "turns": {"used": 1, "cap": "none"},
+            "context": "unknown",
+            "tokens": {"input": 1, "output": 2},
+            "spend": {"tokens": 3, "ceiling": "none"},
+        });
+        let without = session_status_row(&status);
+        status["keep_working"] = serde_json::json!("none");
+        assert_eq!(session_status_row(&status), without);
+        status["keep_working"] = serde_json::json!({"used": 1, "left": 1});
+        assert_eq!(
+            session_status_row(&status),
+            format!("{without}  keep_working 1 used 1 left")
+        );
     }
 
     /// A `tool_input_refused` line parses into its own variant, and its row names the tool and

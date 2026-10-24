@@ -83,6 +83,22 @@ pub struct LifecycleConfig {
     /// minutes, or a tenth of the deadline when that is shorter, and at least one second. `0`
     /// sends no notice. Inert for a session launched with no deadline.
     pub deadline_notice_secs: Option<u64>,
+    /// Keeps a task's agent working past its turn ends: each time an attempt ends at a turn end,
+    /// the runtime sends [`KeepWorking::message`] as the next user message in the same
+    /// conversation, up to [`KeepWorking::limit`] times per task. `None` (the default, and what a
+    /// manifest without `lifecycle.keep_working` gets) ends a task at its first turn end.
+    pub keep_working: Option<KeepWorking>,
+}
+
+/// `lifecycle.keep_working`: what the runtime sends when a task's attempt ends at a turn end, and
+/// how many times per task it does so. Both fields are required; see
+/// [`LifecycleConfig::keep_working`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeepWorking {
+    /// Sent verbatim, unfenced, as the next user message. Never blank.
+    pub message: String,
+    /// How many continuations one task may receive. At least 1.
+    pub limit: u32,
 }
 
 impl LifecycleConfig {
@@ -137,6 +153,7 @@ impl Default for LifecycleConfig {
             shell_grace_secs: 10,
             delegation_deadline_secs: 600,
             deadline_notice_secs: None,
+            keep_working: None,
         }
     }
 }
@@ -1973,6 +1990,12 @@ pub enum RuntimeManifestError {
     TopLevelMurVersion,
     #[error("{}: invalid trace config for '{field}': {message}", MANIFEST_FILENAME)]
     InvalidTraceConfig { field: String, message: String },
+    /// A `lifecycle` field holds a value the runtime cannot act on; `field` is its dotted path.
+    #[error(
+        "{}: invalid lifecycle config for '{field}': {message}",
+        MANIFEST_FILENAME
+    )]
+    InvalidLifecycleConfig { field: String, message: String },
     /// A field naming an artifact to resolve does not hold a full `<scope>/<name>`, or a
     /// `source:` entry's name is not a bare name. `hint` names the form to write instead.
     #[error("{}: invalid artifact name in '{field}': {message}", MANIFEST_FILENAME)]
@@ -2165,6 +2188,18 @@ struct RawLifecycleConfig {
     delegation_deadline_secs: Option<u64>,
     #[serde(default)]
     deadline_notice_secs: Option<u64>,
+    #[serde(default)]
+    keep_working: Option<RawKeepWorking>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawKeepWorking {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2802,6 +2837,33 @@ impl RawBlock for RawFileExport {
     }
 }
 
+/// Resolves `lifecycle.keep_working`, refusing a missing or blank `message` and a missing or zero
+/// `limit`. The message keeps the operator's bytes as written: only the blank check trims.
+fn parse_keep_working(raw: RawKeepWorking) -> Result<KeepWorking, RuntimeManifestError> {
+    let invalid = |field: &str, message: &str| RuntimeManifestError::InvalidLifecycleConfig {
+        field: format!("lifecycle.keep_working.{field}"),
+        message: message.to_string(),
+    };
+    let message = match raw.message {
+        None => return Err(invalid("message", "is required")),
+        Some(message) if message.trim().is_empty() => {
+            return Err(invalid("message", "must not be blank"))
+        }
+        Some(message) => message,
+    };
+    let limit = match raw.limit {
+        None => return Err(invalid("limit", "is required")),
+        Some(0) => {
+            return Err(invalid(
+                "limit",
+                "must be at least 1; omit lifecycle.keep_working to turn the option off",
+            ))
+        }
+        Some(limit) => limit,
+    };
+    Ok(KeepWorking { message, limit })
+}
+
 impl RawBlock for RawLifecycleConfig {
     const KNOWN_KEYS: &'static [&'static str] = &[
         "task_acceptance",
@@ -2813,7 +2875,21 @@ impl RawBlock for RawLifecycleConfig {
         "shell_grace_secs",
         "delegation_deadline_secs",
         "deadline_notice_secs",
+        "keep_working",
     ];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        if let Some(keep_working) = &self.keep_working {
+            collect_block(keep_working, &child_path(path, "keep_working"), out);
+        }
+    }
+}
+
+impl RawBlock for RawKeepWorking {
+    const KNOWN_KEYS: &'static [&'static str] = &["message", "limit"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
@@ -3854,6 +3930,7 @@ impl RuntimeManifest {
                         .delegation_deadline_secs
                         .unwrap_or(defaults.delegation_deadline_secs),
                     deadline_notice_secs: raw_lc.deadline_notice_secs,
+                    keep_working: raw_lc.keep_working.map(parse_keep_working).transpose()?,
                 };
                 if lifecycle.queue_has_room() {
                     Ok(lifecycle)
@@ -11478,6 +11555,107 @@ context:
     #[test]
     fn lifecycle_deadline_notice_secs_is_a_known_key() {
         assert!(RawLifecycleConfig::KNOWN_KEYS.contains(&"deadline_notice_secs"));
+    }
+
+    fn lifecycle_with_keep_working(block: &str) -> Result<RuntimeManifest, RuntimeManifestError> {
+        RuntimeManifest::from_yaml_str(&format!(
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  keep_working:\n{block}"
+        ))
+    }
+
+    fn refused_keep_working_field(block: &str) -> (String, String) {
+        match lifecycle_with_keep_working(block) {
+            Err(RuntimeManifestError::InvalidLifecycleConfig { field, message }) => {
+                (field, message)
+            }
+            other => panic!("expected InvalidLifecycleConfig for {block:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lifecycle_keep_working_is_off_when_absent() {
+        let without_block =
+            RuntimeManifest::from_yaml_str("name: cap\nversion: 0.0.1\nartifacts: []\n").unwrap();
+        assert_eq!(without_block.effective_lifecycle().keep_working, None);
+        let without_key = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  queue_depth: 3\n",
+        )
+        .unwrap();
+        assert_eq!(without_key.lifecycle.unwrap().keep_working, None);
+    }
+
+    #[test]
+    fn lifecycle_keep_working_takes_the_declared_message_and_limit() {
+        let manifest =
+            lifecycle_with_keep_working("    message: \"go on\"\n    limit: 3\n").unwrap();
+        assert!(
+            manifest.unknown_keys.is_empty(),
+            "{:?}",
+            manifest.unknown_keys
+        );
+        assert_eq!(
+            manifest.lifecycle.unwrap().keep_working,
+            Some(KeepWorking {
+                message: "go on".into(),
+                limit: 3
+            })
+        );
+    }
+
+    /// The blank check trims; the message the runtime sends is the operator's bytes as written.
+    #[test]
+    fn lifecycle_keep_working_keeps_the_message_as_written() {
+        let manifest =
+            lifecycle_with_keep_working("    message: \"  go on \\n\"\n    limit: 1\n").unwrap();
+        assert_eq!(
+            manifest.lifecycle.unwrap().keep_working.unwrap().message,
+            "  go on \n"
+        );
+    }
+
+    #[test]
+    fn lifecycle_keep_working_refuses_a_missing_or_blank_message() {
+        for block in [
+            "    limit: 3\n",
+            "    message: \"\"\n    limit: 3\n",
+            "    message: \"  \\n\\t \"\n    limit: 3\n",
+        ] {
+            let (field, _) = refused_keep_working_field(block);
+            assert_eq!(field, "lifecycle.keep_working.message", "{block:?}");
+        }
+    }
+
+    #[test]
+    fn lifecycle_keep_working_refuses_a_missing_limit() {
+        let (field, message) = refused_keep_working_field("    message: go on\n");
+        assert_eq!(field, "lifecycle.keep_working.limit");
+        assert_eq!(message, "is required");
+    }
+
+    #[test]
+    fn lifecycle_keep_working_refuses_a_zero_limit_and_says_how_to_turn_it_off() {
+        let (field, message) = refused_keep_working_field("    message: go on\n    limit: 0\n");
+        assert_eq!(field, "lifecycle.keep_working.limit");
+        assert!(
+            message.contains("omit lifecycle.keep_working"),
+            "the refusal says how to turn the option off: {message}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_keep_working_reports_an_unknown_key_inside_the_block() {
+        assert!(RawLifecycleConfig::KNOWN_KEYS.contains(&"keep_working"));
+        let manifest =
+            lifecycle_with_keep_working("    message: go on\n    limit: 2\n    lmit: 3\n").unwrap();
+        let reported: Vec<(String, String)> = manifest
+            .unknown_keys
+            .iter()
+            .map(|key| (key.key.clone(), key.block_path.clone()))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![("lmit".to_string(), "lifecycle.keep_working".to_string())]
+        );
     }
 
     /// `0` is a valid explicit value, not an absent one: it demotes at the first poll after the
