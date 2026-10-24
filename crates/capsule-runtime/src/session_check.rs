@@ -144,7 +144,8 @@ pub struct CheckOutcome {
 pub struct CheckRunner {
     session_id: String,
     policy: CapabilityPolicy,
-    declared_floor: murmur_artifact::ContainmentClass,
+    /// The session's own decision, so the check installs the tier the session's commands ran on.
+    containment: crate::containment::ContainmentDecision,
     host_probe: HostProbe,
     temp_mapping: crate::temp_dir::TempMapping,
     accessible_root: WorkdirRoot,
@@ -152,7 +153,6 @@ pub struct CheckRunner {
     records_dir: PathBuf,
     /// `~/.murmur/sessions`, where the session's runtime directory was and the check's goes.
     sessions_dir: Option<PathBuf>,
-    containment: murmur_artifact::ContainmentClass,
 }
 
 impl StagedSession {
@@ -163,7 +163,7 @@ impl StagedSession {
         CheckRunner {
             session_id: self.session_id.clone(),
             policy: self.capability_policy.clone(),
-            declared_floor: self.declared_containment_floor,
+            containment: self.containment,
             host_probe: self.host_probe.clone(),
             temp_mapping: self.temp_mapping,
             accessible_root: self.accessible_root.clone(),
@@ -174,7 +174,6 @@ impl StagedSession {
                 .parent()
                 .and_then(Path::parent)
                 .map(Path::to_path_buf),
-            containment: self.scope_report.achieved_containment,
         }
     }
 }
@@ -186,7 +185,7 @@ impl CheckRunner {
     /// Call only after `launch_session` has returned: the session's processes are dead then, and
     /// nothing the session started can see the files or the command.
     pub fn run(&self, check: &SessionCheck) -> CheckOutcome {
-        let containment = self.containment.as_str().to_string();
+        let containment = self.containment.achieved().as_str().to_string();
         let error = |error: String| CheckOutcome {
             result: CheckResult::Error,
             exit_code: None,
@@ -319,7 +318,7 @@ impl CheckRunner {
             roots = roots.with_home(home);
         }
         let enforcement =
-            ShellEnforcement::resolve(&self.policy, self.declared_floor, self.host_probe.clone())?
+            ShellEnforcement::resolve(&self.policy, &self.containment, self.host_probe.clone())?
                 .with_host_bounding(prepared.scope, Some(workdir_guard))
                 .with_runtime_dir(roots, None)
                 .with_temp_mapping(self.temp_mapping);
