@@ -304,13 +304,6 @@ impl RunRecord {
     }
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis().try_into().unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}
-
 /// Writes `record` to `path` at `0600`, replacing what is there in one rename.
 fn write_record(path: &Path, record: &EvalRunRecord) -> Result<(), CliError> {
     let group = path.parent().unwrap_or(path);
@@ -598,8 +591,8 @@ struct PreparedCase {
 }
 
 /// `path`, made absolute against the current directory, as `task_path` is read.
-fn from_cwd(path: &str) -> PathBuf {
-    let path = Path::new(path);
+fn from_cwd(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
     if path.is_absolute() {
         return path.to_path_buf();
     }
@@ -854,10 +847,10 @@ pub(crate) fn run_eval_run(args: EvalRunArgs<'_>) -> Result<(), CliError> {
     let mut record = EvalRunRecord {
         record_version: RECORD_VERSION,
         run_id: run_id.clone(),
-        started_at_ms: now_ms(),
+        started_at_ms: capsule_runtime::retention::now_ms(),
         ended_at_ms: None,
         complete: false,
-        dataset: resolved_dataset.display().to_string(),
+        dataset: from_cwd(&resolved_dataset).display().to_string(),
         repeat: args.repeat,
         arms: arms.iter().map(Arm::record).collect::<Result<_, _>>()?,
         cases: prepared
@@ -914,7 +907,7 @@ pub(crate) fn run_eval_run(args: EvalRunArgs<'_>) -> Result<(), CliError> {
     }
 
     record.complete = true;
-    record.ended_at_ms = Some(now_ms());
+    record.ended_at_ms = Some(capsule_runtime::retention::now_ms());
     write_record(&record_path, &record)?;
 
     capsule_runtime::report_println!();

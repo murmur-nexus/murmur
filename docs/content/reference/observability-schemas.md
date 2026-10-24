@@ -1565,8 +1565,7 @@ The 32 hex characters are a uuid v7, so the names sort by when the runs started.
 replaced in one rename after every run with `complete: false`, and a last time with
 `complete: true`, so an interrupted run leaves a record of the runs it finished.
 [`mur eval diff --run`](cli.md#mur-eval-diff-run) reads it and nothing else: the record holds
-every measure it prints, copied from the sessions' traces when they ran. The runtime never writes
-it; `mur eval run` does.
+every measure it prints, copied from the sessions' traces when they ran.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -1624,7 +1623,7 @@ Each `runs[]` entry:
 | `resource_limit` | string \| null | The host resource limit that killed the command |
 | `output_tail` | string | The last 4096 bytes of stdout followed by stderr |
 | `output_log` | string \| null | `logs/check.log` in the session's records directory, `0600`, holding stdout then stderr |
-| `error` | string \| null | Why the result is `error`, naming the path a refused copy stopped at |
+| `error` | string \| null | Why the result is `error`, naming the path a refused copy stopped at; beside another result, why `logs/check.log` could not be written |
 | `containment` | string | The class the session's `session_start.containment_achieved` recorded, which the check ran under |
 
 ### Start digest { #start-digest }

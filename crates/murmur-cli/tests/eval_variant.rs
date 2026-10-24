@@ -316,17 +316,25 @@ fn a_variant_that_fixes_the_bug_passes_its_checks_and_the_baseline_does_not() {
                "check": {"command": "grep -q fixed main.txt", "timeout_secs": 30}}),
     ]);
 
-    let stdout = run_ok(
-        world
-            .mur()
-            .args(["eval", "run", "base", "--variant", "./variant"]),
-    );
+    let stdout = run_ok(world.mur().args([
+        "eval",
+        "run",
+        "base",
+        "--dataset",
+        "eval.jsonl",
+        "--variant",
+        "./variant",
+    ]));
 
     let records = world.run_records("base");
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(mode(&records[0]), 0o600);
     let record = read_json(&records[0]);
     assert_eq!(record["complete"], true);
+    assert_eq!(
+        record["dataset"],
+        world.path("eval.jsonl").display().to_string()
+    );
     assert_eq!(record["record_version"], 1);
     assert_eq!(record["arms"][0]["name"], "baseline");
     assert_eq!(record["arms"][1]["name"], "variant");

@@ -6,10 +6,11 @@
 //! body any of them reaches to parse an ordinal, match a suffix, recognise a full id or pass a
 //! literal path through; every command reaches it through a [`SessionQuery`] carrying the three
 //! things the vocabulary itself cannot know. `mur eval diff --run` names an eval-run record
-//! (`evr_<id>.json`, beside the sessions) the same way, through [`EVAL_RUN`]. `mur trace list` prints the candidates in the order
-//! ordinals count them, through [`sessions_newest_first`]. `mur trace rm` speaks the vocabulary
-//! less the literal path, which it refuses by [`is_literal_path`], and accepts a full id by
-//! [`is_full_session_id`] while either half of that session is left.
+//! (`evr_<id>.json`, beside the sessions) the same way, through [`EVAL_RUN`]. `mur trace list`
+//! prints the candidates in the order ordinals count them, through [`sessions_newest_first`].
+//! `mur trace rm` speaks the vocabulary less the literal path, which it refuses by
+//! [`is_literal_path`], and accepts a full id by [`is_full_session_id`] while either half of that
+//! session is left.
 //!
 //! The candidates are the sessions of one **workdir root** — the directory a run was given as
 //! `--workdir`, or `<manifest-dir>/workdir` — whose records directories sit in that root's records

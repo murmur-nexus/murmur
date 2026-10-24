@@ -99,12 +99,6 @@ impl SessionCheck {
     pub fn files(&self) -> Option<&Path> {
         self.files.as_deref()
     }
-
-    /// How long the command may run before it is killed.
-    #[must_use]
-    pub fn timeout(&self) -> Duration {
-        self.timeout
-    }
 }
 
 /// How a check ended.
@@ -186,12 +180,6 @@ impl StagedSession {
 }
 
 impl CheckRunner {
-    /// The session's records directory, where [`CHECK_LOG_FILE`] goes.
-    #[must_use]
-    pub fn records_dir(&self) -> &Path {
-        &self.records_dir
-    }
-
     /// Copies `check`'s files into the work folder and runs its command there, under the
     /// session's containment, then kills everything it started. Every failure is an outcome.
     ///
