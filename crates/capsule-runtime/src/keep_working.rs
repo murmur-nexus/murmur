@@ -1,11 +1,10 @@
 //! `lifecycle.keep_working`: when a task kept working past a turn end stops being sent on.
 //!
 //! The runtime never judges whether the work is done. These functions only read budgets: how
-//! many continuations the task has had, the turns left under `inference.max_turns`, whether the
-//! conversation can be resumed, and how a continued attempt ended.
+//! many continuations the task has had, the turns left under `inference.max_turns` and whether the
+//! conversation can be resumed. How a continued attempt ended is [`crate::agent::budget_stop`]'s.
 
-use crate::agent::AgentLoopExit;
-use crate::errors::RuntimeError;
+use crate::agent::BudgetStop;
 
 /// What stopped a task from being kept working, recorded as `task_end.keep_working.stopped_by`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,19 +53,13 @@ pub(crate) fn stop_at_turn_end(
     }
 }
 
-/// Whether a continued attempt ended on a budget, which ends the task with the answer it already
-/// holds. `stopped_at_deadline` is whether the task registry recorded the task as stopped by the
-/// session deadline; a `Canceled` attempt it did not stop (a person's cancel, `SIGTERM`, the
-/// formation's end) is `None`, as is every other ending.
-pub(crate) fn budget_stop(
-    result: &Result<AgentLoopExit, RuntimeError>,
-    stopped_at_deadline: bool,
-) -> Option<KeepWorkingStop> {
-    match result {
-        Ok(AgentLoopExit::MaxTurnsReached) => Some(KeepWorkingStop::MaxTurns),
-        Ok(AgentLoopExit::SpendCeilingReached) => Some(KeepWorkingStop::SpendCeiling),
-        Ok(AgentLoopExit::Canceled) if stopped_at_deadline => Some(KeepWorkingStop::Deadline),
-        _ => None,
+impl From<BudgetStop> for KeepWorkingStop {
+    fn from(stop: BudgetStop) -> Self {
+        match stop {
+            BudgetStop::MaxTurns => Self::MaxTurns,
+            BudgetStop::SpendCeiling => Self::SpendCeiling,
+            BudgetStop::Deadline => Self::Deadline,
+        }
     }
 }
 
@@ -119,38 +112,6 @@ mod tests {
         assert_eq!(
             stop_at_turn_end(0, 5, None, false),
             Some(KeepWorkingStop::NoSession)
-        );
-    }
-
-    #[test]
-    fn a_continued_attempt_that_spent_a_budget_is_a_budget_stop() {
-        assert_eq!(
-            budget_stop(&Ok(AgentLoopExit::MaxTurnsReached), false),
-            Some(KeepWorkingStop::MaxTurns)
-        );
-        assert_eq!(
-            budget_stop(&Ok(AgentLoopExit::SpendCeilingReached), false),
-            Some(KeepWorkingStop::SpendCeiling)
-        );
-        assert_eq!(
-            budget_stop(&Ok(AgentLoopExit::Canceled), true),
-            Some(KeepWorkingStop::Deadline)
-        );
-    }
-
-    #[test]
-    fn every_other_ending_of_a_continued_attempt_is_reported_as_it_is() {
-        assert_eq!(budget_stop(&Ok(AgentLoopExit::Canceled), false), None);
-        for exit in [
-            AgentLoopExit::Ok,
-            AgentLoopExit::Failed,
-            AgentLoopExit::NoAnswer,
-        ] {
-            assert_eq!(budget_stop(&Ok(exit), true), None);
-        }
-        assert_eq!(
-            budget_stop(&Err(RuntimeError::AgentLoopFailed("boom".into())), true),
-            None
         );
     }
 }

@@ -509,6 +509,34 @@ impl AgentLoopExit {
     }
 }
 
+/// A budget that ended an attempt the runtime continued past a turn end — by
+/// `lifecycle.keep_working` or a `lifecycle.done_check` reopen. The task ends with the answer that
+/// preceded the continuation, and the mechanism that sent it records the stop under its own name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BudgetStop {
+    /// `inference.max_turns` was spent inside the continued attempt.
+    MaxTurns,
+    /// A spend ceiling refused the continued attempt's next driver call.
+    SpendCeiling,
+    /// The session deadline stopped the continued attempt.
+    Deadline,
+}
+
+/// Whether a continued attempt ended on a budget. `stopped_at_deadline` is whether the task
+/// registry recorded the task as stopped by the session deadline; a `Canceled` attempt it did not
+/// stop (a person's cancel, `SIGTERM`, the formation's end) is `None`, as is every other ending.
+pub(crate) fn budget_stop(
+    result: &Result<AgentLoopExit, RuntimeError>,
+    stopped_at_deadline: bool,
+) -> Option<BudgetStop> {
+    match result {
+        Ok(AgentLoopExit::MaxTurnsReached) => Some(BudgetStop::MaxTurns),
+        Ok(AgentLoopExit::SpendCeilingReached) => Some(BudgetStop::SpendCeiling),
+        Ok(AgentLoopExit::Canceled) if stopped_at_deadline => Some(BudgetStop::Deadline),
+        _ => None,
+    }
+}
+
 /// The A2A state a task is left in by an attempt that ended with `outcome`.
 ///
 /// The one classification every surface reads — the registry slot `GetTask` answers from, and
@@ -5108,6 +5136,38 @@ mod tests {
 
     /// The output cap the payload and occupancy tests build with.
     const OUTPUT_CAP: u32 = 8192;
+
+    #[test]
+    fn a_continued_attempt_that_spent_a_budget_is_a_budget_stop() {
+        assert_eq!(
+            budget_stop(&Ok(AgentLoopExit::MaxTurnsReached), false),
+            Some(BudgetStop::MaxTurns)
+        );
+        assert_eq!(
+            budget_stop(&Ok(AgentLoopExit::SpendCeilingReached), false),
+            Some(BudgetStop::SpendCeiling)
+        );
+        assert_eq!(
+            budget_stop(&Ok(AgentLoopExit::Canceled), true),
+            Some(BudgetStop::Deadline)
+        );
+    }
+
+    #[test]
+    fn every_other_ending_of_a_continued_attempt_is_reported_as_it_is() {
+        assert_eq!(budget_stop(&Ok(AgentLoopExit::Canceled), false), None);
+        for exit in [
+            AgentLoopExit::Ok,
+            AgentLoopExit::Failed,
+            AgentLoopExit::NoAnswer,
+        ] {
+            assert_eq!(budget_stop(&Ok(exit), true), None);
+        }
+        assert_eq!(
+            budget_stop(&Err(RuntimeError::AgentLoopFailed("boom".into())), true),
+            None
+        );
+    }
 
     use crate::spend::SpendLimit;
     use std::fs;

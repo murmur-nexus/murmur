@@ -5,7 +5,7 @@
 //! feedback is the run's facts — the command, its exit code and its capped output — with no
 //! wording about what to do next.
 
-use crate::agent::AgentLoopExit;
+use crate::agent::BudgetStop;
 use crate::errors::RuntimeError;
 use crate::shell::{ForegroundRun, ForegroundStopReason, ShellExecError};
 
@@ -116,18 +116,13 @@ impl DoneCheckTally {
     }
 }
 
-/// Whether an attempt reopened by the check ended on a budget, which ends the task with the
-/// answer that preceded the reopen. `stopped_at_deadline` is whether the task registry recorded
-/// the task as stopped by the session deadline.
-pub(crate) fn budget_stop(
-    result: &Result<AgentLoopExit, RuntimeError>,
-    stopped_at_deadline: bool,
-) -> Option<DoneCheckStop> {
-    match result {
-        Ok(AgentLoopExit::MaxTurnsReached) => Some(DoneCheckStop::MaxTurns),
-        Ok(AgentLoopExit::SpendCeilingReached) => Some(DoneCheckStop::SpendCeiling),
-        Ok(AgentLoopExit::Canceled) if stopped_at_deadline => Some(DoneCheckStop::Deadline),
-        _ => None,
+impl From<BudgetStop> for DoneCheckStop {
+    fn from(stop: BudgetStop) -> Self {
+        match stop {
+            BudgetStop::MaxTurns => Self::MaxTurns,
+            BudgetStop::SpendCeiling => Self::SpendCeiling,
+            BudgetStop::Deadline => Self::Deadline,
+        }
     }
 }
 
@@ -302,25 +297,6 @@ mod tests {
             decide(DoneCheckOutcome::TimedOut, 1, 5, Some(0)),
             DoneCheckVerdict::Unmet(DoneCheckStop::MaxTurns)
         );
-    }
-
-    #[test]
-    fn a_reopened_attempt_that_spent_a_budget_is_a_budget_stop() {
-        assert_eq!(
-            budget_stop(&Ok(AgentLoopExit::MaxTurnsReached), false),
-            Some(DoneCheckStop::MaxTurns)
-        );
-        assert_eq!(
-            budget_stop(&Ok(AgentLoopExit::SpendCeilingReached), false),
-            Some(DoneCheckStop::SpendCeiling)
-        );
-        assert_eq!(
-            budget_stop(&Ok(AgentLoopExit::Canceled), true),
-            Some(DoneCheckStop::Deadline)
-        );
-        assert_eq!(budget_stop(&Ok(AgentLoopExit::Canceled), false), None);
-        assert_eq!(budget_stop(&Ok(AgentLoopExit::Ok), true), None);
-        assert_eq!(budget_stop(&Ok(AgentLoopExit::Failed), true), None);
     }
 
     fn report(outcome: DoneCheckOutcome, exit_code: Option<i32>) -> DoneCheckReport {

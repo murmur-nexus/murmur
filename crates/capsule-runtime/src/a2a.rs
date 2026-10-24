@@ -1681,7 +1681,7 @@ impl TaskRegistry {
     }
 
     /// Mark `task_id` as holding a standing answer: an earlier turn end's answer, which the task
-    /// keeps while `lifecycle.keep_working` sends it on.
+    /// keeps while `lifecycle.keep_working` sends it on or `lifecycle.done_check` checks it.
     pub(crate) fn mark_standing_answer(&mut self, task_id: &str) {
         self.standing_answers.insert(task_id.to_string());
     }

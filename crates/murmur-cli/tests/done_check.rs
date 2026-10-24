@@ -249,7 +249,7 @@ fn assert_runs(trace: &[Value], expected: &[(&str, Value, bool, u32)]) {
     }
 }
 
-// ── S1: off ───────────────────────────────────────────────────────────────────
+// ── No block ──────────────────────────────────────────────────────────────────
 
 /// With no `lifecycle.done_check` nothing runs: the task ends at its first turn end.
 #[test]
@@ -269,7 +269,7 @@ fn without_the_block_nothing_runs() {
     assert_eq!(run.result(), "first");
 }
 
-// ── S2: fails once, then met ──────────────────────────────────────────────────
+// ── Fails once, then met ──────────────────────────────────────────────────────
 
 /// A check that fails once reopens the task once with the run's facts as the next user message,
 /// and the task ends `ok` with the check met. Nothing else changes in what the provider is sent.
@@ -359,7 +359,7 @@ fn run_control(home: &TempDir, project: &Project) -> Run {
     run(home, project, &[])
 }
 
-// ── S3 + S4: the limit ────────────────────────────────────────────────────────
+// ── The limit ─────────────────────────────────────────────────────────────────
 
 /// A check that always fails reopens up to its limit, then the task ends `ok` with the last
 /// answer and the check unmet.
@@ -417,7 +417,7 @@ fn limit_zero_runs_the_check_and_never_reopens() {
     assert_eq!(run.result(), "a");
 }
 
-// ── S5: the turn limit ────────────────────────────────────────────────────────
+// ── The turn limit ────────────────────────────────────────────────────────────
 
 /// `max_turns` stops the check: at a turn end with no turn left, and inside a reopened attempt,
 /// which ends the task `ok` with the answer that preceded the reopen.
@@ -472,7 +472,7 @@ fn max_turns_stops_the_done_check() {
     assert_eq!(run_b.result(), "a");
 }
 
-// ── S6: the spend ceiling ─────────────────────────────────────────────────────
+// ── The spend ceiling ─────────────────────────────────────────────────────────
 
 const MAX_OUTPUT: u64 = 1_000;
 
@@ -525,7 +525,7 @@ fn a_spend_ceiling_ends_a_reopened_attempt_ok() {
     assert_eq!(run.result(), "a");
 }
 
-// ── S7: the deadline ──────────────────────────────────────────────────────────
+// ── The deadline ──────────────────────────────────────────────────────────────
 
 const DEADLINE_SECS: u64 = 45;
 
@@ -583,12 +583,13 @@ fn a_deadline_stops_a_running_check() {
         .trim()
         .parse()
         .unwrap();
-    // SAFETY: signal 0 delivers nothing; it only asks whether `pid` exists.
-    let alive = unsafe { libc::kill(pid, 0) } == 0;
-    assert!(!alive, "the check's process {pid} outlived the deadline");
+    assert!(
+        !common::pid_alive(pid),
+        "the check's process {pid} outlived the deadline"
+    );
 }
 
-// ── S8: the timeout ───────────────────────────────────────────────────────────
+// ── The timeout ───────────────────────────────────────────────────────────────
 
 /// A check that outruns `timeout_secs` is killed and counts as a failed run; the feedback says
 /// what it printed, `Exit code: none`, and that the timeout stopped it.
@@ -635,7 +636,7 @@ fn timeout_secs_kills_a_hung_check() {
     );
 }
 
-// ── S9: a person's cancel ─────────────────────────────────────────────────────
+// ── A person's cancel ─────────────────────────────────────────────────────────
 
 /// A scratch `$HOME` for the in-process launch, set once for this whole binary: `set_var` is
 /// process-global. Every `mur run` case passes its own `HOME`, so none reads this one.
@@ -880,7 +881,7 @@ fn a_cancel_during_the_check_cancels_the_task() {
     );
 }
 
-// ── S10: containment ──────────────────────────────────────────────────────────
+// ── Containment ───────────────────────────────────────────────────────────────
 
 /// The check runs under the capsule's own containment and environment: it can no more write
 /// outside the work folder than the agent's shell can, and its `HOME` is the session's.
@@ -941,7 +942,7 @@ fn the_check_runs_in_the_capsule_s_containment() {
     let _ = fs::remove_dir_all(&outside);
 }
 
-// ── S12: validation ───────────────────────────────────────────────────────────
+// ── Validation ────────────────────────────────────────────────────────────────
 
 /// A check whose program `capabilities.shell.allow` does not list is refused before any session
 /// starts, naming the field.

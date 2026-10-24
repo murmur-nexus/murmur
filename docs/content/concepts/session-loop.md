@@ -243,7 +243,7 @@ A run that exits non-zero fails, and so does one a resource limit kills, one sti
 the status says whether the session ran to an end. A caller that wants to know whether the work
 passed reads `task_end.done_check.met`.
 
-These stop the check before its limit:
+What ends a task with its check unmet:
 
 | Stop | `stopped_by` | How the task ends |
 |---|---|---|
@@ -292,9 +292,10 @@ Stderr:
 </untrusted-content>
 ```
 
-`Exit code` reads `none` for a run killed at `timeout_secs` or one that did not start; one that did
-not start shows `Did not start: <error>` in place of the exit code and streams. Truncated output
-ends with `Output truncated.` inside the fence. Two lines may follow the closing marker:
+`Exit code` reads `none` for a run killed at `timeout_secs`. A run that could not start shows
+`Did not start: <error>` in place of the exit code and streams. Output cut at the cap ends with
+`Output truncated.` inside the fence, followed by the path of the full output when it was kept in
+the records directory. Two lines may follow the closing marker:
 `Resource limit: capabilities.resources.<field>` when a limit killed the command, and
 `Stopped after <n> s by lifecycle.done_check.timeout_secs.` for a run the timeout killed. The
 runtime adds no wording about what to do next, and nothing about the option enters the system

@@ -677,29 +677,21 @@ async fn run_task_with_reopens(
             }
         }
 
-        // `lifecycle.keep_working`. A continued attempt that a budget stopped ends the task with
-        // the answer its last turn end gave: `ok`, with that answer back in `out/result.txt` over
-        // the marker the attempt left there. Nothing else is converted, a person's cancel
-        // included.
+        // `lifecycle.keep_working` and `lifecycle.done_check`. A continued attempt that a budget
+        // stopped ends the task with the answer its last turn end gave: `ok`, with that answer
+        // back in `out/result.txt` over the marker the attempt left there. Nothing else is
+        // converted, a person's cancel included.
         let turn_end = matches!(result, Ok(AgentLoopExit::Ok));
         if let Some(answer) = &standing {
             let at_deadline = matches!(result, Ok(AgentLoopExit::Canceled))
                 && registry_stopped_at_deadline(state, task_id);
-            // A reopen by the done check kept the answer, so the stop is the check's.
-            let converted = if standing_from_done_check {
-                let stop = crate::done_check::budget_stop(&result, at_deadline);
-                if stop.is_some() {
-                    done_check_tally.stopped_by = stop;
+            if let Some(stop) = agent::budget_stop(&result, at_deadline) {
+                // The stop belongs to whichever mechanism kept the answer.
+                if standing_from_done_check {
+                    done_check_tally.stopped_by = Some(stop.into());
+                } else {
+                    stopped_by = Some(stop.into());
                 }
-                stop.is_some()
-            } else {
-                let stop = crate::keep_working::budget_stop(&result, at_deadline);
-                if stop.is_some() {
-                    stopped_by = stop;
-                }
-                stop.is_some()
-            };
-            if converted {
                 result = Ok(AgentLoopExit::Ok);
                 thread.ending = Some(answer.clone());
                 if let Some(text) = &answer.response {

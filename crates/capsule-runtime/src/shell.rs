@@ -588,74 +588,73 @@ fn spawn_and_wait(
     };
 
     let mut stopped = None;
-    let (status, drain_deadline) =
-        match wait {
-            Wait::Blocking => {
-                let status = child.wait().map_err(|error| error.to_string())?;
-                (status, Instant::now() + PIPE_DRAIN_AFTER_EXIT)
-            }
-            Wait::Stop(stop) => {
-                let deadline = started + stop.timeout;
-                loop {
-                    if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-                        break (status, Instant::now() + PIPE_DRAIN_AFTER_EXIT);
-                    }
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    let reason = if stop.canceled.is_canceled() {
-                        Some(ForegroundStopReason::Canceled)
-                    } else if remaining.is_zero() {
-                        Some(ForegroundStopReason::TimedOut)
-                    } else {
-                        None
-                    };
-                    if let Some(reason) = reason {
-                        // The leader is not reaped yet, so `pgid` still names this command's group.
-                        crate::formation_launch::signal_group(i64::from(pgid), libc::SIGKILL);
-                        let status = child.wait().map_err(|error| error.to_string())?;
-                        stopped = Some(reason);
-                        break (status, Instant::now() + PIPE_DRAIN_AFTER_EXIT);
-                    }
-                    std::thread::sleep(remaining.min(DETACH_POLL_INTERVAL));
+    let (status, drain_deadline) = match wait {
+        Wait::Blocking => {
+            let status = child.wait().map_err(|error| error.to_string())?;
+            (status, Instant::now() + PIPE_DRAIN_AFTER_EXIT)
+        }
+        Wait::Stop(stop) => {
+            let deadline = started + stop.timeout;
+            loop {
+                if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+                    break (status, Instant::now() + PIPE_DRAIN_AFTER_EXIT);
                 }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let reason = if stop.canceled.is_canceled() {
+                    Some(ForegroundStopReason::Canceled)
+                } else if remaining.is_zero() {
+                    Some(ForegroundStopReason::TimedOut)
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    // The leader is not reaped yet, so `pgid` still names this command's group.
+                    crate::formation_launch::signal_group(i64::from(pgid), libc::SIGKILL);
+                    let status = child.wait().map_err(|error| error.to_string())?;
+                    stopped = Some(reason);
+                    break (status, Instant::now() + PIPE_DRAIN_AFTER_EXIT);
+                }
+                std::thread::sleep(remaining.min(DETACH_POLL_INTERVAL));
             }
-            Wait::Detach(policy) => {
-                let deadline = started + policy.grace;
-                loop {
-                    match child.try_wait().map_err(|error| error.to_string())? {
-                        Some(status) => {
-                            break (
-                                status,
-                                (Instant::now() + PIPE_DRAIN_AFTER_EXIT).min(deadline),
-                            )
+        }
+        Wait::Detach(policy) => {
+            let deadline = started + policy.grace;
+            loop {
+                match child.try_wait().map_err(|error| error.to_string())? {
+                    Some(status) => {
+                        break (
+                            status,
+                            (Instant::now() + PIPE_DRAIN_AFTER_EXIT).min(deadline),
+                        )
+                    }
+                    None => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        // A caller that stopped waiting gets the same demotion the deadline
+                        // gives, at the next poll: nobody is left to read a foreground result.
+                        let abandoned = policy
+                            .abandoned
+                            .as_ref()
+                            .is_some_and(crate::detached::AbandonSignal::is_raised);
+                        // A cancelled task stops waiting the same way, and the session's end
+                        // kills the command it leaves running.
+                        let canceled = policy
+                            .canceled
+                            .as_ref()
+                            .filter(|signal| signal.is_canceled());
+                        if let Some(signal) = canceled {
+                            signal.note_phase(crate::cancel::PHASE_SHELL);
                         }
-                        None => {
-                            let remaining = deadline.saturating_duration_since(Instant::now());
-                            // A caller that stopped waiting gets the same demotion the deadline
-                            // gives, at the next poll: nobody is left to read a foreground result.
-                            let abandoned = policy
-                                .abandoned
-                                .as_ref()
-                                .is_some_and(crate::detached::AbandonSignal::is_raised);
-                            // A cancelled task stops waiting the same way, and the session's end
-                            // kills the command it leaves running.
-                            let canceled = policy
-                                .canceled
-                                .as_ref()
-                                .filter(|signal| signal.is_canceled());
-                            if let Some(signal) = canceled {
-                                signal.note_phase(crate::cancel::PHASE_SHELL);
-                            }
-                            if remaining.is_zero() || abandoned || canceled.is_some() {
-                                // A zero grace demotes here, at the first poll after the spawn.
-                                return Ok((
-                                ShellOutcome::Detached(demote(
+                        if remaining.is_zero() || abandoned || canceled.is_some() {
+                            // A zero grace demotes here, at the first poll after the spawn.
+                            let records_root = records_root
+                                .expect("a detach policy is kept only with a records root")
+                                .clone();
+                            let detached = demote(
                                 child,
                                 readers,
                                 DemotionContext {
                                     policy,
-                                    records_root: records_root
-                                        .expect("a detach policy is kept only with a records root")
-                                        .clone(),
+                                    records_root,
                                     invoked_binary: binary.to_string(),
                                     resolved_binary,
                                     args: args.iter().map(|arg| (*arg).to_string()).collect(),
@@ -665,16 +664,15 @@ fn spawn_and_wait(
                                     cgroup_counters_before,
                                     cgroup_occupancy,
                                 },
-                            )),
-                                None,
-                            ));
-                            }
-                            std::thread::sleep(remaining.min(DETACH_POLL_INTERVAL));
+                            );
+                            return Ok((ShellOutcome::Detached(detached), None));
                         }
+                        std::thread::sleep(remaining.min(DETACH_POLL_INTERVAL));
                     }
                 }
             }
-        };
+        }
+    };
     let (stdout_bytes, stderr_bytes, output_holders) = finish_output(readers, pgid, drain_deadline);
     let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
