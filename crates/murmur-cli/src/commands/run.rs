@@ -1137,7 +1137,7 @@ fn deadline_outcome(
             E_RUN_053,
             format!(
                 "the session reached the deadline it inherited, at {}, from the formation or the \
-                 capsule that launched it; the runtime cancelled the running task and ended the \
+                 capsule that launched it; the runtime stopped the running task and ended the \
                  session",
                 deadline.at_rfc3339()
             ),
@@ -1149,7 +1149,7 @@ fn deadline_outcome(
     Err(CliError::with_hint(
         E_RUN_053,
         format!(
-            "the session reached its --deadline{limit}; the runtime cancelled the running task \
+            "the session reached its --deadline{limit}; the runtime stopped the running task \
              and ended the session"
         ),
         "raise --deadline, or set lifecycle.deadline_notice_secs so the agent is told sooner; \

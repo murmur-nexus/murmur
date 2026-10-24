@@ -218,7 +218,7 @@ fn carries_message(request: &Value) -> bool {
 
 // ── S1: off ───────────────────────────────────────────────────────────────────
 
-/// With no `lifecycle.keep_working` the task ends at its first turn end, exactly as before.
+/// With no `lifecycle.keep_working` the task ends at its first turn end.
 #[test]
 fn without_the_block_the_task_ends_at_its_first_turn_end() {
     let home = home_with_driver();

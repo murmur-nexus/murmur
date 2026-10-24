@@ -689,7 +689,12 @@ async fn run_task_with_reopens(
             .filter(|_| turn_end && stopped_by.is_none())
         {
             let turns = turns_left(inference.max_turns, trace.task_turns());
-            let can_continue = thread.can_continue(&inference.transport);
+            let budget = crate::keep_working::stop_at_turn_end(
+                keep_working_used,
+                setting.limit,
+                turns,
+                thread.can_continue(&inference.transport),
+            );
             // Decided and marked under the lock the session deadline cancels under, so a deadline
             // either finds the standing answer marked or has already stopped the task.
             let decision = match state.a2a_task_registry.as_ref() {
@@ -700,28 +705,14 @@ async fn run_task_with_reopens(
                     let decision = keep_working_decision(
                         registry.stopped_at_deadline(task_id),
                         cancel.is_canceled(),
-                        crate::keep_working::stop_at_turn_end(
-                            keep_working_used,
-                            setting.limit,
-                            turns,
-                            can_continue,
-                        ),
+                        budget,
                     );
                     if decision == KeepWorkingDecision::Continue {
                         registry.mark_standing_answer(task_id);
                     }
                     decision
                 }
-                None => keep_working_decision(
-                    false,
-                    cancel.is_canceled(),
-                    crate::keep_working::stop_at_turn_end(
-                        keep_working_used,
-                        setting.limit,
-                        turns,
-                        can_continue,
-                    ),
-                ),
+                None => keep_working_decision(false, cancel.is_canceled(), budget),
             };
             match decision {
                 KeepWorkingDecision::Stop(stop) => stopped_by = Some(stop),

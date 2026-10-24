@@ -2704,12 +2704,10 @@ A missing or blank `message`, a missing `limit` and `limit: 0` are refused with
 `murmur.yaml: invalid lifecycle config for 'lifecycle.keep_working.limit': must be at least 1;
 omit lifecycle.keep_working to turn the option off`.
 
-The runtime adds no wording of its own: nothing in the system prompt, `MURMUR.md` or the
-`[Capsule]` block mentions the option, and the model reads only `message` and the `keep_working`
-field of [`session-status`](runtime-provided-tools.md#session-status). Every continuation resends
-the whole context, so each one costs at least as much input as the turn before it.
-
-What stops the task, what it ends with, and how the deadline treats it are in
+The model is told nothing about the option beyond `message` itself and the `keep_working` field of
+[`session-status`](runtime-provided-tools.md#session-status), so write `message` to stand on its
+own. Every continuation resends the whole context, so cost rises with each one. What stops the
+task, what it ends with, and how the deadline treats it are in
 [Keeping a task working](../concepts/session-loop.md#keep-working).
 
 ### `lifecycle.conversation` { #lifecycle-conversation }
