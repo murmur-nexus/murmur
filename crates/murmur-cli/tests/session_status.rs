@@ -480,6 +480,7 @@ fn unset_limits_say_none_and_unreported_counts_say_unknown() {
     );
     assert_eq!(status["spend"]["ceiling"], "none");
     assert_eq!(status["spend"]["machine"], "none");
+    assert_eq!(status["keep_working"], "none");
 }
 
 // ── Process transport ─────────────────────────────────────────────────────

@@ -1318,6 +1318,9 @@ verbatim and unredacted — bodies can be large, and a blob holds the wire paylo
 | `lifecycle.shell_grace_secs` | integer | no | Default: `10`. Seconds a shell command runs in the foreground before it is demoted to the background — see [`lifecycle.shell_grace_secs`](#lifecycle-shell-grace-secs). |
 | `lifecycle.delegation_deadline_secs` | integer | no | Default: `600`. Seconds a delegated sub-capsule may run before it is ended, and a [`call-member`](runtime-provided-tools.md#call-member) call may spend offering a busy member the task and waiting for its answer — see [`lifecycle.delegation_deadline_secs`](#lifecycle-delegation-deadline-secs). |
 | `lifecycle.deadline_notice_secs` | integer | no | Default: five minutes, or a tenth of the deadline when that is shorter, and at least `1`. Seconds before a [`mur run --deadline`](cli.md#mur-run-deadline) at which the agent is told, once, that the session is about to end — see [The deadline notice](runtime-provided-tools.md#deadline-notice). `0` sends no notice. Must be ≥ 0. Inert without `--deadline`. |
+| `lifecycle.keep_working` | object | no | Absent: a task ends at its first turn end. Sends `message` after each turn end, up to `limit` times per task — see [`lifecycle.keep_working`](#lifecycle-keep-working). |
+| `lifecycle.keep_working.message` | string | yes, in the block | The text sent as the next user message, verbatim. Must not be blank. |
+| `lifecycle.keep_working.limit` | integer | yes, in the block | Most continuations one task receives. Must be ≥ 1. |
 
 #### `exports` { #field-exports }
 
@@ -2435,6 +2438,7 @@ lifecycle:
   max_task_reopens: 1
   shell_grace_secs: 10
   delegation_deadline_secs: 600
+  # keep_working: absent, so a task ends at its first turn end — see lifecycle.keep_working
 ```
 
 ### `lifecycle.task_acceptance` { #lifecycle-task-acceptance }
@@ -2675,6 +2679,38 @@ seconds past the deadline ends the sub-capsule itself.
 lifecycle:
   delegation_deadline_secs: 120
 ```
+
+### `lifecycle.keep_working` { #lifecycle-keep-working }
+
+Keeps a task's agent working past the point where the model ends its turn. Each time an attempt
+ends at a turn end — the model ended its turn with no tool call and nothing it handed off is
+outstanding — the runtime sends `message` as the next user message in the same conversation and
+the task goes on. Absent, a task ends at its first turn end.
+
+```yaml
+lifecycle:
+  keep_working:
+    message: "Keep working on the task. Check your work against what was asked."
+    limit: 20
+```
+
+| Field | Rule |
+|---|---|
+| `message` | Required. Sent verbatim and unfenced. Must not be blank after trimming; the text is sent as written, surrounding whitespace included. |
+| `limit` | Required. At least `1`. To turn the option off, omit the block. |
+
+A missing or blank `message`, a missing `limit` and `limit: 0` are refused with
+[`E-MAN-003`](diagnostics.md#e-man-003), naming the field:
+`murmur.yaml: invalid lifecycle config for 'lifecycle.keep_working.limit': must be at least 1;
+omit lifecycle.keep_working to turn the option off`.
+
+The runtime adds no wording of its own: nothing in the system prompt, `MURMUR.md` or the
+`[Capsule]` block mentions the option, and the model reads only `message` and the `keep_working`
+field of [`session-status`](runtime-provided-tools.md#session-status). Every continuation resends
+the whole context, so each one costs at least as much input as the turn before it.
+
+What stops the task, what it ends with, and how the deadline treats it are in
+[Keeping a task working](../concepts/session-loop.md#keep-working).
 
 ### `lifecycle.conversation` { #lifecycle-conversation }
 

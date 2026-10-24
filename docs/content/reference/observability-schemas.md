@@ -33,7 +33,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 |---|---|
 | `session_start` | Nothing — its `event_id` is the session node |
 | `task_start` | The session node. Its `event_id` is the task node |
-| `task_end`, `task_reopened`, `task_continued`, `task_canceled`, `task_failed`, `context_seed` | The task node, or the session node for a `task_failed` written outside any task |
+| `task_end`, `task_reopened`, `task_continued`, `keep_working`, `task_canceled`, `task_failed`, `context_seed` | The task node, or the session node for a `task_failed` written outside any task |
 | `workdir_path_refused` | The task node, or the session node outside any task |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
@@ -658,6 +658,7 @@ for every task, on every exit path
 | `shell_calls` | u32 | Shell calls for this task only |
 | `reopen_count` | u32 | Times an `on-task-end` hook reopened this task before it ended. `0` for a task that ran once (the common case). A reader that finds no `reopen_count` field should default it to `0` |
 | `running_commands` | array of string | The `work_id`s of the shell commands moved to the background and still running when the task ended, oldest first — the same commands the task's A2A result names in [`metadata.murmur.runningCommands`](agent-card.md#no-answer-metadata). Absent when there were none |
+| `keep_working` | object | Present only when the capsule sets [`lifecycle.keep_working`](manifest.md#lifecycle-keep-working): `used` (u32), the continuations sent across reopens; `limit` (u32), `lifecycle.keep_working.limit`; `stopped_by` (string \| null), what stopped the task being kept working — `"limit"`, `"max_turns"`, `"spend_ceiling"`, `"deadline"` or `"no_session"` (see [Keeping a task working](../concepts/session-loop.md#keep-working)) — and `null` when it ended any other way. A stopped task's `exit_status` is `"ok"` |
 
 **`task_canceled`**{ #task-canceled } — written where the agent loop stopped because a person
 called [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task)
@@ -952,6 +953,27 @@ Written after the round's `member_call` and `delegation` lines and before the co
 first `inference`. Not written when the task is cancelled while it waits, when the attempt ended any
 other way, or when no turn is left. `mur trace show` counts these lines under **Turns** as
 `continued:  <N>  (<A> member answer(s), <D> delegation outcome(s))`.
+
+**`keep_working`**{ #keep-working } — written once per continuation
+[`lifecycle.keep_working`](manifest.md#lifecycle-keep-working) sends: the task's attempt ended at a
+turn end, and the next attempt receives the operator's message
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The task kept working |
+| `number` | u32 | 1-based ordinal of this continuation within the task, counted across reopens |
+| `limit` | u32 | `lifecycle.keep_working.limit` |
+| `turns_remaining` | u32 \| null | Turns the continued attempt is handed: `inference.max_turns` less every turn the task's attempts have spent. `null` when `inference.max_turns` sets no cap |
+| `message_bytes` | u64 | Byte length of the message sent |
+
+```json
+{"event_type":"keep_working","event_id":"evt_0193…","parent_id":"evt_0192…","session_id":"ses_0192…","timestamp":1791273600000,"task_id":"tsk_0192…","number":1,"limit":20,"turns_remaining":null,"message_bytes":66}
+```
+
+Written after the `inference` of the turn end it answers and before the continued attempt's first
+`inference`. `mur trace show` lists each under **Turns** as
+`keep working: <number> of <limit>  turns remaining <n>  message <bytes> bytes`, followed by one
+`kept working: <used> of <limit> (stopped by <stop>)` line per task from `task_end.keep_working`.
 
 **`call_denied`**{ #call-denied } — written when a [policy hook](../concepts/hooks.md#policy-hooks)
 refuses a shell command or tool call before it runs

@@ -166,6 +166,7 @@ A `TASK_STATE_WORKING` status says what the task is doing:
 | `waiting on delegate-task: <n> delegation(s) outstanding` | Delegations the task started have not reported back |
 | `continuing with <n> member answer(s)` | The task continues with the member answers that arrived |
 | `continuing with <n> delegation outcome(s)` | The task continues with the delegation outcomes that arrived |
+| `keep working <n> of <limit>` | [`lifecycle.keep_working`](manifest.md#lifecycle-keep-working) sends its message after a turn end |
 
 When both kinds are outstanding, or both kinds arrived, the two messages are joined with `; ` in
 one status.

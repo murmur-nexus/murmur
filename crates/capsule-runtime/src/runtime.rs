@@ -15,9 +15,9 @@ use murmur_artifact::{
     parse_hook_config_from_yaml, parse_tool_implementation_from_yaml, read_lockfile,
     runtime_warning_link, security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask,
     ApiKeyReference, ArtifactImplementation, ArtifactName, ArtifactRuntime, ContextConfig,
-    ConversationMode, HookBinding, InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig,
-    LockOrigin, LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry,
-    RegistryError, RuntimeArtifact, RuntimeType, TaskAcceptance, LOCK_VERSION,
+    ConversationMode, HookBinding, InferenceConfig, InterpreterRuntimeGrant, KeepWorking,
+    LifecycleConfig, LockOrigin, LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict,
+    Registry, RegistryError, RuntimeArtifact, RuntimeType, TaskAcceptance, LOCK_VERSION,
     PACKED_MANIFEST_ENTRY, W_RUN_003, W_RUN_008, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
     W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018,
     W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
@@ -73,6 +73,7 @@ use crate::{
     },
     identity::{self, CapsuleIdentity},
     inference_import::{HookInferenceCtx, InferenceUnavailable},
+    keep_working::KeepWorkingStop,
     lanes::LaneQueue,
     limits::{classify_guest_failure, EpochTicker, ExecutionLimiter, GuestFailure},
     murmur_md,
@@ -308,6 +309,13 @@ fn check_workdir_identity(
 /// `seed` is whatever the task's single `on-task-start` dispatch proposed. The hook is
 /// dispatched once, at task start, and is not asked again.
 ///
+/// `keep_working` is the capsule's `lifecycle.keep_working`. With it set, an attempt that ends at
+/// a turn end — `ok`, with nothing it handed off outstanding — is continued with the operator's
+/// message instead of ending the task, until a [`KeepWorkingStop`]: no `on-task-end` dispatch,
+/// no `task.md` rewrite and no `as-given` change in between, one `keep_working` record and one
+/// `working` status per continuation. The last turn end's answer stands: a continued attempt
+/// that ends on a budget (turns, spend, the session deadline) ends the task `ok` with it.
+///
 /// `task_id` is the door task's id: the registry entry this function finishes, the task `sse`
 /// carries frames for, and the id on the `task_start`/`task_reopened`/`task_end` records and the
 /// `on-task-end` hook event. Every task runs as a door task, the launch's own included, so
@@ -318,6 +326,7 @@ async fn run_task_with_reopens(
     state: &mut CapsuleStoreState,
     inference: &InferenceConfig,
     max_task_reopens: u32,
+    keep_working: Option<KeepWorking>,
     system_prompt: Option<String>,
     run_config: agent::AgentRunConfig,
     hooks: &mut HookRuntime,
@@ -347,6 +356,7 @@ async fn run_task_with_reopens(
             task_id,
             "failed",
             0,
+            keep_working_summary(keep_working.as_ref(), 0, None),
             context_id,
             &sse,
             agent::AttemptEnding::failed(reason),
@@ -375,9 +385,14 @@ async fn run_task_with_reopens(
     let mut delegation_outcomes: Vec<String> = Vec::new();
     // The conversation this task has built, handed from each attempt to the next.
     let mut thread = agent::TaskThread::default();
-    // What the next attempt continues with: `None` until a hook reopens the task or handed-off
-    // work reports back.
+    // What the next attempt continues with: `None` until a hook reopens the task, handed-off
+    // work reports back or `lifecycle.keep_working` sends the task on.
     let mut continuation: Option<agent::Continuation> = None;
+    // `lifecycle.keep_working`: continuations sent across reopens, the last turn end's ending
+    // while the task is kept working past it, and what stopped it.
+    let mut keep_working_used: u32 = 0;
+    let mut standing: Option<agent::AttemptEnding> = None;
+    let mut stopped_by: Option<KeepWorkingStop> = None;
     // The formation member that sent the task, which `end-without-answer` reports to; `None` for
     // a task no formation token started. The registry lock is released here, before `scope_task`
     // takes the member-calls lock.
@@ -644,6 +659,108 @@ async fn run_task_with_reopens(
             }
         }
 
+        // `lifecycle.keep_working`. A continued attempt that a budget stopped ends the task with
+        // the answer its last turn end gave: `ok`, with that answer back in `out/result.txt` over
+        // the marker the attempt left there. Nothing else is converted, a person's cancel
+        // included.
+        let turn_end = matches!(result, Ok(AgentLoopExit::Ok));
+        if let Some(answer) = &standing {
+            let at_deadline = matches!(result, Ok(AgentLoopExit::Canceled))
+                && registry_stopped_at_deadline(state, task_id);
+            if let Some(stop) = crate::keep_working::budget_stop(&result, at_deadline) {
+                stopped_by = Some(stop);
+                result = Ok(AgentLoopExit::Ok);
+                thread.ending = Some(answer.clone());
+                if let Some(text) = &answer.response {
+                    if let Err(error) = agent::record_standing_answer(
+                        hooks,
+                        &state.records_root,
+                        &mode,
+                        task_id,
+                        text,
+                    ) {
+                        crate::runtime_err!("[capsule-runtime] keep_working: {error}");
+                    }
+                }
+            }
+        }
+        if let Some(setting) = keep_working
+            .as_ref()
+            .filter(|_| turn_end && stopped_by.is_none())
+        {
+            let turns = turns_left(inference.max_turns, trace.task_turns());
+            let can_continue = thread.can_continue(&inference.transport);
+            // Decided and marked under the lock the session deadline cancels under, so a deadline
+            // either finds the standing answer marked or has already stopped the task.
+            let decision = match state.a2a_task_registry.as_ref() {
+                Some(registry) => {
+                    let mut registry = registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let decision = keep_working_decision(
+                        registry.stopped_at_deadline(task_id),
+                        cancel.is_canceled(),
+                        crate::keep_working::stop_at_turn_end(
+                            keep_working_used,
+                            setting.limit,
+                            turns,
+                            can_continue,
+                        ),
+                    );
+                    if decision == KeepWorkingDecision::Continue {
+                        registry.mark_standing_answer(task_id);
+                    }
+                    decision
+                }
+                None => keep_working_decision(
+                    false,
+                    cancel.is_canceled(),
+                    crate::keep_working::stop_at_turn_end(
+                        keep_working_used,
+                        setting.limit,
+                        turns,
+                        can_continue,
+                    ),
+                ),
+            };
+            match decision {
+                KeepWorkingDecision::Stop(stop) => stopped_by = Some(stop),
+                KeepWorkingDecision::End => {}
+                KeepWorkingDecision::Continue => {
+                    keep_working_used += 1;
+                    standing =
+                        Some(
+                            thread
+                                .ending
+                                .clone()
+                                .unwrap_or_else(|| agent::AttemptEnding {
+                                    state: TaskState::Completed,
+                                    message: AgentLoopExit::Ok.as_str().to_string(),
+                                    response: None,
+                                    no_answer: false,
+                                }),
+                        );
+                    let _ = trace
+                        .write_keep_working(
+                            task_id,
+                            keep_working_used,
+                            setting.limit,
+                            turns,
+                            setting.message.len() as u64,
+                        )
+                        .await;
+                    emit_task_working(
+                        &sse,
+                        Some(task_id),
+                        context_id.as_ref(),
+                        format!("keep working {keep_working_used} of {}", setting.limit),
+                    );
+                    continuation = Some(agent::Continuation::KeepWorking(setting.message.clone()));
+                    continue;
+                }
+            }
+        }
+
         // The attempt's own terminal outcome, not a coarse ok/failed: an agent loop that
         // burned its turn budget reports `max_turns_reached`, and this is the only record
         // that keeps it.
@@ -672,8 +789,10 @@ async fn run_task_with_reopens(
         // dispatched above with exit status `canceled` — but re-running work a person just
         // stopped is the defect this refusal exists to prevent.
         let canceled = matches!(result, Ok(AgentLoopExit::Canceled));
-        // Nor is a refused one: the refused operation is never retried.
-        match reopen.filter(|_| !canceled && !refused) {
+        // Nor is a refused one: the refused operation is never retried. Nor one the session
+        // deadline stopped while it was kept working: the session is ending.
+        let at_deadline = stopped_by == Some(KeepWorkingStop::Deadline);
+        match reopen.filter(|_| !canceled && !refused && !at_deadline) {
             Some(TaskReopen { hook_name, reason }) => {
                 // A hook wants more. Honor it only if a reopen remains in the budget AND
                 // turns remain under the ceiling; otherwise the request is exhausted and
@@ -682,6 +801,17 @@ async fn run_task_with_reopens(
                 let turns_ok = turns_left(inference.max_turns, trace.task_turns()) != Some(0);
                 if budget_ok && turns_ok {
                     reopens_used += 1;
+                    // The reopened attempt has no answer of its own yet; the continuation count
+                    // is the task's, so it carries over.
+                    if standing.take().is_some() {
+                        if let Some(registry) = state.a2a_task_registry.as_ref() {
+                            registry
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clear_standing_answer(task_id);
+                        }
+                    }
+                    stopped_by = None;
                     // The reopened attempt may answer after all.
                     if let Some(calls) = &calls {
                         calls.clear_decline();
@@ -752,6 +882,7 @@ async fn run_task_with_reopens(
                     task_id,
                     "reopen_budget_exhausted",
                     reopens_used,
+                    keep_working_summary(keep_working.as_ref(), keep_working_used, stopped_by),
                     context_id,
                     &sse,
                     agent::AttemptEnding::failed(refusal.clone()),
@@ -769,6 +900,7 @@ async fn run_task_with_reopens(
                     task_id,
                     exit_str,
                     reopens_used,
+                    keep_working_summary(keep_working.as_ref(), keep_working_used, stopped_by),
                     context_id,
                     &sse,
                     ending,
@@ -778,6 +910,58 @@ async fn run_task_with_reopens(
             }
         }
     }
+}
+
+/// What [`run_task_with_reopens`] does at a turn end under `lifecycle.keep_working`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepWorkingDecision {
+    /// Send the message and run another attempt.
+    Continue,
+    /// End the task, recording what stopped it.
+    Stop(KeepWorkingStop),
+    /// End the task with no stop recorded: a cancel is already ending it.
+    End,
+}
+
+/// The turn-end decision: the session deadline having stopped the task wins, then a raised
+/// cancel (a person's `CancelTask`, `SIGTERM`, the formation's end), which sends nothing more,
+/// then the budgets [`crate::keep_working::stop_at_turn_end`] read.
+fn keep_working_decision(
+    stopped_at_deadline: bool,
+    canceled: bool,
+    budget: Option<KeepWorkingStop>,
+) -> KeepWorkingDecision {
+    if stopped_at_deadline {
+        KeepWorkingDecision::Stop(KeepWorkingStop::Deadline)
+    } else if canceled {
+        KeepWorkingDecision::End
+    } else {
+        budget.map_or(KeepWorkingDecision::Continue, KeepWorkingDecision::Stop)
+    }
+}
+
+/// Whether the task registry recorded `task_id` as stopped by the session deadline while it held
+/// a standing answer. `false` with no registry.
+fn registry_stopped_at_deadline(state: &CapsuleStoreState, task_id: &str) -> bool {
+    state.a2a_task_registry.as_ref().is_some_and(|registry| {
+        registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stopped_at_deadline(task_id)
+    })
+}
+
+/// `task_end.keep_working`: `None` when the capsule does not set `lifecycle.keep_working`.
+fn keep_working_summary(
+    setting: Option<&KeepWorking>,
+    used: u32,
+    stopped_by: Option<KeepWorkingStop>,
+) -> Option<crate::trace::KeepWorkingSummary> {
+    setting.map(|setting| crate::trace::KeepWorkingSummary {
+        used,
+        limit: setting.limit,
+        stopped_by: stopped_by.map(KeepWorkingStop::as_str),
+    })
 }
 
 /// End a task [`run_task_with_reopens`] ran, in the order its readers rely on: `task_end` with
@@ -801,6 +985,7 @@ async fn end_task(
     task_id: &str,
     exit_status: &str,
     reopens_used: u32,
+    keep_working: Option<crate::trace::KeepWorkingSummary>,
     context_id: Option<String>,
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
     ending: agent::AttemptEnding,
@@ -829,6 +1014,7 @@ async fn end_task(
                 .iter()
                 .map(|running| running.work_id.clone())
                 .collect(),
+            keep_working,
         )
         .await;
     hooks.end_task();
@@ -3733,6 +3919,10 @@ fn launch(
                         deadline.secs(),
                     )
                 }),
+                effective_lifecycle
+                    .keep_working
+                    .as_ref()
+                    .map(|keep_working| keep_working.limit),
             ));
             trace.set_session_status(Arc::clone(&session_status));
 
@@ -4516,6 +4706,7 @@ fn launch(
                             &mut state,
                             inference,
                             effective_lifecycle.max_task_reopens,
+                            effective_lifecycle.keep_working.clone(),
                             system_prompt.clone(),
                             run_config.clone(),
                             &mut hooks,
@@ -12339,7 +12530,11 @@ fn begin_termination(
 ) {
     // Cancelled before the signal is raised, so an agent loop that wakes on either finds its task
     // already `Canceled`.
-    let _ = task_registry.lock().unwrap().cancel_every_live();
+    // The deadline spares a task kept working past a turn end: it ends with the answer it holds.
+    let _ = task_registry
+        .lock()
+        .unwrap()
+        .cancel_every_live(matches!(cause, TerminationCause::Deadline));
     // Before `terminating`, so the task loop that wakes on it reads the cause already set.
     match cause {
         TerminationCause::FormationEnded => termination_ending.set(LaunchEnding::FormationEnded),
@@ -12650,6 +12845,62 @@ pub(crate) use tests::{
 #[cfg(test)]
 mod tests {
     use murmur_artifact::LockedArtifact;
+
+    // ── lifecycle.keep_working at a turn end ─────────────────────────────────────────────────
+
+    /// The deadline having stopped the task wins over a raised cancel and every budget; a raised
+    /// cancel sends nothing more and records no stop; otherwise the budgets decide.
+    #[test]
+    fn keep_working_decision_puts_the_deadline_then_a_cancel_before_the_budgets() {
+        use super::{keep_working_decision, KeepWorkingDecision, KeepWorkingStop};
+        assert_eq!(
+            keep_working_decision(true, true, Some(KeepWorkingStop::Limit)),
+            KeepWorkingDecision::Stop(KeepWorkingStop::Deadline)
+        );
+        assert_eq!(
+            keep_working_decision(false, true, None),
+            KeepWorkingDecision::End
+        );
+        assert_eq!(
+            keep_working_decision(false, true, Some(KeepWorkingStop::MaxTurns)),
+            KeepWorkingDecision::End
+        );
+        assert_eq!(
+            keep_working_decision(false, false, Some(KeepWorkingStop::NoSession)),
+            KeepWorkingDecision::Stop(KeepWorkingStop::NoSession)
+        );
+        assert_eq!(
+            keep_working_decision(false, false, None),
+            KeepWorkingDecision::Continue
+        );
+    }
+
+    /// `task_end.keep_working` is absent with the option off and carries the count, the limit and
+    /// the stop with it on.
+    #[test]
+    fn keep_working_summary_is_absent_with_the_option_off() {
+        use super::{keep_working_summary, KeepWorkingStop};
+        assert_eq!(
+            keep_working_summary(None, 3, Some(KeepWorkingStop::Limit)),
+            None
+        );
+        let setting = murmur_artifact::KeepWorking {
+            message: "go on".into(),
+            limit: 4,
+        };
+        assert_eq!(
+            keep_working_summary(Some(&setting), 2, Some(KeepWorkingStop::SpendCeiling)),
+            Some(crate::trace::KeepWorkingSummary {
+                used: 2,
+                limit: 4,
+                stopped_by: Some("spend_ceiling"),
+            })
+        );
+        assert_eq!(
+            keep_working_summary(Some(&setting), 0, None).map(|summary| summary.stopped_by),
+            Some(None)
+        );
+    }
 
     // ── shell tool manifests stay inside the runtime directory's tools/ ──────────────────────
 
@@ -17341,6 +17592,7 @@ inference:
                 &self.inference,
                 0,
                 None,
+                None,
                 run_config,
                 &mut self.hooks,
                 &mut self.trace,
@@ -21865,6 +22117,7 @@ inference:
             inference,
             max_task_reopens,
             None,
+            None,
             run_config,
             hooks,
             &mut trace,
@@ -22290,6 +22543,7 @@ inference:
             &mut state,
             &inference,
             max_task_reopens,
+            None,
             None,
             run_config,
             &mut hooks,

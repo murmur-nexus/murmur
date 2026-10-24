@@ -1132,6 +1132,23 @@ struct TaskEndEvent {
     /// first. Absent when there were none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     running_commands: Vec<String>,
+    /// How `lifecycle.keep_working` went for this task. Absent when the capsule does not set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep_working: Option<KeepWorkingSummary>,
+}
+
+/// `task_end.keep_working`: the continuations `lifecycle.keep_working` sent this task and what
+/// stopped them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct KeepWorkingSummary {
+    /// Continuations sent, across reopens.
+    pub(crate) used: u32,
+    /// `lifecycle.keep_working.limit`.
+    pub(crate) limit: u32,
+    /// What stopped the task being kept working: `limit`, `max_turns`, `spend_ceiling`,
+    /// `deadline` or `no_session`. `null` when it ended on anything else — a failure, a cancel, a
+    /// turn end that handed off work.
+    pub(crate) stopped_by: Option<&'static str>,
 }
 
 /// A person stopped this task. Written where the loop actually stopped, so the record names the
@@ -1416,6 +1433,27 @@ struct TaskContinuedEvent<'a> {
     /// task's attempts have spent so far. `null` when
     /// `inference.max_turns` sets no cap.
     turns_remaining: Option<u32>,
+}
+
+/// `lifecycle.keep_working` sent its message after the task's attempt ended at a turn end. Written
+/// after that turn's `inference` and before the continued attempt's first one.
+#[derive(Serialize)]
+struct KeepWorkingEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: String,
+    /// 1-based ordinal of this continuation within the task, counted across reopens.
+    number: u32,
+    /// `lifecycle.keep_working.limit`.
+    limit: u32,
+    /// The turns the continued attempt is handed: `inference.max_turns` less every turn the
+    /// task's attempts have spent so far. `null` when `inference.max_turns` sets no cap.
+    turns_remaining: Option<u32>,
+    /// The byte length of the message sent.
+    message_bytes: u64,
 }
 
 /// A driver call failed transiently and is about to be made again. The call's one `inference`
@@ -3163,6 +3201,7 @@ impl TraceWriter {
         exit_status: &str,
         reopen_count: u32,
         running_commands: Vec<String>,
+        keep_working: Option<KeepWorkingSummary>,
     ) -> std::io::Result<()> {
         let duration_ms = self
             .task_start_instant
@@ -3186,6 +3225,7 @@ impl TraceWriter {
             shell_calls: self.task_shell_calls,
             reopen_count,
             running_commands,
+            keep_working,
         };
         self.active_task_id = None;
         self.task_event_id = None;
@@ -3366,6 +3406,34 @@ impl TraceWriter {
             waited_ms,
             turns_remaining,
         };
+        self.write_event(&event).await
+    }
+
+    /// Record that `lifecycle.keep_working` sent its message as the task's `number`th continuation
+    /// (1-based), before the continued attempt's first `inference`.
+    pub(crate) async fn write_keep_working(
+        &mut self,
+        task_id: &str,
+        number: u32,
+        limit: u32,
+        turns_remaining: Option<u32>,
+        message_bytes: u64,
+    ) -> std::io::Result<()> {
+        let event = KeepWorkingEvent {
+            event_type: "keep_working",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: task_id.to_string(),
+            number,
+            limit,
+            turns_remaining,
+            message_bytes,
+        };
+        if let Some(status) = &self.session_status {
+            status.keep_working_sent(number);
+        }
         self.write_event(&event).await
     }
 
@@ -7182,7 +7250,7 @@ mod tests {
         w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
             .await
             .unwrap();
-        w.write_task_end("tsk_1", "ok", 2, Vec::new())
+        w.write_task_end("tsk_1", "ok", 2, Vec::new(), None)
             .await
             .unwrap();
         w.flush().await.unwrap();
@@ -7195,6 +7263,113 @@ mod tests {
         assert_eq!(end["task_id"], "tsk_1");
         assert_eq!(end["exit_status"], "ok");
         assert_eq!(end["reopen_count"], 2);
+    }
+
+    /// `task_end.keep_working` is the summary the runtime passes, `stopped_by` `null` when unset,
+    /// and absent when the capsule does not set `lifecycle.keep_working`.
+    #[tokio::test]
+    async fn task_end_carries_keep_working_only_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        for (task_id, keep_working) in [
+            (
+                "tsk_1",
+                Some(KeepWorkingSummary {
+                    used: 2,
+                    limit: 2,
+                    stopped_by: Some("limit"),
+                }),
+            ),
+            (
+                "tsk_2",
+                Some(KeepWorkingSummary {
+                    used: 1,
+                    limit: 5,
+                    stopped_by: None,
+                }),
+            ),
+            ("tsk_3", None),
+        ] {
+            w.write_task_start(task_id, "ctx_1", "a2a", event_provenance(), 3, &[], &[])
+                .await
+                .unwrap();
+            w.write_task_end(task_id, "ok", 0, Vec::new(), keep_working)
+                .await
+                .unwrap();
+        }
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let ends: Vec<_> = events
+            .iter()
+            .filter(|e| e["event_type"] == "task_end")
+            .collect();
+        assert_eq!(
+            ends[0]["keep_working"],
+            serde_json::json!({"used": 2, "limit": 2, "stopped_by": "limit"})
+        );
+        assert_eq!(
+            ends[1]["keep_working"],
+            serde_json::json!({"used": 1, "limit": 5, "stopped_by": null})
+        );
+        assert!(ends[2].get("keep_working").is_none(), "{}", ends[2]);
+    }
+
+    /// One `keep_working` record per continuation, parented on the task, and the session-status
+    /// count follows it.
+    #[tokio::test]
+    async fn keep_working_record_carries_its_fields_and_feeds_session_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        let status = std::sync::Arc::new(crate::session_status::SessionStatus::new(
+            std::time::Instant::now(),
+            false,
+            None,
+            None,
+            0,
+            Some(3),
+        ));
+        w.set_session_status(std::sync::Arc::clone(&status));
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
+            .await
+            .unwrap();
+        w.write_keep_working("tsk_1", 1, 3, Some(4), 66)
+            .await
+            .unwrap();
+        w.write_keep_working("tsk_1", 2, 3, None, 66).await.unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let start = events
+            .iter()
+            .find(|e| e["event_type"] == "task_start")
+            .unwrap();
+        let records: Vec<_> = events
+            .iter()
+            .filter(|e| e["event_type"] == "keep_working")
+            .collect();
+        assert_eq!(records.len(), 2);
+        for (record, (number, turns)) in records
+            .iter()
+            .zip([(1, serde_json::json!(4)), (2, serde_json::Value::Null)])
+        {
+            assert_eq!(record["task_id"], "tsk_1");
+            assert_eq!(record["number"], number);
+            assert_eq!(record["limit"], 3);
+            assert_eq!(record["turns_remaining"], turns);
+            assert_eq!(record["message_bytes"], 66);
+            assert_eq!(record["parent_id"], start["event_id"]);
+            assert!(record["event_id"].is_string());
+        }
+        let spend = crate::session_status::SpendReading {
+            used: 0,
+            ceiling: None,
+            machine: None,
+        };
+        assert_eq!(
+            serde_json::to_value(status.snapshot(spend)).unwrap()["keep_working"],
+            serde_json::json!({"used": 2, "left": 1})
+        );
     }
 
     /// `task_end` names the background commands still running, and has no such field when there
@@ -7210,7 +7385,9 @@ mod tests {
             w.write_task_start(task_id, "ctx_1", "a2a", event_provenance(), 3, &[], &[])
                 .await
                 .unwrap();
-            w.write_task_end(task_id, "ok", 0, running).await.unwrap();
+            w.write_task_end(task_id, "ok", 0, running, None)
+                .await
+                .unwrap();
         }
         w.flush().await.unwrap();
 
@@ -7439,7 +7616,7 @@ mod tests {
         assert_eq!(w.task_agent_turns(), 2);
         assert_eq!(w.task_turns(), 3);
         assert_eq!(w.task_hook_inferences(), 1);
-        w.write_task_end("tsk_1", "completed", 0, Vec::new())
+        w.write_task_end("tsk_1", "completed", 0, Vec::new(), None)
             .await
             .unwrap();
         assert_eq!(
@@ -7533,7 +7710,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        w.write_task_end("tsk_1", "ok", 0, Vec::new())
+        w.write_task_end("tsk_1", "ok", 0, Vec::new(), None)
             .await
             .unwrap();
         w.write_session_end("ok").await.unwrap();
@@ -7849,7 +8026,7 @@ mod tests {
         w.write_task_start("tsk_ran", "ctx_ran", "a2a", event_provenance(), 3, &[], &[])
             .await
             .unwrap();
-        w.write_task_end("tsk_ran", "ok", 0, Vec::new())
+        w.write_task_end("tsk_ran", "ok", 0, Vec::new(), None)
             .await
             .unwrap();
         w.write_task_rejected(
@@ -7909,7 +8086,7 @@ mod tests {
         w.write_task_failed(Some(2), TASK_FAILED_DRIVER_ERROR, &long)
             .await
             .unwrap();
-        w.write_task_end("tsk_1", "failed", 0, Vec::new())
+        w.write_task_end("tsk_1", "failed", 0, Vec::new(), None)
             .await
             .unwrap();
         w.flush().await.unwrap();
@@ -7984,7 +8161,7 @@ mod tests {
         w.write_compaction(0, 100, OccupancyBasis::Estimate, 40)
             .await
             .unwrap();
-        w.write_task_end("tsk_1", "ok", 0, Vec::new())
+        w.write_task_end("tsk_1", "ok", 0, Vec::new(), None)
             .await
             .unwrap();
         w.write_inference(
