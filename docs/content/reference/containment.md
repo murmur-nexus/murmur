@@ -64,7 +64,9 @@ is granted wholesale and the only writable paths outside the workdir are `/dev/n
 [the fixed capsule device set](#capsule-device-set)), the
 [session's temporary folder](#temp-folder) and its [home folder](#home-folder). An allowlisted CPython or Perl interpreter also gets
 read-only grants on the directories it reports on its own import path (see
-[Derived interpreter runtimes](#derived-interpreter-runtime)). For any other path-based
+[Derived interpreter runtimes](#derived-interpreter-runtime)), and a capsule that declares
+`capabilities.network.allow` gets a read-only grant on the host's TLS trust store (see
+[The trust store for commands that reach the network](#trust-store)). For any other path-based
 interpreter, a capsule may name the host directories it needs via
 `capabilities.shell.interpreter_runtime`, which grants exactly the directories named, each with an
 explicit per-directory `list_dir` flag (see [`W-SEC-009`](diagnostics.md#w-sec-009)). The workdir
@@ -158,7 +160,7 @@ Everything else the tool reads, writes, runs or connects to has to be granted by
 |---|---|
 | Runs another program, such as `git` | That program in `capabilities.shell.allow` |
 | Is a `#!/usr/bin/env python3` script | `python3` in `capabilities.shell.allow`: the `#!` grant covers `env` only |
-| Reads or writes a path outside the workdir | On Full and Sealed, keep its inputs and outputs in the workdir or the [session's temporary folder](#temp-folder). Nothing grants a write anywhere else; the read grants outside it are an allowlisted interpreter's [derived runtime](#derived-interpreter-runtime) and a [`capabilities.shell.interpreter_runtime`](manifest.md#field-capabilities) directory, which names a `shell.allow` binary and grants execute as well |
+| Reads or writes a path outside the workdir | On Full and Sealed, keep its inputs and outputs in the workdir or the [session's temporary folder](#temp-folder). Nothing grants a write anywhere else; the read grants outside it are an allowlisted interpreter's [derived runtime](#derived-interpreter-runtime), the host's [trust store](#trust-store) when the capsule declares `capabilities.network.allow`, and a [`capabilities.shell.interpreter_runtime`](manifest.md#field-capabilities) directory, which names a `shell.allow` binary and grants execute as well |
 | Reaches a host | That host in `capabilities.network.allow`; the connection leaves through the egress proxy |
 | Reaches a server an earlier shell call started on `127.0.0.1` | Nothing: the tool shares the session's loopback |
 | Opens an `AF_UNIX` socket | `capabilities.network.unix_sockets: true` |
@@ -572,7 +574,9 @@ resolve and agree with `$HOME`; **no host account name appears inside the capsul
 
 **`scoped` gets none of this**, for the reason [the runtime-tree grant](#sealed-runtime-tree-grant)
 gives: without a composed root these rules would apply to the host's own `/etc` — its real trust
-store, its real `resolv.conf`, its real account databases.
+store, its real `resolv.conf`, its real account databases. The trust store alone reaches `scoped`
+commands, for a capsule that declares `capabilities.network.allow`, through
+[the trust-store grant](#trust-store).
 
 ## What the composed root contains { #composed-root-listability }
 
@@ -967,6 +971,80 @@ needs that library named in `capabilities.shell.interpreter_runtime`.
 ```
 
 On macOS nothing is derived and nothing is run.
+
+## The trust store for commands that reach the network { #trust-store }
+
+A command that opens a TLS connection reads the host's CA certificates to verify the server. When
+`mur` stages a session on Linux, it grants the host's TLS trust store to the capsule's commands
+when both of these hold:
+
+- `capabilities.shell.allow` is non-empty;
+- [`capabilities.network.allow`](manifest.md#field-capabilities) is non-empty.
+
+A capsule missing either gets no trust-store grant. No manifest key turns this on or names a path.
+
+`mur` checks this fixed list of locations:
+
+| Path | Kind | Where it is the trust store |
+|---|---|---|
+| `/etc/ssl/certs/ca-certificates.crt` | file | Debian, Ubuntu, Arch, Gentoo |
+| `/etc/pki/tls/certs/ca-bundle.crt` | file | Fedora, RHEL |
+| `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem` | file | RHEL 7+, Fedora, CentOS |
+| `/etc/ssl/ca-bundle.pem` | file | openSUSE |
+| `/etc/pki/tls/cacert.pem` | file | OpenELEC |
+| `/etc/ssl/cert.pem` | file | Alpine |
+| `/usr/lib/ssl/cert.pem` | file | Debian's OpenSSL default, a symlink |
+| `/etc/ssl/certs` | directory | Debian, Ubuntu, Alpine, Arch |
+| `/etc/pki/tls/certs` | directory | Fedora, RHEL |
+| `/etc/pki/ca-trust/extracted/pem` | directory | RHEL 7+, Fedora |
+| `/usr/lib/ssl/certs` | directory | Debian's OpenSSL default, a symlink |
+| `/var/lib/ca-certificates/pem` | directory | openSUSE |
+
+What the host has decides what is granted:
+
+1. Only locations that exist on the host, as the kind the list names, are granted. A missing or
+   dangling location is skipped.
+2. Each is granted at its real path, with symlinks resolved.
+3. `mur` reads the entries directly inside each granted directory. A symlink there that resolves to
+   a file outside every granted directory grants that file's directory too. On Debian and Ubuntu
+   this is how `/etc/ssl/certs/*.pem` reach `/usr/share/ca-certificates/mozilla`.
+4. That linked directory is not granted when it is `/`, a directory containing a granted path, or
+   inside a capsule-writable tree. A link such as `/etc/ssl/certs/x -> ../openssl.cnf` therefore
+   grants nothing, and `/etc/ssl`, `/etc/ssl/private` and `/etc/ssl/openssl.cnf` stay unreadable.
+
+A file inside a granted directory is not listed again. Nothing inside the workdir root or
+`~/.murmur/records/<workdir root>/` is granted.
+
+| Right | Granted |
+|---|---|
+| `ReadFile` | yes |
+| `ReadDir` | on directories |
+| `Execute` | no |
+| every write right | no |
+
+The grant applies on Full and Sealed. On Sealed it adds no composed-root bind: the
+[sealed `/etc` grant](#sealed-etc-grant) already carries `/etc/ssl`, `/etc/pki` and
+`/etc/ca-certificates`, and a trust store the composed root does not carry, such as openSUSE's
+`/var/lib/ca-certificates`, stays unreachable there. [Native tools](#native-tools)
+inherit the grant with the rest of the session's.
+
+`SSL_CERT_FILE` and `SSL_CERT_DIR` are not read: they are `mur`'s own environment, which the
+capsule's commands do not receive. A trust store outside the list needs a
+[`capabilities.shell.interpreter_runtime`](manifest.md#field-capabilities) directory.
+
+`mur run --explain-scope` lists the granted paths under `trust store`, and the `session_start`
+event records them under
+[`effective_grants.trust_store`](observability-schemas.md#session-trace-tracejsonl):
+
+```text
+  trust store:
+    - /etc/ssl/certs (list_dir)
+    - /usr/share/ca-certificates/mozilla (list_dir)
+```
+
+A capsule that does not qualify prints `  trust store: <none>`.
+
+On macOS nothing is derived: commands' reads are not path-scoped there.
 
 ## Staged runtime { #field-staged-runtime }
 

@@ -345,6 +345,8 @@ Use `strip_env` to remove sensitive/unnecessary subprocess environment variables
 
 An allowlisted CPython or Perl interpreter needs no declaration for its own standard library and installed packages: on Linux, `mur` asks the interpreter for its import path and grants those directories read-only (`mur run --explain-scope` lists them under `derived interpreter runtime`). Do not add `interpreter_runtime` for them.
 
+Likewise, allowlisted commands in a capsule with a non-empty `capabilities.network.allow` get the host's TLS trust store read-only on Linux (`mur run --explain-scope` lists it under `trust store`). Do not add `interpreter_runtime` for `/etc/ssl` or another CA-certificate directory.
+
 If another interpreter, or a directory a recognised one does not report (such as a virtual environment's `site-packages`), needs host runtime directories outside the workdir, use one of:
 
 - `interpreter_runtime` — explicitly grants the required host runtime directories;

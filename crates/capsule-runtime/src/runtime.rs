@@ -2437,6 +2437,11 @@ pub fn stage_session(
             &request.capability_policy.shell_staged_runtime,
             &crate::interpreter_runtime::capsule_writable_roots(&runtime_dir_placement),
         );
+    request.capability_policy.shell_trust_store = crate::trust_store::derive_trust_store(
+        &request.capability_policy.shell_allow,
+        &request.capability_policy.network_allow,
+        &crate::interpreter_runtime::capsule_writable_roots(&runtime_dir_placement),
+    );
     let mut scope_report = crate::containment::scope_report_for_tier(
         &request.capability_policy,
         &containment,

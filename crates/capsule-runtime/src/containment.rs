@@ -1048,6 +1048,12 @@ pub struct ScopeReport {
     /// archive or an extension-module library. Each is readable and none is executable. Always
     /// serialized, `[]` when no allowlisted binary is a recognised interpreter.
     pub derived_interpreter_runtime: Vec<String>,
+    /// Every host trust-store path staging found for a capsule whose commands reach the network,
+    /// rendered `<path> (list_dir)` for a directory and `<path>` for a CA bundle file. Each is
+    /// readable and none is executable. Always serialized, `[]` when `shell.allow` or
+    /// `network.allow` is empty or the host has none of the locations
+    /// [`crate::trust_store`] checks.
+    pub trust_store: Vec<String>,
     /// The read-only file surface `exports.files` declares, or `null` when the capsule declares
     /// none. Always serialized (never skipped), so a consumer can tell "this runtime predates
     /// exports" from "this capsule declined to export anything" by the field's presence rather
@@ -1254,6 +1260,7 @@ impl ScopeReport {
             "derived interpreter runtime",
             &self.derived_interpreter_runtime,
         );
+        push_list(&mut out, "trust store", &self.trust_store);
         push_list(&mut out, "staged runtime", &self.staged_runtime_grants);
         push_list(
             &mut out,
@@ -1663,6 +1670,14 @@ pub(crate) fn scope_report_for_tier(
                             .map(|library| format!("{binary}: {}", library.display())),
                     )
                     .collect::<Vec<_>>()
+            })
+            .collect(),
+        trust_store: policy
+            .shell_trust_store
+            .iter()
+            .map(|entry| {
+                let listable = if entry.directory { " (list_dir)" } else { "" };
+                format!("{}{listable}", entry.path.display())
             })
             .collect(),
         staged_runtime_grants: policy
@@ -3919,6 +3934,7 @@ mod tests {
                 "shell_derived_interpreter_runtime",
                 "derived_interpreter_runtime",
             ),
+            ("shell_trust_store", "trust_store"),
             ("shell_staged_runtime", "staged_runtime_grants"),
             ("env_allow", "env_allow"),
             ("plan_submit", "plan_submit"),

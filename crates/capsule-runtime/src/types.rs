@@ -251,6 +251,13 @@ pub struct CapabilityPolicy {
     /// `sealed`, an optional composed-root bind.
     pub shell_derived_interpreter_runtime:
         Vec<crate::interpreter_runtime::DerivedInterpreterRuntime>,
+    /// The host's TLS trust store, as staging found it for a capsule with a non-empty
+    /// `shell_allow` and a non-empty `network_allow` (see [`crate::trust_store`]). Not a manifest
+    /// field: empty from [`capability_policy_from_runtime_manifest`], filled once by
+    /// `stage_session` and by `mur run --explain-scope` through
+    /// [`crate::trust_store::derive_trust_store`]. Each becomes a readable, non-executable
+    /// Landlock grant (`sandbox::resolve_trust_store_grants`), listable for a directory.
+    pub shell_trust_store: Vec<crate::trust_store::TrustStorePath>,
     /// Host env var names a WASM guest may observe, from `capabilities.env.allow`. Empty by
     /// default: a guest sees only the runtime's own `MURMUR_*` injection unless the manifest
     /// names a variable here. `shell_strip_env` and the credential patterns still apply on
@@ -996,6 +1003,7 @@ pub fn capability_policy_from_runtime_manifest(
         shell_interpreter_runtime,
         shell_staged_runtime,
         shell_derived_interpreter_runtime: Vec::new(),
+        shell_trust_store: Vec::new(),
         env_allow,
         limits,
         resources,
@@ -1139,6 +1147,7 @@ capabilities:
         assert!(policy.shell_interpreter_runtime.is_empty());
         // Derived at staging, never lowered from the manifest.
         assert!(policy.shell_derived_interpreter_runtime.is_empty());
+        assert!(policy.shell_trust_store.is_empty());
     }
 
     /// A shell block that declares no staged runtime lowers to an empty list, not to a default

@@ -3162,7 +3162,9 @@ parent or siblings. A directory not named in the manifest receives no rule at al
 **What to do:** for an allowlisted CPython or Perl interpreter, delete the grant unless it names a
 directory the interpreter does not report on its own import path, such as a virtual environment's
 `site-packages`; `mur run --explain-scope` lists what is derived under `derived interpreter
-runtime`. Otherwise, name the narrowest set of directories that actually works — measure the real
+runtime`. A grant naming a trust-store directory such as `/etc/ssl` is not needed when the capsule
+declares `capabilities.network.allow`: `mur` [grants the host's trust store](containment.md#trust-store)
+then, so delete it. Otherwise, name the narrowest set of directories that actually works — measure the real
 requirement with `strace -f -e trace=openat,getdents64 <interpreter> -c "import ..."` rather than
 guessing, and set `list_dir: false` on any directory you only open known files inside. Accept
 that the capsule is now pinned to this host's interpreter layout, or switch to

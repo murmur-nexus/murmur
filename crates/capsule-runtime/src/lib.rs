@@ -112,6 +112,7 @@ pub(crate) mod tool_call_progress;
 pub mod tool_names;
 pub(crate) mod trace;
 pub(crate) mod trace_blobs;
+pub(crate) mod trust_store;
 pub mod types;
 pub(crate) mod wit_versions;
 pub mod workdir_fs;
@@ -155,6 +156,9 @@ pub use runtime_dir::{
 pub use session_check::{
     copy_tree_into, walk_tree, CheckOutcome, CheckResult, CheckRunner, SessionCheck, TreeEntry,
 };
+// `mur run --explain-scope` derives the host trust store through the same function
+// `stage_session` does, so the report and the session's grants name one set.
+pub use trust_store::{derive_trust_store, TrustStorePath};
 // `network_policy` is a private module; `preopen_reports` is re-exported because `mur run
 // --explain-scope` and `mur doctor` both resolve the preopen set the same way `stage_session`
 // does, and one resolver shared by all three is what keeps the report a description of the launch.
