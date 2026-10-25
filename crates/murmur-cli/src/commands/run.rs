@@ -616,8 +616,9 @@ pub(crate) fn run_run(
         } else {
             IoMaxReport::no_scope_required(capability_policy.resources.cgroup_io_bytes_per_sec)
         };
-        // The interpreter runtimes `stage_session` would derive, through the same function and
-        // with the same trees excluded, so the report names the directories a launch grants.
+        // The interpreter runtimes and trust store `stage_session` would derive, through the same
+        // functions and with the same trees excluded, so the report names the paths a launch
+        // grants.
         let launch_workdir = workdir_root(&project_dir, workdir_arg.as_deref());
         let placement = capsule_runtime::runtime_dir_placement(&launch_workdir)
             .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
@@ -627,6 +628,11 @@ pub(crate) fn run_run(
                 &capability_policy.shell_staged_runtime,
                 &capsule_runtime::capsule_writable_roots(&placement),
             );
+        capability_policy.shell_trust_store = capsule_runtime::derive_trust_store(
+            &capability_policy.shell_allow,
+            &capability_policy.network_allow,
+            &capsule_runtime::capsule_writable_roots(&placement),
+        );
         let report = explain_scope(
             &capability_policy,
             declared_containment_floor,

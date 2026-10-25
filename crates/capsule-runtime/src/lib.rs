@@ -112,6 +112,7 @@ pub(crate) mod tool_call_progress;
 pub mod tool_names;
 pub(crate) mod trace;
 pub(crate) mod trace_blobs;
+pub(crate) mod trust_store;
 pub mod types;
 pub(crate) mod wit_versions;
 pub mod workdir_fs;
@@ -138,6 +139,7 @@ pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
 pub use interpreter_runtime::{
     capsule_writable_roots, derive_interpreter_runtimes, DerivedInterpreterRuntime,
 };
+// The same holds for the host trust store a networked capsule's commands are granted.
 pub use murmur_home::{usable_murmur_home, HomeUnusable, HOME_UNUSABLE_HINT};
 pub use namespace_probe::{MountAttempt, MountAttemptError, MountStep, NamespaceReading};
 pub use network_namespace::{
@@ -155,6 +157,7 @@ pub use runtime_dir::{
 pub use session_check::{
     copy_tree_into, walk_tree, CheckOutcome, CheckResult, CheckRunner, SessionCheck, TreeEntry,
 };
+pub use trust_store::{derive_trust_store, TrustStorePath};
 // `network_policy` is a private module; `preopen_reports` is re-exported because `mur run
 // --explain-scope` and `mur doctor` both resolve the preopen set the same way `stage_session`
 // does, and one resolver shared by all three is what keeps the report a description of the launch.

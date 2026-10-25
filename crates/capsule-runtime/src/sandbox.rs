@@ -1155,6 +1155,31 @@ pub(crate) fn resolve_derived_interpreter_grants(
         .collect()
 }
 
+/// One [`LandlockGrant`] per host trust-store path staging found (see [`crate::trust_store`]): a
+/// directory readable and listable, a CA bundle file readable.
+///
+/// `executable: false` on every one (see [`LandlockGrant`]): a certificate is read, never run. No
+/// write right, as on every [`LandlockGrant`]. The network gate (a non-empty `shell.allow` and a
+/// non-empty `network.allow`) lives in [`crate::trust_store::derive_trust_store`], so a policy
+/// that fails it reaches here with nothing to grant; the derivation never names `/` or an
+/// ancestor of a trust-store path, so no grant here reaches `/etc/ssl/private`.
+///
+/// Issued on every tier and consulted only on `KernelFull` and `KernelSealed`. On `KernelSealed`
+/// a path the composed root does not bind stays unreachable: this grant adds no bind.
+pub(crate) fn resolve_trust_store_grants(
+    paths: &[crate::trust_store::TrustStorePath],
+) -> Vec<LandlockGrant> {
+    paths
+        .iter()
+        .map(|entry| LandlockGrant {
+            path: entry.path.clone(),
+            list_dir: entry.directory,
+            executable: false,
+            pinned: None,
+        })
+        .collect()
+}
+
 /// The host directories a composed root must carry *beyond* [`crate::sealed::SEALED_RUNTIME_PATHS`]
 /// for this capsule's `shell.allow` to keep working: the containing directory of each resolved
 /// allowlisted binary, each declared `interpreter_runtime` directory, and each directory a
@@ -1481,6 +1506,8 @@ pub(crate) fn resolve_sealed_runtime_landlock_grants(tier: EnforcementTier) -> V
 /// hand out the host's own trust store, `resolv.conf` and account databases. Under `KernelSealed`
 /// the paths resolve inside a private read-only bind of an allowlist that was curated precisely so
 /// reading it reveals nothing sensitive. Empty on every other tier.
+/// The trust store alone is granted on every Landlock tier, under the network gate, by
+/// [`resolve_trust_store_grants`].
 ///
 /// Pure and syscall-free (paths need not exist here — `apply_landlock_scope` skips any that fail to
 /// open), so unit-testable on every platform.
@@ -2208,7 +2235,7 @@ pub(crate) struct ShellEnforcement {
     pub(crate) landlock_abi: Option<u8>,
     /// Narrow read (never write) Landlock grants *outside* the workdir so the allowlisted
     /// binaries can actually exec, dynamically link, and (for a path-based interpreter) reach their
-    /// stdlib. Six origins, combined here:
+    /// stdlib. Seven origins, combined here:
     ///
     ///   - the `DT_NEEDED`-closure files (`shell.allow` binaries, their ELF interpreter, their
     ///     shared-library closure), from `resolve_landlock_grants` — each wrapped `list_dir: false`
@@ -2219,6 +2246,9 @@ pub(crate) struct ShellEnforcement {
     ///   - one non-executable grant per entry a recognised interpreter reported on its import
     ///     path at staging, and per library its extension modules need, from
     ///     `resolve_derived_interpreter_grants` — listable for a directory;
+    ///   - one non-executable read grant per host trust-store path staging found for a capsule
+    ///     with a non-empty `shell.allow` and `network.allow`, from `resolve_trust_store_grants` —
+    ///     listable for a directory;
     ///   - one listable grant per `capabilities.shell.staged_runtime` tree, from
     ///     `resolve_staged_runtime_landlock_grants`;
     ///   - on `KernelSealed` **only**, one listable but *non-executable* grant per fixed
@@ -2231,8 +2261,8 @@ pub(crate) struct ShellEnforcement {
     ///     root's `/etc` allowlist, likewise granted by nothing else.
     ///
     /// The closure, `interpreter_runtime` and `staged_runtime` grants carry `executable: true`;
-    /// the derived interpreter grants and the two tier-issued ones do not, and that asymmetry is
-    /// load-bearing — see [`LandlockGrant`].
+    /// the derived interpreter grants, the trust-store grants and the two tier-issued ones do not,
+    /// and that asymmetry is load-bearing — see [`LandlockGrant`].
     ///
     /// Resolved once at launch (in the parent) and threaded into the forked child's `pre_exec`,
     /// where `apply_landlock_scope` turns each into a per-path `PathBeneath` rule with an access
@@ -2344,6 +2374,10 @@ impl ShellEnforcement {
         landlock_grants.extend(resolve_derived_interpreter_grants(
             &policy.shell_derived_interpreter_runtime,
         ));
+        // Plus one read-only grant per host trust-store path staging found. Not tier-gated: the
+        // network gate lives in the derivation, which leaves the field empty for a capsule whose
+        // commands cannot reach the network.
+        landlock_grants.extend(resolve_trust_store_grants(&policy.shell_trust_store));
         // Plus one per staged runtime tree. Without this the tree is bind-mounted into the
         // composed root and then denied by the Landlock ruleset installed inside it — see
         // `resolve_staged_runtime_landlock_grants`.
@@ -11792,6 +11826,301 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             result.exit_code, result.stdout, result.stderr
         );
         result
+    }
+
+    /// A policy allowlisting `shell_allow` and reaching `network_allow`, with the trust store
+    /// derived the way `stage_session` derives it, `work` excluded as the capsule-writable root.
+    fn trust_store_policy(
+        shell_allow: &[&str],
+        network_allow: &[&str],
+        work: &Path,
+    ) -> CapabilityPolicy {
+        let mut policy = CapabilityPolicy {
+            shell_allow: shell_allow.iter().map(|name| name.to_string()).collect(),
+            network_allow: network_allow.iter().map(|rule| rule.to_string()).collect(),
+            ..CapabilityPolicy::default()
+        };
+        policy.shell_trust_store = crate::trust_store::derive_trust_store(
+            &policy.shell_allow,
+            &policy.network_allow,
+            &[work],
+        );
+        println!("derived trust store: {:#?}", policy.shell_trust_store);
+        policy
+    }
+
+    /// The first CA bundle file of the candidate table this host has.
+    fn host_ca_bundle() -> Option<PathBuf> {
+        crate::trust_store::TRUST_STORE_CANDIDATES
+            .iter()
+            .filter(|candidate| !candidate.directory)
+            .map(|candidate| PathBuf::from(candidate.path))
+            .find(|path| std::fs::metadata(path).is_ok_and(|m| m.is_file()))
+    }
+
+    /// An allowlisted `curl` in a capsule with a network allowlist and no `interpreter_runtime`
+    /// block verifies a server certificate under `scoped`.
+    #[test]
+    fn a_scoped_curl_with_network_allow_completes_an_https_request() {
+        let test = "a_scoped_curl_with_network_allow_completes_an_https_request";
+        if find_on_path("curl").is_none() {
+            eprintln!("SKIP — PROVES NOTHING: {test} needs curl on PATH");
+            return;
+        }
+        let unsandboxed = std::process::Command::new("curl")
+            .args([
+                "-sS",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--max-time",
+                "15",
+            ])
+            .arg("https://example.com/")
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&unsandboxed.stdout) != "200" {
+            eprintln!(
+                "SKIP — PROVES NOTHING: {test} needs https://example.com/ to answer 200 outside \
+                 the sandbox; it gave {unsandboxed:?}"
+            );
+            return;
+        }
+        let (_base, work, _outside) = work_and_outside();
+        let policy = trust_store_policy(&["curl"], &["example.com"], &work);
+        assert!(policy.shell_interpreter_runtime.is_empty());
+        assert!(
+            !policy.shell_trust_store.is_empty(),
+            "this host has a trust store the candidate table names"
+        );
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+
+        let fetched = execute(
+            "curl",
+            &[
+                "-sS",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--max-time",
+                "30",
+                "https://example.com/",
+            ],
+            &work,
+            &policy,
+            &enforcement,
+        );
+        enforcement.end_session();
+        assert_eq!(fetched.exit_code, 0, "{}", fetched.stderr);
+        assert_eq!(fetched.stdout, "200");
+    }
+
+    /// The trust store reaches a command only when the capsule declares a network allowlist.
+    #[test]
+    fn a_scoped_command_reads_the_trust_store_only_with_network_allow() {
+        let test = "a_scoped_command_reads_the_trust_store_only_with_network_allow";
+        assert!(
+            crate::trust_store::derive_trust_store(&[], &["example.com".into()], &[]).is_empty()
+        );
+        let Some(bundle) = host_ca_bundle() else {
+            eprintln!("SKIP — PROVES NOTHING: {test} needs a CA bundle the candidate table names");
+            return;
+        };
+        let bundle_arg = bundle.to_str().unwrap();
+        let (_base, work, _outside) = work_and_outside();
+
+        let offline = trust_store_policy(&["cat"], &[], &work);
+        assert!(offline.shell_trust_store.is_empty());
+        let online = trust_store_policy(&["cat"], &["127.0.0.1"], &work);
+        assert!(!online.shell_trust_store.is_empty());
+        let Some(enforcement) = scoped_landlock_enforcement(test, &offline, 1) else {
+            return;
+        };
+        for derived in &online.shell_trust_store {
+            assert!(
+                !enforcement
+                    .landlock_grants
+                    .iter()
+                    .any(|grant| grant.path == derived.path),
+                "{derived:?} granted without network.allow"
+            );
+        }
+        let denied = execute("cat", &[bundle_arg], &work, &offline, &enforcement);
+        enforcement.end_session();
+        assert_ne!(denied.exit_code, 0);
+        assert!(
+            denied.stderr.contains("Permission denied"),
+            "{}",
+            denied.stderr
+        );
+
+        let Some(enforcement) = scoped_landlock_enforcement(test, &online, 1) else {
+            return;
+        };
+        let read = execute("cat", &[bundle_arg], &work, &online, &enforcement);
+        enforcement.end_session();
+        assert_eq!(read.exit_code, 0, "{}", read.stderr);
+        assert!(
+            read.stdout.starts_with("-----BEGIN CERTIFICATE-----"),
+            "{}",
+            &read.stdout[..read.stdout.len().min(200)]
+        );
+    }
+
+    /// The trust-store grant reaches the certificates and nothing beside them: not the directory
+    /// above, its OpenSSL configuration or its private keys, and nothing is writable.
+    #[test]
+    fn the_trust_store_grant_reaches_nothing_beyond_the_trust_store() {
+        let test = "the_trust_store_grant_reaches_nothing_beyond_the_trust_store";
+        let (_base, work, _outside) = work_and_outside();
+        let policy = trust_store_policy(&["cat", "ls", "bash"], &["127.0.0.1"], &work);
+        for entry in &policy.shell_trust_store {
+            for broad in ["/", "/etc", "/etc/ssl", "/etc/pki", "/etc/pki/tls"] {
+                assert_ne!(entry.path, Path::new(broad));
+            }
+            assert!(
+                !entry.path.components().any(|c| c.as_os_str() == "private"),
+                "{entry:?}"
+            );
+        }
+        assert!(resolve_trust_store_grants(&policy.shell_trust_store)
+            .iter()
+            .all(|grant| !grant.executable));
+        if std::fs::metadata("/etc/ssl/certs").map_or(true, |m| !m.is_dir()) {
+            eprintln!("SKIP — PROVES NOTHING: {test} needs /etc/ssl/certs on this host");
+            return;
+        }
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+
+        let listed = execute("ls", &["/etc/ssl/certs"], &work, &policy, &enforcement);
+        assert_eq!(listed.exit_code, 0, "{}", listed.stderr);
+        let above = execute("ls", &["/etc/ssl"], &work, &policy, &enforcement);
+        assert_ne!(above.exit_code, 0);
+        assert!(
+            above.stderr.contains("Permission denied"),
+            "{}",
+            above.stderr
+        );
+        if std::fs::metadata("/etc/ssl/openssl.cnf").is_ok() {
+            let config = execute(
+                "cat",
+                &["/etc/ssl/openssl.cnf"],
+                &work,
+                &policy,
+                &enforcement,
+            );
+            assert_ne!(config.exit_code, 0);
+            assert!(
+                config.stderr.contains("Permission denied"),
+                "{}",
+                config.stderr
+            );
+        }
+        let private = execute("ls", &["/etc/ssl/private"], &work, &policy, &enforcement);
+        assert_ne!(private.exit_code, 0);
+        let probe = Path::new("/etc/ssl/certs/murmur-probe");
+        let written = execute(
+            "bash",
+            &["-c", "echo x > /etc/ssl/certs/murmur-probe"],
+            &work,
+            &policy,
+            &enforcement,
+        );
+        enforcement.end_session();
+        assert_ne!(written.exit_code, 0);
+        assert!(std::fs::symlink_metadata(probe).is_err());
+    }
+
+    #[test]
+    fn resolve_trust_store_grants_reads_and_lists_but_never_executes() {
+        let paths = [
+            crate::trust_store::TrustStorePath {
+                path: PathBuf::from("/etc/ssl/certs"),
+                directory: true,
+            },
+            crate::trust_store::TrustStorePath {
+                path: PathBuf::from("/etc/pki/tls/cacert.pem"),
+                directory: false,
+            },
+        ];
+        assert_eq!(
+            resolve_trust_store_grants(&paths),
+            vec![
+                LandlockGrant {
+                    path: PathBuf::from("/etc/ssl/certs"),
+                    list_dir: true,
+                    executable: false,
+                    pinned: None,
+                },
+                LandlockGrant {
+                    path: PathBuf::from("/etc/pki/tls/cacert.pem"),
+                    list_dir: false,
+                    executable: false,
+                    pinned: None,
+                },
+            ]
+        );
+        assert!(resolve_trust_store_grants(&[]).is_empty());
+    }
+
+    /// `ShellEnforcement::resolve` adds exactly the policy's trust-store grants on both Landlock
+    /// tiers, whatever the host, and leaves the sealed `/etc` grants in place.
+    #[test]
+    fn shell_enforcement_resolve_adds_the_trust_store() {
+        use murmur_artifact::ContainmentClass;
+        let store = vec![
+            crate::trust_store::TrustStorePath {
+                path: PathBuf::from("/murmur-test/certs"),
+                directory: true,
+            },
+            crate::trust_store::TrustStorePath {
+                path: PathBuf::from("/murmur-test/bundle.pem"),
+                directory: false,
+            },
+        ];
+        let expected = resolve_trust_store_grants(&store);
+        let with_store = CapabilityPolicy {
+            shell_trust_store: store.clone(),
+            ..CapabilityPolicy::default()
+        };
+        let without = CapabilityPolicy::default();
+        for (tier, declared) in [
+            (EnforcementTier::KernelFull, ContainmentClass::Scoped),
+            (EnforcementTier::KernelSealed, ContainmentClass::Sealed),
+        ] {
+            let decision =
+                crate::containment::ContainmentDecision::decide(tier, declared, false, false);
+            let granted = |policy: &CapabilityPolicy| {
+                let enforcement =
+                    ShellEnforcement::resolve(policy, &decision, HostProbe::probe()).unwrap();
+                assert_eq!(enforcement.tier, tier);
+                enforcement.landlock_grants
+            };
+            let with_grants = granted(&with_store);
+            let without_grants = granted(&without);
+            for grant in &expected {
+                assert_eq!(
+                    with_grants.iter().filter(|g| *g == grant).count(),
+                    1,
+                    "{tier:?}: {grant:?}"
+                );
+            }
+            assert!(without_grants
+                .iter()
+                .all(|grant| !grant.path.starts_with("/murmur-test")));
+            assert_eq!(with_grants.len(), without_grants.len() + expected.len());
+            let sealed_etc = resolve_sealed_etc_landlock_grants(tier);
+            assert_eq!(sealed_etc.is_empty(), tier != EnforcementTier::KernelSealed);
+            for grant in &sealed_etc {
+                assert!(with_grants.contains(grant), "{tier:?}: {grant:?}");
+            }
+        }
     }
 
     /// An allowlisted `python3` with no `interpreter_runtime` block imports its standard library
