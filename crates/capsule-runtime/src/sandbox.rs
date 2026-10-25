@@ -2774,7 +2774,8 @@ const KERNEL_ENFORCEMENT_NOTICE: &str = "capabilities.shell.allow is non-empty a
 resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now grants a narrow, \
 derived read+execute scope outside the workdir (the allowlisted binaries, their loader, and their \
 shared libraries — nothing writable), read-only access to the directories an allowlisted \
-CPython or Perl interpreter reports on its own import path, and no other directory granted \
+CPython or Perl interpreter reports on its own import path, read-only access to the host's TLS \
+trust store when capabilities.network.allow is also non-empty, and no other directory granted \
 wholesale, plus a fixed device set \
 every capsule gets unconditionally: /dev/null read+write (with the session's temporary and home \
 folders, the only writable paths outside the workdir), \

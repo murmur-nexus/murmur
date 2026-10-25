@@ -983,8 +983,7 @@ when both of these hold:
 
 A capsule missing either gets no trust-store grant. No manifest key turns this on or names a path.
 
-`mur` checks a fixed list of locations, the union of the Go standard library's and the
-`openssl-probe` crate's Linux search lists:
+`mur` checks this fixed list of locations:
 
 | Path | Kind | Where it is the trust store |
 |---|---|---|
@@ -1031,7 +1030,7 @@ inherit the grant with the rest of the session's.
 
 `SSL_CERT_FILE` and `SSL_CERT_DIR` are not read: they are `mur`'s own environment, which the
 capsule's commands do not receive. A trust store outside the list needs a
-[`capabilities.shell.interpreter_runtime`](diagnostics.md#w-sec-009) directory.
+[`capabilities.shell.interpreter_runtime`](manifest.md#field-capabilities) directory.
 
 `mur run --explain-scope` lists the granted paths under `trust store`, and the `session_start`
 event records them under

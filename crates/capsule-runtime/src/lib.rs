@@ -139,7 +139,6 @@ pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
 pub use interpreter_runtime::{
     capsule_writable_roots, derive_interpreter_runtimes, DerivedInterpreterRuntime,
 };
-// The same holds for the host trust store a networked capsule's commands are granted.
 pub use murmur_home::{usable_murmur_home, HomeUnusable, HOME_UNUSABLE_HINT};
 pub use namespace_probe::{MountAttempt, MountAttemptError, MountStep, NamespaceReading};
 pub use network_namespace::{
@@ -157,6 +156,8 @@ pub use runtime_dir::{
 pub use session_check::{
     copy_tree_into, walk_tree, CheckOutcome, CheckResult, CheckRunner, SessionCheck, TreeEntry,
 };
+// `mur run --explain-scope` derives the host trust store through the same function
+// `stage_session` does, so the report and the session's grants name one set.
 pub use trust_store::{derive_trust_store, TrustStorePath};
 // `network_policy` is a private module; `preopen_reports` is re-exported because `mur run
 // --explain-scope` and `mur doctor` both resolve the preopen set the same way `stage_session`
