@@ -764,6 +764,11 @@ fn session_start_effective_grants_match_explain_scope_json() {
 /// `~/.murmur/host_facts` deleted, the next launch reads `derived`/`absent` and the same grants.
 #[test]
 fn session_start_host_facts_say_kept_and_grant_what_a_fresh_derivation_grants() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "session_start_host_facts_say_kept_and_grant_what_a_fresh_derivation_grants",
+    ) {
+        return;
+    }
     if capsule_runtime::find_on_path("python3").is_none() {
         println!("[SKIP] no python3 on PATH");
         return;
