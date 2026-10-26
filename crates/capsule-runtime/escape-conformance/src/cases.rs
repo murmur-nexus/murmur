@@ -1387,18 +1387,9 @@ def main():
     # workdir_max_bytes is 50 MiB in the tight profile; 9 MiB per file stays under the 10 MiB
     # per-file ceiling so this exercises the aggregate check and not RLIMIT_FSIZE.
     #
-    # The files must land in the *session* workdir, which is what WorkdirGuard watches -- the
-    # shell tool's cwd is the accessible workdir one level above it. There is exactly one
-    # session directory under .murmur for this run; falling back to cwd would silently measure
-    # the wrong tree, so the fallback says so instead.
-    import glob
-    sessions = sorted(glob.glob("./.murmur/*"))
-    target = sessions[-1] if sessions else "."
-    if target == ".":
-        verdict("INCONCLUSIVE", "could not locate the session workdir under ./.murmur -- the "
-                                "aggregate ceiling watches that tree, so writing anywhere else "
-                                "would measure nothing")
-        return
+    # Under `--workdir`, WorkdirGuard counts the whole folder passed, which is the shell tool's
+    # cwd: the files land there.
+    target = "."
     chunk = b"\0" * (1024 * 1024)
     for i in range(120):
         try:

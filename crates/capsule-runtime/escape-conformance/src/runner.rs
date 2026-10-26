@@ -449,7 +449,10 @@ fn session_output(case_dir: &Path, workdir: &Path) -> String {
             text.push_str(&content);
         }
     }
-    if let Ok(sessions) = fs::read_dir(workdir.join(".murmur")) {
+    let sessions = capsule_runtime::records_group(workdir)
+        .ok()
+        .and_then(|group| fs::read_dir(group).ok());
+    if let Some(sessions) = sessions {
         for session in sessions.flatten() {
             let log = session.path().join("logs").join("bootstrap.log");
             if let Ok(content) = fs::read_to_string(log) {
@@ -767,12 +770,20 @@ pub fn run_case(
             ),
         },
         Evidence::SecondSpawnRefused(needle) => {
-            let second = driver_summary
-                .split("|| SECOND-CALL")
-                .nth(1)
-                .map(str::trim)
-                .unwrap_or("");
-            if second.is_empty() {
+            let mut calls = driver_summary.split("|| SECOND-CALL");
+            let first = calls.next().unwrap_or("");
+            let second = calls.next().map(str::trim).unwrap_or("");
+            if first.contains("EC_VERDICT=INCONCLUSIVE") {
+                // A probe that gave up caused no breach, so the follow-up call has nothing to be
+                // refused for and its outcome measures nothing.
+                (
+                    Verdict::Inconclusive,
+                    format!(
+                        "the probe gave up before causing a breach, so the follow-up call \
+                         measured nothing. Tool call: {driver_summary}"
+                    ),
+                )
+            } else if second.is_empty() {
                 (
                     Verdict::Inconclusive,
                     format!(
