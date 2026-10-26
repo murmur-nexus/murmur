@@ -426,7 +426,8 @@ fn child_result_relatives(task_id: Option<&str>) -> Vec<(bool, String)> {
 /// held root it lies in, `child_records` (the child's records directory) or `child_workdir` (its
 /// work folder); a root the caller could not open is skipped. The returned path is absolute. A
 /// link where a candidate belongs is refused and latched on that root, and its target is never
-/// read.
+/// read. Bytes that are not UTF-8 are replaced rather than refused: a script child writes its own
+/// result, and a file it wrote must never be reported as no file.
 pub(crate) fn read_child_result(
     child_records: Option<&WorkdirRoot>,
     child_workdir: Option<&WorkdirRoot>,
@@ -440,10 +441,15 @@ pub(crate) fn read_child_result(
             } else {
                 child_workdir
             }?;
-            root.read_to_string(&relative)
+            root.read_file(&relative, u64::MAX)
                 .ok()
                 .flatten()
-                .map(|text| (root.host_path(&relative), text))
+                .map(|bytes| {
+                    (
+                        root.host_path(&relative),
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                    )
+                })
         })
 }
 
@@ -969,6 +975,20 @@ mod tests {
         assert_eq!(
             result_block(Some(&records), Some(&work), None, "dlg_0001", &runtime),
             "result: (the child's result file is empty)"
+        );
+    }
+
+    /// A result file that is not UTF-8 is still the child's answer: handed over with the bad bytes
+    /// replaced, never reported as no file.
+    #[test]
+    fn a_result_that_is_not_utf8_is_handed_over_not_dropped() {
+        let (_child, records, work) = child_roots();
+        work.write_file("out/result.txt", b"caf\xe9 ANSWER", DEFAULT_FILE_MODE)
+            .unwrap();
+        let (_runtime_dir, runtime) = runtime_root();
+        assert_eq!(
+            result_block(Some(&records), Some(&work), None, "dlg_0001", &runtime),
+            "result:\ncaf\u{FFFD} ANSWER"
         );
     }
 

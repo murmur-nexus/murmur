@@ -822,7 +822,8 @@ fn a_parent_that_exits_after_its_task_has_its_childs_answer_first() {
         "the outcome became a task of its own: {kinds:?}"
     );
 
-    // The continuation: the runtime's line, the fenced outcome, a path and not the answer.
+    // The continuation: the runtime's line, then the fenced outcome ending with the child's
+    // answer, which the parent's runtime read once the child had exited.
     let requests = parent._model.requests();
     assert_eq!(requests.len(), 3, "{requests:?}");
     let continued = last_user_text(&requests[2]);
@@ -832,14 +833,13 @@ fn a_parent_that_exits_after_its_task_has_its_childs_answer_first() {
             delegation.delegation_id
         ),
         format!("source=delegation:{SLOW}"),
-        "result: ".to_string(),
         "status: ok".to_string(),
     ] {
         assert!(continued.contains(&said), "missing {said:?}: {continued}");
     }
     assert!(
-        !continued.contains(SLOW_ANSWER),
-        "the child's answer stays in its file: {continued}"
+        continued.ends_with(&format!("result:\n{SLOW_ANSWER}\n</untrusted-content>")),
+        "the outcome carries the child's answer: {continued}"
     );
     let arrivals = arrivals.lock().unwrap().clone();
     let waited = arrivals[2].duration_since(arrivals[1]);
