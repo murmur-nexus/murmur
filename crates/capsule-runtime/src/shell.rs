@@ -2895,6 +2895,12 @@ mod tests {
         script: &str,
         stop: ForegroundStop,
     ) -> ForegroundRun {
+        let mut enforcement = ShellEnforcement::environment_only()
+            .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime), None);
+        // With no cgroup scope, `RLIMIT_NPROC` is headroom over the uid's thread count at the
+        // spawn, and every test running beside this one spends it before `bash` forks. These
+        // tests stop a command rather than bound it, so the headroom is out of their way.
+        enforcement.resource_limits.max_processes = 1 << 20;
         run_shell_until_stopped(
             "bash",
             &["-c", script],
@@ -2904,8 +2910,7 @@ mod tests {
                 shell_allow: vec!["bash".to_string()],
                 ..CapabilityPolicy::default()
             },
-            &ShellEnforcement::environment_only()
-                .with_runtime_dir(crate::sandbox::test_runtime_dir(runtime), None),
+            &enforcement,
             stop,
         )
         .expect("a declared binary runs")
@@ -3350,8 +3355,16 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let roots = crate::sandbox::test_runtime_dir(base.path());
         let folder = roots.temp.as_ref().unwrap().path().to_path_buf();
+        // The host value is process-wide, and every test running beside this one creates its
+        // temporary folders under it: it names a directory that exists and is never removed.
+        let host_tmp = std::env::temp_dir().join("murmur-host-tmp");
+        std::fs::create_dir_all(&host_tmp).unwrap();
+        let saved: Vec<_> = TEMP_DIR_ENV
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
         for name in TEMP_DIR_ENV {
-            std::env::set_var(name, "/host/tmp");
+            std::env::set_var(name, &host_tmp);
         }
         let policy = CapabilityPolicy {
             shell_baseline_env: TEMP_DIR_ENV.iter().map(|name| name.to_string()).collect(),
@@ -3439,6 +3452,12 @@ mod tests {
                     "{name} on {:?}",
                     enforcement.tier
                 );
+            }
+        }
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
             }
         }
     }
