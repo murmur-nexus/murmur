@@ -1335,6 +1335,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
             launched,
             stop,
         },
+        &ctx.runtime_dir.runtime,
     );
 
     // The child is ended and its row is the cancelled task's: the task writes the terminal

@@ -247,6 +247,7 @@ mod tests {
         ),
         ("TRACE_FILE_NAME", crate::trace::TRACE_FILE_NAME),
         ("CHILDREN_DIR", crate::child_launch::CHILDREN_DIR),
+        ("DELEGATIONS_SUBDIR", crate::runtime_dir::DELEGATIONS_SUBDIR),
         ("HOOKS_SUBDIR", crate::records_dir::HOOKS_SUBDIR),
         ("HOME_SUBDIR", crate::records_dir::HOME_SUBDIR),
         ("CHECK_LOG_FILE", crate::session_check::CHECK_LOG_FILE),
@@ -614,6 +615,11 @@ mod tests {
             "murmur.yaml",
             "The project manifest, copied on every launch.",
         ),
+        (
+            "delegations",
+            "One `<delegation-id>.txt` per sub-capsule whose answer was cut in the report its \
+             parent was handed: the whole answer, written once by `hand_over_answer`.",
+        ),
     ];
 
     /// Entry names of files the runtime owns and of the records it keeps: a write or read under
@@ -969,20 +975,6 @@ mod tests {
              operator's outside every work folder, walked by `walk_tree` with no link followed: a \
              link or special file in it refuses the copy. What it reads is written into the work \
              folder through `WorkdirRoot`.",
-        ),
-        (
-            "sandbox.rs",
-            "children_records_path",
-            "Asks whether `records_group(<records dir>/children)` under `~/.murmur/records`, outside \
-             every work folder, exists yet; the descriptor a grant is taken on is opened with no \
-             link followed by `open_directory_no_follow`.",
-        ),
-        (
-            "sandbox.rs",
-            "open_directory_no_follow",
-            "Opens `records_group(<records dir>/children)` under `~/.murmur/records`, outside every \
-             work folder, `O_PATH` with no link followed at its last component, as the descriptor \
-             a parent's read-only rule and bind on its children's records are taken on.",
         ),
         (
             "network_policy.rs",

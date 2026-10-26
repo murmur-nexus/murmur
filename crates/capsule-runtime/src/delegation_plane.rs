@@ -35,7 +35,6 @@
 //! interpolated into a message — a missing approval is reported by naming the field, not by
 //! quoting the body that lacked it.
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -92,12 +91,17 @@ const SEND_DEADLINE: Duration = Duration::from_secs(30);
 /// How often the child is asked whether its task reached a terminal state.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Ceiling on the answer text a delegation returns to the model.
+/// Ceiling on the answer text a delegation hands its parent, in a plan `capsule` step's output and
+/// in the report a `delegate-task` task continues with alike.
 ///
 /// A child that produced a hundred megabytes must not be able to spend its parent's whole context
-/// by being asked one question. Past this, the text is cut and [`DelegationResult::result_path`]
-/// is how the parent reads the rest.
+/// by being asked one question. Past this, [`crate::delegation::hand_over_answer`] cuts the text,
+/// marks the cut and keeps the whole answer at `delegations/<delegation_id>.txt` in the session's
+/// runtime directory.
 pub(crate) const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// What [`bounded`] appends to a text it cut.
+pub(crate) const CUT_MARK: &str = " […]";
 
 /// The three strings an agent supplies for one delegation, and the whole of what it supplies.
 #[derive(Debug, Clone)]
@@ -164,9 +168,9 @@ impl DelegationStatus {
 /// What one delegation produced.
 ///
 /// Carries the child's answer text directly, unlike [`crate::delegation::DelegationOutcome`],
-/// which names a file: this is the return value of a tool call the agent made on purpose, so the
-/// answer is what it asked for. It reaches the model through the untrusted-content fence like
-/// every other tool result.
+/// which carries none: this is the return value of a step the plan made on purpose, so the answer
+/// is what it asked for. It reaches the model through the untrusted-content fence like every other
+/// tool result.
 #[derive(Debug, Clone)]
 pub struct DelegationResult {
     /// The id this delegation is named by, in the `dlg_` id space
@@ -182,15 +186,15 @@ pub struct DelegationResult {
     /// The child's answer on [`DelegationStatus::Completed`]; on every other status, why there is
     /// no answer.
     pub output: String,
-    /// Where the child's answer is on disk, relative to the delegating capsule's own accessible
-    /// workdir — so a parent that wants the untruncated text reads it with an ordinary tool call.
-    /// `None` when the child wrote no result file, and on every non-`Completed` status.
+    /// `delegations/<delegation_id>.txt`, relative to the session's runtime directory: where the
+    /// whole answer is kept, present only when a [`DelegationStatus::Completed`] answer was cut at
+    /// [`MAX_OUTPUT_BYTES`] and the copy was written ([`crate::delegation::hand_over_answer`]).
+    /// `None` for an answer handed over whole, and on every non-`Completed` status.
     pub result_path: Option<String>,
     /// Whether [`Self::output`] was cut at [`MAX_OUTPUT_BYTES`].
     pub truncated: bool,
-    /// The child's directory, relative to the delegating capsule's own accessible workdir — the
-    /// path a parent joins to reach the child's `trace.jsonl` and, once the child ends, its
-    /// result file.
+    /// The child's work folder, in this session's records directory. The child's trace and
+    /// result are in its own records directory, which this session's commands cannot read.
     ///
     /// `Some` only on [`DelegationStatus::Started`], which is the one status where a directory is
     /// all there is to name.
@@ -642,7 +646,7 @@ impl DelegationPlane {
             }
         };
 
-        let child = match launch_child_capsule(launch) {
+        let mut child = match launch_child_capsule(launch) {
             Ok(child) => child,
             Err(error) => {
                 return StartedDelegation::without_child(DelegationResult::unmade(
@@ -684,14 +688,15 @@ impl DelegationPlane {
         }
         let capsule_url = child.capsule_url.trim_end_matches('/').to_string();
         let door_token = child.door_token.clone();
-        if let Err(reason) = deliver_task(
+        match deliver_task(
             &capsule_url,
             door_token.as_ref(),
             &delegation_id,
             request,
             &|| false,
         ) {
-            return failed(&child.session_id, reason);
+            Ok(task_id) => child.task_id = Some(task_id),
+            Err(reason) => return failed(&child.session_id, reason),
         }
 
         let session_id = child.session_id.clone();
@@ -726,6 +731,9 @@ impl DelegationPlane {
     /// — because the step maps them all onto a step result, and a refusal is as much a fact about
     /// the run as an answer is.
     ///
+    /// `runtime_root` is the delegating session's runtime directory: a `completed` answer is handed
+    /// over through [`crate::delegation::hand_over_answer`], which keeps a cut answer whole there.
+    ///
     /// **Cancellation.** [`DelegationOrigin::stop`] is asked once the child is announced, between
     /// delivery attempts, and on every poll. When it reports true this method ends the child,
     /// records it `terminated` by the launcher in the child's `completion.json` with
@@ -737,6 +745,7 @@ impl DelegationPlane {
         &self,
         request: &DelegationRequest,
         origin: &DelegationOrigin<'_>,
+        runtime_root: &WorkdirRoot,
     ) -> DelegationResult {
         // Step 1: ask whether this session may spawn that capsule.
         let grant = match self.approval_for(request) {
@@ -789,7 +798,8 @@ impl DelegationPlane {
         // Every result this call can produce past the launch, built from one place so the
         // delegation id, the capsule and the version cannot disagree between two of them — and so
         // [`MAX_OUTPUT_BYTES`] bounds every branch. A child's *failure* message is as much its own
-        // text as its answer is, so it is cut on the same terms.
+        // text as its answer is, so it is cut on the same terms; its answer is bounded by
+        // [`crate::delegation::hand_over_answer`] instead, which also keeps it whole.
         let outcome = |status, session_id: &str, output: String| {
             let (output, truncated) = bounded(output);
             DelegationResult {
@@ -933,16 +943,26 @@ impl DelegationPlane {
                         .and_then(|artifact| artifact.first_text())
                         .filter(|text| !text.is_empty())
                         .map(str::to_string);
-                    let found =
-                        read_child_result(&child.records_root, &child.workdir_root, &task_id);
+                    let answer = carried
+                        .or_else(|| {
+                            crate::delegation::read_child_result(
+                                Some(&child.records_root),
+                                Some(&child.workdir_root),
+                                Some(&task_id),
+                            )
+                            .map(|(_, text)| text)
+                        })
+                        .unwrap_or_default();
+                    let handed =
+                        crate::delegation::hand_over_answer(answer, &delegation_id, runtime_root);
                     let mut result = outcome(
                         DelegationStatus::Completed,
                         &child.session_id,
-                        carried
-                            .or_else(|| found.as_ref().map(|(_, text)| text.clone()))
-                            .unwrap_or_default(),
+                        String::new(),
                     );
-                    result.result_path = found.map(|(path, _)| path.to_string_lossy().into_owned());
+                    result.output = handed.text;
+                    result.truncated = handed.truncated;
+                    result.result_path = handed.full_path;
                     return result;
                 }
                 TaskState::Failed | TaskState::Rejected => {
@@ -1090,27 +1110,6 @@ fn end_for_canceled_task(
     );
 }
 
-/// Where a finished child left its answer, and what it says.
-///
-/// The candidates are [`crate::delegation::child_result_reads`], most specific first. Each is read
-/// through the held root it lies in, `child_records` (the child's records directory) or
-/// `child_workdir` (its work folder), and the returned path is absolute. A link where a candidate
-/// belongs is refused and latched on that root, and its target is never read.
-pub(crate) fn read_child_result(
-    child_records: &WorkdirRoot,
-    child_workdir: &WorkdirRoot,
-    task_id: &str,
-) -> Option<(PathBuf, String)> {
-    crate::delegation::child_result_reads(child_records, child_workdir, task_id).find_map(
-        |(root, relative)| {
-            root.read_to_string(&relative)
-                .ok()
-                .flatten()
-                .map(|text| (root.host_path(&relative), text))
-        },
-    )
-}
-
 /// `(output, truncated)`, with `output` cut by [`bound_output`] when it is over
 /// [`MAX_OUTPUT_BYTES`].
 pub(crate) fn bounded(output: String) -> (String, bool) {
@@ -1127,7 +1126,7 @@ fn bound_output(output: String) -> String {
     while end > 0 && !output.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{} […]", &output[..end])
+    format!("{}{CUT_MARK}", &output[..end])
 }
 
 /// The host variables a child is handed: the names it declares that its parent declares too.
@@ -1196,6 +1195,7 @@ fn daemon_refusal(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// The five words a tool result's `status` can carry.
     #[test]

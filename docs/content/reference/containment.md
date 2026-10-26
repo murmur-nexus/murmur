@@ -594,7 +594,6 @@ onto. It holds exactly what the sections above put there, and every other path i
 | The work folder, at its own absolute host path | The capsule's work folder, read-write | lists |
 | The [runtime directory](workdir.md#runtime-directory) and the [records directory](workdir.md#records-directory), each at its own absolute host path | Bound read-only | lists |
 | The records directory's `home/`, at its own absolute host path | The session's [home folder](#home-folder), a verified read-write bind mounted after the records directory's read-only bind | lists |
-| The delegated children's records, `~/.murmur/records/<records directory>/children/`, at its own absolute host path | Present for a capsule granted `capabilities.spawn.allow` once a child has staged; bound read-only and verified | lists |
 | `/`, `/etc` as a directory, and each path component above the work folder and the bound directories | Scaffolding the runtime created so the mounts have somewhere to land | `Permission denied` |
 
 The work folder, `/tmp` and the home folder are the only writable paths in the root.

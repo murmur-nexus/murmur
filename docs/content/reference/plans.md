@@ -160,7 +160,7 @@ registered grant, not checked here.
 | `steps` | list | One entry per settled step, in the order they settled |
 | `steps[].step_id` | string | |
 | `steps[].status` | `success` \| `failed` \| `skipped` | |
-| `steps[].output` | string \| null | The step's output text, `null` when it produced none |
+| `steps[].output` | string \| null | The step's output text, `null` when it produced none. A `capsule` step's answer over 64 KiB is cut and marked, and kept whole in the runtime directory, on the terms of a [`delegate-task` outcome](roost-api.md#how-the-outcome-arrives) |
 | `steps[].error` | string \| null | Why the step failed, `null` otherwise |
 
 A plan that did not complete comes back as a failed tool result, so the model is told the outcome
