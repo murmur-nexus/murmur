@@ -981,8 +981,9 @@ recognised interpreter, the paths it reported, the files in each reported direct
 dependencies of every library its extension modules need. Beside each fact the entry records the
 identity of the file or directory it was read from: device, inode, size, owner, mode, modification
 time and change time. A staging that finds every recorded identity unchanged takes the entry, and
-runs no interpreter and reads no binary. Otherwise it works the binary's facts out again, runs the
-interpreter, and rewrites the entry.
+runs no interpreter, lists no reported directory and reads no extension module or library;
+binaries are read only as far as their ELF headers. Otherwise it works the binary's facts out again,
+runs the interpreter, and rewrites the entry.
 
 `session_start.host_facts` in the [session trace](observability-schemas.md#session-trace-tracejsonl)
 says, for each binary, whether the launch kept its facts (`kept`) or worked them out (`derived`),
@@ -999,9 +1000,9 @@ A file edited in place beside the interpreter, or in the directory above it, cha
 binary nor either directory, and goes unseen. Delete `~/.murmur/host_facts/` after such an edit;
 `mur` writes it again.
 
-The per-session filtering is never kept. Every launch drops reported paths inside the two
-capsule-writable trees and skips them in the library walk, so a launch grants exactly what working
-the facts out from scratch would grant.
+Which reported paths a launch grants is decided again on every launch: paths inside the two
+capsule-writable trees are dropped and skipped in the library walk, so a launch with a kept entry
+grants exactly what working the facts out from scratch would grant.
 
 ## The trust store for commands that reach the network { #trust-store }
 

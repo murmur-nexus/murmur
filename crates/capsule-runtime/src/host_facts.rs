@@ -818,7 +818,7 @@ mod tests {
             && matches!(read_entry(path), Read::Entry(_))
     }
 
-    /// S1: a cold derivation stores an entry; the next staging keeps it, runs nothing and reads a
+    /// A cold derivation stores an entry; the next staging keeps it, runs nothing and reads a
     /// few KiB, though the binary is padded to 64 MiB.
     #[test]
     fn a_kept_entry_runs_nothing_and_reads_no_binary_in_full() {
@@ -847,7 +847,7 @@ mod tests {
         println!("a kept staging read {read} bytes");
     }
 
-    /// S3: a binary replaced by rename is worked out again, and its entry rewritten.
+    /// A binary replaced by rename is worked out again, and its entry rewritten.
     #[test]
     fn a_replaced_binary_is_derived_again() {
         let (_guard, root) = canonical_tempdir();
@@ -882,7 +882,7 @@ mod tests {
         );
     }
 
-    /// S4: a module dropped into a kept directory is worked out again, and its closure is granted.
+    /// A module dropped into a kept directory is worked out again, and its closure is granted.
     #[test]
     fn a_module_added_to_a_kept_directory_is_derived_again() {
         let (_guard, root) = canonical_tempdir();
@@ -924,7 +924,7 @@ mod tests {
         );
     }
 
-    /// S5: stores a valid entry, damages it with `damage`, and expects the next staging to work
+    /// Stores a valid entry, damages it with `damage`, and expects the next staging to work
     /// the facts out again, equal to a derivation with no cache, and to leave a valid entry.
     fn an_entry_damaged_by(damage: impl FnOnce(&Path)) {
         let (_guard, root) = canonical_tempdir();
@@ -1049,7 +1049,7 @@ mod tests {
         }
     }
 
-    /// S7: the per-staging filtering runs live. An entry derived reporting A and B with `deps`
+    /// The per-staging filtering runs live. An entry derived reporting A and B with `deps`
     /// writable is kept for a staging that can write B, granting A alone, and for one that can
     /// write neither, granting both; a staging whose closure walk reaches the file under `deps`
     /// the entry never read works the facts out again.
@@ -1104,7 +1104,7 @@ mod tests {
         assert_eq!(reached.runtimes, stand_in.derive_uncached(&[]).runtimes);
     }
 
-    /// S9a: a cache under one of the capsule's writable roots is neither read nor written.
+    /// A cache under one of the capsule's writable roots is neither read nor written.
     #[test]
     fn a_cache_under_a_writable_root_is_never_read_or_written() {
         let (_guard, root) = canonical_tempdir();
@@ -1140,7 +1140,7 @@ mod tests {
         assert!(!fresh.join("host_facts").exists());
     }
 
-    /// S9b: a cache directory reached through a symlink is never used, and one wider than
+    /// A cache directory reached through a symlink is never used, and one wider than
     /// owner-only is narrowed and emptied before anything is kept in it.
     #[test]
     fn a_symlinked_or_wide_cache_directory_keeps_nothing() {
