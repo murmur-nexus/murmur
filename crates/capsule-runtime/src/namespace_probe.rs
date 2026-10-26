@@ -713,11 +713,48 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    const INNER_RUN_ENV: &str = "MURMUR_NAMESPACE_PROBE_UNCHANGED_INNER";
+
     /// The probe runs every attempt in a child: the calling process keeps its namespaces, and no
     /// descriptor it opened outlives it.
+    ///
+    /// `/proc/self/fd` counts every thread's descriptors, so the count is exact only with no
+    /// other test running: the check runs in a single-threaded re-exec of this binary.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_probe_leaves_the_calling_process_unchanged() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "namespace_probe::tests::inner_the_probe_leaves_the_calling_process_unchanged",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(INNER_RUN_ENV, "1")
+            .output()
+            .expect("re-exec the test binary for the single-threaded inner run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "inner probe run failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "inner run did not execute the probe test\n--- stdout ---\n{stdout}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by the_probe_leaves_the_calling_process_unchanged"]
+    fn inner_the_probe_leaves_the_calling_process_unchanged() {
+        if std::env::var(INNER_RUN_ENV).is_err() {
+            return;
+        }
         let namespaces = || {
             ["user", "net", "mnt"].map(|ns| std::fs::read_link(format!("/proc/self/ns/{ns}")).ok())
         };

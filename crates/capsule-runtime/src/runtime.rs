@@ -19385,6 +19385,9 @@ inference:
             resources: limits,
             ..CapabilityPolicy::default()
         };
+        // `bash` can give up on the loop while sleeps it already started still run: their output
+        // goes elsewhere so they never hold the call's, and only the limit line follows the fence.
+        let command = "for i in $(seq 1 32); do sleep 1 >/dev/null 2>&1 & done; wait";
         let prepared = crate::cgroup::prepare_scope(
             true,
             &limits,
@@ -19400,9 +19403,7 @@ inference:
         let mut outcome = dispatch_shell_tool(
             "bash",
             murmur::tool::run::ToolInput {
-                data: Some(
-                    r#"{"command":"for i in $(seq 1 32); do sleep 1 & done; wait"}"#.to_string(),
-                ),
+                data: Some(serde_json::json!({ "command": command }).to_string()),
                 log_path: None,
             },
             &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
