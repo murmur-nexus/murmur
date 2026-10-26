@@ -71,6 +71,9 @@ pub(crate) struct TraceWriter {
     /// The staged artifacts whose `murmur.lock` pin a running capsule fetched. Set by
     /// [`Self::set_runtime_artifacts`] before `session_start` is written; empty until then.
     runtime_artifacts: Vec<RuntimeArtifact>,
+    /// Where staging took the facts about each allowlisted binary it examined. Set by
+    /// [`Self::set_host_facts`] before `session_start` is written; empty until then.
+    host_facts: Vec<HostFactsRecord>,
     /// The session `mur run --resume` continued, verbatim as the operator's address resolved it.
     /// `None` on every ordinary launch. Written to `session_start` on both, so its absence
     /// identifies a trace from a runtime that predates the key.
@@ -392,6 +395,10 @@ struct SessionStartEvent {
     /// capsule's `manage.pull()`, never vetted by the operator — in staging order. Each reaches
     /// the model marked untrusted. Always written, `[]` when there are none.
     runtime_artifacts: Vec<RuntimeArtifact>,
+    /// One object per allowlisted binary staging examined, saying whether its facts came from a
+    /// kept `~/.murmur/host_facts` entry or were worked out, and why. Always written, `[]` when
+    /// no binary was examined.
+    host_facts: Vec<HostFactsRecord>,
     /// The session `mur run --resume` continued, or `null` on an ordinary launch. Together with
     /// `context_id` below it is what makes a resumed conversation followable back through the
     /// sessions that built it.
@@ -2306,6 +2313,7 @@ impl TraceWriter {
             inference_choices: Vec::new(),
             tool_refresh: None,
             runtime_artifacts: Vec::new(),
+            host_facts: Vec::new(),
             resumed_from,
             context_id,
             spawned_by,
@@ -2434,6 +2442,11 @@ impl TraceWriter {
             .collect();
     }
 
+    /// Records `uses`, in order, for `session_start.host_facts`.
+    pub(crate) fn set_host_facts(&mut self, uses: &[crate::host_facts::HostFactsUse]) {
+        self.host_facts = uses.iter().map(HostFactsRecord::of).collect();
+    }
+
     /// Records that this inference call is the first to use a setting value a controller set:
     /// `turn` is the call's zero-based turn, the same number its `inference` line carries, and
     /// `change_id` the `event_id` of the `control_change` that set `value`.
@@ -2560,6 +2573,7 @@ impl TraceWriter {
             inference_choices: self.inference_choices.clone(),
             tool_refresh: self.tool_refresh,
             runtime_artifacts: self.runtime_artifacts.clone(),
+            host_facts: self.host_facts.clone(),
             resumed_from: self.resumed_from.clone(),
             context_id: self.context_id.clone(),
             spawned_by: self.spawned_by.clone(),
@@ -4081,6 +4095,47 @@ pub(crate) struct RuntimeArtifact {
     session: String,
     /// Always `"untrusted"`, derived from `origin`.
     trust: &'static str,
+}
+
+/// One element of `session_start.host_facts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct HostFactsRecord {
+    /// The binary, canonical.
+    binary: String,
+    /// `"kept"` or `"derived"`.
+    source: &'static str,
+    /// Why the facts were derived, as [`crate::host_facts::HostFactsReason::wire_name`] spells
+    /// it. Omitted for `"kept"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// The first path whose stamp differed. Written only for the reason `"changed"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changed_path: Option<String>,
+}
+
+impl HostFactsRecord {
+    fn of(used: &crate::host_facts::HostFactsUse) -> Self {
+        use crate::host_facts::HostFactsSource;
+
+        let binary = used.binary.display().to_string();
+        match &used.source {
+            HostFactsSource::Kept => Self {
+                binary,
+                source: "kept",
+                reason: None,
+                changed_path: None,
+            },
+            HostFactsSource::Derived {
+                reason,
+                changed_path,
+            } => Self {
+                binary,
+                source: "derived",
+                reason: Some(reason.wire_name()),
+                changed_path: changed_path.as_ref().map(|path| path.display().to_string()),
+            },
+        }
+    }
 }
 
 /// `session_start.control`: the names a capsule's `control:` block declares, never a value.

@@ -1162,6 +1162,7 @@ Murmur home (/home/alice/.murmur)
   state: 0700  capsule state stores, expected owner-only
   artifacts: 0755  installed artifacts
   compiled: 0700  compiled WASM cache, safe to delete, expected owner-only
+  host_facts: 0700  facts about allowlisted host binaries, safe to delete, expected owner-only
   bin: absent  cached mur binaries
   formations: 0700  formation members' working directories, each kept until its formation has ended and the entry member's trace.retain expires it, expected owner-only
   nexus-config.json: 0644  something not recognised by this build
@@ -1173,7 +1174,7 @@ Murmur home (/home/alice/.murmur)
 | `<name>: absent` | Nothing exists at that name |
 | `<name>: unreadable (<error>)` | The entry exists and its metadata could not be read |
 | `each kept until …` | How long `mur` keeps what the entry holds. Only `formations` has one: see [Removing formation directories](roster.md#formation-retention) |
-| `safe to delete` | Deleting the entry loses nothing, because `mur` writes it again when it needs it. Only `compiled` is |
+| `safe to delete` | Deleting the entry loses nothing, because `mur` writes it again when it needs it. Only `compiled` and `host_facts` are |
 | `expected owner-only` | The entry is held at the mode in [`~/.murmur` modes](config.md#murmur-home-permissions), and so is everything beneath it. Under `formations`, only the `<frm_id>/` and `<member>/` levels are held: what a member's sessions write inside its owner-only member directory is not reported |
 | `wider than <mode>: <path> is <mode>` | A directory beneath an owner-only entry wider than `0700`, or a file wider than `0600`. At most 20 are listed per entry, then `and N more wider than expected` |
 

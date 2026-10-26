@@ -310,12 +310,13 @@ describe *what* is allowed once a session is running. Three classes exist, weake
 
 `advisory` is user-level trust. What a capsule's shell can write, including the compiled WASM
 artifacts in [`~/.murmur/compiled/`](config.md#murmur-home-permissions) that every later launch
-loads, depends on the [tier](#subprocess-enforcement-tiers) the host achieves:
+loads and the [host facts](#host-facts) in `~/.murmur/host_facts/` that every later launch grants
+from, depends on the [tier](#subprocess-enforcement-tiers) the host achieves:
 
-| Tier | The shell can write | `~/.murmur/compiled/` |
+| Tier | The shell can write | `~/.murmur/compiled/` and `~/.murmur/host_facts/` |
 |---|---|---|
-| Seccomp-only, Environment-only | Anything you can | Writable. A later `scoped` or `sealed` launch loads what the shell wrote there. The checksum stored beside each compiled artifact detects damage and is no defence against code running as you |
-| Full, Sealed | Its workdir only | Writable only when `~/.murmur` lies inside the workdir. `mur` then keeps no compiled artifacts for that launch, but a later launch from another workdir loads what the shell wrote there |
+| Seccomp-only, Environment-only | Anything you can | Writable. A later `scoped` or `sealed` launch loads the compiled artifacts and grants the paths the host facts the shell wrote there name. The checksum stored beside each compiled artifact and the file stamps in each host facts entry detect damage and are no defence against code running as you |
+| Full, Sealed | Its workdir only | Writable only when `~/.murmur` lies inside the workdir. `mur` then neither reads nor writes either directory for that launch, but a later launch from another workdir uses what the shell wrote there |
 
 !!! note "`sealed`'s one documented exception: `/proc`"
 
@@ -935,13 +936,14 @@ names a path.
 | Perl | its binary lists the symbol `perl_parse` | `-f -e` and a program printing `@INC` |
 
 The interpreter runs outside the sandbox, with an empty environment, `/` as its working directory
-and a 5-second limit: once each time `mur` stages a session, before the capsule starts, and once for
-each `mur run --explain-scope`. A binary the capsule's commands could have written is never run:
-one inside the workdir root, or inside `~/.murmur/records/<workdir root>/`, which holds every
-session's [temporary folder](#temp-folder). A binary named by a
-[`staged_runtime`](#field-staged-runtime) grant is not asked, because its runtime is the staged
-tree. When the interpreter cannot answer, `mur` prints one line naming the binary and the reason,
-and the session starts with the binary's usual grants.
+and a 5-second limit, before the capsule starts: when a staging or a `mur run --explain-scope`
+finds no [kept entry](#host-facts) for it that still matches the host. A binary the capsule's
+commands could have written is never run: one inside the workdir root, or inside
+`~/.murmur/records/<workdir root>/`, which holds every session's
+[temporary folder](#temp-folder). A binary named by a [`staged_runtime`](#field-staged-runtime)
+grant is not asked, because its runtime is the staged tree. When the interpreter cannot answer,
+`mur` prints one line naming the binary and the reason, keeps nothing, and the session starts with
+the binary's usual grants; the next launch asks again.
 
 What the interpreter reports becomes a grant:
 
@@ -970,6 +972,36 @@ needs that library named in `capabilities.shell.interpreter_runtime`.
 ```
 
 On macOS nothing is derived and nothing is run.
+
+### Kept host facts { #host-facts }
+
+What `mur` works out for each `capabilities.shell.allow` binary is kept in one entry per binary
+under [`~/.murmur/host_facts/`](config.md#murmur-home-permissions): whether the binary is a
+recognised interpreter, the paths it reported, the files in each reported directory, and the
+dependencies of every library its extension modules need. Beside each fact the entry records the
+identity of the file or directory it was read from: device, inode, size, owner, mode, modification
+time and change time. A staging that finds every recorded identity unchanged takes the entry, and
+runs no interpreter and reads no binary. Otherwise it works the binary's facts out again, runs the
+interpreter, and rewrites the entry.
+
+`session_start.host_facts` in the [session trace](observability-schemas.md#session-trace-tracejsonl)
+says, for each binary, whether the launch kept its facts (`kept`) or worked them out (`derived`),
+and why:
+
+| `reason` | The launch worked the facts out because |
+|---|---|
+| `absent` | No entry exists for the binary |
+| `changed` | The binary, its directory, the directory above it, a reported path, a file in a reported directory or a library the entry records has changed, or the launch reached a library the entry does not record. `changed_path` names the first such path |
+| `unreadable` | The entry is not an owner-only regular file you own, does not parse, or was written by another `mur` version or with another interpreter table |
+| `not-kept` | `~/.murmur` or `~/.murmur/host_facts/` lies inside a tree the capsule's commands can write, or the directory is a symlink, is not yours, or was wider than `0700`. A wide directory is narrowed and emptied |
+
+A file edited in place beside the interpreter, or in the directory above it, changes neither the
+binary nor either directory, and goes unseen. Delete `~/.murmur/host_facts/` after such an edit;
+`mur` writes it again.
+
+The per-session filtering is never kept. Every launch drops reported paths inside the two
+capsule-writable trees and skips them in the library walk, so a launch grants exactly what working
+the facts out from scratch would grant.
 
 ## The trust store for commands that reach the network { #trust-store }
 

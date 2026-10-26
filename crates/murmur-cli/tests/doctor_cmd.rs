@@ -2210,7 +2210,8 @@ fn doctor_reports_the_compiled_forms_directory_as_owner_only() {
     assert!(
         stdout.contains(
             "  artifacts: absent  installed artifacts\n  compiled: absent  compiled WASM cache, safe \
-             to delete, expected owner-only\n"
+             to delete, expected owner-only\n  host_facts: absent  facts about allowlisted host \
+             binaries, safe to delete, expected owner-only\n"
         ),
         "{stdout}"
     );

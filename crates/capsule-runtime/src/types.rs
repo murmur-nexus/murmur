@@ -612,6 +612,9 @@ pub struct StagedSession {
     pub(crate) capsule_url: String,
     pub resolved_lock_artifacts: Vec<ResolvedLockArtifact>,
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
+    /// Where staging took the facts about each allowlisted binary it examined, for
+    /// `session_start.host_facts`.
+    pub(crate) host_facts: Vec<crate::host_facts::HostFactsUse>,
     /// Each staged artifact's full name, by the tool name the session knows it by.
     pub(crate) artifact_full_names: std::collections::HashMap<String, String>,
     pub(crate) inference: Option<InferenceConfig>,

@@ -165,8 +165,8 @@ pub fn write_private_file(target: &Path, contents: &[u8]) -> Result<(), String> 
 /// has timer-tick resolution, as on Linux before 6.13, a same-size write within one tick of the
 /// stamp can keep it.
 ///
-/// Its `Display` form is recorded on disk beside each compiled form, so changing the format makes
-/// every recorded stamp miss once.
+/// Its `Display` form is recorded on disk beside each compiled form and in each host facts entry,
+/// so changing the format makes every recorded stamp miss once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FileStamp {
     dev: u64,
@@ -212,6 +212,103 @@ impl std::fmt::Display for FileStamp {
     }
 }
 
+/// `<home>/<name>`, a cache directory of this uid held owner-only, and whether this call found
+/// it wider than that and emptied it; `None` when it cannot be used. `reachable` says whether a
+/// directory can be written from the capsule being staged: a `home` or directory it reaches is
+/// neither read nor written. Only `create` touches the disk: it holds the directory owner-only,
+/// as every other writer under the home does, and creates or narrows nothing through a symlink.
+/// The home is checked before anything is created beneath it and the directory again after.
+///
+/// A directory `create` finds wider than owner-only is narrowed and emptied of everything but
+/// subdirectories: while it was wide, another uid could have planted or hard-linked an entry that
+/// passes every per-file check of [`open_private`].
+pub(crate) fn private_subdir(
+    home: &Path,
+    name: &str,
+    create: bool,
+    reachable: impl Fn(&Path) -> bool,
+) -> Option<(PathBuf, bool)> {
+    if reachable(home) {
+        return None;
+    }
+    let dir = home.join(name);
+    let mut widened = false;
+    if create {
+        // `hold_private_dir` sets the mode through a symlink, so it only ever sees a real
+        // directory or a missing path.
+        match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) if metadata.is_dir() => widened = !held_private(&dir),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+        hold_private_dir(&dir).ok()?;
+    }
+    if !held_private(&dir) || reachable(&dir) {
+        return None;
+    }
+    if widened {
+        for (path, _) in direct_files(&dir) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Some((dir, widened))
+}
+
+/// Whether `dir` is `root` or lies beneath it once both are resolved. A `dir` that cannot be
+/// resolved, or a `root` that cannot be resolved for any reason but not existing, counts as
+/// reachable.
+pub(crate) fn reachable_from(dir: &Path, root: &Path) -> bool {
+    match (dir.canonicalize(), root.canonicalize()) {
+        (Ok(dir), Ok(root)) => dir.starts_with(root),
+        (Ok(_), Err(err)) => err.kind() != std::io::ErrorKind::NotFound,
+        (Err(_), _) => true,
+    }
+}
+
+/// Whether `dir` itself, not a symlink to it, is a directory of this uid in the state
+/// [`hold_private_dir`] leaves it in.
+pub(crate) fn held_private(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|metadata| {
+        metadata.is_dir() && owned_within(&metadata, current_euid(), MURMUR_HOME_DIR_MODE)
+    })
+}
+
+/// Whether `metadata` belongs to `euid` and grants no permission bit beyond `allowed`.
+pub(crate) fn owned_within(metadata: &std::fs::Metadata, euid: u32, allowed: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.uid() == euid && !is_wider_than(metadata.mode(), allowed)
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn current_euid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, touches no memory of the caller and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// `path` opened for reading, when it is a regular file of this uid at [`PRIVATE_FILE_MODE`] or
+/// narrower. Does not follow a symlink on the final component, does not block on a FIFO, and
+/// checks the owner, type and mode on the open handle.
+pub(crate) fn open_private(path: &Path) -> Option<(std::fs::File, std::fs::Metadata)> {
+    let (file, metadata) = crate::resource_plane::open_no_follow(path).ok()?;
+    (metadata.is_file() && owned_within(&metadata, current_euid(), PRIVATE_FILE_MODE))
+        .then_some((file, metadata))
+}
+
+/// Every direct entry of `dir` that is not a directory, with its `lstat` metadata. Never recurses,
+/// never follows a symlink, and skips an entry it cannot read.
+pub(crate) fn direct_files(dir: &Path) -> impl Iterator<Item = (PathBuf, std::fs::Metadata)> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).ok()?;
+            (!metadata.is_dir()).then_some((path, metadata))
+        })
+}
+
 /// Whether `mode` grants any permission bit `allowed` does not.
 pub fn is_wider_than(mode: u32, allowed: u32) -> bool {
     (mode & 0o777) & !allowed != 0
@@ -231,6 +328,7 @@ pub enum HomeEntryKind {
     State,
     Artifacts,
     CompiledForms,
+    HostFacts,
     BinaryCache,
     Formations,
     Sessions,
@@ -241,7 +339,7 @@ pub enum HomeEntryKind {
 
 impl HomeEntryKind {
     /// Every kind with a fixed name, in the order the audit reports them after the home itself.
-    const KNOWN: [HomeEntryKind; 14] = [
+    const KNOWN: [HomeEntryKind; 15] = [
         Self::Config,
         Self::DeployKeys,
         Self::DeployStaging,
@@ -252,6 +350,7 @@ impl HomeEntryKind {
         Self::State,
         Self::Artifacts,
         Self::CompiledForms,
+        Self::HostFacts,
         Self::BinaryCache,
         Self::Formations,
         Self::Sessions,
@@ -272,6 +371,7 @@ impl HomeEntryKind {
             Self::State => "state",
             Self::Artifacts => "artifacts",
             Self::CompiledForms => "compiled",
+            Self::HostFacts => "host_facts",
             Self::BinaryCache => "bin",
             Self::Formations => crate::formation_launch::FORMATIONS_DIR,
             Self::Sessions => crate::runtime_dir::SESSIONS_DIR_NAME,
@@ -294,6 +394,7 @@ impl HomeEntryKind {
             Self::State => "capsule state stores",
             Self::Artifacts => "installed artifacts",
             Self::CompiledForms => "compiled WASM cache",
+            Self::HostFacts => "facts about allowlisted host binaries",
             Self::BinaryCache => "cached mur binaries",
             Self::Formations => "formation members' working directories",
             Self::Sessions => "running sessions' runtime directories",
@@ -326,7 +427,7 @@ impl HomeEntryKind {
     /// `formations/` is not: deleting an ended formation's directory stops nothing, but its peers'
     /// traces go with it and are never written again.
     pub fn safe_to_delete(&self) -> bool {
-        matches!(self, Self::CompiledForms)
+        matches!(self, Self::CompiledForms | Self::HostFacts)
     }
 
     /// Whether the entry, and everything beneath it down to [`Self::private_depth`], is expected
@@ -663,6 +764,7 @@ pub(crate) fn wide_file(path: &Path, contents: &str, mode: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn murmur_home_is_wider_than_truth_table() {
@@ -806,7 +908,6 @@ mod tests {
     #[test]
     #[ignore = "run by an_unusable_home_names_home_and_its_cause"]
     fn a_closed_home_inner() {
-        use std::os::unix::fs::PermissionsExt;
         if !in_scratch_home() {
             return;
         }
@@ -838,25 +939,27 @@ mod tests {
 
         let reports = audit_murmur_home(&home);
 
-        assert_eq!(reports.len(), 15);
+        assert_eq!(reports.len(), 16);
         assert_eq!(reports[0].kind, HomeEntryKind::Home);
         assert_eq!(reports[1].kind, HomeEntryKind::Config);
         assert_eq!(reports[10].kind, HomeEntryKind::CompiledForms);
-        assert_eq!(reports[11].kind, HomeEntryKind::BinaryCache);
-        assert_eq!(reports[12].kind, HomeEntryKind::Formations);
-        assert_eq!(reports[13].kind, HomeEntryKind::Sessions);
-        assert_eq!(reports[14].kind, HomeEntryKind::Records);
+        assert_eq!(reports[11].kind, HomeEntryKind::HostFacts);
+        assert_eq!(reports[11].path, home.join("host_facts"));
+        assert_eq!(reports[12].kind, HomeEntryKind::BinaryCache);
+        assert_eq!(reports[13].kind, HomeEntryKind::Formations);
+        assert_eq!(reports[14].kind, HomeEntryKind::Sessions);
+        assert_eq!(reports[15].kind, HomeEntryKind::Records);
         assert!(reports
             .iter()
             .all(|report| report.state == HomeEntryState::Absent));
     }
 
     /// Only `formations/`, `sessions/` and `records/` say how long they are kept, and only
-    /// `compiled/` is safe to delete: a formation directory and a session's records are removed by
-    /// retention, and what they hold is never written again; a session's runtime directory is
-    /// removed when it ends.
+    /// `compiled/` and `host_facts/` are safe to delete: a formation directory and a session's
+    /// records are removed by retention, and what they hold is never written again; a session's
+    /// runtime directory is removed when it ends.
     #[test]
-    fn murmur_home_kinds_say_how_formations_are_kept_and_only_compiled_is_safe_to_delete() {
+    fn murmur_home_kinds_say_how_formations_are_kept_and_only_the_caches_are_safe_to_delete() {
         let every = HomeEntryKind::KNOWN
             .into_iter()
             .chain([HomeEntryKind::Home, HomeEntryKind::Unrecognised("x".into())]);
@@ -871,10 +974,20 @@ mod tests {
             );
             assert_eq!(
                 kind.safe_to_delete(),
-                kind == HomeEntryKind::CompiledForms,
+                matches!(
+                    kind,
+                    HomeEntryKind::CompiledForms | HomeEntryKind::HostFacts
+                ),
                 "{kind:?}"
             );
+            if kind.safe_to_delete() {
+                assert!(kind.expected_private(), "{kind:?}");
+            }
         }
+        assert_eq!(
+            HomeEntryKind::HostFacts.holds(),
+            "facts about allowlisted host binaries"
+        );
         assert_eq!(
             HomeEntryKind::Formations.kept(),
             Some(
@@ -882,6 +995,56 @@ mod tests {
                  expires it"
             )
         );
+    }
+
+    #[test]
+    fn owned_within_refuses_an_owner_other_than_the_expected_uid() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("form.cwasm");
+        std::fs::write(&path, b"form").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+
+        assert!(owned_within(&metadata, current_euid(), 0o600));
+        assert!(!owned_within(
+            &metadata,
+            current_euid().wrapping_add(1),
+            0o600
+        ));
+    }
+
+    #[test]
+    fn held_private_accepts_only_an_owner_only_directory_reached_without_a_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("forms");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(held_private(&dir));
+
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(!held_private(&link));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(!held_private(&dir));
+    }
+
+    #[test]
+    fn a_directory_beneath_the_capsule_workdir_is_reachable_from_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("work");
+        let inside = workdir.join(".murmur");
+        let outside = temp.path().join("home");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+
+        assert!(reachable_from(&workdir, &workdir));
+        assert!(reachable_from(&inside, &workdir));
+        assert!(!reachable_from(&outside, &workdir));
+        // A workdir staging has not created yet cannot contain an existing directory.
+        assert!(!reachable_from(&outside, &temp.path().join("not-created")));
+        // A directory that cannot be resolved is never used.
+        assert!(reachable_from(&temp.path().join("missing"), &workdir));
     }
 
     /// `formations/` holds members' working directories: known, owner-only down to each member's

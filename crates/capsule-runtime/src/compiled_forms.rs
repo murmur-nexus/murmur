@@ -165,44 +165,18 @@ impl CompiledForms {
         format!("{key_sha256}-{:016x}.cwasm", self.engine_key)
     }
 
-    /// `~/.murmur/compiled`, or `None` when it cannot be used. Only `create` touches the disk: it
-    /// holds the home and the directory owner-only, as every other writer under the home does,
-    /// and creates or narrows nothing through a symlink. The home is checked before anything is
-    /// created beneath it and the directory again after.
-    ///
-    /// A directory `create` finds wider than owner-only is narrowed and emptied of everything but
-    /// subdirectories: while it was wide, another uid could have planted or hard-linked an entry
-    /// that passes every per-file check in [`load`].
+    /// `~/.murmur/compiled`, or `None` when it cannot be used, on
+    /// [`crate::murmur_home::private_subdir`]'s terms. Only `create` touches the disk.
     fn dir(&self, create: bool) -> Option<PathBuf> {
         let home = if create {
             crate::murmur_home::ensure_murmur_home().ok()?
         } else {
             crate::state_store::murmur_home_dir().ok()?
         };
-        if self.reachable_from_capsule(&home) {
-            return None;
-        }
-        let dir = home.join(COMPILED_DIR);
-        let mut widened = false;
-        if create {
-            // `hold_private_dir` sets the mode through a symlink, so it only ever sees a real
-            // directory or a missing path.
-            match std::fs::symlink_metadata(&dir) {
-                Ok(metadata) if metadata.is_dir() => widened = !held_private(&dir),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                _ => return None,
-            }
-            crate::murmur_home::hold_private_dir(&dir).ok()?;
-        }
-        if !held_private(&dir) || self.reachable_from_capsule(&dir) {
-            return None;
-        }
-        if widened {
-            for (path, _) in files(&dir) {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-        Some(dir)
+        crate::murmur_home::private_subdir(&home, COMPILED_DIR, create, |dir| {
+            self.reachable_from_capsule(dir)
+        })
+        .map(|(dir, _)| dir)
     }
 
     /// Whether `dir` is reachable from the staged capsule's writable root; never, when no capsule
@@ -210,7 +184,7 @@ impl CompiledForms {
     fn reachable_from_capsule(&self, dir: &Path) -> bool {
         self.capsule_writable
             .as_deref()
-            .is_some_and(|root| reachable_from(dir, root))
+            .is_some_and(|root| crate::murmur_home::reachable_from(dir, root))
     }
 }
 
@@ -234,59 +208,6 @@ fn is_key(key_sha256: &str) -> bool {
 /// The file beside a form that records the form's sha256.
 fn sidecar(path: &Path) -> PathBuf {
     path.with_extension("cwasm.sha256")
-}
-
-/// Whether `dir` is `root` or lies beneath it once both are resolved. A `dir` that cannot be
-/// resolved, or a `root` that cannot be resolved for any reason but not existing, counts as
-/// reachable.
-fn reachable_from(dir: &Path, root: &Path) -> bool {
-    match (dir.canonicalize(), root.canonicalize()) {
-        (Ok(dir), Ok(root)) => dir.starts_with(root),
-        (Ok(_), Err(err)) => err.kind() != std::io::ErrorKind::NotFound,
-        (Err(_), _) => true,
-    }
-}
-
-/// Whether `dir` itself, not a symlink to it, is a directory of this uid in the state
-/// `hold_private_dir` leaves it in.
-fn held_private(dir: &Path) -> bool {
-    std::fs::symlink_metadata(dir).is_ok_and(|metadata| {
-        metadata.is_dir()
-            && owned_within(
-                &metadata,
-                current_euid(),
-                crate::murmur_home::MURMUR_HOME_DIR_MODE,
-            )
-    })
-}
-
-/// Whether `metadata` belongs to `euid` and grants no permission bit beyond `allowed`.
-fn owned_within(metadata: &Metadata, euid: u32, allowed: u32) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    metadata.uid() == euid && !crate::murmur_home::is_wider_than(metadata.mode(), allowed)
-}
-
-#[allow(unsafe_code)]
-fn current_euid() -> u32 {
-    // SAFETY: `geteuid` takes no arguments, touches no memory of the caller and cannot fail.
-    unsafe { libc::geteuid() }
-}
-
-/// `path` opened for reading, when it is a regular file of this uid at [`PRIVATE_FILE_MODE`] or
-/// narrower. Does not follow a symlink on the final component, does not block on a FIFO, and
-/// checks the owner, type and mode on the open handle.
-///
-/// [`PRIVATE_FILE_MODE`]: crate::murmur_home::PRIVATE_FILE_MODE
-fn open_private(path: &Path) -> Option<(std::fs::File, Metadata)> {
-    let (file, metadata) = crate::resource_plane::open_no_follow(path).ok()?;
-    (metadata.is_file()
-        && owned_within(
-            &metadata,
-            current_euid(),
-            crate::murmur_home::PRIVATE_FILE_MODE,
-        ))
-    .then_some((file, metadata))
 }
 
 /// Writes the form `bytes` as `file_name` in `dir` and a sidecar holding their sha256, then reads
@@ -325,11 +246,11 @@ fn store(dir: &Path, file_name: &str, bytes: &[u8]) {
 fn read_verified(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read;
 
-    let (mut file, before) = open_private(path)?;
+    let (mut file, before) = crate::murmur_home::open_private(path)?;
     let mut bytes = Vec::with_capacity(usize::try_from(before.len()).ok()?);
     file.read_to_end(&mut bytes).ok()?;
     let mut recorded = String::new();
-    open_private(&sidecar(path))?
+    crate::murmur_home::open_private(&sidecar(path))?
         .0
         .read_to_string(&mut recorded)
         .ok()?;
@@ -401,7 +322,7 @@ fn prune_stale(dir: &Path, now: SystemTime) {
                 .is_ok_and(|unused| unused > retention)
         })
     };
-    for (path, metadata) in files(dir) {
+    for (path, metadata) in crate::murmur_home::direct_files(dir) {
         let Some(name) = path.file_name().map(OsStrExt::as_bytes) else {
             continue;
         };
@@ -447,20 +368,6 @@ fn last_used(metadata: &Metadata) -> Option<SystemTime> {
         (Ok(used), Err(_)) | (Err(_), Ok(used)) => Some(used),
         (Err(_), Err(_)) => None,
     }
-}
-
-/// Every direct entry of `dir` that is not a directory, with its `lstat` metadata. Never recurses,
-/// never follows a symlink, and skips an entry it cannot read.
-fn files(dir: &Path) -> impl Iterator<Item = (PathBuf, Metadata)> {
-    std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path).ok()?;
-            (!metadata.is_dir()).then_some((path, metadata))
-        })
 }
 
 /// The empty component in the binary format: the component preamble alone.
@@ -723,56 +630,6 @@ mod tests {
                 .next(),
             Some(murmur_artifact::sha256_hex(&bytes).as_str()),
         );
-    }
-
-    #[test]
-    fn owned_within_refuses_an_owner_other_than_the_expected_uid() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("form.cwasm");
-        std::fs::write(&path, b"form").unwrap();
-        std::fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-
-        assert!(owned_within(&metadata, current_euid(), 0o600));
-        assert!(!owned_within(
-            &metadata,
-            current_euid().wrapping_add(1),
-            0o600
-        ));
-    }
-
-    #[test]
-    fn held_private_accepts_only_an_owner_only_directory_reached_without_a_symlink() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join("forms");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, Permissions::from_mode(0o700)).unwrap();
-        assert!(held_private(&dir));
-
-        let link = temp.path().join("link");
-        std::os::unix::fs::symlink(&dir, &link).unwrap();
-        assert!(!held_private(&link));
-
-        std::fs::set_permissions(&dir, Permissions::from_mode(0o750)).unwrap();
-        assert!(!held_private(&dir));
-    }
-
-    #[test]
-    fn a_directory_beneath_the_capsule_workdir_is_reachable_from_it() {
-        let temp = tempfile::tempdir().unwrap();
-        let workdir = temp.path().join("work");
-        let inside = workdir.join(".murmur");
-        let outside = temp.path().join("home");
-        std::fs::create_dir_all(&inside).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-
-        assert!(reachable_from(&workdir, &workdir));
-        assert!(reachable_from(&inside, &workdir));
-        assert!(!reachable_from(&outside, &workdir));
-        // A workdir staging has not created yet cannot contain an existing directory.
-        assert!(!reachable_from(&outside, &temp.path().join("not-created")));
-        // A directory that cannot be resolved is never used.
-        assert!(reachable_from(&temp.path().join("missing"), &workdir));
     }
 
     #[test]

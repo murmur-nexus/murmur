@@ -1110,9 +1110,9 @@ mod tests {
         ),
         (
             "sandbox.rs",
-            "resolve_landlock_grants_outside",
-            "The ELF images of host binaries and libraries a shell grant names, read for their \
-             dependencies.",
+            "open_host",
+            "The ELF images of host binaries and libraries a shell grant or a derived interpreter \
+             runtime names, opened to read their headers and dependencies.",
         ),
         (
             "sandbox.rs",
