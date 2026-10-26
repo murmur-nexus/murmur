@@ -14,14 +14,21 @@ use capsule_runtime::{
 };
 use murmur_artifact::ContainmentClass;
 
-/// `HostProbe::probes_taken` counts the whole process, so the two tests that assert on deltas
-/// must not overlap: without this they see each other's probes and read a correct implementation
-/// as a wrong count.
+/// `HostProbe::probes_taken` counts the whole process, so every test here that takes a probe
+/// holds this lock: without it the two tests that assert on deltas see the others' probes and read
+/// a correct implementation as a wrong count.
 static COUNTER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Holds [`COUNTER`]; a test that failed while holding it leaves the count no less exact.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    COUNTER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[test]
 fn two_probes_are_two_readings() {
-    let _serial = COUNTER.lock().expect("counter lock");
+    let _serial = serial();
     let before = HostProbe::probes_taken();
     let _first = HostProbe::probe();
     let _second = HostProbe::probe();
@@ -36,7 +43,7 @@ fn two_probes_are_two_readings() {
 /// `detect_containment_decision`, the public wrapper the escape-conformance harness calls.
 #[test]
 fn each_standalone_host_question_takes_its_own_reading() {
-    let _serial = COUNTER.lock().expect("counter lock");
+    let _serial = serial();
 
     fn probes_during(ask: impl FnOnce()) -> u64 {
         let before = HostProbe::probes_taken();
@@ -73,6 +80,7 @@ fn each_standalone_host_question_takes_its_own_reading() {
 #[test]
 fn only_a_sealed_declaration_is_reported_sealed() {
     const SEALED_TIER: &str = "mountns+pivot_root+landlock+seccomp";
+    let _serial = serial();
     let host = detect_containment_decision(ContainmentClass::Sealed).0;
     println!(
         "host can back: {}, sealed declaration runs on {}",
@@ -111,6 +119,7 @@ fn only_a_sealed_declaration_is_reported_sealed() {
 /// `/tmp` is mappable is crate-private; `sandbox`'s live-reading test checks it.
 #[test]
 fn one_reading_answers_every_namespace_question_from_its_attempts() {
+    let _serial = serial();
     let probe = HostProbe::probe();
     let namespaces = probe.namespaces();
     println!("namespace reading: {namespaces:?}");
