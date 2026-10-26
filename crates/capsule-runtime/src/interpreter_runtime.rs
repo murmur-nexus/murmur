@@ -21,9 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::host_facts::HostFactsCache;
-#[cfg(target_os = "linux")]
-use crate::host_facts::HostFactsUse;
+use crate::host_facts::{HostFactsCache, HostFactsUse};
 
 /// One interpreter family the runtime recognises from the binary itself.
 #[cfg(target_os = "linux")]
