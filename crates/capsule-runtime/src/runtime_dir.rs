@@ -6,7 +6,9 @@
 //! └── <session-id>/                   0700, created at staging, removed when the session ends
 //!     ├── .lock                       flock held from creation until removal
 //!     ├── runtime/                    $MURMUR_RUNTIME_DIR: MURMUR.md, task.md, murmur.yaml,
-//!     │                               tools/, plans/ — readable by commands, never writable
+//!     │   │                           tools/, plans/ — readable by commands, never writable
+//!     │   └── delegations/            <delegation-id>.txt: the whole answer of a sub-capsule
+//!     │                               whose answer was cut in the report its parent was handed
 //!     ├── sealed-etc/                 the composed root's /etc/passwd and /etc/group
 //!     └── harness/<run-id>/           a `transport: process` harness's files
 //! ```
@@ -91,6 +93,12 @@ pub const SESSIONS_DIR_NAME: &str = "sessions";
 /// The directory beneath `<session-id>/` that `$MURMUR_RUNTIME_DIR` names.
 pub const RUNTIME_SUBDIR: &str = "runtime";
 
+/// The directory beneath `runtime/` holding `<delegation-id>.txt`, the whole answer of each
+/// sub-capsule whose answer was cut at [`crate::delegation_plane::MAX_OUTPUT_BYTES`] in what the
+/// parent was handed. Written only by [`crate::delegation::hand_over_answer`], and only for a cut
+/// answer.
+pub const DELEGATIONS_SUBDIR: &str = "delegations";
+
 /// The directory beneath `<session-id>/` holding the composed root's synthetic `/etc` files.
 pub const SEALED_ETC_SUBDIR: &str = "sealed-etc";
 
@@ -106,7 +114,7 @@ pub const LOCK_FILE_NAME: &str = ".lock";
 pub const STALE_AFTER: Duration = Duration::from_secs(60);
 
 /// The mode every directory beneath `~/.murmur/sessions` is created at.
-const PRIVATE_DIR_MODE: u32 = crate::murmur_home::MURMUR_HOME_DIR_MODE;
+pub(crate) const PRIVATE_DIR_MODE: u32 = crate::murmur_home::MURMUR_HOME_DIR_MODE;
 
 /// Where the runtime directory and the records directory lie relative to a workdir, decided
 /// without creating anything.
@@ -285,12 +293,6 @@ pub struct RuntimeDirRoots {
     /// granted exactly as [`Self::temp`] is. `None` for roots held outside a session, where no
     /// command runs.
     pub home: Option<WorkdirRoot>,
-    /// The directory every delegated child's records directory lies beneath,
-    /// `records_group(<records dir>/children)`: readable, never writable, to the session's
-    /// commands, so a parent's agent can read the result an outcome names. A path rather than a
-    /// root, because it exists only once a child has staged; a command is granted it when it
-    /// exists. `None` for a session that can delegate nothing.
-    pub children_records: Option<std::path::PathBuf>,
 }
 
 impl RuntimeDirRoots {
@@ -305,7 +307,6 @@ impl RuntimeDirRoots {
             records: None,
             temp: None,
             home: None,
-            children_records: None,
         }
     }
 
@@ -327,14 +328,6 @@ impl RuntimeDirRoots {
     #[must_use]
     pub fn with_home(mut self, home: WorkdirRoot) -> Self {
         self.home = Some(home);
-        self
-    }
-
-    /// These roots with `children_records` as the directory the session's delegated children keep
-    /// their records beneath.
-    #[must_use]
-    pub fn with_children_records(mut self, children_records: std::path::PathBuf) -> Self {
-        self.children_records = Some(children_records);
         self
     }
 }

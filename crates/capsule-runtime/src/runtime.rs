@@ -1721,26 +1721,25 @@ async fn end_child(child: Option<crate::child_launch::LaunchedChild>) {
 }
 
 /// Deliver one delegation whose outcome has arrived: let its child finish exiting, read the
-/// child's own record once, and write the terminal `delegation` line from it. Returns what the
-/// task is told.
+/// child's own record once, write the terminal `delegation` line from it, and read the child's
+/// answer. Returns what the task is told.
 ///
 /// `outcome` and `reason` come out of the child's `completion.json`, never out of the
 /// completion's message text: both reporters write that file before they post. A file that cannot
 /// be read still closes the row — a delegation left permanently in flight in the trace is a worse
-/// record than one whose outcome is stated as unknown.
+/// record than one whose outcome is stated as unknown. The answer is read through the child's
+/// directories ([`ChildDirs`]), never through the `result_path` the record names.
 async fn deliver_delegation(
     state: &CapsuleStoreState,
     delegation_id: String,
     mut delegation: crate::cancel::LiveDelegation,
 ) -> crate::delegation::OutcomeNotice {
-    release_finished_child(delegation.child.take()).await;
-    // The child's records directory as the child reported it, never a path beneath the parent's
-    // workdir, which the parent's commands can write.
-    let child_records = WorkdirRoot::open_sharing_latch_absolute(
-        &delegation.child_records_dir,
-        &state.accessible_root,
-    )
-    .ok();
+    let child = delegation.child.take();
+    let held = child.as_ref().map(ChildDirs::held);
+    release_finished_child(child).await;
+    let dirs = held.unwrap_or_else(|| ChildDirs::opened(state, &delegation));
+    let result = dirs.result_block(state, &delegation_id);
+    let child_records = dirs.records;
     match child_records
         .as_ref()
         .and_then(crate::delegation::read_completion)
@@ -1760,6 +1759,7 @@ async fn deliver_delegation(
                 &outcome,
                 &delegation.capsule,
                 &delegation.version,
+                &result,
             )
         }
         None => {
@@ -1783,9 +1783,57 @@ async fn deliver_delegation(
                 capsule: delegation.capsule,
                 version: delegation.version,
                 status: "unknown".to_string(),
-                body: reason,
+                body: format!("{reason}\n{result}"),
             }
         }
+    }
+}
+
+/// The directories a delegated child's answer is read through, each with no link followed and
+/// sharing the session's refusal latch.
+struct ChildDirs {
+    /// The child's records directory: its `completion.json`, and an agent child's `out/`.
+    records: Option<WorkdirRoot>,
+    /// The child's work folder, where a script child writes its own `out/`.
+    workdir: Option<WorkdirRoot>,
+    /// The id the child gave its task, naming its per-task result file.
+    task_id: Option<String>,
+}
+
+impl ChildDirs {
+    /// The roots the adopted handle holds, taken before the handle is released.
+    fn held(child: &crate::child_launch::LaunchedChild) -> Self {
+        Self {
+            records: Some(child.records_root.clone()),
+            workdir: Some(child.workdir_root.clone()),
+            task_id: child.task_id.clone(),
+        }
+    }
+
+    /// The roots opened by the absolute paths the launch notice named, for a delegation no handle
+    /// was adopted for. The records directory is as the child reported it, never a path beneath
+    /// the parent's workdir, which the parent's commands can write.
+    fn opened(state: &CapsuleStoreState, delegation: &crate::cancel::LiveDelegation) -> Self {
+        let open = |path: &std::path::Path| {
+            WorkdirRoot::open_sharing_latch_absolute(path, &state.accessible_root).ok()
+        };
+        Self {
+            records: open(&delegation.child_records_dir),
+            workdir: open(&delegation.workdir),
+            task_id: None,
+        }
+    }
+
+    /// The child's [`crate::delegation::result_block`], a cut answer kept whole in this session's
+    /// runtime directory.
+    fn result_block(&self, state: &CapsuleStoreState, delegation_id: &str) -> String {
+        crate::delegation::result_block(
+            self.records.as_ref(),
+            self.workdir.as_ref(),
+            self.task_id.as_deref(),
+            delegation_id,
+            &state.runtime_root,
+        )
     }
 }
 
@@ -1797,7 +1845,12 @@ async fn end_overdue_delegation(
     mut delegation: crate::cancel::LiveDelegation,
     bound: std::time::Duration,
 ) -> crate::delegation::OutcomeNotice {
-    end_child(delegation.child.take()).await;
+    let child = delegation.child.take();
+    let held = child.as_ref().map(ChildDirs::held);
+    end_child(child).await;
+    let result = held
+        .unwrap_or_else(|| ChildDirs::opened(state, &delegation))
+        .result_block(state, &delegation_id);
     let reason = format!(
         "no outcome reached the delegating task within {}s of this sub-capsule starting",
         bound.as_secs()
@@ -1827,7 +1880,12 @@ async fn end_overdue_delegation(
         delivered: false,
         delivery_error: None,
     };
-    crate::delegation::OutcomeNotice::recorded(&outcome, &delegation.capsule, &delegation.version)
+    crate::delegation::OutcomeNotice::recorded(
+        &outcome,
+        &delegation.capsule,
+        &delegation.version,
+        &result,
+    )
 }
 
 /// Account for one delegation a task leaves behind. One whose outcome had already arrived is
@@ -3183,24 +3241,12 @@ pub fn stage_session(
                     .display()
             ),
         })?;
-    let mut runtime_dirs = runtime_dir_guard
+    let runtime_dirs = runtime_dir_guard
         .roots()
         .clone()
         .with_records(records_root.clone())
         .with_temp(temp_root)
         .with_home(home_root);
-    // Every delegated child's records directory lies beneath this one, its records group being
-    // its work folder's, `<records dir>/children/<capsule>-<16 hex>`.
-    if !request.capability_policy.spawn_allow.is_empty() {
-        runtime_dirs = runtime_dirs.with_children_records(
-            crate::records_dir::records_group(
-                &records_dir.path().join(crate::child_launch::CHILDREN_DIR),
-            )
-            .map_err(|unusable| RuntimeError::RecordsDirUnavailable {
-                reason: unusable.to_string(),
-            })?,
-        );
-    }
     let runtime_root = runtime_dirs.runtime.clone();
     let manifest_file_name = request
         .manifest_file
@@ -11324,6 +11370,8 @@ fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
     let started = crate::delegation_plane::DelegationStatus::Started.as_str();
     let failed = crate::delegation_plane::DelegationStatus::Failed.as_str();
     let terminated = crate::delegation::DelegationStatus::Terminated.as_str();
+    let bound_kib = crate::delegation_plane::MAX_OUTPUT_BYTES / 1024;
+    let delegations = crate::runtime_dir::DELEGATIONS_SUBDIR;
     let description = format!(
         "Hand one task to one sub-capsule and return as soon as it is running and holding that \
          task. This call does not wait for the sub-capsule to finish and never returns its \
@@ -11337,10 +11385,12 @@ fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
          delegation comes back as an error saying why; one that could not be started has \
          `status: {failed}` and an `output` saying why. Once you end your turn, this task waits \
          for every sub-capsule it started and continues in this conversation with each one's \
-         outcome: its `delegation_id`, its final status, and either the path of its result \
-         file, which you read for its answer, or `result: none` when it wrote no file. A \
-         sub-capsule still running at the delegation deadline is ended and reported as \
-         `{terminated}`. No tool reports on a sub-capsule while it runs. A task that is \
+         outcome: its `delegation_id`, its final status, and the sub-capsule's answer under \
+         `result:`, or `result: none` when it wrote no result. An answer longer than \
+         {bound_kib} KiB is cut there with the cut marked, and the whole answer is at \
+         `{delegations}/<delegation_id>.txt` in the runtime directory. A sub-capsule still \
+         running at the delegation deadline is ended and reported as `{terminated}`. No tool \
+         reports on a sub-capsule while it runs. A task that is \
          cancelled, or that ends any other way while a sub-capsule is still running, ends that \
          sub-capsule with it."
     );
@@ -11364,9 +11414,9 @@ fn delegate_task_result_data(
         "status": result.status.as_str(),
     });
     match &result.child_workdir {
-        // Present only on a started delegation, and the only path there is to the child's own
-        // trace: joined to this capsule's workdir, it is a directory the parent's ordinary
-        // file tools can already address.
+        // Present only on a started delegation: the child's work folder, in this session's
+        // records directory. The child's trace is in its own records directory, which this
+        // capsule's commands cannot read.
         Some(workdir) => {
             data["child_workdir"] = serde_json::Value::String(workdir.clone());
         }
@@ -13497,7 +13547,10 @@ mod tests {
             "return as soon as it is running and holding that task",
             "does not wait for the sub-capsule to finish",
             "this task waits for every sub-capsule it started",
-            "the path of its result file",
+            "the sub-capsule's answer under `result:`",
+            "64 KiB",
+            "cut there with the cut marked",
+            "`delegations/<delegation_id>.txt` in the runtime directory",
             "`result: none`",
             "No tool reports on a sub-capsule while it runs",
             "ends that sub-capsule with it",
@@ -13515,6 +13568,8 @@ mod tests {
             "carry on with other work",
             concat!("nothing to ", "poll"),
             "then end your turn",
+            "the path of its result file",
+            "which you read for its answer",
         ] {
             assert!(
                 !description.contains(forbidden),
@@ -16091,16 +16146,6 @@ inference:
             };
             let staged = stage_session(Arc::new(LocalSourceOnlyRegistry), request).unwrap();
 
-            // A session that can delegate grants its commands its children's records.
-            assert_eq!(
-                staged.runtime_dirs.children_records,
-                Some(
-                    crate::records_dir::records_group(
-                        &staged.records_dir.join(crate::child_launch::CHILDREN_DIR)
-                    )
-                    .unwrap()
-                )
-            );
             if workdir.is_some() {
                 assert_eq!(fs::read_dir(operator.path()).unwrap().count(), 0);
             } else {
@@ -25935,8 +25980,11 @@ inference:
                 .unwrap()
         };
 
-        let found =
-            crate::delegation_plane::read_child_result(&open("records"), &open("work"), "tsk_1");
+        let found = crate::delegation::read_child_result(
+            Some(&open("records")),
+            Some(&open("work")),
+            Some("tsk_1"),
+        );
 
         assert!(found.is_none(), "{found:?}");
         let mut refused: Vec<String> = state

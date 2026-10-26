@@ -447,7 +447,7 @@ it are composed by the capsule's own runtime, so **a delegating capsule needs no
 | `session_id` | string | `ses_…`, the child's own session |
 | `capsule`, `version` | string | The artifact that was launched, `capsule` by its bare name |
 | `status` | string | `started` or `failed`. A refused call returns no object — see below |
-| `child_workdir` | string | The child's work folder, absolute: `<parent records directory>/children/<capsule>-<16 hex>`. Its `trace.jsonl` and an agent child's `out/result.txt` are in its own [records directory](workdir.md#records-directory). Present only on `started` |
+| `child_workdir` | string | The child's work folder, absolute: `<parent records directory>/children/<capsule>-<16 hex>`. Present only on `started` |
 | `output` | string | Why there is no delegation, on `failed`. Absent on `started`, which has produced nothing yet |
 
 `started` means the sub-capsule is running **and holding its task**, not merely that a process
@@ -487,7 +487,7 @@ continuation however far apart the outcomes arrive: the delivery spends one turn
 [`task_continued`](observability-schemas.md#task-continued) trace line. The wait spends no tokens
 and counts against no spend ceiling.
 
-Each outcome reaches the model as one block:
+Each outcome reaches the model as one block, the sub-capsule's answer under `result:` at its end:
 
 ```text
 [delegate-task] delegation dlg_0193… to worker@1.0.0 ended ok:
@@ -499,15 +499,40 @@ session_id: ses_0193…
 status: ok
 duration_ms: 4210
 workdir: /home/me/.murmur/records/home/me/project/ses_0192…/children/worker-3f2a…
-result: /home/me/.murmur/records/home/me/.murmur/records/home/me/project/ses_0192…/children/worker-3f2a…/ses_0193…/out/result.txt
-
-The child's own output is in that file and is not reproduced here.
+result:
+The report has three findings. …
 </untrusted-content>
 ```
 
-The block names the result file, which the model reads for the answer, or says
-`result: none (the child wrote no result file)`. It never carries the child's output. Every
-outcome of the round is delivered in one continuation, one block per delegation in id order.
+The delegating capsule's runtime reads the answer from the result file the sub-capsule left in its
+own directories, once the sub-capsule has exited, and hands it over inside the
+`delegation:<capsule>` fence. What follows `result:` depends on what the sub-capsule left:
+
+| The sub-capsule left | The block ends with |
+|---|---|
+| A result of at most 64 KiB | `result:` and the whole answer |
+| A result over 64 KiB | `result:`, the first 64 KiB of the answer cut on a character boundary and marked ` […]`, then the cut line below |
+| An empty result file | `result: (the child's result file is empty)` |
+| No result file | `result: none (the child wrote no result file)` |
+
+A cut answer is kept whole at `delegations/<delegation_id>.txt` in the delegating session's
+[runtime directory](workdir.md#runtime-directory), and the cut line names that place:
+
+```text
+result:
+The report has three findings. … […]
+[cut at 65536 of 72000 bytes; the whole answer is delegations/dlg_0193….txt in the runtime directory]
+```
+
+Every kind of tool reads that file read-only: a WASM tool at
+`murmur-runtime/delegations/<delegation_id>.txt`, a shell command at
+`$MURMUR_RUNTIME_DIR/delegations/<delegation_id>.txt`. A copy that cannot be written is said in
+the cut line in place of the path: `[cut at <kept> of <total> bytes; the whole answer could not be
+kept in the runtime directory: <reason>]`.
+
+Every outcome of the round is delivered in one continuation, one block per delegation in id order.
+The capsule's own commands cannot read a sub-capsule's records directory, so the block is where
+the answer reaches the delegating capsule.
 
 A task that ends before an outcome arrives ends the sub-capsule. The `delegation` trace line
 records `terminated`, with a `reason` naming why:
@@ -571,9 +596,10 @@ cannot be read refuses to launch with [`E-RUN-020`](diagnostics.md#e-run-020).
 
 ### What the completion carries
 
-The delegation's identity, the outcome and where the result is — never the child's output. The
-result stays in the child's own files: `out/result.txt` in the child's records directory for an
-agent child, or in its work folder for a script child, which writes its own.
+The delegation's identity, the outcome and where the child left its result — never the child's
+output. The child leaves its result in its own files: `out/result.txt` in the child's records
+directory for an agent child, or in its work folder for a script child, which writes its own. The
+parent's runtime reads it there and hands it over in the [outcome block](#how-the-outcome-arrives).
 
 | Field | Meaning |
 |---|---|
@@ -581,7 +607,7 @@ agent child, or in its work folder for a script child, which writes its own.
 | `capsule_name`, `capsule_version` | Which capsule ran |
 | `session_id` | The child's own session, so its trace is findable |
 | `status` | `ok`, `error`, `crashed` or `terminated`. These are the words the `delegation` trace line carries for a delegation closed from a completion — see [Which outcome vocabulary applies](observability-schemas.md#delegation-outcome) |
-| `result_path` | The result file's absolute path, absent when the child wrote none |
+| `result_path` | The result file's absolute path, absent when the child wrote none. A record for a reader of `completion.json`: the parent's runtime does not open it |
 | `workdir` | The child's work folder, absolute |
 | `duration_ms` | How long the child ran |
 | `detail` | The exit status and the child's last stderr lines, on a `crashed` or `terminated` outcome |

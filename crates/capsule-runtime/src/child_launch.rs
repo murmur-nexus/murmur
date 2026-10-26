@@ -401,6 +401,10 @@ pub struct LaunchedChild {
     /// The formation the child reports it joined, read from `formation_id` on its readiness
     /// line. `None` when the line carries no such key, or a value that is not a formation id.
     pub formation_id: Option<FormationId>,
+    /// The id the child gave the task its parent delivered, once [`crate::delegation_plane`] has
+    /// delivered one: what names the child's per-task result file when its parent reads the
+    /// answer. `None` until then.
+    pub(crate) task_id: Option<String>,
     process: Arc<Mutex<ChildProcess>>,
     /// The child's last [`CHILD_STDERR_TAIL_LINES`] lines, retained so a crash can say why.
     stderr_tail: Arc<StderrTail>,
@@ -665,6 +669,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         delegation_id: handle.as_ref().map(|handle| handle.delegation_id.clone()),
         door_token: readiness.door_token,
         formation_id: readiness.formation_id,
+        task_id: None,
         process: unclaimed.claim(),
         stderr_tail,
         started,
@@ -1764,6 +1769,7 @@ mod tests {
             env: Vec::new(),
             delegation_id: None,
             formation_id: None,
+            task_id: None,
             door_token: Some(crate::door_auth::DoorToken::new(
                 "mdt1.secretpayload.secretmac".to_string(),
             )),
@@ -1935,6 +1941,7 @@ mod tests {
                 env: Vec::new(),
                 delegation_id: None,
                 formation_id: None,
+                task_id: None,
                 door_token: None,
                 process: Arc::new(Mutex::new(process)),
                 stderr_tail: Arc::new(StderrTail {
@@ -1999,6 +2006,7 @@ mod tests {
                 env: Vec::new(),
                 delegation_id: None,
                 formation_id: None,
+                task_id: None,
                 door_token: None,
                 process: Arc::clone(&process),
                 stderr_tail: Arc::new(StderrTail {
@@ -2067,6 +2075,7 @@ mod tests {
             env: Vec::new(),
             delegation_id: Some("dlg_watched".to_string()),
             formation_id: None,
+            task_id: None,
             door_token: None,
             process: Arc::new(Mutex::new(process)),
             stderr_tail: Arc::new(StderrTail {
@@ -2142,6 +2151,7 @@ mod tests {
             env: Vec::new(),
             delegation_id: Some("dlg_watched".to_string()),
             formation_id: None,
+            task_id: None,
             door_token: None,
             process: Arc::new(Mutex::new(process)),
             stderr_tail: Arc::new(StderrTail {

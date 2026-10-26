@@ -1088,10 +1088,6 @@ pub(crate) struct SealedBindSources<'a> {
     /// descriptor its home root holds on it, bound read-write and required at its own absolute
     /// path, after [`Self::records_dir`], so `$HOME` names it inside the root.
     pub(crate) home_dir: Option<(&'a Path, (u64, u64))>,
-    /// The directory the session's delegated children keep their records beneath, and the
-    /// identity of the descriptor taken on it, bound read-only at its own absolute path once a
-    /// child has staged there.
-    pub(crate) children_records: Option<(&'a Path, (u64, u64))>,
 }
 
 /// Directory the old root is parked in between `pivot_root(2)` and `umount2(MNT_DETACH)`.
@@ -1475,22 +1471,6 @@ pub(crate) fn plan_composed_root(
                 source: path.to_path_buf(),
                 target,
                 read_only: false,
-                identity,
-            },
-            true,
-        );
-    }
-
-    // 10. The delegated children's records, read-only and REQUIRED once they exist, at their own
-    //    absolute path, so the result an outcome names reads the same inside the root.
-    if let Some((path, identity)) = sources.children_records {
-        let target = rebase(base, path);
-        builder.mkdir_p(&target);
-        builder.push(
-            RootOp::BindVerified {
-                source: path.to_path_buf(),
-                target,
-                read_only: true,
                 identity,
             },
             true,
@@ -2594,7 +2574,6 @@ mod tests {
             runtime_dir: None,
             records_dir: None,
             home_dir: None,
-            children_records: None,
         }
     }
 
@@ -2979,17 +2958,21 @@ mod tests {
         ));
     }
 
-    /// The delegated children's records, once a child has staged, are bound read-only, verified
-    /// and required at their own path.
+    /// A delegating session's root binds nothing beneath the directory its delegated children keep
+    /// their records in, `records_group(<records dir>/children)`: the parent's runtime reads a
+    /// child's answer and hands it over, so no command of the parent's reaches a child's records.
     #[test]
-    fn the_childrens_records_are_bound_read_only_and_verified() {
+    fn nothing_is_bound_beneath_the_childrens_records() {
+        const TEST_RECORDS_DIR: &str = "/home/u/.murmur/records/home/u/w/ses_x";
+        const TEST_HOME_DIR: &str = "/home/u/.murmur/records/home/u/w/ses_x/home";
         const TEST_CHILDREN_RECORDS: &str =
             "/home/u/.murmur/records/home/u/.murmur/records/home/u/w/ses_x/children";
-        const TEST_CHILDREN_IDENTITY: (u64, u64) = (7, 79);
         let plan = plan_composed_root(
             Path::new("/home/u/w"),
             &SealedBindSources {
-                children_records: Some((Path::new(TEST_CHILDREN_RECORDS), TEST_CHILDREN_IDENTITY)),
+                runtime_dir: Some((Path::new(TEST_RUNTIME_DIR), TEST_RUNTIME_IDENTITY)),
+                records_dir: Some((Path::new(TEST_RECORDS_DIR), (7, 77))),
+                home_dir: Some((Path::new(TEST_HOME_DIR), (7, 78))),
                 ..test_sources()
             },
             Path::new("/tmp"),
@@ -2997,27 +2980,28 @@ mod tests {
             &[],
             &FakeHost::usrmerge(),
         );
-        let step = plan
+        let bound: Vec<&Path> = plan
             .steps
             .iter()
-            .find(|step| {
-                matches!(&step.op, RootOp::BindVerified { source, .. } if source == Path::new(TEST_CHILDREN_RECORDS))
+            .filter_map(|step| match &step.op {
+                RootOp::BindVerified { source, .. } | RootOp::Bind { source, .. } => {
+                    Some(source.as_path())
+                }
+                _ => None,
             })
-            .expect("the children's records are bound");
-        assert!(step.required);
-        assert_eq!(
-            step.op,
-            RootOp::BindVerified {
-                source: PathBuf::from(TEST_CHILDREN_RECORDS),
-                target: PathBuf::from("/tmp").join(TEST_CHILDREN_RECORDS.trim_start_matches('/')),
-                read_only: true,
-                identity: TEST_CHILDREN_IDENTITY,
-            }
+            .collect();
+        assert!(
+            bound.contains(&Path::new(TEST_RECORDS_DIR)),
+            "the plan binds the session's own records: {bound:?}"
         );
-        assert!(plan_for("/home/u/w").steps.iter().all(|step| !matches!(
-            &step.op,
-            RootOp::BindVerified { source, .. } if source == Path::new(TEST_CHILDREN_RECORDS)
-        )));
+        for source in &bound {
+            assert!(
+                !source.starts_with(TEST_CHILDREN_RECORDS)
+                    && !Path::new(TEST_CHILDREN_RECORDS).starts_with(source),
+                "{} is bound, which reaches the children's records",
+                source.display()
+            );
+        }
     }
 
     /// The remount keeps every flag a user namespace locks on the source mount.

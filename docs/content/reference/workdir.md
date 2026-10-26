@@ -127,6 +127,7 @@ directory outside the work folder:
     │   ├── task.md
     │   ├── murmur.yaml                   the launched manifest, under its own name
     │   ├── plans/plan-<n>.json
+    │   ├── delegations/<delegation-id>.txt
     │   └── tools/<name>/murmur.yaml | <name> | skill.md
     ├── sealed-etc/passwd, sealed-etc/group
     └── harness/<run-id>/
@@ -144,6 +145,7 @@ created is refused with [`E-IO-004`](diagnostics.md#e-io-004) before anything is
 | `runtime/tools/<name>/<name>` | A staged or pulled native tool, marked executable |
 | `runtime/tools/<name>/skill.md` | A staged skill's text. The runtime returns this as the tool result when the skill is called |
 | `runtime/plans/plan-<n>.json` | One submitted plan per file, numbered by this session's own counter, and read back when the plan runs |
+| `runtime/delegations/<delegation-id>.txt` | The whole answer of a sub-capsule whose answer was cut at 64 KiB in what this session was handed — a [`delegate-task` outcome](roost-api.md#how-the-outcome-arrives) or a plan `capsule` step's output. Present only for a cut answer; the cut line names it |
 | `sealed-etc/` | The `passwd` and `group` a `sealed` capsule's composed root binds at `/etc/passwd` and `/etc/group` |
 | `harness/<run-id>/` | The files a `transport: process` driver asked for, present while its harness runs |
 
@@ -306,12 +308,6 @@ remove, rename over or create a file there gets `Permission denied` under Landlo
 `Read-only file system` inside a composed root; a hard link from it into the work folder gets
 `Invalid cross-device link`. `out/` and `children/` are read-only to the capsule's commands like
 every other record.
-
-A capsule granted `capabilities.spawn.allow` gives its commands one
-more read-only path: the records group of its `children/`,
-`~/.murmur/records/<records directory>/children/`, which holds every delegated child's records
-directory. It is granted once a child has staged, so the parent agent can read the
-`out/result.txt` a delegation outcome names, and no command can change it.
 
 `tmp/` and `home/` are the two writable paths, each granted the work folder's rights:
 

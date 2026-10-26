@@ -79,6 +79,17 @@ const AUTH_WORKER: &str = "auth-worker";
 /// The sub-capsule that answers as [`WORKER`] does and then stays up for its next task, so a plan
 /// step polling it for its task's state still reaches it after the answer.
 const STAYING_WORKER: &str = "staying-worker";
+/// The sub-capsule whose answer is longer than a delegation hands over whole: [`long_answer`].
+const LONG_WORKER: &str = "long-worker";
+/// The same answer from a sub-capsule that stays up after it, so a plan step polling it for its
+/// task's state still reaches it.
+const LONG_STAYING_WORKER: &str = "long-staying-worker";
+/// The parent whose envelope grants a few commands, so its own commands can read what its
+/// runtime directory holds and try what its children's records hold.
+const READING_PARENT: &str = "reading-delegator";
+/// The WASM tool a parent with no shell reads files with, preopened at `murmur-runtime/` the way
+/// every `runtime: tool` with no `capabilities.filesystem.scope` is.
+const PROBE_TOOL: &str = "runtime-dir-probe";
 /// The parent whose envelope also grants `bash`, so the child it delegates to may run commands.
 const FORGING_PARENT: &str = "forging-delegator";
 /// The sub-capsule whose one command tries to forge its own outcome, and whose task then fails.
@@ -94,6 +105,25 @@ const PROVIDER_KEY_VALUE: &str = "sk-test-PROVIDERKEY-8W3M-DELEGATED";
 const UNGRANTED_VAR: &str = "MURMUR_TEST_UNGRANTED_KEY";
 
 const WORKER_ANSWER: &str = "WORKER-ANSWER-4K2P-DELEGATED";
+
+/// The sentinels at the two ends of [`long_answer`].
+const LONG_HEAD: &str = "LONG-ANSWER-HEAD-6R1T";
+const LONG_TAIL: &str = "LONG-ANSWER-TAIL-6R1T";
+
+/// [`LONG_WORKER`]'s answer: 72 000 bytes of plain ASCII, past the 64 KiB a delegation hands over
+/// whole, opening with [`LONG_HEAD`] and closing with [`LONG_TAIL`].
+fn long_answer() -> String {
+    let len = 72_000;
+    let mut answer = format!("{LONG_HEAD} ");
+    while answer.len() + LONG_TAIL.len() + 1 < len {
+        answer.push_str("lorem ");
+    }
+    answer.truncate(len - LONG_TAIL.len() - 1);
+    answer.push(' ');
+    answer.push_str(LONG_TAIL);
+    assert_eq!(answer.len(), len);
+    answer
+}
 
 /// The bound every delegation in this file runs under, short enough that the wedged-child case
 /// finishes in a test and long enough that a launched child gets its turn.
@@ -572,6 +602,7 @@ fn suite() -> &'static Suite {
                 common::local(PARENT).as_str(),
                 common::local(UNGRANTED_PARENT).as_str(),
                 common::local(FORGING_PARENT).as_str(),
+                common::local(READING_PARENT).as_str(),
             ],
         );
         std::env::set_var("MURMUR_ROOST_URL", &roost.url);
@@ -597,7 +628,9 @@ fn suite() -> &'static Suite {
                     DEEP_WORKER,
                     THIRSTY_WORKER,
                     AUTH_WORKER,
-                    STAYING_WORKER
+                    STAYING_WORKER,
+                    LONG_WORKER,
+                    LONG_STAYING_WORKER
                 ]
                 .map(common::local)
                 .join(", ")
@@ -647,6 +680,54 @@ fn suite() -> &'static Suite {
                 "task_acceptance: queue\n  after_task: sleep",
             ),
             None,
+        );
+        // The sub-capsules whose answer is cut in what their parent is handed.
+        // `scoped`, so a `scoped` parent may delegate to it as well as an `advisory` one.
+        roost.publish(
+            LONG_WORKER,
+            VERSION,
+            &agent_capsule_manifest(&always_replying(&long_answer()).endpoint)
+                .replace("capabilities:\n", "capabilities:\n  containment: scoped\n"),
+            None,
+        );
+        roost.publish(
+            LONG_STAYING_WORKER,
+            VERSION,
+            &agent_capsule_manifest_with(
+                &always_replying(&long_answer()).endpoint,
+                "task_acceptance: queue\n  after_task: sleep",
+            ),
+            None,
+        );
+        // The file tool of the parent that has no shell.
+        common::publish_to_store(
+            &registry,
+            &common::local(PROBE_TOOL),
+            VERSION,
+            "tool",
+            "runtime: tool\n",
+            Some((
+                "tool.wasm",
+                &common::fixture_path("runtime-dir-probe/tool/runtime-dir-probe.wasm"),
+            )),
+        );
+        // The reading parent's envelope: a few commands, `scoped`, and the two capsules its
+        // cases delegate to.
+        roost.publish(
+            READING_PARENT,
+            VERSION,
+            &format!(
+                "artifacts: []\ncapabilities:\n  \
+                 containment: scoped\n  \
+                 network:\n    allow: [127.0.0.1]\n  \
+                 env:\n    allow: [{PROVIDER_KEY_VAR}]\n  \
+                 shell:\n    allow: [{READING_SHELL}]\n  \
+                 spawn:\n    allow: [{}]\n",
+                common::local(LONG_WORKER)
+            ),
+            Some(&common::fixture_path(
+                "run/components/capsule-env-echo.wasm",
+            )),
         );
         // The sub-capsule the referee refuses: one grant beyond its parent's envelope. It never
         // launches, so its component only has to resolve.
@@ -776,6 +857,8 @@ struct ParentConfig {
     /// A `task.md` written into the project before launch, which the session runs as its first
     /// task.
     task_md: Option<String>,
+    /// Entries appended verbatim to the parent's `artifacts:` list, after its driver.
+    extra_artifacts: String,
 }
 
 impl Default for ParentConfig {
@@ -786,6 +869,7 @@ impl Default for ParentConfig {
             after_task: AfterTask::Sleep,
             max_turns: None,
             task_md: None,
+            extra_artifacts: String::new(),
         }
     }
 }
@@ -866,6 +950,7 @@ impl Parent {
             "name: {name}\nversion: {VERSION}\n\
              artifacts:\n  - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
              \x20   gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
+             {extra_artifacts}\
              capabilities:\n  network:\n    allow: [127.0.0.1]\n  \
              env:\n    allow: [{PROVIDER_KEY_VAR}]\n{spawn_yaml}\
              {lifecycle}\
@@ -873,6 +958,7 @@ impl Parent {
              driver:\n    artifact: {DRIVER}\n",
             endpoint = server.endpoint,
             lifecycle = config.lifecycle_yaml(),
+            extra_artifacts = config.extra_artifacts,
         );
         let manifest_path = project.join("murmur.yaml");
         std::fs::write(&manifest_path, manifest_body).unwrap();
@@ -1169,7 +1255,13 @@ fn stage_request(
                 capabilities: artifact.capabilities.clone(),
             })
             .collect(),
-        allowlisted_tools: HashSet::new(),
+        // Every `runtime: tool` entry is callable, as `mur run` makes it.
+        allowlisted_tools: runtime_manifest
+            .artifacts
+            .iter()
+            .filter(|artifact| matches!(artifact.runtime, murmur_artifact::ArtifactRuntime::Tool))
+            .map(|artifact| artifact.name.clone())
+            .collect(),
         lock_expectations: None,
         capability_policy: capability_policy_from_runtime_manifest(runtime_manifest),
         inference: runtime_manifest.inference.clone(),
@@ -1412,6 +1504,9 @@ fn find_in_files(root: &Path, needle: &str) -> Option<PathBuf> {
     })
 }
 
+/// The commands [`READING_PARENT`] is granted.
+const READING_SHELL: &str = "bash, wc, tail, ls, cat";
+
 const SPAWN_YAML: &str = "  spawn:\n    allow: [local/worker, local/worker-two, \
                           local/worker-three, local/greedy-worker, local/mute-worker, \
                           local/deep-worker, local/thirsty-worker]\n";
@@ -1422,7 +1517,7 @@ const SPAWN_YAML: &str = "  spawn:\n    allow: [local/worker, local/worker-two, 
 ///
 /// The agent names a capsule, a version and a task, and is handed back a delegation in flight. Its
 /// task stays `working` until the sub-capsule's outcome arrives, then continues in the same
-/// conversation with it, naming the file the answer is in — on `queue` + `sleep` exactly as on
+/// conversation with it, carrying the sub-capsule's answer — on `queue` + `sleep` exactly as on
 /// every other lifecycle. Neither workdir, neither trace nor the model's own context holds a token
 /// of either kind, and the parent goes on to run its next task.
 #[test]
@@ -1477,6 +1572,9 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
         "`delegation_id`",
         "`child_workdir`",
         "this task waits for every sub-capsule it started",
+        "the sub-capsule's answer under `result:`",
+        "64 KiB",
+        "`delegations/<delegation_id>.txt` in the runtime directory",
         "`result: none`",
     ] {
         assert!(
@@ -1484,6 +1582,10 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
             "missing '{said}': {description}"
         );
     }
+    assert!(
+        !description.contains("the path of its result file"),
+        "{description}"
+    );
 
     let text = parent.delegate("toolu_happy", WORKER, VERSION, "summarise the report");
 
@@ -1609,8 +1711,8 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     );
     assert_no_completion_task(&parent);
 
-    // What the agent was handed names the delegation and where the answer is, and never the
-    // answer itself.
+    // What the agent was handed names the delegation and carries the child's answer, read by the
+    // parent's runtime, at the end of the fenced block — never the path of the child's file.
     let handed = await_model_message(&parent, OUTCOME_OPENING, Duration::from_secs(120));
     assert!(
         handed.starts_with(&format!(
@@ -1623,14 +1725,19 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
         "{handed}"
     );
     assert!(handed.contains("status: ok"), "{handed}");
-    let child_out = child_records(&child_dir, child_session_id).join("out");
     assert!(
-        handed.contains(&format!("result: {}/result", child_out.display())),
-        "the outcome names the child's result file, absolute, rather than carrying it: {handed}"
+        handed.ends_with(&format!("result:\n{WORKER_ANSWER}\n</untrusted-content>")),
+        "the outcome carries the child's answer: {handed}"
     );
+    let child_records_dir = child_records(&child_dir, child_session_id);
     assert!(
-        !handed.contains(WORKER_ANSWER),
-        "the child's answer stays in its file: {handed}"
+        !handed.contains(&child_records_dir.display().to_string()),
+        "the outcome names no path in the child's records: {handed}"
+    );
+    assert!(!handed.contains("not reproduced"), "{handed}");
+    assert!(
+        !parent.runtime_dir.join("delegations").exists(),
+        "an answer handed over whole is copied nowhere"
     );
 
     // The child recorded the same outcome for itself, and the delivery landed.
@@ -2144,6 +2251,15 @@ fn a_wedged_started_child_is_ended_at_the_deadline() {
     assert!(
         handed.contains(&format!("{TIMEOUT_SECS}s")) && handed.contains("delegation deadline"),
         "the detail names the deadline in seconds: {handed}"
+    );
+    // The child's runtime wrote the `canceled:` line as its result when it was ended, and that
+    // file is what the outcome carries.
+    assert!(
+        handed.ends_with(
+            "result:\ncanceled: the task was canceled before it completed, so it has no \
+             result\n</untrusted-content>"
+        ),
+        "the outcome carries what the ended child left as its result: {handed}"
     );
 
     // The child's own directory records the same ending, delivered — the watcher wrote it, and
@@ -3100,5 +3216,380 @@ fn a_child_cannot_forge_its_completion() {
     assert!(
         shown.contains(&format!("child trace: {}/trace.jsonl", records.display())),
         "{shown}"
+    );
+}
+
+// ── The answer in the outcome ─────────────────────────────────────────────────
+
+/// The entry a parent with no shell declares for its one file tool: `runtime: tool` and no
+/// `capabilities.filesystem.scope`, so the tool reads the runtime directory at `murmur-runtime/`.
+fn probe_artifact_entry() -> String {
+    format!(
+        "  - name: {}\n    version: {VERSION}\n    runtime: tool\n",
+        common::local(PROBE_TOOL)
+    )
+}
+
+/// A [`PARENT`] whose only tool beyond `delegate-task` is [`PROBE_TOOL`], allowed to delegate to
+/// `capsules`.
+fn wasm_only_parent(capsules: &[&str]) -> Parent {
+    Parent::launch_configured(
+        TempDir::new().unwrap().keep(),
+        PARENT,
+        &format!(
+            "  spawn:\n    allow: [{}]\n",
+            capsules
+                .iter()
+                .map(|capsule| common::local(capsule))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None,
+        None,
+        ParentConfig {
+            extra_artifacts: probe_artifact_entry(),
+            ..ParentConfig::default()
+        },
+    )
+}
+
+/// A [`READING_PARENT`]: `scoped`, its few commands, and [`LONG_WORKER`] to delegate to.
+fn reading_parent() -> Parent {
+    Parent::launch(
+        READING_PARENT,
+        &format!(
+            "  containment: scoped\n  shell:\n    allow: [{READING_SHELL}]\n  \
+             spawn:\n    allow: [{}]\n",
+            common::local(LONG_WORKER)
+        ),
+    )
+}
+
+/// The delegation id of the outcome `handed` carries for `capsule`.
+fn outcome_id(handed: &str, capsule: &str) -> String {
+    handed
+        .split(OUTCOME_OPENING)
+        .skip(1)
+        .find_map(|block| {
+            let (id, rest) = block.split_once(' ')?;
+            rest.starts_with(&format!("to {capsule}@"))
+                .then(|| id.to_string())
+        })
+        .unwrap_or_else(|| panic!("no outcome for {capsule}: {handed}"))
+}
+
+/// The outcome for delegation `id` in `handed`: the runtime's line and its fenced block.
+fn outcome_block<'a>(handed: &'a str, id: &str) -> &'a str {
+    let start = handed
+        .find(&format!("{OUTCOME_OPENING}{id} "))
+        .unwrap_or_else(|| panic!("no outcome for {id}: {handed}"));
+    let rest = &handed[start..];
+    let end = rest
+        .find("\n</untrusted-content>")
+        .unwrap_or_else(|| panic!("the outcome for {id} is not fenced: {rest}"))
+        + "\n</untrusted-content>".len();
+    &rest[..end]
+}
+
+/// Delegate one task to [`LONG_WORKER`] and wait until the continuation carrying its outcome has
+/// been requested, leaving that turn unanswered. Returns the task, the delegation id and the
+/// continuation.
+fn delegate_long(parent: &Parent, tool_id: &str) -> (String, String, String) {
+    parent.server.push(tool_use_response(
+        tool_id,
+        "delegate-task",
+        json!({"capsule": LONG_WORKER, "version": VERSION, "task": "answer at length"}),
+    ));
+    parent.server.push(end_turn_response("delegated"));
+    let task_id = parent.submit(&format!("msg-{tool_id}"), "delegate it");
+    let handed = await_model_message(parent, OUTCOME_OPENING, Duration::from_secs(240));
+    let id = outcome_id(&handed, LONG_WORKER);
+    (task_id, id, handed)
+}
+
+/// The cut line a 72 000-byte answer is marked with in what delegation `id` hands over.
+fn long_cut_line(id: &str) -> String {
+    format!(
+        "[cut at 65536 of 72000 bytes; the whole answer is delegations/{id}.txt in the runtime \
+         directory]"
+    )
+}
+
+/// A parent whose only file tool is a WASM tool, and which has no shell, is handed both of its
+/// sub-capsules' answers in the continuation itself: each at the end of its own
+/// `delegation:<capsule>` fence, read by the parent's runtime, with no tool call of the parent's
+/// and no path into either child's records.
+#[test]
+fn a_parent_with_only_a_wasm_tool_gets_both_answers_in_its_continuation() {
+    if common::skip_without_host_support(
+        "a_parent_with_only_a_wasm_tool_gets_both_answers_in_its_continuation",
+    ) {
+        return;
+    }
+    let parent = wasm_only_parent(&[WORKER, WORKER_TWO]);
+
+    let results = parent.delegate_all(
+        "msg-wasm-only",
+        &[
+            ("toolu_wasm_1", WORKER, VERSION, "first"),
+            ("toolu_wasm_2", WORKER_TWO, VERSION, "second"),
+        ],
+    );
+    for text in &results {
+        assert!(text.contains("\"status\":\"started\""), "{text}");
+    }
+    let offered = parent.server.offered_tools();
+    assert!(offered.contains(PROBE_TOOL), "{offered:?}");
+    assert!(
+        !offered.contains("bash"),
+        "the parent has no shell: {offered:?}"
+    );
+
+    let continuations = parent.outcome_messages();
+    assert_eq!(continuations.len(), 1, "{continuations:?}");
+    let handed = &continuations[0];
+    for (capsule, answer) in [
+        (WORKER, WORKER_ANSWER.to_string()),
+        (WORKER_TWO, format!("{WORKER_ANSWER}-{WORKER_TWO}")),
+    ] {
+        let block = outcome_block(handed, &outcome_id(handed, capsule));
+        assert!(
+            block.contains(&format!(
+                " ended ok:\n<untrusted-content source=delegation:{capsule}>\n"
+            )),
+            "{block}"
+        );
+        assert!(
+            block.ends_with(&format!("result:\n{answer}\n</untrusted-content>")),
+            "{block}"
+        );
+    }
+    for start in parent.events("delegation_start") {
+        let records = start["child_records_dir"].as_str().unwrap_or_default();
+        assert!(!records.is_empty(), "{start}");
+        assert!(
+            !handed.contains(records),
+            "the continuation names a path in a child's records: {handed}"
+        );
+    }
+    assert!(!handed.contains("out/result"), "{handed}");
+
+    // The answers came in with the outcomes: the model called nothing but `delegate-task`.
+    for request in parent.server.requests() {
+        for message in request["messages"].as_array().into_iter().flatten() {
+            for block in message["content"].as_array().into_iter().flatten() {
+                if block["type"] == "tool_use" {
+                    assert_eq!(block["name"], "delegate-task", "{block}");
+                }
+            }
+        }
+    }
+    assert!(
+        !parent.runtime_dir.join("delegations").exists(),
+        "answers handed over whole are copied nowhere"
+    );
+}
+
+/// An answer past 64 KiB reaches the parent cut, with the cut marked and naming where the whole
+/// answer is, and the parent's WASM tool reads the whole answer there, at
+/// `murmur-runtime/delegations/<id>.txt`.
+#[test]
+fn a_cut_answer_is_read_whole_by_a_wasm_tool_in_the_runtime_directory() {
+    if common::skip_without_host_support(
+        "a_cut_answer_is_read_whole_by_a_wasm_tool_in_the_runtime_directory",
+    ) {
+        return;
+    }
+    let parent = wasm_only_parent(&[LONG_WORKER]);
+    let answer = long_answer();
+
+    let (task_id, id, handed) = delegate_long(&parent, "toolu_long_wasm");
+    let block = outcome_block(&handed, &id);
+    assert!(block.contains(&format!("result:\n{LONG_HEAD}")), "{block}");
+    assert!(!block.contains(LONG_TAIL), "the answer was not cut");
+    assert!(
+        block.ends_with(&format!(
+            " […]\n{}\n</untrusted-content>",
+            long_cut_line(&id)
+        )),
+        "{}",
+        &block[block.len().saturating_sub(400)..]
+    );
+
+    parent.server.push(tool_use_response(
+        "toolu_read_whole",
+        PROBE_TOOL,
+        json!({"op": "read", "path": format!("murmur-runtime/delegations/{id}.txt")}),
+    ));
+    parent.server.push(end_turn_response("read it"));
+    parent.await_task(&task_id, Duration::from_secs(240));
+
+    let read = tool_result_text(&parent.server.requests(), "toolu_read_whole")
+        .expect("the probe's read reached the model");
+    assert!(
+        read.contains(&answer),
+        "the WASM tool read the whole answer: {}",
+        &read[..read.len().min(400)]
+    );
+    assert_eq!(
+        std::fs::read_to_string(parent.runtime_dir.join(format!("delegations/{id}.txt"))).unwrap(),
+        answer
+    );
+}
+
+/// The same whole answer is read by a shell command at `$MURMUR_RUNTIME_DIR/delegations/<id>.txt`,
+/// and the command cannot change it.
+#[test]
+fn a_cut_answer_is_read_whole_by_a_command_in_the_runtime_directory() {
+    if common::skip_without_host_support(
+        "a_cut_answer_is_read_whole_by_a_command_in_the_runtime_directory",
+    ) {
+        return;
+    }
+    let parent = reading_parent();
+    let answer = long_answer();
+
+    let (task_id, id, handed) = delegate_long(&parent, "toolu_long_shell");
+    assert!(
+        tool_result_text(&parent.server.requests(), "toolu_long_shell")
+            .is_some_and(|text| text.contains("\"status\":\"started\"")),
+        "{:?}",
+        tool_result_text(&parent.server.requests(), "toolu_long_shell")
+    );
+    assert!(handed.contains(&long_cut_line(&id)), "{handed}");
+
+    let file = format!("$MURMUR_RUNTIME_DIR/delegations/{id}.txt");
+    parent.server.push(tool_use_response(
+        "toolu_shell_whole",
+        "bash",
+        json!({"command": format!(
+            "wc -c < \"{file}\"; tail -c 64 \"{file}\"; echo; \
+             if echo forged > \"{file}\"; then echo write-done; else echo write-refused; fi"
+        )}),
+    ));
+    parent.server.push(end_turn_response("read it"));
+    parent.await_task(&task_id, Duration::from_secs(240));
+
+    let read = tool_result_text(&parent.server.requests(), "toolu_shell_whole")
+        .expect("the command's result reached the model");
+    // Whole lines, because the result echoes the command, which spells every word it prints.
+    let lines: Vec<&str> = read.lines().collect();
+    assert!(lines.contains(&"72000"), "{read}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.ends_with(LONG_TAIL) && !line.starts_with('$')),
+        "{read}"
+    );
+    assert!(lines.contains(&"write-refused"), "{read}");
+    assert!(!lines.contains(&"write-done"), "{read}");
+    assert_eq!(
+        std::fs::read_to_string(parent.runtime_dir.join(format!("delegations/{id}.txt"))).unwrap(),
+        answer
+    );
+}
+
+/// At `containment: scoped`, a parent's command can neither list a child's records directory
+/// nor read the child's result there, while it reads its own runtime directory: the child's
+/// answer reaches the parent only in its outcome.
+///
+/// The refusal is `Permission denied` where Landlock refuses the path, and `No such file or
+/// directory` where the command's private `/tmp` holds no such path: this suite's `HOME` is
+/// under `/tmp`.
+#[test]
+#[allow(clippy::print_stdout)]
+fn a_parents_command_cannot_list_its_childs_records() {
+    if common::skip_without_host_support("a_parents_command_cannot_list_its_childs_records") {
+        return;
+    }
+    let parent = reading_parent();
+    let text = parent.delegate("toolu_reading", LONG_WORKER, VERSION, "answer at length");
+    assert!(text.contains("\"status\":\"started\""), "{text}");
+
+    let start = only_event(&parent.trace_events(), "delegation_start").clone();
+    let records = PathBuf::from(start["child_records_dir"].as_str().unwrap_or_default());
+    assert_eq!(
+        std::fs::read_to_string(records.join("out/result.txt")).unwrap(),
+        long_answer(),
+        "the child left its result where the command looks"
+    );
+
+    parent.server.push(tool_use_response(
+        "toolu_peek",
+        "bash",
+        json!({"command": format!(
+            "ls '{dir}'; echo \"ls=$?\"; cat '{dir}/out/result.txt'; echo \"cat=$?\"; \
+             [ -n \"$(cat \"$MURMUR_RUNTIME_DIR/MURMUR.md\")\" ] && echo control-read",
+            dir = records.display()
+        )}),
+    ));
+    parent.server.push(end_turn_response("looked"));
+    let task_id = parent.submit("msg-peek", "look at the child");
+    parent.await_task(&task_id, Duration::from_secs(120));
+
+    let peek = tool_result_text(&parent.server.requests(), "toolu_peek")
+        .expect("the command's result reached the model");
+    println!("{peek}");
+    // Whole lines, because the result echoes the command, which spells every word it prints.
+    let lines: Vec<&str> = peek.lines().collect();
+    assert!(lines.contains(&"control-read"), "{peek}");
+    assert!(
+        lines.iter().any(|line| line.starts_with("ls=")) && !lines.contains(&"ls=0"),
+        "the child's records were listed: {peek}"
+    );
+    assert!(
+        lines.iter().any(|line| line.starts_with("cat=")) && !lines.contains(&"cat=0"),
+        "the child's result was read: {peek}"
+    );
+    assert!(
+        peek.contains("Permission denied") || peek.contains("No such file or directory"),
+        "{peek}"
+    );
+    assert!(!peek.contains(LONG_HEAD), "{peek}");
+}
+
+/// A plan `capsule` step's answer past 64 KiB is cut and marked on the same terms as an outcome,
+/// and kept whole in the runtime directory at the path the cut line names.
+#[test]
+fn a_plan_steps_cut_answer_is_marked_and_kept_whole() {
+    if common::skip_without_host_support("a_plan_steps_cut_answer_is_marked_and_kept_whole") {
+        return;
+    }
+    let parent = Parent::launch(
+        PARENT,
+        &format!(
+            "  spawn:\n    allow: [{}]\n  plan:\n    submit: true\n",
+            common::local(LONG_STAYING_WORKER)
+        ),
+    );
+
+    parent.server.push(tool_use_response(
+        "toolu_plan_long",
+        "submit-plan",
+        json!({"plan": {"id": "p", "steps": [
+            {"id": "long", "capsule": LONG_STAYING_WORKER, "input": "answer at length"}
+        ]}}),
+    ));
+    parent.server.push(end_turn_response("planned"));
+    let task_id = parent.submit("msg-plan-long", "plan it");
+    parent.await_task(&task_id, Duration::from_secs(300));
+
+    let start = only_event(&parent.trace_events(), "delegation_start").clone();
+    let id = start["delegation_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let result = tool_result_text(&parent.server.requests(), "toolu_plan_long")
+        .expect("the plan's result reached the model");
+    assert!(result.contains(LONG_HEAD), "{result}");
+    assert!(!result.contains(LONG_TAIL), "the step's answer was not cut");
+    assert!(
+        result.contains(&long_cut_line(&id)),
+        "{}",
+        &result[result.len().saturating_sub(600)..]
+    );
+    assert_eq!(
+        std::fs::read_to_string(parent.runtime_dir.join(format!("delegations/{id}.txt"))).unwrap(),
+        long_answer()
     );
 }

@@ -2481,17 +2481,6 @@ impl ShellEnforcement {
             .and_then(|roots| roots.home.as_ref())
     }
 
-    /// The directory the session's delegated children keep their records beneath, when the
-    /// session can delegate and a child has staged there; read-only to every command. Linux only:
-    /// no other platform grants it.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn children_records_path(&self) -> Option<&Path> {
-        self.runtime_dir
-            .as_ref()
-            .and_then(|roots| roots.children_records.as_deref())
-            .filter(|path| path.is_dir())
-    }
-
     /// The home folder's absolute path, the value of `$HOME` and the synthetic passwd's home
     /// directory on every tier. `None` for an enforcement held outside a session.
     pub(crate) fn home_dir_path(&self) -> Option<&Path> {
@@ -3216,14 +3205,6 @@ pub(crate) fn prepare_enforcement(
         .transpose()
         .map_err(|error| format!("sandbox: failed to open the session's home folder: {error}"))?;
 
-    // The delegated children's records, opened only once a child has staged there, with no link
-    // at the last component followed: a read-only rule on both Landlock tiers and a read-only
-    // bind on `KernelSealed`, so a parent's agent reads the result an outcome names.
-    let children_records_fd = enforcement
-        .children_records_path()
-        .map(|path| open_directory_no_follow(path).map(|fd| (Arc::new(fd), path.to_path_buf())))
-        .transpose()?;
-
     // The descriptors a rule and a bind share on `KernelSealed`: the temporary folder and the
     // runtime and records directories, each taken once, with no link followed, from a held
     // descriptor. The Landlock rule is taken on the descriptor, and the bind is refused unless
@@ -3234,7 +3215,6 @@ pub(crate) fn prepare_enforcement(
             enforcement,
             temp_dir_fd.as_ref(),
             home_dir_fd.as_ref(),
-            children_records_fd.clone(),
         )?)
     } else {
         None
@@ -3302,7 +3282,6 @@ pub(crate) fn prepare_enforcement(
                 home_dir_fd,
                 runtime_dir_fd,
                 records_dir_fd,
-                children_records_fd: children_records_fd.map(|(fd, _)| fd),
             },
         )?)
     } else {
@@ -3503,7 +3482,6 @@ fn build_tmp_map_spec(
     let read_only = [
         enforcement.runtime_dir_path(),
         enforcement.records_dir_path(),
-        enforcement.children_records_path(),
     ]
     .into_iter()
     .flatten()
@@ -3525,19 +3503,6 @@ fn build_tmp_map_spec(
         &reexposed,
         accessible_workdir,
     )
-}
-
-/// `path`, a directory, opened `O_PATH` with no link followed at its last component: the
-/// descriptor a rule is taken on and a bind is verified against.
-#[cfg(target_os = "linux")]
-fn open_directory_no_follow(path: &Path) -> Result<std::os::fd::OwnedFd, String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)
-        .map(std::os::fd::OwnedFd::from)
-        .map_err(|error| format!("sandbox: failed to open {}: {error}", path.display()))
 }
 
 /// Writes (idempotently) the synthetic `/etc/passwd`/`/etc/group` the composed root binds in place
@@ -3622,9 +3587,6 @@ pub(crate) struct SealedSourceFds {
     /// its rule's fd and its read-only bind, on the runtime directory's terms. `None` for an
     /// enforcement held outside a session.
     records_dir: Option<(Arc<std::os::fd::OwnedFd>, PathBuf)>,
-    /// The delegated children's records, and its absolute path: its rule's fd and its read-only
-    /// bind. `None` until a child has staged there.
-    children_records: Option<(Arc<std::os::fd::OwnedFd>, PathBuf)>,
     /// `sealed-etc/`'s host path.
     etc_dir: PathBuf,
     /// The synthetic `/etc` files, in [`crate::sealed::SEALED_ETC_PATHS`] order.
@@ -3641,7 +3603,6 @@ impl SealedSourceFds {
         enforcement: &ShellEnforcement,
         temp_dir_fd: Option<&Arc<std::os::fd::OwnedFd>>,
         home_dir_fd: Option<&Arc<std::os::fd::OwnedFd>>,
-        children_records: Option<(Arc<std::os::fd::OwnedFd>, PathBuf)>,
     ) -> Result<Self, String> {
         let roots = enforcement.runtime_dir.as_ref().ok_or_else(|| {
             "sealed: a composed root needs the session's runtime directory, and this \
@@ -3685,7 +3646,6 @@ impl SealedSourceFds {
             runtime_dir,
             runtime_dir_path: roots.runtime.path().to_path_buf(),
             records_dir,
-            children_records,
             etc_dir: roots.sealed_etc.path().to_path_buf(),
             identity_files,
         })
@@ -3769,13 +3729,6 @@ fn build_sealed_root(
                 &sources.home_dir.1,
                 SealedSourceFds::identity_of(&sources.home_dir.0)?,
             )),
-            children_records: sources
-                .children_records
-                .as_ref()
-                .map(|(fd, path)| {
-                    SealedSourceFds::identity_of(fd).map(|identity| (path.as_path(), identity))
-                })
-                .transpose()?,
         },
         &base,
         extra_read_only,
@@ -3884,9 +3837,6 @@ mod linux_enforce {
         /// none of them. `None` outside a session. On `KernelSealed` the same descriptor is the
         /// read-only bind's source.
         records_dir_fd: Option<std::sync::Arc<OwnedFd>>,
-        /// The delegated children's records, granted on [`Self::records_dir_fd`]'s terms, once a
-        /// child has staged there.
-        children_records_fd: Option<std::sync::Arc<OwnedFd>>,
         grants: Vec<OpenLandlockGrant>,
         devices: Vec<OpenDeviceGrant>,
     }
@@ -3915,12 +3865,6 @@ mod linux_enforce {
         #[cfg(test)]
         pub(super) fn records_dir_fd(&self) -> Option<&OwnedFd> {
             self.records_dir_fd.as_deref()
-        }
-
-        /// The delegated children's records' fd, for the tier-gate test, on the same terms.
-        #[cfg(test)]
-        pub(super) fn children_records_fd(&self) -> Option<&OwnedFd> {
-            self.children_records_fd.as_deref()
         }
 
         /// How many synthetic-`/etc` fds were opened, for the tier-gate test. A count, not the fds:
@@ -4948,18 +4892,6 @@ mod linux_enforce {
                 })?;
         }
 
-        // The delegated children's records, on the records directory's terms.
-        if let Some(children_records_fd) = &fds.children_records_fd {
-            ruleset = ruleset
-                .add_rule(PathBeneath::new(
-                    children_records_fd.as_fd(),
-                    read_list & handled,
-                ))
-                .map_err(|error| {
-                    format!("landlock: add_rule for the children's records failed: {error}")
-                })?;
-        }
-
         // `KernelSealed` only — empty on every other tier. `ReadFile` alone: these are the two
         // synthetic account databases the root binds read-only at `/etc/passwd`/`/etc/group`, and
         // the grant loop's rules for those two paths are taken on the host's files, not on these.
@@ -5040,8 +4972,6 @@ mod linux_enforce {
         pub(super) runtime_dir_fd: Option<std::sync::Arc<OwnedFd>>,
         /// The records directory's descriptor, on the same terms as [`Self::temp_dir_fd`].
         pub(super) records_dir_fd: Option<std::sync::Arc<OwnedFd>>,
-        /// The delegated children's records' descriptor, on the same terms.
-        pub(super) children_records_fd: Option<std::sync::Arc<OwnedFd>>,
     }
 
     impl<'a> LandlockFdRequest<'a> {
@@ -5060,7 +4990,6 @@ mod linux_enforce {
                 home_dir_fd: None,
                 runtime_dir_fd: None,
                 records_dir_fd: None,
-                children_records_fd: None,
             }
         }
     }
@@ -5092,7 +5021,6 @@ mod linux_enforce {
             home_dir_fd,
             runtime_dir_fd,
             records_dir_fd,
-            children_records_fd,
         } = request;
         let workdir_fd = open_o_path(accessible_workdir)
             .map(OwnedFd::from)
@@ -5173,7 +5101,6 @@ mod linux_enforce {
             sealed_identity_fds,
             runtime_dir_fd,
             records_dir_fd,
-            children_records_fd,
             grants,
             devices,
         })
@@ -8533,7 +8460,6 @@ mod linux_integration_tests {
             &enforcement,
             temp_dir_fd.as_ref(),
             home_dir_fd_of(&enforcement).as_ref(),
-            None,
         )
         .expect("a real, writable workdir must yield the sealed sources");
         assert_eq!(
@@ -8581,7 +8507,6 @@ mod linux_integration_tests {
             "an enforcement holding no temporary folder grants none"
         );
         assert!(fds.home_dir_fd().is_none());
-        assert!(fds.children_records_fd().is_none());
     }
 
     /// A sealed root cannot be composed without the session's temporary folder: the refusal is
@@ -8596,14 +8521,10 @@ mod linux_integration_tests {
             ..ShellEnforcement::environment_only().with_test_session_dirs()
         }
         .with_runtime_dir(roots, None);
-        let error = SealedSourceFds::open(
-            &enforcement,
-            None,
-            home_dir_fd_of(&enforcement).as_ref(),
-            None,
-        )
-        .err()
-        .expect("refused");
+        let error =
+            SealedSourceFds::open(&enforcement, None, home_dir_fd_of(&enforcement).as_ref())
+                .err()
+                .expect("refused");
         assert!(error.contains("temporary folder"), "{error}");
     }
 
@@ -8621,14 +8542,10 @@ mod linux_integration_tests {
             ..ShellEnforcement::environment_only().with_test_session_dirs()
         }
         .with_runtime_dir(roots, None);
-        let error = SealedSourceFds::open(
-            &enforcement,
-            temp_dir_fd_of(&enforcement).as_ref(),
-            None,
-            None,
-        )
-        .err()
-        .expect("refused");
+        let error =
+            SealedSourceFds::open(&enforcement, temp_dir_fd_of(&enforcement).as_ref(), None)
+                .err()
+                .expect("refused");
         assert!(error.contains("no home folder"), "{error}");
         assert!(!runtime
             .path()
@@ -8653,7 +8570,6 @@ mod linux_integration_tests {
             &enforcement,
             temp_dir_fd_of(&enforcement).as_ref(),
             home_dir_fd_of(&enforcement).as_ref(),
-            None,
         )
         .unwrap();
         let fds = linux_enforce::open_landlock_fds(linux_enforce::LandlockFdRequest {
@@ -8700,7 +8616,7 @@ mod linux_integration_tests {
             tier: EnforcementTier::KernelSealed,
             ..ShellEnforcement::environment_only()
         };
-        let error = SealedSourceFds::open(&enforcement, None, None, None)
+        let error = SealedSourceFds::open(&enforcement, None, None)
             .err()
             .expect("refused");
         assert!(error.contains("runtime directory"), "{error}");
@@ -9353,59 +9269,63 @@ if mv "$HOME" "$HOME.moved"; then echo home-moved; else echo home-move-refused; 
         assert_eq!(std::fs::read_dir(workdir.path()).unwrap().count(), 0);
     }
 
-    /// A delegated child's records, beneath the session's children's records directory, are
-    /// readable by a parent's command and never writable: the result an outcome names can be read,
-    /// and nothing of the child's can be changed. Before any child has staged there is nothing to
-    /// grant, and nothing is.
+    /// A delegated child's records, laid out where staging puts them — its records group,
+    /// `records_group(<records dir>/children)`, beside the session's own directories — are out of
+    /// reach of a parent's command: it can neither list the child's records directory nor read its
+    /// result, while the runtime directory reads in the same command. The parent's runtime reads
+    /// the child's answer and hands it over instead.
+    ///
+    /// The refusal is `Permission denied` where Landlock refuses the path, and `No such file or
+    /// directory` where the command's private `/tmp` does not re-expose it.
     #[test]
-    fn children_records_are_readable_and_never_writable_by_a_parents_commands() {
-        let test = "children_records_are_readable_and_never_writable_by_a_parents_commands";
-        let policy = coreutils_policy(&[]);
-        let Some(mut enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+    fn children_records_are_not_reachable_by_a_parents_commands() {
+        let test = "children_records_are_not_reachable_by_a_parents_commands";
+        let policy = coreutils_policy(&["ls"]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
             return;
         };
+        let runtime_dir = enforcement.runtime_dir_path().unwrap().to_path_buf();
+        std::fs::write(runtime_dir.join("MURMUR.md"), "RUNTIME-DIR-CONTROL\n").unwrap();
         let base = tempfile::tempdir().unwrap();
-        let children_records = base.path().join("children");
-        enforcement.runtime_dir.as_mut().unwrap().children_records = Some(children_records.clone());
-        assert_eq!(
-            enforcement.children_records_path(),
-            None,
-            "no child has staged"
-        );
-
-        let result_file = children_records.join("worker-0123456789abcdef/ses_child/out/result.txt");
+        let child_records = base
+            .path()
+            .join("records/children/worker-0123456789abcdef/ses_child");
+        let result_file = child_records.join("out/result.txt");
         std::fs::create_dir_all(result_file.parent().unwrap()).unwrap();
-        std::fs::write(&result_file, "the child's answer").unwrap();
-        assert_eq!(
-            enforcement.children_records_path(),
-            Some(children_records.as_path())
-        );
+        std::fs::write(&result_file, "CHILD-ANSWER-7Q2W").unwrap();
 
         let workdir = tempfile::tempdir().unwrap();
         let result = run_bash_in(
             workdir.path(),
             &format!(
-                r#"cat '{file}'; echo
-if echo forged > '{file}'; then echo written; else echo write-refused; fi
-if mkdir '{dir}/x'; then echo created; else echo create-refused; fi
+                r#"cat "$MURMUR_RUNTIME_DIR/MURMUR.md"
+if ls '{dir}'; then echo listed; else echo list-refused; fi
+if cat '{file}'; then echo read; else echo read-refused; fi
 "#,
+                dir = child_records.display(),
                 file = result_file.display(),
-                dir = children_records.display()
             ),
             &policy,
             &enforcement,
         );
 
         assert_eq!(
-            result.stdout, "the child's answer\nwrite-refused\ncreate-refused\n",
+            result.stdout, "RUNTIME-DIR-CONTROL\nlist-refused\nread-refused\n",
             "stderr: {}",
             result.stderr
         );
-        assert_eq!(
-            std::fs::read_to_string(&result_file).unwrap(),
-            "the child's answer"
+        assert!(
+            !result.stdout.contains("CHILD-ANSWER") && !result.stderr.contains("CHILD-ANSWER"),
+            "the child's answer reached the parent's command: {result:?}"
         );
-        assert!(!children_records.join("x").exists());
+        for line in result.stderr.lines() {
+            assert!(
+                line.contains("Permission denied") || line.contains("No such file or directory"),
+                "an unexpected refusal: {}",
+                result.stderr
+            );
+        }
+        assert_eq!(result.stderr.lines().count(), 2, "{}", result.stderr);
     }
 
     /// The ruleset a 5.13–5.18 kernel gets, forced through the same `landlock_abi` field the probe
@@ -9838,7 +9758,8 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
 
     /// A real sealed run: the composed root's `/tmp` is the session's temporary folder in its
     /// records directory, `$HOME` and the synthetic `/etc/passwd`'s home are both its home folder,
-    /// writable inside the root (`cd ~ && touch f`), and the work folder gains nothing.
+    /// writable inside the root (`cd ~ && touch f`), the work folder gains nothing, and a delegated
+    /// child's result beside the session's directories is not in the root at all.
     ///
     /// This drives a composed root end to end, so it needs a host that can actually reach
     /// `KernelSealed` and skips loudly on one that cannot; the parent-side halves are covered
@@ -9882,11 +9803,9 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             probe.clone(),
         )
         .expect("a sealed-capable host resolves sealed enforcement")
-        .with_runtime_dir(
-            test_runtime_dir(runtime.path()).with_children_records(runtime.path().join("children")),
-            None,
-        );
-        // A delegated child's result, as a child that has staged leaves it.
+        .with_runtime_dir(test_runtime_dir(runtime.path()), None);
+        // A delegated child's result, beside the session's own directories as a child that has
+        // staged leaves it, and out of the composed root's reach.
         let child_result = runtime
             .path()
             .join("children/worker-0123456789abcdef/out/result.txt");
@@ -9910,8 +9829,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
                     "echo t > /tmp/{probe_name} && cat /tmp/{probe_name} && id -un && \
                      printf '%s\\n' \"$TMPDIR\" && printf '%s\\n' \"$HOME\" && \
                      getent passwd \"$(id -u)\" | cut -d: -f6 && cd ~ && touch f && echo touched && \
-                     cat '{child}' && echo && \
-                     {{ echo forged > '{child}' && echo forged || echo child-read-only; }}",
+                     {{ cat '{child}' 2>&1 || true; }}",
                     child = child_result.display()
                 ),
             ],
@@ -9952,15 +9870,16 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
             Some("touched"),
             "~ is writable inside the root"
         );
-        assert_eq!(
-            lines.next(),
-            Some("the child's answer"),
-            "a child's result reads"
+        let child_read = lines.next().unwrap_or_default();
+        assert!(
+            child_read.contains("No such file or directory"),
+            "a child's result is not in the composed root: {}",
+            result.stdout
         );
-        assert_eq!(
-            lines.next(),
-            Some("child-read-only"),
-            "and cannot be changed"
+        assert!(
+            !result.stdout.contains("the child's answer"),
+            "{}",
+            result.stdout
         );
         assert!(Path::new(home).join("f").is_file());
 
