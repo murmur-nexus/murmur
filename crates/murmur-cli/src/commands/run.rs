@@ -627,7 +627,9 @@ pub(crate) fn run_run(
                 &capability_policy.shell_allow,
                 &capability_policy.shell_staged_runtime,
                 &capsule_runtime::capsule_writable_roots(&placement),
-            );
+                &capsule_runtime::HostFactsCache::in_murmur_home(),
+            )
+            .runtimes;
         capability_policy.shell_trust_store = capsule_runtime::derive_trust_store(
             &capability_policy.shell_allow,
             &capability_policy.network_allow,

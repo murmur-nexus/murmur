@@ -6,8 +6,9 @@
 //! directories have no Landlock rule, so CPython dies in `init_fs_encoding` looking for
 //! `encodings`. Where they are differs by distribution, interpreter version and install method, so
 //! the runtime does not write any of them down. It recognises the interpreter from its own
-//! dynamic symbol table and runs it once, at staging, with a fixed program that prints the
-//! interpreter's import path.
+//! dynamic symbol table and runs it with a fixed program that prints the interpreter's import
+//! path: at the first staging that meets it, and again whenever [`crate::host_facts`] finds that
+//! a file it was worked out from has changed.
 //!
 //! Each existing directory the interpreter reports becomes a readable, listable, non-executable
 //! Landlock grant (see [`crate::sandbox::resolve_derived_interpreter_grants`]), and on `sealed` an
@@ -19,6 +20,8 @@
 //! `capabilities.shell.interpreter_runtime` remains the way to name its directories.
 
 use std::path::{Path, PathBuf};
+
+use crate::host_facts::{HostFactsCache, HostFactsUse};
 
 /// One interpreter family the runtime recognises from the binary itself.
 #[cfg(target_os = "linux")]
@@ -91,22 +94,38 @@ impl DerivedInterpreterRuntime {
     }
 }
 
+/// What one staging derived for its allowlisted binaries.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InterpreterRuntimes {
+    /// One per recognised interpreter whose runtime was derived, ordered by binary path.
+    pub runtimes: Vec<DerivedInterpreterRuntime>,
+    /// One per examined binary: every resolved `shell.allow` binary that no `staged` grant names
+    /// and that lies under no writable root, ordered by binary path.
+    pub host_facts: Vec<HostFactsUse>,
+}
+
 /// The runtime directories of each `shell_allow` binary that is a recognised interpreter.
 ///
 /// `capsule_writable` are the trees the capsule's commands can write: a binary under one is never
 /// run, and nothing under one is derived. A binary a `staged` grant names is not queried, because
 /// its runtime is the staged tree.
 ///
+/// Each examined binary's facts come from `cache` when its kept entry still matches the host, and
+/// are otherwise worked out, which runs the interpreter, and stored there. Either way the result
+/// is what a fresh derivation gives; [`InterpreterRuntimes::host_facts`] says which happened.
+///
 /// A query that cannot be completed (spawn error, a run past [`QUERY_TIMEOUT`], a non-zero exit,
 /// output that is not UTF-8, or no usable entry) derives nothing for that binary, writes one line
-/// to standard error naming the binary and the reason, and fails nothing.
+/// to standard error naming the binary and the reason, and fails nothing. A query that did not
+/// complete is never kept.
 ///
 /// Off Linux this returns nothing and runs nothing: there is no Landlock rule to feed.
 pub fn derive_interpreter_runtimes(
     shell_allow: &[String],
     staged: &[murmur_artifact::StagedRuntimeGrant],
     capsule_writable: &[&Path],
-) -> Vec<DerivedInterpreterRuntime> {
+    cache: &HostFactsCache,
+) -> InterpreterRuntimes {
     #[cfg(target_os = "linux")]
     {
         let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
@@ -119,12 +138,13 @@ pub fn derive_interpreter_runtimes(
             &path_dirs,
             INTERPRETER_KINDS,
             QUERY_TIMEOUT,
+            cache,
         )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (shell_allow, staged, capsule_writable);
-        Vec::new()
+        let _ = (shell_allow, staged, capsule_writable, cache);
+        InterpreterRuntimes::default()
     }
 }
 
@@ -144,7 +164,8 @@ pub(crate) fn derive_in(
     path_dirs: &[PathBuf],
     kinds: &[InterpreterKind<'_>],
     timeout: std::time::Duration,
-) -> Vec<DerivedInterpreterRuntime> {
+    cache: &HostFactsCache,
+) -> InterpreterRuntimes {
     use crate::sandbox::resolve_exec_allowlist_in;
 
     let roots: Vec<PathBuf> = capsule_writable
@@ -158,42 +179,29 @@ pub(crate) fn derive_in(
         .filter(|name| !staged_names.contains(name))
         .cloned()
         .collect();
+    let examined: Vec<PathBuf> = resolve_exec_allowlist_in(&queried, path_dirs)
+        .into_iter()
+        .filter(|binary| {
+            !staged_binaries.contains(binary) && !crate::reachability::under_any(binary, &roots)
+        })
+        .collect();
 
-    let mut derived = Vec::new();
-    for binary in resolve_exec_allowlist_in(&queried, path_dirs) {
-        if staged_binaries.contains(&binary) || crate::reachability::under_any(&binary, &roots) {
-            continue;
-        }
-        let Ok(image) = std::fs::read(&binary) else {
-            continue;
-        };
-        let Some(kind) = recognise(&image, kinds) else {
-            continue;
-        };
-        drop(image);
-        let dirs = match query(&binary, kind, timeout) {
-            Ok(entries) => keep_entries(&binary, &entries, &roots),
-            Err(reason) => {
-                report_not_derived(&binary, kind, &reason);
-                continue;
-            }
-        };
-        if dirs.is_empty() {
-            report_not_derived(&binary, kind, "it reported no existing directory to grant");
-            continue;
-        }
-        let libraries = extension_module_closure(&binary, &dirs, &roots);
-        derived.push(DerivedInterpreterRuntime {
-            binary,
-            dirs,
-            libraries,
-        });
+    let mut derived = InterpreterRuntimes::default();
+    if examined.is_empty() {
+        return derived;
+    }
+    let shelf = cache.open(&roots);
+    for binary in examined {
+        let (runtime, source) =
+            crate::host_facts::runtime_of(shelf.as_ref(), &binary, kinds, &roots, timeout);
+        derived.runtimes.extend(runtime);
+        derived.host_facts.push(HostFactsUse { binary, source });
     }
     derived
 }
 
 #[cfg(target_os = "linux")]
-fn report_not_derived(binary: &Path, kind: InterpreterKind<'_>, reason: &str) {
+pub(crate) fn report_not_derived(binary: &Path, kind: InterpreterKind<'_>, reason: &str) {
     crate::runtime_err!(
         "[capsule-runtime] the runtime directories of {} interpreter {} were not derived: {reason}",
         kind.name,
@@ -201,14 +209,17 @@ fn report_not_derived(binary: &Path, kind: InterpreterKind<'_>, reason: &str) {
     );
 }
 
-/// The first kind whose marker symbol `image`'s `.dynsym` lists. `None` for an ELF that lists
-/// none of them and for anything that is not ELF, a `#!` script included.
+/// The first kind whose marker symbol the `.dynsym` of the file at `binary` lists. `None` for an
+/// ELF that lists none of them, for anything that is not ELF, a `#!` script included, and for a
+/// file that cannot be opened. Reads the ELF and section headers, `.dynsym` and its string table,
+/// never the whole file.
 #[cfg(target_os = "linux")]
 pub(crate) fn recognise<'a>(
-    image: &[u8],
+    binary: &Path,
     kinds: &[InterpreterKind<'a>],
 ) -> Option<InterpreterKind<'a>> {
-    let names = crate::sandbox::elf_dynamic_symbol_names(image)?;
+    let image = crate::sandbox::ElfFile::open_host(binary).ok()?;
+    let names = crate::sandbox::elf_dynamic_symbol_names(&image)?;
     kinds
         .iter()
         .find(|kind| names.iter().any(|name| name == kind.marker_symbol))
@@ -219,7 +230,7 @@ pub(crate) fn recognise<'a>(
 /// `/` as working directory, and returns the NUL-separated entries it printed. Killed at
 /// `timeout`. Standard error is read only to explain a failure.
 #[cfg(target_os = "linux")]
-fn query(
+pub(crate) fn query(
     binary: &Path,
     kind: InterpreterKind<'_>,
     timeout: std::time::Duration,
@@ -332,56 +343,90 @@ pub(crate) fn keep_entries(binary: &Path, reported: &[String], roots: &[PathBuf]
     kept
 }
 
+/// Where a derivation takes the facts about directories and ELF files it reads: from the host,
+/// or from a kept entry that hands each out only while its recorded stamp still matches.
+#[cfg(target_os = "linux")]
+pub(crate) trait Facts {
+    /// The path a kept entry did not record, or recorded with another stamp.
+    type Changed;
+
+    /// The ELF shared objects directly inside `dir`, which is a canonical kept import-path entry.
+    /// Empty for one that cannot be listed.
+    fn shared_objects_in(&mut self, dir: &Path) -> Result<Vec<PathBuf>, Self::Changed>;
+
+    /// The dependencies of the canonical file at `path`, `None` when it cannot be read or is not
+    /// ELF64.
+    fn dependencies(
+        &mut self,
+        path: &Path,
+    ) -> Result<Option<crate::sandbox::ElfDependencies>, Self::Changed>;
+}
+
+/// The runtime of interpreter `binary` from the entries its completed query `reported`, filtered
+/// against the canonical `roots` and with its extension modules' closure walked through `facts`.
+/// `None`, after one line to standard error, when no entry is left to grant.
+#[cfg(target_os = "linux")]
+pub(crate) fn runtime_from_report<F: Facts>(
+    binary: &Path,
+    kind: InterpreterKind<'_>,
+    reported: &[String],
+    roots: &[PathBuf],
+    facts: &mut F,
+) -> Result<Option<DerivedInterpreterRuntime>, F::Changed> {
+    let dirs = keep_entries(binary, reported, roots);
+    if dirs.is_empty() {
+        report_not_derived(binary, kind, "it reported no existing directory to grant");
+        return Ok(None);
+    }
+    let libraries = extension_module_closure(binary, &dirs, roots, facts)?;
+    Ok(Some(DerivedInterpreterRuntime {
+        binary: binary.to_path_buf(),
+        dirs,
+        libraries,
+    }))
+}
+
 /// The `DT_NEEDED` closure of every ELF shared object directly inside one of the directories in
 /// `dirs` (no recursion), less the files inside `dirs` themselves and those in `binary`'s own ELF
 /// closure, which `shell.allow` already grants. Nothing under `roots` is read or returned.
 #[cfg(target_os = "linux")]
-fn extension_module_closure(binary: &Path, dirs: &[PathBuf], roots: &[PathBuf]) -> Vec<PathBuf> {
-    use std::io::Read;
-
+fn extension_module_closure<F: Facts>(
+    binary: &Path,
+    dirs: &[PathBuf],
+    roots: &[PathBuf],
+    facts: &mut F,
+) -> Result<Vec<PathBuf>, F::Changed> {
     let mut seeds = Vec::new();
     for dir in dirs {
-        let Ok(listing) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in listing.flatten() {
-            let path = entry.path();
-            if !std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
-                continue;
-            }
-            let mut head = [0u8; 18];
-            let is_shared_object = std::fs::File::open(&path)
-                .and_then(|mut file| file.read_exact(&mut head))
-                .is_ok()
-                && crate::sandbox::elf_is_shared_object(&head);
-            if is_shared_object {
-                seeds.push(path);
-            }
-        }
+        seeds.extend(facts.shared_objects_in(dir)?);
     }
     if seeds.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let search_dirs: Vec<PathBuf> = crate::sandbox::DEFAULT_LIBRARY_SEARCH_DIRS
         .iter()
         .map(PathBuf::from)
         .collect();
     let own_closure = crate::sandbox::resolve_landlock_grants(&[binary.to_path_buf()]);
-    crate::sandbox::resolve_landlock_grants_outside(&seeds, &search_dirs, roots)
+    let closure = crate::sandbox::walk_dependency_closure(&seeds, &search_dirs, roots, |path| {
+        facts.dependencies(path)
+    })?;
+    Ok(closure
         .into_iter()
         .filter(|path| !dirs.iter().any(|dir| path.starts_with(dir)))
         .filter(|path| !own_closure.contains(path))
-        .collect()
+        .collect())
 }
 
 #[cfg(all(test, target_os = "linux"))]
 #[allow(clippy::print_stdout)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::host_facts::{HostFactsReason, HostFactsSource};
     use std::time::Duration;
 
     /// A kind that recognises `dash` (whose `.dynsym` lists `execve`) and runs `args` with it.
-    fn dash_kind<'a>(args: &'a [&'a str]) -> InterpreterKind<'a> {
+    pub(crate) fn dash_kind<'a>(args: &'a [&'a str]) -> InterpreterKind<'a> {
         InterpreterKind {
             name: "test",
             marker_symbol: "execve",
@@ -391,7 +436,7 @@ mod tests {
 
     /// A copy of the host's `dash` named `name` in a fresh directory under `parent`, or `None`
     /// with a skip line when the host has none.
-    fn dash_copy(parent: &Path, name: &str) -> Option<PathBuf> {
+    pub(crate) fn dash_copy(parent: &Path, name: &str) -> Option<PathBuf> {
         let dash = std::fs::canonicalize("/bin/dash")
             .or_else(|_| std::fs::canonicalize("/usr/bin/dash"))
             .ok();
@@ -406,10 +451,37 @@ mod tests {
         Some(copy)
     }
 
-    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+    pub(crate) fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         (temp, root)
+    }
+
+    /// This thread's `rchar` from `/proc/thread-self/io`: the bytes its `read`-family calls have
+    /// returned, page cache hits included. Panics when the file cannot be read.
+    pub(crate) fn thread_rchar() -> u64 {
+        let io = std::fs::read_to_string("/proc/thread-self/io")
+            .expect("/proc/thread-self/io is readable");
+        io.lines()
+            .find_map(|line| line.strip_prefix("rchar: "))
+            .and_then(|value| value.trim().parse().ok())
+            .expect("/proc/thread-self/io has an rchar line")
+    }
+
+    /// Appends `bytes` zero bytes to the file at `path`.
+    pub(crate) fn pad_with_zeros(path: &Path, bytes: usize) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        let chunk = vec![0u8; 1 << 20];
+        for _ in 0..bytes / chunk.len() {
+            file.write_all(&chunk).unwrap();
+        }
+        file.write_all(&chunk[..bytes % chunk.len()]).unwrap();
+    }
+
+    /// A host facts cache at `<root>/host_facts`, never the developer's own.
+    pub(crate) fn cache_in(root: &Path) -> HostFactsCache {
+        HostFactsCache::at(root.join("host_facts"))
     }
 
     #[test]
@@ -418,9 +490,9 @@ mod tests {
             println!("[SKIP] no python3 on PATH");
             return;
         };
-        let image = std::fs::read(std::fs::canonicalize(python).unwrap()).unwrap();
+        let binary = std::fs::canonicalize(python).unwrap();
         assert_eq!(
-            recognise(&image, INTERPRETER_KINDS).unwrap().name,
+            recognise(&binary, INTERPRETER_KINDS).unwrap().name,
             "CPython"
         );
     }
@@ -431,23 +503,31 @@ mod tests {
             println!("[SKIP] no perl on PATH");
             return;
         };
-        let image = std::fs::read(std::fs::canonicalize(perl).unwrap()).unwrap();
-        assert_eq!(recognise(&image, INTERPRETER_KINDS).unwrap().name, "Perl");
+        let binary = std::fs::canonicalize(perl).unwrap();
+        assert_eq!(recognise(&binary, INTERPRETER_KINDS).unwrap().name, "Perl");
     }
 
     #[test]
     fn a_plain_elf_and_a_script_are_not_interpreters() {
-        let test_binary = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let test_binary = std::env::current_exe().unwrap();
         assert!(
-            crate::sandbox::elf_dynamic_symbol_names(&test_binary).is_some(),
+            crate::sandbox::elf_dynamic_symbol_names(
+                &crate::sandbox::ElfFile::open_host(&test_binary).unwrap()
+            )
+            .is_some(),
             "the test binary is a dynamic ELF with a .dynsym to read"
         );
         assert_eq!(recognise(&test_binary, INTERPRETER_KINDS), None);
-        if let Ok(true_binary) = std::fs::read("/bin/true") {
-            assert_eq!(recognise(&true_binary, INTERPRETER_KINDS), None);
-        }
-        let script = b"#!/usr/bin/python3\nimport sys\n# Py_BytesMain perl_parse\n";
-        assert_eq!(recognise(script, INTERPRETER_KINDS), None);
+        assert_eq!(recognise(Path::new("/bin/true"), INTERPRETER_KINDS), None);
+        let (_temp, root) = canonical_tempdir();
+        let script = root.join("script");
+        std::fs::write(
+            &script,
+            b"#!/usr/bin/python3\nimport sys\n# Py_BytesMain perl_parse\n",
+        )
+        .unwrap();
+        assert_eq!(recognise(&script, INTERPRETER_KINDS), None);
+        assert_eq!(recognise(&root.join("missing"), INTERPRETER_KINDS), None);
     }
 
     #[test]
@@ -513,13 +593,22 @@ mod tests {
             &path_dirs,
             &kinds,
             QUERY_TIMEOUT,
+            &cache_in(&root),
         );
-        assert!(derived.is_empty());
+        assert_eq!(derived, InterpreterRuntimes::default());
         assert!(!marker.exists(), "the excluded binary was executed");
 
         // The same stand-in outside every excluded root is recognised and run, so the absence
         // of the marker above is the exclusion and not a stand-in that never runs.
-        derive_in(&allow, &[], &[], &path_dirs, &kinds, QUERY_TIMEOUT);
+        derive_in(
+            &allow,
+            &[],
+            &[],
+            &path_dirs,
+            &kinds,
+            QUERY_TIMEOUT,
+            &cache_in(&root),
+        );
         assert!(
             marker.exists(),
             "the stand-in did not run when nothing excluded it"
@@ -549,8 +638,9 @@ mod tests {
             &path_dirs,
             &kinds,
             QUERY_TIMEOUT,
+            &cache_in(&root),
         );
-        assert!(derived.is_empty());
+        assert_eq!(derived, InterpreterRuntimes::default());
         assert!(!marker.exists(), "the staged binary was queried");
     }
 
@@ -562,6 +652,7 @@ mod tests {
         };
         let path_dirs = vec![fake.parent().unwrap().to_path_buf()];
         let allow = vec!["fakeinterp".to_string()];
+        let cache = cache_in(&root);
         // The positive control: the same stand-in printing an existing directory derives it.
         let lib = root.join("lib");
         std::fs::create_dir_all(&lib).unwrap();
@@ -576,12 +667,20 @@ mod tests {
             let args = ["-c", script];
             let kinds = [dash_kind(&args)];
             let started = std::time::Instant::now();
-            let derived = derive_in(&allow, &[], &[], &path_dirs, &kinds, timeout);
+            let derived = derive_in(&allow, &[], &[], &path_dirs, &kinds, timeout, &cache);
             if case == "answers" {
-                assert_eq!(derived.len(), 1, "{case}");
-                assert_eq!(derived[0].dirs, vec![lib.clone()], "{case}");
+                assert_eq!(derived.runtimes.len(), 1, "{case}");
+                assert_eq!(derived.runtimes[0].dirs, vec![lib.clone()], "{case}");
             } else {
-                assert!(derived.is_empty(), "{case}: {derived:?}");
+                assert!(derived.runtimes.is_empty(), "{case}: {derived:?}");
+                // Never kept: the same query a second time runs again and is not taken from
+                // the cache.
+                let again = derive_in(&allow, &[], &[], &path_dirs, &kinds, timeout, &cache);
+                assert!(again.runtimes.is_empty(), "{case}: {again:?}");
+                assert!(
+                    !matches!(again.host_facts[0].source, HostFactsSource::Kept),
+                    "{case}: {again:?}"
+                );
             }
             assert!(
                 started.elapsed() < Duration::from_secs(5),
@@ -628,30 +727,82 @@ mod tests {
         assert!(binds.contains(&PathBuf::from("/opt/test/lib")), "{binds:?}");
     }
 
-    /// The derivation for this host's `python3` and `perl`: each one on `PATH` is derived, none of
-    /// its entries is its own directory or an ancestor of it, and the time taken is printed for the
-    /// staging cost it adds.
+    /// The derivation for this host's `python3` and `perl`, through a temporary cache: each one
+    /// on `PATH` is derived, none of its entries is its own directory or an ancestor of it, the
+    /// second staging keeps every entry the first stored, and both equal a derivation through a
+    /// cache that cannot be used. The cold and kept times are printed for the staging cost each
+    /// adds.
     #[test]
     fn this_hosts_interpreters_derive_their_runtimes() {
         let allow = vec!["python3".to_string(), "perl".to_string()];
-        let started = std::time::Instant::now();
-        let derived = derive_interpreter_runtimes(&allow, &[], &[]);
-        let elapsed = started.elapsed();
+        let (_temp, root) = canonical_tempdir();
+        let cache = cache_in(&root);
+        let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default();
+        let derive = |cache: &HostFactsCache| {
+            let started = std::time::Instant::now();
+            let derived = derive_in(
+                &allow,
+                &[],
+                &[],
+                &path_dirs,
+                INTERPRETER_KINDS,
+                QUERY_TIMEOUT,
+                cache,
+            );
+            (derived, started.elapsed())
+        };
+        let (cold, cold_elapsed) = derive(&cache);
+        let (kept, kept_elapsed) = derive(&cache);
+        // A cache whose directory is a file is unusable, so this derives with nothing kept.
+        std::fs::write(root.join("not-a-cache"), b"").unwrap();
+        let (uncached, _) = derive(&HostFactsCache::at(root.join("not-a-cache")));
+
+        let mut found = 0;
         for name in &allow {
-            let Some(found) = crate::sandbox::find_on_path(name) else {
+            let Some(path) = crate::sandbox::find_on_path(name) else {
                 println!("[SKIP] no {name} on PATH");
                 continue;
             };
-            let binary = std::fs::canonicalize(found).unwrap();
+            found += 1;
+            let binary = std::fs::canonicalize(path).unwrap();
             assert!(
-                derived
+                cold.runtimes
                     .iter()
                     .any(|runtime| runtime.binary == binary && !runtime.dirs.is_empty()),
-                "{name} ({}) derived nothing: {derived:?}",
+                "{name} ({}) derived nothing: {cold:?}",
                 binary.display()
             );
+            let source = |derived: &InterpreterRuntimes| {
+                derived
+                    .host_facts
+                    .iter()
+                    .find(|used| used.binary == binary)
+                    .map(|used| used.source.clone())
+            };
+            assert_eq!(
+                source(&cold),
+                Some(HostFactsSource::Derived {
+                    reason: HostFactsReason::Absent,
+                    changed_path: None
+                }),
+                "{name}"
+            );
+            assert_eq!(source(&kept), Some(HostFactsSource::Kept), "{name}");
+            assert_eq!(
+                source(&uncached),
+                Some(HostFactsSource::Derived {
+                    reason: HostFactsReason::NotKept,
+                    changed_path: None
+                }),
+                "{name}"
+            );
         }
-        for runtime in &derived {
+        assert_eq!(kept.runtimes, cold.runtimes);
+        assert_eq!(uncached.runtimes, cold.runtimes);
+        assert_eq!(cold.host_facts.len(), found);
+        for runtime in &cold.runtimes {
             println!("{}", runtime.binary.display());
             for dir in &runtime.dirs {
                 println!("  dir {}", dir.display());
@@ -663,6 +814,6 @@ mod tests {
                 assert!(!runtime.binary.parent().unwrap().starts_with(dir));
             }
         }
-        println!("derive_interpreter_runtimes([python3, perl]) took {elapsed:?}");
+        println!("derive_in([python3, perl]) took {cold_elapsed:?} cold and {kept_elapsed:?} kept");
     }
 }

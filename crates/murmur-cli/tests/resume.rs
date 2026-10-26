@@ -574,6 +574,7 @@ fn session_start_carries_resumed_from_and_context_id() {
             "event_id",
             "event_type",
             "gateways",
+            "host_facts",
             "machine_tokens_per_day",
             "max_session_tokens",
             "max_turns",

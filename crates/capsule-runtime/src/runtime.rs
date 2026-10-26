@@ -2489,12 +2489,14 @@ pub fn stage_session(
     // known, and before the report below so `session_start` names what `launch_session`'s
     // enforcement then grants. Plans, delegated children and formation members stage through here
     // or reuse this policy.
-    request.capability_policy.shell_derived_interpreter_runtime =
-        crate::interpreter_runtime::derive_interpreter_runtimes(
-            &request.capability_policy.shell_allow,
-            &request.capability_policy.shell_staged_runtime,
-            &crate::interpreter_runtime::capsule_writable_roots(&runtime_dir_placement),
-        );
+    let interpreter_runtimes = crate::interpreter_runtime::derive_interpreter_runtimes(
+        &request.capability_policy.shell_allow,
+        &request.capability_policy.shell_staged_runtime,
+        &crate::interpreter_runtime::capsule_writable_roots(&runtime_dir_placement),
+        &crate::host_facts::HostFactsCache::in_murmur_home(),
+    );
+    request.capability_policy.shell_derived_interpreter_runtime = interpreter_runtimes.runtimes;
+    let host_facts = interpreter_runtimes.host_facts;
     request.capability_policy.shell_trust_store = crate::trust_store::derive_trust_store(
         &request.capability_policy.shell_allow,
         &request.capability_policy.network_allow,
@@ -3475,6 +3477,7 @@ pub fn stage_session(
         capsule_url: String::new(), // set by launch_session after port binding
         resolved_lock_artifacts,
         installed_artifacts,
+        host_facts,
         inference: request.inference,
         artifact_full_names: full_names,
         gateways,
@@ -4168,6 +4171,7 @@ fn launch(
         let artifact_grants = staged.artifact_grants;
         let allowlisted_tools = staged.allowlisted_tools.clone();
         let installed_artifacts = staged.installed_artifacts;
+        let host_facts = staged.host_facts;
         let declared_artifacts = declared_artifact_names(&installed_artifacts);
         let engine = staged.engine.clone();
         let capability_policy = staged.capability_policy.clone();
@@ -4297,6 +4301,7 @@ fn launch(
                 (inference.transport != "process").then(|| inference.tool_refresh.wire_name()),
             );
             trace.set_runtime_artifacts(&installed_artifacts);
+            trace.set_host_facts(&host_facts);
             trace.set_formation_id(formation_id.as_ref());
             trace.set_formation_member(formation_member.as_deref());
             trace

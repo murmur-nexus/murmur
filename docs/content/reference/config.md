@@ -195,6 +195,7 @@ chmod 600 ~/.murmur/config.yaml
 | `deploy_keys/` | Expected `0700`, files `0600` | SSH private keys for a deployment | Nothing writes here; `mur destroy` removes a deployment's directory |
 | `artifacts/` | Umask | Installed artifacts | `mur install`, `mur publish` |
 | `compiled/`, `compiled/<sha256>-<engine>.cwasm` | `0700`, `0600` | Compiled WASM artifacts, so a later launch or `manage.pull()` of the same artifact version skips compiling. An entry not read in 30 days is deleted by the next `mur install`, `mur precompile` or `mur run` that compiles a component; deleting the directory is safe | `mur install`, `mur precompile`, `mur run` at staging, and when a capsule pulls a WASM tool (`manage.pull()`, `pull-artifact`) |
+| `host_facts/`, `host_facts/<sha256>.json` | `0700`, `0600` | One entry per [`capabilities.shell.allow` binary](containment.md#host-facts), named by the sha256 of its resolved path: whether it is a recognised interpreter, what it reported and the libraries its extension modules need, so a later launch skips running the interpreter. Entries are never pruned; deleting the directory is safe | `mur run` at staging and `mur run --explain-scope`, for a binary whose entry is missing or no longer matches |
 | `bin/mur-*` | `0755` | Cached `mur` binaries for deploy targets | `mur deploy` |
 | `formations/`, `formations/<frm_id>/`, `formations/<frm_id>/<member>/` | `0700` | Each formation peer's [working directory](roster.md#member-directories). What the member's sessions write inside its directory keeps the umask's modes; the owner-only member directory is what keeps it from other accounts. A formation's directory is kept until the formation has ended and the roster entry member's `trace.retain` [expires it](roster.md#formation-retention); with no `trace.retain`, it is kept forever | `mur run --roster` |
 | `sessions/`, `sessions/<session_id>/` and the `runtime/`, `sealed-etc/` and `harness/` in it | `0700` | Each running session's [runtime directory](workdir.md#runtime-directory): its `MURMUR.md`, task, manifest copy, installed tools and plans. Files inside keep the umask's modes. Removed when the session ends; one a session left behind is removed by the next launch once its lock is free and it is more than 60 seconds old. A `HOME` that cannot hold `~/.murmur` refuses the launch with [`E-IO-004`](diagnostics.md#e-io-004) | `mur run` at staging |
@@ -216,8 +217,20 @@ artifact again, unless `mur install` or `mur precompile` has run under the new v
 [`mur deploy run`](cli.md#deploy-precompile) compiles on the target under the target's value, the
 one the capsule runs under.
 
-Which capsules can write to `compiled/`, and so choose what a later launch or pull loads, is set out
-under [Containment class](containment.md#field-containment).
+`mur run` uses an entry in `host_facts/` only when all of these hold, and otherwise works the
+binary's facts out again, runs the interpreter and replaces the entry:
+
+- `host_facts/` is a real directory, not a symlink, and it and the entry are yours and owner-only.
+  A directory found wider than `0700` is narrowed and emptied first.
+- The entry was written by the same `mur` version, with the same interpreter table.
+- The binary, its directory, the directory above it, and every reported path, extension module and
+  library the entry records are unchanged since the entry was written: same file, size, owner,
+  mode and change time.
+- `~/.murmur` is outside every tree the capsule's commands can write. When it is inside,
+  `mur run` neither reads nor writes `host_facts/`.
+
+Which capsules can write to `compiled/` and `host_facts/`, and so choose what a later launch or
+pull loads or grants, is set out under [Containment class](containment.md#field-containment).
 
 Every mode marked `0700` or `0600` is set again on each write, not only when the path is created.
 A `mur run` that writes under an existing `~/.murmur` removes its group and other permissions and

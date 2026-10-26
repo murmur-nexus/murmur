@@ -618,11 +618,75 @@ pub(crate) const DEFAULT_LIBRARY_SEARCH_DIRS: &[&str] = &[
 /// dynamic loader will touch at load time: the interpreter path (`PT_INTERP`), the direct
 /// shared-library dependencies (`DT_NEEDED` sonames), and the runtime library search paths
 /// (`DT_RPATH`/`DT_RUNPATH`, already split on `:`, `$ORIGIN` left unexpanded here).
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ElfDependencies {
     pub(crate) interp: Option<String>,
     pub(crate) needed: Vec<String>,
     pub(crate) runpaths: Vec<String>,
+}
+
+/// An ELF image the parsers below read by position: its length, and the bytes at an offset. Each
+/// parser asks only for the headers and tables it decodes, so an image read from a file costs a
+/// few `pread`s, never the whole file.
+pub(crate) trait ElfSource {
+    /// The image's length in bytes.
+    fn size(&self) -> u64;
+
+    /// The `len` bytes at `offset`, or `None` when they do not lie wholly inside the image or
+    /// cannot be read.
+    fn read_at(&self, offset: u64, len: u64) -> Option<std::borrow::Cow<'_, [u8]>>;
+}
+
+/// An image already in memory, such as a native tool the runtime has just written.
+impl ElfSource for [u8] {
+    fn size(&self) -> u64 {
+        self.len() as u64
+    }
+
+    fn read_at(&self, offset: u64, len: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.get(start..end).map(std::borrow::Cow::Borrowed)
+    }
+}
+
+/// An image read from an open file with `pread`, its length the file's size when it was opened.
+pub(crate) struct ElfFile {
+    file: std::fs::File,
+    metadata: std::fs::Metadata,
+}
+
+impl ElfFile {
+    /// Opens the host file at `path` for reading.
+    pub(crate) fn open_host(path: &Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        Ok(Self { file, metadata })
+    }
+
+    /// The open file's metadata, read from the handle when it was opened.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn metadata(&self) -> &std::fs::Metadata {
+        &self.metadata
+    }
+}
+
+impl ElfSource for ElfFile {
+    fn size(&self) -> u64 {
+        self.metadata.len()
+    }
+
+    fn read_at(&self, offset: u64, len: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
+        use std::os::unix::fs::FileExt;
+
+        if offset.checked_add(len)? > self.size() {
+            return None;
+        }
+        let mut bytes = vec![0; usize::try_from(len).ok()?];
+        self.file.read_exact_at(&mut bytes, offset).ok()?;
+        Some(std::borrow::Cow::Owned(bytes))
+    }
 }
 
 fn read_u16(bytes: &[u8], off: usize, le: bool) -> Option<u16> {
@@ -652,6 +716,34 @@ fn read_u64(bytes: &[u8], off: usize, le: bool) -> Option<u64> {
     })
 }
 
+/// Whether the ELF identification at the start of `header` is ELF64 little-endian (`true`) or
+/// big-endian (`false`); `None` for anything else.
+fn elf64_little_endian(header: &[u8]) -> Option<bool> {
+    // EI_CLASS: 2 == ELFCLASS64. EI_DATA: 1 == little-endian, 2 == big-endian.
+    if header.get(0..4)? != b"\x7fELF" || *header.get(4)? != 2 {
+        return None;
+    }
+    match header.get(5)? {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+/// The `len` bytes at `offset`, or as many of them as `image` holds; empty when `offset` is at or
+/// past its end.
+fn read_clamped<S: ElfSource + ?Sized>(
+    image: &S,
+    offset: u64,
+    len: u64,
+) -> Option<std::borrow::Cow<'_, [u8]>> {
+    let available = image.size().saturating_sub(offset).min(len);
+    if available == 0 {
+        return Some(std::borrow::Cow::Borrowed(&[]));
+    }
+    image.read_at(offset, available)
+}
+
 /// Reads a NUL-terminated string starting at the beginning of `region` (used for both the
 /// `PT_INTERP` segment and dynamic-string-table entries).
 fn cstr_at_start(region: &[u8]) -> String {
@@ -673,29 +765,23 @@ fn vaddr_to_file_offset(vaddr: u64, loads: &[(u64, u64, u64)]) -> Option<u64> {
 /// Pure ELF64 parser: extracts the dynamic-linking metadata that determines which extra files the
 /// loader touches. Returns `None` for anything that is not a well-formed ELF64 image (bad magic,
 /// 32-bit, truncated headers) — a non-ELF or unparseable binary simply contributes nothing to the
-/// grant set (shrink-not-fail). Deliberately hand-rolled (no crate dependency) and byte-slice-in /
-/// struct-out so it is fully unit-testable off-Linux with synthetic fixtures; it makes no syscalls.
+/// grant set (shrink-not-fail). Deliberately hand-rolled (no crate dependency) so it is fully
+/// unit-testable off-Linux with synthetic in-memory fixtures.
+///
+/// Reads only the 64-byte header, the program header table, the `PT_INTERP` bytes, the
+/// `PT_DYNAMIC` array and the dynamic string table. Every read is bounded by the image's length,
+/// so the answer is the same whether `image` is in memory or a file read by position.
 ///
 /// Only ELF64 is parsed: both supported Linux targets (`x86_64`, `aarch64`) are 64-bit, so a
 /// 32-bit image is not a binary this runtime would exec and is treated as unparseable.
-pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
+pub(crate) fn parse_elf_dependencies<S: ElfSource + ?Sized>(image: &S) -> Option<ElfDependencies> {
     // e_ident (16) + fixed ELF64 header fields extend to offset 64.
-    if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" {
-        return None;
-    }
-    // EI_CLASS: 2 == ELFCLASS64. EI_DATA: 1 == little-endian, 2 == big-endian.
-    if bytes[4] != 2 {
-        return None;
-    }
-    let le = match bytes[5] {
-        1 => true,
-        2 => false,
-        _ => return None,
-    };
+    let header = image.read_at(0, 64)?;
+    let le = elf64_little_endian(&header)?;
 
-    let e_phoff = read_u64(bytes, 32, le)? as usize;
-    let e_phentsize = read_u16(bytes, 54, le)? as usize;
-    let e_phnum = read_u16(bytes, 56, le)? as usize;
+    let e_phoff = read_u64(&header, 32, le)?;
+    let e_phentsize = u64::from(read_u16(&header, 54, le)?);
+    let e_phnum = u64::from(read_u16(&header, 56, le)?);
     // Each Elf64_Phdr is 56 bytes; a smaller entsize is not this layout.
     if e_phentsize < 56 {
         return None;
@@ -705,20 +791,24 @@ pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
     let mut dynamic_region: Option<(u64, u64)> = None; // (file offset, size)
     let mut loads: Vec<(u64, u64, u64)> = Vec::new(); // (p_vaddr, p_offset, p_filesz)
 
+    // Every field read below lies in the first 40 bytes of an entry, so the table ends 40 bytes
+    // into its last entry.
+    let table = match e_phnum.checked_sub(1) {
+        None => std::borrow::Cow::Borrowed(&[][..]),
+        Some(last) => image.read_at(e_phoff, last.checked_mul(e_phentsize)?.checked_add(40)?)?,
+    };
     for i in 0..e_phnum {
-        let base = e_phoff.checked_add(i.checked_mul(e_phentsize)?)?;
-        let p_type = read_u32(bytes, base, le)?;
-        let p_offset = read_u64(bytes, base + 8, le)?;
-        let p_vaddr = read_u64(bytes, base + 16, le)?;
-        let p_filesz = read_u64(bytes, base + 32, le)?;
+        let base = usize::try_from(i * e_phentsize).ok()?;
+        let p_type = read_u32(&table, base, le)?;
+        let p_offset = read_u64(&table, base + 8, le)?;
+        let p_vaddr = read_u64(&table, base + 16, le)?;
+        let p_filesz = read_u64(&table, base + 32, le)?;
         match p_type {
             1 => loads.push((p_vaddr, p_offset, p_filesz)), // PT_LOAD
             2 => dynamic_region = Some((p_offset, p_filesz)), // PT_DYNAMIC
             3 => {
                 // PT_INTERP: a NUL-terminated interpreter path in the file image.
-                let start = p_offset as usize;
-                let end = start.checked_add(p_filesz as usize)?;
-                interp = Some(cstr_at_start(bytes.get(start..end)?));
+                interp = Some(cstr_at_start(&image.read_at(p_offset, p_filesz)?));
             }
             _ => {}
         }
@@ -738,11 +828,15 @@ pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
     let mut strtab_vaddr: Option<u64> = None;
     let mut strsz: Option<u64> = None;
 
-    let mut off = dyn_off as usize;
-    let dyn_end = off.checked_add(dyn_size as usize)?;
-    while off + 16 <= dyn_end {
-        let d_tag = read_u64(bytes, off, le)?;
-        let d_val = read_u64(bytes, off + 8, le)?;
+    dyn_off.checked_add(dyn_size)?;
+    // Entries after `DT_NULL` are never read, so a segment that runs past the end of the file is
+    // read as far as the file goes, and an entry before `DT_NULL` beyond that fails the parse.
+    let dynamic = read_clamped(image, dyn_off, dyn_size)?;
+    let mut off = 0u64;
+    while off + 16 <= dyn_size {
+        let entry = dynamic.get(usize::try_from(off).ok()?..usize::try_from(off + 16).ok()?)?;
+        let d_tag = read_u64(entry, 0, le)?;
+        let d_val = read_u64(entry, 8, le)?;
         match d_tag {
             0 => break,                             // DT_NULL — end of dynamic array
             1 => needed_offsets.push(d_val),        // DT_NEEDED
@@ -758,13 +852,11 @@ pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
     let mut runpaths = Vec::new();
     if let (Some(strtab_vaddr), Some(strsz)) = (strtab_vaddr, strsz) {
         if let Some(strtab_off) = vaddr_to_file_offset(strtab_vaddr, &loads) {
-            let start = strtab_off as usize;
             // Prefer the declared string-table bounds, but tolerate an over-long DT_STRSZ by
             // falling back to the rest of the file rather than dropping every soname.
-            let strtab = start
-                .checked_add(strsz as usize)
-                .and_then(|end| bytes.get(start..end))
-                .or_else(|| bytes.get(start..));
+            let strtab = (strtab_off <= image.size())
+                .then(|| read_clamped(image, strtab_off, strsz))
+                .flatten();
             if let Some(strtab) = strtab {
                 for offset in needed_offsets {
                     if let Some(region) = strtab.get(offset as usize..) {
@@ -791,56 +883,47 @@ pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
     })
 }
 
-/// Whether `bytes` begins an ELF64 shared object (`e_type` `ET_DYN`), in either byte order. Needs
-/// only the first 18 bytes, so a caller sorting a directory reads no more of each file than that.
-/// A position-independent executable is `ET_DYN` too and answers `true`.
+/// Whether `image` is an ELF64 shared object (`e_type` `ET_DYN`), in either byte order. Reads only
+/// the first 18 bytes, so a caller sorting a directory reads no more of each file than that. A
+/// position-independent executable is `ET_DYN` too and answers `true`.
 #[cfg(target_os = "linux")]
-pub(crate) fn elf_is_shared_object(bytes: &[u8]) -> bool {
-    if bytes.len() < 18 || &bytes[0..4] != b"\x7fELF" || bytes[4] != 2 {
+pub(crate) fn elf_is_shared_object<S: ElfSource + ?Sized>(image: &S) -> bool {
+    let Some(head) = image.read_at(0, 18) else {
         return false;
-    }
-    let le = match bytes[5] {
-        1 => true,
-        2 => false,
-        _ => return false,
     };
-    read_u16(bytes, 16, le) == Some(3)
+    elf64_little_endian(&head).is_some_and(|le| read_u16(&head, 16, le) == Some(3))
 }
 
 /// The name of every entry in an ELF64 image's dynamic symbol table (`.dynsym`), defined and
 /// undefined alike, in table order. `None` for anything that is not a well-formed ELF64 image or
 /// has no `.dynsym` section.
 ///
-/// Reads the section headers: the `SHT_DYNSYM` section and the string table its `sh_link` names.
-/// A symbol the binary imports from a shared library is listed here as well as one it defines, so
-/// an interpreter built against `libpython` or `libperl` names its entry symbol the same way a
-/// statically linked one does. A binary stripped of its section headers names nothing.
+/// Reads the header, the section headers up to the `SHT_DYNSYM` one, that section and the string
+/// table its `sh_link` names, and nothing else of the image. A symbol the binary imports from a
+/// shared library is listed here as well as one it defines, so an interpreter built against
+/// `libpython` or `libperl` names its entry symbol the same way a statically linked one does. A
+/// binary stripped of its section headers names nothing.
 #[cfg(target_os = "linux")]
-pub(crate) fn elf_dynamic_symbol_names(bytes: &[u8]) -> Option<Vec<String>> {
-    if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" || bytes[4] != 2 {
-        return None;
-    }
-    let le = match bytes[5] {
-        1 => true,
-        2 => false,
-        _ => return None,
-    };
-    let e_shoff = read_u64(bytes, 40, le)? as usize;
-    let e_shentsize = read_u16(bytes, 58, le)? as usize;
-    let e_shnum = read_u16(bytes, 60, le)? as usize;
+pub(crate) fn elf_dynamic_symbol_names<S: ElfSource + ?Sized>(image: &S) -> Option<Vec<String>> {
+    let header = image.read_at(0, 64)?;
+    let le = elf64_little_endian(&header)?;
+    let e_shoff = read_u64(&header, 40, le)?;
+    let e_shentsize = u64::from(read_u16(&header, 58, le)?);
+    let e_shnum = u64::from(read_u16(&header, 60, le)?);
     // Each Elf64_Shdr is 64 bytes; a smaller entsize is not this layout.
     if e_shentsize < 64 {
         return None;
     }
     // (sh_type, sh_offset, sh_size, sh_link, sh_entsize) of section `index`.
-    let section = |index: usize| -> Option<(u32, usize, usize, usize, usize)> {
+    let section = |index: u64| -> Option<(u32, u64, u64, u64, u64)> {
         let base = e_shoff.checked_add(index.checked_mul(e_shentsize)?)?;
+        let entry = image.read_at(base, 64)?;
         Some((
-            read_u32(bytes, base + 4, le)?,
-            read_u64(bytes, base + 24, le)? as usize,
-            read_u64(bytes, base + 32, le)? as usize,
-            read_u32(bytes, base + 40, le)? as usize,
-            read_u64(bytes, base + 56, le)? as usize,
+            read_u32(&entry, 4, le)?,
+            read_u64(&entry, 24, le)?,
+            read_u64(&entry, 32, le)?,
+            u64::from(read_u32(&entry, 40, le)?),
+            read_u64(&entry, 56, le)?,
         ))
     };
     // SHT_DYNSYM == 11.
@@ -852,10 +935,10 @@ pub(crate) fn elf_dynamic_symbol_names(bytes: &[u8]) -> Option<Vec<String>> {
         return None;
     }
     let (_, str_off, str_size, _, _) = section(strtab_index)?;
-    let strtab = bytes.get(str_off..str_off.checked_add(str_size)?)?;
-    let symbols = bytes.get(sym_off..sym_off.checked_add(sym_size)?)?;
+    let strtab = image.read_at(str_off, str_size)?;
+    let symbols = image.read_at(sym_off, sym_size)?;
     let mut names = Vec::new();
-    for symbol in symbols.chunks_exact(sym_entsize) {
+    for symbol in symbols.chunks_exact(usize::try_from(sym_entsize).ok()?) {
         let st_name = read_u32(symbol, 0, le)? as usize;
         if st_name == 0 {
             continue;
@@ -955,6 +1038,30 @@ pub(crate) fn resolve_landlock_grants_outside(
     search_dirs: &[PathBuf],
     excluded: &[PathBuf],
 ) -> Vec<PathBuf> {
+    let Ok(grants) = walk_dependency_closure(
+        exec_allow_paths,
+        search_dirs,
+        excluded,
+        |path| -> Result<_, std::convert::Infallible> { Ok(read_elf_dependencies(path)) },
+    );
+    grants
+}
+
+/// The dependencies of the ELF image at `path`, read through [`ElfFile`]. `None` when it cannot
+/// be opened or does not parse.
+fn read_elf_dependencies(path: &Path) -> Option<ElfDependencies> {
+    parse_elf_dependencies(&ElfFile::open_host(path).ok()?)
+}
+
+/// The walk behind [`resolve_landlock_grants_outside`], with each visited file's dependencies
+/// taken from `dependencies`, which is asked once per visited path. An error from it ends the
+/// walk with that error.
+pub(crate) fn walk_dependency_closure<E>(
+    exec_allow_paths: &[PathBuf],
+    search_dirs: &[PathBuf],
+    excluded: &[PathBuf],
+    mut dependencies: impl FnMut(&Path) -> Result<Option<ElfDependencies>, E>,
+) -> Result<Vec<PathBuf>, E> {
     let mut grants: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     let mut visited: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     let mut queue: std::collections::VecDeque<PathBuf> = std::collections::VecDeque::new();
@@ -980,10 +1087,7 @@ pub(crate) fn resolve_landlock_grants_outside(
         // full-access rule already covers it and this extra read+execute rule is simply redundant.
         grants.insert(path.clone());
 
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let Some(deps) = parse_elf_dependencies(&bytes) else {
+        let Some(deps) = dependencies(&path)? else {
             continue;
         };
         let origin_dir = path.parent().unwrap_or_else(|| Path::new("/"));
@@ -1001,7 +1105,7 @@ pub(crate) fn resolve_landlock_grants_outside(
         }
     }
 
-    grants.into_iter().collect()
+    Ok(grants.into_iter().collect())
 }
 
 /// One resolved Landlock filesystem grant outside the workdir: a canonical path plus the two
@@ -5705,6 +5809,115 @@ mod linux_enforce {
     }
 }
 
+/// Builds a minimal but well-formed ELF64 image exercising exactly the fields
+/// `parse_elf_dependencies` reads: a single identity-mapped `PT_LOAD` (so virtual address ==
+/// file offset), an optional `PT_INTERP`, and — when any dynamic metadata is requested — a
+/// `PT_DYNAMIC` with `DT_NEEDED`/`DT_RUNPATH`/`DT_STRTAB`/`DT_STRSZ`/`DT_NULL` entries.
+#[cfg(test)]
+pub(crate) fn build_elf64(interp: Option<&str>, needed: &[&str], runpath: Option<&str>) -> Vec<u8> {
+    let has_dynamic = !needed.is_empty() || runpath.is_some();
+
+    let mut phnum: u16 = 1; // PT_LOAD
+    if interp.is_some() {
+        phnum += 1;
+    }
+    if has_dynamic {
+        phnum += 1;
+    }
+
+    let ehsize = 64usize;
+    let phentsize = 56usize;
+    let phoff = ehsize;
+    let body_start = phoff + phentsize * phnum as usize;
+
+    // Dynamic string table: index 0 is a NUL, then each soname and the runpath.
+    let mut strtab: Vec<u8> = vec![0];
+    let mut needed_offsets = Vec::new();
+    for name in needed {
+        needed_offsets.push(strtab.len() as u64);
+        strtab.extend_from_slice(name.as_bytes());
+        strtab.push(0);
+    }
+    let runpath_offset = runpath.map(|r| {
+        let off = strtab.len() as u64;
+        strtab.extend_from_slice(r.as_bytes());
+        strtab.push(0);
+        off
+    });
+
+    let mut body: Vec<u8> = Vec::new();
+
+    let interp_offset = body_start + body.len();
+    if let Some(i) = interp {
+        body.extend_from_slice(i.as_bytes());
+        body.push(0);
+    }
+
+    // Align the dynamic array to 8 bytes.
+    while !(body_start + body.len()).is_multiple_of(8) {
+        body.push(0);
+    }
+    let dyn_offset = body_start + body.len();
+    let num_dyn = needed.len() + runpath.map_or(0, |_| 1) + 3; // + DT_STRTAB, DT_STRSZ, DT_NULL
+    let dyn_size = num_dyn * 16;
+    let strtab_offset = dyn_offset + dyn_size;
+
+    if has_dynamic {
+        let mut push_dyn = |tag: u64, val: u64| {
+            body.extend_from_slice(&tag.to_le_bytes());
+            body.extend_from_slice(&val.to_le_bytes());
+        };
+        for &o in &needed_offsets {
+            push_dyn(1, o); // DT_NEEDED
+        }
+        if let Some(ro) = runpath_offset {
+            push_dyn(29, ro); // DT_RUNPATH
+        }
+        push_dyn(5, strtab_offset as u64); // DT_STRTAB (vaddr == offset, identity PT_LOAD)
+        push_dyn(10, strtab.len() as u64); // DT_STRSZ
+        push_dyn(0, 0); // DT_NULL
+        assert_eq!(body_start + body.len(), strtab_offset);
+        body.extend_from_slice(&strtab);
+    }
+
+    let total_len = body_start + body.len();
+    let mut out = vec![0u8; total_len];
+    out[0..4].copy_from_slice(b"\x7fELF");
+    out[4] = 2; // ELFCLASS64
+    out[5] = 1; // little-endian
+    out[6] = 1; // EI_VERSION
+    out[16..18].copy_from_slice(&3u16.to_le_bytes()); // e_type = ET_DYN
+    out[18..20].copy_from_slice(&0x3eu16.to_le_bytes()); // e_machine = x86_64 (irrelevant)
+    out[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+    out[32..40].copy_from_slice(&(phoff as u64).to_le_bytes()); // e_phoff
+    out[54..56].copy_from_slice(&(phentsize as u16).to_le_bytes()); // e_phentsize
+    out[56..58].copy_from_slice(&phnum.to_le_bytes()); // e_phnum
+
+    let mut phdrs: Vec<(u32, u64, u64, u64)> = Vec::new(); // (p_type, p_offset, p_vaddr, p_filesz)
+    phdrs.push((1, 0, 0, total_len as u64)); // PT_LOAD identity-maps the whole file
+    if let Some(i) = interp {
+        phdrs.push((
+            3,
+            interp_offset as u64,
+            interp_offset as u64,
+            i.len() as u64 + 1,
+        ));
+    }
+    if has_dynamic {
+        phdrs.push((2, dyn_offset as u64, dyn_offset as u64, dyn_size as u64));
+    }
+    for (idx, (p_type, p_offset, p_vaddr, p_filesz)) in phdrs.iter().enumerate() {
+        let base = phoff + idx * phentsize;
+        out[base..base + 4].copy_from_slice(&p_type.to_le_bytes());
+        out[base + 8..base + 16].copy_from_slice(&p_offset.to_le_bytes());
+        out[base + 16..base + 24].copy_from_slice(&p_vaddr.to_le_bytes());
+        out[base + 32..base + 40].copy_from_slice(&p_filesz.to_le_bytes());
+    }
+
+    out[body_start..total_len].copy_from_slice(&body);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7105,114 +7318,6 @@ mod tests {
 
     // ---- ELF dependency parsing (pure, synthetic fixtures — runs on every OS) ----
 
-    /// Builds a minimal but well-formed ELF64 image exercising exactly the fields
-    /// `parse_elf_dependencies` reads: a single identity-mapped `PT_LOAD` (so virtual address ==
-    /// file offset), an optional `PT_INTERP`, and — when any dynamic metadata is requested — a
-    /// `PT_DYNAMIC` with `DT_NEEDED`/`DT_RUNPATH`/`DT_STRTAB`/`DT_STRSZ`/`DT_NULL` entries.
-    fn build_elf64(interp: Option<&str>, needed: &[&str], runpath: Option<&str>) -> Vec<u8> {
-        let has_dynamic = !needed.is_empty() || runpath.is_some();
-
-        let mut phnum: u16 = 1; // PT_LOAD
-        if interp.is_some() {
-            phnum += 1;
-        }
-        if has_dynamic {
-            phnum += 1;
-        }
-
-        let ehsize = 64usize;
-        let phentsize = 56usize;
-        let phoff = ehsize;
-        let body_start = phoff + phentsize * phnum as usize;
-
-        // Dynamic string table: index 0 is a NUL, then each soname and the runpath.
-        let mut strtab: Vec<u8> = vec![0];
-        let mut needed_offsets = Vec::new();
-        for name in needed {
-            needed_offsets.push(strtab.len() as u64);
-            strtab.extend_from_slice(name.as_bytes());
-            strtab.push(0);
-        }
-        let runpath_offset = runpath.map(|r| {
-            let off = strtab.len() as u64;
-            strtab.extend_from_slice(r.as_bytes());
-            strtab.push(0);
-            off
-        });
-
-        let mut body: Vec<u8> = Vec::new();
-
-        let interp_offset = body_start + body.len();
-        if let Some(i) = interp {
-            body.extend_from_slice(i.as_bytes());
-            body.push(0);
-        }
-
-        // Align the dynamic array to 8 bytes.
-        while !(body_start + body.len()).is_multiple_of(8) {
-            body.push(0);
-        }
-        let dyn_offset = body_start + body.len();
-        let num_dyn = needed.len() + runpath.map_or(0, |_| 1) + 3; // + DT_STRTAB, DT_STRSZ, DT_NULL
-        let dyn_size = num_dyn * 16;
-        let strtab_offset = dyn_offset + dyn_size;
-
-        if has_dynamic {
-            let mut push_dyn = |tag: u64, val: u64| {
-                body.extend_from_slice(&tag.to_le_bytes());
-                body.extend_from_slice(&val.to_le_bytes());
-            };
-            for &o in &needed_offsets {
-                push_dyn(1, o); // DT_NEEDED
-            }
-            if let Some(ro) = runpath_offset {
-                push_dyn(29, ro); // DT_RUNPATH
-            }
-            push_dyn(5, strtab_offset as u64); // DT_STRTAB (vaddr == offset, identity PT_LOAD)
-            push_dyn(10, strtab.len() as u64); // DT_STRSZ
-            push_dyn(0, 0); // DT_NULL
-            assert_eq!(body_start + body.len(), strtab_offset);
-            body.extend_from_slice(&strtab);
-        }
-
-        let total_len = body_start + body.len();
-        let mut out = vec![0u8; total_len];
-        out[0..4].copy_from_slice(b"\x7fELF");
-        out[4] = 2; // ELFCLASS64
-        out[5] = 1; // little-endian
-        out[6] = 1; // EI_VERSION
-        out[16..18].copy_from_slice(&3u16.to_le_bytes()); // e_type = ET_DYN
-        out[18..20].copy_from_slice(&0x3eu16.to_le_bytes()); // e_machine = x86_64 (irrelevant)
-        out[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
-        out[32..40].copy_from_slice(&(phoff as u64).to_le_bytes()); // e_phoff
-        out[54..56].copy_from_slice(&(phentsize as u16).to_le_bytes()); // e_phentsize
-        out[56..58].copy_from_slice(&phnum.to_le_bytes()); // e_phnum
-
-        let mut phdrs: Vec<(u32, u64, u64, u64)> = Vec::new(); // (p_type, p_offset, p_vaddr, p_filesz)
-        phdrs.push((1, 0, 0, total_len as u64)); // PT_LOAD identity-maps the whole file
-        if let Some(i) = interp {
-            phdrs.push((
-                3,
-                interp_offset as u64,
-                interp_offset as u64,
-                i.len() as u64 + 1,
-            ));
-        }
-        if has_dynamic {
-            phdrs.push((2, dyn_offset as u64, dyn_offset as u64, dyn_size as u64));
-        }
-        for (idx, (p_type, p_offset, p_vaddr, p_filesz)) in phdrs.iter().enumerate() {
-            let base = phoff + idx * phentsize;
-            out[base..base + 4].copy_from_slice(&p_type.to_le_bytes());
-            out[base + 8..base + 16].copy_from_slice(&p_offset.to_le_bytes());
-            out[base + 16..base + 24].copy_from_slice(&p_vaddr.to_le_bytes());
-            out[base + 32..base + 40].copy_from_slice(&p_filesz.to_le_bytes());
-        }
-
-        out[body_start..total_len].copy_from_slice(&body);
-        out
-    }
-
     #[test]
     fn parse_elf_extracts_interp_needed_and_runpath() {
         let bytes = build_elf64(
@@ -7220,7 +7325,7 @@ mod tests {
             &["libc.so.6", "libm.so.6"],
             Some("$ORIGIN/../lib:/opt/custom/lib"),
         );
-        let deps = parse_elf_dependencies(&bytes).expect("well-formed ELF64 must parse");
+        let deps = parse_elf_dependencies(bytes.as_slice()).expect("well-formed ELF64 must parse");
         assert_eq!(deps.interp.as_deref(), Some("/lib64/ld-linux-x86-64.so.2"));
         assert_eq!(
             deps.needed,
@@ -7237,20 +7342,147 @@ mod tests {
     fn parse_elf_static_binary_contributes_only_itself() {
         // No PT_INTERP, no PT_DYNAMIC — a statically linked binary.
         let bytes = build_elf64(None, &[], None);
-        let deps = parse_elf_dependencies(&bytes).expect("a static ELF64 is still valid ELF");
+        let deps =
+            parse_elf_dependencies(bytes.as_slice()).expect("a static ELF64 is still valid ELF");
         assert_eq!(deps, ElfDependencies::default());
     }
 
     #[test]
     fn parse_elf_rejects_non_elf_and_non_elf64() {
-        assert!(parse_elf_dependencies(b"not an elf at all, way too short").is_none());
+        assert!(parse_elf_dependencies(&b"not an elf at all, way too short"[..]).is_none());
         // Correct magic but ELFCLASS32 (byte 4 == 1) must be rejected.
         let mut elf32 = build_elf64(Some("/lib/ld.so"), &["libc.so.6"], None);
         elf32[4] = 1;
         assert!(
-            parse_elf_dependencies(&elf32).is_none(),
+            parse_elf_dependencies(elf32.as_slice()).is_none(),
             "32-bit ELF is not a binary this runtime execs and must not parse"
         );
+    }
+
+    /// Every ELF image of this host's `python3`, `perl`, `bash` and `git` closures and every file
+    /// in python's `lib-dynload`, and truncated and malformed copies of each binary, parse the same
+    /// read from memory and read by position from the file, `None` included.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn a_file_read_by_position_parses_exactly_as_its_bytes_in_memory() {
+        let mut binaries = Vec::new();
+        for name in ["python3", "perl", "bash", "git"] {
+            match find_on_path(name) {
+                Some(path) => binaries.push(std::fs::canonicalize(path).unwrap()),
+                None => println!("[SKIP] no {name} on PATH"),
+            }
+        }
+        let mut images: std::collections::BTreeSet<PathBuf> =
+            resolve_landlock_grants(&binaries).into_iter().collect();
+        let dynload = std::process::Command::new("python3")
+            .args(["-I", "-S", "-c", "import sys; print('\\n'.join(sys.path))"])
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        for dir in dynload.lines().filter(|line| line.ends_with("lib-dynload")) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                images.insert(entry.path());
+            }
+        }
+        let compare = |path: &Path| {
+            let Ok(bytes) = std::fs::read(path) else {
+                return;
+            };
+            let file = ElfFile::open_host(path).unwrap();
+            assert_eq!(
+                parse_elf_dependencies(bytes.as_slice()),
+                parse_elf_dependencies(&file),
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                elf_dynamic_symbol_names(bytes.as_slice()),
+                elf_dynamic_symbol_names(&file),
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                elf_is_shared_object(bytes.as_slice()),
+                elf_is_shared_object(&file),
+                "{}",
+                path.display()
+            );
+        };
+        for path in &images {
+            compare(path);
+        }
+        println!("compared {} host images", images.len());
+
+        // Truncated and malformed copies: cut inside each table the parsers read, and with the
+        // header's table offsets pointed past the end of the file.
+        let temp = tempfile::tempdir().unwrap();
+        let mut variants = 0;
+        for binary in &binaries {
+            let bytes = std::fs::read(binary).unwrap();
+            let mut cuts = vec![
+                0,
+                1,
+                17,
+                18,
+                63,
+                64,
+                100,
+                4096,
+                bytes.len() / 2,
+                bytes.len() - 1,
+            ];
+            for field in [32usize, 40] {
+                if let Some(offset) = read_u64(&bytes, field, true) {
+                    cuts.push(offset as usize + 30);
+                }
+            }
+            let mut copies: Vec<Vec<u8>> = cuts
+                .into_iter()
+                .filter(|cut| *cut <= bytes.len())
+                .map(|cut| bytes[..cut].to_vec())
+                .collect();
+            for field in [32usize, 40] {
+                let mut moved = bytes.clone();
+                moved[field..field + 8].copy_from_slice(&(bytes.len() as u64 - 8).to_le_bytes());
+                copies.push(moved);
+            }
+            let mut big_endian = bytes.clone();
+            big_endian[5] = 2;
+            copies.push(big_endian);
+            for copy in copies {
+                let path = temp.path().join(format!("variant-{variants}"));
+                std::fs::write(&path, &copy).unwrap();
+                compare(&path);
+                variants += 1;
+            }
+        }
+        println!("compared {variants} malformed images");
+    }
+
+    /// Resolving a binary's closure reads its headers and tables, not the whole file: a stand-in
+    /// padded to 64 MiB costs a few KiB.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn resolving_a_closure_reads_no_binary_in_full() {
+        let (_temp, root) = crate::interpreter_runtime::tests::canonical_tempdir();
+        let Some(stand_in) = crate::interpreter_runtime::tests::dash_copy(&root, "padded") else {
+            return;
+        };
+        crate::interpreter_runtime::tests::pad_with_zeros(&stand_in, 64 << 20);
+        let unpadded = resolve_landlock_grants(&[std::fs::canonicalize("/bin/dash").unwrap()]);
+        let before = crate::interpreter_runtime::tests::thread_rchar();
+        let grants = resolve_landlock_grants(std::slice::from_ref(&stand_in));
+        let read = crate::interpreter_runtime::tests::thread_rchar() - before;
+        assert_eq!(grants.len(), unpadded.len(), "{grants:?}");
+        assert!(grants.contains(&stand_in));
+        assert!(
+            read < 8 * 1024 * 1024,
+            "resolving the closure read {read} bytes"
+        );
+        println!("resolving the padded stand-in's closure read {read} bytes");
     }
 
     // ---- soname resolution (loader search-order, synthetic fixtures) ----
@@ -11660,18 +11892,22 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
     }
 
     /// A policy allowlisting `binary` with its interpreter runtime derived the way
-    /// `stage_session` derives it, `work` excluded as the capsule-writable root.
+    /// `stage_session` derives it, `work` excluded as the capsule-writable root, through a host
+    /// facts cache of its own.
     fn derived_interpreter_policy(binary: &str, work: &Path) -> CapabilityPolicy {
         let mut policy = CapabilityPolicy {
             shell_allow: vec![binary.to_string()],
             ..CapabilityPolicy::default()
         };
+        let cache = tempfile::tempdir().unwrap();
         policy.shell_derived_interpreter_runtime =
             crate::interpreter_runtime::derive_interpreter_runtimes(
                 &policy.shell_allow,
                 &[],
                 &[work],
-            );
+                &crate::host_facts::HostFactsCache::at(cache.path().join("host_facts")),
+            )
+            .runtimes;
         policy
     }
 
@@ -11955,6 +12191,41 @@ export UV_CACHE_DIR="$PWD/.uv-cache" UV_PYTHON_DOWNLOADS=never
         enforcement.end_session();
         assert_ne!(written.exit_code, 0);
         assert!(std::fs::symlink_metadata(probe).is_err());
+    }
+
+    /// A `scoped` command cannot write into `~/.murmur/host_facts`: with the home outside the
+    /// workdir, a shell redirection there is refused and leaves no file.
+    #[test]
+    fn a_scoped_command_cannot_write_the_host_facts_cache() {
+        let test = "a_scoped_command_cannot_write_the_host_facts_cache";
+        let home = home_tempdir();
+        let workdir = home_tempdir();
+        let cache = home.path().join(".murmur").join(
+            crate::murmur_home::HomeEntryKind::HostFacts
+                .file_name()
+                .unwrap(),
+        );
+        crate::murmur_home::hold_private_dir(&home.path().join(".murmur")).unwrap();
+        crate::murmur_home::hold_private_dir(&cache).unwrap();
+        let policy = coreutils_policy(&[]);
+        let Some(enforcement) = scoped_landlock_enforcement(test, &policy, 1) else {
+            return;
+        };
+        let probe = cache.join("probe");
+        let written = run_bash_in(
+            workdir.path(),
+            &format!("printf x > '{}'", probe.display()),
+            &policy,
+            &enforcement,
+        );
+        enforcement.end_session();
+        assert_ne!(written.exit_code, 0);
+        assert!(
+            written.stderr.contains("Permission denied"),
+            "{}",
+            written.stderr
+        );
+        assert!(std::fs::symlink_metadata(&probe).is_err());
     }
 
     #[test]

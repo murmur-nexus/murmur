@@ -757,6 +757,151 @@ fn session_start_effective_grants_match_explain_scope_json() {
     assert_eq!(session_start["workdir_exec"], grants["workdir_exec"]);
 }
 
+/// A launch that keeps every host fact grants and reports exactly what one that works them out
+/// does. Under one scratch home, two `--explain-scope --json` runs print the same bytes, the first
+/// working out `python3` and `bash` and the second keeping them; a staged launch then reads `kept`
+/// for both in `session_start.host_facts` with `effective_grants` equal to the report; and with
+/// `~/.murmur/host_facts` deleted, the next launch reads `derived`/`absent` and the same grants.
+#[test]
+fn session_start_host_facts_say_kept_and_grant_what_a_fresh_derivation_grants() {
+    if capsule_runtime::skip_without_egress_namespace(
+        "session_start_host_facts_say_kept_and_grant_what_a_fresh_derivation_grants",
+    ) {
+        return;
+    }
+    if capsule_runtime::find_on_path("python3").is_none() {
+        println!("[SKIP] no python3 on PATH");
+        return;
+    }
+    let server = common::ScriptedServer::start(vec![end_turn_response(), end_turn_response()]);
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    setup_driver(&home, &artifact_dir);
+    let manifest_path = create_grants_manifest(project.path(), &server.endpoint);
+    let manifest = fs::read_to_string(&manifest_path).unwrap().replace(
+        "capabilities:\n",
+        "capabilities:\n  shell:\n    allow:\n      - python3\n      - bash\n",
+    );
+    fs::write(&manifest_path, manifest).unwrap();
+
+    // Staged first only to learn the scratch home this process stages under; its facts are then
+    // forgotten so the first report below works them out.
+    drop(common::stage_agent_session(
+        &home,
+        project.path(),
+        &manifest_path,
+    ));
+    let process_home = PathBuf::from(std::env::var_os("HOME").expect("staging set HOME"));
+    let cache = process_home.join(".murmur").join("host_facts");
+    fs::remove_dir_all(&cache).unwrap();
+
+    let explain = || {
+        let output = assert_cmd::Command::cargo_bin("mur")
+            .unwrap()
+            .env("HOME", &process_home)
+            .current_dir(project.path())
+            .args([
+                "run",
+                "--manifest",
+                "murmur.yaml",
+                "--explain-scope",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        (output.stdout, output.stderr)
+    };
+    let (derived_stdout, derived_stderr) = explain();
+    let (kept_stdout, kept_stderr) = explain();
+    assert_eq!(
+        String::from_utf8_lossy(&kept_stdout),
+        String::from_utf8_lossy(&derived_stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&kept_stderr),
+        String::from_utf8_lossy(&derived_stderr)
+    );
+    let explain_report: Value =
+        serde_json::from_str(String::from_utf8(kept_stdout).unwrap().trim()).unwrap();
+    assert_ne!(
+        explain_report["derived_interpreter_runtime"],
+        json!([]),
+        "python3's runtime must be derived for this test to compare anything"
+    );
+    assert!(explain_report["derived_interpreter_runtime"].is_array());
+
+    let entries: Vec<PathBuf> = fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    for entry in &entries {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(
+            entry.extension().is_some_and(|ext| ext == "json"),
+            "{entry:?}"
+        );
+        assert_eq!(
+            fs::symlink_metadata(entry).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "{entry:?}"
+        );
+    }
+
+    let launch = || {
+        let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
+        let records = staged.records_dir.clone();
+        fs::write(
+            staged.accessible_workdir.join("task.md"),
+            "Report and stop.",
+        )
+        .unwrap();
+        launch_session(staged, |_| {}).expect("agent launch should succeed");
+        parse_events(&records)
+            .into_iter()
+            .find(|event| event["event_type"] == "session_start")
+            .expect("a completed session must have written session_start")
+    };
+    // Ordered by resolved path, as staging examines them.
+    let mut binaries: Vec<String> = ["python3", "bash"]
+        .iter()
+        .map(|name| {
+            fs::canonicalize(capsule_runtime::find_on_path(name).unwrap())
+                .unwrap()
+                .display()
+                .to_string()
+        })
+        .collect();
+    binaries.sort();
+
+    let kept = launch();
+    println!("kept: {}", kept["host_facts"]);
+    assert_eq!(
+        kept["host_facts"],
+        json!([
+            {"binary": binaries[0], "source": "kept"},
+            {"binary": binaries[1], "source": "kept"},
+        ])
+    );
+    assert_eq!(kept["effective_grants"], explain_report);
+    assert!(kept["effective_grants"].get("host_facts").is_none());
+
+    fs::remove_dir_all(&cache).unwrap();
+    let derived = launch();
+    println!("derived: {}", derived["host_facts"]);
+    assert_eq!(
+        derived["host_facts"],
+        json!([
+            {"binary": binaries[0], "source": "derived", "reason": "absent"},
+            {"binary": binaries[1], "source": "derived", "reason": "absent"},
+        ])
+    );
+    assert_eq!(derived["effective_grants"], explain_report);
+}
+
 /// Two manifests differing only in `capabilities.network.allow` produce `effective_grants` entries
 /// that differ exactly as the manifests do. The whole point of recording the grant set is that
 /// this is legible from the trace alone, with neither manifest in hand.
