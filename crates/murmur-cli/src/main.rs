@@ -259,7 +259,9 @@ enum Commands {
         #[arg(long)]
         all_platforms: bool,
 
-        /// Skip compiling installed WASM artifacts for this machine; they compile on first launch instead.
+        /// Skip the work install does ahead of the first launch: compiling WASM artifacts for this
+        /// machine and keeping host facts for the manifest's shell.allow binaries; the first launch
+        /// does it instead.
         #[arg(long)]
         no_precompile: bool,
     },

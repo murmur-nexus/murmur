@@ -985,6 +985,10 @@ runs no interpreter, lists no reported directory and reads no extension module o
 binaries are read only as far as their ELF headers. Otherwise it works the binary's facts out again,
 runs the interpreter, and rewrites the entry.
 
+[`mur install`](cli.md#mur-install) in a project writes the entries the project's first launch would
+write, so that launch reports those binaries `kept`. An interpreter that does not answer gets no
+entry, and the first launch works it out. `mur install --no-precompile` writes none.
+
 `session_start.host_facts` in the [session trace](observability-schemas.md#session-trace-tracejsonl)
 says, for each binary, whether the launch kept its facts (`kept`) or worked them out (`derived`),
 and why:

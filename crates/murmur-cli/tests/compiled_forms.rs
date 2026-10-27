@@ -1,7 +1,8 @@
 //! `mur run` keeps the compiled form of every staged WASM component in `~/.murmur/compiled` and
 //! loads it on the next launch, and a form it cannot trust is compiled again and rewritten without
 //! changing the launch. `mur install` writes the same forms for the artifacts it installs, so the
-//! first launch loads them.
+//! first launch loads them, and in a project keeps the host facts of the manifest's
+//! `capabilities.shell.allow` binaries, so that launch reports every one kept.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -17,6 +18,7 @@ use std::{
 use assert_cmd::Command;
 use murmur_artifact::{read_lockfile, sha256_hex};
 use predicates::prelude::*;
+use serde_json::{json, Value};
 use tempfile::TempDir;
 use zip::{
     write::{FileOptions, SimpleFileOptions},
@@ -1098,6 +1100,479 @@ fn a_tampered_payload_fails_even_with_an_install_written_form() {
         .failure()
         .stderr(predicate::str::contains("E-REG-002"));
     assert!(form.is_file());
+}
+
+/// The binaries the host facts scenarios allow, all on any host that runs them.
+const ALLOWED: &[&str] = &["python3", "bash", "cat"];
+
+/// The driver an [`Allowed`] project's agent infers through, published into its `HOME` before
+/// the first run.
+const DRIVER: &str = "local/murmur-driver-anthropic";
+const DRIVER_VERSION: &str = "0.1.0";
+
+/// Whether a host facts scenario named `test` must skip: its capsule allows a shell, which needs
+/// an egress namespace, and it needs a `python3` to be an interpreter whose facts are kept.
+fn skip_host_facts(test: &str) -> bool {
+    if capsule_runtime::skip_without_egress_namespace(test) {
+        return true;
+    }
+    if capsule_runtime::find_on_path("python3").is_none() {
+        println!("[SKIP] no python3 on PATH");
+        return true;
+    }
+    false
+}
+
+fn host_facts(home: &Path) -> PathBuf {
+    home.join(".murmur").join("host_facts")
+}
+
+/// Each entry in `home`'s host facts directory, by file name, with its bytes.
+fn host_facts_entries(home: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut entries: Vec<_> = fs::read_dir(host_facts(home))
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().into_string().unwrap(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// `session_start.host_facts` reporting `source` for each of [`ALLOWED`], in the order a staging
+/// examines them: by canonical path.
+fn every_allowed_binary(source: Value) -> Value {
+    let mut binaries: Vec<String> = ALLOWED
+        .iter()
+        .map(|name| {
+            fs::canonicalize(capsule_runtime::find_on_path(name).unwrap())
+                .unwrap()
+                .display()
+                .to_string()
+        })
+        .collect();
+    binaries.sort();
+    binaries
+        .into_iter()
+        .map(|binary| {
+            let mut object = json!({ "binary": binary });
+            object
+                .as_object_mut()
+                .unwrap()
+                .extend(source.as_object().unwrap().clone());
+            object
+        })
+        .collect()
+}
+
+fn kept() -> Value {
+    every_allowed_binary(json!({"source": "kept"}))
+}
+
+fn derived(reason: &str) -> Value {
+    every_allowed_binary(json!({"source": "derived", "reason": reason}))
+}
+
+fn end_turn_response() -> String {
+    json!({
+        "id": "msg_et",
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [{"type": "text", "text": "done"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": Value::Null,
+        "usage": {"input_tokens": 8, "output_tokens": 3},
+    })
+    .to_string()
+}
+
+/// An http agent on a scripted model, declaring `echo-tool` and allowing `allow` in its shell,
+/// with a scratch `HOME` that holds nothing until the first install or run.
+struct Allowed {
+    home: TempDir,
+    project: TempDir,
+    manifest: PathBuf,
+    /// The `echo-tool` `.mur.zip` every install installs.
+    artifact: PathBuf,
+    server: common::ScriptedServer,
+    fixture: TempDir,
+}
+
+impl Allowed {
+    fn new(allow: &[&str]) -> Self {
+        let server = common::ScriptedServer::start(vec![end_turn_response(); 4]);
+        let fixture = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let artifact = create_tool_artifact(
+            fixture.path(),
+            TOOL_NAME,
+            TOOL_VERSION,
+            &fixture_component("echo-tool.wasm"),
+        );
+        let allow: String = allow
+            .iter()
+            .map(|name| format!("      - {name}\n"))
+            .collect();
+        let endpoint = &server.endpoint;
+        let manifest = project.path().join("murmur.yaml");
+        fs::write(
+            &manifest,
+            format!(
+                "name: host-facts\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    version: \
+                 {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      \
+                 api_key: test-key\n  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\ncapabilities:\n  \
+                 network:\n    allow:\n      - {endpoint}\n  shell:\n    allow:\n{allow}inference:\n  \
+                 transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER}\n"
+            ),
+        )
+        .unwrap();
+        Self {
+            home: tempfile::tempdir().unwrap(),
+            project,
+            manifest,
+            artifact,
+            server,
+            fixture,
+        }
+    }
+
+    /// `mur install <echo-tool zip>` in the project with `extra_args`, required to exit 0.
+    fn install(&self, extra_args: &[&str]) -> (String, String) {
+        output(
+            common::install_artifact_to_project_with_home(
+                self.project.path(),
+                &self.home,
+                &self.artifact,
+                extra_args,
+            )
+            .success(),
+        )
+    }
+
+    /// What [`Self::install`] prints holding facts for `n` binaries.
+    fn installed_and_kept(&self, n: usize) -> (String, String) {
+        (
+            format!(
+                "Installed {TOOL_NAME}@{TOOL_VERSION} from {}\nKept host facts for {n} allowlisted \
+                 binaries\n",
+                self.artifact.display()
+            ),
+            String::new(),
+        )
+    }
+
+    /// What [`Self::install`] prints holding no facts.
+    fn installed_only(&self) -> (String, String) {
+        (
+            format!(
+                "Installed {TOOL_NAME}@{TOOL_VERSION} from {}\n",
+                self.artifact.display()
+            ),
+            String::new(),
+        )
+    }
+
+    /// `mur run` of the agent with `extra_args`, required to finish `ok`. The driver is installed
+    /// into the project first, with `--no-precompile` so it writes nothing under `~/.murmur`, if
+    /// no run has installed it.
+    fn run(&self, extra_args: &[&str]) -> Run {
+        let driver = self
+            .fixture
+            .path()
+            .join("murmur-driver-anthropic-0.1.0.mur.zip");
+        if !driver.exists() {
+            common::create_driver_artifact(
+                self.fixture.path(),
+                DRIVER,
+                DRIVER_VERSION,
+                &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+            );
+            common::install_artifact_to_project_with_home(
+                self.project.path(),
+                &self.home,
+                &driver,
+                &["--no-precompile"],
+            )
+            .success();
+        }
+        let output = Command::cargo_bin("mur")
+            .unwrap()
+            .env("HOME", self.home.path())
+            .current_dir(self.project.path())
+            .args([
+                "run",
+                "--manifest",
+                self.manifest.to_str().unwrap(),
+                "--task",
+                "Report and stop.",
+                "--verbose",
+            ])
+            .args(extra_args)
+            .timeout(Duration::from_secs(300))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("status:  ok"))
+            .get_output()
+            .clone();
+        Run {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    }
+}
+
+/// One finished `mur run` of an [`Allowed`] agent.
+struct Run {
+    stdout: String,
+    stderr: String,
+}
+
+impl Run {
+    fn session_start(&self) -> Value {
+        let records = common::parse_records_from_stdout(&self.stdout);
+        common::read_whole_trace(&records.join("trace.jsonl"))
+            .into_iter()
+            .find(|record| record["event_type"] == "session_start")
+            .unwrap_or_else(|| panic!("no session_start: {}", self.stdout))
+    }
+}
+
+#[test]
+fn install_keeps_host_facts_so_the_first_run_keeps_every_binary() {
+    if skip_host_facts("install_keeps_host_facts_so_the_first_run_keeps_every_binary") {
+        return;
+    }
+    let allowed = Allowed::new(ALLOWED);
+    assert_eq!(allowed.install(&[]), allowed.installed_and_kept(3));
+    let dir = host_facts(allowed.home.path());
+    assert_eq!(mode(&dir), 0o700);
+    let entries: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 3, "{entries:?}");
+    for entry in &entries {
+        assert!(
+            entry.extension().is_some_and(|ext| ext == "json"),
+            "{entry:?}"
+        );
+        assert_eq!(mode(entry), 0o600, "{entry:?}");
+    }
+
+    assert_eq!(allowed.run(&[]).session_start()["host_facts"], kept());
+}
+
+#[test]
+fn install_kept_host_facts_hold_for_a_run_with_another_workdir() {
+    if skip_host_facts("install_kept_host_facts_hold_for_a_run_with_another_workdir") {
+        return;
+    }
+    let allowed = Allowed::new(ALLOWED);
+    allowed.install(&[]);
+    let workdir = tempfile::tempdir().unwrap();
+    let run = allowed.run(&["--workdir", workdir.path().to_str().unwrap()]);
+    assert_eq!(run.session_start()["host_facts"], kept());
+}
+
+#[test]
+fn install_written_host_facts_are_the_launchs_own_and_change_no_grant() {
+    if skip_host_facts("install_written_host_facts_are_the_launchs_own_and_change_no_grant") {
+        return;
+    }
+    let installed = Allowed::new(ALLOWED);
+    installed.install(&[]);
+    let after_install = host_facts_entries(installed.home.path());
+    let launched = Allowed::new(ALLOWED);
+    launched.install(&["--no-precompile"]);
+
+    let kept_run = installed.run(&[]);
+    let derived_run = launched.run(&[]);
+    assert_eq!(after_install.len(), 3);
+    assert_eq!(after_install, host_facts_entries(launched.home.path()));
+
+    let kept_start = kept_run.session_start();
+    let derived_start = derived_run.session_start();
+    assert_eq!(kept_start["host_facts"], kept());
+    assert_eq!(derived_start["host_facts"], derived("absent"));
+    // Each run's own home, project, model endpoint and session id named alike.
+    let neutral = |text: String, allowed: &Allowed, session_start: &Value| {
+        let mut text = text;
+        for (path, placeholder) in [
+            (allowed.project.path(), "<PROJECT>"),
+            (allowed.home.path(), "<HOME>"),
+        ] {
+            let canonical = fs::canonicalize(path).unwrap();
+            text = text.replace(&canonical.display().to_string(), placeholder);
+            text = text.replace(&path.display().to_string(), placeholder);
+        }
+        text.replace(&allowed.server.endpoint, "<ENDPOINT>")
+            .replace(session_start["session_id"].as_str().unwrap(), "<SESSION>")
+    };
+    assert_ne!(kept_start["effective_grants"], Value::Null);
+    assert_eq!(
+        neutral(
+            kept_start["effective_grants"].to_string(),
+            &installed,
+            &kept_start
+        ),
+        neutral(
+            derived_start["effective_grants"].to_string(),
+            &launched,
+            &derived_start
+        )
+    );
+    assert_eq!(
+        neutral(kept_run.stderr, &installed, &kept_start),
+        neutral(derived_run.stderr, &launched, &derived_start)
+    );
+}
+
+#[test]
+fn install_skips_an_allowlisted_binary_it_cannot_examine_without_a_word() {
+    if skip_host_facts("install_skips_an_allowlisted_binary_it_cannot_examine_without_a_word") {
+        return;
+    }
+    let allowed = Allowed::new(&["python3", "cat", "murmur-test-no-such-binary"]);
+    assert_eq!(allowed.install(&[]), allowed.installed_and_kept(2));
+    assert_eq!(host_facts_entries(allowed.home.path()).len(), 2);
+}
+
+#[test]
+fn install_with_no_precompile_keeps_no_host_facts() {
+    if skip_host_facts("install_with_no_precompile_keeps_no_host_facts") {
+        return;
+    }
+    let allowed = Allowed::new(ALLOWED);
+    assert_eq!(
+        allowed.install(&["--no-precompile"]),
+        allowed.installed_only()
+    );
+    assert!(!allowed.home.path().join(".murmur").exists());
+    assert_eq!(
+        allowed.run(&[]).session_start()["host_facts"],
+        derived("absent")
+    );
+
+    Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", allowed.home.path())
+        .args(["install", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "keeping host facts for the manifest's shell.allow binaries",
+        ));
+}
+
+#[test]
+fn an_install_with_nothing_allowlisted_or_into_the_global_store_keeps_no_host_facts() {
+    let unallowed = Installed::new(&[]);
+    assert!(unallowed.project.compiled().exists());
+    assert!(!host_facts(unallowed.project.home.path()).exists());
+
+    let global = Allowed::new(ALLOWED);
+    let (stdout, stderr) = output(
+        Command::cargo_bin("mur")
+            .unwrap()
+            .env("HOME", global.home.path())
+            .current_dir(global.project.path())
+            .args(["install", "-g", global.artifact.to_str().unwrap()])
+            .assert()
+            .success(),
+    );
+    assert!(!stdout.contains("host facts"), "{stdout}");
+    assert_eq!(stderr, "");
+    assert!(global.home.path().join(".murmur").exists());
+    assert!(!host_facts(global.home.path()).exists());
+}
+
+#[test]
+fn a_repeat_install_keeps_every_host_facts_entry_as_it_is() {
+    if skip_host_facts("a_repeat_install_keeps_every_host_facts_entry_as_it_is") {
+        return;
+    }
+    let allowed = Allowed::new(ALLOWED);
+    let first = allowed.install(&[]);
+    let dir = host_facts(allowed.home.path());
+    let before = snapshot(&dir);
+    assert_eq!(before.len(), 3);
+    assert_eq!(allowed.install(&[]), first);
+    assert_eq!(snapshot(&dir), before);
+}
+
+#[test]
+fn an_unusable_host_facts_path_never_fails_an_install() {
+    if skip_host_facts("an_unusable_host_facts_path_never_fails_an_install") {
+        return;
+    }
+    let elsewhere = tempfile::tempdir().unwrap();
+    type Plant = fn(&Path, &Path);
+    let plants: [(&str, Plant); 2] = [
+        ("a regular file", |dir, _| {
+            fs::write(dir, b"not a directory").unwrap()
+        }),
+        ("a symlink to a directory", |dir, target| {
+            std::os::unix::fs::symlink(target, dir).unwrap()
+        }),
+    ];
+    for (case, plant) in plants {
+        let allowed = Allowed::new(ALLOWED);
+        let murmur_home = allowed.home.path().join(".murmur");
+        fs::create_dir_all(&murmur_home).unwrap();
+        set_mode(&murmur_home, 0o700);
+        let dir = host_facts(allowed.home.path());
+        plant(&dir, elsewhere.path());
+        let planted = || (fs::read_link(&dir).ok(), fs::read(&dir).ok());
+        let before = planted();
+
+        assert_eq!(allowed.install(&[]), allowed.installed_only(), "{case}");
+        assert_eq!(planted(), before, "{case}");
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0, "{case}");
+
+        assert_eq!(
+            allowed.run(&[]).session_start()["host_facts"],
+            derived("not-kept"),
+            "{case}"
+        );
+        assert_eq!(planted(), before, "{case}");
+    }
+}
+
+#[test]
+fn a_manifest_install_keeps_host_facts_once_after_its_roll_up() {
+    if skip_host_facts("a_manifest_install_keeps_host_facts_once_after_its_roll_up") {
+        return;
+    }
+    let allowed = Allowed::new(ALLOWED);
+    common::publish_local(&allowed.home, &allowed.artifact).success();
+    let driver = common::create_driver_artifact(
+        allowed.fixture.path(),
+        DRIVER,
+        DRIVER_VERSION,
+        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&allowed.home, &driver).success();
+
+    let (stdout, stderr) = output(
+        Command::cargo_bin("mur")
+            .unwrap()
+            .env("HOME", allowed.home.path())
+            .current_dir(allowed.project.path())
+            .arg("install")
+            .assert()
+            .success(),
+    );
+    assert_eq!(stderr, "");
+    let line = "Kept host facts for 3 allowlisted binaries\n";
+    assert_eq!(stdout.matches(line).count(), 1, "{stdout}");
+    assert!(stdout.ends_with(line), "{stdout}");
+    assert_eq!(host_facts_entries(allowed.home.path()).len(), 3);
+    assert_eq!(allowed.run(&[]).session_start()["host_facts"], kept());
 }
 
 fn fixture_component(name: &str) -> PathBuf {

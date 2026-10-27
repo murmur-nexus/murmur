@@ -763,7 +763,7 @@ mur install --all-platforms <scope/name@version>
 | `mur install <path>` | Installs a `.mur.zip` file as `local/<name>`, `<name>` being the name its `murmur.yaml` declares |
 | `mur install -g <ref>` | Fetches into the global store (`~/.murmur/artifacts/`) |
 | `mur install --all-platforms <scope/name@version>` | Downloads all platform variants into the global store, filing each under its own platform tag; useful for CI and cross-platform build seeding |
-| `mur install --no-precompile` | Installs without compiling. Without the flag, `mur install` compiles each WASM tool, driver and hook it installs into [`~/.murmur/compiled/`](config.md#murmur-home-permissions), for this machine and this `mur` build, so the first `mur run` loads it instead of compiling it. With no arguments that includes each manifest artifact already in the store, and one whose compiled form is already there is not compiled again. A compile that fails does not fail the install or change its output; that artifact compiles on its first launch |
+| `mur install --no-precompile` | Installs without compiling and without keeping host facts; a project install then writes nothing under `~/.murmur`. Without the flag, `mur install` compiles each WASM tool, driver and hook it installs into [`~/.murmur/compiled/`](config.md#murmur-home-permissions), for this machine and this `mur` build, so the first `mur run` loads it instead of compiling it. With no arguments that includes each manifest artifact already in the store, and one whose compiled form is already there is not compiled again. A compile that fails does not fail the install or change its output; that artifact compiles on its first launch. In a project it also keeps the [host facts](containment.md#host-facts) of the manifest's `capabilities.shell.allow` binaries, Behavior step 6 below |
 
 `mur install` (no args) is the standard pre-run step. It reads `murmur.yaml`, resolves every artifact listed in it, and if an artifact is not in the global store it fetches it from the [source of its scope](installing-artifacts.md#sources-and-scopes). A pinned version that does not fit this `mur` refuses the whole install before anything is fetched or written. An install refused for any reason before its first write leaves the project as it was, with no `.murmur/artifacts/` created. See [Resolution order](config.md#resolution-order). `--registry` is refused with exit status 2 and a hint naming that order.
 
@@ -792,6 +792,13 @@ Behavior:
     ```
 
 5. Compile each WASM tool, driver and hook for this machine into `~/.murmur/compiled/`, unless `--no-precompile` is given (see the table above)
+6. Keep the [host facts](containment.md#host-facts) of each `capabilities.shell.allow` binary in `~/.murmur/host_facts/`, worked out as a `mur run` of the project without `--workdir` would work them out, so the first launch keeps them instead of running each interpreter. Project installs only, and not with `--no-precompile`. When at least one binary's facts are kept, install prints one line after the lines reporting what it installed:
+
+    ```text
+    Kept host facts for 3 allowlisted binaries
+    ```
+
+    A binary that is not a recognised interpreter is kept too, and counts in that line. A binary that is not on `PATH`, or an interpreter that does not answer, is skipped without a message and never fails the install; the first launch works out what install could not
 
 A `local/` artifact missing from the global store is refused without asking a source:
 

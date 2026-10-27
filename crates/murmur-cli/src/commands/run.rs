@@ -83,7 +83,7 @@ fn fail(session_id: &str, workdir: &std::path::Path, error: CliError, json: bool
 /// in, and therefore where `--resume` looks for the one it names: `--workdir <dir>` itself, and
 /// without it `<manifest_dir>/workdir`. Never `$CWD/workdir` — a `--manifest` pointing elsewhere
 /// would then resolve `@1` against a group this capsule never wrote to.
-fn workdir_root(project_dir: &Path, workdir_arg: Option<&Path>) -> PathBuf {
+pub(crate) fn workdir_root(project_dir: &Path, workdir_arg: Option<&Path>) -> PathBuf {
     match workdir_arg {
         Some(dir) => absolutise(dir),
         None => project_dir.join("workdir"),

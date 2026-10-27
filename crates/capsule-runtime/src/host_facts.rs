@@ -162,9 +162,21 @@ pub(crate) struct Shelf {
     emptied: bool,
 }
 
+/// What [`runtime_of`] found for one binary.
+#[cfg(target_os = "linux")]
+pub(crate) struct RuntimeOf {
+    /// `None` when the binary is not a recognised interpreter or its runtime was not derived.
+    pub(crate) runtime: Option<DerivedInterpreterRuntime>,
+    pub(crate) source: HostFactsSource,
+    /// Whether the shelf holds an entry for the binary when the call returns: the kept one, or
+    /// the one just stored.
+    pub(crate) held: bool,
+}
+
 /// `binary`'s runtime, from its kept entry in `shelf` when every recorded stamp matches, and
-/// otherwise worked out and stored. `None` when `binary` is not a recognised interpreter or its
-/// runtime was not derived. With no `shelf` the facts are worked out and nothing is stored.
+/// otherwise worked out and stored. With no `shelf` the facts are worked out and nothing is
+/// stored. Each line saying an interpreter's runtime was not derived goes to `report`, kept or
+/// worked out alike.
 #[cfg(target_os = "linux")]
 pub(crate) fn runtime_of(
     shelf: Option<&Shelf>,
@@ -172,33 +184,47 @@ pub(crate) fn runtime_of(
     kinds: &[InterpreterKind<'_>],
     roots: &[PathBuf],
     timeout: std::time::Duration,
-) -> (Option<DerivedInterpreterRuntime>, HostFactsSource) {
+    report: &mut dyn FnMut(&str),
+) -> RuntimeOf {
     let derived = |reason, changed_path| HostFactsSource::Derived {
         reason,
         changed_path,
     };
     let Some(shelf) = shelf.filter(|shelf| !shelf.emptied) else {
-        let fresh = derive(binary, kinds, roots, timeout);
-        if let (Some(shelf), Some(entry)) = (shelf, fresh.entry) {
-            store(&shelf.dir.join(entry_name(binary)), &entry);
-        }
-        return (fresh.runtime, derived(HostFactsReason::NotKept, None));
+        let fresh = derive(binary, kinds, roots, timeout, report);
+        let held = match (shelf, fresh.entry) {
+            (Some(shelf), Some(entry)) => store(&shelf.dir.join(entry_name(binary)), &entry),
+            _ => false,
+        };
+        return RuntimeOf {
+            runtime: fresh.runtime,
+            source: derived(HostFactsReason::NotKept, None),
+            held,
+        };
     };
     let path = shelf.dir.join(entry_name(binary));
     let source = match read_entry(&path) {
         Read::Absent => derived(HostFactsReason::Absent, None),
         Read::Unreadable => derived(HostFactsReason::Unreadable, None),
-        Read::Entry(entry) => match reuse(&entry, binary, kinds, roots) {
-            Ok(runtime) => return (runtime, HostFactsSource::Kept),
+        Read::Entry(entry) => match reuse(&entry, binary, kinds, roots, report) {
+            Ok(runtime) => {
+                return RuntimeOf {
+                    runtime,
+                    source: HostFactsSource::Kept,
+                    held: true,
+                }
+            }
             Err(Stale::Unreadable) => derived(HostFactsReason::Unreadable, None),
             Err(Stale::Changed(changed)) => derived(HostFactsReason::Changed, Some(changed)),
         },
     };
-    let fresh = derive(binary, kinds, roots, timeout);
-    if let Some(entry) = fresh.entry {
-        store(&path, &entry);
+    let fresh = derive(binary, kinds, roots, timeout, report);
+    let held = fresh.entry.is_some_and(|entry| store(&path, &entry));
+    RuntimeOf {
+        runtime: fresh.runtime,
+        source,
+        held,
     }
-    (fresh.runtime, source)
 }
 
 /// `<lowercase hex sha256 of the canonical binary path's bytes>.json`.
@@ -371,12 +397,14 @@ struct Fresh {
 
 /// `binary`'s facts worked out from scratch: recognised from its `.dynsym`, queried, filtered
 /// against `roots`, and its extension modules' closure walked, every read recorded with its stamp.
+/// A query that fails, or leaves nothing to grant, is reported to `report`.
 #[cfg(target_os = "linux")]
 fn derive(
     binary: &Path,
     kinds: &[InterpreterKind<'_>],
     roots: &[PathBuf],
     timeout: std::time::Duration,
+    report: &mut dyn FnMut(&str),
 ) -> Fresh {
     use crate::interpreter_runtime::{query, recognise, report_not_derived, runtime_from_report};
 
@@ -411,7 +439,7 @@ fn derive(
     let reported = match query(binary, kind, timeout) {
         Ok(reported) => reported,
         Err(reason) => {
-            report_not_derived(binary, kind, &reason);
+            report_not_derived(binary, kind, &reason, report);
             return Fresh {
                 runtime: None,
                 entry: None,
@@ -423,7 +451,7 @@ fn derive(
         .map(|entry| resolve_reported(entry))
         .collect();
     let mut recorder = Recorder::default();
-    let Ok(runtime) = runtime_from_report(binary, kind, &reported, roots, &mut recorder);
+    let Ok(runtime) = runtime_from_report(binary, kind, &reported, roots, &mut recorder, report);
     // A binary or prefix replaced while the query ran leaves the entry describing neither.
     let unmoved = stamp_of(binary) == binary_stamp && context_of(binary) == context;
     let entry = header(Some(kind.name))
@@ -618,6 +646,7 @@ fn reuse(
     binary: &Path,
     kinds: &[InterpreterKind<'_>],
     roots: &[PathBuf],
+    report: &mut dyn FnMut(&str),
 ) -> Result<Option<DerivedInterpreterRuntime>, Stale> {
     let foreign = entry.format != HOST_FACTS_FORMAT
         || entry.runtime_version != env!("CARGO_PKG_VERSION")
@@ -672,17 +701,17 @@ fn reuse(
         &entry.reported,
         roots,
         &mut Recorded::of(entry),
+        report,
     )
     .map_err(Stale::Changed)
 }
 
-/// Writes `entry` to `path`, owner-only, by rename. A failed write is ignored: the next staging
-/// works the facts out again.
+/// Writes `entry` to `path`, owner-only, by rename, and says whether it was written. A failed
+/// write leaves the next staging to work the facts out again.
 #[cfg(target_os = "linux")]
-fn store(path: &Path, entry: &Entry) {
-    if let Ok(bytes) = serde_json::to_vec(entry) {
-        let _ = crate::murmur_home::write_private_file(path, &bytes);
-    }
+fn store(path: &Path, entry: &Entry) -> bool {
+    serde_json::to_vec(entry)
+        .is_ok_and(|bytes| crate::murmur_home::write_private_file(path, &bytes).is_ok())
 }
 
 #[cfg(all(test, target_os = "linux"))]
