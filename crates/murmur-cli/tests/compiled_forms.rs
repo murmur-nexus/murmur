@@ -1437,7 +1437,7 @@ fn install_skips_an_allowlisted_binary_it_cannot_examine_without_a_word() {
     if skip_host_facts("install_skips_an_allowlisted_binary_it_cannot_examine_without_a_word") {
         return;
     }
-    let allowed = Allowed::new(&["python3", "cat", "no-such-binary-3d8f8b19"]);
+    let allowed = Allowed::new(&["python3", "cat", "murmur-test-no-such-binary"]);
     assert_eq!(allowed.install(&[]), allowed.installed_and_kept(2));
     assert_eq!(host_facts_entries(allowed.home.path()).len(), 2);
 }

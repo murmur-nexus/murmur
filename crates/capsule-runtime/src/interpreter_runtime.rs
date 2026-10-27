@@ -977,7 +977,7 @@ pub(crate) mod tests {
         let (_temp, root) = canonical_tempdir();
         let kinds = [dash_kind(&["-c", "exit 0"])];
         let kept = fill_in(
-            &["no-such-binary-3d8f8b19".to_string()],
+            &["murmur-test-no-such-binary".to_string()],
             &[],
             &[],
             std::slice::from_ref(&root),
