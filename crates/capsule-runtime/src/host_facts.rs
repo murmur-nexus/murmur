@@ -1181,7 +1181,11 @@ mod tests {
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
-        let planted_ino = std::fs::metadata(wide.join(&entry_file)).unwrap().ino();
+        // A second link outside the cache keeps the planted inode allocated, so the entry written
+        // after the narrowing cannot be handed its number, as ext4 does with a just-freed inode.
+        let planted_link = root.join("planted-entry");
+        std::fs::hard_link(wide.join(&entry_file), &planted_link).unwrap();
+        let planted_ino = std::fs::metadata(&planted_link).unwrap().ino();
         std::fs::write(wide.join("planted.json"), b"{}").unwrap();
         std::fs::create_dir(wide.join("subdir")).unwrap();
         stand_in.forget_run();
@@ -1200,6 +1204,7 @@ mod tests {
             planted_ino,
             "the entry found in the wide directory was kept"
         );
+        assert_eq!(std::fs::metadata(&planted_link).unwrap().nlink(), 1);
         assert!(holds_a_valid_entry(&wide.join(&entry_file)));
         let kept = stand_in.derive_with(&[], &HostFactsCache::at(&wide));
         assert_eq!(stand_in.source(&kept), HostFactsSource::Kept);
