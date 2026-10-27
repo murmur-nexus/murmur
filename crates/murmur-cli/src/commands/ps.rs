@@ -191,7 +191,8 @@ struct ListedCapsule {
     session_id: String,
     /// [`STATUS_RUNNING`] or [`STATUS_UNREACHABLE`], from [`running::verify`].
     status: &'static str,
-    url: String,
+    /// The door's `host:port`; `null` for a script capsule, which binds no door.
+    url: Option<String>,
     pid: u32,
     process_start: String,
     capsule_name: String,
@@ -273,7 +274,8 @@ fn listed_capsule(record: RunningRecord, status: &'static str) -> ListedCapsule 
 }
 
 /// The status a running record's row carries: [`STATUS_RUNNING`] when its door answered for it,
-/// else [`STATUS_UNREACHABLE`].
+/// or, for a script capsule with no door, when its process is the one that wrote the record; else
+/// [`STATUS_UNREACHABLE`].
 fn row_status(liveness: &Liveness) -> &'static str {
     if *liveness == Liveness::Live {
         STATUS_RUNNING
@@ -329,7 +331,7 @@ fn print_table(rows: &[(RunningRecord, &str)], with_formation: bool) {
             status,
             if record.outlives_launcher { "yes" } else { "no" },
             uptime(record),
-            record.url,
+            record.url.as_deref().unwrap_or("-"),
         );
     }
 }
@@ -708,7 +710,7 @@ mod tests {
     fn row(session_id: &str, formation: Option<&FormationId>) -> (RunningRecord, &'static str) {
         let record = RunningRecord {
             session_id: session_id.to_string(),
-            url: "127.0.0.1:1".to_string(),
+            url: Some("127.0.0.1:1".to_string()),
             pid: 1,
             process_start: String::new(),
             capsule_name: "c".to_string(),

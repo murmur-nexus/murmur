@@ -64,7 +64,7 @@ mod tests {
     fn record(door_token: Option<&str>, credentials: &[(&str, &str)]) -> RunningRecord {
         RunningRecord {
             session_id: "ses_0199c4e2f1b7712a9d3e4f5061728394".to_string(),
-            url: "127.0.0.1:1".to_string(),
+            url: Some("127.0.0.1:1".to_string()),
             pid: 1,
             process_start: "42".to_string(),
             capsule_name: "c".to_string(),

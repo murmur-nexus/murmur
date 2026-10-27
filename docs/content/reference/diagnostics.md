@@ -137,6 +137,7 @@ section that explains it.
 | `E-RUN-053` | The session reached its deadline, own or inherited, and was ended; a formation's `--deadline` fell before its entry member started; or a launch was handed a deadline it cannot enforce | [E-RUN-053](#e-run-053) |
 | `E-RUN-054` | `inference.compaction.max_tokens` is above the output ceiling the primary driver's `models:` table declares for the compaction model | [E-RUN-054](#e-run-054) |
 | `E-RUN-055` | A driver choice's output cap, or `inference.compaction.max_tokens`, is at or above its context window, leaving its calls no input budget | [E-RUN-055](#e-run-055) |
+| `E-RUN-056` | The running session a session address named is a script capsule, which binds no door to connect to | [E-RUN-056](#e-run-056) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -1494,6 +1495,20 @@ error[E-RUN-055]: compaction calls have no input budget: the context window of 1
 
 A compaction model with neither window is not checked. [`mur doctor`](cli.md#mur-doctor) reports
 both conditions as a fix.
+
+### E-RUN-056 — a script capsule has no door { #e-run-056 }
+
+`mur watch`, `mur cancel` and `mur control` connect to a capsule's door. The address named a
+running [script capsule](../concepts/capsules.md#script-capsules), which binds none, so nothing is
+connected to:
+
+```text
+error[E-RUN-056]: ses_019f01a940ce7761854e768ecbe3d399 is a script capsule: it binds no door, so there is nothing to connect to
+  hint: mur ps lists it and mur stop ends it
+```
+
+[`mur stop`](cli.md#mur-stop) ends a script capsule with a signal, and its
+[trace](observability-schemas.md) records what it did.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 

@@ -433,7 +433,7 @@ fn max_age_removes_an_ended_formation_and_keeps_a_live_one() {
     let session_id = format!("ses_{:012x}{:020x}", now_ms() - 2 * DAY_MS, 2);
     let record = RunningRecord {
         session_id: session_id.clone(),
-        url: "127.0.0.1:1".to_string(),
+        url: Some("127.0.0.1:1".to_string()),
         pid: member.pid(),
         process_start: member.token(),
         capsule_name: "worker".to_string(),

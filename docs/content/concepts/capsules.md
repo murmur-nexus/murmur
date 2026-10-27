@@ -37,6 +37,38 @@ inference:
 
 `mur build` packages this as a manifest-only `.mur.zip`.
 
+## Script capsules { #script-capsules }
+
+A **script capsule** runs its own code instead of the agent loop. Its manifest has no `inference:`
+block, and its root holds one `.wasm` component, compiled against the `capsule` world, that exports
+`murmur:capsule/run`. The runtime calls `run` once; the session ends when it returns.
+
+| The component can | Through |
+|---|---|
+| Call a tool the manifest declares under `artifacts:` | [`murmur:tool-registry/invoke`](../reference/wit-interfaces.md#interfaces) |
+| List, describe, search, pull and remove artifacts | [`murmur:artifact-manager/manage`](../reference/wit-interfaces.md#murmurartifact-managermanage) |
+| Send a task to a peer capsule | [`murmur:message/send`](../reference/wit-interfaces.md#message-send) |
+| Read and write its [work folder](../reference/workdir.md#work-folder), and read the [runtime directory](../reference/workdir.md#runtime-directory) at `murmur-runtime/` | WASI |
+| Reach the hosts [`capabilities.network.allow`](../reference/manifest.md#network-allow-entries) lists | `wasi:http` |
+
+It reads its task from `murmur-runtime/task.md` and writes its result to `out/result.txt` in its
+work folder.
+
+A script capsule leaves the record an agent session leaves:
+
+- its [`trace.jsonl`](../reference/observability-schemas.md#session-trace-tracejsonl) opens with
+  `session_start` and holds one [`tool_call`](../reference/observability-schemas.md#tool-call) per
+  `invoke`, and one `artifact_pulled` or `a2a_send` line per pull or send, each written as it
+  happens
+- its `session_end` says how `run` ended: `ok`, `trapped`, `deadline_exceeded`, `resource_limit` or
+  `failed` — see [script capsule endings](../reference/observability-schemas.md#script-capsule-endings)
+- while it runs it holds a [running-capsule record](../reference/cli.md#running-capsule-records)
+  with no address, so [`mur ps`](../reference/cli.md#mur-ps) lists it and `mur-roost` counts it
+- with `observability.otel_endpoint` set, it posts one `capsule.session` span and one
+  `capsule.tool_call` span per `invoke`
+
+No hooks run in a script capsule, and the `wasi:http` requests it makes itself are not traced.
+
 ## Isolation model
 
 Murmur uses the WASM Component Model as the primary execution boundary:

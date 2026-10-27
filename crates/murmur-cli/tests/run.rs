@@ -1070,3 +1070,256 @@ fn workdir_path_with_no_links_runs_to_completion() {
     assert!(!linked.workdir().join(".murmur").exists());
     linked.assert_outside_unchanged();
 }
+
+// ── A script capsule's record ─────────────────────────────────────────────────
+
+/// The startup line `marker` (`session: `, `records: `) of a successful `mur run --verbose`.
+fn startup_value(stdout: &str, marker: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(marker))
+        .unwrap_or_else(|| panic!("no `{marker}` line in:\n{stdout}"))
+        .trim()
+        .to_string()
+}
+
+/// The `capsule-allowlisted` project, `echo-tool` installed, with `extra_yaml` appended to its
+/// manifest.
+fn allowlisted_echo_project(fixture: &Path, project: &Path, extra_yaml: &str) -> PathBuf {
+    let artifact_path = create_tool_artifact(
+        fixture,
+        TOOL_NAME,
+        TOOL_VERSION,
+        &fixture_component("echo-tool.wasm"),
+    );
+    let manifest_path = create_project(
+        project,
+        "capsule-allowlisted.wasm",
+        &format!("  - name: {TOOL_ARTIFACT}\n    version: {TOOL_VERSION}\n"),
+        None,
+    );
+    if !extra_yaml.is_empty() {
+        let mut manifest = fs::read_to_string(&manifest_path).unwrap();
+        manifest.push_str(extra_yaml);
+        fs::write(&manifest_path, manifest).unwrap();
+    }
+    common::install_artifact_to_project(project, &artifact_path).success();
+    manifest_path
+}
+
+/// A script capsule's trace is a session like an agent's: `session_start` first, one `tool_call`
+/// per `invoke` hanging off it, and `session_end` last, saying the run returned.
+#[test]
+fn a_script_capsule_writes_a_session_frame_and_a_tool_call_per_invoke() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let manifest_path = allowlisted_echo_project(fixture.path(), project.path(), "");
+
+    let output = common::run_capsule(&home, &manifest_path)
+        .success()
+        .stdout(predicate::str::contains("status:  ok"))
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    let session_id = startup_value(&stdout, "session: ");
+    let records = PathBuf::from(startup_value(&stdout, "records: "));
+    let lines = common::read_whole_trace(&records.join("trace.jsonl"));
+
+    let start = &lines[0];
+    assert_eq!(start["event_type"], "session_start", "{start}");
+    assert_eq!(start["capsule_name"], "capsule");
+    assert_eq!(start["capsule_version"], "0.0.1");
+    assert_eq!(start["session_id"], session_id.as_str());
+    assert_eq!(start["model"], "");
+    assert!(start["max_turns"].is_null(), "{start}");
+    assert!(start["model_limits"].is_null(), "{start}");
+    assert_eq!(start["tools_declared"], serde_json::json!(["echo-tool"]));
+    for key in [
+        "containment_declared",
+        "containment_achieved",
+        "userns_grant",
+        "workdir_exec",
+    ] {
+        assert!(start.get(key).is_some(), "no {key} in {start}");
+    }
+    assert!(start["effective_grants"].is_object(), "{start}");
+
+    let calls: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["event_type"] == "tool_call")
+        .collect();
+    assert_eq!(calls.len(), 1, "{lines:#?}");
+    let call = calls[0];
+    assert_eq!(call["tool_name"], "echo-tool");
+    assert_eq!(call["status"], "ok");
+    assert_eq!(call["turn"], 0);
+    assert!(call["task_id"].is_null(), "{call}");
+    assert!(call["tool_call_id"].is_null(), "{call}");
+    assert_eq!(call["input"], "hello");
+    assert_eq!(call["input_bytes"], 5);
+    assert!(call.get("error").is_none(), "{call}");
+    assert_eq!(call["parent_id"], start["event_id"]);
+
+    let end = lines.last().unwrap();
+    assert_eq!(end["event_type"], "session_end", "{end}");
+    assert_eq!(end["exit_status"], "ok");
+    assert_eq!(end["total_tool_calls"], 1);
+    assert_eq!(end["total_turns"], 0);
+    let parentless: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["parent_id"].is_null())
+        .collect();
+    assert_eq!(parentless, vec![start], "only session_start is a root");
+
+    Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .args([
+            "trace",
+            "show",
+            records.join("trace.jsonl").to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+}
+
+/// A guest that traps ends its session `trapped`, after the refused `invoke` that made it trap is
+/// recorded, and leaves no running record behind.
+#[test]
+fn a_trapped_script_capsule_ends_its_session_trapped() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let manifest_path = create_project(project.path(), "capsule-allowlisted.wasm", " []\n", None);
+
+    common::run_capsule(&home, &manifest_path)
+        .code(1)
+        .stdout(predicate::str::contains("status:  trapped"));
+
+    let trace = common::find_file(&common::records_root(home.path()), "trace.jsonl")
+        .expect("the session wrote a trace");
+    let lines = common::read_whole_trace(&trace);
+    assert_eq!(lines[0]["event_type"], "session_start");
+    let calls: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["event_type"] == "tool_call")
+        .collect();
+    assert_eq!(calls.len(), 1, "{lines:#?}");
+    assert_eq!(calls[0]["status"], "error");
+    assert!(
+        calls[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not declared in manifest allowlist"),
+        "{}",
+        calls[0]
+    );
+    let end = lines.last().unwrap();
+    assert_eq!(end["event_type"], "session_end", "{end}");
+    assert_eq!(end["exit_status"], "trapped");
+    assert_eq!(end["total_tool_calls"], 1);
+
+    let session_id = lines[0]["session_id"].as_str().unwrap();
+    assert!(!home
+        .path()
+        .join(".murmur")
+        .join("running")
+        .join(format!("{session_id}.json"))
+        .exists());
+}
+
+/// Every OTLP request body posted to the returned port, as it arrives; each is answered `200`.
+fn otlp_collector() -> (
+    u16,
+    std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) {
+    use std::io::{BufRead, BufReader, Read};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = std::sync::Arc::clone(&bodies);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                if header.trim().is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            if request_line.starts_with("POST /v1/traces ") {
+                kept.lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&body).unwrap());
+            }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        }
+    });
+    (port, bodies)
+}
+
+/// The string attribute `key` of an OTLP span.
+fn span_attribute<'a>(span: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    span["attributes"]
+        .as_array()?
+        .iter()
+        .find(|attribute| attribute["key"] == key)?["value"]["stringValue"]
+        .as_str()
+}
+
+/// With `observability.otel_endpoint` set, a script session posts its `capsule.session` span and
+/// one `capsule.tool_call` child per `invoke`, in one trace.
+#[test]
+fn a_script_capsule_posts_a_session_span_and_a_tool_call_span() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let (port, bodies) = otlp_collector();
+    let manifest_path = allowlisted_echo_project(
+        fixture.path(),
+        project.path(),
+        &format!("observability:\n  otel_endpoint: http://127.0.0.1:{port}\n"),
+    );
+
+    common::run_capsule(&home, &manifest_path)
+        .success()
+        .stdout(predicate::str::contains("status:  ok"));
+
+    let spans: Vec<serde_json::Value> = bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|body| {
+            body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
+    let named = |name: &str| -> Vec<&serde_json::Value> {
+        spans.iter().filter(|span| span["name"] == name).collect()
+    };
+    let sessions = named("capsule.session");
+    let calls = named("capsule.tool_call");
+    assert_eq!(sessions.len(), 1, "{spans:#?}");
+    assert_eq!(calls.len(), 1, "{spans:#?}");
+    let (session, call) = (sessions[0], calls[0]);
+    assert_eq!(span_attribute(session, "exit_status"), Some("ok"));
+    assert_eq!(span_attribute(call, "tool_name"), Some("echo-tool"));
+    assert_eq!(span_attribute(call, "status"), Some("ok"));
+    assert_eq!(call["parentSpanId"], session["spanId"]);
+    assert_eq!(call["traceId"], session["traceId"]);
+}

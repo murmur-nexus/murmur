@@ -6,8 +6,9 @@
 //! [`ProcessState::Gone`]. [`ProcessState::Unverified`] counts, because something holds the pid
 //! and it may be the capsule. A daemon cannot tell which survivors its predecessor admitted, so
 //! every live record counts, roots started by hand among them; that over-count shrinks as they
-//! exit. What it cannot see goes uncounted: a session whose record could not be written, a script
-//! capsule, which writes none, a record that does not parse, and capsules under another `HOME`.
+//! exit. Agent sessions and script capsules both count: a script capsule holds a record with no
+//! door for as long as its run lasts. What it cannot see goes uncounted: a session whose record
+//! could not be written, a record that does not parse, and capsules under another `HOME`.
 //!
 //! There is no door probe. Layer 3, the agent-card probe `mur ps` runs, can only turn a live
 //! process into an unreachable one, and both still hold memory, which is what the ceiling

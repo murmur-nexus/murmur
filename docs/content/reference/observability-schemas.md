@@ -50,10 +50,6 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `plan_step_start`, `plan_step` | The plan node |
 | `plan_end` | The plan node, or the session node for a plan file that never parsed and so has none |
 
-A trace with no `session_start` line — a script capsule flushing buffered `artifact_pulled` and
-`a2a_send` records into a file that has no session frame — writes `parent_id: null` on every line,
-rather than naming a parent that has no line behind it.
-
 **`session_start`** — written once per launch, before the `on-session-start` hooks fire and
 before the first task begins
 
@@ -380,6 +376,19 @@ storing the wire payload as sent; the default, `meta`, stores no bodies at all.
 | `state_effect` | string | `"read"` \| `"mutate"`, as the tool declared it. Absent when the tool declared none — see [`state_effect`](wit-interfaces.md#murmurtoolrun) |
 | `resource_id` | string | The resource this call addressed, as the tool declared it. An opaque, tool-defined string. Absent when the tool declared none |
 
+A [script capsule](../concepts/capsules.md#script-capsules) writes one `tool_call` for every
+`murmur:tool-registry/invoke` call, a refused one included:
+
+| Field | In a script capsule's trace |
+|---|---|
+| `turn` | `0`: a script capsule has no turns |
+| `task_id`, `tool_call_id` | `null` |
+| `input` | The `data` the component passed, as JSON when it parses as JSON, else as a string. `null` when it passed none |
+| `input_bytes` | The byte length of `data`, `0` when it passed none |
+| `output` | The tool's `data`, else its `summary`, unfenced; for a refused call, the refusal the component received |
+| `status` | `"ok"` when the tool returned `passed`, else `"error"` |
+| `error` | The refusal, for a call the runtime refused, such as a tool not in the manifest's `artifacts:` |
+
 **`skill_call`** — written after each skill invocation returns
 
 | Field | Type | Notes |
@@ -581,7 +590,20 @@ loop has exited, on every exit path
 | `total_tool_calls` | u32 | Equals the count of `tool_call` lines |
 | `total_shell_calls` | u32 | Equals the count of `shell` plus `shell_detached` lines |
 | `duration_ms` | u64 | Wall-clock time from session start |
-| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"spend_ceiling_reached"` \| `"canceled"` \| `"formation_ended"` \| `"deadline_reached"` — the launch's outcome, which is the status [`mur run`](cli.md#mur-run-status) prints. The first [task that decides the launch](cli.md#mur-run-status) and ended anything but `"ok"` sets it, and no later run replaces it. `"formation_ended"`: a formation member was running a task when its [formation ended](roster.md#launch-stop), and the wind-down canceled that task. `"deadline_reached"`: the session reached its [deadline](cli.md#mur-run-deadline), own or inherited, whether or not a task was running |
+| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"spend_ceiling_reached"` \| `"canceled"` \| `"formation_ended"` \| `"deadline_reached"` for an agent session, and `"ok"` \| `"trapped"` \| `"deadline_exceeded"` \| `"resource_limit"` \| `"failed"` for a [script capsule](#script-capsule-endings). For an agent session, the launch's outcome, which is the status [`mur run`](cli.md#mur-run-status) prints. The first [task that decides the launch](cli.md#mur-run-status) and ended anything but `"ok"` sets it, and no later run replaces it. `"formation_ended"`: a formation member was running a task when its [formation ended](roster.md#launch-stop), and the wind-down canceled that task. `"deadline_reached"`: the session reached its [deadline](cli.md#mur-run-deadline), own or inherited, whether or not a task was running |
+
+<span id="script-capsule-endings"></span>A [script capsule](../concepts/capsules.md#script-capsules)'s
+`exit_status` says how its `run` ended:
+
+| `exit_status` | `run` |
+|---|---|
+| `"ok"` | Returned |
+| `"trapped"` | Stopped with a guest error |
+| `"deadline_exceeded"` | Ran past [`capabilities.limits.deadline_seconds`](manifest.md#field-capabilities), the epoch deadline on the component. This is not `"deadline_reached"`, which is an agent session's `--deadline` |
+| `"resource_limit"` | Hit its memory, table or instance cap under `capabilities.limits` |
+| `"failed"` | Could not be run by the runtime, or a trace line could not be written |
+
+A script capsule ended by `SIGKILL`, `SIGTERM` or its spawner's lifeline writes no `session_end`.
 
 **`a2a_task_received`** — written when an incoming message reserves the task slot
 
@@ -593,7 +615,7 @@ loop has exited, on every exit path
 | `traceparent_from_caller` | string \| null | W3C `traceparent` header from the incoming request |
 | `caller_member` | string | The roster name of the formation member that called, when the door let the task in on a [formation token](roster.md#formation-token). Absent for every other task |
 
-**`a2a_send`** — written when a capsule component calls `murmur:message/send`
+**`a2a_send`** — written when a script capsule calls `murmur:message/send` and the peer answers
 
 | Field | Type | Notes |
 |---|---|---|
@@ -617,8 +639,8 @@ loop has exited, on every exit path
 | `fetched_from` | string | Where the payload came from: `"project store"`, `"global store"` or `"github:<owner>/<repo>"` |
 | `owner_id` | u64 | GitHub's numeric id of the scope's owner, pinned in `murmur.lock` beside the entry. Absent when neither the source nor the stored payload records one |
 
-A script capsule writes these lines, before its buffered `a2a_send` lines, after its `run` returns.
-An agent capsule writes each one after the `pull-artifact` call that made it.
+A script capsule writes each one as its `manage.pull()` call returns. An agent capsule writes each
+one after the `pull-artifact` call that made it.
 
 **`task_start`**{ #task-start-record } — written at the start of each task, before the agent loop runs
 
@@ -1717,7 +1739,7 @@ Neither path can suppress or corrupt the other, and a failure on either is non-f
 
 | Span name | Source event | Attributes |
 |---|---|---|
-| `capsule.session` | One per task | `exit_status` |
+| `capsule.session` | One per task; one per launch for a script capsule | `exit_status` |
 | `capsule.inference` | `inference` | `turn`, `input_tokens` and `output_tokens` (each when the turn was counted at all), `decision`, `stop_reason` (the provider's own reason, on every agent-loop turn), `tool_name` (when the response asked for one), `input_tokens_actual`, `output_tokens_actual`, `cached_tokens`, `cache_write_tokens` and `thinking_tokens` (each when the driver reported it), plus `origin` and `model` for a hook-run completion |
 | `capsule.tool_call` | `tool_call` | `tool_name`, `input_bytes`, `output_bytes`, `duration_ms`, `status` |
 | `capsule.shell` | `shell` | `command` (first 200 characters), `exit_code`, `duration_ms` |
@@ -1730,7 +1752,9 @@ their own — they appear in `trace.jsonl` alone.
 A `capsule.session` span covers one task, under its own trace id. A launch that handles three
 queued tasks therefore posts three of them, where `trace.jsonl` holds a single
 `session_start`/`session_end` pair around three `task_start`/`task_end` pairs. Correlate the two
-by task, not by session.
+by task, not by session. A script capsule posts one `capsule.session` span for its run, with a
+`capsule.tool_call` child for each `invoke`, and stamps its outgoing `murmur:message/send`
+requests, and their `a2a_send.traceparent`, with that session span.
 
 **Non-obvious behaviour:**
 

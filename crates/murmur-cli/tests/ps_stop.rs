@@ -3342,3 +3342,145 @@ fn ps_json_on_an_empty_machine_an_unreadable_one_and_with_verbose() {
         .code(2)
         .stdout("");
 }
+
+// ── A script capsule ──────────────────────────────────────────────────────────
+
+/// A `capsule-sleep-long` script capsule, `mur run` in the background under `home`: a capsule with
+/// no door, which sleeps 8 s and returns.
+fn start_sleeping_script(home: &Path, project: &Path) -> Child {
+    fs::write(
+        project.join("murmur.yaml"),
+        "name: capsule\nversion: 0.0.1\nartifacts: []\n",
+    )
+    .unwrap();
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/run/components/capsule-sleep-long.wasm"),
+        project.join("capsule.wasm"),
+    )
+    .unwrap();
+    std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
+        .env("HOME", home)
+        .args(["run", "--manifest"])
+        .arg(project.join("murmur.yaml"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+/// `mur ps --json`'s `capsules`, polled every 200 ms until it lists one. The record is written once
+/// staging has compiled the component and the session has started, which a loaded host can take
+/// well over the 8 s the capsule then runs for, so the wait is a minute.
+fn wait_for_listed_capsule(home: &Path) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (stdout, _) = ps_output_with(home, &["--json"]);
+        let listing: Value = serde_json::from_str(&stdout).unwrap();
+        if let Some(capsule) = listing["capsules"].as_array().and_then(|c| c.first()) {
+            return capsule.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no capsule listed within 60 s: {stdout}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// A script capsule holds a record with no address while it runs, which `mur ps` lists without
+/// asking a door, and removes it when its session ends.
+#[test]
+fn ps_lists_a_running_script_capsule_with_no_url() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut child = start_sleeping_script(home.path(), project.path());
+
+    let listed = wait_for_listed_capsule(home.path());
+    let session_id = listed["session_id"].as_str().unwrap().to_string();
+    assert!(listed["url"].is_null(), "{listed}");
+    assert_eq!(listed["status"], "running", "{listed}");
+    assert_eq!(listed["pid"], child.id(), "{listed}");
+    let records_dir = PathBuf::from(listed["records_dir"].as_str().unwrap());
+    let record_text = fs::read_to_string(record_for(home.path(), &session_id)).unwrap();
+    let record: Value = serde_json::from_str(&record_text).unwrap();
+    assert!(record["url"].is_null(), "{record_text}");
+    assert!(record_text.contains("\"url\": null"), "{record_text}");
+
+    let stdout = ps_stdout(home.path());
+    let rows = ps_rows(&stdout);
+    assert_eq!(rows.len(), 1, "{stdout}");
+    assert!(rows[0].starts_with(&session_id), "{stdout}");
+    assert_eq!(rows[0].split_whitespace().last(), Some("-"), "{stdout}");
+
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{status}");
+    let (stdout, _) = ps_output_with(home.path(), &["--json"]);
+    let listing: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(listing["capsules"], json!([]), "{stdout}");
+    assert!(!record_for(home.path(), &session_id).exists());
+    let trace = read_trace(&records_dir.join("trace.jsonl"));
+    assert_eq!(trace[0]["event_type"], "session_start");
+    assert_eq!(trace.last().unwrap()["exit_status"], "ok");
+}
+
+/// `mur watch` and `mur cancel` have no door to connect to on a script capsule, and say so;
+/// `mur stop` asks no door and ends the process.
+#[test]
+fn watch_and_cancel_refuse_a_script_capsule_and_stop_ends_it() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut child = start_sleeping_script(home.path(), project.path());
+    let session_id = wait_for_listed_capsule(home.path())["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for args in [
+        vec!["watch", session_id.as_str()],
+        vec!["cancel", session_id.as_str(), "tsk_none"],
+    ] {
+        let output = mur(home.path())
+            .args(&args)
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("error[E-RUN-056]"), "{args:?}: {stderr}");
+        assert!(stderr.contains("is a script capsule"), "{args:?}: {stderr}");
+    }
+
+    let output = mur(home.path())
+        .args(["stop", session_id.as_str()])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("stopped: {session_id}")),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("residue:"), "{stdout}");
+    assert!(!stdout.contains("could not be asked"), "{stdout}");
+
+    assert!(
+        exited_within_secs(&mut child, 5),
+        "the script capsule is still running"
+    );
+    assert!(!record_for(home.path(), &session_id).exists());
+}
+
+/// Whether `child` has exited within `secs` seconds.
+fn exited_within_secs(child: &mut Child, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
+}

@@ -3880,8 +3880,12 @@ fn launch(
 
         // Built while `staged` is still whole. It is written, and the URL announced, inside the
         // task `LocalSet` below, once the door has been spawned.
-        let running_record =
-            running_record_for(&staged, &session_id, &capsule_url, holds_formation_lifeline);
+        let running_record = running_record_for(
+            &staged,
+            &session_id,
+            Some(&capsule_url),
+            holds_formation_lifeline,
+        );
 
         // The control token is minted here, from a key generated for this session alone, and
         // written beside where the running record will be before that record exists. The guard
@@ -4515,8 +4519,8 @@ fn launch(
                         required_schema_warned: Mutex::new(BTreeSet::new()),
                         logged_tool_inventory: None,
                         session_id: session_id.clone(),
-                        pending_a2a_events: Vec::new(),
                         pending_artifact_pulls: Vec::new(),
+                        script_session: None,
                         capability_policy,
                         protected_paths,
                         tool_annotations,
@@ -4661,7 +4665,7 @@ fn launch(
                     // A guard rather than a line at each return, bound in this future so it lives
                     // until the task loop has ended: a record that outlived its session would
                     // resolve an address onto a port nothing holds. Only the agent path reaches
-                    // here; a script capsule binds nothing and is never addressable.
+                    // here; a script capsule writes a record with no door from its own path.
                     // Tasks taken off the channel but not yet started. It outlives one iteration
                     // because a task drained while another was running has to still be here when
                     // that one finishes.
@@ -5359,6 +5363,9 @@ fn launch(
             })?;
     }
 
+    // Built while `staged` is still whole; written once `session_start` is.
+    let running_record = running_record_for(&staged, &staged.session_id, None, false);
+
     // Script capsule path — requires a compiled WASM component.
     let capsule_component = staged
         .capsule_component
@@ -5399,23 +5406,89 @@ fn launch(
     // Read before `staged.capability_policy` moves into the store state below.
     let capsule_limits = staged.capability_policy.limits;
 
+    let wasi = build_wasi_ctx(
+        &staged.accessible_workdir,
+        // The capsule component runs on the ceiling, not on any artifact's grant — so it gets
+        // neither a narrowed workdir preopen, nor a state preopen, nor a config block. A capsule
+        // cannot reach a tool's store, by construction and not by convention: it holds no
+        // descriptor that names one.
+        None,
+        None,
+        None,
+        &inference_env,
+        &staged.capability_policy,
+        // A script capsule reads its task, like a whole-workdir tool reads `MURMUR.md`, from the
+        // read-only runtime directory at `murmur-runtime/`.
+        Some(&staged.runtime_dir),
+    )?;
+
+    // Script capsule uses a multi-thread runtime so block_in_place works inside the host
+    // functions (`invoke`, `send`, `pull`), which write the session's trace lines as they run.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| RuntimeError::Runtime(format!("failed to create tokio runtime: {e}")))?;
+
+    // The session frame, opened with what the agent path records and before the guest's own code
+    // runs, so every line a host function writes has `session_start` to hang off. From here on
+    // every return goes through the ending below, which writes `session_end`.
+    let records_root = staged.records_root.clone();
+    let mut trace = rt
+        .block_on(TraceWriter::open(
+            &records_root,
+            staged.session_id.clone(),
+            staged.capsule_name.clone(),
+            staged.capsule_version.clone(),
+            String::new(),
+            capability_names(&staged.capability_policy),
+            staged.scope_report.clone(),
+            staged.trace_capture,
+            None,
+            false,
+            None,
+            None,
+            staged
+                .spawner
+                .as_ref()
+                .map(|handle| handle.session_id.clone()),
+            staged
+                .spawner
+                .as_ref()
+                .map(|handle| handle.delegation_id.clone()),
+        ))
+        .map_err(|e| match records_root.take_refusals().into_iter().next() {
+            // A link at `trace.jsonl`: refused, with no trace to record it in.
+            Some(refusal) => RuntimeError::WorkdirPathRefused { refusal },
+            None => RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")),
+        })?;
+    trace.set_spend_ceilings(spend.session_ceiling(), spend.machine_ceiling());
+    trace.set_credential_source("none");
+    trace.set_gateways(session_gateway_records);
+    trace.set_control(staged.control.as_ref().map(|state| state.session_control()));
+    trace.set_tool_refresh(None);
+    trace.set_runtime_artifacts(&staged.installed_artifacts);
+    trace.set_host_facts(&staged.host_facts);
+    trace.set_formation_id(staged.formation_id.as_ref());
+    trace.set_formation_member(staged.formation_member.as_deref());
+    let mut tools_declared: Vec<String> = staged.allowlisted_tools.iter().cloned().collect();
+    tools_declared.sort_unstable();
+    rt.block_on(trace.write_session_start(None, None, tools_declared))
+        .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+    let mut otel = OtelEmitter::new(
+        staged.otel_endpoint.clone(),
+        &records_root,
+        staged.capsule_name.clone(),
+        staged.capsule_version.clone(),
+    );
+    otel.begin_session(None);
+    let current_traceparent = otel.outgoing_traceparent();
+    // Held until the session has ended. A run the process does not survive — a `SIGKILL`, a
+    // `SIGTERM`, the spawner lifeline's EOF — leaves it for `mur ps` to prune on pid evidence.
+    let running_guard = write_running_record(&running_record, &records_root);
+
     let state = CapsuleStoreState {
         table: ResourceTable::new(),
-        wasi: build_wasi_ctx(
-            &staged.accessible_workdir,
-            // The capsule component runs on the ceiling, not on any artifact's grant — so it gets
-            // neither a narrowed workdir preopen, nor a state preopen, nor a config block. A
-            // capsule cannot reach a tool's store, by construction and not by convention: it holds
-            // no descriptor that names one.
-            None,
-            None,
-            None,
-            &inference_env,
-            &staged.capability_policy,
-            // A script capsule reads its task, like a whole-workdir tool reads `MURMUR.md`, from
-            // the read-only runtime directory at `murmur-runtime/`.
-            Some(&staged.runtime_dir),
-        )?,
+        wasi,
         http: WasiHttpCtx::new(),
         http_hooks: NetworkPolicyHooks {
             network_allow_rules: network_allow_rules.clone(),
@@ -5467,13 +5540,17 @@ fn launch(
         required_schema_warned: Mutex::new(BTreeSet::new()),
         logged_tool_inventory: None,
         session_id: staged.session_id.clone(),
-        pending_a2a_events: Vec::new(),
         pending_artifact_pulls: Vec::new(),
+        script_session: Some(ScriptSessionRecord {
+            trace,
+            otel,
+            write_error: None,
+        }),
         capability_policy: staged.capability_policy,
         protected_paths: staged.protected_paths,
         tool_annotations: staged.tool_annotations,
         shell_enforcement: shell_enforcement.clone(),
-        current_traceparent: None,
+        current_traceparent,
         current_task_provenance: None,
         current_context_id: None,
         current_forget_harness_session: None,
@@ -5508,13 +5585,7 @@ fn launch(
     // the store enforces, and instantiation itself allocates against them.
     store.limiter(|state| &mut state.limits);
 
-    // Script capsule uses a multi-thread runtime so block_in_place works inside send::Host::send
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| RuntimeError::Runtime(format!("failed to create tokio runtime: {e}")))?;
-
-    rt.block_on(async {
+    let ran: Result<(), RuntimeError> = rt.block_on(async {
         // Instantiation runs the guest's own start/init code, so it gets a deadline too.
         store.set_epoch_deadline(capsule_limits.deadline_ticks());
         let instantiated = linker
@@ -5545,26 +5616,38 @@ fn launch(
         }
 
         Ok(())
-    })?;
+    });
 
-    // The capsule's run has returned, so its session ends: every process a shell call started is
-    // killed and the session's network namespace is released.
+    // The capsule's run has ended, however it ended, so its session ends: every process a shell
+    // call started is killed and the session's network namespace is released.
     store.data().shell_enforcement.end_session();
 
-    // The trace lines the capsule's run buffered on its store, written now that it has returned.
-    let pending_pulls = std::mem::take(&mut store.data_mut().pending_artifact_pulls);
-    let pending_sends = std::mem::take(&mut store.data_mut().pending_a2a_events);
-    rt.block_on(drain_script_trace_buffers(
-        &staged.records_root,
-        &staged.session_id,
-        &staged.capsule_name,
-        &staged.capsule_version,
-        &staged.scope_report,
-        pending_pulls,
-        pending_sends,
-    ));
+    let mut ran = ran;
+    if let Some(mut session) = store.data_mut().script_session.take() {
+        // A line a host function could not write leaves the record incomplete, which fails the
+        // launch whatever `run` did.
+        if let Some(error) = session.write_error.take() {
+            ran = Err(RuntimeError::AgentLoopFailed(format!(
+                "trace write failed: {error}"
+            )));
+        }
+        let exit_status = script_exit_status(&ran);
+        let ended = rt.block_on(async {
+            let written = session.trace.write_session_end(exit_status).await;
+            session.otel.emit_session_end(exit_status).await;
+            written.and(session.trace.flush().await)
+        });
+        if let (Ok(()), Err(error)) = (&ran, ended) {
+            ran = Err(RuntimeError::AgentLoopFailed(format!(
+                "trace write failed: {error}"
+            )));
+        }
+    }
+    drop(running_guard);
+    ran?;
 
-    // Notify the caller that the capsule has started (no URL for script capsules).
+    // The readiness line, written once the run has finished: a script capsule announces no URL,
+    // and a launcher waiting on the line is waiting on the run.
     on_url("");
 
     delegation.complete();
@@ -5577,68 +5660,138 @@ fn launch(
     })
 }
 
-/// One buffered `a2a_send` line: (peer_url, message_id, task_id, context_id, traceparent, trust).
-pub(crate) type PendingA2aSend = (String, String, String, String, Option<String>, TrustClass);
+/// `session_end.exit_status` for a script capsule whose `run` ended in `ran`: `ok` when it
+/// returned, `trapped` for a guest error, `deadline_exceeded` past
+/// `capabilities.limits.deadline_seconds`, `resource_limit` at a memory, table or instance cap,
+/// and `failed` when the runtime could not run it.
+pub(crate) fn script_exit_status(ran: &Result<(), RuntimeError>) -> &'static str {
+    match ran {
+        Ok(()) => "ok",
+        Err(RuntimeError::CapsuleTrap(_)) => "trapped",
+        Err(RuntimeError::CapsuleDeadlineExceeded { .. }) => "deadline_exceeded",
+        Err(RuntimeError::CapsuleResourceLimit { .. }) => "resource_limit",
+        Err(_) => "failed",
+    }
+}
 
-/// Write the trace lines a script capsule's run buffered on its store: every `artifact_pulled`
-/// line first, then every `a2a_send` line, each in the order it was buffered.
+/// The record a script capsule's session writes while its `run` executes: its trace, its
+/// OpenTelemetry spans, and the first trace write a host function could not make.
 ///
-/// A script capsule writes no `session_start`, so these go through a writer opened here, after
-/// the guest's `run` returned, and parent to nothing. No trace file is opened when both buffers
-/// are empty. A write failure is dropped: the run it describes has already succeeded.
-async fn drain_script_trace_buffers(
-    workdir: &WorkdirRoot,
-    session_id: &str,
-    capsule_name: &str,
-    capsule_version: &str,
-    scope_report: &crate::containment::ScopeReport,
-    pulls: Vec<PulledArtifact>,
-    sends: Vec<PendingA2aSend>,
-) {
-    if pulls.is_empty() && sends.is_empty() {
-        return;
+/// Held on [`CapsuleStoreState::script_session`], so every host function the guest calls writes
+/// its line at the call, inside the frame `launch` opened. A host function cannot fail the guest
+/// for a write of its own, so the first failure is kept here and the launch fails on it once
+/// `run` has returned.
+pub(crate) struct ScriptSessionRecord {
+    pub(crate) trace: TraceWriter,
+    pub(crate) otel: OtelEmitter,
+    pub(crate) write_error: Option<std::io::Error>,
+}
+
+impl ScriptSessionRecord {
+    /// Keeps `written`'s error when it is the first.
+    fn keep_error(&mut self, written: std::io::Result<()>) {
+        if let Err(error) = written {
+            self.write_error.get_or_insert(error);
+        }
     }
-    let Ok(mut trace) = TraceWriter::open(
-        workdir,
-        session_id.to_string(),
-        capsule_name.to_string(),
-        capsule_version.to_string(),
-        String::new(),
-        Vec::new(),
-        scope_report.clone(),
-        // This writer exists only to drain buffered events; it writes no record that can carry a
-        // hash or a body.
-        murmur_artifact::TraceCapture::None,
-        None,
-        false,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    else {
-        return;
-    };
-    for artifact in &pulls {
-        let _ = trace.write_artifact_pulled(artifact).await;
+
+    /// Writes the `tool_call` line and posts the `capsule.tool_call` span for one `invoke`: `data`
+    /// is the guest's input, `result` what the guest is handed back.
+    fn record_invoke(
+        &mut self,
+        tool_name: String,
+        data: Option<&str>,
+        result: &Result<murmur::tool::run::ToolResult, String>,
+        duration_ms: u64,
+    ) {
+        let input = match data {
+            Some(data) => serde_json::from_str(data)
+                .unwrap_or_else(|_| serde_json::Value::String(data.to_string())),
+            None => serde_json::Value::Null,
+        };
+        let input_bytes = data.map_or(0, |data| data.len() as u64);
+        let (output, status, state_effect, resource_id, error) = match result {
+            Ok(result) => (
+                result
+                    .data
+                    .clone()
+                    .or_else(|| result.summary.clone())
+                    .unwrap_or_else(|| "tool returned no data".to_string()),
+                if matches!(result.status, murmur::tool::run::Status::Passed) {
+                    "ok"
+                } else {
+                    "error"
+                },
+                agent::extract_state_effect(&result.metadata),
+                agent::extract_resource_id(&result.metadata),
+                None,
+            ),
+            Err(text) => (text.clone(), "error", None, None, Some(text.as_str())),
+        };
+        let output_bytes = output.len() as u64;
+        let written = block_on_host(async {
+            self.otel
+                .emit_tool_call(&tool_name, input_bytes, output_bytes, duration_ms, status)
+                .await;
+            self.trace
+                .write_tool_call(
+                    0,
+                    tool_name,
+                    None,
+                    input,
+                    input_bytes,
+                    &output,
+                    output_bytes,
+                    duration_ms,
+                    status.to_string(),
+                    state_effect,
+                    resource_id,
+                    error,
+                )
+                .await
+        });
+        self.keep_error(written);
     }
-    for (peer_url, message_id, task_id, context_id, traceparent, trust) in sends {
-        let _ = trace
-            .write_a2a_send(
-                &peer_url,
-                &message_id,
-                &task_id,
-                &context_id,
-                traceparent.as_deref(),
-                trust,
-            )
-            .await;
+
+    /// Writes the `artifact_pulled` line for each of `pulls`, in order.
+    fn record_pulls(&mut self, pulls: Vec<PulledArtifact>) {
+        for pulled in pulls {
+            let written = block_on_host(self.trace.write_artifact_pulled(&pulled));
+            self.keep_error(written);
+        }
     }
-    let _ = trace.flush().await;
+
+    /// Writes the `a2a_send` line for one message a peer took.
+    fn record_send(
+        &mut self,
+        peer_url: &str,
+        message_id: &str,
+        task_id: &str,
+        context_id: &str,
+        traceparent: Option<&str>,
+        trust: TrustClass,
+    ) {
+        let written = block_on_host(self.trace.write_a2a_send(
+            peer_url,
+            message_id,
+            task_id,
+            context_id,
+            traceparent,
+            trust,
+        ));
+        self.keep_error(written);
+    }
+}
+
+/// Runs `future` to completion from a synchronous host function, which the script path calls
+/// from inside its multi-thread Tokio runtime.
+fn block_on_host<F: std::future::Future>(future: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
 }
 
 /// This session's entry for `~/.murmur/running/`, not yet written — see [`write_running_record`].
+///
+/// `capsule_url` is the door's `host:port`, and `None` for a script capsule, which binds no door.
 ///
 /// `outlives_launcher` is derived from whether the launching process has a controlling terminal.
 /// A capsule started in a terminal dies with that window; one started without a terminal —
@@ -5659,13 +5812,13 @@ async fn drain_script_trace_buffers(
 fn running_record_for(
     staged: &StagedSession,
     session_id: &str,
-    capsule_url: &str,
+    capsule_url: Option<&str>,
     holds_formation_lifeline: bool,
 ) -> running::RunningRecord {
     let pid = std::process::id();
     running::RunningRecord {
         session_id: session_id.to_string(),
-        url: capsule_url.to_string(),
+        url: capsule_url.map(str::to_string),
         pid,
         // An unreadable start time is recorded as the empty string, which no freshly read token
         // equals, so the record fails layer 2 on the first read instead of resolving unverified.
@@ -5713,7 +5866,7 @@ fn running_record_for(
 ///
 /// `None` when the record could not be written, which warns `W-SEC-023` and changes nothing else:
 /// the session runs and serves exactly as it would have, reachable by the URL `mur run` prints
-/// rather than by session address.
+/// rather than by session address, or, for a script capsule, unlisted.
 fn write_running_record(
     record: &running::RunningRecord,
     workdir: &WorkdirRoot,
@@ -5722,12 +5875,19 @@ fn write_running_record(
         Ok(guard) => Some(guard),
         Err(reason) => {
             let link = security_warning_link(W_SEC_023);
-            let message = format!(
-                "this session's record under ~/.murmur/running/ could not be written, so \
-                 `mur watch` and `mur cancel` cannot reach it by session address — only by the \
-                 URL it announces — and `mur token` cannot read the tokens of an authenticated \
-                 door: {reason}"
-            );
+            let message = if record.url.is_some() {
+                format!(
+                    "this session's record under ~/.murmur/running/ could not be written, so \
+                     `mur watch` and `mur cancel` cannot reach it by session address — only by \
+                     the URL it announces — and `mur token` cannot read the tokens of an \
+                     authenticated door: {reason}"
+                )
+            } else {
+                format!(
+                    "this session's record under ~/.murmur/running/ could not be written, so \
+                     `mur ps` cannot list it and `mur-roost` cannot count it: {reason}"
+                )
+            };
             crate::runtime_err!("[capsule-runtime] warning[{W_SEC_023}]: {message} ({link})");
             agent::append_bootstrap_log(
                 workdir,
@@ -7601,16 +7761,18 @@ pub(crate) struct CapsuleStoreState {
     /// and again each time it changes.
     pub(crate) logged_tool_inventory: Option<String>,
     pub(crate) session_id: String,
-    /// Buffered outgoing A2A send events — drained into trace.jsonl after the capsule run.
-    pub(crate) pending_a2a_events: Vec<PendingA2aSend>,
     /// One record per successful pull, as `installed_artifacts` records it after the pull,
     /// awaiting its `artifact_pulled` trace line. A refused or failed pull pushes nothing.
     ///
-    /// Drained by both paths a pull is reachable from: the script-capsule path after the guest's
-    /// `run` returns ([`drain_script_trace_buffers`]), and the http agent loop after each
-    /// `pull-artifact` call. A path that makes a pull reachable anywhere else must drain it there
-    /// too, or its pulls go unrecorded.
+    /// Drained by both paths a pull is reachable from: `manage.pull` on the script-capsule path,
+    /// into [`Self::script_session`] as soon as the pull returns, and the http agent loop after
+    /// each `pull-artifact` call. A path that makes a pull reachable anywhere else must drain it
+    /// there too, or its pulls go unrecorded.
     pub(crate) pending_artifact_pulls: Vec<PulledArtifact>,
+    /// The record a script capsule's session writes while its `run` executes: `Some` on the
+    /// script-capsule path only. `invoke`, `send` and `pull` write their lines through it at the
+    /// call; `None` writes nothing from them.
+    pub(crate) script_session: Option<ScriptSessionRecord>,
     pub(crate) capability_policy: CapabilityPolicy,
     /// The lowered `capabilities.filesystem.read_only` surface, built and validated once at
     /// staging. Empty for every capsule that declared nothing, and
@@ -7830,21 +7992,45 @@ impl WasiHttpView for CapsuleStoreState {
 }
 
 impl invoke::Host for CapsuleStoreState {
+    /// Every call, refused or dispatched, writes one `tool_call` line through
+    /// [`CapsuleStoreState::script_session`].
     fn invoke(
         &mut self,
         name: String,
         input: murmur::tool::run::ToolInput,
     ) -> Result<murmur::tool::run::ToolResult, String> {
-        if self.removed_artifacts.contains(&name) {
-            return Err(crate::artifact_removal::called_after_removal(&name));
+        let data = self
+            .script_session
+            .is_some()
+            .then(|| input.data.clone())
+            .flatten();
+        let started = std::time::Instant::now();
+        let result = self.invoke_tool(&name, input);
+        let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        if let Some(session) = self.script_session.as_mut() {
+            session.record_invoke(name, data.as_deref(), &result, duration_ms);
         }
-        if !self.allowlisted_tools.contains(&name) {
+        result
+    }
+}
+
+impl CapsuleStoreState {
+    /// `invoke`'s refusal or dispatch, unrecorded.
+    fn invoke_tool(
+        &mut self,
+        name: &str,
+        input: murmur::tool::run::ToolInput,
+    ) -> Result<murmur::tool::run::ToolResult, String> {
+        if self.removed_artifacts.contains(name) {
+            return Err(crate::artifact_removal::called_after_removal(name));
+        }
+        if !self.allowlisted_tools.contains(name) {
             return Err(format!(
                 "tool '{name}' is not declared in manifest allowlist"
             ));
         }
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.dispatch_tool_async(&name, input))
+            tokio::runtime::Handle::current().block_on(self.dispatch_tool_async(name, input))
         })
     }
 }
@@ -7922,14 +8108,16 @@ impl send::Host for CapsuleStoreState {
             None => error.replace(&connect_url, &peer_url),
         })?;
 
-        self.pending_a2a_events.push((
-            peer_url.clone(),
-            message_id,
-            task.id.clone(),
-            task.context_id.clone(),
-            traceparent,
-            stamp_for_peer(sender_task).trust(),
-        ));
+        if let Some(session) = self.script_session.as_mut() {
+            session.record_send(
+                &peer_url,
+                &message_id,
+                &task.id,
+                &task.context_id,
+                traceparent.as_deref(),
+                stamp_for_peer(sender_task).trust(),
+            );
+        }
         Ok(task.into())
     }
 }
@@ -8032,6 +8220,9 @@ impl manage::Host for CapsuleStoreState {
     /// A version is required here, as the WIT signature has it; `pull-artifact` may omit one.
     fn pull(&mut self, name: String, version: String) -> Result<manage::ArtifactSummary, String> {
         let pulled = self.pull_artifact(&name, Some(&version))?;
+        if let Some(session) = self.script_session.as_mut() {
+            session.record_pulls(std::mem::take(&mut self.pending_artifact_pulls));
+        }
         Ok(manage::ArtifactSummary {
             name: pulled.summary.name,
             version: pulled.summary.version,
@@ -16665,69 +16856,82 @@ inference:
         assert!(state.installed_artifacts.is_empty());
     }
 
-    /// The script path's drain writes one `artifact_pulled` line per buffered pull, ahead of the
-    /// buffered `a2a_send` lines, and opens no trace when there is nothing to write.
+    /// A script session over `records`, with its `session_start` written, as `launch` holds it on
+    /// the script path.
+    async fn script_session_over(records: &Path) -> ScriptSessionRecord {
+        let records_root = crate::workdir_fs::WorkdirRoot::open(records).unwrap();
+        let mut trace = TraceWriter::open(
+            &records_root,
+            "ses_test".to_string(),
+            "cap".to_string(),
+            "0.0.1".to_string(),
+            String::new(),
+            Vec::new(),
+            crate::containment::report_for(
+                &CapabilityPolicy::default(),
+                murmur_artifact::ContainmentClass::Advisory,
+                sandbox::EnforcementTier::EnvironmentOnly,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
+                crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
+                    sandbox::EnforcementTier::EnvironmentOnly,
+                    murmur_artifact::ContainmentClass::Advisory,
+                )),
+                crate::cgroup::IoMaxReport::default(),
+            ),
+            murmur_artifact::TraceCapture::Meta,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        trace
+            .write_session_start(None, None, Vec::new())
+            .await
+            .unwrap();
+        ScriptSessionRecord {
+            trace,
+            otel: OtelEmitter::new(None, &records_root, "cap".to_string(), "0.0.1".to_string()),
+            write_error: None,
+        }
+    }
+
+    /// Every line of the trace under `records`, parsed.
+    fn script_trace_lines(records: &Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(records.join(crate::trace::TRACE_FILE_NAME))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// On the script path, `manage.pull` writes its `artifact_pulled` line at the call, inside the
+    /// session frame, and leaves nothing buffered.
     #[test]
     fn runtime_origin_artifact_pulled_is_written() {
         let project = RuntimeOriginProject::new();
         let mut state = project.session();
-        pull_skill(&mut state).unwrap();
+        let records = tempfile::tempdir().unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let report = crate::containment::report_for(
-            &CapabilityPolicy::default(),
-            murmur_artifact::ContainmentClass::Advisory,
-            sandbox::EnforcementTier::EnvironmentOnly,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            &crate::runtime_dir::RuntimeDirPlacement::outside_for_test(),
-            crate::temp_dir::tier_temp_mapping(crate::sandbox::applied_tier(
-                sandbox::EnforcementTier::EnvironmentOnly,
-                murmur_artifact::ContainmentClass::Advisory,
-            )),
-            crate::cgroup::IoMaxReport::default(),
-        );
+        state.script_session = Some(rt.block_on(script_session_over(records.path())));
 
-        let empty = tempfile::tempdir().unwrap();
-        rt.block_on(drain_script_trace_buffers(
-            &crate::workdir_fs::WorkdirRoot::open(empty.path()).unwrap(),
-            "ses_test",
-            "cap",
-            "0.0.1",
-            &report,
-            Vec::new(),
-            Vec::new(),
-        ));
-        assert!(!empty.path().join("trace.jsonl").exists());
+        rt.block_on(async { pull_skill(&mut state) }).unwrap();
 
-        rt.block_on(drain_script_trace_buffers(
-            &crate::workdir_fs::WorkdirRoot::open(&project.workdir).unwrap(),
-            "ses_test",
-            "cap",
-            "0.0.1",
-            &report,
-            std::mem::take(&mut state.pending_artifact_pulls),
-            vec![(
-                "http://peer".to_string(),
-                "msg_1".to_string(),
-                "tsk_1".to_string(),
-                "ctx_1".to_string(),
-                None,
-                TrustClass::Trusted,
-            )],
-        ));
-
-        let lines: Vec<serde_json::Value> = fs::read_to_string(project.workdir.join("trace.jsonl"))
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        assert!(state.pending_artifact_pulls.is_empty());
+        let lines = script_trace_lines(records.path());
         assert_eq!(lines.len(), 2);
-        let pulled = &lines[0];
+        assert_eq!(lines[0]["event_type"], "session_start");
+        let pulled = &lines[1];
         assert_eq!(pulled["event_type"], "artifact_pulled");
         assert_eq!(pulled["name"], PULLED_SKILL);
         assert_eq!(pulled["version"], "1.0.0");
@@ -16736,8 +16940,99 @@ inference:
         assert_eq!(pulled["session"], "ses_test");
         assert_eq!(pulled["trust"], "untrusted");
         assert_eq!(pulled["session_id"], "ses_test");
-        assert_eq!(pulled["parent_id"], lines[1]["parent_id"]);
-        assert_eq!(lines[1]["event_type"], "a2a_send");
+        assert_eq!(pulled["parent_id"], lines[0]["event_id"]);
+        assert!(state.script_session.unwrap().write_error.is_none());
+    }
+
+    /// Off the script path a pull stays buffered for the http agent loop to write.
+    #[test]
+    fn runtime_origin_pull_without_a_script_session_stays_buffered() {
+        let project = RuntimeOriginProject::new();
+        let mut state = project.session();
+        pull_skill(&mut state).unwrap();
+        assert!(state.script_session.is_none());
+        assert_eq!(state.pending_artifact_pulls.len(), 1);
+    }
+
+    /// `script_exit_status` names how `run` ended.
+    #[test]
+    fn script_exit_status_names_each_ending() {
+        assert_eq!(script_exit_status(&Ok(())), "ok");
+        assert_eq!(
+            script_exit_status(&Err(RuntimeError::CapsuleTrap("boom".to_string()))),
+            "trapped"
+        );
+        assert_eq!(
+            script_exit_status(&Err(RuntimeError::CapsuleDeadlineExceeded { seconds: 1 })),
+            "deadline_exceeded"
+        );
+        assert_eq!(
+            script_exit_status(&Err(RuntimeError::CapsuleResourceLimit {
+                message: "memory".to_string()
+            })),
+            "resource_limit"
+        );
+        assert_eq!(
+            script_exit_status(&Err(RuntimeError::CapsuleExportMissing)),
+            "failed"
+        );
+        assert_eq!(
+            script_exit_status(&Err(RuntimeError::AgentLoopFailed(
+                "trace write failed: disk full".to_string()
+            ))),
+            "failed"
+        );
+    }
+
+    /// `invoke` writes one `tool_call` per call, a refusal included, with the guest's input as
+    /// JSON when it parses and as a string when it does not.
+    #[test]
+    fn script_invoke_writes_a_tool_call_for_a_refused_call() {
+        let project = RuntimeOriginProject::new();
+        let mut state = project.session();
+        let records = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        state.script_session = Some(rt.block_on(script_session_over(records.path())));
+
+        let (text, json) = rt.block_on(async {
+            (
+                invoke::Host::invoke(
+                    &mut state,
+                    "no-such-tool".to_string(),
+                    murmur::tool::run::ToolInput {
+                        data: Some("hello".to_string()),
+                        log_path: None,
+                    },
+                ),
+                invoke::Host::invoke(
+                    &mut state,
+                    "no-such-tool".to_string(),
+                    murmur::tool::run::ToolInput {
+                        data: Some(r#"{"a":1}"#.to_string()),
+                        log_path: None,
+                    },
+                ),
+            )
+        });
+        let refusal = text.unwrap_err();
+        assert!(refusal.contains("not declared in manifest allowlist"));
+        json.unwrap_err();
+
+        let lines = script_trace_lines(records.path());
+        assert_eq!(lines.len(), 3);
+        for line in &lines[1..] {
+            assert_eq!(line["event_type"], "tool_call");
+            assert_eq!(line["parent_id"], lines[0]["event_id"]);
+            assert_eq!(line["turn"], 0);
+            assert_eq!(line["tool_call_id"], serde_json::Value::Null);
+            assert_eq!(line["tool_name"], "no-such-tool");
+            assert_eq!(line["status"], "error");
+            assert_eq!(line["error"], refusal.as_str());
+        }
+        assert_eq!(lines[1]["input"], "hello");
+        assert_eq!(lines[1]["input_bytes"], 5);
+        assert_eq!(lines[2]["input"], serde_json::json!({"a": 1}));
+        assert_eq!(lines[2]["input_bytes"], 7);
     }
 
     /// A runtime-origin skill's guidance is fenced under `skill:<name>` and labelled so; an
@@ -17040,8 +17335,8 @@ inference:
             required_schema_warned: Mutex::new(BTreeSet::new()),
             logged_tool_inventory: None,
             session_id: "ses_test".to_string(),
-            pending_a2a_events: Vec::new(),
             pending_artifact_pulls: Vec::new(),
+            script_session: None,
             capability_policy: CapabilityPolicy::default(),
             protected_paths: ProtectedPaths::default(),
             tool_annotations: ToolAnnotationMap::default(),
@@ -25245,6 +25540,8 @@ inference:
             text: "review this".to_string(),
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
+        let records = tempfile::tempdir().unwrap();
+        state.script_session = Some(rt.block_on(script_session_over(records.path())));
         let (sent, refused_planner, refused_unknown) = rt.block_on(async {
             (
                 send::Host::send(
@@ -25275,11 +25572,13 @@ inference:
         );
         assert!(lower.contains("x-murmur-task-origin: peer\r\n"), "{head}");
         assert!(lower.contains("x-murmur-task-trust: trusted\r\n"), "{head}");
-        assert_eq!(state.pending_a2a_events.len(), 1);
-        assert_eq!(
-            state.pending_a2a_events[0].0,
-            "http://reviewer.formation.invalid"
-        );
+        let lines = script_trace_lines(records.path());
+        assert_eq!(lines.len(), 2, "one line for the one message a peer took");
+        assert_eq!(lines[1]["event_type"], "a2a_send");
+        assert_eq!(lines[1]["peer_url"], "http://reviewer.formation.invalid");
+        assert_eq!(lines[1]["message_id"], "msg_1");
+        assert_eq!(lines[1]["task_id"], "tsk_1");
+        assert_eq!(lines[1]["parent_id"], lines[0]["event_id"]);
         let refused_planner = refused_planner.unwrap_err();
         let refused_unknown = refused_unknown.unwrap_err();
         assert_eq!(

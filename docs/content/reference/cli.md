@@ -162,25 +162,27 @@ An address matching no session, or several, is refused with
 
 ## Running-capsule records { #running-capsule-records }
 
-A capsule that opens an [A2A door](../how-to/capsules-a2a-messaging.md) writes one record of where that door is, and
-removes it when the session ends.
+Every running session holds one record on this machine, and removes it when the session ends. An
+agent session's record says where its [A2A door](../how-to/capsules-a2a-messaging.md) is; a
+[script capsule](../concepts/capsules.md#script-capsules) binds no door, and its record's `url` is
+`null`.
 
 | Property | Value |
 |---|---|
 | Location | `~/.murmur/running/<session_id>.json` |
 | Directory mode | `0700` |
 | File mode | `0600` |
-| Written by | The runtime, once the capsule is serving its door and just before `mur run` prints its URL |
+| Written by | The runtime: for an agent session, once the capsule is serving its door and just before `mur run` prints its URL; for a script capsule, once its trace's `session_start` is written |
 | Removed by | The runtime, when the session ends |
 
 A session whose manifest declares `control:` also holds its control token beside its record, at
 `~/.murmur/running/<session_id>.control`, mode `0600`, removed with the record — see
 [Control surface](control-surface.md#token).
 
-Each record carries the session id, the capsule address, the process id and its start time, the
-capsule name and version, the session's work folder as `workdir`, the session's
-[records directory](workdir.md#records-directory) as `records_dir`, whether the session outlives
-its launcher, and the time it started. It carries nothing from the environment: no API key, no
+Each record carries the session id, the capsule address as `url` (`null` for a script capsule),
+the process id and its start time, the capsule name and version, the session's work folder as
+`workdir`, the session's [records directory](workdir.md#records-directory) as `records_dir`,
+whether the session outlives its launcher, and the time it started. It carries nothing from the environment: no API key, no
 granted variable.
 
 A record that is a JSON object with a string `session_id` and no `records_dir` key was written by
@@ -245,7 +247,8 @@ read verifies it in three layers, and a session is reported as running only when
 | 3 | Does the capsule's agent card answer, naming that session? | That the capsule is the one being addressed and can still respond |
 
 Layer 3 reads the public card, or, for a record holding a `door_token`, the
-[extended card](agent-card.md#extended-card) with that token.
+[extended card](agent-card.md#extended-card) with that token. A record with a `null` `url` has no
+door to ask: layers 1 and 2 decide it, and a process that passes both is running.
 
 Reading the records removes a record only on evidence that its process is gone — that is the only
 sweep there is, and it is enough because a record is never treated as truth.
@@ -1683,7 +1686,7 @@ unchanged. See [Removing formation directories](roster.md#formation-retention).
 
 ## `mur ps`
 
-List the capsules running on this machine, with the address each one answers on.
+List the capsules running on this machine, with the address each agent session answers on.
 
 ```bash
 mur ps [--verbose | --json]
@@ -1706,7 +1709,7 @@ lists it.
 | `DETACHED` | 8 | `yes` when the capsule outlives the window that launched it, `no` when it dies with it |
 | `UPTIME` | 9 | `HH:MM:SS` since the session started, prefixed `Nd ` past a day |
 | `FORMATION` | 36 | The full formation id of a [member](#mur-run-formation), `-` for a session in no formation. Present only when [a record that keys the listing names a formation](#mur-ps-formations) |
-| `URL` | — | The `host:port` the capsule's A2A door is bound to |
+| `URL` | — | The `host:port` the capsule's A2A door is bound to; `-` for a script capsule, which binds no door |
 
 ```text
 SESSION                               CAPSULE                   STATUS        DETACHED  UPTIME     URL
@@ -1849,8 +1852,8 @@ mur ps --json
 | `capsules` | array | One entry for each record `mur ps` would print a row for, sorted by session id descending. Empty when nothing runs, and when `~/.murmur/running/` is absent or empty |
 | `capsules[].session_id` | string | The session the door answers for |
 | `capsules[].status` | string | `running` or `unreachable`: the `STATUS` column `mur ps` prints for this record, from the [same three layers](#mur-ps-verification), door probe included |
-| `capsules[].url` | string | The `host:port` the A2A door is bound to, with no scheme |
-| `capsules[].pid` | integer | The process holding the door |
+| `capsules[].url` | string or `null` | The `host:port` the A2A door is bound to, with no scheme. `null` for a script capsule, which binds no door |
+| `capsules[].pid` | integer | The process running the session |
 | `capsules[].process_start` | string | That process's start time, an opaque token local to this machine |
 | `capsules[].capsule_name` | string | `name:` from the manifest the session was launched from |
 | `capsules[].capsule_version` | string | `version:` from that manifest |
@@ -1992,6 +1995,10 @@ Three steps, in this order:
 
 A cancelled task's ending is its `task_end` record, or, for a task cancelled before it started,
 its `task_canceled` record with `phase: "queued"`.
+
+A [script capsule](../concepts/capsules.md#script-capsules) has no door, so step 1 is skipped and
+no `residue:` line is printed: `mur stop` begins with `SIGTERM`, which ends a script capsule at
+once, with no `session_end` in its trace.
 
 The door step is the only moment anything can ask the capsule what it was running. The record of a
 detached shell command dies with the process, so the question is asked while the capsule is still
@@ -2269,8 +2276,8 @@ error[E-IO-003]: connection to ses_019ed2af53da75c2aefee84ee10c34af lost after e
 Exit codes:
 
 - `0` — the capsule closed the stream with a `capsule-closed` frame
-- `1` — the session address named nothing running (`E-RUN-022`), the capsule did not answer
-  (`E-RUN-023`), the connection failed, or the connection was lost before the capsule closed the
+- `1` — the session address named nothing running (`E-RUN-022`) or a script capsule
+  (`E-RUN-056`), the capsule did not answer (`E-RUN-023`), the connection failed, or the connection was lost before the capsule closed the
   stream (`E-IO-003`)
 
 ---
@@ -2334,7 +2341,7 @@ Exit codes:
 
 - `0` — the capsule holds this task; the line printed says what state it is in
 - `1` — the capsule does not hold this task id, the session address named nothing running
-  (`E-RUN-022`), or the capsule did not answer (`E-RUN-023`)
+  (`E-RUN-022`) or a script capsule (`E-RUN-056`), or the capsule did not answer (`E-RUN-023`)
 
 ---
 
@@ -2407,7 +2414,7 @@ Exit codes:
 - `0` — the control surface accepted the request
 - `1` — the session has no control surface or the surface refused the request (`E-RUN-042`, which
   states the HTTP status and the surface's reason), the session address named nothing running
-  (`E-RUN-022`), or the capsule did not answer (`E-RUN-023`)
+  (`E-RUN-022`) or a script capsule (`E-RUN-056`), or the capsule did not answer (`E-RUN-023`)
 
 ---
 
