@@ -2943,7 +2943,7 @@ mod tests {
     fn running_record(pid: u32, formation: Option<&FormationId>) -> crate::running::RunningRecord {
         crate::running::RunningRecord {
             session_id: "ses_0199c4e2f1b7712a9d3e4f5061728394".to_string(),
-            url: "127.0.0.1:1".to_string(),
+            url: Some("127.0.0.1:1".to_string()),
             pid,
             process_start: crate::running::process_start_token(pid).unwrap_or_default(),
             capsule_name: "worker".to_string(),

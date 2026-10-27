@@ -1,5 +1,7 @@
-//! The machine-wide map of capsules that are currently reachable: one record per session that
-//! opened an A2A door, at `~/.murmur/running/<session_id>.json`.
+//! The machine-wide map of capsules that are currently running: one record per session, at
+//! `~/.murmur/running/<session_id>.json`. An agent session writes its record once its A2A door is
+//! bound and names the door in `url`; a script capsule binds no door, writes its record when its
+//! session starts, and holds `"url": null`.
 //!
 //! A record is a **hint, never a truth**. Nothing can guarantee it is removed — a `SIGKILL`ed
 //! capsule writes no farewell — so a reader never trusts one. [`verify`] puts three layers between
@@ -10,7 +12,8 @@
 //!    record can name an unrelated process that happens to hold the number now.
 //! 3. **The door answers and identifies itself.** A live pid proves neither that the process is
 //!    the capsule nor that it can still respond, so the agent card is fetched and the `sessionId`
-//!    of its capsule extension compared.
+//!    of its capsule extension compared. A record with no door has no third layer: layers 1 and 2
+//!    decide it alone.
 //!
 //! Reading prunes a record only on evidence: layer 1 finding no process, or layer 2 reading a start
 //! time that differs from the recorded one, which means the pid was reused. That is the only reaper
@@ -61,7 +64,7 @@ const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// deadline: a capsule mid-turn has answered, and is allowed to be slow about the rest.
 const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Where one running session's door is, and which process holds it.
+/// Which process holds one running session, and where its door is when it has one.
 ///
 /// Every field but `door_token`, `credentials`, `formation_id`, `formation_member`,
 /// `formation_entry`, `formation_lifeline`, `formation_launcher` and `spawned_by` is required, and
@@ -74,8 +77,9 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct RunningRecord {
     /// The session this door answers for, compared against the agent card by layer 3.
     pub session_id: String,
-    /// `host:port` the A2A door is bound to.
-    pub url: String,
+    /// `host:port` the A2A door is bound to. `None` for a script capsule, which binds no door;
+    /// always serialized, as `null` then.
+    pub url: Option<String>,
     /// The process holding the door.
     pub pid: u32,
     /// That process's start time, as an opaque platform-local token — see [`process_start_token`].
@@ -505,17 +509,20 @@ impl Liveness {
 ///
 /// The probe is one blocking `GET /.well-known/agent-card.json`, so this is callable from outside
 /// any async runtime. A record whose process is not [`ProcessState::Alive`] is answered without a
-/// probe.
+/// probe, and so is a record with no door: its [`ProcessState::Alive`] process is
+/// [`Liveness::Live`], with no connection made.
 pub fn verify(record: &RunningRecord) -> Liveness {
     if let Some(liveness) = liveness_without_probe(process_state(record)) {
         return liveness;
     }
-    match probe_session_id(record) {
+    let Some(url) = record.url.as_deref() else {
+        return Liveness::Live;
+    };
+    match probe_door_session_id(url, record.door_token.as_ref()) {
         Ok(session_id) if session_id == record.session_id => Liveness::Live,
-        Ok(other) => Liveness::Unreachable(format!(
-            "the capsule at {} answers for session {other}",
-            record.url
-        )),
+        Ok(other) => {
+            Liveness::Unreachable(format!("the capsule at {url} answers for session {other}"))
+        }
         Err(reason) => Liveness::Unreachable(reason),
     }
 }
@@ -871,18 +878,12 @@ mod platform {
     }
 }
 
-/// Layer 3: the session id the door at `record.url` claims on its agent card.
-///
-/// A record carrying a door token reads the extended card, the only one an authenticated door
-/// names its session on, by `GetExtendedAgentCard`; any other record reads the public card. A
-/// card with no capsule extension naming a session names no session, so its capsule reads as
-/// unreachable.
-fn probe_session_id(record: &RunningRecord) -> Result<String, String> {
-    probe_door_session_id(&record.url, record.door_token.as_ref())
-}
-
 /// The session id the door at `url` — `host:port`, with or without `http://` — names on its agent
 /// card: the extended card read with `token` when one is given, else the public card.
+///
+/// The extended card is the only one an authenticated door names its session on, read by
+/// `GetExtendedAgentCard`. A card with no capsule extension naming a session names no session, so
+/// its capsule reads as unreachable.
 ///
 /// The one door probe: [`verify`]'s layer 3 and a formation launcher's readiness check both ask
 /// it, so "this door answers as that session" means the same thing to both.
@@ -961,7 +962,7 @@ mod tests {
         }
         let record = RunningRecord {
             session_id: "ses_0199prunecontroltoken000000000000".to_string(),
-            url: "localhost:1".to_string(),
+            url: Some("localhost:1".to_string()),
             pid: std::process::id(),
             process_start: String::new(),
             capsule_name: "c".to_string(),
@@ -1008,7 +1009,7 @@ mod tests {
     fn record(pid: u32, process_start: &str) -> RunningRecord {
         RunningRecord {
             session_id: "ses_0199c4e2f1b7712a9d3e4f5061728394".to_string(),
-            url: "127.0.0.1:1".to_string(),
+            url: Some("127.0.0.1:1".to_string()),
             pid,
             process_start: process_start.to_string(),
             capsule_name: "demo".to_string(),
@@ -1533,6 +1534,38 @@ mod tests {
         assert_eq!(signal_term(&record), SignalOutcome::AlreadyGone);
     }
 
+    /// A record with no door is decided by layers 1 and 2 alone: its live process is `Live`
+    /// without a connection being made, and a dead one is `Gone`.
+    #[test]
+    fn a_doorless_record_is_live_on_its_process_alone() {
+        let pid = std::process::id();
+        let token = process_start_token(pid).unwrap();
+        let mut doorless = record(pid, &token);
+        doorless.url = None;
+        assert_eq!(verify(&doorless), Liveness::Live);
+
+        let mut dead = record(0, "42");
+        dead.url = None;
+        assert!(matches!(verify(&dead), Liveness::Gone(_)));
+    }
+
+    /// No door is written as `"url": null`, and a record with a string `url` still parses.
+    #[test]
+    fn a_doorless_record_round_trips_with_a_null_url() {
+        let mut doorless = record(1, "42");
+        doorless.url = None;
+        let text = serde_json::to_string(&doorless).unwrap();
+        assert!(text.contains("\"url\":null"), "{text}");
+        let back: RunningRecord = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, doorless);
+
+        let with_door = record(1, "42");
+        let text = serde_json::to_string(&with_door).unwrap();
+        assert!(text.contains("\"url\":\"127.0.0.1:1\""), "{text}");
+        let back: RunningRecord = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.url.as_deref(), Some("127.0.0.1:1"));
+    }
+
     /// A pid nothing holds is reported as already gone rather than as a refusal — there is
     /// nothing there to refuse.
     #[test]
@@ -1549,7 +1582,7 @@ mod tests {
         let mut record = record(pid, &token);
         // Claimed and never bound: the port is one nothing listens on.
         let port = crate::pinned_port::claim();
-        record.url = format!("127.0.0.1:{port}");
+        record.url = Some(format!("127.0.0.1:{port}"));
         assert!(matches!(verify(&record), Liveness::Unreachable(_)));
     }
 
@@ -1763,7 +1796,7 @@ mod home_tests {
     fn record(session_id: &str) -> RunningRecord {
         RunningRecord {
             session_id: session_id.to_string(),
-            url: "127.0.0.1:1".to_string(),
+            url: Some("127.0.0.1:1".to_string()),
             pid: 1,
             process_start: "42".to_string(),
             capsule_name: "demo".to_string(),

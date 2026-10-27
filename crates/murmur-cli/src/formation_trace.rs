@@ -925,7 +925,7 @@ mod tests {
                 end("completed"),
             ],
         );
-        // A script capsule's drain-only trace: the formation is named, but not on a session_start.
+        // A trace whose first line is not session_start: the formation is named, but not on it.
         write_trace(
             root.path(),
             &drained,

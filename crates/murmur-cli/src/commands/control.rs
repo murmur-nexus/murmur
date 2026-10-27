@@ -224,7 +224,7 @@ impl Surface {
     ///
     /// `E-RUN-042` when the session holds no token file: it declares no `control:` block.
     fn resolve(session: Option<&str>) -> Result<Self, CliError> {
-        let record = resolve_live(session.unwrap_or(LATEST))?;
+        let (addr, record) = resolve_live(session.unwrap_or(LATEST))?;
         let path = capsule_runtime::running::control_token_path(&record.session_id)
             .map_err(|reason| crate::live_address::records_unreadable(&reason))?;
         let token = match std::fs::read_to_string(&path) {
@@ -250,7 +250,7 @@ impl Surface {
         };
         Ok(Self {
             session_id: record.session_id,
-            addr: record.url,
+            addr,
             token,
         })
     }

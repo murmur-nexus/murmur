@@ -269,8 +269,8 @@ Derived on the host above.
 ## What this does not settle
 
 - **A restarted daemon counts only capsules that left a running-capsule record.** It resumes the
-  census from `~/.murmur/running`, so a script capsule, or a session whose record could not be
-  written, is under-counted after a restart. See
+  census from `~/.murmur/running`, so a session whose record could not be written is
+  under-counted after a restart. See
   [Capsules running at startup](roost-api.md#capsules-running-at-startup).
 - **It is one daemon's ceiling.** Two daemons on one host each enforce their own.
 - **The stub task is a memory floor.** A real task grows its conversation and runs compilers and

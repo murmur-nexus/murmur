@@ -65,8 +65,9 @@ struct StoppedSession {
     capsule: String,
     /// What actually ended the process.
     signal: &'static str,
-    /// The door's `murmur.StopSession` answer, or why it could not be had.
-    door: Result<Value, String>,
+    /// The door's `murmur.StopSession` answer, or why it could not be had. `None` for a script
+    /// capsule, which binds no door to ask.
+    door: Option<Result<Value, String>>,
     /// Cancelled tasks whose ending the final trace does not record.
     unended: Vec<String>,
 }
@@ -80,17 +81,18 @@ struct StoppedSession {
 ///
 /// A door that does not answer stops nothing: the two signalling steps still run, and the missing
 /// account is reported as missing. The session was ended either way; only the accounting is
-/// incomplete. The `Err` is `E-RUN-024`, the process still running, with its record kept.
+/// incomplete. A script capsule has no door, so nothing is asked and the stop begins with the
+/// signal. The `Err` is `E-RUN-024`, the process still running, with its record kept.
 fn stop_session(record: &RunningRecord, grace: Duration) -> Result<StoppedSession, CliError> {
-    let door = ask_the_door(record);
-    if let Ok(result) = &door {
+    let door = record.url.as_deref().map(|url| ask_the_door(url, record));
+    if let Some(Ok(result)) = &door {
         wait_for_endings(record, result);
     }
     let signal = end_the_process(record, grace)?;
 
     // The process is gone, so the trace is final: whatever ending is missing now stays missing.
     let unended: Vec<String> = match &door {
-        Ok(result) => {
+        Some(Ok(result)) => {
             let trace_path = record.records_dir.join("trace.jsonl");
             if trace_path.exists() {
                 let settled = endings_noted(&trace_path);
@@ -103,7 +105,7 @@ fn stop_session(record: &RunningRecord, grace: Duration) -> Result<StoppedSessio
                 Vec::new()
             }
         }
-        Err(_) => Vec::new(),
+        Some(Err(_)) | None => Vec::new(),
     };
 
     // A capsule that ran its `SIGTERM` teardown removed its own record, and pruning an absent
@@ -127,7 +129,8 @@ fn print_session_stop(stopped: &StoppedSession) {
     capsule_runtime::report_println!("capsule: {}", stopped.capsule);
     capsule_runtime::report_println!("signal:  {}", stopped.signal);
     match &stopped.door {
-        Ok(result) => {
+        None => {}
+        Some(Ok(result)) => {
             for task_id in canceled_ids(result) {
                 capsule_runtime::report_println!("canceled: {task_id}");
             }
@@ -145,7 +148,9 @@ fn print_session_stop(stopped: &StoppedSession) {
                 print_residue(&residue);
             }
         }
-        Err(reason) => capsule_runtime::report_println!("{RESIDUE_UNKNOWN_PREFIX} {reason}"),
+        Some(Err(reason)) => {
+            capsule_runtime::report_println!("{RESIDUE_UNKNOWN_PREFIX} {reason}")
+        }
     }
 }
 
@@ -484,14 +489,13 @@ fn wait_for_exit(identity: &ProcessIdentity, grace: Duration) -> bool {
     }
 }
 
-/// `murmur.StopSession` through the door: cancel what the session still holds, and read the
-/// residue.
+/// `murmur.StopSession` through the door at `url`: cancel what the session still holds, and read
+/// the residue.
 ///
 /// The `Err` is why the door could not answer, which is printed rather than returned — a capsule
 /// that has stopped listening still has a process to end.
-fn ask_the_door(record: &RunningRecord) -> Result<Value, String> {
-    let addr = record
-        .url
+fn ask_the_door(url: &str, record: &RunningRecord) -> Result<Value, String> {
+    let addr = url
         .trim_start_matches("http://")
         .trim_start_matches("https://");
     let body = serde_json::json!({
@@ -751,7 +755,7 @@ mod tests {
     fn only_a_member_holding_no_lifeline_and_no_spawner_was_started_by_hand() {
         let mut member = RunningRecord {
             session_id: "ses_0199c4e2f1b7712a9d3e4f5061728394".to_string(),
-            url: "127.0.0.1:1".to_string(),
+            url: Some("127.0.0.1:1".to_string()),
             pid: 1,
             process_start: "42".to_string(),
             capsule_name: "coder".to_string(),

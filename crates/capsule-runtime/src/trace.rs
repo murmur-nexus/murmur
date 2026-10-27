@@ -2383,8 +2383,7 @@ impl TraceWriter {
 
     /// Parent for a launch-scoped event: the session node, or `None` on a writer that has not
     /// written `session_start`. A trace line must never name a parent that has no line behind
-    /// it, and the script-capsule `a2a_send` drain opens a writer over a file with no session
-    /// frame at all.
+    /// it.
     fn session_parent(&self) -> Option<String> {
         self.session_started.then(|| self.session_event_id.clone())
     }
@@ -3185,10 +3184,7 @@ impl TraceWriter {
     }
 
     /// Records a successful pull of `pulled` (`manage.pull()` or `pull-artifact`), as the store
-    /// summarised it after the lock was written. Parented to the session node when
-    /// `session_start` was written through this writer, and to nothing otherwise — the script
-    /// path drains these through a writer it opens after the guest returns, as it does its
-    /// buffered `a2a_send` lines.
+    /// summarised it after the lock was written. Parented to the session node.
     pub(crate) async fn write_artifact_pulled(
         &mut self,
         pulled: &crate::runtime::PulledArtifact,
@@ -8276,9 +8272,7 @@ mod tests {
         assert!(hook.get("message_ids").is_none(), "{hook}");
     }
 
-    /// A writer with no session frame behind it names no parent. This is the script-capsule
-    /// `a2a_send` drain, which opens a writer purely to flush buffered sends into a file that
-    /// has no `session_start` line — naming one would dangle.
+    /// A writer with no session frame behind it names no parent: naming one would dangle.
     #[tokio::test]
     async fn a2a_send_parents_to_null_without_a_session_frame_and_to_it_with_one() {
         let bare = tempfile::tempdir().unwrap();

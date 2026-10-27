@@ -105,6 +105,7 @@ pub const E_RUN_052: &str = "E-RUN-052"; // a driver choice has no output cap, o
 pub const E_RUN_053: &str = "E-RUN-053"; // the session reached its mur run --deadline, or a launch cannot enforce the deadline it was staged with
 pub const E_RUN_054: &str = "E-RUN-054"; // inference.compaction.max_tokens is above the primary driver's output ceiling for the compaction model
 pub const E_RUN_055: &str = "E-RUN-055"; // a driver choice's output cap, or inference.compaction.max_tokens, leaves no input budget in its context window
+pub const E_RUN_056: &str = "E-RUN-056"; // the running session an address resolved to is a script capsule, which binds no door
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed

@@ -945,7 +945,7 @@ is never counted again. A session that also registers with the daemon is counted
 | A record whose process id nothing holds, or is held by a process that started at another time | No — stale |
 | A `.json` file that does not parse, or a [record an older `mur` wrote](cli.md#running-capsule-records) | No — unreadable, and under-counted if its capsule is running |
 | A session that runs on with no record after [`W-SEC-023`](diagnostics.md#w-sec-023) | No — under-counted |
-| A script capsule | No — under-counted: it opens no door and writes no record |
+| A [script capsule](../concepts/capsules.md#script-capsules) whose run has not ended | Yes — its record has no door, and its process decides it |
 | A capsule running under another user's `HOME` | No — under-counted: the daemon reads its own `HOME` only |
 
 The startup line reports the count, and every record read that it left out:

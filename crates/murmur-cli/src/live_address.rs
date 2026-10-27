@@ -15,7 +15,7 @@
 
 use capsule_runtime::{running, Liveness, ProcessState, RunningRecord};
 
-use crate::error::{CliError, E_RUN_022, E_RUN_023, E_RUN_028};
+use crate::error::{CliError, E_RUN_022, E_RUN_023, E_RUN_028, E_RUN_056};
 
 /// The address an omitted argument means: the most recent running session.
 pub(crate) const LATEST: &str = "@1";
@@ -25,8 +25,9 @@ const MIN_SUFFIX_LEN: usize = 4;
 
 /// The capsule a command connects to, and how it was named.
 pub(crate) enum Target {
-    /// Named by session address, and verified reachable before this value existed.
-    Session(Box<RunningRecord>),
+    /// Named by session address, and verified reachable before this value existed: its door's
+    /// `host:port`, and the record that names it.
+    Session(String, Box<RunningRecord>),
     /// Named directly with `--url`, on the caller's word.
     Url(String),
 }
@@ -35,8 +36,7 @@ impl Target {
     /// The `host:port` to connect to.
     pub(crate) fn url(&self) -> &str {
         match self {
-            Target::Session(record) => &record.url,
-            Target::Url(url) => url,
+            Target::Session(url, _) | Target::Url(url) => url,
         }
     }
 
@@ -45,7 +45,7 @@ impl Target {
     /// door answers and an authenticated door refuses.
     pub(crate) fn door_token(&self) -> Option<capsule_runtime::DoorToken> {
         match self {
-            Target::Session(record) => record.door_token.clone(),
+            Target::Session(_, record) => record.door_token.clone(),
             Target::Url(_) => std::env::var(capsule_runtime::DOOR_TOKEN_ENV)
                 .ok()
                 .filter(|token| !token.trim().is_empty())
@@ -57,7 +57,7 @@ impl Target {
     /// it turned out to be, or the address they typed when that is all that was given.
     pub(crate) fn label(&self) -> &str {
         match self {
-            Target::Session(record) => &record.session_id,
+            Target::Session(_, record) => &record.session_id,
             Target::Url(url) => url,
         }
     }
@@ -71,30 +71,33 @@ impl Target {
 pub(crate) fn target(session: Option<&str>, url: Option<&str>) -> Result<Target, CliError> {
     match url {
         Some(url) => Ok(Target::Url(url.to_string())),
-        None => {
-            resolve_live(session.unwrap_or(LATEST)).map(|record| Target::Session(Box::new(record)))
-        }
+        None => resolve_live(session.unwrap_or(LATEST))
+            .map(|(url, record)| Target::Session(url, Box::new(record))),
     }
 }
 
-/// The running session `address` names, verified reachable.
+/// The running session `address` names, verified reachable, with its door's `host:port`.
 ///
 /// Three forms: an `@N` ordinal counting back over running sessions, a full `ses_` id, and a
 /// 4-plus-character case-insensitive suffix of one. A literal path is refused — a path names a
 /// recorded session directory on disk, which says nothing about whether a process is running.
 ///
-/// Two ways to fail, and they mean different things. `E-RUN-022` is the address naming no running
-/// session: the process is gone and its record has been unlinked. `E-RUN-023` is the capsule not
+/// Three ways to fail, and they mean different things. `E-RUN-022` is the address naming no
+/// running session: the process is gone and its record has been unlinked. `E-RUN-056` is a script
+/// capsule, which binds no door: nothing is connected to. `E-RUN-023` is the capsule not
 /// answering: the process is alive, so the record stands.
-pub(crate) fn resolve_live(address: &str) -> Result<RunningRecord, CliError> {
+pub(crate) fn resolve_live(address: &str) -> Result<(String, RunningRecord), CliError> {
     let record = resolve_live_process(address)?;
+    let Some(url) = record.url.clone() else {
+        return Err(no_door(&record));
+    };
     match running::verify(&record) {
-        Liveness::Live => Ok(record),
+        Liveness::Live => Ok((url, record)),
         Liveness::Unreachable(reason) => Err(CliError::with_hint(
             E_RUN_023,
             format!(
-                "{} is running but its capsule did not answer at {}: {reason}",
-                record.session_id, record.url
+                "{} is running but its capsule did not answer at {url}: {reason}",
+                record.session_id
             ),
             "the process holding the door is alive — it may be suspended or the host overloaded; its record is kept",
         )),
@@ -104,6 +107,19 @@ pub(crate) fn resolve_live(address: &str) -> Result<RunningRecord, CliError> {
             Err(not_running(&record, &reason))
         }
     }
+}
+
+/// `E-RUN-056` for a running script capsule, which a command that connects has nothing to
+/// connect to.
+fn no_door(record: &RunningRecord) -> CliError {
+    CliError::with_hint(
+        E_RUN_056,
+        format!(
+            "{} is a script capsule: it binds no door, so there is nothing to connect to",
+            record.session_id
+        ),
+        "mur ps lists it and mur stop ends it",
+    )
 }
 
 /// The running session `address` names, verified only as far as its process.

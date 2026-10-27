@@ -58,6 +58,27 @@ fn run_capsule(home: &Path, manifest_path: &Path) -> assert_cmd::assert::Assert 
         .assert()
 }
 
+/// The first and last lines of the one `trace.jsonl` the run left under `home`'s records.
+fn trace_frame(home: &Path) -> (serde_json::Value, serde_json::Value) {
+    let mut stack = vec![home.join(".murmur").join("records")];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().is_some_and(|name| name == "trace.jsonl") {
+                let lines: Vec<serde_json::Value> = fs::read_to_string(&path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                return (lines[0].clone(), lines.last().unwrap().clone());
+            }
+        }
+    }
+    panic!("no trace.jsonl under {}", home.display());
+}
+
 /// The headline proof: a capsule spinning in a loop that never returns and never calls the
 /// host is interrupted at its deadline and `mur run` exits. Without epoch interruption this
 /// command could not be made to terminate.
@@ -82,6 +103,11 @@ fn spin_loop_capsule_is_interrupted_at_its_configured_deadline() {
         .stderr(predicate::str::contains(
             "capabilities.limits.deadline_seconds",
         ));
+
+    let (start, end) = trace_frame(home.path());
+    assert_eq!(start["event_type"], "session_start");
+    assert_eq!(end["event_type"], "session_end");
+    assert_eq!(end["exit_status"], "deadline_exceeded");
 }
 
 /// A capsule that grows its linear memory without bound traps at the configured cap rather
@@ -106,6 +132,11 @@ fn memory_balloon_capsule_traps_at_its_configured_memory_cap() {
             "exceeded its configured resource limits",
         ))
         .stderr(predicate::str::contains("capabilities.limits.memory_bytes"));
+
+    let (start, end) = trace_frame(home.path());
+    assert_eq!(start["event_type"], "session_start");
+    assert_eq!(end["event_type"], "session_end");
+    assert_eq!(end["exit_status"], "resource_limit");
 }
 
 /// A nonsensical limit is a manifest authoring error, so it must be rejected while parsing

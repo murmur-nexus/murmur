@@ -148,8 +148,10 @@ fn record_for(home: &Path, session_id: &str) -> PathBuf {
         .join(format!("{session_id}.json"))
 }
 
+/// Polls `condition` for up to a minute. A running record appears only once staging has compiled
+/// the capsule's component, which a loaded host can take tens of seconds over.
 fn wait_for(what: &str, condition: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !condition() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         thread::sleep(Duration::from_millis(50));
@@ -310,4 +312,53 @@ fn a_restarted_daemon_counts_running_capsules_until_they_exit() {
     assert!(record_for(home.path(), &standalone.session_id()).exists());
 
     drop(member);
+}
+
+/// A script capsule running when the daemon starts is counted: it holds a running record with no
+/// door for as long as its run lasts, and stops counting once it has exited.
+#[test]
+fn a_restarted_daemon_counts_a_running_script_capsule() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: capsule\nversion: 0.0.1\nartifacts: []\n",
+    )
+    .unwrap();
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/run/components/capsule-sleep-long.wasm"),
+        project.path().join("capsule.wasm"),
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
+        .env("HOME", home.path())
+        .args(["run", "--manifest"])
+        .arg(project.path().join("murmur.yaml"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let running = home.path().join(".murmur").join("running");
+    wait_for("the script capsule's running record", || {
+        fs::read_dir(&running).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        })
+    });
+
+    let (mut inherited, report) = mur_roost::census::inherit(&running).unwrap();
+    assert_eq!(report.counted, 1, "{report:?}");
+    assert!(
+        report
+            .startup_line()
+            .contains("1 live capsules already running"),
+        "{}",
+        report.startup_line()
+    );
+
+    assert!(child.wait().unwrap().success());
+    assert_eq!(inherited.live(&HashMap::new()), 0);
 }
