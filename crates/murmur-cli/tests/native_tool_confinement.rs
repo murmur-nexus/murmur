@@ -777,7 +777,8 @@ fn assert_allowlisted_python3_imports(test: &str, floor: ContainmentClass) {
 
     let text = ran.text("toolu_python3");
     assert!(
-        text.contains("Exit code: 0") && text.contains("imported"),
+        text.lines().any(|line| line == "Exit code: 0")
+            && text.lines().any(|line| line == "imported"),
         "python3 must import its stdlib: {text}\ntrace record: {}",
         ran.tool_call_record("toolu_python3")
     );

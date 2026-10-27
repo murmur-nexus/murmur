@@ -118,8 +118,9 @@ pub(crate) struct DetachedCompletion {
 }
 
 impl DetachedCompletion {
-    /// The `IncomingTask.message_text` the agent reads: the work id, the command, the exit code,
-    /// the duration and the output path. Never the output itself.
+    /// The `IncomingTask.message_text` the agent reads: the work id, the status, the exit code,
+    /// the duration and the output path. Never the output itself, nor the command, which the work
+    /// id names and the tool call that started it holds.
     ///
     /// An attributed limit adds the [`crate::resources::resource_limit_line`] a foreground call
     /// would get, naming the limit and what to do about it, and output holders that were killed
@@ -128,15 +129,11 @@ impl DetachedCompletion {
         let mut text = format!(
             "Background shell command finished.\n\
              work_id: {}\n\
-             binary: {}\n\
-             command: {}\n\
              status: {}\n\
              exit_code: {}\n\
              duration_ms: {}\n\
              output: {} ({} bytes)",
             self.work_id,
-            self.binary,
-            self.command,
             self.status(),
             self.exit_code,
             self.duration_ms,
@@ -360,8 +357,6 @@ struct DetachedEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct CommandSnapshot {
     pub work_id: String,
-    pub binary: String,
-    pub command: String,
     pub state: CommandState,
     /// From spawn to now, or to the end of its completion for a finished command.
     pub elapsed_ms: u64,
@@ -519,8 +514,6 @@ impl DetachedRegistry {
         };
         Some(CommandSnapshot {
             work_id: entry.work.work_id.clone(),
-            binary: entry.work.binary.clone(),
-            command: entry.work.command.clone(),
             state,
             elapsed_ms,
             finished: entry.finished.clone(),
@@ -912,8 +905,9 @@ pub(crate) struct LostReport {
 }
 
 impl LostReport {
-    /// The `IncomingTask.message_text` the agent reads: the work id, the binary, the command and
-    /// the demotion instant of each lost command, and the statement that no exit code was recorded.
+    /// The `IncomingTask.message_text` the agent reads: the work id and the demotion instant of
+    /// each lost command, and the statement that no exit code was recorded. The work id names the
+    /// command, which the tool call that started it holds.
     ///
     /// Shares no opening line with [`DetachedCompletion::message_text`]. A model that cannot tell
     /// "it failed" from "nobody knows" retries, and the retry is the cost demotion exists to
@@ -930,8 +924,8 @@ impl LostReport {
         );
         for work in &self.lost {
             text.push_str(&format!(
-                "\nwork_id: {}\nbinary: {}\ncommand: {}\ndetached_at_ms: {}\n",
-                work.work_id, work.binary, work.command, work.detached_at_ms
+                "\nwork_id: {}\ndetached_at_ms: {}\n",
+                work.work_id, work.detached_at_ms
             ));
         }
         text.push_str(
@@ -1149,6 +1143,84 @@ mod tests {
         assert!(text.ends_with("are not reproduced here."), "{text}");
     }
 
+    /// A completion names its command by the work id alone: the tool call that started it holds
+    /// the command, and the trace's `shell_completed` line keeps it.
+    #[test]
+    fn a_completion_names_the_work_id_and_not_the_command() {
+        let completion = DetachedCompletion {
+            work_id: "wrk_0001".to_string(),
+            binary: "/usr/bin/bash".to_string(),
+            command: "make -j64".to_string(),
+            exit_code: 0,
+            duration_ms: 3_000,
+            output_path: "/home/test/.murmur/records/work/ses_1/logs/wrk_0001.log".to_string(),
+            output_bytes: 12,
+            resource_limit: None,
+            output_holders: crate::shell::OutputHolders::Closed,
+            context_id: "ctx_1".to_string(),
+            provenance: completion_provenance(),
+            error: Some("the wait failed".to_string()),
+        };
+        assert_eq!(
+            completion.message_text(),
+            "Background shell command finished.\n\
+             work_id: wrk_0001\n\
+             status: error\n\
+             exit_code: 0\n\
+             duration_ms: 3000\n\
+             output: /home/test/.murmur/records/work/ses_1/logs/wrk_0001.log (12 bytes)\n\
+             wait_error: the wait failed\n\
+             \n\
+             The full stdout and stderr are in that file and are not reproduced here."
+        );
+    }
+
+    /// A lost-work report names each command by its work id and demotion instant; the binary
+    /// and the command text stay in the `shell_detached` and `shell_lost` trace lines.
+    #[test]
+    fn a_lost_report_names_each_work_id_and_not_the_command() {
+        let lost = |work_id: &str, command: &str, detached_at_ms| LostWork {
+            work_id: work_id.to_string(),
+            binary: "/usr/bin/bash".to_string(),
+            command: command.to_string(),
+            detached_at_ms,
+        };
+        let report = LostReport {
+            started_in_session: "ses_prior".to_string(),
+            lost: vec![
+                lost("wrk_one", "sleep 60", 1750),
+                lost("wrk_two", "make test", 2500),
+            ],
+            context_id: "ctx_1".to_string(),
+            provenance: completion_provenance(),
+            task_id: "tsk_1".to_string(),
+        };
+        let text = report.message_text();
+        assert!(
+            text.contains(
+                "\nwork_id: wrk_one\ndetached_at_ms: 1750\n\nwork_id: wrk_two\ndetached_at_ms: 2500\n"
+            ),
+            "{text}"
+        );
+        assert!(text.starts_with(
+            "Background shell commands from an earlier session were never accounted for.\n\n\
+             Session ses_prior ended without recording what became of the commands below;"
+        ));
+        assert!(
+            text.ends_with("start the work again only if it still matters."),
+            "{text}"
+        );
+        for absent in [
+            "binary:",
+            "command:",
+            "/usr/bin/bash",
+            "sleep 60",
+            "make test",
+        ] {
+            assert!(!text.contains(absent), "{absent} in:\n{text}");
+        }
+    }
+
     /// A demoted command that exits while a process it started still holds its output completes
     /// anyway: the holder is killed, the completion says so, and the log has what was printed.
     #[test]
@@ -1201,7 +1273,7 @@ mod tests {
         let runtime = tempfile::tempdir().unwrap();
         let started = Instant::now();
         // The output word is spelled nowhere in the command, so finding it in the completion
-        // would mean the output leaked into the turn rather than merely being echoed back.
+        // can only mean the output leaked into the turn.
         let (outcome, registry, mut receiver) = detached_run(
             workdir.path(),
             runtime.path(),

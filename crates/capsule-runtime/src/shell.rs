@@ -1941,6 +1941,10 @@ mod tests {
             .expect("the log keeps its Stdout: and Stderr: sections");
         assert_eq!(stdout, expected, "the log holds the full stdout");
         assert!(log.starts_with("Command: bash -c seq 1 20000\nExit code: 0\n"));
+        assert!(
+            log.ends_with("\n\nStderr:\n\n"),
+            "the log keeps the empty Stderr: section"
+        );
 
         assert!(
             !workdir.path().join("logs").exists(),

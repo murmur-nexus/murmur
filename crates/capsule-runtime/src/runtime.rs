@@ -12403,7 +12403,7 @@ fn dispatch_shell_tool(
             DispatchOutcome {
                 shell: Some(shell),
                 runtime_note,
-                ..DispatchOutcome::tool(shell_result_to_tool_result(name, &command, result))
+                ..DispatchOutcome::tool(shell_result_to_tool_result(result))
             }
         }
         // A demoted command has no exit code, no output and no duration yet, so it fills none of
@@ -12453,36 +12453,24 @@ fn extract_shell_command(input: &murmur::tool::run::ToolInput) -> Result<String,
     Ok(command.to_string())
 }
 
-/// The command line a person would type at a shell prompt to run this call.
+/// The tool result a finished shell call returns: what the call produced and nothing the model's
+/// own tool call already holds, so the command line it sent is not repeated.
 ///
-/// An interpreter's `command` is already a whole shell line — it becomes the `-c` body — so it
-/// stands alone. Every other allowlisted binary receives the argument list alone, because
-/// `shell_tool_manifest_yaml` tells the model to omit the binary name, so the name goes back in
-/// front of it here.
+/// `data` is `Exit code: <n>`, then `\nStdout:\n<stdout>` when stdout printed anything and
+/// `\nStderr:\n<stderr>` when stderr did, in that order. A stream that printed nothing (zero
+/// bytes) has no section; whitespace is output. A truncated result ends with
+/// `\n\nOutput truncated. Full output written to <path>`, or `\n\nOutput truncated.` when no
+/// log was written.
 ///
-/// `name` is the declared short name, the `capabilities.shell.allow` entry, not
-/// `ShellResult::binary`: that field is the resolved absolute path and would render
-/// `$ /usr/bin/ls .`.
-fn shell_command_line(name: &str, command: &str) -> String {
-    if is_shell_interpreter(name) {
-        format!("$ {command}")
-    } else {
-        format!("$ {name} {command}")
+/// `summary` restates the exit code; [`fence_result`] drops it without sending it, because `data`
+/// is always present here.
+fn shell_result_to_tool_result(result: ShellResult) -> murmur::tool::run::ToolResult {
+    let mut data = format!("Exit code: {}", result.exit_code);
+    for (label, output) in [("Stdout", &result.stdout), ("Stderr", &result.stderr)] {
+        if !output.is_empty() {
+            data.push_str(&format!("\n{label}:\n{output}"));
+        }
     }
-}
-
-fn shell_result_to_tool_result(
-    name: &str,
-    command: &str,
-    result: ShellResult,
-) -> murmur::tool::run::ToolResult {
-    let mut data = format!(
-        "{}\nExit code: {}\nStdout:\n{}\nStderr:\n{}",
-        shell_command_line(name, command),
-        result.exit_code,
-        result.stdout,
-        result.stderr
-    );
 
     let mut metadata = Vec::new();
     if result.truncated {
@@ -20008,7 +19996,7 @@ inference:
     /// A call nothing was attributed to carries no note and no `resource_limit` metadata, and no
     /// limit is guessed from a non-zero exit.
     #[test]
-    fn a_shell_result_with_no_attributed_limit_renders_exactly_as_before() {
+    fn a_shell_result_with_no_attributed_limit_carries_no_note_or_metadata() {
         let tmp = TempDir::new().unwrap();
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
@@ -20030,7 +20018,7 @@ inference:
 
         assert_eq!(
             outcome.result.data.as_deref(),
-            Some("$ echo hi\nExit code: 0\nStdout:\nhi\n\nStderr:\n")
+            Some("Exit code: 0\nStdout:\nhi\n")
         );
         assert_eq!(
             outcome.result.summary.as_deref(),
@@ -20048,22 +20036,63 @@ inference:
             .unwrap()
             .ends_with(crate::fence::FENCE_CLOSE));
 
-        let failed = shell_result_to_tool_result(
-            "bash",
-            "exit 3",
-            ShellResult {
-                binary: "/usr/bin/bash".to_string(),
-                exit_code: 3,
-                stdout: String::new(),
-                stderr: String::new(),
-                duration_ms: 1,
-                truncated: false,
-                full_output_path: None,
-                resource_limit_hit: None,
-                output_holders: crate::shell::OutputHolders::Closed,
-            },
-        );
+        let failed = shell_result_to_tool_result(finished_shell_result(3, "", ""));
         assert!(failed.metadata.is_empty());
+    }
+
+    fn finished_shell_result(exit_code: i32, stdout: &str, stderr: &str) -> ShellResult {
+        ShellResult {
+            binary: "/usr/bin/bash".to_string(),
+            exit_code,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            duration_ms: 1,
+            truncated: false,
+            full_output_path: None,
+            resource_limit_hit: None,
+            output_holders: crate::shell::OutputHolders::Closed,
+        }
+    }
+
+    /// The exit line always opens the text, and a stream that printed nothing has no section at
+    /// all; a stream that printed only whitespace printed something.
+    #[test]
+    fn shell_result_leaves_out_a_stream_that_printed_nothing() {
+        let data = |exit_code, stdout, stderr| {
+            shell_result_to_tool_result(finished_shell_result(exit_code, stdout, stderr))
+                .data
+                .expect("a finished call renders text")
+        };
+
+        assert_eq!(data(3, "", ""), "Exit code: 3");
+        assert_eq!(data(0, "hi\n", ""), "Exit code: 0\nStdout:\nhi\n");
+        assert_eq!(data(0, "", "err\n"), "Exit code: 0\nStderr:\nerr\n");
+        assert_eq!(
+            data(0, "hi\n", "err\n"),
+            "Exit code: 0\nStdout:\nhi\n\nStderr:\nerr\n"
+        );
+        assert_eq!(data(0, "\n", ""), "Exit code: 0\nStdout:\n\n");
+        assert_eq!(data(1, "", " "), "Exit code: 1\nStderr:\n ");
+    }
+
+    /// The exit code is stated once in what the model reads: `summary` repeats it for unfenced
+    /// readers, and fencing consumes `summary` without sending it because `data` is present.
+    #[test]
+    fn shell_result_states_the_exit_code_to_the_model_once() {
+        let mut outcome = DispatchOutcome::tool(shell_result_to_tool_result(
+            finished_shell_result(2, "out\n", "err\n"),
+        ));
+        assert_eq!(
+            outcome.result.summary.as_deref(),
+            Some("Shell command exited with code 2")
+        );
+
+        fence_and_label("bash", &LockOrigin::Operator, &mut outcome);
+        assert!(outcome.result.summary.is_none());
+        let data = outcome.result.data.expect("a finished call renders text");
+        assert_eq!(data.matches("Exit code:").count(), 1, "{data}");
+        assert!(!data.contains("Shell command exited with code"), "{data}");
+        assert!(data.lines().any(|line| line == "Exit code: 2"), "{data}");
     }
 
     /// A truncated result names the log by the path it carries, and a command run with no
@@ -20071,28 +20100,25 @@ inference:
     #[test]
     fn a_truncated_result_names_its_log_or_with_no_records_directory_nothing() {
         let truncated = |full_output_path: Option<&str>| {
-            shell_result_to_tool_result(
-                "bash",
-                "seq 1 20000",
-                ShellResult {
-                    binary: "/usr/bin/bash".to_string(),
-                    exit_code: 0,
-                    stdout: "1\n".to_string(),
-                    stderr: String::new(),
-                    duration_ms: 1,
-                    truncated: true,
-                    full_output_path: full_output_path.map(str::to_string),
-                    resource_limit_hit: None,
-                    output_holders: crate::shell::OutputHolders::Closed,
-                },
-            )
+            shell_result_to_tool_result(ShellResult {
+                truncated: true,
+                full_output_path: full_output_path.map(str::to_string),
+                ..finished_shell_result(0, "1\n", "")
+            })
         };
 
         let path = "/home/test/.murmur/records/work/ses_1/logs/shell-1.log";
         let named = truncated(Some(path));
-        assert!(named.data.as_deref().unwrap().ends_with(&format!(
-            "\n\nOutput truncated. Full output written to {path}"
-        )));
+        assert_eq!(
+            named.data.as_deref(),
+            Some(
+                format!(
+                    "Exit code: 0\nStdout:\n1\n\n\nOutput truncated. Full output written to {path}"
+                )
+                .as_str()
+            )
+        );
+        assert!(named.truncated);
         assert_eq!(
             named.metadata,
             vec![("full_output_path".to_string(), path.to_string())]
@@ -20105,6 +20131,10 @@ inference:
             .unwrap()
             .ends_with("\n\nOutput truncated."));
         assert!(unnamed.metadata.is_empty());
+        for result in [&named, &unnamed] {
+            let data = result.data.as_deref().unwrap();
+            assert!(!data.lines().any(|line| line.starts_with("$ ")), "{data}");
+        }
     }
 
     /// Text a command prints stays inside the fence however much it looks like the runtime's
@@ -20154,11 +20184,10 @@ inference:
         assert!(data.ends_with(crate::fence::FENCE_CLOSE));
     }
 
-    /// The `$ ` line is a command line, so for a non-interpreter it carries the binary the
-    /// model was told to omit from `command`. The name printed is the declared short name and
-    /// not `ShellResult::binary`, which is the resolved path.
+    /// The model's tool call already holds the command, so a non-interpreter's result carries
+    /// neither a command line nor the arguments it was given.
     #[test]
-    fn shell_tool_result_names_the_binary_a_non_interpreter_call_ran() {
+    fn shell_tool_result_holds_no_command_line_for_a_non_interpreter() {
         let tmp = TempDir::new().unwrap();
         let policy = CapabilityPolicy {
             shell_allow: vec!["ls".to_string()],
@@ -20179,27 +20208,14 @@ inference:
         );
 
         let data = outcome.result.data.expect("a finished call renders text");
-        let first = data.lines().next().expect("the text opens with the $ line");
-        assert_eq!(first, "$ ls -d .");
-        assert!(
-            !first.starts_with("$ /"),
-            "the resolved path must not reach the $ line, got {first:?}"
-        );
-        let printed_binary = first
-            .strip_prefix("$ ")
-            .and_then(|rest| rest.split_whitespace().next())
-            .expect("the $ line names a binary");
-        assert!(
-            !printed_binary.contains('/'),
-            "the $ line names the declared short name, got {printed_binary:?}"
-        );
+        assert_eq!(data, "Exit code: 0\nStdout:\n.\n");
+        assert!(!data.lines().any(|line| line.starts_with("$ ")), "{data}");
+        assert!(!data.contains("-d ."), "{data}");
     }
 
-    /// An interpreter's `command` is a whole shell line already, so it stands alone: `$ bash
-    /// echo hi` would read as bash invoked with `echo` as its script argument, which is not
-    /// what ran.
+    /// An interpreter's result opens with the exit line; the script it ran is not repeated.
     #[test]
-    fn shell_tool_result_leaves_an_interpreter_command_line_alone() {
+    fn shell_tool_result_holds_no_command_line_for_an_interpreter() {
         let tmp = TempDir::new().unwrap();
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
@@ -20209,7 +20225,7 @@ inference:
         let outcome = dispatch_shell_tool(
             "bash",
             murmur::tool::run::ToolInput {
-                data: Some(r#"{"command":"echo hi"}"#.to_string()),
+                data: Some(r#"{"command":"printf 'out\\n'"}"#.to_string()),
                 log_path: None,
             },
             &crate::workdir_fs::WorkdirRoot::open(tmp.path()).unwrap(),
@@ -20220,8 +20236,7 @@ inference:
         );
 
         let data = outcome.result.data.expect("a finished call renders text");
-        let first = data.lines().next().expect("the text opens with the $ line");
-        assert_eq!(first, "$ echo hi");
+        assert_eq!(data, "Exit code: 0\nStdout:\nout\n");
     }
 
     /// The argv a policy hook decides on and the argv the spawn receives come from one

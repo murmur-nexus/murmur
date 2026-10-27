@@ -2332,20 +2332,27 @@ the same terms. Omit the key to deliver no variable.
 - The tool's `command` argument carries the arguments alone — the runtime supplies the binary. A
   shell interpreter (`bash`, `sh`, `zsh`, `fish`, `dash`, `ksh`) is the exception: its `command` is
   a whole shell line, run as the interpreter's `-c` argument.
-- The result the agent reads back opens with the command line that ran, then the exit code and the
-  two output streams:
+- The result the agent reads back holds the exit code and each output stream that printed
+  anything; the command is in the agent's own tool call. A call to `bash` with
+  `printf 'out\n'; printf 'err\n' >&2` reads back:
 
   ```text
-  $ ls -d .
   Exit code: 0
   Stdout:
-  .
+  out
 
   Stderr:
+  err
   ```
 
-  The name on the `$` line is the allowlist entry, so an interpreter's line shows the shell line
-  on its own (`$ echo hi`). When the runtime attributes the command's failure to one
+  | Part | Present |
+  |---|---|
+  | `Exit code: <n>` | Always, first |
+  | `Stdout:` and the output | When the command printed to stdout |
+  | `Stderr:` and the output | When the command printed to stderr |
+  | `Output truncated. Full output written to <path>` | When the output passed 16 KiB |
+
+  When the runtime attributes the command's failure to one
   `capabilities.resources` limit, a line naming that limit and what to do follows the result; see
   [Which limit a subprocess hit](resource-limits.md#which-limit).
 
@@ -2534,7 +2541,7 @@ How the exit reaches the agent:
 | Lifecycle | Delivery |
 |---|---|
 | Any | `background-command` returns the exit code, `status` and the last 16 KiB of output once the command has exited |
-| `task_acceptance: queue` with `after_task: sleep` | Also a task with [origin](../concepts/access-control.md#task-origin-and-trust-class) `completion` in the `bg` lane, carrying the exit code and the log's path. Not enqueued when `background-command` already returned the exit |
+| `task_acceptance: queue` with `after_task: sleep` | Also a task with [origin](../concepts/access-control.md#task-origin-and-trust-class) `completion` in the `bg` lane, carrying the work id, the exit code and the log's path. Not enqueued when `background-command` already returned the exit |
 
 A non-zero exit, a signal kill and a [resource limit](resource-limits.md#which-limit) are told
 apart by the `status` field on the command's

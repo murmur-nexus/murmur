@@ -234,11 +234,14 @@ fn a_scoped_capsule_on_a_sealed_host_reports_and_runs_on_landlock() {
         "{report}"
     );
     assert_eq!(exit_code(&tool_result), 0, "{tool_result}");
-    let listing = tool_result
-        .split_once("Stdout:")
-        .and_then(|(_, rest)| rest.split_once("Stderr:"))
-        .map(|(stdout, _)| stdout.trim())
-        .unwrap_or_default();
+    // The `Stdout:` section is present only when `ls` printed something.
+    let listing: Vec<&str> = tool_result
+        .lines()
+        .skip_while(|line| *line != "Stdout:")
+        .skip(1)
+        .take_while(|line| *line != "Stderr:")
+        .filter(|line| !line.trim().is_empty())
+        .collect();
     assert!(
         !listing.is_empty(),
         "the composed root binds /usr and lists it: {tool_result}"
@@ -295,11 +298,16 @@ fn a_sealed_verdict_survives_the_first_subprocess() {
         // The subprocess itself, not just the turn around it: the echoed marker can only reach
         // the provider by way of a process that ran inside the composed root. Asserting the turn
         // count alone passes on a tool call the dispatcher refused before spawning anything.
-        let tool_result = requests[1].to_string();
+        // Read by whole lines of the result, so the command text in the call's own input cannot
+        // stand in for the output.
+        let tool_result = common::tool_result_text(&requests, "toolu_call")
+            .expect("the provider received the echo call's result");
         assert!(
-            tool_result.contains("sealed-subprocess-ran") && tool_result.contains("Exit code: 0"),
-            "the echo subprocess must have run and its output reached the provider: {}",
-            requests[1]
+            tool_result
+                .lines()
+                .any(|line| line == "sealed-subprocess-ran")
+                && tool_result.lines().next() == Some("Exit code: 0"),
+            "the echo subprocess must have run and its output reached the provider: {tool_result}"
         );
         return;
     }

@@ -186,7 +186,6 @@ Each operation returns the same text, `Passed` whatever the command's exit code:
 
 ```text
 work_id: wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2
-command: /usr/bin/bash cargo test --workspace
 state: exited
 elapsed_secs: 312
 waited_secs: 41
@@ -202,7 +201,6 @@ output_shown: last 16384 bytes
 | Line | Value | Present |
 |---|---|---|
 | `work_id` | The work id | Always |
-| `command` | The resolved binary and the command text the model wrote | Always |
 | `state` | `running`, `exited`, or `stopped` for a command that ended after a `stop` reached it | Always |
 | `elapsed_secs` | Whole seconds from the command's start to now, or to its exit | Always |
 | `waited_secs` | Whole seconds this call waited | `wait` only |

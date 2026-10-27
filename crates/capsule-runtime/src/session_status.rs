@@ -567,48 +567,41 @@ struct SpendReport {
     machine: Value,
 }
 
-/// The fields every description states, in the order the result carries them.
-const FIELDS: &str = "`time`: `elapsed_secs` since the session started, `task_elapsed_secs` since \
-     the current task started, and `deadline`, with `at`, the RFC 3339 UTC time the runtime ends \
-     the session, and `left_secs` until then. `turns`: `used`, the inference calls this task has \
-     made, and `cap`, the most it may make. `keep_working`: `used`, the messages \
-     lifecycle.keep_working has sent this task to keep it working past a turn end, and `left`, \
-     how many more it may send. `done_check`: `used`, the times lifecycle.done_check has \
-     reopened this task because its command failed, and `left`, how many more it may.";
+/// The opening and the fields every description states, in the order the result carries them.
+const FIELDS: &str = "This session's state now, as one JSON object; no input. time: \
+     elapsed_secs (session), task_elapsed_secs (current task), deadline {at: RFC 3339 UTC \
+     session end, left_secs to it}. turns: used, cap (this task's inference calls). \
+     keep_working: used, left (lifecycle.keep_working messages that kept this task working \
+     past a turn end). done_check: used, left (lifecycle.done_check reopens of this task on \
+     a failed command).";
 
-/// The `spend` and closing sentences every description shares.
-const SPEND_AND_VALUES: &str = "`spend`: `tokens`, what the spend ceilings count for this \
-     session, `ceiling`, this session's token ceiling, and `machine`, this machine's \
-     `tokens_today` against its daily `ceiling`. No money amount is kept: spend is counted in \
-     tokens. A limit that is not set reads \"none\" and a count the runtime does not have reads \
-     \"unknown\". Seconds are whole.";
+/// The `spend` field and the value rules every description shares.
+const SPEND_AND_VALUES: &str = "spend: tokens (this session's, as the spend ceilings count \
+     them), session ceiling, machine {tokens_today, daily ceiling}; counted in tokens, no \
+     money amount is kept. Unset limit: \"none\". Unknown count: \"unknown\". Seconds are whole.";
 
 /// `session-status`'s description under `transport: http`. Fixed, so the tool array's bytes do
 /// not change from one request to the next.
 pub fn description_http() -> String {
     format!(
-        "Report where this session stands, measured at the moment of the call. Takes no input and \
-         returns one JSON object. {FIELDS} `context`: `used_tokens`, the conversation's size as \
-         the runtime last counted it, `window_tokens`, the model's context window, \
-         `budget_tokens`, the most input tokens a call may carry, which compaction measures \
-         against, `budget_basis`, the limit that sets it (\"max_input_tokens\": the provider's \
-         input ceiling; \"context_window_less_output_cap\": the window less the call's output \
-         cap), and `measured_by`, how the count was made (\"actual\": the provider's own count of the last \
-         call; \"estimate\": the runtime's own count). `tokens`: \
-         the `input`, `output`, `cached` and `cache_write` tokens the provider reported for this \
-         session's inference calls, and `unreported_calls`, the calls it reported none for. \
-         {SPEND_AND_VALUES}"
+        "{FIELDS} context: used_tokens (conversation size at last count), window_tokens \
+         (model context window), budget_tokens (most input tokens per call; compaction measures \
+         against it), budget_basis (\"max_input_tokens\": provider input ceiling; \
+         \"context_window_less_output_cap\": window less output cap), measured_by (\"actual\": \
+         provider's count of the last call; \"estimate\": runtime's count). tokens: \
+         provider-reported input, output, cached, cache_write for this session's calls, \
+         and unreported_calls it reported none for. {SPEND_AND_VALUES}"
     )
 }
 
-/// `session-status`'s description under `transport: process`.
+/// `session-status`'s description under `transport: process`. Fixed, as
+/// [`description_http`] is.
 pub fn description_process() -> String {
     format!(
-        "Report where this session stands, measured at the moment of the call. Takes no input and \
-         returns one JSON object. {FIELDS} Turns are counted as they close. `context` reads \
-         \"unknown\": the harness keeps its own context. `tokens`: the `input`, `output`, \
-         `cached` and `cache_write` tokens the harness reported for this session's closed turns, \
-         and `unreported_calls`, the turns it reported none for. {SPEND_AND_VALUES}"
+        "{FIELDS} Turns are counted as they close. context: \"unknown\"; the harness keeps its \
+         own context. tokens: harness-reported input, output, cached, cache_write for \
+         this session's closed turns, and unreported_calls, turns it reported none for. \
+         {SPEND_AND_VALUES}"
     )
 }
 
@@ -1041,47 +1034,73 @@ mod tests {
         );
     }
 
+    /// Every field the report carries is named, with the facts that are not in the field names:
+    /// what each count counts, the sentinels and the unit of spend. Nothing advises when to call.
     #[test]
     fn session_status_descriptions_name_every_field_and_no_timing_advice() {
-        for description in [description_http(), description_process()] {
-            for field in [
-                "elapsed_secs",
-                "task_elapsed_secs",
-                "deadline",
-                "left_secs",
-                "`turns`",
-                "`cap`",
-                "`keep_working`",
-                "`done_check`",
-                "`used`",
-                "`left`",
-                "`context`",
-                "`tokens`",
-                "`cached`",
-                "`cache_write`",
-                "unreported_calls",
-                "`spend`",
-                "`ceiling`",
-                "`machine`",
-                "tokens_today",
-                "No money amount is kept",
-                "\"none\"",
-                "\"unknown\"",
-            ] {
-                assert!(
-                    description.contains(field),
-                    "{field} missing: {description}"
-                );
+        let shared = [
+            "This session's state now, as one JSON object; no input.",
+            "time: elapsed_secs (session), task_elapsed_secs (current task), deadline {at: RFC \
+             3339 UTC session end, left_secs to it}.",
+            "turns: used, cap (this task's inference calls).",
+            "keep_working: used, left (lifecycle.keep_working messages that kept this task \
+             working past a turn end).",
+            "done_check: used, left (lifecycle.done_check reopens of this task on a failed \
+             command).",
+            " input, output, cached, cache_write for this session's ",
+            "unreported_calls",
+            "spend: tokens (this session's, as the spend ceilings count them), session ceiling, \
+             machine {tokens_today, daily ceiling}; counted in tokens, no money amount is kept.",
+            "Unset limit: \"none\".",
+            "Unknown count: \"unknown\".",
+            "Seconds are whole.",
+        ];
+        let http = description_http();
+        let process = description_process();
+        for (description, own) in [
+            (
+                &http,
+                &[
+                    "used_tokens (conversation size at last count)",
+                    "window_tokens (model context window)",
+                    "budget_tokens (most input tokens per call; compaction measures against it)",
+                    "budget_basis",
+                    "\"max_input_tokens\": provider input ceiling",
+                    "\"context_window_less_output_cap\": window less output cap",
+                    "measured_by",
+                    "\"actual\": provider's count of the last call",
+                    "\"estimate\": runtime's count",
+                    "context: used_tokens",
+                    "tokens: provider-reported input, output, cached, cache_write for this \
+                     session's calls, and unreported_calls it reported none for.",
+                ][..],
+            ),
+            (
+                &process,
+                &[
+                    "Turns are counted as they close",
+                    "context: \"unknown\"; the harness keeps its own context",
+                    "tokens: harness-reported input, output, cached, cache_write for this \
+                     session's closed turns",
+                    "unreported_calls, turns it reported none for",
+                ][..],
+            ),
+        ] {
+            for fact in shared.iter().chain(own) {
+                assert!(description.contains(fact), "{fact} missing: {description}");
             }
             let lower = description.to_lowercase();
             for advice in ["when", "should", "call this", "periodically"] {
                 assert!(!lower.contains(advice), "{advice}: {description}");
             }
         }
-        assert!(description_http().contains("measured_by"));
-        assert!(description_http().contains("budget_tokens"));
-        assert!(description_http().contains("budget_basis"));
-        assert!(description_http().contains("\"actual\""));
-        assert!(description_process().contains("the harness keeps its own context"));
+        for http_only in [
+            "used_tokens",
+            "window_tokens",
+            "budget_tokens",
+            "measured_by",
+        ] {
+            assert!(!process.contains(http_only), "{http_only}: {process}");
+        }
     }
 }
