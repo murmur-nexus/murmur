@@ -137,9 +137,10 @@ pub use containment::{
 pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
 // `mur run --explain-scope` derives an allowlisted interpreter's runtime directories through the
 // same function `stage_session` does, so the report and the session's grants name one set.
+// `mur install` keeps host facts through the same derivation, so the first launch keeps them.
 pub use interpreter_runtime::{
-    capsule_writable_roots, derive_interpreter_runtimes, DerivedInterpreterRuntime,
-    InterpreterRuntimes,
+    capsule_writable_roots, derive_interpreter_runtimes, keep_host_facts,
+    DerivedInterpreterRuntime, HostFactsKept, InterpreterRuntimes,
 };
 // Both pass the same host facts cache, and `session_start.host_facts` reports what a launch kept.
 pub use host_facts::{HostFactsCache, HostFactsReason, HostFactsSource, HostFactsUse};

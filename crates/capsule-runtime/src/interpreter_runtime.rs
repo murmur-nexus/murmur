@@ -148,6 +148,57 @@ pub fn derive_interpreter_runtimes(
     }
 }
 
+/// How many allowlisted binaries [`keep_host_facts`] examined, and how many of those the cache
+/// holds an entry for afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HostFactsKept {
+    /// Every resolved `shell.allow` binary that no `staged` grant names and that lies under no
+    /// writable root, as [`InterpreterRuntimes::host_facts`] counts them.
+    pub examined: usize,
+    /// The examined binaries whose entry `cache` holds when the call returns: one that still
+    /// matched, or one just worked out and stored. A binary whose query failed has none.
+    pub kept: usize,
+}
+
+/// Fills `cache` with the entries [`derive_interpreter_runtimes`] would keep for the same
+/// arguments, ahead of the launch that would otherwise work them out, and counts them.
+///
+/// The derivation is the launch's own, with the same `PATH`, interpreter table and query timeout,
+/// so an entry written here is the one that launch would write and the launch reports it kept. A
+/// staging passing other `capsule_writable` trees still keeps every entry whose recorded paths lie
+/// outside both sets. Nothing is written to standard error: a query that fails stores no entry,
+/// and the launch that works it out again reports it.
+///
+/// Off Linux this keeps nothing and runs nothing.
+pub fn keep_host_facts(
+    shell_allow: &[String],
+    staged: &[murmur_artifact::StagedRuntimeGrant],
+    capsule_writable: &[&Path],
+    cache: &HostFactsCache,
+) -> HostFactsKept {
+    #[cfg(target_os = "linux")]
+    {
+        let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default();
+        fill_in(
+            shell_allow,
+            staged,
+            capsule_writable,
+            &path_dirs,
+            INTERPRETER_KINDS,
+            QUERY_TIMEOUT,
+            cache,
+            &mut |_| {},
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (shell_allow, staged, capsule_writable, cache);
+        HostFactsKept::default()
+    }
+}
+
 /// The trees a session placed at `placement` lets its commands write, as
 /// [`derive_interpreter_runtimes`] takes them: the workdir root and the records group, which holds
 /// every session's temporary folder.
@@ -166,6 +217,63 @@ pub(crate) fn derive_in(
     timeout: std::time::Duration,
     cache: &HostFactsCache,
 ) -> InterpreterRuntimes {
+    examine(
+        shell_allow,
+        staged,
+        capsule_writable,
+        path_dirs,
+        kinds,
+        timeout,
+        cache,
+        &mut |line| crate::runtime_err!("{line}"),
+    )
+    .0
+}
+
+/// [`keep_host_facts`] with `PATH`, the kind table and the timeout injected, and each line saying
+/// an interpreter's runtime was not derived handed to `report`.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fill_in(
+    shell_allow: &[String],
+    staged: &[murmur_artifact::StagedRuntimeGrant],
+    capsule_writable: &[&Path],
+    path_dirs: &[PathBuf],
+    kinds: &[InterpreterKind<'_>],
+    timeout: std::time::Duration,
+    cache: &HostFactsCache,
+    report: &mut dyn FnMut(&str),
+) -> HostFactsKept {
+    let (derived, kept) = examine(
+        shell_allow,
+        staged,
+        capsule_writable,
+        path_dirs,
+        kinds,
+        timeout,
+        cache,
+        report,
+    );
+    HostFactsKept {
+        examined: derived.host_facts.len(),
+        kept,
+    }
+}
+
+/// The derivation both [`derive_in`] and [`fill_in`] run, and how many examined binaries the cache
+/// holds an entry for when it returns.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn examine(
+    shell_allow: &[String],
+    staged: &[murmur_artifact::StagedRuntimeGrant],
+    capsule_writable: &[&Path],
+    path_dirs: &[PathBuf],
+    kinds: &[InterpreterKind<'_>],
+    timeout: std::time::Duration,
+    cache: &HostFactsCache,
+    report: &mut dyn FnMut(&str),
+) -> (InterpreterRuntimes, usize) {
     use crate::sandbox::resolve_exec_allowlist_in;
 
     let roots: Vec<PathBuf> = capsule_writable
@@ -187,26 +295,44 @@ pub(crate) fn derive_in(
         .collect();
 
     let mut derived = InterpreterRuntimes::default();
+    let mut held = 0;
     if examined.is_empty() {
-        return derived;
+        return (derived, held);
     }
     let shelf = cache.open(&roots);
     for binary in examined {
-        let (runtime, source) =
-            crate::host_facts::runtime_of(shelf.as_ref(), &binary, kinds, &roots, timeout);
-        derived.runtimes.extend(runtime);
-        derived.host_facts.push(HostFactsUse { binary, source });
+        let found = crate::host_facts::runtime_of(
+            shelf.as_ref(),
+            &binary,
+            kinds,
+            &roots,
+            timeout,
+            &mut *report,
+        );
+        derived.runtimes.extend(found.runtime);
+        held += usize::from(found.held);
+        derived.host_facts.push(HostFactsUse {
+            binary,
+            source: found.source,
+        });
     }
-    derived
+    (derived, held)
 }
 
+/// Hands `report` the line saying `binary`'s runtime was not derived and why. A launch writes it
+/// to standard error; [`keep_host_facts`] drops it.
 #[cfg(target_os = "linux")]
-pub(crate) fn report_not_derived(binary: &Path, kind: InterpreterKind<'_>, reason: &str) {
-    crate::runtime_err!(
+pub(crate) fn report_not_derived(
+    binary: &Path,
+    kind: InterpreterKind<'_>,
+    reason: &str,
+    report: &mut dyn FnMut(&str),
+) {
+    report(&format!(
         "[capsule-runtime] the runtime directories of {} interpreter {} were not derived: {reason}",
         kind.name,
         binary.display()
-    );
+    ));
 }
 
 /// The first kind whose marker symbol the `.dynsym` of the file at `binary` lists. `None` for an
@@ -364,7 +490,7 @@ pub(crate) trait Facts {
 
 /// The runtime of interpreter `binary` from the entries its completed query `reported`, filtered
 /// against the canonical `roots` and with its extension modules' closure walked through `facts`.
-/// `None`, after one line to standard error, when no entry is left to grant.
+/// `None`, after one line to `report`, when no entry is left to grant.
 #[cfg(target_os = "linux")]
 pub(crate) fn runtime_from_report<F: Facts>(
     binary: &Path,
@@ -372,10 +498,16 @@ pub(crate) fn runtime_from_report<F: Facts>(
     reported: &[String],
     roots: &[PathBuf],
     facts: &mut F,
+    report: &mut dyn FnMut(&str),
 ) -> Result<Option<DerivedInterpreterRuntime>, F::Changed> {
     let dirs = keep_entries(binary, reported, roots);
     if dirs.is_empty() {
-        report_not_derived(binary, kind, "it reported no existing directory to grant");
+        report_not_derived(
+            binary,
+            kind,
+            "it reported no existing directory to grant",
+            report,
+        );
         return Ok(None);
     }
     let libraries = extension_module_closure(binary, &dirs, roots, facts)?;
@@ -688,6 +820,174 @@ pub(crate) mod tests {
                 started.elapsed()
             );
         }
+    }
+
+    /// The file names in `cache`'s directory, each with its bytes, sorted.
+    fn entries_of(root: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+        let mut entries: Vec<_> = std::fs::read_dir(root.join("host_facts"))
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn kept_host_facts_are_the_entries_a_launch_writes() {
+        let (_temp, root) = canonical_tempdir();
+        let Some(fake) = dash_copy(&root.join("prefix"), "fakeinterp") else {
+            return;
+        };
+        let lib = root.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let script = format!("printf '%s' {}", lib.display());
+        let args = ["-c", script.as_str()];
+        let kinds = [dash_kind(&args)];
+        let path_dirs = vec![fake.parent().unwrap().to_path_buf()];
+        let allow = vec!["fakeinterp".to_string()];
+        let filled = root.join("filled");
+        let launched = root.join("launched");
+
+        let mut lines = Vec::new();
+        let kept = fill_in(
+            &allow,
+            &[],
+            &[],
+            &path_dirs,
+            &kinds,
+            QUERY_TIMEOUT,
+            &cache_in(&filled),
+            &mut |line| lines.push(line.to_string()),
+        );
+        assert_eq!(
+            kept,
+            HostFactsKept {
+                examined: 1,
+                kept: 1
+            }
+        );
+        assert_eq!(lines, Vec::<String>::new());
+        let fresh = derive_in(
+            &allow,
+            &[],
+            &[],
+            &path_dirs,
+            &kinds,
+            QUERY_TIMEOUT,
+            &cache_in(&launched),
+        );
+        assert_eq!(entries_of(&filled).len(), 1);
+        assert_eq!(entries_of(&filled), entries_of(&launched));
+
+        let after_fill = derive_in(
+            &allow,
+            &[],
+            &[],
+            &path_dirs,
+            &kinds,
+            QUERY_TIMEOUT,
+            &cache_in(&filled),
+        );
+        assert_eq!(after_fill.host_facts[0].source, HostFactsSource::Kept);
+        assert_eq!(after_fill.runtimes, fresh.runtimes);
+        assert_eq!(fresh.runtimes[0].dirs, vec![lib]);
+
+        // A second fill keeps the entry it finds.
+        assert_eq!(
+            fill_in(
+                &allow,
+                &[],
+                &[],
+                &path_dirs,
+                &kinds,
+                QUERY_TIMEOUT,
+                &cache_in(&filled),
+                &mut |_| {},
+            ),
+            kept
+        );
+    }
+
+    #[test]
+    fn keeping_host_facts_keeps_nothing_for_a_failing_query_and_reports_it_to_its_sink() {
+        let (_temp, root) = canonical_tempdir();
+        let Some(fake) = dash_copy(&root.join("prefix"), "fakeinterp") else {
+            return;
+        };
+        let args = ["-c", "exit 3"];
+        let kinds = [dash_kind(&args)];
+        let path_dirs = vec![fake.parent().unwrap().to_path_buf()];
+        let allow = vec!["fakeinterp".to_string()];
+        let cache = cache_in(&root);
+        let fill = || {
+            let mut lines = Vec::new();
+            let kept = fill_in(
+                &allow,
+                &[],
+                &[],
+                &path_dirs,
+                &kinds,
+                QUERY_TIMEOUT,
+                &cache,
+                &mut |line| lines.push(line.to_string()),
+            );
+            (kept, lines)
+        };
+
+        let (kept, lines) = fill();
+        assert_eq!(
+            kept,
+            HostFactsKept {
+                examined: 1,
+                kept: 0
+            }
+        );
+        assert_eq!(
+            lines,
+            vec![format!(
+                "[capsule-runtime] the runtime directories of test interpreter {} were not \
+                 derived: it exited with exit status: 3",
+                fake.display()
+            )]
+        );
+        assert_eq!(entries_of(&root), Vec::new());
+
+        // The launch after it finds no entry and works the binary out again, as does a later fill.
+        let launched = derive_in(&allow, &[], &[], &path_dirs, &kinds, QUERY_TIMEOUT, &cache);
+        assert_eq!(
+            launched.host_facts,
+            vec![HostFactsUse {
+                binary: fake.clone(),
+                source: HostFactsSource::Derived {
+                    reason: HostFactsReason::Absent,
+                    changed_path: None
+                }
+            }]
+        );
+        assert!(launched.runtimes.is_empty());
+        assert_eq!(entries_of(&root), Vec::new());
+        assert_eq!(fill(), (kept, lines));
+    }
+
+    #[test]
+    fn keeping_host_facts_with_nothing_to_examine_creates_no_cache() {
+        let (_temp, root) = canonical_tempdir();
+        let kinds = [dash_kind(&["-c", "exit 0"])];
+        let kept = fill_in(
+            &["no-such-binary-3d8f8b19".to_string()],
+            &[],
+            &[],
+            std::slice::from_ref(&root),
+            &kinds,
+            QUERY_TIMEOUT,
+            &cache_in(&root),
+            &mut |_| {},
+        );
+        assert_eq!(kept, HostFactsKept::default());
+        assert!(!root.join("host_facts").exists());
     }
 
     #[test]

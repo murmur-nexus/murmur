@@ -338,6 +338,38 @@ fn precompile(precompiler: Option<&Precompiler>, name: &str, version: &str, byte
     }
 }
 
+/// Keeps the host facts of the `capabilities.shell.allow` binaries of the manifest at
+/// `project_root`, as `mur run` without `--workdir` would derive them, so the project's first
+/// launch keeps them instead of running each interpreter. Prints one line when at least one is
+/// kept. Never fails and never writes to standard error: a manifest that does not load, an
+/// unusable home or cache, or a binary that cannot be examined only means fewer entries, which
+/// that launch works out itself. Nothing runs under `--no-precompile` or without a project.
+fn keep_host_facts(no_precompile: bool, project_root: Option<&Path>) {
+    let Some(root) = project_root.filter(|_| !no_precompile) else {
+        return;
+    };
+    let Ok(manifest) = load_runtime_manifest(&resolve_manifest_path(root)) else {
+        return;
+    };
+    let policy = capsule_runtime::capability_policy_from_runtime_manifest(&manifest);
+    let Ok(placement) =
+        capsule_runtime::runtime_dir_placement(&super::run::workdir_root(root, None))
+    else {
+        return;
+    };
+    let kept = capsule_runtime::keep_host_facts(
+        &policy.shell_allow,
+        &policy.shell_staged_runtime,
+        &capsule_runtime::capsule_writable_roots(&placement),
+        &capsule_runtime::HostFactsCache::in_murmur_home(),
+    )
+    .kept;
+    if kept > 0 {
+        let noun = if kept == 1 { "binary" } else { "binaries" };
+        capsule_runtime::report_println!("Kept host facts for {kept} allowlisted {noun}");
+    }
+}
+
 /// The platforms `mur install --all-platforms` downloads for.
 ///
 /// Deliberately a subset of [`SUPPORTED_PLATFORMS`]: which platforms CI seeds a store with is a
@@ -404,7 +436,11 @@ pub(crate) fn run_install(
 
     match parsed {
         None => install_manifest_deps(&store, &project_root, no_precompile),
-        Some(parsed) => install_single(parsed, &store, project_root.as_deref(), no_precompile),
+        Some(parsed) => {
+            install_single(parsed, &store, project_root.as_deref(), no_precompile)?;
+            keep_host_facts(no_precompile, project_root.as_deref());
+            Ok(())
+        }
     }
 }
 
@@ -900,6 +936,7 @@ fn install_manifest_deps(
             format!("{} ↓ {}", style("✓").green().bold(), summary_tail),
         );
         print_adoptions(&adoptions);
+        keep_host_facts(no_precompile, Some(&root));
         return Ok(());
     }
 
@@ -909,6 +946,9 @@ fn install_manifest_deps(
         format!("{} ↓ artifacts  failed", style("✗").red().bold()),
     );
     print_adoptions(&adoptions);
+    if !successes.is_empty() {
+        keep_host_facts(no_precompile, Some(&root));
+    }
 
     // Plain report lines rather than indicatif bar text: MultiProgress writes nothing at all
     // when stdout/stderr is not a terminal, so bar messages are cosmetic-only and would make
