@@ -148,8 +148,10 @@ fn record_for(home: &Path, session_id: &str) -> PathBuf {
         .join(format!("{session_id}.json"))
 }
 
+/// Polls `condition` for up to a minute. A running record appears only once staging has compiled
+/// the capsule's component, which a loaded host can take tens of seconds over.
 fn wait_for(what: &str, condition: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !condition() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         thread::sleep(Duration::from_millis(50));

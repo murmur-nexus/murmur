@@ -956,10 +956,12 @@ fn a_run_with_no_home_at_all_is_refused_with_e_io_004() {
     assert!(!doctor.status.success(), "{stdout}");
 }
 
-// ── 10. A script capsule writes no record ─────────────────────────────────────
+// ── 10. A script capsule holds a record with no door ─────────────────────────
 
+/// A script capsule's record names no door, exists while its `run` executes, and is removed when
+/// the session ends.
 #[test]
-fn a_script_capsule_writes_no_record() {
+fn a_script_capsule_holds_a_record_with_no_door_while_it_runs() {
     let home = driver_home();
     let project = tempfile::tempdir().unwrap();
     fs::write(
@@ -986,23 +988,27 @@ fn a_script_capsule_writes_no_record() {
         .spawn()
         .expect("the script capsule should start");
 
-    // The fixture sleeps for two seconds, so the directory is read while the capsule is running:
-    // "never written" and "written then removed" are different claims.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut looked = 0_u32;
-    while Instant::now() < deadline {
+    // The record is written once staging has compiled the component, which a loaded host can
+    // take tens of seconds over; the fixture then sleeps for two seconds with it in place.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (path, record) = loop {
+        if let Some(found) = records(home.path()).pop() {
+            break found;
+        }
         assert!(
-            records(home.path()).is_empty(),
-            "a script capsule binds no door and must record nothing"
+            child.try_wait().unwrap().is_none(),
+            "the script capsule ended without a record being seen"
         );
-        looked += 1;
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert!(looked > 5, "the running capsule was barely looked at");
+        assert!(Instant::now() < deadline, "no record within 60 s");
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(record["url"].is_null(), "{record}");
+    assert_eq!(record["pid"], child.id(), "{record}");
+    assert_eq!(record["capsule_name"], "script-capsule", "{record}");
 
     let status = child.wait().expect("the script capsule should end");
     assert!(status.success(), "the script capsule failed: {status}");
-    assert!(records(home.path()).is_empty());
+    assert!(!path.exists(), "{} outlived its session", path.display());
 }
 
 // ── 11. Recorded-session addressing is unchanged ──────────────────────────────

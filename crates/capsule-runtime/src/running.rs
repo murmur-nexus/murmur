@@ -1534,8 +1534,6 @@ mod tests {
         assert_eq!(signal_term(&record), SignalOutcome::AlreadyGone);
     }
 
-    /// A pid nothing holds is reported as already gone rather than as a refusal — there is
-    /// nothing there to refuse.
     /// A record with no door is decided by layers 1 and 2 alone: its live process is `Live`
     /// without a connection being made, and a dead one is `Gone`.
     #[test]
@@ -1568,6 +1566,8 @@ mod tests {
         assert_eq!(back.url.as_deref(), Some("127.0.0.1:1"));
     }
 
+    /// A pid nothing holds is reported as already gone rather than as a refusal — there is
+    /// nothing there to refuse.
     #[test]
     fn a_signal_at_a_pid_nothing_holds_is_already_gone() {
         assert_eq!(signal_term(&record(0, "42")), SignalOutcome::AlreadyGone);

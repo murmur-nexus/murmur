@@ -8029,9 +8029,7 @@ impl CapsuleStoreState {
                 "tool '{name}' is not declared in manifest allowlist"
             ));
         }
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.dispatch_tool_async(name, input))
-        })
+        block_on_host(self.dispatch_tool_async(name, input))
     }
 }
 

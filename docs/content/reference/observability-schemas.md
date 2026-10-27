@@ -598,8 +598,8 @@ loop has exited, on every exit path
 | `exit_status` | `run` |
 |---|---|
 | `"ok"` | Returned |
-| `"trapped"` | Stopped with a guest error |
-| `"deadline_exceeded"` | Ran past [`capabilities.limits.deadline_seconds`](manifest.md#field-capabilities), the epoch deadline on the component. This is not `"deadline_reached"`, which is an agent session's `--deadline` |
+| `"trapped"` | Stopped on an error in the component's own code, such as a panic |
+| `"deadline_exceeded"` | Ran past [`capabilities.limits.deadline_seconds`](manifest.md#field-capabilities). This is not `"deadline_reached"`, which is an agent session's `--deadline` |
 | `"resource_limit"` | Hit its memory, table or instance cap under `capabilities.limits` |
 | `"failed"` | Could not be run by the runtime, or a trace line could not be written |
 

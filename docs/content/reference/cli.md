@@ -182,8 +182,8 @@ A session whose manifest declares `control:` also holds its control token beside
 Each record carries the session id, the capsule address as `url` (`null` for a script capsule),
 the process id and its start time, the capsule name and version, the session's work folder as
 `workdir`, the session's [records directory](workdir.md#records-directory) as `records_dir`,
-whether the session outlives its launcher, and the time it started. It carries nothing from the environment: no API key, no
-granted variable.
+whether the session outlives its launcher, and the time it started. It carries nothing from the
+environment: no API key, no granted variable.
 
 A record that is a JSON object with a string `session_id` and no `records_dir` key was written by
 an older `mur`. Its capsule may still be running, and only the `mur` that started it can stop it.
@@ -1773,6 +1773,7 @@ decides both the `STATUS` column and whether the record survives the read.
 | Layers | `STATUS` | The record | Reason on the `pruned:` line |
 |---|---|---|---|
 | All three pass | `running` | Kept | — |
+| A script capsule's record: the process is the one that wrote it | `running` | Kept | — |
 | The process is the one that wrote the record; the door did not answer | `unreachable` | Kept | — |
 | A process holds the process id and its start time could not be read | `unreachable` | Kept | — |
 | No process holds the process id | No row | Unlinked | `no process holds pid N` |
@@ -1850,8 +1851,8 @@ mur ps --json
 | Key | Type | Meaning |
 |---|---|---|
 | `capsules` | array | One entry for each record `mur ps` would print a row for, sorted by session id descending. Empty when nothing runs, and when `~/.murmur/running/` is absent or empty |
-| `capsules[].session_id` | string | The session the door answers for |
-| `capsules[].status` | string | `running` or `unreachable`: the `STATUS` column `mur ps` prints for this record, from the [same three layers](#mur-ps-verification), door probe included |
+| `capsules[].session_id` | string | The session this record is for |
+| `capsules[].status` | string | `running` or `unreachable`: the `STATUS` column `mur ps` prints for this record, from the [same three layers](#mur-ps-verification), door probe included for an agent session |
 | `capsules[].url` | string or `null` | The `host:port` the A2A door is bound to, with no scheme. `null` for a script capsule, which binds no door |
 | `capsules[].pid` | integer | The process running the session |
 | `capsules[].process_start` | string | That process's start time, an opaque token local to this machine |
@@ -2277,8 +2278,8 @@ Exit codes:
 
 - `0` — the capsule closed the stream with a `capsule-closed` frame
 - `1` — the session address named nothing running (`E-RUN-022`) or a script capsule
-  (`E-RUN-056`), the capsule did not answer (`E-RUN-023`), the connection failed, or the connection was lost before the capsule closed the
-  stream (`E-IO-003`)
+  (`E-RUN-056`), the capsule did not answer (`E-RUN-023`), the connection failed, or the
+  connection was lost before the capsule closed the stream (`E-IO-003`)
 
 ---
 

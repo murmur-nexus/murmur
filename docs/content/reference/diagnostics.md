@@ -3668,23 +3668,32 @@ stops it by that id with [`background-command`](runtime-provided-tools.md#backgr
 
 ### W-SEC-023 — the session is not addressable { #w-sec-023 }
 
-**Fires when:** a session opened its A2A door and its
-[running-capsule record](cli.md#running-capsule-records) could not be written. Once per launch, on
-stderr and in the session's `logs/bootstrap.log`.
+**Fires when:** a session's [running-capsule record](cli.md#running-capsule-records) could not be
+written: an agent session's once its A2A door is open, a
+[script capsule](../concepts/capsules.md#script-capsules)'s once its session starts. Once per
+launch, on stderr and in the session's `logs/bootstrap.log`.
 
 ```text
 [capsule-runtime] warning[W-SEC-023]: this session's record under ~/.murmur/running/ could not be written, so `mur watch` and `mur cancel` cannot reach it by session address — only by the URL it announces — and `mur token` cannot read the tokens of an authenticated door: failed to create the directory: Permission denied (os error 13) (https://docs.murmur.nexus/reference/diagnostics/#w-sec-023)
 ```
 
-**Why it matters:** the record is what lets [`mur watch`](cli.md#mur-watch) and
+A script capsule's warning says what it loses instead:
+
+```text
+[capsule-runtime] warning[W-SEC-023]: this session's record under ~/.murmur/running/ could not be written, so `mur ps` cannot list it and `mur-roost` cannot count it: failed to create the directory: Permission denied (os error 13) (https://docs.murmur.nexus/reference/diagnostics/#w-sec-023)
+```
+
+**Why it matters:** for a script capsule, the record is what lets [`mur ps`](cli.md#mur-ps) list it
+and a `mur-roost` started while it runs count it. For an agent session, the record is what lets [`mur watch`](cli.md#mur-watch) and
 [`mur cancel`](cli.md#mur-cancel) name this session from a terminal that never saw its URL. Without
 one, the address `mur run` printed is the only way back to the capsule, and it is gone as soon as
 that terminal is. It is also where [`mur token`](cli.md#mur-token) reads a token: a capsule declaring
 `network.authentication` whose record was not written has no token anyone can read, so its door
 refuses every caller.
 
-**What the runtime does about it:** nothing is refused and no exit code changes. The capsule binds
-its port, serves its door and runs its tasks exactly as it would have.
+**What the runtime does about it:** nothing is refused and no exit code changes. An agent session
+binds its port, serves its door and runs its tasks exactly as it would have; a script capsule runs
+its `run` to the end.
 
 **What to do:** the message carries the reason the write failed, usually a `~/.murmur` that is not
 writable or a home directory the host would not resolve. Restore write access to `~/.murmur`, or
