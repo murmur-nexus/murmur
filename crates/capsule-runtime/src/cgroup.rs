@@ -1686,6 +1686,35 @@ fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
     None
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) static DELEGATED_BASE_RESOLUTION_SPAWNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Resolves [`delegated_base`] on a `murmur-cgroup-base` thread of its own, so the systemd
+/// `StartTransientUnit` request, the wait for the kernel to move this process, the delegation
+/// probe and the controller enable overlap the rest of staging instead of delaying
+/// [`prepare_scope`]. A [`prepare_scope`] call that arrives mid-resolution blocks on the same lock
+/// and finds the base cached. A failed resolution caches nothing, so [`prepare_scope`] resolves
+/// again and reports the same reason; either way systemd is asked at most once per process. A
+/// failed spawn leaves the whole resolution to [`prepare_scope`]. Off Linux nothing is spawned.
+///
+/// Callers start it after the last fork they make before [`prepare_scope`]. The resolution moves
+/// this process into its own scope and possibly into `<base>/murmur-supervisor`, and a child
+/// forked meanwhile stays in the cgroup the process held at the fork, where it can occupy the base
+/// whose `cgroup.subtree_control` the resolution writes.
+pub(crate) fn resolve_delegated_base_in_background() {
+    #[cfg(target_os = "linux")]
+    {
+        #[cfg(test)]
+        DELEGATED_BASE_RESOLUTION_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::thread::Builder::new()
+            .name("murmur-cgroup-base".to_string())
+            .spawn(|| {
+                let _ = delegated_base();
+            });
+    }
+}
+
 /// The delegated cgroup root this process creates its scopes under, resolved once.
 ///
 /// [`probe_delegation`] derives the root from `/proc/self/cgroup`, but establishing the first
@@ -3012,6 +3041,19 @@ mod tests {
             base,
             "a base already nested by an earlier build must still resolve to the real root"
         );
+    }
+
+    /// The background resolution and a direct one reach the same answer, on a delegated host and
+    /// on one that is not: a base resolved in the background is the one every later caller gets,
+    /// and a failure resolved in the background leaves the next caller to fail with the same
+    /// reason rather than inheriting a cached error or a half-made base.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn background_resolution_agrees_with_a_direct_one() {
+        resolve_delegated_base_in_background();
+        let first = delegated_base();
+        let second = delegated_base();
+        assert_eq!(first, second);
     }
 
     /// Two scopes must never share a directory even when handed the same id: `Drop` removes the
