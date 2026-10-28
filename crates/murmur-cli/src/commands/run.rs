@@ -674,13 +674,21 @@ pub(crate) fn run_run(
         json,
     )?;
     if own_deadline.is_some() && staged_inference.is_none() {
+        // Under `--capsule` the manifest is the one inside the installed artifact: there is no
+        // murmur.yaml beside the operator to add an inference: block to.
+        let hint = match installed_capsule {
+            Some((name, version)) => format!(
+                "{name}@{version} is a script capsule, which takes no deadline; drop --deadline"
+            ),
+            None => "add an inference: block to murmur.yaml, or drop --deadline".to_string(),
+        };
         return Err(fail(
             &session_id,
             &workdir,
             CliError::with_hint(
                 E_IO_003,
                 "--deadline requires an agent capsule: this manifest has no inference: block",
-                "add an inference: block to murmur.yaml, or drop --deadline",
+                hint,
             ),
             json,
         ));
