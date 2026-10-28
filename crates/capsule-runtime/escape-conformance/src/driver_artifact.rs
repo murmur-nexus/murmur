@@ -203,7 +203,7 @@ mod tests {
         .to_string();
         let lines = vec![
             tool_line("c1", "python3", r#"{"command":"ec-probe.py"}"#),
-            result_line("c1", false, "$ python3 ec-probe.py\nExit code: 0"),
+            result_line("c1", false, "Exit code: 0\nStdout:\nran"),
             tool_line("c2", "python3", r#"{"command":"ec-probe2.py"}"#),
             result_line("c2", true, "workdir ceiling exceeded"),
             usage_line(),
@@ -243,7 +243,7 @@ mod tests {
                 assert_eq!(c1.input, r#"{"command":"ec-probe.py"}"#);
                 assert_eq!(r1.id, "c1");
                 assert!(!r1.is_error);
-                assert_eq!(r1.output, "$ python3 ec-probe.py Exit code: 0");
+                assert_eq!(r1.output, "Exit code: 0 Stdout: ran");
                 assert_eq!((c2.id.as_str(), c2.name.as_str()), ("c2", "python3"));
                 assert_eq!(r2.id, "c2");
                 assert!(r2.is_error);

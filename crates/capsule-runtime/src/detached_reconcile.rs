@@ -322,10 +322,16 @@ mod tests {
             !message.starts_with("Background shell command finished."),
             "the loss report must not open like a completion: {message}"
         );
-        for named in ["wrk_one", "/usr/bin/bash", "sleep 60", "1750"] {
+        for named in ["work_id: wrk_one", "detached_at_ms: 1750"] {
             assert!(
-                message.contains(named),
+                message.lines().any(|line| line == named),
                 "the report names {named}: {message}"
+            );
+        }
+        for absent in ["binary:", "command:", "/usr/bin/bash", "sleep 60"] {
+            assert!(
+                !message.contains(absent),
+                "the work id names the command, so {absent} is not repeated: {message}"
             );
         }
     }

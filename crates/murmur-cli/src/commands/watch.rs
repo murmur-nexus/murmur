@@ -787,7 +787,7 @@ mod tests {
     #[test]
     fn successful_shell_call_reports_ok_exit_and_duration() {
         let artifact = json!({
-            "toolName": "bash", "content": "$ echo hello", "fenceSource": "tool:bash",
+            "toolName": "bash", "content": "Exit code: 0\nStdout:\nhello\n", "fenceSource": "tool:bash",
             "toolCallId": "call_1", "isError": false, "durationMs": 12, "exitCode": 0,
             "truncated": false,
         });

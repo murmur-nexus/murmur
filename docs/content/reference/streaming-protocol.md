@@ -551,7 +551,7 @@ successful call whatever its exit status, so `bash` reports `"isError":false` be
 
 | Frame | Example |
 |---|---|
-| A successful tool call | `{"frame":"artifact","toolName":"bash","content":"<untrusted-content source=tool:bash>\n$ echo hello\nExit code: 0\nStdout:\nhello\n\nStderr:\n\n</untrusted-content>","fenceSource":"tool:bash","toolCallId":"toolu_01","isError":false,"durationMs":12,"exitCode":0,"truncated":false}` |
+| A successful tool call | `{"frame":"artifact","toolName":"bash","content":"<untrusted-content source=tool:bash>\nExit code: 0\nStdout:\nhello\n\n</untrusted-content>","fenceSource":"tool:bash","toolCallId":"toolu_01","isError":false,"durationMs":12,"exitCode":0,"truncated":false}` |
 | A call that never reached a tool | `{"frame":"artifact","toolName":"no-such-tool","content":"tool 'no-such-tool' is not declared in manifest allowlist","fenceSource":null,"toolCallId":"toolu_03","isError":true,"durationMs":0,"exitCode":null,"truncated":false}` |
 | A hook artifact | `{"frame":"artifact","toolName":"my-hook","content":"{\"reviewed\":true}","fenceSource":null,"toolCallId":null,"isError":false,"durationMs":null,"exitCode":null,"truncated":false}` |
 

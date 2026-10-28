@@ -2229,12 +2229,9 @@ Output format:
 ```text
 [working]  inference turn 1
 [artifact] tool: bash [ok, exit 0, 12ms] | <untrusted-content source=tool:bash>
-  $ echo hello
   Exit code: 0
   Stdout:
   hello
-
-  Stderr:
 
   </untrusted-content>
 [working]  inference turn 2

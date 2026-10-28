@@ -168,6 +168,11 @@ pub fn effective_wait(wait_secs: Option<u64>) -> Duration {
 
 /// The tool result for `snapshot`, and the runtime note that goes after the fence.
 ///
+/// The lines are `work_id`, `state`, `elapsed_secs`, `waited_secs` (a `wait` only), `exit_code`,
+/// `status` and `wait_error` (a finished command only, `wait_error` when the wait failed),
+/// `output`, `output_bytes` and `output_shown`, then a blank line and the output tail. The command
+/// is not among them: the work id names it, and the tool call that started it holds it.
+///
 /// `waited` is the time a `wait` blocked, and `None` for the other operations. A found command is
 /// `Passed` whatever its exit code. The note carries an attributed resource limit and the output
 /// holders a foreground call would report, and is `None` when there is neither.
@@ -177,11 +182,6 @@ pub(crate) fn render(
 ) -> (ToolResult, Option<String>) {
     let mut lines = vec![
         format!("work_id: {}", snapshot.work_id),
-        if snapshot.command.is_empty() {
-            format!("command: {}", snapshot.binary)
-        } else {
-            format!("command: {} {}", snapshot.binary, snapshot.command)
-        },
         format!("state: {}", snapshot.state.as_str()),
         format!("elapsed_secs: {}", snapshot.elapsed_ms / 1000),
     ];
@@ -351,8 +351,6 @@ mod tests {
     fn snapshot(tail: &[u8], output_bytes: u64) -> CommandSnapshot {
         CommandSnapshot {
             work_id: "wrk_0a1b".to_string(),
-            binary: "/usr/bin/bash".to_string(),
-            command: "make test".to_string(),
             state: CommandState::Running,
             elapsed_ms: 12_345,
             finished: None,
@@ -370,7 +368,7 @@ mod tests {
         assert_eq!(
             result.data.as_deref(),
             Some(
-                "work_id: wrk_0a1b\ncommand: /usr/bin/bash make test\nstate: running\n\
+                "work_id: wrk_0a1b\nstate: running\n\
                  elapsed_secs: 12\noutput: /records/logs/wrk_0a1b.log\noutput_bytes: 7\n\
                  output_shown: all\n\ntick 1\n"
             )
@@ -378,6 +376,66 @@ mod tests {
         assert!(note.is_none());
         assert!(!result.truncated);
         assert!(matches!(result.status, Status::Passed));
+    }
+
+    fn finished(state: CommandState, exit_code: i32) -> CommandSnapshot {
+        CommandSnapshot {
+            state,
+            finished: Some(crate::detached::DetachedCompletion {
+                work_id: "wrk_0a1b".to_string(),
+                binary: "/usr/bin/bash".to_string(),
+                command: "make test".to_string(),
+                exit_code,
+                duration_ms: 12_345,
+                output_path: "/records/logs/wrk_0a1b.log".to_string(),
+                output_bytes: 7,
+                resource_limit: None,
+                output_holders: crate::shell::OutputHolders::Closed,
+                context_id: "ctx_1".to_string(),
+                provenance: crate::origin::TaskProvenance::derive(
+                    crate::origin::TaskOrigin::Completion,
+                    None,
+                ),
+                error: None,
+            }),
+            ..snapshot(b"tick 1\n", 7)
+        }
+    }
+
+    /// An exited and a stopped command render their exit lines and, like a running one, name the
+    /// command by its work id alone.
+    #[test]
+    fn a_finished_command_renders_its_exit_lines_and_no_command() {
+        let (exited, _) = render(&finished(CommandState::Exited, 0), None);
+        assert_eq!(
+            exited.data.as_deref(),
+            Some(
+                "work_id: wrk_0a1b\nstate: exited\nelapsed_secs: 12\nexit_code: 0\nstatus: ok\n\
+                 output: /records/logs/wrk_0a1b.log\noutput_bytes: 7\noutput_shown: all\n\n\
+                 tick 1\n"
+            )
+        );
+        let (stopped, _) = render(
+            &finished(CommandState::Stopped, 143),
+            Some(Duration::from_secs(2)),
+        );
+        let stopped = stopped.data.unwrap();
+        assert!(
+            stopped.lines().any(|line| line == "state: stopped"),
+            "{stopped}"
+        );
+        assert!(
+            stopped.lines().any(|line| line == "exit_code: 143"),
+            "{stopped}"
+        );
+        for data in [exited.data.as_deref().unwrap(), stopped.as_str()] {
+            assert!(
+                !data.lines().any(|line| line.starts_with("command:")),
+                "{data}"
+            );
+            assert!(!data.contains("make test"), "{data}");
+            assert!(!data.contains("/usr/bin/bash"), "{data}");
+        }
     }
 
     /// A tail cut inside a multi-byte character starts at the next character.

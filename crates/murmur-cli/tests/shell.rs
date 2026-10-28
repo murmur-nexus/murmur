@@ -1030,14 +1030,24 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
         .expect("a request carries the loss report");
     assert!(!resumed_workdir.join("task.md").exists());
     for named in [
-        work_id.as_str(),
-        binary.as_str(),
-        "sleep 60; echo never-seen",
-        &detached_at_ms.to_string(),
+        format!("work_id: {work_id}"),
+        format!("detached_at_ms: {detached_at_ms}"),
     ] {
         assert!(
-            message.contains(named),
+            message.lines().any(|line| line == named),
             "the report must name {named}:\n{message}"
+        );
+    }
+    // The work id names the command; the binary and the command text stay in the trace.
+    for absent in [
+        "binary:",
+        "command:",
+        binary.as_str(),
+        "sleep 60; echo never-seen",
+    ] {
+        assert!(
+            !message.contains(absent),
+            "the report must not repeat {absent}:\n{message}"
         );
     }
     assert!(

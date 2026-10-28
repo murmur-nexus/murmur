@@ -978,10 +978,10 @@ mod tests {
 
     #[test]
     fn each_preflight_check_gets_its_own_hint() {
-        let refused_exec = "case=preflight tool=python3 :: isError=true :: $ python3 ec-probe.py \
-                            Permission denied (os error 13)";
-        let traceback = "case=preflight tool=python3 :: isError=false :: $ python3 ec-probe.py \
-                         Exit code: 1 Stdout:  Stderr: Traceback (most recent call last):";
+        let refused_exec =
+            "case=preflight tool=python3 :: isError=true :: Permission denied (os error 13)";
+        let traceback = "case=preflight tool=python3 :: isError=false :: Exit code: 1 Stderr: \
+                         Traceback (most recent call last):";
         let table = [
             (
                 preflight_outcome(
@@ -1178,13 +1178,10 @@ mod tests {
     #[test]
     fn shell_exit_code_is_read_out_of_the_tool_result_text() {
         assert_eq!(
-            shell_exit_code("case=x tool=python3 isError=false :: $ python3 ec-probe.py Exit code: 137 Stdout:  Stderr:"),
+            shell_exit_code("case=x tool=python3 isError=false :: Exit code: 137"),
             Some(137)
         );
-        assert_eq!(
-            shell_exit_code("$ python3 ec-probe.py Exit code: 0 Stdout: hi"),
-            Some(0)
-        );
+        assert_eq!(shell_exit_code("Exit code: 0 Stdout: hi"), Some(0));
         assert_eq!(shell_exit_code("no exit code here"), None);
     }
 
