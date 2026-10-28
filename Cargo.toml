@@ -29,20 +29,17 @@ codegen-units = 1
 opt-level = "z"
 panic = "abort"
 
-# Every warm launch inflates entries out of each artifact's .mur.zip and checks their CRC-32
-# before its first model request, so the zip reader and the deflate and checksum crates under it
-# are built for speed rather than size.
+# A warm launch inflates entries out of each artifact's .mur.zip and checks their CRC-32: zip
+# reads the entries, flate2 and zlib-rs inflate them and crc32fast checks them, so these four are
+# built for speed rather than size.
 [profile.release.package.zip]
 opt-level = 3
 
 [profile.release.package.flate2]
 opt-level = 3
 
-[profile.release.package.miniz_oxide]
+[profile.release.package.zlib-rs]
 opt-level = 3
 
 [profile.release.package.crc32fast]
-opt-level = 3
-
-[profile.release.package.adler2]
 opt-level = 3
