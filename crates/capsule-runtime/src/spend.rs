@@ -456,11 +456,11 @@ impl SpendAdmission {
                 self.meter.finish(self.reserved, *input_tokens, 0);
                 *input_tokens
             }
-            // Released before the count is waited for, so the admission closes at once. That
-            // reverses `finish`'s record-then-release order, which every ceiling check depends
-            // on: an admission taking the lock between the two would see the call neither
-            // reserved nor used. A deferred input exists only on a meter with no session ceiling
-            // and no machine ledger, so no check is asked.
+            // Sound only on a meter with no session ceiling and no machine ledger, the only kind
+            // that holds a deferred input. This releases before it records, the reverse of
+            // `finish`'s order: a ceiling check taking the lock between the two would see the
+            // call neither reserved nor used. Releasing first closes the admission before the
+            // count is waited for.
             AdmissionInput::Deferred(estimate) => {
                 self.meter.release(self.reserved);
                 let input_tokens = u64::from(estimate.get());

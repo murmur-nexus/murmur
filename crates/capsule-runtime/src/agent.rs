@@ -5160,10 +5160,10 @@ static TOKEN_TABLE_BUILD_SPAWNS: std::sync::atomic::AtomicUsize =
 /// own, at most once per process. An agent session counts its first inference request's tokens,
 /// before sending it under a spend ceiling and alongside the call otherwise, and the build costs
 /// tens of milliseconds; started at staging, it overlaps artifact loading instead of delaying that
-/// count. A [`count_tokens`] call that arrives mid-build
-/// blocks on the `LazyLock` until the build completes, and a failed spawn leaves the build to
-/// the first [`count_tokens`] call. The tables are process-wide and carry no session's data, so
-/// a process that stages many sessions builds them once.
+/// count. A [`count_tokens`] call that arrives mid-build blocks on the `LazyLock` until the build
+/// completes, and a failed spawn leaves the build to the first [`count_tokens`] call. The tables
+/// are process-wide and carry no session's data, so a process that stages many sessions builds
+/// them once.
 pub(crate) fn build_token_tables_in_background() {
     TOKEN_TABLE_BUILD.call_once(|| {
         #[cfg(test)]
@@ -8755,10 +8755,11 @@ mod tests {
     #[test]
     fn dropping_a_counting_estimate_joins_its_thread() {
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release, released) = std::sync::mpsc::channel::<()>();
         let estimate = RequestEstimate::counting_with("text".to_string(), {
             let finished = Arc::clone(&finished);
             move |text| {
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                let _ = released.recv();
                 finished.store(true, Ordering::SeqCst);
                 count_tokens(text)
             }
@@ -8766,8 +8767,16 @@ mod tests {
         let clone = estimate.clone();
         drop(estimate);
         assert!(!finished.load(Ordering::SeqCst), "a clone still holds it");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            release.send(()).unwrap();
+        });
         drop(clone);
-        assert!(finished.load(Ordering::SeqCst));
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the drop waited for the count"
+        );
+        releaser.join().unwrap();
     }
 
     /// A count whose thread cannot start is taken on the reader's thread, with the same value.
