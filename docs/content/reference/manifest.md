@@ -2350,10 +2350,10 @@ the same terms. Omit the key to deliver no variable.
   | `Exit code: <n>` | Always, first |
   | `Stdout:` and the output | When the command printed to stdout |
   | `Stderr:` and the output | When the command printed to stderr |
-  | `Output truncated. Full output written to <path>` | When the output passed 16 KiB |
+  | `Output truncated. Full output written to <path>` | When stdout or stderr passed 16 KiB; the log at `<path>` holds both in full |
 
-  When the runtime attributes the command's failure to one
-  `capabilities.resources` limit, a line naming that limit and what to do follows the result; see
+  When the runtime attributes the command's failure to one `capabilities.resources` limit, a line
+  naming that limit and what to do follows the result; see
   [Which limit a subprocess hit](resource-limits.md#which-limit).
 
 ### Install entries { #install-entries }
