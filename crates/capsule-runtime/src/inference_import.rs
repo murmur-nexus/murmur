@@ -324,7 +324,6 @@ impl HookInferenceCtx {
                                 admission,
                                 reason,
                                 failure.usage.as_ref().and_then(provider_counts),
-                                input_tokens,
                             );
                             retries_made += 1;
                             self.record_retry(InferenceRetryRecord {

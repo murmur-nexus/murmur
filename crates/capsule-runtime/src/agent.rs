@@ -1295,13 +1295,24 @@ pub(crate) async fn run_agent_loop(
         // (possibly smaller) incremental wire payload, so it is the same whether or not a
         // continuation is active. It anchors on the provider's last count of this context when
         // that count still applies, and counts the whole payload otherwise. The one number feeds
-        // the spend admission, the trace, the `on-inference` hook and the span.
-        let input_tokens = request_estimate(
+        // the spend admission, the trace, the `on-inference` hook and the span. Only a ceiling's
+        // admission reads it before the send, so without one a whole-payload count runs alongside
+        // the call.
+        let timing = if store_state.spend.measures_before_send() {
+            EstimateTiming::BeforeSend
+        } else {
+            EstimateTiming::AlongsideCall
+        };
+        let estimate = request_estimate(
             reported,
             &occupancy,
             messages,
             &choice.name,
             tools_refreshed,
+            timing,
+            active_continuation
+                .is_none()
+                .then_some(payload_json.as_str()),
         );
 
         // The checkpoint before every inference request: a refusal latched since the last one —
@@ -1349,13 +1360,14 @@ pub(crate) async fn run_agent_loop(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear_writing();
 
-            // Admitted after the call is measured and before anything is sent. The guard is
-            // settled once the response is parsed, with the provider's counts when it reported
-            // them; a failed call that reported them settles with them too. Every other way out
-            // of this turn drops it, which charges the input estimate alone.
+            // Admitted before anything is sent: under a ceiling, by the measured estimate; with
+            // none, at once, the estimate still counting. The guard is settled once the response
+            // is parsed, with the provider's counts when it reported them; a failed call that
+            // reported them settles with them too. Every other way out of this turn drops it,
+            // which charges the input estimate alone.
             let admission = match store_state
                 .spend
-                .admit(u64::from(input_tokens), u64::from(max_output_tokens))
+                .admit_request(&estimate, u64::from(max_output_tokens))
             {
                 Ok(admission) => admission,
                 Err(refusal) => {
@@ -1496,7 +1508,6 @@ pub(crate) async fn run_agent_loop(
                 admission,
                 reason,
                 failed.usage.as_ref().and_then(provider_counts),
-                u64::from(input_tokens),
             );
             // Text the failed attempt streamed stays on the stream; the cursor is closed so the
             // retry's text starts a fresh run.
@@ -1545,6 +1556,10 @@ pub(crate) async fn run_agent_loop(
                 .await);
             }
         };
+        // The call has returned, so the count that ran alongside it is waited for here, before
+        // anything of this turn is settled, emitted or written. Every reader below takes this
+        // one value.
+        let input_tokens = estimate.get();
         let provider_status = outcome.and_then(UpstreamOutcome::status);
         let failed_call = |error_code: &'static str, error: String| FailedTurnCall {
             turn: turn_u32,
@@ -4608,6 +4623,11 @@ impl ContextOccupancy<'_> {
     /// Count the full payload carrying `messages`, independent of whether a continuation is
     /// active — a continuation shrinks the wire payload, never the context the provider holds.
     pub(crate) fn count(&self, messages: &[Value]) -> u32 {
+        count_tokens(&self.payload_text(messages))
+    }
+
+    /// The serialized full payload carrying `messages`: the text [`Self::count`] counts.
+    fn payload_text(&self, messages: &[Value]) -> String {
         let payload = build_call_payload(
             self.model,
             self.max_output_tokens,
@@ -4618,7 +4638,7 @@ impl ContextOccupancy<'_> {
             self.prompt_cache_key,
             self.view.as_ref(),
         );
-        count_tokens(&serde_json::to_string(&payload).unwrap_or_default())
+        serde_json::to_string(&payload).unwrap_or_default()
     }
 }
 
@@ -4767,19 +4787,174 @@ impl ReportedOccupancy {
     }
 }
 
-/// The pre-send estimate of the request carrying `messages` under `choice`.
+/// When a request's whole-payload count is taken, relative to sending the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EstimateTiming {
+    /// Counted before the request is sent, because a spend ceiling admits it by that number.
+    BeforeSend,
+    /// Counted on a `request-estimate` thread while the request is in flight. Only a session no
+    /// spend ceiling covers counts this way: nothing before the send reads the number.
+    AlongsideCall,
+}
+
+/// One request's input estimate, shared by every reader of it.
+///
+/// Either already known ([`Self::ready`]) or being counted on a `request-estimate` thread
+/// ([`Self::counting`]). [`Self::get`] waits for the count, and every clone returns the same
+/// value from every call. A count that cannot run on its own thread — the spawn failed or the
+/// thread panicked — is taken on the thread that calls [`Self::get`], with the same
+/// [`count_tokens`], so the value never depends on where it was counted. Dropping the last clone
+/// joins a count still running, so no counting thread outlives the session.
+#[derive(Clone)]
+pub(crate) struct RequestEstimate(Arc<EstimateState>);
+
+struct EstimateState {
+    value: std::sync::OnceLock<u32>,
+    /// `None` for an estimate made ready.
+    counting: Mutex<Option<PendingCount>>,
+}
+
+struct PendingCount {
+    text: Arc<str>,
+    /// `None` once joined, or when the thread never started.
+    thread: Option<std::thread::JoinHandle<u32>>,
+}
+
+impl RequestEstimate {
+    /// An estimate whose value is already known.
+    pub(crate) fn ready(tokens: u32) -> Self {
+        Self(Arc::new(EstimateState {
+            value: std::sync::OnceLock::from(tokens),
+            counting: Mutex::new(None),
+        }))
+    }
+
+    /// Starts counting `text` on a `request-estimate` thread and returns at once.
+    pub(crate) fn counting(text: impl Into<Arc<str>>) -> Self {
+        Self::spawn_count(text.into(), count_tokens)
+    }
+
+    /// Starts counting `text` with `count` in place of [`count_tokens`], so a test can hold the
+    /// count back. The fallback count is still [`count_tokens`].
+    #[cfg(test)]
+    pub(crate) fn counting_with(
+        text: String,
+        count: impl FnOnce(&str) -> u32 + Send + 'static,
+    ) -> Self {
+        Self::spawn_count(text.into(), count)
+    }
+
+    fn spawn_count(text: Arc<str>, count: impl FnOnce(&str) -> u32 + Send + 'static) -> Self {
+        let counted = Arc::clone(&text);
+        #[cfg(test)]
+        let spawned = estimate_seams::spawn(move || count(&counted));
+        #[cfg(not(test))]
+        let spawned = std::thread::Builder::new()
+            .name("request-estimate".to_string())
+            .spawn(move || count(&counted));
+        Self(Arc::new(EstimateState {
+            value: std::sync::OnceLock::new(),
+            counting: Mutex::new(Some(PendingCount {
+                text,
+                thread: spawned.ok(),
+            })),
+        }))
+    }
+
+    /// The estimate, waiting for a count still running.
+    pub(crate) fn get(&self) -> u32 {
+        *self.0.value.get_or_init(|| {
+            let mut counting = self
+                .0
+                .counting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pending = counting
+                .as_mut()
+                .expect("an estimate without a value is counting");
+            let joined = pending.thread.take().and_then(|thread| thread.join().ok());
+            joined.unwrap_or_else(|| count_tokens(&pending.text))
+        })
+    }
+}
+
+impl std::fmt::Debug for RequestEstimate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.value.get() {
+            Some(tokens) => write!(f, "RequestEstimate({tokens})"),
+            None => f.write_str("RequestEstimate(counting)"),
+        }
+    }
+}
+
+impl Drop for EstimateState {
+    fn drop(&mut self) {
+        let thread = self
+            .counting
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|pending| pending.thread.take());
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The spawn seams [`RequestEstimate`] counts through in tests. Per test thread, so tests running
+/// side by side in one process do not see each other's spawns.
+#[cfg(test)]
+pub(crate) mod estimate_seams {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SPAWNS: Cell<usize> = const { Cell::new(0) };
+        static FAIL_SPAWN: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// How many counting threads this test thread has started, failed spawns included.
+    pub(crate) fn spawns() -> usize {
+        SPAWNS.with(Cell::get)
+    }
+
+    /// Makes every later spawn on this test thread fail, as a thread limit would.
+    pub(crate) fn fail_spawns(fail: bool) {
+        FAIL_SPAWN.with(|cell| cell.set(fail));
+    }
+
+    pub(super) fn spawn(
+        count: impl FnOnce() -> u32 + Send + 'static,
+    ) -> std::io::Result<std::thread::JoinHandle<u32>> {
+        SPAWNS.with(|cell| cell.set(cell.get() + 1));
+        if FAIL_SPAWN.with(Cell::get) {
+            return Err(std::io::Error::other("spawn refused by the test"));
+        }
+        std::thread::Builder::new()
+            .name("request-estimate".to_string())
+            .spawn(count)
+    }
+}
+
+/// The estimate of the request carrying `messages` under `choice`.
 ///
 /// With a report that applies, this is the reported count plus the per-message count of every
-/// message added after it. Otherwise it is [`ContextOccupancy::count`], the whole payload. A call
-/// whose tool array changed (`tools_refreshed`) sends a prefix no report covered, so the report
-/// is dropped first.
+/// message added after it, counted here. Otherwise it is [`ContextOccupancy::count`], the whole
+/// payload: counted here under [`EstimateTiming::BeforeSend`], and on a `request-estimate` thread
+/// under [`EstimateTiming::AlongsideCall`]. A call whose tool array changed (`tools_refreshed`)
+/// sends a prefix no report covered, so the report is dropped first.
+///
+/// `payload_json`, when given, must be the serialized payload of a request sent with no
+/// continuation: that string is exactly what [`ContextOccupancy::count`] serializes, so the
+/// counting thread takes it rather than building the payload a second time.
 pub(crate) fn request_estimate(
     reported: &mut Option<ReportedOccupancy>,
     occupancy: &ContextOccupancy<'_>,
     messages: &[Value],
     choice: &str,
     tools_refreshed: bool,
-) -> u32 {
+    timing: EstimateTiming,
+    payload_json: Option<&str>,
+) -> RequestEstimate {
     if tools_refreshed {
         *reported = None;
     }
@@ -4792,9 +4967,15 @@ pub(crate) fn request_estimate(
                 .iter()
                 .map(message_tokens)
                 .fold(0, u64::saturating_add);
-            reported.tokens.saturating_add(saturating_u32(added))
+            RequestEstimate::ready(reported.tokens.saturating_add(saturating_u32(added)))
         }
-        None => occupancy.count(messages),
+        None => match timing {
+            EstimateTiming::BeforeSend => RequestEstimate::ready(occupancy.count(messages)),
+            EstimateTiming::AlongsideCall => RequestEstimate::counting(match payload_json {
+                Some(payload_json) => Arc::from(payload_json),
+                None => Arc::from(occupancy.payload_text(messages)),
+            }),
+        },
     }
 }
 
@@ -4976,12 +5157,13 @@ static TOKEN_TABLE_BUILD_SPAWNS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Builds the `cl100k_base` tables behind [`count_tokens`] on a `cl100k-build` thread of their
-/// own, at most once per process. An agent session counts tokens before its first inference
-/// request and the build costs tens of milliseconds; started at staging, it overlaps artifact
-/// loading instead of delaying that request. A [`count_tokens`] call that arrives mid-build
-/// blocks on the `LazyLock` until the build completes, and a failed spawn leaves the build to
-/// the first [`count_tokens`] call. The tables are process-wide and carry no session's data, so
-/// a process that stages many sessions builds them once.
+/// own, at most once per process. An agent session counts its first inference request's tokens,
+/// before sending it under a spend ceiling and alongside the call otherwise, and the build costs
+/// tens of milliseconds; started at staging, it overlaps artifact loading instead of delaying that
+/// count. A [`count_tokens`] call that arrives mid-build blocks on the `LazyLock` until the build
+/// completes, and a failed spawn leaves the build to the first [`count_tokens`] call. The tables
+/// are process-wide and carry no session's data, so a process that stages many sessions builds
+/// them once.
 pub(crate) fn build_token_tables_in_background() {
     TOKEN_TABLE_BUILD.call_once(|| {
         #[cfg(test)]
@@ -8121,7 +8303,16 @@ mod tests {
         let mut reported = report(500, messages.len());
 
         assert_eq!(
-            request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+            request_estimate(
+                &mut reported,
+                &occupancy,
+                &messages,
+                CHOICE,
+                false,
+                EstimateTiming::BeforeSend,
+                None
+            )
+            .get(),
             500,
             "nothing added since the report"
         );
@@ -8130,7 +8321,16 @@ mod tests {
         let added = tokens_of(&messages[2]);
         assert!(added > 0);
         assert_eq!(
-            request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+            request_estimate(
+                &mut reported,
+                &occupancy,
+                &messages,
+                CHOICE,
+                false,
+                EstimateTiming::BeforeSend,
+                None
+            )
+            .get(),
             500 + added
         );
         let mut without_id = messages[2].clone();
@@ -8147,7 +8347,16 @@ mod tests {
         let occupancy = occupancy_fixture(&[], "sys");
         let messages = occupancy_messages();
         assert_eq!(
-            request_estimate(&mut None, &occupancy, &messages, CHOICE, false),
+            request_estimate(
+                &mut None,
+                &occupancy,
+                &messages,
+                CHOICE,
+                false,
+                EstimateTiming::BeforeSend,
+                None
+            )
+            .get(),
             occupancy.count(&messages)
         );
     }
@@ -8202,7 +8411,16 @@ mod tests {
 
         messages.push(tool_result("hello"));
         assert_eq!(
-            request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+            request_estimate(
+                &mut reported,
+                &occupancy,
+                &messages,
+                CHOICE,
+                false,
+                EstimateTiming::BeforeSend,
+                None
+            )
+            .get(),
             825 + tokens_of(&messages[3])
         );
 
@@ -8223,17 +8441,44 @@ mod tests {
             Continuation::ReopenFeedback("the answer missed the second file".to_string()),
             Continuation::Outcomes("member reviewer answered: looks right".to_string()),
         ] {
-            let before = request_estimate(&mut reported, &occupancy, &messages, CHOICE, false);
+            let before = request_estimate(
+                &mut reported,
+                &occupancy,
+                &messages,
+                CHOICE,
+                false,
+                EstimateTiming::BeforeSend,
+                None,
+            )
+            .get();
             let message = user_message(continuation.into_payload(None));
             let added = tokens_of(&message);
             messages.push(message);
             assert_eq!(
-                request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+                request_estimate(
+                    &mut reported,
+                    &occupancy,
+                    &messages,
+                    CHOICE,
+                    false,
+                    EstimateTiming::BeforeSend,
+                    None
+                )
+                .get(),
                 before + added
             );
         }
         assert_eq!(
-            request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+            request_estimate(
+                &mut reported,
+                &occupancy,
+                &messages,
+                CHOICE,
+                false,
+                EstimateTiming::BeforeSend,
+                None
+            )
+            .get(),
             640 + tokens_of(&messages[2]) + tokens_of(&messages[3])
         );
     }
@@ -8246,7 +8491,16 @@ mod tests {
         let mut reported = report(10, messages.len());
 
         assert_eq!(
-            request_estimate(&mut reported, &occupancy, &messages, CHOICE, true),
+            request_estimate(
+                &mut reported,
+                &occupancy,
+                &messages,
+                CHOICE,
+                true,
+                EstimateTiming::BeforeSend,
+                None
+            )
+            .get(),
             occupancy.count(&messages)
         );
         assert_eq!(reported, None);
@@ -8267,7 +8521,16 @@ mod tests {
 
         assert_eq!(reported, None);
         assert_eq!(
-            request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+            request_estimate(
+                &mut reported,
+                &occupancy,
+                &messages,
+                CHOICE,
+                false,
+                EstimateTiming::BeforeSend,
+                None
+            )
+            .get(),
             occupancy.count(&messages)
         );
     }
@@ -8319,19 +8582,46 @@ mod tests {
 
         let mut reported = report(10, messages.len());
         assert_eq!(
-            request_estimate(&mut reported, &occupancy, &messages, "gpt", false),
+            request_estimate(
+                &mut reported,
+                &occupancy,
+                &messages,
+                "gpt",
+                false,
+                EstimateTiming::BeforeSend,
+                None
+            )
+            .get(),
             whole
         );
         assert_eq!(reported, report(10, messages.len()));
         assert_eq!(
-            request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+            request_estimate(
+                &mut reported,
+                &occupancy,
+                &messages,
+                CHOICE,
+                false,
+                EstimateTiming::BeforeSend,
+                None
+            )
+            .get(),
             10,
             "switching back finds it"
         );
 
         let mut reported = report(10, messages.len() + 1);
         assert_eq!(
-            request_estimate(&mut reported, &occupancy, &messages, CHOICE, false),
+            request_estimate(
+                &mut reported,
+                &occupancy,
+                &messages,
+                CHOICE,
+                false,
+                EstimateTiming::BeforeSend,
+                None
+            )
+            .get(),
             whole
         );
     }
@@ -8348,6 +8638,233 @@ mod tests {
         assert!(!actual(849).crosses(1000, 0.85));
         assert!(SessionOccupancy::estimate(850).crosses(1000, 0.85));
         assert!(!actual(u32::MAX).crosses(0, 0.85));
+    }
+
+    // ── Request estimate timing ──────────────────────────────────────────────────────
+
+    /// An estimate whose count waits for `release` before counting `text` with
+    /// [`count_tokens`].
+    fn held_estimate(text: &str) -> (RequestEstimate, std::sync::mpsc::Sender<()>) {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let estimate = RequestEstimate::counting_with(text.to_string(), move |text| {
+            let _ = released.recv();
+            count_tokens(text)
+        });
+        (estimate, release)
+    }
+
+    /// The serialized payload of a request sent with no continuation is the text the whole-payload
+    /// count serializes, so the counting thread may take it instead.
+    #[test]
+    fn a_payload_without_a_continuation_counts_as_the_whole_payload() {
+        let tools = [json!({"name": "bash", "description": "run", "input_schema": {}})];
+        let occupancy = occupancy_fixture(&tools, "sys");
+        let messages = occupancy_messages();
+        let payload = build_call_payload(
+            occupancy.model,
+            occupancy.max_output_tokens,
+            &messages,
+            occupancy.tools,
+            occupancy.system,
+            None,
+            occupancy.prompt_cache_key,
+            occupancy.view.as_ref(),
+        );
+        let payload_json = serde_json::to_string(&payload).unwrap();
+        assert_eq!(payload_json, occupancy.payload_text(&messages));
+        assert_eq!(count_tokens(&payload_json), occupancy.count(&messages));
+    }
+
+    /// Counted alongside the call, the whole-payload estimate is the number counted before the
+    /// send, from the serialized payload or from the occupancy. Counted before the send, it
+    /// starts no thread.
+    #[test]
+    fn a_whole_payload_estimate_is_the_same_whenever_it_is_counted() {
+        let occupancy = occupancy_fixture(&[], "sys");
+        let messages = occupancy_messages();
+        let payload_json = occupancy.payload_text(&messages);
+
+        let spawns = estimate_seams::spawns();
+        let before = request_estimate(
+            &mut None,
+            &occupancy,
+            &messages,
+            CHOICE,
+            false,
+            EstimateTiming::BeforeSend,
+            Some(&payload_json),
+        );
+        assert_eq!(estimate_seams::spawns(), spawns, "counted before the send");
+        assert_eq!(before.get(), occupancy.count(&messages));
+
+        for payload_json in [Some(payload_json.as_str()), None] {
+            let alongside = request_estimate(
+                &mut None,
+                &occupancy,
+                &messages,
+                CHOICE,
+                false,
+                EstimateTiming::AlongsideCall,
+                payload_json,
+            );
+            assert_eq!(alongside.get(), before.get());
+        }
+        assert_eq!(estimate_seams::spawns(), spawns + 2);
+    }
+
+    /// An anchored estimate is counted at once whatever the timing: it is a handful of new
+    /// messages, not the whole payload.
+    #[test]
+    fn an_anchored_estimate_starts_no_thread() {
+        let occupancy = occupancy_fixture(&[], "sys");
+        let messages = occupancy_messages();
+        let spawns = estimate_seams::spawns();
+        let estimate = request_estimate(
+            &mut report(500, messages.len()),
+            &occupancy,
+            &messages,
+            CHOICE,
+            false,
+            EstimateTiming::AlongsideCall,
+            None,
+        );
+        assert_eq!(estimate_seams::spawns(), spawns);
+        assert_eq!(estimate.get(), 500);
+    }
+
+    /// Every clone, on every thread, reads the one count.
+    #[test]
+    fn every_clone_of_an_estimate_reads_one_count() {
+        let text = "one count shared by every reader";
+        let (estimate, release) = held_estimate(text);
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let estimate = estimate.clone();
+                std::thread::spawn(move || estimate.get())
+            })
+            .collect();
+        release.send(()).unwrap();
+        for reader in readers {
+            assert_eq!(reader.join().unwrap(), count_tokens(text));
+        }
+        assert_eq!(estimate.get(), count_tokens(text));
+    }
+
+    /// Dropping the last clone of an estimate still counting waits for the count, so the thread
+    /// does not outlive it.
+    #[test]
+    fn dropping_a_counting_estimate_joins_its_thread() {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let estimate = RequestEstimate::counting_with("text".to_string(), {
+            let finished = Arc::clone(&finished);
+            move |text| {
+                let _ = released.recv();
+                finished.store(true, Ordering::SeqCst);
+                count_tokens(text)
+            }
+        });
+        let clone = estimate.clone();
+        drop(estimate);
+        assert!(!finished.load(Ordering::SeqCst), "a clone still holds it");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            release.send(()).unwrap();
+        });
+        drop(clone);
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the drop waited for the count"
+        );
+        releaser.join().unwrap();
+    }
+
+    /// A count whose thread cannot start is taken on the reader's thread, with the same value.
+    #[test]
+    fn a_failed_spawn_counts_on_the_reader_s_thread() {
+        let text = "counted without a thread of its own";
+        estimate_seams::fail_spawns(true);
+        let spawns = estimate_seams::spawns();
+        let estimate = RequestEstimate::counting(text);
+        estimate_seams::fail_spawns(false);
+        assert_eq!(estimate_seams::spawns(), spawns + 1, "a spawn was tried");
+        assert_eq!(estimate.get(), count_tokens(text));
+    }
+
+    /// A count whose thread panics is taken again on the reader's thread, with the same value.
+    #[test]
+    fn a_panicked_count_is_taken_on_the_reader_s_thread() {
+        let text = "counted again after the thread died";
+        let estimate = RequestEstimate::counting_with(text.to_string(), |_| panic!("count failed"));
+        assert_eq!(estimate.get(), count_tokens(text));
+    }
+
+    /// The turn's records, when the response is in hand before the count that ran alongside the
+    /// call is done: the loop's order after the call — wait for the estimate, settle, write the
+    /// `inference` line — settles and writes nothing until the count is in, and then carries the
+    /// whole count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_count_done_after_the_response_reaches_every_record_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut trace = content_capture_writer(dir.path()).await;
+        let meter = Arc::new(crate::spend::SpendMeter::new(None, None));
+        let text = "a request whose count is still running when the response arrives";
+        let (estimate, release) = held_estimate(text);
+        let admission = meter.admit_request(&estimate, 4096).unwrap();
+        let output_tokens = 7u32;
+
+        let written = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tail = tokio::spawn({
+            let written = Arc::clone(&written);
+            async move {
+                let input_tokens = estimate.get();
+                admission.settle(u64::from(input_tokens), u64::from(output_tokens));
+                trace
+                    .write_turn_inference(
+                        1,
+                        Some(u64::from(input_tokens)),
+                        Some(u64::from(output_tokens)),
+                        "end_turn".to_string(),
+                        Some("end_turn"),
+                        None,
+                        None,
+                        Vec::new(),
+                        None,
+                        None,
+                        None,
+                        RetryNote::default(),
+                    )
+                    .await
+                    .unwrap();
+                trace.flush().await.unwrap();
+                written.store(true, Ordering::SeqCst);
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !written.load(Ordering::SeqCst),
+            "nothing is written before the count"
+        );
+        assert_eq!(meter.used(), 0, "nothing is settled before the count");
+        let inference_lines = || {
+            std::fs::read_to_string(dir.path().join("trace.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|event| event["event_type"] == "inference")
+                .collect::<Vec<_>>()
+        };
+        assert!(inference_lines().is_empty());
+
+        release.send(()).unwrap();
+        tail.await.unwrap();
+        let lines = inference_lines();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["input_tokens"], count_tokens(text));
+        assert_eq!(lines[0]["output_tokens"], output_tokens);
+        assert_eq!(meter.used(), u64::from(count_tokens(text) + output_tokens));
+        assert!(!meter.has_open_admission());
     }
 }
 

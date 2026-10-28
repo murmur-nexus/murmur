@@ -203,12 +203,12 @@ pub(crate) struct InferenceRetryRecord {
 ///
 /// An attempt that failed on a status or a broken connection is released without charge. Any
 /// other is charged as a failed call is: the provider's counts from its failed payload when they
-/// make a report, its input estimate alone otherwise.
+/// make a report, its input estimate alone otherwise. Only that last charge reads the estimate,
+/// so only it waits for an estimate still counting.
 pub(crate) fn charge_retried_attempt(
     admission: SpendAdmission,
     reason: RetryReason,
     counts: Option<ProviderCounts>,
-    input_tokens: u64,
 ) -> u64 {
     if reason.releases_admission() {
         admission.release();
@@ -219,10 +219,7 @@ pub(crate) fn charge_retried_attempt(
             admission.settle(counts.request, counts.completion);
             counts.request.saturating_add(counts.completion)
         }
-        None => {
-            drop(admission);
-            input_tokens
-        }
+        None => admission.charge_input(),
     }
 }
 
@@ -433,6 +430,33 @@ mod tests {
             max_delay_ms,
         }
         .into()
+    }
+
+    /// A status or connection failure releases its admission without waiting for an estimate
+    /// still counting; a driver failure with no report charges the count.
+    #[test]
+    fn inference_retry_charge_reads_the_estimate_only_to_charge_it() {
+        let meter = std::sync::Arc::new(crate::spend::SpendMeter::new(None, None));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let estimate = crate::agent::RequestEstimate::counting_with(String::new(), move |_| {
+            let _ = released.recv();
+            120
+        });
+
+        for reason in [RetryReason::Status, RetryReason::Connection] {
+            let admission = meter.admit_request(&estimate, 500).unwrap();
+            assert_eq!(charge_retried_attempt(admission, reason, None), 0);
+        }
+        assert!(!meter.has_open_admission());
+        assert_eq!(meter.used(), 0);
+
+        let admission = meter.admit_request(&estimate, 500).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            charge_retried_attempt(admission, RetryReason::Driver, None),
+            120
+        );
+        assert_eq!(meter.used(), 120);
     }
 
     #[test]

@@ -1690,6 +1690,16 @@ A session with `inference.max_session_tokens` set therefore reserves the whole o
 call: with the cap taken from the driver's table, that is the model's full output ceiling. Set
 `inference.max_tokens` to reserve less.
 
+When an agent turn's request is measured depends on whether any spend ceiling covers the session:
+
+| In effect | The request is measured |
+|---|---|
+| `inference.max_session_tokens`, [`spend.machine_tokens_per_day`](config.md#spend), or both | Before it is sent, and admitted by that number |
+| Neither | Alongside the call, while the provider answers |
+
+Either way the trace, the `on-inference` hook event and the spend meter carry the same
+`input_tokens`.
+
 A call that does not fit is never sent. The refusal appears as:
 
 | Surface | What it says |
