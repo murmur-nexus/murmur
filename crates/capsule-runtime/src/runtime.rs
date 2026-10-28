@@ -2623,8 +2623,9 @@ pub fn stage_session(
         agent::build_token_tables_in_background();
     }
     // Past the host probes' forks and the last fork staging makes, so no child is forked while
-    // this process moves into its own scope. A fork added to staging after `build_engine()` goes
-    // above this call, or this call moves below it. A capsule that needs a scope only for a native
+    // this process moves into its own scope. A fork added between here and `prepare_scope` in
+    // `launch` (later in staging, in a caller before it launches, or early in `launch`) goes above
+    // this call, or this call moves below it. A capsule that needs a scope only for a native
     // artifact is known once the artifacts resolve, and `prepare_scope` resolves the base for it.
     if cgroup::requires_process_bounding(&request.capability_policy, false) {
         cgroup::resolve_delegated_base_in_background();

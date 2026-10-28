@@ -3043,10 +3043,10 @@ mod tests {
         );
     }
 
-    /// The background resolution and a direct one reach the same answer, on a delegated host and
-    /// on one that is not: a base resolved in the background is the one every later caller gets,
-    /// and a failure resolved in the background leaves the next caller to fail with the same
-    /// reason rather than inheriting a cached error or a half-made base.
+    /// A background resolution racing direct callers leaves them agreeing, whichever reaches the
+    /// lock first, on a delegated host and on one that is not: every caller gets the one base, or
+    /// each fails afresh with the same reason rather than inheriting a cached error or a half-made
+    /// base.
     #[cfg(target_os = "linux")]
     #[test]
     fn background_resolution_agrees_with_a_direct_one() {
