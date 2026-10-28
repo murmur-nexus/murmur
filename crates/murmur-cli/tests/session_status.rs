@@ -1244,25 +1244,6 @@ fn assert_not_installed(stderr: &str) {
     );
 }
 
-/// Every `trace.jsonl` under `dir`.
-fn traces_under(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .map(|entry| entry.unwrap().path())
-        .flat_map(|path| {
-            if path.is_dir() {
-                traces_under(&path)
-            } else if path.file_name().is_some_and(|name| name == "trace.jsonl") {
-                vec![path]
-            } else {
-                Vec::new()
-            }
-        })
-        .collect()
-}
-
 /// An installed capsule is resolved from `<workdir>/.murmur/artifacts`, whatever the current
 /// directory. On one with no `inference:` block `--deadline` is refused with the manifest form's
 /// code and message, a hint naming the capsule rather than a murmur.yaml, and nothing staged.
@@ -1295,15 +1276,12 @@ fn an_installed_script_capsule_refuses_a_deadline_from_the_workdir_store() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert_eq!(entries, [".murmur"], "{entries:?}");
-    let records = home.path().join(".murmur").join("records");
-    let groups: Vec<_> = fs::read_dir(&records)
+    let groups: Vec<_> = fs::read_dir(common::records_root(home.path()))
         .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
         .unwrap_or_default();
     assert!(groups.is_empty(), "{groups:?}");
-    assert_eq!(
-        traces_under(&home.path().join(".murmur")),
-        Vec::<PathBuf>::new()
-    );
+    let trace = common::find_file(&home.path().join(".murmur"), "trace.jsonl");
+    assert_eq!(trace, None);
     assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
 }
 
