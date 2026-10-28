@@ -2622,6 +2622,14 @@ pub fn stage_session(
     if request.inference.is_some() {
         agent::build_token_tables_in_background();
     }
+    // Past the host probes' forks and the last fork staging makes, so no child is forked while
+    // this process moves into its own scope. A fork added between here and `prepare_scope` in
+    // `launch` (later in staging, in a caller before it launches, or early in `launch`) goes above
+    // this call, or this call moves below it. A capsule that needs a scope only for a native
+    // artifact is known once the artifacts resolve, and `prepare_scope` resolves the base for it.
+    if cgroup::requires_process_bounding(&request.capability_policy, false) {
+        cgroup::resolve_delegated_base_in_background();
+    }
     let engine = build_engine()?;
     let compiled_forms = CompiledForms::new(
         &engine,
@@ -16277,6 +16285,78 @@ inference:
             murmur_md.contains("call by name to load guidance"),
             "MURMUR.md missing callable skill hint:\n{murmur_md}"
         );
+    }
+
+    /// Staging creates the session's runtime and records directories under `HOME`, so the body
+    /// runs in a process of its own with a scratch one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_resolves_the_cgroup_base_in_the_background_only_for_a_subprocess_route() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(
+            "runtime::tests::staging_resolves_the_cgroup_base_in_the_background_only_for_a_subprocess_route_inner",
+            home.path(),
+        );
+    }
+
+    /// Each manifest subprocess route alone starts one background resolution of the delegated
+    /// cgroup base per staging, and a capsule with none starts no thread.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by staging_resolves_the_cgroup_base_in_the_background_only_for_a_subprocess_route under a scratch HOME"]
+    fn staging_resolves_the_cgroup_base_in_the_background_only_for_a_subprocess_route_inner() {
+        use std::sync::atomic::Ordering;
+
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        // Every route but the bare policy's is refused with `E-CAP-005` on a host that cannot
+        // give the session a network namespace.
+        if crate::network_namespace::skip_without_egress_namespace(
+            "staging_resolves_the_cgroup_base_in_the_background_only_for_a_subprocess_route_inner",
+        ) {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "shell.allow",
+                CapabilityPolicy {
+                    shell_allow: vec!["bash".to_string()],
+                    ..CapabilityPolicy::default()
+                },
+                1,
+            ),
+            (
+                "spawn.allow",
+                CapabilityPolicy {
+                    spawn_allow: vec!["worker".to_string()],
+                    ..CapabilityPolicy::default()
+                },
+                1,
+            ),
+            (
+                "install.tool",
+                CapabilityPolicy {
+                    install_tool: vec!["local/tool-*".to_string()],
+                    ..CapabilityPolicy::default()
+                },
+                1,
+            ),
+            ("no route", CapabilityPolicy::default(), 0),
+        ];
+        for (route, policy, expected) in cases {
+            let request = StageRequest {
+                capability_policy: policy,
+                ..local_source_skill_agent_request(project.path())
+            };
+            let before = cgroup::DELEGATED_BASE_RESOLUTION_SPAWNS.load(Ordering::SeqCst);
+            let staged = stage_session(Arc::new(LocalSourceOnlyRegistry), request)
+                .unwrap_or_else(|error| panic!("{route}: {error}"));
+            let after = cgroup::DELEGATED_BASE_RESOLUTION_SPAWNS.load(Ordering::SeqCst);
+            assert_eq!(after - before, expected, "{route}");
+            drop(staged);
+        }
     }
 
     /// Staging creates the session's runtime and records directories under `HOME`, so the body
