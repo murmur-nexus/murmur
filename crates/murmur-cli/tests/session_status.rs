@@ -1138,8 +1138,10 @@ fn deadline_arguments_are_validated() {
             "30",
         ],
     );
+    assert!(stderr.contains("error[E-IO-003]"), "{stderr}");
+    assert!(stderr.contains(DEADLINE_REFUSAL), "{stderr}");
     assert!(
-        stderr.contains("--deadline requires an agent capsule"),
+        stderr.contains("hint: add an inference: block to murmur.yaml, or drop --deadline"),
         "{stderr}"
     );
 
@@ -1181,6 +1183,189 @@ fn deadline_arguments_are_validated() {
     let help = String::from_utf8_lossy(&help.stdout);
     assert!(help.contains("--deadline"), "{help}");
     assert!(!help.contains("inherited-deadline"), "{help}");
+}
+
+// ── --deadline under --capsule ────────────────────────────────────────────
+
+const DEADLINE_REFUSAL: &str =
+    "--deadline requires an agent capsule: this manifest has no inference: block";
+const PROBE: &str = "local/probe";
+const PROBE_VERSION: &str = "0.1.0";
+
+/// Publishes the script capsule `local/probe@0.1.0` into `<dir>/.murmur/artifacts`. It has no
+/// component: the deadline check runs before one is extracted.
+fn publish_probe(dir: &Path, manifest_body: &str) {
+    common::publish_to_store(
+        &dir.join(".murmur").join("artifacts"),
+        PROBE,
+        PROBE_VERSION,
+        "capsule",
+        manifest_body,
+        None,
+    );
+}
+
+/// `mur run --capsule local/probe --capsule-version 0.1.0 --deadline 30` plus `extra`, from `cwd`
+/// under `home`, refused; its stderr. A resolved script capsule is refused with `E-IO-003` and an
+/// unresolved one with `E-RUN-008`, so the code says which stores resolution searched.
+fn capsule_deadline_refusal(home: &TempDir, cwd: &Path, extra: &[&str]) -> String {
+    let output = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .current_dir(cwd)
+        .args([
+            "run",
+            "--capsule",
+            PROBE,
+            "--capsule-version",
+            PROBE_VERSION,
+            "--deadline",
+            "30",
+            "--no-env-file",
+        ])
+        .args(extra)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(1), "{extra:?}: {stderr}");
+    stderr
+}
+
+fn assert_resolved(stderr: &str) {
+    assert!(stderr.contains("error[E-IO-003]"), "{stderr}");
+    assert!(stderr.contains(DEADLINE_REFUSAL), "{stderr}");
+}
+
+fn assert_not_installed(stderr: &str) {
+    assert!(stderr.contains("error[E-RUN-008]"), "{stderr}");
+    assert!(
+        stderr.contains("capsule 'local/probe@0.1.0' is not installed"),
+        "{stderr}"
+    );
+}
+
+/// Every `trace.jsonl` under `dir`.
+fn traces_under(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .map(|entry| entry.unwrap().path())
+        .flat_map(|path| {
+            if path.is_dir() {
+                traces_under(&path)
+            } else if path.file_name().is_some_and(|name| name == "trace.jsonl") {
+                vec![path]
+            } else {
+                Vec::new()
+            }
+        })
+        .collect()
+}
+
+/// An installed capsule is resolved from `<workdir>/.murmur/artifacts`, whatever the current
+/// directory. On one with no `inference:` block `--deadline` is refused with the manifest form's
+/// code and message, a hint naming the capsule rather than a murmur.yaml, and nothing staged.
+#[test]
+fn an_installed_script_capsule_refuses_a_deadline_from_the_workdir_store() {
+    let home = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    publish_probe(workdir.path(), "artifacts: []\n");
+
+    let stderr = capsule_deadline_refusal(
+        &home,
+        elsewhere.path(),
+        &["--workdir", workdir.path().to_str().unwrap()],
+    );
+    assert_resolved(&stderr);
+    let hint = stderr
+        .lines()
+        .find(|line| line.trim_start().starts_with("hint:"))
+        .unwrap_or_else(|| panic!("no hint line: {stderr}"));
+    assert_eq!(
+        hint.trim(),
+        "hint: local/probe@0.1.0 is a script capsule, which takes no deadline; drop --deadline",
+        "{stderr}"
+    );
+    assert!(!stderr.contains("murmur.yaml"), "{stderr}");
+
+    let entries: Vec<_> = fs::read_dir(workdir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, [".murmur"], "{entries:?}");
+    let records = home.path().join(".murmur").join("records");
+    let groups: Vec<_> = fs::read_dir(&records)
+        .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+        .unwrap_or_default();
+    assert!(groups.is_empty(), "{groups:?}");
+    assert_eq!(
+        traces_under(&home.path().join(".murmur")),
+        Vec::<PathBuf>::new()
+    );
+    assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+}
+
+/// Without `--workdir` the current directory's `.murmur/artifacts` is the project store.
+#[test]
+fn an_installed_capsule_resolves_from_the_current_directory_without_a_workdir() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    publish_probe(project.path(), "artifacts: []\n");
+
+    assert_resolved(&capsule_deadline_refusal(&home, project.path(), &[]));
+    assert_not_installed(&capsule_deadline_refusal(&home, elsewhere.path(), &[]));
+}
+
+/// A capsule missing from the project store resolves from the global store `~/.murmur/artifacts`;
+/// one in both resolves from the project store.
+#[test]
+fn an_installed_capsule_falls_back_to_the_global_store_behind_the_project_store() {
+    let home = TempDir::new().unwrap();
+    let empty = TempDir::new().unwrap();
+    publish_probe(home.path(), "artifacts: []\n");
+    assert_resolved(&capsule_deadline_refusal(&home, empty.path(), &[]));
+
+    // The global copy's manifest does not parse, so resolving it fails before the deadline check.
+    let home = TempDir::new().unwrap();
+    publish_probe(home.path(), "artifacts: 7\n");
+    let global_only = capsule_deadline_refusal(&home, empty.path(), &[]);
+    assert!(global_only.contains("error[E-MAN-002]"), "{global_only}");
+
+    let project = TempDir::new().unwrap();
+    publish_probe(project.path(), "artifacts: []\n");
+    assert_resolved(&capsule_deadline_refusal(
+        &home,
+        empty.path(),
+        &["--workdir", project.path().to_str().unwrap()],
+    ));
+}
+
+/// The hidden `--store-root`, which `mur run --roster` passes every peer, names the store
+/// directory in place of `--workdir`; a relative one is taken against the current directory.
+#[test]
+fn the_store_root_replaces_the_workdir_as_the_store_directory() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let store_root = cwd.path().join("store-root");
+    let workdir = cwd.path().join("workdir");
+    fs::create_dir_all(&store_root).unwrap();
+    fs::create_dir_all(&workdir).unwrap();
+    let flags = [
+        "--store-root",
+        "store-root",
+        "--workdir",
+        workdir.to_str().unwrap(),
+    ];
+
+    publish_probe(&store_root, "artifacts: []\n");
+    assert_resolved(&capsule_deadline_refusal(&home, cwd.path(), &flags));
+
+    fs::remove_dir_all(store_root.join(".murmur")).unwrap();
+    publish_probe(&workdir, "artifacts: []\n");
+    assert_not_installed(&capsule_deadline_refusal(&home, cwd.path(), &flags));
 }
 
 /// Only the launch that owns its process enforces a deadline; `launch_session` refuses a session
