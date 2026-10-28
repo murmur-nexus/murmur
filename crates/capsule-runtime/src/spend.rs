@@ -10,7 +10,10 @@
 //!   `output_tokens` its `inference` line carries.
 //! - `process`: the harness's own reported counts, the only measurement of that transport there is.
 //!
-//! The reservation an admission makes before an `http` call is always the runtime's estimate.
+//! Under a ceiling, the reservation an admission makes before an `http` call is always the
+//! runtime's estimate, so an agent-loop request is measured before it is sent. With no ceiling
+//! nothing reads the reservation, and the request's estimate may still be counting when it is sent
+//! ([`SpendMeter::admit_request`]); every charge still uses the finished count.
 //!
 //! [`SpendMeter`] is the one per-session account. Under `http` a call is admitted against it
 //! before dispatch and settled once its response is parsed; the [`SpendAdmission`] guard releases
@@ -47,7 +50,7 @@ use std::{
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::errors::RuntimeError;
+use crate::{agent::RequestEstimate, errors::RuntimeError};
 
 /// The ledger directory, under `~/.murmur`.
 pub(crate) const SPEND_DIR: &str = "spend";
@@ -185,6 +188,40 @@ impl SpendMeter {
         self.machine.as_ref().map(|ledger| ledger.ceiling)
     }
 
+    /// Whether an agent request must be measured before it is sent: a session or machine ceiling
+    /// is in effect, and admits each request by its input. Fixed for the meter's life.
+    pub(crate) fn measures_before_send(&self) -> bool {
+        self.session_ceiling.is_some() || self.machine.is_some()
+    }
+
+    /// Admit one agent-loop request whose input is `estimate` and which may request up to
+    /// `max_output_tokens` of output.
+    ///
+    /// Under a ceiling ([`Self::measures_before_send`]) this is [`Self::admit`] with the estimate,
+    /// waited for if it is still counting, so a ceiling is never asked without the number. With
+    /// no ceiling nothing can refuse the request: the admission opens at once, reserving
+    /// `max_output_tokens`, which nothing reads without a ceiling, and keeps the estimate as its
+    /// input until its charge needs it.
+    pub(crate) fn admit_request(
+        self: &Arc<Self>,
+        estimate: &RequestEstimate,
+        max_output_tokens: u64,
+    ) -> Result<SpendAdmission, SpendRefusal> {
+        if self.measures_before_send() {
+            return self.admit(u64::from(estimate.get()), max_output_tokens);
+        }
+        let mut state = self.lock();
+        state.reserved = state.reserved.saturating_add(max_output_tokens);
+        state.open = state.open.saturating_add(1);
+        drop(state);
+        Ok(SpendAdmission {
+            meter: Arc::clone(self),
+            reserved: max_output_tokens,
+            input: AdmissionInput::Deferred(estimate.clone()),
+            finished: false,
+        })
+    }
+
     /// Admit one driver call whose input measures `input_tokens` and which may request up to
     /// `max_output_tokens` of output.
     ///
@@ -239,7 +276,7 @@ impl SpendMeter {
         Ok(SpendAdmission {
             meter: Arc::clone(self),
             reserved: requested,
-            input_tokens,
+            input: AdmissionInput::Measured(input_tokens),
             finished: false,
         })
     }
@@ -368,15 +405,25 @@ impl SpendMeter {
 pub(crate) struct SpendAdmission {
     meter: Arc<SpendMeter>,
     reserved: u64,
-    input_tokens: u64,
+    input: AdmissionInput,
     finished: bool,
+}
+
+/// What an unsettled admission charges as its input.
+#[derive(Debug)]
+enum AdmissionInput {
+    /// Measured before admission, as every admission under a ceiling is.
+    Measured(u64),
+    /// Still being counted when the admission opened. Only [`SpendMeter::admit_request`] makes
+    /// one, and only on a meter with no ceiling.
+    Deferred(RequestEstimate),
 }
 
 impl fmt::Debug for SpendAdmission {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpendAdmission")
             .field("reserved", &self.reserved)
-            .field("input_tokens", &self.input_tokens)
+            .field("input", &self.input)
             .finish()
     }
 }
@@ -396,12 +443,38 @@ impl SpendAdmission {
         self.finished = true;
         self.meter.release(self.reserved);
     }
+
+    /// Charge the input alone, as dropping the admission unsettled does, and return the charge.
+    pub(crate) fn charge_input(mut self) -> u64 {
+        self.finished = true;
+        self.finish_unsettled()
+    }
+
+    fn finish_unsettled(&self) -> u64 {
+        match &self.input {
+            AdmissionInput::Measured(input_tokens) => {
+                self.meter.finish(self.reserved, *input_tokens, 0);
+                *input_tokens
+            }
+            // Released before the count is waited for, so the admission closes at once. That
+            // reverses `finish`'s record-then-release order, which every ceiling check depends
+            // on: an admission taking the lock between the two would see the call neither
+            // reserved nor used. A deferred input exists only on a meter with no session ceiling
+            // and no machine ledger, so no check is asked.
+            AdmissionInput::Deferred(estimate) => {
+                self.meter.release(self.reserved);
+                let input_tokens = u64::from(estimate.get());
+                self.meter.record(input_tokens, 0);
+                input_tokens
+            }
+        }
+    }
 }
 
 impl Drop for SpendAdmission {
     fn drop(&mut self) {
         if !self.finished {
-            self.meter.finish(self.reserved, self.input_tokens, 0);
+            self.finish_unsettled();
         }
     }
 }
@@ -637,7 +710,7 @@ mod tests {
         os::unix::fs::PermissionsExt,
         process::{Child, Command, Stdio},
         sync::{
-            atomic::{AtomicI64, Ordering},
+            atomic::{AtomicBool, AtomicI64, Ordering},
             Barrier,
         },
         time::{Duration, Instant},
@@ -755,6 +828,163 @@ mod tests {
                 .settle(1_000, 1_000);
         }
         assert_eq!(meter.used(), 6_000);
+    }
+
+    // ── request admission ──────────────────────────────────────────────────────
+
+    /// An estimate that counts `tokens` once `release` is sent or dropped.
+    fn held_estimate(tokens: u32) -> (RequestEstimate, std::sync::mpsc::Sender<()>) {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let estimate = RequestEstimate::counting_with(String::new(), move |_| {
+            let _ = released.recv();
+            tokens
+        });
+        (estimate, release)
+    }
+
+    /// `(used, reserved, open)`.
+    fn meter_state(meter: &SpendMeter) -> (u64, u64, u32) {
+        let state = meter.lock();
+        (state.used, state.reserved, state.open)
+    }
+
+    #[test]
+    fn a_meter_measures_before_send_exactly_under_a_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!SpendMeter::new(None, None).measures_before_send());
+        assert!(SpendMeter::new(Some(1_000), None).measures_before_send());
+        let machine = ledger(dir.path(), "ses_a", 1_000, fixed_clock);
+        assert!(SpendMeter::new(None, Some(machine)).measures_before_send());
+    }
+
+    /// With no ceiling, a request is admitted while its count is still running, and its
+    /// unsettled drop charges exactly the count.
+    #[test]
+    fn a_request_with_no_ceiling_is_admitted_before_its_count() {
+        let meter = Arc::new(SpendMeter::new(None, None));
+        let (estimate, release) = held_estimate(120);
+        let admission = meter.admit_request(&estimate, 500).unwrap();
+        assert!(meter.has_open_admission());
+        assert_eq!(meter.used(), 0);
+
+        release.send(()).unwrap();
+        assert_eq!(estimate.get(), 120);
+        drop(admission);
+        assert_eq!(meter_state(&meter), (120, 0, 0));
+    }
+
+    /// Runs the same admissions through `admit` with each measured input and through
+    /// `admit_request` with an estimate released from another thread, on two meters `make_meter`
+    /// builds alike, and requires the same answers and the same meters after each.
+    fn assert_requests_admit_as_measured(make_meter: impl Fn() -> Arc<SpendMeter>) {
+        let measured = make_meter();
+        let requested = make_meter();
+        for (input, max_output) in [(300, 200), (400, 500), (50, 10)] {
+            let expected = measured.admit(u64::from(input), max_output);
+
+            let (estimate, release) = held_estimate(input);
+            let released = Arc::new(AtomicBool::new(false));
+            let releaser = std::thread::spawn({
+                let released = Arc::clone(&released);
+                move || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    released.store(true, Ordering::SeqCst);
+                    release.send(()).unwrap();
+                }
+            });
+            let actual = requested.admit_request(&estimate, max_output);
+            assert!(
+                released.load(Ordering::SeqCst),
+                "a ceiling is asked only with the count"
+            );
+            releaser.join().unwrap();
+
+            match (expected, actual) {
+                (Ok(expected), Ok(actual)) => {
+                    drop(expected);
+                    drop(actual);
+                }
+                (Err(expected), Err(actual)) => {
+                    assert_eq!(actual, expected);
+                    assert_eq!(actual.to_string(), expected.to_string());
+                }
+                (expected, actual) => panic!("admit gave {expected:?}, admit_request {actual:?}"),
+            }
+            assert_eq!(meter_state(&requested), meter_state(&measured));
+        }
+    }
+
+    #[test]
+    fn a_session_ceiling_admits_a_request_by_its_awaited_count() {
+        assert_requests_admit_as_measured(|| session_meter(1_000));
+    }
+
+    /// The same under a machine ceiling alone, and the two ledgers hold the same lines.
+    #[test]
+    fn a_machine_ceiling_admits_a_request_by_its_awaited_count() {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        assert_requests_admit_as_measured(|| {
+            let dir = dirs[next.fetch_add(1, Ordering::SeqCst)].path();
+            Arc::new(SpendMeter::new(
+                None,
+                Some(ledger(dir, "ses_a", 1_000, fixed_clock)),
+            ))
+        });
+        // Each line's `ts` is the wall clock at the append; every other byte must match.
+        let lines = |dir: &Path| -> Vec<serde_json::Value> {
+            let mut lines = Vec::new();
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+                for line in text.lines() {
+                    let mut line: serde_json::Value = serde_json::from_str(line).unwrap();
+                    line.as_object_mut().unwrap().remove("ts");
+                    lines.push(line);
+                }
+            }
+            lines
+        };
+        assert!(!lines(dirs[0].path()).is_empty());
+        assert_eq!(lines(dirs[1].path()), lines(dirs[0].path()));
+    }
+
+    /// Settling or releasing a deferred admission never waits on its count.
+    #[test]
+    fn a_deferred_admission_settles_and_releases_without_its_count() {
+        let meter = Arc::new(SpendMeter::new(None, None));
+        let (estimate, release) = held_estimate(120);
+
+        meter.admit_request(&estimate, 500).unwrap().settle(60, 15);
+        assert_eq!(meter_state(&meter), (75, 0, 0));
+        meter.admit_request(&estimate, 500).unwrap().release();
+        assert_eq!(meter_state(&meter), (75, 0, 0));
+
+        drop(release);
+        assert_eq!(estimate.get(), 120);
+    }
+
+    /// An unsettled deferred admission closes as soon as it is dropped, and charges its count
+    /// once the count is in.
+    #[test]
+    fn a_deferred_admission_dropped_closes_before_its_count() {
+        let meter = Arc::new(SpendMeter::new(None, None));
+        let (estimate, release) = held_estimate(120);
+        let admission = meter.admit_request(&estimate, 500).unwrap();
+        let dropper = std::thread::spawn(move || drop(admission));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while meter.has_open_admission() {
+            assert!(
+                Instant::now() < deadline,
+                "the drop never closed the admission"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(meter.used(), 0, "the count is still held");
+
+        release.send(()).unwrap();
+        dropper.join().unwrap();
+        assert_eq!(meter_state(&meter), (120, 0, 0));
     }
 
     #[test]

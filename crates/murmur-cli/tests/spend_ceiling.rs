@@ -440,6 +440,127 @@ fn ceiling_below_first_call_sends_nothing() {
     println!("upstream requests: 0; refusal line: {}", refusals[0]);
 }
 
+// ── Estimates measured before the send and alongside the call ────────────────
+
+/// The context id every run in an estimate comparison passes, so the prompt-cache key, and the
+/// count of the payload carrying it, is the same in each.
+const ESTIMATE_CONTEXT: &str = "ctx-estimates";
+
+/// Keys a trace line carries that differ from run to run whatever the estimate: clocks, durations
+/// and the ids each launch mints.
+const VOLATILE_KEYS: &[&str] = &[
+    "ts",
+    "timestamp",
+    "duration_ms",
+    "inference_duration_ms",
+    "session_id",
+    "task_id",
+    "context_id",
+    "event_id",
+    "parent_id",
+    "message_ids",
+    "port",
+];
+
+/// `line` without [`VOLATILE_KEYS`] or any other `*_ms` key, at any depth.
+fn without_volatile_keys(line: &Value) -> Value {
+    match line {
+        Value::Object(members) => Value::Object(
+            members
+                .iter()
+                .filter(|(key, _)| !VOLATILE_KEYS.contains(&key.as_str()) && !key.ends_with("_ms"))
+                .map(|(key, value)| (key.clone(), without_volatile_keys(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_volatile_keys).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Every line that carries a token count, normalized. `max_session_tokens` and
+/// `machine_tokens_per_day` are the ceilings the run was given, not counts, so they neither select
+/// a line nor stay on one.
+fn token_lines(trace: &[Value]) -> Vec<Value> {
+    trace
+        .iter()
+        .filter_map(|line| {
+            let mut line = without_volatile_keys(line);
+            let members = line.as_object_mut()?;
+            members.remove("max_session_tokens");
+            members.remove("machine_tokens_per_day");
+            members
+                .keys()
+                .any(|key| key.contains("tokens"))
+                .then_some(line)
+        })
+        .collect()
+}
+
+/// One run of `responses` per entry of `machine_ceilings`, each in a fresh home with that
+/// `spend.machine_tokens_per_day`, against one shared server, in one shared project directory and
+/// under [`ESTIMATE_CONTEXT`]. Returns each run's trace, after asserting the provider received the
+/// same requests in every run.
+///
+/// The ceiling is the machine one because `inference.max_session_tokens` is stated in the system
+/// prompt, so a session ceiling changes the request itself.
+fn estimate_runs(
+    responses: impl Fn() -> Vec<String>,
+    task: &str,
+    machine_ceilings: &[Option<u64>],
+) -> Vec<Vec<Value>> {
+    let server =
+        common::ScriptedServer::start(machine_ceilings.iter().flat_map(|_| responses()).collect());
+    let project = project(&http_manifest("spend-capsule", &server.endpoint, ""));
+    let mut traces = Vec::new();
+    let mut requests_seen = 0;
+    let mut requests_of_runs: Vec<Vec<String>> = Vec::new();
+    for &machine_ceiling in machine_ceilings {
+        let home = home_with_driver();
+        if let Some(ceiling) = machine_ceiling {
+            set_machine_ceiling(&home, ceiling);
+        }
+        let run = run_task_with(&home, &project, task, &["--context", ESTIMATE_CONTEXT]);
+        let trace = run.trace();
+        assert_eq!(exit_status(&trace, "session_end"), "ok", "{}", run.stderr);
+        assert_eq!(
+            events(&trace, "session_start")[0]["machine_tokens_per_day"],
+            json!(machine_ceiling)
+        );
+        let requests = server.requests();
+        requests_of_runs.push(
+            requests[requests_seen..]
+                .iter()
+                .map(Value::to_string)
+                .collect(),
+        );
+        requests_seen = requests.len();
+        traces.push(trace);
+    }
+    for requests in &requests_of_runs[1..] {
+        assert_eq!(
+            requests, &requests_of_runs[0],
+            "the provider must receive the same requests in every run"
+        );
+    }
+    traces
+}
+
+/// Without a ceiling each request is counted alongside the call; under one it is counted before
+/// the send. Either way the provider receives the same requests and every record carries the same
+/// numbers.
+#[test]
+fn estimates_counted_alongside_the_call_match_those_counted_before_the_send() {
+    let traces = estimate_runs(two_turns, "Say hello.", &[None, Some(1_000_000)]);
+    let (alongside, before) = (&traces[0], &traces[1]);
+
+    let turns = agent_turns(alongside);
+    assert_eq!(turns.len(), 2);
+    assert!(turns.iter().all(|&(input, output)| input > 0 && output > 0));
+    assert_eq!(turns, agent_turns(before));
+    assert_eq!(token_lines(alongside), token_lines(before));
+    println!("agent turns (input, output): {turns:?}");
+}
+
 // ── S4: a latched session refuses the next task ───────────────────────────────
 
 /// A scratch `$HOME` for the in-process launches below. Set once for the whole binary: the

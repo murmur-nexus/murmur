@@ -300,7 +300,10 @@ It charges every agent turn and every hook's `run-inference` call what
 charges it: under `transport: http`, the provider's request and completion when the call reported
 both, and the runtime's own counts otherwise. Under `transport: http`, before each call a run adds the day's
 total, its own calls still in flight and the call's input plus its most output; a call that would
-cross the ceiling is refused before it is sent. Under [`transport: process`](manifest.md#transport-process)
+cross the ceiling is refused before it is sent. With this ceiling or
+`inference.max_session_tokens` in effect, each agent turn's request is measured before it is sent;
+with neither, it is measured alongside the call. Either way the trace and the meter carry the same
+numbers. Under [`transport: process`](manifest.md#transport-process)
 there is nothing to admit: each turn is charged the counts the harness reported once it closes, and
 a turn that reaches the ceiling stops the run. Either way the stop carries `limit: "machine"` on its
 [`spend_ceiling_reached`](observability-schemas.md#spend-ceiling-reached) line. A machine refusal

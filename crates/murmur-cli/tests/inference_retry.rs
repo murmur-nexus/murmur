@@ -679,6 +679,59 @@ fn a_driver_marked_transient_failure_is_retried() {
     }
 }
 
+/// A retried attempt's charge is the request's estimate whether the estimate was counted before
+/// the send, under a machine ceiling, or alongside the call, with none: the provider receives the
+/// same requests and the records carry the same numbers. The ceiling is the machine one because
+/// `inference.max_session_tokens` is stated in the system prompt, so it changes the request.
+#[test]
+fn a_retried_attempt_charges_the_same_estimates_with_and_without_a_ceiling() {
+    let upstream = Upstream::start(|n| match n % 2 {
+        0 => answer(
+            200,
+            r#"{"fixture_break":{"error":"stream broke","transient":"true"}}"#,
+        ),
+        _ => answer(200, HOST_END_TURN),
+    });
+    let capsule = Home::new().capsule(RETRY_DRIVER, &upstream.endpoint, "", FAST_RETRY);
+
+    let mut charges = Vec::new();
+    for machine_ceiling in [None, Some(1_000_000u64)] {
+        let home = Home::new();
+        if let Some(ceiling) = machine_ceiling {
+            let config = home.home.path().join(".murmur/config.yaml");
+            let mut yaml = fs::read_to_string(&config).unwrap_or_default();
+            yaml.push_str(&format!("spend:\n  machine_tokens_per_day: {ceiling}\n"));
+            fs::write(&config, yaml).unwrap();
+        }
+        let run = home.run_with(&capsule, &["--context", "ctx-estimates"]);
+        assert_eq!(run.output.status.code(), Some(0), "{}", run.context());
+        assert_eq!(
+            run.of_type("session_start")[0]["machine_tokens_per_day"],
+            serde_json::json!(machine_ceiling)
+        );
+        let retries = run.retries();
+        assert_eq!(retries.len(), 1, "{}", run.context());
+        let record = run.the_turn_record();
+        assert_eq!(retries[0]["charged_tokens"], record["input_tokens"]);
+        charges.push((
+            retries[0]["charged_tokens"].clone(),
+            record["input_tokens"].clone(),
+            record["output_tokens"].clone(),
+        ));
+    }
+    let bodies: Vec<_> = upstream.requests().into_iter().map(|r| r.body).collect();
+    assert_eq!(bodies.len(), 4);
+    assert!(
+        bodies.iter().all(|body| body == &bodies[0]),
+        "every attempt sends the same request"
+    );
+    assert_eq!(charges[0], charges[1]);
+    println!(
+        "(charged_tokens, input_tokens, output_tokens): {:?}",
+        charges[0]
+    );
+}
+
 /// A response that breaks off mid-body after its `200` head is retried when the driver marks the
 /// break transient, and the turn commits only the retry's answer.
 #[test]
