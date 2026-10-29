@@ -51,7 +51,7 @@ use crate::{
         INFERENCE_ERROR_DRIVER_FAILED, INFERENCE_ERROR_MALFORMED_RESPONSE,
         MAX_TASK_FAILURE_REASON_BYTES, TASK_FAILED_COMPACTION_HOOK,
         TASK_FAILED_CREDENTIAL_REJECTED, TASK_FAILED_DRIVER_ERROR, TASK_FAILED_INPUT_TIMEOUT,
-        TASK_FAILED_MALFORMED_RESPONSE, TASK_FAILED_RUNTIME_ERROR,
+        TASK_FAILED_MALFORMED_RESPONSE, TASK_FAILED_OUTPUT_CAP, TASK_FAILED_RUNTIME_ERROR,
         TASK_FAILED_WORKDIR_PATH_REFUSED,
     },
     types::ResumeMode,
@@ -678,6 +678,10 @@ pub(crate) enum Continuation {
     /// command's output already fenced under `done-check`, then the runtime's own fact lines. Sent
     /// as written, never fenced again on the task's provenance.
     DoneCheck(String),
+    /// The runtime's fact line after a turn the provider cut at the output cap, as
+    /// [`output_cap_fact`] wrote it. Added inside the attempt, before the next turn, and never at
+    /// an attempt's start: a capped turn is not a turn end. Sent as written, never fenced.
+    OutputCapped(String),
 }
 
 impl Continuation {
@@ -690,7 +694,9 @@ impl Continuation {
         match self {
             Self::ReopenFeedback(feedback) => fence_task_payload(provenance, feedback),
             Self::Outcomes(outcomes) => (outcomes, None),
-            Self::KeepWorking(message) | Self::DoneCheck(message) => (message, None),
+            Self::KeepWorking(message) | Self::DoneCheck(message) | Self::OutputCapped(message) => {
+                (message, None)
+            }
         }
     }
 }
@@ -702,6 +708,20 @@ impl Continuation {
 /// reopen's feedback on the same condition.
 fn task_user_message(provenance: Option<TaskProvenance>, text: String) -> Value {
     user_message(fence_task_payload(provenance, text))
+}
+
+/// Add `continuation`'s user message to the task's conversation: appended to the record, then
+/// pushed onto the context. The one way the runtime inserts its own message, whether a continued
+/// attempt starts with it or a capped turn is followed by it.
+fn push_continuation(
+    messages: &mut Vec<Value>,
+    record: Option<&mut crate::conversation::ConversationRecord>,
+    continuation: Continuation,
+    provenance: Option<TaskProvenance>,
+) {
+    let message = user_message(continuation.into_payload(provenance));
+    append_to_record(record, std::slice::from_ref(&message));
+    messages.push(message);
 }
 
 /// A user message carrying `text`, labelled with `fence_source` when the text was wrapped.
@@ -987,12 +1007,12 @@ pub(crate) async fn run_agent_loop(
         // answer, or a turn that ended waiting on a member — and the continuation is the one
         // message it adds before the next turn. Nothing is loaded and no task message is sent:
         // both are already in the list.
-        Some(continuation) => {
-            let continuation_message =
-                user_message(continuation.into_payload(store_state.current_task_provenance));
-            append_to_record(record.as_mut(), std::slice::from_ref(&continuation_message));
-            messages.push(continuation_message);
-        }
+        Some(continuation) => push_continuation(
+            messages,
+            record.as_mut(),
+            continuation,
+            store_state.current_task_provenance,
+        ),
         None => {
             // In threaded mode the task continues the record's conversation, so the message list
             // starts from what the record already holds — including messages written by an
@@ -1102,6 +1122,9 @@ pub(crate) async fn run_agent_loop(
     let turn_bound = inference
         .max_turns
         .map_or(usize::MAX, |max_turns| max_turns as usize);
+    // Capped turns in a row with no text and no tool call, this attempt. The second ends the task
+    // failed; any other response resets it.
+    let mut empty_capped_in_a_row = 0u32;
     for attempt_turn in 0..turn_bound {
         let turn = first_turn as usize + attempt_turn;
         let turn_u32 = u32::try_from(turn).unwrap_or(u32::MAX);
@@ -1681,15 +1704,14 @@ pub(crate) async fn run_agent_loop(
             (None, true) => drop(admission),
             (None, false) => admission.settle(u64::from(input_tokens), u64::from(output_tokens)),
         }
-        // A capped turn reports `"text"` here: `decision` names what the loop does next, and a
-        // capped turn ends the task the same way an `end_turn` does. `stop_reason`, recorded
-        // verbatim beside it, is the field that says it was cut off.
-        let decision = if stop_reason == "tool_call" {
-            "tool_call"
-        } else if stop_reason == "end_turn" {
-            "end_turn"
-        } else {
-            "text"
+        // `decision` names what the loop does with the response. A capped turn reports
+        // `"capped"` whether it continues the task, ends it on its last allowed turn or ends it
+        // failed at the bound; `stop_reason`, recorded verbatim beside it, is the provider's word.
+        let decision = match stop_reason {
+            "tool_call" => "tool_call",
+            "end_turn" => "end_turn",
+            "max_tokens" => "capped",
+            _ => "text",
         };
         let hook_tool_name =
             response
@@ -2307,6 +2329,7 @@ pub(crate) async fn run_agent_loop(
                 ));
                 ReportedOccupancy::advance(reported, counts);
                 messages.extend(tool_messages);
+                empty_capped_in_a_row = 0;
                 // The turn's whole contribution, in the order it entered the context: the
                 // assistant message that asked for the tools, then each tool result.
                 append_to_record(record.as_mut(), &messages[turn_start..]);
@@ -2336,9 +2359,91 @@ pub(crate) async fn run_agent_loop(
             }
             "max_tokens" => {
                 // The provider honoured the cap the capsule asked for, so nothing failed and
-                // nothing is retried. What the turn leaves behind is a fragment, and every
-                // surface that carries the result says so.
+                // nothing is retried. A capped turn ends the turn, not the task: its fragment
+                // stays in the conversation, any tool call in it is dropped unrun (its arguments
+                // may be cut), and the runtime states the cut in one user message before the next
+                // turn. The task's own limits bound the repeats, plus one fixed bound below.
                 let cap = max_output_tokens;
+                let (cut_calls, kept): (Vec<Value>, Vec<Value>) = content
+                    .into_iter()
+                    .partition(|b| b.get("type").and_then(Value::as_str) == Some("tool_call"));
+                let dropped: Vec<String> = cut_calls
+                    .iter()
+                    .map(|b| {
+                        b.get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect();
+                let empty = dropped.is_empty() && extract_text_content(&kept).trim().is_empty();
+                empty_capped_in_a_row = if empty { empty_capped_in_a_row + 1 } else { 0 };
+                let truncated_assistant = |kept: Vec<Value>| {
+                    let mut assistant = with_producer(
+                        with_new_id(json!({"role": "assistant", "content": kept})),
+                        producer.as_ref(),
+                    );
+                    if let Some(fields) = assistant.as_object_mut() {
+                        fields.insert(MESSAGE_TRUNCATED_KEY.to_string(), json!(true));
+                    }
+                    assistant
+                };
+
+                // The bound: a model that twice in a row spends the whole cap without saying or
+                // doing anything is not converging. A failure, not a budget stop, so keep-working
+                // restores no standing answer.
+                if empty_capped_in_a_row >= 2 {
+                    if !kept.is_empty() {
+                        let assistant = truncated_assistant(kept);
+                        append_to_record(record.as_mut(), std::slice::from_ref(&assistant));
+                        messages.push(assistant);
+                    }
+                    crate::runtime_err!(
+                        "[capsule-runtime] warning[{W_RUN_001}]: {} ({})",
+                        truncation_bound_warning_message(cap),
+                        runtime_warning_link(W_RUN_001)
+                    );
+                    let reason =
+                        output_cap_failure_reason(turn_u32.saturating_sub(1), turn_u32, cap);
+                    return finish_failed_turn(
+                        hooks,
+                        trace,
+                        otel,
+                        &records_root,
+                        ending,
+                        turn_u32,
+                        TASK_FAILED_OUTPUT_CAP,
+                        &reason,
+                        RetryNote::default(),
+                    )
+                    .await;
+                }
+
+                // No turn left for the task: the fragment is its answer, as a capped turn always
+                // was, so `inference.max_turns: 1` behaves as it did before capped turns continued.
+                let last_turn = task_max_turns.is_some_and(|max| trace.task_turns() >= max)
+                    || (inference.max_turns.is_some() && attempt_turn + 1 == turn_bound);
+                if !last_turn {
+                    if !kept.is_empty() {
+                        let assistant = truncated_assistant(kept);
+                        append_to_record(record.as_mut(), std::slice::from_ref(&assistant));
+                        messages.push(assistant);
+                    }
+                    ReportedOccupancy::advance(reported, counts);
+                    crate::runtime_err!(
+                        "[capsule-runtime] warning[{W_RUN_001}]: {} ({})",
+                        truncation_continuing_warning_message(cap),
+                        runtime_warning_link(W_RUN_001)
+                    );
+                    push_continuation(
+                        messages,
+                        record.as_mut(),
+                        Continuation::OutputCapped(output_cap_fact(cap, &dropped)),
+                        store_state.current_task_provenance,
+                    );
+                    continue;
+                }
+
                 crate::runtime_err!(
                     "[capsule-runtime] warning[{W_RUN_001}]: {} ({})",
                     truncation_warning_message(cap),
@@ -2353,7 +2458,7 @@ pub(crate) async fn run_agent_loop(
                     messages,
                     reported,
                     counts,
-                    content,
+                    kept,
                     &records_root,
                     mode,
                     &sse,
@@ -2900,10 +3005,55 @@ fn truncated_result_text(partial: &str, cap: u32) -> String {
     }
 }
 
-/// The [`W_RUN_001`] warning body, printed to stderr once per capped turn.
+/// The [`W_RUN_001`] warning body for a capped turn that ends the task: its last allowed turn.
 fn truncation_warning_message(cap: u32) -> String {
     format!(
         "this turn stopped at {}, so out/result.txt holds a fragment rather than a finished answer",
+        output_cap_phrase(cap)
+    )
+}
+
+/// The [`W_RUN_001`] warning body for a capped turn the task goes on from.
+fn truncation_continuing_warning_message(cap: u32) -> String {
+    format!(
+        "this turn stopped at {} and was cut off; the task goes on with another turn",
+        output_cap_phrase(cap)
+    )
+}
+
+/// The [`W_RUN_001`] warning body for the second capped turn in a row with no text and no tool
+/// call, which ends the task failed.
+fn truncation_bound_warning_message(cap: u32) -> String {
+    format!(
+        "this turn stopped at {} with no text and no tool call, the second in a row, so the task \
+         ends failed",
+        output_cap_phrase(cap)
+    )
+}
+
+/// The user message that follows a capped turn the task goes on from: the fact of the cut and
+/// what happened to the turn's tool calls, `dropped` in response order. States the fact only.
+fn output_cap_fact(cap: u32, dropped: &[String]) -> String {
+    let calls = match dropped {
+        [] => "It made no tool call.".to_string(),
+        [name] => format!("Its tool call {name} was cut off with it and was not run."),
+        names => format!(
+            "Its tool calls {} were cut off with it and were not run.",
+            names.join(", ")
+        ),
+    };
+    format!(
+        "The previous turn reached {} and was cut off. {calls}",
+        output_cap_phrase(cap)
+    )
+}
+
+/// `task_failed.reason` for [`TASK_FAILED_OUTPUT_CAP`]: the two empty capped turns, by the numbers
+/// `mur trace show` prints, and the cap.
+fn output_cap_failure_reason(first: u32, second: u32, cap: u32) -> String {
+    format!(
+        "two turns in a row (turn {first} and turn {second}) stopped at {} with no text and no \
+         tool call",
         output_cap_phrase(cap)
     )
 }
@@ -2913,12 +3063,12 @@ fn truncation_warning_message(cap: u32) -> String {
 /// Everything a completed turn leaves behind, in one place so the two stop reasons that reach it
 /// cannot record it differently. `truncated_at` is the whole difference between them: `None` for a
 /// turn that finished saying what it meant to, `Some(cap)` for one the provider cut off at that
-/// output cap.
+/// output cap on the task's last allowed turn.
 ///
-/// A capped turn is a result, not a failure — the session ends `ok` and the A2A task reaches
-/// `completed` either way, and no continuation turn is attempted. What changes is that every
-/// surface carrying the *result* names the truncation, while the conversation record keeps the
-/// model's own bytes and carries the mark as [`MESSAGE_TRUNCATED_KEY`].
+/// A capped last turn is a result, not a failure — the session ends `ok` and the A2A task reaches
+/// `completed` either way. What changes is that every surface carrying the *result* names the
+/// truncation, while the conversation record keeps the model's own bytes and carries the mark as
+/// [`MESSAGE_TRUNCATED_KEY`].
 #[allow(clippy::too_many_arguments)]
 async fn finish_completed_turn(
     store_state: &mut CapsuleStoreState,
@@ -6160,6 +6310,74 @@ mod tests {
             assert_eq!(message["content"].as_array().unwrap().len(), 1);
             assert!(message.get(MESSAGE_FENCE_KEY).is_none());
         }
+    }
+
+    /// The fact line after a capped turn is the runtime's own text: never fenced or labelled,
+    /// whatever the task's trust.
+    #[test]
+    fn output_capped_is_sent_unfenced_whatever_the_task_s_trust() {
+        use crate::origin::TaskOrigin;
+        let fact = output_cap_fact(65_536, &[]);
+        assert_eq!(
+            Continuation::OutputCapped(fact.clone()).into_payload(None),
+            (fact.clone(), None)
+        );
+        for origin in [TaskOrigin::Event, TaskOrigin::User, TaskOrigin::Peer] {
+            let message = user_message(
+                Continuation::OutputCapped(fact.clone())
+                    .into_payload(Some(TaskProvenance::derive(origin, None))),
+            );
+            assert_eq!(message["role"], "user");
+            assert_eq!(message["content"][0]["text"], fact.as_str(), "{origin:?}");
+            assert!(message.get(MESSAGE_FENCE_KEY).is_none());
+        }
+    }
+
+    #[test]
+    fn output_cap_fact_names_the_cap_and_every_dropped_call_in_order() {
+        assert_eq!(
+            output_cap_fact(65_536, &[]),
+            "The previous turn reached the inference.max_tokens output cap of 65536 tokens and \
+             was cut off. It made no tool call."
+        );
+        assert_eq!(
+            output_cap_fact(1024, &["session-status".to_string()]),
+            "The previous turn reached the inference.max_tokens output cap of 1024 tokens and was \
+             cut off. Its tool call session-status was cut off with it and was not run."
+        );
+        assert_eq!(
+            output_cap_fact(1024, &["bash".to_string(), "write".to_string()]),
+            "The previous turn reached the inference.max_tokens output cap of 1024 tokens and was \
+             cut off. Its tool calls bash, write were cut off with it and were not run."
+        );
+    }
+
+    #[test]
+    fn output_cap_failure_reason_names_both_turns_and_the_cap() {
+        assert_eq!(
+            output_cap_failure_reason(3, 4, 8192),
+            "two turns in a row (turn 3 and turn 4) stopped at the inference.max_tokens output \
+             cap of 8192 tokens with no text and no tool call"
+        );
+    }
+
+    #[test]
+    fn w_run_001_has_a_wording_per_outcome() {
+        assert_eq!(
+            truncation_warning_message(512),
+            "this turn stopped at the inference.max_tokens output cap of 512 tokens, so \
+             out/result.txt holds a fragment rather than a finished answer"
+        );
+        assert_eq!(
+            truncation_continuing_warning_message(512),
+            "this turn stopped at the inference.max_tokens output cap of 512 tokens and was cut \
+             off; the task goes on with another turn"
+        );
+        assert_eq!(
+            truncation_bound_warning_message(512),
+            "this turn stopped at the inference.max_tokens output cap of 512 tokens with no text \
+             and no tool call, the second in a row, so the task ends failed"
+        );
     }
 
     // ── prompt_cache_key ────────────────────────────────────────────────────────

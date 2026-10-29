@@ -578,6 +578,10 @@ struct TaskEndEvent {
     /// pre-slice traces, so it defaults to 0.
     #[serde(default)]
     reopen_count: u32,
+    /// How many of this task's agent-loop turns stopped at the output cap. Absent in traces
+    /// written before the runtime counted them, so it defaults to 0.
+    #[serde(default)]
+    capped_turns: u32,
     /// How `lifecycle.keep_working` went for this task; absent when the capsule does not set it.
     #[serde(default)]
     keep_working: Option<KeepWorkingEnd>,
@@ -1571,6 +1575,8 @@ struct TraceMetrics {
     continuations: Vec<TaskContinuedEvent>,
     /// One row per `keep_working` record, in file order.
     keep_working_rows: Vec<String>,
+    /// Agent-loop turns that stopped at the `inference.max_tokens` output cap.
+    capped_turns: u32,
     /// One `kept working:` line per `task_end` carrying `keep_working`, in file order.
     kept_working: Vec<String>,
     /// One row per `done_check` record, in file order.
@@ -2122,6 +2128,7 @@ struct TaskMetrics {
     input_tokens: u64,
     output_tokens: u64,
     reopen_count: u32,
+    capped_turns: u32,
 }
 
 // ── Parsing ───────────────────────────────────────────────────────────────────
@@ -2449,6 +2456,7 @@ fn compute_metrics(
     let mut continuations: Vec<TaskContinuedEvent> = Vec::new();
     let mut keep_working_rows: Vec<String> = Vec::new();
     let mut kept_working: Vec<String> = Vec::new();
+    let mut capped_turns = 0u32;
     let mut done_check_rows: Vec<String> = Vec::new();
     let mut done_checked: Vec<String> = Vec::new();
     let mut context_seeds: Vec<ContextSeedRecord> = Vec::new();
@@ -2492,6 +2500,11 @@ fn compute_metrics(
                     seen_turns += 1;
                     seen_input_tokens += e.input_tokens.unwrap_or(0);
                     seen_output_tokens += e.output_tokens.unwrap_or(0);
+                }
+                // Read from the turns themselves rather than `task_end.capped_turns`, so a trace
+                // written before that field existed counts its capped turns too.
+                if e.origin.is_none() && e.stop_reason.as_deref() == Some(MAX_TOKENS_STOP_REASON) {
+                    capped_turns += 1;
                 }
                 inference_records.push(InferenceRecord::from_event(e));
             }
@@ -2602,6 +2615,7 @@ fn compute_metrics(
                         input_tokens: e.input_tokens,
                         output_tokens: e.output_tokens,
                         reopen_count: e.reopen_count,
+                        capped_turns: e.capped_turns,
                     });
                 }
             }
@@ -2935,6 +2949,7 @@ fn compute_metrics(
             continuations,
             keep_working_rows,
             kept_working,
+            capped_turns,
             done_check_rows,
             done_checked,
             context_seeds,
@@ -3266,6 +3281,12 @@ fn fmt_session_short(id: &str) -> String {
 
 // ── Show ──────────────────────────────────────────────────────────────────────
 
+/// The `── Turns ──` line counting the session's capped turns, printed only when there is one.
+fn capped_line(capped_turns: u32) -> String {
+    let turns = if capped_turns == 1 { "turn" } else { "turns" };
+    format!("capped:     {capped_turns} {turns} stopped at the inference.max_tokens output cap")
+}
+
 fn print_show(m: &TraceMetrics) {
     capsule_runtime::report_println!("── Session ──────────────────────────────────────");
     capsule_runtime::report_println!("session:    {}", m.session_id);
@@ -3407,6 +3428,9 @@ fn print_show(m: &TraceMetrics) {
     );
     if let Some(line) = continued_line(&m.continuations) {
         capsule_runtime::report_println!("{line}");
+    }
+    if m.capped_turns > 0 {
+        capsule_runtime::report_println!("{}", capped_line(m.capped_turns));
     }
     for line in m.keep_working_rows.iter().chain(&m.kept_working) {
         capsule_runtime::report_println!("{line}");
@@ -4346,8 +4370,13 @@ pub(crate) fn run_trace_show(
             } else {
                 String::new()
             };
+            let capped_note = if t.capped_turns > 0 {
+                format!("  capped: {}", t.capped_turns)
+            } else {
+                String::new()
+            };
             capsule_runtime::report_println!(
-                "task {}  {}  turns: {}  in: {}  out: {}  {}  {}{}",
+                "task {}  {}  turns: {}  in: {}  out: {}  {}  {}{}{}",
                 i + 1,
                 short_id,
                 t.turns,
@@ -4355,7 +4384,8 @@ pub(crate) fn run_trace_show(
                 fmt_thousands(t.output_tokens),
                 t.exit_status,
                 fmt_dur(t.duration_ms),
-                reopen_note
+                reopen_note,
+                capped_note
             );
         }
     }

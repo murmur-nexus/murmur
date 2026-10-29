@@ -127,6 +127,9 @@ pub(crate) struct TraceWriter {
     /// Counted hook `run-inference` lines (`origin` present) written since `task_start`: the part
     /// of [`Self::task_turns`] no agent-loop turn spent. Reset with the other per-task counters.
     task_hook_inferences: u32,
+    /// Agent-loop `inference` lines whose `stop_reason` is `"max_tokens"`, written since
+    /// `task_start`: `task_end.capped_turns`. Reset with the other per-task counters.
+    task_capped_turns: u32,
     task_start_instant: Option<Instant>,
     pub(crate) active_task_id: Option<String>,
     /// How many `task_failed` lines this writer has written, so a caller can tell whether one run
@@ -1135,6 +1138,9 @@ struct TaskEndEvent {
     /// How many times this task's agent loop was reopened by an `on-task-end` hook
     /// before the terminal outcome. `0` for a task that ran once (the common case).
     reopen_count: u32,
+    /// How many of this task's agent-loop turns stopped at the `inference.max_tokens` output
+    /// cap. Always present; `0` when none did.
+    capped_turns: u32,
     /// The work ids of the background shell commands still running when the task ended, oldest
     /// first. Absent when there were none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1262,6 +1268,10 @@ pub(crate) const TASK_FAILED_REOPEN_BUDGET_EXHAUSTED: &str = "reopen_budget_exha
 /// `task_failed.cause` for an attempt that ended in a runtime error no other cause names. The
 /// reason is the error's own text.
 pub(crate) const TASK_FAILED_RUNTIME_ERROR: &str = "runtime_error";
+
+/// `task_failed.cause` when two agent-loop turns in a row stopped at the `inference.max_tokens`
+/// output cap with no text and no tool call. The reason names both turns and the cap.
+pub(crate) const TASK_FAILED_OUTPUT_CAP: &str = "output_cap";
 
 /// `task_failed.cause` for a task ended because a runtime write, append, read, create or removal
 /// inside the workdir was refused. Always preceded by one `workdir_path_refused` line per refusal.
@@ -2338,6 +2348,7 @@ impl TraceWriter {
             task_shell_calls: 0,
             task_agent_turns: 0,
             task_hook_inferences: 0,
+            task_capped_turns: 0,
             task_start_instant: None,
             active_task_id: None,
             task_failures_written: 0,
@@ -2689,6 +2700,9 @@ impl TraceWriter {
         settings: Option<&InferenceCallSettings>,
         retry: RetryNote,
     ) -> std::io::Result<()> {
+        if stop_reason == Some("max_tokens") {
+            self.task_capped_turns = self.task_capped_turns.saturating_add(1);
+        }
         self.write_inference_event(InferenceLine {
             turn,
             input_tokens,
@@ -3233,6 +3247,7 @@ impl TraceWriter {
         self.task_shell_calls = 0;
         self.task_agent_turns = 0;
         self.task_hook_inferences = 0;
+        self.task_capped_turns = 0;
         let started = Instant::now();
         self.task_start_instant = Some(started);
         self.active_task_id = Some(task_id.to_string());
@@ -3297,6 +3312,7 @@ impl TraceWriter {
             tool_calls: self.task_tool_calls,
             shell_calls: self.task_shell_calls,
             reopen_count,
+            capped_turns: self.task_capped_turns,
             running_commands,
             keep_working,
             done_check,
@@ -7401,6 +7417,62 @@ mod tests {
         assert_eq!(end["task_id"], "tsk_1");
         assert_eq!(end["exit_status"], "ok");
         assert_eq!(end["reopen_count"], 2);
+        assert_eq!(
+            end["capped_turns"], 0,
+            "always present, 0 when no turn was capped"
+        );
+    }
+
+    /// `task_end.capped_turns` counts the task's agent-loop `inference` lines with
+    /// `stop_reason: "max_tokens"`, and a new task starts it at 0.
+    #[tokio::test]
+    async fn task_end_counts_capped_turns_per_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        for task in ["tsk_1", "tsk_2"] {
+            w.write_task_start(task, "ctx_1", "a2a", event_provenance(), 3, &[], &[])
+                .await
+                .unwrap();
+            let stops: &[&str] = if task == "tsk_1" {
+                &["max_tokens", "tool_call", "max_tokens", "end_turn"]
+            } else {
+                &["end_turn"]
+            };
+            for (turn, stop) in stops.iter().enumerate() {
+                let decision = if *stop == "max_tokens" {
+                    "capped"
+                } else {
+                    stop
+                };
+                w.write_turn_inference(
+                    u32::try_from(turn).unwrap(),
+                    Some(10),
+                    Some(5),
+                    decision.to_string(),
+                    Some(stop),
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                    RetryNote::default(),
+                )
+                .await
+                .unwrap();
+            }
+            w.write_task_end(task, "ok", 0, Vec::new(), None, None)
+                .await
+                .unwrap();
+        }
+        w.flush().await.unwrap();
+
+        let capped: Vec<_> = read_events(dir.path())
+            .iter()
+            .filter(|e| e["event_type"] == "task_end")
+            .map(|e| e["capped_turns"].clone())
+            .collect();
+        assert_eq!(capped, vec![serde_json::json!(2), serde_json::json!(0)]);
     }
 
     /// `task_end.keep_working` is the summary the runtime passes, `stopped_by` `null` when unset,

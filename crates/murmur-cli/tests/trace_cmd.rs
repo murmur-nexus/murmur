@@ -1814,6 +1814,77 @@ fn trace_show_multi_task_breakdown() {
         .stdout(predicate::str::contains("ok"));
 }
 
+/// The Turns section counts the session's capped turns from the `inference` lines themselves, so
+/// a trace whose `task_end` carries no `capped_turns` counts them too; a task line appends its own
+/// `capped:` count from `task_end.capped_turns`. Neither appears when nothing was capped.
+#[test]
+fn show_counts_capped_turns_for_the_session_and_each_task() {
+    let tmp = TempDir::new().unwrap();
+    let capped_turn = |turn: u32| {
+        format!(
+            "\"turn\":{turn},\"input_tokens\":10,\"output_tokens\":5,\"decision\":\"capped\",\
+             \"stop_reason\":\"max_tokens\",\"tool_name\":null}}\n"
+        )
+    };
+    let fixture = make_multi_task_fixture(2);
+    let mut seen = 0;
+    let fixture: String = fixture
+        .lines()
+        .map(|line| {
+            let mut line = line.to_string();
+            if line.contains("\"event_type\":\"inference\"") && line.contains("\"turn\":0,") {
+                seen += 1;
+                // Task 1's first turn and task 2's first turn are capped; the older field spelling
+                // (`decision: "text"`) on the second still counts, by its `stop_reason`.
+                let prefix = &line[..line.find("\"turn\":").unwrap()];
+                line = format!("{prefix}{}", capped_turn(0).trim_end());
+                if seen == 2 {
+                    line = line.replace("\"capped\"", "\"text\"");
+                }
+            }
+            if line.contains("\"event_type\":\"task_end\"") && line.contains("tsk_00000000") {
+                line = line.replace(
+                    "\"shell_calls\":0}",
+                    "\"shell_calls\":0,\"capped_turns\":1}",
+                );
+            }
+            format!("{line}\n")
+        })
+        .collect();
+    let path = write_fixture(tmp.path(), "capped.jsonl", &fixture);
+    let output = mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    let count = lines
+        .iter()
+        .position(|line| line.starts_with("count:"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert_eq!(
+        lines[count + 1],
+        "capped:     2 turns stopped at the inference.max_tokens output cap",
+        "{stdout}"
+    );
+    let task_line = |n: u32| {
+        *lines
+            .iter()
+            .find(|line| line.starts_with(&format!("task {n}  ")))
+            .unwrap_or_else(|| panic!("{stdout}"))
+    };
+    assert!(task_line(1).ends_with("  capped: 1"), "{stdout}");
+    assert!(!task_line(2).contains("capped:"), "{stdout}");
+
+    let plain = write_fixture(tmp.path(), "plain.jsonl", &make_multi_task_fixture(2));
+    mur()
+        .args(["trace", "show", plain.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("capped:").not());
+}
+
 #[test]
 fn trace_report_per_task_averages_section() {
     // Two multi-task sessions should show a per-task averages section.
