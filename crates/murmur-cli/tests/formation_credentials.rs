@@ -341,8 +341,8 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
     assert_eq!(refused.status, 403, "{refused:?}");
     assert_eq!(refused.json()["error"], "peer_not_accepted");
 
-    // The tasks the formation token started are recorded as `planner`'s; the operator's is no
-    // member's.
+    // The tasks the formation token started are recorded as `planner`'s; the operator's is the
+    // operator's, and no member's.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let received = loop {
         let received: Vec<Value> = trace_events(&coder.records_dir)
@@ -354,13 +354,23 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let callers: Vec<Option<&str>> = received
+    let callers: Vec<(Option<&str>, Option<&str>, Option<&str>)> = received
         .iter()
-        .map(|event| event["caller_member"].as_str())
+        .map(|event| {
+            (
+                event["caller"].as_str(),
+                event["caller_member"].as_str(),
+                event["caller_credential"].as_str(),
+            )
+        })
         .collect();
     assert_eq!(
         callers,
-        [Some("planner"), None, Some("planner")],
+        [
+            (Some("member"), Some("planner"), None),
+            (Some("operator"), None, None),
+            (Some("member"), Some("planner"), None),
+        ],
         "{received:?}"
     );
     let start = &trace_events(&coder.records_dir)[0];

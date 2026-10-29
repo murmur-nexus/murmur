@@ -1723,7 +1723,7 @@ fn make_multi_task_fixture(n_tasks: usize) -> String {
         let output: u64 = (i as u64 + 1) * 100;
         let duration: u64 = (i as u64 + 1) * 200;
 
-        // a2a_task_received (legacy event — should be silently skipped)
+        // a2a_task_received, as a trace older than its caller fields writes it
         lines.push_str(&format!(
             "{{\"event_type\":\"a2a_task_received\",\"session_id\":\"{SESSION_ID_MT}\",\"timestamp\":{},\
             \"task_id\":\"{task_id}\",\"context_id\":\"{context_id}\",\
@@ -1811,7 +1811,11 @@ fn trace_show_multi_task_breakdown() {
         .stdout(predicate::str::contains("task 4").not())
         // turns and exit_status visible
         .stdout(predicate::str::contains("turns:"))
-        .stdout(predicate::str::contains("ok"));
+        .stdout(predicate::str::contains("ok"))
+        // a received task whose line names no caller is from an unknown caller
+        .stdout(predicate::str::contains(
+            "received:   3 tasks — unknown caller 3\n",
+        ));
 }
 
 /// The Turns section counts the session's capped turns from the `inference` lines themselves, so
@@ -3056,9 +3060,41 @@ fn show_names_every_previously_dropped_event_type() {
         .stdout(predicate::str::contains("fetched:    1 peer_unreachable"))
         // a2a_task_received / a2a_send
         .stdout(predicate::str::contains("── A2A"))
-        .stdout(predicate::str::contains("received:   1 task"))
+        .stdout(predicate::str::contains(
+            "received:   1 task — unknown caller 1\n",
+        ))
         .stdout(predicate::str::contains("sent:       1 message"))
         .stdout(predicate::str::contains("http://peer.example/a2a"));
+}
+
+/// The A2A section counts received tasks by who the door let each in as, most first; a line
+/// with no caller fields still parses and counts.
+#[test]
+fn show_counts_received_tasks_by_caller() {
+    let tmp = TempDir::new().unwrap();
+    let s = SESSION_ID_NINE;
+    let received = |n: u32, fields: &str| {
+        format!("{{\"event_type\":\"a2a_task_received\",\"event_id\":\"evt_r{n}\",\"parent_id\":\"evt_1\",\"session_id\":\"{s}\",\"timestamp\":103{n},\"task_id\":\"tsk_r{n}\",\"context_id\":\"ctx_r{n}\",\"message_id\":\"msg-r{n}\",\"traceparent_from_caller\":null{fields}}}")
+    };
+    let fixture = nine_event_fixture().replace(
+        &format!("{{\"event_type\":\"a2a_task_received\",\"event_id\":\"evt_4\",\"parent_id\":\"evt_1\",\"session_id\":\"{s}\",\"timestamp\":1030,\"task_id\":\"tsk_one\",\"context_id\":\"ctx_one\",\"message_id\":\"msg-in\",\"traceparent_from_caller\":null}}"),
+        &[
+            received(1, ",\"caller\":\"member\",\"caller_member\":\"lead\""),
+            received(2, ",\"caller\":\"operator\",\"message_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""),
+            received(3, ",\"caller_member\":\"lead\""),
+        ]
+        .join("\n"),
+    );
+    assert_eq!(fixture.matches("a2a_task_received").count(), 3);
+    let path = write_fixture(tmp.path(), "received.jsonl", &fixture);
+
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "received:   3 tasks — member 2, operator 1\n",
+        ));
 }
 
 /// The Session block reports what the session ran under, not just what it was called.

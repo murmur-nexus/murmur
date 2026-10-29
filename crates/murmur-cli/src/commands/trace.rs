@@ -18,9 +18,10 @@ use crate::error::{
     path_refused_hint, CliError, RefusedPlace, E_IO_001, E_IO_003, E_RUN_024, E_RUN_050,
 };
 use crate::formation_trace::{
-    fold_member_call, fold_member_call_busy, fold_member_call_start, formation_calls,
-    no_answer_below_note, search_formation, CallEnding, FormationCall, FormationSearch,
-    MemberCallBusyLine, MemberCallLine, MemberCallRecord, MemberCallStartLine, RecordedMember,
+    fold_member_call, fold_member_call_busy, fold_member_call_start, formation_rows,
+    no_answer_below_note, search_formation, sender_kind_counts, CallEnding, FormationCall,
+    FormationRow, FormationSearch, FormationTask, MemberCallBusyLine, MemberCallLine,
+    MemberCallRecord, MemberCallStartLine, ReceivedFrom, RecordedMember,
 };
 use crate::live_address::records_unreadable;
 use crate::session_address::{self, ses_entries, SessionQuery};
@@ -1027,6 +1028,20 @@ struct A2aSendEvent {
     peer_url: String,
 }
 
+/// One `a2a_task_received` record's caller fields and message hash. Every field is optional: a
+/// trace older than them carries none, and its task is from an unknown caller.
+#[derive(Debug, Default, Deserialize)]
+struct A2aTaskReceivedEvent {
+    #[serde(default)]
+    caller: Option<String>,
+    #[serde(default)]
+    caller_member: Option<String>,
+    #[serde(default)]
+    caller_credential: Option<String>,
+    #[serde(default)]
+    message_sha256: Option<String>,
+}
+
 /// One `delegation_start` record: a child that was launched, whatever became of it.
 #[derive(Debug, Deserialize)]
 struct DelegationStartEvent {
@@ -1235,9 +1250,9 @@ enum TraceEvent {
     PeerHandleMint(OutcomeEvent),
     PeerHandleRedeem(OutcomeEvent),
     PeerFileFetch(OutcomeEvent),
-    /// Counted, not detailed: the A2A section reports how many tasks arrived, and nothing
-    /// on the record beyond its own existence is rendered.
-    A2aTaskReceived,
+    /// Counted by who sent it: the A2A section reports how many tasks arrived from each kind
+    /// of caller.
+    A2aTaskReceived(A2aTaskReceivedEvent),
     A2aSend(A2aSendEvent),
     DelegationStart(DelegationStartEvent),
     Delegation(DelegationEvent),
@@ -1603,7 +1618,8 @@ struct TraceMetrics {
     peer_mints: OutcomeCounts,
     peer_redeems: OutcomeCounts,
     peer_fetches: OutcomeCounts,
-    a2a_tasks_received: u32,
+    /// Who sent each task `a2a_task_received` records, in file order.
+    a2a_tasks_received: Vec<ReceivedFrom>,
     /// The peer URL of every `a2a_send`, in file order.
     a2a_sends: Vec<String>,
     /// `session_start.runtime_artifacts`, in file order.
@@ -2470,7 +2486,7 @@ fn compute_metrics(
     let mut peer_mints = OutcomeCounts::new();
     let mut peer_redeems = OutcomeCounts::new();
     let mut peer_fetches = OutcomeCounts::new();
-    let mut a2a_tasks_received = 0u32;
+    let mut a2a_tasks_received: Vec<ReceivedFrom> = Vec::new();
     let mut a2a_sends: Vec<String> = Vec::new();
     let mut artifacts_pulled: Vec<ArtifactPulledEvent> = Vec::new();
     let mut delegations: Vec<DelegationRecord> = Vec::new();
@@ -2717,7 +2733,11 @@ fn compute_metrics(
             TraceEvent::PeerHandleMint(e) => *peer_mints.entry(e.outcome).or_insert(0) += 1,
             TraceEvent::PeerHandleRedeem(e) => *peer_redeems.entry(e.outcome).or_insert(0) += 1,
             TraceEvent::PeerFileFetch(e) => *peer_fetches.entry(e.outcome).or_insert(0) += 1,
-            TraceEvent::A2aTaskReceived => a2a_tasks_received += 1,
+            TraceEvent::A2aTaskReceived(e) => a2a_tasks_received.push(ReceivedFrom::of(
+                e.caller.as_deref(),
+                e.caller_member,
+                e.caller_credential,
+            )),
             TraceEvent::A2aSend(e) => a2a_sends.push(e.peer_url),
             TraceEvent::ArtifactPulled(e) => artifacts_pulled.push(e),
             TraceEvent::DelegationStart(e) => delegations.push(DelegationRecord {
@@ -3958,14 +3978,10 @@ fn print_show(m: &TraceMetrics) {
         }
     }
 
-    if m.a2a_tasks_received > 0 || !m.a2a_sends.is_empty() {
+    if !m.a2a_tasks_received.is_empty() || !m.a2a_sends.is_empty() {
         capsule_runtime::report_println!();
         capsule_runtime::report_println!("── A2A ──────────────────────────────────────────");
-        capsule_runtime::report_println!(
-            "received:   {} task{}",
-            m.a2a_tasks_received,
-            if m.a2a_tasks_received == 1 { "" } else { "s" }
-        );
+        capsule_runtime::report_println!("{}", received_line(&m.a2a_tasks_received));
         capsule_runtime::report_println!(
             "sent:       {} message{}",
             m.a2a_sends.len(),
@@ -3988,7 +4004,7 @@ fn print_show(m: &TraceMetrics) {
 /// The content-addressed store the runtime writes beside `trace.jsonl` under
 /// `trace.capture: content`, one file per distinct body named by its own sha256. Spelled out
 /// here because the runtime's own constant is private to `capsule-runtime`.
-const BLOB_DIR_NAME: &str = "blobs";
+pub(crate) const BLOB_DIR_NAME: &str = "blobs";
 
 /// The shortest `--body <sha>` prefix that is accepted. Eight hex characters is where a
 /// prefix stops being a plausible typo for one of the named selectors.
@@ -4066,8 +4082,8 @@ fn parse_body_selector(arg: &str) -> Result<BodySelector, CliError> {
 /// that is still running.
 struct WireIndex {
     turns: Vec<WireTurn>,
-    /// In file order, deduplicated: `session_start.system_prompt_sha256` first, then each
-    /// turn's system, tools, response and message hashes.
+    /// In file order, deduplicated: `session_start.system_prompt_sha256`, each turn's system,
+    /// tools, response and message hashes, and each `a2a_task_received.message_sha256`.
     known_hashes: Vec<String>,
 }
 
@@ -4120,6 +4136,9 @@ impl WireIndex {
                             task_id: identity.task_id,
                         });
                     }
+                }
+                TraceEvent::A2aTaskReceived(e) => {
+                    note(e.message_sha256.as_ref(), &mut known_hashes);
                 }
                 _ => {}
             }
@@ -4443,7 +4462,8 @@ fn session_root(trace: &Path) -> Option<PathBuf> {
 }
 
 /// The Formation section: a `searched:` line per root, one row per member found under any of
-/// them by session id, then every `call-member` call they record.
+/// them by session id, then every `call-member` call they record and every task a member received
+/// that no member sent.
 ///
 /// Follows no delegation edge out of the searched roots, so a member's child recorded elsewhere
 /// is counted and pointed at rather than listed.
@@ -4463,13 +4483,42 @@ fn print_formation(formation: &FormationId, search: &FormationSearch) {
             found.children_elsewhere.len()
         );
     }
-    let calls = formation_calls(&found.members);
-    if !calls.is_empty() {
-        capsule_runtime::report_println!("calls:      {}", calls.len());
-        for line in formation_call_lines(&calls) {
-            capsule_runtime::report_println!("{line}");
-        }
+    let rows = formation_rows(&found.members);
+    for line in formation_summary_lines(&rows) {
+        capsule_runtime::report_println!("{line}");
     }
+    for line in formation_row_lines(&rows) {
+        capsule_runtime::report_println!("{line}");
+    }
+}
+
+/// The `calls:` line when any row is a call, and the `tasks:` line when any is a task no member
+/// sent, counting those by kind of sender:
+/// `tasks:      3 not from a member — operator 1, credential 1, public 1`.
+fn formation_summary_lines(rows: &[FormationRow]) -> Vec<String> {
+    let calls = rows
+        .iter()
+        .filter(|row| matches!(row, FormationRow::Call(_)))
+        .count();
+    let senders: Vec<&ReceivedFrom> = rows
+        .iter()
+        .filter_map(|row| match row {
+            FormationRow::Task(task) => Some(&task.from),
+            FormationRow::Call(_) => None,
+        })
+        .collect();
+    let mut lines = Vec::new();
+    if calls > 0 {
+        lines.push(format!("calls:      {calls}"));
+    }
+    if !senders.is_empty() {
+        lines.push(format!(
+            "tasks:      {} not from a member — {}",
+            senders.len(),
+            kind_counts_text(&sender_kind_counts(senders.iter().copied()))
+        ));
+    }
+    lines
 }
 
 /// One row per formation member: its session id, its roster name (`-` for a session with none),
@@ -4506,45 +4555,17 @@ fn formation_member_lines(members: &[RecordedMember]) -> Vec<String> {
         .collect()
 }
 
-/// One row per formation call, indented two spaces per depth: the call id, `caller → callee`, how
-/// it ended, its duration, whether its answer was delivered, and the note for a missing side.
-fn formation_call_lines(calls: &[FormationCall]) -> Vec<String> {
-    let cells: Vec<[String; 6]> = calls
+/// One line per formation row, indented two spaces per depth, in aligned columns.
+///
+/// A call row: the call id, `caller → callee`, how it ended, its duration, whether its answer
+/// was delivered, and the notes for a missing side. A task row: the task id, `<sender> → member`,
+/// its `task_end` status or `outstanding`, its duration, no delivery, and where its message is.
+fn formation_row_lines(rows: &[FormationRow]) -> Vec<String> {
+    let cells: Vec<[String; 6]> = rows
         .iter()
-        .map(|call| {
-            let id = format!(
-                "{}{}",
-                "  ".repeat(call.depth),
-                call.call_id.as_deref().unwrap_or("(no call id)")
-            );
-            let pair = format!("{} → {}", call.caller, call.callee);
-            let (status, duration, delivery) = match &call.ending {
-                CallEnding::Ended {
-                    status,
-                    duration_ms,
-                    delivered,
-                } => (
-                    status.clone(),
-                    fmt_dur(*duration_ms),
-                    if *delivered {
-                        "delivered"
-                    } else {
-                        "not delivered"
-                    },
-                ),
-                CallEnding::Outstanding => ("outstanding".to_string(), "-".to_string(), ""),
-                CallEnding::Unknown => ("unknown".to_string(), "-".to_string(), ""),
-            };
-            let note = call
-                .gap
-                .as_ref()
-                .map(|gap| gap.note(&call.caller, &call.callee))
-                .into_iter()
-                .chain((call.busy_offers > 0).then(|| busy_note(call.busy_offers)))
-                .chain(no_answer_below_note(&call.no_answer_below))
-                .collect::<Vec<_>>()
-                .join("; ");
-            [id, pair, status, duration, delivery.to_string(), note]
+        .map(|row| match row {
+            FormationRow::Call(call) => call_cells(call),
+            FormationRow::Task(task) => task_cells(task),
         })
         .collect();
     let width = |column: usize| {
@@ -4566,6 +4587,85 @@ fn formation_call_lines(calls: &[FormationCall]) -> Vec<String> {
             line.trim_end().to_string()
         })
         .collect()
+}
+
+/// A task row's six cells: see [`formation_row_lines`].
+fn task_cells(task: &FormationTask) -> [String; 6] {
+    let (status, duration) = match &task.ending {
+        Some(status) => (status.clone(), fmt_dur(task.duration_ms)),
+        None => ("outstanding".to_string(), "-".to_string()),
+    };
+    [
+        format!("{}{}", "  ".repeat(task.depth), task.task_id),
+        format!("{} → {}", task.from.label(), task.member),
+        status,
+        duration,
+        String::new(),
+        task.note(),
+    ]
+}
+
+/// A call row's six cells: see [`formation_row_lines`].
+fn call_cells(call: &FormationCall) -> [String; 6] {
+    let id = format!(
+        "{}{}",
+        "  ".repeat(call.depth),
+        call.call_id.as_deref().unwrap_or("(no call id)")
+    );
+    let pair = format!("{} → {}", call.caller, call.callee);
+    let (status, duration, delivery) = match &call.ending {
+        CallEnding::Ended {
+            status,
+            duration_ms,
+            delivered,
+        } => (
+            status.clone(),
+            fmt_dur(*duration_ms),
+            if *delivered {
+                "delivered"
+            } else {
+                "not delivered"
+            },
+        ),
+        CallEnding::Outstanding => ("outstanding".to_string(), "-".to_string(), ""),
+        CallEnding::Unknown => ("unknown".to_string(), "-".to_string(), ""),
+    };
+    let note = call
+        .gap
+        .as_ref()
+        .map(|gap| gap.note(&call.caller, &call.callee))
+        .into_iter()
+        .chain((call.busy_offers > 0).then(|| busy_note(call.busy_offers)))
+        .chain(no_answer_below_note(&call.no_answer_below))
+        .collect::<Vec<_>>()
+        .join("; ");
+    [id, pair, status, duration, delivery.to_string(), note]
+}
+
+/// The A2A section's `received:` line: how many tasks arrived, then how many from each kind of
+/// caller, most first and ties in [`sender_kind_counts`] order:
+/// `received:   3 tasks — member 2, operator 1`.
+fn received_line(senders: &[ReceivedFrom]) -> String {
+    let mut line = format!(
+        "received:   {} task{}",
+        senders.len(),
+        if senders.len() == 1 { "" } else { "s" }
+    );
+    if !senders.is_empty() {
+        let mut counts = sender_kind_counts(senders);
+        counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        line.push_str(&format!(" — {}", kind_counts_text(&counts)));
+    }
+    line
+}
+
+/// `operator 1, public 2`: each kind and its count, in the order given.
+fn kind_counts_text(counts: &[(&str, usize)]) -> String {
+    counts
+        .iter()
+        .map(|(kind, count)| format!("{kind} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One `searched:` line per root a formation search read, naming why a root could not be read.
@@ -7525,6 +7625,7 @@ mod tests {
     ) -> RecordedMember {
         RecordedMember {
             session_id: session_id.to_string(),
+            session_dir: PathBuf::from("/records").join(session_id),
             capsule: capsule.to_string(),
             member: member.map(str::to_string),
             callees: callees.iter().map(|c| c.to_string()).collect(),
@@ -7613,11 +7714,11 @@ mod tests {
             duration_ms: 2500,
             delivered: true,
         };
-        let listed = formation_call_lines(&[FormationCall {
+        let listed = formation_row_lines(&[FormationRow::Call(FormationCall {
             busy_offers: 1,
             no_answer_below: below,
             ..formation_call(0, Some("mcl_1"), ("lead", "p"), ended, None)
-        }]);
+        })]);
         assert_eq!(
             listed,
             ["mcl_1  lead → p  no_answer  2.5s  delivered  busy ×1; no answer below: q (timed_out), \
@@ -7677,7 +7778,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            formation_call_lines(&calls),
+            formation_row_lines(&calls.map(FormationRow::Call)),
             [
                 "mcl_1         chief → lead-b      completed    12.3s  delivered",
                 "  mcl_2       lead-b → worker-b4  rejected     4ms    delivered      never held by worker-b4",
@@ -7685,6 +7786,148 @@ mod tests {
                 "mcl_4         chief → lead-a      outstanding  -                     lead-a's task has no task_end",
                 "(no call id)  ghost → lead-a      unknown      -                     ghost's trace not found; lead-a's task ended completed",
             ]
+        );
+    }
+
+    fn formation_task(
+        depth: usize,
+        task_id: &str,
+        from: ReceivedFrom,
+        member: &str,
+        ending: Option<(&str, u64)>,
+        message: Option<&str>,
+    ) -> FormationTask {
+        FormationTask {
+            depth,
+            task_id: task_id.to_string(),
+            from,
+            member: member.to_string(),
+            received_ms: 0,
+            ending: ending.map(|(status, _)| status.to_string()),
+            duration_ms: ending.map_or(0, |(_, duration_ms)| duration_ms),
+            message: message.map(|sha| crate::formation_trace::StoredMessage {
+                trace: PathBuf::from("/records/ses_w/trace.jsonl"),
+                sha256: sha.to_string(),
+            }),
+        }
+    }
+
+    /// A task row reads `<task id>  <sender> → <member>  <status>  <duration>` with an empty
+    /// delivery column, then the command that prints its message or `message not captured`; an
+    /// outstanding task has no duration. A call made inside it sits a level deeper. The summary
+    /// counts calls and tasks apart, the tasks by kind of sender in a fixed order.
+    #[test]
+    fn formation_task_rows_name_their_sender_and_their_message() {
+        let sha = "3f2a9c1e0b7d".to_string() + &"0".repeat(52);
+        let rows = [
+            FormationRow::Task(formation_task(
+                0,
+                "tsk_op",
+                ReceivedFrom::Operator,
+                "lead",
+                Some(("ok", 35_500)),
+                Some(&sha),
+            )),
+            FormationRow::Call(formation_call(
+                1,
+                Some("mcl_1"),
+                ("lead", "worker"),
+                CallEnding::Ended {
+                    status: "completed".to_string(),
+                    duration_ms: 12_300,
+                    delivered: true,
+                },
+                None,
+            )),
+            FormationRow::Task(formation_task(
+                0,
+                "tsk_alice",
+                ReceivedFrom::Credential("alice".to_string()),
+                "worker",
+                Some(("failed", 4)),
+                None,
+            )),
+            FormationRow::Task(formation_task(
+                0,
+                "tsk_pub",
+                ReceivedFrom::Public,
+                "worker",
+                None,
+                None,
+            )),
+            FormationRow::Task(formation_task(
+                0,
+                "tsk_old",
+                ReceivedFrom::Unknown,
+                "worker",
+                Some(("ok", 1)),
+                None,
+            )),
+            FormationRow::Task(formation_task(
+                0,
+                "tsk_op2",
+                ReceivedFrom::Operator,
+                "worker",
+                Some(("ok", 2)),
+                None,
+            )),
+        ];
+        assert_eq!(
+            formation_summary_lines(&rows),
+            [
+                "calls:      1",
+                "tasks:      5 not from a member — operator 2, credential 1, public 1, unknown caller 1",
+            ]
+        );
+        assert_eq!(
+            formation_row_lines(&rows),
+            [
+                "tsk_op     operator → lead            ok           35.5s             message: mur trace show /records/ses_w/trace.jsonl --body 3f2a9c1e0b7d",
+                "  mcl_1    lead → worker              completed    12.3s  delivered",
+                "tsk_alice  credential alice → worker  failed       4ms               message not captured",
+                "tsk_pub    public → worker            outstanding  -                 message not captured",
+                "tsk_old    unknown caller → worker    ok           1ms               message not captured",
+                "tsk_op2    operator → worker          ok           2ms               message not captured",
+            ]
+        );
+        let tasks_only = &rows[2..3];
+        assert_eq!(
+            formation_summary_lines(tasks_only),
+            ["tasks:      1 not from a member — credential 1"]
+        );
+        assert!(formation_summary_lines(&[]).is_empty());
+    }
+
+    /// The A2A section's `received:` line counts tasks by kind of sender, most first, and a line
+    /// that names no sender is from an unknown caller.
+    #[test]
+    fn the_received_line_counts_tasks_by_kind_of_sender() {
+        let member = || ReceivedFrom::Member("lead".to_string());
+        assert_eq!(
+            received_line(&[member(), ReceivedFrom::Operator, member()]),
+            "received:   3 tasks — member 2, operator 1"
+        );
+        assert_eq!(
+            received_line(&[ReceivedFrom::Public, ReceivedFrom::Operator]),
+            "received:   2 tasks — operator 1, public 1"
+        );
+        assert_eq!(
+            received_line(&[ReceivedFrom::Unknown]),
+            "received:   1 task — unknown caller 1"
+        );
+        assert_eq!(received_line(&[]), "received:   0 tasks");
+        let TraceEvent::A2aTaskReceived(legacy) =
+            serde_json::from_str::<TraceEvent>(r#"{"event_type":"a2a_task_received"}"#).unwrap()
+        else {
+            panic!("a bare a2a_task_received line parses");
+        };
+        assert_eq!(
+            ReceivedFrom::of(
+                legacy.caller.as_deref(),
+                legacy.caller_member,
+                legacy.caller_credential
+            ),
+            ReceivedFrom::Unknown
         );
     }
 

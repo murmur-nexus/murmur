@@ -1989,19 +1989,22 @@ pub(crate) struct MessageSender {
 /// Who is calling, as far as which tasks it reaches: the one rule [`visible_to`] reads for every
 /// method that names or lists a task.
 ///
-/// | Caller | Reaches |
-/// |---|---|
-/// | any caller of a public door | every task of the session |
-/// | the operator token | every task of the session |
-/// | a declared credential's token | the tasks a request carrying that credential started |
-/// | a formation token, credential `member:<from>` | the tasks that member started |
+/// | Variant | Caller | Reaches |
+/// |---|---|---|
+/// | `Public` | any caller of a public door | every task of the session |
+/// | `Operator` | the operator token | every task of the session |
+/// | `Credential(name)` | a declared credential's token | the tasks a request carrying that credential started |
+/// | `Credential("member:<from>")` | a formation token | the tasks that member started |
 ///
 /// The session's own methods, `murmur.WatchSession` and `murmur.StopSession`, are not task
-/// methods: whoever holds their scope reaches every task through them.
+/// methods: whoever holds their scope reaches every task through them. A door task's
+/// `a2a_task_received` trace event names the variant as its `caller`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TaskCaller {
-    /// A caller of a public door, or the holder of the operator token.
-    Session,
+    /// A caller of a door with no `network.authentication`.
+    Public,
+    /// The holder of the operator token.
+    Operator,
     /// The holder of any other token, by the credential it was minted for.
     Credential(String),
 }
@@ -2010,10 +2013,11 @@ impl TaskCaller {
     /// The caller a request is, from the grant the door let it in on, or `None` on a public door.
     pub(crate) fn of(grant: Option<&crate::door_auth::DoorGrant>) -> TaskCaller {
         match grant {
-            Some(grant) if grant.credential() != murmur_artifact::OPERATOR_CREDENTIAL => {
-                TaskCaller::Credential(grant.credential().to_string())
+            None => TaskCaller::Public,
+            Some(grant) if grant.credential() == murmur_artifact::OPERATOR_CREDENTIAL => {
+                TaskCaller::Operator
             }
-            _ => TaskCaller::Session,
+            Some(grant) => TaskCaller::Credential(grant.credential().to_string()),
         }
     }
 }
@@ -2174,6 +2178,7 @@ fn start_task(
         source: crate::a2a::SOURCE_A2A,
         forget_session: message.forget_session,
         caller_member: sender.caller_member,
+        caller: Some(sender.caller),
         reference_task_ids: message.reference_task_ids,
         part_kinds,
     };
@@ -2398,14 +2403,14 @@ fn settled_task(task_registry: &Mutex<TaskRegistry>, task_id: &str) -> Option<A2
     settled.then_some(task)
 }
 
-/// Whether `caller` reaches `task_id`, by the rule [`TaskCaller`] states: a session caller every
-/// task, any other credential only the tasks it started.
+/// Whether `caller` reaches `task_id`, by the rule [`TaskCaller`] states: a public-door caller
+/// and the operator every task, any other credential only the tasks it started.
 ///
 /// Every path that reads, lists, cancels, continues, subscribes to or references a task decides
 /// here, and answers a task it hides exactly as one the session never held.
 fn visible_to(reg: &TaskRegistry, task_id: &str, caller: &TaskCaller) -> bool {
     match caller {
-        TaskCaller::Session => true,
+        TaskCaller::Public | TaskCaller::Operator => true,
         TaskCaller::Credential(credential) => reg.owner(task_id) == Some(credential.as_str()),
     }
 }
@@ -3851,7 +3856,7 @@ mod tests {
             traceparent: None,
             provenance: TaskProvenance::derive(TaskOrigin::User, None),
             caller_member: caller.map(str::to_string),
-            caller: caller.map_or(TaskCaller::Session, |member| {
+            caller: caller.map_or(TaskCaller::Operator, |member| {
                 TaskCaller::Credential(format!("member:{member}"))
             }),
         }
@@ -4074,7 +4079,7 @@ mod tests {
             serde_json::json!(1),
             &serde_json::json!({"id": "tsk_refused"}),
             &task_registry,
-            &TaskCaller::Session,
+            &TaskCaller::Operator,
         );
 
         assert!(
@@ -4375,7 +4380,7 @@ mod tests {
                 serde_json::json!(1),
                 &params,
                 &registry,
-                &TaskCaller::Session,
+                &TaskCaller::Operator,
             ));
             assert_eq!(answer["error"]["code"], -32602, "{answer}");
             assert_eq!(answer["error"]["message"], "GetTask requires an id");
@@ -4384,7 +4389,7 @@ mod tests {
             serde_json::json!(1),
             &serde_json::json!({"id": "tsk_done", "historyLength": 3}),
             &registry,
-            &TaskCaller::Session,
+            &TaskCaller::Operator,
         ));
         assert_eq!(answer["result"]["status"]["state"], "TASK_STATE_COMPLETED");
     }
@@ -4407,7 +4412,7 @@ mod tests {
         let total = |after: Value| {
             let answer = list(
                 &registry,
-                &TaskCaller::Session,
+                &TaskCaller::Operator,
                 serde_json::json!({"statusTimestampAfter": after}),
             );
             answer["result"]["totalSize"]
@@ -4422,7 +4427,7 @@ mod tests {
         let cutoff = newest.status.timestamp.clone().unwrap();
         let answer = list(
             &registry,
-            &TaskCaller::Session,
+            &TaskCaller::Operator,
             serde_json::json!({"statusTimestampAfter": cutoff}),
         );
         let tasks = answer["result"]["tasks"].as_array().unwrap();
@@ -4482,14 +4487,14 @@ mod tests {
                 "status",
             ),
         ] {
-            let answer = list(&registry, &TaskCaller::Session, params.clone());
+            let answer = list(&registry, &TaskCaller::Operator, params.clone());
             assert_eq!(answer["error"]["code"], code, "{params}: {answer}");
             let message = answer["error"]["message"].as_str().unwrap();
             assert!(message.contains(names), "{params}: {message}");
         }
         let not_a_timestamp = list(
             &registry,
-            &TaskCaller::Session,
+            &TaskCaller::Operator,
             serde_json::json!({"statusTimestampAfter": "yesterday"}),
         );
         assert_eq!(
@@ -4503,7 +4508,7 @@ mod tests {
                 "pageToken": "", "statusTimestampAfter": null, "historyLength": 3,
                 "includeArtifacts": false, "somethingElse": true}),
         ] {
-            let answer = list(&registry, &TaskCaller::Session, accepted.clone());
+            let answer = list(&registry, &TaskCaller::Operator, accepted.clone());
             assert_eq!(answer["result"]["totalSize"], 3, "{accepted}: {answer}");
             assert_eq!(answer["result"]["pageSize"], 50, "{accepted}: {answer}");
             assert_eq!(
@@ -4513,13 +4518,13 @@ mod tests {
         }
         let lowered = list(
             &registry,
-            &TaskCaller::Session,
+            &TaskCaller::Operator,
             serde_json::json!({"pageSize": 500}),
         );
         assert_eq!(lowered["result"]["pageSize"], 100, "{lowered}");
         let nothing = list(
             &registry,
-            &TaskCaller::Session,
+            &TaskCaller::Operator,
             serde_json::json!({"status": "TASK_STATE_AUTH_REQUIRED"}),
         );
         assert_eq!(
@@ -4528,7 +4533,7 @@ mod tests {
         );
     }
 
-    /// A credential lists only the tasks it started; a session caller lists every task. Each
+    /// A credential lists only the tasks it started; the operator lists every task. Each
     /// listed task is `GetTask`'s, with `artifacts` only when asked for.
     #[test]
     fn list_tasks_shows_each_caller_what_it_may_see() {
@@ -4553,7 +4558,7 @@ mod tests {
             alice["result"],
             serde_json::json!({"tasks": [], "nextPageToken": "", "pageSize": 50, "totalSize": 0})
         );
-        let session = list(&registry, &TaskCaller::Session, serde_json::json!({}));
+        let session = list(&registry, &TaskCaller::Operator, serde_json::json!({}));
         assert_eq!(ids(&session), ["tsk_queued", "tsk_wait", "tsk_done"]);
 
         let reg = registry.lock().unwrap();
@@ -4566,7 +4571,7 @@ mod tests {
         drop(reg);
         let with = list(
             &registry,
-            &TaskCaller::Session,
+            &TaskCaller::Operator,
             serde_json::json!({"includeArtifacts": true}),
         );
         let tasks = with["result"]["tasks"].as_array().unwrap();
@@ -4576,7 +4581,7 @@ mod tests {
 
         let first = list(
             &registry,
-            &TaskCaller::Session,
+            &TaskCaller::Operator,
             serde_json::json!({"pageSize": 2}),
         );
         assert_eq!(ids(&first), ["tsk_queued", "tsk_wait"]);
@@ -4584,7 +4589,7 @@ mod tests {
         assert!(!token.is_empty());
         let second = list(
             &registry,
-            &TaskCaller::Session,
+            &TaskCaller::Operator,
             serde_json::json!({"pageSize": 2, "pageToken": token}),
         );
         assert_eq!(ids(&second), ["tsk_done"]);
@@ -4634,7 +4639,7 @@ mod tests {
     /// The operator is the session; every other token, a formation token's included, is its
     /// credential.
     #[test]
-    fn task_caller_of_a_grant_is_the_session_only_for_the_operator() {
+    fn task_caller_of_a_grant_names_public_operator_and_credential() {
         let auth = crate::door_auth::DoorAuth::mint(&murmur_artifact::NetworkAuthentication {
             scheme: murmur_artifact::AuthenticationScheme::Bearer,
             credentials: vec![murmur_artifact::DoorCredential {
@@ -4648,10 +4653,10 @@ mod tests {
             auth.verify(&[&crate::door_auth::bearer_header(token)])
                 .unwrap()
         };
-        assert_eq!(TaskCaller::of(None), TaskCaller::Session);
+        assert_eq!(TaskCaller::of(None), TaskCaller::Public);
         assert_eq!(
             TaskCaller::of(Some(&grant_of("operator"))),
-            TaskCaller::Session
+            TaskCaller::Operator
         );
         assert_eq!(
             TaskCaller::of(Some(&grant_of("alice"))),
@@ -5956,7 +5961,7 @@ mod tests {
             serde_json::json!({"id": ""}),
             serde_json::json!({"id": 7}),
         ] {
-            let answer = refusal(params, &TaskCaller::Session);
+            let answer = refusal(params, &TaskCaller::Operator);
             assert_eq!(answer["error"]["code"], -32602, "{answer}");
             assert_eq!(answer["error"]["message"], "SubscribeToTask requires an id");
         }
@@ -5971,7 +5976,7 @@ mod tests {
             as_never["error"]["data"][0]["metadata"]["taskId"] = Value::from(hidden);
             assert_eq!(answer, as_never, "a hidden task reads as one never held");
         }
-        let ended = refusal(serde_json::json!({"id": "tsk_done"}), &TaskCaller::Session);
+        let ended = refusal(serde_json::json!({"id": "tsk_done"}), &TaskCaller::Operator);
         assert_eq!(ended["error"]["code"], -32004, "{ended}");
         assert_eq!(
             ended["error"]["data"][0]["metadata"],
@@ -5983,7 +5988,7 @@ mod tests {
             params: serde_json::json!({"id": id}),
         };
         assert!(subscribable_task(&req("tsk_alice"), &registry, &credential("alice")).is_ok());
-        assert!(subscribable_task(&req("tsk_run"), &registry, &TaskCaller::Session).is_ok());
+        assert!(subscribable_task(&req("tsk_run"), &registry, &TaskCaller::Operator).is_ok());
     }
 
     /// A subscription opens with the task as `GetTask` reports it, and a live `input-required`
@@ -5997,7 +6002,7 @@ mod tests {
         let (handler, lines, client) = serve_subscription(
             "tsk_run",
             Arc::clone(&registry),
-            TaskCaller::Session,
+            TaskCaller::Operator,
             &sse_tx,
             &sse_buffer,
             closing,
@@ -6052,7 +6057,7 @@ mod tests {
         let (handler, lines, client) = serve_subscription(
             "tsk_run",
             Arc::clone(&registry),
-            TaskCaller::Session,
+            TaskCaller::Operator,
             &sse_tx,
             &sse_buffer,
             closing,
@@ -6111,7 +6116,7 @@ mod tests {
         let (handler, lines, client) = serve_subscription(
             "tsk_run",
             Arc::clone(&registry),
-            TaskCaller::Session,
+            TaskCaller::Operator,
             &sse_tx,
             &sse_buffer,
             closing,

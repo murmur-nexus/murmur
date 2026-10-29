@@ -32,6 +32,8 @@ use crate::session_address::ses_entries;
 pub(crate) struct RecordedMember {
     /// The session directory's name, a `ses_` id.
     pub(crate) session_id: String,
+    /// The session directory the trace was read from, under the root it was found in.
+    pub(crate) session_dir: PathBuf,
     /// `name@version` from `session_start`.
     pub(crate) capsule: String,
     /// The roster name, `session_start.formation_member`. `None` for a member's delegated child,
@@ -48,9 +50,10 @@ pub(crate) struct RecordedMember {
     pub(crate) delegated_children: Vec<String>,
     /// Every `call-member` call this session made, in the order its first line was written.
     pub(crate) calls_made: Vec<MemberCallRecord>,
-    /// Every task a formation token let in, in the order received. A task with no
-    /// `caller_member` — an operator's, or a plain A2A peer's — is not here.
-    pub(crate) tasks_received: Vec<ReceivedMemberTask>,
+    /// Every task the session's door let in, one per `a2a_task_received`, in the order received,
+    /// whoever sent it: another member's `call-member` call, the operator, a declared credential,
+    /// a public-door caller, or a caller an older trace does not name.
+    pub(crate) tasks_received: Vec<ReceivedTask>,
 }
 
 impl RecordedMember {
@@ -252,18 +255,130 @@ pub(crate) fn fold_member_call(calls: &mut Vec<MemberCallRecord>, line: MemberCa
     }
 }
 
-/// One task another member handed this one with `call-member`, from its `a2a_task_received`.
+/// One task a session's door let in, from its `a2a_task_received`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReceivedMemberTask {
+pub(crate) struct ReceivedTask {
     pub(crate) task_id: String,
     /// The `mcl_` call id the caller minted, read from the message id `msg_<call id>`; `None`
     /// for a message id of any other shape.
     pub(crate) call_id: Option<String>,
-    /// The calling member's roster name, `caller_member`.
-    pub(crate) caller: String,
+    /// Who sent it.
+    pub(crate) from: ReceivedFrom,
     pub(crate) received_ms: u64,
     /// `exit_status` of the task's `task_end`; `None` while it has none.
     pub(crate) ending: Option<String>,
+    /// `duration_ms` of the task's `task_end`; 0 while it has none.
+    pub(crate) duration_ms: u64,
+    /// `message_sha256`, when the line carries a well-formed one: `None` under `capture: none`
+    /// and in a trace older than the field.
+    pub(crate) message_sha256: Option<String>,
+    /// Whether `<session dir>/blobs/<message_sha256>` exists, so `mur trace show --body` can
+    /// print the message.
+    pub(crate) message_stored: bool,
+}
+
+/// Who sent a received task, as its `a2a_task_received` names it.
+///
+/// | `caller` | `caller_member` | `caller_credential` | Sender |
+/// |---|---|---|---|
+/// | `member` or absent | the name | - | [`Self::Member`] |
+/// | `operator` | - | - | [`Self::Operator`] |
+/// | `credential` | - | the name | [`Self::Credential`] |
+/// | `public` | - | - | [`Self::Public`] |
+/// | anything else, or a name missing | | | [`Self::Unknown`] |
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReceivedFrom {
+    /// A formation member's `call-member` call, by the caller's roster name.
+    Member(String),
+    /// The holder of the session's operator token.
+    Operator,
+    /// The holder of a declared credential's token, by the credential's name.
+    Credential(String),
+    /// A caller of a door with no `network.authentication`.
+    Public,
+    /// A line that does not say who sent it: an older trace's task no member sent, or a `caller`
+    /// this reader does not know.
+    Unknown,
+}
+
+impl ReceivedFrom {
+    /// The sender an `a2a_task_received` line's caller fields name.
+    pub(crate) fn of(
+        caller: Option<&str>,
+        caller_member: Option<String>,
+        caller_credential: Option<String>,
+    ) -> Self {
+        match (caller, caller_member, caller_credential) {
+            (Some("member") | None, Some(member), _) => Self::Member(member),
+            (Some("operator"), _, _) => Self::Operator,
+            (Some("public"), _, _) => Self::Public,
+            (Some("credential"), _, Some(credential)) => Self::Credential(credential),
+            _ => Self::Unknown,
+        }
+    }
+
+    /// The kind of sender, as a count names it: `operator`, `member`, `credential`, `public` or
+    /// `unknown caller`.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Member(_) => "member",
+            Self::Credential(_) => "credential",
+            Self::Public => "public",
+            Self::Unknown => "unknown caller",
+        }
+    }
+
+    /// Where [`Self::kind`] sorts among the kinds: operator, member, credential, public, unknown
+    /// caller.
+    fn rank(&self) -> usize {
+        match self {
+            Self::Operator => 0,
+            Self::Member(_) => 1,
+            Self::Credential(_) => 2,
+            Self::Public => 3,
+            Self::Unknown => 4,
+        }
+    }
+
+    /// The sender as a row names it: the member's roster name, `operator`, `credential <name>`,
+    /// `public` or `unknown caller`.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::Member(member) => member.clone(),
+            Self::Credential(credential) => format!("credential {credential}"),
+            Self::Operator | Self::Public | Self::Unknown => self.kind().to_string(),
+        }
+    }
+}
+
+/// How many of `senders` are of each kind, the kinds in [`ReceivedFrom::rank`] order and each
+/// present at least once: `[("operator", 1), ("public", 2)]`.
+pub(crate) fn sender_kind_counts<'a>(
+    senders: impl IntoIterator<Item = &'a ReceivedFrom>,
+) -> Vec<(&'static str, usize)> {
+    let mut counts = [0usize; 5];
+    let mut kinds = [""; 5];
+    for sender in senders {
+        counts[sender.rank()] += 1;
+        kinds[sender.rank()] = sender.kind();
+    }
+    kinds
+        .into_iter()
+        .zip(counts)
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
+
+/// `message_sha256` as a blob name: 64 lowercase hex digits, or `None` for any other value, so
+/// no line can name a path outside the blob directory.
+fn blob_name(sha: Option<String>) -> Option<String> {
+    sha.filter(|sha| {
+        sha.len() == 64
+            && sha
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
 /// The call id a `call-member` message id carries: `msg_mcl_…` is call `mcl_…`.
@@ -297,7 +412,13 @@ struct A2aTaskReceivedLine {
     #[serde(default)]
     message_id: String,
     #[serde(default)]
+    caller: Option<String>,
+    #[serde(default)]
     caller_member: Option<String>,
+    #[serde(default)]
+    caller_credential: Option<String>,
+    #[serde(default)]
+    message_sha256: Option<String>,
     #[serde(default)]
     timestamp: u64,
 }
@@ -324,6 +445,8 @@ enum Line {
         task_id: String,
         #[serde(default)]
         exit_status: Option<String>,
+        #[serde(default)]
+        duration_ms: u64,
     },
     #[serde(other)]
     Other,
@@ -511,7 +634,7 @@ impl CallGap {
 /// One `call-member` call in a formation, joined from whichever of its two sides was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FormationCall {
-    /// How many calls this one is nested under: 0 for a call no found call handed its task over.
+    /// How many rows this one is nested under: 0 for a call no found row handed its task over.
     pub(crate) depth: usize,
     /// The `mcl_` id; `None` for a received task whose message id carries none.
     pub(crate) call_id: Option<String>,
@@ -532,28 +655,119 @@ pub(crate) struct FormationCall {
     pub(crate) no_answer_below: Vec<NoAnswerBelow>,
 }
 
-/// Every `call-member` call `members` record, once each, in display order.
+/// A task a member's door let in that no member sent: one the operator, a declared credential,
+/// a public-door caller or an unnamed caller sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FormationTask {
+    /// How many rows this one is nested under; always 0, since no call hands over such a task.
+    pub(crate) depth: usize,
+    pub(crate) task_id: String,
+    /// Who sent it; never [`ReceivedFrom::Member`].
+    pub(crate) from: ReceivedFrom,
+    /// The receiving member's roster name, or its session id when it has none.
+    pub(crate) member: String,
+    pub(crate) received_ms: u64,
+    /// `exit_status` of the task's `task_end`; `None` while it is outstanding.
+    pub(crate) ending: Option<String>,
+    /// `duration_ms` of the task's `task_end`.
+    pub(crate) duration_ms: u64,
+    /// Where the message text is stored, `None` when no blob holds it.
+    pub(crate) message: Option<StoredMessage>,
+}
+
+/// A received message stored behind its hash in a member's session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredMessage {
+    /// The member's `<session dir>/trace.jsonl`.
+    pub(crate) trace: PathBuf,
+    /// The message's `sha256`, the blob's name.
+    pub(crate) sha256: String,
+}
+
+/// How many hex digits of a message hash a task row's note gives `--body`.
+pub(crate) const MESSAGE_SHA_SHOWN: usize = 12;
+
+impl FormationTask {
+    /// The row's note: the command that prints the message, or that it was not captured.
+    pub(crate) fn note(&self) -> String {
+        match &self.message {
+            Some(message) => format!(
+                "message: mur trace show {} --body {}",
+                message.trace.display(),
+                &message.sha256[..MESSAGE_SHA_SHOWN]
+            ),
+            None => "message not captured".to_string(),
+        }
+    }
+}
+
+/// One row of a formation's listing: a `call-member` call, or a task no member sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FormationRow {
+    Call(FormationCall),
+    Task(FormationTask),
+}
+
+impl FormationRow {
+    fn set_depth(&mut self, depth: usize) {
+        match self {
+            Self::Call(call) => call.depth = depth,
+            Self::Task(task) => task.depth = depth,
+        }
+    }
+
+    /// The task this row hands a member, and that member: what a call made from it nests under.
+    fn holds(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Call(call) => Some((call.member_task_id.as_deref()?, call.callee.as_str())),
+            Self::Task(task) => Some((task.task_id.as_str(), task.member.as_str())),
+        }
+    }
+
+    /// The task this row was made from, and the member holding it; `None` for a row that was
+    /// made from no task found.
+    fn made_from(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Call(call) => Some((call.calling_task_id.as_deref()?, call.caller.as_str())),
+            Self::Task(_) => None,
+        }
+    }
+
+    /// The order rows sort in among their siblings: when they started, then their id.
+    fn sort_key(&self) -> (u64, Option<String>) {
+        match self {
+            Self::Call(call) => (call.started_ms, call.call_id.clone()),
+            Self::Task(task) => (task.received_ms, Some(task.task_id.clone())),
+        }
+    }
+}
+
+/// Every `call-member` call `members` record, once each, and every task a member received that
+/// no member sent, in display order.
 ///
-/// A call's caller side is its caller's [`MemberCallRecord`]; its callee side is the
-/// [`ReceivedMemberTask`] whose task id is the call's `member_task_id`. Every caller-side call is a
-/// row, and so is every received task no caller-side call matched. A row's parent is the call
-/// that handed over the task it was made from: the row whose `member_task_id` is its calling task
-/// and whose callee is its caller. Calls with no parent come first by `(started_ms, call id)`,
-/// each followed by its children, ordered the same way, one level deeper. Calls whose parents form
-/// a cycle have no root to be reached from: they follow every other call, each cycle starting at
-/// its earliest call with the rest nested beneath it, so every call is listed exactly once.
-pub(crate) fn formation_calls(members: &[RecordedMember]) -> Vec<FormationCall> {
-    // Each received task's callee and how it ended, by task id.
-    let mut received: HashMap<&str, (&RecordedMember, &ReceivedMemberTask)> = HashMap::new();
+/// A call's caller side is its caller's [`MemberCallRecord`]; its callee side is the member's
+/// [`ReceivedTask`] whose task id is the call's `member_task_id`. Every caller-side call is a
+/// row, and so is every member's received task no caller-side call matched. Every received task
+/// no member sent is a [`FormationTask`] row. A call row's parent is the row that handed over the
+/// task it was made from: the row whose task is its calling task and whose member is its caller.
+/// Rows with no parent come first by `(started, id)`, a task row's id being its task id, each
+/// followed by its children, ordered the same way, one level deeper. Calls whose parents form a
+/// cycle have no root to be reached from: they follow every other row, each cycle starting at its
+/// earliest call with the rest nested beneath it, so every row is listed exactly once.
+pub(crate) fn formation_rows(members: &[RecordedMember]) -> Vec<FormationRow> {
+    // Each member task's callee and how it ended, by task id.
+    let mut received: HashMap<&str, (&RecordedMember, &ReceivedTask)> = HashMap::new();
     for member in members {
         for task in &member.tasks_received {
-            received
-                .entry(task.task_id.as_str())
-                .or_insert((member, task));
+            if matches!(task.from, ReceivedFrom::Member(_)) {
+                received
+                    .entry(task.task_id.as_str())
+                    .or_insert((member, task));
+            }
         }
     }
     let mut matched: BTreeSet<&str> = BTreeSet::new();
-    let mut rows: Vec<FormationCall> = Vec::new();
+    let mut rows: Vec<FormationRow> = Vec::new();
     for member in members {
         for call in &member.calls_made {
             let callee_task = call
@@ -569,7 +783,7 @@ pub(crate) fn formation_calls(members: &[RecordedMember]) -> Vec<FormationCall> 
                 (None, _, Some((_, task))) => Some(CallGap::CalleeTaskEnded(task.ending.clone())),
                 (Some(_), Some(_), Some(_)) | (None, None, _) => None,
             };
-            rows.push(FormationCall {
+            rows.push(FormationRow::Call(FormationCall {
                 depth: 0,
                 call_id: Some(call.call_id.clone()),
                 caller: member.name().to_string(),
@@ -588,47 +802,62 @@ pub(crate) fn formation_calls(members: &[RecordedMember]) -> Vec<FormationCall> 
                 member_task_id: call.member_task_id.clone(),
                 busy_offers: call.busy_offers,
                 no_answer_below: call.no_answer_below.clone(),
-            });
+            }));
         }
     }
     for member in members {
         for task in &member.tasks_received {
-            if matched.contains(task.task_id.as_str()) {
-                continue;
-            }
-            rows.push(FormationCall {
-                depth: 0,
-                call_id: task.call_id.clone(),
-                caller: task.caller.clone(),
-                callee: member.name().to_string(),
-                started_ms: task.received_ms,
-                ending: CallEnding::Unknown,
-                gap: Some(CallGap::CallerTraceNotFound(task.ending.clone())),
-                calling_task_id: None,
-                member_task_id: Some(task.task_id.clone()),
-                busy_offers: 0,
-                no_answer_below: Vec::new(),
-            });
+            let row = match &task.from {
+                ReceivedFrom::Member(_) if matched.contains(task.task_id.as_str()) => continue,
+                ReceivedFrom::Member(caller) => FormationRow::Call(FormationCall {
+                    depth: 0,
+                    call_id: task.call_id.clone(),
+                    caller: caller.clone(),
+                    callee: member.name().to_string(),
+                    started_ms: task.received_ms,
+                    ending: CallEnding::Unknown,
+                    gap: Some(CallGap::CallerTraceNotFound(task.ending.clone())),
+                    calling_task_id: None,
+                    member_task_id: Some(task.task_id.clone()),
+                    busy_offers: 0,
+                    no_answer_below: Vec::new(),
+                }),
+                from => FormationRow::Task(FormationTask {
+                    depth: 0,
+                    task_id: task.task_id.clone(),
+                    from: from.clone(),
+                    member: member.name().to_string(),
+                    received_ms: task.received_ms,
+                    ending: task.ending.clone(),
+                    duration_ms: task.duration_ms,
+                    message: task
+                        .message_sha256
+                        .as_ref()
+                        .filter(|_| task.message_stored)
+                        .map(|sha| StoredMessage {
+                            trace: member.session_dir.join("trace.jsonl"),
+                            sha256: sha.clone(),
+                        }),
+                }),
+            };
+            rows.push(row);
         }
     }
     nest(rows)
 }
 
-/// `rows` in display order, each with its depth: see [`formation_calls`].
-fn nest(rows: Vec<FormationCall>) -> Vec<FormationCall> {
+/// `rows` in display order, each with its depth: see [`formation_rows`].
+fn nest(rows: Vec<FormationRow>) -> Vec<FormationRow> {
     let by_task: HashMap<(&str, &str), usize> = rows
         .iter()
         .enumerate()
-        .filter_map(|(i, row)| Some(((row.member_task_id.as_deref()?, row.callee.as_str()), i)))
+        .filter_map(|(i, row)| Some((row.holds()?, i)))
         .collect();
     let parent: Vec<Option<usize>> = rows
         .iter()
-        .map(|row| {
-            let task = row.calling_task_id.as_deref()?;
-            by_task.get(&(task, row.caller.as_str())).copied()
-        })
+        .map(|row| by_task.get(&row.made_from()?).copied())
         .collect();
-    let key = |i: &usize| (rows[*i].started_ms, rows[*i].call_id.clone());
+    let key = |i: &usize| rows[*i].sort_key();
     let mut children: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     let mut roots = Vec::new();
     for (i, parent) in parent.iter().enumerate() {
@@ -660,22 +889,23 @@ fn nest(rows: Vec<FormationCall>) -> Vec<FormationCall> {
             }
         }
     }
-    let mut rows: Vec<Option<FormationCall>> = rows.into_iter().map(Some).collect();
+    let mut rows: Vec<Option<FormationRow>> = rows.into_iter().map(Some).collect();
     order
         .into_iter()
         .filter_map(|(i, depth)| {
             let mut row = rows[i].take()?;
-            row.depth = depth;
+            row.set_depth(depth);
             Some(row)
         })
         .collect()
 }
 
 /// A member's whole trace, read once for its identity, its ending, its delegations, the calls it
-/// made and the member tasks it received.
+/// made and the tasks it received.
 fn read_member(session_dir: &Path, session_id: String) -> RecordedMember {
     let mut member = RecordedMember {
         session_id,
+        session_dir: session_dir.to_path_buf(),
         capsule: String::new(),
         member: None,
         callees: Vec::new(),
@@ -715,19 +945,32 @@ fn read_member(session_dir: &Path, session_id: String) -> RecordedMember {
             Line::MemberCallStart(start) => fold_member_call_start(&mut member.calls_made, start),
             Line::MemberCall(end) => fold_member_call(&mut member.calls_made, end),
             Line::A2aTaskReceived(received) => {
-                if let Some(caller) = received.caller_member {
-                    member.tasks_received.push(ReceivedMemberTask {
-                        call_id: call_id_of_message(&received.message_id),
-                        task_id: received.task_id,
-                        caller,
-                        received_ms: received.timestamp,
-                        ending: None,
-                    });
-                }
+                let message_sha256 = blob_name(received.message_sha256);
+                let message_stored = message_sha256.as_ref().is_some_and(|sha| {
+                    session_dir
+                        .join(crate::commands::trace::BLOB_DIR_NAME)
+                        .join(sha)
+                        .is_file()
+                });
+                member.tasks_received.push(ReceivedTask {
+                    call_id: call_id_of_message(&received.message_id),
+                    task_id: received.task_id,
+                    from: ReceivedFrom::of(
+                        received.caller.as_deref(),
+                        received.caller_member,
+                        received.caller_credential,
+                    ),
+                    received_ms: received.timestamp,
+                    ending: None,
+                    duration_ms: 0,
+                    message_sha256,
+                    message_stored,
+                });
             }
             Line::TaskEnd {
                 task_id,
                 exit_status,
+                duration_ms,
             } => {
                 if let Some(task) = member
                     .tasks_received
@@ -735,6 +978,7 @@ fn read_member(session_dir: &Path, session_id: String) -> RecordedMember {
                     .find(|task| task.task_id == task_id && task.ending.is_none())
                 {
                     task.ending = Some(exit_status.unwrap_or_default());
+                    task.duration_ms = duration_ms;
                 }
             }
             _ => {}
@@ -943,6 +1187,7 @@ mod tests {
             vec![
                 RecordedMember {
                     session_id: ended.clone(),
+                    session_dir: root.path().join(&ended),
                     capsule: "member@0.1.0".to_string(),
                     member: None,
                     callees: Vec::new(),
@@ -954,6 +1199,7 @@ mod tests {
                 },
                 RecordedMember {
                     session_id: killed.clone(),
+                    session_dir: root.path().join(&killed),
                     capsule: "member@0.1.0".to_string(),
                     member: None,
                     callees: Vec::new(),
@@ -965,6 +1211,7 @@ mod tests {
                 },
                 RecordedMember {
                     session_id: child_here.clone(),
+                    session_dir: root.path().join(&child_here),
                     capsule: "member@0.1.0".to_string(),
                     member: None,
                     callees: Vec::new(),
@@ -1073,6 +1320,57 @@ mod tests {
 
     fn task_end(task: &str, status: &str) -> String {
         json!({"event_type": "task_end", "task_id": task, "exit_status": status}).to_string()
+    }
+
+    /// An `a2a_task_received` line as this version writes it, `fields` naming the caller and
+    /// the message hash.
+    fn received_as(task: &str, message_id: &str, fields: serde_json::Value, at: u64) -> String {
+        let mut line = json!({
+            "event_type": "a2a_task_received", "timestamp": at, "task_id": task,
+            "context_id": "ctx", "message_id": message_id, "traceparent_from_caller": null,
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            line[key] = value.clone();
+        }
+        line.to_string()
+    }
+
+    fn task_end_after(task: &str, status: &str, duration_ms: u64) -> String {
+        json!({"event_type": "task_end", "task_id": task, "exit_status": status,
+               "duration_ms": duration_ms})
+        .to_string()
+    }
+
+    /// The call rows of [`formation_rows`], in display order.
+    fn formation_calls(members: &[RecordedMember]) -> Vec<FormationCall> {
+        formation_rows(members)
+            .into_iter()
+            .filter_map(|row| match row {
+                FormationRow::Call(call) => Some(call),
+                FormationRow::Task(_) => None,
+            })
+            .collect()
+    }
+
+    /// Every row's depth, `from→to` and note: a call's gap note, a task's message note.
+    fn row_summary(rows: &[FormationRow]) -> Vec<(usize, String, String)> {
+        rows.iter()
+            .map(|row| match row {
+                FormationRow::Call(call) => (
+                    call.depth,
+                    format!("{}→{}", call.caller, call.callee),
+                    call.gap
+                        .as_ref()
+                        .map(|gap| gap.note(&call.caller, &call.callee))
+                        .unwrap_or_default(),
+                ),
+                FormationRow::Task(task) => (
+                    task.depth,
+                    format!("{}→{}", task.from.label(), task.member),
+                    task.note(),
+                ),
+            })
+            .collect()
     }
 
     /// Every row's depth, `caller→callee` and gap note.
@@ -1459,6 +1757,7 @@ mod tests {
     ) -> RecordedMember {
         RecordedMember {
             session_id: format!("ses_{name}"),
+            session_dir: PathBuf::from(format!("/records/ses_{name}")),
             capsule: "c@0.1.0".to_string(),
             member: Some(name.to_string()),
             callees: Vec::new(),
@@ -1482,12 +1781,15 @@ mod tests {
                 .collect(),
             tasks_received: tasks
                 .iter()
-                .map(|(task, caller)| ReceivedMemberTask {
+                .map(|(task, caller)| ReceivedTask {
                     task_id: task.to_string(),
                     call_id: None,
-                    caller: caller.to_string(),
+                    from: ReceivedFrom::Member(caller.to_string()),
                     received_ms: 0,
                     ending: Some("completed".to_string()),
+                    duration_ms: 1,
+                    message_sha256: None,
+                    message_stored: false,
                 })
                 .collect(),
         }
@@ -1572,9 +1874,134 @@ mod tests {
         );
     }
 
-    /// A task an operator or a plain A2A peer sent carries no `caller_member` and is no call.
+    /// `lead` received `worker`'s call and, later, the operator's task: both are rows in time
+    /// order, the call joined from both sides and the operator's a task row of its own; without
+    /// the operator's line only the call row is left.
     #[test]
-    fn an_operator_task_makes_no_call_row() {
+    fn an_operator_task_is_a_row_beside_the_calls() {
+        for with_operator in [true, false] {
+            let formation = FormationId::mint();
+            let root = tempfile::tempdir().unwrap();
+            let lead = session_after(&formation, 10, "1");
+            let worker = session_after(&formation, 20, "2");
+            let mut lead_lines = vec![
+                member_start(&lead, &formation, Some("lead"), &["worker"], "lead"),
+                received_as(
+                    "tsk_l",
+                    "msg_mcl_1",
+                    json!({"caller": "member", "caller_member": "worker"}),
+                    60,
+                ),
+                task_end_after("tsk_l", "completed", 70),
+            ];
+            if with_operator {
+                lead_lines.push(received_as(
+                    "tsk_op",
+                    "msg_op",
+                    json!({"caller": "operator", "message_sha256": "ab".repeat(32)}),
+                    500,
+                ));
+                lead_lines.push(task_end_after("tsk_op", "ok", 35_500));
+            }
+            write_trace(root.path(), &lead, &lead_lines);
+            write_trace(
+                root.path(),
+                &worker,
+                &[
+                    member_start(&worker, &formation, Some("worker"), &["lead"], "worker"),
+                    call_start("tsk_w", "mcl_1", "lead", "tsk_l", 50),
+                    call_end(
+                        "tsk_w",
+                        "mcl_1",
+                        "lead",
+                        Some("tsk_l"),
+                        "completed",
+                        90,
+                        true,
+                        140,
+                    ),
+                ],
+            );
+            let members = recorded_members(root.path(), &formation).unwrap().members;
+            let rows = formation_rows(&members);
+            let mut expected = vec![(0, "worker→lead".to_string(), String::new())];
+            if with_operator {
+                expected.push((0, "operator→lead".into(), "message not captured".into()));
+            }
+            assert_eq!(row_summary(&rows), expected);
+            if with_operator {
+                let FormationRow::Task(task) = &rows[1] else {
+                    panic!("the operator's task is a task row: {rows:?}");
+                };
+                assert_eq!(task.task_id, "tsk_op");
+                assert_eq!(task.ending.as_deref(), Some("ok"));
+                assert_eq!(task.duration_ms, 35_500);
+            }
+        }
+    }
+
+    /// A task row points at its message only when the blob holding it exists, and a hash that is
+    /// no blob name is no hash.
+    #[test]
+    fn a_task_row_points_at_its_message_only_when_the_blob_exists() {
+        let formation = FormationId::mint();
+        let root = tempfile::tempdir().unwrap();
+        let worker = session_after(&formation, 20, "2");
+        let stored = "3f2a9c1e0b7d".to_string() + &"1".repeat(52);
+        let missing = "c".repeat(64);
+        write_trace(
+            root.path(),
+            &worker,
+            &[
+                member_start(&worker, &formation, Some("worker"), &[], "worker"),
+                received_as(
+                    "tsk_a",
+                    "msg_a",
+                    json!({"caller": "operator", "message_sha256": stored}),
+                    10,
+                ),
+                received_as(
+                    "tsk_b",
+                    "msg_b",
+                    json!({"caller": "operator", "message_sha256": missing}),
+                    20,
+                ),
+                received_as(
+                    "tsk_c",
+                    "msg_c",
+                    json!({"caller": "operator", "message_sha256": "../trace.jsonl"}),
+                    30,
+                ),
+            ],
+        );
+        let blobs = root.path().join(&worker).join("blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        fs::write(blobs.join(&stored), "Name three colours.").unwrap();
+        let members = recorded_members(root.path(), &formation).unwrap().members;
+        let trace = root.path().join(&worker).join("trace.jsonl");
+        assert_eq!(
+            row_summary(&formation_rows(&members)),
+            [
+                (
+                    0,
+                    "operator→worker".into(),
+                    format!(
+                        "message: mur trace show {} --body 3f2a9c1e0b7d",
+                        trace.display()
+                    )
+                ),
+                (0, "operator→worker".into(), "message not captured".into()),
+                (0, "operator→worker".into(), "message not captured".into()),
+            ]
+        );
+        assert_eq!(members[0].tasks_received[2].message_sha256, None);
+    }
+
+    /// Each sender `a2a_task_received` can name, and every line that names none or names it
+    /// incompletely: an older trace's task with no `caller` is a member's call when it carries
+    /// `caller_member` and from an unknown caller when it does not.
+    #[test]
+    fn every_received_task_is_classified_by_who_let_it_in() {
         let formation = FormationId::mint();
         let root = tempfile::tempdir().unwrap();
         let worker = session_after(&formation, 20, "2");
@@ -1583,13 +2010,144 @@ mod tests {
             &worker,
             &[
                 member_start(&worker, &formation, Some("worker"), &[], "worker"),
-                received("tsk_op", "msg_mcl_looks_like_a_call", None, 60),
-                task_end("tsk_op", "completed"),
+                received_as("tsk_1", "m", json!({"caller": "operator"}), 1),
+                received_as("tsk_2", "m", json!({"caller": "public"}), 2),
+                received_as(
+                    "tsk_3",
+                    "m",
+                    json!({"caller": "credential", "caller_credential": "alice"}),
+                    3,
+                ),
+                received_as(
+                    "tsk_4",
+                    "m",
+                    json!({"caller": "member", "caller_member": "lead"}),
+                    4,
+                ),
+                received("tsk_5", "m", Some("lead"), 5),
+                received("tsk_6", "m", None, 6),
+                received_as("tsk_7", "m", json!({"caller": "wizard"}), 7),
+                received_as("tsk_8", "m", json!({"caller": "credential"}), 8),
+                received_as("tsk_9", "m", json!({"caller": "member"}), 9),
+                r#"{"event_type":"a2a_task_received","task_id":"tsk_torn","cal"#.to_string(),
             ],
         );
         let members = recorded_members(root.path(), &formation).unwrap().members;
-        assert!(members[0].tasks_received.is_empty());
-        assert!(formation_calls(&members).is_empty());
+        let from: Vec<&ReceivedFrom> = members[0]
+            .tasks_received
+            .iter()
+            .map(|task| &task.from)
+            .collect();
+        let lead = ReceivedFrom::Member("lead".into());
+        assert_eq!(
+            from,
+            [
+                &ReceivedFrom::Operator,
+                &ReceivedFrom::Public,
+                &ReceivedFrom::Credential("alice".into()),
+                &lead,
+                &lead,
+                &ReceivedFrom::Unknown,
+                &ReceivedFrom::Unknown,
+                &ReceivedFrom::Unknown,
+                &ReceivedFrom::Unknown,
+            ]
+        );
+        assert_eq!(
+            row_summary(&formation_rows(&members))
+                .into_iter()
+                .map(|(_, pair, _)| pair)
+                .collect::<Vec<_>>(),
+            [
+                "operator→worker",
+                "public→worker",
+                "credential alice→worker",
+                "lead→worker",
+                "lead→worker",
+                "unknown caller→worker",
+                "unknown caller→worker",
+                "unknown caller→worker",
+                "unknown caller→worker",
+            ]
+        );
+        assert_eq!(
+            sender_kind_counts(&from.into_iter().cloned().collect::<Vec<_>>()),
+            [
+                ("operator", 1),
+                ("member", 2),
+                ("credential", 1),
+                ("public", 1),
+                ("unknown caller", 4)
+            ]
+        );
+    }
+
+    /// A call `lead` made from the operator's task sits under the operator's row; the same call
+    /// with no operator's line is a root, as is a call from the launch's own task.
+    #[test]
+    fn a_call_made_inside_a_task_no_member_sent_nests_under_it() {
+        for with_operator in [true, false] {
+            let formation = FormationId::mint();
+            let root = tempfile::tempdir().unwrap();
+            let lead = session_after(&formation, 10, "1");
+            let mut lead_lines = vec![member_start(
+                &lead,
+                &formation,
+                Some("lead"),
+                &["worker"],
+                "lead",
+            )];
+            if with_operator {
+                lead_lines.push(received_as(
+                    "tsk_A",
+                    "msg_a",
+                    json!({"caller": "operator"}),
+                    40,
+                ));
+            }
+            lead_lines.extend([
+                call_start("tsk_A", "mcl_1", "worker", "tsk_w", 50),
+                call_end(
+                    "tsk_A",
+                    "mcl_1",
+                    "worker",
+                    Some("tsk_w"),
+                    "completed",
+                    90,
+                    true,
+                    140,
+                ),
+                call_start("tsk_launch", "mcl_0", "worker", "tsk_w0", 45),
+            ]);
+            write_trace(root.path(), &lead, &lead_lines);
+            let rows = formation_rows(&recorded_members(root.path(), &formation).unwrap().members);
+            let listed: Vec<(usize, String)> = row_summary(&rows)
+                .into_iter()
+                .map(|(depth, pair, _)| (depth, pair))
+                .collect();
+            if with_operator {
+                assert_eq!(
+                    listed,
+                    [
+                        (0, "operator→lead".to_string()),
+                        (1, "lead→worker".to_string()),
+                        (0, "lead→worker".to_string()),
+                    ]
+                );
+                let FormationRow::Call(nested) = &rows[1] else {
+                    panic!("{rows:?}");
+                };
+                assert_eq!(nested.call_id.as_deref(), Some("mcl_1"));
+            } else {
+                assert_eq!(
+                    listed,
+                    [
+                        (0, "lead→worker".to_string()),
+                        (0, "lead→worker".to_string()),
+                    ]
+                );
+            }
+        }
     }
 
     /// A torn line costs only itself, and a field another event spells with another type makes
