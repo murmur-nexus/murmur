@@ -478,7 +478,9 @@ fn the_spend_ceiling_refuses_the_call_after_a_capped_turn() {
         "{trace:#?}"
     );
     assert!(events(&trace, "task_failed").is_empty(), "{trace:#?}");
-    assert_eq!(only(&trace, "task_end")["capped_turns"], 1);
+    let task_end = only(&trace, "task_end");
+    assert_eq!(task_end["exit_status"], "spend_ceiling_reached");
+    assert_eq!(task_end["capped_turns"], 1);
 }
 
 // ── S8: keep-working sees only real turn ends ────────────────────────────────

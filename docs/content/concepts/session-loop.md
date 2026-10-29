@@ -60,6 +60,8 @@ A `transport: http` turn the provider stopped at
 | The second turn in a row cut at the cap with no text and no tool call | The task ends `failed`, with [`task_failed`](../reference/observability-schemas.md#task-failed) cause `output_cap` |
 | Any other | The task goes on with another turn |
 
+A turn that is both the second empty one in a row and the last allowed turn ends the task `failed`.
+
 Before the next turn, the runtime keeps the turn's thinking and text in the conversation, marked
 `truncated` in the [conversation record](../reference/workdir.md#the-conversation-record), and
 drops any tool call in it unrun, because its arguments may be cut. A turn with nothing left after
@@ -84,8 +86,9 @@ A capped turn the task goes on from is not a turn end:
 
 The task's own limits bound the repeats: `inference.max_turns`, the
 [spend ceilings](../reference/manifest.md#inference-max-session-tokens) and the
-[session deadline](#deadlines). An `output_cap` failure is a failure, not a budget stop, so a task
-being kept working does not end with its last turn end's answer. Each capped turn prints
+[session deadline](#deadlines). Under [keep-working](#keep-working), an `output_cap` failure ends
+the task `failed`: it does not end `ok` with the last turn end's answer, as reaching one of those
+limits does. Each capped turn prints
 [`W-RUN-001`](../reference/diagnostics.md#w-run-001).
 
 ## `MURMUR.md` { #murmur-md }

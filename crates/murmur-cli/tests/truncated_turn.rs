@@ -361,8 +361,7 @@ fn a_missing_stop_reason_is_recorded_as_the_empty_string() {
 }
 
 /// A turn cut off before it produced any text writes the marker alone when it is the task's last.
-/// `inference.max_turns: 1` ends the task on its one capped turn, as it did before capped turns
-/// continued.
+/// `inference.max_turns: 1` ends the task `ok` on its one capped turn.
 #[test]
 fn an_empty_capped_turn_writes_the_marker_alone() {
     let run = run(Some("EMPTY"), Some(1));

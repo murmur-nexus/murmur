@@ -2419,8 +2419,8 @@ pub(crate) async fn run_agent_loop(
                     .await;
                 }
 
-                // No turn left for the task: the fragment is its answer, as a capped turn always
-                // was, so `inference.max_turns: 1` behaves as it did before capped turns continued.
+                // No turn left for the task: the fragment is its answer, so `inference.max_turns: 1`
+                // ends the task `ok` on its one capped turn.
                 let last_turn = task_max_turns.is_some_and(|max| trace.task_turns() >= max)
                     || (inference.max_turns.is_some() && attempt_turn + 1 == turn_bound);
                 if !last_turn {

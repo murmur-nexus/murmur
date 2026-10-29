@@ -340,8 +340,8 @@ curl -s -X POST http://localhost:$PORT \
 
 | Final `status.state` | The task |
 |---|---|
-| `TASK_STATE_COMPLETED` | Finished its work. A reply cut off at `inference.max_tokens` still counts |
-| `TASK_STATE_FAILED` | Did not finish: an inference call failed, a `request-input` wait timed out, it used every turn `inference.max_turns` allows, or a spend ceiling stopped it. The worker's `trace.jsonl` says which — its `task_end` status, and a `task_failed` line naming the cause |
+| `TASK_STATE_COMPLETED` | Finished its work. A reply cut off at `inference.max_tokens` on the task's last allowed turn still counts |
+| `TASK_STATE_FAILED` | Did not finish: an inference call failed, a `request-input` wait timed out, it used every turn `inference.max_turns` allows, two turns in a row stopped at `inference.max_tokens` with no text and no tool call, or a spend ceiling stopped it. The worker's `trace.jsonl` says which — its `task_end` status, and a `task_failed` line naming the cause |
 | `TASK_STATE_CANCELED` | Was stopped with `CancelTask`, `murmur.StopSession` or `mur stop` |
 
 ```json

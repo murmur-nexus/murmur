@@ -1660,7 +1660,7 @@ On `transport: http`, a turn the provider stopped at the cap ends that turn, not
 | The capped turn | Result |
 |---|---|
 | The task's last allowed turn under [`inference.max_turns`](#inference-max-turns) | The task ends `ok`; every surface carrying the reply marks it as a fragment |
-| The second in a row with no text and no tool call | The task ends `failed`, [`task_failed`](observability-schemas.md#task-failed) cause `output_cap` |
+| The second in a row with no text and no tool call, even when it is also the last allowed turn | The task ends `failed`, [`task_failed`](observability-schemas.md#task-failed) cause `output_cap` |
 | Any other | The runtime drops any tool call in it unrun, adds one user message stating the cut, and the task goes on |
 
 `inference.max_turns: 1` allows one counted inference call per task, an agent-loop turn and a
