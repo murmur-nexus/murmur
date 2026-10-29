@@ -43,8 +43,53 @@ signals it is done, or until it reaches the turn limit `inference.max_turns` set
 manifest sets one. One *turn* is one round-trip to the inference driver — the runtime sends the
 current conversation history, tool list, and system prompt; the driver returns a response. If the model requests a tool call, the runtime
 executes it, appends the result, and starts the next turn. When the model returns `end_turn`
-(or `max_tokens`) the result is written to `out/result.txt` in the session's
-[records directory](../reference/workdir.md#records-directory) and the loop exits.
+the result is written to `out/result.txt` in the session's
+[records directory](../reference/workdir.md#records-directory) and the loop exits. A turn the
+provider cut at the output cap ends that turn, not the task: see
+[A turn cut at the output cap](#output-cap).
+
+## A turn cut at the output cap { #output-cap }
+
+A `transport: http` turn the provider stopped at
+[`inference.max_tokens`](../reference/manifest.md#inference-max-tokens) (`stop_reason:
+"max_tokens"`) is a turn that was cut off, not a turn end. What happens next depends on the turn:
+
+| The capped turn | What happens |
+|---|---|
+| The task's last allowed turn under [`inference.max_turns`](#turn-limit-inferencemax_turns) | The task ends `ok`, and its result is the fragment with a marker naming the cap |
+| The second turn in a row cut at the cap with no text and no tool call | The task ends `failed`, with [`task_failed`](../reference/observability-schemas.md#task-failed) cause `output_cap` |
+| Any other | The task goes on with another turn |
+
+A turn that is both the second empty one in a row and the last allowed turn ends the task `failed`.
+
+Before the next turn, the runtime keeps the turn's thinking and text in the conversation, marked
+`truncated` in the [conversation record](../reference/workdir.md#the-conversation-record), and
+drops any tool call in it unrun, because its arguments may be cut. A turn with nothing left after
+that adds no assistant message. The runtime then adds one user message stating the fact:
+
+```text
+The previous turn reached the inference.max_tokens output cap of 65536 tokens and was cut off. It made no tool call.
+```
+
+When the turn's tool calls were dropped, the second sentence names them in the order the model
+made them: `Its tool call write was cut off with it and was not run.`, or
+`Its tool calls bash, write were cut off with it and were not run.` for more than one.
+
+A capped turn the task goes on from is not a turn end:
+
+- [Keep-working](#keep-working) and the [done check](#done-check) do not answer it. They answer
+  the next real turn end.
+- `on-task-end` hooks do not run between it and the next turn.
+- [`call-member`](../reference/runtime-provided-tools.md#call-member) calls and delegations are
+  unaffected by it.
+- Its fragment never reaches `out/result.txt`, which only the turn that ends the task writes.
+
+The task's own limits bound the repeats: `inference.max_turns`, the
+[spend ceilings](../reference/manifest.md#inference-max-session-tokens) and the
+[session deadline](#deadlines). Under [keep-working](#keep-working), an `output_cap` failure ends
+the task `failed`: it does not end `ok` with the last turn end's answer, as reaching one of those
+limits does. Each capped turn prints
+[`W-RUN-001`](../reference/diagnostics.md#w-run-001).
 
 ## `MURMUR.md` { #murmur-md }
 

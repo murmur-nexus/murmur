@@ -505,7 +505,7 @@ before the messages go to a driver:
 |---|---|
 | `source_id` | A message a hook produced, when that hook supplied one |
 | `canceled` | The assistant message left behind by a turn a person stopped |
-| `truncated` | An assistant message the provider cut off at [`inference.max_tokens`](manifest.md#inference-max-tokens) |
+| `truncated` | An assistant message the provider cut off at [`inference.max_tokens`](manifest.md#inference-max-tokens). It holds the turn's thinking and text only: a tool call in a capped turn is never run and never kept |
 | `fence` | A message whose `content` is wrapped in the [untrusted fence](untrusted-fence.md) — the source name, `tool:<artifact name>` or `task:<origin>` |
 | `inserted_by` | A message a hook output put into the conversation: `replace-context` for a compaction hook's replacement, `seed-context` for an `on-task-start` hook's seed |
 | `produced_by` | Every assistant message the agent loop writes, when the capsule declares [`inference.alternates`](manifest.md#inference-alternates): `{"driver": "<artifact>", "model": "<model>"}`, the [driver choice](../concepts/context.md#switching-drivers) that produced it. A message without it counts as the primary's |
@@ -513,8 +513,12 @@ before the messages go to a driver:
 `inserted_by` is set by the runtime when it commits the hook's output, whatever `role` the message has and whatever the hook claimed. A message a compaction hook hands back unchanged keeps the value it already had, so a person's task message stays without one.
 
 The record holds every message that enters the context, in the order it enters: the task's user
-message, each committed `seed-context` message, each assistant message, each tool result, and each
-message a compaction commits — beside, not instead of, the messages it replaced.
+message, each committed `seed-context` message, each assistant message, each tool result, each
+user message the runtime adds to continue the task — a reopen's feedback, handed-off work's
+outcomes, the [keep-working](manifest.md#lifecycle-keep-working) message, a failing
+[done check](manifest.md#lifecycle-done-check)'s output, and the
+[statement of a capped turn](../concepts/session-loop.md#output-cap) — and each message a
+compaction commits — beside, not instead of, the messages it replaced.
 
 [`context.retain`](manifest.md#retention) is what bounds it, and
 [`mur conversation`](cli.md#mur-conversation) is what an operator prunes it with by hand. Without

@@ -289,7 +289,7 @@ Key attributes on `capsule.inference` child spans:
 | `turn` | Turn number (0-indexed) |
 | `input_tokens` | Tokens in the inference request |
 | `output_tokens` | Tokens in the model's response |
-| `decision` | What the model decided: `tool_call` or `end_turn` |
+| `decision` | What the loop did with the response: `tool_call`, `end_turn`, `capped` (cut at the output cap), `text` or `error` |
 | `tool_name` | Name of the tool called (when `decision` is `tool_call`) |
 
 To filter to sessions that exited cleanly:

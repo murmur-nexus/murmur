@@ -1655,9 +1655,19 @@ this value also squeezes a configured thinking budget.
 
 ##### When a turn hits the cap { #inference-max-tokens-reached }
 
-A turn the provider stopped at the cap still produces a result: the session ends `ok`, the runtime
-attempts no continuation turn, and every surface carrying the reply marks it as a fragment.
-[`W-RUN-001`](diagnostics.md#w-run-001) lists what the turn leaves behind.
+On `transport: http`, a turn the provider stopped at the cap ends that turn, not the task:
+
+| The capped turn | Result |
+|---|---|
+| The task's last allowed turn under [`inference.max_turns`](#inference-max-turns) | The task ends `ok`; every surface carrying the reply marks it as a fragment |
+| The second in a row with no text and no tool call, even when it is also the last allowed turn | The task ends `failed`, [`task_failed`](observability-schemas.md#task-failed) cause `output_cap` |
+| Any other | The runtime drops any tool call in it unrun, adds one user message stating the cut, and the task goes on |
+
+`inference.max_turns: 1` allows one counted inference call per task, an agent-loop turn and a
+hook's `run-inference` call alike, so a capped first turn is always the last and ends the task
+`ok` with the fragment. [A turn cut at the output cap](../concepts/session-loop.md#output-cap)
+gives the message's text and what a capped turn skips;
+[`W-RUN-001`](diagnostics.md#w-run-001) lists what each outcome leaves behind.
 
 A driver reaches this path by reporting `stop_reason: "max_tokens"` in its response. A driver whose
 provider names the same condition differently normalizes it to that value.

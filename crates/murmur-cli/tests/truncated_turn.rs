@@ -39,16 +39,24 @@ fn driver_wasm() -> PathBuf {
     common::fixture_path("truncation-driver/tool/truncation-driver.wasm")
 }
 
-/// A capsule wired to the fixture, declaring `inference.max_tokens: 256`.
+/// A capsule wired to the fixture, declaring `inference.max_tokens: 256` and, when given,
+/// `inference.max_turns`.
+///
+/// The fixture answers every call in a mode the same way, and a capped turn that is not the task's
+/// last continues it, so a capped mode is run with the `max_turns` that makes its capped turn the
+/// last one.
 ///
 /// It declares no `capabilities.shell.allow` and no `capabilities.spawn`, so the session needs no
 /// cgroup scope and runs unprivileged. The endpoint is a dummy: the fixture answers locally.
-fn write_project(project_dir: &Path, config_mode: Option<&str>) -> PathBuf {
+fn write_project(project_dir: &Path, config_mode: Option<&str>, max_turns: Option<u32>) -> PathBuf {
     let endpoint = "http://127.0.0.1:9";
     let config_section = match config_mode {
         Some(mode) => format!("    config:\n      mode: {mode}\n"),
         None => String::new(),
     };
+    let max_turns = max_turns
+        .map(|max| format!("  max_turns: {max}\n"))
+        .unwrap_or_default();
     let manifest = format!(
         "name: truncation-capsule\n\
          version: 0.1.0\n\
@@ -56,7 +64,7 @@ fn write_project(project_dir: &Path, config_mode: Option<&str>) -> PathBuf {
          \x20   gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
          capabilities:\n  network:\n    allow:\n      - {endpoint}\n\
          inference:\n  transport: http\n  model: test-model\n  \
-         max_tokens: {CAP}\n  driver:\n    artifact: {DRIVER_NAME}\n\
+         max_tokens: {CAP}\n{max_turns}  driver:\n    artifact: {DRIVER_NAME}\n\
          {config_section}"
     );
     let path = project_dir.join("murmur.yaml");
@@ -156,8 +164,9 @@ impl Run {
     }
 }
 
-/// Publish the fixture driver, then run `mur run --context` against it under `config_mode`.
-fn run(config_mode: Option<&str>) -> Run {
+/// Publish the fixture driver, then run `mur run --context` against it under `config_mode` and
+/// `max_turns`.
+fn run(config_mode: Option<&str>, max_turns: Option<u32>) -> Run {
     let home = TempDir::new().unwrap();
     let artifact_dir = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
@@ -170,7 +179,7 @@ fn run(config_mode: Option<&str>) -> Run {
     );
     common::publish_local(&home, &artifact).success();
 
-    let manifest = write_project(project.path(), config_mode);
+    let manifest = write_project(project.path(), config_mode, max_turns);
     let assertion = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
@@ -209,7 +218,7 @@ fn warning_lines(stderr: &str) -> Vec<&str> {
 /// `stop_reason`, one warning naming the setting and its value, and an `ok` session.
 #[test]
 fn a_capped_turn_is_marked_on_every_surface() {
-    let run = run(None);
+    let run = run(None, Some(1));
     run.assert_success();
 
     assert_eq!(
@@ -226,8 +235,8 @@ fn a_capped_turn_is_marked_on_every_surface() {
     let inference = run.sole_inference();
     assert_eq!(inference["stop_reason"], "max_tokens");
     assert_eq!(
-        inference["decision"], "text",
-        "`decision` keeps its existing vocabulary; `stop_reason` is what says the turn was cut off"
+        inference["decision"], "capped",
+        "a capped turn's decision says so, beside the provider's own stop_reason"
     );
 
     let stderr = run.stderr();
@@ -259,7 +268,7 @@ fn a_capped_turn_is_marked_on_every_surface() {
 /// warning, no envelope key. The only addition anywhere is `stop_reason` on the trace event.
 #[test]
 fn a_completed_turn_is_untouched() {
-    let run = run(Some("ENDTURN"));
+    let run = run(Some("ENDTURN"), None);
     run.assert_success();
 
     assert_eq!(
@@ -290,7 +299,7 @@ fn a_completed_turn_is_untouched() {
 /// same terms as cancellation — never by editing the content a later resume replays.
 #[test]
 fn the_record_marks_the_envelope_and_keeps_the_content() {
-    let run = run(None);
+    let run = run(None, Some(1));
     run.assert_success();
 
     let assistants = run.recorded_assistants();
@@ -315,7 +324,7 @@ fn the_record_marks_the_envelope_and_keeps_the_content() {
 /// cannot be used to confirm success.
 #[test]
 fn stop_reason_is_written_for_every_turn() {
-    let run = run(Some("TOOLTHENCAP"));
+    let run = run(Some("TOOLTHENCAP"), Some(2));
     run.assert_success();
 
     let events = run.inference_events();
@@ -331,7 +340,7 @@ fn stop_reason_is_written_for_every_turn() {
 /// recorded nothing".
 #[test]
 fn a_missing_stop_reason_is_recorded_as_the_empty_string() {
-    let run = run(Some("NOSTOP"));
+    let run = run(Some("NOSTOP"), None);
 
     let inference = run.sole_inference();
     assert!(
@@ -351,21 +360,77 @@ fn a_missing_stop_reason_is_recorded_as_the_empty_string() {
     );
 }
 
-/// A turn cut off before it produced any text writes the marker alone.
+/// A turn cut off before it produced any text writes the marker alone when it is the task's last.
+/// `inference.max_turns: 1` ends the task `ok` on its one capped turn.
 #[test]
 fn an_empty_capped_turn_writes_the_marker_alone() {
-    let run = run(Some("EMPTY"));
+    let run = run(Some("EMPTY"), Some(1));
     run.assert_success();
 
     assert_eq!(run.result(), MARKER, "no leading blank lines");
     assert_eq!(run.exit_status(), "ok");
+    assert_eq!(run.inference_events().len(), 1);
+}
+
+/// With turns left, a capped turn with no text and no tool call continues the task, and a second
+/// one in a row ends it `failed` with cause `output_cap`, naming both turns and the cap.
+#[test]
+fn two_empty_capped_turns_in_a_row_end_the_task_failed() {
+    let run = run(Some("EMPTY"), None);
+    assert!(!run.output.status.success(), "stderr: {}", run.stderr());
+
+    let events = run.inference_events();
+    assert_eq!(events.len(), 2, "two turns, then the bound: {events:?}");
+    for event in &events {
+        assert_eq!(event["decision"], "capped");
+        assert_eq!(event["stop_reason"], "max_tokens");
+    }
+    let trace: Vec<Value> = run
+        .trace()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let failed: Vec<&Value> = trace
+        .iter()
+        .filter(|ev| ev["event_type"] == "task_failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "trace: {}", run.trace());
+    assert_eq!(failed[0]["cause"], "output_cap");
+    let reason = "two turns in a row (turn 0 and turn 1) stopped at the inference.max_tokens \
+                  output cap of 256 tokens with no text and no tool call";
+    assert_eq!(failed[0]["reason"], reason);
+    let task_end = trace
+        .iter()
+        .find(|ev| ev["event_type"] == "task_end")
+        .expect("a task_end");
+    assert_eq!(task_end["exit_status"], "failed");
+    assert_eq!(task_end["capped_turns"], 2);
+    assert_eq!(run.result(), format!("error: {reason}"));
+
+    let stderr = run.stderr();
+    let warnings = warning_lines(&stderr);
+    assert_eq!(
+        warnings.len(),
+        2,
+        "one warning per capped turn; stderr: {stderr}"
+    );
+    assert!(
+        warnings[0].contains("the task goes on with another turn"),
+        "{}",
+        warnings[0]
+    );
+    assert!(
+        warnings[1].contains("the second in a row, so the task ends failed"),
+        "{}",
+        warnings[1]
+    );
 }
 
 /// `mur trace steps` names the truncation on the turn's own line, so a person sees it without
 /// reaching for `jq`.
 #[test]
 fn trace_steps_renders_a_capped_turn_as_truncated() {
-    let capped = run(None);
+    let capped = run(None, Some(1));
     capped.assert_success();
     let rendered = capped.trace_steps();
     assert!(
@@ -376,7 +441,7 @@ fn trace_steps_renders_a_capped_turn_as_truncated() {
         "rendered: {rendered}"
     );
 
-    let completed = run(Some("ENDTURN"));
+    let completed = run(Some("ENDTURN"), None);
     completed.assert_success();
     let rendered = completed.trace_steps();
     assert!(

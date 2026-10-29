@@ -2769,7 +2769,7 @@ which is over by the time a turn happens.
 ### W-RUN-001 — a turn stopped at the output cap { #w-run-001 }
 
 ```text
-[capsule-runtime] warning[W-RUN-001]: this turn stopped at the inference.max_tokens output cap of 256 tokens, so out/result.txt holds a fragment rather than a finished answer
+[capsule-runtime] warning[W-RUN-001]: this turn stopped at the inference.max_tokens output cap of 256 tokens and was cut off; the task goes on with another turn
   (https://docs.murmur.nexus/reference/diagnostics/#w-run-001)
 ```
 
@@ -2778,19 +2778,39 @@ The provider reported `stop_reason: "max_tokens"`: it generated the whole budget
 named in the warning is the value that was in force — the manifest's `inference.max_tokens`, the
 driver's [`models:`](manifest.md#driver-models) entry for the model, or a controller's change.
 
-What the turn leaves behind:
+The warning prints once per capped turn, worded by what the turn does to the task:
 
-| Surface | What it holds |
+| Outcome | Warning body |
 |---|---|
-| `out/result.txt` in the session's [records directory](workdir.md#records-directory), and `out/result_<task-id>.txt` under `mode: threaded` | The model's partial text, then a marker naming `inference.max_tokens` and the cap |
-| The task's [`response` artifact](streaming-protocol.md#standard-events) that `GetTask` reports, and the task output an `on-task-end` hook reads | The same marked text |
-| The [conversation record](workdir.md#the-conversation-record)'s assistant message | The model's own bytes, with `"truncated": true` on the message envelope |
-| The trace's [`inference`](observability-schemas.md#session-trace-tracejsonl) event | `"stop_reason": "max_tokens"`, beside a `decision` of `"text"` |
+| The task goes on | `this turn stopped at the inference.max_tokens output cap of <N> tokens and was cut off; the task goes on with another turn` |
+| The task's last allowed turn under [`inference.max_turns`](manifest.md#inference-max-turns) | `this turn stopped at the inference.max_tokens output cap of <N> tokens, so out/result.txt holds a fragment rather than a finished answer` |
+| The second turn in a row with no text and no tool call | `this turn stopped at the inference.max_tokens output cap of <N> tokens with no text and no tool call, the second in a row, so the task ends failed` |
 
-The turn is a result, not a failure: the session ends `ok`, the A2A task reaches
-`TASK_STATE_COMPLETED`, and the runtime attempts no continuation turn. Raising
-`inference.max_tokens` gives the next run room to finish; a task whose answer is genuinely long is
-better split across turns the agent drives itself.
+What each outcome leaves behind:
+
+| Surface | The task goes on | Last allowed turn | Second empty turn in a row |
+|---|---|---|---|
+| `out/result.txt` in the session's [records directory](workdir.md#records-directory), and `out/result_<task-id>.txt` under `mode: threaded` | Untouched by this turn; the turn that ends the task writes it | The model's partial text, then a marker naming `inference.max_tokens` and the cap | `error: ` and the failure reason |
+| The task's [`response` artifact](streaming-protocol.md#standard-events) that `GetTask` reports, and the task output an `on-task-end` hook reads | — | The same marked text | The failure |
+| The [conversation record](workdir.md#the-conversation-record) | The turn's thinking and text, with `"truncated": true`, then the runtime's user message stating the cut | The turn's thinking and text, with `"truncated": true` | The turn's thinking and text, with `"truncated": true`, when it had any |
+| The trace's [`inference`](observability-schemas.md#session-trace-tracejsonl) event | `"decision": "capped"`, `"stop_reason": "max_tokens"` | The same | The same |
+| The trace's [`task_end`](observability-schemas.md#task-end) | `capped_turns` counts the turn | The same; `exit_status` `"ok"` | The same; `exit_status` `"failed"`, after a [`task_failed`](observability-schemas.md#task-failed) with cause `output_cap` |
+
+A tool call in a capped turn is never run, in any outcome: its arguments may be cut. The user
+message names it, and the record keeps only the turn's thinking and text.
+[A turn cut at the output cap](../concepts/session-loop.md#output-cap) gives the message's exact
+text.
+
+`inference.max_turns: 1` makes every capped turn the last: the task ends `ok` with the fragment.
+The `output_cap` failure's reason names both turns and the cap:
+
+```text
+two turns in a row (turn 0 and turn 1) stopped at the inference.max_tokens output cap of 256 tokens with no text and no tool call
+```
+
+Raising `inference.max_tokens` gives a turn room to finish. A model that spends the whole cap
+reasoning, with no text and no tool call, is the case the `output_cap` failure stops: lower its
+reasoning effort, or raise the cap.
 
 ### W-RUN-002 — an untested harness version { #w-run-002 }
 
