@@ -1294,16 +1294,19 @@ has no compaction step. Under `transport: process`, `threshold`, `model`, `syste
 | `trace.retain.max_sessions` | integer ≥ 1 | no | Sessions to keep in the running session's records group, counting the running session itself. The rest are removed whole: the records directory, with its `trace.jsonl`, `blobs/`, `out/`, `home/`, `tmp/` and `children/`, and, for a launch without `--workdir`, its work folder `<manifest-dir>/workdir/<session-id>`. On an entry member, also the project's formation directories to keep, counting the current formation's. |
 | `trace.retain.max_age` | duration | no | Age beyond which a session is removed, measured from the millisecond timestamp inside its own uuid-v7 `ses_` id. No file metadata is read. On an entry member, also the age beyond which an ended formation directory is removed, measured from its `frm_` id. |
 
-| `trace.capture` | `inference` content hashes | `blobs/` | `tool_call.output` |
-|---|---|---|---|
-| `none` | — | — | — |
-| `meta` | written | — | — |
-| `content` | written | written | written |
+| `trace.capture` | `inference` content hashes | `a2a_task_received.message_sha256` | `blobs/` | `tool_call.output` |
+|---|---|---|---|---|
+| `none` | — | — | — | — |
+| `meta` | written | written | — | — |
+| `content` | written | written | written | written |
 
 The hashes are `system_sha`, `tools_sha`, `response_sha` and `message_shas` on each
-[`inference` event](observability-schemas.md#wire-hashes). Under `content` the body behind each
-one is also written to [`<session_id>/blobs/<sha256>`](observability-schemas.md#trace-blobs),
-verbatim and unredacted — bodies can be large, and a blob holds the wire payload as sent.
+[`inference` event](observability-schemas.md#wire-hashes), and the hash of the message text of
+each task the door let in, on its
+[`a2a_task_received` event](observability-schemas.md#a2a-task-received). Under `content` the body
+behind each one is also written to
+[`<session_id>/blobs/<sha256>`](observability-schemas.md#trace-blobs), verbatim and unredacted —
+bodies can be large, and a blob holds the wire payload or the received message as sent.
 
 #### `lifecycle` { #field-lifecycle }
 

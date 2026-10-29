@@ -2853,16 +2853,17 @@ Output sections, in the order they are printed:
 | Peer files | one or more `peer_handle_mint`/`peer_handle_redeem`/`peer_file_fetch` records | Counts by outcome |
 | Delegations | one or more [`delegation_start`](observability-schemas.md#delegation-lineage)/`delegation` records | One row per delegation: its `dlg_` id, `capsule@version`, the child session, and the outcome — `in flight` for a delegation this trace never saw end. The reason follows on any outcome that recorded one, and the path to the child's own trace, in the records directory the child reported, follows on any delegation that launched one |
 | Plan | one or more [`plan_start`](observability-schemas.md#plan-events)/`plan_step`/`plan_end` records | Per plan run: its id, outcome, duration and step totals by status, the step that ended it, and one row per step in the order the plan declared them — kind, status, duration, attempt count when it retried more than once, what it waited on, and its error. A step the run never reached reads `not run` |
-| A2A | one or more `a2a_task_received`/`a2a_send` records | Tasks received, messages sent, and the peer URLs they went to |
+| A2A | one or more `a2a_task_received`/`a2a_send` records | Tasks received, counted by who the door let each in as, most first — `received:   3 tasks — member 2, operator 1`, the kinds being `operator`, `member`, `credential`, `public` and `unknown caller` for a line that names none — then messages sent, and the peer URLs they went to |
 | Tasks | more than one task in the session | Per-task breakdown: turns, tokens, exit status and duration, then the task's reopens and `capped: <n>`, its turns stopped at the output cap, when either is non-zero |
 | Member calls | one or more [`member_call_busy`](observability-schemas.md#member-call-busy)/[`member_call_start`](observability-schemas.md#member-call-start)/[`member_call`](observability-schemas.md#member-call) records | One row per [`call-member`](runtime-provided-tools.md#call-member) call: its `mcl_` id, the member, the member's task id — `(not started)` for a call the member never held — and how it ended with its duration, `outstanding` for a call this trace never saw end, `not delivered` for an answer the task never received. `busy ×<n>` follows when the member turned `<n>` offers of the task away busy, and `no answer below: <member> (<status>), …` when the call's [`member_call.no_answer_below`](observability-schemas.md#member-call) names members further down that gave it no answer |
-| Formation | the session is a [formation member](#mur-run-formation) | The [Formation section](#mur-trace-show-formation) for the session root this session is in and the formation's peer directories: every member by roster name, and every `call-member` call between them |
+| Formation | the session is a [formation member](#mur-run-formation) | The [Formation section](#mur-trace-show-formation) for the session root this session is in and the formation's peer directories: every member by roster name, every `call-member` call between them, and every task a member received that no member sent |
 
 #### Listing a formation { #mur-trace-show-formation }
 
 `mur trace show <formation-id>` lists every session whose trace names that formation, by session
 id, with its roster name and how it ended, then every [`call-member`](runtime-provided-tools.md#call-member)
-call between the members. It searches these [records groups](workdir.md#records-directory), in
+call between the members and every task a member's door let in that no member sent: the
+operator's, a declared credential's, or a public-door caller's. It searches these [records groups](workdir.md#records-directory), in
 order:
 
 | `--workdir` | Groups searched |
@@ -2898,12 +2899,15 @@ ses_019f01a948e57f603b4c5d6e7f8091a2  worker-b1  worker@0.1.0     ok
 ses_019f01a949f6807a4c5d6e7f8091a2b3  worker-b2  worker@0.1.0     no session_end
 ses_019f01a9b1d27c3e8f0a4b5c6d7e8f90  -          checker@0.1.0    ok  spawned by ses_019f01a944a17b2c9d0e1f2a3b4c5d6e
 calls:      6
-mcl_019f01a9512a7b3c8d9e0f1a2b3c4d5e    chief → lead-a      completed  48.2s  delivered
-  mcl_019f01a9563b7c4d9e0f1a2b3c4d5e6f  lead-a → worker-a1  completed  21.7s  delivered
-  mcl_019f01a9564c7d5e0f1a2b3c4d5e6f70  lead-a → worker-a2  completed  19.4s  delivered
-mcl_019f01a9513d7e6f1a2b3c4d5e6f7081    chief → lead-b      completed  51.0s  delivered
-  mcl_019f01a9575e7f702b3c4d5e6f708192  lead-b → worker-b1  completed  24.9s  delivered
-  mcl_019f01a9576f80813c4d5e6f708192a3  lead-b → worker-b2  completed  38.6s  delivered  busy ×3
+tasks:      2 not from a member — operator 2
+tsk_019f01a9502b7a1c8d9e0f1a2b3c4d5e      operator → chief      ok         52.3s             message: mur trace show /home/me/.murmur/records/home/me/project/ses_019f01a940ce7761854e768ecbe3d399/trace.jsonl --body 3f2a9c1e0b7d
+  mcl_019f01a9512a7b3c8d9e0f1a2b3c4d5e    chief → lead-a        completed  48.2s  delivered
+    mcl_019f01a9563b7c4d9e0f1a2b3c4d5e6f  lead-a → worker-a1    completed  21.7s  delivered
+    mcl_019f01a9564c7d5e0f1a2b3c4d5e6f70  lead-a → worker-a2    completed  19.4s  delivered
+  mcl_019f01a9513d7e6f1a2b3c4d5e6f7081    chief → lead-b        completed  51.0s  delivered
+    mcl_019f01a9575e7f702b3c4d5e6f708192  lead-b → worker-b1    completed  24.9s  delivered
+    mcl_019f01a9576f80813c4d5e6f708192a3  lead-b → worker-b2    completed  38.6s  delivered  busy ×3
+tsk_019f01a9c18e7a2b3c4d5e6f708192a3      operator → worker-b2  ok         12.0s             message not captured
 ```
 
 | Row | Carries |
@@ -2912,8 +2916,10 @@ mcl_019f01a9513d7e6f1a2b3c4d5e6f7081    chief → lead-b      completed  51.0s  
 | `searched:` | One line per session root searched, in the order searched, whether or not it exists. A root after the first that could not be listed ends `could not be read: <why>`, and fails nothing |
 | One per member | Session id, the roster name from [`session_start.formation_member`](observability-schemas.md#session-trace-tracejsonl) — `-` for a member's delegated child, which has none — `name@version`, and the `session_end` exit status — `no session_end` for a member that was killed or is still running. `spawned by <session>` follows for a member another member delegated to, and `may call <member>, …` for a member the roster lets call others, its callees in roster order |
 | `delegated children not under these roots` | Members' delegated children whose traces are in another records group. Only when there are any. The member's own `mur trace show` prints each `child trace:` path in its Delegations section |
-| `calls:` | How many calls follow. Only when the members' traces record at least one call |
+| `calls:` | How many call rows follow. Only when the members' traces record at least one call |
+| `tasks:` | `<n> not from a member — operator <a>, credential <b>, public <c>, unknown caller <d>`: how many task rows follow, and how many of them each kind of sender sent, in that order, a kind with none left out. Only when there is at least one task row |
 | One per call | `<call id>  <caller> → <callee>  <status>  <duration>  <delivery>`, then the note for a missing side when there is one, `busy ×<n>` when the callee turned `<n>` offers away busy, and `no answer below: <member> (<status>), …` when the call names members further down that gave no answer, joined by `; `. Columns are aligned |
+| One per task | `<task id>  <sender> → <member>  <status>  <duration>`, an empty delivery column, then where the task's message is. Aligned with the call rows |
 
 Each call row carries:
 
@@ -2924,6 +2930,27 @@ Each call row carries:
 | Status | The [`member_call.status`](observability-schemas.md#member-call) — `completed`, `failed`, `canceled`, `rejected`, `timed_out`, `unreachable`, `abandoned` or `no_answer`. `outstanding` for a call with a `member_call_start` or `member_call_busy` and no `member_call`; `unknown` for a call only the callee recorded |
 | Duration | From the tool call to the outcome. `-` for `outstanding` and `unknown` |
 | Delivery | `delivered`, or `not delivered` for an answer the calling task never received. Empty for `outstanding` and `unknown` |
+
+Each task row carries one task a member's door let in, from its
+[`a2a_task_received`](observability-schemas.md#a2a-task-received) and `task_end`:
+
+| Field | Value |
+|---|---|
+| Task id | The receiving member's `tsk_` id for the task |
+| `<sender> → <member>` | The member is the receiving session's roster name. The sender is one of the labels below |
+| Status | The task's `task_end.exit_status`, verbatim. `outstanding` for a task with no `task_end` |
+| Duration | The task's `task_end.duration_ms`. `-` for `outstanding` |
+| Message | `message: mur trace show <session dir>/trace.jsonl --body <first 12 hex digits>` when the message text is stored behind its `message_sha256`, which it is under [`trace.capture: content`](manifest.md#field-trace). That command prints the text from any directory. `message not captured` otherwise |
+
+| Sender | `a2a_task_received` |
+|---|---|
+| `operator` | `caller: "operator"`: the session's [operator token](#mur-token), as `nexus` presents it |
+| `credential <name>` | `caller: "credential"` and `caller_credential: "<name>"`: a declared credential's token |
+| `public` | `caller: "public"`: a door with no `network.authentication` |
+| `unknown caller` | No `caller` and no `caller_member`, as a trace older than `caller` records a task no member sent; a `caller` with another value; or a `caller` whose name field is missing |
+
+A task a member sent is a call, never a task row: its `a2a_task_received` has `caller: "member"`,
+or, in a trace older than `caller`, a `caller_member`.
 
 A call whose other side was not found still has its row, with one of these notes:
 
@@ -2940,10 +2967,18 @@ Calls are nested and ordered by these rules:
 1. A call made inside a task that another call handed over is nested directly under that call,
    indented two spaces per level: in a two-tier formation, each lead's calls to its workers sit
    under the entry member's call to that lead.
-2. Calls with nothing above them come first, by start time, each followed by the calls under it.
-3. The calls under one call are ordered by start time.
+2. A call made inside a task that has a task row is nested directly under that row: a lead the
+   operator steered sits its calls under the `operator → lead` row.
+3. Rows with nothing above them come first, by start time — a task row's is when the task was
+   received — each followed by the calls under it. A call made inside the launch's own `--task`
+   has nothing above it.
+4. The calls under one row are ordered by start time.
 
-A task an operator or an A2A peer sent a member is no call, and has no row.
+These have no task row:
+
+- the launch's own `--task`
+- a message that continues a task in `TASK_STATE_INPUT_REQUIRED`
+- a message the door refused busy
 
 A member that ran from another project, or with another `--workdir`, is listed by running the
 command against that root.

@@ -353,11 +353,13 @@ The call row comes from three records. In `lead`'s trace,
 In `worker`'s trace, the task arrives named for the member that sent it:
 
 ```json
-{"event_type":"a2a_task_received","event_id":"evt_01a11002a5dc79e2bd4a5bf91768acba","parent_id":"evt_01a11002969c75d28c8244f84ad1425f","session_id":"ses_01a11002968476428a785ab0b3ae4fbb","timestamp":1791269971420,"task_id":"tsk_01a11002a5db7fe0a98b4e4e743aa444","context_id":"ctx_01a11002a5db7fe0a98b4e57a39f2e8a","message_id":"msg_mcl_01a11002a5d57021b9017e9e2e31a465","traceparent_from_caller":null,"caller_member":"lead"}
+{"event_type":"a2a_task_received","event_id":"evt_01a11002a5dc79e2bd4a5bf91768acba","parent_id":"evt_01a11002969c75d28c8244f84ad1425f","session_id":"ses_01a11002968476428a785ab0b3ae4fbb","timestamp":1791269971420,"task_id":"tsk_01a11002a5db7fe0a98b4e4e743aa444","context_id":"ctx_01a11002a5db7fe0a98b4e57a39f2e8a","message_id":"msg_mcl_01a11002a5d57021b9017e9e2e31a465","traceparent_from_caller":null,"caller":"member","caller_member":"lead","message_sha256":"5c1f0e9b7a3d42c8e6f1a0b9d8c7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9"}
 ```
 
 `mur trace show` matches this record to the call by its `task_id`, the call's `member_task_id`.
-`caller_member` is `lead`, and the message id carries the call id. See
+`caller` is `member`, `caller_member` is `lead`, and the message id carries the call id.
+`message_sha256` is the hash of the task's message text; under
+[`trace.capture: content`](../reference/manifest.md#field-trace) the text is stored behind it. See
 [`call-member`](../reference/runtime-provided-tools.md#call-member) and the
 [`member_call`](../reference/observability-schemas.md#member-call) record.
 
@@ -439,7 +441,7 @@ duration:   7.7s
 formation_ended  frm_01a1100295f47ea3b227ddf4612759f3  the formation ended; this session wound down
 
 ── A2A ──────────────────────────────────────────
-received:   1 task
+received:   1 task — member 1
 sent:       0 messages
 
 ── Formation ────────────────────────────────────
@@ -512,5 +514,5 @@ formation. See
 | Key | `mur config set -g credentials.<KEY_VAR> <your key>`, first of the `Next:` steps |
 | Launch | `mur run --roster crew --task "…"` starts the peers, waits for each door, then starts the entry member |
 | Hand-off | `call-member` returns at once: started when the callee holds the task, or busy when it has no room, and the runtime keeps offering a busy callee the task. The answer, or word that none came, comes back into the caller's same task. A member with nothing to give ends its task with `end-without-answer`, and its caller's call ends `no_answer` |
-| Trace | `mur trace show frm_<id>` from the roster's directory lists every member by roster name and every call: who called whom, how it ended, whether the answer was delivered, and how many offers a busy callee turned away. Behind each call row, `member_call` in the caller's trace and `a2a_task_received` with `caller_member` in the callee's |
+| Trace | `mur trace show frm_<id>` from the roster's directory lists every member by roster name, every call — who called whom, how it ended, whether the answer was delivered, and how many offers a busy callee turned away — and every task a person sent a member over its door, such as one `nexus` sent with the operator token. Behind each call row, `member_call` in the caller's trace and `a2a_task_received` with `caller: "member"` in the callee's; behind each task row, the member's `a2a_task_received` with its `caller` |
 | End | With `--task`, the entry member exits after its task; every other member records `formation_ended` and exits; the launcher exits with the entry member's status. Without, `mur stop frm_<id>` ends every member and the launcher exits `143` |

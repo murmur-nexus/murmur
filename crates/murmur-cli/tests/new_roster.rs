@@ -601,6 +601,7 @@ fn the_scaffolded_lead_hands_the_worker_a_task() {
         .contains(&Value::from("call-member")));
     let received = records(&worker, "a2a_task_received");
     assert_eq!(received.len(), 1, "{worker:?}");
+    assert_eq!(received[0]["caller"], "member");
     assert_eq!(received[0]["caller_member"], "lead");
     assert_eq!(received[0]["message_id"], format!("msg_{call_id}"));
     assert_eq!(received[0]["task_id"], member_task_id.as_str());

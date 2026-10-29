@@ -14,7 +14,7 @@ use std::{
 use common::door_capsule::{
     agent_project, bearer, driver_home, end_turn, launch_door, message, request,
     returning_immediately, rpc, stage_door, trace_events, wait_completed, MurRun,
-    AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
+    AUTHENTICATION_YAML, CREDENTIALS_YAML, QUEUE_SLEEP_YAML,
 };
 use serde_json::{json, Value};
 
@@ -29,6 +29,55 @@ fn event_count(records_dir: &Path, event: &str) -> usize {
         .iter()
         .filter(|e| e["event_type"] == event)
         .count()
+}
+
+/// The `a2a_task_received` line of `task_id`, waiting for the trace to carry it.
+fn received_line(records_dir: &Path, task_id: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(line) = trace_events(records_dir)
+            .into_iter()
+            .find(|e| e["event_type"] == "a2a_task_received" && e["task_id"] == task_id)
+        {
+            return line;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no a2a_task_received for {task_id}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `received` says the door let its task in as `caller`, names the credential when it is one,
+/// names no member, and carries the hash of `text` with no blob behind it under the default
+/// `capture: meta`.
+fn assert_received_from(
+    records_dir: &Path,
+    received: &Value,
+    caller: &str,
+    credential: Option<&str>,
+    text: &str,
+) {
+    println!("a2a_task_received: {received}");
+    assert_eq!(received["caller"], caller, "{received}");
+    assert!(received.get("caller_member").is_none(), "{received}");
+    match credential {
+        Some(name) => assert_eq!(received["caller_credential"], name, "{received}"),
+        None => assert!(received.get("caller_credential").is_none(), "{received}"),
+    }
+    let sha = murmur_artifact::sha256_hex(text.as_bytes());
+    assert_eq!(received["message_sha256"], sha.as_str(), "{received}");
+    assert!(
+        !records_dir.join("blobs").join(&sha).exists(),
+        "capture: meta stores no message"
+    );
+}
+
+/// No line of the session's trace carries a door token.
+fn assert_trace_has_no_token(records_dir: &Path) {
+    let trace = fs::read_to_string(records_dir.join("trace.jsonl")).unwrap();
+    assert!(!trace.contains("mdt1."), "a trace line carries a token");
 }
 
 fn assert_refused(
@@ -229,6 +278,8 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
         "TASK_STATE_COMPLETED",
         "{read:?}"
     );
+    let received = received_line(&records_dir, &task_id);
+    assert_received_from(&records_dir, &received, "operator", None, "hello");
 
     // The extended card: any valid token, the v1.0 card with the capsule extension.
     let refused = rpc(&addr, None, "GetExtendedAgentCard", json!({}));
@@ -329,6 +380,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
 
     // Refusals at the gate write nothing: the one task_start is the operator's task.
     assert_eq!(event_count(&records_dir, "task_start"), 1);
+    assert_trace_has_no_token(&records_dir);
 }
 
 #[test]
@@ -343,6 +395,7 @@ fn public_door_ignores_authorization_and_has_no_extended_card() {
     let project = agent_project(&server.endpoint, CAPSULE_NAME, "", QUEUE_SLEEP_YAML);
     let staged = stage_door(&home, &project.path().join("murmur.yaml"), None);
     assert!(staged.door_tokens().is_empty());
+    let records_dir = staged.records_dir.clone();
     let addr = launch_door(staged);
 
     let card = request(&addr, "GET", "/.well-known/agent-card.json", &[], "").json();
@@ -368,6 +421,8 @@ fn public_door_ignores_authorization_and_has_no_extended_card() {
             .unwrap()
             .to_string();
         wait_completed(&addr, None, &task_id);
+        let received = received_line(&records_dir, &task_id);
+        assert_received_from(&records_dir, &received, "public", None, "hello");
     }
 
     for token in [None, Some("garbage")] {
@@ -382,6 +437,59 @@ fn public_door_ignores_authorization_and_has_no_extended_card() {
     }
     let absent = request(&addr, "GET", "/no-such-path", &[], "");
     assert_eq!(absent.status, 404);
+}
+
+/// A task a declared credential's token started is recorded as that credential's, by name, and
+/// the operator's as the operator's; neither names a member, and no line carries a token.
+#[test]
+fn a_received_task_names_the_credential_that_let_it_in() {
+    if common::skip_without_host_support("a_received_task_names_the_credential_that_let_it_in") {
+        return;
+    }
+    let server = common::ScriptedServer::start(vec![end_turn(1, "one"), end_turn(2, "two")]);
+    let home = driver_home();
+    let project = agent_project(
+        &server.endpoint,
+        CAPSULE_NAME,
+        "",
+        &format!("{QUEUE_SLEEP_YAML}{CREDENTIALS_YAML}"),
+    );
+    let staged = stage_door(&home, &project.path().join("murmur.yaml"), None);
+    let records_dir = staged.records_dir.clone();
+    let tokens: Vec<(String, String)> = staged
+        .door_tokens()
+        .into_iter()
+        .map(|(name, token)| (name, token.expose().to_string()))
+        .collect();
+    let token = |name: &str| {
+        tokens
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, t)| t.clone())
+            .unwrap()
+    };
+    let addr = launch_door(staged);
+
+    for (who, caller, credential, text) in [
+        ("alice", "credential", Some("alice"), "from alice"),
+        ("operator", "operator", None, "from the operator"),
+    ] {
+        let sent = rpc(
+            &addr,
+            Some(&token(who)),
+            "SendMessage",
+            returning_immediately(message(&format!("m-{who}"), text)),
+        );
+        assert_eq!(sent.status, 200, "{sent:?}");
+        let task_id = sent.json()["result"]["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        wait_completed(&addr, Some(&token(who)), &task_id);
+        let received = received_line(&records_dir, &task_id);
+        assert_received_from(&records_dir, &received, caller, credential, text);
+    }
+    assert_trace_has_no_token(&records_dir);
 }
 
 /// The `W-SEC-032` lines in `text`.

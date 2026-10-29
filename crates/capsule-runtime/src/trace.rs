@@ -1025,11 +1025,30 @@ struct A2aTaskReceivedEvent {
     context_id: String,
     message_id: String,
     traceparent_from_caller: Option<String>,
-    /// The formation member that called, when the door let the task in on a formation token.
-    /// Omitted for every other task.
+    /// Who the door let the task in as: [`RECEIVED_FROM_OPERATOR`], [`RECEIVED_FROM_MEMBER`],
+    /// [`RECEIVED_FROM_CREDENTIAL`] or [`RECEIVED_FROM_PUBLIC`].
+    caller: &'static str,
+    /// The formation member that called, present exactly with `caller: "member"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     caller_member: Option<String>,
+    /// The declared credential whose token let the task in, present exactly with
+    /// `caller: "credential"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caller_credential: Option<String>,
+    /// The `sha256` of the task's message text, omitted under `capture: none`. Under `content`
+    /// the text is stored as the blob of that name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_sha256: Option<String>,
 }
+
+/// `a2a_task_received.caller` for a task the operator token let in.
+pub(crate) const RECEIVED_FROM_OPERATOR: &str = "operator";
+/// `a2a_task_received.caller` for a task a formation token let in.
+pub(crate) const RECEIVED_FROM_MEMBER: &str = "member";
+/// `a2a_task_received.caller` for a task a declared credential's token let in.
+pub(crate) const RECEIVED_FROM_CREDENTIAL: &str = "credential";
+/// `a2a_task_received.caller` for a task a door with no `network.authentication` let in.
+pub(crate) const RECEIVED_FROM_PUBLIC: &str = "public";
 
 #[derive(Serialize)]
 struct A2aSendEvent {
@@ -3149,14 +3168,39 @@ impl TraceWriter {
         self.write_event(&event).await
     }
 
+    /// Records a task the door let in. `caller` is who the door let it in as and `caller_member`
+    /// the roster name a formation token carried; a task with a member is recorded as the
+    /// member's, whatever credential the token was minted for. The message text is hashed under
+    /// `meta` and `content` and stored as a blob under `content`; the JSONL never holds it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_a2a_task_received(
         &mut self,
         task_id: &str,
         context_id: &str,
         message_id: &str,
         traceparent_from_caller: Option<&str>,
+        caller: &crate::identity::TaskCaller,
         caller_member: Option<&str>,
+        message_text: &str,
     ) -> std::io::Result<()> {
+        use crate::identity::TaskCaller;
+        let (received_from, caller_credential) = match (caller_member, caller) {
+            (Some(_), _) => (RECEIVED_FROM_MEMBER, None),
+            (None, TaskCaller::Operator) => (RECEIVED_FROM_OPERATOR, None),
+            (None, TaskCaller::Public) => (RECEIVED_FROM_PUBLIC, None),
+            (None, TaskCaller::Credential(name)) => {
+                (RECEIVED_FROM_CREDENTIAL, Some(name.to_string()))
+            }
+        };
+        let message_sha256 = if self.capture.captures_hashes() {
+            let sha = murmur_artifact::sha256_hex(message_text.as_bytes());
+            if self.capture.captures_content() {
+                self.blobs.put(&sha, message_text.as_bytes()).await?;
+            }
+            Some(sha)
+        } else {
+            None
+        };
         let event = A2aTaskReceivedEvent {
             event_type: "a2a_task_received",
             event_id: new_event_id(),
@@ -3167,7 +3211,10 @@ impl TraceWriter {
             context_id: context_id.to_string(),
             message_id: message_id.to_string(),
             traceparent_from_caller: traceparent_from_caller.map(str::to_string),
+            caller: received_from,
             caller_member: caller_member.map(str::to_string),
+            caller_credential,
+            message_sha256,
         };
         self.write_event(&event).await
     }
@@ -5735,7 +5782,11 @@ mod tests {
             w.write_session_start(Some(10), None, Vec::new())
                 .await
                 .unwrap();
-            w.write_a2a_task_received("tsk_1", "ctx_1", "msg_1", None, caller)
+            let door_caller = match caller {
+                Some(caller) => crate::identity::TaskCaller::Credential(format!("member:{caller}")),
+                None => crate::identity::TaskCaller::Operator,
+            };
+            w.write_a2a_task_received("tsk_1", "ctx_1", "msg_1", None, &door_caller, caller, "hi")
                 .await
                 .unwrap();
             w.flush().await.unwrap();
@@ -5763,10 +5814,114 @@ mod tests {
                 }
             }
             match caller {
-                Some(caller) => assert_eq!(received["caller_member"], caller),
+                Some(caller) => {
+                    assert_eq!(received["caller"], "member");
+                    assert_eq!(received["caller_member"], caller);
+                }
+                None => {
+                    assert_eq!(received["caller"], "operator");
+                    assert!(received.get("caller_member").is_none(), "{received}");
+                }
+            }
+            assert!(received.get("caller_credential").is_none(), "{received}");
+            assert!(!content.contains("mft1."), "{content}");
+        }
+    }
+
+    /// `a2a_task_received.caller` names each way a door lets a task in, with `caller_member` only
+    /// for a member and `caller_credential` only for a declared credential; a formation token's
+    /// task is the member's whatever credential the token carries.
+    #[tokio::test]
+    async fn a_received_task_names_who_the_door_let_it_in_as() {
+        use crate::identity::TaskCaller;
+        let cases = [
+            (TaskCaller::Operator, None, "operator", None),
+            (TaskCaller::Public, None, "public", None),
+            (
+                TaskCaller::Credential("alice".to_string()),
+                None,
+                "credential",
+                Some("alice"),
+            ),
+            (
+                TaskCaller::Credential("member:planner".to_string()),
+                Some("planner"),
+                "member",
+                None,
+            ),
+        ];
+        for (door_caller, member, caller, credential) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = make_writer(dir.path()).await;
+            w.write_session_start(Some(10), None, Vec::new())
+                .await
+                .unwrap();
+            w.write_a2a_task_received("tsk_1", "ctx_1", "msg_1", None, &door_caller, member, "hi")
+                .await
+                .unwrap();
+            w.flush().await.unwrap();
+            let received = read_events(dir.path())
+                .into_iter()
+                .find(|line| line["event_type"] == "a2a_task_received")
+                .unwrap();
+            assert_eq!(received["caller"], caller, "{received}");
+            match member {
+                Some(member) => assert_eq!(received["caller_member"], member, "{received}"),
                 None => assert!(received.get("caller_member").is_none(), "{received}"),
             }
-            assert!(!content.contains("mft1."), "{content}");
+            match credential {
+                Some(name) => assert_eq!(received["caller_credential"], name, "{received}"),
+                None => assert!(received.get("caller_credential").is_none(), "{received}"),
+            }
+        }
+    }
+
+    /// The received message's hash is written under `meta` and `content`, and only `content`
+    /// stores the text behind it; `none` writes neither. The text never reaches the JSONL.
+    #[tokio::test]
+    async fn a_received_message_is_hashed_and_stored_by_capture_mode() {
+        let text = "Name three colours, please.";
+        let sha = murmur_artifact::sha256_hex(text.as_bytes());
+        for capture in [
+            TraceCapture::None,
+            TraceCapture::Meta,
+            TraceCapture::Content,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = make_writer_with_opts(dir.path(), capture).await;
+            w.write_a2a_task_received(
+                "tsk_1",
+                "ctx_1",
+                "msg_1",
+                None,
+                &crate::identity::TaskCaller::Operator,
+                None,
+                text,
+            )
+            .await
+            .unwrap();
+            w.flush().await.unwrap();
+            let content = std::fs::read_to_string(dir.path().join("trace.jsonl")).unwrap();
+            assert!(!content.contains(text), "{content}");
+            let received = read_events(dir.path())
+                .into_iter()
+                .find(|line| line["event_type"] == "a2a_task_received")
+                .unwrap();
+            let blob = std::fs::read(blob_path(dir.path(), &sha)).ok();
+            match capture {
+                TraceCapture::None => {
+                    assert!(received.get("message_sha256").is_none(), "{received}");
+                    assert_eq!(blob, None);
+                }
+                TraceCapture::Meta => {
+                    assert_eq!(received["message_sha256"], sha.as_str(), "{received}");
+                    assert_eq!(blob, None);
+                }
+                TraceCapture::Content => {
+                    assert_eq!(received["message_sha256"], sha.as_str(), "{received}");
+                    assert_eq!(blob.as_deref(), Some(text.as_bytes()));
+                }
+            }
         }
     }
 

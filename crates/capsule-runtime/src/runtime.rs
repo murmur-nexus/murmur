@@ -5000,14 +5000,18 @@ fn launch(
                         // Only a task that actually arrived over the peer door gets the
                         // received record; the launch's own task and a report the runtime
                         // produced for itself never crossed that boundary.
-                        if incoming.source == crate::a2a::SOURCE_A2A {
+                        if let (crate::a2a::SOURCE_A2A, Some(caller)) =
+                            (incoming.source, incoming.caller.as_ref())
+                        {
                             let _ = trace
                                 .write_a2a_task_received(
                                     &incoming.task_id,
                                     &incoming.context_id,
                                     &incoming.message_id,
                                     incoming.traceparent.as_deref(),
+                                    caller,
                                     incoming.caller_member.as_deref(),
+                                    &incoming.message_text,
                                 )
                                 .await;
                         }
@@ -13234,6 +13238,7 @@ fn enqueue_launch_task(
         source: crate::a2a::SOURCE_TASK_MD,
         forget_session: std::mem::take(pending_forget_session),
         caller_member: None,
+        caller: None,
         reference_task_ids: Vec::new(),
         part_kinds: Vec::new(),
     };
@@ -13306,6 +13311,7 @@ async fn enqueue_detached_report(
                 // itself.
                 forget_session: false,
                 caller_member: None,
+                caller: None,
                 reference_task_ids: Vec::new(),
                 part_kinds: Vec::new(),
             };
@@ -13338,6 +13344,7 @@ async fn enqueue_detached_report(
             source: crate::a2a::SOURCE_DETACHED_LOST,
             forget_session: false,
             caller_member: None,
+            caller: None,
             reference_task_ids: Vec::new(),
             part_kinds: Vec::new(),
         },

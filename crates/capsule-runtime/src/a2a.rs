@@ -2026,6 +2026,10 @@ pub(crate) struct IncomingTask {
     /// The formation member that called, when the door let this task in on a formation token.
     /// Recorded as `a2a_task_received.caller_member`; `None` for every other task.
     pub caller_member: Option<String>,
+    /// Who the door let this task in as, recorded as `a2a_task_received.caller`. `Some` exactly
+    /// for a [`SOURCE_A2A`] task; `None` for the launch's own task and every report the runtime
+    /// enqueued for itself, none of which crossed the door.
+    pub caller: Option<crate::identity::TaskCaller>,
     /// The message's `referenceTaskIds`, each once, recorded as `task_start.reference_task_ids`.
     /// Empty for every task that did not arrive over the door.
     pub reference_task_ids: Vec<String>,

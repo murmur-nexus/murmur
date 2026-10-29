@@ -352,7 +352,8 @@ hash to its body by joining the two: `cat <records dir>/blobs/<the sha the line 
 | Lifetime | Session-scoped. Readable exactly as long as the session directory is; nothing prunes it |
 
 `system_prompt_sha256` from `session_start` resolves the same way, to the resolved prompt before
-the `[Capsule]` block was prepended.
+the `[Capsule]` block was prepended, and so does `message_sha256` from
+[`a2a_task_received`](#a2a-task-received), to the message text of a task the door let in.
 
 **Blob bodies are the payload verbatim, unredacted** — including any peer handle token, which
 `tool_call` redacts out of its own `input` and `output`. Setting `capture: content` opts in to
@@ -605,7 +606,7 @@ loop has exited, on every exit path
 
 A script capsule ended by `SIGKILL`, `SIGTERM` or its spawner's lifeline writes no `session_end`.
 
-**`a2a_task_received`** — written when an incoming message reserves the task slot
+<span id="a2a-task-received"></span>**`a2a_task_received`** — written when an incoming message reserves the task slot
 
 | Field | Type | Notes |
 |---|---|---|
@@ -613,7 +614,19 @@ A script capsule ended by `SIGKILL`, `SIGTERM` or its spawner's lifeline writes 
 | `context_id` | string | Echoed or generated `contextId` |
 | `message_id` | string | `messageId` from the incoming A2A Message |
 | `traceparent_from_caller` | string \| null | W3C `traceparent` header from the incoming request |
-| `caller_member` | string | The roster name of the formation member that called, when the door let the task in on a [formation token](roster.md#formation-token). Absent for every other task |
+| `caller` | string | Who the door let the task in as — see the table below. Always written |
+| `caller_member` | string | The roster name of the formation member that called. Present exactly when `caller` is `"member"` |
+| `caller_credential` | string | The name of the declared credential whose token let the task in. Present exactly when `caller` is `"credential"` |
+| `message_sha256` | string | `sha256` of the message text, the text written to `task.md`. Written under [`trace.capture`](manifest.md#field-trace) `meta` and `content`, absent under `none`. Under `content` the text is stored at [`<session_id>/blobs/<message_sha256>`](#trace-blobs) |
+
+| `caller` | The request carried |
+|---|---|
+| `"operator"` | The session's [operator token](cli.md#mur-token) |
+| `"member"` | A [formation token](roster.md#formation-token) |
+| `"credential"` | The token of a credential declared under [`network.authentication.credentials`](manifest.md#field-network-authentication) |
+| `"public"` | Anything, or nothing: the door declares no `network.authentication` |
+
+No field carries a token, and the message text itself is never written to `trace.jsonl`.
 
 **`a2a_send`** — written when a script capsule calls `murmur:message/send` and the peer answers
 
