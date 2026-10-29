@@ -28,3 +28,18 @@ lto = true
 codegen-units = 1
 opt-level = "z"
 panic = "abort"
+
+# A warm launch inflates entries out of each artifact's .mur.zip and checks their CRC-32: zip
+# reads the entries, flate2 and zlib-rs inflate them and crc32fast checks them, so these four are
+# built for speed rather than size.
+[profile.release.package.zip]
+opt-level = 3
+
+[profile.release.package.flate2]
+opt-level = 3
+
+[profile.release.package.zlib-rs]
+opt-level = 3
+
+[profile.release.package.crc32fast]
+opt-level = 3
