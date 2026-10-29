@@ -303,16 +303,16 @@ pub(crate) enum ReceivedFrom {
 
 impl ReceivedFrom {
     /// The sender an `a2a_task_received` line's caller fields name.
-    pub(crate) fn of(
+    fn of(
         caller: Option<&str>,
-        caller_member: Option<String>,
-        caller_credential: Option<String>,
+        caller_member: Option<&str>,
+        caller_credential: Option<&str>,
     ) -> Self {
         match (caller, caller_member, caller_credential) {
-            (Some("member") | None, Some(member), _) => Self::Member(member),
+            (Some("member") | None, Some(member), _) => Self::Member(member.to_string()),
             (Some("operator"), _, _) => Self::Operator,
             (Some("public"), _, _) => Self::Public,
-            (Some("credential"), _, Some(credential)) => Self::Credential(credential),
+            (Some("credential"), _, Some(credential)) => Self::Credential(credential.to_string()),
             _ => Self::Unknown,
         }
     }
@@ -411,6 +411,16 @@ struct A2aTaskReceivedLine {
     task_id: String,
     #[serde(default)]
     message_id: String,
+    #[serde(flatten)]
+    caller: ReceivedCallerFields,
+    #[serde(default)]
+    timestamp: u64,
+}
+
+/// The caller fields and message hash of an `a2a_task_received` line. Every one is optional: a
+/// trace older than them carries none, and its task is from an unknown caller.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ReceivedCallerFields {
     #[serde(default)]
     caller: Option<String>,
     #[serde(default)]
@@ -418,9 +428,18 @@ struct A2aTaskReceivedLine {
     #[serde(default)]
     caller_credential: Option<String>,
     #[serde(default)]
-    message_sha256: Option<String>,
-    #[serde(default)]
-    timestamp: u64,
+    pub(crate) message_sha256: Option<String>,
+}
+
+impl ReceivedCallerFields {
+    /// Who the line says sent the task.
+    pub(crate) fn sender(&self) -> ReceivedFrom {
+        ReceivedFrom::of(
+            self.caller.as_deref(),
+            self.caller_member.as_deref(),
+            self.caller_credential.as_deref(),
+        )
+    }
 }
 
 /// The trace lines this reader reads, by `event_type`. Each type reads its own fields only, so a
@@ -945,7 +964,8 @@ fn read_member(session_dir: &Path, session_id: String) -> RecordedMember {
             Line::MemberCallStart(start) => fold_member_call_start(&mut member.calls_made, start),
             Line::MemberCall(end) => fold_member_call(&mut member.calls_made, end),
             Line::A2aTaskReceived(received) => {
-                let message_sha256 = blob_name(received.message_sha256);
+                let from = received.caller.sender();
+                let message_sha256 = blob_name(received.caller.message_sha256);
                 let message_stored = message_sha256.as_ref().is_some_and(|sha| {
                     session_dir
                         .join(crate::commands::trace::BLOB_DIR_NAME)
@@ -955,11 +975,7 @@ fn read_member(session_dir: &Path, session_id: String) -> RecordedMember {
                 member.tasks_received.push(ReceivedTask {
                     call_id: call_id_of_message(&received.message_id),
                     task_id: received.task_id,
-                    from: ReceivedFrom::of(
-                        received.caller.as_deref(),
-                        received.caller_member,
-                        received.caller_credential,
-                    ),
+                    from,
                     received_ms: received.timestamp,
                     ending: None,
                     duration_ms: 0,

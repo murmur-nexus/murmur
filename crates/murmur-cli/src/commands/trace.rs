@@ -21,7 +21,7 @@ use crate::formation_trace::{
     fold_member_call, fold_member_call_busy, fold_member_call_start, formation_rows,
     no_answer_below_note, search_formation, sender_kind_counts, CallEnding, FormationCall,
     FormationRow, FormationSearch, FormationTask, MemberCallBusyLine, MemberCallLine,
-    MemberCallRecord, MemberCallStartLine, ReceivedFrom, RecordedMember,
+    MemberCallRecord, MemberCallStartLine, ReceivedCallerFields, ReceivedFrom, RecordedMember,
 };
 use crate::live_address::records_unreadable;
 use crate::session_address::{self, ses_entries, SessionQuery};
@@ -1028,20 +1028,6 @@ struct A2aSendEvent {
     peer_url: String,
 }
 
-/// One `a2a_task_received` record's caller fields and message hash. Every field is optional: a
-/// trace older than them carries none, and its task is from an unknown caller.
-#[derive(Debug, Default, Deserialize)]
-struct A2aTaskReceivedEvent {
-    #[serde(default)]
-    caller: Option<String>,
-    #[serde(default)]
-    caller_member: Option<String>,
-    #[serde(default)]
-    caller_credential: Option<String>,
-    #[serde(default)]
-    message_sha256: Option<String>,
-}
-
 /// One `delegation_start` record: a child that was launched, whatever became of it.
 #[derive(Debug, Deserialize)]
 struct DelegationStartEvent {
@@ -1252,7 +1238,7 @@ enum TraceEvent {
     PeerFileFetch(OutcomeEvent),
     /// Counted by who sent it: the A2A section reports how many tasks arrived from each kind
     /// of caller.
-    A2aTaskReceived(A2aTaskReceivedEvent),
+    A2aTaskReceived(ReceivedCallerFields),
     A2aSend(A2aSendEvent),
     DelegationStart(DelegationStartEvent),
     Delegation(DelegationEvent),
@@ -2733,11 +2719,7 @@ fn compute_metrics(
             TraceEvent::PeerHandleMint(e) => *peer_mints.entry(e.outcome).or_insert(0) += 1,
             TraceEvent::PeerHandleRedeem(e) => *peer_redeems.entry(e.outcome).or_insert(0) += 1,
             TraceEvent::PeerFileFetch(e) => *peer_fetches.entry(e.outcome).or_insert(0) += 1,
-            TraceEvent::A2aTaskReceived(e) => a2a_tasks_received.push(ReceivedFrom::of(
-                e.caller.as_deref(),
-                e.caller_member,
-                e.caller_credential,
-            )),
+            TraceEvent::A2aTaskReceived(e) => a2a_tasks_received.push(e.sender()),
             TraceEvent::A2aSend(e) => a2a_sends.push(e.peer_url),
             TraceEvent::ArtifactPulled(e) => artifacts_pulled.push(e),
             TraceEvent::DelegationStart(e) => delegations.push(DelegationRecord {
@@ -7921,14 +7903,7 @@ mod tests {
         else {
             panic!("a bare a2a_task_received line parses");
         };
-        assert_eq!(
-            ReceivedFrom::of(
-                legacy.caller.as_deref(),
-                legacy.caller_member,
-                legacy.caller_credential
-            ),
-            ReceivedFrom::Unknown
-        );
+        assert_eq!(legacy.sender(), ReceivedFrom::Unknown);
     }
 
     /// `mur trace steps` refuses a formation id before resolving any session, and points at

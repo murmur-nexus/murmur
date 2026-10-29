@@ -2974,8 +2974,11 @@ Calls are nested and ordered by these rules:
    has nothing above it.
 4. The calls under one row are ordered by start time.
 
-The launch's own `--task`, a message continuing an `input-required` task, and a message refused
-busy have no task row.
+These have no task row:
+
+- the launch's own `--task`
+- a message that continues a task in `TASK_STATE_INPUT_REQUIRED`
+- a message the door refused busy
 
 A member that ran from another project, or with another `--workdir`, is listed by running the
 command against that root.

@@ -1907,7 +1907,8 @@ fn await_trace_line(root: &Path, needles: &[&str]) {
 /// so that call is turned away busy and offered again until `worker-b4` takes it. `mur trace show
 /// <frm>`, run from the roster's directory, lists every member by roster name and every call
 /// nested under the call that handed over its task, the busy one completed with its busy offers
-/// counted, and no row for the operator's tasks.
+/// counted. Each operator task `worker-b4` took is a task row of its own, `operator → worker-b4`,
+/// and the one its door refused has none.
 #[test]
 fn two_tier_formation_trace_names_every_call() {
     const A_WORKERS: [&str; 4] = ["worker-a1", "worker-a2", "worker-a3", "worker-a4"];
@@ -2125,7 +2126,21 @@ fn two_tier_formation_trace_names_every_call() {
         .iter()
         .position(|line| *line == "calls:      10")
         .unwrap_or_else(|| panic!("no `calls:      10` line:\n{stdout}"));
-    let rows = &lines[at + 1..];
+    let accepted = sent - 1;
+    assert_eq!(
+        lines[at + 1],
+        format!("tasks:      {accepted} not from a member — operator {accepted}"),
+        "{stdout}"
+    );
+    let (task_rows, rows): (Vec<&str>, Vec<&str>) = lines[at + 2..]
+        .iter()
+        .copied()
+        .partition(|line| line.starts_with("tsk_"));
+    assert_eq!(task_rows.len(), accepted, "{stdout}");
+    for line in &task_rows {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(words[1..5], ["operator", "→", "worker-b4", "ok"], "{line}");
+    }
     assert_eq!(rows.len(), 10, "{stdout}");
     // `<call id>  <caller> → <callee>  …`, at its depth.
     let row = |line: &str| -> (usize, String, String) {

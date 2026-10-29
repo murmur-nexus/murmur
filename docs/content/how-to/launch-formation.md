@@ -441,7 +441,7 @@ duration:   7.7s
 formation_ended  frm_01a1100295f47ea3b227ddf4612759f3  the formation ended; this session wound down
 
 ── A2A ──────────────────────────────────────────
-received:   1 task
+received:   1 task — member 1
 sent:       0 messages
 
 ── Formation ────────────────────────────────────

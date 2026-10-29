@@ -4636,8 +4636,8 @@ mod tests {
         assert!(tenant_refusal(&req(serde_json::json!({"id": "tsk_1"}))).is_none());
     }
 
-    /// The operator is the session; every other token, a formation token's included, is its
-    /// credential.
+    /// No grant is a public-door caller and the operator token is the operator; every other
+    /// token, a formation token's included, is its credential.
     #[test]
     fn task_caller_of_a_grant_names_public_operator_and_credential() {
         let auth = crate::door_auth::DoorAuth::mint(&murmur_artifact::NetworkAuthentication {
