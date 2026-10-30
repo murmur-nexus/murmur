@@ -779,6 +779,7 @@ async fn run_harness(
         &staged.component,
         &staged.name,
         &staged.version,
+        store_state.call_deadlines.clone(),
     )
     .await?;
 

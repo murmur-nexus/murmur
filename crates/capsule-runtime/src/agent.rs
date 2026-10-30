@@ -22,7 +22,7 @@ use crate::{
     bindings::host::murmur::tool::run::{Status, ToolInput, ToolResult},
     cancel::{CancelSignal, Residue, PHASE_INFERENCE},
     capsule_facts::CapsuleFacts,
-    credential_gateway::UpstreamOutcome,
+    credential_gateway::{GatewayOffsets, UpstreamOutcome},
     detached::DetachedDispatchInfo,
     driver_choice::{DriverChoice, DriverChoices},
     errors::{RuntimeError, E_RUN_033, E_RUN_034, E_RUN_035, E_RUN_036},
@@ -1370,7 +1370,15 @@ pub(crate) async fn run_agent_loop(
         // an `inference_retry` line and waited out; nothing else of it is applied. Every other
         // attempt leaves the loop and is handled below as the call's only one.
         let mut retries_made = 0u32;
-        let (admission, dispatched, inference_started, started_calls, outcome, retry_note) = loop {
+        let (
+            admission,
+            dispatched,
+            inference_started,
+            started_calls,
+            outcome,
+            gateway_timing,
+            retry_note,
+        ) = loop {
             // Reset per-turn streaming flag before each driver dispatch.
             store_state
                 .a2a_chunks_emitted
@@ -1410,6 +1418,7 @@ pub(crate) async fn run_agent_loop(
 
             if let Some(gateway) = &gateway {
                 gateway.take_upstream_outcome();
+                gateway.take_timing();
             }
             let inference_started = Instant::now();
             // Raced rather than awaited: a cancel must stop the provider call in flight rather
@@ -1475,6 +1484,9 @@ pub(crate) async fn run_agent_loop(
             let outcome = gateway
                 .as_ref()
                 .and_then(|gateway| gateway.take_upstream_outcome());
+            let gateway_timing = gateway
+                .as_ref()
+                .map(|gateway| gateway.take_timing().offsets_from(inference_started));
 
             let Some(failed) = FailedAttempt::of(&dispatched) else {
                 break (
@@ -1483,6 +1495,7 @@ pub(crate) async fn run_agent_loop(
                     inference_started,
                     started_calls,
                     outcome,
+                    gateway_timing,
                     RetryNote::new(retries_made + 1, None),
                 );
             };
@@ -1502,6 +1515,7 @@ pub(crate) async fn run_agent_loop(
                     inference_started,
                     started_calls,
                     outcome,
+                    gateway_timing,
                     RetryNote::new(retries_made + 1, None),
                 );
             }
@@ -1521,6 +1535,7 @@ pub(crate) async fn run_agent_loop(
                         inference_started,
                         started_calls,
                         outcome,
+                        gateway_timing,
                         RetryNote::new(retries_made + 1, Some(stop)),
                     );
                 }
@@ -1592,6 +1607,7 @@ pub(crate) async fn run_agent_loop(
             choice: has_alternates.then_some(&choice),
             settings: &call_settings,
             retry: retry_note,
+            gateway: gateway_timing,
         };
         let driver_result = match dispatched {
             Ok(r) => r,
@@ -1818,6 +1834,7 @@ pub(crate) async fn run_agent_loop(
                 has_alternates.then_some(&choice),
                 Some(&call_settings),
                 retry_note,
+                gateway_timing,
             )
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
@@ -2659,6 +2676,8 @@ struct FailedTurnCall<'a> {
     choice: Option<&'a DriverChoice>,
     settings: &'a InferenceCallSettings,
     retry: RetryNote,
+    /// The last attempt's gateway timing; `None` for a driver with no runtime gateway.
+    gateway: Option<GatewayOffsets>,
 }
 
 impl FailedTurnCall<'_> {
@@ -2687,6 +2706,7 @@ impl FailedTurnCall<'_> {
                 spent: None,
                 settings: Some(self.settings),
                 retry: self.retry,
+                gateway: self.gateway,
             })
             .await;
     }
@@ -3231,6 +3251,7 @@ async fn write_hook_inference_record(
                     spent: Some((Some(record.input_tokens), None)),
                     settings: Some(&record.settings),
                     retry: record.retry,
+                    gateway: record.gateway,
                 })
                 .await
         }
@@ -3249,6 +3270,7 @@ async fn write_hook_inference_record(
                     record.usage.as_ref(),
                     Some(&record.settings),
                     record.retry,
+                    record.gateway,
                 )
                 .await
         }
@@ -6761,6 +6783,10 @@ mod tests {
                 driver_config: Some(json!({"reasoning_effort": "low"})),
             },
             retry: Default::default(),
+            gateway: Some(GatewayOffsets {
+                reached_ms: Some(1),
+                responded_ms: Some(2),
+            }),
         };
         write_hook_inference_record(&mut trace, 2, &record)
             .await
@@ -6775,6 +6801,8 @@ mod tests {
         assert_eq!(event["stop_reason"], "error");
         assert_eq!(event["error_code"], "driver_error");
         assert_eq!(event["provider_status"], 500);
+        assert_eq!(event["gateway_reached_ms"], 1);
+        assert_eq!(event["upstream_responded_ms"], 2);
         assert!(event["error"].as_str().unwrap().contains("HTTP 500: boom"));
         assert_eq!(event["input_tokens"], 42);
         assert!(event.get("output_tokens").is_none());
@@ -9051,6 +9079,7 @@ mod tests {
                         None,
                         None,
                         RetryNote::default(),
+                        None,
                     )
                     .await
                     .unwrap();

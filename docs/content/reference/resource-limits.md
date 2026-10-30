@@ -19,8 +19,8 @@ error[E-MAN-003]: murmur.yaml: invalid capability config for 'capabilities.limit
 
 `capabilities.limits` bounds every component call — a capsule `run`, a tool or driver `run`, and
 each hook lifecycle call — in wall-clock time and in the memory, table space and instances it may
-take. See [Execution limits](../concepts/capsules.md#execution-limits) for what a deadline does and
-does not bound.
+take. See [Execution limits](../concepts/capsules.md#execution-limits) for how a deadline stops a
+call that is computing and one that is waiting on the host.
 
 ```yaml
 capabilities:
@@ -33,7 +33,7 @@ capabilities:
 
 | Field crossed | What happens |
 |---|---|
-| `deadline_seconds` | The call is interrupted and fails with `E-RUN-001` naming the deadline that fired |
+| `deadline_seconds` | The call is stopped, whether it is computing or waiting on the host, and fails with `E-RUN-001` naming the deadline that fired. A call stopped while waiting on the host is recorded as [`call_deadline`](observability-schemas.md#call-deadline) |
 | `memory_bytes`, `table_elements` | The growth is refused and the call fails with `E-RUN-001` naming the limit and the size it tried to reach |
 
 Both are reported distinctly from a plain crash — see [CLI error codes](diagnostics.md#index).

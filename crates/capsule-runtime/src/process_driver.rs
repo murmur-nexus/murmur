@@ -14,7 +14,10 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::bindings::process_driver::ProcessDriver as ProcessDriverBindings;
 use crate::errors::RuntimeError;
-use crate::limits::{classify_guest_failure, EpochTicker, ExecutionLimiter, GuestFailure};
+use crate::limits::{
+    classify_guest_failure, CallDeadlines, ComponentRole, EpochTicker, ExecutionLimiter,
+    GuestFailure, WallDeadline,
+};
 use crate::ExecutionLimits;
 
 pub use crate::bindings::process_driver::exports::murmur::driver::process::{
@@ -259,6 +262,11 @@ pub struct ProcessDriver {
     version: String,
     store: Store<ProcessDriverStoreState>,
     bindings: ProcessDriverBindings,
+    /// The session's latch, where a call the wall-clock bound stops is recorded.
+    call_deadlines: CallDeadlines,
+    /// The call the wall-clock bound stopped, once one has, and its deadline in seconds. The
+    /// stopped call's future was dropped mid-guest, so the instance is never entered again.
+    cut: Option<(&'static str, u64)>,
 }
 
 impl ProcessDriver {
@@ -267,14 +275,16 @@ impl ProcessDriver {
     ///
     /// Each call into the driver is bounded by the hook call limits
     /// ([`ExecutionLimits::for_hook_calls`] with no declared deadline), so `engine` must have an
-    /// epoch ticker running. `name` and `version` identify the driver in errors. Any failure,
-    /// including an import the empty context does not provide, is
-    /// [`RuntimeError::ProcessDriverLoad`] carrying wasmtime's message.
-    pub async fn instantiate(
+    /// epoch ticker running, and to the same wall-clock bound, recorded in `call_deadlines`.
+    /// `name` and `version` identify the driver in errors. Any failure, including an import the
+    /// empty context does not provide, is [`RuntimeError::ProcessDriverLoad`] carrying wasmtime's
+    /// message.
+    pub(crate) async fn instantiate(
         engine: &Engine,
         component: &Component,
         name: &str,
         version: &str,
+        call_deadlines: CallDeadlines,
     ) -> Result<Self, RuntimeError> {
         let load_error = |message: String| RuntimeError::ProcessDriverLoad {
             name: name.to_string(),
@@ -298,14 +308,24 @@ impl ProcessDriver {
         store.limiter(|state| &mut state.limits);
         store.set_epoch_deadline(limits.deadline_ticks());
 
-        let bindings = ProcessDriverBindings::instantiate_async(&mut store, component, &linker)
+        let bindings = call_deadlines
+            .bound(
+                name,
+                ComponentRole::ProcessDriver,
+                "instantiate",
+                &limits,
+                ProcessDriverBindings::instantiate_async(&mut store, component, &linker),
+            )
             .await
+            .map_err(|_| load_error(format!("instantiation {}", wall_deadline_text(&limits))))?
             .map_err(|e| load_error(format!("{e:#}")))?;
         Ok(Self {
             name: name.to_string(),
             version: version.to_string(),
             store,
             bindings,
+            call_deadlines,
+            cut: None,
         })
     }
 
@@ -314,12 +334,24 @@ impl ProcessDriver {
     /// A trap, an exceeded deadline, or a `required-env` entry that is not a usable variable
     /// name (empty, or containing `=` or NUL) is [`RuntimeError::ProcessDriverLoad`].
     pub async fn describe(&mut self) -> Result<Description, RuntimeError> {
-        self.reset_deadline();
+        self.enter("describe")
+            .map_err(|message| self.load_error(message))?;
+        let limits = self.reset_deadline();
+        let called = self
+            .call_deadlines
+            .bound(
+                &self.name,
+                ComponentRole::ProcessDriver,
+                "describe",
+                &limits,
+                self.bindings
+                    .murmur_driver_process()
+                    .call_describe(&mut self.store),
+            )
+            .await;
         let description = self
-            .bindings
-            .murmur_driver_process()
-            .call_describe(&mut self.store)
-            .await
+            .settle("describe", &limits, called)
+            .map_err(|message| self.load_error(format!("describe() {message}")))?
             .map_err(|e| {
                 let message = match classify_guest_failure(&e, &self.store.data().limits) {
                     GuestFailure::DeadlineExceeded { seconds } => {
@@ -346,41 +378,112 @@ impl ProcessDriver {
         &mut self,
         request: LaunchRequest,
     ) -> Result<Result<LaunchPlan, String>, RuntimeError> {
-        self.reset_deadline();
-        self.bindings
-            .murmur_driver_process()
-            .call_launch(&mut self.store, &request)
-            .await
+        self.enter("launch")
+            .map_err(|message| self.failed_in("launch", message))?;
+        let limits = self.reset_deadline();
+        let called = self
+            .call_deadlines
+            .bound(
+                &self.name,
+                ComponentRole::ProcessDriver,
+                "launch",
+                &limits,
+                self.bindings
+                    .murmur_driver_process()
+                    .call_launch(&mut self.store, &request),
+            )
+            .await;
+        self.settle("launch", &limits, called)
+            .map_err(|message| self.failed_in("launch", message))?
             .map_err(|e| self.call_error("launch", &e))
     }
 
     /// Reads one batch of complete stdout lines into events. The same instance serves a whole
     /// run, so the driver may answer from what `launch` was given.
     pub async fn parse(&mut self, lines: Vec<String>) -> Result<Vec<Event>, RuntimeError> {
-        self.reset_deadline();
-        self.bindings
-            .murmur_driver_process()
-            .call_parse(&mut self.store, &lines)
-            .await
+        self.enter("parse")
+            .map_err(|message| self.failed_in("parse", message))?;
+        let limits = self.reset_deadline();
+        let called = self
+            .call_deadlines
+            .bound(
+                &self.name,
+                ComponentRole::ProcessDriver,
+                "parse",
+                &limits,
+                self.bindings
+                    .murmur_driver_process()
+                    .call_parse(&mut self.store, &lines),
+            )
+            .await;
+        self.settle("parse", &limits, called)
+            .map_err(|message| self.failed_in("parse", message))?
             .map_err(|e| self.call_error("parse", &e))
     }
 
     /// Asks the driver what a run whose output ended without a terminal event amounts to.
     pub async fn classify_exit(&mut self, exit: ExitStatus) -> Result<Event, RuntimeError> {
-        self.reset_deadline();
-        self.bindings
-            .murmur_driver_process()
-            .call_classify_exit(&mut self.store, &exit)
-            .await
+        self.enter("classify-exit")
+            .map_err(|message| self.failed_in("classify-exit", message))?;
+        let limits = self.reset_deadline();
+        let called = self
+            .call_deadlines
+            .bound(
+                &self.name,
+                ComponentRole::ProcessDriver,
+                "classify-exit",
+                &limits,
+                self.bindings
+                    .murmur_driver_process()
+                    .call_classify_exit(&mut self.store, &exit),
+            )
+            .await;
+        self.settle("classify-exit", &limits, called)
+            .map_err(|message| self.failed_in("classify-exit", message))?
             .map_err(|e| self.call_error("classify-exit", &e))
     }
 
-    /// Gives the next call its own deadline. Without this the ticks the previous call spent
-    /// would count against it, so a long run would eventually interrupt a driver that had done
-    /// nothing wrong.
-    fn reset_deadline(&mut self) {
-        let deadline = self.store.data().limits.limits().deadline_ticks();
-        self.store.set_epoch_deadline(deadline);
+    /// Gives the next call its own deadline, and returns the limits it runs under. Without this
+    /// the ticks the previous call spent would count against it, so a long run would eventually
+    /// interrupt a driver that had done nothing wrong.
+    fn reset_deadline(&mut self) -> ExecutionLimits {
+        let limits = self.store.data().limits.limits();
+        self.store.set_epoch_deadline(limits.deadline_ticks());
+        limits
+    }
+
+    /// Refuses a call into an instance the wall-clock bound stopped earlier, naming that call.
+    fn enter(&self, call: &str) -> Result<(), String> {
+        match self.cut {
+            None => Ok(()),
+            Some((earlier, seconds)) => Err(format!(
+                "{call} was not called: the earlier {earlier} call was stopped at its {seconds}s \
+                 deadline, and a stopped driver is not entered again"
+            )),
+        }
+    }
+
+    /// A bound call's outcome: the call's own result, or, when the wall-clock bound stopped it,
+    /// the instance marked cut and the text saying so.
+    fn settle<T>(
+        &mut self,
+        call: &'static str,
+        limits: &ExecutionLimits,
+        called: Result<T, WallDeadline>,
+    ) -> Result<T, String> {
+        called.map_err(|_| {
+            self.cut = Some((call, limits.deadline_seconds));
+            wall_deadline_text(limits)
+        })
+    }
+
+    fn failed_in(&self, call: &str, message: String) -> RuntimeError {
+        RuntimeError::ProcessDriverCallFailed {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            call: call.to_string(),
+            message,
+        }
     }
 
     fn call_error(&self, call: &str, error: &wasmtime::Error) -> RuntimeError {
@@ -408,6 +511,16 @@ impl ProcessDriver {
             message,
         }
     }
+}
+
+/// What a process driver phase the wall-clock bound stopped reports, in the wording of the
+/// epoch's "exceeded its …s deadline and was interrupted": the driver's deadline is the hook
+/// default, which no manifest key sets.
+fn wall_deadline_text(limits: &ExecutionLimits) -> String {
+    format!(
+        "waited on the host past its {}s deadline and was stopped",
+        limits.deadline_seconds
+    )
 }
 
 /// Whether `name` can be set as an environment variable.
@@ -474,6 +587,8 @@ impl StandaloneDriver {
             &self.component,
             STANDALONE_NAME,
             STANDALONE_VERSION,
+            // No session trace exists to drain a firing into.
+            CallDeadlines::default(),
         )
         .await
     }
@@ -863,7 +978,11 @@ mod tests {
         let start = Instant::now();
         for _ in 0..instantiations {
             rt.block_on(ProcessDriver::instantiate(
-                &engine, &component, "d", "0.1.0",
+                &engine,
+                &component,
+                "d",
+                "0.1.0",
+                CallDeadlines::default(),
             ))
             .expect("instantiates");
         }
@@ -871,7 +990,11 @@ mod tests {
 
         let mut driver = rt
             .block_on(ProcessDriver::instantiate(
-                &engine, &component, "d", "0.1.0",
+                &engine,
+                &component,
+                "d",
+                "0.1.0",
+                CallDeadlines::default(),
             ))
             .expect("instantiates");
         for lines in [1usize, 64] {
@@ -913,7 +1036,11 @@ mod tests {
             .build()
             .expect("runtime");
         let result = rt.block_on(ProcessDriver::instantiate(
-            &engine, &component, "d", "1.0.0",
+            &engine,
+            &component,
+            "d",
+            "1.0.0",
+            CallDeadlines::default(),
         ));
         match result {
             Err(RuntimeError::ProcessDriverLoad { name, message, .. }) => {

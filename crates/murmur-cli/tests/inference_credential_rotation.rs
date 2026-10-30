@@ -1089,9 +1089,12 @@ fn a_rejected_key_leaves_a_failed_inference_record() {
             "trace.capture={capture}: mur trace show\n{}",
             turns.join("\n")
         );
+        // The line goes on with the call's gateway timing, which differs every run.
         let failed = turns
             .iter()
-            .position(|line| *line == "failed:     turn 0  credential_rejected  HTTP 401")
+            .position(|line| {
+                line.starts_with("failed:     turn 0  credential_rejected  HTTP 401  gateway ")
+            })
             .unwrap_or_else(|| panic!("{capture}: {}", show.context()));
         assert!(
             turns[failed + 1].starts_with(&format!(

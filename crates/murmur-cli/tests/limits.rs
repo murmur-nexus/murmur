@@ -58,8 +58,8 @@ fn run_capsule(home: &Path, manifest_path: &Path) -> assert_cmd::assert::Assert 
         .assert()
 }
 
-/// The first and last lines of the one `trace.jsonl` the run left under `home`'s records.
-fn trace_frame(home: &Path) -> (serde_json::Value, serde_json::Value) {
+/// Every line of the one `trace.jsonl` the run left under `home`'s records.
+fn trace_lines(home: &Path) -> Vec<serde_json::Value> {
     let mut stack = vec![home.join(".murmur").join("records")];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).unwrap().flatten() {
@@ -67,16 +67,40 @@ fn trace_frame(home: &Path) -> (serde_json::Value, serde_json::Value) {
             if path.is_dir() {
                 stack.push(path);
             } else if path.file_name().is_some_and(|name| name == "trace.jsonl") {
-                let lines: Vec<serde_json::Value> = fs::read_to_string(&path)
+                return fs::read_to_string(&path)
                     .unwrap()
                     .lines()
                     .map(|line| serde_json::from_str(line).unwrap())
                     .collect();
-                return (lines[0].clone(), lines.last().unwrap().clone());
             }
         }
     }
     panic!("no trace.jsonl under {}", home.display());
+}
+
+/// The first and last lines of the one `trace.jsonl` the run left under `home`'s records.
+fn trace_frame(home: &Path) -> (serde_json::Value, serde_json::Value) {
+    let lines = trace_lines(home);
+    (lines[0].clone(), lines.last().unwrap().clone())
+}
+
+/// Whether a file named `name` exists anywhere under `root`.
+fn file_under(root: &Path, name: &str) -> bool {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().is_some_and(|file| file == name) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The headline proof: a capsule spinning in a loop that never returns and never calls the
@@ -108,6 +132,56 @@ fn spin_loop_capsule_is_interrupted_at_its_configured_deadline() {
     assert_eq!(start["event_type"], "session_start");
     assert_eq!(end["event_type"], "session_end");
     assert_eq!(end["exit_status"], "deadline_exceeded");
+    assert!(
+        !trace_lines(home.path())
+            .iter()
+            .any(|line| line["event_type"] == "call_deadline"),
+        "computing past the deadline is the epoch's to stop, and writes no call_deadline"
+    );
+}
+
+/// A capsule whose `run` sleeps — a host wait the epoch cannot interrupt — is stopped at its
+/// deadline plus the grace instead of sleeping out its eight seconds: the run fails as a deadline,
+/// one `call_deadline` names the stopped `run`, and the marker the finished run would write is
+/// never written.
+#[test]
+fn a_capsule_sleeping_in_the_host_is_stopped_at_its_deadline() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let manifest_path = create_project(
+        project.path(),
+        "capsule-sleep-long.wasm",
+        "  limits:\n    deadline_seconds: 2\n",
+    );
+
+    run_capsule(home.path(), &manifest_path)
+        .failure()
+        .stderr(predicate::str::contains("E-RUN-001"))
+        .stderr(predicate::str::contains(
+            "capsule execution exceeded its 2s deadline",
+        ));
+
+    let lines = trace_lines(home.path());
+    let cuts: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["event_type"] == "call_deadline")
+        .collect();
+    assert_eq!(cuts.len(), 1, "{lines:#?}");
+    let cut = cuts[0];
+    assert_eq!(cut["role"], "capsule");
+    assert_eq!(cut["component"], "capsule");
+    assert_eq!(cut["call"], "run");
+    assert_eq!(cut["deadline_seconds"], 2);
+    let elapsed = cut["elapsed_ms"].as_u64().unwrap();
+    assert!((2_000..8_000).contains(&elapsed), "{cut}");
+    let end = lines.last().unwrap();
+    assert_eq!(end["event_type"], "session_end");
+    assert_eq!(end["exit_status"], "deadline_exceeded");
+    assert!(
+        !file_under(project.path(), "done.txt") && !file_under(home.path(), "done.txt"),
+        "the stopped run wrote nothing after its sleep"
+    );
 }
 
 /// A capsule that grows its linear memory without bound traps at the configured cap rather

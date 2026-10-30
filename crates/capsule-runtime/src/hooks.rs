@@ -28,7 +28,10 @@ use crate::{
         add_inference_to_linker, HookInferenceCtx, HookInferencePurpose, HookInferenceRecord,
         InferenceUnavailable,
     },
-    limits::{classify_guest_failure, ExecutionLimiter, ExecutionLimits},
+    limits::{
+        classify_guest_failure, wall_deadline_hook_message, CallDeadlines, ComponentRole,
+        ExecutionLimiter, ExecutionLimits,
+    },
     network_policy::{resolve_scoped_dir, HookCapabilityGrant},
     runtime::NetworkPolicyHooks,
     state_store::STATE_PREOPEN_NAME,
@@ -321,6 +324,18 @@ struct HookInstance {
     /// (e.g. `"on-session-start"`). Always holds every entry in [`REQUIRED_HOOK_FNS`];
     /// entries from [`OPTIONAL_HOOK_FNS`] are present only if the component exports them.
     funcs: HashMap<String, wasmtime::component::Func>,
+    /// The call the wall-clock bound stopped on this instance, once one has. The stopped call's
+    /// future was dropped mid-guest, so the instance is never entered again: every later call
+    /// fails at once, naming this one.
+    cut: Option<HookCut>,
+}
+
+/// A lifecycle call the wall-clock bound stopped on a session-long hook instance.
+#[derive(Debug, Clone)]
+struct HookCut {
+    /// The WIT function name of the stopped call.
+    fn_name: String,
+    deadline_seconds: u64,
 }
 
 /// One async hook's dispatch endpoint, held by [`HookRuntime`] for the life of the session.
@@ -379,6 +394,8 @@ struct HookStoreState {
     /// What a `run-inference` call made now is for: set by [`call_hook`] for the length of each
     /// lifecycle call, `Lifecycle` between calls.
     inference_purpose: HookInferencePurpose,
+    /// The session's latch, where a call on this store the wall-clock bound stops is recorded.
+    call_deadlines: CallDeadlines,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -683,6 +700,10 @@ pub(crate) struct HookEnvVars<'a> {
     /// egress reaches them through it. `Some` only for a formation member; taken from the
     /// session, never from the process.
     pub formation_member: Option<&'a Arc<crate::formation_credentials::FormationMember>>,
+    /// The session's latch, cloned into each hook store, where a call the wall-clock bound
+    /// stops is recorded. Not an environment variable: carried here because every hook store is
+    /// built from this group.
+    pub call_deadlines: CallDeadlines,
 }
 
 /// Dispatch `on-stage` for all blocking hooks with a matching binding.
@@ -842,14 +863,30 @@ async fn call_stage_once(
             task_provenance: None,
         },
         inference_purpose: HookInferencePurpose::Lifecycle,
+        call_deadlines: env_vars.call_deadlines.clone(),
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limits);
     store.set_epoch_deadline(limits.deadline_ticks());
 
-    let instance = linker
-        .instantiate_async(&mut store, &staged.component)
+    let instance = env_vars
+        .call_deadlines
+        .bound(
+            &staged.name,
+            ComponentRole::Hook,
+            "instantiate",
+            &limits,
+            linker.instantiate_async(&mut store, &staged.component),
+        )
         .await
+        .map_err(|_| {
+            wall_deadline_hook_message(
+                &staged.name,
+                &staged.entry,
+                "instantiate",
+                limits.deadline_seconds,
+            )
+        })?
         .map_err(|e| {
             format!(
                 "failed to instantiate hook {}@{}: {e}",
@@ -889,7 +926,20 @@ where
         .map_err(|e| e.to_string())?;
     // Fresh budget for the call itself, so instantiation cost cannot eat into it.
     store.set_epoch_deadline(limits.deadline_ticks());
-    let called = f.call_async(&mut *store, (evt.clone(),)).await;
+    // The store is thrown away after this call, so a stopped call needs no cut marker.
+    let call_deadlines = store.data().call_deadlines.clone();
+    let called = call_deadlines
+        .bound(
+            hook_name,
+            ComponentRole::Hook,
+            "on-stage",
+            &limits,
+            f.call_async(&mut *store, (evt.clone(),)),
+        )
+        .await
+        .map_err(|_| {
+            wall_deadline_hook_message(hook_name, entry, "on-stage", limits.deadline_seconds)
+        })?;
     let (result,) = match called {
         Ok(result) => result,
         Err(err) => {
@@ -1681,14 +1731,30 @@ async fn instantiate_hook(
             task_provenance: None,
         },
         inference_purpose: HookInferencePurpose::Lifecycle,
+        call_deadlines: env_vars.call_deadlines.clone(),
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limits);
     store.set_epoch_deadline(limits.deadline_ticks());
 
-    let instance = linker
-        .instantiate_async(&mut store, &staged.component)
+    let instance = env_vars
+        .call_deadlines
+        .bound(
+            &staged.name,
+            ComponentRole::Hook,
+            "instantiate",
+            &limits,
+            linker.instantiate_async(&mut store, &staged.component),
+        )
         .await
+        .map_err(|_| {
+            RuntimeError::Runtime(wall_deadline_hook_message(
+                &staged.name,
+                &staged.entry,
+                "instantiate",
+                limits.deadline_seconds,
+            ))
+        })?
         .map_err(|err| {
             RuntimeError::Runtime(format!(
                 "failed to instantiate hook {}@{}: {err}",
@@ -1716,6 +1782,7 @@ async fn instantiate_hook(
         entry: staged.entry.clone(),
         config: staged.config.clone(),
         store,
+        cut: None,
     })
 }
 
@@ -1808,16 +1875,44 @@ where
     T: wasmtime::component::ComponentType + wasmtime::component::Lower,
     O: wasmtime::component::ComponentType + wasmtime::component::Lift + 'static,
 {
+    if let Some(cut) = &hook.cut {
+        return Err(format!(
+            "hook '{}' {fn_name} was not called: its earlier {} call was stopped at its {}s \
+             execution deadline, and a stopped instance is not entered again",
+            hook.name, cut.fn_name, cut.deadline_seconds
+        ));
+    }
     let f = func
         .typed::<(T,), (Result<O, String>,)>(&hook.store)
         .map_err(|e| e.to_string())?;
 
     // A blocking hook's store outlives every event it handles, so each lifecycle call is
     // given its own fresh budget rather than sharing one across the whole session.
-    let ticks = hook.store.data().limits.limits().deadline_ticks();
-    hook.store.set_epoch_deadline(ticks);
+    let limits = hook.store.data().limits.limits();
+    hook.store.set_epoch_deadline(limits.deadline_ticks());
 
-    let called = f.call_async(&mut hook.store, (arg,)).await;
+    let call_deadlines = hook.store.data().call_deadlines.clone();
+    let called = call_deadlines
+        .bound(
+            &hook.name,
+            ComponentRole::Hook,
+            fn_name,
+            &limits,
+            f.call_async(&mut hook.store, (arg,)),
+        )
+        .await;
+    let Ok(called) = called else {
+        hook.cut = Some(HookCut {
+            fn_name: fn_name.to_string(),
+            deadline_seconds: limits.deadline_seconds,
+        });
+        return Err(wall_deadline_hook_message(
+            &hook.name,
+            &hook.entry,
+            fn_name,
+            limits.deadline_seconds,
+        ));
+    };
     let (result,) = match called {
         Ok(result) => result,
         Err(err) => {
@@ -3712,6 +3807,7 @@ mod tests {
             retries: std::sync::Mutex::new(Vec::new()),
             retry: Default::default(),
             deadline: None,
+            call_deadlines: CallDeadlines::default(),
         });
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3795,6 +3891,7 @@ mod tests {
             retries: std::sync::Mutex::new(Vec::new()),
             retry: Default::default(),
             deadline: None,
+            call_deadlines: CallDeadlines::default(),
         })
     }
 
@@ -5061,6 +5158,7 @@ mod tests {
                 task_provenance: None,
             },
             inference_purpose: HookInferencePurpose::Lifecycle,
+            call_deadlines: CallDeadlines::default(),
         }
     }
 

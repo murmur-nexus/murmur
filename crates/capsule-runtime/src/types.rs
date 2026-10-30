@@ -15,7 +15,7 @@ use crate::{
     formation::FormationId,
     formation_credentials::FormationMember,
     hooks::ShellDispatchInfo,
-    limits::{EpochTicker, ExecutionLimits},
+    limits::{CallDeadlines, EpochTicker, ExecutionLimits},
     network_policy::{HookCapabilityGrant, ToolCapabilityGrant},
     spawn_credential::{SpawnApproval, SpawnCredential},
 };
@@ -759,6 +759,10 @@ pub struct StagedSession {
     /// stops when the session's `StagedSession` drops. `launch_session` moves the other
     /// fields out one by one, which leaves this one in place until the session returns.
     pub(crate) _epoch_ticker: EpochTicker,
+    /// The session's record of component calls the wall-clock bound stopped, created at staging
+    /// beside the epoch ticker and cloned into every store that runs a component and into the
+    /// session's trace writer, which drains it.
+    pub(crate) call_deadlines: CallDeadlines,
     /// The credential this session presents when it asks `mur-roost` to spawn a capsule.
     ///
     /// `None` for every session that cannot delegate, which is nearly all of them. Set by the

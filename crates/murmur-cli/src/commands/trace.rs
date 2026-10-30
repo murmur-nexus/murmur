@@ -329,6 +329,25 @@ struct InferenceEvent {
     /// Why a call whose last attempt failed transiently was not made again.
     #[serde(default)]
     retry_stopped: Option<String>,
+    /// Milliseconds from the attempt's start until the request reached the runtime's credential
+    /// gateway. The outer `None` is an absent key — no runtime gateway — and the inner one a
+    /// `null`: no request reached it.
+    #[serde(default, deserialize_with = "present_key")]
+    gateway_reached_ms: Option<Option<u64>>,
+    /// Milliseconds from the attempt's start until the provider's response head arrived, on the
+    /// same terms as `gateway_reached_ms`.
+    #[serde(default, deserialize_with = "present_key")]
+    upstream_responded_ms: Option<Option<u64>>,
+}
+
+/// A key whose `null` means something other than its absence: `Some(None)` for `null`, and
+/// `None`, through `#[serde(default)]`, for no key.
+fn present_key<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 impl InferenceEvent {
@@ -338,18 +357,35 @@ impl InferenceEvent {
             error_code: code.clone(),
             error: self.error.clone().unwrap_or_default(),
             provider_status: self.provider_status,
-            retry: self.retry_suffix(),
+            retry: self.call_suffix(),
         })
     }
 
-    /// `  attempts N` and `  retry stopped: <reason>`, each when the record carries it.
-    fn retry_suffix(&self) -> String {
+    /// `  attempts N`, `  retry stopped: <reason>` and the gateway timing
+    /// (`  gateway 12ms  responded 1.4s`, `  gateway 12ms  no response`, `  gateway not reached`),
+    /// each when the record carries it.
+    fn call_suffix(&self) -> String {
         let mut suffix = String::new();
         if let Some(attempts) = self.attempts {
             suffix.push_str(&format!("  attempts {attempts}"));
         }
         if let Some(stopped) = &self.retry_stopped {
             suffix.push_str(&format!("  retry stopped: {stopped}"));
+        }
+        match (
+            self.gateway_reached_ms,
+            self.upstream_responded_ms.flatten(),
+        ) {
+            (None, _) => {}
+            (Some(None), _) => suffix.push_str("  gateway not reached"),
+            (Some(Some(reached)), Some(responded)) => suffix.push_str(&format!(
+                "  gateway {}  responded {}",
+                fmt_dur(reached),
+                fmt_dur(responded)
+            )),
+            (Some(Some(reached)), None) => {
+                suffix.push_str(&format!("  gateway {}  no response", fmt_dur(reached)));
+            }
         }
         suffix
     }
@@ -371,7 +407,7 @@ struct FailedCall {
     error_code: String,
     error: String,
     provider_status: Option<u16>,
-    /// [`InferenceEvent::retry_suffix`] of the record.
+    /// [`InferenceEvent::call_suffix`] of the record.
     retry: String,
 }
 
@@ -907,6 +943,29 @@ struct ToolInputRefusedEvent {
     missing: Vec<String>,
 }
 
+/// A component call the wall-clock bound on its execution deadline stopped while it waited on the
+/// host.
+#[derive(Debug, Deserialize)]
+struct CallDeadlineEvent {
+    /// `capsule`, `driver`, `tool`, `hook` or `process_driver`.
+    role: String,
+    component: String,
+    /// `instantiate`, `run`, a hook lifecycle function or a process driver function.
+    call: String,
+    deadline_seconds: u64,
+}
+
+impl CallDeadlineEvent {
+    /// `call_deadline  driver stall-driver run  stopped at 3s`: what was stopped, as what, in
+    /// which call, and the deadline it was stopped at.
+    fn row(&self) -> String {
+        format!(
+            "call_deadline  {} {} {}  stopped at {}s",
+            self.role, self.component, self.call, self.deadline_seconds
+        )
+    }
+}
+
 /// A driver call failed transiently and was made again. The call's one `inference` line follows
 /// its last attempt.
 #[derive(Debug, Deserialize)]
@@ -1251,6 +1310,7 @@ enum TraceEvent {
     PlanEnd(PlanEndEvent),
     SpendCeilingReached(SpendCeilingReachedEvent),
     InferenceRetry(InferenceRetryEvent),
+    CallDeadline(CallDeadlineEvent),
     HarnessWarning(HarnessWarningEvent),
     HarnessFailed(HarnessFailedEvent),
     HarnessInterrupt(HarnessInterruptEvent),
@@ -1540,6 +1600,8 @@ struct TraceMetrics {
     inference_records: Vec<InferenceRecord>,
     /// Every retry, as its row reads, beside the turn it was made on.
     retries: Vec<(u32, String)>,
+    /// One [`CallDeadlineEvent::row`] per `call_deadline` line, in trace order.
+    call_deadlines: Vec<String>,
     provider_tokens: Option<ProviderTokens>,
     total_shell_calls: u32,
     shell_exit_codes: HashMap<i32, u32>,
@@ -2433,6 +2495,7 @@ fn compute_metrics(
     let mut resource_last_access: HashMap<String, CallSite> = HashMap::new();
     let mut inference_records: Vec<InferenceRecord> = Vec::new();
     let mut retries: Vec<(u32, String)> = Vec::new();
+    let mut call_deadlines: Vec<String> = Vec::new();
     let mut provider_tokens: Option<ProviderTokens> = None;
     let mut shell_exit_codes: HashMap<i32, u32> = HashMap::new();
     let mut shell_latencies: Vec<u64> = Vec::new();
@@ -2836,6 +2899,7 @@ fn compute_metrics(
             // Rendered in the step list; the summary has no spend section.
             TraceEvent::SpendCeilingReached(_) => {}
             TraceEvent::InferenceRetry(e) => retries.push((e.turn, e.row())),
+            TraceEvent::CallDeadline(e) => call_deadlines.push(e.row()),
             TraceEvent::ControlChange(change) => control_changes.push(ControlChangeRecord {
                 change,
                 applied_turn: None,
@@ -2928,6 +2992,7 @@ fn compute_metrics(
             redundant_calls,
             inference_records,
             retries,
+            call_deadlines,
             provider_tokens,
             total_shell_calls: se.total_shell_calls,
             shell_exit_codes,
@@ -3373,6 +3438,16 @@ fn print_show(m: &TraceMetrics) {
         capsule_runtime::report_println!("── Hook failures ────────────────────────────────");
         for f in &m.hook_failures {
             capsule_runtime::report_println!("✗ {}  {}  {}", f.hook_name, f.event, f.arm);
+        }
+        capsule_runtime::report_println!();
+    }
+
+    // Beside the hook failures: a component stopped while it waited on the host leaves no other
+    // line naming what it was waiting in.
+    if !m.call_deadlines.is_empty() {
+        capsule_runtime::report_println!("── Call deadlines ───────────────────────────────");
+        for row in &m.call_deadlines {
+            capsule_runtime::report_println!("{row}");
         }
         capsule_runtime::report_println!();
     }
@@ -4799,7 +4874,7 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
                     kind("inference"),
                     origin,
                     e.decision,
-                    e.retry_suffix()
+                    e.call_suffix()
                 ),
             },
             None => {
@@ -4824,7 +4899,7 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
                     (Some(choice), None) => format!("  on {choice}"),
                     _ => String::new(),
                 };
-                let retried = e.retry_suffix();
+                let retried = e.call_suffix();
                 match &e.tool_name {
                     Some(tool) => format!(
                         "turn {}  {}  {}{}{}{}",
@@ -5036,6 +5111,7 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.missing.join(", ")
         ),
         TraceEvent::InferenceRetry(e) => e.row(),
+        TraceEvent::CallDeadline(e) => e.row(),
         TraceEvent::SpendCeilingReached(e) => format!(
             "{}{}  used {} of {}  needs {}{}",
             kind("spend_ceiling_reached"),
@@ -6889,6 +6965,38 @@ mod tests {
 
     /// A retry row names the attempt out of every attempt the call may make, the status, and the
     /// wait; a retry with no status names its reason instead.
+    /// A `call_deadline` line renders as one row naming the role, the component, the call and
+    /// the deadline it was stopped at.
+    #[test]
+    fn call_deadline_row_names_what_was_stopped_and_at_which_deadline() {
+        let line = r#"{"event_type":"call_deadline","event_id":"evt_4","parent_id":"evt_1","session_id":"s","timestamp":4,"task_id":"tsk_1","component":"stall-driver","role":"driver","call":"run","deadline_seconds":3,"elapsed_ms":5002}"#;
+        assert_eq!(
+            row(line),
+            "call_deadline  driver stall-driver run  stopped at 3s"
+        );
+    }
+
+    /// The gateway timing renders on the `inference` row when the record carries it: both
+    /// offsets, a reach with no response, and a gateway no request reached.
+    #[test]
+    fn gateway_timing_renders_on_the_inference_row() {
+        let answered = r#"{"event_type":"inference","turn":0,"decision":"end_turn","stop_reason":"end_turn","tool_name":null,"gateway_reached_ms":12,"upstream_responded_ms":1400}"#;
+        assert_eq!(
+            row(answered),
+            "turn 0  end_turn  gateway 12ms  responded 1.4s"
+        );
+        let slow = r#"{"event_type":"inference","turn":0,"decision":"error","stop_reason":"error","tool_name":null,"error_code":"driver_failed","error":"stopped","gateway_reached_ms":12,"upstream_responded_ms":null}"#;
+        assert_eq!(
+            row(slow),
+            "turn 0  error  driver_failed  gateway 12ms  no response"
+        );
+        let never_sent = r#"{"event_type":"inference","turn":0,"decision":"error","stop_reason":"error","tool_name":null,"error_code":"driver_failed","error":"stopped","gateway_reached_ms":null,"upstream_responded_ms":null}"#;
+        assert_eq!(
+            row(never_sent),
+            "turn 0  error  driver_failed  gateway not reached"
+        );
+    }
+
     #[test]
     fn inference_retry_row_names_the_attempt_the_status_and_the_wait() {
         let line = r#"{"event_type":"inference_retry","event_id":"evt_5","parent_id":"evt_1","session_id":"s","timestamp":5,"turn":0,"task_id":"tsk_1","attempt":1,"max_retries":6,"reason":"status","provider_status":429,"error":"HTTP 429: slow down","delay_ms":1200,"retry_after_ms":1200,"charged_tokens":0}"#;

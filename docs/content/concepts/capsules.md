@@ -123,10 +123,18 @@ hooks included. A hook's own entry can set `deadline_seconds` for that hook alon
 capsule-wide value. Hitting either limit is reported distinctly from an ordinary crash. On the hook
 path it is handled like any other hook error: logged, and the runtime moves on to the next hook.
 
-**Caveat:** the deadline only counts down while the component's own code is running. Time it
-spends waiting on the runtime (for example, a driver awaiting a streaming provider response)
-counts against the same budget but cannot be cut short until control returns to the
-component. The deadline bounds runaway compute, not slow I/O.
+The deadline bounds the whole call in wall-clock time, whether the component is computing or
+waiting on the runtime — a sleep, or a driver awaiting a provider response that never comes:
+
+| The call is | Stopped at |
+|---|---|
+| Running its own code | The deadline |
+| Waiting on the runtime | The deadline plus a 2-second grace |
+
+A call stopped while waiting is recorded in the trace as a
+[`call_deadline`](../reference/observability-schemas.md#call-deadline) line naming the component and
+the call. A hook stopped this way is not called again for the rest of the session: each later
+event it is bound to is logged as not called.
 
 ## Runtime identity
 

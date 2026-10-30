@@ -11,6 +11,7 @@ use tokio::{
 use crate::{
     agent::{DriverUsage, OccupancyBasis},
     containment::ScopeReport,
+    credential_gateway::GatewayOffsets,
     formation::FormationId,
     gateway_credential::CredentialChange,
     inference_retry::{InferenceRetryRecord, RetryNote, RetryStop},
@@ -144,6 +145,10 @@ pub(crate) struct TraceWriter {
     /// writes and named by `session_start.deadline`. Set by [`Self::set_session_status`]; `None`
     /// feeds nothing.
     session_status: Option<std::sync::Arc<crate::session_status::SessionStatus>>,
+    /// The session's record of component calls the wall-clock bound stopped, drained into
+    /// `call_deadline` lines ahead of every line this writer writes. Set by
+    /// [`Self::set_call_deadlines`]; `None` drains nothing.
+    call_deadlines: Option<crate::limits::CallDeadlines>,
 }
 
 /// Provenance of an inference record that did **not** come from the agent
@@ -586,6 +591,17 @@ struct InferenceEvent {
     /// gateway the runtime does not own.
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_status: Option<u16>,
+    /// Milliseconds from the start of the attempt this record describes until the driver's
+    /// request reached the runtime's credential gateway. Present exactly on a call made through
+    /// a runtime-owned gateway; `null` there means no request reached it. The outer `Option` is
+    /// the key, the inner one its value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway_reached_ms: Option<Option<u64>>,
+    /// Milliseconds from the start of the attempt until the provider's response head arrived at
+    /// the gateway, the last one when the gateway resent. Present exactly when
+    /// `gateway_reached_ms` is; `null` there means no response head arrived.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_responded_ms: Option<Option<u64>>,
     /// How many attempts the call took, written only when it took more than one. Each retry
     /// before the last attempt has its own `inference_retry` line.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1355,6 +1371,8 @@ pub(crate) struct FailedInference<'a> {
     pub(crate) settings: Option<&'a InferenceCallSettings>,
     /// The call's attempts and why its retrying stopped, as its retry loop ended.
     pub(crate) retry: RetryNote,
+    /// The last attempt's gateway timing; `None` for a call made through no runtime gateway.
+    pub(crate) gateway: Option<GatewayOffsets>,
 }
 
 /// One `inference` line, as the writers that share [`TraceWriter::write_inference_event`] hand
@@ -1378,6 +1396,9 @@ struct InferenceLine<'a> {
     /// How the call was sent; `None` on the `process` transport, which writes neither key.
     settings: Option<&'a InferenceCallSettings>,
     retry: RetryNote,
+    /// When the attempt's request reached the runtime's credential gateway and was answered;
+    /// `None` for a call made through no runtime gateway, which writes neither key.
+    gateway: Option<GatewayOffsets>,
 }
 
 /// The most `task_failed.reason` carries, in bytes. A driver's error text is provider-supplied
@@ -1552,6 +1573,29 @@ pub(crate) struct DoneCheckRun<'a> {
     pub(crate) reopens_left: u32,
     /// `inference.max_turns` less every turn the task has spent. `null` with no cap.
     pub(crate) turns_remaining: Option<u32>,
+}
+
+/// A component call the wall-clock bound on `capabilities.limits.deadline_seconds` stopped while
+/// it waited on the host. Written once per firing, before the record of the call it cut and
+/// before `session_end`; never for an epoch trap.
+#[derive(Serialize)]
+struct CallDeadlineEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    /// [`crate::limits::CallDeadline::component`].
+    component: String,
+    /// [`crate::limits::ComponentRole::wire_name`].
+    role: &'static str,
+    /// [`crate::limits::CallDeadline::call`].
+    call: String,
+    deadline_seconds: u64,
+    /// How long the stopped phase had run, from the start of that phase.
+    elapsed_ms: u64,
 }
 
 /// A driver call failed transiently and is about to be made again. The call's one `inference`
@@ -2375,7 +2419,14 @@ impl TraceWriter {
             max_session_tokens: None,
             machine_tokens_per_day: None,
             session_status: None,
+            call_deadlines: None,
         })
+    }
+
+    /// The session's [`crate::limits::CallDeadlines`], which this writer drains into one
+    /// `call_deadline` line per firing ahead of each line it writes, `session_end` included.
+    pub(crate) fn set_call_deadlines(&mut self, deadlines: crate::limits::CallDeadlines) {
+        self.call_deadlines = Some(deadlines);
     }
 
     /// The session's standing, which every later `inference`, `task_start` and `task_end` write
@@ -2616,7 +2667,8 @@ impl TraceWriter {
         };
         self.write_event(&event).await?;
         self.session_started = true;
-        Ok(())
+        // A firing from before the session frame existed — an `on-stage` hook's — hangs off it.
+        self.write_call_deadlines().await
     }
 
     /// `input_tokens`/`output_tokens` are what the session and task totals accumulate: the
@@ -2662,6 +2714,7 @@ impl TraceWriter {
             counted: true,
             settings,
             retry: RetryNote::default(),
+            gateway: None,
         })
         .await
     }
@@ -2679,6 +2732,7 @@ impl TraceWriter {
         usage: Option<&DriverUsage>,
         settings: Option<&InferenceCallSettings>,
         retry: RetryNote,
+        gateway: Option<GatewayOffsets>,
     ) -> std::io::Result<()> {
         self.write_inference_event(InferenceLine {
             turn,
@@ -2696,6 +2750,7 @@ impl TraceWriter {
             counted: true,
             settings,
             retry,
+            gateway,
         })
         .await
     }
@@ -2718,6 +2773,7 @@ impl TraceWriter {
         choice: Option<&crate::driver_choice::DriverChoice>,
         settings: Option<&InferenceCallSettings>,
         retry: RetryNote,
+        gateway: Option<GatewayOffsets>,
     ) -> std::io::Result<()> {
         if stop_reason == Some("max_tokens") {
             self.task_capped_turns = self.task_capped_turns.saturating_add(1);
@@ -2738,6 +2794,7 @@ impl TraceWriter {
             counted: true,
             settings,
             retry,
+            gateway,
         })
         .await
     }
@@ -2773,6 +2830,7 @@ impl TraceWriter {
             counted: failed.spent.is_some(),
             settings: failed.settings,
             retry: failed.retry,
+            gateway: failed.gateway,
         })
         .await
     }
@@ -2794,11 +2852,14 @@ impl TraceWriter {
             counted,
             settings,
             retry,
+            gateway,
         } = line;
         let (error_code, error, provider_status) = match failure {
             Some((code, error, status)) => (Some(code.to_string()), Some(error), status),
             None => (None, None, None),
         };
+        // Drained under the previous turn, before this line becomes the turn node.
+        self.write_call_deadlines().await?;
         let event_id = new_event_id();
         // The agent loop's own inference *is* the turn node — there is no separate turn line —
         // so it hangs off the task and everything the turn goes on to produce hangs off it. A
@@ -2849,6 +2910,8 @@ impl TraceWriter {
             error_code,
             error,
             provider_status,
+            gateway_reached_ms: gateway.map(|gateway| gateway.reached_ms),
+            upstream_responded_ms: gateway.map(|gateway| gateway.responded_ms),
             attempts: retry.attempts,
             retry_stopped: retry.stopped.map(RetryStop::wire_name),
         };
@@ -3286,6 +3349,8 @@ impl TraceWriter {
         part_kinds: &[&'static str],
         reference_task_ids: &[String],
     ) -> std::io::Result<()> {
+        // Drained under the ids in force before this task, which the lines below replace.
+        self.write_call_deadlines().await?;
         // Reset per-task counters for this task
         self.task_turns = 0;
         self.task_input_tokens = 0;
@@ -3338,6 +3403,8 @@ impl TraceWriter {
         keep_working: Option<KeepWorkingSummary>,
         done_check: Option<DoneCheckSummary>,
     ) -> std::io::Result<()> {
+        // Drained inside the task, before the lines below clear its ids.
+        self.write_call_deadlines().await?;
         let duration_ms = self
             .task_start_instant
             .take()
@@ -4120,7 +4187,44 @@ impl TraceWriter {
     /// whatever the appender wrote in between and the file would stop parsing as JSONL. The
     /// two writers agree on one rule — a complete line per write, then flush — and that rule is
     /// what makes concurrent reads during a running task safe to record.
+    /// Write `event` as one line, after a `call_deadline` line for each firing the session's
+    /// latch holds. Draining here, ahead of every line, is what puts a cut call's
+    /// `call_deadline` before the record of that call and every one before `session_end`.
     async fn write_event(&mut self, event: &impl Serialize) -> std::io::Result<()> {
+        self.write_call_deadlines().await?;
+        self.write_line(event).await
+    }
+
+    /// One `call_deadline` line per firing [`Self::call_deadlines`] holds, parented to the turn
+    /// as `inference_retry` is. Nothing before `session_start`, which every line hangs off.
+    async fn write_call_deadlines(&mut self) -> std::io::Result<()> {
+        let Some(deadlines) = self
+            .call_deadlines
+            .as_ref()
+            .filter(|_| self.session_started)
+        else {
+            return Ok(());
+        };
+        for cut in deadlines.take() {
+            let event = CallDeadlineEvent {
+                event_type: "call_deadline",
+                event_id: new_event_id(),
+                parent_id: self.turn_parent(),
+                session_id: self.session_id.clone(),
+                timestamp: timestamp_ms(),
+                task_id: self.active_task_id.clone(),
+                component: cut.component,
+                role: cut.role.wire_name(),
+                call: cut.call,
+                deadline_seconds: cut.deadline_seconds,
+                elapsed_ms: cut.elapsed_ms,
+            };
+            self.write_line(&event).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_line(&mut self, event: &impl Serialize) -> std::io::Result<()> {
         let mut line = serde_json::to_string(event).map_err(std::io::Error::other)?;
         line.push('\n');
         self.writer.write_all(line.as_bytes()).await?;
@@ -6468,6 +6572,7 @@ mod tests {
             spent: None,
             settings: None,
             retry: RetryNote::default(),
+            gateway: None,
         })
         .await
         .unwrap();
@@ -6488,6 +6593,7 @@ mod tests {
             spent: Some((Some(10), Some(5))),
             settings: None,
             retry: RetryNote::default(),
+            gateway: None,
         })
         .await
         .unwrap();
@@ -6553,6 +6659,136 @@ mod tests {
         assert_eq!(failed[0]["parent_id"], task_start["event_id"]);
     }
 
+    /// The gateway timing keys: absent with no runtime gateway, `null` for a moment that never
+    /// came, numbers for one that did.
+    #[tokio::test]
+    async fn gateway_timing_keys_follow_the_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        let failed = |turn, gateway| FailedInference {
+            turn,
+            error_code: INFERENCE_ERROR_DRIVER_FAILED,
+            error: "stopped",
+            provider_status: None,
+            usage: None,
+            origin: None,
+            choice: None,
+            message_ids: Vec::new(),
+            tool_name: None,
+            spent: None,
+            settings: None,
+            retry: RetryNote::default(),
+            gateway,
+        };
+        w.write_failed_inference(failed(0, None)).await.unwrap();
+        w.write_failed_inference(failed(1, Some(GatewayOffsets::default())))
+            .await
+            .unwrap();
+        let answered = GatewayOffsets {
+            reached_ms: Some(4),
+            responded_ms: Some(90),
+        };
+        w.write_failed_inference(failed(2, Some(answered)))
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        assert!(events[0].get("gateway_reached_ms").is_none());
+        assert!(events[0].get("upstream_responded_ms").is_none());
+        assert_eq!(events[1]["gateway_reached_ms"], Value::Null);
+        assert_eq!(events[1]["upstream_responded_ms"], Value::Null);
+        assert!(events[1]
+            .as_object()
+            .unwrap()
+            .contains_key("gateway_reached_ms"));
+        assert!(events[1]
+            .as_object()
+            .unwrap()
+            .contains_key("upstream_responded_ms"));
+        assert_eq!(events[2]["gateway_reached_ms"], 4);
+        assert_eq!(events[2]["upstream_responded_ms"], 90);
+    }
+
+    /// A firing in the latch is written as one `call_deadline` line ahead of the next line the
+    /// writer writes, inside the task and under the previous turn, and is not written twice. One
+    /// from before the session frame follows `session_start`.
+    #[tokio::test]
+    async fn call_deadlines_are_drained_ahead_of_the_next_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        let deadlines = crate::limits::CallDeadlines::default();
+        w.set_call_deadlines(deadlines.clone());
+        let staged = |component: &str, call: &str| crate::limits::CallDeadline {
+            component: component.to_string(),
+            role: crate::limits::ComponentRole::Hook,
+            call: call.to_string(),
+            deadline_seconds: 2,
+            elapsed_ms: 4_000,
+        };
+        deadlines.push_for_test(staged("stager", "on-stage"));
+        w.write_session_start(None, None, Vec::new()).await.unwrap();
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3, &[], &[])
+            .await
+            .unwrap();
+        deadlines.push_for_test(crate::limits::CallDeadline {
+            component: "stall-driver".to_string(),
+            role: crate::limits::ComponentRole::Driver,
+            call: "run".to_string(),
+            deadline_seconds: 3,
+            elapsed_ms: 5_001,
+        });
+        w.write_failed_inference(FailedInference {
+            turn: 0,
+            error_code: INFERENCE_ERROR_DRIVER_FAILED,
+            error: "stopped",
+            provider_status: None,
+            usage: None,
+            origin: None,
+            choice: None,
+            message_ids: Vec::new(),
+            tool_name: None,
+            spent: None,
+            settings: None,
+            retry: RetryNote::default(),
+            gateway: Some(GatewayOffsets::default()),
+        })
+        .await
+        .unwrap();
+        w.write_session_end("ok").await.unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let types: Vec<&str> = events
+            .iter()
+            .map(|e| e["event_type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "session_start",
+                "call_deadline",
+                "task_start",
+                "call_deadline",
+                "inference",
+                "session_end"
+            ]
+        );
+        assert_eq!(events[1]["call"], "on-stage");
+        assert_eq!(events[1]["parent_id"], events[0]["event_id"]);
+        assert!(events[1].get("task_id").is_none(), "outside a task");
+        let cut = &events[3];
+        assert_eq!(cut["component"], "stall-driver");
+        assert_eq!(cut["role"], "driver");
+        assert_eq!(cut["call"], "run");
+        assert_eq!(cut["deadline_seconds"], 3);
+        assert_eq!(cut["elapsed_ms"], 5_001);
+        assert_eq!(cut["task_id"], "tsk_1");
+        assert_eq!(cut["parent_id"], events[2]["event_id"]);
+        assert!(cut["event_id"].as_str().is_some());
+        assert!(cut["timestamp"].as_u64().is_some());
+    }
+
     #[tokio::test]
     async fn a_failed_hook_record_hangs_off_the_turn_and_keeps_hook_accounting() {
         let dir = tempfile::tempdir().unwrap();
@@ -6589,6 +6825,7 @@ mod tests {
             spent: Some((Some(40), None)),
             settings: None,
             retry: RetryNote::default(),
+            gateway: None,
         })
         .await
         .unwrap();
@@ -6645,6 +6882,7 @@ mod tests {
             None,
             Some(&turn),
             RetryNote::default(),
+            None,
         )
         .await
         .unwrap();
@@ -6661,6 +6899,7 @@ mod tests {
             None,
             Some(&unconfigured),
             RetryNote::default(),
+            None,
         )
         .await
         .unwrap();
@@ -6692,6 +6931,7 @@ mod tests {
             spent: None,
             settings: Some(&turn),
             retry: RetryNote::default(),
+            gateway: None,
         })
         .await
         .unwrap();
@@ -6778,6 +7018,7 @@ mod tests {
             spent: None,
             settings: None,
             retry: RetryNote::default(),
+            gateway: None,
         })
         .await
         .unwrap();
@@ -7612,6 +7853,7 @@ mod tests {
                     None,
                     None,
                     RetryNote::default(),
+                    None,
                 )
                 .await
                 .unwrap();
